@@ -1,0 +1,21 @@
+[package]
+name = "focal-consensus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+focal-log = { version = "0.1.0", path = "../focal-log" }
+focal-memory = { version = "0.1.0", path = "../focal-memory" }
+postcard.workspace = true
+raft.workspace = true
+serde.workspace = true
+slog.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

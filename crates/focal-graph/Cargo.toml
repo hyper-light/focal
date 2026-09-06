@@ -1,0 +1,18 @@
+[package]
+name = "focal-graph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+focal-model = { version = "0.1.0", path = "../focal-model" }
+focal-core = { version = "0.1.0", path = "../focal-core" }
+focal-memory = { version = "0.1.0", path = "../focal-memory" }
+serde.workspace = true
+postcard.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

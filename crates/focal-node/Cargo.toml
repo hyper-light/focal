@@ -1,0 +1,47 @@
+[package]
+name = "focal-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "focal"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+focal-consensus = { version = "0.1.0", path = "../focal-consensus" }
+focal-control = { version = "0.1.0", path = "../focal-control" }
+focal-directory = { version = "0.1.0", path = "../focal-directory" }
+focal-enrollment = { version = "0.1.0", path = "../focal-enrollment" }
+focal-evidence = { version = "0.1.0", path = "../focal-evidence" }
+focal-graph = { version = "0.1.0", path = "../focal-graph" }
+focal-memory = { version = "0.1.0", path = "../focal-memory" }
+focal-ledger = { version = "0.1.0", path = "../focal-ledger" }
+focal-log = { version = "0.1.0", path = "../focal-log" }
+focal-model = { version = "0.1.0", path = "../focal-model" }
+focal-runtime = { version = "0.1.0", path = "../focal-runtime" }
+focal-wire = { version = "0.1.0", path = "../focal-wire" }
+focal-stream = { version = "0.1.0", path = "../focal-stream" }
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+blake3.workspace = true
+clap.workspace = true
+getrandom.workspace = true
+fs2.workspace = true
+postcard.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_saphyr.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+zeroize = "1.8"
+
+[dev-dependencies]
+focal-log = { version = "0.1.0", path = "../focal-log", features = ["test-support"] }
+tempfile.workspace = true
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring", "x509-parser"] }

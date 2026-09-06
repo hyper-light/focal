@@ -1,0 +1,267 @@
+{
+  "captured_on": "2026-09-05",
+  "source_repository": "hecate",
+  "source_commit": "103c0785d2623c19d0c02a450e94677bbfc70359",
+  "capture": "working-tree bytes; per-file differs_from_head recorded",
+  "files": [
+    {
+      "source_path": "CONTEXT.md",
+      "snapshot_path": "CONTEXT.md",
+      "sha256": "cbaab9a60dac2c8ba921550c5093f9413312d7edd6386d4e58600e23617b9949",
+      "bytes": 16822,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/GAPS.md",
+      "snapshot_path": "docs/GAPS.md",
+      "sha256": "52a78875a9f7e5ad4818211c3c26794d033789cdd0be53673056f25b66b6a4f1",
+      "bytes": 38161,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/architecture/LEDGER.md",
+      "snapshot_path": "docs/architecture/LEDGER.md",
+      "sha256": "efa0b65995723406dc95e484c81d08e73f9fb04c255a7d642199a2520cd77cec",
+      "bytes": 29008,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/architecture/PLATFORM.md",
+      "snapshot_path": "docs/architecture/PLATFORM.md",
+      "sha256": "81dd828bc5486bbfa2fc0b9798d0a7191221b58e64d84ddf1572f2344005004c",
+      "bytes": 10168,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/architecture/AGENTS.md",
+      "snapshot_path": "docs/architecture/AGENT_MODEL.md",
+      "sha256": "b0451607a78781b578b7e9cd9ebaa3a8d0f71bd2f83e64fe568075db175071b9",
+      "bytes": 22766,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/architecture/SKILLS.md",
+      "snapshot_path": "docs/architecture/SKILLS.md",
+      "sha256": "7be265cda8a935a92dc7ce5c5b3cdc4204671907f08a857904d7dbc2ef70a6c3",
+      "bytes": 5316,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/architecture/SUMMONING.md",
+      "snapshot_path": "docs/architecture/SUMMONING.md",
+      "sha256": "9c794d61378e4ae698d0da0acc7d8463a4dc701e81af04dd62ff2c58da788d64",
+      "bytes": 13677,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/LEDGER_CORE.md",
+      "snapshot_path": "docs/specs/LEDGER_CORE.md",
+      "sha256": "bc5600024bfdc2e632464879d2677ee104335326d9ef3321520292115177f1f6",
+      "bytes": 16959,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/LEDGER_SUBSTRATE.md",
+      "snapshot_path": "docs/specs/LEDGER_SUBSTRATE.md",
+      "sha256": "2f5957782c78f6bb4a0f71961c412dc957d5a0210075ba1b0f4c4ebbc69e59cd",
+      "bytes": 15710,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/MATERIALIZER.md",
+      "snapshot_path": "docs/specs/MATERIALIZER.md",
+      "sha256": "c1254d8a64ac3b59fb8736973324faba6823cf49a49e2ad00c28f81241ac632f",
+      "bytes": 16057,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/STORE.md",
+      "snapshot_path": "docs/specs/STORE.md",
+      "sha256": "6359c4813a7fef2083e368bdb35d86ed5eb174a0bf859a1c56ae033dd81cbd73",
+      "bytes": 43238,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/WAL.md",
+      "snapshot_path": "docs/specs/WAL.md",
+      "sha256": "9f81d8de9b6a64ab94f09b9948f67b6aa02bcf2a6d82df1f4ee1e9d05cb483c9",
+      "bytes": 13983,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/CONSENSUS.md",
+      "snapshot_path": "docs/specs/CONSENSUS.md",
+      "sha256": "5f7ddd2c0bd36b9d872e4ad00091e4d7f258d94bc49c848200913362edc9ed70",
+      "bytes": 30119,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/CACHE.md",
+      "snapshot_path": "docs/specs/CACHE.md",
+      "sha256": "4c1323c0160db5968f0c28d0624f4f6e57372d39c88894496d3347491c82f616",
+      "bytes": 16629,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/FANOUT.md",
+      "snapshot_path": "docs/specs/FANOUT.md",
+      "sha256": "9e7387e663fb65c6afb3fe00e7589de93d1a731577bff2c70b71d7085b19d687",
+      "bytes": 9472,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/QUEUE.md",
+      "snapshot_path": "docs/specs/QUEUE.md",
+      "sha256": "9c1f94fcac3c995ae04a5b2d13523eaa0e7d4914bb36ac70ac92ff710206c5c0",
+      "bytes": 11372,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/PROTOCOL.md",
+      "snapshot_path": "docs/specs/PROTOCOL.md",
+      "sha256": "9d668e22af55d3149d844cb923114ed48ce983b6324e0c8b4275c8eee4f04286",
+      "bytes": 24015,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/WIRE_FORMAT.md",
+      "snapshot_path": "docs/specs/WIRE_FORMAT.md",
+      "sha256": "11962d12738448f6cfea9d2d9627756539b9dcba68e12d9b1d098049fdadeee5",
+      "bytes": 13519,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/WIRE_SECURITY.md",
+      "snapshot_path": "docs/specs/WIRE_SECURITY.md",
+      "sha256": "ba5a7aba69e91cf47e79161741fcdc7180e61b08378d3c8b80fd87594b96064b",
+      "bytes": 15174,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/ARCHIVE.md",
+      "snapshot_path": "docs/specs/ARCHIVE.md",
+      "sha256": "d576524af6faf21a353bf60f6060e95f74ca192aa3c23c2a3eadf8f4a4deb85d",
+      "bytes": 31514,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/OBJECT_TIER.md",
+      "snapshot_path": "docs/specs/OBJECT_TIER.md",
+      "sha256": "b538b376134ebc7cbd4e396a898a0bfa0cf559e7f6ca488ad959a263f828bb27",
+      "bytes": 25705,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/TRANSFER.md",
+      "snapshot_path": "docs/specs/TRANSFER.md",
+      "sha256": "10b48a4c2d93db614703c58d8bd7b4b09e4c92785e05f2c5441cba760c0cb3b3",
+      "bytes": 16484,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/SESSIONS.md",
+      "snapshot_path": "docs/specs/SESSIONS.md",
+      "sha256": "092477c8adb5e2521bea2a25337838101b3e9c0ba19197be6e28a977e229161b",
+      "bytes": 16981,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/RUNTIME.md",
+      "snapshot_path": "docs/specs/RUNTIME.md",
+      "sha256": "9d98caddeb329d2bb80be97071dcd92caa070ed8a2967f6bbd01b3ab04fad330",
+      "bytes": 14259,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/FAULTS.md",
+      "snapshot_path": "docs/specs/FAULTS.md",
+      "sha256": "b316a1c1d6b467b34ad63c0dc94b70aaf109f9c70d2d139506844b6e4e36caae",
+      "bytes": 14770,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/RANK.md",
+      "snapshot_path": "docs/specs/RANK.md",
+      "sha256": "131220edf4095947df265d991fd07da60754d4d71c9cace4dbc34ad7e507ae7b",
+      "bytes": 7284,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/IAM.md",
+      "snapshot_path": "docs/specs/IAM.md",
+      "sha256": "6fe56a1000a5f3b795d88f4efeedf335a63922d1b01862b0e8fa7f2fc7bea9b0",
+      "bytes": 45942,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/REGISTRY.md",
+      "snapshot_path": "docs/specs/REGISTRY.md",
+      "sha256": "d3a1f71217ff0463193a65ae9a02a0d04a57fd2cea07ad50e5606e72824755e0",
+      "bytes": 22354,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/HEALTH.md",
+      "snapshot_path": "docs/specs/HEALTH.md",
+      "sha256": "2ba28189fb750f392531ad9f36768c23a25d1f538df4859b7d7da07b4d3b2950",
+      "bytes": 6635,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/TRACING.md",
+      "snapshot_path": "docs/specs/TRACING.md",
+      "sha256": "a2b43a4ecb7316cdfd9d913aa710cf43d2e2b6c83a34c98ee47cc2ee99727a76",
+      "bytes": 26947,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/SKILLS_API.md",
+      "snapshot_path": "docs/specs/SKILLS_API.md",
+      "sha256": "0d7c6737f43cdc96ae08696ab6739377190ca8b02c436686eeff81f597bed45e",
+      "bytes": 8024,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/AGENTS_RUNTIME.md",
+      "snapshot_path": "docs/specs/AGENTS_RUNTIME.md",
+      "sha256": "dec20b2b0e3f6b1f4bdce4d15b89f0bf52e96b4c0b02b07db72789703d6d5177",
+      "bytes": 9354,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/SERVING.md",
+      "snapshot_path": "docs/specs/SERVING.md",
+      "sha256": "422b037ad4f8652ae443f9ff1d5e0a461bc87d169910013bf2faac227020aa5e",
+      "bytes": 16994,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/specs/AUTOSCALING.md",
+      "snapshot_path": "docs/specs/AUTOSCALING.md",
+      "sha256": "6bc3e9c9bc2652f9e71c851b5cd1f145b0194c145c8d8879c7d12d6ebf7c25a9",
+      "bytes": 9218,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/adr/0002-custom-dual-stack-claims-protocol.md",
+      "snapshot_path": "docs/adr/0002-custom-dual-stack-claims-protocol.md",
+      "sha256": "11af0386a30051a245ba1438f388a38a235e48e303ee74e16ebe067f54888b94",
+      "bytes": 1359,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/adr/0003-streaming-merge-gate.md",
+      "snapshot_path": "docs/adr/0003-streaming-merge-gate.md",
+      "sha256": "892ece83f551fd0795675a3d5f1877c7604f195a5206604876261a3ee14195a4",
+      "bytes": 1349,
+      "differs_from_head": false
+    },
+    {
+      "source_path": "docs/adr/0004-single-binary-with-client-runtime-seam.md",
+      "snapshot_path": "docs/adr/0004-single-binary-with-client-runtime-seam.md",
+      "sha256": "c14a4158a5003e91e6bfc651426a9dbf9ec5f3e5fd8ebe2591fce0cd81df4b67",
+      "bytes": 1220,
+      "differs_from_head": false
+    }
+  ]
+}

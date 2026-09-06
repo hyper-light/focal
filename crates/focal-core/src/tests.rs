@@ -1,0 +1,2124 @@
+use super::*;
+
+pub(crate) const ISSUER: ParticipantId = ParticipantId::from_u128(1);
+pub(crate) const WORKER: ParticipantId = ParticipantId::from_u128(2);
+pub(crate) const EVALUATOR: ParticipantId = ParticipantId::from_u128(3);
+pub(crate) fn ledger() -> LedgerId {
+    LedgerId {
+        tenant: TenantId::from_u128(10),
+        session: SessionId::from_u128(20),
+    }
+}
+fn root() -> Cause {
+    Cause::Root(RootCommandId::from_u128(30))
+}
+pub(crate) fn input(n: u128, actor: ParticipantId, command: Command) -> AuthenticatedInput {
+    AuthenticatedInput {
+        ledger: ledger(),
+        principal: actor,
+        request_epoch: RequestEpoch(1),
+        request_id: RequestId::from_u128(n),
+        expected_revision: None,
+        authority: AuthorityContext {
+            runtime: true,
+            cause: root(),
+            policy_revision: 1,
+            logical_time: 1000,
+            evidence: Vec::new(),
+        },
+        command,
+    }
+}
+fn apply(core: &mut Core, i: AuthenticatedInput) -> ApplyResult {
+    let prepared = core
+        .prepare(&i)
+        .unwrap_or_else(|e| panic!("prepare command {}: {e}", i.command.code()));
+    // Every existing workflow is also an equivalence test through the public
+    // tracked interface, including graph cascades and validation aggregation.
+    let traced = core.prepare_tracked(&i, 65_536);
+    assert_eq!(traced.result.as_ref().unwrap(), &prepared);
+    assert!(!traced.accesses.session_exclusive);
+    let mut oracle = core.clone();
+    let sequence = SessionSeq(core.sequence().0 + 1);
+    let result = core
+        .apply_serial(sequence, prepared.clone())
+        .expect("apply");
+    let replay = oracle.apply_tracked(sequence, prepared, 65_536);
+    assert_eq!(replay.result.as_ref().unwrap(), &result);
+    assert!(traced.accesses.covers(&replay.accesses));
+    assert_eq!(
+        core.normalized_bytes().unwrap(),
+        oracle.normalized_bytes().unwrap()
+    );
+    assert_eq!(
+        core.encode_checkpoint().unwrap(),
+        oracle.encode_checkpoint().unwrap()
+    );
+    result
+}
+pub(crate) fn setup() -> Core {
+    let mut core = Core::new(ledger(), Limits::default());
+    for (i, p) in [ISSUER, WORKER, EVALUATOR].into_iter().enumerate() {
+        apply(
+            &mut core,
+            input(
+                900 + i as u128,
+                p,
+                Command::NegotiateEpoch {
+                    epoch: RequestEpoch(1),
+                },
+            ),
+        );
+    }
+    core
+}
+pub(crate) fn new_claim(id: u128) -> NewClaim {
+    let cid = ClaimId::from_u128(id);
+    let vid = ValidationId::from_u128(id + 100_000);
+    let v = ValidationContent {
+        ledger: ledger(),
+        schema: SCHEMA_MAJOR,
+        claim: cid,
+        kind: ValidationKind::Receipt,
+        phase: ValidationPhase::WholeWork,
+        mode: ValidationMode::Required,
+        description: "acknowledged receipt".into(),
+        quality_bar: None,
+        evaluator: EVALUATOR,
+        handlers: Vec::new(),
+        evidence_schemas: BTreeSet::new(),
+        contributed_by: BTreeSet::from([ISSUER]),
+        policy_revision: 1,
+    };
+    NewClaim {
+        id: cid,
+        content: ClaimContent {
+            ledger: ledger(),
+            schema: SCHEMA_MAJOR,
+            occurrence: OccurrenceId::from_u128(id),
+            description: "return evidence".into(),
+            relations: BTreeSet::from([
+                Relation {
+                    kind: RelationKind::Issuer,
+                    target: RelationTarget::Participant(ISSUER),
+                },
+                Relation {
+                    kind: RelationKind::Subject,
+                    target: RelationTarget::Participant(WORKER),
+                },
+                Relation {
+                    kind: RelationKind::ClaimAction,
+                    target: RelationTarget::Action(ActionType::Work),
+                },
+                Relation {
+                    kind: RelationKind::CausedBy,
+                    target: RelationTarget::Root(RootCommandId::from_u128(30)),
+                },
+            ]),
+            scopes: BTreeSet::new(),
+            requirements: vec![RequirementRef {
+                id: vid,
+                specification: v.specification_hash().unwrap(),
+            }],
+            deadline: None,
+        },
+        validations: vec![NewValidation {
+            id: vid,
+            content: v,
+        }],
+    }
+}
+fn add_validation(c: &mut NewClaim, id: u128, mode: ValidationMode, phase: ValidationPhase) {
+    let v = ValidationContent {
+        ledger: ledger(),
+        schema: SCHEMA_MAJOR,
+        claim: c.id,
+        kind: ValidationKind::Test,
+        phase,
+        mode,
+        description: "tests pass".into(),
+        quality_bar: None,
+        evaluator: EVALUATOR,
+        handlers: vec![
+            HandlerRef {
+                id: ValidatorId::from_u128(1),
+                version: ContentHash([1; 32]),
+                agentic: false,
+            },
+            HandlerRef {
+                id: ValidatorId::from_u128(2),
+                version: ContentHash([2; 32]),
+                agentic: true,
+            },
+        ],
+        evidence_schemas: BTreeSet::new(),
+        contributed_by: BTreeSet::from([ISSUER]),
+        policy_revision: 1,
+    };
+    c.content.requirements.push(RequirementRef {
+        id: ValidationId::from_u128(id),
+        specification: v.specification_hash().unwrap(),
+    });
+    c.validations.push(NewValidation {
+        id: ValidationId::from_u128(id),
+        content: v,
+    });
+}
+fn edge(c: &mut NewClaim, kind: RelationKind, target: ClaimId) {
+    c.content.relations.insert(Relation {
+        kind,
+        target: RelationTarget::Object(ObjectRef::claim(ledger(), target)),
+    });
+}
+fn receive(core: &mut Core, c: NewClaim) {
+    let id = c.id;
+    apply(
+        core,
+        input(
+            1000 + u128::from_be_bytes(id.0) * 10,
+            ISSUER,
+            Command::GenerateClaim { claim: c },
+        ),
+    );
+    apply(
+        core,
+        input(
+            1001 + u128::from_be_bytes(id.0) * 10,
+            ISSUER,
+            Command::PostClaim { claim: id },
+        ),
+    );
+    apply(
+        core,
+        input(
+            1002 + u128::from_be_bytes(id.0) * 10,
+            WORKER,
+            Command::AcquireReceipt {
+                claim: id,
+                receipt: ReceiptId(id.0),
+                epoch: 1,
+            },
+        ),
+    );
+}
+fn close(core: &mut Core, id: ClaimId) {
+    let n = u128::from_be_bytes(id.0) * 100;
+    let receipt = core.snapshot().claims[&id]
+        .lifecycle()
+        .receipt
+        .as_ref()
+        .unwrap()
+        .fence;
+    let evidence_set = EvidenceSetId::from_u128(n + 3);
+    let testament = TestamentId::from_u128(n + 4);
+    apply(
+        core,
+        input(
+            n + 2003,
+            WORKER,
+            Command::BeginEvidenceSet {
+                claim: id,
+                receipt,
+                evidence_set,
+            },
+        ),
+    );
+    apply(
+        core,
+        input(
+            n + 2004,
+            WORKER,
+            Command::CloseTestament {
+                claim: id,
+                receipt,
+                testament,
+                evidence_set,
+                manifest: vec![],
+                summary: "finished".into(),
+                confidence: Confidence::Committed,
+                outcome: OutcomeKind::Complete,
+            },
+        ),
+    );
+    apply(
+        core,
+        input(
+            n + 2005,
+            ISSUER,
+            Command::AcknowledgeTestament {
+                claim: id,
+                testament,
+            },
+        ),
+    );
+    apply(
+        core,
+        input(
+            n + 2006,
+            ISSUER,
+            Command::BeginWholeWorkValidation { claim: id },
+        ),
+    );
+}
+fn finish(core: &mut Core, id: ClaimId) -> ApplyResult {
+    apply(
+        core,
+        input(
+            5000 + u128::from_be_bytes(id.0),
+            ISSUER,
+            Command::CompleteWholeWork { claim: id },
+        ),
+    )
+}
+fn outcome_code(out: DomainOutcome) -> ErrorCode {
+    match out {
+        DomainOutcome::Refuse { code, .. } => code,
+        other => panic!("expected refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn complete_receipt_workflow_replays_exact_state_and_deltas() {
+    let mut core = setup();
+    let c = new_claim(100);
+    let id = c.id;
+    receive(&mut core, c);
+    close(&mut core, id);
+    let final_result = finish(&mut core, id);
+    assert_eq!(
+        core.snapshot().claims[&id].lifecycle().status,
+        ClaimStatus::Satisfied
+    );
+    assert_eq!(
+        core.snapshot().claims[&id]
+            .lifecycle()
+            .history
+            .iter()
+            .map(|h| h.status)
+            .collect::<Vec<_>>(),
+        vec![
+            ClaimStatus::Generated,
+            ClaimStatus::Posted,
+            ClaimStatus::Received,
+            ClaimStatus::TestamentGenerated,
+            ClaimStatus::TestamentAcknowledged,
+            ClaimStatus::Validating,
+            ClaimStatus::Satisfied
+        ]
+    );
+    assert!(
+        final_result
+            .deltas
+            .iter()
+            .any(|d| d.action == LifecycleAction::Satisfied)
+    );
+    for (ordinal, d) in final_result.deltas.iter().enumerate() {
+        assert_eq!(d.id.ordinal, ordinal as u32);
+        assert_eq!(d.id.sequence, final_result.receipt.sequence)
+    }
+    let encoded = core.encode_checkpoint().unwrap();
+    let recovered = Core::decode_checkpoint(&encoded).unwrap();
+    assert_eq!(
+        core.normalized_bytes().unwrap(),
+        recovered.normalized_bytes().unwrap()
+    );
+    let mut corrupted = encoded;
+    *corrupted.last_mut().unwrap() ^= 1;
+    assert!(matches!(
+        Core::decode_checkpoint(&corrupted),
+        Err(CoreError::Checksum)
+    ));
+}
+
+#[test]
+fn generated_cannot_receive_and_terminal_progress_is_inform() {
+    let mut core = setup();
+    let c = new_claim(100);
+    let id = c.id;
+    apply(
+        &mut core,
+        input(1, ISSUER, Command::GenerateClaim { claim: c }),
+    );
+    let request = input(
+        2,
+        WORKER,
+        Command::AcquireReceipt {
+            claim: id,
+            receipt: ReceiptId::from_u128(50),
+            epoch: 1,
+        },
+    );
+    assert!(matches!(
+        core.prepare(&request),
+        Err(DomainOutcome::Inform {
+            reason: InformReason::Status(ClaimStatus::Generated),
+            ..
+        })
+    ));
+    apply(
+        &mut core,
+        input(
+            3,
+            ISSUER,
+            Command::CancelClaim {
+                claim: id,
+                reason: "cancel".into(),
+            },
+        ),
+    );
+    let before = core.normalized_bytes().unwrap();
+    assert!(matches!(
+        core.prepare(&input(
+            4,
+            WORKER,
+            Command::RecordProgress {
+                claim: id,
+                receipt: ReceiptFence {
+                    receipt: ReceiptId::from_u128(50),
+                    epoch: 1
+                },
+                message: "late".into()
+            }
+        )),
+        Err(DomainOutcome::Inform {
+            reason: InformReason::Terminal(ClaimStatus::Cancelled),
+            ..
+        })
+    ));
+    assert_eq!(before, core.normalized_bytes().unwrap());
+}
+
+#[test]
+fn request_identity_and_content_identity_are_independent() {
+    let mut core = setup();
+    let claim = new_claim(100);
+    let request = input(
+        1,
+        ISSUER,
+        Command::GenerateClaim {
+            claim: claim.clone(),
+        },
+    );
+    let original = apply(&mut core, request.clone());
+    assert_eq!(
+        core.prepare(&request),
+        Err(DomainOutcome::Duplicate(Box::new(original.receipt.clone())))
+    );
+    let mut conflict = request.clone();
+    if let Command::GenerateClaim { claim } = &mut conflict.command {
+        claim.content.description = "different".into()
+    }
+    assert_eq!(
+        outcome_code(core.prepare(&conflict).unwrap_err()),
+        ErrorCode::IdempotencyConflict
+    );
+    let duplicate = apply(
+        &mut core,
+        input(
+            2,
+            ISSUER,
+            Command::GenerateClaim {
+                claim: claim.clone(),
+            },
+        ),
+    );
+    assert_eq!(
+        duplicate.receipt.outcome,
+        CommandResult::Existing(vec![claim.id])
+    );
+    assert!(duplicate.deltas.is_empty());
+    let mut repeat = claim.clone();
+    repeat.id = ClaimId::from_u128(101);
+    repeat.content.occurrence = OccurrenceId::from_u128(101);
+    repeat.validations[0].id = ValidationId::from_u128(100_101);
+    repeat.validations[0].content.claim = repeat.id;
+    repeat.content.requirements = vec![RequirementRef {
+        id: repeat.validations[0].id,
+        specification: repeat.validations[0].content.specification_hash().unwrap(),
+    }];
+    apply(
+        &mut core,
+        input(3, ISSUER, Command::GenerateClaim { claim: repeat }),
+    );
+    assert_eq!(core.snapshot().claims.len(), 2);
+}
+
+#[test]
+fn epoch_floor_rejects_unseen_old_requests_but_preserves_original_receipts() {
+    let mut core = setup();
+    let request = input(
+        1,
+        ISSUER,
+        Command::GenerateClaim {
+            claim: new_claim(100),
+        },
+    );
+    let original = apply(&mut core, request.clone());
+    let mut negotiate = input(
+        2,
+        ISSUER,
+        Command::NegotiateEpoch {
+            epoch: RequestEpoch(2),
+        },
+    );
+    negotiate.request_epoch = RequestEpoch(2);
+    apply(&mut core, negotiate);
+    let mut advance = input(
+        3,
+        ISSUER,
+        Command::AdvanceEpochFloor {
+            minimum: RequestEpoch(2),
+        },
+    );
+    advance.request_epoch = RequestEpoch(2);
+    apply(&mut core, advance);
+    assert_eq!(
+        core.prepare(&request),
+        Err(DomainOutcome::Duplicate(Box::new(original.receipt)))
+    );
+    assert_eq!(
+        outcome_code(
+            core.prepare(&input(
+                99,
+                ISSUER,
+                Command::GenerateClaim {
+                    claim: new_claim(101)
+                }
+            ))
+            .unwrap_err()
+        ),
+        ErrorCode::RequestHistoryExpired
+    );
+    let mut future = input(
+        4,
+        WORKER,
+        Command::GenerateClaim {
+            claim: new_claim(102),
+        },
+    );
+    future.request_epoch = RequestEpoch(2);
+    assert_eq!(
+        outcome_code(core.prepare(&future).unwrap_err()),
+        ErrorCode::RequestEpochNotAdmitted
+    );
+    let recovered = Core::decode_checkpoint(&core.encode_checkpoint().unwrap()).unwrap();
+    assert_eq!(
+        outcome_code(
+            recovered
+                .prepare(&input(
+                    100,
+                    ISSUER,
+                    Command::GenerateClaim {
+                        claim: new_claim(103)
+                    }
+                ))
+                .unwrap_err()
+        ),
+        ErrorCode::RequestHistoryExpired
+    );
+}
+
+#[test]
+fn pending_projection_prevents_double_receipt_and_can_discard_uncommitted_work() {
+    let mut core = setup();
+    let c = new_claim(100);
+    let id = c.id;
+    apply(
+        &mut core,
+        input(1, ISSUER, Command::GenerateClaim { claim: c }),
+    );
+    apply(
+        &mut core,
+        input(2, ISSUER, Command::PostClaim { claim: id }),
+    );
+    let original = core.normalized_bytes().unwrap();
+    let mut projected = EffectiveCore::new(core);
+    let a = input(
+        3,
+        WORKER,
+        Command::AcquireReceipt {
+            claim: id,
+            receipt: ReceiptId::from_u128(7),
+            epoch: 1,
+        },
+    );
+    let b = input(
+        4,
+        WORKER,
+        Command::AcquireReceipt {
+            claim: id,
+            receipt: ReceiptId::from_u128(8),
+            epoch: 1,
+        },
+    );
+    projected.prepare(&a).unwrap();
+    assert!(matches!(
+        projected.prepare(&b),
+        Err(DomainOutcome::Inform {
+            reason: InformReason::Status(ClaimStatus::Received),
+            ..
+        })
+    ));
+    assert_eq!(projected.committed().normalized_bytes().unwrap(), original);
+    projected.discard_pending();
+    assert_eq!(projected.effective().normalized_bytes().unwrap(), original);
+    projected.prepare(&b).unwrap();
+    projected.commit_next().unwrap().unwrap();
+    assert_eq!(
+        projected.committed().snapshot().claims[&id]
+            .lifecycle()
+            .receipt
+            .as_ref()
+            .unwrap()
+            .fence
+            .receipt,
+        ReceiptId::from_u128(8)
+    );
+}
+
+#[test]
+fn forged_namespace_cause_and_writer_do_not_change_state() {
+    for variant in 0..3 {
+        let core = setup();
+        let mut c = new_claim(100);
+        let expected = match variant {
+            0 => {
+                edge(&mut c, RelationKind::DependsOn, ClaimId::from_u128(111));
+                let old = c
+                    .content
+                    .relations
+                    .iter()
+                    .find(|r| r.kind == RelationKind::DependsOn)
+                    .unwrap()
+                    .clone();
+                c.content.relations.remove(&old);
+                let mut new = old;
+                if let RelationTarget::Object(o) = &mut new.target {
+                    o.ledger.session = SessionId::from_u128(999)
+                }
+                c.content.relations.insert(new);
+                ErrorCode::InvalidNamespace
+            }
+            1 => {
+                c.content
+                    .relations
+                    .retain(|r| r.kind != RelationKind::CausedBy);
+                c.content.relations.insert(Relation {
+                    kind: RelationKind::CausedBy,
+                    target: RelationTarget::Root(RootCommandId::from_u128(999)),
+                });
+                ErrorCode::InvalidCause
+            }
+            _ => ErrorCode::WrongActor,
+        };
+        let before = core.normalized_bytes().unwrap();
+        let mut request = input(
+            1,
+            if variant == 2 { WORKER } else { ISSUER },
+            Command::GenerateClaim { claim: c },
+        );
+        request.authority.runtime = false;
+        assert_eq!(outcome_code(core.prepare(&request).unwrap_err()), expected);
+        assert_eq!(before, core.normalized_bytes().unwrap());
+    }
+}
+
+#[test]
+fn artifact_close_is_immutable_and_requires_verified_custody() {
+    let mut core = setup();
+    let c = new_claim(100);
+    let id = c.id;
+    receive(&mut core, c);
+    let fence = core.snapshot().claims[&id]
+        .lifecycle()
+        .receipt
+        .as_ref()
+        .unwrap()
+        .fence;
+    let set = EvidenceSetId::from_u128(501);
+    apply(
+        &mut core,
+        input(
+            11,
+            WORKER,
+            Command::BeginEvidenceSet {
+                claim: id,
+                receipt: fence,
+                evidence_set: set,
+            },
+        ),
+    );
+    let artifact = NewArtifact {
+        id: ArtifactId::from_u128(502),
+        content: ArtifactContent {
+            ledger: ledger(),
+            schema: SCHEMA_MAJOR,
+            kind: "test_report".into(),
+            schema_hash: ContentHash([1; 32]),
+            metadata: Vec::new(),
+            payload: ArtifactPayload::Inline(b"PASS".to_vec()),
+            producer: WORKER,
+            receipt: Some(fence),
+            inputs: BTreeSet::new(),
+            visibility: BTreeSet::new(),
+        },
+    };
+    let mut request = input(
+        12,
+        WORKER,
+        Command::AttachArtifact {
+            claim: id,
+            receipt: fence,
+            evidence_set: set,
+            artifact: artifact.clone(),
+        },
+    );
+    assert_eq!(
+        outcome_code(core.prepare(&request).unwrap_err()),
+        ErrorCode::EvidenceNotDurable
+    );
+    request.authority.evidence.push(EvidenceAttestation {
+        descriptor_hash: artifact.content.content_hash().unwrap(),
+        custody_revision: 1,
+        durable: true,
+        schema_valid: true,
+    });
+    let result = apply(&mut core, request);
+    let reference = match result.receipt.outcome {
+        CommandResult::Artifact(a) => a,
+        _ => panic!(),
+    };
+    let close_request = input(
+        13,
+        WORKER,
+        Command::CloseTestament {
+            claim: id,
+            receipt: fence,
+            testament: TestamentId::from_u128(503),
+            evidence_set: set,
+            manifest: vec![reference],
+            summary: "pass".into(),
+            confidence: Confidence::Committed,
+            outcome: OutcomeKind::Complete,
+        },
+    );
+    let first = apply(&mut core, close_request.clone());
+    assert_eq!(
+        core.prepare(&close_request),
+        Err(DomainOutcome::Duplicate(Box::new(first.receipt)))
+    );
+    let late = input(
+        14,
+        WORKER,
+        Command::AttachArtifact {
+            claim: id,
+            receipt: fence,
+            evidence_set: set,
+            artifact,
+        },
+    );
+    assert!(matches!(
+        core.prepare(&late),
+        Err(DomainOutcome::Inform {
+            reason: InformReason::Status(ClaimStatus::TestamentGenerated),
+            ..
+        })
+    ));
+    let t = &core.snapshot().testaments[&TestamentId::from_u128(503)];
+    assert_eq!(t.content().artifacts, vec![reference]);
+    assert_eq!(t.content_hash(), t.content().content_hash().unwrap());
+}
+
+fn submit_verdict(
+    core: &mut Core,
+    run: ValidationRunId,
+    value: VerdictValue,
+    request: u128,
+) -> ApplyResult {
+    let r = &core.snapshot().runs[&run];
+    let v = &core.snapshot().validations[&run.validation];
+    let verdict = VerdictRecord {
+        run,
+        evaluator: EVALUATOR,
+        handler: v.content().handlers[r.handler_index as usize].clone(),
+        attempt: r.attempts.len() as u32,
+        manifest: r.manifest,
+        value,
+        evidence: vec![],
+    };
+    apply(
+        core,
+        input(
+            request,
+            EVALUATOR,
+            Command::RecordValidationVerdict { verdict },
+        ),
+    )
+}
+
+#[test]
+fn fail_never_falls_back_error_does_and_observe_does_not_block() {
+    for outcome in [VerdictValue::Fail, VerdictValue::Error] {
+        let mut core = setup();
+        let mut c = new_claim(100);
+        add_validation(
+            &mut c,
+            333,
+            ValidationMode::Required,
+            ValidationPhase::WholeWork,
+        );
+        let id = c.id;
+        receive(&mut core, c);
+        close(&mut core, id);
+        let run = *core
+            .snapshot()
+            .runs
+            .keys()
+            .find(|r| r.validation == ValidationId::from_u128(333))
+            .unwrap();
+        let response = submit_verdict(&mut core, run, outcome, 9000);
+        if outcome == VerdictValue::Fail {
+            assert!(response.effects.is_empty());
+            finish(&mut core, id);
+            assert_eq!(
+                core.snapshot().claims[&id].lifecycle().status,
+                ClaimStatus::ValidationFailed
+            )
+        } else {
+            assert_eq!(response.effects.len(), 1);
+            assert!(core.snapshot().runs[&run].final_verdict.is_none());
+            submit_verdict(&mut core, run, VerdictValue::Pass, 9001);
+            finish(&mut core, id);
+            assert_eq!(
+                core.snapshot().claims[&id].lifecycle().status,
+                ClaimStatus::Satisfied
+            )
+        }
+    }
+    let mut core = setup();
+    let mut c = new_claim(100);
+    add_validation(
+        &mut c,
+        334,
+        ValidationMode::Observe,
+        ValidationPhase::WholeWork,
+    );
+    let id = c.id;
+    receive(&mut core, c);
+    close(&mut core, id);
+    let run = *core
+        .snapshot()
+        .runs
+        .keys()
+        .find(|r| r.validation == ValidationId::from_u128(334))
+        .unwrap();
+    finish(&mut core, id);
+    let history = core.snapshot().claims[&id].lifecycle().clone();
+    submit_verdict(&mut core, run, VerdictValue::Fail, 9010);
+    assert_eq!(*core.snapshot().claims[&id].lifecycle(), history);
+}
+
+#[test]
+fn admission_blocks_receipt_and_final_admission_failure_is_post_failed() {
+    let mut core = setup();
+    let mut c = new_claim(100);
+    add_validation(
+        &mut c,
+        333,
+        ValidationMode::Required,
+        ValidationPhase::Admission,
+    );
+    let id = c.id;
+    apply(
+        &mut core,
+        input(1, ISSUER, Command::GenerateClaim { claim: c }),
+    );
+    apply(
+        &mut core,
+        input(2, ISSUER, Command::PostClaim { claim: id }),
+    );
+    assert!(matches!(
+        core.prepare(&input(
+            3,
+            WORKER,
+            Command::AcquireReceipt {
+                claim: id,
+                receipt: ReceiptId::from_u128(1),
+                epoch: 1
+            }
+        )),
+        Err(DomainOutcome::Inform {
+            reason: InformReason::ValidationPending,
+            ..
+        })
+    ));
+    let run = *core.snapshot().runs.keys().next().unwrap();
+    submit_verdict(&mut core, run, VerdictValue::Incomplete, 4);
+    assert_eq!(
+        core.snapshot().claims[&id].lifecycle().status,
+        ClaimStatus::PostFailed
+    );
+}
+
+#[test]
+fn receipt_adoption_fences_previous_holder_but_keeps_pinned_evaluator() {
+    let mut core = setup();
+    let mut c = new_claim(100);
+    add_validation(
+        &mut c,
+        333,
+        ValidationMode::Required,
+        ValidationPhase::WholeWork,
+    );
+    let id = c.id;
+    receive(&mut core, c);
+    close(&mut core, id);
+    let old = core.snapshot().claims[&id]
+        .lifecycle()
+        .receipt
+        .as_ref()
+        .unwrap()
+        .fence;
+    apply(
+        &mut core,
+        input(
+            700,
+            ISSUER,
+            Command::AdoptReceipt {
+                claim: id,
+                previous: old,
+                receipt: ReceiptId::from_u128(888),
+                holder: ISSUER,
+                epoch: 2,
+            },
+        ),
+    );
+    let run = *core
+        .snapshot()
+        .runs
+        .keys()
+        .find(|r| r.validation == ValidationId::from_u128(333))
+        .unwrap();
+    submit_verdict(&mut core, run, VerdictValue::Pass, 701);
+    finish(&mut core, id);
+    assert_eq!(
+        core.snapshot().claims[&id].lifecycle().status,
+        ClaimStatus::Satisfied
+    );
+    let mut core = setup();
+    receive(&mut core, new_claim(100));
+    let old = core.snapshot().claims[&id]
+        .lifecycle()
+        .receipt
+        .as_ref()
+        .unwrap()
+        .fence;
+    apply(
+        &mut core,
+        input(
+            700,
+            ISSUER,
+            Command::AdoptReceipt {
+                claim: id,
+                previous: old,
+                receipt: ReceiptId::from_u128(888),
+                holder: ISSUER,
+                epoch: 2,
+            },
+        ),
+    );
+    assert_eq!(
+        outcome_code(
+            core.prepare(&input(
+                701,
+                WORKER,
+                Command::RecordProgress {
+                    claim: id,
+                    receipt: old,
+                    message: "stale".into()
+                }
+            ))
+            .unwrap_err()
+        ),
+        ErrorCode::StaleReceipt
+    );
+}
+
+#[test]
+fn mixed_dependency_failure_and_wait_release_are_atomic() {
+    let mut core = setup();
+    let b = new_claim(100);
+    let mut a = new_claim(101);
+    edge(&mut a, RelationKind::Awaits, b.id);
+    let mut c = new_claim(102);
+    edge(&mut c, RelationKind::DependsOn, b.id);
+    let (aid, bid, cid) = (a.id, b.id, c.id);
+    apply(
+        &mut core,
+        input(
+            1,
+            ISSUER,
+            Command::GenerateClaimBatch {
+                claims: vec![a, b, c],
+            },
+        ),
+    );
+    let monitor = MonitorId::from_u128(800);
+    apply(
+        &mut core,
+        input(
+            2,
+            ISSUER,
+            Command::RegisterMonitor {
+                monitor,
+                owner: aid,
+                roots: BTreeSet::from([WaitPredicate::Terminal(bid)]),
+                deadline: Deadline {
+                    timer: TimerId::from_u128(90),
+                    generation: 1,
+                    at: 2000,
+                },
+            },
+        ),
+    );
+    let result = apply(
+        &mut core,
+        input(
+            3,
+            ISSUER,
+            Command::CancelClaim {
+                claim: bid,
+                reason: "failed work".into(),
+            },
+        ),
+    );
+    assert_eq!(
+        core.snapshot().claims[&aid].lifecycle().status,
+        ClaimStatus::Generated
+    );
+    assert_eq!(
+        core.snapshot().claims[&cid].lifecycle().status,
+        ClaimStatus::DependencyFailed
+    );
+    assert_eq!(
+        core.snapshot().monitors[&monitor].released,
+        Some(result.receipt.sequence)
+    );
+    assert!(
+        result
+            .deltas
+            .iter()
+            .any(|d| d.claim == Some(cid) && d.action == LifecycleAction::DependencyFailed)
+    );
+    assert!(
+        result
+            .effects
+            .contains(&EffectIntent::MonitorReleased { monitor })
+    );
+}
+
+#[test]
+fn legal_wait_cycles_use_least_fixpoint_and_deadline_victim_is_canonical() {
+    let mut core = setup();
+    let mut a = new_claim(100);
+    let mut b = new_claim(101);
+    edge(&mut a, RelationKind::Awaits, b.id);
+    edge(&mut b, RelationKind::Awaits, a.id);
+    let d = Deadline {
+        timer: TimerId::from_u128(90),
+        generation: 1,
+        at: 1000,
+    };
+    a.content.deadline = Some(d);
+    b.content.deadline = Some(d);
+    let (aid, bid) = (a.id, b.id);
+    apply(
+        &mut core,
+        input(
+            1,
+            ISSUER,
+            Command::GenerateClaimBatch { claims: vec![b, a] },
+        ),
+    );
+    assert!(least_fixpoint(core.snapshot()).is_empty());
+    apply(
+        &mut core,
+        input(
+            2,
+            ISSUER,
+            Command::ExpireClaim {
+                claim: bid,
+                timer: d.timer,
+                generation: 1,
+                fired_at: 1000,
+            },
+        ),
+    );
+    assert_eq!(
+        core.snapshot().claims[&aid].lifecycle().status,
+        ClaimStatus::Deadlocked
+    );
+    assert_eq!(
+        core.snapshot().claims[&bid].lifecycle().status,
+        ClaimStatus::Generated
+    );
+}
+
+#[test]
+fn terminal_supersession_preserves_old_proof_and_verdicts() {
+    let mut core = setup();
+    let c = new_claim(100);
+    let old = c.id;
+    receive(&mut core, c);
+    close(&mut core, old);
+    finish(&mut core, old);
+    let original = core.snapshot().claims[&old].clone();
+    let original_runs = core.snapshot().runs.clone();
+    let mut successor = new_claim(101);
+    edge(&mut successor, RelationKind::Supersedes, old);
+    apply(
+        &mut core,
+        input(
+            1,
+            ISSUER,
+            Command::SupersedeClaim {
+                predecessor: old,
+                successor,
+            },
+        ),
+    );
+    assert_eq!(core.snapshot().claims[&old], original);
+    assert_eq!(core.snapshot().runs, original_runs);
+}
+
+#[test]
+fn every_terminal_state_rejects_progress_without_mutation() {
+    let base = setup();
+    for status in ClaimStatus::ALL.iter().copied().filter(|s| s.is_terminal()) {
+        let mut core = base.clone();
+        let c = new_claim(100);
+        let id = c.id;
+        receive(&mut core, c);
+        let existing = core.state.claims[&id].clone();
+        let mut lifecycle = existing.lifecycle().clone();
+        lifecycle.status = status;
+        core.state
+            .claims
+            .insert(id, existing.with_lifecycle(lifecycle));
+        let before = core.normalized_bytes().unwrap();
+        let outcome = core.prepare(&input(
+            1,
+            WORKER,
+            Command::RecordProgress {
+                claim: id,
+                receipt: ReceiptFence {
+                    receipt: ReceiptId(id.0),
+                    epoch: 1,
+                },
+                message: "progress".into(),
+            },
+        ));
+        assert_eq!(
+            outcome,
+            Err(DomainOutcome::Inform {
+                claim: Some(id),
+                reason: InformReason::Terminal(status)
+            })
+        );
+        assert_eq!(core.normalized_bytes().unwrap(), before);
+    }
+}
+
+#[test]
+fn prepared_log_replays_without_external_handlers() {
+    let mut writer = setup();
+    let mut replay = writer.clone();
+    let mut log = Vec::new();
+    let c = new_claim(100);
+    let id = c.id;
+    let commands = vec![
+        input(1, ISSUER, Command::GenerateClaim { claim: c }),
+        input(2, ISSUER, Command::PostClaim { claim: id }),
+        input(
+            3,
+            WORKER,
+            Command::AcquireReceipt {
+                claim: id,
+                receipt: ReceiptId::from_u128(33),
+                epoch: 1,
+            },
+        ),
+        input(
+            4,
+            WORKER,
+            Command::RecordProgress {
+                claim: id,
+                receipt: ReceiptFence {
+                    receipt: ReceiptId::from_u128(33),
+                    epoch: 1,
+                },
+                message: "observed".into(),
+            },
+        ),
+        input(
+            5,
+            ISSUER,
+            Command::CancelClaim {
+                claim: id,
+                reason: "done".into(),
+            },
+        ),
+    ];
+    for i in commands {
+        let p = writer.prepare(&i).unwrap();
+        let encoded = postcard::to_allocvec(&p).unwrap();
+        let seq = SessionSeq(writer.sequence().0 + 1);
+        let expected = writer.apply(seq, p).unwrap();
+        log.push((seq, encoded, expected));
+    }
+    for (seq, bytes, expected) in log {
+        let prepared = postcard::from_bytes(&bytes).unwrap();
+        let actual = replay.apply(seq, prepared).unwrap();
+        assert_eq!(actual, expected);
+    }
+    assert_eq!(
+        writer.normalized_bytes().unwrap(),
+        replay.normalized_bytes().unwrap()
+    );
+}
+
+#[test]
+fn capacity_failure_never_publishes_partial_batch() {
+    let mut core = setup();
+    core.limits.max_objects = 3;
+    let before = core.normalized_bytes().unwrap();
+    let request = input(
+        1,
+        ISSUER,
+        Command::GenerateClaimBatch {
+            claims: vec![new_claim(100), new_claim(101)],
+        },
+    );
+    assert_eq!(
+        outcome_code(core.prepare(&request).unwrap_err()),
+        ErrorCode::Capacity
+    );
+    assert_eq!(core.normalized_bytes().unwrap(), before);
+}
+
+#[test]
+fn fresh_object_allocations_do_not_defeat_same_occurrence_dedup() {
+    let mut core = setup();
+    let claim = new_claim(100);
+    let original = claim.id;
+    apply(
+        &mut core,
+        input(
+            1,
+            ISSUER,
+            Command::GenerateClaim {
+                claim: claim.clone(),
+            },
+        ),
+    );
+    let mut retry = claim;
+    retry.id = ClaimId::from_u128(101);
+    retry.validations[0].id = ValidationId::from_u128(100_101);
+    retry.validations[0].content.claim = retry.id;
+    retry.content.requirements = vec![RequirementRef {
+        id: retry.validations[0].id,
+        specification: retry.validations[0].content.specification_hash().unwrap(),
+    }];
+    let result = apply(
+        &mut core,
+        input(2, ISSUER, Command::GenerateClaim { claim: retry }),
+    );
+    assert_eq!(
+        result.receipt.outcome,
+        CommandResult::Existing(vec![original])
+    );
+    assert_eq!(core.snapshot().claims.len(), 1);
+    assert_eq!(core.snapshot().validations.len(), 1);
+}
+
+#[test]
+fn completion_releases_transitive_waiters_in_the_same_mutation() {
+    let mut core = setup();
+    let b = new_claim(101);
+    let mut a = new_claim(100);
+    edge(&mut a, RelationKind::Awaits, b.id);
+    let (aid, bid) = (a.id, b.id);
+    apply(
+        &mut core,
+        input(
+            1,
+            ISSUER,
+            Command::GenerateClaimBatch {
+                claims: vec![a.clone(), b.clone()],
+            },
+        ),
+    );
+    receive(&mut core, a);
+    receive(&mut core, b);
+    close(&mut core, aid);
+    close(&mut core, bid);
+    let monitor = MonitorId::from_u128(700);
+    apply(
+        &mut core,
+        input(
+            2,
+            ISSUER,
+            Command::RegisterMonitor {
+                monitor,
+                owner: aid,
+                roots: BTreeSet::from([WaitPredicate::Released(bid)]),
+                deadline: Deadline {
+                    timer: TimerId::from_u128(701),
+                    generation: 1,
+                    at: 2000,
+                },
+            },
+        ),
+    );
+    finish(&mut core, aid);
+    assert_eq!(
+        core.snapshot().claims[&aid].lifecycle().status,
+        ClaimStatus::Validating
+    );
+    let completion = finish(&mut core, bid);
+    assert_eq!(
+        core.snapshot().claims[&aid].lifecycle().status,
+        ClaimStatus::Satisfied
+    );
+    assert_eq!(
+        core.snapshot().monitors[&monitor].released,
+        Some(completion.receipt.sequence)
+    );
+    assert!(
+        completion
+            .deltas
+            .iter()
+            .any(|d| d.claim == Some(aid) && d.action == LifecycleAction::Satisfied)
+    );
+    assert_eq!(
+        core.snapshot().claims[&aid]
+            .lifecycle()
+            .history
+            .last()
+            .unwrap()
+            .sequence,
+        completion.receipt.sequence
+    );
+}
+
+#[test]
+fn quality_evaluation_requires_the_agentic_phase_after_deterministic_pass() {
+    let mut core = setup();
+    let mut c = new_claim(100);
+    add_validation(
+        &mut c,
+        333,
+        ValidationMode::Required,
+        ValidationPhase::WholeWork,
+    );
+    c.validations[1].content.quality_bar = Some("review usability".into());
+    c.content.requirements[1].specification =
+        c.validations[1].content.specification_hash().unwrap();
+    let id = c.id;
+    receive(&mut core, c);
+    close(&mut core, id);
+    let run = *core
+        .snapshot()
+        .runs
+        .keys()
+        .find(|r| r.validation == ValidationId::from_u128(333))
+        .unwrap();
+    let first = submit_verdict(&mut core, run, VerdictValue::Pass, 8000);
+    assert!(matches!(
+        first.effects.as_slice(),
+        [EffectIntent::ExecuteValidation {
+            quality_phase: true,
+            ..
+        }]
+    ));
+    assert!(core.snapshot().runs[&run].final_verdict.is_none());
+    assert!(matches!(
+        core.prepare(&input(
+            8001,
+            ISSUER,
+            Command::CompleteWholeWork { claim: id }
+        )),
+        Err(DomainOutcome::Inform {
+            reason: InformReason::ValidationPending,
+            ..
+        })
+    ));
+    submit_verdict(&mut core, run, VerdictValue::Fail, 8002);
+    finish(&mut core, id);
+    assert_eq!(
+        core.snapshot().claims[&id].lifecycle().status,
+        ClaimStatus::ValidationFailed
+    );
+}
+
+#[test]
+fn wrong_evaluator_fence_and_conflicting_verdict_do_not_mutate_the_run() {
+    let mut core = setup();
+    let mut c = new_claim(100);
+    add_validation(
+        &mut c,
+        333,
+        ValidationMode::Required,
+        ValidationPhase::WholeWork,
+    );
+    let id = c.id;
+    receive(&mut core, c);
+    close(&mut core, id);
+    let run = *core
+        .snapshot()
+        .runs
+        .keys()
+        .find(|r| r.validation == ValidationId::from_u128(333))
+        .unwrap();
+    let state = core.snapshot();
+    let verdict = VerdictRecord {
+        run,
+        evaluator: EVALUATOR,
+        handler: state.validations[&run.validation].content().handlers[0].clone(),
+        attempt: 0,
+        manifest: state.runs[&run].manifest,
+        value: VerdictValue::Pass,
+        evidence: vec![],
+    };
+    let before = core.normalized_bytes().unwrap();
+    assert_eq!(
+        outcome_code(
+            core.prepare(&input(
+                1,
+                WORKER,
+                Command::RecordValidationVerdict {
+                    verdict: verdict.clone()
+                }
+            ))
+            .unwrap_err()
+        ),
+        ErrorCode::WrongActor
+    );
+    let mut stale = verdict.clone();
+    stale.run.epoch += 1;
+    assert_eq!(
+        outcome_code(
+            core.prepare(&input(
+                2,
+                EVALUATOR,
+                Command::RecordValidationVerdict { verdict: stale }
+            ))
+            .unwrap_err()
+        ),
+        ErrorCode::StaleEvaluator
+    );
+    assert_eq!(core.normalized_bytes().unwrap(), before);
+    let accepted = apply(
+        &mut core,
+        input(
+            3,
+            EVALUATOR,
+            Command::RecordValidationVerdict {
+                verdict: verdict.clone(),
+            },
+        ),
+    );
+    assert_eq!(accepted.deltas.len(), 1);
+    let same = apply(
+        &mut core,
+        input(
+            4,
+            EVALUATOR,
+            Command::RecordValidationVerdict {
+                verdict: verdict.clone(),
+            },
+        ),
+    );
+    assert!(same.deltas.is_empty());
+    let mut conflict = verdict;
+    conflict.value = VerdictValue::Fail;
+    assert_eq!(
+        outcome_code(
+            core.prepare(&input(
+                5,
+                EVALUATOR,
+                Command::RecordValidationVerdict { verdict: conflict }
+            ))
+            .unwrap_err()
+        ),
+        ErrorCode::ConflictingVerdict
+    );
+}
+
+#[test]
+fn pending_terminalization_fences_progress_and_pending_close_fences_second_close() {
+    let mut core = setup();
+    receive(&mut core, new_claim(100));
+    let id = ClaimId::from_u128(100);
+    let fence = core.snapshot().claims[&id]
+        .lifecycle()
+        .receipt
+        .as_ref()
+        .unwrap()
+        .fence;
+    let mut pending = EffectiveCore::new(core.clone());
+    pending
+        .prepare(&input(
+            1,
+            ISSUER,
+            Command::CancelClaim {
+                claim: id,
+                reason: "stop".into(),
+            },
+        ))
+        .unwrap();
+    assert!(matches!(
+        pending.prepare(&input(
+            2,
+            WORKER,
+            Command::RecordProgress {
+                claim: id,
+                receipt: fence,
+                message: "late".into()
+            }
+        )),
+        Err(DomainOutcome::Inform {
+            reason: InformReason::Terminal(ClaimStatus::Cancelled),
+            ..
+        })
+    ));
+    assert_eq!(
+        pending.committed().snapshot().claims[&id]
+            .lifecycle()
+            .status,
+        ClaimStatus::Received
+    );
+    let set = EvidenceSetId::from_u128(88);
+    apply(
+        &mut core,
+        input(
+            3,
+            WORKER,
+            Command::BeginEvidenceSet {
+                claim: id,
+                receipt: fence,
+                evidence_set: set,
+            },
+        ),
+    );
+    let mut pending = EffectiveCore::new(core);
+    let close = input(
+        4,
+        WORKER,
+        Command::CloseTestament {
+            claim: id,
+            receipt: fence,
+            testament: TestamentId::from_u128(89),
+            evidence_set: set,
+            manifest: vec![],
+            summary: "done".into(),
+            confidence: Confidence::Committed,
+            outcome: OutcomeKind::Complete,
+        },
+    );
+    pending.prepare(&close).unwrap();
+    assert!(matches!(
+        pending.prepare(&close),
+        Err(DomainOutcome::Duplicate(_))
+    ));
+    let mut other = close;
+    other.request_id = RequestId::from_u128(5);
+    assert!(matches!(
+        pending.prepare(&other),
+        Err(DomainOutcome::Inform {
+            reason: InformReason::Status(ClaimStatus::TestamentGenerated),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn pending_generation_floor_fences_an_unseen_old_request() {
+    let mut core = setup();
+    let mut next = input(
+        1,
+        ISSUER,
+        Command::NegotiateEpoch {
+            epoch: RequestEpoch(2),
+        },
+    );
+    next.request_epoch = RequestEpoch(2);
+    apply(&mut core, next);
+    let mut pending = EffectiveCore::new(core);
+    let mut floor = input(
+        2,
+        ISSUER,
+        Command::AdvanceEpochFloor {
+            minimum: RequestEpoch(2),
+        },
+    );
+    floor.request_epoch = RequestEpoch(2);
+    pending.prepare(&floor).unwrap();
+    assert_eq!(
+        outcome_code(
+            pending
+                .prepare(&input(
+                    99,
+                    ISSUER,
+                    Command::GenerateClaim {
+                        claim: new_claim(100)
+                    }
+                ))
+                .unwrap_err()
+        ),
+        ErrorCode::RequestHistoryExpired
+    );
+}
+
+#[test]
+fn stale_timer_and_completion_race_preserve_terminal_truth() {
+    let mut core = setup();
+    let mut c = new_claim(100);
+    c.content.deadline = Some(Deadline {
+        timer: TimerId::from_u128(55),
+        generation: 1,
+        at: 1000,
+    });
+    let id = c.id;
+    receive(&mut core, c);
+    close(&mut core, id);
+    let stale = apply(
+        &mut core,
+        input(
+            1,
+            ISSUER,
+            Command::ExpireClaim {
+                claim: id,
+                timer: TimerId::from_u128(55),
+                generation: 0,
+                fired_at: 1000,
+            },
+        ),
+    );
+    assert!(stale.deltas.is_empty());
+    finish(&mut core, id);
+    let terminal = core.snapshot().claims[&id].clone();
+    let late = apply(
+        &mut core,
+        input(
+            2,
+            ISSUER,
+            Command::ExpireClaim {
+                claim: id,
+                timer: TimerId::from_u128(55),
+                generation: 1,
+                fired_at: 1000,
+            },
+        ),
+    );
+    assert!(late.deltas.is_empty());
+    assert_eq!(core.snapshot().claims[&id], terminal);
+}
+
+#[test]
+fn least_fixed_point_matches_enumerated_fixed_points_on_small_mixed_graphs() {
+    // Exhaust every directed three-node graph without self edges, with independent
+    // DependsOn/Awaits tags. Derive the oracle by enumerating all candidate solutions.
+    let mut core = setup();
+    apply(
+        &mut core,
+        input(
+            1,
+            ISSUER,
+            Command::GenerateClaimBatch {
+                claims: vec![new_claim(100), new_claim(101), new_claim(102)],
+            },
+        ),
+    );
+    let base = core.snapshot().clone();
+    let ids = [
+        ClaimId::from_u128(100),
+        ClaimId::from_u128(101),
+        ClaimId::from_u128(102),
+    ];
+    for encoding in 0..729_usize {
+        let mut state = base.clone();
+        let mut digits = encoding;
+        for from in 0..3 {
+            let existing = state.claims[&ids[from]].clone();
+            let mut content = existing.content().clone();
+            let mut lifecycle = existing.lifecycle().clone();
+            lifecycle.local_complete = true;
+            lifecycle.status = ClaimStatus::Validating;
+            for (to, target) in ids.iter().enumerate() {
+                if from == to {
+                    continue;
+                }
+                let tag = digits % 3;
+                digits /= 3;
+                if tag != 0 {
+                    content.relations.insert(Relation {
+                        kind: if tag == 1 {
+                            RelationKind::DependsOn
+                        } else {
+                            RelationKind::Awaits
+                        },
+                        target: RelationTarget::Object(ObjectRef::claim(ledger(), *target)),
+                    });
+                }
+            }
+            state.claims.insert(
+                ids[from],
+                Claim::new(content.clone(), content.content_hash().unwrap(), lifecycle),
+            );
+        }
+        let mut fixed = Vec::new();
+        for mask in 0..8_u8 {
+            let candidate: BTreeSet<_> = ids
+                .iter()
+                .enumerate()
+                .filter(|(bit, _)| mask & (1 << bit) != 0)
+                .map(|(_, id)| *id)
+                .collect();
+            let image: BTreeSet<_> = ids
+                .iter()
+                .filter(|id| {
+                    state.claims[id]
+                        .content()
+                        .dependencies(RelationKind::DependsOn)
+                        .chain(
+                            state.claims[id]
+                                .content()
+                                .dependencies(RelationKind::Awaits),
+                        )
+                        .all(|d| candidate.contains(&d))
+                })
+                .copied()
+                .collect();
+            if image == candidate {
+                fixed.push(candidate)
+            }
+        }
+        let expected = fixed
+            .into_iter()
+            .reduce(|a, b| a.intersection(&b).copied().collect())
+            .unwrap();
+        assert_eq!(least_fixpoint(&state), expected, "graph {encoding}");
+    }
+}
+
+#[test]
+fn required_quality_phase_never_bypasses_failed_programmatic_execution() {
+    let mut core = setup();
+    let mut claim = new_claim(100);
+    add_validation(
+        &mut claim,
+        333,
+        ValidationMode::Required,
+        ValidationPhase::WholeWork,
+    );
+    claim.validations[1].content.quality_bar = Some("quality requires test pass".into());
+    claim.content.requirements[1].specification =
+        claim.validations[1].content.specification_hash().unwrap();
+    let id = claim.id;
+    receive(&mut core, claim);
+    close(&mut core, id);
+    let run = *core
+        .snapshot()
+        .runs
+        .keys()
+        .find(|r| r.validation == ValidationId::from_u128(333))
+        .unwrap();
+    let result = submit_verdict(&mut core, run, VerdictValue::Error, 9999);
+    assert!(result.effects.is_empty());
+    assert_eq!(
+        core.snapshot().runs[&run].final_verdict,
+        Some(VerdictValue::Error)
+    );
+    finish(&mut core, id);
+    assert_eq!(
+        core.snapshot().claims[&id].lifecycle().status,
+        ClaimStatus::ValidationErrored
+    );
+}
+
+#[test]
+fn missing_required_schema_needs_diagnostic_and_cannot_produce_pass_or_fail() {
+    let mut core = setup();
+    let mut claim = new_claim(100);
+    add_validation(
+        &mut claim,
+        333,
+        ValidationMode::Required,
+        ValidationPhase::WholeWork,
+    );
+    claim.validations[1]
+        .content
+        .evidence_schemas
+        .insert(ContentHash([90; 32]));
+    claim.content.requirements[1].specification =
+        claim.validations[1].content.specification_hash().unwrap();
+    let id = claim.id;
+    receive(&mut core, claim);
+    close(&mut core, id);
+    let run_id = *core
+        .snapshot()
+        .runs
+        .keys()
+        .find(|r| r.validation == ValidationId::from_u128(333))
+        .unwrap();
+    let artifact = NewArtifact {
+        id: ArtifactId::from_u128(999),
+        content: ArtifactContent {
+            ledger: ledger(),
+            schema: 1,
+            kind: "error".into(),
+            schema_hash: ContentHash([91; 32]),
+            metadata: Vec::new(),
+            payload: ArtifactPayload::Inline(b"missing test report".to_vec()),
+            producer: EVALUATOR,
+            receipt: None,
+            inputs: BTreeSet::new(),
+            visibility: BTreeSet::new(),
+        },
+    };
+    let reference = ArtifactRef {
+        id: artifact.id,
+        hash: artifact.content.content_hash().unwrap(),
+    };
+    let mut create = input(8000, EVALUATOR, Command::RegisterArtifact { artifact });
+    create.authority.evidence.push(EvidenceAttestation {
+        descriptor_hash: reference.hash,
+        custody_revision: 1,
+        durable: true,
+        schema_valid: true,
+    });
+    apply(&mut core, create);
+    let run = &core.snapshot().runs[&run_id];
+    let verdict = VerdictRecord {
+        run: run_id,
+        evaluator: EVALUATOR,
+        handler: core.snapshot().validations[&run_id.validation]
+            .content()
+            .handlers[0]
+            .clone(),
+        attempt: 0,
+        manifest: run.manifest,
+        value: VerdictValue::Incomplete,
+        evidence: vec![reference],
+    };
+    for value in [VerdictValue::Pass, VerdictValue::Fail] {
+        let mut rejected = verdict.clone();
+        rejected.value = value;
+        assert!(matches!(
+            core.prepare(&input(
+                8001,
+                EVALUATOR,
+                Command::RecordValidationVerdict { verdict: rejected }
+            )),
+            Err(DomainOutcome::Refuse {
+                code: ErrorCode::InvalidManifest,
+                ..
+            })
+        ));
+    }
+    let mut no_diagnostic = verdict.clone();
+    no_diagnostic.evidence.clear();
+    assert!(matches!(
+        core.prepare(&input(
+            8002,
+            EVALUATOR,
+            Command::RecordValidationVerdict {
+                verdict: no_diagnostic
+            }
+        )),
+        Err(DomainOutcome::Refuse {
+            code: ErrorCode::InvalidManifest,
+            ..
+        })
+    ));
+    apply(
+        &mut core,
+        input(
+            8003,
+            EVALUATOR,
+            Command::RecordValidationVerdict { verdict },
+        ),
+    );
+    assert_eq!(
+        core.snapshot().runs[&run_id].final_verdict,
+        Some(VerdictValue::Incomplete)
+    );
+}
+
+#[test]
+fn missing_graph_endpoints_and_truncated_checkpoints_return_typed_errors() {
+    let mut core = setup();
+    apply(
+        &mut core,
+        input(
+            1,
+            ISSUER,
+            Command::GenerateClaim {
+                claim: new_claim(100),
+            },
+        ),
+    );
+    let mut state = core.snapshot().clone();
+    let id = ClaimId::from_u128(100);
+    let stored = state.claims.get(&id).unwrap().clone();
+    let mut content = stored.content().clone();
+    content.relations.insert(Relation {
+        kind: RelationKind::DerivedFrom,
+        target: RelationTarget::Object(ObjectRef::claim(ledger(), ClaimId::from_u128(999))),
+    });
+    state.claims.insert(
+        id,
+        Claim::new(
+            content.clone(),
+            content.content_hash().unwrap(),
+            stored.lifecycle().clone(),
+        ),
+    );
+    assert!(matches!(
+        crate::graph::check_acyclic(&state, &[RelationKind::DerivedFrom], 100),
+        Err(DomainOutcome::Refuse {
+            code: ErrorCode::InvalidRelation,
+            ..
+        })
+    ));
+    assert!(matches!(
+        crate::graph::cycle_containing(&state, ClaimId::from_u128(999), 100),
+        Err(DomainOutcome::Refuse {
+            code: ErrorCode::InvalidRelation,
+            ..
+        })
+    ));
+
+    let checkpoint = core.encode_checkpoint().unwrap();
+    for length in 0..checkpoint.len() {
+        assert!(
+            Core::decode_checkpoint(&checkpoint[..length]).is_err(),
+            "prefix {length}"
+        );
+    }
+    assert_eq!(
+        Core::decode_checkpoint(&checkpoint).unwrap().snapshot(),
+        core.snapshot()
+    );
+}
+
+#[test]
+fn pending_projection_rejects_exhausted_sequence_without_mutation() {
+    let mut core = setup();
+    core.state.sequence = SessionSeq(u64::MAX);
+    let mut effective = EffectiveCore::new(core);
+    let before = effective.effective().normalized_bytes().unwrap();
+    assert!(
+        effective
+            .prepare(&input(
+                1,
+                ISSUER,
+                Command::GenerateClaim {
+                    claim: new_claim(100)
+                }
+            ))
+            .is_err()
+    );
+    assert_eq!(effective.effective().normalized_bytes().unwrap(), before);
+    assert_eq!(effective.pending_len(), 0);
+}
+
+#[test]
+fn appended_fenced_verdict_checks_pending_adoption_and_replays_exactly() {
+    let mut core = setup();
+    let mut claim = new_claim(100);
+    add_validation(
+        &mut claim,
+        333,
+        ValidationMode::Required,
+        ValidationPhase::WholeWork,
+    );
+    let id = claim.id;
+    receive(&mut core, claim);
+    close(&mut core, id);
+    let run = core
+        .snapshot()
+        .runs
+        .values()
+        .find(|run| run.id.validation == ValidationId::from_u128(333))
+        .unwrap();
+    let verdict = VerdictRecord {
+        run: run.id,
+        evaluator: EVALUATOR,
+        handler: core.snapshot().validations[&run.id.validation]
+            .content()
+            .handlers[0]
+            .clone(),
+        attempt: 0,
+        manifest: run.manifest,
+        value: VerdictValue::Pass,
+        evidence: vec![],
+    };
+    let old = ReceiptFence {
+        receipt: ReceiptId(id.0),
+        epoch: 1,
+    };
+    let fresh = ReceiptFence {
+        receipt: ReceiptId::from_u128(888),
+        epoch: 2,
+    };
+    let legacy = Command::RecordValidationVerdict {
+        verdict: verdict.clone(),
+    };
+    assert_eq!(legacy.code(), 15);
+    assert_eq!(postcard::to_stdvec(&legacy).unwrap()[0], 14);
+    let fenced = Command::RecordFencedValidationVerdict {
+        verdict: verdict.clone(),
+        receipt: Some(old),
+    };
+    assert_eq!(fenced.code(), 29);
+    assert_eq!(postcard::to_stdvec(&fenced).unwrap()[0], 28);
+    assert_eq!(
+        postcard::from_bytes::<Command>(&postcard::to_stdvec(&legacy).unwrap()).unwrap(),
+        legacy
+    );
+    let mut pending = EffectiveCore::new(core.clone());
+    pending
+        .prepare(&input(
+            9900,
+            EVALUATOR,
+            Command::AdoptReceipt {
+                claim: id,
+                previous: old,
+                receipt: fresh.receipt,
+                holder: WORKER,
+                epoch: fresh.epoch,
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        outcome_code(
+            pending
+                .prepare(&input(9901, EVALUATOR, fenced))
+                .unwrap_err()
+        ),
+        ErrorCode::StaleReceipt
+    );
+    assert_eq!(
+        outcome_code(
+            pending
+                .prepare(&input(
+                    9902,
+                    EVALUATOR,
+                    Command::RecordFencedValidationVerdict {
+                        verdict: verdict.clone(),
+                        receipt: None
+                    }
+                ))
+                .unwrap_err()
+        ),
+        ErrorCode::StaleReceipt
+    );
+    let prepared = pending
+        .prepare(&input(
+            9903,
+            EVALUATOR,
+            Command::RecordFencedValidationVerdict {
+                verdict,
+                receipt: Some(fresh),
+            },
+        ))
+        .unwrap();
+    pending.commit_next().unwrap();
+    let before = pending.committed().encode_checkpoint().unwrap();
+    let mut replay = Core::decode_checkpoint(&before).unwrap();
+    let applied = replay
+        .apply(
+            SessionSeq(replay.sequence().0 + 1),
+            postcard::from_bytes(&postcard::to_stdvec(&prepared).unwrap()).unwrap(),
+        )
+        .unwrap();
+    let committed = pending.commit_next().unwrap().unwrap();
+    assert_eq!(applied, committed);
+    assert_eq!(
+        replay.normalized_bytes().unwrap(),
+        pending.committed().normalized_bytes().unwrap()
+    );
+}
+
+#[test]
+fn fenced_admission_verdict_accepts_none_only_before_receipt_acquisition() {
+    let mut core = setup();
+    let mut claim = new_claim(100);
+    add_validation(
+        &mut claim,
+        333,
+        ValidationMode::Required,
+        ValidationPhase::Admission,
+    );
+    let id = claim.id;
+    apply(
+        &mut core,
+        input(9900, ISSUER, Command::GenerateClaim { claim }),
+    );
+    apply(
+        &mut core,
+        input(9901, ISSUER, Command::PostClaim { claim: id }),
+    );
+    let run = core
+        .snapshot()
+        .runs
+        .values()
+        .find(|run| run.id.validation == ValidationId::from_u128(333))
+        .unwrap();
+    let verdict = VerdictRecord {
+        run: run.id,
+        evaluator: EVALUATOR,
+        handler: core.snapshot().validations[&run.id.validation]
+            .content()
+            .handlers[0]
+            .clone(),
+        attempt: 0,
+        manifest: run.manifest,
+        value: VerdictValue::Pass,
+        evidence: vec![],
+    };
+    assert_eq!(
+        outcome_code(
+            core.prepare(&input(
+                9902,
+                EVALUATOR,
+                Command::RecordFencedValidationVerdict {
+                    verdict: verdict.clone(),
+                    receipt: Some(ReceiptFence {
+                        receipt: ReceiptId::from_u128(77),
+                        epoch: 1
+                    }),
+                }
+            ))
+            .unwrap_err()
+        ),
+        ErrorCode::StaleReceipt
+    );
+    apply(
+        &mut core,
+        input(
+            9903,
+            EVALUATOR,
+            Command::RecordFencedValidationVerdict {
+                verdict,
+                receipt: None,
+            },
+        ),
+    );
+    assert_eq!(core.snapshot().claims[&id].lifecycle().receipt, None);
+}
+
+#[path = "access_tests.rs"]
+mod access_tests;

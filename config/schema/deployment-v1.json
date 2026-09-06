@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:focal:deployment:1",
+  "title": "Focal deployment configuration v1",
+  "type": "object",
+  "required": ["version"],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "const": 1 },
+    "node": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "data_dir": { "type": ["string", "null"], "minLength": 1 },
+        "listen": { "type": ["string", "null"] },
+        "advertise": { "type": ["string", "null"], "minLength": 1 },
+        "seeds": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }
+      }
+    },
+    "topology": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "zone": { "type": ["string", "null"], "minLength": 1 }, "region": { "type": ["string", "null"], "minLength": 1 } }
+    },
+    "durability": {
+      "type": "object", "additionalProperties": false,
+      "properties": { "survive": { "enum": ["node", "zone", "region"] }, "max_failures": { "type": "integer", "minimum": 0, "maximum": 65535 } }
+    },
+    "placement": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "home_regions": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+        "residency": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }
+      }
+    }
+  }
+}

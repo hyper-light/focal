@@ -1,0 +1,116 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::panic,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::disallowed_macros
+    )
+)]
+//! Partitioned control metadata, bounded routing caches, and fair admission.
+//! This crate has no claim lookup, transport, clock, or authority election loop.
+//! Prepared metadata becomes durable only through an embedding consensus log.
+
+mod authority;
+mod authority_proof;
+mod cache;
+mod control;
+mod partition;
+mod placement;
+mod scheduler;
+mod types;
+
+pub use authority::*;
+pub use authority_proof::*;
+pub use cache::*;
+pub use control::*;
+pub use partition::*;
+pub use placement::*;
+pub use scheduler::*;
+pub use types::*;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectoryError {
+    Invalid(&'static str),
+    Capacity,
+    CounterExhausted,
+    WrongCluster,
+    WrongPartition,
+    OutsideNamespace,
+    Missing,
+    Duplicate,
+    CompareFailed,
+    StalePreparation,
+    StaleEpoch,
+    StaleNode,
+    WrongOperation,
+    Phase,
+    NotReady,
+    UnverifiedAuthority,
+    Residency,
+    Quorum,
+    Custody,
+    NoPlacement,
+    ClockRegression,
+    Expired,
+    WatchGap { expected: u64, actual: u64 },
+    InFlight,
+    Memory(focal_memory::MemoryError),
+}
+impl From<focal_memory::MemoryError> for DirectoryError {
+    fn from(value: focal_memory::MemoryError) -> Self {
+        Self::Memory(value)
+    }
+}
+impl std::fmt::Display for DirectoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl std::error::Error for DirectoryError {}
+pub(crate) const ALLOCATOR_OVERHEAD: usize = 4 * size_of::<usize>();
+pub(crate) fn add(left: usize, right: usize) -> Result<usize, DirectoryError> {
+    left.checked_add(right)
+        .ok_or(DirectoryError::CounterExhausted)
+}
+pub(crate) fn mul(left: usize, right: usize) -> Result<usize, DirectoryError> {
+    left.checked_mul(right)
+        .ok_or(DirectoryError::CounterExhausted)
+}
+pub(crate) fn tree_row<T>() -> usize {
+    size_of::<T>()
+        .saturating_add(size_of::<usize>())
+        .saturating_mul(16)
+        .saturating_add(ALLOCATOR_OVERHEAD)
+}
+
+pub(crate) fn digest<T: serde::Serialize>(
+    domain: &[u8],
+    value: &T,
+) -> Result<focal_model::ContentHash, DirectoryError> {
+    struct HashFlavor(blake3::Hasher);
+    impl postcard::ser_flavors::Flavor for HashFlavor {
+        type Output = focal_model::ContentHash;
+        fn try_push(&mut self, byte: u8) -> postcard::Result<()> {
+            self.0.update(&[byte]);
+            Ok(())
+        }
+        fn try_extend(&mut self, bytes: &[u8]) -> postcard::Result<()> {
+            self.0.update(bytes);
+            Ok(())
+        }
+        fn finalize(self) -> postcard::Result<Self::Output> {
+            Ok(focal_model::ContentHash(*self.0.finalize().as_bytes()))
+        }
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(domain);
+    postcard::serialize_with_flavor(value, HashFlavor(hasher))
+        .map_err(|_| DirectoryError::Invalid("metadata digest codec"))
+}
+
+#[cfg(test)]
+mod authority_tests;

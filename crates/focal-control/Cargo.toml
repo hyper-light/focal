@@ -1,0 +1,24 @@
+[package]
+name = "focal-control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+focal-model = { version = "0.1.0", path = "../focal-model" }
+focal-consensus = { version = "0.1.0", path = "../focal-consensus" }
+focal-directory = { version = "0.1.0", path = "../focal-directory" }
+focal-enrollment = { version = "0.1.0", path = "../focal-enrollment" }
+focal-memory = { version = "0.1.0", path = "../focal-memory" }
+serde.workspace = true
+postcard.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+focal-log = { version = "0.1.0", path = "../focal-log" }
+
+[lints]
+workspace = true

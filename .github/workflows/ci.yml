@@ -1,0 +1,45 @@
+name: Rust contracts
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  dependencies:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.94.1 --profile minimal
+      - name: Install pinned dependency auditor
+        run: cargo install cargo-deny --version 0.20.2 --locked
+      - name: Audit dependencies
+        run: cargo deny check advisories bans licenses sources
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+      - name: Install native protobuf compiler (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install native protobuf compiler (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+      - name: Verify source and schema contracts
+        run: python3 scripts/check-contracts.py
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Lints
+        run: bash scripts/cargo.sh clippy --workspace --all-targets --locked -- -D warnings
+      - name: Production panic policy
+        run: bash scripts/check-production.sh
+      - name: Tests
+        run: bash scripts/cargo.sh test --workspace --locked
+      - name: Release build
+        run: bash scripts/cargo.sh build --release --workspace --locked

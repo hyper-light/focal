@@ -1,0 +1,237 @@
+use super::*;
+use crate::tests::{ISSUER, WORKER, input, new_claim, setup};
+
+#[test]
+fn bounded_staging_refuses_touched_payload_before_copying_and_preserves_pending() {
+    let mut core = setup();
+    let mut claim = new_claim(7000);
+    claim.content.description = "x".repeat(16 * 1024);
+    let command = input(7000, ISSUER, Command::GenerateClaim { claim });
+    let prepared = core.prepare(&command).unwrap();
+    core.apply_serial(SessionSeq(core.sequence().0 + 1), prepared)
+        .unwrap();
+    let mut pending = PendingState::new();
+    pending.reserve(1).unwrap();
+    let before = core.normalized_bytes().unwrap();
+    let post = input(
+        7001,
+        ISSUER,
+        Command::PostClaim {
+            claim: ClaimId::from_u128(7000),
+        },
+    );
+    assert!(matches!(
+        core.stage_pending_bounded(&pending, &post, 32 * 1024),
+        Err(StagingError::Capacity)
+    ));
+    assert!(pending.is_empty());
+    assert_eq!(core.normalized_bytes().unwrap(), before);
+    let staged = core
+        .stage_pending_bounded(&pending, &post, 4 * 1024 * 1024)
+        .unwrap();
+    assert_eq!(staged.prepared(), &core.prepare(&post).unwrap());
+    assert_eq!(staged.patch().claims().count(), 1);
+}
+
+#[test]
+fn graph_scratch_is_charged_before_each_worklist_allocation() {
+    let mut core = setup();
+    for id in 8000..8032 {
+        let claim = new_claim(id);
+        let hash = claim.content.content_hash().unwrap();
+        core.state.claims.insert(
+            claim.id,
+            Claim::new(
+                claim.content,
+                hash,
+                ClaimLifecycle {
+                    status: ClaimStatus::Satisfied,
+                    created: SessionSeq(1),
+                    revision: ObjectRevision(1),
+                    history: Vec::new(),
+                    receipt: None,
+                    evidence_set: None,
+                    testament: None,
+                    terminal_witness: None,
+                    local_complete: true,
+                    released: true,
+                },
+            ),
+        );
+    }
+    let recorder = Recorder::bounded(core.state.ledger, core.sequence(), 128);
+    let state = access::WriteState::overlay(
+        &core.state,
+        &[],
+        SessionSeq(core.sequence().0 + 1),
+        &recorder,
+    );
+    let result = crate::graph::tracked_fixpoint(&state);
+    assert_eq!(result.len(), 1);
+    assert!(recorder.failed());
+    assert!(state.check_capacity().is_err());
+}
+
+#[test]
+fn pending_views_and_partial_publication_match_serial_state_bytes() {
+    let mut core = setup();
+    let original = core.normalized_bytes().unwrap();
+    let mut oracle = core.clone();
+    let mut pending = PendingState::new();
+    pending.reserve(8).unwrap();
+    let id = ClaimId::from_u128(700);
+    let commands = vec![
+        input(
+            1,
+            ISSUER,
+            Command::GenerateClaim {
+                claim: new_claim(700),
+            },
+        ),
+        input(2, ISSUER, Command::PostClaim { claim: id }),
+        input(
+            3,
+            WORKER,
+            Command::AcquireReceipt {
+                claim: id,
+                receipt: ReceiptId::from_u128(800),
+                epoch: 1,
+            },
+        ),
+        input(
+            4,
+            ISSUER,
+            Command::CancelClaim {
+                claim: id,
+                reason: "retire".into(),
+            },
+        ),
+    ];
+    let mut intents = Vec::new();
+    for command in commands {
+        let staged = core.stage_pending(&pending, &command).unwrap();
+        core.audit_pending_stage(&pending, &staged, EpochLimits::default())
+            .unwrap();
+        let intent = oracle.prepare(&command).unwrap();
+        assert_eq!(staged.prepared(), &intent);
+        let expected = oracle
+            .apply_serial(SessionSeq(oracle.sequence().0 + 1), intent.clone())
+            .unwrap();
+        assert_eq!(staged.result(), &expected);
+        assert_eq!(
+            postcard::to_allocvec(&staged.view_after(&core, &pending).unwrap()).unwrap(),
+            oracle.normalized_bytes().unwrap()
+        );
+        pending.accept(&core, staged).unwrap();
+        intents.push(intent);
+        assert_eq!(
+            postcard::to_allocvec(&pending.view(&core).unwrap()).unwrap(),
+            oracle.normalized_bytes().unwrap()
+        );
+        assert_eq!(core.normalized_bytes().unwrap(), original);
+    }
+    let output = core
+        .plan_epoch(intents[..2].to_vec(), EpochLimits::default())
+        .unwrap()
+        .execute(&core)
+        .unwrap();
+    assert!(pending.matches_epoch(&output));
+    core.publish_epoch(output).unwrap();
+    pending.drop_prefix(2, &core).unwrap();
+    assert_eq!(
+        postcard::to_allocvec(&pending.view(&core).unwrap()).unwrap(),
+        oracle.normalized_bytes().unwrap()
+    );
+    let output = core
+        .plan_epoch(intents[2..].to_vec(), EpochLimits::default())
+        .unwrap()
+        .execute(&core)
+        .unwrap();
+    core.publish_epoch(output).unwrap();
+    pending.drop_prefix(2, &core).unwrap();
+    assert!(pending.is_empty());
+    assert_eq!(
+        core.encode_checkpoint().unwrap(),
+        oracle.encode_checkpoint().unwrap()
+    );
+}
+#[test]
+fn pending_admission_retains_only_changed_rows_and_checks_provenance() {
+    let mut core = setup();
+    let command = input(
+        1,
+        ISSUER,
+        Command::GenerateClaimBatch {
+            claims: (1000..1016).map(new_claim).collect(),
+        },
+    );
+    let prepared = core.prepare(&command).unwrap();
+    core.apply_serial(SessionSeq(core.sequence().0 + 1), prepared)
+        .unwrap();
+    let mut pending = PendingState::new();
+    pending.reserve(8).unwrap();
+    for index in 0..8 {
+        let principal = ParticipantId::from_u128(100 + index);
+        let command = input(
+            100 + index,
+            principal,
+            Command::NegotiateEpoch {
+                epoch: RequestEpoch(1),
+            },
+        );
+        let stage = core.stage_pending(&pending, &command).unwrap();
+        assert_eq!(stage.patch().claims().count(), 0);
+        let mut foreign = core.clone();
+        foreign.limits.max_objects -= 1;
+        assert!(stage.view_after(&foreign, &pending).is_err());
+        assert!(pending.validate_next(&foreign, &stage).is_err());
+        pending.accept(&core, stage).unwrap();
+    }
+    assert_eq!(
+        pending
+            .rows
+            .iter()
+            .flatten()
+            .map(|row| row.rows.claims.len())
+            .sum::<usize>(),
+        0
+    );
+    assert_eq!(
+        pending
+            .rows
+            .iter()
+            .flatten()
+            .map(|row| row.rows.receipts.len())
+            .sum::<usize>(),
+        8
+    );
+    assert_eq!(core.snapshot().claims.len(), 16);
+}
+#[test]
+fn bounded_stage_audit_refuses_before_pending_acceptance() {
+    let core = setup();
+    let mut pending = PendingState::new();
+    pending.reserve(1).unwrap();
+    let stage = core
+        .stage_pending(
+            &pending,
+            &input(
+                1,
+                ISSUER,
+                Command::GenerateClaim {
+                    claim: new_claim(999),
+                },
+            ),
+        )
+        .unwrap();
+    let limits = EpochLimits {
+        max_bytes: 1,
+        ..EpochLimits::default()
+    };
+    assert!(matches!(
+        core.audit_pending_stage(&pending, &stage, limits),
+        Err(EpochError::Capacity(_))
+    ));
+    assert!(pending.is_empty());
+    assert!(core.snapshot().claims.is_empty());
+}

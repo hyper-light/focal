@@ -1,0 +1,22 @@
+[package]
+name = "focal-directory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+focal-model = { version = "0.1.0", path = "../focal-model" }
+focal-enrollment = { version = "0.1.0", path = "../focal-enrollment" }
+focal-memory = { version = "0.1.0", path = "../focal-memory" }
+serde.workspace = true
+postcard.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+focal-consensus = { version = "0.1.0", path = "../focal-consensus" }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,29 @@
+[package]
+name = "focal-enrollment"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3.workspace = true
+fs2.workspace = true
+getrandom.workspace = true
+postcard.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring", "x509-parser", "zeroize"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+time = { version = "0.3", default-features = false }
+x509-parser = { version = "0.18", features = ["verify"] }
+zeroize = "1.8"
+ring = "0.17"
+
+[dev-dependencies]
+tempfile.workspace = true
+focal-log = { version = "0.1.0", path = "../focal-log" }
+
+[lints]
+workspace = true

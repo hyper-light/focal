@@ -1,0 +1,25 @@
+[package]
+name = "focal-ledger"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+focal-model = { version = "0.1.0", path = "../focal-model" }
+focal-core = { version = "0.1.0", path = "../focal-core" }
+focal-consensus = { version = "0.1.0", path = "../focal-consensus" }
+focal-graph = { version = "0.1.0", path = "../focal-graph" }
+focal-memory = { version = "0.1.0", path = "../focal-memory" }
+focal-stream = { version = "0.1.0", path = "../focal-stream" }
+blake3.workspace = true
+postcard.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+focal-sim = { version = "0.1.0", path = "../focal-sim" }

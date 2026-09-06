@@ -1,0 +1,9 @@
+# Production assertions and convenience output macros may unwind. Tests opt out
+# explicitly at their crate root; production handles failures with typed results.
+disallowed-macros = [
+  "std::assert", "std::assert_eq", "std::assert_ne",
+  "std::debug_assert", "std::debug_assert_eq", "std::debug_assert_ne",
+  "core::assert", "core::assert_eq", "core::assert_ne",
+  "core::debug_assert", "core::debug_assert_eq", "core::debug_assert_ne",
+  "std::print", "std::println", "std::eprint", "std::eprintln",
+]

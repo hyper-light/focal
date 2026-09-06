@@ -1,0 +1,26 @@
+[package]
+name = "focal-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+focal-model = { path = "../focal-model", version = "0.1.0" }
+focal-core = { path = "../focal-core", version = "0.1.0" }
+focal-ledger = { path = "../focal-ledger", version = "0.1.0" }
+focal-graph = { path = "../focal-graph", version = "0.1.0" }
+focal-consensus = { path = "../focal-consensus", version = "0.1.0" }
+focal-memory = { path = "../focal-memory", version = "0.1.0" }
+focal-evidence = { path = "../focal-evidence", version = "0.1.0" }
+blake3.workspace = true
+postcard.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
