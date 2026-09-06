@@ -139,7 +139,15 @@ impl Session {
         command: &RequestStreamCommand,
     ) -> Result<Option<&RequestStreamControlReceipt>, LedgerError> {
         self.check()?;
-        self.managed_input_size(&(cluster, self.ledger, principal, id, command))?;
+        // Preserve the original control-input field order while borrowing the
+        // ACK manifest. This bound participates in exact retained lookup.
+        self.managed_input_size_view(&(
+            focal_model::durable_v1::Ref(&cluster),
+            focal_model::durable_v1::Ref(&self.ledger),
+            focal_model::durable_v1::Ref(&principal),
+            focal_model::durable_v1::Ref(&id),
+            focal_model::durable_v1::Ref(command),
+        ))?;
         self.request_streams
             .control_receipt_parts(cluster, self.ledger, principal, id, command)
     }
@@ -203,8 +211,7 @@ impl Session {
             domain_sequence: self.sequence(),
             input: input.clone(),
         };
-        let mut data = REQUEST_STREAM_MAGIC.to_vec();
-        data.extend(postcard::to_stdvec(&envelope)?);
+        let data = durable_session_v1::encode(REQUEST_STREAM_MAGIC, &envelope, usize::MAX)?;
         let digest = ContentHash(*blake3::hash(&data).as_bytes());
         self.consensus.propose_in(data, BudgetLane::Completion)?;
         self.pending_managed = Some(Box::new(PendingManaged {
@@ -269,7 +276,7 @@ impl Session {
             )?;
         }
         let mut data = MANAGED_DOMAIN_MAGIC.to_vec();
-        data.extend(postcard::to_stdvec(staged.prepared())?);
+        data.extend(staged.prepared().encode_v1()?);
         let digest = ContentHash(*blake3::hash(&data).as_bytes());
         self.ensure_delta_slots()?;
         let candidate = self.reserve_managed_domain(staged, lane, scratch)?;
@@ -334,7 +341,9 @@ impl Session {
                 )?
                 .commit();
             retained.push(RetainedDelta {
-                bytes: postcard::experimental::serialized_size(delta)?,
+                bytes: postcard::experimental::serialized_size(&focal_model::durable_v1::Ref(
+                    delta,
+                ))?,
                 delta: delta.clone(),
                 _charge: charge,
             });
@@ -386,7 +395,7 @@ impl Session {
                 )?;
                 let candidate = if let Some(encoded) = data.strip_prefix(REQUEST_STREAM_MAGIC) {
                     let (envelope, rest): (RequestStreamEnvelope, _) =
-                        postcard::take_from_bytes(encoded)?;
+                        durable_session_v1::take(encoded)?;
                     if !rest.is_empty()
                         || envelope.schema != 1
                         || envelope.domain_sequence != self.sequence()
@@ -402,17 +411,15 @@ impl Session {
                     if self.placement_state.paused() {
                         return Err(LedgerError::Corrupt);
                     }
-                    let (prepared, rest): (focal_core::PreparedManagedMutation, _) =
-                        postcard::take_from_bytes(encoded)?;
-                    if !rest.is_empty()
-                        || self
-                            .request_streams
-                            .exact(
-                                &prepared.input.key,
-                                prepared.command_hash,
-                                ManagedRequestFamily::Domain,
-                            )?
-                            .is_some()
+                    let prepared = focal_core::PreparedManagedMutation::decode_v1(encoded)?;
+                    if self
+                        .request_streams
+                        .exact(
+                            &prepared.input.key,
+                            prepared.command_hash,
+                            ManagedRequestFamily::Domain,
+                        )?
+                        .is_some()
                     {
                         return Err(LedgerError::Corrupt);
                     }
@@ -427,7 +434,7 @@ impl Session {
                         scratch,
                     )?)
                 } else {
-                    let (envelope, rest): (ManagedCursorEnvelope, _) = postcard::take_from_bytes(
+                    let (envelope, rest): (ManagedCursorEnvelope, _) = durable_session_v1::take(
                         data.strip_prefix(MANAGED_CURSOR_MAGIC)
                             .ok_or(LedgerError::Corrupt)?,
                     )?;
@@ -580,8 +587,7 @@ impl Session {
             trusted_control,
             input: input.clone(),
         };
-        let mut data = MANAGED_CURSOR_MAGIC.to_vec();
-        data.extend(postcard::to_stdvec(&envelope)?);
+        let data = durable_session_v1::encode(MANAGED_CURSOR_MAGIC, &envelope, usize::MAX)?;
         let hash = ContentHash(*blake3::hash(&data).as_bytes());
         let candidate = self.build_managed_cursor(&envelope, false)?;
         self.consensus.propose_in(data, BudgetLane::Completion)?;
@@ -718,7 +724,18 @@ impl Session {
 }
 
 impl Session {
-    fn managed_input_size<T: Serialize + ?Sized>(&self, value: &T) -> Result<usize, LedgerError> {
+    // This is a semantic encoded-byte limit, including historical cursor replay,
+    // not a current in-memory allocation charge. Keep its V1 representation.
+    fn managed_input_size<T: focal_model::durable_v1::V1>(
+        &self,
+        value: &T,
+    ) -> Result<usize, LedgerError> {
+        self.managed_input_size_view(&focal_model::durable_v1::Ref(value))
+    }
+    fn managed_input_size_view<T: Serialize + ?Sized>(
+        &self,
+        value: &T,
+    ) -> Result<usize, LedgerError> {
         struct BoundedSize {
             count: usize,
             limit: usize,

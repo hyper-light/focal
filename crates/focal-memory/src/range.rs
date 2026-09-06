@@ -110,6 +110,22 @@ pub(crate) struct Page<K, V> {
     _allocation: Allocation,
 }
 
+// A merge plan retains no reference into the owned input iterator. This keeps
+// descriptors small while newly supplied values move directly into final pages.
+enum MergeEntry<'a, K, V> {
+    Retained(&'a Entry<K, V>),
+    Incoming { heap_bytes: usize },
+}
+
+impl<K, V> MergeEntry<'_, K, V> {
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Retained(entry) => entry.heap_bytes,
+            Self::Incoming { heap_bytes } => *heap_bytes,
+        }
+    }
+}
+
 pub(crate) struct Root<K, V> {
     owner: crate::OwnerId,
     pub range: RangeId,
@@ -211,9 +227,14 @@ impl<K: Ord, V> PreparedRange<K, V> {
     pub fn get(&self, key: &K) -> Option<&V> {
         self.root.get(key).map(|entry| &entry.value)
     }
+    /// Complete ordered view of this unpublished prefix. Entries remain owned
+    /// by the candidate and cannot be modified through the view.
+    pub fn entries(&self) -> impl Iterator<Item = &Entry<K, V>> {
+        self.root.from(0, 0)
+    }
 }
 
-impl<K: Ord + Clone, V: Clone> RangeStore<K, V> {
+impl<K: Ord + Clone, V> RangeStore<K, V> {
     pub fn new(
         id: RangeId,
         initial_prefix: u64,
@@ -282,7 +303,10 @@ impl<K: Ord + Clone, V: Clone> RangeStore<K, V> {
         prefix: u64,
         changes: Vec<Change<K, V>>,
         lane: BudgetLane,
-    ) -> Result<(), MemoryError> {
+    ) -> Result<(), MemoryError>
+    where
+        V: Clone,
+    {
         let prepared = self.prepare_batch(prefix, changes, lane)?;
         self.publish(prepared)
     }
@@ -294,8 +318,36 @@ impl<K: Ord + Clone, V: Clone> RangeStore<K, V> {
         prefix: u64,
         changes: Vec<Change<K, V>>,
         lane: BudgetLane,
-    ) -> Result<PreparedRange<K, V>, MemoryError> {
-        self.prepare_root(&self.root, prefix, changes, lane)
+    ) -> Result<PreparedRange<K, V>, MemoryError>
+    where
+        V: Clone,
+    {
+        self.prepare_batch_with(prefix, changes, lane, |value| Ok(value.clone()))
+    }
+
+    /// Prepare owned changes without requiring values to implement `Clone`.
+    /// Supplied `Put` values move into the candidate and never reach `copy`.
+    /// Only retained entries in touched pages require a value copy; untouched
+    /// pages remain shared with the original prefix.
+    ///
+    /// Before invoking `copy`, the engine reserves the entry's `heap_bytes`
+    /// for its copied key and value. That recorded charge must conservatively
+    /// cover their resulting heap capacities and allocator overhead. The copier
+    /// must preserve the value's meaning without mutating its source, and must
+    /// separately account any extra temporary workspace. An error discards the
+    /// entire provisional candidate; published rows, roots and leases remain
+    /// unchanged.
+    pub fn prepare_batch_with<F>(
+        &self,
+        prefix: u64,
+        changes: Vec<Change<K, V>>,
+        lane: BudgetLane,
+        mut copy: F,
+    ) -> Result<PreparedRange<K, V>, MemoryError>
+    where
+        F: FnMut(&V) -> Result<V, MemoryError>,
+    {
+        self.prepare_root_with(&self.root, prefix, changes, lane, &mut copy)
     }
 
     /// Prepare a pipelined suffix against an unpublished predecessor. Publish
@@ -306,20 +358,50 @@ impl<K: Ord + Clone, V: Clone> RangeStore<K, V> {
         prefix: u64,
         changes: Vec<Change<K, V>>,
         lane: BudgetLane,
-    ) -> Result<PreparedRange<K, V>, MemoryError> {
+    ) -> Result<PreparedRange<K, V>, MemoryError>
+    where
+        V: Clone,
+    {
+        self.prepare_after_with(
+            predecessor,
+            prefix,
+            changes,
+            lane,
+            |value| Ok(value.clone()),
+        )
+    }
+
+    /// Prepare against an unpublished predecessor using the same fallible copy
+    /// and heap-charge contract as [`Self::prepare_batch_with`]. Every supplied
+    /// value remains owned; the predecessor's published rows remain unchanged.
+    pub fn prepare_after_with<F>(
+        &self,
+        predecessor: &PreparedRange<K, V>,
+        prefix: u64,
+        changes: Vec<Change<K, V>>,
+        lane: BudgetLane,
+        mut copy: F,
+    ) -> Result<PreparedRange<K, V>, MemoryError>
+    where
+        F: FnMut(&V) -> Result<V, MemoryError>,
+    {
         if predecessor.root.owner != self.root.owner {
             return Err(MemoryError::WrongRange);
         }
-        self.prepare_root(&predecessor.root, prefix, changes, lane)
+        self.prepare_root_with(&predecessor.root, prefix, changes, lane, &mut copy)
     }
 
-    fn prepare_root(
+    fn prepare_root_with<F>(
         &self,
         base: &Arc<Root<K, V>>,
         prefix: u64,
         mut changes: Vec<Change<K, V>>,
         lane: BudgetLane,
-    ) -> Result<PreparedRange<K, V>, MemoryError> {
+        copy: &mut F,
+    ) -> Result<PreparedRange<K, V>, MemoryError>
+    where
+        F: FnMut(&V) -> Result<V, MemoryError>,
+    {
         let expected = base
             .prefix
             .checked_add(1)
@@ -379,9 +461,10 @@ impl<K: Ord + Clone, V: Clone> RangeStore<K, V> {
         pages
             .try_reserve_exact(max_pages)
             .map_err(|_| MemoryError::AllocationFailed)?;
-        let mut change_offset = 0;
+        let mut changes = changes.into_iter();
         if base.pages.is_empty() {
-            self.merge_page(&[], &changes, &mut pages, lane)?;
+            let count = changes.len();
+            self.merge_page_with(&[], &mut changes, count, &mut pages, lane, copy)?;
         } else {
             for (page_index, page) in base.pages.iter().enumerate() {
                 let next_first = base
@@ -389,24 +472,25 @@ impl<K: Ord + Clone, V: Clone> RangeStore<K, V> {
                     .get(checked_add(page_index, 1)?)
                     .and_then(|page| page.entries.first())
                     .map(|entry| &entry.key);
-                let remaining = changes
-                    .get(change_offset..)
-                    .ok_or(MemoryError::MissingKey)?;
-                let count = remaining.partition_point(|change| {
+                let count = changes.as_slice().partition_point(|change| {
                     next_first.is_none_or(|boundary| change.key() < boundary)
                 });
                 if count == 0 {
                     pages.push(Arc::clone(page));
                 } else {
-                    self.merge_page(
+                    self.merge_page_with(
                         &page.entries,
-                        remaining.get(..count).ok_or(MemoryError::MissingKey)?,
+                        &mut changes,
+                        count,
                         &mut pages,
                         lane,
+                        copy,
                     )?;
                 }
-                change_offset = checked_add(change_offset, count)?;
             }
+        }
+        if !changes.as_slice().is_empty() {
+            return Err(MemoryError::MissingKey);
         }
         let root = Root {
             owner: base.owner,
@@ -431,7 +515,10 @@ impl<K: Ord + Clone, V: Clone> RangeStore<K, V> {
         config: RangeConfig,
         budget: MemoryBudget,
         entries: impl IntoIterator<Item = Entry<K, V>>,
-    ) -> Result<Self, MemoryError> {
+    ) -> Result<Self, MemoryError>
+    where
+        V: Clone,
+    {
         let mut store = Self::new(id, 0, config, budget)?;
         let chunk_limit = config.page_entries.min(config.max_batch_entries);
         let mut source = entries.into_iter().peekable();
@@ -535,19 +622,28 @@ impl<K: Ord + Clone, V: Clone> RangeStore<K, V> {
         Ok(())
     }
 
-    fn merge_page(
+    fn merge_page_with<F>(
         &self,
         old: &[Entry<K, V>],
-        changes: &[Change<K, V>],
+        changes: &mut std::vec::IntoIter<Change<K, V>>,
+        count: usize,
         pages: &mut Vec<Arc<Page<K, V>>>,
         lane: BudgetLane,
-    ) -> Result<(), MemoryError> {
+        copy: &mut F,
+    ) -> Result<(), MemoryError>
+    where
+        F: FnMut(&V) -> Result<V, MemoryError>,
+    {
         // Only one changed page's descriptors exist at once; no full range
         // clone or unbounded collected graph is built to plan an update.
-        let max_entries = checked_add(old.len(), changes.len())?;
+        let selected = changes
+            .as_slice()
+            .get(..count)
+            .ok_or(MemoryError::MissingKey)?;
+        let max_entries = checked_add(old.len(), count)?;
         let staging_bytes = checked_add(
             ALLOCATOR_OVERHEAD,
-            checked_mul(max_entries, size_of::<&Entry<K, V>>())?,
+            checked_mul(max_entries, size_of::<MergeEntry<'_, K, V>>())?,
         )?;
         let _staging = self
             .budget
@@ -557,12 +653,14 @@ impl<K: Ord + Clone, V: Clone> RangeStore<K, V> {
             .try_reserve_exact(max_entries)
             .map_err(|_| MemoryError::AllocationFailed)?;
         let mut existing = old.iter().peekable();
-        for change in changes {
+        for change in selected {
             while existing
                 .peek()
                 .is_some_and(|entry| &entry.key < change.key())
             {
-                merged.push(existing.next().ok_or(MemoryError::MissingKey)?);
+                merged.push(MergeEntry::Retained(
+                    existing.next().ok_or(MemoryError::MissingKey)?,
+                ));
             }
             if existing
                 .peek()
@@ -571,10 +669,21 @@ impl<K: Ord + Clone, V: Clone> RangeStore<K, V> {
                 existing.next();
             }
             if let Change::Put(entry) = change {
-                merged.push(entry);
+                merged.push(MergeEntry::Incoming {
+                    heap_bytes: entry.heap_bytes,
+                });
             }
         }
-        merged.extend(existing);
+        merged.extend(existing.map(MergeEntry::Retained));
+        // Planning only borrows old rows. The incoming descriptors carry a
+        // charge, allowing each owned Put to move out of the input exactly once.
+        let mut incoming = changes
+            .by_ref()
+            .take(count)
+            .filter_map(|change| match change {
+                Change::Put(entry) => Some(entry),
+                Change::Delete(_) => None,
+            });
         for chunk in merged.chunks(self.config.page_entries) {
             let mut bytes = checked_add(
                 ALLOCATOR_OVERHEAD,
@@ -582,7 +691,7 @@ impl<K: Ord + Clone, V: Clone> RangeStore<K, V> {
             )?;
             bytes = checked_add(bytes, checked_mul(chunk.len(), size_of::<Entry<K, V>>())?)?;
             for entry in chunk {
-                bytes = checked_add(bytes, entry.heap_bytes)?;
+                bytes = checked_add(bytes, entry.heap_bytes())?;
             }
             let allocation = self
                 .budget
@@ -593,12 +702,26 @@ impl<K: Ord + Clone, V: Clone> RangeStore<K, V> {
                 .try_reserve_exact(chunk.len())
                 .map_err(|_| MemoryError::AllocationFailed)?;
             for entry in chunk {
-                entries.push((*entry).clone());
+                entries.push(match entry {
+                    MergeEntry::Retained(entry) => Entry {
+                        key: entry.key.clone(),
+                        value: copy(&entry.value)?,
+                        heap_bytes: entry.heap_bytes,
+                    },
+                    MergeEntry::Incoming { .. } => {
+                        incoming.next().ok_or(MemoryError::MissingKey)?
+                    }
+                });
             }
             pages.push(Arc::new(Page {
                 entries,
                 _allocation: allocation,
             }));
+        }
+        // Drain trailing deletions belonging to this page. An unplanned Put
+        // would indicate an incomplete merge and must never be published.
+        if incoming.next().is_some() {
+            return Err(MemoryError::MissingKey);
         }
         Ok(())
     }

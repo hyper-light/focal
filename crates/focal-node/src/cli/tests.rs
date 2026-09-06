@@ -304,7 +304,7 @@ fn joined_markers_reject_manual_context_before_journaling_or_transmission() {
         .build()
         .unwrap();
     assert_eq!(
-        Context::open(&settings).unwrap().build.actor,
+        Context::open(&settings, None).unwrap().build.actor,
         identity.issuer
     );
     for marker in ["JOIN", "JOIN.initialized"] {
@@ -314,8 +314,11 @@ fn joined_markers_reject_manual_context_before_journaling_or_transmission() {
             &runtime,
             &settings,
             command(&["claim", "post", "00000000000000000000000000000001"]),
+            None,
         );
-        assert!(matches!(result, Err(CliError::Input(message)) if message.contains("joined node")));
+        assert!(
+            matches!(result, Err(CliError::Input(message)) if message.contains("local node client context"))
+        );
         assert!(!directory.path().join("client").exists());
         assert_eq!(
             decode_identity(&directory.path().join("IDENTITY")).unwrap(),
@@ -329,6 +332,48 @@ fn joined_markers_reject_manual_context_before_journaling_or_transmission() {
         directory.path().join("JOIN"),
     )
     .unwrap();
-    assert!(matches!(Context::open(&settings), Err(CliError::Input(_))));
+    assert!(matches!(
+        Context::open(&settings, None),
+        Err(CliError::Input(_))
+    ));
     assert!(!directory.path().join("client").exists());
+}
+
+#[test]
+fn atomic_claim_batch_flags_json_yaml_share_one_intent_and_reject_mixed_input() {
+    let claim = r#"{"id":"00000000000000000000000000000010","occurrence":"00000000000000000000000000000011","description":"Batch claim","target":"self","action":"handoff","validations":[{"id":"00000000000000000000000000000012","kind":"receipt","phase":"whole_work","mode":"required","description":"Receive response","evaluator":"self"}]}"#;
+    let batch = format!("{{\"claims\":[{claim}]}}");
+    let yaml = format!("claims:\n  - {claim}\n");
+    let cases = [
+        vec!["submit", "claims", "--claim-json", claim],
+        vec!["submit", "claims", "--json", &batch],
+        vec!["submit", "claims", "--yaml", &yaml],
+    ];
+    let mut intents = Vec::new();
+    let mut wires = Vec::new();
+    for args in cases {
+        let (authored, _) = authored::mutation(command(&args)).unwrap();
+        authored.preflight(&context()).unwrap();
+        intents.push(authored.canonical_intent().unwrap());
+        wires.push(
+            authored
+                .build(&context(), &mut || Err(InputError::Identity))
+                .unwrap()
+                .into_wire(None)
+                .unwrap(),
+        );
+    }
+    assert!(intents.windows(2).all(|pair| pair[0] == pair[1]));
+    assert!(wires.windows(2).all(|pair| pair[0] == pair[1]));
+    assert!(
+        authored::mutation(command(&[
+            "submit",
+            "claims",
+            "--json",
+            &batch,
+            "--claim-json",
+            claim
+        ]))
+        .is_err()
+    );
 }

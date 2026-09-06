@@ -688,6 +688,11 @@ impl RequestStreams {
             n.checked_add(s.data.charge()?).ok_or(LedgerError::Capacity)
         })
     }
+    /// Borrow the retained slot rows in their original durable order.
+    pub(crate) fn checkpoint_rows(&self) -> impl ExactSizeIterator<Item = &StreamSlotData> {
+        self.slots.iter().map(|slot| &slot.data)
+    }
+    #[cfg(test)]
     pub fn checkpoint(&self) -> RequestStreamsCheckpoint {
         RequestStreamsCheckpoint {
             activated: self.activated,

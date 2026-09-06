@@ -1,0 +1,60 @@
+{
+  "time": "2026-09-06T16:10:30.314903+00:00",
+  "scope": "Current implementation source observed while planning the actual immutable old executable experiment. These are not claimed as the exact source tree that built the old executable; see old-binary-capture.json.",
+  "files": [
+    {
+      "path": "crates/focal-log/src/lib.rs",
+      "sha256": "4fb2f801343810149e11b773eae0032e6811b0b7950faf59fdedcecd70a13b6d",
+      "bytes": 35903,
+      "snapshot": "observed-source/crates/focal-log/src/lib.rs.txt"
+    },
+    {
+      "path": "crates/focal-log/src/writer.rs",
+      "sha256": "a458d6f559f760e31dcc06fb149d2f5245812bba407f89b0ae9d3a82af82aa99",
+      "bytes": 40578,
+      "snapshot": "observed-source/crates/focal-log/src/writer.rs.txt"
+    },
+    {
+      "path": "crates/focal-consensus/src/checkpoint.rs",
+      "sha256": "97d83f9f46982a198080c25a30c12cbb4216628b34df78111b8a062826f82562",
+      "bytes": 10723,
+      "snapshot": "observed-source/crates/focal-consensus/src/checkpoint.rs.txt"
+    },
+    {
+      "path": "crates/focal-consensus/src/decoder.rs",
+      "sha256": "1436941c879a7c29fbb20962d32226bf3280fa6afe479cdcaa7816dd2abf16f7",
+      "bytes": 12418,
+      "snapshot": "observed-source/crates/focal-consensus/src/decoder.rs.txt"
+    },
+    {
+      "path": "crates/focal-consensus/src/lib.rs",
+      "sha256": "62dc12c037e17d2e6a09daccffa5001174367283d6024287b20d14751f47c8b6",
+      "bytes": 42002,
+      "snapshot": "observed-source/crates/focal-consensus/src/lib.rs.txt"
+    },
+    {
+      "path": "crates/focal-node/src/main.rs",
+      "sha256": "26fbbd4ceb2d3c41f580b0827e85b7f2fb36e130bd371dd0d04cad9db07c1b84",
+      "bytes": 17559,
+      "snapshot": "observed-source/crates/focal-node/src/main.rs.txt"
+    },
+    {
+      "path": "crates/focal-node/src/embedded.rs",
+      "sha256": "24a30b2039e53287917fa57bc25ae91ef882674319b51196a4c4d95887987317",
+      "bytes": 12722,
+      "snapshot": "observed-source/crates/focal-node/src/embedded.rs.txt"
+    },
+    {
+      "path": "crates/focal-node/src/node_directory.rs",
+      "sha256": "b4db1219984f4a56fa54ac00a27e6823c36eb337116158dea450f40890eb88a2",
+      "bytes": 10049,
+      "snapshot": "observed-source/crates/focal-node/src/node_directory.rs.txt"
+    },
+    {
+      "path": "crates/focal-ledger/src/managed_support.rs",
+      "sha256": "082873a34f53bce7dc3a11efd10af59e53b3deb0ddfa9b0cb0424844a3eae8c4",
+      "bytes": 10706,
+      "snapshot": "observed-source/crates/focal-ledger/src/managed_support.rs.txt"
+    }
+  ]
+}

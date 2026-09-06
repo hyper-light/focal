@@ -67,7 +67,8 @@ pub(super) fn lane(work: &Work) -> BudgetLane {
 }
 fn class(work: &Work) -> WorkClass {
     match work {
-        Work::Stop(_)
+        Work::Diagnostics(..)
+        | Work::Stop(_)
         | Work::Transfer(..)
         | Work::ManagedSupport(..)
         | Work::Membership(..)

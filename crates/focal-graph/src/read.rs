@@ -75,6 +75,32 @@ impl GraphSnapshot {
     pub fn expires_at(&self) -> u64 {
         self.lease.expires_at()
     }
+    /// Account retained adapter metadata under the same graph owner.
+    pub fn reserve_query(&self, bytes: usize) -> Result<Allocation, GraphError> {
+        Ok(self
+            .budget
+            .reserve(BudgetKind::Query, BudgetLane::Ordinary, bytes)?
+            .commit())
+    }
+    /// Membership is derived from the committed ByClaim index, never inferred
+    /// from an artifact's immutable provenance inputs.
+    pub fn belongs_to_claim(
+        &self,
+        reference: ObjectRef,
+        claim: ClaimId,
+        now: u64,
+    ) -> Result<bool, GraphError> {
+        self.namespace(reference)?;
+        if reference.kind == ObjectKind::Claim {
+            return Ok(reference.id.0 == claim.0);
+        }
+        let key = GraphKey::ByClaim(claim, reference.kind, reference.id);
+        let end = GraphKey::Identity(ObjectKind::Claim, ContentHash::default());
+        self.lease
+            .project_next(&key, false, &end, now, |entry| entry.key == key)
+            .map(|found| found.unwrap_or(false))
+            .map_err(Into::into)
+    }
     pub fn next_candidate(
         &self,
         query: &GraphScan,
@@ -121,6 +147,80 @@ impl GraphSnapshot {
                 },
             )?
             .transpose()
+    }
+    /// One bounded adjacency lookup. Projection borrows the fixed-prefix row;
+    /// only its fixed-size key and edge are copied into traversal state.
+    fn next_edge(
+        &self,
+        query: &GraphScan,
+        after: Option<&GraphKey>,
+        now: u64,
+    ) -> Result<Option<(GraphKey, GraphEdge)>, GraphError> {
+        let query = self.scan_query(query)?;
+        let start = query.start.ok_or(GraphError::IndexMismatch)?;
+        let end = query.end.ok_or(GraphError::IndexMismatch)?;
+        if after.is_some_and(|key| key < &start || key >= &end) {
+            return Err(MemoryError::QueryMismatch.into());
+        }
+        self.lease
+            .project_next(
+                after.unwrap_or(&start),
+                after.is_some(),
+                &end,
+                now,
+                |entry| {
+                    let GraphValue::Edge(edge) = &entry.value else {
+                        return Err(GraphError::IndexMismatch);
+                    };
+                    Ok((entry.key.clone(), edge.clone()))
+                },
+            )?
+            .transpose()
+    }
+    /// Retain the original checkpoint for exact page retries. The independent
+    /// clone is admitted before copying any frontier/visited metadata.
+    pub fn clone_traversal(
+        &self,
+        value: &GraphTraversalContinuation,
+    ) -> Result<GraphTraversalContinuation, GraphError> {
+        if value.lease != self.lease.id()
+            || value.prefix != self.sequence()
+            || value.range != self.lease.range_id()
+        {
+            return Err(MemoryError::WrongLease.into());
+        }
+        let allocation = self
+            .budget
+            .reserve(
+                BudgetKind::Query,
+                BudgetLane::Ordinary,
+                value._allocation.bytes(),
+            )?
+            .commit();
+        let mut queue = VecDeque::new();
+        queue
+            .try_reserve_exact(value.queue.len())
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        queue.extend(value.queue.iter().cloned());
+        let mut roots = Vec::new();
+        roots
+            .try_reserve_exact(value.roots.len())
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        roots.extend_from_slice(&value.roots);
+        Ok(GraphTraversalContinuation {
+            range: value.range,
+            lease: value.lease,
+            prefix: value.prefix,
+            query: value.query.clone(),
+            roots,
+            limits: value.limits,
+            queue,
+            visited: value.visited.clone(),
+            current: value.current.clone(),
+            edges: value.edges,
+            depth_pruned: value.depth_pruned,
+            _allocation: allocation,
+        })
     }
 
     /// Borrow one exact object without cloning its payload or relations. The
@@ -366,7 +466,35 @@ impl GraphSnapshot {
         continuation: Option<GraphTraversalContinuation>,
         now: u64,
     ) -> Result<GraphTraversalPage, GraphError> {
-        self.namespace(query.root)?;
+        self.traverse_roots(
+            std::slice::from_ref(&query.root),
+            query,
+            limits,
+            budget,
+            continuation,
+            now,
+        )
+    }
+    /// Multiple roots enter one deterministic BFS frontier and share visited state.
+    pub fn traverse_roots(
+        &self,
+        roots: &[ObjectRef],
+        query: &GraphTraversalQuery,
+        limits: TraversalLimits,
+        budget: ReadBudget,
+        continuation: Option<GraphTraversalContinuation>,
+        now: u64,
+    ) -> Result<GraphTraversalPage, GraphError> {
+        if roots.is_empty()
+            || roots.len() > 32
+            || roots.first() != Some(&query.root)
+            || roots.windows(2).any(|pair| matches!(pair, [a,b] if a>=b))
+        {
+            return Err(MemoryError::QueryMismatch.into());
+        }
+        for root in roots {
+            self.namespace(*root)?;
+        }
         let limits = TraversalLimits {
             max_depth: limits.max_depth.min(self.config.max_traversal_depth),
             max_nodes: limits.max_nodes.min(self.config.max_traversal_nodes),
@@ -394,13 +522,13 @@ impl GraphSnapshot {
                 {
                     return Err(MemoryError::WrongLease.into());
                 }
-                if c.query != *query || !same_limits(c.limits, limits) {
+                if c.query != *query || c.roots != roots || !same_limits(c.limits, limits) {
                     return Err(MemoryError::QueryMismatch.into());
                 }
                 c
             }
             None => {
-                let minimum = cursor_charge(1, query)?;
+                let minimum = cursor_charge(roots.len(), query)?;
                 if minimum > limits.max_state_bytes {
                     return Err(MemoryError::Capacity {
                         requested: minimum,
@@ -416,16 +544,30 @@ impl GraphSnapshot {
                         limits.max_state_bytes,
                     )?
                     .commit();
+                if roots.len() > limits.max_nodes {
+                    return Err(MemoryError::QueryMismatch.into());
+                }
                 let mut queue = VecDeque::new();
-                queue.push_back(PendingNode::new(query.root, 0));
+                queue
+                    .try_reserve_exact(roots.len())
+                    .map_err(|_| MemoryError::AllocationFailed)?;
+                for root in roots {
+                    queue.push_back(PendingNode::new(*root, 0));
+                }
+                let mut owned_roots = Vec::new();
+                owned_roots
+                    .try_reserve_exact(roots.len())
+                    .map_err(|_| MemoryError::AllocationFailed)?;
+                owned_roots.extend_from_slice(roots);
                 GraphTraversalContinuation {
                     range: self.lease.range_id(),
                     lease: self.lease.id(),
                     prefix: self.sequence(),
                     query: query.clone(),
+                    roots: owned_roots,
                     limits,
                     queue,
-                    visited: BTreeSet::from([query.root]),
+                    visited: roots.iter().copied().collect(),
                     current: None,
                     edges: 0,
                     depth_pruned: false,
@@ -502,78 +644,52 @@ impl GraphSnapshot {
                 Direction::Forward => GraphScan::Forward(current.object),
                 Direction::Reverse => GraphScan::Reverse(current.object),
             };
-            let page_budget = ReadBudget {
-                max_items: max_edges
-                    .saturating_sub(probes)
-                    .min(limits.max_edges.saturating_sub(cursor.edges))
-                    .min(64),
-                max_bytes: self.config.max_query_bytes,
-                max_edge_visits: 1,
+            let edge = self.next_edge(&index, current.after.as_ref(), now)?;
+            probes = probes.checked_add(1).ok_or(GraphError::Overflow)?;
+            cursor.edges = cursor.edges.checked_add(1).ok_or(GraphError::Overflow)?;
+            let Some((key, edge)) = edge else {
+                cursor.current = None;
+                continue;
             };
-            let mut neighbors = self.scan(&index, page_budget, current.edges.take(), now)?;
-            current.edges = neighbors.continuation.take();
-            probes = probes
-                .checked_add(neighbors.len())
-                .ok_or(GraphError::Overflow)?;
-            cursor.edges = cursor
-                .edges
-                .checked_add(neighbors.len())
-                .ok_or(GraphError::Overflow)?;
-            let mut cumulative_stop = None;
-            for entry in neighbors.items() {
-                let GraphValue::Edge(edge) = &entry.value else {
-                    return Err(GraphError::IndexMismatch);
-                };
-                if !query.relations.is_empty() && !query.relations.contains(&edge.relation) {
-                    continue;
-                }
-                let target = match query.direction {
-                    Direction::Forward => match &edge.target {
-                        RelationTarget::Object(o) => *o,
-                        _ => continue,
-                    },
-                    Direction::Reverse => edge.source,
-                };
-                if current.depth == limits.max_depth {
-                    cursor.depth_pruned = true;
-                    continue;
-                }
-                if cursor.visited.contains(&target) {
-                    continue;
-                }
-                if cursor.visited.len() == limits.max_nodes {
-                    cumulative_stop = Some(TraversalStop::NodeLimit);
-                    break;
-                }
-                if cursor_charge(
-                    cursor
-                        .visited
-                        .len()
-                        .checked_add(1)
-                        .ok_or(GraphError::Overflow)?,
-                    query,
-                )? > limits.max_state_bytes
-                {
-                    cumulative_stop = Some(TraversalStop::StateLimit);
-                    break;
-                }
-                cursor.visited.insert(target);
-                cursor.queue.push_back(PendingNode::new(
-                    target,
-                    current.depth.checked_add(1).ok_or(GraphError::Overflow)?,
-                ));
+            current.after = Some(key);
+            if !query.relations.is_empty() && !query.relations.contains(&edge.relation) {
+                continue;
             }
-            if let Some(stop) = cumulative_stop {
-                break stop;
+            let target = match query.direction {
+                Direction::Forward => match edge.target {
+                    RelationTarget::Object(object) => object,
+                    _ => continue,
+                },
+                Direction::Reverse => edge.source,
+            };
+            if cursor.visited.contains(&target) {
+                continue;
             }
-            if current.edges.is_none() {
-                cursor.current = None
+            if current.depth == limits.max_depth {
+                cursor.depth_pruned = true;
+                continue;
             }
-            // Count even an empty adjacency probe, so isolated graphs cannot bypass work limits.
-            if neighbors.is_empty() {
-                probes = probes.checked_add(1).ok_or(GraphError::Overflow)?;
-                cursor.edges = cursor.edges.checked_add(1).ok_or(GraphError::Overflow)?
+            if cursor.visited.len() == limits.max_nodes {
+                break TraversalStop::NodeLimit;
             }
+            if cursor_charge(
+                cursor
+                    .visited
+                    .len()
+                    .checked_add(1)
+                    .ok_or(GraphError::Overflow)?,
+                query,
+            )? > limits.max_state_bytes
+            {
+                break TraversalStop::StateLimit;
+            }
+            let depth = current.depth.checked_add(1).ok_or(GraphError::Overflow)?;
+            cursor
+                .queue
+                .try_reserve(1)
+                .map_err(|_| MemoryError::AllocationFailed)?;
+            cursor.visited.insert(target);
+            cursor.queue.push_back(PendingNode::new(target, depth));
         };
         let total_edge_visits = cursor.edges;
         Ok(GraphTraversalPage {
@@ -632,11 +748,12 @@ fn cursor_charge(nodes: usize, query: &GraphTraversalQuery) -> Result<usize, Gra
         })
         .ok_or(GraphError::Overflow)
 }
+#[derive(Clone)]
 struct PendingNode {
     object: ObjectRef,
     depth: u32,
     emitted: bool,
-    edges: Option<GraphScanContinuation>,
+    after: Option<GraphKey>,
 }
 impl PendingNode {
     fn new(object: ObjectRef, depth: u32) -> Self {
@@ -644,7 +761,7 @@ impl PendingNode {
             object,
             depth,
             emitted: false,
-            edges: None,
+            after: None,
         }
     }
 }
@@ -653,6 +770,7 @@ pub struct GraphTraversalContinuation {
     lease: u64,
     prefix: SessionSeq,
     query: GraphTraversalQuery,
+    roots: Vec<ObjectRef>,
     limits: TraversalLimits,
     queue: VecDeque<PendingNode>,
     visited: BTreeSet<ObjectRef>,

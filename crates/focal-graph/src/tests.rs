@@ -108,6 +108,95 @@ fn setup() -> (Core, GraphStore) {
     .unwrap();
     (core, graph)
 }
+
+#[test]
+fn traversal_clones_are_independently_accounted_and_failed_admission_preserves_cursor() {
+    let (mut core, mut graph) = setup();
+    transition(
+        &mut core,
+        &mut graph,
+        2,
+        Command::GenerateClaimBatch {
+            claims: vec![claim(100), claim(101)],
+        },
+    );
+    let snapshot = graph.snapshot(0, 100).unwrap();
+    let roots = [
+        ObjectRef::claim(ledger(), ClaimId::from_u128(100)),
+        ObjectRef::claim(ledger(), ClaimId::from_u128(101)),
+    ];
+    let query = GraphTraversalQuery {
+        root: roots[0],
+        direction: Direction::Forward,
+        relations: [GraphRelation::Requirement].into_iter().collect(),
+        authority_scope: ContentHash([1; 32]),
+    };
+    let limits = TraversalLimits::default();
+    let budget = ReadBudget {
+        max_items: 1,
+        max_bytes: 64 * 1024,
+        max_edge_visits: 1,
+    };
+    let mut first = snapshot
+        .traverse_roots(&roots, &query, limits, budget, None, 0)
+        .unwrap();
+    let original = first.continuation.take().unwrap();
+    drop(first);
+    let baseline = graph.memory_stats().used;
+    let cloned = snapshot.clone_traversal(&original).unwrap();
+    assert!(graph.memory_stats().used > baseline);
+    drop(cloned);
+    assert_eq!(graph.memory_stats().used, baseline);
+    let stats = graph.memory_stats();
+    let pressure = graph
+        .budget
+        .reserve(
+            BudgetKind::Pending,
+            BudgetLane::Ordinary,
+            stats.limit - stats.completion_reserve - stats.ordinary_used - 1024,
+        )
+        .unwrap()
+        .commit();
+    assert!(matches!(
+        snapshot.clone_traversal(&original),
+        Err(GraphError::Memory(MemoryError::Capacity { .. }))
+    ));
+    drop(pressure);
+    assert_eq!(graph.memory_stats().used, baseline);
+    let first = snapshot
+        .traverse_roots(
+            &roots,
+            &query,
+            limits,
+            budget,
+            Some(snapshot.clone_traversal(&original).unwrap()),
+            0,
+        )
+        .unwrap();
+    let second = snapshot
+        .traverse_roots(
+            &roots,
+            &query,
+            limits,
+            budget,
+            Some(snapshot.clone_traversal(&original).unwrap()),
+            0,
+        )
+        .unwrap();
+    assert_eq!(first.stop, second.stop);
+    assert_eq!(first.edge_visits, second.edge_visits);
+    let keys = |page: &GraphTraversalPage| {
+        page.objects
+            .iter()
+            .flat_map(|page| page.items().iter().map(|entry| entry.key.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(keys(&first), keys(&second));
+    drop(first);
+    drop(second);
+    drop(original);
+    assert!(graph.memory_stats().used < baseline);
+}
 fn transition(core: &mut Core, graph: &mut GraphStore, n: u128, command: Command) {
     let before = core.snapshot().clone();
     advance(core, n, command);

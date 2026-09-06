@@ -388,3 +388,6 @@ fn unknown_reply_and_eof_leave_exact_epoch_request_recoverable() {
     let journal = store.open_existing(OPERATION_ID, &context()).unwrap();
     assert_eq!(journal.next_request().unwrap(), Some(&saved));
 }
+
+#[path = "traversal_backend_tests.rs"]
+mod traversal;

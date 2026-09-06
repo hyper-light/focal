@@ -1,0 +1,411 @@
+use focal_core::{Core, Footprint, PreparedManagedMutation, PreparedMutation, State};
+use focal_model::*;
+use std::{collections::BTreeSet, path::Path};
+
+fn hash(seed: u8) -> ContentHash {
+    ContentHash(std::array::from_fn(|i| seed.wrapping_add(i as u8)))
+}
+fn actor(seed: u128) -> ParticipantId {
+    ParticipantId::from_u128(0xa0000000000000000000000000000000 | seed)
+}
+fn fence() -> ReceiptFence {
+    ReceiptFence {
+        receipt: ReceiptId::from_u128(0xb10000000000000000000000000000ff),
+        epoch: u64::MAX,
+    }
+}
+fn aref(n: u128) -> ArtifactRef {
+    ArtifactRef {
+        id: ArtifactId::from_u128(3000 + n),
+        hash: hash(n as u8),
+    }
+}
+fn claim(state: &State, rich: bool) -> NewClaim {
+    let id = ClaimId::from_u128(if rich { 1001 } else { 1000 });
+    let original = state.claims.get(&id).unwrap();
+    let mut content = original.content().clone();
+    let validations: Vec<_> = if rich {
+        state
+            .validations
+            .iter()
+            .map(|(id, v)| NewValidation {
+                id: *id,
+                content: v.content().clone(),
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+    content.requirements = validations
+        .iter()
+        .map(|v| RequirementRef {
+            id: v.id,
+            specification: v.content.specification_hash().unwrap(),
+        })
+        .collect();
+    if !rich {
+        content.relations.clear();
+        content.scopes.clear();
+        content.description.clear();
+    }
+    NewClaim {
+        id,
+        content,
+        validations,
+    }
+}
+fn artifact(state: &State, rich: bool) -> NewArtifact {
+    let id = ArtifactId::from_u128(if rich { 3004 } else { 3000 });
+    NewArtifact {
+        id,
+        content: state.artifacts.get(&id).unwrap().content().clone(),
+    }
+}
+fn verdict(rich: bool) -> VerdictRecord {
+    VerdictRecord {
+        run: ValidationRunId {
+            validation: ValidationId::from_u128(2099),
+            target_hash: hash(91),
+            phase: if rich {
+                ValidationPhase::WholeWork
+            } else {
+                ValidationPhase::Increment
+            },
+            epoch: if rich { u64::MAX } else { 0 },
+        },
+        evaluator: actor(3),
+        handler: HandlerRef {
+            id: ValidatorId::from_u128(9001),
+            version: hash(92),
+            agentic: rich,
+        },
+        attempt: if rich { u32::MAX } else { 0 },
+        manifest: hash(93),
+        value: if rich {
+            VerdictValue::Error
+        } else {
+            VerdictValue::Pass
+        },
+        evidence: if rich { vec![aref(3), aref(1)] } else { vec![] },
+    }
+}
+fn commands(state: &State, rich: bool) -> Vec<Command> {
+    let c = ClaimId::from_u128(0xc10000000000000000000000000000ff);
+    let set = EvidenceSetId::from_u128(7001);
+    let t = TestamentId::from_u128(4001);
+    let m = MonitorId::from_u128(8001);
+    let timer = TimerId::from_u128(9001);
+    let text = if rich {
+        "request proof: λ\nsecond line\0"
+    } else {
+        ""
+    }
+    .to_owned();
+    vec![
+        Command::NegotiateEpoch {
+            epoch: RequestEpoch(if rich { u64::MAX } else { 0 }),
+        },
+        Command::AdvanceEpochFloor {
+            minimum: RequestEpoch(if rich { 128 } else { 127 }),
+        },
+        Command::GenerateClaim {
+            claim: claim(state, rich),
+        },
+        Command::GenerateClaimBatch {
+            claims: if rich {
+                vec![claim(state, true), claim(state, false)]
+            } else {
+                vec![]
+            },
+        },
+        Command::PostClaim { claim: c },
+        Command::AcquireReceipt {
+            claim: c,
+            receipt: fence().receipt,
+            epoch: if rich { u64::MAX } else { 0 },
+        },
+        Command::AdoptReceipt {
+            claim: c,
+            previous: fence(),
+            receipt: ReceiptId::from_u128(10101),
+            holder: actor(4),
+            epoch: if rich { 128 } else { 0 },
+        },
+        Command::RecordProgress {
+            claim: c,
+            receipt: fence(),
+            message: text.clone(),
+        },
+        Command::BeginEvidenceSet {
+            claim: c,
+            receipt: fence(),
+            evidence_set: set,
+        },
+        Command::AttachArtifact {
+            claim: c,
+            receipt: fence(),
+            evidence_set: set,
+            artifact: artifact(state, rich),
+        },
+        Command::CloseTestament {
+            claim: c,
+            receipt: fence(),
+            testament: t,
+            evidence_set: set,
+            manifest: if rich { vec![aref(3), aref(1)] } else { vec![] },
+            summary: text.clone(),
+            confidence: if rich {
+                Confidence::Consensus
+            } else {
+                Confidence::Hint
+            },
+            outcome: if rich {
+                OutcomeKind::Failed
+            } else {
+                OutcomeKind::Complete
+            },
+        },
+        Command::AcknowledgeTestament {
+            claim: c,
+            testament: t,
+        },
+        Command::BeginWholeWorkValidation { claim: c },
+        Command::BeginIncrementValidation {
+            claim: c,
+            validation: ValidationId::from_u128(2099),
+            target: hash(91),
+            manifest: hash(93),
+        },
+        Command::RecordValidationVerdict {
+            verdict: verdict(rich),
+        },
+        Command::CompleteWholeWork { claim: c },
+        Command::FailPost {
+            claim: c,
+            evidence: aref(4),
+        },
+        Command::FailReceipt {
+            claim: c,
+            evidence: aref(3),
+        },
+        Command::FailTestamentGeneration {
+            claim: c,
+            testament: t,
+            evidence_set: set,
+            error: artifact(state, rich),
+            summary: text.clone(),
+        },
+        Command::CancelClaim {
+            claim: c,
+            reason: text.clone(),
+        },
+        Command::RevokeClaim {
+            claim: c,
+            reason: text,
+        },
+        Command::ExpireClaim {
+            claim: c,
+            timer,
+            generation: if rich { u64::MAX } else { 0 },
+            fired_at: if rich { u64::MAX } else { 128 },
+        },
+        Command::SupersedeClaim {
+            predecessor: c,
+            successor: claim(state, rich),
+        },
+        Command::RegisterMonitor {
+            monitor: m,
+            owner: c,
+            roots: if rich {
+                BTreeSet::from([
+                    WaitPredicate::Satisfied(c),
+                    WaitPredicate::Terminal(ClaimId::from_u128(1002)),
+                    WaitPredicate::Released(ClaimId::from_u128(1003)),
+                ])
+            } else {
+                BTreeSet::new()
+            },
+            deadline: Deadline {
+                timer,
+                generation: if rich { u64::MAX } else { 0 },
+                at: if rich { u64::MAX } else { 127 },
+            },
+        },
+        Command::RebindMonitor {
+            monitor: m,
+            predecessor: c,
+            successor: ClaimId::from_u128(1004),
+        },
+        Command::ReleaseScope { claim: c },
+        Command::RegisterArtifact {
+            artifact: artifact(state, rich),
+        },
+        Command::ExpireMonitor {
+            monitor: m,
+            timer,
+            generation: if rich { u64::MAX } else { 0 },
+            fired_at: if rich { u64::MAX } else { 128 },
+        },
+        Command::RecordFencedValidationVerdict {
+            verdict: verdict(rich),
+            receipt: if rich { Some(fence()) } else { None },
+        },
+    ]
+}
+fn save<T: serde::Serialize + ?Sized>(out: &Path, name: &str, value: &T) {
+    std::fs::write(out.join(name), postcard::to_stdvec(value).unwrap()).unwrap();
+}
+fn main() {
+    let out = Path::new("/private/tmp/focal-v1-inputs-original");
+    assert!(
+        !out.exists(),
+        "use a fresh output path; preserve previous capture"
+    );
+    let source = std::fs::read("crates/focal-core/fixtures/durable-v1-nested/broad.cp1").unwrap();
+    let core = Core::decode_checkpoint(&source).unwrap();
+    let state = core.snapshot();
+    let commands: Vec<_> = commands(state, true)
+        .into_iter()
+        .chain(commands(state, false))
+        .collect();
+    assert_eq!(commands.len(), 58);
+    let mut legacy = Vec::new();
+    let mut managed = Vec::new();
+    let mut hashes = Vec::new();
+    let mut managed_hashes = Vec::new();
+    let mut parts = Vec::new();
+    let mut tags = Vec::new();
+    let mut prepared_legacy = Vec::new();
+    let mut prepared_managed = Vec::new();
+    let mut legacy_bodies = Vec::new();
+    let mut managed_bodies = Vec::new();
+    let mut legacy_entries = Vec::new();
+    let mut managed_entries = Vec::new();
+    for (i, command) in commands.iter().enumerate() {
+        assert_eq!(command.code(), (i % 29 + 1) as u16);
+        let authority = AuthorityContext {
+            runtime: i % 2 == 0,
+            cause: if i % 2 == 0 {
+                Cause::Root(RootCommandId::from_u128(70000 + i as u128))
+            } else {
+                Cause::Claim(ClaimId::from_u128(1000 + i as u128))
+            },
+            policy_revision: if i % 3 == 0 { 0 } else { u64::MAX - i as u64 },
+            logical_time: 128 + i as u64,
+            evidence: if i % 3 == 0 {
+                vec![]
+            } else {
+                (0..4)
+                    .map(|j| EvidenceAttestation {
+                        descriptor_hash: hash(100 + j),
+                        custody_revision: if j == 0 { 0 } else { u64::MAX },
+                        durable: j % 2 == 0,
+                        schema_valid: j < 2,
+                    })
+                    .collect()
+            },
+        };
+        let input = AuthenticatedInput {
+            ledger: state.ledger,
+            principal: actor(1),
+            request_epoch: RequestEpoch(if i % 2 == 0 { 128 } else { u64::MAX }),
+            request_id: RequestId::from_u128(0xf1000000000000000000000000000000 | i as u128),
+            expected_revision: if i % 2 == 0 {
+                None
+            } else {
+                Some(ObjectRevision(u64::MAX - i as u64))
+            },
+            authority,
+            command: command.clone(),
+        };
+        let m = ManagedAuthenticatedInput {
+            key: ManagedRequestKey {
+                stream: RequestStreamIdentity {
+                    cluster: [0xa5; 16],
+                    ledger: input.ledger,
+                    principal: input.principal,
+                    slot: if i % 2 == 0 { 0 } else { u32::MAX },
+                    generation: if i % 2 == 0 { 1 } else { u64::MAX },
+                },
+                ordinal: if i % 2 == 0 { 128 } else { u64::MAX },
+                id: input.request_id,
+            },
+            expected_revision: input.expected_revision,
+            authority: input.authority.clone(),
+            command: input.command.clone(),
+        };
+        let h = command_hash(&input).unwrap();
+        let mh = managed_command_hash(&m).unwrap();
+        assert_eq!(h, mh);
+        let raw = postcard::to_stdvec(&(&input.expected_revision, &input.command)).unwrap();
+        let mut canonical = b"focal.command\0".to_vec();
+        canonical.extend(1u16.to_be_bytes());
+        canonical.extend(input.ledger.tenant.0);
+        canonical.extend(input.ledger.session.0);
+        canonical.extend(input.principal.0);
+        canonical.extend(command.code().to_be_bytes());
+        canonical.extend(u32::try_from(raw.len()).unwrap().to_be_bytes());
+        canonical.extend(&raw);
+        assert_eq!(h, ContentHash(*blake3::hash(&canonical).as_bytes()));
+        let p = PreparedMutation {
+            schema: 1,
+            base: SessionSeq(if i % 2 == 0 { 128 } else { u64::MAX }),
+            input: input.clone(),
+            command_hash: h,
+            footprint: Footprint {
+                ledger: state.ledger,
+                session_exclusive: i % 2 == 0,
+            },
+        };
+        let pm = PreparedManagedMutation {
+            schema: 1,
+            base: p.base,
+            input: m.clone(),
+            command_hash: mh,
+            footprint: p.footprint.clone(),
+        };
+        let pb = postcard::to_stdvec(&p).unwrap();
+        assert_eq!(p.encode_v1().unwrap(), pb);
+        assert_eq!(PreparedMutation::decode_v1(&pb).unwrap(), p);
+        let pmb = postcard::to_stdvec(&pm).unwrap();
+        assert_eq!(pm.encode_v1().unwrap(), pmb);
+        assert_eq!(PreparedManagedMutation::decode_v1(&pmb).unwrap(), pm);
+        let mut pe = b"FOCALOP1".to_vec();
+        pe.extend(&pb);
+        let mut pme = b"FOCALMD1".to_vec();
+        pme.extend(&pmb);
+        legacy.push(input);
+        managed.push(m);
+        hashes.push(h);
+        managed_hashes.push(mh);
+        parts.push(raw);
+        tags.push(command.code());
+        prepared_legacy.push(p);
+        prepared_managed.push(pm);
+        legacy_bodies.push(pb);
+        managed_bodies.push(pmb);
+        legacy_entries.push(pe);
+        managed_entries.push(pme);
+    }
+    std::fs::create_dir(out).unwrap();
+    save(out, "commands.rows", &commands);
+    save(out, "legacy-inputs.rows", &legacy);
+    save(out, "managed-inputs.rows", &managed);
+    save(out, "command-hashes.rows", &hashes);
+    save(out, "managed-command-hashes.rows", &managed_hashes);
+    save(out, "canonical-bodies.rows", &parts);
+    save(out, "canonical-tags.rows", &tags);
+    save(out, "legacy-prepared.rows", &prepared_legacy);
+    save(out, "managed-prepared.rows", &prepared_managed);
+    save(out, "legacy-prepared-bodies.rows", &legacy_bodies);
+    save(out, "managed-prepared-bodies.rows", &managed_bodies);
+    save(out, "legacy-entries.rows", &legacy_entries);
+    save(out, "managed-entries.rows", &managed_entries);
+    for (i, c) in commands.iter().enumerate() {
+        save(out, &format!("command-{i:02}.bin"), c);
+    }
+    println!(
+        "captured {} commands/legacy/managed inputs and prepared envelopes",
+        commands.len()
+    );
+}

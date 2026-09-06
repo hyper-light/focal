@@ -9,6 +9,9 @@ use crate::{
 };
 use focal_consensus::PbMessageExt as _;
 use focal_consensus::StateRole;
+#[path = "fleet_diagnostics.rs"]
+mod diagnostics;
+pub use diagnostics::ReplicaDiagnosticsReply;
 use focal_ledger::{
     LedgerError, ManagedSubmission, RequestStreamSubmission, Session, SessionEvents, Submission,
 };
@@ -127,6 +130,10 @@ pub struct ReplicaProgress {
     pub stopped: bool,
 }
 enum Work {
+    Diagnostics(
+        oneshot::Sender<Result<ReplicaDiagnosticsReply, LedgerError>>,
+        Allocation,
+    ),
     Request(
         Box<AdmittedRequest>,
         oneshot::Sender<OwnedResponse>,
@@ -137,7 +144,11 @@ enum Work {
         oneshot::Sender<Result<ReceiptProbe, AccessError>>,
         Allocation,
     ),
-    Transfer(u64, oneshot::Sender<Result<(), LedgerError>>),
+    Transfer(
+        u64,
+        Option<Box<CheckedTransfer>>,
+        oneshot::Sender<Result<(), LedgerError>>,
+    ),
     Membership(Box<MembershipCall>, Allocation),
     ManagedSupport(Box<SupportCall>, Allocation),
     Placement(Box<PlacementCall>, Allocation),
@@ -156,6 +167,11 @@ struct AdmittedRequest {
 struct MembershipCall {
     request: Option<SessionMembershipRequest>,
     response: oneshot::Sender<Result<MembershipReply, LedgerError>>,
+}
+struct CheckedTransfer {
+    expected_index: u64,
+    expected: focal_consensus::MembershipConfiguration,
+    _charge: Allocation,
 }
 /// The reply retains its memory permit across the owner/caller boundary.
 pub struct MembershipReply {
@@ -207,7 +223,8 @@ fn completion_request(request: &VerifiedRequest) -> bool {
                 | RequestStreamCommand::Close { .. },
             ..
         }
-        | Operation::ManagedSupport { .. } => return true,
+        | Operation::ManagedSupport { .. }
+        | Operation::Monitor { .. } => return true,
         Operation::Submit { command, .. }
         | Operation::Managed {
             operation: ManagedOperation::Submit { command, .. },
@@ -322,6 +339,31 @@ enum WaitingFor {
         principal: ParticipantId,
         scope: ContentHash,
         list: ListRequest,
+    },
+    Select {
+        context: Vec<u8>,
+        principal: ParticipantId,
+        scope: ContentHash,
+        list: SelectionRequest,
+    },
+    Validators {
+        context: Vec<u8>,
+        principal: ParticipantId,
+        scope: ContentHash,
+        list: ValidatorRequest,
+    },
+    Traverse {
+        context: Vec<u8>,
+        principal: ParticipantId,
+        scope: ContentHash,
+        traversal: TraversalRequest,
+    },
+    Summary {
+        context: Vec<u8>,
+    },
+    Monitor {
+        context: Vec<u8>,
+        id: MonitorId,
     },
     Reconcile {
         context: Vec<u8>,
@@ -541,12 +583,45 @@ impl ReplicaHost {
     pub async fn transfer_leader(&self, target: u64) -> Result<(), LedgerError> {
         let (send, receive) = oneshot::channel();
         self.sender
-            .try_send(Work::Transfer(target, send))
+            .try_send(Work::Transfer(target, None, send))
             .map_err(|error| match error {
                 HostQueueError::Full => LedgerError::Capacity,
                 HostQueueError::Disconnected => LedgerError::Failed,
             })?;
         receive.await.map_err(|_| LedgerError::Failed)?
+    }
+    /// OS/control-owner transfer with an exact fence checked at owner dispatch.
+    /// Success remains initiation, not an observed election or durable receipt.
+    pub async fn transfer_leader_checked(
+        &self,
+        request: focal_control::ControlTransfer,
+    ) -> Result<(), LedgerError> {
+        let bytes = request
+            .expected
+            .charged_bytes()?
+            .checked_add(192 * 1024)
+            .ok_or(LedgerError::Capacity)?;
+        let charge = self
+            .budget
+            .reserve(BudgetKind::Control, BudgetLane::Completion, bytes)?
+            .commit();
+        request.expected.validate()?;
+        let (send, receive) = oneshot::channel();
+        self.sender
+            .try_send(Work::Transfer(
+                request.target,
+                Some(Box::new(CheckedTransfer {
+                    expected_index: request.expected_configuration_index,
+                    expected: request.expected,
+                    _charge: charge,
+                })),
+                send,
+            ))
+            .map_err(|error| match error {
+                HostQueueError::Full => LedgerError::Capacity,
+                HostQueueError::Disconnected => LedgerError::Failed,
+            })?;
+        receive.await.map_err(|_| LedgerError::OutcomeUnknown)?
     }
     /// Trusted in-process control read, completed behind a quorum ReadIndex.
     pub async fn membership(&self) -> Result<MembershipReply, LedgerError> {
@@ -612,6 +687,9 @@ impl RequestHandler for ReplicaHost {
     fn supports_managed_requests(&self) -> bool {
         true
     }
+    fn supports_participant_requests(&self) -> bool {
+        true
+    }
     fn handle(
         &self,
         request: VerifiedRequest,
@@ -638,7 +716,9 @@ impl ReplicaHost {
         let unknown = request.request().reply(Response::Error(
             if matches!(
                 request.request().operation,
-                Operation::Reconcile(_)
+                Operation::Summary
+                    | Operation::Monitor { .. }
+                    | Operation::Reconcile(_)
                     | Operation::RequestStreamRead { .. }
                     | Operation::ManagedSupport { .. }
             ) {
@@ -655,6 +735,13 @@ impl ReplicaHost {
             .reply(Response::Error(AccessError::Unavailable));
         let replication = matches!(request.request().operation, Operation::Raft { .. });
         let response_bytes = match &request.request().operation {
+            Operation::Monitor { .. } => crate::monitor_reads::RESPONSE_BYTES,
+            Operation::Summary => {
+                match crate::ledger_summary::response_bytes(self.client_frame_bytes) {
+                    Some(bytes) => bytes,
+                    None => return OwnedResponse::new(full),
+                }
+            }
             Operation::Reconcile(query) => match crate::reconciliation::response_bytes(
                 query,
                 self.client_frame_bytes,
@@ -676,7 +763,18 @@ impl ReplicaHost {
                 }
             }
             Operation::ManagedSupport { .. } => 32 * 1024 + 1024,
-            Operation::Read(_) | Operation::List(_) => self.client_frame_bytes as usize,
+            Operation::Read(ReadRequest {
+                query: ReadQuery::SeedScan { max_bytes, .. },
+                ..
+            }) => match ((*max_bytes).min(self.client_frame_bytes) as usize).checked_mul(2) {
+                Some(bytes) => bytes,
+                None => return OwnedResponse::new(full),
+            },
+            Operation::Read(_)
+            | Operation::List(_)
+            | Operation::Select(_)
+            | Operation::Traverse(_)
+            | Operation::Validators(_) => self.client_frame_bytes as usize,
             Operation::Stream(stream) => {
                 stream.credits().bytes.min(self.client_frame_bytes) as usize
             }
@@ -874,6 +972,9 @@ impl Owner {
             }
         }
         match work {
+            Work::Diagnostics(response, charge) => {
+                let _ = response.send(Ok(self.diagnostics(charge)));
+            }
             Work::Request(request, response, charge) => {
                 self.request(request.verified, response, charge, request.witness);
                 self.drain()?;
@@ -886,8 +987,26 @@ impl Owner {
                 });
                 let _ = response.send(result);
             }
-            Work::Transfer(target, response) => {
-                let result = self.session.transfer_leader(target);
+            Work::Transfer(target, fence, response) => {
+                let result = (|| {
+                    if let Some(fence) = &fence {
+                        if !self.session.is_authoritative() {
+                            return Err(LedgerError::NotReady {
+                                leader: self.session.status().leader_id,
+                            });
+                        }
+                        if self.session.pending_count() != 0 {
+                            return Err(LedgerError::Capacity);
+                        }
+                        let current = self.session.membership()?;
+                        if current.configuration_index != fence.expected_index
+                            || current.configuration != fence.expected
+                        {
+                            return Err(LedgerError::MembershipConflict);
+                        }
+                    }
+                    self.session.transfer_leader(target)
+                })();
                 self.drain()?;
                 let _ = response.send(result);
             }
@@ -963,7 +1082,10 @@ impl Owner {
         while let Some(pending) = self.pending.pop_front() {
             let error = if matches!(
                 pending.waiting,
-                WaitingFor::Reconcile { .. } | WaitingFor::RequestStreamRead { .. }
+                WaitingFor::Summary { .. }
+                    | WaitingFor::Monitor { .. }
+                    | WaitingFor::Reconcile { .. }
+                    | WaitingFor::RequestStreamRead { .. }
             ) {
                 AccessError::Unavailable
             } else {
@@ -1104,7 +1226,17 @@ impl Owner {
                         logical_time: wall_ms().map_err(access)? / 1000,
                         evidence,
                     };
-                    let input = verified.into_managed(authority)?;
+                    let protocol = verified.request().protocol;
+                    let mut input = verified.into_managed(authority)?;
+                    if let Some(runtime) = crate::participant_ingress::authority(
+                        &self.session,
+                        protocol,
+                        input.key.stream.principal,
+                        &input.command,
+                        input.expected_revision,
+                    )? {
+                        input.authority.runtime = runtime;
+                    }
                     match self.session.propose_managed(&input).map_err(access)? {
                         ManagedSubmission::Committed(receipt) => {
                             Ok(Response::Managed(ManagedReply {
@@ -1123,7 +1255,9 @@ impl Owner {
                             ));
                             Ok(Response::Error(AccessError::OutcomeUnknown))
                         }
-                        ManagedSubmission::Domain(_) => Err(AccessError::InvalidRequest),
+                        ManagedSubmission::Domain(outcome) => {
+                            Ok(Response::Submitted(MutationReply::Domain(outcome)))
+                        }
                     }
                 }
                 Operation::Managed {
@@ -1245,7 +1379,17 @@ impl Owner {
                         logical_time: wall_ms().map_err(access)? / 1000,
                         evidence,
                     };
-                    let input = verified.into_authenticated(authority)?;
+                    let protocol = verified.request().protocol;
+                    let mut input = verified.into_authenticated(authority)?;
+                    if let Some(runtime) = crate::participant_ingress::authority(
+                        &self.session,
+                        protocol,
+                        input.principal,
+                        &input.command,
+                        input.expected_revision,
+                    )? {
+                        input.authority.runtime = runtime;
+                    }
                     match self.session.propose(&input).map_err(access)? {
                         Submission::Committed(receipt) => {
                             Ok(Response::Submitted(MutationReply::Committed(receipt)))
@@ -1271,6 +1415,38 @@ impl Owner {
                         &self.client_limits,
                     )?;
                     waiting = Some((WaitingFor::Stream(pending), deadline));
+                    Ok(Response::Error(AccessError::Unavailable))
+                }
+                Operation::Monitor { id } => {
+                    if !self.session.is_authoritative() {
+                        return Err(AccessError::Unavailable);
+                    }
+                    if self.pending.len() == self.config.pending_clients {
+                        return Err(AccessError::Capacity);
+                    }
+                    self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
+                    let mut context = b"focal.replica.monitor.v1\0".to_vec();
+                    context.extend_from_slice(&self.nonce.to_be_bytes());
+                    context.extend_from_slice(&peer.principal().0);
+                    context.extend_from_slice(&request.request_id.0);
+                    self.session.read_index(context.clone()).map_err(access)?;
+                    waiting = Some((WaitingFor::Monitor { context, id: *id }, deadline));
+                    Ok(Response::Error(AccessError::Unavailable))
+                }
+                Operation::Summary => {
+                    if !self.session.is_authoritative() {
+                        return Err(AccessError::Unavailable);
+                    }
+                    if self.pending.len() == self.config.pending_clients {
+                        return Err(AccessError::Capacity);
+                    }
+                    self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
+                    let mut context = b"focal.replica.summary.v1\0".to_vec();
+                    context.extend_from_slice(&self.nonce.to_be_bytes());
+                    context.extend_from_slice(&peer.principal().0);
+                    context.extend_from_slice(&request.request_id.0);
+                    self.session.read_index(context.clone()).map_err(access)?;
+                    waiting = Some((WaitingFor::Summary { context }, deadline));
                     Ok(Response::Error(AccessError::Unavailable))
                 }
                 Operation::Reconcile(query) => {
@@ -1335,6 +1511,129 @@ impl Owner {
                                 &self.client_limits,
                             )
                             .map(Response::Listed)
+                    }
+                }
+                Operation::Select(list) => {
+                    let scope = selection_scope(peer, self.session.ledger(), list)?;
+                    if list.query.cursor.is_none() {
+                        if !self.session.is_authoritative() {
+                            return Err(AccessError::Unavailable);
+                        }
+                        if self.pending.len() == self.config.pending_clients {
+                            return Err(AccessError::Capacity);
+                        }
+                        self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
+                        let mut context = b"focal.replica.selection.v1\0".to_vec();
+                        context.extend_from_slice(&self.nonce.to_be_bytes());
+                        context.extend_from_slice(&peer.principal().0);
+                        context.extend_from_slice(&request.request_id.0);
+                        self.session.read_index(context.clone()).map_err(access)?;
+                        waiting = Some((
+                            WaitingFor::Select {
+                                context,
+                                principal: peer.principal(),
+                                scope,
+                                list: list.clone(),
+                            },
+                            deadline,
+                        ));
+                        Ok(Response::Error(AccessError::Unavailable))
+                    } else {
+                        self.views
+                            .selection(
+                                &mut self.session,
+                                ListReadContext {
+                                    principal: peer.principal(),
+                                    scope,
+                                    request_id: request.request_id,
+                                    barrier: None,
+                                },
+                                list,
+                                &self.client_limits,
+                            )
+                            .map(Response::Listed)
+                    }
+                }
+                Operation::Validators(list) => {
+                    let scope = validator_scope(peer, self.session.ledger(), list)?;
+                    if list.query.cursor.is_none() {
+                        if !self.session.is_authoritative() {
+                            return Err(AccessError::Unavailable);
+                        }
+                        if self.pending.len() == self.config.pending_clients {
+                            return Err(AccessError::Capacity);
+                        }
+                        self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
+                        let mut context = b"focal.replica.validators.v1\0".to_vec();
+                        context.extend_from_slice(&self.nonce.to_be_bytes());
+                        context.extend_from_slice(&peer.principal().0);
+                        context.extend_from_slice(&request.request_id.0);
+                        self.session.read_index(context.clone()).map_err(access)?;
+                        waiting = Some((
+                            WaitingFor::Validators {
+                                context,
+                                principal: peer.principal(),
+                                scope,
+                                list: list.clone(),
+                            },
+                            deadline,
+                        ));
+                        Ok(Response::Error(AccessError::Unavailable))
+                    } else {
+                        self.views
+                            .validators(
+                                &mut self.session,
+                                ListReadContext {
+                                    principal: peer.principal(),
+                                    scope,
+                                    request_id: request.request_id,
+                                    barrier: None,
+                                },
+                                list,
+                                &self.client_limits,
+                            )
+                            .map(Response::Validators)
+                    }
+                }
+                Operation::Traverse(traversal) => {
+                    let scope = traversal_scope(peer, self.session.ledger(), traversal)?;
+                    if traversal.cursor.is_none() {
+                        if !self.session.is_authoritative() {
+                            return Err(AccessError::Unavailable);
+                        }
+                        if self.pending.len() == self.config.pending_clients {
+                            return Err(AccessError::Capacity);
+                        }
+                        self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
+                        let mut context = b"focal.replica.traversal.v1\0".to_vec();
+                        context.extend_from_slice(&self.nonce.to_be_bytes());
+                        context.extend_from_slice(&peer.principal().0);
+                        context.extend_from_slice(&request.request_id.0);
+                        self.session.read_index(context.clone()).map_err(access)?;
+                        waiting = Some((
+                            WaitingFor::Traverse {
+                                context,
+                                principal: peer.principal(),
+                                scope,
+                                traversal: traversal.clone(),
+                            },
+                            deadline,
+                        ));
+                        Ok(Response::Error(AccessError::Unavailable))
+                    } else {
+                        self.views
+                            .traverse(
+                                &mut self.session,
+                                ListReadContext {
+                                    principal: peer.principal(),
+                                    scope,
+                                    request_id: request.request_id,
+                                    barrier: None,
+                                },
+                                traversal,
+                                &self.client_limits,
+                            )
+                            .map(Response::Traversed)
                     }
                 }
                 Operation::Read(read) => {
@@ -1689,6 +1988,43 @@ impl Owner {
                             .map(Response::Read)
                             .unwrap_or_else(Response::Error)
                     }),
+                WaitingFor::Monitor { context, id }
+                    if pending.term == status.term && self.session.is_authoritative() =>
+                {
+                    events
+                        .read_barriers
+                        .iter()
+                        .find(|(value, _)| value.as_slice() == context.as_slice())
+                        .map(|(_, prefix)| {
+                            crate::monitor_reads::after_barrier(
+                                &self.session,
+                                *id,
+                                *prefix,
+                                pending.header.route_epoch,
+                                &self.client_limits,
+                            )
+                            .map(Response::Monitor)
+                            .unwrap_or_else(Response::Error)
+                        })
+                }
+                WaitingFor::Summary { context }
+                    if pending.term == status.term && self.session.is_authoritative() =>
+                {
+                    events
+                        .read_barriers
+                        .iter()
+                        .find(|(value, _)| value.as_slice() == context.as_slice())
+                        .map(|(_, prefix)| {
+                            crate::ledger_summary::after_barrier(
+                                &self.session,
+                                *prefix,
+                                pending.header.route_epoch,
+                                &self.client_limits,
+                            )
+                            .map(Response::Summary)
+                            .unwrap_or_else(Response::Error)
+                        })
+                }
                 WaitingFor::Reconcile {
                     context,
                     principal,
@@ -1732,6 +2068,81 @@ impl Owner {
                                 &self.client_limits,
                             )
                             .map(Response::Listed)
+                            .unwrap_or_else(Response::Error)
+                    }),
+                WaitingFor::Select {
+                    context,
+                    principal,
+                    scope,
+                    list,
+                } if pending.term == status.term && status.role == StateRole::Leader => events
+                    .read_barriers
+                    .iter()
+                    .find(|(value, _)| value.as_slice() == context.as_slice())
+                    .map(|(_, prefix)| {
+                        self.views
+                            .selection(
+                                &mut self.session,
+                                ListReadContext {
+                                    principal: *principal,
+                                    scope: *scope,
+                                    request_id: pending.header.request_id,
+                                    barrier: Some(*prefix),
+                                },
+                                list,
+                                &self.client_limits,
+                            )
+                            .map(Response::Listed)
+                            .unwrap_or_else(Response::Error)
+                    }),
+                WaitingFor::Validators {
+                    context,
+                    principal,
+                    scope,
+                    list,
+                } if pending.term == status.term && status.role == StateRole::Leader => events
+                    .read_barriers
+                    .iter()
+                    .find(|(value, _)| value.as_slice() == context.as_slice())
+                    .map(|(_, prefix)| {
+                        self.views
+                            .validators(
+                                &mut self.session,
+                                ListReadContext {
+                                    principal: *principal,
+                                    scope: *scope,
+                                    request_id: pending.header.request_id,
+                                    barrier: Some(*prefix),
+                                },
+                                list,
+                                &self.client_limits,
+                            )
+                            .map(Response::Validators)
+                            .unwrap_or_else(Response::Error)
+                    }),
+                WaitingFor::Traverse {
+                    context,
+                    principal,
+                    scope,
+                    traversal,
+                } if pending.term == status.term && status.role == StateRole::Leader => events
+                    .read_barriers
+                    .iter()
+                    .find(|(value, _)| value.as_slice() == context.as_slice())
+                    .map(|(_, prefix)| {
+                        self.views
+                            .traverse(
+                                &mut self.session,
+                                ListReadContext {
+                                    principal: *principal,
+                                    scope: *scope,
+                                    request_id: pending.header.request_id,
+                                    barrier: Some(*prefix),
+                                },
+                                traversal,
+                                &self.client_limits,
+                            )
+                            .map(Response::Traversed)
                             .unwrap_or_else(Response::Error)
                     }),
                 WaitingFor::Stream(stream) if self.stopping.is_none() => {

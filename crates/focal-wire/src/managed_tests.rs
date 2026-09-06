@@ -190,3 +190,91 @@ fn managed_cursor_hash_matches_existing_bytes_and_control_receipt_is_exact() {
         Err(AccessError::UnsupportedProtocol)
     ));
 }
+
+#[test]
+fn managed_transient_domain_outcomes_never_accept_legacy_receipts_or_yield() {
+    let request = mutation();
+    let principal = actor().principal();
+    let limits = WireLimits::default();
+    for outcome in [
+        DomainOutcome::refuse(ErrorCode::UnknownObject, "unknown claim"),
+        DomainOutcome::Inform {
+            claim: Some(ClaimId::from_u128(1)),
+            reason: InformReason::Status(ClaimStatus::Generated),
+        },
+    ] {
+        let response = request.reply(Response::Submitted(MutationReply::Domain(outcome)));
+        validate_response(&request, &response, Some(principal), &limits).unwrap();
+        assert!(
+            validate_response(
+                &request,
+                &response,
+                Some(ParticipantId::from_u128(10)),
+                &limits
+            )
+            .is_err()
+        );
+        let mut changed = response;
+        changed.route_epoch = RouteEpoch(2);
+        assert!(validate_response(&request, &changed, Some(principal), &limits).is_err());
+    }
+    let receipt = MutationReceipt {
+        ledger: request.ledger,
+        key: RequestKey {
+            principal,
+            epoch: request.request_epoch,
+            id: request.request_id,
+        },
+        sequence: SessionSeq(1),
+        command_hash: ContentHash([1; 32]),
+        outcome: CommandResult::Noop,
+    };
+    for invalid in [
+        MutationReply::Committed(receipt.clone()),
+        MutationReply::Domain(DomainOutcome::Duplicate(Box::new(receipt.clone()))),
+        MutationReply::Pending(receipt.key),
+        MutationReply::Yield {
+            monitor: MonitorId::from_u128(1),
+            observed: ReadToken {
+                ledger: request.ledger,
+                sequence: SessionSeq(1),
+                route_epoch: request.route_epoch,
+            },
+        },
+    ] {
+        assert!(
+            validate_response(
+                &request,
+                &request.reply(Response::Submitted(invalid)),
+                Some(principal),
+                &limits
+            )
+            .is_err()
+        );
+    }
+    let mut cursor = request.clone();
+    cursor.operation = Operation::Managed {
+        key: key(),
+        operation: ManagedOperation::Cursor(StreamRequest::Open {
+            consumer: ConsumerId([1; 16]),
+            filter: DeltaFilter::All,
+            start: None,
+            seed: false,
+            credits: Credits {
+                items: 1,
+                bytes: 1024,
+            },
+        }),
+    };
+    assert!(
+        validate_response(
+            &cursor,
+            &cursor.reply(Response::Submitted(MutationReply::Domain(
+                DomainOutcome::refuse(ErrorCode::UnknownObject, "unknown")
+            ))),
+            Some(principal),
+            &limits
+        )
+        .is_err()
+    );
+}

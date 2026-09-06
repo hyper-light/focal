@@ -267,7 +267,17 @@ pub(crate) fn local(
                     .as_secs(),
                 evidence: Vec::new(),
             };
+            let protocol = verified.request().protocol;
             let mut input = verified.into_managed(authority)?;
+            if let Some(runtime) = crate::participant_ingress::authority(
+                &node.session,
+                protocol,
+                input.key.stream.principal,
+                &input.command,
+                input.expected_revision,
+            )? {
+                input.authority.runtime = runtime;
+            }
             input.authority.evidence = crate::host::attest(node, &input.command)?;
             match node.session.propose_managed(&input).map_err(access)? {
                 ManagedSubmission::Committed(receipt) => Ok(Response::Managed(ManagedReply {
@@ -282,7 +292,9 @@ pub(crate) fn local(
                     reply(&node.session, &key, intent, family, None, limits)?
                         .ok_or(AccessError::OutcomeUnknown)
                 }
-                ManagedSubmission::Domain(_) => Err(AccessError::InvalidRequest),
+                ManagedSubmission::Domain(outcome) => {
+                    Ok(Response::Submitted(MutationReply::Domain(outcome)))
+                }
             }
         }
         _ => Err(AccessError::UnsupportedOperation),

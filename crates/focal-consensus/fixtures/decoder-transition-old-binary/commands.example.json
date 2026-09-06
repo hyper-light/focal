@@ -1,0 +1,22 @@
+{
+  "install-predecessor": [
+    "/absolute/path/to/compiled/helper",
+    "install-predecessor",
+    "{data}"
+  ],
+  "transition": [
+    "/absolute/path/to/compiled/helper",
+    "transition",
+    "{data}"
+  ],
+  "compact-same": [
+    "/absolute/path/to/compiled/helper",
+    "compact-same",
+    "{data}"
+  ],
+  "compact-other": [
+    "/absolute/path/to/compiled/helper",
+    "compact-other",
+    "{data}"
+  ]
+}

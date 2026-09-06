@@ -104,7 +104,9 @@ impl Session {
                 .reserve(BudgetKind::Payload, lane, reference_charge(delta)?)?
                 .commit();
             retained.push(RetainedDelta {
-                bytes: postcard::experimental::serialized_size(delta)?,
+                bytes: postcard::experimental::serialized_size(&focal_model::durable_v1::Ref(
+                    delta,
+                ))?,
                 delta: delta.clone(),
                 _charge: allocation,
             });
@@ -250,7 +252,7 @@ impl Session {
                 return Err(LedgerError::Corrupt);
             }
             previous = entry.index;
-            inputs.push(postcard::from_bytes::<PreparedMutation>(
+            inputs.push(PreparedMutation::decode_v1(
                 entry
                     .data
                     .strip_prefix(ENTRY_MAGIC)
@@ -365,7 +367,11 @@ impl Session {
             .chain(candidates.iter().flat_map(|candidate| &candidate.retained))
             .filter(|delta| delta.delta.id.sequence > floor)
         {
-            if delta.bytes != postcard::experimental::serialized_size(&delta.delta)? {
+            if delta.bytes
+                != postcard::experimental::serialized_size(&focal_model::durable_v1::Ref(
+                    &delta.delta,
+                ))?
+            {
                 return Err(LedgerError::Corrupt);
             }
             bytes = bytes

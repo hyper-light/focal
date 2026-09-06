@@ -1,0 +1,9 @@
+{
+  "binary": "/private/tmp/focal-before-execution-v1/focal",
+  "sha256": "da54f8b8be83766555f72397ecf3a8a1bfae970995fa388b6285296e1260c4d4",
+  "bytes": 19823696,
+  "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)",
+  "git_base": "31198c225b5ab6fb7c0414fe423d069701b9c9a2",
+  "cargo_lock_sha256": "1cdc2b87a2e4f473faaf8c2217c479ec8afafdfd4280292241ddba3fa4d66c93",
+  "scope": "Previous full release build, before execution_v1 extraction; qualified 916-test codec increment. Preserved executable only, not an exact source reconstruction."
+}

@@ -288,7 +288,7 @@ impl Streams {
                 seed: true,
                 credits,
             } => {
-                if start.is_some() || *filter != DeltaFilter::All {
+                if start.is_some() {
                     return Err(AccessError::UnsupportedOperation);
                 }
                 if credits.items == 0 || credits.bytes as usize <= REPLY_OVERHEAD + 256 {
@@ -323,7 +323,18 @@ impl Streams {
                     pending.key.principal(),
                     &ReadRequest {
                         consistency,
-                        query: ReadQuery::Scan { after: None },
+                        query: match filter {
+                            DeltaFilter::All => ReadQuery::SeedScan {
+                                after: None,
+                                claims: vec![],
+                                max_bytes: seed_limits.max_frame_bytes,
+                            },
+                            DeltaFilter::Claims(claims) => ReadQuery::SeedScan {
+                                after: None,
+                                claims: claims.iter().copied().collect(),
+                                max_bytes: seed_limits.max_frame_bytes,
+                            },
+                        },
                         max_items: credits.items,
                     },
                     pending.key.id(),

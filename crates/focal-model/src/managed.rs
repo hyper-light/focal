@@ -1,5 +1,7 @@
 //! Managed request identities are separate from legacy principal-wide epochs.
 //! Registration/retirement authority belongs to the committed session owner.
+use crate::digest::Digest;
+use crate::durable_v1::Ref;
 use crate::*;
 use serde::{Deserialize, Serialize};
 
@@ -18,11 +20,7 @@ pub struct RequestStreamIdentity {
 }
 impl RequestStreamIdentity {
     pub fn is_valid(&self) -> bool {
-        self.cluster != [0; 16]
-            && !self.ledger.tenant.is_zero()
-            && !self.ledger.session.is_zero()
-            && !self.principal.is_zero()
-            && self.generation > 0
+        crate::semantics_v1::request_stream_valid(self)
     }
 }
 
@@ -37,7 +35,7 @@ pub struct ManagedRequestKey {
 }
 impl ManagedRequestKey {
     pub fn is_valid(&self) -> bool {
-        self.stream.is_valid() && self.ordinal > 0 && !self.id.is_zero()
+        crate::semantics_v1::request_key_valid(self)
     }
 }
 
@@ -90,7 +88,7 @@ impl ManagedReceipt {
     /// Stream the original outcome into its acknowledgment commitment. This
     /// excludes no fields and allocates no serialized receipt buffer.
     pub fn content_hash(&self) -> Result<ContentHash, CanonicalError> {
-        managed_hash(b"focal.managed-receipt\0", self)
+        managed_hash(b"focal.managed-receipt\0", &Ref(self))
     }
 }
 
@@ -158,7 +156,9 @@ pub fn request_stream_control_hash(
 ) -> Result<ContentHash, CanonicalError> {
     managed_hash(
         b"focal.request-stream-control\0",
-        &(cluster, ledger, principal, command),
+        // This four-field historical intent tuple excludes the independent
+        // request ID. Every domain field uses its explicit V1 representation.
+        &(Ref(&cluster), Ref(&ledger), Ref(&principal), Ref(command)),
     )
 }
 
@@ -294,42 +294,20 @@ pub fn managed_command_parts_hash(
     expected_revision: &Option<ObjectRevision>,
     command: &Command,
 ) -> Result<ContentHash, CanonicalError> {
-    let body = (expected_revision, command);
-    let length = u32::try_from(postcard::experimental::serialized_size(&body)?)
-        .map_err(|_| CanonicalError::Length)?;
-    let mut digest = Digest(blake3::Hasher::new());
-    digest.0.update(b"focal.command\0");
-    digest.0.update(&SCHEMA_MAJOR.to_be_bytes());
-    digest.0.update(&ledger.tenant.0);
-    digest.0.update(&ledger.session.0);
-    digest.0.update(&principal.0);
-    digest.0.update(&command.code().to_be_bytes());
-    digest.0.update(&length.to_be_bytes());
-    Ok(postcard::serialize_with_flavor(&body, digest)?)
-}
-
-struct Digest(blake3::Hasher);
-impl postcard::ser_flavors::Flavor for Digest {
-    type Output = ContentHash;
-    fn try_push(&mut self, byte: u8) -> Result<(), postcard::Error> {
-        self.0.update(&[byte]);
-        Ok(())
-    }
-    fn try_extend(&mut self, bytes: &[u8]) -> Result<(), postcard::Error> {
-        self.0.update(bytes);
-        Ok(())
-    }
-    fn finalize(self) -> Result<Self::Output, postcard::Error> {
-        Ok(ContentHash(*self.0.finalize().as_bytes()))
-    }
+    // Both request families share one frozen V1 identity representation/header.
+    // Stream identity still belongs to deduplication, outside this intent hash.
+    crate::canonical::command_parts_hash_streamed(ledger, principal, expected_revision, command)
 }
 fn managed_hash<T: Serialize + ?Sized>(
     domain: &[u8],
     value: &T,
 ) -> Result<ContentHash, CanonicalError> {
-    let mut digest = Digest(blake3::Hasher::new());
-    digest.0.update(domain);
-    digest.0.update(&MANAGED_REQUEST_SCHEMA.to_be_bytes());
+    let mut digest = Digest::new();
+    digest.update(domain)?;
+    // A retained V1 identity must not change if the current admission schema
+    // advances. Future formats require their own explicitly selected commitment.
+    const HASH_SCHEMA_V1: u16 = 1;
+    digest.update(&HASH_SCHEMA_V1.to_be_bytes())?;
     Ok(postcard::serialize_with_flavor(value, digest)?)
 }
 

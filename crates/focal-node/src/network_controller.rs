@@ -97,14 +97,12 @@ async fn wait_registered_grant(
     grant: &PeerGrant,
     deadline: Duration,
 ) -> Result<(), JoinFailure> {
-    let node = receipt
-        .identity
-        .node_id
-        .ok_or(JoinFailure::OutcomeUnknown)?;
-    if receipt.identity.role != EnrollmentRole::Node
-        || grant.principal.0 != receipt.identity.principal
-        || grant.role != (PeerRole::Node { node_id: node })
-    {
+    let role = match (receipt.identity.role, receipt.identity.node_id) {
+        (EnrollmentRole::Node, Some(node_id)) if node_id != 0 => PeerRole::Node { node_id },
+        (EnrollmentRole::Client, None) => PeerRole::Actor,
+        _ => return Err(JoinFailure::OutcomeUnknown),
+    };
+    if grant.principal.0 != receipt.identity.principal || grant.role != role {
         return Err(JoinFailure::OutcomeUnknown);
     }
     let fingerprint = certificate_fingerprint(&receipt.certificate);
@@ -227,14 +225,18 @@ fn active_grants(
         if identity.cluster != state.genesis.founder.cluster {
             return Err(ControllerError::Identity);
         }
-        if identity.role != EnrollmentRole::Node {
-            continue;
-        }
-        let node = identity.node_id.ok_or(ControllerError::Identity)?;
-        grants.insert(
-            certificate_fingerprint(&receipt.certificate),
-            node_grant(node, identity.principal, state),
-        );
+        let grant = match (identity.role, identity.node_id) {
+            (EnrollmentRole::Node, Some(node)) if node != 0 => {
+                node_grant(node, identity.principal, state)
+            }
+            (EnrollmentRole::Client, None) => PeerGrant {
+                principal: ParticipantId(identity.principal),
+                tenants: BTreeSet::from([state.genesis.founder.ledger.tenant]),
+                role: PeerRole::Actor,
+            },
+            _ => return Err(ControllerError::Identity),
+        };
+        grants.insert(certificate_fingerprint(&receipt.certificate), grant);
     }
     Ok(grants)
 }

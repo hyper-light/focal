@@ -401,3 +401,112 @@ async fn local_owner_lists_under_actor_authority_and_preserves_reply_charge() {
     owner.join().unwrap();
     assert_eq!(page.objects.len(), 2); // delivered snapshot materialization outlives owner
 }
+
+#[test]
+fn validator_contract_pages_bind_filters_and_preserve_empty_prefix_continuations() {
+    let root = tempfile::tempdir().unwrap();
+    let mut node = fixture(root.path());
+    for id in 100..106 {
+        add_claim(&mut node, id);
+    }
+    let actor = peer(&node);
+    let ledger = node.identity.ledger;
+    let mut views = ReadViews::new();
+    let mut query = ValidatorRequest {
+        query: ListRequest {
+            filter: ListFilter::new(ObjectKind::Validation),
+            cursor: None,
+            max_items: 1,
+            max_visits: 1,
+        },
+        handler: None,
+        version: None,
+        agentic: None,
+        evidence_schema: None,
+    };
+    let read = |views: &mut ReadViews,
+                node: &mut EmbeddedNode,
+                query: &ValidatorRequest,
+                actor: &AuthenticatedPeer| {
+        let scope = validator_scope(actor, ledger, query).unwrap();
+        views.validators(
+            &mut node.session,
+            ListReadContext {
+                principal: actor.principal(),
+                scope,
+                request_id: RequestId::from_u128(801),
+                barrier: None,
+            },
+            query,
+            &WireLimits::default(),
+        )
+    };
+    let first = read(&mut views, &mut node, &query, &actor).unwrap();
+    assert!(first.objects.is_empty());
+    assert_eq!(first.visited, 1);
+    assert!(first.next.is_some());
+    query.query.cursor = first.next.clone();
+    let retry = read(&mut views, &mut node, &query, &actor).unwrap();
+    assert_eq!(read(&mut views, &mut node, &query, &actor).unwrap(), retry);
+    let mut changed = query.clone();
+    changed.agentic = Some(false);
+    assert_eq!(
+        read(&mut views, &mut node, &changed, &actor),
+        Err(AccessError::Unauthorized)
+    );
+    changed = query.clone();
+    changed.query.max_visits = 2;
+    assert_eq!(
+        read(&mut views, &mut node, &changed, &actor),
+        Err(AccessError::Unauthorized)
+    );
+    changed = query.clone();
+    changed.query.cursor.as_mut().unwrap().bytes[0] ^= 1;
+    assert_eq!(
+        read(&mut views, &mut node, &changed, &actor),
+        Err(AccessError::InvalidRequest)
+    );
+    let stranger = AuthenticatedPeer::local(PeerGrant {
+        principal: ParticipantId::from_u128(999),
+        tenants: [ledger.tenant].into_iter().collect(),
+        role: PeerRole::Actor,
+    })
+    .unwrap();
+    assert_eq!(
+        read(&mut views, &mut node, &query, &stranger),
+        Err(AccessError::Unauthorized)
+    );
+    // A later mutation cannot extend a previously pinned contract catalogue.
+    add_claim(&mut node, 107);
+    let mut matches = 0;
+    let mut visits = first.visited;
+    let mut done = false;
+    for _ in 0..12 {
+        let page = read(&mut views, &mut node, &query, &actor).unwrap();
+        assert_eq!(page.token, first.token);
+        visits += page.visited;
+        matches += page.objects.len();
+        for object in &page.objects {
+            assert!(
+                matches!(object,ReadObject::Validation{value,..} if !value.content().handlers.is_empty())
+            );
+        }
+        query.query.cursor = page.next;
+        if query.query.cursor.is_none() {
+            done = true;
+            break;
+        }
+    }
+    assert!(done);
+    assert_eq!(matches, 1);
+    assert_eq!(visits, 8);
+    views.expire_test_views();
+    query.query.cursor = first.next;
+    assert_eq!(
+        read(&mut views, &mut node, &query, &actor),
+        Err(AccessError::SnapshotExpired)
+    );
+}
+
+#[path = "selection_read_tests.rs"]
+mod selection_tests;

@@ -1,0 +1,182 @@
+use super::*;
+
+const EMPTY: &[u8] = include_bytes!("../fixtures/durable-v1/empty.cp1");
+const BASE: &[u8] = include_bytes!("../fixtures/durable-v1/base.cp1");
+const OPEN: &[u8] = include_bytes!("../fixtures/durable-v1/open-evidence.cp1");
+const CLOSED: &[u8] = include_bytes!("../fixtures/durable-v1/closed-evidence.cp1");
+const FINAL: &[u8] = include_bytes!("../fixtures/durable-v1/final.cp1");
+const WORKSPACE: usize = 16 * 1024 * 1024;
+macro_rules! fixture_pair {
+    ($number:literal) => {
+        (
+            include_bytes!(concat!("../fixtures/durable-v1/", $number, ".entry")).as_slice(),
+            include_bytes!(concat!("../fixtures/durable-v1/", $number, ".result")).as_slice(),
+        )
+    };
+}
+const HISTORY: &[(&[u8], &[u8])] = &[
+    fixture_pair!("00"),
+    fixture_pair!("01"),
+    fixture_pair!("02"),
+    fixture_pair!("03"),
+    fixture_pair!("04"),
+    fixture_pair!("05"),
+    fixture_pair!("06"),
+    fixture_pair!("07"),
+    fixture_pair!("08"),
+];
+
+#[test]
+fn original_v1_checkpoints_preserve_exact_bytes_and_independent_evidence_facts() {
+    for original in [EMPTY, BASE, OPEN, CLOSED, FINAL] {
+        let core = Core::decode_checkpoint(original).unwrap();
+        assert_eq!(core.encode_checkpoint().unwrap(), original);
+        // Independent old writer shape, not the new DTO serializer.
+        let payload = postcard::to_allocvec(&(1u16, &core)).unwrap();
+        assert_eq!(&original[40..], payload);
+    }
+    let open = Core::decode_checkpoint(OPEN).unwrap();
+    let closed = Core::decode_checkpoint(CLOSED).unwrap();
+    let artifact = ArtifactId::from_u128(102);
+    let set = EvidenceSetId::from_u128(103);
+    assert_eq!(
+        open.snapshot().artifacts[&artifact],
+        closed.snapshot().artifacts[&artifact]
+    );
+    assert!(!open.snapshot().evidence_sets[&set].closed);
+    assert!(open.snapshot().testaments.is_empty());
+    assert!(closed.snapshot().evidence_sets[&set].closed);
+    assert_eq!(closed.snapshot().testaments.len(), 1);
+}
+
+#[test]
+fn original_mixed_v1_entries_replay_exact_results_effects_and_receipts() {
+    let mut core = Core::decode_checkpoint(BASE).unwrap();
+    for (index, (entry, expected)) in HISTORY.iter().enumerate() {
+        if let Some(body) = entry.strip_prefix(b"FOCALOP1") {
+            let prepared = PreparedMutation::decode_v1(body).unwrap();
+            assert_eq!(prepared.encode_v1().unwrap(), body);
+            assert_eq!(postcard::to_allocvec(&prepared).unwrap(), body);
+            assert_eq!(
+                command_hash(&prepared.input).unwrap(),
+                prepared.command_hash
+            );
+            let input = prepared.input.clone();
+            let actual = core
+                .apply(SessionSeq(core.sequence().0 + 1), prepared)
+                .unwrap();
+            assert_eq!(postcard::to_allocvec(&actual).unwrap(), *expected);
+            assert_eq!(
+                core.prepare(&input),
+                Err(DomainOutcome::Duplicate(Box::new(actual.receipt)))
+            );
+        } else {
+            let body = entry.strip_prefix(b"FOCALMD1").unwrap();
+            let prepared = PreparedManagedMutation::decode_v1(body).unwrap();
+            assert_eq!(prepared.encode_v1().unwrap(), body);
+            assert_eq!(postcard::to_allocvec(&prepared).unwrap(), body);
+            assert_eq!(
+                managed_command_hash(&prepared.input).unwrap(),
+                prepared.command_hash
+            );
+            let staged = core.replay_managed_bounded(&prepared, WORKSPACE).unwrap();
+            let actual = core.publish_managed(staged).unwrap();
+            assert_eq!(postcard::to_allocvec(&actual).unwrap(), *expected);
+        }
+        if index == 4 {
+            assert_eq!(core.encode_checkpoint().unwrap(), OPEN);
+        }
+        if index == 5 {
+            assert_eq!(core.encode_checkpoint().unwrap(), CLOSED);
+        }
+        // Every subsequent entry also follows actual checkpoint recovery.
+        core = Core::decode_checkpoint(&core.encode_checkpoint().unwrap()).unwrap();
+    }
+    assert_eq!(core.encode_checkpoint().unwrap(), FINAL);
+    assert_eq!(
+        core.snapshot().claims[&ClaimId::from_u128(100)]
+            .lifecycle()
+            .status,
+        ClaimStatus::Satisfied
+    );
+}
+
+#[test]
+fn v1_checkpoint_rejects_checksum_valid_suffix_and_preserves_nondefault_limits() {
+    let mut suffix = BASE[40..].to_vec();
+    suffix.push(0);
+    let mut corrupt = b"FOCALCP1".to_vec();
+    corrupt.extend_from_slice(blake3::hash(&suffix).as_bytes());
+    corrupt.extend_from_slice(&suffix);
+    assert!(matches!(
+        Core::decode_checkpoint(&corrupt),
+        Err(CoreError::Codec(_))
+    ));
+    for length in 0..BASE.len() {
+        assert!(Core::decode_checkpoint(&BASE[..length]).is_err());
+    }
+    let mut wrong_version = BASE[40..].to_vec();
+    wrong_version[0] = 2;
+    corrupt.truncate(8);
+    corrupt.extend_from_slice(blake3::hash(&wrong_version).as_bytes());
+    corrupt.extend_from_slice(&wrong_version);
+    assert!(matches!(
+        Core::decode_checkpoint(&corrupt),
+        Err(CoreError::UnsupportedSchema(2))
+    ));
+    corrupt.truncate(8);
+    corrupt.extend_from_slice(blake3::hash(&[2]).as_bytes());
+    corrupt.push(2);
+    assert!(matches!(
+        Core::decode_checkpoint(&corrupt),
+        Err(CoreError::UnsupportedSchema(2))
+    ));
+    let limits = Limits {
+        max_objects: 17,
+        max_command_bytes: 12345,
+        max_text_bytes: 97,
+        max_relations: 19,
+        max_requirements: 7,
+        max_batch: 5,
+        max_artifacts_per_set: 13,
+        max_inline_bytes: 111,
+        max_requests: 23,
+        max_monitors: 3,
+        max_graph_visits: 101,
+    };
+    let core = Core::new(crate::tests::ledger(), limits.clone());
+    let encoded = core.encode_checkpoint().unwrap();
+    assert_eq!(Core::decode_checkpoint(&encoded).unwrap().limits(), &limits);
+    assert_eq!(
+        &encoded[40..],
+        postcard::to_allocvec(&(1u16, &core)).unwrap()
+    );
+}
+
+#[test]
+fn v1_prepared_codecs_reject_truncation_suffix_and_new_schema() {
+    for (entry, _) in HISTORY {
+        let legacy = entry.starts_with(b"FOCALOP1");
+        let body = &entry[8..];
+        let decode = |bytes: &[u8]| {
+            if legacy {
+                PreparedMutation::decode_v1(bytes).map(|_| ())
+            } else {
+                PreparedManagedMutation::decode_v1(bytes).map(|_| ())
+            }
+        };
+        for length in 0..body.len() {
+            assert!(decode(&body[..length]).is_err());
+        }
+        let mut corrupt = body.to_vec();
+        corrupt.push(0);
+        assert!(matches!(decode(&corrupt), Err(CoreError::Codec(_))));
+        corrupt.pop();
+        corrupt[0] = 2;
+        assert!(matches!(
+            decode(&corrupt),
+            Err(CoreError::UnsupportedSchema(2))
+        ));
+        assert!(matches!(decode(&[2]), Err(CoreError::UnsupportedSchema(2))));
+    }
+}

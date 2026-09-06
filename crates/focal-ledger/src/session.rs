@@ -22,6 +22,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 
+#[path = "session_durable_v1.rs"]
+mod durable_session_v1;
+
 const ENTRY_MAGIC: &[u8] = b"FOCALOP1";
 const SNAPSHOT_MAGIC: &[u8] = b"FOCALSS1";
 const CURSOR_MAGIC: &[u8] = b"FOCALCU2";
@@ -643,7 +646,7 @@ impl Session {
         self.core
             .audit_pending_stage(&self.pending_rows, &staged, self.apply_config())?;
         let mut data = ENTRY_MAGIC.to_vec();
-        data.extend(postcard::to_stdvec(staged.prepared())?);
+        data.extend(staged.prepared().encode_v1()?);
         let digest = ContentHash(*blake3::hash(&data).as_bytes());
         let core_bytes = reference_charge(&staged.view_after(&self.core, &self.pending_rows)?)?;
         let candidate = self.reserve_candidate(
@@ -1444,4 +1447,9 @@ mod tests {
     include!("evidence_snapshot_tests.rs");
     include!("reconciliation_session_tests.rs");
     include!("managed_tests.rs");
+    include!("durable_v1_tests.rs");
+    mod session_storage {
+        use super::*;
+        include!("session_storage_tests.rs");
+    }
 }

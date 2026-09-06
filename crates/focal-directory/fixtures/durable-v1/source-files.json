@@ -1,0 +1,68 @@
+[
+  {
+    "path": "crates/focal-directory/src/authority.rs",
+    "sha256": "eed4ea7dd2bbda931f8117c526528cacc17a94a6022c5c42dd24b0548d295c06",
+    "bytes": 21131,
+    "snapshot": "source-snapshot/authority.rs.txt"
+  },
+  {
+    "path": "crates/focal-directory/src/authority_proof.rs",
+    "sha256": "69b3da1ea43e5cfafb24cf533b9e8b6e937913084b7a304fefc9bf8068501a55",
+    "bytes": 15077,
+    "snapshot": "source-snapshot/authority_proof.rs.txt"
+  },
+  {
+    "path": "crates/focal-directory/src/authority_tests.rs",
+    "sha256": "400ec35359d0cd88c91456122f5fa8cca1368496fd4662e33c698a0ae6daa22f",
+    "bytes": 26393,
+    "snapshot": "source-snapshot/authority_tests.rs.txt"
+  },
+  {
+    "path": "crates/focal-directory/src/cache.rs",
+    "sha256": "af3e095652b6c7240f5e7262854b9303ed29a3ba59e8280aadef93b4f0853360",
+    "bytes": 10054,
+    "snapshot": "source-snapshot/cache.rs.txt"
+  },
+  {
+    "path": "crates/focal-directory/src/control.rs",
+    "sha256": "6dd22ddab2c65a36f360b3731ee3484c1f02f0093c9db569d60d88e6684031b6",
+    "bytes": 13261,
+    "snapshot": "source-snapshot/control.rs.txt"
+  },
+  {
+    "path": "crates/focal-directory/src/lib.rs",
+    "sha256": "f70ef68c446402555807309bedbe3361d247e4f37574b58aa2e06c05dae55db4",
+    "bytes": 3191,
+    "snapshot": "source-snapshot/lib.rs.txt"
+  },
+  {
+    "path": "crates/focal-directory/src/partition.rs",
+    "sha256": "fcbf42bee4f442d09334d1a04bbb2caab01017374a6047bd9100d3222f326d7a",
+    "bytes": 31541,
+    "snapshot": "source-snapshot/partition.rs.txt"
+  },
+  {
+    "path": "crates/focal-directory/src/placement.rs",
+    "sha256": "aa910421f2d4c24d50c053a52e7350024b43b2477afd98d67d77e6f15ec0573e",
+    "bytes": 9843,
+    "snapshot": "source-snapshot/placement.rs.txt"
+  },
+  {
+    "path": "crates/focal-directory/src/scheduler.rs",
+    "sha256": "fc305e5c8d7ce04c3fb01949ee7c667a7f16e36e0bc7eb1ff0c7f28a01d372c0",
+    "bytes": 26444,
+    "snapshot": "source-snapshot/scheduler.rs.txt"
+  },
+  {
+    "path": "crates/focal-directory/src/types.rs",
+    "sha256": "6369476a77a3ae5662b21c9f513a40e0f818e5a01400987896bdce165484ba24",
+    "bytes": 5733,
+    "snapshot": "source-snapshot/types.rs.txt"
+  },
+  {
+    "path": "crates/focal-model/src/ids.rs",
+    "sha256": "23008e268e85846964926049119aa5548ef997268376f69cc34004220504c3a9",
+    "bytes": 2793,
+    "snapshot": "source-snapshot/model-ids.rs.txt"
+  }
+]

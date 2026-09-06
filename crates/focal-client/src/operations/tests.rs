@@ -151,13 +151,13 @@ fn cursor_reconciliation_output_preserves_the_distinct_committed_result_family()
     );
 }
 
-fn id(value: u128) -> String {
+pub(super) fn id(value: u128) -> String {
     format!("{value:032x}")
 }
 fn hash(value: u8) -> String {
     format!("{value:02x}").repeat(32)
 }
-fn context() -> BuildContext {
+pub(super) fn context() -> BuildContext {
     BuildContext {
         ledger: LedgerId {
             tenant: TenantId::from_u128(1),
@@ -173,12 +173,32 @@ fn claim() -> Value {
 }
 fn fixture(name: &str) -> Value {
     match name {
+        "validator.get" => json!({"id":id(21),"version":hash(8)}),
         "claim.submit" => claim(),
+        "claim.submit_batch" => json!({"claims":[claim()]}),
+        "claim.wait" => json!({"claim":id(10),"until":"satisfied","timeout_ms":1000}),
         "claim.post" => json!({"claim":id(10)}),
         "claim.progress" => {
             json!({"claim":id(10),"receipt":{"id":id(13),"epoch":1},"message":"Working"})
         }
         "claim.cancel" => json!({"claim":id(10),"reason":"No longer needed"}),
+        "claim.supersede" => json!({"predecessor":id(9),"successor":claim()}),
+        "testament.receive" => json!({"claim":id(10),"testament":id(16)}),
+        "validation.begin_increment" => {
+            json!({"claim":id(10),"validation":id(12),"target_hash":hash(7),"manifest":hash(9)})
+        }
+        "validation.begin" | "validation.complete" => json!({"claim":id(10)}),
+        "validation.submit" => {
+            json!({"validation":id(12),"target_hash":hash(7),"phase":"whole_work","epoch":1,"handler":{"id":id(21),"version":hash(8),"agentic":false},"attempt":0,"manifest":hash(9),"value":"pass","evidence":[{"id":id(15),"hash":hash(6)}]})
+        }
+        "artifact.register" => {
+            json!({"id":id(15),"kind":"text","schema_hash":hash(5),"payload":{"type":"text","text":"Independent evidence"}})
+        }
+        "monitor.register" => {
+            json!({"monitor":id(19),"owner":id(10),"roots":[{"predicate":"terminal","claim":id(10)}],"deadline":{"timer":id(20),"generation":1,"at":100}})
+        }
+        "ledger.summary" => json!({}),
+        "ledger.traverse" => json!({"roots":[format!("claim:{}",id(10))]}),
         "request.epoch" => json!({"epoch":3}),
         "request.status" => json!({"epoch":3,"request_id":id(44)}),
         "receipt.acquire" => json!({"claim":id(10),"id":id(13),"epoch":1}),
@@ -191,16 +211,17 @@ fn fixture(name: &str) -> Value {
         }
         name if name.ends_with(".list") => json!({}),
         name if name.ends_with(".get") => json!({"id":id(10)}),
+        "validation.context" => json!({"id":id(10)}),
         _ => panic!("fixture {name}"),
     }
 }
-fn parse(name: &str, value: &Value) -> AuthoredOperation {
+pub(super) fn parse(name: &str, value: &Value) -> AuthoredOperation {
     parse_json(name, &serde_json::to_vec(value).unwrap()).unwrap()
 }
 
 #[test]
 fn catalog_is_complete_sorted_and_every_released_builder_preserves_field_and_wire_parity() {
-    assert_eq!(descriptors().len(), 18);
+    assert_eq!(descriptors().len(), 34);
     assert_eq!(COMMAND_INVENTORY.len(), 29);
     let mut previous = "";
     for descriptor in descriptors() {
@@ -226,6 +247,29 @@ fn catalog_is_complete_sorted_and_every_released_builder_preserves_field_and_wir
             reparsed.canonical_intent().unwrap()
         );
         let mut no_ids = || Err(InputError::Identity);
+        if descriptor.name == "claim.wait" {
+            let first = authored.build(&context(), &mut no_ids).unwrap();
+            assert_eq!(first, reparsed.build(&context(), &mut no_ids).unwrap());
+            assert!(matches!(&first, PlannedOperation::ClaimWait { .. }));
+            assert!(first.into_wire(None).is_err());
+            assert!(!descriptor.mutation);
+            continue;
+        }
+        if descriptor.name == "validation.context" {
+            let first = authored.build(&context(), &mut no_ids).unwrap();
+            let second = reparsed.build(&context(), &mut no_ids).unwrap();
+            assert_eq!(first, second);
+            assert!(matches!(
+                &first,
+                PlannedOperation::ValidationContext(ReadRequest {
+                    query: focal_wire::ReadQuery::ValidationResults { .. },
+                    ..
+                })
+            ));
+            assert!(first.into_wire(None).is_err());
+            assert!(!descriptor.mutation);
+            continue;
+        }
         let first = authored
             .build(&context(), &mut no_ids)
             .unwrap()
@@ -242,10 +286,22 @@ fn catalog_is_complete_sorted_and_every_released_builder_preserves_field_and_wir
         );
         assert_eq!(wire_coverage(&first).mutation, descriptor.mutation);
         assert_eq!(wire_coverage(&first).exposure, Exposure::AuthoredTool);
-        assert_eq!(
-            focal_wire::capability(&first),
-            focal_wire::Capability::Actor
-        );
+        if participant_protocol(&first) == PEER_PROTOCOL_VERSION {
+            assert!(
+                matches!(first, Operation::Submit { ref command, .. } if peer_command(command))
+            );
+            // The old profile remains role restricted. The new profile checks
+            // command-specific standing in the ledger owner after authentication.
+            assert_ne!(
+                focal_wire::capability(&first),
+                focal_wire::Capability::Actor
+            );
+        } else {
+            assert_eq!(
+                focal_wire::capability(&first),
+                focal_wire::Capability::Actor
+            );
+        }
     }
     let names: BTreeSet<_> = COMMAND_INVENTORY.iter().map(|entry| entry.name).collect();
     assert_eq!(names.len(), 29);
@@ -617,17 +673,28 @@ fn shape_matches(root: &Value, schema: &Value, value: &Value) -> bool {
             value,
         );
     }
-    if let Some(expected) = schema.get("const") {
-        return expected == value;
+    if schema
+        .get("const")
+        .is_some_and(|expected| expected != value)
+    {
+        return false;
+    }
+    if schema
+        .get("enum")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| !choices.contains(value))
+    {
+        return false;
     }
     if let Some(choices) = schema
         .get("anyOf")
         .or_else(|| schema.get("oneOf"))
         .and_then(Value::as_array)
-    {
-        return choices
+        && !choices
             .iter()
-            .any(|candidate| shape_matches(root, candidate, value));
+            .any(|candidate| shape_matches(root, candidate, value))
+    {
+        return false;
     }
     if schema
         .get("type")
@@ -635,14 +702,200 @@ fn shape_matches(root: &Value, schema: &Value, value: &Value) -> bool {
     {
         return false;
     }
-    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
-        for (name, property) in properties {
-            if let Some(expected) = property.get("const")
-                && value.get(name) != Some(expected)
-            {
-                return false;
+    if let Some(object) = value.as_object() {
+        if schema
+            .get("required")
+            .and_then(Value::as_array)
+            .is_some_and(|required| {
+                required
+                    .iter()
+                    .any(|key| !object.contains_key(key.as_str().unwrap()))
+            })
+        {
+            return false;
+        }
+        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+            for (name, value) in object {
+                match properties.get(name) {
+                    Some(property) if !shape_matches(root, property, value) => return false,
+                    None if schema.get("additionalProperties") == Some(&Value::Bool(false)) => {
+                        return false;
+                    }
+                    _ => {}
+                }
             }
         }
     }
     true
+}
+
+#[test]
+fn shared_mutation_intent_matches_frozen_legacy_fence_and_binds_revision() {
+    // Frozen legacy MCP IntentFence encoded revision before the tagged DTO.
+    #[derive(serde::Serialize)]
+    struct LegacyIntentFence<'a> {
+        revision: Option<ObjectRevision>,
+        authored: &'a AuthoredOperation,
+    }
+    let post = parse("claim.post", &json!({"claim":id(10)}));
+    assert_eq!(post.canonical_mutation_intent(None).unwrap(),
+        br#"{"revision":null,"authored":{"operation":"claim.post","input":{"claim":"0000000000000000000000000000000a"}}}"#);
+    assert_eq!(post.canonical_mutation_intent(Some(ObjectRevision(7))).unwrap(),
+        br#"{"revision":7,"authored":{"operation":"claim.post","input":{"claim":"0000000000000000000000000000000a"}}}"#);
+    for descriptor in descriptors()
+        .iter()
+        .filter(|descriptor| descriptor.mutation)
+    {
+        let authored = parse(descriptor.name, &fixture(descriptor.name));
+        let original = authored.canonical_intent().unwrap();
+        let mut encodings = BTreeSet::new();
+        for revision in [
+            None,
+            Some(ObjectRevision(0)),
+            Some(ObjectRevision(1)),
+            Some(ObjectRevision(u64::MAX)),
+        ] {
+            let canonical = authored.canonical_mutation_intent(revision).unwrap();
+            assert_eq!(
+                canonical,
+                serde_json::to_vec(&LegacyIntentFence {
+                    revision,
+                    authored: &authored
+                })
+                .unwrap(),
+                "{}",
+                descriptor.name
+            );
+            assert!(encodings.insert(canonical));
+        }
+        assert_eq!(authored.canonical_intent().unwrap(), original);
+    }
+}
+
+#[test]
+fn preflight_rejects_semantic_inputs_without_expanding_the_authored_identity_fields() {
+    let mut invalid = claim();
+    invalid.as_object_mut().unwrap().remove("id");
+    invalid.as_object_mut().unwrap().remove("occurrence");
+    invalid["target"] = json!("self"); // ordinary work cannot target its issuer
+    let invalid = parse("claim.submit", &invalid);
+    let before = invalid.canonical_intent().unwrap();
+    assert!(matches!(
+        invalid.preflight(&context()),
+        Err(InputError::Invalid("self targeting requires handoff"))
+    ));
+    assert_eq!(invalid.canonical_intent().unwrap(), before);
+    if let AuthoredOperation::ClaimSubmit(document) = &invalid {
+        assert!(document.id.is_none() && document.occurrence.is_none());
+    } else {
+        panic!("claim")
+    }
+    for (name, input) in [
+        ("receipt.acquire", json!({"claim":id(10),"epoch":0})),
+        (
+            "claim.cancel",
+            json!({"claim":id(10),"reason":"x".repeat(16 * 1024 + 1)}),
+        ),
+        (
+            "artifact.submit",
+            json!({"claim":id(10),"receipt":{"id":id(13),"epoch":1},"evidence_set":id(14),"kind":"text","schema_hash":hash(5),"payload":{"type":"content","reference":{"domain":id(20),"root":hash(6),"length":1,"class":"unknown"}}}),
+        ),
+    ] {
+        let input = parse(name, &input);
+        let canonical = input.canonical_intent().unwrap();
+        assert!(input.preflight(&context()).is_err(), "{name}");
+        assert_eq!(input.canonical_intent().unwrap(), canonical);
+    }
+    let mut bad_context = context();
+    bad_context.policy_revision = 0;
+    assert!(
+        parse("claim.post", &json!({"claim":id(10)}))
+            .preflight(&bad_context)
+            .is_err()
+    );
+}
+
+#[test]
+fn preflight_synthetic_ids_exclude_explicit_lineage_and_validation_ids() {
+    let mut input = claim();
+    input.as_object_mut().unwrap().remove("id");
+    input.as_object_mut().unwrap().remove("occurrence");
+    input["relations"] = Value::Array(
+        (1..=252)
+            .map(|number| {
+                let kind = match number {
+                    1 => "supersedes",
+                    10 => "amends",
+                    _ => "derived_from",
+                };
+                json!({"kind":kind,"target":id(number).to_uppercase()})
+            })
+            .collect(),
+    );
+    input["validations"][0]["id"] = json!(id(3));
+    let mut second = input["validations"][0].clone();
+    second.as_object_mut().unwrap().remove("id");
+    second["description"] = json!("independent receipt check");
+    input["validations"].as_array_mut().unwrap().push(second);
+    let authored = parse("claim.submit", &input);
+    let before = authored
+        .canonical_mutation_intent(Some(ObjectRevision(3)))
+        .unwrap();
+    // A naive synthetic sequence invents self-lineage at id=1, although a real
+    // generated claim has no authored identity. The preflight must avoid it.
+    let mut naive = 0u128;
+    assert!(matches!(
+        authored.clone().build(&context(), &mut || {
+            naive += 1;
+            Ok(naive.to_be_bytes())
+        }),
+        Err(InputError::Invalid("self lineage"))
+    ));
+    authored.preflight(&context()).unwrap();
+    assert_eq!(
+        authored
+            .canonical_mutation_intent(Some(ObjectRevision(3)))
+            .unwrap(),
+        before
+    );
+    let mut actual = 1_000u128;
+    let PlannedOperation::Mutation(Command::GenerateClaim { claim }) = authored
+        .build(&context(), &mut || {
+            actual += 1;
+            Ok(actual.to_be_bytes())
+        })
+        .unwrap()
+    else {
+        panic!("generation")
+    };
+    assert_eq!(actual, 1_003);
+    assert_eq!(claim.id, ClaimId::from_u128(1_001));
+    assert_eq!(claim.content.occurrence, OccurrenceId::from_u128(1_002));
+    assert_eq!(claim.validations[0].id, ValidationId::from_u128(3));
+    assert_eq!(claim.validations[1].id, ValidationId::from_u128(1_003));
+}
+
+#[test]
+fn authored_id_scan_deduplicates_exact_strings_and_ignores_escaped_prose() {
+    let mut values: Vec<String> = (1..=4_096u128)
+        .rev()
+        .map(|number| id(number).to_uppercase())
+        .collect();
+    values.extend([id(10), id(20), id(0)]);
+    values.extend([
+        format!("quoted \"{}\" prose", id(5_000)),
+        format!("{} suffix", id(5_001)),
+        format!("prefix {}", id(5_002)),
+        hash(6),
+    ]);
+    let canonical = serde_json::to_vec(&values).unwrap();
+    assert!(canonical.len() < MAX_INPUT_BYTES);
+    let ids = authored_ids(&canonical).unwrap();
+    assert_eq!(ids.len(), 4_096);
+    assert_eq!(ids.first(), Some(&1u128.to_be_bytes()));
+    assert_eq!(ids.last(), Some(&4_096u128.to_be_bytes()));
+    assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+    for absent in [0u128, 5_000, 5_001, 5_002] {
+        assert!(ids.binary_search(&absent.to_be_bytes()).is_err());
+    }
 }

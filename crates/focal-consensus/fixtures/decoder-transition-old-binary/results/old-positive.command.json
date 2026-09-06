@@ -1,0 +1,11 @@
+{
+  "command": [
+    "/private/tmp/focal-before-execution-v1/focal",
+    "--data-dir",
+    "/private/tmp/focal-refusal-results-20260906a/old-positive-control",
+    "demo"
+  ],
+  "returncode": 0,
+  "stdout_sha256": "59233a486eb1791a84e3982c56dec3881de5d1ddf50c232ff714d353d08009c8",
+  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}

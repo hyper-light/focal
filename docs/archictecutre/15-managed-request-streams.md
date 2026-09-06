@@ -1,8 +1,8 @@
 # Managed request streams and safe retirement
 
-Status: P17.11 implementation in progress, 2026-09-05. This document fixes the
+Status: P17.11 implementation in progress, 2026-09-06. This document fixes the
 identity, ownership and recovery contract. [09](09-implementation-status.md)
-records qualification; the remaining adapter and throughput gates below remain
+records qualification; the remaining lifecycle and throughput gates below remain
 required before P17.11 is complete.
 
 ## Identity and compatibility
@@ -152,6 +152,71 @@ The private filesystem layer reuses the legacy store's checksummed frame, mode,
 inode/link and atomic publication checks with a distinct managed initialization
 marker. Unix private-file semantics are currently required.
 
+### Automatic local ownership and result delivery
+
+[ManagedRequests](../../crates/focal-client/src/managed_requests.rs) now owns the
+bounded registration and maintenance state machine used by both adapters. It
+probes at most 64 slots in first-fit order. Uncontended first use takes one
+authenticated slot read and one exact registration RPC. The slot choice, owner
+nonce and request identity are durable before transmission. Concurrent callers
+reload after a stale maintenance result; they do not replace an unknown business
+request. An outer initialization record and lock remain outside the child store,
+so losing initialized child state cannot be mistaken for first use.
+
+The normal human CLI uses `CLI.requests`; MCP uses the independent `MCP.requests`
+store. Neither requires users to choose a slot, epoch or generation. Both use the
+existing caller-owned filesystem execution seam and release short locks before
+network waits. This adapter increment changes private client coordination state,
+not the server's managed WAL, checkpoint, request-key or decoder-floor formats.
+
+Ordinary `focal submit` durably reserves an ID internally, binds normalized input
+and saves the complete expanded request before sending. Successful output contains
+compact object IDs; unresolved operations or failed output receive a copyable
+recovery diagnostic. An abrupt process kill remains recoverable through
+`request pending`, even if nothing was printed. After a committed result is written and
+**flushed**, the CLI durably marks that operation delivered. Maintenance ACKs only
+the contiguous prefix of delivered, locally saved results. A later delivered
+result cannot reclaim an earlier unobserved one. Flush establishes delivery to
+the selected output stream, not consumption by another application. Cleanup
+failure after successful output is deferred; it does not turn committed business
+success into failure. Normal use therefore exceeds the 32-request default window
+without manual acknowledgment.
+
+A timeout, failed output, canceled wait, Refuse or Inform leaves the exact request
+recoverable. `request pending` discovers the bounded CLI and MCP stores;
+`request inspect --operation-id` does not acknowledge a result; `request retry
+--operation-id` resubmits or prints the original outcome. Explicit `request seal`
+(alias `request abandon`) resolves a gap to an earlier committed outcome or an
+admission fence. It does not cancel a claim or undo committed work. After its
+result is flushed, the CLI follows the same delivery/ACK path. A retired operation
+returns `Retired` and cannot execute again; its full original result may have been
+removed.
+Sealing drains an already saved competing control within a bounded retry loop;
+it never falls through to submitting the business mutation it was asked to fence.
+
+MCP exposes `request.reserve`, `request.pending`, `request.inspect`,
+`request.retry`, `request.acknowledge` and `request.seal`. Reservation is explicitly
+non-idempotent and performs no business work: after a lost reservation reply,
+discover the original ID rather than reserve and dispatch another. Mutations use
+that already reserved ID. Returning, inspecting or retrying a result never marks
+it consumed. The caller explicitly acknowledges consumption; acknowledgment then
+advances only the contiguous delivered prefix. A seal result likewise requires
+explicit acknowledgment. MCP pending discovery is scoped to its own store.
+JSON-RPC IDs remain unrelated to durable operation IDs.
+
+Existing unqualified 32-digit MCP IDs, raw protocol-one requests, explicit CLI
+`--operation PATH` journals and positional-path inspect/retry remain compatible.
+An ID flag is never interpreted as a filesystem path. Managed stores require a
+private data directory (`0700`) and files (`0600`). Newly created node directories
+satisfy this. Older permissive data directories produce an actionable permission
+error; the CLI does not silently chmod them. The [manual guide](../manual-cli.md)
+describes owner-controlled migration and the preserved explicit legacy path.
+
+Automatic close/rotation is not implemented. The adapter also does not solve
+indefinite principal churn, cross-principal slot reassignment or managed epoch
+batching. Separate CLI/MCP windows prevent an unconsumed MCP result from filling
+the ordinary CLI window; they do not eliminate the need to resolve unknown gaps.
+
 ## Wire activation and upgrades
 
 [Managed wire contracts](../../crates/focal-wire/src/managed.rs) append new
@@ -227,9 +292,8 @@ precede introducing a record any voter cannot replay.
 P17.11 remains open until all nine gates in [13](13-cli-and-agent-implementation-plan.md)
 pass together. Required remaining integration includes:
 
-- Automatic durable registration/store selection for normal CLI and MCP work,
-  versioned caller-known reservation/recovery discovery, exact adapter retry,
-  and bounded namespace rotation without changing legacy ID semantics.
+- Automatic bounded close and namespace rotation without changing legacy ID
+  semantics or losing initialized-store and retired-generation fences.
 - Principal-churn qualification and, where slots are reassigned across principals,
   a persistent global slot generation with old-principal fences and occupancy
   responses that cannot expose another principal's receipts or ownership nonce.

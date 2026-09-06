@@ -14,13 +14,25 @@ use tokio::{runtime::Runtime, sync::oneshot};
 
 // OperationStore owns the bounded catalogue and exact prepared requests. It is
 // intentionally synchronous and lives only on this backend's OS thread.
+use focal_client::managed_requests::{ManagedRequests, ManagedRequestsError};
+use focal_client::managed_store::{ManagedOperationId, ManagedStoreError};
 use focal_client::operation_store::{OperationIntent, OperationStore, StoreError};
+#[path = "managed_backend.rs"]
+mod managed;
+#[path = "transfer_backend.rs"]
+mod transfer;
+#[path = "watch_backend.rs"]
+mod watch;
 
 pub struct Backend<T: ClientTransport> {
     client: Client<T>,
     build: BuildContext,
     context: OperationContext,
     store: OperationStore,
+    managed: Option<ManagedRequests>,
+    admin: Option<Box<dyn crate::AdminBackend>>,
+    uploads: Option<focal_client::artifact_transfer::UploadStore>,
+    watches: Option<focal_client::watch::WatchStore>,
 }
 impl<T: ClientTransport> Backend<T> {
     pub fn new(
@@ -41,7 +53,47 @@ impl<T: ClientTransport> Backend<T> {
             build,
             context,
             store,
+            managed: None,
+            admin: None,
+            uploads: None,
+            watches: None,
         })
+    }
+    /// Enable the managed namespace without changing legacy operation bindings.
+    pub fn with_admin(mut self, admin: Box<dyn crate::AdminBackend>) -> Self {
+        self.admin = Some(admin);
+        self
+    }
+    pub(crate) fn has_admin(&self) -> bool {
+        self.admin.is_some()
+    }
+    pub fn with_uploads(mut self, uploads: focal_client::artifact_transfer::UploadStore) -> Self {
+        self.uploads = Some(uploads);
+        self
+    }
+    pub(crate) fn has_uploads(&self) -> bool {
+        self.uploads.is_some()
+    }
+    pub fn with_watches(
+        mut self,
+        watches: focal_client::watch::WatchStore,
+    ) -> Result<Self, InputError> {
+        if watches.context() != self.context {
+            return Err(InputError::Invalid("watch backend context mismatch"));
+        }
+        self.watches = Some(watches);
+        Ok(self)
+    }
+    pub(crate) fn has_watches(&self) -> bool {
+        self.watches.is_some()
+    }
+    /// Enable the managed namespace without changing legacy operation bindings.
+    pub fn with_managed_requests(mut self, requests: ManagedRequests) -> Result<Self, InputError> {
+        if requests.context() != self.context {
+            return Err(InputError::Invalid("managed backend context mismatch"));
+        }
+        self.managed = Some(requests);
+        Ok(self)
     }
     pub(crate) fn execute(
         &mut self,
@@ -63,6 +115,14 @@ impl<T: ClientTransport> Backend<T> {
                 operation_id,
                 condition: "DomainOutcome".into(),
                 result: OperationOutput::Mutation { reply: *reply },
+            },
+            Err(BackendError::ManagedDomain(outcome)) => ApplicationResult {
+                schema_version: 1,
+                operation_id,
+                condition: "DomainOutcome".into(),
+                result: OperationOutput::Mutation {
+                    reply: MutationReply::Domain(*outcome),
+                },
             },
             Err(error) => ApplicationResult {
                 schema_version: 1,
@@ -88,6 +148,26 @@ impl<T: ClientTransport> Backend<T> {
         if cancelled(cancel) {
             return Err(BackendError::Cancelled);
         }
+        if call.tool.starts_with("cluster.") {
+            let action = crate::admin::parse(&call.tool, std::mem::take(&mut call.arguments))?;
+            let backend = self.admin.as_mut().ok_or(BackendError::Configuration)?;
+            return match backend.execute(runtime, action, cancel) {
+                Ok(result) => Ok(("Administration", OperationOutput::Administration { result })),
+                Err(error) => Err(BackendError::Admin(error)),
+            };
+        }
+        if call.tool.starts_with("upload.") || call.tool == "artifact.download" {
+            return self.transfer(runtime, call, cancel);
+        }
+        if call.tool.starts_with("watch.") {
+            return self.watch(runtime, call, cancel);
+        }
+        if matches!(
+            call.tool.as_str(),
+            "request.reserve" | "request.pending" | "request.acknowledge" | "request.seal"
+        ) {
+            return self.managed_control(runtime, call, cancel, operation_id);
+        }
         if matches!(call.tool.as_str(), "request.inspect" | "request.retry") {
             let id = take_id(&mut call.arguments)?;
             *operation_id = Some(id.clone());
@@ -108,6 +188,15 @@ impl<T: ClientTransport> Backend<T> {
                 return Err(BackendError::Input(InputError::Invalid(
                     "unsupported recovery argument",
                 )));
+            }
+            if id.starts_with("m1:") {
+                return self.managed_recovery(
+                    runtime,
+                    &id,
+                    call.tool == "request.retry",
+                    remote,
+                    cancel,
+                );
             }
             let mut journal = self.store.open_existing(&id, &self.context)?;
             if remote {
@@ -158,12 +247,43 @@ impl<T: ClientTransport> Backend<T> {
         let bytes = bounded_json(&call.arguments)?;
         let authored = operations::parse_json(&call.tool, &bytes)?;
         if descriptor.mutation {
-            let canonical = bounded_json(&IntentFence {
-                revision: expected_revision,
-                authored: &authored,
-            })?;
+            let canonical = authored.canonical_mutation_intent(expected_revision)?;
             let id = operation_id.as_deref().ok_or(BackendError::Configuration)?;
+            if id.starts_with("m1:") {
+                authored.preflight(&self.build)?;
+                return self.managed_mutation(
+                    runtime,
+                    id,
+                    authored,
+                    expected_revision,
+                    &canonical,
+                    cancel,
+                );
+            }
             let build = self.build;
+            let expected_revision = if expected_revision.is_none() {
+                if let Some(claim) = authored.revision_claim()? {
+                    match self.store.open_existing(id, &self.context) {
+                        Ok(journal) => match &journal.business_request()?.operation {
+                            Operation::Submit {
+                                expected_revision, ..
+                            } => *expected_revision,
+                            _ => return Err(StoreError::IntentConflict.into()),
+                        },
+                        Err(StoreError::MissingOperation) => Some(self.participant_revision(
+                            runtime,
+                            claim,
+                            RequestId(random_id()?),
+                            cancel,
+                        )?),
+                        Err(error) => return Err(error.into()),
+                    }
+                } else {
+                    expected_revision
+                }
+            } else {
+                expected_revision
+            };
             let mut journal = self.store.open_or_create(
                 id,
                 self.context,
@@ -199,6 +319,45 @@ impl<T: ClientTransport> Backend<T> {
                 let reply = self.reconcile(runtime, query, cancel)?;
                 return Ok(("Reconciled", OperationOutput::Reconcile { reply }));
             }
+            if let PlannedOperation::ClaimWait {
+                read,
+                until,
+                timeout_ms,
+            } = planned
+            {
+                let request = envelope(self.build.ledger, Operation::Read(read))?;
+                let result=runtime.block_on(async { tokio::select! {
+                    result=self.client.claim_wait(request,until,std::time::Duration::from_millis(u64::from(timeout_ms)))=>result.map_err(claim_wait_error),
+                    _=cancel=>Err(BackendError::Cancelled),
+                }})?;
+                return Ok((
+                    result.condition.as_str(),
+                    OperationOutput::ClaimWait { result },
+                ));
+            }
+            if let PlannedOperation::ClaimGet(selector) = planned {
+                let request = envelope(self.build.ledger, selector.into_operation())?;
+                let page=runtime.block_on(async {tokio::select! {
+                    result=self.client.claim_get(request)=>result.map_err(BackendError::ClaimGet),
+                    _=cancel=>Err(BackendError::Cancelled),
+                }})?;
+                return Ok(("Read", OperationOutput::Read { page }));
+            }
+            if let PlannedOperation::ValidationContext(read) = planned {
+                let request = envelope(self.build.ledger, Operation::Read(read))?;
+                let context = runtime.block_on(async {
+                    tokio::select! {
+                        result=self.client.validation_context(request)=>result.map_err(validation_context_error),
+                        _=cancel=>Err(BackendError::Cancelled),
+                    }
+                })?;
+                return Ok((
+                    "Read",
+                    OperationOutput::ValidationContext {
+                        context: Box::new(context),
+                    },
+                ));
+            }
             let request = envelope(self.build.ledger, planned.into_wire(None)?)?;
             let reply = runtime.block_on(async {
                 tokio::select! {
@@ -207,6 +366,22 @@ impl<T: ClientTransport> Backend<T> {
                 }
             })?;
             match reply.result {
+                Response::Monitor(page) => {
+                    let Some(monitor) = &page.monitor else {
+                        return Err(BackendError::NotFound);
+                    };
+                    Ok((
+                        if monitor.released.is_some() {
+                            "Released"
+                        } else {
+                            "Pending"
+                        },
+                        OperationOutput::Monitor { page },
+                    ))
+                }
+                Response::Summary(summary) => {
+                    Ok(("Observed", OperationOutput::Summary { summary }))
+                }
                 Response::Read(page) => {
                     if page.objects.is_empty() {
                         return Err(BackendError::NotFound);
@@ -214,9 +389,29 @@ impl<T: ClientTransport> Backend<T> {
                     Ok(("Read", OperationOutput::Read { page }))
                 }
                 Response::Listed(page) => Ok(("Listed", OperationOutput::List { page })),
+                Response::Validators(page) => {
+                    Ok(("RecordedContracts", OperationOutput::List { page }))
+                }
+                Response::Traversed(page) => Ok(("Traversed", OperationOutput::Traversal { page })),
                 _ => Err(BackendError::Configuration),
             }
         }
+    }
+    fn participant_revision(
+        &self,
+        runtime: &Runtime,
+        claim: ClaimId,
+        nonce: RequestId,
+        cancel: &mut oneshot::Receiver<()>,
+    ) -> Result<ObjectRevision, BackendError> {
+        runtime.block_on(async {
+            tokio::select! {
+                result = self.client.claim_revision(self.context.ledger, claim, nonce) => {
+                    result?.ok_or_else(|| InputError::Invalid("claim was not found").into())
+                },
+                _ = cancel => Err(BackendError::Cancelled),
+            }
+        })
     }
     fn reconcile(
         &self,
@@ -259,15 +454,37 @@ impl<T: ClientTransport> Backend<T> {
         Ok(())
     }
 }
-#[derive(Serialize)]
-struct IntentFence<'a> {
-    revision: Option<ObjectRevision>,
-    authored: &'a AuthoredOperation,
+fn claim_wait_error(error: focal_client::claim_wait::ClaimWaitError) -> BackendError {
+    use focal_client::claim_wait::ClaimWaitError;
+    match error {
+        ClaimWaitError::Client(error) => BackendError::Client(error),
+        ClaimWaitError::NotFound => BackendError::NotFound,
+        ClaimWaitError::InvalidRequest => {
+            BackendError::Input(InputError::Invalid("invalid claim wait query"))
+        }
+    }
+}
+fn validation_context_error(
+    error: focal_client::validation_context::ValidationContextError,
+) -> BackendError {
+    use focal_client::validation_context::ValidationContextError;
+    match error {
+        ValidationContextError::Client(error) => BackendError::Client(error),
+        ValidationContextError::NotFound => BackendError::NotFound,
+        ValidationContextError::InvalidRequest => {
+            BackendError::Input(InputError::Invalid("validation context query"))
+        }
+        ValidationContextError::Capacity => BackendError::Input(InputError::Capacity),
+    }
 }
 fn take_id(arguments: &mut serde_json::Map<String, Value>) -> Result<String, BackendError> {
     let Some(Value::String(id)) = arguments.remove("operation_id") else {
         return Err(InputError::Invalid("operation_id is required").into());
     };
+    if id.starts_with("m1:") {
+        id.parse::<ManagedOperationId>()?;
+        return Ok(id);
+    }
     parse_id(&id)?;
     if id.bytes().any(|byte| byte.is_ascii_uppercase()) {
         return Err(InputError::Invalid("operation_id must use lowercase hexadecimal").into());
@@ -312,7 +529,7 @@ fn random_id() -> Result<[u8; 16], InputError> {
 }
 fn envelope(ledger: LedgerId, operation: Operation) -> Result<RequestEnvelope, InputError> {
     Ok(RequestEnvelope {
-        protocol: PROTOCOL_VERSION,
+        protocol: participant_protocol(&operation),
         ledger,
         route_epoch: RouteEpoch(1),
         request_epoch: RequestEpoch(1),
@@ -365,6 +582,8 @@ fn bounded_detail(error: &impl std::fmt::Display) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn oversized_unicode_diagnostic_remains_bounded_valid_utf8() {
         let detail = super::bounded_detail(&"é".repeat(20_000));
@@ -372,13 +591,122 @@ mod tests {
         assert!(detail.ends_with(" [truncated]"));
         assert!(!detail.contains('\u{fffd}'));
     }
+
+    #[test]
+    fn nested_store_errors_keep_actionable_codes() {
+        fn check(make: impl Fn() -> StoreError, code: &str) {
+            for error in [
+                BackendError::Store(make()),
+                BackendError::ManagedStore(ManagedStoreError::Store(make())),
+                BackendError::Managed(ManagedRequestsError::Store(make())),
+                BackendError::Managed(ManagedRequestsError::Managed(ManagedStoreError::Store(
+                    make(),
+                ))),
+            ] {
+                assert_eq!((error.condition(), error.code()), ("Error", code));
+            }
+        }
+        check(|| StoreError::Locked, "busy");
+        check(|| StoreError::Capacity, "capacity");
+        check(|| StoreError::InvalidId, "invalid_input");
+        check(|| StoreError::MissingOperation, "not_found");
+        check(|| StoreError::IntentConflict, "operation_conflict");
+        check(|| StoreError::Corrupt, "operation_store");
+        check(
+            || StoreError::Expansion(InputError::Identity),
+            "invalid_input",
+        );
+        check(|| StoreError::Expansion(InputError::Capacity), "capacity");
+        check(
+            || StoreError::Pending(focal_client::pending::PendingError::Locked),
+            "busy",
+        );
+    }
+
+    #[test]
+    fn coordinator_failures_preserve_retirement_capacity_and_identity() {
+        for (error, condition, code) in [
+            (
+                ManagedRequestsError::Managed(ManagedStoreError::Retired),
+                "Retired",
+                "managed_retired",
+            ),
+            (
+                ManagedRequestsError::Managed(ManagedStoreError::Capacity),
+                "Error",
+                "capacity",
+            ),
+            (ManagedRequestsError::Exhausted, "Error", "capacity"),
+            (
+                ManagedRequestsError::Identity(InputError::Identity),
+                "Error",
+                "invalid_input",
+            ),
+            (ManagedRequestsError::Context, "Error", "operation_conflict"),
+            (ManagedRequestsError::Missing, "Error", "not_found"),
+            (ManagedRequestsError::Corrupt, "Error", "managed_requests"),
+        ] {
+            let error = BackendError::Managed(error);
+            assert_eq!((error.condition(), error.code()), (condition, code));
+        }
+    }
+
+    #[test]
+    fn coordinator_remote_rejections_match_direct_client_access() {
+        for (access, condition, code) in [
+            (AccessError::Unauthorized, "Error", "unauthorized"),
+            (AccessError::InvalidRequest, "Error", "invalid_input"),
+            (AccessError::Capacity, "Error", "capacity"),
+            (AccessError::Unavailable, "Error", "unavailable"),
+            (
+                AccessError::OutcomeUnknown,
+                "OutcomeUnknown",
+                "outcome_unknown",
+            ),
+            (
+                AccessError::ManagedRetired { through: 7 },
+                "Retired",
+                "managed_retired",
+            ),
+            (
+                AccessError::ManagedClosed { generation: 3 },
+                "Error",
+                "managed_closed",
+            ),
+            (AccessError::ManagedConflict, "Error", "managed_conflict"),
+            (
+                AccessError::ManagedNotRegistered,
+                "Error",
+                "managed_not_registered",
+            ),
+        ] {
+            for error in [
+                BackendError::Client(ClientError::Access(access.clone())),
+                BackendError::Managed(ManagedRequestsError::Remote(access)),
+            ] {
+                assert_eq!((error.condition(), error.code()), (condition, code));
+            }
+        }
+    }
 }
 #[derive(Debug, thiserror::Error)]
 enum BackendError {
     #[error(transparent)]
+    ClaimGet(#[from] focal_client::claim_get::ClaimGetError),
+    #[error(transparent)]
+    Watch(#[from] focal_client::watch::WatchError),
+    #[error(transparent)]
+    Transfer(#[from] focal_client::artifact_transfer::TransferError),
+    #[error(transparent)]
+    Admin(#[from] crate::AdminError),
+    #[error(transparent)]
     Input(#[from] InputError),
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error(transparent)]
+    Managed(#[from] ManagedRequestsError),
+    #[error(transparent)]
+    ManagedStore(#[from] ManagedStoreError),
     #[error(transparent)]
     Journal(#[from] focal_client::pending::PendingError),
     #[error(transparent)]
@@ -391,51 +719,46 @@ enum BackendError {
     Configuration,
     #[error("domain outcome; exact request remains saved: {0:?}")]
     Domain(Box<MutationReply>),
+    #[error("domain outcome; exact managed request remains saved: {0:?}")]
+    ManagedDomain(Box<DomainOutcome>),
 }
 impl BackendError {
     fn condition(&self) -> &'static str {
-        match self {
-            Self::Client(ClientError::OutcomeUnknown { .. }) => "OutcomeUnknown",
-            Self::Cancelled => "Cancelled",
-            Self::Domain(_) => "DomainOutcome",
-            _ => "Error",
-        }
+        self.classification().0
     }
     fn code(&self) -> &'static str {
-        match self {
-            Self::Input(_) => "invalid_input",
-            Self::Store(StoreError::IntentConflict | StoreError::ContextMismatch) => {
-                "operation_conflict"
-            }
-            Self::Store(StoreError::Locked)
-            | Self::Journal(focal_client::pending::PendingError::Locked) => "busy",
-            Self::Store(StoreError::Capacity) => "capacity",
-            Self::Store(StoreError::MissingOperation) => "not_found",
-            Self::Store(_) => "operation_store",
-            Self::Journal(_) => "operation_journal",
-            Self::Client(ClientError::Access(access)) => match access {
-                AccessError::Unauthorized => "unauthorized",
-                AccessError::UnsupportedProtocol => "unsupported_protocol",
-                AccessError::InvalidRequest => "invalid_input",
-                AccessError::Capacity => "capacity",
-                AccessError::Unavailable => "unavailable",
-                AccessError::OutcomeUnknown => "outcome_unknown",
-                AccessError::RouteChanged(_) => "route_changed",
-                AccessError::Behind { .. } => "behind",
-                AccessError::SnapshotExpired => "snapshot_expired",
-                AccessError::ResyncRequired { .. } => "resync_required",
-                AccessError::UnsupportedOperation => "unsupported_operation",
-                AccessError::ManagedRetired { .. } => "managed_retired",
-                AccessError::ManagedClosed { .. } => "managed_closed",
-                AccessError::ManagedConflict => "managed_conflict",
-                AccessError::ManagedNotRegistered => "managed_not_registered",
+        self.classification().1
+    }
+    fn classification(&self) -> (&'static str, &'static str) {
+        use focal_client::failure::{self, Failure};
+        let value = match self {
+            Self::ClaimGet(error) => match error {
+                focal_client::claim_get::ClaimGetError::Client(error) => failure::client(error),
+                focal_client::claim_get::ClaimGetError::NotFound => Failure::error("not_found", 4),
+                focal_client::claim_get::ClaimGetError::Ambiguous => Failure::error("ambiguous", 5),
+                focal_client::claim_get::ClaimGetError::Incomplete => Failure {
+                    condition: "Incomplete",
+                    code: "incomplete",
+                    exit_code: 6,
+                },
+                focal_client::claim_get::ClaimGetError::InvalidRequest => {
+                    Failure::error("invalid_input", 2)
+                }
             },
-            Self::Client(ClientError::OutcomeUnknown { .. }) => "outcome_unknown",
-            Self::Client(_) => "transport",
-            Self::Cancelled => "cancelled",
-            Self::NotFound => "not_found",
-            Self::Configuration => "configuration",
-            Self::Domain(_) => "domain",
-        }
+            Self::Watch(error) => failure::watch(error),
+            Self::Transfer(error) => failure::transfer(error),
+            Self::Input(error) => failure::input(error),
+            Self::Store(error) => failure::store(error),
+            Self::Managed(error) => failure::managed(error),
+            Self::ManagedStore(error) => failure::managed_store(error),
+            Self::Journal(error) => failure::pending(error),
+            Self::Client(error) => failure::client(error),
+            Self::Cancelled => Failure::cancelled(),
+            Self::NotFound => Failure::error("not_found", 4),
+            Self::Configuration => Failure::error("configuration", 2),
+            Self::Admin(error) => return (error.condition, error.code),
+            Self::Domain(_) | Self::ManagedDomain(_) => return ("DomainOutcome", "domain"),
+        };
+        (value.condition, value.code)
     }
 }

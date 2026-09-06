@@ -1,0 +1,161 @@
+{
+  "git_base": "31198c225b5ab6fb7c0414fe423d069701b9c9a2",
+  "method": "Reconstructed after capture: original lib.rs from the recorded Git base; other existing Core/model files unchanged by the codec tranche. The retained patch records the preexisting source changes. This is a source reconstruction, not a claim of a reproducible binary build.",
+  "files": {
+    "Cargo.toml": {
+      "sha256": "8731bfe4f39e8232a783a6a810693bb39976de496fb681ca6f5204131d017565",
+      "bytes": 1718,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "Cargo.lock": {
+      "sha256": "1cdc2b87a2e4f473faaf8c2217c479ec8afafdfd4280292241ddba3fa4d66c93",
+      "bytes": 52352,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-core/Cargo.toml": {
+      "sha256": "12e8b032fcff0d308f896f57118e5bd61b2da2ac5f19b2976fd602129d8a381e",
+      "bytes": 386,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-model/Cargo.toml": {
+      "sha256": "7236c62d34212115522cc9025fd11b8ec4fac08456eb96c014d454e95ee205ff",
+      "bytes": 326,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-core/src/access.rs": {
+      "sha256": "f8e6bf11feef82f2238da832d9ccafdc71310deaececdcac944aeabed118086a",
+      "bytes": 29422,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-core/src/access_tests.rs": {
+      "sha256": "f38b35dc0b7810a53d75a08e0023f7d46b94b2f308bc7b6a43fe80d56ed2b41f",
+      "bytes": 12241,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-core/src/epoch.rs": {
+      "sha256": "74d1a2e42cd07ec926119bc89d83484bb61ec26b1b0ecb61a56c52028680b400",
+      "bytes": 26565,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-core/src/epoch_tests.rs": {
+      "sha256": "2d096827c7679c5be01be2aea1b50078c3a138d9836ff075d5dc726102b7cb8a",
+      "bytes": 12605,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-core/src/graph.rs": {
+      "sha256": "e6735442bbddedea86f43ea09ca135cebfa5df38f852d868d514695326d7bf9d",
+      "bytes": 6893,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-core/src/lib.rs": {
+      "sha256": "e5b5eb9f3874ac6670033b66e36bf004b136d27cec33440ac64b3f121f5305e7",
+      "bytes": 12308,
+      "reconstruction": "original tracked file; current diff contains only the later codec delegation"
+    },
+    "crates/focal-core/src/managed.rs": {
+      "sha256": "8b5f2a543a9014eebfc96347c063782eefd573b643c7f5a66fee624cfd209774",
+      "bytes": 12508,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-core/src/managed_tests.rs": {
+      "sha256": "80f8a5b069aed419661e4972f853ab49c7c3583d1b65191c72c8277136e4b9cb",
+      "bytes": 18502,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-core/src/overlay.rs": {
+      "sha256": "f81b760f4ef0c49335fb7664aebdd271c5cf660965dead2f3a30cceb7e391059",
+      "bytes": 7595,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-core/src/pending.rs": {
+      "sha256": "4e2c7a579bbfa0f519756f82584bd961a243e9f06d140dadb0fe0a5026bd20f9",
+      "bytes": 17641,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-core/src/pending_tests.rs": {
+      "sha256": "7fb48b278d9954c7c2693b20e0c611991e3e51aaf0e9a6180e70f31dd14cd818",
+      "bytes": 7526,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-core/src/reconciliation.rs": {
+      "sha256": "c47ab495b44a0e37cb8f0f93014883ce2b45fe1e6845d0b90e28d588e4a24c8b",
+      "bytes": 7694,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-core/src/reconciliation_tests.rs": {
+      "sha256": "7e591d4ca39437a01570eedb7013af5f4bf9869ebe2af98562d1fec5373c20e8",
+      "bytes": 7873,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-core/src/reduce.rs": {
+      "sha256": "5bfb6b2a70b55c1aea22fe088b4e413299c40a9d8d031fae58345823caffab2a",
+      "bytes": 75037,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-core/src/tests.rs": {
+      "sha256": "cfbf2ce7868191179681714b7788be6f7edd95e0f76dcc7213fe22ef1c701058",
+      "bytes": 68727,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-core/src/validation.rs": {
+      "sha256": "c3a29b501acc0e413ce6a8c9cb5951d605d939714b3d5cc3e348db52241d3eaf",
+      "bytes": 15375,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-model/src/canonical.rs": {
+      "sha256": "9216c1faba8a628929f4d56d77fb71f82052bb3dc66d3111e0f7e49432afe06d",
+      "bytes": 10062,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-model/src/command.rs": {
+      "sha256": "7d98db788176e0f9b3fa05b7375a7947ecdf3479325cfe6a6e723279f71e9f7c",
+      "bytes": 10794,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-model/src/ids.rs": {
+      "sha256": "23008e268e85846964926049119aa5548ef997268376f69cc34004220504c3a9",
+      "bytes": 2793,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-model/src/lib.rs": {
+      "sha256": "218044cb7ab4cd74ed1c56baec1339e9eee49a91c6c526dddc8184955eb8610b",
+      "bytes": 700,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-model/src/managed.rs": {
+      "sha256": "e3db3bd3cf3fa4cf1d2aaec1f1428dad827c55a0b87681393a404953d0a5daa2",
+      "bytes": 11182,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-model/src/managed_tests.rs": {
+      "sha256": "3860937f0ba09b6ab8abee8e6f577ccf413b1005fbf6b7a57dfc4852b57aa7ae",
+      "bytes": 7797,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-model/src/objects.rs": {
+      "sha256": "bf40539022facb38eb93076244161c67e82890e6691f0b9afdd2359e9ebb9bba",
+      "bytes": 10155,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-model/src/reconciliation.rs": {
+      "sha256": "862c7b9c1dfa4a4264d8080a23e734c39535175633c0be730623ca485928b2a5",
+      "bytes": 6694,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-model/src/tests.rs": {
+      "sha256": "b5adbb8bc08e45dbffefb896bd4fb995ce9d5071a9c7360884a64c2422371fc9",
+      "bytes": 6128,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-model/src/validation_read.rs": {
+      "sha256": "c349bb3a8b419dfd0be733af63dd6eacb751215b6c14bb5afd1ff4924171d890",
+      "bytes": 1241,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    },
+    "crates/focal-model/src/vocabulary.rs": {
+      "sha256": "b431c0b337efd5b97ab6934cf450f55811d04c6d1adfa0521840afaa263027fa",
+      "bytes": 6904,
+      "reconstruction": "unchanged by the codec tranche; includes preexisting working-tree changes"
+    }
+  }
+}

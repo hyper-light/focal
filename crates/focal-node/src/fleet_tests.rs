@@ -218,6 +218,9 @@ impl Drop for Fleet {
     }
 }
 
+#[path = "fleet_summary_tests.rs"]
+mod summary_tests;
+
 #[path = "fleet_reconciliation_tests.rs"]
 mod reconciliation_tests;
 

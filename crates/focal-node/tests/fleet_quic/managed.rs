@@ -391,5 +391,69 @@ async fn managed_mtls_support_domain_cursor_retirement_quorum_and_disk_recovery(
         committed.receipt.outcome,
         ManagedReceiptOutcome::Domain(CommandResult::Generated(_))
     ));
+    for (ordinal, id, command) in [
+        (
+            4,
+            108,
+            Command::PostClaim {
+                claim: ClaimId::from_u128(9999),
+            },
+        ),
+        (
+            5,
+            109,
+            Command::AcquireReceipt {
+                claim: ClaimId::from_u128(700),
+                receipt: ReceiptId::from_u128(1001),
+                epoch: 1,
+            },
+        ),
+    ] {
+        let key = ManagedRequestKey {
+            stream,
+            ordinal,
+            id: RequestId::from_u128(id),
+        };
+        let request = managed_request(
+            id,
+            Operation::Managed {
+                key,
+                operation: ManagedOperation::Submit {
+                    expected_revision: None,
+                    command,
+                },
+            },
+        );
+        let result = exchange(&reopened, owner, &request).await;
+        match result {
+            Response::Submitted(MutationReply::Domain(DomainOutcome::Refuse {
+                code: ErrorCode::UnknownObject,
+                ..
+            })) if ordinal == 4 => {}
+            Response::Submitted(MutationReply::Domain(DomainOutcome::Inform {
+                reason: InformReason::Status(ClaimStatus::Generated),
+                ..
+            })) if ordinal == 5 => {}
+            other => panic!("transient managed domain response: {other:?}"),
+        }
+        let lookup = managed_request(
+            id + 100,
+            Operation::RequestStreamRead {
+                cluster: [7; 16],
+                query: RequestStreamQuery::Receipt { key },
+            },
+        );
+        let Response::RequestStreamRead(unknown) = exchange(&reopened, owner, &lookup).await else {
+            panic!("fresh managed lookup")
+        };
+        assert_eq!(unknown.page.sequence, SessionSeq(2));
+        assert!(matches!(
+            unknown.page.result,
+            RequestStreamReadResult::Receipt {
+                resolution: ManagedReceiptResolution::Unknown,
+                ..
+            }
+        ));
+    }
     reopened.stop().await;
 }

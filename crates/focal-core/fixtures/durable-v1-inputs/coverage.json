@@ -1,0 +1,298 @@
+{
+  "rows": 58,
+  "ordering": "Two rounds of the same29variants: first rich populated command fields, then alternate/empty branches. Authenticated envelope fields alternate separately by row index.",
+  "commands": [
+    {
+      "variant": "NegotiateEpoch",
+      "canonical_tag": 1,
+      "postcard_ordinal": 0,
+      "rich_row": 0,
+      "alternate_row": 29
+    },
+    {
+      "variant": "AdvanceEpochFloor",
+      "canonical_tag": 2,
+      "postcard_ordinal": 1,
+      "rich_row": 1,
+      "alternate_row": 30
+    },
+    {
+      "variant": "GenerateClaim",
+      "canonical_tag": 3,
+      "postcard_ordinal": 2,
+      "rich_row": 2,
+      "alternate_row": 31
+    },
+    {
+      "variant": "GenerateClaimBatch",
+      "canonical_tag": 4,
+      "postcard_ordinal": 3,
+      "rich_row": 3,
+      "alternate_row": 32
+    },
+    {
+      "variant": "PostClaim",
+      "canonical_tag": 5,
+      "postcard_ordinal": 4,
+      "rich_row": 4,
+      "alternate_row": 33
+    },
+    {
+      "variant": "AcquireReceipt",
+      "canonical_tag": 6,
+      "postcard_ordinal": 5,
+      "rich_row": 5,
+      "alternate_row": 34
+    },
+    {
+      "variant": "AdoptReceipt",
+      "canonical_tag": 7,
+      "postcard_ordinal": 6,
+      "rich_row": 6,
+      "alternate_row": 35
+    },
+    {
+      "variant": "RecordProgress",
+      "canonical_tag": 8,
+      "postcard_ordinal": 7,
+      "rich_row": 7,
+      "alternate_row": 36
+    },
+    {
+      "variant": "BeginEvidenceSet",
+      "canonical_tag": 9,
+      "postcard_ordinal": 8,
+      "rich_row": 8,
+      "alternate_row": 37
+    },
+    {
+      "variant": "AttachArtifact",
+      "canonical_tag": 10,
+      "postcard_ordinal": 9,
+      "rich_row": 9,
+      "alternate_row": 38
+    },
+    {
+      "variant": "CloseTestament",
+      "canonical_tag": 11,
+      "postcard_ordinal": 10,
+      "rich_row": 10,
+      "alternate_row": 39
+    },
+    {
+      "variant": "AcknowledgeTestament",
+      "canonical_tag": 12,
+      "postcard_ordinal": 11,
+      "rich_row": 11,
+      "alternate_row": 40
+    },
+    {
+      "variant": "BeginWholeWorkValidation",
+      "canonical_tag": 13,
+      "postcard_ordinal": 12,
+      "rich_row": 12,
+      "alternate_row": 41
+    },
+    {
+      "variant": "BeginIncrementValidation",
+      "canonical_tag": 14,
+      "postcard_ordinal": 13,
+      "rich_row": 13,
+      "alternate_row": 42
+    },
+    {
+      "variant": "RecordValidationVerdict",
+      "canonical_tag": 15,
+      "postcard_ordinal": 14,
+      "rich_row": 14,
+      "alternate_row": 43
+    },
+    {
+      "variant": "CompleteWholeWork",
+      "canonical_tag": 16,
+      "postcard_ordinal": 15,
+      "rich_row": 15,
+      "alternate_row": 44
+    },
+    {
+      "variant": "FailPost",
+      "canonical_tag": 17,
+      "postcard_ordinal": 16,
+      "rich_row": 16,
+      "alternate_row": 45
+    },
+    {
+      "variant": "FailReceipt",
+      "canonical_tag": 18,
+      "postcard_ordinal": 17,
+      "rich_row": 17,
+      "alternate_row": 46
+    },
+    {
+      "variant": "FailTestamentGeneration",
+      "canonical_tag": 19,
+      "postcard_ordinal": 18,
+      "rich_row": 18,
+      "alternate_row": 47
+    },
+    {
+      "variant": "CancelClaim",
+      "canonical_tag": 20,
+      "postcard_ordinal": 19,
+      "rich_row": 19,
+      "alternate_row": 48
+    },
+    {
+      "variant": "RevokeClaim",
+      "canonical_tag": 21,
+      "postcard_ordinal": 20,
+      "rich_row": 20,
+      "alternate_row": 49
+    },
+    {
+      "variant": "ExpireClaim",
+      "canonical_tag": 22,
+      "postcard_ordinal": 21,
+      "rich_row": 21,
+      "alternate_row": 50
+    },
+    {
+      "variant": "SupersedeClaim",
+      "canonical_tag": 23,
+      "postcard_ordinal": 22,
+      "rich_row": 22,
+      "alternate_row": 51
+    },
+    {
+      "variant": "RegisterMonitor",
+      "canonical_tag": 24,
+      "postcard_ordinal": 23,
+      "rich_row": 23,
+      "alternate_row": 52
+    },
+    {
+      "variant": "RebindMonitor",
+      "canonical_tag": 25,
+      "postcard_ordinal": 24,
+      "rich_row": 24,
+      "alternate_row": 53
+    },
+    {
+      "variant": "ReleaseScope",
+      "canonical_tag": 26,
+      "postcard_ordinal": 25,
+      "rich_row": 25,
+      "alternate_row": 54
+    },
+    {
+      "variant": "RegisterArtifact",
+      "canonical_tag": 27,
+      "postcard_ordinal": 26,
+      "rich_row": 26,
+      "alternate_row": 55
+    },
+    {
+      "variant": "ExpireMonitor",
+      "canonical_tag": 28,
+      "postcard_ordinal": 27,
+      "rich_row": 27,
+      "alternate_row": 56
+    },
+    {
+      "variant": "RecordFencedValidationVerdict",
+      "canonical_tag": 29,
+      "postcard_ordinal": 28,
+      "rich_row": 28,
+      "alternate_row": 57
+    }
+  ],
+  "new_claim": {
+    "rich_validations": 42,
+    "alternate_validations": 0,
+    "rich_validation_product": "7 kinds × 3 phases × 2 modes",
+    "handler_lists": [
+      "empty",
+      "programmatic",
+      "programmatic_then_agentic"
+    ],
+    "quality_bar": [
+      "None",
+      "Some"
+    ],
+    "evidence_schemas": [
+      "empty",
+      "nonempty"
+    ],
+    "contributed_by": [
+      "empty",
+      "nonempty"
+    ],
+    "deadline": [
+      "None",
+      "Some"
+    ],
+    "claim_collection_branches": [
+      "empty",
+      "nonempty"
+    ]
+  },
+  "artifact_payloads": [
+    "empty_inline",
+    "content_reference_checkpoint_class_u64_max_length"
+  ],
+  "cause_ordinals": [
+    0,
+    1
+  ],
+  "runtime": [
+    false,
+    true
+  ],
+  "expected_revision": [
+    "None",
+    "Some"
+  ],
+  "authority_evidence": [
+    "empty",
+    "durable=false/schema_valid=false",
+    "durable=false/schema_valid=true",
+    "durable=true/schema_valid=false",
+    "durable=true/schema_valid=true"
+  ],
+  "receipt_fence": [
+    "None",
+    "Some"
+  ],
+  "monitor_predicates": [
+    "Satisfied",
+    "Terminal",
+    "Released"
+  ],
+  "numeric_boundaries": [
+    "0",
+    "1",
+    "127",
+    "128",
+    "u32::MAX",
+    "u64::MAX"
+  ],
+  "text": [
+    "empty",
+    "UTF-8 λ",
+    "newline",
+    "NUL"
+  ],
+  "vectors_preserve_order": true,
+  "prepared_session_exclusive": [
+    false,
+    true
+  ],
+  "not_claimed": [
+    "Reducer admission",
+    "Session replay",
+    "complete nested enum Cartesian product",
+    "managed registry/cursor serialization",
+    "delta/effect canonical identity",
+    "successor lifecycle behavior"
+  ]
+}

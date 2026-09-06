@@ -55,7 +55,7 @@ impl SessionMembershipRequest {
     }
     fn hash(&self) -> Result<[u8; 32], LedgerError> {
         self.validate()?;
-        Ok(*blake3::hash(&postcard::to_stdvec(self)?).as_bytes())
+        Ok(focal_model::durable_v1::hash(self)?.0)
     }
 }
 impl Session {
@@ -160,8 +160,7 @@ impl Session {
             change: request.change,
             hash,
         };
-        let mut encoded = MEMBERSHIP_MAGIC.to_vec();
-        encoded.extend(postcard::to_stdvec(&context)?);
+        let encoded = durable_session_v1::encode(MEMBERSHIP_MAGIC, &context, usize::MAX)?;
         self.consensus
             .propose_membership(&request.expected, request.change, encoded)?;
         self.pending_membership = Some(PendingMembership {
@@ -189,7 +188,7 @@ impl Session {
             self.pending_membership = None;
             return Ok(());
         };
-        let (context, remaining): (MembershipContext, _) = postcard::take_from_bytes(encoded)?;
+        let (context, remaining): (MembershipContext, _) = durable_session_v1::take(encoded)?;
         if !remaining.is_empty() {
             return Err(LedgerError::Corrupt);
         }

@@ -19,6 +19,7 @@ blake3.workspace = true
 
 [dev-dependencies]
 focal-core = { version = "0.1.0", path = "../focal-core" }
+focal-evidence = { version = "0.1.0", path = "../focal-evidence" }
 tempfile.workspace = true
 
 [lints]

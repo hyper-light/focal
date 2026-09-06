@@ -211,26 +211,10 @@ pub fn run(node: &mut EmbeddedNode) -> Result<DemoReport, NodeError> {
     )?;
     let bytes = br#"{"passed":1,"failed":0,"skipped":0}"#;
     let upload = UploadId(demo_id(&identity, "upload"));
-    let offset = node.content.begin(
-        upload,
-        ContentDomainId(identity.ledger.tenant.0),
-        ContentClass::Evidence,
-        bytes.len() as u64,
-        Some(ContentHash(*blake3::hash(bytes).as_bytes())),
-    )?;
-    if offset < bytes.len() as u64 {
-        node.content.append(
-            upload,
-            offset,
-            bytes
-                .get(usize::try_from(offset).map_err(|_| NodeError::Identity)?..)
-                .ok_or(NodeError::Identity)?,
-        )?;
-    }
-    let content = node.content.seal(upload)?;
-    node.content.verify(&content)?;
+    let artifact_id = ArtifactId(demo_id(&identity, "artifact"));
+    let content = demo_content(node, artifact_id, upload, bytes)?;
     let artifact = NewArtifact {
-        id: ArtifactId(demo_id(&identity, "artifact")),
+        id: artifact_id,
         content: ArtifactContent {
             ledger: identity.ledger,
             schema: SCHEMA_MAJOR,
@@ -248,6 +232,15 @@ pub fn run(node: &mut EmbeddedNode) -> Result<DemoReport, NodeError> {
         id: artifact.id,
         hash: artifact.content.content_hash()?,
     };
+    if node
+        .session
+        .read_at_least(SessionSeq(0))?
+        .artifacts
+        .get(&artifact.id)
+        .is_some_and(|stored| stored.content_hash() != artifact_ref.hash)
+    {
+        return Err(NodeError::Identity);
+    }
     // This attestation is created by trusted ingress after local fsync + schema
     // verification. A replicated host must establish the active custody contract.
     let _: focal_evidence::TestReport =
@@ -378,6 +371,59 @@ pub fn run(node: &mut EmbeddedNode) -> Result<DemoReport, NodeError> {
     })
 }
 
+fn demo_content(
+    node: &mut EmbeddedNode,
+    artifact: ArtifactId,
+    upload: UploadId,
+    bytes: &[u8],
+) -> Result<ContentRef, NodeError> {
+    // Finish permanently retires an upload ID. Once attachment committed, its
+    // immutable artifact is the durable reference; recovery must not Begin again.
+    let existing = node
+        .session
+        .read_at_least(SessionSeq(0))?
+        .artifacts
+        .get(&artifact)
+        .map(|artifact| match &artifact.content().payload {
+            ArtifactPayload::Content(reference) => Ok(reference.clone()),
+            ArtifactPayload::Inline(_) => Err(NodeError::Identity),
+        })
+        .transpose()?;
+    let content = if let Some(content) = existing {
+        content
+    } else {
+        let offset = node.content.begin(
+            upload,
+            ContentDomainId(node.identity.ledger.tenant.0),
+            ContentClass::Evidence,
+            bytes.len() as u64,
+            Some(ContentHash(*blake3::hash(bytes).as_bytes())),
+        )?;
+        if offset < bytes.len() as u64 {
+            node.content.append(
+                upload,
+                offset,
+                bytes
+                    .get(usize::try_from(offset).map_err(|_| NodeError::Identity)?..)
+                    .ok_or(NodeError::Identity)?,
+            )?;
+        }
+        node.content.seal(upload)?
+    };
+    if content.domain != ContentDomainId(node.identity.ledger.tenant.0)
+        || content.class != ContentClass::Evidence
+        || content.length != bytes.len() as u64
+    {
+        return Err(NodeError::Identity);
+    }
+    // Read verifies the retained manifest, every chunk, and stream digest. Never
+    // reconstruct missing committed evidence or silently accept a different proof.
+    if node.content.read_bytes(&content, bytes.len())? != bytes {
+        return Err(focal_evidence::ContentError::Corrupt.into());
+    }
+    Ok(content)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,6 +438,17 @@ mod tests {
             first = run(&mut node).unwrap();
             assert_eq!(first.status, ClaimStatus::Satisfied);
             assert_eq!(first.validation, VerdictValue::Pass);
+            assert_eq!(node.content.staged(), (0, 0));
+            assert!(matches!(
+                node.content.begin(
+                    UploadId(demo_id(&node.identity, "upload")),
+                    ContentDomainId(node.identity.ledger.tenant.0),
+                    ContentClass::Evidence,
+                    0,
+                    None,
+                ),
+                Err(focal_evidence::ContentError::FinishedUpload)
+            ));
             node.checkpoint().unwrap();
         }
         let mut node = EmbeddedNode::open(&settings).unwrap();
@@ -399,6 +456,66 @@ mod tests {
         assert_eq!(first.sequence, second.sequence);
         assert_eq!(first.artifact, second.artifact);
         assert_eq!(first.history, second.history);
+        assert_eq!(node.content.staged(), (0, 0));
         node.content.verify(&second.artifact).unwrap();
+    }
+
+    #[test]
+    fn canceled_demo_upload_without_committed_artifact_cannot_be_resurrected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = crate::config::Settings::default();
+        settings.node.data_dir = Some(dir.path().to_owned());
+        let mut node = EmbeddedNode::open(&settings).unwrap();
+        let upload = UploadId(demo_id(&node.identity, "upload"));
+        node.content.finish(upload).unwrap();
+        drop(node);
+        let mut node = EmbeddedNode::open(&settings).unwrap();
+        assert!(matches!(
+            run(&mut node),
+            Err(NodeError::Content(
+                focal_evidence::ContentError::FinishedUpload
+            ))
+        ));
+        assert_eq!(node.content.staged(), (0, 0));
+        assert!(
+            node.session
+                .read_at_least(SessionSeq(0))
+                .unwrap()
+                .artifacts
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn demo_recovery_reports_missing_committed_evidence_without_reupload_or_new_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = crate::config::Settings::default();
+        settings.node.data_dir = Some(dir.path().to_owned());
+        let mut node = EmbeddedNode::open(&settings).unwrap();
+        let report = run(&mut node).unwrap();
+        let manifest = node
+            .root()
+            .join("content")
+            .join("objects")
+            .join(
+                report
+                    .artifact
+                    .domain
+                    .0
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>(),
+            )
+            .join(format!("{}.manifest", report.artifact.root));
+        node.checkpoint().unwrap();
+        drop(node);
+        std::fs::remove_file(&manifest).unwrap();
+        let mut node = EmbeddedNode::open(&settings).unwrap();
+        assert!(
+            matches!(run(&mut node), Err(NodeError::Content(focal_evidence::ContentError::Io(ref error))) if error.kind()==std::io::ErrorKind::NotFound)
+        );
+        assert_eq!(node.session.sequence(), report.sequence);
+        assert_eq!(node.content.staged(), (0, 0));
+        assert!(!manifest.exists());
     }
 }

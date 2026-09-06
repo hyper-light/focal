@@ -1,63 +1,557 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "adapter": {
     "name": "focal-mcp",
     "version": "0.1.0",
-    "recovery_contract_version": 1
+    "recovery_contract_version": 2,
+    "transfer_contract_version": 1,
+    "watch_contract_version": 1,
+    "administration_contract_version": 1
   },
   "resources": [
     {
       "path": "references/workflow-contract.md",
-      "blake3": "0a5ba65cc8decd97058b237dae317765074b5987765c3fe49a540dba3e4f92ee"
+      "blake3": "46b74419895e534d16833c147967a6614d9cf4899ff71fe9d008fea1438f7017"
+    },
+    {
+      "path": "references/admin-workflow.md",
+      "blake3": "5a57272861e188911edf45bb8127d521fb01708c93a7e5852709d631dc69bdd8"
     }
   ],
   "skills": [
     {
       "name": "focal-claims",
-      "version": 1,
+      "version": 7,
       "path": "focal-claims/SKILL.md",
-      "blake3": "e293f8e13c177a17179c1680170c1d9e87422dc4976fbb893926c02da1994cfb",
-      "references": ["references/workflow-contract.md"],
+      "blake3": "f18a3517cdfe50c75bd670d7bf8f070af81043e64d8fce4c49b6027faa6b6cf9",
+      "references": [
+        "references/workflow-contract.md"
+      ],
       "required_operations": [
-        {"name": "claim.cancel", "version": 1},
-        {"name": "claim.get", "version": 1},
-        {"name": "claim.list", "version": 1},
-        {"name": "claim.post", "version": 1},
-        {"name": "claim.progress", "version": 1},
-        {"name": "claim.submit", "version": 1},
-        {"name": "receipt.acquire", "version": 1},
-        {"name": "request.epoch", "version": 1},
-        {"name": "request.status", "version": 1},
-        {"name": "validation.get", "version": 1},
-        {"name": "validation.list", "version": 1}
+        {
+          "name": "claim.cancel",
+          "version": 1
+        },
+        {
+          "name": "claim.get",
+          "version": 1
+        },
+        {
+          "name": "claim.list",
+          "version": 1
+        },
+        {
+          "name": "claim.post",
+          "version": 1
+        },
+        {
+          "name": "claim.progress",
+          "version": 1
+        },
+        {
+          "name": "claim.submit",
+          "version": 1
+        },
+        {
+          "name": "claim.submit_batch",
+          "version": 1
+        },
+        {
+          "name": "claim.supersede",
+          "version": 1
+        },
+        {
+          "name": "claim.wait",
+          "version": 1
+        },
+        {
+          "name": "ledger.summary",
+          "version": 1
+        },
+        {
+          "name": "ledger.traverse",
+          "version": 1
+        },
+        {
+          "name": "monitor.get",
+          "version": 1
+        },
+        {
+          "name": "monitor.register",
+          "version": 1
+        },
+        {
+          "name": "receipt.acquire",
+          "version": 1
+        },
+        {
+          "name": "request.epoch",
+          "version": 1
+        },
+        {
+          "name": "request.status",
+          "version": 1
+        },
+        {
+          "name": "validation.context",
+          "version": 1
+        },
+        {
+          "name": "validation.get",
+          "version": 1
+        },
+        {
+          "name": "validation.list",
+          "version": 1
+        }
       ],
       "required_recovery_tools": [
-        {"name": "request.inspect", "version": 1},
-        {"name": "request.retry", "version": 1}
-      ]
+        {
+          "name": "request.inspect",
+          "version": 2
+        },
+        {
+          "name": "request.retry",
+          "version": 2
+        },
+        {
+          "name": "request.reserve",
+          "version": 2
+        },
+        {
+          "name": "request.pending",
+          "version": 2
+        },
+        {
+          "name": "request.acknowledge",
+          "version": 2
+        },
+        {
+          "name": "request.seal",
+          "version": 2
+        }
+      ],
+      "required_transfer_tools": [],
+      "required_watch_tools": [
+        {
+          "name": "watch.open",
+          "version": 1
+        },
+        {
+          "name": "watch.next",
+          "version": 1
+        },
+        {
+          "name": "watch.acknowledge",
+          "version": 1
+        },
+        {
+          "name": "watch.inspect",
+          "version": 1
+        }
+      ],
+      "required_admin_tools": []
     },
     {
       "name": "focal-evidence",
-      "version": 1,
+      "version": 6,
       "path": "focal-evidence/SKILL.md",
-      "blake3": "707f8c4f1caf4f9928af25bab65240608c2ccdf745777e1f0fc194a4cb2889e4",
-      "references": ["references/workflow-contract.md"],
+      "blake3": "5b83bd19df287a29d355f8863837315e661569a07d2922e8263b897d095dbefc",
+      "references": [
+        "references/workflow-contract.md"
+      ],
       "required_operations": [
-        {"name": "artifact.get", "version": 1},
-        {"name": "artifact.list", "version": 1},
-        {"name": "artifact.submit", "version": 1},
-        {"name": "claim.get", "version": 1},
-        {"name": "evidence.begin", "version": 1},
-        {"name": "receipt.acquire", "version": 1},
-        {"name": "testament.get", "version": 1},
-        {"name": "testament.list", "version": 1},
-        {"name": "testament.submit", "version": 1},
-        {"name": "validation.get", "version": 1},
-        {"name": "validation.list", "version": 1}
+        {
+          "name": "artifact.get",
+          "version": 1
+        },
+        {
+          "name": "artifact.list",
+          "version": 1
+        },
+        {
+          "name": "artifact.register",
+          "version": 1
+        },
+        {
+          "name": "artifact.submit",
+          "version": 1
+        },
+        {
+          "name": "claim.get",
+          "version": 1
+        },
+        {
+          "name": "evidence.begin",
+          "version": 1
+        },
+        {
+          "name": "receipt.acquire",
+          "version": 1
+        },
+        {
+          "name": "testament.get",
+          "version": 1
+        },
+        {
+          "name": "testament.list",
+          "version": 1
+        },
+        {
+          "name": "testament.receive",
+          "version": 1
+        },
+        {
+          "name": "testament.submit",
+          "version": 1
+        },
+        {
+          "name": "validation.begin",
+          "version": 1
+        },
+        {
+          "name": "validation.begin_increment",
+          "version": 1
+        },
+        {
+          "name": "validation.complete",
+          "version": 1
+        },
+        {
+          "name": "validation.context",
+          "version": 1
+        },
+        {
+          "name": "validation.get",
+          "version": 1
+        },
+        {
+          "name": "validation.list",
+          "version": 1
+        },
+        {
+          "name": "validation.submit",
+          "version": 1
+        },
+        {
+          "name": "validator.get",
+          "version": 1
+        },
+        {
+          "name": "validator.list",
+          "version": 1
+        }
       ],
       "required_recovery_tools": [
-        {"name": "request.inspect", "version": 1},
-        {"name": "request.retry", "version": 1}
+        {
+          "name": "request.inspect",
+          "version": 2
+        },
+        {
+          "name": "request.retry",
+          "version": 2
+        },
+        {
+          "name": "request.reserve",
+          "version": 2
+        },
+        {
+          "name": "request.pending",
+          "version": 2
+        },
+        {
+          "name": "request.acknowledge",
+          "version": 2
+        },
+        {
+          "name": "request.seal",
+          "version": 2
+        }
+      ],
+      "required_transfer_tools": [
+        {
+          "name": "artifact.download",
+          "version": 1
+        },
+        {
+          "name": "upload.append",
+          "version": 1
+        },
+        {
+          "name": "upload.begin",
+          "version": 1
+        },
+        {
+          "name": "upload.cancel",
+          "version": 1
+        },
+        {
+          "name": "upload.seal",
+          "version": 1
+        }
+      ],
+      "required_watch_tools": [
+        {
+          "name": "watch.open",
+          "version": 1
+        },
+        {
+          "name": "watch.next",
+          "version": 1
+        },
+        {
+          "name": "watch.acknowledge",
+          "version": 1
+        },
+        {
+          "name": "watch.inspect",
+          "version": 1
+        }
+      ],
+      "required_admin_tools": []
+    },
+    {
+      "name": "focal-validation",
+      "version": 2,
+      "path": "focal-validation/SKILL.md",
+      "blake3": "75748af3608662e09fafee6b957a55c1ae9647b3936188f4b62fe44348c61be1",
+      "references": [
+        "references/workflow-contract.md"
+      ],
+      "required_operations": [
+        {
+          "name": "artifact.get",
+          "version": 1
+        },
+        {
+          "name": "artifact.list",
+          "version": 1
+        },
+        {
+          "name": "artifact.register",
+          "version": 1
+        },
+        {
+          "name": "claim.get",
+          "version": 1
+        },
+        {
+          "name": "testament.receive",
+          "version": 1
+        },
+        {
+          "name": "validation.begin",
+          "version": 1
+        },
+        {
+          "name": "validation.begin_increment",
+          "version": 1
+        },
+        {
+          "name": "validation.complete",
+          "version": 1
+        },
+        {
+          "name": "validation.context",
+          "version": 1
+        },
+        {
+          "name": "validation.get",
+          "version": 1
+        },
+        {
+          "name": "validation.list",
+          "version": 1
+        },
+        {
+          "name": "validation.submit",
+          "version": 1
+        },
+        {
+          "name": "validator.get",
+          "version": 1
+        },
+        {
+          "name": "validator.list",
+          "version": 1
+        }
+      ],
+      "required_recovery_tools": [
+        {
+          "name": "request.inspect",
+          "version": 2
+        },
+        {
+          "name": "request.retry",
+          "version": 2
+        },
+        {
+          "name": "request.reserve",
+          "version": 2
+        },
+        {
+          "name": "request.pending",
+          "version": 2
+        },
+        {
+          "name": "request.acknowledge",
+          "version": 2
+        },
+        {
+          "name": "request.seal",
+          "version": 2
+        }
+      ],
+      "required_transfer_tools": [
+        {
+          "name": "artifact.download",
+          "version": 1
+        }
+      ],
+      "required_watch_tools": [],
+      "required_admin_tools": []
+    },
+    {
+      "name": "focal-cluster",
+      "version": 1,
+      "path": "focal-cluster/SKILL.md",
+      "blake3": "9667396fdb559ac14922cd96108f6c27405ee8f0ba24126afb1c06962c41f535",
+      "references": [
+        "references/admin-workflow.md"
+      ],
+      "required_operations": [],
+      "required_recovery_tools": [],
+      "required_transfer_tools": [],
+      "required_watch_tools": [],
+      "required_admin_tools": [
+        {
+          "name": "cluster.client.invite",
+          "version": 1
+        },
+        {
+          "name": "cluster.credentials.get",
+          "version": 1
+        },
+        {
+          "name": "cluster.credentials.revoke",
+          "version": 1
+        },
+        {
+          "name": "cluster.invitations.get",
+          "version": 1
+        },
+        {
+          "name": "cluster.invitations.list",
+          "version": 1
+        },
+        {
+          "name": "cluster.invitations.revoke",
+          "version": 1
+        },
+        {
+          "name": "cluster.invite",
+          "version": 1
+        },
+        {
+          "name": "cluster.leader.transfer",
+          "version": 1
+        },
+        {
+          "name": "cluster.membership.add_learner",
+          "version": 1
+        },
+        {
+          "name": "cluster.membership.leave_joint",
+          "version": 1
+        },
+        {
+          "name": "cluster.membership.promote",
+          "version": 1
+        },
+        {
+          "name": "cluster.membership.remove",
+          "version": 1
+        },
+        {
+          "name": "cluster.membership.show",
+          "version": 1
+        },
+        {
+          "name": "cluster.node.config",
+          "version": 1
+        },
+        {
+          "name": "cluster.node.health",
+          "version": 1
+        },
+        {
+          "name": "cluster.node.identity",
+          "version": 1
+        },
+        {
+          "name": "cluster.nodes.list",
+          "version": 1
+        },
+        {
+          "name": "cluster.replicas.add_learner",
+          "version": 1
+        },
+        {
+          "name": "cluster.replicas.diagnostics",
+          "version": 1
+        },
+        {
+          "name": "cluster.replicas.leave_joint",
+          "version": 1
+        },
+        {
+          "name": "cluster.replicas.list",
+          "version": 1
+        },
+        {
+          "name": "cluster.replicas.promote",
+          "version": 1
+        },
+        {
+          "name": "cluster.replicas.remove",
+          "version": 1
+        },
+        {
+          "name": "cluster.replicas.request.inspect",
+          "version": 1
+        },
+        {
+          "name": "cluster.replicas.request.reconcile",
+          "version": 1
+        },
+        {
+          "name": "cluster.replicas.request.retry",
+          "version": 1
+        },
+        {
+          "name": "cluster.replicas.show",
+          "version": 1
+        },
+        {
+          "name": "cluster.replicas.transfer",
+          "version": 1
+        },
+        {
+          "name": "cluster.request.inspect",
+          "version": 1
+        },
+        {
+          "name": "cluster.request.reconcile",
+          "version": 1
+        },
+        {
+          "name": "cluster.request.retry",
+          "version": 1
+        },
+        {
+          "name": "cluster.status",
+          "version": 1
+        }
       ]
     }
   ]

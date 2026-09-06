@@ -1,5 +1,13 @@
 # focal-runtime
 
+This crate is an **optional participant-owned Rust embedding helper**. Focal is a
+peer-to-peer claims ledger, not an agent launcher or job system. Participants
+invoke their own tools/skills and submit evidence/verdicts; evaluation by another
+agent uses ordinary claims and testaments. The pool and host integration below
+are existing library capabilities and test fixtures, not a required Focal daemon
+scheduler, worker registry or model-provider service. Using this helper does not
+grant authority to author corrective or follow-up claims.
+
 A bounded worker service for committed validation obligations and claim/monitor
 timers. `Runtime::drive` runs on a local or replicated session owner; a fixed worker pool does
 evidence IO and pinned validator execution on separate threads. The core reducer

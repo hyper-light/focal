@@ -235,8 +235,11 @@ async fn serve_authenticated_connection_inner<H: RequestHandler + Clone>(
             .map_err(|_| WireError::Connection)?;
         let hello: Hello = read_frame(&mut recv, FrameKind::Hello, 4096).await?;
         require_end(&mut recv).await?;
-        let negotiated = match limits.negotiate_managed(&hello, handler.supports_managed_requests())
-        {
+        let negotiated = match limits.negotiate_profiles(
+            &hello,
+            handler.supports_managed_requests(),
+            handler.supports_participant_requests(),
+        ) {
             Ok(value) => value,
             Err(error) => {
                 write_frame(
@@ -398,7 +401,11 @@ impl QuicConnector {
                 .await
                 .map_err(|_| WireError::Connection)?;
             let hello = Hello {
-                versions: vec![MANAGED_PROTOCOL_VERSION, PROTOCOL_VERSION],
+                versions: vec![
+                    PEER_PROTOCOL_VERSION,
+                    MANAGED_PROTOCOL_VERSION,
+                    PROTOCOL_VERSION,
+                ],
                 max_frame_bytes: self.limits.max_frame_bytes,
                 max_items: self.limits.max_items,
             };
@@ -416,7 +423,7 @@ impl QuicConnector {
             .map_err(|_| WireError::Timeout)??;
         if !matches!(
             negotiated.protocol,
-            PROTOCOL_VERSION | MANAGED_PROTOCOL_VERSION
+            PROTOCOL_VERSION | MANAGED_PROTOCOL_VERSION | PEER_PROTOCOL_VERSION
         ) || negotiated.max_frame_bytes > self.limits.max_frame_bytes
             || negotiated.max_items > self.limits.max_items
         {

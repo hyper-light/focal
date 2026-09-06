@@ -1,0 +1,565 @@
+use focal_core::{Core, EpochWindow, State};
+use focal_model::*;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
+
+fn ledger() -> LedgerId {
+    LedgerId {
+        tenant: TenantId::from_u128(0x01020304050607080910111213141516),
+        session: SessionId::from_u128(0xf1e2d3c4b5a697887766554433221100),
+    }
+}
+fn hash(seed: u8) -> ContentHash {
+    ContentHash(std::array::from_fn(|i| seed.wrapping_add(i as u8)))
+}
+fn actor(seed: u128) -> ParticipantId {
+    ParticipantId::from_u128(0xa0000000000000000000000000000000 | seed)
+}
+fn fence(seed: u128) -> ReceiptFence {
+    ReceiptFence {
+        receipt: ReceiptId::from_u128(0xb0000000000000000000000000000000 | seed),
+        epoch: if seed % 2 == 0 { 128 } else { u64::MAX },
+    }
+}
+fn deadline(seed: u128) -> Deadline {
+    Deadline {
+        timer: TimerId::from_u128(seed),
+        generation: if seed % 2 == 0 { 0 } else { u64::MAX },
+        at: 1_000_000 + seed as u64,
+    }
+}
+fn object(kind: ObjectKind, n: u128) -> ObjectRef {
+    ObjectRef {
+        ledger: ledger(),
+        kind,
+        id: ObjectId::from_u128(n),
+    }
+}
+fn handler(agentic: bool) -> HandlerRef {
+    HandlerRef {
+        id: ValidatorId::from_u128(if agentic { 9002 } else { 9001 }),
+        version: hash(if agentic { 42 } else { 41 }),
+        agentic,
+    }
+}
+fn artifact_ref(seed: u128) -> ArtifactRef {
+    ArtifactRef {
+        id: ArtifactId::from_u128(3000 + seed),
+        hash: hash(seed as u8),
+    }
+}
+fn save<T: serde::Serialize + ?Sized>(path: &Path, name: &str, value: &T) {
+    std::fs::write(path.join(name), postcard::to_stdvec(value).unwrap()).unwrap();
+}
+
+fn main() {
+    // Deliberately separate temporary output: never generate into the checked-in corpus.
+    let out = Path::new("/private/tmp/focal-v1-nested-original");
+    std::fs::create_dir_all(out).unwrap();
+    let mut state = State {
+        ledger: ledger(),
+        sequence: SessionSeq(1_000_000),
+        claims: BTreeMap::new(),
+        validations: BTreeMap::new(),
+        artifacts: BTreeMap::new(),
+        testaments: BTreeMap::new(),
+        evidence_sets: BTreeMap::new(),
+        runs: BTreeMap::new(),
+        monitors: BTreeMap::new(),
+        identities: BTreeMap::new(),
+        epochs: BTreeMap::new(),
+        receipts: BTreeMap::new(),
+    };
+
+    for (i, status) in ClaimStatus::ALL.iter().copied().enumerate() {
+        let n = i as u128;
+        let id = ClaimId::from_u128(1000 + n);
+        let mut relations = BTreeSet::new();
+        for (j, kind) in RelationKind::ALL.iter().copied().enumerate() {
+            let target = match j % 4 {
+                0 => RelationTarget::Participant(actor(j as u128 + 1)),
+                1 => RelationTarget::Object(object(
+                    ObjectKind::ALL[j % ObjectKind::ALL.len()],
+                    1000 + j as u128,
+                )),
+                2 => RelationTarget::Action(ActionType::ALL[j % ActionType::ALL.len()]),
+                _ => RelationTarget::Root(RootCommandId::from_u128(5000 + j as u128)),
+            };
+            relations.insert(Relation { kind, target });
+        }
+        // Every ActionType is present even if future ALL ordering changes.
+        for action in ActionType::ALL {
+            relations.insert(Relation {
+                kind: RelationKind::ClaimAction,
+                target: RelationTarget::Action(*action),
+            });
+        }
+        let content = ClaimContent {
+            ledger: ledger(),
+            schema: 1,
+            occurrence: OccurrenceId::from_u128(6000 + n),
+            description: format!("historical claim {i}: λ\nline two\0"),
+            relations,
+            scopes: ScopeKind::ALL
+                .iter()
+                .copied()
+                .map(|kind| Scope {
+                    kind,
+                    key: format!("scope-{}-é", kind.code()),
+                })
+                .collect(),
+            requirements: if i % 2 == 0 {
+                vec![]
+            } else {
+                vec![
+                    RequirementRef {
+                        id: ValidationId::from_u128(2000 + n),
+                        specification: hash(i as u8),
+                    },
+                    RequirementRef {
+                        id: ValidationId::from_u128(2001 + n),
+                        specification: hash(i as u8 + 1),
+                    },
+                ]
+            },
+            deadline: if i % 2 == 0 { None } else { Some(deadline(n)) },
+        };
+        let lifecycle = ClaimLifecycle {
+            status,
+            revision: ObjectRevision(if i == 0 {
+                0
+            } else if i == 19 {
+                u64::MAX
+            } else {
+                128 + i as u64
+            }),
+            created: SessionSeq(10 + i as u64),
+            history: if i == 0 {
+                vec![]
+            } else {
+                ClaimStatus::ALL
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(j, status)| StatusFact {
+                        status,
+                        sequence: SessionSeq(j as u64),
+                    })
+                    .collect()
+            },
+            receipt: if i % 2 == 0 {
+                None
+            } else {
+                Some(Receipt {
+                    fence: fence(n),
+                    holder: actor(n + 1),
+                    acquired: SessionSeq(128 + i as u64),
+                })
+            },
+            evidence_set: if i % 3 == 0 {
+                None
+            } else {
+                Some(EvidenceSetId::from_u128(7000 + n))
+            },
+            testament: if i % 3 == 1 {
+                None
+            } else {
+                Some(TestamentId::from_u128(4000 + n))
+            },
+            local_complete: i % 2 == 0,
+            released: i % 3 == 0,
+            terminal_witness: if i % 2 == 0 {
+                None
+            } else {
+                Some(ClaimId::from_u128(1000))
+            },
+        };
+        let digest = content.content_hash().unwrap();
+        state
+            .identities
+            .insert((ObjectKind::Claim, digest), ObjectId(id.0));
+        state
+            .claims
+            .insert(id, StoredObject::new(content, digest, lifecycle));
+    }
+
+    let mut counter = 0u128;
+    for kind in ValidationKind::ALL {
+        for phase in ValidationPhase::ALL {
+            for mode in ValidationMode::ALL {
+                let n = counter;
+                counter += 1;
+                let id = ValidationId::from_u128(2000 + n);
+                let content = ValidationContent {
+                    ledger: ledger(),
+                    schema: 1,
+                    claim: ClaimId::from_u128(1000 + n % 20),
+                    kind: *kind,
+                    phase: *phase,
+                    mode: *mode,
+                    description: format!("check {n}"),
+                    quality_bar: if n % 3 == 0 {
+                        None
+                    } else {
+                        Some("historical quality λ".into())
+                    },
+                    evaluator: actor(3),
+                    handlers: match n % 3 {
+                        0 => vec![],
+                        1 => vec![handler(false)],
+                        _ => vec![handler(false), handler(true)],
+                    },
+                    evidence_schemas: if n % 2 == 0 {
+                        BTreeSet::new()
+                    } else {
+                        BTreeSet::from([hash(7), hash(255)])
+                    },
+                    contributed_by: if n % 2 == 0 {
+                        BTreeSet::new()
+                    } else {
+                        BTreeSet::from([actor(1), actor(u128::MAX)])
+                    },
+                    policy_revision: if n == 0 { 0 } else { u64::MAX - n as u64 },
+                };
+                let digest = content.content_hash().unwrap();
+                state
+                    .identities
+                    .insert((ObjectKind::Validation, digest), ObjectId(id.0));
+                state.validations.insert(
+                    id,
+                    StoredObject::new(
+                        content,
+                        digest,
+                        ValidationLifecycle {
+                            created: SessionSeq(50 + n as u64),
+                            latest_epoch: if n % 2 == 0 { 0 } else { u64::MAX },
+                        },
+                    ),
+                );
+            }
+        }
+    }
+
+    for n in 0..5u128 {
+        let id = ArtifactId::from_u128(3000 + n);
+        let payload = match n {
+            0 => ArtifactPayload::Inline(vec![]),
+            1 => ArtifactPayload::Inline((0..4096).map(|i| (i % 256) as u8).collect()),
+            _ => ArtifactPayload::Content(ContentRef {
+                domain: ContentDomainId::from_u128(8888 + n),
+                root: hash(n as u8),
+                length: if n == 4 { u64::MAX } else { 16384 + n as u64 },
+                class: ContentClass::ALL[(n - 2) as usize],
+            }),
+        };
+        let content = ArtifactContent {
+            ledger: ledger(),
+            schema: 1,
+            kind: format!("artifact-{n}"),
+            schema_hash: hash(73),
+            metadata: if n % 2 == 0 {
+                vec![]
+            } else {
+                vec![0, 1, 127, 128, 255]
+            },
+            payload,
+            producer: actor(n + 1),
+            receipt: if n % 2 == 0 { None } else { Some(fence(n)) },
+            inputs: if n == 0 {
+                BTreeSet::new()
+            } else {
+                ObjectKind::ALL
+                    .iter()
+                    .copied()
+                    .map(|kind| object(kind, 1000 + n))
+                    .collect()
+            },
+            visibility: if n == 0 {
+                BTreeSet::new()
+            } else {
+                BTreeSet::from(["auditors".into(), "peer:λ".into()])
+            },
+        };
+        // One deliberately non-recomputed stored hash catches illicit decode-time rehashing.
+        let digest = if n == 4 {
+            hash(199)
+        } else {
+            content.content_hash().unwrap()
+        };
+        state
+            .identities
+            .insert((ObjectKind::Artifact, digest), ObjectId(id.0));
+        state.artifacts.insert(
+            id,
+            StoredObject::new(
+                content,
+                digest,
+                ArtifactLifecycle {
+                    created: SessionSeq(200 + n as u64),
+                    custody_revision: if n == 0 { 0 } else { u64::MAX - n as u64 },
+                },
+            ),
+        );
+    }
+
+    counter = 0;
+    for confidence in Confidence::ALL {
+        for outcome in OutcomeKind::ALL {
+            let n = counter;
+            counter += 1;
+            let id = TestamentId::from_u128(4000 + n);
+            let content = TestamentContent {
+                ledger: ledger(),
+                schema: 1,
+                claim: ClaimId::from_u128(1000 + n % 20),
+                receipt: fence(n),
+                evidence_set: EvidenceSetId::from_u128(7000 + n),
+                artifacts: if n % 2 == 0 {
+                    vec![]
+                } else {
+                    vec![artifact_ref(3), artifact_ref(1)]
+                },
+                summary: format!("testament {n}: réponse"),
+                confidence: *confidence,
+                outcome: *outcome,
+            };
+            let digest = content.content_hash().unwrap();
+            state
+                .identities
+                .insert((ObjectKind::Testament, digest), ObjectId(id.0));
+            state.testaments.insert(
+                id,
+                StoredObject::new(
+                    content,
+                    digest,
+                    TestamentLifecycle {
+                        created: SessionSeq(300 + n as u64),
+                        acknowledged: if n % 2 == 0 {
+                            None
+                        } else {
+                            Some(SessionSeq(400 + n as u64))
+                        },
+                    },
+                ),
+            );
+        }
+    }
+
+    for n in 0..4u128 {
+        let id = EvidenceSetId::from_u128(7000 + n);
+        state.evidence_sets.insert(
+            id,
+            EvidenceSet {
+                id,
+                claim: ClaimId::from_u128(1000 + n),
+                receipt: fence(n),
+                artifacts: if n % 2 == 0 {
+                    vec![]
+                } else {
+                    vec![artifact_ref(3), artifact_ref(1)]
+                },
+                closed: n >= 2,
+            },
+        );
+    }
+    for phase in ValidationPhase::ALL {
+        for n in 0..5u128 {
+            let id = ValidationRunId {
+                validation: ValidationId::from_u128(2000 + n),
+                target_hash: hash(n as u8 + 90),
+                phase: *phase,
+                epoch: if n == 0 { 0 } else { u64::MAX - n as u64 },
+            };
+            let attempts = if n == 0 {
+                vec![]
+            } else {
+                VerdictValue::ALL
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(j, value)| VerdictRecord {
+                        run: id,
+                        evaluator: actor(3),
+                        handler: handler(j % 2 != 0),
+                        attempt: if j == 3 { u32::MAX } else { j as u32 },
+                        manifest: hash(50 + j as u8),
+                        value,
+                        evidence: if j % 2 == 0 {
+                            vec![]
+                        } else {
+                            vec![artifact_ref(3), artifact_ref(1)]
+                        },
+                    })
+                    .collect()
+            };
+            state.runs.insert(
+                id,
+                ValidationRun {
+                    id,
+                    claim: ClaimId::from_u128(1000 + n),
+                    evaluator: actor(3),
+                    manifest: hash(150),
+                    handler_index: if n == 0 { 0 } else { u32::MAX },
+                    quality_phase: n % 2 != 0,
+                    attempts,
+                    final_verdict: if n == 0 {
+                        None
+                    } else {
+                        Some(VerdictValue::ALL[(n - 1) as usize])
+                    },
+                },
+            );
+        }
+    }
+    for n in 0..3u128 {
+        let id = MonitorId::from_u128(8000 + n);
+        state.monitors.insert(
+            id,
+            Monitor {
+                id,
+                owner: ClaimId::from_u128(1000 + n),
+                roots: if n == 0 {
+                    BTreeSet::new()
+                } else {
+                    BTreeSet::from([
+                        WaitPredicate::Satisfied(ClaimId::from_u128(1000)),
+                        WaitPredicate::Terminal(ClaimId::from_u128(1001)),
+                        WaitPredicate::Released(ClaimId::from_u128(1002)),
+                    ])
+                },
+                deadline: deadline(n),
+                registered: SessionSeq(500 + n as u64),
+                released: if n == 0 {
+                    None
+                } else {
+                    Some(SessionSeq(600 + n as u64))
+                },
+            },
+        );
+    }
+    state.epochs.insert(
+        actor(1),
+        EpochWindow {
+            minimum: RequestEpoch(0),
+            admitted: BTreeSet::new(),
+        },
+    );
+    state.epochs.insert(
+        actor(2),
+        EpochWindow {
+            minimum: RequestEpoch(128),
+            admitted: BTreeSet::from([
+                RequestEpoch(0),
+                RequestEpoch(127),
+                RequestEpoch(128),
+                RequestEpoch(u64::MAX),
+            ]),
+        },
+    );
+    state.epochs.insert(
+        actor(3),
+        EpochWindow {
+            minimum: RequestEpoch(u64::MAX),
+            admitted: BTreeSet::from([RequestEpoch(u64::MAX)]),
+        },
+    );
+    let results = vec![
+        CommandResult::EpochAdmitted(RequestEpoch(u64::MAX)),
+        CommandResult::EpochFloorAdvanced(RequestEpoch(128)),
+        CommandResult::Generated(vec![ClaimId::from_u128(1001), ClaimId::from_u128(1000)]),
+        CommandResult::Existing(vec![ClaimId::from_u128(1000), ClaimId::from_u128(1001)]),
+        CommandResult::Claim {
+            claim: ClaimId::from_u128(1000),
+            status: ClaimStatus::Deadlocked,
+        },
+        CommandResult::Receipt {
+            claim: ClaimId::from_u128(1001),
+            fence: fence(1),
+        },
+        CommandResult::EvidenceSet(EvidenceSetId::from_u128(7000)),
+        CommandResult::Artifact(artifact_ref(1)),
+        CommandResult::Testament(TestamentId::from_u128(4000)),
+        CommandResult::Validation(ValidationRunId {
+            validation: ValidationId::from_u128(2000),
+            target_hash: hash(90),
+            phase: ValidationPhase::Admission,
+            epoch: 0,
+        }),
+        CommandResult::Monitor(MonitorId::from_u128(8000)),
+        CommandResult::Noop,
+        CommandResult::Generated(vec![]),
+        CommandResult::Existing(vec![]),
+    ];
+    for (i, outcome) in results.iter().cloned().enumerate() {
+        let key = RequestKey {
+            principal: actor(1 + (i % 3) as u128),
+            epoch: RequestEpoch(if i == 0 { 0 } else { u64::MAX }),
+            id: RequestId::from_u128(10000 + i as u128),
+        };
+        state.receipts.insert(
+            key,
+            MutationReceipt {
+                ledger: ledger(),
+                key,
+                sequence: SessionSeq(700 + i as u64),
+                command_hash: hash(i as u8),
+                outcome,
+            },
+        );
+    }
+    let limits = Limits {
+        max_objects: 123456,
+        max_command_bytes: 1048577,
+        max_text_bytes: 32769,
+        max_relations: 257,
+        max_requirements: 65,
+        max_batch: 129,
+        max_artifacts_per_set: 1025,
+        max_inline_bytes: 16385,
+        max_requests: 100001,
+        max_monitors: 10001,
+        max_graph_visits: 1000001,
+    };
+
+    // Postcard serializes a two-field struct exactly as this fixed tuple. This
+    // bypasses any newly introduced Core encoder and is verified against it.
+    let payload = postcard::to_stdvec(&(1u16, (&state, &limits))).unwrap();
+    let mut checkpoint = b"FOCALCP1".to_vec();
+    checkpoint.extend_from_slice(blake3::hash(&payload).as_bytes());
+    checkpoint.extend_from_slice(&payload);
+    let decoded = Core::decode_checkpoint(&checkpoint).unwrap();
+    assert_eq!(decoded.snapshot(), &state);
+    assert_eq!(decoded.limits(), &limits);
+    assert_eq!(decoded.encode_checkpoint().unwrap(), checkpoint);
+    std::fs::write(out.join("broad.cp1"), checkpoint).unwrap();
+    save(out, "state.bin", &state);
+    save(out, "claims.rows", &state.claims);
+    save(out, "validations.rows", &state.validations);
+    save(out, "artifacts.rows", &state.artifacts);
+    save(out, "testaments.rows", &state.testaments);
+    save(out, "evidence-sets.rows", &state.evidence_sets);
+    save(out, "runs.rows", &state.runs);
+    save(out, "monitors.rows", &state.monitors);
+    save(out, "identities.rows", &state.identities);
+    save(out, "epochs.rows", &state.epochs);
+    save(out, "receipts.rows", &state.receipts);
+    save(out, "command-results.rows", &results);
+    save(out, "limits.bin", &limits);
+    let empty = Core::new(ledger(), Limits::default());
+    std::fs::write(out.join("empty.cp1"), empty.encode_checkpoint().unwrap()).unwrap();
+    println!(
+        "Captured broad original checkpoint: {} claims, {} validations, {} artifacts, {} testaments, {} evidence sets, {} runs, {} monitors, {} identities, {} epoch windows, {} receipts",
+        state.claims.len(),
+        state.validations.len(),
+        state.artifacts.len(),
+        state.testaments.len(),
+        state.evidence_sets.len(),
+        state.runs.len(),
+        state.monitors.len(),
+        state.identities.len(),
+        state.epochs.len(),
+        state.receipts.len()
+    );
+}

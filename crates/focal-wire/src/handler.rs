@@ -55,6 +55,10 @@ pub trait RequestHandler: Send + Sync + 'static {
     fn supports_managed_requests(&self) -> bool {
         false
     }
+    /// The handler performs command-specific participant standing checks.
+    fn supports_participant_requests(&self) -> bool {
+        false
+    }
     fn handle(&self, request: VerifiedRequest) -> HandlerFuture<'_>;
     fn handle_accounted(&self, request: VerifiedRequest) -> OwnedHandlerFuture<'_> {
         Box::pin(async move { OwnedResponse::new(self.handle(request).await) })
@@ -73,6 +77,9 @@ where
 // Compatibility for callers that intentionally share a dynamically dispatched
 // handler. Concrete actor handles pass directly to servers without allocation.
 impl RequestHandler for std::sync::Arc<dyn RequestHandler> {
+    fn supports_participant_requests(&self) -> bool {
+        self.as_ref().supports_participant_requests()
+    }
     fn supports_managed_requests(&self) -> bool {
         self.as_ref().supports_managed_requests()
     }
@@ -114,6 +121,13 @@ pub async fn dispatch_accounted(
         Ok(value) => value,
         Err(error) => return OwnedResponse::new(request.reply(Response::Error(error))),
     };
+    if request.protocol == PEER_PROTOCOL_VERSION
+        && (!handler.supports_managed_requests() || !handler.supports_participant_requests())
+    {
+        return OwnedResponse::new(
+            request.reply(Response::Error(AccessError::UnsupportedProtocol)),
+        );
+    }
     let response = match tokio::time::timeout(
         limits.request_timeout,
         handler.handle_accounted(verified),
@@ -244,6 +258,24 @@ pub fn validate_response(
                 return Err(WireError::InvalidFrame);
             }
         }
+        Response::Submitted(MutationReply::Domain(
+            DomainOutcome::Refuse { .. } | DomainOutcome::Inform { .. },
+        )) if matches!(
+            request.operation,
+            Operation::Managed {
+                operation: ManagedOperation::Submit { .. },
+                ..
+            }
+        ) =>
+        {
+            let (key, family, _) = crate::managed::managed_request_identity(request)?;
+            if family != ManagedRequestFamily::Domain
+                || response.route_epoch != request.route_epoch
+                || principal.is_some_and(|principal| principal != key.stream.principal)
+            {
+                return Err(WireError::InvalidFrame);
+            }
+        }
         Response::Submitted(reply) => {
             if !matches!(
                 request.operation,
@@ -273,9 +305,57 @@ pub fn validate_response(
                 _ => {}
             }
         }
-        Response::Listed(page) => {
-            let Operation::List(list) = &request.operation else {
+        Response::Monitor(value) => crate::monitor::validate(request, response, value, limits)?,
+        Response::Summary(value) => crate::summary::validate(request, response, value)?,
+        Response::Traversed(page) => {
+            let Operation::Traverse(query) = &request.operation else {
                 return Err(WireError::InvalidFrame);
+            };
+            if page.token.ledger != request.ledger
+                || page.token.route_epoch != response.route_epoch
+                || page.objects.len() > query.max_items.min(limits.max_items) as usize
+                || page.visited > query.max_visits
+                || page.total_visits > query.max_edges
+                || page.visited > page.total_visits
+                || page.next.is_some() != (page.stop == TraversalStop::PageLimit)
+                || page.next.as_ref().is_some_and(|c| {
+                    c.bytes.is_empty() || c.bytes.len() > MAX_TRAVERSAL_CURSOR_BYTES
+                })
+                || page
+                    .objects
+                    .iter()
+                    .any(|o| matches!(o, ReadObject::ValidationResults { .. }))
+            {
+                return Err(WireError::InvalidFrame);
+            }
+            if postcard::experimental::serialized_size(page).map_err(|_| WireError::InvalidFrame)?
+                > query.max_bytes as usize
+            {
+                return Err(WireError::InvalidFrame);
+            }
+            validate_objects(&page.objects, request.ledger)?;
+        }
+        Response::Listed(page) | Response::Validators(page) => {
+            let list = match (&request.operation, &response.result) {
+                (Operation::List(list), Response::Listed(_)) => list,
+                (Operation::Select(query), Response::Listed(_)) => {
+                    if page.token.route_epoch != request.route_epoch
+                        || page
+                            .objects
+                            .iter()
+                            .any(|object| !query.matches_at(object, page.token.sequence))
+                    {
+                        return Err(WireError::InvalidFrame);
+                    }
+                    &query.query
+                }
+                (Operation::Validators(query), Response::Validators(_)) => {
+                    if page.objects.iter().any(|object| !matches!(object, ReadObject::Validation { value, .. } if query.matches(value.content()))) {
+                        return Err(WireError::InvalidFrame);
+                    }
+                    &query.query
+                }
+                _ => return Err(WireError::InvalidFrame),
             };
             if page.token.ledger != request.ledger
                 || page.token.route_epoch != response.route_epoch
@@ -314,6 +394,19 @@ pub fn validate_response(
                 matches!(read.query, ReadQuery::ValidationResults { .. }),
             )?;
             match &read.query {
+                ReadQuery::SeedScan {
+                    after,
+                    claims,
+                    max_bytes,
+                } => {
+                    if postcard::experimental::serialized_size(page)
+                        .map_err(|_| WireError::InvalidFrame)?
+                        > *max_bytes as usize
+                    {
+                        return Err(WireError::InvalidFrame);
+                    }
+                    validate_seed_selection(page, *after, claims)?;
+                }
                 ReadQuery::Objects(references) => {
                     if references.len() > read.max_items.min(limits.max_items) as usize {
                         return Err(WireError::InvalidFrame);
@@ -660,6 +753,44 @@ fn validate_objects(objects: &[ReadObject], ledger: LedgerId) -> Result<(), Wire
         if object_ledger != ledger {
             return Err(WireError::InvalidFrame);
         }
+    }
+    Ok(())
+}
+
+fn validate_seed_selection(
+    page: &ReadPage,
+    after: Option<ObjectKey>,
+    claims: &[ClaimId],
+) -> Result<(), WireError> {
+    let mut previous = after;
+    for object in &page.objects {
+        let (kind, id, claim) = match object {
+            ReadObject::Claim { id, .. } => (ObjectKind::Claim, id.0, Some(*id)),
+            ReadObject::Testament { id, value } => {
+                (ObjectKind::Testament, id.0, Some(value.content().claim))
+            }
+            ReadObject::Validation { id, value } => {
+                (ObjectKind::Validation, id.0, Some(value.content().claim))
+            }
+            ReadObject::Artifact { id, .. } => (ObjectKind::Artifact, id.0, None),
+            ReadObject::ValidationResults { .. } => return Err(WireError::InvalidFrame),
+        };
+        let key = ObjectKey {
+            kind,
+            id: ObjectId(id),
+        };
+        if previous.is_some_and(|previous| previous >= key)
+            || (!claims.is_empty()
+                && claim.is_some_and(|claim| claims.binary_search(&claim).is_err()))
+        {
+            return Err(WireError::InvalidFrame);
+        }
+        previous = Some(key);
+    }
+    if page.next.is_some_and(|next| {
+        after.is_some_and(|after| next <= after) || previous.is_some_and(|previous| next < previous)
+    }) {
+        return Err(WireError::InvalidFrame);
     }
     Ok(())
 }

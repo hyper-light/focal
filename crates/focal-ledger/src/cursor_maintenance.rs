@@ -114,8 +114,7 @@ impl Session {
             BudgetLane::Completion,
             reference_charge(&envelope)?,
         )?;
-        let mut data = CURSOR_MAINTENANCE_MAGIC.to_vec();
-        data.extend(postcard::to_stdvec(&envelope)?);
+        let data = durable_session_v1::encode(CURSOR_MAINTENANCE_MAGIC, &envelope, usize::MAX)?;
         let digest = ContentHash(*blake3::hash(&data).as_bytes());
         let candidate = self.prepare_maintenance(&envelope, digest)?;
         let target = CursorMaintenance {
@@ -177,8 +176,10 @@ impl Session {
                     .and_then(|n| n.checked_add(4096))
                     .ok_or(LedgerError::Capacity)?,
             )?;
-            let envelope: MaintenanceEnvelope =
-                postcard::from_bytes(data.strip_prefix(CURSOR_MAINTENANCE_MAGIC).ok_or(LedgerError::Corrupt)?)?;
+            // CM1 retains its original tolerant body-suffix rule.
+            let (envelope, _): (MaintenanceEnvelope, _) = durable_session_v1::take(
+                data.strip_prefix(CURSOR_MAINTENANCE_MAGIC).ok_or(LedgerError::Corrupt)?,
+            )?;
             self.prepare_maintenance(&envelope, digest)?
         };
         self.cursors.publish(candidate.prepared)?;

@@ -1,0 +1,27 @@
+{
+  "captured_before_codec_change": true,
+  "date": "2026-09-06",
+  "generator_source_sha256": "b43400869042864113c53440e19e10177fbcd0569d0cf6ac759da954acb973e4",
+  "generator_executable_sha256": "2c7a2d6cd22b7547764850b10c168c73a56e4920a11fa70067cd76a9758a1df6",
+  "rlibs_used": [
+    "libfocal_core-e95784d63892ceeb.rlib",
+    "libfocal_model-851348f3e41fe022.rlib",
+    "libpostcard-355a74c06a2f301c.rlib"
+  ],
+  "scope": "Original Core V1 encode/apply; no Session registry receipt or successor semantics claimed.",
+  "generator_source_path": "generator.rs.txt",
+  "original_linked_writer": {
+    "sha256": "2c7a2d6cd22b7547764850b10c168c73a56e4920a11fa70067cd76a9758a1df6",
+    "identity": "SHA-256 of the exact standalone capture executable, statically linked to the original compiled Core/model writer before the codec edits. The executable was run once to produce these fixtures and is not checked in.",
+    "compile_command": "rustc --edition=2024 /private/tmp/focal-v1-fixtures.rs -L dependency=/Users/adalundhe/Projects/focal/target/debug/deps -o /private/tmp/focal-v1-fixtures --extern focal_core=target/debug/deps/libfocal_core-e95784d63892ceeb.rlib --extern focal_model=target/debug/deps/libfocal_model-851348f3e41fe022.rlib --extern postcard=target/debug/deps/libpostcard-355a74c06a2f301c.rlib",
+    "rlib_names_are_immutable_identities": false
+  },
+  "source_reconstruction": {
+    "git_base": "31198c225b5ab6fb7c0414fe423d069701b9c9a2",
+    "patch_path": "writer-source.patch",
+    "patch_sha256": "2e1ec72515dd3f72fd32cd6f605ed28f8936fe37ab384e713b8bb9c383219f01",
+    "manifest_path": "writer-source-manifest.json",
+    "manifest_sha256": "baf5bfd0a15e2dc026827690872cda370497bca9ccf30e82641835d37f74e6d2",
+    "limitation": "Original rlib contents were not independently hashed at capture and mutable target paths may have been overwritten. The linked executable digest is the immutable original build identity; source reconstruction and byte fixtures are retained for independent review, without promising byte-identical compiler output."
+  }
+}

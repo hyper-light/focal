@@ -1,0 +1,1423 @@
+{
+  "time": "2026-09-06T16:13:43.547736+00:00",
+  "command": [
+    "rustc",
+    "--edition=2024",
+    "/private/tmp/focal-decoder-refusal-hvuffg_d/helper.rs",
+    "-L",
+    "dependency=/Users/adalundhe/Projects/focal/target/debug/deps",
+    "--extern",
+    "focal_consensus=/Users/adalundhe/Projects/focal/target/debug/deps/libfocal_consensus-aa642e1728c6bff2.rlib",
+    "--extern",
+    "focal_ledger=/Users/adalundhe/Projects/focal/target/debug/deps/libfocal_ledger-96723a7bb9a9995a.rlib",
+    "--extern",
+    "focal_log=/Users/adalundhe/Projects/focal/target/debug/deps/libfocal_log-c2ff0f57cc02d794.rlib",
+    "--extern",
+    "focal_node=/Users/adalundhe/Projects/focal/target/debug/libfocal_node.rlib",
+    "-L",
+    "native=/Users/adalundhe/Projects/focal/target/debug/build/blake3-41ea7326ff6bbc81/out",
+    "-L",
+    "native=/Users/adalundhe/Projects/focal/target/debug/build/ring-85127937c3e32863/out",
+    "-o",
+    "/private/tmp/focal-decoder-refusal-hvuffg_d/helper"
+  ],
+  "returncode": 0,
+  "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)\nbinary: rustc\ncommit-hash: e408947bfd200af42db322daf0fadfe7e26d3bd1\ncommit-date: 2026-03-25\nhost: aarch64-apple-darwin\nrelease: 1.94.1\nLLVM version: 21.1.8\n",
+  "source_sha256": "5b1496a8de91f3b3230a35669e942eb616d21b31e5fe7460ef0a7d96beb51d6e",
+  "rlibs": [
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libunicode_ident-06aa080a31ee3bf4.rlib",
+      "bytes": 51392,
+      "sha256": "3cb9f19eaa5dd5ebe032680a8748f4c862d938ebfd8e025c456034a05437ab87",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#unicode-ident@1.0.24",
+      "target": "unicode_ident",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libcfg_if-99f5ae0b2fd642fc.rlib",
+      "bytes": 6432,
+      "sha256": "a27c7326997460fde3912b173ebdf981c4388387a1aaea16683c9224490fc5a0",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#cfg-if@1.0.4",
+      "target": "cfg_if",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libfind_msvc_tools-f7186398a24fdfb9.rlib",
+      "bytes": 208344,
+      "sha256": "1003ac2a388f79969adc07d75165477acd60e404d2bbb1575b07d2b7bcd64831",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#find-msvc-tools@0.1.12",
+      "target": "find_msvc_tools",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libshlex-97203136223ea9ea.rlib",
+      "bytes": 105456,
+      "sha256": "e44f884798288d1b848cfe4f9255e65704bff9a1b87f2b70d7de4f1f4d3e1053",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#shlex@2.0.1",
+      "target": "shlex",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libmemchr-2784fa790b9ce392.rlib",
+      "bytes": 1030016,
+      "sha256": "045ac6633ba7ff34196e11ea28b168b55e36636dbde22164bec6519b4b3dad65",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#memchr@2.8.3",
+      "target": "memchr",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libsemver-5e876ab2c375619b.rlib",
+      "bytes": 320960,
+      "sha256": "053e95970858b93eac663d705e83ca2b9b68f0c04b2f9d720ce7cbecd6b4bc9b",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#semver@1.0.28",
+      "target": "semver",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libautocfg-83a13ff3625ea177.rlib",
+      "bytes": 472912,
+      "sha256": "f379ce90c513332dc565580572eb696a98e8eab64956eca8a7b8f5f044132307",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#autocfg@1.5.1",
+      "target": "autocfg",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libbyteorder-c12775dc3813acea.rlib",
+      "bytes": 178320,
+      "sha256": "9366b539a5e9bb7a7f79b6ff29deb00e8cfcd9e183d7607c9512e9dcd3eddee7",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#byteorder@1.5.0",
+      "target": "byteorder",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libstable_deref_trait-a50517c213d34ee3.rlib",
+      "bytes": 11232,
+      "sha256": "7cef7105d86ea4cb01571698fae0632c421c45fbed193ec6ff0133cb582c0097",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#stable_deref_trait@1.2.1",
+      "target": "stable_deref_trait",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libeither-958611c085765818.rlib",
+      "bytes": 256200,
+      "sha256": "69861c57ed3c3b73525e036512ff13bce0d689d37b4dce71b6100d7b4c4925e0",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#either@1.18.0",
+      "target": "either",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libproc_macro2-e6b31cf9db3a0416.rlib",
+      "bytes": 920000,
+      "sha256": "df799c095133b94e38b79cf7db4296b31bd94c012b7503eca1deef1049016212",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#proc-macro2@1.0.107",
+      "target": "proc_macro2",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libcc-d6600914eb542680.rlib",
+      "bytes": 2183392,
+      "sha256": "c5d5cea9892990b603d47209399763cab36c4cc6315cc4b0d1b2e5694ffe7c78",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#cc@1.4.5",
+      "target": "cc",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/librustc_version-d149d07672a4ca18.rlib",
+      "bytes": 324664,
+      "sha256": "6a1560f4508cad705b38dab949e9ffdb093413b93bb18ad7e2f13a771c4c3fa7",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#rustc_version@0.4.1",
+      "target": "rustc_version",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libhash32-97bbcdec1a62a1c9.rlib",
+      "bytes": 161592,
+      "sha256": "4aebbe03bc397b87c408fec2c4a590f8079081e4e84cd02314b0c6ecb1e8153e",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#hash32@0.2.1",
+      "target": "hash32",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libpin_project_lite-70707b69d9120e38.rlib",
+      "bytes": 95176,
+      "sha256": "af57bd850dada5733040bdf3e659aa37da427e971366d2a7d4b3cb29f9808526",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#pin-project-lite@0.2.17",
+      "target": "pin_project_lite",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libbytes-0b858c727541b724.rlib",
+      "bytes": 1117048,
+      "sha256": "cd0888eb7cc9df64029e8d90b65729909974d936ee815a008e247bcd12e3cf1b",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#bytes@1.12.1",
+      "target": "bytes",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libuntrusted-4ba38da824ea20b9.rlib",
+      "bytes": 45352,
+      "sha256": "51968267f933e3d9b72f6899d0591217505c5ba6bc6a0a6dc18af05200b9f1b4",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#untrusted@0.9.0",
+      "target": "untrusted",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libitertools-725b7306385e4f54.rlib",
+      "bytes": 2164880,
+      "sha256": "6dc97d193e31816035d27499db5c784a0305197bd9402fd0a56eb963fa742596",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#itertools@0.10.5",
+      "target": "itertools",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libarrayvec-1a197d9d3c843332.rlib",
+      "bytes": 242264,
+      "sha256": "30162beb14864fe6fc489e4b5bd66c51e04fba041694b6b72b84c37d638de792",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#arrayvec@0.7.8",
+      "target": "arrayvec",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libquote-d2f5e500a9a1b98d.rlib",
+      "bytes": 422648,
+      "sha256": "1740dbf50f11e190a8d63cf81e67b3bd8c0adec8d9939bb580d233eb85956a81",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#quote@1.0.47",
+      "target": "quote",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/liblibc-507ff03685151877.rlib",
+      "bytes": 2385056,
+      "sha256": "2b869890d4a4e04751a0288e47037ab53bdd44b0b8828c2ae3c6b1f36d348268",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#libc@0.2.189",
+      "target": "libc",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libserde_core-933e1c5903ce015d.rlib",
+      "bytes": 4867264,
+      "sha256": "77b464e7917870eea7c3e0dbe3c3c45c434754144ea28571947fbe42d89dadb7",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#serde_core@1.0.229",
+      "target": "serde_core",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/liblibc-283da1ecf68b3796.rlib",
+      "bytes": 3076800,
+      "sha256": "e566391a2bae0ccc3f845987c56bb91d17404986bd9a835b931c4a84ffc13c53",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#libc@0.2.189",
+      "target": "libc",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libbitflags-f55cdf33814290e6.rlib",
+      "bytes": 276152,
+      "sha256": "414d3f07e68288fcfc1484ecabe691830c2cb4c2cb24f21cdfb313c66f008317",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#bitflags@2.13.1",
+      "target": "bitflags",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/librand_core-10c82f77c7c498ce.rlib",
+      "bytes": 122384,
+      "sha256": "fff57a631dc3c7f47fce80e2e18c0fddc54d18f8600445569daa343eaf7a5c05",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#rand_core@0.10.1",
+      "target": "rand_core",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libcfg_aliases-ba1c32d0aa0e2b96.rlib",
+      "bytes": 18952,
+      "sha256": "955d386c57022d06021ed70a0dd4a60d704d0a83b591123b9d2707a49bdb540d",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#cfg_aliases@0.2.2",
+      "target": "cfg_aliases",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libzeroize-1bece4f25c23682b.rlib",
+      "bytes": 327264,
+      "sha256": "530c3822165748d86a5dfd3db46a84948dec72d49c72b1560177329c7b9fa0ae",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#zeroize@1.9.0",
+      "target": "zeroize",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/liblazy_static-cc3690079b819490.rlib",
+      "bytes": 22320,
+      "sha256": "4034cba75686ba1440b23f90a23b0575a45e6a33e628204aeb1cb16234a68d62",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#lazy_static@1.5.0",
+      "target": "lazy_static",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libconstant_time_eq-9e421fd44c4a12e9.rlib",
+      "bytes": 257744,
+      "sha256": "12bb5273d5be7f12b8f28c2c354fc15d8d76ad192e014b9e257b520d45f58abd",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#constant_time_eq@0.4.2",
+      "target": "constant_time_eq",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libonce_cell-6f89980a5017a3ad.rlib",
+      "bytes": 215880,
+      "sha256": "1956d172306b0b4b4d90820fcf0b3f11e3a25832a18d2020d32be859999859a8",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#once_cell@1.21.4",
+      "target": "once_cell",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libsyn-8ea901e2ad11305d.rlib",
+      "bytes": 6917432,
+      "sha256": "ce4ac4ed05cdd78de175f35d2a063eda045c71c8c9a4f209f2d9cad667104f89",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#syn@3.0.5",
+      "target": "syn",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libgetrandom-f8f117e3c67b700c.rlib",
+      "bytes": 88032,
+      "sha256": "618262016782f9525752381ed2b8871ac72043c82acec118cc646b0cfc20efb8",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#getrandom@0.2.17",
+      "target": "getrandom",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libsyn-11192f276d10b684.rlib",
+      "bytes": 9277184,
+      "sha256": "0253bf7c536eeaf54e959de0e4886e3c6bfb59ed98f41fa32690ae9883b3508b",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#syn@2.0.119",
+      "target": "syn",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libsyn-a33b3f4f1f6c4234.rlib",
+      "bytes": 8774336,
+      "sha256": "8d0821c7defd2ed482e95b2351eae7d5a545a6833aca4836da25192003154da5",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#syn@1.0.109",
+      "target": "syn",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libnum_traits-c81872969629f262.rlib",
+      "bytes": 1828352,
+      "sha256": "e9b58222e7448b4b39c44914c828f3db348022f0dbf933c452a10288e5c00d75",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#num-traits@0.2.19",
+      "target": "num_traits",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/liberrno-0384e8d723a0f4fd.rlib",
+      "bytes": 34768,
+      "sha256": "defab6713f19f4fcecffc259d02800e314b5d92634d5184a694bde4f617e7b43",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#errno@0.3.14",
+      "target": "errno",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libanyhow-bedccdd67bcfd999.rlib",
+      "bytes": 703672,
+      "sha256": "50f388921109f41c4d0c3671275e63e5a0f58dee9612b167fd76eb9467b5cea1",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#anyhow@1.0.104",
+      "target": "anyhow",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/librustls_pki_types-40f63d45ac09db4a.rlib",
+      "bytes": 668488,
+      "sha256": "06db7f8ee8451babe489a84c27e6e4d759ff45878c5459a8c2adcc936d7e38e1",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#rustls-pki-types@1.15.1",
+      "target": "rustls_pki_types",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/liberrno-9b83439a4b4190a2.rlib",
+      "bytes": 35584,
+      "sha256": "101fad8ad4ad5e04f53d4945d97ea4aaca07d00ae7fb686d0bf7f6fecb264bb5",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#errno@0.3.14",
+      "target": "errno",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libsocket2-e55c349d16f4be91.rlib",
+      "bytes": 646176,
+      "sha256": "671f4fd674fba268b492bc2d1d739a3c950cbf56bb48276d4a1c82f874b85a92",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#socket2@0.6.5",
+      "target": "socket2",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libtime_core-d02fb02f034d84c6.rlib",
+      "bytes": 471296,
+      "sha256": "6703ca055c36bc302cc8b1124632fce508bf206d278c61fc647c8b977c22e3c5",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#time-core@0.1.9",
+      "target": "time_core",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libnum_conv-116a6ca8272ff27a.rlib",
+      "bytes": 200648,
+      "sha256": "3934f13ae4f36ea3f71edd52bcbe88ae4f31a997a927926cedd0e01749eb655d",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#num-conv@0.2.2",
+      "target": "num_conv",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libmio-31347faccdd70f15.rlib",
+      "bytes": 905480,
+      "sha256": "1c762e05ff6ac9acdd933a1b4c47b54d5a17b1c1e1931e45886090afb61c3585",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#mio@1.2.3",
+      "target": "mio",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libring-a35013a7e49b886a.rlib",
+      "bytes": 3920616,
+      "sha256": "4a0a4316224205ba56f4c5c01babfb261253d2749d2e109817c62a59623cc00d",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#ring@0.17.14",
+      "target": "ring",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libblake3-f2396448715842b9.rlib",
+      "bytes": 644880,
+      "sha256": "c15484dc07da78630643a822b960bacff82919e5872fd093d73f75e5720d0057",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#blake3@1.8.7",
+      "target": "blake3",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libsignal_hook_registry-96e58397765dadac.rlib",
+      "bytes": 235768,
+      "sha256": "517bcdaf9bb20c370f3bf38f8b38011fc00895e5a7c994feaf2a1d3a43accc30",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#signal-hook-registry@1.4.8",
+      "target": "signal_hook_registry",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libtracing_core-106bb3a7038291fc.rlib",
+      "bytes": 1008576,
+      "sha256": "a618e044b8f3a84845ba12421220d64010806f481e63fad7992916229c029dd9",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#tracing-core@0.1.36",
+      "target": "tracing_core",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libautotools-c673160671b75314.rlib",
+      "bytes": 170056,
+      "sha256": "1f0d388df6d890227e1f72e0458bb10cb08bfc23d4727897ab9a1aef6e4dd7ea",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#autotools@0.2.7",
+      "target": "autotools",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libaho_corasick-c5a401122ea70917.rlib",
+      "bytes": 2965408,
+      "sha256": "bba90c52905cbdeddcbfa5c307ea6080ae0158884a2c4e6d282476de793d889a",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#aho-corasick@1.1.5",
+      "target": "aho_corasick",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libbytes-5540572964557656.rlib",
+      "bytes": 1062952,
+      "sha256": "e56273f59d6c307473e16d18ba578ca8c569ab4a910c6dd4bbb8da74bc0ec488",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#bytes@1.12.1",
+      "target": "bytes",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/librustc_hash-2ceade0476782f16.rlib",
+      "bytes": 30528,
+      "sha256": "5ce26622746644b715391e09c879ecbd9ccc0bb8df96f63b335df033287b3840",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#rustc-hash@2.1.3",
+      "target": "rustc_hash",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libthiserror-adbc6dd184d213ff.rlib",
+      "bytes": 31312,
+      "sha256": "887ce8766969a2bdd9c5d749389e189775d00cb334ad068f205c48a4654539b4",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#thiserror@2.0.20",
+      "target": "thiserror",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libserde-893d8c76b1ce26e1.rlib",
+      "bytes": 901560,
+      "sha256": "493e22a212181073dbdf3e127495813702d9989958945f2ccb88fb2386f553b4",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.229",
+      "target": "serde",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libequivalent-5ed891581e7b282a.rlib",
+      "bytes": 9144,
+      "sha256": "060c3eadaebce0d12e6c7c282a21408d823c5ce3d647ba24630c9e8f80e3f18f",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#equivalent@1.0.2",
+      "target": "equivalent",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libhashbrown-1ff03109bcb2a890.rlib",
+      "bytes": 1250792,
+      "sha256": "ed67811989cd8ded860982f4c735f2111a1532476505198b02ab35fbcdccadc2",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#hashbrown@0.17.1",
+      "target": "hashbrown",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libminimal_lexical-4ea6feca763fc9d8.rlib",
+      "bytes": 304512,
+      "sha256": "af980c6a66251803fa81a399ffc4b2f4fc38421aaf02464163b387e194658814",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#minimal-lexical@0.2.1",
+      "target": "minimal_lexical",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libderanged-7278186833d9bf6a.rlib",
+      "bytes": 3524784,
+      "sha256": "37826a026d0cbdf8317aa217c9d612a885eeae97b53641cb4fecc7a4f0c511c9",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#deranged@0.5.8",
+      "target": "deranged",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libregex_syntax-6242af003b5d6b2d.rlib",
+      "bytes": 7305848,
+      "sha256": "cfc90470f77935d0e7c67d40fd7d29b306c5bac0be621f7fd69195469c80eb6d",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#regex-syntax@0.8.11",
+      "target": "regex_syntax",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libpowerfmt-a8b19600ece10f32.rlib",
+      "bytes": 194296,
+      "sha256": "392eb560cde368b20f63ebe0ea9c57ca5e327ee2e578fcac85645fd774b47d39",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#powerfmt@0.2.0",
+      "target": "powerfmt",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libprost-2c7521dc32107616.rlib",
+      "bytes": 473288,
+      "sha256": "20858e522afbe7486987852567e0a1830e405446eb9173d5daba14fa7f50966a",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#prost@0.11.9",
+      "target": "prost",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/librustix-8a88095d4716fd51.rlib",
+      "bytes": 2715968,
+      "sha256": "2d15d2fe8d672de27a1da868207106b83fe2f2b95e1ac1f0cd4ad0eeebe3136d",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#rustix@0.38.44",
+      "target": "rustix",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libtracing-b793768997fe4045.rlib",
+      "bytes": 627200,
+      "sha256": "7ff66a1c6b713ec18562a4182baf6763e5a2ca4d7c8099d9bccfdb8274254529",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#tracing@0.1.44",
+      "target": "tracing",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/librustix-e6c28b7fe222143f.rlib",
+      "bytes": 3079544,
+      "sha256": "ec46ac680ae94b55f9398c9fddd40c1f97d68a48f917bced3ccc92968282d14b",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#rustix@1.1.4",
+      "target": "rustix",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libwebpki-3599e1e9fc2b6312.rlib",
+      "bytes": 1464296,
+      "sha256": "264fd10d35613e98e0e781354c519b35225f8519b9c5682bd295d1b20b5ea73a",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#rustls-webpki@0.103.15",
+      "target": "webpki",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libtokio-11662edde6531432.rlib",
+      "bytes": 13008888,
+      "sha256": "f44f5a02cf188e95d7ff11f6f2835b0d0e1016c52ee6e793abdb9e8073337aac",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#tokio@1.53.1",
+      "target": "tokio",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libgetrandom-878732d8b411be3d.rlib",
+      "bytes": 74920,
+      "sha256": "35d3578ce383c3e3cde1934d57de63d8f18ba1b6ddfa597ba072f3cc34067fed",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#getrandom@0.4.3",
+      "target": "getrandom",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libheapless-e274590da767156c.rlib",
+      "bytes": 1084768,
+      "sha256": "65421ca5da51c01f322d00e1d1702be8677686914e55bbf8e75bbac5ca34530f",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#heapless@0.7.17",
+      "target": "heapless",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libcobs-6f60fbfb2419852b.rlib",
+      "bytes": 100776,
+      "sha256": "0207bf8e7b0b6495173caef2f5abb09a6cf6fc3ee5bc1b05826015e56cbefc3e",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#cobs@0.3.0",
+      "target": "cobs",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libtime-67b2bc254c00fa62.rlib",
+      "bytes": 5482464,
+      "sha256": "0a64fcab292a4523ebbe2159976f8cce593a53b881ac660562650c0edb5f6a14",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#time@0.3.55",
+      "target": "time",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libnom-3fe557329228c559.rlib",
+      "bytes": 3525576,
+      "sha256": "85703fc65035db3d866c393bfbe8c1e9fd71fbe780f7b9ea1dd8f2beacbcfb48",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#nom@7.1.3",
+      "target": "nom",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libindexmap-155a1315bbf569b1.rlib",
+      "bytes": 1279256,
+      "sha256": "910efaa555c5f76796ff9ba5f8a7ac73c532168c8cdb0edb19a4db33582b9f23",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#indexmap@2.14.2",
+      "target": "indexmap",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libregex_automata-18b11c031c5abe44.rlib",
+      "bytes": 6701896,
+      "sha256": "5a74dc7067bc24edb6ffc331af17d3b1a65c1e5e36238fea98ec70d0a509fb8a",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#regex-automata@0.4.18",
+      "target": "regex_automata",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libgetrandom-5adc6de3fee66fb9.rlib",
+      "bytes": 104464,
+      "sha256": "c67ddb867c8a0247cf7b818aeccfe5227b061920c956b39c06532dca0bf22adb",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#getrandom@0.4.3",
+      "target": "getrandom",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libsynstructure-6181c6bf4a37acae.rlib",
+      "bytes": 979824,
+      "sha256": "5474bb14cb36aa5be2df97ea46db9ab2612319279862f0e20012f685b67b3450",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#synstructure@0.13.2",
+      "target": "synstructure",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libchacha20-892a87e0a9c5d2a9.rlib",
+      "bytes": 378584,
+      "sha256": "701c83edcf9c7a45989d5be2a92ca981d9c755799e16e9fb67e46bd30bce2170",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#chacha20@0.10.2",
+      "target": "chacha20",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libonce_cell-fdd44cbd1b0d86e5.rlib",
+      "bytes": 215880,
+      "sha256": "ca4c5e97b615b479651298b1e6d0642aa5ebc4a1cabc8762aba6bbb0ad7124ab",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#once_cell@1.21.4",
+      "target": "once_cell",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libfastrand-ddbabc4492a96c85.rlib",
+      "bytes": 185680,
+      "sha256": "90118b7afcfc9bbe2b965be60a216d23d0caf44d9dae4a377204ad92351a50d9",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#fastrand@2.5.0",
+      "target": "fastrand",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libhome-f7e57a26e7dee764.rlib",
+      "bytes": 39336,
+      "sha256": "367aede2da8ee3a85326404783234ac30df75b6a256d21a4e4a75401cf8798bc",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#home@0.5.12",
+      "target": "home",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libtinyvec_macros-328c1912d3a45661.rlib",
+      "bytes": 3848,
+      "sha256": "e2bbfc2a2c4fc346ac4429ab11360bc739144714178c6abdd87b234c3ea39e57",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#tinyvec_macros@0.1.1",
+      "target": "tinyvec_macros",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libslab-9807c133ba495cb1.rlib",
+      "bytes": 145088,
+      "sha256": "4792f4c955c675a18b884f5b0ea3e9d66ad2db40a89e5b3fa11f271afdce81b8",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#slab@0.4.12",
+      "target": "slab",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libfocal_memory-faaec37ae025308f.rlib",
+      "bytes": 538424,
+      "sha256": "53744bdc48a7b076391a0399d978a48b7f80413ab45af777bf59252cffd30618",
+      "package_id": "path+file:///Users/adalundhe/Projects/focal/crates/focal-memory#0.1.0",
+      "target": "focal_memory",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libsubtle-2c522949696bb118.rlib",
+      "bytes": 120224,
+      "sha256": "32edc052b5586b819d547a7e0614e0c62f76868dcec32e99df74d0e4836e4699",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#subtle@2.6.1",
+      "target": "subtle",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libpostcard-379aea4f900dfe85.rlib",
+      "bytes": 533640,
+      "sha256": "bcabbf11ee14ee82870bcb6f1d0cd38b6e8978db94fc6685ba8a7f342ac10a29",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#postcard@1.1.3",
+      "target": "postcard",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libfixedbitset-ab9244e7c9ee5094.rlib",
+      "bytes": 157640,
+      "sha256": "ca8ead6c1e63d92f4a7d5c2ca13e216f7e84553560578aa07507fd2d2336cf66",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#fixedbitset@0.4.2",
+      "target": "fixedbitset",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libtinyvec-972f239a66d46ec5.rlib",
+      "bytes": 532048,
+      "sha256": "3f95a2389e03bc3d466b83a39918e2f790c679f387c54034ca4d8d38d78bdaa8",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#tinyvec@1.13.2",
+      "target": "tinyvec",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/librand-7448a9530f631751.rlib",
+      "bytes": 1237184,
+      "sha256": "9ebddab8012aa8b53f70d383ddcc0e0b3309f3093149fd27c264e9e059b6c417",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#rand@0.10.2",
+      "target": "rand",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libtempfile-7d5377700f13c812.rlib",
+      "bytes": 551296,
+      "sha256": "3d839438e742ad667c8d4357aae7672d21380ff8dc25488888be34faca75c8e2",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#tempfile@3.27.0",
+      "target": "tempfile",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libprettyplease-0eb2794a6e933bb7.rlib",
+      "bytes": 1128184,
+      "sha256": "8fb1ee2fcc3a4bfabd379dae2ff88c1cbec2e61c869bb69447c2b3d06bdfc93b",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#prettyplease@0.1.25",
+      "target": "prettyplease",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/librusticata_macros-d48c3525fb46a6ec.rlib",
+      "bytes": 112960,
+      "sha256": "d8a69094794512ad7a46d4bbb26bdb3870160710d66f3b7ac42799f99a70f4f5",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#rusticata-macros@4.1.0",
+      "target": "rusticata_macros",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libwhich-bc95aa38fa8a32ad.rlib",
+      "bytes": 222264,
+      "sha256": "f0541ef374300621f9602b02d0fa8aba690b58e1e95ab42154bac5a7325f6c44",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#which@4.4.2",
+      "target": "which",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/librustls-a9a8819015542656.rlib",
+      "bytes": 8605368,
+      "sha256": "a5922c09f91ccd8a040e6c9df2e7c59d3df284475ffc76e031357016d13d55e3",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#rustls@0.23.43",
+      "target": "rustls",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libregex-8a298dd2236a3c1e.rlib",
+      "bytes": 922224,
+      "sha256": "56649198b5050d2072faebc474a6b3a55249f41adf4c0a0f9c3737b6eca98499",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#regex@1.13.1",
+      "target": "regex",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libprost_types-5e18c1b63eece702.rlib",
+      "bytes": 2132224,
+      "sha256": "ebf6285171bede512d3fd92fbe175a10eeaac148b169e397dabb0dae22d26c14",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#prost-types@0.11.9",
+      "target": "prost_types",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/librand_pcg-0c55f4402e302dc6.rlib",
+      "bytes": 102968,
+      "sha256": "530fc3a261e3c2f26c059e1873f94598de40d4c08c2cbf14e5664f8561f10bea",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#rand_pcg@0.10.2",
+      "target": "rand_pcg",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libfocal_model-7810d853602e5c07.rlib",
+      "bytes": 14521000,
+      "sha256": "c1a5b7745a6e1dfb489e408ab1fa2d4b6a527cf21552f82d00170ba10c40190a",
+      "package_id": "path+file:///Users/adalundhe/Projects/focal/crates/focal-model#0.1.0",
+      "target": "focal_model",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libpetgraph-bca6457e3233131c.rlib",
+      "bytes": 2084736,
+      "sha256": "6f32765b803a5f5fc8e248ba5d36f998ad7da1ca8312cfff299e2bf2205eb488",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#petgraph@0.6.5",
+      "target": "petgraph",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libfs2-b6dbe9133ffe8a26.rlib",
+      "bytes": 54136,
+      "sha256": "e5a46eec5721d18347d5bd0c3bf87b86552486fba8f303ee333bf8e766e84227",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#fs2@0.4.3",
+      "target": "fs2",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/liblru_slab-558a0c492b61a415.rlib",
+      "bytes": 55880,
+      "sha256": "ce41a8a1b0b944ba29772692e9b1fe49a83eb181f37b9eda28bf58ab7580c1f8",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#lru-slab@0.1.2",
+      "target": "lru_slab",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libheck-5fc0dcea86ca9b4e.rlib",
+      "bytes": 179632,
+      "sha256": "c6cb33b6eb50dd1b7113e912a6c2b03b196d261d18c0b37158d555098678d2b8",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#heck@0.4.1",
+      "target": "heck",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/liblog-164434aa99227b64.rlib",
+      "bytes": 219504,
+      "sha256": "153c589b7a08a533889f5ef5646f5284cad9b182e851c46400a44fabfbd4e17a",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#log@0.4.34",
+      "target": "log",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libmultimap-08a83ffbca5c1a68.rlib",
+      "bytes": 94992,
+      "sha256": "0ee954501b9778144afcdc21bfde49c6f99b0894e6706711d395b23f3156a3db",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#multimap@0.8.3",
+      "target": "multimap",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libasn1_rs-57aac7442abdf5f3.rlib",
+      "bytes": 2571736,
+      "sha256": "2f7ed039e4872da9fc7f72db8aca091ca5fa1f6d32cfe896d623383eb4d7c804",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#asn1-rs@0.7.2",
+      "target": "asn1_rs",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libquinn_udp-57c647df350c1d3b.rlib",
+      "bytes": 156392,
+      "sha256": "22736ddbe8b647c0c7b06c9a556777a2feac9f5b3606e602be1320c5bc94e383",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#quinn-udp@0.5.15",
+      "target": "quinn_udp",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libprotobuf_src-b5081bcabbe65005.rlib",
+      "bytes": 20136,
+      "sha256": "f5281c0295e72443c7ea5f94d0a407684273e0f4c0ff82421d69fe523137e65c",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#protobuf-src@1.1.0+21.5",
+      "target": "protobuf_src",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libnum_integer-2d4cf816330359da.rlib",
+      "bytes": 417792,
+      "sha256": "5778613ca3c1d5224c6c97ecd1bb9865c183a6aa18ec5c9d2960fd3a5586b22b",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#num-integer@0.1.47",
+      "target": "num_integer",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libbitflags-bccd2330c2cbb3b2.rlib",
+      "bytes": 44776,
+      "sha256": "a247ad5501b4a12c000bf7ad130ee4b2ded7920c5bf2f51a695f446f553cea4c",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#bitflags@1.3.2",
+      "target": "bitflags",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libquinn_proto-e61a81a4553a3fdb.rlib",
+      "bytes": 6315384,
+      "sha256": "8f6ec52a4bc061f1312dcc8845741a43087a7e8ae4f987a80209b953fb7ff04f",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#quinn-proto@0.11.17",
+      "target": "quinn_proto",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libprost_build-1b77275d8aa2f681.rlib",
+      "bytes": 1698608,
+      "sha256": "2bdd6ba2d2fa1207e82a2f54bc90e77d276753a31e804414367e2a93c792be7c",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#prost-build@0.11.9",
+      "target": "prost_build",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libnum_bigint-f0921c745ddb60ba.rlib",
+      "bytes": 2743168,
+      "sha256": "7265fe8c7f6adb241a929dd9478b8a555cc0031e3fdffaa2cf7e3736d397e293",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#num-bigint@0.4.8",
+      "target": "num_bigint",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libanstyle-78a05c03a1505a84.rlib",
+      "bytes": 245136,
+      "sha256": "88ba57d1a9ee3e6082b6517f40ea86eda3517a66492b0e4ec1b52c2772121dd1",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#anstyle@1.0.14",
+      "target": "anstyle",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/librand_core-f85fbffcea849d17.rlib",
+      "bytes": 180088,
+      "sha256": "c2bd98a07799b4425cfdf577e6f7e00cc3ed4083412d43932aef4ebcb90a505c",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#rand_core@0.6.4",
+      "target": "rand_core",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libdata_encoding-caa17621cf2948b9.rlib",
+      "bytes": 1226440,
+      "sha256": "1060370f29078a7df70c10af13c198320feefe7a1356889acd71ba7f2c9c303f",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#data-encoding@2.11.1",
+      "target": "data_encoding",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libyasna-ed7ad06fef7ee905.rlib",
+      "bytes": 1005968,
+      "sha256": "16ffd715c063fbbdf29e24e9d57d9fffbc2f8b736e2a2cf703883ce651274c8d",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#yasna@0.6.0",
+      "target": "yasna",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/liberased_serde-393e8873f5c7a873.rlib",
+      "bytes": 998408,
+      "sha256": "add630031a8c1f91f20e56e77f0e17b9b51b6f03951487ac145a89478d2b03f3",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#erased-serde@0.3.31",
+      "target": "erased_serde",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libprost-a995b7c73bf5af8b.rlib",
+      "bytes": 514392,
+      "sha256": "4200e786593a7dcbca6db4bbd57c438338d3533e68ebe7e16a28bfed1e1220eb",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#prost@0.11.9",
+      "target": "prost",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libprotobuf_build-026ffa8050d3ccf9.rlib",
+      "bytes": 1112304,
+      "sha256": "15625385190a7b36bf0f84e66c84be4685583c1f5ef1ec12e7169cd579dc11bd",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#protobuf-build@0.15.1",
+      "target": "protobuf_build",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libzerocopy-227cbd16323eb0a1.rlib",
+      "bytes": 14267848,
+      "sha256": "6a1a95bdaa256009153bfdf001833ef79586a172c2d1f979a294aa7dbc55c154",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#zerocopy@0.8.56",
+      "target": "zerocopy",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libquinn-458b621bc551e186.rlib",
+      "bytes": 1857600,
+      "sha256": "cafdaa0f83e87db0595debdd5147b4a13d1bebe2d1c2e1e19f3ea8bff9356e5c",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#quinn@0.11.11",
+      "target": "quinn",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libder_parser-a8676403aaf70565.rlib",
+      "bytes": 872640,
+      "sha256": "18748c3356354ff5467d3dc7fa28cc61b8e22d8d461615f8cdb421a61bd202b9",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#der-parser@10.0.0",
+      "target": "der_parser",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/liboid_registry-924eebad91a1b02b.rlib",
+      "bytes": 370176,
+      "sha256": "ce42eaf3fe0db2f4a95305bab9769d29c1349c90ae721685ac0e3fa21cecbe80",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#oid-registry@0.8.1",
+      "target": "oid_registry",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libzmij-f15600c38a6655ff.rlib",
+      "bytes": 235736,
+      "sha256": "9b32436fb94efd76109c3d01825e416c25baf61197ee5f9af8b7641240108958",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#zmij@1.0.23",
+      "target": "zmij",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libgetrandom-33bfa2bcad86ebfc.rlib",
+      "bytes": 74416,
+      "sha256": "d98d86829b99da1c096d34a7f5c71adc47c805912991853478fdb7be36df4bb3",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#getrandom@0.3.4",
+      "target": "getrandom",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libfocal_stream-5da1867ef36a143d.rlib",
+      "bytes": 2074192,
+      "sha256": "cf0beabfb871ff0a6378f5134710d616b4a1fa24e08dbbf2d9ecf4b2b8594fd6",
+      "package_id": "path+file:///Users/adalundhe/Projects/focal/crates/focal-stream#0.1.0",
+      "target": "focal_stream",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libitoa-1ff8c0093d7a46ac.rlib",
+      "bytes": 109832,
+      "sha256": "ef67937bfb10b2358d5cc591de551204f4f6a5ff7a256a5170ae45bc883778f7",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#itoa@1.0.18",
+      "target": "itoa",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libutf8parse-25034f183a8e19d5.rlib",
+      "bytes": 31272,
+      "sha256": "baef2b48776d511b0f415e8be44349b68be6d13c5f7e462c83b64dd1e4feb2ec",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#utf8parse@0.2.2",
+      "target": "utf8parse",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libencoding_rs-4a57f247508095ae.rlib",
+      "bytes": 2329160,
+      "sha256": "e208eae10df77baeaf0b78c3bdbe79d43816434ca39559f1a6c3b9c54ccc0366",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#encoding_rs@0.8.35",
+      "target": "encoding_rs",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libsmallvec-2a7ba35937068190.rlib",
+      "bytes": 258600,
+      "sha256": "3d41c7b0f2c3cb14422336309948d5c369255f48a73009f486b77a0c073bc6b7",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#smallvec@1.16.0",
+      "target": "smallvec",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libarraydeque-dd1d971fd5440737.rlib",
+      "bytes": 203136,
+      "sha256": "3675ab9f775d4424a4d23af10826f1d422bbdc3cd0b86a2434b707366e577347",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#arraydeque@0.5.1",
+      "target": "arraydeque",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libppv_lite86-1d1c14106a74d5f3.rlib",
+      "bytes": 419064,
+      "sha256": "f5b321effee37e92da4a464d593ff04cbe68501e1ea494a59d049e668906872e",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#ppv-lite86@0.2.21",
+      "target": "ppv_lite86",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libx509_parser-f3a251c60145dbc1.rlib",
+      "bytes": 3495824,
+      "sha256": "b4899af7a6a9618ca28043d5272e9cead49b400030e1fe4a70d140cab84a36c8",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#x509-parser@0.18.1",
+      "target": "x509_parser",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libthiserror-aa29286fdfe2504b.rlib",
+      "bytes": 26000,
+      "sha256": "34f3c4fd0127e4b3bc2475a97ef1ee3101bcf9582742806cc2526d8808367c7a",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#thiserror@1.0.69",
+      "target": "thiserror",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libcrc32fast-62ef8518540eb48d.rlib",
+      "bytes": 125440,
+      "sha256": "573d5d508ee90a912fc24132b1042e91c289f731d294203e15d4b097f7466a2f",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#crc32fast@1.5.1",
+      "target": "crc32fast",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libanstyle_parse-d88709b94d966e0f.rlib",
+      "bytes": 187648,
+      "sha256": "1669cc9b5ee46efd888b79a38305bc0ffa3f05b24c62154c7259cceba720b26e",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#anstyle-parse@1.0.0",
+      "target": "anstyle_parse",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libserde_json-6834a99ed7936cd8.rlib",
+      "bytes": 2147960,
+      "sha256": "8b96ad543869a3dfb05b9be528590c40af868d793fe165a1ff6c9f3b2feb45e9",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#serde_json@1.0.151",
+      "target": "serde_json",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libanstyle_query-e958d72643a9d888.rlib",
+      "bytes": 14056,
+      "sha256": "6322200099b0748f285bfe5951abb2060d3fa8ae31de66a24700a49c4bffd647",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#anstyle-query@1.1.5",
+      "target": "anstyle_query",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libunicode_width-94887219682bc327.rlib",
+      "bytes": 887888,
+      "sha256": "44ac252eea7398cb5dd97d06a30957fbdc8d3b9fbe5a1acfcf09a898bc80acc7",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#unicode-width@0.2.2",
+      "target": "unicode_width",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libcolorchoice-8c6628b9cde1d874.rlib",
+      "bytes": 20272,
+      "sha256": "77860d6af219c2155c1ba780d426e955f8e18dac041c9ff0ee436c6277f066f4",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#colorchoice@1.0.5",
+      "target": "colorchoice",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libis_terminal_polyfill-6a55157b71356033.rlib",
+      "bytes": 10512,
+      "sha256": "6836e159d7a3cc59d65ba60cf7b6cfe9beeac1c3494b16377b312cddf9661ba9",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#is_terminal_polyfill@1.70.2",
+      "target": "is_terminal_polyfill",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libencoding_rs_io-b0cb074b3e291c95.rlib",
+      "bytes": 93160,
+      "sha256": "02276d2a0068957d906596b9c5216d256b3f7449c18e8782f7f78ebb3731b5ea",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#encoding_rs_io@0.1.8",
+      "target": "encoding_rs_io",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libgranit_parser-9bbb0b12bfb246f8.rlib",
+      "bytes": 1551952,
+      "sha256": "ddd051fa4db4019afa4824df18cf122d2df8d1fa2e5a33b8750cfb290aeca68f",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#granit-parser@1.2.0",
+      "target": "granit_parser",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libfocal_core-a251f0b8041eb9b3.rlib",
+      "bytes": 10881376,
+      "sha256": "3af8f2628666534dd7d971e04105382f728a4dd6603c2dabaecedf04cff51d8c",
+      "package_id": "path+file:///Users/adalundhe/Projects/focal/crates/focal-core#0.1.0",
+      "target": "focal_core",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libclap_lex-c1d0434542044118.rlib",
+      "bytes": 156792,
+      "sha256": "7c338b0eb6a29ad3cea0935cf3d602847c0e8604e3d7273b6f7b9560b9fabef0",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#clap_lex@1.1.0",
+      "target": "clap_lex",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libheck-416c0beace2e0876.rlib",
+      "bytes": 261856,
+      "sha256": "a96dea1477ba3bca7b9c4ceed80d91f511e5670f9feb84e3af9d26cf67511a80",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#heck@0.5.0",
+      "target": "heck",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libbase64-17cf945283330a04.rlib",
+      "bytes": 424768,
+      "sha256": "30740c99c93a467d2c1a92a60ce203a21a7fa22ec5af8fc02ba5a6dc2594f1e9",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#base64@0.22.1",
+      "target": "base64",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/librand_chacha-eec4cb56c45e2882.rlib",
+      "bytes": 372536,
+      "sha256": "90403158f5b6a0c3e57e0edcc0a681dc54dd432f318840b634c338b6d0120892",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#rand_chacha@0.3.1",
+      "target": "rand_chacha",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/librcgen-c5ab855687e159cf.rlib",
+      "bytes": 1434584,
+      "sha256": "4cdc52d1dced1b1d0e02545ab4dae1e42c623ac9300e47c0886f1f7022058860",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#rcgen@0.14.10",
+      "target": "rcgen",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libanstream-2d89e619dd1b83d3.rlib",
+      "bytes": 363936,
+      "sha256": "1ab13108f171db748983668ce53f3adf82999a9b5fa7fbcbda0c01d816225c4f",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#anstream@1.0.0",
+      "target": "anstream",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libannotate_snippets-74a6876754d81f84.rlib",
+      "bytes": 1756896,
+      "sha256": "ae60bd65c1879ab576491320affc234ce40e2539c258656c2d81a0c8f349ae68",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#annotate-snippets@0.12.16",
+      "target": "annotate_snippets",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libnohash_hasher-bae9cd77b5dbe266.rlib",
+      "bytes": 24216,
+      "sha256": "369c6994b91015ee0885a4d2847b49f87504140e1c46a7b56427002d91177a2b",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#nohash-hasher@0.2.0",
+      "target": "nohash_hasher",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libstrsim-fe3f546911108c60.rlib",
+      "bytes": 337464,
+      "sha256": "c45e20855b00ef08e55c70d7c757f458aed3bf10b610b4c29a92f1b1c12385e3",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#strsim@0.11.1",
+      "target": "strsim",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libfocal_graph-a6a8999f6cb3afd7.rlib",
+      "bytes": 2662248,
+      "sha256": "912792e499a6b01eed67f190837ee30a52a712db5608922799416e780da6ab56",
+      "package_id": "path+file:///Users/adalundhe/Projects/focal/crates/focal-graph#0.1.0",
+      "target": "focal_graph",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libfocal_wire-bcdd5a24da00fb4f.rlib",
+      "bytes": 7262152,
+      "sha256": "30ba33c2891166f489d64c7227fad633d435dca38d967cf092df25e15d77bf91",
+      "package_id": "path+file:///Users/adalundhe/Projects/focal/crates/focal-wire#0.1.0",
+      "target": "focal_wire",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libfocal_evidence-b605aaca6dac8c75.rlib",
+      "bytes": 1107392,
+      "sha256": "c15faefe171e58fb6475a085d6dfc7fff0b3e4291addcccd00c69d18bdf8cc7e",
+      "package_id": "path+file:///Users/adalundhe/Projects/focal/crates/focal-evidence#0.1.0",
+      "target": "focal_evidence",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libfutures_task-82af80d7ed80cfa2.rlib",
+      "bytes": 120104,
+      "sha256": "929b56a63d30b880e32fe3aa784c03bcccab764746871220e4f4021028b5b257",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#futures-task@0.3.34",
+      "target": "futures_task",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libfutures_core-b829cbb3231ea723.rlib",
+      "bytes": 78656,
+      "sha256": "00317e94296557af7fa25b89f518bd2260f8d355d91c6e803ee7cd3ab3c8a130",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#futures-core@0.3.34",
+      "target": "futures_core",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libslog-db5c6b4c9ed67ce2.rlib",
+      "bytes": 557816,
+      "sha256": "fde4c904c04abbcb94f75b2e0ba837ce3fe3672ecebbc2743f486088b521b81b",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#slog@2.8.2",
+      "target": "slog",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libraft_proto-76c7caf4f396ac59.rlib",
+      "bytes": 576376,
+      "sha256": "5ab91556fe2a14e087ba2cb1a01cea1b0fb3862db816ee3d7ed1845a243d30f3",
+      "package_id": "git+https://github.com/tikv/raft-rs?rev=8e4cef172421bf77b2ae1c26628a9531b0be41f0#raft-proto@0.7.0",
+      "target": "raft_proto",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/librand-d30917a82a813190.rlib",
+      "bytes": 1416168,
+      "sha256": "6586bdf1b65833cbd7378cbfba61dfb50d02eca361a8eae35b82a49d942697c0",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#rand@0.8.8",
+      "target": "rand",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libfocal_enrollment-015ca5613f0d7e90.rlib",
+      "bytes": 2908240,
+      "sha256": "4e38464cb4b44ec20acdcec0870cb42f4686c7fcb2b5bed0688cac3e4aa54887",
+      "package_id": "path+file:///Users/adalundhe/Projects/focal/crates/focal-enrollment#0.1.0",
+      "target": "focal_enrollment",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libclap_builder-9ccbaeac8517be59.rlib",
+      "bytes": 5776704,
+      "sha256": "ed74945213788adea520567b086d4ac49f05c71c11d7f6987458f27aaaa59101",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#clap_builder@4.6.6",
+      "target": "clap_builder",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libserde_saphyr-9cce0955a169d0b7.rlib",
+      "bytes": 5816208,
+      "sha256": "4e4e2bdc63c853aa05744dcdeb76865a36dc8456c1e1e1106564f0dfd55cf55b",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#serde-saphyr@1.2.0",
+      "target": "serde_saphyr",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libfutures_util-e85400014ceec556.rlib",
+      "bytes": 4228216,
+      "sha256": "8f7fee45abc580b449d2534b0f36804266ddceb9c416bf5788550c3b0ed2ecef",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#futures-util@0.3.34",
+      "target": "futures_util",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libraft-aa24ad8bbc458b9e.rlib",
+      "bytes": 1968920,
+      "sha256": "17f88434cb96ccd8be02e2142dc7de4115906d057c2382dfd657e03a4e16c37f",
+      "package_id": "git+https://github.com/tikv/raft-rs?rev=8e4cef172421bf77b2ae1c26628a9531b0be41f0#raft@0.7.0",
+      "target": "raft",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libfocal_directory-5ea8002be3e8fa93.rlib",
+      "bytes": 5613760,
+      "sha256": "3ae5c94c6923f1bc9b7d8956d50bf9183500e136793b1b12f3cf8b4b6e207a86",
+      "package_id": "path+file:///Users/adalundhe/Projects/focal/crates/focal-directory#0.1.0",
+      "target": "focal_directory",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libfocal_client-d748d7a01b789cde.rlib",
+      "bytes": 21602800,
+      "sha256": "ce04e2ab8e99a65ec41a0a9b356fadbe785e020bf1ab9479a4177771a15930d1",
+      "package_id": "path+file:///Users/adalundhe/Projects/focal/crates/focal-client#0.1.0",
+      "target": "focal_client",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libclap-44867f9b035d99fd.rlib",
+      "bytes": 13232,
+      "sha256": "6c94b4f2ae6d9ac13fea3fd486dd21f67db86161bd583a3fd1a4798a1ad65e1e",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#clap@4.6.6",
+      "target": "clap",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libfocal_mcp-d73983dbd72fcb6d.rlib",
+      "bytes": 3892280,
+      "sha256": "ab3c91e2bb2415e30a55f1bf3118d6e4af1b2d815cfafd76c1cfa6262db3c9a2",
+      "package_id": "path+file:///Users/adalundhe/Projects/focal/crates/focal-mcp#0.1.0",
+      "target": "focal_mcp",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libclap_complete-e3912a7c2f227aa2.rlib",
+      "bytes": 856048,
+      "sha256": "e015b583e8b234718f96bca4a169866336a7ebe7ca817bd7fbc1288c23b5233c",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#clap_complete@4.6.6",
+      "target": "clap_complete",
+      "fresh": true
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libfocal_log-c2ff0f57cc02d794.rlib",
+      "bytes": 2484760,
+      "sha256": "476b5c54d52ed7403f00b22c7644f269b1375f0e7c158f2597495183ff46022e",
+      "package_id": "path+file:///Users/adalundhe/Projects/focal/crates/focal-log#0.1.0",
+      "target": "focal_log",
+      "fresh": false
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libfocal_consensus-aa642e1728c6bff2.rlib",
+      "bytes": 2407776,
+      "sha256": "588a7a008e2160dddd2b25ef9855b4f8f9f13b585368552dbf299f5a5e632e36",
+      "package_id": "path+file:///Users/adalundhe/Projects/focal/crates/focal-consensus#0.1.0",
+      "target": "focal_consensus",
+      "fresh": false
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libfocal_control-99f759c2309d3988.rlib",
+      "bytes": 5524344,
+      "sha256": "87da438b92f754190a06df6c27b0dcd9c3e30cf16b5d579de314a2af20ee2488",
+      "package_id": "path+file:///Users/adalundhe/Projects/focal/crates/focal-control#0.1.0",
+      "target": "focal_control",
+      "fresh": false
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libfocal_ledger-96723a7bb9a9995a.rlib",
+      "bytes": 8337344,
+      "sha256": "21451d757663382a7649279086e1382ab72d8d7fed83f51f066d9fbe0a204f77",
+      "package_id": "path+file:///Users/adalundhe/Projects/focal/crates/focal-ledger#0.1.0",
+      "target": "focal_ledger",
+      "fresh": false
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/deps/libfocal_runtime-47df346a47098965.rlib",
+      "bytes": 1955824,
+      "sha256": "ef3ecfe6c9af9cbd86c54a1330282f5f5b8f498273a09b90460f8a0efbde185a",
+      "package_id": "path+file:///Users/adalundhe/Projects/focal/crates/focal-runtime#0.1.0",
+      "target": "focal_runtime",
+      "fresh": false
+    },
+    {
+      "path": "/Users/adalundhe/Projects/focal/target/debug/libfocal_node.rlib",
+      "bytes": 19110688,
+      "sha256": "8dea830c782973acff6592707b0a6a245924776e41d9219b6b90f11e7b545747",
+      "package_id": "path+file:///Users/adalundhe/Projects/focal/crates/focal-node#0.1.0",
+      "target": "focal_node",
+      "fresh": false
+    }
+  ],
+  "artifact_stream_sha256": "91d081b818ebcf13278d69ecf52abc8749aaa63bf59ac46918eb0529f09900c9",
+  "executable_sha256": "fd83c77312cf98686013f90b7014d1ff0193dce8d4bc3c40cda6cc5cfdd3a558"
+}

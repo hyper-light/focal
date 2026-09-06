@@ -1,5 +1,5 @@
-//! Founder-only local invitation administration. Kernel-authenticated Unix
-//! ingress calls the existing bounded signer directly; no extra actor or queue.
+//! Physical-owner administration over kernel-authenticated Unix ingress.
+//! Signing remains founder-only; reads and mutations use existing bounded owners.
 use crate::{
     cluster::InviteIntent,
     embedded::NodeIdentity,
@@ -8,7 +8,10 @@ use crate::{
     node_directory::NodeDirectory,
     quorum_enrollment::{QuorumEnrollmentError, QuorumEnrollmentHost},
 };
-use focal_control::{ControlFailure, ControlIdentity, ControlScope};
+use focal_control::{
+    ControlCommand, ControlFailure, ControlIdentity, ControlRead, ControlReply, ControlRequest,
+    ControlScope, ControlTransfer,
+};
 use focal_enrollment::{EnrollmentError, EnrollmentRole};
 use focal_memory::{BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::{RequestEpoch, RequestId, RouteEpoch};
@@ -18,8 +21,14 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 pub const ADMIN_SOCKET: &str = "focal-admin.sock";
 const MAGIC: &[u8] = b"FCLADMIN1";
-const MAX_COMMAND: usize = 128;
+const MAX_COMMAND: usize = 60 * 1024;
 const WORKSPACE: usize = 2 * 1024 * 1024;
+#[path = "replica_admin_protocol.rs"]
+mod replicas;
+pub use replicas::{ReplicaAdminCommand, ReplicaAdminReply, ReplicaAdminStatus};
+#[path = "operator_admin.rs"]
+pub(crate) mod operator;
+pub use operator::OperatorRead;
 
 pub fn admin_wire_limits() -> WireLimits {
     WireLimits {
@@ -34,6 +43,33 @@ pub fn admin_wire_limits() -> WireLimits {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum AdminCommand {
     Invite { name: String },
+    Read(AdminRead),
+    Membership(Box<ControlRequest>),
+    Transfer(ControlTransfer),
+    Revocation(Box<ControlRequest>),
+    InviteClient { name: String },
+    Replica(Box<ReplicaAdminCommand>),
+    Operator(OperatorRead),
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum AdminRead {
+    Membership,
+    Configuration,
+    Contacts,
+    Invitations {
+        after: Option<[u8; 16]>,
+        limit: u16,
+        expected_revision: Option<u64>,
+    },
+    Invitation {
+        id: [u8; 16],
+    },
+    PrepareRevocation {
+        id: [u8; 16],
+    },
+    Reconcile {
+        sequence: u64,
+    },
 }
 impl AdminCommand {
     pub fn invitation(name: impl Into<String>) -> Result<Self, AccessError> {
@@ -42,8 +78,7 @@ impl AdminCommand {
         Ok(Self::Invite { name })
     }
     pub fn encode(&self) -> Result<Vec<u8>, AccessError> {
-        let Self::Invite { name } = self;
-        validate_name(name)?;
+        self.validate()?;
         let len = postcard::experimental::serialized_size(self)
             .map_err(|_| AccessError::InvalidRequest)?;
         let total = MAGIC
@@ -75,27 +110,112 @@ impl AdminCommand {
             .ok_or(AccessError::InvalidRequest)?;
         let (command, tail): (Self, _) =
             postcard::take_from_bytes(payload).map_err(|_| AccessError::InvalidRequest)?;
-        let Self::Invite { name } = &command;
         if !tail.is_empty() {
             return Err(AccessError::InvalidRequest);
         }
-        validate_name(name)?;
+        command.validate()?;
         Ok(command)
     }
     pub fn request(&self, identity: &NodeIdentity) -> Result<RequestEnvelope, AccessError> {
-        let Self::Invite { name } = self;
+        self.validate()?;
         Ok(RequestEnvelope {
             protocol: PROTOCOL_VERSION,
             ledger: root_namespace(identity),
             route_epoch: RouteEpoch(1),
             request_epoch: RequestEpoch(1),
-            request_id: invitation_request_id(identity.cluster, name)?,
+            request_id: match self {
+                Self::Invite { name } => invitation_request_id(identity.cluster, name)?,
+                Self::InviteClient { name } => {
+                    client_invitation_request_id(identity.cluster, name)?
+                }
+                _ => admin_request_id(&self.encode()?)?,
+            },
             operation: Operation::Control {
                 group: crate::network_state::root_group(identity.cluster),
                 request: self.encode()?,
             },
         })
     }
+    fn validate(&self) -> Result<(), AccessError> {
+        match self {
+            Self::Operator(read) => read.validate(),
+            Self::Replica(command) => command.validate(),
+            Self::Invite { name } | Self::InviteClient { name } => validate_name(name),
+            Self::Read(AdminRead::Invitations { limit, .. }) if *limit == 0 || *limit > 64 => {
+                Err(AccessError::InvalidRequest)
+            }
+            Self::Read(AdminRead::Reconcile { sequence: 0 }) => Err(AccessError::InvalidRequest),
+            Self::Read(AdminRead::Invitation { id } | AdminRead::PrepareRevocation { id })
+                if *id == [0; 16] =>
+            {
+                Err(AccessError::InvalidRequest)
+            }
+            Self::Read(_) => Ok(()),
+            Self::Revocation(request) => {
+                let ControlCommand::Enrollment(command) = &request.command else {
+                    return Err(AccessError::Unauthorized);
+                };
+                if command.revoked_invitation().is_none()
+                    || request.id.sequence == 0
+                    || request.acknowledged_through >= request.id.sequence
+                {
+                    return Err(AccessError::InvalidRequest);
+                }
+                Ok(())
+            }
+            Self::Membership(request) => {
+                let ControlCommand::Membership(command) = &request.command else {
+                    return Err(AccessError::Unauthorized);
+                };
+                if request.id.sequence == 0 || request.acknowledged_through >= request.id.sequence {
+                    return Err(AccessError::InvalidRequest);
+                }
+                command
+                    .expected
+                    .validate()
+                    .map_err(|_| AccessError::InvalidRequest)?;
+                command
+                    .change
+                    .apply_to(&command.expected)
+                    .map_err(|_| AccessError::InvalidRequest)?;
+                Ok(())
+            }
+            Self::Transfer(request) => {
+                request
+                    .expected
+                    .validate()
+                    .map_err(|_| AccessError::InvalidRequest)?;
+                if request.target == 0 || !request.expected.voters.contains(&request.target) {
+                    return Err(AccessError::InvalidRequest);
+                }
+                Ok(())
+            }
+        }
+    }
+}
+fn admin_request_id(bytes: &[u8]) -> Result<RequestId, AccessError> {
+    let digest = blake3::derive_key("focal.node.local-admin.request.v1", bytes);
+    let mut id = [0; 16];
+    for (target, byte) in id.iter_mut().zip(digest) {
+        *target = byte;
+    }
+    if id == [0; 16] {
+        return Err(AccessError::InvalidRequest);
+    }
+    Ok(RequestId(id))
+}
+/// A fixed private control sequence namespace, minted only at the trusted
+/// local administrator boundary. It is not a network Runtime credential.
+pub fn admin_principal(identity: &NodeIdentity) -> focal_model::ParticipantId {
+    let mut hash = blake3::Hasher::new_derive_key("focal.node.local-admin.principal.v1");
+    hash.update(&identity.cluster);
+    hash.update(&identity.node.to_be_bytes());
+    hash.update(&identity.issuer.0);
+    let mut bytes = [0; 16];
+    for (target, byte) in bytes.iter_mut().zip(hash.finalize().as_bytes()) {
+        *target = *byte;
+    }
+    focal_model::ParticipantId(bytes)
 }
 pub fn invitation_request_id(cluster: [u8; 16], name: &str) -> Result<RequestId, AccessError> {
     validate_name(name)?;
@@ -113,6 +233,26 @@ pub fn invitation_request_id(cluster: [u8; 16], name: &str) -> Result<RequestId,
         return Err(AccessError::InvalidRequest);
     }
     Ok(RequestId(id))
+}
+pub fn client_invitation_request_id(
+    cluster: [u8; 16],
+    name: &str,
+) -> Result<RequestId, AccessError> {
+    validate_name(name)?;
+    if cluster == [0; 16] {
+        return Err(AccessError::InvalidRequest);
+    }
+    let mut hash = blake3::Hasher::new_derive_key("focal.node.named-client-invitation.v1");
+    hash.update(&cluster);
+    hash.update(name.as_bytes());
+    let mut bytes = [0; 16];
+    for (target, byte) in bytes.iter_mut().zip(hash.finalize().as_bytes()) {
+        *target = *byte;
+    }
+    if bytes == [0; 16] {
+        return Err(AccessError::InvalidRequest);
+    }
+    Ok(RequestId(bytes))
 }
 fn validate_name(name: &str) -> Result<(), AccessError> {
     if name.is_empty()
@@ -134,7 +274,10 @@ pub struct LocalNetworkAdmin {
     identity: NodeIdentity,
     root: ControlIdentity,
     advertise: SocketAddr,
-    enrollment: QuorumEnrollmentHost,
+    listen: SocketAddr,
+    enrollment: Option<QuorumEnrollmentHost>,
+    control: Option<crate::control_host::ControlHost>,
+    fleet: Option<crate::fleet::FleetManager>,
     budget: MemoryBudget,
 }
 impl LocalNetworkAdmin {
@@ -160,9 +303,54 @@ impl LocalNetworkAdmin {
             identity: directory.identity().clone(),
             root,
             advertise,
-            enrollment,
+            listen: state.listen,
+            enrollment: Some(enrollment),
+            control: None,
+            fleet: None,
             budget,
         })
+    }
+    /// Every physical node may expose its own OS-authorized root owner. Node
+    /// certificates never receive this authority and invitations remain founder-only.
+    pub fn for_node(
+        directory: &NodeDirectory,
+        root: ControlIdentity,
+        advertise: SocketAddr,
+        enrollment: Option<QuorumEnrollmentHost>,
+        budget: MemoryBudget,
+    ) -> Result<Self, AccessError> {
+        let state = NetworkState::load(directory)
+            .map_err(|_| AccessError::Unavailable)?
+            .ok_or(AccessError::Unavailable)?;
+        if root.scope != ControlScope::Root
+            || state.genesis.root != root
+            || state.advertise != advertise
+            || (enrollment.is_some() && state.genesis.founder != *directory.identity())
+        {
+            return Err(AccessError::Unauthorized);
+        }
+        Ok(Self {
+            directory: directory.root().to_path_buf(),
+            identity: directory.identity().clone(),
+            root,
+            advertise,
+            listen: state.listen,
+            enrollment,
+            control: None,
+            fleet: None,
+            budget,
+        })
+    }
+    pub fn with_control(
+        mut self,
+        control: crate::control_host::ControlHost,
+    ) -> Result<Self, AccessError> {
+        let progress = control.progress();
+        if progress.identity != self.root || progress.node != self.identity.node {
+            return Err(AccessError::Unauthorized);
+        }
+        self.control = Some(control);
+        Ok(self)
     }
     async fn invite(&self, verified: &VerifiedRequest) -> Result<Vec<u8>, AccessError> {
         let peer = verified.peer();
@@ -186,11 +374,33 @@ impl LocalNetworkAdmin {
         if *group != self.root.group {
             return Err(AccessError::Unauthorized);
         }
-        let AdminCommand::Invite { name } = AdminCommand::decode(bytes)?;
-        let id = invitation_request_id(self.identity.cluster, &name)?;
-        if request.request_id != id {
+        let command = AdminCommand::decode(bytes)?;
+        if request.request_id != command.request(&self.identity)?.request_id {
             return Err(AccessError::InvalidRequest);
         }
+        if let AdminCommand::Operator(read) = command {
+            return self.operator_read(read).await;
+        }
+        if let AdminCommand::Replica(command) = command {
+            return self.replica_command(*command).await;
+        }
+        if !matches!(
+            command,
+            AdminCommand::Invite { .. } | AdminCommand::InviteClient { .. }
+        ) {
+            return self.control_command(command, request.request_id).await;
+        }
+        let (name, role, id) = match command {
+            AdminCommand::Invite { name } => {
+                let id = invitation_request_id(self.identity.cluster, &name)?;
+                (name, EnrollmentRole::Node, id)
+            }
+            AdminCommand::InviteClient { name } => {
+                let id = client_invitation_request_id(self.identity.cluster, &name)?;
+                (name, EnrollmentRole::Client, id)
+            }
+            _ => return Err(AccessError::InvalidRequest),
+        };
         let state = NetworkState::load_from(&self.directory, &self.identity)
             .map_err(|_| AccessError::Unavailable)?
             .ok_or(AccessError::Unavailable)?;
@@ -202,20 +412,107 @@ impl LocalNetworkAdmin {
         }
         let invitation = self
             .enrollment
+            .as_ref()
+            .ok_or(AccessError::Unauthorized)?
             .invite(
                 id,
                 InviteIntent {
                     endpoint: self.advertise.to_string(),
-                    role: EnrollmentRole::Node,
+                    role,
                     lifetime_seconds: 3600,
                 },
             )
             .await
             .map_err(enrollment_error)?;
-        let bundle = NodeInvitation::new(name, state.genesis, invitation)
-            .map_err(|_| AccessError::Unavailable)?;
-        let mut bytes = bundle.encode().map_err(|_| AccessError::Capacity)?;
+        let mut bytes = match role {
+            EnrollmentRole::Node => NodeInvitation::new(name, state.genesis, invitation)
+                .map_err(|_| AccessError::Unavailable)?
+                .encode()
+                .map_err(|_| AccessError::Capacity)?,
+            EnrollmentRole::Client => {
+                crate::network_join::ClientInvitation::new(name, state.genesis, invitation)
+                    .map_err(|_| AccessError::Unavailable)?
+                    .encode()
+                    .map_err(|_| AccessError::Capacity)?
+            }
+        };
         Ok(std::mem::take(&mut *bytes))
+    }
+    async fn control_command(
+        &self,
+        command: AdminCommand,
+        id: RequestId,
+    ) -> Result<Vec<u8>, AccessError> {
+        let control = self.control.as_ref().ok_or(AccessError::Unavailable)?;
+        let principal = admin_principal(&self.identity);
+        if principal.is_zero() {
+            return Err(AccessError::Unauthorized);
+        }
+        let peer = AuthenticatedPeer::local(PeerGrant {
+            principal,
+            tenants: std::collections::BTreeSet::from([self.identity.ledger.tenant]),
+            role: PeerRole::Runtime,
+        })
+        .map_err(|_| AccessError::Unauthorized)?;
+        let result = match command {
+            AdminCommand::Read(query) => control
+                .read(
+                    peer,
+                    id,
+                    match query {
+                        AdminRead::Membership => ControlRead::Membership,
+                        AdminRead::Configuration => ControlRead::Configuration,
+                        AdminRead::Contacts => ControlRead::Contacts,
+                        AdminRead::Invitations {
+                            after,
+                            limit,
+                            expected_revision,
+                        } => ControlRead::InvitationPage {
+                            after,
+                            limit,
+                            expected_revision,
+                        },
+                        AdminRead::Invitation { id } => ControlRead::Invitation { id },
+                        AdminRead::PrepareRevocation { id } => {
+                            ControlRead::PrepareRevocation { id }
+                        }
+                        AdminRead::Reconcile { sequence } => ControlRead::AdminReceipt {
+                            id: focal_control::ControlRequestId {
+                                client: principal.0,
+                                sequence,
+                            },
+                        },
+                    },
+                )
+                .await
+                .map(ControlReply::Read),
+            AdminCommand::Membership(request) | AdminCommand::Revocation(request) => {
+                if request.id.client != principal.0 {
+                    return Err(AccessError::Unauthorized);
+                }
+                control
+                    .submit(peer, *request)
+                    .await
+                    .map(ControlReply::Committed)
+            }
+            AdminCommand::Transfer(request) => {
+                let target = request.target;
+                control
+                    .transfer(peer, id, request)
+                    .await
+                    .map(|()| ControlReply::TransferInitiated { target })
+            }
+            AdminCommand::Invite { .. }
+            | AdminCommand::InviteClient { .. }
+            | AdminCommand::Operator(_)
+            | AdminCommand::Replica(_) => {
+                return Err(AccessError::Unauthorized);
+            }
+        };
+        result
+            .unwrap_or_else(ControlReply::Rejected)
+            .encode(admin_wire_limits().max_frame_bytes as usize)
+            .map_err(|_| AccessError::Capacity)
     }
 }
 impl RequestHandler for LocalNetworkAdmin {
@@ -295,6 +592,10 @@ mod tests {
             invitation_request_id([1; 16], "worker-2").unwrap(),
             invitation_request_id([1; 16], "worker-3").unwrap()
         );
+        assert_ne!(
+            invitation_request_id([1; 16], "worker-2").unwrap(),
+            client_invitation_request_id([1; 16], "worker-2").unwrap()
+        );
         for name in ["", "two words", "node\nname", &"x".repeat(64)] {
             assert!(AdminCommand::invitation(name).is_err());
         }
@@ -305,6 +606,11 @@ mod tests {
         trailing.push(0);
         assert!(AdminCommand::decode(&trailing).is_err());
         assert!(AdminCommand::decode(&[0; MAX_COMMAND + 1]).is_err());
+        assert!(
+            AdminCommand::Read(AdminRead::Reconcile { sequence: 0 })
+                .encode()
+                .is_err()
+        );
         assert_eq!(
             enrollment_error(QuorumEnrollmentError::Enrollment(EnrollmentError::Io(
                 std::io::Error::other("private detail")

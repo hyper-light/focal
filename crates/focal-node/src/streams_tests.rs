@@ -72,6 +72,142 @@ fn register(seed: bool) -> StreamRequest {
     }
 }
 #[test]
+fn claim_seed_visits_unselected_rows_and_uses_committed_associations() {
+    let root = tempfile::tempdir().unwrap();
+    let mut node = open(root.path());
+    let report = crate::demo::run(&mut node).unwrap();
+    // Provenance alone does not attach an artifact to the claim's evidence.
+    let artifact = NewArtifact {
+        id: ArtifactId::from_u128(88001),
+        content: ArtifactContent {
+            ledger: node.identity.ledger,
+            schema: SCHEMA_MAJOR,
+            kind: "notes".into(),
+            schema_hash: ContentHash([98; 32]),
+            metadata: vec![],
+            payload: ArtifactPayload::Inline(b"related, not attached".to_vec()),
+            producer: node.identity.issuer,
+            receipt: None,
+            inputs: BTreeSet::from([ObjectRef {
+                ledger: node.identity.ledger,
+                kind: ObjectKind::Claim,
+                id: ObjectId(report.claim.0),
+            }]),
+            visibility: BTreeSet::new(),
+        },
+    };
+    let hash = artifact.content.content_hash().unwrap();
+    let input = crate::demo::request(
+        &node.identity,
+        "unattached-seed-artifact",
+        node.identity.issuer,
+        Command::RegisterArtifact { artifact },
+        vec![EvidenceAttestation {
+            descriptor_hash: hash,
+            custody_revision: 1,
+            durable: true,
+            schema_valid: true,
+        }],
+    );
+    assert!(matches!(
+        node.session.submit_local(&input).unwrap(),
+        focal_ledger::Submission::Committed(_)
+    ));
+    let mut views = ReadViews::new();
+    let mut streams = Streams::new().unwrap();
+    let claims = BTreeSet::from([report.claim]);
+    let first = invoke(
+        &mut node,
+        &mut views,
+        &mut streams,
+        88002,
+        StreamRequest::Open {
+            consumer: ConsumerId::from_u128(88003),
+            filter: DeltaFilter::Claims(claims.clone()),
+            start: None,
+            seed: true,
+            credits: Credits {
+                items: 1,
+                bytes: 64 * 1024,
+            },
+        },
+    )
+    .unwrap();
+    let mut page = first.seed.unwrap();
+    let token = page.token;
+    let mut rows = vec![];
+    let mut empty = 0;
+    loop {
+        if page.objects.is_empty() {
+            empty += 1;
+        }
+        rows.extend(page.objects.clone());
+        let Some(after) = page.next else {
+            break;
+        };
+        let query = ReadRequest {
+            consistency: ReadConsistency::Exact(token),
+            query: ReadQuery::SeedScan {
+                after: Some(after),
+                claims: claims.iter().copied().collect(),
+                max_bytes: 65536,
+            },
+            max_items: 1,
+        };
+        let request = RequestEnvelope {
+            protocol: PROTOCOL_VERSION,
+            ledger: node.identity.ledger,
+            route_epoch: RouteEpoch(1),
+            request_epoch: RequestEpoch(1),
+            request_id: RequestId::from_u128(88004),
+            operation: Operation::Read(query.clone()),
+        };
+        let next = views
+            .read(
+                &mut node.session,
+                node.identity.issuer,
+                &query,
+                request.request_id,
+                &WireLimits::default(),
+            )
+            .unwrap();
+        assert!(next.next.is_none_or(|next| next > after));
+        validate_response(
+            &request,
+            &request.reply(Response::Read(next.clone())),
+            Some(node.identity.issuer),
+            &WireLimits::default(),
+        )
+        .unwrap();
+        let retry = views
+            .read(
+                &mut node.session,
+                node.identity.issuer,
+                &query,
+                request.request_id,
+                &WireLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(next, retry);
+        page = next;
+    }
+    assert!(
+        empty > 0,
+        "an unselected artifact must consume a bounded visit"
+    );
+    assert_eq!(rows.len(), 5);
+    assert!(
+        !rows.iter().any(
+            |row| matches!(row,ReadObject::Artifact{id,..} if *id==ArtifactId::from_u128(88001))
+        )
+    );
+    assert!(
+        rows.iter()
+            .any(|row| matches!(row, ReadObject::Artifact { .. }))
+    );
+}
+
+#[test]
 fn delivery_replays_after_restart_but_only_committed_ack_releases_progress() {
     let root = tempfile::tempdir().unwrap();
     let mut node = open(root.path());

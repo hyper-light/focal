@@ -1,0 +1,125 @@
+//! One-off physical downgrade experiment, never a released application decoder.
+//! Compile only after the real consensus transition API is available.
+use focal_consensus::{DurableNode, NodeConfig};
+use focal_ledger::Session;
+use focal_log::{SharedWal, WalIdentity, WalOptions};
+use focal_node::{
+    config::{NodeSettings, Settings},
+    node_directory::NodeDirectory,
+};
+use std::{error::Error, io, path::PathBuf};
+
+fn fail(message: &'static str) -> Box<dyn Error> {
+    Box::new(io::Error::other(message))
+}
+fn main() -> Result<(), Box<dyn Error>> {
+    let mut args = std::env::args_os().skip(1);
+    let mode = args.next().ok_or_else(|| fail("missing experiment mode"))?;
+    let mode = mode.to_str().ok_or_else(|| fail("mode is not UTF-8"))?;
+    let data = PathBuf::from(args.next().ok_or_else(|| fail("missing data directory"))?);
+    if args.next().is_some() || !data.is_absolute() || !data.join("IDENTITY").is_file() {
+        return Err(fail(
+            "requires an existing isolated absolute data directory",
+        ));
+    }
+    let settings = Settings {
+        node: NodeSettings {
+            data_dir: Some(data),
+            ..NodeSettings::default()
+        },
+        ..Settings::default()
+    };
+    let directory = NodeDirectory::open(&settings)?;
+    let identity = directory.identity();
+    let wal = SharedWal::open(
+        directory.root().join("wal"),
+        WalOptions::new(WalIdentity {
+            cluster: identity.cluster,
+            node: identity.node,
+            stream: 0,
+        }),
+    )?;
+    let config = NodeConfig::single(identity.node, identity.cluster, identity.ledger.session.0);
+    let predecessor = Session::managed_decoder_hash();
+    // Explicitly synthetic; no Focal Session claims to implement this decoder.
+    let successor: [u8; 32] = *b"focal-test-only-successor-v2!!!!";
+    let mut group = DurableNode::open_on_wal(config, wal.clone())?;
+    if mode == "install-predecessor" {
+        group.confirm_decoder(predecessor)?;
+    } else {
+        group.confirm_decoder_pair(predecessor, successor)?;
+    }
+    let recovered = group.drain()?;
+    if !recovered.committed.is_empty() || !recovered.messages.is_empty() {
+        return Err(fail(
+            "baseline must have only a complete checkpoint, no application suffix",
+        ));
+    }
+    let snapshot = recovered
+        .snapshot
+        .ok_or_else(|| fail("missing original real Session snapshot"))?;
+    if snapshot.index != group.status().committed_index {
+        return Err(fail("snapshot is not the delivered committed prefix"));
+    }
+    println!(
+        "original snapshot index={} term={} bytes={}",
+        snapshot.index,
+        snapshot.term,
+        snapshot.data.len()
+    );
+    match mode {
+        "install-predecessor" => {
+            group.begin_decoder_floor(predecessor)?;
+            group.finish_decoder_floor()?;
+            if !group.decoder_floor_ready(predecessor) {
+                return Err(fail("predecessor floor was not durably published"));
+            }
+        }
+        "transition" => {
+            if group.required_decoder() != Some(predecessor) {
+                return Err(fail("transition requires the actual durable predecessor"));
+            }
+            group.begin_decoder_transition()?;
+            group.finish_decoder_floor()?;
+            if !group.decoder_floor_ready(successor) || group.required_decoder() != Some(successor)
+            {
+                return Err(fail("transition did not change the exact published floor"));
+            }
+        }
+        "compact-same" => {
+            if !group.decoder_floor_ready(successor) {
+                return Err(fail("successor pair confirmation failed after reopening"));
+            }
+            // Preserve exact original opaque Session bytes, index, term and
+            // configuration; no successor application records are authored.
+            group.checkpoint(snapshot.index, snapshot.data)?;
+        }
+        "compact-other" => {
+            if !group.decoder_floor_ready(successor) {
+                return Err(fail("successor pair confirmation failed after reopening"));
+            }
+            let mut other_id = identity.ledger.session.0;
+            if let Some(first) = other_id.first_mut() {
+                *first ^= 0x80;
+            }
+            let mut other = DurableNode::open_on_wal(
+                NodeConfig::single(identity.node, identity.cluster, other_id),
+                wal,
+            )?;
+            other.campaign()?;
+            let events = other.drain()?;
+            if !events.messages.is_empty() || events.applied_index == 0 {
+                return Err(fail(
+                    "unrelated single-node group did not commit its election",
+                ));
+            }
+            other.checkpoint(
+                events.applied_index,
+                b"focal test-only unrelated group checkpoint".to_vec(),
+            )?;
+        }
+        _ => return Err(fail("unknown experiment mode")),
+    }
+    println!("required decoder {:?}", group.required_decoder());
+    Ok(())
+}

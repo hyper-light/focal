@@ -30,6 +30,11 @@ pub struct FleetStatus {
     pub running: usize,
     pub stopped: bool,
 }
+pub(crate) type ReplicaPage = (
+    FleetStatus,
+    Vec<(LedgerId, [u8; 16], ReplicaProgress)>,
+    Option<LedgerId>,
+);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum FleetError {
     #[error("fleet capacity exhausted")]
@@ -160,6 +165,10 @@ pub struct FleetManager {
     slots: MemoryBudget,
 }
 impl FleetManager {
+    pub(crate) fn identity(&self) -> (u64, [u8; 16]) {
+        let state = self.state.borrow();
+        (state.node, state.cluster)
+    }
     pub fn status(&self) -> FleetStatus {
         self.state.borrow().status
     }
@@ -167,6 +176,12 @@ impl FleetManager {
     /// before calling. A short watch borrow clones only the current fenced host;
     /// no owner round trip or mutable session access is involved.
     pub fn current_host(&self, ledger: LedgerId) -> Result<ReplicaHost, FleetError> {
+        self.replica_target(ledger).map(|(_, host)| host)
+    }
+    pub(crate) fn replica_target(
+        &self,
+        ledger: LedgerId,
+    ) -> Result<([u8; 16], ReplicaHost), FleetError> {
         let state = self.state.borrow();
         if state.status.stopped || state.quiesced {
             return Err(FleetError::Unavailable);
@@ -175,7 +190,54 @@ impl FleetManager {
         if entry.host.progress().stopped {
             return Err(FleetError::Unavailable);
         }
-        Ok(entry.host.clone())
+        Ok((entry.group, entry.host.clone()))
+    }
+    /// A bounded local management observation, not a quorum or placement claim.
+    pub(crate) fn replica_page(
+        &self,
+        tenant: TenantId,
+        after: Option<LedgerId>,
+        limit: usize,
+    ) -> Result<ReplicaPage, FleetError> {
+        if limit == 0 || limit > 64 {
+            return Err(FleetError::Capacity);
+        }
+        if after.is_some_and(|ledger| ledger.tenant != tenant) {
+            return Err(FleetError::InvalidSession);
+        }
+        let state = self.state.borrow();
+        if state.status.stopped || state.quiesced {
+            return Err(FleetError::Unavailable);
+        }
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(limit)
+            .map_err(|_| FleetError::Capacity)?;
+        let lower = after.map_or(
+            std::ops::Bound::Included(LedgerId {
+                tenant,
+                session: SessionId([0; 16]),
+            }),
+            std::ops::Bound::Excluded,
+        );
+        let mut entries = state.entries.range((
+            lower,
+            std::ops::Bound::Included(LedgerId {
+                tenant,
+                session: SessionId([255; 16]),
+            }),
+        ));
+        for _ in 0..limit {
+            let Some((ledger, entry)) = entries.next() else {
+                return Ok((state.status, rows, None));
+            };
+            rows.push((*ledger, entry.group, entry.host.progress()));
+        }
+        let next = if entries.next().is_some() {
+            rows.last().map(|row| row.0)
+        } else {
+            None
+        };
+        Ok((state.status, rows, next))
     }
     /// Allocation-free traversal for node-owned background capabilities. A
     /// returned host keeps that exact installed incarnation through an exchange.

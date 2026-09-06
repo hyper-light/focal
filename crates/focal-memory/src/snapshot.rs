@@ -201,7 +201,7 @@ impl<K, V> std::fmt::Debug for ReadPage<K, V> {
     }
 }
 
-impl<K: Ord + Clone, V: Clone> SnapshotLease<K, V> {
+impl<K: Ord, V> SnapshotLease<K, V> {
     /// Project one immutable entry without copying its potentially large value.
     /// The borrow cannot escape the callback. The caller accounts any owned
     /// projection; this method allocates no response buffer or continuation.
@@ -222,6 +222,9 @@ impl<K: Ord + Clone, V: Clone> SnapshotLease<K, V> {
             .filter(|entry| entry.key < *end)
             .map(project))
     }
+}
+
+impl<K: Ord + Clone, V: Clone> SnapshotLease<K, V> {
     pub fn get(&self, key: &K, now: u64) -> Result<ReadPage<K, V>, MemoryError> {
         let state = self.checked_state(now)?;
         let entry = state.root.get(key);

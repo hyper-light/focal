@@ -1,5 +1,7 @@
 use super::{CliError, Context, Result, Settings};
 use focal_client::{
+    managed_requests::ManagedRequests,
+    managed_store::ManagedStoreLimits,
     operation_store::{OperationStore, StoreError, StoreLimits},
     pending::OperationContext,
 };
@@ -16,7 +18,7 @@ const MARKER: &str = "MCP.operations.initialized";
 const MAGIC: &[u8; 8] = b"FCLMCP01";
 const MARKER_BYTES: u64 = 104;
 
-pub(crate) fn serve(settings: &Settings) -> Result<()> {
+pub(crate) fn serve(settings: &Settings, selection: Option<&str>) -> Result<()> {
     if tokio::runtime::Handle::try_current().is_ok() {
         return Err(CliError::Input(
             "MCP foreground startup requires a blocking process owner".into(),
@@ -27,11 +29,41 @@ pub(crate) fn serve(settings: &Settings) -> Result<()> {
         build,
         operation,
         root,
-    } = Context::open(settings)?;
+        admin_root,
+        invocation: _,
+    } = Context::open(settings, selection)?;
     let store = Bootstrap::open(&root)
         .and_then(|bootstrap| bootstrap.finish(&operation))
         .map_err(|error| CliError::Other(Box::new(error)))?;
-    let backend = focal_mcp::Backend::new(client, build, operation, store)?;
+    let managed = ManagedRequests::open(
+        &root,
+        "MCP.requests",
+        operation,
+        ManagedStoreLimits::default(),
+    )
+    .map_err(|error| CliError::Other(Box::new(error)))?;
+    let mut backend =
+        focal_mcp::Backend::new(client, build, operation, store)?.with_managed_requests(managed)?;
+    let uploads = focal_client::artifact_transfer::UploadStore::bootstrap(
+        &root,
+        "MCP.uploads",
+        operation,
+        focal_client::artifact_transfer::UploadStoreLimits::default(),
+    )
+    .map_err(|error| CliError::Other(Box::new(error)))?;
+    backend = backend.with_uploads(uploads);
+    let watches = focal_client::watch::WatchStore::open(&root, operation)
+        .map_err(|error| CliError::Other(Box::new(error)))?;
+    backend = backend.with_watches(watches)?;
+    if let Some(admin_root) = admin_root {
+        let mut admin_settings = Settings::default();
+        admin_settings.node.data_dir = Some(admin_root);
+        if let Some(admin) = focal_node::cluster_admin::ClusterAdmin::available(&admin_settings)
+            .map_err(|error| CliError::Other(Box::new(error)))?
+        {
+            backend = backend.with_admin(Box::new(admin));
+        }
+    }
     focal_mcp::serve(backend, std::io::stdin(), std::io::stdout())
         .map_err(|error| CliError::Other(Box::new(error)))
 }
@@ -404,7 +436,7 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
-        assert!(runtime.block_on(async { serve(&settings) }).is_err());
+        assert!(runtime.block_on(async { serve(&settings, None) }).is_err());
         assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
     }
 }

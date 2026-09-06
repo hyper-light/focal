@@ -211,6 +211,23 @@ pub struct ListDocument {
     pub phase: Option<String>,
     #[serde(default)]
     pub mode: Option<String>,
+    #[serde(default)]
+    pub scopes: Vec<ScopeDocument>,
+    /// Typed relation targets: claim:ID, participant:self, action:work, root:ID.
+    #[serde(default)]
+    pub relations: Vec<ClaimRelationDocument>,
+    #[serde(default)]
+    pub caused_by: Option<String>,
+    #[serde(default)]
+    pub inputs: Vec<ObjectReferenceDocument>,
+    #[serde(default)]
+    pub outcome: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<String>,
+    #[serde(default)]
+    pub created_after: Option<u64>,
+    #[serde(default)]
+    pub created_through: Option<u64>,
     /// Exact hexadecimal encoding of the server's opaque authenticated cursor.
     #[serde(default)]
     pub cursor: Option<String>,
@@ -234,6 +251,14 @@ impl Default for ListDocument {
             evaluator: None,
             phase: None,
             mode: None,
+            scopes: Vec::new(),
+            relations: Vec::new(),
+            caused_by: None,
+            inputs: Vec::new(),
+            outcome: None,
+            confidence: None,
+            created_after: None,
+            created_through: None,
             cursor: None,
             limit: page_items(),
             max_visits: page_visits(),
@@ -246,6 +271,11 @@ impl ListDocument {
         kind: ObjectKind,
         context: &BuildContext,
     ) -> Result<ListRequest, InputError> {
+        if self.has_predicates() {
+            return Err(InputError::Invalid(
+                "extended list filters require build_operation",
+            ));
+        }
         context.validate()?;
         if self.limit == 0 || self.limit > 1024 || self.max_visits == 0 || self.max_visits > 1024 {
             return Err(InputError::Capacity);
@@ -352,3 +382,8 @@ pub fn decode_list_cursor(value: &str) -> Result<ListCursor, InputError> {
     }
     Ok(ListCursor { bytes })
 }
+
+/// No filters or historical-prefix claims: summary observes one current ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryDocument {}

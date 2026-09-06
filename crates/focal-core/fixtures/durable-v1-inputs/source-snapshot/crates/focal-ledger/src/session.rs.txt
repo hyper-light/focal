@@ -1,0 +1,1448 @@
+use crate::request_streams::{
+    ManagedError, PreparedStream, RequestStreamLimits, RequestStreams, RequestStreamsCheckpoint,
+};
+use focal_consensus::{ConsensusError, DurableNode, Message, NodeConfig, NodeStatus, StateRole};
+use focal_core::{
+    ApplyResult, Core, CoreError, CoreView, EpochError, EpochLimits, EpochOutput, EpochReport,
+    PendingState, PreparedMutation, RowPatch, State,
+};
+use focal_graph::{
+    GraphConfig, GraphError, GraphSnapshot, GraphStore, PreparedGraph, reference_charge,
+};
+use focal_memory::{
+    Allocation, BudgetKind, BudgetLane, BudgetStats, MemoryBudget, MemoryError, RangeId,
+};
+use focal_model::*;
+use focal_stream::{
+    ConsumerId, CursorCheckpoint, CursorCommand, CursorOperation, CursorRecord, CursorRegistry,
+    DeltaSource, Position, PositionOffset, PreparedCursorUpdate, RegistryConfig, ReplayBounds,
+    ReplayLimit, ResyncReason, StreamError,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, VecDeque};
+use std::path::Path;
+
+const ENTRY_MAGIC: &[u8] = b"FOCALOP1";
+const SNAPSHOT_MAGIC: &[u8] = b"FOCALSS1";
+const CURSOR_MAGIC: &[u8] = b"FOCALCU2";
+const LEGACY_CURSOR_MAGIC: &[u8] = b"FOCALCU1";
+const CURSOR_MAINTENANCE_MAGIC: &[u8] = b"FOCALCM1";
+const SNAPSHOT_V2_MAGIC: &[u8] = b"FOCALSS2";
+const SNAPSHOT_V3_MAGIC: &[u8] = b"FOCALSS3";
+
+#[derive(Debug, Clone)]
+pub struct SessionLimits {
+    pub apply: EpochLimits,
+    pub core: Limits,
+    pub pending: usize,
+    pub delta_bytes: usize,
+    pub delta_items: usize,
+    pub memory_bytes: usize,
+    pub completion_reserve_bytes: usize,
+    pub graph: GraphConfig,
+    pub cursors: RegistryConfig,
+    /// Dedicated exact cursor outcomes; domain receipts cannot consume these slots.
+    pub cursor_receipts: usize,
+    pub request_streams: RequestStreamLimits,
+}
+
+impl Default for SessionLimits {
+    fn default() -> Self {
+        Self {
+            apply: EpochLimits {
+                max_commands: 16,
+                max_workers: 2,
+                max_edges: 120,
+                max_bytes: 8 * 1024 * 1024,
+                max_trace_entries: 128,
+                worker_stack_bytes: 512 * 1024,
+            },
+            core: Limits::default(),
+            pending: 128,
+            delta_bytes: 8 * 1024 * 1024,
+            delta_items: 4096,
+            memory_bytes: 256 * 1024 * 1024,
+            completion_reserve_bytes: 32 * 1024 * 1024,
+            graph: GraphConfig::default(),
+            cursors: RegistryConfig::default(),
+            cursor_receipts: 8192,
+            request_streams: RequestStreamLimits::default(),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LedgerError {
+    #[error("managed request: {0}")]
+    Managed(#[from] ManagedError),
+    #[error("reconciliation: {0}")]
+    Reconciliation(#[from] focal_core::ReconciliationError),
+    #[error("epoch: {0}")]
+    Epoch(#[from] EpochError),
+    #[error("stream: {0}")]
+    Stream(#[from] StreamError),
+    #[error("cursor request rejected: {0:?}")]
+    CursorRequest(ErrorCode),
+    #[error("graph: {0}")]
+    Graph(#[from] GraphError),
+    #[error("memory: {0}")]
+    Memory(#[from] MemoryError),
+    #[error("consensus: {0}")]
+    Consensus(#[from] ConsensusError),
+    #[error("core: {0}")]
+    Core(#[from] CoreError),
+    #[error("encoding: {0}")]
+    Encoding(#[from] postcard::Error),
+    #[error("session is not ready for authoritative work; known leader {leader}")]
+    NotReady { leader: u64 },
+    #[error("session capacity exceeded")]
+    Capacity,
+    #[error("membership request identity or configuration precondition changed")]
+    MembershipConflict,
+    #[error("placement request conflicts with the committed session lifecycle")]
+    PlacementConflict,
+    #[error("session is stopped after application failure; reopen to recover")]
+    Failed,
+    #[error("persisted ledger identity, format or prefix mismatch")]
+    Corrupt,
+    #[error("request outcome is not yet known; preserve its complete request key")]
+    OutcomeUnknown,
+    #[error("requested delta cursor is older than retained history")]
+    ResyncRequired,
+    #[error("requested sequence is not yet published")]
+    Behind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Submission {
+    Committed(MutationReceipt),
+    Pending(RequestKey),
+    Domain(DomainOutcome),
+}
+
+#[derive(Debug, Default)]
+pub struct SessionEvents {
+    pub messages: Vec<Message>,
+    pub committed: Vec<ApplyResult>,
+    pub cursor_committed: Vec<CursorReceipt>,
+    pub managed_committed: Vec<ManagedCommitted>,
+    pub request_stream_committed: Vec<RequestStreamControlReceipt>,
+    pub read_barriers: Vec<(Vec<u8>, SessionSeq)>,
+    _charges: Vec<Allocation>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SnapshotEnvelope {
+    schema: u16,
+    ledger: LedgerId,
+    raft_index: u64,
+    core: Vec<u8>,
+}
+
+struct RetainedDelta {
+    bytes: usize,
+    delta: Delta,
+    _charge: Allocation,
+}
+struct Candidate {
+    sequence: SessionSeq,
+    entry_hash: ContentHash,
+    prepared: PreparedMutation,
+    core_bytes: usize,
+    graph: PreparedGraph,
+    result: ApplyResult,
+    retained: Vec<RetainedDelta>,
+    retire_through: SessionSeq,
+    core_growth: Allocation,
+    _rows_charge: Allocation,
+    _intent_charge: Allocation,
+    result_charge: Allocation,
+    _charge: Allocation,
+}
+
+/// One owner per session. Proposals may be pipelined, but speculative outcomes are
+/// never returned as committed. Both retries and effective admission include pending work.
+pub struct Session {
+    ledger: LedgerId,
+    core: Core,
+    graph: GraphStore,
+    budget: MemoryBudget,
+    core_charge: Allocation,
+    core_completion_charge: Allocation,
+    pending_rows: PendingState,
+    apply_workspace: Option<Allocation>,
+    last_epoch: Option<EpochReport>,
+    #[cfg(test)]
+    omit_epoch_declarations: bool,
+    _pending_slots: Allocation,
+    _delta_slots: Allocation,
+    consensus: DurableNode,
+    limits: SessionLimits,
+    pending: VecDeque<Candidate>,
+    cursors: CursorRegistry,
+    cursor_meta: CursorMetadata,
+    cursor_charge: Allocation,
+    pending_cursor: Option<CursorCandidate>,
+    request_streams: RequestStreams,
+    managed_support: ManagedSupportCache,
+    pending_managed: Option<Box<PendingManaged>>,
+    pending_maintenance: Option<MaintenanceCandidate>,
+    membership_state: MembershipState,
+    membership_charge: Option<Allocation>,
+    pending_membership: Option<PendingMembership>,
+    placement_state: PlacementState,
+    placement_charge: Option<Allocation>,
+    pending_placement: Option<PendingPlacementRecord>,
+    pending_evidence: Option<Box<DurableEvidenceSnapshot>>,
+    last_term: u64,
+    was_leader: bool,
+    ready_term: Option<u64>,
+    readiness_requested: Option<u64>,
+    applied_raft: u64,
+    deltas: VecDeque<RetainedDelta>,
+    delta_bytes: usize,
+    delta_floor: SessionSeq,
+    failed: bool,
+}
+
+impl Session {
+    pub fn group_id(&self) -> [u8; 16] {
+        self.consensus.group_id()
+    }
+    pub fn cluster_id(&self) -> [u8; 16] {
+        self.consensus.cluster_id()
+    }
+    pub fn open(
+        path: impl AsRef<Path>,
+        ledger: LedgerId,
+        config: NodeConfig,
+        limits: SessionLimits,
+    ) -> Result<Self, LedgerError> {
+        let consensus = DurableNode::open(config, path)?;
+        Self::from_node(ledger, consensus, limits)
+    }
+
+    pub fn from_node(
+        ledger: LedgerId,
+        consensus: DurableNode,
+        limits: SessionLimits,
+    ) -> Result<Self, LedgerError> {
+        let budget = MemoryBudget::new(limits.memory_bytes, limits.completion_reserve_bytes)?;
+        Self::from_node_budget(ledger, consensus, limits, budget)
+    }
+    /// A node/tenant owner supplies the parent allowance; all graph, reference,
+    /// cursor, pending and retained-delta permits stay inside that hierarchy.
+    pub fn from_node_in(
+        ledger: LedgerId,
+        consensus: DurableNode,
+        limits: SessionLimits,
+        parent: &MemoryBudget,
+    ) -> Result<Self, LedgerError> {
+        if !consensus.is_budgeted_within(parent) {
+            return Err(LedgerError::Capacity);
+        }
+        let budget = parent.child(limits.memory_bytes, limits.completion_reserve_bytes)?;
+        Self::from_node_budget(ledger, consensus, limits, budget)
+    }
+    pub fn is_budgeted_within(&self, parent: &MemoryBudget) -> bool {
+        self.budget.is_within(parent) && self.consensus.is_budgeted_within(parent)
+    }
+    fn from_node_budget(
+        ledger: LedgerId,
+        mut consensus: DurableNode,
+        limits: SessionLimits,
+        budget: MemoryBudget,
+    ) -> Result<Self, LedgerError> {
+        if limits.apply.max_commands == 0
+            || limits.apply.max_workers == 0
+            || limits.apply.max_bytes == 0
+            || limits.pending == 0
+            || limits.delta_bytes == 0
+            || limits.delta_items == 0
+            || limits.cursor_receipts < 2
+            || ledger.tenant.is_zero()
+            || ledger.session.is_zero()
+        {
+            return Err(LedgerError::Capacity);
+        }
+        // A recovered decoder floor blocks every Raft action until the actual
+        // application owner confirms its compiled persistent-format descriptor.
+        consensus.confirm_decoder(managed_format_hash())?;
+        let core = Core::new(ledger, limits.core.clone());
+        let core_charge = budget
+            .reserve(
+                BudgetKind::Payload,
+                BudgetLane::Ordinary,
+                reference_charge(core.snapshot())?,
+            )?
+            .commit();
+        // Validate future capacity without allocating idle publication queues.
+        let _pending_bytes = limits
+            .pending
+            .checked_mul(
+                size_of::<Candidate>()
+                    .checked_add(PendingState::slot_bytes())
+                    .ok_or(LedgerError::Capacity)?,
+            )
+            .and_then(|b| b.checked_add(64))
+            .ok_or(LedgerError::Capacity)?;
+        let _delta_bytes = limits
+            .delta_items
+            .checked_mul(size_of::<RetainedDelta>())
+            .and_then(|b| b.checked_add(64))
+            .ok_or(LedgerError::Capacity)?;
+        let pending_slots = budget
+            .reserve(BudgetKind::Pending, BudgetLane::Ordinary, 0)?
+            .commit();
+        let delta_slots = budget
+            .reserve(BudgetKind::Payload, BudgetLane::Ordinary, 0)?
+            .commit();
+        let pending = VecDeque::new();
+        let deltas = VecDeque::new();
+        let graph = GraphStore::from_state(
+            core.snapshot(),
+            RangeId(u128::from_be_bytes(ledger.session.0)),
+            limits.graph,
+            budget.clone(),
+        )?;
+        let cursors = CursorRegistry::new(ledger, limits.cursors, budget.clone())?;
+        let cursor_meta = CursorMetadata::default();
+        let cursor_charge = budget
+            .reserve(
+                BudgetKind::ReadPins,
+                BudgetLane::Completion,
+                reference_charge(&cursor_meta)?,
+            )?
+            .commit();
+        let consensus_cluster = consensus.cluster_id();
+        let request_streams =
+            RequestStreams::new(consensus_cluster, ledger, limits.request_streams)?;
+        let mut session = Self {
+            ledger,
+            core,
+            graph,
+            budget: budget.clone(),
+            core_charge,
+            core_completion_charge: budget
+                .reserve(BudgetKind::Payload, BudgetLane::Completion, 0)?
+                .commit(),
+            pending_rows: PendingState::new(),
+            apply_workspace: None,
+            last_epoch: None,
+            #[cfg(test)]
+            omit_epoch_declarations: false,
+            _pending_slots: pending_slots,
+            _delta_slots: delta_slots,
+            consensus,
+            limits,
+            pending,
+            cursors,
+            cursor_meta,
+            cursor_charge,
+            request_streams,
+            managed_support: ManagedSupportCache::default(),
+            pending_managed: None,
+            pending_cursor: None,
+            pending_maintenance: None,
+            membership_state: MembershipState::default(),
+            membership_charge: None,
+            pending_membership: None,
+            placement_state: PlacementState::default(),
+            placement_charge: None,
+            pending_placement: None,
+            pending_evidence: None,
+            last_term: 0,
+            was_leader: false,
+            ready_term: None,
+            readiness_requested: None,
+            applied_raft: 0,
+            deltas,
+            delta_bytes: 0,
+            delta_floor: SessionSeq(0),
+            failed: false,
+        };
+        // Recovery consumes prior committed outcomes without executing their effects.
+        let _ = session.poll()?;
+        Ok(session)
+    }
+
+    pub fn campaign(&mut self) -> Result<(), LedgerError> {
+        self.check()?;
+        self.consensus.campaign()?;
+        Ok(())
+    }
+    /// Requests a transfer to an existing voter. Success means the request was
+    /// accepted locally; callers observe status to learn whether it completed.
+    pub fn transfer_leader(&mut self, target: u64) -> Result<(), LedgerError> {
+        self.check()?;
+        if target == 0 || !self.status().voters.contains(&target) {
+            return Err(ConsensusError::Configuration("transfer target must be a voter").into());
+        }
+        self.consensus.transfer_leader(target)?;
+        Ok(())
+    }
+    pub fn tick(&mut self) -> Result<(), LedgerError> {
+        self.check()?;
+        self.consensus.tick()?;
+        Ok(())
+    }
+    pub fn step(&mut self, message: Message) -> Result<(), LedgerError> {
+        self.check()?;
+        self.fence_managed_message(&message)?;
+        self.consensus.step(message)?;
+        Ok(())
+    }
+    /// Trusted transport feedback for this exact physical group incarnation.
+    /// Ingress acceptance is not snapshot application or a quorum acknowledgment.
+    pub fn report_snapshot(
+        &mut self,
+        node: u64,
+        status: focal_consensus::SnapshotStatus,
+    ) -> Result<(), LedgerError> {
+        self.check()?;
+        self.consensus.report_snapshot(node, status)?;
+        Ok(())
+    }
+    pub fn report_snapshot_at(
+        &mut self,
+        node: u64,
+        term: u64,
+        index: u64,
+        status: focal_consensus::SnapshotStatus,
+    ) -> Result<(), LedgerError> {
+        self.check()?;
+        self.consensus
+            .report_snapshot_at(node, term, index, status)?;
+        Ok(())
+    }
+    pub fn step_authenticated(
+        &mut self,
+        peer_node_id: u64,
+        encoded: &[u8],
+    ) -> Result<(), LedgerError> {
+        self.check()?;
+        if self.consensus.decoder_floor_ready(managed_format_hash()) {
+            self.consensus.step_authenticated(peer_node_id, encoded)?;
+            return Ok(());
+        }
+        if self.consensus.persistence_pending() {
+            return Err(ConsensusError::PersistencePending.into());
+        }
+        // Inspect first managed history before passing it into Raft. The same
+        // structural preflight as normal ingress reserves all decoded storage;
+        // authentication precedes any durable decoder-floor mutation.
+        let bytes = focal_consensus::decode_message_charge(encoded)?;
+        let _decode = self
+            .budget
+            .reserve(BudgetKind::Pending, BudgetLane::Completion, bytes)?;
+        let message = focal_consensus::decode_message(encoded)?;
+        if peer_node_id == 0 || message.from != peer_node_id {
+            return Err(ConsensusError::MalformedMessage(
+                "Raft sender does not match authenticated peer",
+            )
+            .into());
+        }
+        self.step(message)
+    }
+    pub fn status(&self) -> NodeStatus {
+        self.consensus.status()
+    }
+    /// Current-term authority has crossed the committed ReadIndex barrier.
+    /// Recovered workers must check this before dispatch, even without a write.
+    pub fn is_authoritative(&self) -> bool {
+        let status = self.status();
+        !self.failed && status.role == StateRole::Leader && self.ready_term == Some(status.term)
+    }
+    pub fn sequence(&self) -> SessionSeq {
+        self.core.sequence()
+    }
+    pub fn ledger(&self) -> LedgerId {
+        self.ledger
+    }
+    pub fn pending_count(&self) -> usize {
+        self.pending
+            .len()
+            .saturating_add(usize::from(self.pending_cursor.is_some()))
+            .saturating_add(usize::from(self.pending_managed.is_some()))
+            .saturating_add(usize::from(self.pending_maintenance.is_some()))
+            .saturating_add(usize::from(self.pending_membership.is_some()))
+            .saturating_add(usize::from(self.pending_placement.is_some()))
+            .saturating_add(usize::from(self.pending_evidence.is_some()))
+    }
+
+    /// Explicitly local committed-prefix view; callers needing a linearizable read
+    /// first complete read_index and then require at least its returned sequence.
+    pub fn read_at_least(&self, sequence: SessionSeq) -> Result<&State, LedgerError> {
+        self.check()?;
+        if self.core.sequence() < sequence {
+            return Err(LedgerError::Behind);
+        }
+        Ok(self.core.snapshot())
+    }
+
+    pub fn receipt(&self, key: &RequestKey) -> Option<&MutationReceipt> {
+        self.core.snapshot().receipts.get(key)
+    }
+
+    /// The authenticated host supplies the principal and a fresh ReadIndex's
+    /// minimum domain prefix. This only enforces local publication of that
+    /// prefix; it never creates a quorum proof or observes speculative rows.
+    pub fn reconcile_at_least(
+        &self,
+        ledger: LedgerId,
+        principal: ParticipantId,
+        query: &ReconcileQuery,
+        minimum_sequence: SessionSeq,
+    ) -> Result<crate::ReconciliationView<'_>, LedgerError> {
+        self.read_at_least(minimum_sequence)?;
+        let domain = self.core.reconcile(ledger, principal, query)?;
+        let cursor = match domain.result {
+            focal_core::ReconcileResultView::Receipt { key, .. } => self.cursor_receipt(&key),
+            focal_core::ReconcileResultView::Epoch(_) => None,
+        };
+        Ok(crate::ReconciliationView::new(domain, cursor))
+    }
+
+    fn effective(&self) -> Result<CoreView<'_>, LedgerError> {
+        Ok(self.pending_rows.view(&self.core)?)
+    }
+    pub fn last_epoch_report(&self) -> Option<EpochReport> {
+        self.last_epoch
+    }
+    pub fn persistence_pending(&self) -> bool {
+        self.consensus.persistence_pending()
+    }
+    /// Node ownership retains the physical writer across logical-session removal.
+    pub fn shared_wal(&self) -> focal_consensus::SharedWal {
+        self.consensus.shared_wal()
+    }
+    /// Includes unstarted Ready work, such as the internal leadership ReadIndex
+    /// queued by the last publication. Idle owners need not poll their sessions.
+    pub fn has_ready(&self) -> bool {
+        self.consensus.has_ready()
+    }
+    fn clear_pending(&mut self) {
+        self.pending_rows.clear();
+        self.pending.clear();
+    }
+    pub fn memory_stats(&self) -> BudgetStats {
+        self.budget.stats()
+    }
+    pub fn graph_sequence(&self) -> SessionSeq {
+        self.graph.sequence()
+    }
+    pub fn audit_graph(&self) -> Result<(), LedgerError> {
+        self.check()?;
+        self.graph.audit(self.core.snapshot())?;
+        Ok(())
+    }
+    pub fn graph_snapshot(
+        &mut self,
+        minimum: SessionSeq,
+        now: u64,
+        ttl: u64,
+    ) -> Result<GraphSnapshot, LedgerError> {
+        self.check()?;
+        if self.sequence() < minimum {
+            return Err(LedgerError::Behind);
+        }
+        Ok(self.graph.snapshot(now, ttl)?)
+    }
+    pub fn release_graph_snapshot(&mut self, snapshot: &GraphSnapshot) -> Result<(), LedgerError> {
+        self.graph.release_snapshot(snapshot)?;
+        Ok(())
+    }
+    pub fn advance_read_clock(&mut self, now: u64) -> Result<usize, LedgerError> {
+        Ok(self.graph.advance_clock(now)?)
+    }
+    fn staging_bytes(&self) -> usize {
+        // The stage and its apply audit coexist. Their combined fixed ceilings
+        // leave completion capacity for graph pages, receipts and log progress.
+        self.apply_config().max_bytes.checked_div(2).unwrap_or(0)
+    }
+    pub fn propose(&mut self, input: &AuthenticatedInput) -> Result<Submission, LedgerError> {
+        let result = self.propose_inner(input);
+        self.release_empty_slots()?;
+        result
+    }
+    fn propose_inner(&mut self, input: &AuthenticatedInput) -> Result<Submission, LedgerError> {
+        self.check()?;
+        let status = self.status();
+        if status.role != StateRole::Leader || self.ready_term != Some(status.term) {
+            return Err(LedgerError::NotReady {
+                leader: status.leader_id,
+            });
+        }
+        let key = RequestKey {
+            principal: input.principal,
+            epoch: input.request_epoch,
+            id: input.request_id,
+        };
+        if self.cursor_meta.receipts.contains_key(&key)
+            || self
+                .pending_cursor
+                .as_ref()
+                .is_some_and(|c| c.receipt.key == key)
+        {
+            return Ok(Submission::Domain(DomainOutcome::refuse(
+                ErrorCode::IdempotencyConflict,
+                "request key is bound to a cursor command",
+            )));
+        }
+        if self.effective()?.receipt(&key).is_none()
+            && (self.pending_managed.is_some()
+                || self.pending_cursor.is_some()
+                || self.pending_maintenance.is_some()
+                || self.pending_placement.is_some()
+                || self.placement_state.paused())
+        {
+            return Err(LedgerError::Capacity);
+        }
+        // Known retries return the original truth without needing a cloned draft.
+        let scratch = if self.effective()?.receipt(&key).is_some() {
+            None
+        } else {
+            Some(self.budget.reserve(
+                BudgetKind::Pending,
+                mutation_lane(&input.command),
+                self.staging_bytes(),
+            )?)
+        };
+        let stage = if scratch.is_some() {
+            match self
+                .core
+                .stage_pending_bounded(&self.pending_rows, input, self.staging_bytes())
+            {
+                Ok(stage) => Ok(stage),
+                Err(focal_core::StagingError::Domain(outcome)) => Err(outcome),
+                Err(focal_core::StagingError::Capacity) => return Err(LedgerError::Capacity),
+            }
+        } else {
+            // A known key can only return its receipt or an intent conflict;
+            // it cannot enter the reducer or allocate a pending row version.
+            self.core.stage_pending(&self.pending_rows, input)
+        };
+        let staged = match stage {
+            Ok(value) => value,
+            Err(DomainOutcome::Duplicate(receipt)) => {
+                return if self.sequence() >= receipt.sequence {
+                    Ok(Submission::Committed(*receipt))
+                } else {
+                    Ok(Submission::Pending(key))
+                };
+            }
+            Err(other) => return Ok(Submission::Domain(other)),
+        };
+        if self.pending.len() >= self.limits.pending {
+            return Err(LedgerError::Capacity);
+        }
+        let lane = mutation_lane(&input.command);
+        self.ensure_pending_slots(lane)?;
+        self.ensure_delta_slots()?;
+        self.ensure_apply_workspace(lane)?;
+        self.core
+            .audit_pending_stage(&self.pending_rows, &staged, self.apply_config())?;
+        let mut data = ENTRY_MAGIC.to_vec();
+        data.extend(staged.prepared().encode_v1()?);
+        let digest = ContentHash(*blake3::hash(&data).as_bytes());
+        let core_bytes = reference_charge(&staged.view_after(&self.core, &self.pending_rows)?)?;
+        let candidate = self.reserve_candidate(
+            staged.prepared(),
+            digest,
+            self.effective()?,
+            staged.patch(),
+            staged.result(),
+            self.pending.iter(),
+            core_bytes,
+            true,
+        )?;
+        self.pending_rows.validate_next(&self.core, &staged)?;
+        self.consensus.propose_in(data, lane)?;
+        drop(self.pending_rows.accept(&self.core, staged)?);
+        self.pending.push_back(candidate);
+        drop(scratch);
+        Ok(Submission::Pending(key))
+    }
+    fn ensure_pending_slots(&mut self, lane: BudgetLane) -> Result<(), LedgerError> {
+        if self.pending.capacity() < self.limits.pending {
+            let bytes = self
+                .limits
+                .pending
+                .checked_mul(
+                    size_of::<Candidate>()
+                        .checked_add(PendingState::slot_bytes())
+                        .ok_or(LedgerError::Capacity)?,
+                )
+                .and_then(|n| n.checked_add(64))
+                .ok_or(LedgerError::Capacity)?;
+            let charge = self
+                .budget
+                .reserve(BudgetKind::Pending, lane, bytes)?
+                .commit();
+            let additional = self
+                .limits
+                .pending
+                .checked_sub(self.pending.len())
+                .ok_or(LedgerError::Capacity)?;
+            self.pending
+                .try_reserve_exact(additional)
+                .map_err(|_| LedgerError::Capacity)?;
+            self.pending_rows.reserve(self.limits.pending)?;
+            self._pending_slots = charge;
+        }
+        Ok(())
+    }
+    fn ensure_delta_slots(&mut self) -> Result<(), LedgerError> {
+        if self.deltas.capacity() < self.limits.delta_items {
+            let bytes = self
+                .limits
+                .delta_items
+                .checked_mul(size_of::<RetainedDelta>())
+                .and_then(|n| n.checked_add(64))
+                .ok_or(LedgerError::Capacity)?;
+            let charge = self
+                .budget
+                .reserve(BudgetKind::Payload, BudgetLane::Completion, bytes)?
+                .commit();
+            let additional = self
+                .limits
+                .delta_items
+                .checked_sub(self.deltas.len())
+                .ok_or(LedgerError::Capacity)?;
+            self.deltas
+                .try_reserve_exact(additional)
+                .map_err(|_| LedgerError::Capacity)?;
+            self._delta_slots = charge;
+        }
+        Ok(())
+    }
+    fn release_empty_slots(&mut self) -> Result<(), LedgerError> {
+        if self.pending.is_empty() && self.pending_managed.is_none() {
+            self.pending = VecDeque::new();
+            self.pending_rows.release_empty();
+            self.apply_workspace = None;
+            self._pending_slots.shrink_to(0)?;
+            // A pending candidate may require all delta slots at publication.
+            // Only release the empty ring when no such candidate remains.
+            if self.deltas.is_empty() {
+                self.deltas = VecDeque::new();
+                self._delta_slots.shrink_to(0)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Convenience for embedded one-voter operation. For a fleet, transport pumps
+    /// poll/step and matches the durable receipt asynchronously instead.
+    pub fn submit_local(&mut self, input: &AuthenticatedInput) -> Result<Submission, LedgerError> {
+        let status = self.status();
+        if status.voters != [status.node_id] || !status.learners.is_empty() {
+            return Err(LedgerError::NotReady {
+                leader: status.leader_id,
+            });
+        }
+        let submitted = self.propose(input)?;
+        let Submission::Pending(key) = submitted else {
+            return Ok(submitted);
+        };
+        let events = self.poll()?;
+        if !events.messages.is_empty() {
+            return Err(LedgerError::OutcomeUnknown);
+        }
+        self.receipt(&key)
+            .cloned()
+            .map(Submission::Committed)
+            .ok_or(LedgerError::OutcomeUnknown)
+    }
+
+    pub fn read_index(&mut self, context: Vec<u8>) -> Result<(), LedgerError> {
+        self.check()?;
+        self.consensus.read_index(context)?;
+        Ok(())
+    }
+
+    pub fn poll(&mut self) -> Result<SessionEvents, LedgerError> {
+        self.check()?;
+        if self.consensus.checkpoint_pending() {
+            self.consensus.finish_checkpoint()?;
+        }
+        let acquired = self.consensus.drain().map_err(LedgerError::from);
+        let result = acquired.and_then(|events| self.apply_events(events));
+        self.finish_poll(result)
+    }
+    pub fn try_poll(&mut self) -> Result<Option<SessionEvents>, LedgerError> {
+        self.check()?;
+        if self.consensus.checkpoint_pending() {
+            match self.consensus.try_finish_checkpoint() {
+                Ok(false) => return Ok(None),
+                Ok(true) => {}
+                Err(error) => return self.finish_poll(Err(error.into())).map(Some),
+            }
+        }
+        match self.consensus.try_drain() {
+            Ok(None) => Ok(None),
+            Ok(Some(events)) => {
+                let result = self.apply_events(events);
+                self.finish_poll(result).map(Some)
+            }
+            Err(error) => self.finish_poll(Err(error.into())).map(Some),
+        }
+    }
+    fn finish_poll(
+        &mut self,
+        result: Result<SessionEvents, LedgerError>,
+    ) -> Result<SessionEvents, LedgerError> {
+        if result.as_ref().is_err_and(|error| {
+            !matches!(
+                error,
+                LedgerError::Consensus(ConsensusError::PersistencePending)
+            )
+        }) {
+            self.failed = true;
+            self.clear_pending();
+            self.pending_cursor = None;
+            self.pending_managed = None;
+            self.pending_maintenance = None;
+            self.pending_membership = None;
+            self.pending_placement = None;
+        }
+        self.release_empty_slots()?;
+        result
+    }
+    fn apply_events(
+        &mut self,
+        mut events: focal_consensus::NodeEvents,
+    ) -> Result<SessionEvents, LedgerError> {
+        let status = self.status();
+        let leader = status.role == StateRole::Leader;
+        if self.last_term != status.term || self.was_leader != leader {
+            self.clear_pending();
+            self.pending_cursor = None;
+            self.pending_managed = None;
+            self.pending_maintenance = None;
+            self.pending_membership = None;
+            self.pending_placement = None;
+            self.ready_term = None;
+            self.readiness_requested = None;
+            self.last_term = status.term;
+            self.was_leader = leader;
+        }
+        let event_charge = events.take_allocation();
+        let mut result = SessionEvents {
+            messages: std::mem::take(&mut events.messages),
+            ..Default::default()
+        };
+        result
+            .committed
+            .try_reserve_exact(events.committed.len())
+            .map_err(|_| LedgerError::Capacity)?;
+        result
+            .cursor_committed
+            .try_reserve_exact(events.committed.len())
+            .map_err(|_| LedgerError::Capacity)?;
+        let managed_count = events
+            .committed
+            .iter()
+            .filter(|entry| {
+                entry.data.starts_with(MANAGED_DOMAIN_MAGIC)
+                    || entry.data.starts_with(MANAGED_CURSOR_MAGIC)
+            })
+            .count();
+        let control_count = events
+            .committed
+            .iter()
+            .filter(|entry| entry.data.starts_with(REQUEST_STREAM_MAGIC))
+            .count();
+        let managed_slots = if managed_count != 0 || control_count != 0 {
+            Some(
+                self.managed_charge(
+                    managed_count
+                        .checked_mul(size_of::<ManagedCommitted>())
+                        .and_then(|n| {
+                            n.checked_add(
+                                control_count
+                                    .checked_mul(size_of::<RequestStreamControlReceipt>())?,
+                            )
+                        })
+                        .and_then(|n| n.checked_add(256))
+                        .ok_or(LedgerError::Capacity)?,
+                )?,
+            )
+        } else {
+            None
+        };
+        result
+            .managed_committed
+            .try_reserve_exact(managed_count)
+            .map_err(|_| LedgerError::Capacity)?;
+        result
+            .request_stream_committed
+            .try_reserve_exact(control_count)
+            .map_err(|_| LedgerError::Capacity)?;
+        result
+            ._charges
+            .try_reserve_exact(
+                events
+                    .committed
+                    .len()
+                    .checked_add(usize::from(event_charge.is_some()))
+                    .and_then(|n| n.checked_add(usize::from(managed_slots.is_some())))
+                    .ok_or(LedgerError::Capacity)?,
+            )
+            .map_err(|_| LedgerError::Capacity)?;
+        if let Some(charge) = managed_slots {
+            result._charges.push(charge);
+        }
+        if let Some(charge) = event_charge {
+            result._charges.push(charge);
+        }
+        if let Some(snapshot) = events.snapshot {
+            let decode_bytes = snapshot
+                .data
+                .len()
+                .checked_mul(64)
+                .and_then(|n| n.checked_add(4096))
+                .ok_or(LedgerError::Capacity)?;
+            let _decode =
+                self.budget
+                    .reserve(BudgetKind::Recovery, BudgetLane::Completion, decode_bytes)?;
+            self.restore_snapshot(
+                &snapshot.data,
+                snapshot.index,
+                snapshot.term,
+                &snapshot.configuration,
+            )?;
+        }
+        let mut membership_events = events.membership.into_iter().peekable();
+        let mut placement_configuration = membership_events
+            .peek()
+            .map(|entry| entry.before.clone())
+            .unwrap_or_else(|| self.consensus.membership_configuration());
+        let mut offset = 0usize;
+        while let Some(entry) = events.committed.get(offset) {
+            if entry.index <= self.applied_raft {
+                return Err(LedgerError::Corrupt);
+            }
+            while membership_events
+                .peek()
+                .is_some_and(|membership| membership.index < entry.index)
+            {
+                let membership = membership_events.next().ok_or(LedgerError::Corrupt)?;
+                placement_configuration = membership.after.clone();
+                self.apply_membership(membership)?;
+            }
+            if self.apply_managed_entry(&entry.data, entry.index, &mut result)? {
+                self.applied_raft = entry.index;
+                offset = offset.checked_add(1).ok_or(LedgerError::Capacity)?;
+                continue;
+            }
+            if entry.data.starts_with(PLACEMENT_MAGIC) {
+                self.apply_placement_entry(
+                    &entry.data,
+                    entry.index,
+                    entry.term,
+                    &placement_configuration,
+                )?;
+                self.applied_raft = entry.index;
+                offset = offset.checked_add(1).ok_or(LedgerError::Capacity)?;
+                continue;
+            }
+            if entry.data.starts_with(CURSOR_MAINTENANCE_MAGIC) {
+                self.apply_maintenance_entry(&entry.data)?;
+                self.applied_raft = entry.index;
+                offset = offset.checked_add(1).ok_or(LedgerError::Capacity)?;
+                continue;
+            }
+            if entry.data.starts_with(CURSOR_MAGIC) || entry.data.starts_with(LEGACY_CURSOR_MAGIC) {
+                let (receipt, charge) = self.apply_cursor_entry(&entry.data, entry.index)?;
+                self.applied_raft = entry.index;
+                result.cursor_committed.push(receipt);
+                result._charges.push(charge);
+                offset = offset.checked_add(1).ok_or(LedgerError::Capacity)?;
+                continue;
+            }
+            if self.placement_state.paused() || !entry.data.starts_with(ENTRY_MAGIC) {
+                return Err(LedgerError::Corrupt);
+            }
+            let tail = events.committed.get(offset..).ok_or(LedgerError::Corrupt)?;
+            let count = tail
+                .iter()
+                .take(self.apply_config().max_commands)
+                .take_while(|entry| entry.data.starts_with(ENTRY_MAGIC))
+                .count();
+            let applied = self
+                .apply_domain_epoch(tail.get(..count).ok_or(LedgerError::Corrupt)?, &mut result)?;
+            offset = offset.checked_add(applied).ok_or(LedgerError::Capacity)?;
+        }
+        // Membership metadata is independent of domain command application, but
+        // follows its own strictly ordered Raft indices and the snapshot fence.
+        for membership in membership_events {
+            self.apply_membership(membership)?;
+        }
+        self.applied_raft = self.applied_raft.max(events.applied_index);
+        for barrier in events.read_states {
+            if barrier.index > self.applied_raft {
+                return Err(LedgerError::Corrupt);
+            }
+            if barrier.context == readiness_context(status.term) {
+                self.ready_term = Some(status.term);
+            }
+            result
+                .read_barriers
+                .push((barrier.context, self.core.sequence()));
+        }
+        if leader
+            && self.consensus.has_committed_current_term()
+            && self.ready_term != Some(status.term)
+            && self.readiness_requested != Some(status.term)
+        {
+            self.consensus.read_index(readiness_context(status.term))?;
+            self.readiness_requested = Some(status.term);
+        }
+        Ok(result)
+    }
+
+    pub fn deltas_after(
+        &self,
+        cursor: Option<DeltaId>,
+        max_items: usize,
+    ) -> Result<Vec<Delta>, LedgerError> {
+        self.check()?;
+        if max_items > self.limits.delta_items {
+            return Err(LedgerError::Capacity);
+        }
+        if cursor.is_some_and(|c| c.ledger != self.ledger) {
+            return Err(LedgerError::Corrupt);
+        }
+        if self.stream_bounds().floor.0 > 0
+            && cursor.is_none_or(|c| c.sequence <= self.stream_bounds().floor)
+        {
+            return Err(LedgerError::ResyncRequired);
+        }
+        Ok(self
+            .deltas
+            .iter()
+            .map(|d| &d.delta)
+            .filter(|d| cursor.is_none_or(|c| d.id > c))
+            .take(max_items)
+            .cloned()
+            .collect())
+    }
+
+    fn check(&self) -> Result<(), LedgerError> {
+        if self.failed {
+            Err(LedgerError::Failed)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Resource admission for an already authenticated domain mutation. This is
+/// allocation/scheduling policy only and never grants domain authority. Keep
+/// matching exhaustive so new commands must choose their admission policy.
+pub fn mutation_lane(command: &Command) -> BudgetLane {
+    match command {
+        Command::GenerateClaim { .. }
+        | Command::GenerateClaimBatch { .. }
+        | Command::PostClaim { .. }
+        | Command::RegisterMonitor { .. } => BudgetLane::Ordinary,
+        Command::NegotiateEpoch { .. }
+        | Command::AdvanceEpochFloor { .. }
+        | Command::AcquireReceipt { .. }
+        | Command::AdoptReceipt { .. }
+        | Command::RecordProgress { .. }
+        | Command::BeginEvidenceSet { .. }
+        | Command::AttachArtifact { .. }
+        | Command::CloseTestament { .. }
+        | Command::AcknowledgeTestament { .. }
+        | Command::BeginWholeWorkValidation { .. }
+        | Command::BeginIncrementValidation { .. }
+        | Command::RecordValidationVerdict { .. }
+        | Command::CompleteWholeWork { .. }
+        | Command::FailPost { .. }
+        | Command::FailReceipt { .. }
+        | Command::FailTestamentGeneration { .. }
+        | Command::CancelClaim { .. }
+        | Command::RevokeClaim { .. }
+        | Command::ExpireClaim { .. }
+        | Command::SupersedeClaim { .. }
+        | Command::RebindMonitor { .. }
+        | Command::ReleaseScope { .. }
+        | Command::RegisterArtifact { .. }
+        | Command::ExpireMonitor { .. }
+        | Command::RecordFencedValidationVerdict { .. } => BudgetLane::Completion,
+    }
+}
+
+fn readiness_context(term: u64) -> Vec<u8> {
+    let mut bytes = b"focal.leader-ready\0".to_vec();
+    bytes.extend_from_slice(&term.to_be_bytes());
+    bytes
+}
+
+include!("managed_session.rs");
+include!("managed_support.rs");
+include!("apply_epoch.rs");
+include!("cursor_session.rs");
+include!("cursor_maintenance.rs");
+include!("membership_session.rs");
+include!("placement_session.rs");
+include!("evidence_snapshot.rs");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn identity() -> LedgerId {
+        LedgerId {
+            tenant: TenantId::from_u128(1),
+            session: SessionId::from_u128(2),
+        }
+    }
+    fn config() -> NodeConfig {
+        NodeConfig::single(1, [9; 16], identity().session.0)
+    }
+    fn input(id: u128, command: Command) -> AuthenticatedInput {
+        AuthenticatedInput {
+            ledger: identity(),
+            principal: ParticipantId::from_u128(1),
+            request_epoch: RequestEpoch(1),
+            request_id: RequestId::from_u128(id),
+            expected_revision: None,
+            authority: AuthorityContext {
+                runtime: true,
+                cause: Cause::Root(RootCommandId::from_u128(1)),
+                policy_revision: 1,
+                logical_time: 0,
+                evidence: vec![],
+            },
+            command,
+        }
+    }
+    fn elect(s: &mut Session) {
+        s.campaign().unwrap();
+        for _ in 0..5 {
+            s.poll().unwrap();
+        }
+        assert_eq!(s.ready_term, Some(s.status().term));
+    }
+    #[test]
+    fn successful_receipts_recover_through_checkpoint_and_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let request = input(
+            1,
+            Command::NegotiateEpoch {
+                epoch: RequestEpoch(1),
+            },
+        );
+        let receipt;
+        {
+            let mut s =
+                Session::open(dir.path(), identity(), config(), SessionLimits::default()).unwrap();
+            elect(&mut s);
+            receipt = match s.submit_local(&request).unwrap() {
+                Submission::Committed(r) => r,
+                other => panic!("unexpected {other:?}"),
+            };
+            s.checkpoint().unwrap();
+            let mut next = input(
+                2,
+                Command::NegotiateEpoch {
+                    epoch: RequestEpoch(2),
+                },
+            );
+            next.request_epoch = RequestEpoch(2);
+            assert!(matches!(
+                s.submit_local(&next).unwrap(),
+                Submission::Committed(_)
+            ));
+        }
+        let mut s =
+            Session::open(dir.path(), identity(), config(), SessionLimits::default()).unwrap();
+        elect(&mut s);
+        assert_eq!(s.sequence(), SessionSeq(2));
+        assert_eq!(s.propose(&request).unwrap(), Submission::Committed(receipt));
+    }
+    #[test]
+    fn pending_retry_never_returns_a_speculative_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s =
+            Session::open(dir.path(), identity(), config(), SessionLimits::default()).unwrap();
+        elect(&mut s);
+        let request = input(
+            1,
+            Command::NegotiateEpoch {
+                epoch: RequestEpoch(1),
+            },
+        );
+        assert!(matches!(
+            s.propose(&request).unwrap(),
+            Submission::Pending(_)
+        ));
+        assert!(matches!(
+            s.propose(&request).unwrap(),
+            Submission::Pending(_)
+        ));
+        assert_eq!(s.sequence(), SessionSeq(0));
+        assert_eq!(s.pending_count(), 1);
+        s.poll().unwrap();
+        assert_eq!(s.sequence(), SessionSeq(1));
+        assert!(matches!(
+            s.propose(&request).unwrap(),
+            Submission::Committed(_)
+        ));
+    }
+    #[test]
+    fn lazy_publication_queue_keeps_completion_progress_under_ordinary_pressure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session =
+            Session::open(dir.path(), identity(), config(), SessionLimits::default()).unwrap();
+        elect(&mut session);
+        for epoch in 1..=2 {
+            assert_eq!(session.pending.capacity(), 0);
+            let stats = session.memory_stats();
+            let pressure = session
+                .budget
+                .reserve(
+                    BudgetKind::Payload,
+                    BudgetLane::Ordinary,
+                    stats.limit - stats.completion_reserve - stats.ordinary_used,
+                )
+                .unwrap();
+            let mut request = input(
+                epoch,
+                Command::NegotiateEpoch {
+                    epoch: RequestEpoch(epoch as u64),
+                },
+            );
+            request.request_epoch = RequestEpoch(epoch as u64);
+            assert!(matches!(
+                session.submit_local(&request).unwrap(),
+                Submission::Committed(_)
+            ));
+            assert_eq!(session.sequence(), SessionSeq(epoch as u64));
+            assert_eq!(session.pending_count(), 0);
+            assert_eq!(session.pending.capacity(), 0);
+            drop(pressure);
+        }
+        session.audit_graph().unwrap();
+    }
+    #[test]
+    fn memory_pressure_refuses_before_consensus_and_releases_failed_reservations() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s =
+            Session::open(dir.path(), identity(), config(), SessionLimits::default()).unwrap();
+        elect(&mut s);
+        let baseline = s.memory_stats().used;
+        let status = s.status();
+        let pressure = s
+            .budget
+            .reserve(
+                BudgetKind::Control,
+                BudgetLane::Completion,
+                s.memory_stats().limit - baseline - 1024,
+            )
+            .unwrap();
+        let pressured = s.memory_stats().used;
+        let request = input(
+            1,
+            Command::NegotiateEpoch {
+                epoch: RequestEpoch(1),
+            },
+        );
+        assert!(matches!(
+            s.propose(&request),
+            Err(LedgerError::Memory(MemoryError::Capacity { .. }))
+        ));
+        assert_eq!(s.pending_count(), 0);
+        assert_eq!(s.sequence(), SessionSeq(0));
+        assert_eq!(s.graph_sequence(), SessionSeq(0));
+        assert_eq!(s.status().committed_index, status.committed_index);
+        assert_eq!(s.memory_stats().used, pressured);
+        drop(pressure);
+        assert_eq!(s.memory_stats().used, baseline);
+        assert!(matches!(
+            s.submit_local(&request).unwrap(),
+            Submission::Committed(_)
+        ));
+        s.audit_graph().unwrap();
+    }
+    #[test]
+    fn consensus_rejection_drops_fully_prepared_graph_and_reference_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config();
+        cfg.max_entry_bytes = 16;
+        let mut s = Session::open(dir.path(), identity(), cfg, SessionLimits::default()).unwrap();
+        elect(&mut s);
+        let used = s.memory_stats().used;
+        assert!(matches!(
+            s.propose(&input(
+                1,
+                Command::NegotiateEpoch {
+                    epoch: RequestEpoch(1)
+                }
+            )),
+            Err(LedgerError::Consensus(ConsensusError::Capacity))
+        ));
+        assert_eq!(s.pending_count(), 0);
+        assert_eq!(s.sequence(), SessionSeq(0));
+        assert_eq!(s.graph_sequence(), SessionSeq(0));
+        assert_eq!(s.memory_stats().used, used);
+        s.audit_graph().unwrap();
+    }
+    #[test]
+    fn paged_index_capacity_is_checked_before_proposing_a_domain_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut limits = SessionLimits::default();
+        limits.graph.range.max_batch_entries = 1;
+        let mut s = Session::open(dir.path(), identity(), config(), limits).unwrap();
+        elect(&mut s);
+        s.submit_local(&input(
+            1,
+            Command::NegotiateEpoch {
+                epoch: RequestEpoch(1),
+            },
+        ))
+        .unwrap();
+        let artifact = NewArtifact {
+            id: ArtifactId::from_u128(100),
+            content: ArtifactContent {
+                ledger: identity(),
+                schema: 1,
+                kind: "document".into(),
+                schema_hash: ContentHash([1; 32]),
+                metadata: Vec::new(),
+                payload: ArtifactPayload::Inline(vec![1]),
+                producer: ParticipantId::from_u128(1),
+                receipt: None,
+                inputs: Default::default(),
+                visibility: Default::default(),
+            },
+        };
+        let hash = artifact.content.content_hash().unwrap();
+        let mut request = input(2, Command::RegisterArtifact { artifact });
+        request.authority.evidence.push(EvidenceAttestation {
+            descriptor_hash: hash,
+            custody_revision: 1,
+            durable: true,
+            schema_valid: true,
+        });
+        let baseline = s.memory_stats().used;
+        let committed = s.status().committed_index;
+        assert!(matches!(
+            s.propose(&request),
+            Err(LedgerError::Graph(GraphError::Memory(
+                MemoryError::Capacity { .. }
+            )))
+        ));
+        assert_eq!(s.pending_count(), 0);
+        assert_eq!(s.sequence(), SessionSeq(1));
+        assert_eq!(s.graph_sequence(), SessionSeq(1));
+        assert_eq!(s.memory_stats().used, baseline);
+        assert_eq!(s.status().committed_index, committed);
+        assert!(s.core.snapshot().artifacts.is_empty());
+        s.audit_graph().unwrap();
+    }
+    #[test]
+    fn pipelined_candidates_publish_in_order_and_release_pending_charges() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s =
+            Session::open(dir.path(), identity(), config(), SessionLimits::default()).unwrap();
+        elect(&mut s);
+        let baseline = s.memory_stats().by_kind[BudgetKind::Pending as usize];
+        let first = input(
+            1,
+            Command::NegotiateEpoch {
+                epoch: RequestEpoch(1),
+            },
+        );
+        let mut second = input(
+            2,
+            Command::NegotiateEpoch {
+                epoch: RequestEpoch(2),
+            },
+        );
+        second.request_epoch = RequestEpoch(2);
+        s.propose(&first).unwrap();
+        s.propose(&second).unwrap();
+        assert_eq!(s.pending_count(), 2);
+        assert_eq!(s.sequence(), SessionSeq(0));
+        assert!(s.memory_stats().by_kind[BudgetKind::Pending as usize] > baseline);
+        let events = s.poll().unwrap();
+        assert_eq!(events.committed.len(), 2);
+        assert_eq!(events.committed[0].receipt.sequence, SessionSeq(1));
+        assert_eq!(events.committed[1].receipt.sequence, SessionSeq(2));
+        drop(events);
+        assert_eq!(s.graph_sequence(), SessionSeq(2));
+        assert_eq!(s.pending_count(), 0);
+        assert_eq!(
+            s.memory_stats().by_kind[BudgetKind::Pending as usize],
+            baseline
+        );
+        s.audit_graph().unwrap();
+    }
+    #[test]
+    fn higher_term_drops_uncommitted_candidate_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sessions = Vec::new();
+        for id in 1..=3 {
+            let mut cfg = NodeConfig::single(id, [9; 16], identity().session.0);
+            cfg.voters = vec![1, 2, 3];
+            sessions.push(
+                Session::open(
+                    dir.path().join(id.to_string()),
+                    identity(),
+                    cfg,
+                    SessionLimits::default(),
+                )
+                .unwrap(),
+            );
+        }
+        sessions[0].campaign().unwrap();
+        for _ in 0..20 {
+            let mut messages = Vec::new();
+            for s in &mut sessions {
+                messages.extend(s.poll().unwrap().messages)
+            }
+            if messages.is_empty() && sessions[0].ready_term == Some(sessions[0].status().term) {
+                break;
+            }
+            for message in messages {
+                let destination = message.to as usize - 1;
+                sessions[destination].step(message).unwrap();
+            }
+        }
+        let s = &mut sessions[0];
+        assert_eq!(s.ready_term, Some(s.status().term));
+        let baseline = s.memory_stats().used;
+        s.propose(&input(
+            1,
+            Command::NegotiateEpoch {
+                epoch: RequestEpoch(1),
+            },
+        ))
+        .unwrap();
+        assert_eq!(s.pending_count(), 1);
+        assert!(s.memory_stats().used > baseline);
+        let mut heartbeat = Message::default();
+        heartbeat.set_msg_type(focal_consensus::MessageType::MsgHeartbeat);
+        heartbeat.from = 2;
+        heartbeat.to = 1;
+        heartbeat.term = s.status().term + 1;
+        s.step(heartbeat).unwrap();
+        drop(s.poll().unwrap());
+        assert_eq!(s.status().role, StateRole::Follower);
+        assert_eq!(s.pending_count(), 0);
+        assert_eq!(s.sequence(), SessionSeq(0));
+        assert_eq!(s.graph_sequence(), SessionSeq(0));
+        assert_eq!(s.memory_stats().used, baseline);
+    }
+    include!("cursor_tests.rs");
+    include!("epoch_session_tests.rs");
+    include!("membership_tests.rs");
+    include!("placement_tests.rs");
+    include!("evidence_snapshot_tests.rs");
+    include!("reconciliation_session_tests.rs");
+    include!("managed_tests.rs");
+    include!("durable_v1_tests.rs");
+}

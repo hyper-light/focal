@@ -1,0 +1,10 @@
+{
+  "command": [
+    "/private/tmp/focal-decoder-refusal-hvuffg_d/helper",
+    "install-predecessor",
+    "/private/tmp/focal-refusal-results-20260906a/primed"
+  ],
+  "returncode": 0,
+  "stdout_sha256": "9886b713403d5b280a8f0aad8c532fd5cf1717877a7772539d03c6993855928b",
+  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}

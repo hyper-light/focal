@@ -1,0 +1,99 @@
+# Original nested V1 serialization corpus
+
+These 15 files were captured on 2026-09-06 from the compiled Core/model libraries
+**before nested checkpoint codecs were integrated**. The earlier top-level
+`durable_v1` envelope codec was already present. The exact original generator is
+[`generator.rs.txt`](generator.rs.txt); ordinary builds and tests do not execute
+it or regenerate the corpus.
+
+The state is deliberately synthetic and serialization-valid. It is **not** a
+service-ready snapshot or a history admitted by the reducer. In particular, it
+includes receipt requirements rejected by current admission, zero historical
+counters, deliberately inconsistent relationships, and one stored artifact hash
+that must not be recomputed during decode. This verifies historical byte
+preservation independently of present-day admission policy. The existing
+[`durable-v1` corpus](../durable-v1/README.md) remains the separate actual workflow
+and replay fixture set, unchanged by this capture.
+
+## Fixed files and coverage
+
+| File | Original Postcard type or envelope |
+|---|---|
+| `broad.cp1` | `FOCALCP1`, BLAKE3 checksum, then `(1u16, (State, Limits))` |
+| `empty.cp1` | Empty original Core in the same ledger, with default limits |
+| `state.bin` | Original `State`, without a checkpoint envelope |
+| `claims.rows` | `BTreeMap<ClaimId, Claim>`: all 20 claim statuses |
+| `validations.rows` | `BTreeMap<ValidationId, Validation>`: all 42 kind × phase × mode combinations |
+| `artifacts.rows` | `BTreeMap<ArtifactId, Artifact>`: empty/full inline payloads and all three content classes |
+| `testaments.rows` | `BTreeMap<TestamentId, Testament>`: all 24 confidence × outcome combinations |
+| `evidence-sets.rows` | `BTreeMap<EvidenceSetId, EvidenceSet>`: open/closed and empty/nonempty manifests |
+| `runs.rows` | `BTreeMap<ValidationRunId, ValidationRun>`: all phases, absent/all four final verdicts and attempt values |
+| `monitors.rows` | `BTreeMap<MonitorId, Monitor>`: all three predicates, empty roots and absent/present release |
+| `identities.rows` | `BTreeMap<(ObjectKind, ContentHash), ObjectId>`: all object kinds |
+| `epochs.rows` | `BTreeMap<ParticipantId, EpochWindow>`: empty/admitted sets and boundary counters |
+| `receipts.rows` | `BTreeMap<RequestKey, MutationReceipt>`: all twelve result variants |
+| `command-results.rows` | `Vec<CommandResult>`: those twelve variants plus empty Generated/Existing results |
+| `limits.bin` | Original eleven-field `Limits`, all with distinct nondefault values |
+
+[`coverage.json`](coverage.json) pins explicit numeric and ordinal sets and exact
+row counts. The corpus also covers all four `RelationTarget` variants, every
+action/scope/relation vocabulary value, both handler agentic flags, every nested
+Option/bool branch, empty/nonempty collections, UTF-8 and control bytes, nonuniform
+hashes, high-bit IDs, `u32::MAX`, `u64::MAX`, and varint boundaries. Manifests use
+deliberately non-sorted vector order. Content-reference length is metadata; even
+`u64::MAX` must not cause payload allocation during decoding.
+
+## Provenance and reproduction
+
+[`capture.json`](capture.json) records the actual original linked capture
+executable hash **and hashes of the matched original rlib contents before any
+Cargo rebuild**. Filenames alone are not the identities. It also records the
+compiler and exact standalone compilation arguments. No executable or rlib binary
+is added to the repository.
+
+[`source-manifest.json`](source-manifest.json) was captured directly before nested
+integration. Reconstruct those sources from its recorded Git base, apply
+[`source.patch`](source.patch), and restore each explicitly listed `source_addition`
+to its original source path. The additions are stored verbatim as `.txt` files
+under `source-additions`. This reconstruction was checked in an isolated temporary
+directory: all 33 source-file sizes and hashes matched.
+
+The generator encodes the original public State and Limits directly, as the
+Postcard tuple `(1u16, (&state, &limits))`. Postcard's struct encoding has the same
+field order and bytes. It prepends the original magic and checksum, then calls
+the **original compiled** `Core::decode_checkpoint` and `encode_checkpoint` and
+asserts exact State, Limits and checkpoint-byte equality before saving anything.
+The `.rows` files are direct original model serialization, independent of future
+Core codec helpers.
+
+For manual reproduction, build the reconstructed original library sources with
+their captured lockfile in an isolated checkout. Compile the preserved generator
+with matching Core/model/Serde/Postcard/Blake3 rlibs, using `--edition=2024` and an
+explicit crate name such as `--crate-name focal_v1_nested_capture` when compiling
+the `.rs.txt` filename. The original run used Rust 1.94.1 on macOS arm64. Its output
+directory is `/private/tmp/focal-v1-nested-original`; ensure no work needs preserving
+there before running the utility. Compare generated bytes with the checked-in
+manifest. Do not regenerate checked-in fixtures to satisfy a failing test.
+
+## Qualification expected from the new codecs
+
+1. Decode each row-map file using its frozen model wrapper and its original model
+   type; compare the resulting values. Encode through borrowed V1 wrappers and
+   compare the exact original file bytes.
+2. Decode `broad.cp1` through the real Core entry point. Compare every map and
+   nondefault limit, then require byte-identical checkpoint re-encoding. Repeat
+   with `empty.cp1` and the earlier real workflow checkpoints.
+3. Confirm the deliberately stored artifact hash survives unchanged, and that
+   handler/manifest order, absent observations and zero counters are preserved.
+   No schema admission, custody check or hash repair belongs in this conversion.
+4. Reject truncated bodies, unknown frozen vocabulary codes, unexpected enum
+   ordinals and trailing bytes through separate corruption tests. Do not mistake
+   this positive corpus for exhaustive malformed-input qualification.
+5. Keep decode allocations under the existing owner budget. A declared collection
+   size must not cause speculative unbounded allocation; content-reference
+   lengths must remain scalar metadata. Convert decoded elements directly into
+   their final maps/vectors to avoid a second whole decoded State.
+
+Domain outcomes, deltas/effects, prepared commands and managed stream registry
+receipts are outside this nested checkpoint graph. The corpus does not complete
+their separate codec freeze, historical reducer isolation or successor activation.

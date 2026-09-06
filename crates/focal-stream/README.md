@@ -20,6 +20,15 @@ reporting an acknowledgment. `replay_committed` reconstructs state from that log
 `CursorCheckpoint` can be included in a verified durable checkpoint. None of
 these pure operations performs IO or makes unpersisted state durable.
 
+The native cursor types implement `focal_model::durable_v1::V1` for their original
+Postcard storage representation. An embedding historical reader/writer uses
+`durable_v1::Ref` and `durable_v1::Value`; nested collections decode directly into
+their final maps/sets without allocating from untrusted count hints. The codecs
+preserve original fields and admission-independent values. The enclosing Session
+still owns format selection, recovery memory admission, exact body consumption
+and publication. Original bytes and capture provenance live in
+[`fixtures/durable-v1`](fixtures/durable-v1/README.md).
+
 Registration or `BeginSeed` pins the replay suffix immediately. `CompleteSeed`
 opens live delivery only after the consumer durably installed the snapshot.
 Seed reset increments the generation, so stale acknowledgments cannot advance

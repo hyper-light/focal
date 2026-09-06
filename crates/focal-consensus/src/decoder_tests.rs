@@ -3,7 +3,7 @@ use std::sync::mpsc;
 
 const HASH: [u8; 32] = [41; 32];
 
-fn activated(path: &Path) -> DurableNode {
+pub(super) fn activated(path: &Path) -> DurableNode {
     let mut node = DurableNode::open(NodeConfig::single(1, [1; 16], [2; 16]), path).unwrap();
     node.confirm_decoder(HASH).unwrap();
     node.drain().unwrap();
@@ -77,7 +77,7 @@ fn decoder_floor_requires_actual_application_confirmation_before_any_raft_partic
     reopened.drain().unwrap();
 }
 
-fn shared(path: &Path, budget: &MemoryBudget) -> SharedWal {
+pub(super) fn shared(path: &Path, budget: &MemoryBudget) -> SharedWal {
     SharedWal::open_with_budget(
         path,
         WalOptions::new(WalIdentity {
@@ -90,7 +90,7 @@ fn shared(path: &Path, budget: &MemoryBudget) -> SharedWal {
     )
     .unwrap()
 }
-fn configured(shared: &SharedWal, budget: &MemoryBudget, group: u8) -> DurableNode {
+pub(super) fn configured(shared: &SharedWal, budget: &MemoryBudget, group: u8) -> DurableNode {
     let mut node = DurableNode::open_on_wal_in(
         NodeConfig::single(1, [1; 16], [group; 16]),
         shared.clone(),
@@ -103,7 +103,9 @@ fn configured(shared: &SharedWal, budget: &MemoryBudget, group: u8) -> DurableNo
 }
 /// A real bounded replay channel holds the existing disk owner. No timer or
 /// scheduler race substitutes for proving that the floor has not been fsynced.
-fn pause(shared: &SharedWal) -> (mpsc::SyncSender<()>, std::thread::JoinHandle<WalLease>) {
+pub(super) fn pause(
+    shared: &SharedWal,
+) -> (mpsc::SyncSender<()>, std::thread::JoinHandle<WalLease>) {
     let mut lease = shared.lease(LogicalLogId([250; 16])).unwrap();
     let records: Vec<_> = (1..=3)
         .map(|index| Record {

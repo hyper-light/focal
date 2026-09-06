@@ -212,6 +212,28 @@ fn ids_defaults_generator_failures_and_mandatory_validation_are_explicit() {
 }
 
 #[test]
+fn receipt_contract_rejects_authored_quality_handlers_and_evidence() {
+    assert!(claim().build(&context(), &mut ids()).is_ok());
+    for field in 0..3 {
+        let mut doc = claim();
+        let receipt = &mut doc.validations[0];
+        match field {
+            0 => receipt.quality_bar = Some("Prove correctness".into()),
+            1 => receipt.handlers.push(HandlerDocument {
+                id: id(16),
+                version: "ab".repeat(32),
+                agentic: false,
+            }),
+            _ => receipt.evidence_schemas.push("ab".repeat(32)),
+        }
+        assert!(matches!(
+            doc.build(&context(), &mut ids()),
+            Err(InputError::Invalid(message)) if message.contains("delivery only")
+        ));
+    }
+}
+
+#[test]
 fn validator_contract_never_invents_handlers_or_changes_pinned_policy() {
     let mut doc = claim();
     let mut test = receipt_validation();

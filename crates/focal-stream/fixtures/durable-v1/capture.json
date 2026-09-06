@@ -1,0 +1,270 @@
+{
+  "schema": 1,
+  "capture_kind": "original current native Serde writer compiled from the saved pre-codec focal-stream source; not a frozen-V1 writer",
+  "compiler": "rustc 1.94.1 (e408947bf 2026-03-25)",
+  "source_files": "source-files.json",
+  "model_serialized_leaf_source": {
+    "path": "crates/focal-model/src/ids.rs",
+    "sha256": "23008e268e85846964926049119aa5548ef997268376f69cc34004220504c3a9",
+    "bytes": 2793,
+    "snapshot": "source-snapshot/model-ids.rs.txt",
+    "matches_prior_pre_increment_source": "crates/focal-core/fixtures/durable-v1-inputs/source-snapshot/crates/focal-model/src/ids.rs.txt"
+  },
+  "cargo_lock": {
+    "path": "Cargo.lock",
+    "sha256": "1cdc2b87a2e4f473faaf8c2217c479ec8afafdfd4280292241ddba3fa4d66c93",
+    "bytes": 52352
+  },
+  "generator": {
+    "path": "crates/focal-stream/fixtures/durable-v1/generator.rs.txt",
+    "sha256": "42609cc3804b0c850e0f8cdc1b39165169efa08246b89009116bab80e5f278cd",
+    "bytes": 8178
+  },
+  "linked_build_identities": [
+    {
+      "path": "/private/tmp/libfocal_stream_original_v1_capture.rlib",
+      "sha256": "ff44b817768d45ed1533ee289dea75b8c295d1a86ad4d6f7e5f0f250c10bf6a7",
+      "bytes": 1562496
+    },
+    {
+      "path": "/private/tmp/focal-stream-v1-capture",
+      "sha256": "d9c1905964841d2822906cc7d56d57136781642ac17a9583c06f6d7ae278f63d",
+      "bytes": 579816
+    },
+    {
+      "path": "target/release/deps/libfocal_model-7d9ee679eb35f5ab.rlib",
+      "sha256": "1352bfbdc8aae5b3de62eaf4ca41271682f74809623745cce7c202ce0baadb17",
+      "bytes": 12322200
+    },
+    {
+      "path": "target/release/deps/libfocal_memory-a4eae974ea7eb54c.rlib",
+      "sha256": "3ad4e3e992b8aa85179271314ae24c04a83b706081daae873a9111fe8cf19c2a",
+      "bytes": 717520
+    },
+    {
+      "path": "target/release/deps/libserde-85aa4195ed6972a8.rlib",
+      "sha256": "8bac8488784e7f61487b86a2ba2cb196cea4dbad24128051178a60588a2c194b",
+      "bytes": 975464
+    },
+    {
+      "path": "target/release/deps/libpostcard-690a52ff8069fe6b.rlib",
+      "sha256": "f5990dac51b5ddffeed3091227609a7058bbef9fb5a74bd6b7e19e65f4c2f5cb",
+      "bytes": 620456
+    }
+  ],
+  "identity_note": "Paths name mutable local build artifacts; their SHA-256 values, not filenames, identify the exact capture build.",
+  "library_compile": [
+    "rustc",
+    "--edition=2024",
+    "--crate-name",
+    "focal_stream",
+    "--crate-type",
+    "rlib",
+    "-C",
+    "opt-level=3",
+    "-C",
+    "metadata=focal_stream_original_v1_capture",
+    "crates/focal-stream/src/lib.rs",
+    "-L",
+    "dependency=target/release/deps",
+    "--extern",
+    "focal_model=target/release/deps/libfocal_model-7d9ee679eb35f5ab.rlib",
+    "--extern",
+    "focal_memory=target/release/deps/libfocal_memory-a4eae974ea7eb54c.rlib",
+    "--extern",
+    "serde=target/release/deps/libserde-85aa4195ed6972a8.rlib",
+    "--extern",
+    "postcard=target/release/deps/libpostcard-690a52ff8069fe6b.rlib",
+    "-o",
+    "/private/tmp/libfocal_stream_original_v1_capture.rlib"
+  ],
+  "generator_compile": [
+    "rustc",
+    "--edition=2024",
+    "-C",
+    "opt-level=3",
+    "--crate-name",
+    "focal_stream_v1_capture",
+    "crates/focal-stream/fixtures/durable-v1/generator.rs.txt",
+    "-L",
+    "dependency=target/release/deps",
+    "--extern",
+    "focal_stream=/private/tmp/libfocal_stream_original_v1_capture.rlib",
+    "--extern",
+    "focal_model=target/release/deps/libfocal_model-7d9ee679eb35f5ab.rlib",
+    "--extern",
+    "serde=target/release/deps/libserde-85aa4195ed6972a8.rlib",
+    "--extern",
+    "postcard=target/release/deps/libpostcard-690a52ff8069fe6b.rlib",
+    "-o",
+    "/private/tmp/focal-stream-v1-capture"
+  ],
+  "capture_command": [
+    "/private/tmp/focal-stream-v1-capture",
+    "crates/focal-stream/fixtures/durable-v1"
+  ],
+  "counts": {
+    "consumer-ids": 4,
+    "consumer-keys": 4,
+    "position-offsets": 5,
+    "positions": 50,
+    "cursor-tokens": 50,
+    "delta-filters": 4,
+    "resync-reasons": 5,
+    "cursor-modes": 9,
+    "cursor-records": 36,
+    "cursor-checkpoints": 3,
+    "cursor-commands": 18,
+    "cursor-operations": 18
+  },
+  "files": {
+    "checkpoint-00.bin": {
+      "sha256": "2ac60eb83afbbbd1fcea511b3e1fbd69c36a01d4428ac2ec3e56f1fa8486e1a3",
+      "bytes": 37
+    },
+    "checkpoint-01.bin": {
+      "sha256": "f07e74e991521a1faa562a0746c0a72f0dd25d9088553e295c4b1a8bd65da325",
+      "bytes": 171
+    },
+    "checkpoint-02.bin": {
+      "sha256": "30ab4bd16bcb31c9697ea7ca00aa4988745382f8b3f6af5702df4a5193af840e",
+      "bytes": 24292
+    },
+    "consumer-ids.rows": {
+      "sha256": "b522e798111d964ed6ae4d400266d14cbdcd4979ba7cb8ea1af9bab89d87e00a",
+      "bytes": 65
+    },
+    "consumer-keys.rows": {
+      "sha256": "6807271866bace1d9801eb0a4b0a738097cab7af49bd2fef787d86568b435551",
+      "bytes": 193
+    },
+    "cursor-checkpoints.rows": {
+      "sha256": "975cfece821b6fbb239cce19150910dbaa1a398610a0f6bd4ae75bb4fa895f96",
+      "bytes": 24501
+    },
+    "cursor-commands.rows": {
+      "sha256": "53efc3781372ce99b5d9e2746eaf8aa139b286dca4668ef9556cea258ff84797",
+      "bytes": 7577
+    },
+    "cursor-modes.rows": {
+      "sha256": "58f824c968d644b199d5324e02abda6b0caa8127cffa8962dd7dc9ce7f6620db",
+      "bytes": 26
+    },
+    "cursor-operations.rows": {
+      "sha256": "b0f7058c5d15bdd450e011ff767d7f39d3eb303ce21866bece44b2f90ef91e82",
+      "bytes": 7346
+    },
+    "cursor-records.rows": {
+      "sha256": "cdd10ea1a821772e5186d8712d306d1ee16a5e66b2d2e58644a9c26d870c5231",
+      "bytes": 23651
+    },
+    "cursor-tokens.rows": {
+      "sha256": "9fc28b8ef2af409ea7856cdd97149746887de9e117e27bc8b7a01567ddefeec7",
+      "bytes": 6166
+    },
+    "delta-filters.rows": {
+      "sha256": "e9c128feabdef9311c9f31f8561ffebd9ff8100a287938727a9407e1a03366e7",
+      "bytes": 2105
+    },
+    "operation-00.bin": {
+      "sha256": "a14c40586d7b6ba6ecdd4f540fa5ba3006c1c1b11528d2c2089cfe75136339fa",
+      "bytes": 2153
+    },
+    "operation-01.bin": {
+      "sha256": "909fe50b4053f2a5b972609ad6e63b776e8e481a71c46ac083005da582e44c0a",
+      "bytes": 134
+    },
+    "operation-02.bin": {
+      "sha256": "8540bccda16758aaecd43594e7b5a858326be06c7928bf72d049b2fcdcb68cc8",
+      "bytes": 37
+    },
+    "operation-03.bin": {
+      "sha256": "e1b189c421c2e8e74ae4b75137b716ccfbb9f063860b384e6e2452a414bc5e0f",
+      "bytes": 2120
+    },
+    "operation-04.bin": {
+      "sha256": "f58a4eb882d0e4bfba3cfdb3f180e826c6c0b9b5284862fabe9fdabc6609183e",
+      "bytes": 37
+    },
+    "operation-05.bin": {
+      "sha256": "20dcd11d15be8daa1f798d69f32d6762e9b7c32f8a250533de914dbae19c3d4d",
+      "bytes": 28
+    },
+    "operation-06.bin": {
+      "sha256": "bd47dec67c7dd1786edce97e8a7b55d727c227bafd6fa17a66c47b3e3259659b",
+      "bytes": 11
+    },
+    "operation-07.bin": {
+      "sha256": "f908e66d3eea0083ce5881f427be985baeca47dfba6c545304d4c797c6fbf4a7",
+      "bytes": 2143
+    },
+    "operation-08.bin": {
+      "sha256": "4ba2d9bc276b8cdfd1510d36667539470f5c771ce5aeeae54532c3b08357400f",
+      "bytes": 144
+    },
+    "operation-09.bin": {
+      "sha256": "dd7933e577679ede3d7ab40238009329eef9879f73c20e4adb652450c655d33e",
+      "bytes": 87
+    },
+    "operation-10.bin": {
+      "sha256": "20deea835757ee6b6d99eaa9e191975e3c5bd3346688e054556591faa29c76f1",
+      "bytes": 126
+    },
+    "operation-11.bin": {
+      "sha256": "f05b8825fd220b6d61b948e6f675548e4d2284fed9b46e11e775e02d8f302f93",
+      "bytes": 19
+    },
+    "operation-12.bin": {
+      "sha256": "5359385ba1fb24f0265fa1dd6824879a9dc9f20ca068e09af3fceddf07cffca7",
+      "bytes": 53
+    },
+    "operation-13.bin": {
+      "sha256": "eb9fed46e6599b21efa56fcaea76fef0e48852bea1dfcb7c0a5d2331b935b92d",
+      "bytes": 19
+    },
+    "operation-14.bin": {
+      "sha256": "c9fb1e79625b44ef14a3b9a3fcd5346d28b712486dc4e7b99737c6418e82a342",
+      "bytes": 19
+    },
+    "operation-15.bin": {
+      "sha256": "ceb827ad3d3884fd4d50ae6099d6d50c09a21e72ebd309708e8b69d93df19e55",
+      "bytes": 2
+    },
+    "operation-16.bin": {
+      "sha256": "e7c3ddee162981a8dca1762b19af1987831152f1f94ce1491e03da5ec499c419",
+      "bytes": 86
+    },
+    "operation-17.bin": {
+      "sha256": "edad74bbd5719ecb5adb7438851f0ea8d15379617e77da8935c0d8dbe0d1fae1",
+      "bytes": 127
+    },
+    "position-offsets.rows": {
+      "sha256": "56e54e8cbf6071c1bd01550b3c8b16fad8416ace1371e409068572eb17459471",
+      "bytes": 15
+    },
+    "positions.rows": {
+      "sha256": "0b8c95a966034e1112cad1ff3be696bf6a1ee8404ec4ab514ad05ede13f8f272",
+      "bytes": 1891
+    },
+    "resync-reasons.rows": {
+      "sha256": "acc80a36036a3ded1a9442615e43a99bfe34d4feee3d60268ff3d7f1000c3957",
+      "bytes": 6
+    },
+    "unsorted-duplicate-checkpoint.input": {
+      "sha256": "1ea01ffe44ecd3533458a4a3bcb3784d08c05c68315291171de7d947d5aa226f",
+      "bytes": 461
+    },
+    "unsorted-duplicate-checkpoint.normalized": {
+      "sha256": "a98e3c139d43e69048c87cde0d6777afbcf2c59723949a17362517419c59f3b8",
+      "bytes": 326
+    },
+    "unsorted-duplicate-filter.input": {
+      "sha256": "55ed90134c33b4348f61beedd1d9f6e37b4d48376e8ba6475f9604ed6e085912",
+      "bytes": 66
+    },
+    "unsorted-duplicate-filter.normalized": {
+      "sha256": "ea91b8f91ef9b172f8fd09624b3381aadc78984e3a3cec56555a2feb8e886fe9",
+      "bytes": 50
+    }
+  }
+}

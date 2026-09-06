@@ -1,0 +1,71 @@
+//! Internal historical storage codecs, independent of the live model's Serde
+//! implementations. These preserve Postcard V1 fields, numeric codes and enum
+//! ordinals. They do not validate present-day admission or rewrite stored hashes.
+//!
+//! Public visibility allows the Core to use the same frozen nested encoding
+//! without a dependency cycle. This is not a new wire or authored-input format.
+//! Borrowed views serialize existing allocations; decoding constructs each final
+//! row directly. Prepared inputs and historical execution are separate boundaries
+//! and are not frozen by the checkpoint codecs alone.
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+/// Explicit historical representation for a supported value.
+pub trait V1: Sized {
+    fn serialize_v1<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error>;
+    fn deserialize_v1<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error>;
+}
+
+/// A borrowed historical serializer; no clone or second model is retained.
+pub struct Ref<'a, T: V1>(pub &'a T);
+
+impl<T: V1> Serialize for Ref<'_, T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize_v1(serializer)
+    }
+}
+
+/// A decoded historical value, already converted into its final model type.
+pub struct Value<T: V1>(pub T);
+
+impl<'de, T: V1> Deserialize<'de> for Value<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        T::deserialize_v1(deserializer).map(Self)
+    }
+}
+
+// Each invocation is an explicit frozen field list. Exhaustive destructuring
+// makes live model additions demand an intentional historical conversion.
+macro_rules! v1_struct {
+    ($name:ident { $($field:ident: $ty:ty),+ $(,)? }) => {
+        impl $crate::durable_v1::V1 for $name {
+            fn serialize_v1<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                #[derive(serde::Serialize)]
+                struct Record<'a> {
+                    $($field: $crate::durable_v1::Ref<'a, $ty>),+
+                }
+                let Self { $($field),+ } = self;
+                serde::Serialize::serialize(&Record {
+                    $($field: $crate::durable_v1::Ref($field)),+
+                }, serializer)
+            }
+            fn deserialize_v1<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                #[derive(serde::Deserialize)]
+                struct Record {
+                    $($field: $crate::durable_v1::Value<$ty>),+
+                }
+                let Record { $($field),+ } = serde::Deserialize::deserialize(deserializer)?;
+                Ok(Self { $($field: $field.0),+ })
+            }
+        }
+    };
+}
+
+mod collections;
+mod leaves;
+mod lifecycle;
+mod objects;
+mod vocabulary;
+
+#[cfg(test)]
+mod tests;

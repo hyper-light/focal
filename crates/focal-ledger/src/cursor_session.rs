@@ -196,7 +196,9 @@ impl Session {
         {
             return Err(LedgerError::Capacity);
         }
-        if postcard::experimental::serialized_size(input)? > self.limits.core.max_command_bytes {
+        if postcard::experimental::serialized_size(&focal_model::durable_v1::Ref(input))?
+            > self.limits.core.max_command_bytes
+        {
             return Err(LedgerError::Capacity);
         }
         let charge = reference_charge(input)?;
@@ -211,8 +213,7 @@ impl Session {
             trusted_control: control,
             input: input.clone(),
         };
-        let mut data = CURSOR_MAGIC.to_vec();
-        data.extend(postcard::to_stdvec(&envelope)?);
+        let data = durable_session_v1::encode(CURSOR_MAGIC, &envelope, usize::MAX)?;
         let candidate = self.build_cursor_candidate(
             &envelope,
             ContentHash(*blake3::hash(&data).as_bytes()),
@@ -241,7 +242,9 @@ impl Session {
         if input.key.principal.is_zero() || input.key.id.is_zero() {
             return Err(LedgerError::CursorRequest(ErrorCode::InvalidSchema));
         }
-        if postcard::experimental::serialized_size(input)? > self.limits.core.max_command_bytes {
+        if postcard::experimental::serialized_size(&focal_model::durable_v1::Ref(input))?
+            > self.limits.core.max_command_bytes
+        {
             return Err(LedgerError::Capacity);
         }
         if self.core.snapshot().receipts.contains_key(&input.key)
@@ -411,12 +414,15 @@ impl Session {
                     .ok_or(LedgerError::Capacity)?,
             )?;
             let envelope = if data.starts_with(CURSOR_MAGIC) {
-                postcard::from_bytes::<CursorEnvelope>(
+                // CU1/CU2 historically ignore a trailing body suffix. Preserve
+                // that decode rule for these tags; snapshots remain exact.
+                durable_session_v1::take::<CursorEnvelope>(
                     data.strip_prefix(CURSOR_MAGIC)
                         .ok_or(LedgerError::Corrupt)?,
                 )?
+                .0
             } else {
-                let old: LegacyCursorEnvelope = postcard::from_bytes(
+                let (old, _): (LegacyCursorEnvelope, _) = durable_session_v1::take(
                     data.strip_prefix(LEGACY_CURSOR_MAGIC)
                         .ok_or(LedgerError::Corrupt)?,
                 )?;
@@ -658,58 +664,10 @@ impl Session {
             .budget
             .reserve(BudgetKind::Recovery, BudgetLane::Completion, amount)?
             .commit();
-        let envelope = SnapshotEnvelopeV2 {
-            schema: 2,
-            ledger: self.ledger,
-            raft_index: self.applied_raft,
-            core: self.core.encode_checkpoint()?,
-            cursors: self.cursors.checkpoint().clone(),
-            cursor_meta: CursorMetadata {
-                receipts: self.cursor_meta.receipts.clone(),
-                owners: self.cursor_meta.owners.clone(),
-            },
-            delta_floor: self.stream_bounds().floor,
-            deltas: self.deltas.iter().map(|d| d.delta.clone()).collect(),
-        };
-        let envelope = SnapshotEnvelopeV3 {
-            state: envelope,
-            membership: MembershipState {
-                configuration_index: self.membership_state.configuration_index,
-                latest: self.membership_state.latest.clone(),
-            },
-        };
-        let mut bytes = if self.request_streams.activated {
-            SNAPSHOT_V5_MAGIC.to_vec()
-        } else if self.placement_state.latest().is_some() {
-            SNAPSHOT_V4_MAGIC.to_vec()
-        } else {
-            SNAPSHOT_V3_MAGIC.to_vec()
-        };
-        if self.request_streams.activated {
-            bytes.extend(postcard::to_stdvec(&SnapshotEnvelopeV5 {
-                state: SnapshotEnvelopeV4 {
-                    state: envelope,
-                    placement: PlacementState {
-                        active: self.placement_state.active.clone(),
-                        cutover: self.placement_state.cutover.clone(),
-                    },
-                },
-                requests: self.request_streams.checkpoint(),
-            })?);
-        } else if self.placement_state.latest().is_some() {
-            bytes.extend(postcard::to_stdvec(&SnapshotEnvelopeV4 {
-                state: envelope,
-                placement: PlacementState {
-                    active: self.placement_state.active.clone(),
-                    cutover: self.placement_state.cutover.clone(),
-                },
-            })?);
-        } else {
-            bytes.extend(postcard::to_stdvec(&envelope)?);
-        }
-        if bytes.len() > 8 * 1024 * 1024 {
-            return Err(LedgerError::Capacity);
-        }
+        let core = self.core.encode_checkpoint()?;
+        let bytes = durable_session_v1::snapshot(self, &core)?;
+        // Only the final Session bytes remain before optional retained copying.
+        drop(core);
         let retained = if retain_bytes {
             let allocation = self
                 .budget
@@ -744,11 +702,12 @@ impl Session {
         let mut membership = MembershipState::default();
         let mut placement = PlacementState::default();
         let mut requests = RequestStreamsCheckpoint::default();
+        let mut legacy_core = None;
         let envelope = if let Some(data) = data.strip_prefix(SNAPSHOT_V5_MAGIC) {
             if !self.consensus.decoder_floor_ready(managed_format_hash()) {
                 return Err(LedgerError::Corrupt);
             }
-            let (envelope, remaining): (SnapshotEnvelopeV5, _) = postcard::take_from_bytes(data)?;
+            let (envelope, remaining): (SnapshotEnvelopeV5, _) = durable_session_v1::take(data)?;
             if !remaining.is_empty()
                 || envelope.state.state.state.schema != 2
                 || !envelope.requests.activated
@@ -760,7 +719,7 @@ impl Session {
             requests = envelope.requests;
             envelope.state.state.state
         } else if let Some(data) = data.strip_prefix(SNAPSHOT_V4_MAGIC) {
-            let (envelope, remaining): (SnapshotEnvelopeV4, _) = postcard::take_from_bytes(data)?;
+            let (envelope, remaining): (SnapshotEnvelopeV4, _) = durable_session_v1::take(data)?;
             if !remaining.is_empty() || envelope.state.state.schema != 2 {
                 return Err(LedgerError::Corrupt);
             }
@@ -768,7 +727,7 @@ impl Session {
             placement = envelope.placement;
             envelope.state.state
         } else if let Some(data) = data.strip_prefix(SNAPSHOT_V3_MAGIC) {
-            let (envelope, remaining): (SnapshotEnvelopeV3, _) = postcard::take_from_bytes(data)?;
+            let (envelope, remaining): (SnapshotEnvelopeV3, _) = durable_session_v1::take(data)?;
             if !remaining.is_empty() {
                 return Err(LedgerError::Corrupt);
             }
@@ -777,25 +736,22 @@ impl Session {
                 return Err(LedgerError::Corrupt);
             }
             envelope.state
-        } else if data.starts_with(SNAPSHOT_V2_MAGIC) {
-            let envelope: SnapshotEnvelopeV2 = postcard::from_bytes(
-                data.strip_prefix(SNAPSHOT_V2_MAGIC)
-                    .ok_or(LedgerError::Corrupt)?,
-            )?;
-            if envelope.schema != 2 {
+        } else if let Some(data) = data.strip_prefix(SNAPSHOT_V2_MAGIC) {
+            let (envelope, remaining): (SnapshotEnvelopeV2, _) = durable_session_v1::take(data)?;
+            if !remaining.is_empty() || envelope.schema != 2 {
                 return Err(LedgerError::Corrupt);
             }
             envelope
-        } else if data.starts_with(SNAPSHOT_MAGIC) {
-            let old: SnapshotEnvelope = postcard::from_bytes(
-                data.strip_prefix(SNAPSHOT_MAGIC)
-                    .ok_or(LedgerError::Corrupt)?,
-            )?;
-            if old.schema != 1 {
+        } else if let Some(data) = data.strip_prefix(SNAPSHOT_MAGIC) {
+            let (old, remaining): (SnapshotEnvelope, _) = durable_session_v1::take(data)?;
+            if !remaining.is_empty() || old.schema != 1 {
                 return Err(LedgerError::Corrupt);
             }
             let recovered = Core::decode_checkpoint(&old.core)?;
             let prefix = recovered.sequence();
+            // V1 lacks a separate domain prefix. Retain this decoded Core and
+            // move it into publication instead of decoding the same bytes twice.
+            legacy_core = Some(recovered);
             SnapshotEnvelopeV2 {
                 schema: 2,
                 ledger: old.ledger,
@@ -855,7 +811,10 @@ impl Session {
         } else {
             None
         };
-        let recovered = Core::decode_checkpoint(&envelope.core)?;
+        let recovered = match legacy_core {
+            Some(core) => core,
+            None => Core::decode_checkpoint(&envelope.core)?,
+        };
         self.validate_placement_snapshot(&placement, index, term, recovered.sequence())?;
         let placement_charge = if placement.latest().is_some() {
             Some(
@@ -965,7 +924,8 @@ impl Session {
                     }
                 }
             }
-            let size = postcard::experimental::serialized_size(&delta)?;
+            let size =
+                postcard::experimental::serialized_size(&focal_model::durable_v1::Ref(&delta))?;
             bytes = bytes.checked_add(size).ok_or(LedgerError::Capacity)?;
             if bytes > self.limits.delta_bytes {
                 return Err(LedgerError::Capacity);

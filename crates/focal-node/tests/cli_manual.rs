@@ -103,6 +103,45 @@ fn list(root: &Path, family: &str) -> Value {
 }
 
 #[test]
+fn named_status_uses_the_selected_connection_without_local_ledger_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let _server = start(root.path());
+    let client = root.path().join("client workspace 'quoted'");
+    std::fs::create_dir(&client).unwrap();
+    std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o700)).unwrap();
+    cli(
+        &client,
+        &[
+            "context",
+            "add",
+            "near",
+            "--node-data-dir",
+            root.path().to_str().unwrap(),
+        ],
+    );
+    cli(&client, &["context", "use", "near"]);
+    let local = cli(root.path(), &["status"]);
+    let selected = cli(&client, &["status"]);
+    assert_eq!(selected["result"], local["result"]);
+    assert!(!client.join("IDENTITY").exists());
+    assert!(
+        !run(&client, &["--client-context", "local", "status"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        cli(&client, &["--client-context", "near", "status"])["result"],
+        local["result"]
+    );
+    assert!(
+        !run(&client, &["--client-context", "missing", "status"])
+            .status
+            .success()
+    );
+}
+
+#[test]
 fn remote_recovery_reads_are_authenticated_preserve_journals_and_survive_restart() {
     use focal_client::pending::{OperationContext, OperationJournal};
     use focal_model::{RequestEpoch, RequestId};
@@ -442,6 +481,21 @@ fn authored_forms_lifecycle_lists_download_and_exact_journal_retry_survive_resta
             &["list", family, "--claim", &claim_id, "--format", "json"],
         );
         assert_eq!(page["results"].as_array().unwrap().len(), 1);
+        let yaml = run(
+            root.path(),
+            &["list", family, "--claim", &claim_id, "--format", "yaml"],
+        );
+        assert!(
+            yaml.status.success(),
+            "{}",
+            String::from_utf8_lossy(&yaml.stderr)
+        );
+        let decoded: Value =
+            serde_saphyr::from_str(std::str::from_utf8(&yaml.stdout).unwrap()).unwrap();
+        assert_eq!(
+            decoded, page,
+            "YAML and JSON must expose identical typed rows"
+        );
     }
     let manifest_page = cli(
         root.path(),
@@ -775,8 +829,104 @@ fn validation_get_pages_actual_committed_run_and_verdict_after_restart() {
             .len(),
         1
     );
+    // The composed view uses the same saved prefix and continuation as the
+    // compact result read, including actual old run/attempt records.
+    let context = cli(
+        root.path(),
+        &[
+            "get",
+            "validation",
+            validation,
+            "--context",
+            "--limit",
+            "1",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(context["context"]["token"], first["token"]);
+    let yaml = run(
+        root.path(),
+        &[
+            "get",
+            "validation",
+            validation,
+            "--context",
+            "--limit",
+            "1",
+            "--format",
+            "yaml",
+        ],
+    );
+    assert!(
+        yaml.status.success(),
+        "{}",
+        String::from_utf8_lossy(&yaml.stderr)
+    );
+    let decoded: Value =
+        serde_saphyr::from_str(std::str::from_utf8(&yaml.stdout).unwrap()).unwrap();
+    assert_eq!(decoded, context);
+    assert_eq!(
+        context["context"]["records"],
+        serde_json::json!([records[0]])
+    );
+    assert!(context["context"]["testament"].is_object());
+    let next_context = cli(
+        root.path(),
+        &[
+            "get",
+            "validation",
+            validation,
+            "--context",
+            "--limit",
+            "1",
+            "--cursor",
+            cursor,
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(next_context["context"]["token"], first["token"]);
+    assert_eq!(
+        next_context["context"]["records"],
+        serde_json::json!([attempts[0]])
+    );
+    assert_eq!(
+        next_context["context"]["claim"],
+        context["context"]["claim"]
+    );
+    assert_eq!(
+        next_context["context"]["testament"],
+        context["context"]["testament"]
+    );
+    assert!(next_context["cursor"].is_null());
+    let table = run(root.path(), &["get", "validation", validation, "--context"]);
+    assert!(
+        table.status.success(),
+        "{}",
+        String::from_utf8_lossy(&table.stderr)
+    );
+    let text = String::from_utf8(table.stdout).unwrap();
+    assert!(text.contains("CURRENT TESTAMENT\t"));
+    assert!(text.contains("TESTAMENT ACKNOWLEDGED\tsequence="));
+    assert!(text.contains("RECORDED RESULTS\t"));
+    assert!(text.contains("ATTEMPT\t"));
+    assert_eq!(sequence(root.path()), first["token"]["sequence"]);
     drop(server);
     let _server = start(root.path());
+    let expired = run(
+        root.path(),
+        &[
+            "get",
+            "validation",
+            validation,
+            "--context",
+            "--cursor",
+            cursor,
+        ],
+    );
+    assert!(!expired.status.success());
+    assert!(expired.stdout.is_empty());
     let recovered = cli(
         root.path(),
         &["get", "validation", validation, "--format", "json"],

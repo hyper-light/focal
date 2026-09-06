@@ -2,7 +2,7 @@ use super::StoreError;
 use fs2::FileExt;
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{Read, Seek, Write},
     path::{Path, PathBuf},
 };
 
@@ -14,12 +14,16 @@ const MANAGED_INITIALIZED: &[u8; 8] = b"FCLMST01";
 enum Layout {
     Legacy,
     Managed,
+    Coordinator,
+    Watch,
 }
 impl Layout {
     fn marker(self) -> &'static [u8; 8] {
         match self {
             Self::Legacy => INITIALIZED,
             Self::Managed => MANAGED_INITIALIZED,
+            Self::Coordinator => b"FCLMCO01",
+            Self::Watch => b"FCLWAT01",
         }
     }
 }
@@ -30,6 +34,148 @@ pub(crate) struct Directory {
     layout: Layout,
 }
 impl Directory {
+    /// The coordinator lock is an initialized marker outside its managed child.
+    /// An empty lock is recoverable only before any maintenance can be returned.
+    pub(crate) fn coordinator(
+        parent: &Path,
+        name: &str,
+        create: bool,
+    ) -> Result<(Self, bool), StoreError> {
+        Self::named_owner(parent, name, create, Layout::Coordinator)
+    }
+    pub(crate) fn watch(
+        parent: &Path,
+        name: &str,
+        create: bool,
+    ) -> Result<(Self, bool), StoreError> {
+        Self::named_owner(parent, name, create, Layout::Watch)
+    }
+    fn named_owner(
+        parent: &Path,
+        name: &str,
+        create: bool,
+        layout: Layout,
+    ) -> Result<(Self, bool), StoreError> {
+        #[cfg(not(unix))]
+        {
+            let _ = (parent, name, create);
+            Err(StoreError::Permissions)
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = fs::symlink_metadata(parent).map_err(missing_is_corrupt)?;
+            if !metadata.is_dir() || metadata.mode() & 0o077 != 0 {
+                return Err(StoreError::Permissions);
+            }
+            let suffix = if matches!(layout, Layout::Watch) {
+                "watch"
+            } else {
+                "managed"
+            };
+            let path = parent.join(format!("{name}.{suffix}-lock"));
+            match fs::symlink_metadata(&path) {
+                Ok(_) => check_file(&path, metadata.uid())?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if parent.join(format!("{name}.{suffix}-owner")).try_exists()?
+                        || parent.join(name).try_exists()?
+                    {
+                        return Err(StoreError::Corrupt);
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+            let mut lock = options()
+                .read(true)
+                .write(true)
+                .create(create)
+                .open(&path)
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        StoreError::MissingOperation
+                    } else {
+                        error.into()
+                    }
+                })?;
+            check_open_file(&path, &lock, metadata.uid())?;
+            lock.try_lock_exclusive().map_err(|error| {
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    StoreError::Locked
+                } else {
+                    error.into()
+                }
+            })?;
+            let initialized = read_marker_prefix(&mut lock, layout.marker())?;
+            lock.sync_all()?;
+            File::open(parent)?.sync_all()?;
+            Ok((
+                Self {
+                    path: parent.into(),
+                    _lock: lock,
+                    layout,
+                },
+                initialized,
+            ))
+        }
+    }
+    pub(crate) fn finish_coordinator(&self) -> Result<(), StoreError> {
+        let mut lock = &self._lock;
+        lock.rewind()?;
+        lock.write_all(self.layout.marker())?;
+        lock.set_len(8)?;
+        lock.sync_all()?;
+        File::open(&self.path)?.sync_all()?;
+        Ok(())
+    }
+    /// Only a durable outer initialization intent may resume this path; no
+    /// child request can have escaped before that outer intent becomes Ready.
+    pub(crate) fn resume_managed_creation(path: &Path) -> Result<Self, StoreError> {
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err(StoreError::Permissions)
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            match fs::DirBuilder::new().mode(0o700).create(path) {
+                Ok(()) => File::open(parent(path))?.sync_all()?,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+            let missing_lock = !path.join("LOCK").try_exists()?;
+            let mut count = 0usize;
+            for entry in fs::read_dir(path)? {
+                count = count.checked_add(1).ok_or(StoreError::Capacity)?;
+                let name = entry?.file_name();
+                if count > 4
+                    || !matches!(
+                        name.to_str(),
+                        Some("LOCK" | "INITIALIZED" | "stream.bin" | "stream.pending")
+                    )
+                {
+                    return Err(StoreError::Corrupt);
+                }
+            }
+            let directory = Self::lock(path, missing_lock, Layout::Managed)?;
+            if directory.exists(MARKER)? {
+                use std::os::unix::fs::MetadataExt;
+                let marker_path = path.join(MARKER);
+                directory.check_path(&marker_path)?;
+                let mut marker = options().read(true).write(true).open(&marker_path)?;
+                check_open_file(&marker_path, &marker, fs::metadata(path)?.uid())?;
+                if !read_marker_prefix(&mut marker, MANAGED_INITIALIZED)? {
+                    marker.rewind()?;
+                    marker.write_all(MANAGED_INITIALIZED)?;
+                    marker.set_len(8)?;
+                }
+                marker.sync_all()?;
+            } else {
+                directory.initialize()?;
+            }
+            Ok(directory)
+        }
+    }
     pub(crate) fn create(path: &Path) -> Result<Self, StoreError> {
         Self::create_layout(path, Layout::Legacy)
     }
@@ -320,6 +466,12 @@ impl Directory {
         Ok(())
     }
     fn record_limit(&self, relative: &str) -> Result<usize, StoreError> {
+        if matches!(self.layout, Layout::Watch) {
+            return crate::watch::record_limit(relative).ok_or(StoreError::Permissions);
+        }
+        if matches!(self.layout, Layout::Coordinator) {
+            return crate::managed_requests::record_limit(relative).ok_or(StoreError::Permissions);
+        }
         if matches!(self.layout, Layout::Managed) {
             return crate::managed_store::record_limit(relative).ok_or(StoreError::Permissions);
         }
@@ -424,6 +576,19 @@ fn options() -> OpenOptions {
         options.mode(0o600);
     }
     options
+}
+fn read_marker_prefix(file: &mut File, expected: &[u8; 8]) -> Result<bool, StoreError> {
+    let length = usize::try_from(file.metadata()?.len()).map_err(|_| StoreError::Corrupt)?;
+    if length > 8 {
+        return Err(StoreError::Corrupt);
+    }
+    let mut bytes = [0; 8];
+    let prefix = bytes.get_mut(..length).ok_or(StoreError::Corrupt)?;
+    file.read_exact(prefix)?;
+    if Some(&*prefix) != expected.get(..length) {
+        return Err(StoreError::Corrupt);
+    }
+    Ok(length == 8)
 }
 fn parent(path: &Path) -> &Path {
     path.parent()

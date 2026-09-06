@@ -1,3 +1,4 @@
+use crate::PEER_PROTOCOL_VERSION;
 use focal_model::*;
 pub use focal_stream::{
     ConsumerId, CursorToken, DeltaFilter, Position, PositionOffset, StreamEvent,
@@ -46,6 +47,13 @@ pub enum ReadQuery {
     ValidationResults {
         id: ValidationId,
         after: Option<ValidationResultPosition>,
+    },
+    /// Claim-scoped snapshot seed. Continuation advances after the last visited
+    /// object key, including a page with no matching objects.
+    SeedScan {
+        after: Option<ObjectKey>,
+        claims: Vec<ClaimId>,
+        max_bytes: u32,
     },
 }
 
@@ -151,6 +159,13 @@ pub enum Operation {
     ManagedSupport {
         group: [u8; 16],
     },
+    Traverse(crate::TraversalRequest),
+    Validators(crate::ValidatorRequest),
+    Summary,
+    Monitor {
+        id: MonitorId,
+    },
+    Select(crate::SelectionRequest),
 }
 /// Read-only metadata selectors contain no variable-length collections.
 pub const MAX_PEER_CONTROL_REQUEST_BYTES: usize = 64;
@@ -178,6 +193,11 @@ impl Operation {
             Self::RequestStreamControl { .. } => 17,
             Self::RequestStreamRead { .. } => 18,
             Self::ManagedSupport { .. } => 19,
+            Self::Traverse(_) => 20,
+            Self::Validators(_) => 21,
+            Self::Summary => 22,
+            Self::Monitor { .. } => 23,
+            Self::Select(_) => 24,
         }
     }
     pub fn is_mutation(&self) -> bool {
@@ -483,7 +503,23 @@ impl AccessError {
 }
 impl std::fmt::Display for AccessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "protocol access failure {}", self.registered_tag())
+        match self {
+            Self::Unauthorized => f.write_str("authenticated identity lacks access to this operation or ledger"),
+            Self::UnsupportedProtocol => f.write_str("server does not support the requested protocol"),
+            Self::InvalidRequest => f.write_str("request fields or fences are invalid"),
+            Self::Capacity => f.write_str("request exceeds available bounded capacity"),
+            Self::Unavailable => f.write_str("authoritative ledger service is unavailable"),
+            Self::OutcomeUnknown => f.write_str("mutation outcome is unknown; recover the exact saved request"),
+            Self::RouteChanged(hint) => write!(f, "ledger route changed to epoch {}", hint.epoch.0),
+            Self::Behind { published } => write!(f, "serving replica is behind; published sequence is {}", published.0),
+            Self::SnapshotExpired => f.write_str("read snapshot expired; explicitly start a new query"),
+            Self::ResyncRequired { .. } => f.write_str("retained history no longer covers this cursor; explicit resynchronization is required"),
+            Self::UnsupportedOperation => f.write_str("this operation is not supported by the serving capability"),
+            Self::ManagedRetired { through } => write!(f, "request history retired through ordinal {through}; the old ID cannot execute again"),
+            Self::ManagedClosed { generation } => write!(f, "request stream generation {generation} is closed"),
+            Self::ManagedConflict => f.write_str("request identity or stream fence conflicts with saved state"),
+            Self::ManagedNotRegistered => f.write_str("request stream is not registered"),
+        }
     }
 }
 impl std::error::Error for AccessError {}
@@ -509,6 +545,10 @@ pub enum Response {
     RequestStreamControlled(crate::RequestStreamControlReply),
     RequestStreamRead(crate::RequestStreamReadReply),
     ManagedSupport(ManagedFormatSupport),
+    Traversed(crate::TraversalPage),
+    Validators(crate::ListPage),
+    Summary(crate::LedgerSummary),
+    Monitor(crate::MonitorPage),
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponseEnvelope {
@@ -540,6 +580,10 @@ impl Negotiated {
                 | (
                     MANAGED_PROTOCOL_VERSION,
                     PROTOCOL_VERSION | MANAGED_PROTOCOL_VERSION
+                )
+                | (
+                    PEER_PROTOCOL_VERSION,
+                    PROTOCOL_VERSION | MANAGED_PROTOCOL_VERSION | PEER_PROTOCOL_VERSION
                 )
         )
     }
@@ -598,10 +642,21 @@ impl WireLimits {
         hello: &Hello,
         managed: bool,
     ) -> Result<Negotiated, AccessError> {
+        self.negotiate_profiles(hello, managed, false)
+    }
+    pub fn negotiate_profiles(
+        &self,
+        hello: &Hello,
+        managed: bool,
+        participant: bool,
+    ) -> Result<Negotiated, AccessError> {
         if hello.versions.len() > 16 {
             return Err(AccessError::UnsupportedProtocol);
         }
-        let protocol = if managed && hello.versions.contains(&MANAGED_PROTOCOL_VERSION) {
+        let protocol = if managed && participant && hello.versions.contains(&PEER_PROTOCOL_VERSION)
+        {
+            PEER_PROTOCOL_VERSION
+        } else if managed && hello.versions.contains(&MANAGED_PROTOCOL_VERSION) {
             MANAGED_PROTOCOL_VERSION
         } else if hello.versions.contains(&PROTOCOL_VERSION) {
             PROTOCOL_VERSION

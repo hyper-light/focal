@@ -93,7 +93,8 @@ impl State {
         }
         for request in [&self.open_epoch, &self.request] {
             if request.ledger != self.context.ledger
-                || request.protocol != focal_wire::PROTOCOL_VERSION
+                || (request.protocol != focal_wire::PROTOCOL_VERSION
+                    && !focal_wire::is_peer_request(request))
                 || request.request_id.is_zero()
                 || request.route_epoch.0 == 0
             {

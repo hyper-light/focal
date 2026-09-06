@@ -125,10 +125,52 @@ Managed operation IDs use the explicit fixed-width lowercase
 `prepare` cannot create a missing reservation. Compaction records a durable
 retired prefix before deleting old bodies, and old IDs return `Retired` without
 running an expansion closure. Existing 32-digit operation IDs and epoch-one
-journals retain their current semantics. Automatic CLI/MCP managed selection
-and namespace rotation remain integration work. The detailed API lifecycle,
+journals retain their current semantics. The detailed API lifecycle,
 limits and upgrade gates are in the
 [managed-stream architecture](../../docs/archictecutre/15-managed-request-streams.md).
+
+`managed_requests::ManagedRequests::open(parent, name, context, limits)` owns
+automatic initialization for a named private child. The parent must exist with
+mode `0700`. Its initialized lock and checksummed coordinator record remain
+outside the child; losing initialized state cannot create a replacement stream.
+`open_existing` never creates an absent namespace. A durable initialization phase
+can finish constructing a child after a crash, before any operation is exposed.
+
+Call `maintenance(&mut ids)` on the blocking owner, transmit its returned envelope
+after the method releases every lock, and pass the reply to `accept_maintenance`.
+Repeat until maintenance returns `None`, then use `store()` for normal reservation,
+preparation and receipts. The typical first use performs one slot read and one
+registration. Registration retries retain the exact ID, owner nonce and generation
+CAS; a vacant read cannot revoke an earlier unknown request. Concurrent handles
+adopt the persisted action; a stale reply means refresh the next action.
+
+Only `mark_delivered(id)` marks an already synced exact receipt as delivered.
+Maintenance acknowledges a contiguous marked prefix and preserves an unknown ACK
+until its exact receipt is recovered. An earlier undelivered result blocks later
+marks from retiring it. Adapters must mark only after successful output delivery
+or explicit user acknowledgment. Merely reading results does not mark them.
+
+Discovery is first fit over slots `0..64`, with no assumption that this enumerates
+all externally chosen slot numbers. A full remembered-slot catalogue or a server
+window smaller than the configured client window remains an explicit capacity or
+configuration limit. Namespaces do not automatically close or rotate. Default
+window 32 is compatible with the current default server limit 256. The byte quota
+includes the bounded coordinator record and temporary in addition to child files.
+
+## Coherent validation inspection
+
+`Client::validation_context(RequestEnvelope)` composes an existing
+`ReadQuery::ValidationResults` request with exact-prefix reads of its owning
+claim and current closing testament. The typed `validation_context` module
+returns the requirement, claim, optional `NamedTestament`, one run/verdict page
+and its continuation at the same `ReadToken`. Its initial read is linearizable;
+continuations use `Exact(token)`. Snapshot expiry is returned to the caller,
+without silently restarting at a new prefix. An absent requirement is
+`NotFound`; a missing referenced parent or inconsistent pinned hash is an invalid
+response. It performs at most three reads, bounds total JSON output by the
+client frame limit, and shares a deadline capped at 30 seconds. No managed stream
+or mutation ID is required. The result describes current recorded facts, not an
+execution lease or a unique artifact target for historical runs.
 
 ## Reconciliation reads
 
@@ -204,3 +246,35 @@ operations; there is no automatic eviction. Defaults permit 256 claimed IDs and
 admission. This is a conservative bound on store-owned record/temporary bytes,
 with a small metadata allowance; it does not promise a filesystem-specific bound
 on allocated blocks. Changing saved limits requires an explicit future migration.
+
+## Durable artifact transfer
+
+`artifact_transfer::UploadStore` reserves a bounded transfer catalogue; each
+`UploadJournal` binds its caller-known ID, authenticated context, length, class
+and raw BLAKE3 digest before transmission. Stage exact bytes synchronously,
+obtain `next_request`, send it through `Client::upload`, and persist
+`record_reply` before using progress or a returned reference. The saved pending
+request prevents later staging from enlarging an uncertain append. Filesystem
+methods belong on the caller's synchronous owner, outside asynchronous executor
+polling; the per-transfer lock owns source bytes across waits.
+
+Defaults admit 64 retained transfer IDs, 64 MiB per stream and 256 MiB aggregate
+reserved disk. Chunks are at most 64 KiB. Private files, checksums, fsync barriers,
+exact context checks and external bootstrap markers detect interrupted or lost
+state. Completed/cancelled source history remains counted. `cancel_acknowledged`
+records a server acknowledgment using the existing protocol; it is not a
+cross-version capability proof. This release's ContentStore publishes a durable
+terminal-ID fence before removing staging, so delayed Begin requests cannot
+recreate that scoped ID after restart on that owner. Older servers may only
+remove current staging. Immutable content and artifact facts are unaffected.
+The current server bounds live plus retained terminal IDs at 65,536; retain the
+metadata directory with content backups. Future reclamation needs a
+generation-fenced namespace, not time-based deletion.
+
+`PayloadDownload` validates offsets, length and EOF before writing each chunk;
+`retrieve_payload` supplies a complete synchronous streaming loop. A failed sink
+write may be partial, so discard or rewind that sink before retrying.
+`Client::payload_bytes` offers a frame-bounded in-memory result with one whole-call
+deadline. Content-manifest roots are not raw-byte digests. Server custody and
+schema attestation remain prerequisites for artifact admission; storage alone
+never manufactures either fact.

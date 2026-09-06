@@ -21,6 +21,14 @@ impl Default for RetryPolicy {
     }
 }
 
+/// A committed managed receipt or a transient domain response. A Domain value
+/// never releases an issued ordinal and is not a historical receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedSubmitOutcome {
+    Committed(Box<ManagedReply>),
+    Domain(DomainOutcome),
+}
+
 pub enum ClientError {
     /// The exact request is retained for application-controlled retry, even when
     /// the caller can no longer know whether an earlier attempt committed.
@@ -28,6 +36,7 @@ pub enum ClientError {
         request: Box<RequestEnvelope>,
     },
     Access(AccessError),
+    Unauthenticated,
     InvalidResponse,
     Transport,
     Configuration,
@@ -41,6 +50,10 @@ impl std::fmt::Display for ClientError {
                 request.request_id
             ),
             Self::Access(error) => write!(f, "{error}"),
+            Self::Unauthenticated => write!(
+                f,
+                "peer or client authentication failed; check the selected context's credentials and trust"
+            ),
             Self::InvalidResponse => write!(f, "invalid server response"),
             Self::Transport => write!(f, "transport unavailable"),
             Self::Configuration => write!(f, "invalid client limits"),
@@ -105,6 +118,26 @@ pub struct Client<T: ClientTransport> {
     routes: Mutex<Routes>,
 }
 impl<T: ClientTransport> Client<T> {
+    pub(crate) fn wire_limits(&self) -> &WireLimits {
+        &self.limits
+    }
+    pub(crate) fn retry_timeout(&self) -> Duration {
+        self.policy.max_elapsed
+    }
+    /// Read bounded scalar counts after a fresh quorum barrier in this ledger.
+    /// The returned token identifies the observation without retaining a snapshot.
+    pub async fn ledger_summary(
+        &self,
+        request: RequestEnvelope,
+    ) -> Result<focal_wire::LedgerSummary, ClientError> {
+        if !matches!(request.operation, Operation::Summary) {
+            return Err(ClientError::Configuration);
+        }
+        match self.request(request).await?.result {
+            Response::Summary(value) => Ok(value),
+            _ => Err(ClientError::InvalidResponse),
+        }
+    }
     pub fn new(
         transport: T,
         policy: RetryPolicy,
@@ -155,6 +188,19 @@ impl<T: ClientTransport> Client<T> {
             _ => Err(ClientError::InvalidResponse),
         }
     }
+    /// Inspect immutable requirement bindings of externally invoked handlers.
+    pub async fn validators(
+        &self,
+        request: RequestEnvelope,
+    ) -> Result<focal_wire::ListPage, ClientError> {
+        if !matches!(request.operation, Operation::Validators(_)) {
+            return Err(ClientError::Configuration);
+        }
+        match self.request(request).await?.result {
+            Response::Validators(page) => Ok(page),
+            _ => Err(ClientError::InvalidResponse),
+        }
+    }
     /// Submit an already journaled managed request. The journal owns filesystem
     /// work; this method only waits for the authenticated wire result.
     pub async fn submit_managed(
@@ -162,6 +208,18 @@ impl<T: ClientTransport> Client<T> {
         request: RequestEnvelope,
         context: crate::pending::OperationContext,
     ) -> Result<ManagedReply, ClientError> {
+        match self.submit_managed_outcome(request, context).await? {
+            ManagedSubmitOutcome::Committed(reply) => Ok(*reply),
+            ManagedSubmitOutcome::Domain(_) => Err(ClientError::InvalidResponse),
+        }
+    }
+    /// Preserve Refuse/Inform without treating them as committed outcomes. The
+    /// caller keeps the original journal pending until a receipt or exact seal.
+    pub async fn submit_managed_outcome(
+        &self,
+        request: RequestEnvelope,
+        context: crate::pending::OperationContext,
+    ) -> Result<ManagedSubmitOutcome, ClientError> {
         let (key, _, _) = focal_wire::managed_request_identity(&request)
             .map_err(|_| ClientError::Configuration)?;
         if key.stream.cluster != context.cluster
@@ -171,7 +229,10 @@ impl<T: ClientTransport> Client<T> {
             return Err(ClientError::Configuration);
         }
         match self.request(request).await?.result {
-            Response::Managed(reply) => Ok(reply),
+            Response::Managed(reply) => Ok(ManagedSubmitOutcome::Committed(Box::new(reply))),
+            Response::Submitted(MutationReply::Domain(
+                outcome @ (DomainOutcome::Refuse { .. } | DomainOutcome::Inform { .. }),
+            )) => Ok(ManagedSubmitOutcome::Domain(outcome)),
             _ => Err(ClientError::InvalidResponse),
         }
     }
@@ -255,6 +316,18 @@ impl<T: ClientTransport> Client<T> {
             _ => Err(ClientError::InvalidResponse),
         }
     }
+    pub async fn traverse(
+        &self,
+        request: RequestEnvelope,
+    ) -> Result<focal_wire::TraversalPage, ClientError> {
+        if !matches!(request.operation, Operation::Traverse(_)) {
+            return Err(ClientError::Configuration);
+        }
+        match self.request(request).await?.result {
+            Response::Traversed(page) => Ok(page),
+            _ => Err(ClientError::InvalidResponse),
+        }
+    }
     pub async fn upload(&self, request: RequestEnvelope) -> Result<UploadReply, ClientError> {
         if !matches!(request.operation, Operation::Upload(_)) {
             return Err(ClientError::Configuration);
@@ -278,6 +351,43 @@ impl<T: ClientTransport> Client<T> {
     pub async fn request(
         &self,
         mut request: RequestEnvelope,
+    ) -> Result<ResponseEnvelope, ClientError> {
+        use std::{
+            future::{Future, poll_fn},
+            panic::{AssertUnwindSafe, catch_unwind},
+            task::Poll,
+        };
+        let mutation = request.operation.is_mutation();
+        let mut write_uncertain = false;
+        // A missing Tokio driver or a transport dependency failure must not
+        // unwind through an SDK caller. After entering a mutation exchange,
+        // failure cannot establish that no bytes reached the authority.
+        let result = {
+            let mut exchange =
+                std::pin::pin!(self.request_inner(&mut request, &mut write_uncertain));
+            poll_fn(
+                |cx| match catch_unwind(AssertUnwindSafe(|| exchange.as_mut().poll(cx))) {
+                    Ok(poll) => poll.map(Ok),
+                    Err(_) => Poll::Ready(Err(())),
+                },
+            )
+            .await
+        };
+        match result {
+            Ok(Err(_)) if write_uncertain => Err(ClientError::OutcomeUnknown {
+                request: Box::new(request),
+            }),
+            Ok(result) => result,
+            Err(()) if mutation => Err(ClientError::OutcomeUnknown {
+                request: Box::new(request),
+            }),
+            Err(()) => Err(ClientError::Transport),
+        }
+    }
+    async fn request_inner(
+        &self,
+        request: &mut RequestEnvelope,
+        write_uncertain: &mut bool,
     ) -> Result<ResponseEnvelope, ClientError> {
         if tokio::runtime::Handle::try_current().is_err() {
             return Err(ClientError::Transport);
@@ -304,11 +414,11 @@ impl<T: ClientTransport> Client<T> {
                 break;
             }
             let response =
-                tokio::time::timeout(remaining, self.transport.request(route.as_ref(), &request))
+                tokio::time::timeout(remaining, self.transport.request(route.as_ref(), request))
                     .await;
             match response {
                 Ok(Ok(response)) => {
-                    if validate_response(&request, &response, None, &self.limits).is_err() {
+                    if validate_response(request, &response, None, &self.limits).is_err() {
                         if request.operation.is_mutation() {
                             break;
                         }
@@ -334,7 +444,11 @@ impl<T: ClientTransport> Client<T> {
                         Response::Error(AccessError::OutcomeUnknown)
                         | Response::Submitted(MutationReply::Pending(_)) => {
                             uncertain = true;
+                            *write_uncertain = request.operation.is_mutation();
                         }
+                        Response::Submitted(MutationReply::Domain(
+                            DomainOutcome::Refuse { .. } | DomainOutcome::Inform { .. },
+                        )) if uncertain && request.operation.is_mutation() => break,
                         Response::Error(AccessError::Unavailable) => {}
                         Response::Error(error) => {
                             if uncertain && request.operation.is_mutation() {
@@ -361,10 +475,11 @@ impl<T: ClientTransport> Client<T> {
                     if uncertain && request.operation.is_mutation() {
                         break;
                     }
-                    return Err(ClientError::Access(AccessError::Unauthorized));
+                    return Err(ClientError::Unauthenticated);
                 }
                 Ok(Err(WireError::Io(_) | WireError::Connection | WireError::Timeout)) | Err(_) => {
                     uncertain = true;
+                    *write_uncertain = request.operation.is_mutation();
                 }
             }
             if attempt.saturating_add(1) < self.policy.max_attempts {
@@ -378,9 +493,8 @@ impl<T: ClientTransport> Client<T> {
             }
         }
         if request.operation.is_mutation() {
-            Err(ClientError::OutcomeUnknown {
-                request: Box::new(request),
-            })
+            *write_uncertain = true;
+            Err(ClientError::Transport)
         } else {
             Err(ClientError::Transport)
         }

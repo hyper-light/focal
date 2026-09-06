@@ -1,17 +1,52 @@
 # Implementation evidence and remaining work
 
-Updated 2026-09-05. The objective is the complete P00–P20 plan: the original P00–P16 scope plus the user's manual CLI, skills, MCP, challenge and consultation extension in [13](13-cli-and-agent-implementation-plan.md). This record distinguishes executable components from integration and deployment qualification. No package is marked complete merely because its crate compiles. Imported Hecate references remain unchanged.
+Updated 2026-09-06. The objective is the complete P00–P20 plan: the original P00–P16 scope plus the user's manual CLI, skills, MCP, challenge and consultation extension in [13](13-cli-and-agent-implementation-plan.md). This record distinguishes executable components from integration and deployment qualification. No package is marked complete merely because its crate compiles. Imported Hecate references remain unchanged. The current execution boundary is strictly peer-to-peer: Focal records claims, testament/artifact evidence and authenticated verdicts; participants invoke their own validating tools/skills or request evaluation from another peer through ordinary claims. Focal is not an agent/worker launcher or model-job scheduler. Existing optional execution helpers do not make participant execution a daemon responsibility.
+
+A further source audit identifies a real four-family lifecycle gap. Claim
+status/history and durable validation attempts exist, but testament lifecycle is
+currently only created/acknowledged, artifact lifecycle only created/custody
+revision, and validation lifecycle only created/latest epoch. Separate family
+state transitions, artifact-target binding, independent testament posting and
+terminal outcomes, and atomic child-to-parent propagation remain required.
+D-03's single closing attempt is not equivalent to Sylk's multiple posted
+testament aggregation. The [02 gap matrix](02-domain-and-lifecycle.md#35-four-coordinated-lifecycle-families-implementation-gap)
+distinguishes existing code from that required model and migration work. Existing
+tests prove their stated current profile, not completion of the richer lifecycle.
+The [peer-validation contract](16-peer-validation-contract.md) records the exact
+required lifecycle, participant authorization and migration work. Its concrete
+transition/authority decisions are frozen in [17](17-lifecycle-state-and-authority.md);
+the durable decoder/activation and historical import plan is in
+[18](18-lifecycle-storage-upgrade.md). These are target contracts; the new stored state machines remain open. The
+current-profile peer mutation surface is implemented as documented in
+[19](19-cli-mcp-implementation.md).
+
+The dated sections below retain earlier qualification records; their catalogue
+and test counts describe those increments. The latest interface inventory and
+checks are in [the current CLI/MCP qualification](#current-climcp-and-readme-qualification).
+The subsequent [V1 storage compatibility work](#nested-v1-storage-and-command-identity)
+records the lifecycle migration prerequisite now implemented.
+The [historical execution increment](#historical-v1-execution) records the
+subsequent explicit replay boundary and its qualification.
+The [executable lifecycle contract](#executable-successor-lifecycle-contract)
+records the subsequent native state/authority/aggregation increment. Its types
+are not enabled in the live ledger or CLI/MCP protocol.
+The [acceptance and graph increment](#owned-acceptance-graph-and-scope-contracts)
+records the latest native guards and compatibility qualification.
+The [Session storage increment](#session-v1-envelopes-and-output-identities)
+records the subsequent frozen surrounding formats and borrowed checkpoint writer.
+The [decoder transition](#bounded-decoder-transition) adds the durable local
+upgrade mechanism; production Session still selects only V1.
 
 | Package | Concrete implementation | Remaining acceptance work |
 |---|---|---|
 | P00 | Rust 1.94.1 workspace/lockfile, domain registry and canonical fixtures, deployment schema, offline contract checker, two-platform CI definition, deterministic network/disk harness, passing dependency policy scan, production panic lint gate | Execute clean Linux build and CI; release notices |
 | P01 | Typed IDs/vocabularies, explicit numeric tags, four immutable content families, canonical identity, command/result/delta/effect shapes, frozen canonical vectors | Complete malformed-input allocation bounds, service identity registry, full disposition/Yield API contract |
-| P02 | Serial deterministic reducer and owned row overlays; ordered pending admission; retries/epoch floors, revision and actor checks, lifecycle and evidence closure; replay/checkpoints; bounded actual reducer access reports | Exhaustive full transition matrix and tracked paged projection; resource accounting for every retained structure |
+| P02 | Serial deterministic reducer and owned row overlays; ordered pending admission; retries/epoch floors, revision and actor checks, lifecycle and evidence closure; replay/checkpoints; bounded actual reducer access reports | Independent testament/artifact/validation lifecycles, exact evidence binding and atomic propagation with compatible migration; exhaustive transitions and complete resource accounting |
 | P03 | Accounted arena/index primitives; immutable content sharing; prepared COW pages; four object families and derived graph indexes integrated with sequencer; fixed-prefix leased reads; bounded scans and traversal | Remove remaining reference-tree publication allocations; production scale and complete recovery budget qualification |
 | P04 | Real one-voter Raft, checksummed framed multiplexed WAL, bounded disk-owner queue with cross-group flush batching, one-pass indexed startup, nonblocking durable Ready state machine integrated with grouped scheduling, fail-stop disk behavior and checkpoint generations; session commit/publication integration; persistent local identity | Full crash-cut enumeration, sustained resource-pressure qualification, production pinned checkpoints beyond the bounded reference state |
 | P05 | Resumable uploads, bounded verified manifests/chunks, pinned validators; one content owner per node; authenticated placement-fenced peer transfers; required-copy sealing and artifact admission; cold-leader retrieval; bounded live custody/placement replacement with exact-scope retries and stale-job rejection; owned checkpoint/prefix custody verification | Connect replacement to committed placement recovery, grants/schema registry, validator isolation and policy qualification, recovery reconciliation and full GC |
-| P06 | Fixed-point graph oracle, durable monitor records and receipt fences; bounded fixed worker pool; quorum-hosted assignment/dispatch/recovery; deadlines, retained charges through shutdown and effectful indeterminate outcomes | Complete external execution reconciliation and runtime policy/rank qualification |
-| P07 | mTLS QUIC and kernel-authenticated Unix framing/client; snapshot reads, upload/download and durable cursor integration; atomic ACK/renew; gap-free seed and tail in local and quorum hosts; idle lease maintenance; response allocations survive transport | Filtered seeds, wire traversal, complete embedded/network conformance |
+| P06 | Fixed-point graph oracle, durable monitor/attempt records and receipt fences; optional participant-owned focal-runtime helper with bounded pool, quorum-fenced attempt/recovery tests, deadlines and retained charges | Child-cause/continuation seams and full policy/standing qualification; authenticated current-profile peer evaluation is implemented, with no daemon worker scheduler |
+| P07 | mTLS QUIC and kernel-authenticated Unix framing/client; snapshot reads, upload/download and durable cursor integration; atomic ACK/renew; gap-free seed and tail in local and quorum hosts; idle lease maintenance; response allocations survive transport | Complete embedded/network conformance and scale qualification; bounded filtered seeds and cursor-bound wire traversal are implemented |
 | P08 | Real multi-peer Raft and bounded replica host; borrowed direct/grouped peer drivers; committed membership changes with exact configuration fences, caught-up learner promotion and quorum-fenced replies; real QUIC leader-loss/retry/restart and distributed evidence tests; content/stream/runtime composition; pinned enrollment with commit-before-release credentials; one-port data/enrollment listener, durable founding bootstrap and recoverable pinned join intent; foreground network service, invitation/join CLI, certificate-bound node capabilities and automatic committed root-learner admission | Committed application capabilities, live placement/custody assignment and complete join-to-voter journey |
 | P09 | Shared physical WAL; durable root/partition control state machines and authenticated multi-voter owners; quorum metadata reads and durable retries; committed configuration changes and certificate-bound node contacts; placement barriers, route caches and weighted fair scheduler; managed grouped session owner with bounded live installation, removal, incarnation fences and hierarchical tenant/node admission; replicated-root enrollment adapter and founder-pinned remote enrollment routing; bounded signed authority registry with explicit control-log activation, versioned snapshot installation and installed verification; durable-prefix contact/grant projection; real session placement witnesses and installed-authority signing permits; managed service routing; live root-authorized first directory bootstrap over the shared WAL | Quorum-share collection and delegation evidence producers; general directory scheduling, authority refresh and placement execution; committed-assignment recovery and admission qualification across every component |
 | P10 | Serial oracle and owned pending row reservations; default sequencer executes scoped parallel epochs with actual access audits, cursor barriers and whole-epoch serial fallback; prevalidated graph publication | Remove reference-tree publication allocations; persistent worker scheduling, complete memory/performance measurements and broader fallback qualification |
@@ -21,10 +56,10 @@ Updated 2026-09-05. The objective is the complete P00–P20 plan: the original P
 | P14 | Focused deterministic, corruption, concurrency and crash/restart tests; instrumented committed-prefix/receipt history checker; real CLI SIGKILL tests for writes, uploads and streams | Black-box linearizability exploration, full fault matrix, load runner, capacity evidence and long-duration mixed-fault runs |
 | P15 | Strict configuration parser and offline deployment explanation, persisted local identity/policy, foreground local and network services, private invitation/join CLI, bounded ingress and shutdown, build/check harness | Deployment plan/apply and live guarantee explanation, remaining cluster operations, metrics, packaging, rolling upgrades, release artifacts and executed runbooks |
 | P16 | Target deployment contracts and placement solver | All six real deployment journeys, operator walkthroughs and measured concept/configuration increments |
-| P17 | Strict shared claim/testament/artifact DTOs and JSON/YAML builders; indexed optional filters with authenticated fixed-prefix cursors; immutable validation run/attempt projections; private durable operation journals with concurrent fixed-epoch request identities; authenticated quorum-fenced request/epoch reconciliation | Complete operation/schema registry, remaining filters and lifecycle builders, safe epoch-floor advancement/GC and scoped child-cause admission |
-| P18 | Local `submit claim/testament/artifact` with flags/JSON/YAML/file input; all four `get/list` families; validation result pagination; post/progress/cancel, receipt acquisition and evidence begin; atomic artifact download; durable `request inspect/retry`, remote journal inspection and owner `request status/epoch`; built-in schema inspection; existing startup/enrollment/deployment commands; real binary lifecycle/restart tests and [manual guide](../manual-cli.md) | Authenticated remote contexts and joined-node principal selection, resumable upload convenience, complete lifecycle/cluster/deployment administration, watch/traversal, generated schema/completion surfaces and multi-node command journeys |
-| P19 | Bounded local stdio MCP server with current and compatibility profiles; 18 shared operations plus two durable recovery tools; caller-known operation IDs; two packaged skills with digest/version contracts; real executable and protocol conformance tests | Remote authenticated contexts, capability-projected discovery, complete nested schemas, content/evaluator/admin surfaces and external SDK interoperability |
-| P20 | Existing claim/testament/validation lifecycle and fenced runtime primitives; source policy audit | Complete challenge/consult constructors, proof/work acceptance policy, corrective/follow-up issuance, child-cause authority, nested continuation recovery and CLI/MCP journeys |
+| P17 | Exhaustive current-model operation inventory; strict authored JSON/YAML and atomic claim batches; indexed optional filters, bounded singular selection and authenticated cursors; validator contracts and immutable run/attempt projections; peer admission with saved revision/run fences; durable local journals and scoped managed streams; summary/traversal and watches with explicit consumed-page acknowledgment | Remaining query predicates, richer lifecycle storage/model, managed close/rotation and scoped child-cause admission |
+| P18 | Four-family submit/get/list and peer lifecycle commands; durable large artifact upload/registration/download and explicit transfer inspection/cancellation; validator discovery; named Unix/QUIC/enrolled contexts and joined-node principal checks; exact recovery; bounded watch/traversal/summary; table/JSON/YAML output; generated operation schemas/examples, offline input/request validation and five shell completions; root/application administration and passive operator diagnostics; real binary restart tests | Deployment plan/apply, placement drain, same-identity credential renewal, backup/restore and all six deployment journeys |
+| P19 | Bounded stdio MCP with both protocol profiles; shared authored operations, six managed recovery tools, five transfers, four durable watches, and 32 conditional local administration tools; four packaged skills with pinned live contracts; actual CLI/MCP restart and peer-validation parity | Complete external-client interoperability qualification; challenge/consult policy and continuation tooling; independent lifecycle migration and required deployment journeys |
+| P20 | Existing claim/testament/validation lifecycle and fenced evidence/verdict primitives; source policy audit | Complete peer challenge/consult constructors, proof/work acceptance policy, authorized participant corrective/follow-up issuance, child-cause authority, participant continuation recovery and CLI/MCP journeys |
 
 Local focused tests currently establish these properties:
 
@@ -35,7 +70,7 @@ Local focused tests currently establish these properties:
 - The executable survives SIGKILL between successful requests and restart: mutation receipts stay identical, uploads resume at the durable offset, and unacknowledged stream deltas replay with the same IDs. Cursor ACKs persist through the session log and checkpoint; lease-only maintenance adds no client receipts and cannot release protected history.
 - Directory tests reject unverified placement/authority changes and exercise durable checkpoint restore, bounded route invalidation and weighted scheduling under pressure. Three-voter control tests cover root/partition authorization, quorum reads, partitioned writes, exact retries and restart over real TLS/QUIC. Enrollment tests reject mismatched pins before token disclosure, strip caller-requested certificate privileges and release credentials only after the public metadata decision commits.
 - The real three-node evidence test verifies placement-selected durable copies, refusal while a required copy is unavailable, authenticated upload ownership, and a cold replacement leader fetching content before admitting a new artifact. An exact already-committed retry returns its receipt even with both copy routes unavailable; it does not require a fresh content fetch. Reusing that request ID with changed content returns an idempotency conflict. Reopening each disk verifies the transferred content.
-- Quorum runtime tests prevent dispatch before assignment commitment, cancel work on authority loss, and preserve pending intent under backpressure. The appended fenced-verdict command checks the effective pending receipt, including an absent receipt; legacy verdict encodings remain available for replay but are refused at new remote ingress.
+- Optional participant-runtime embedding tests prevent its local tool dispatch before assignment commitment, cancel its work on authority loss, and preserve pending intent under backpressure. They do not establish a Focal daemon agent launcher or external job system. The appended fenced-verdict command checks the effective pending receipt, including an absent receipt; legacy verdict encodings remain available for replay but are refused at new remote ingress.
 - Multi-voter stream tests fence reads with a current-term quorum barrier, commit acknowledgments before replying, retain seed prefixes through concurrent publication, and recover identical durable cursor decisions after restart. The host alone drains consensus messages.
 
 Reproduce the current test set using [building instructions](../building.md). CI and tests added during continued implementation must be executed before their result is recorded as evidence. Fixed test seeds and assertion histories live alongside their corresponding tests.
@@ -182,7 +217,7 @@ The namespace audit also refines P17.11's implementation order in the plan. Lega
 
 ## Managed request streams: implementation in progress
 
-The next increment implements the model, scoped Core reduction, Session registry,
+The managed increment implements the model, scoped Core reduction, Session registry,
 durable WAL/checkpoint state, protocol-two transport and private client store
 described in [15](15-managed-request-streams.md). Domain and cursor outcomes share
 a bounded ordinal window. Registration uses an exact generation CAS; receipts
@@ -198,8 +233,9 @@ publishes immutable request and receipt bodies before catalogue completion flags
 and persists its retired prefix before deleting bodies. Short filesystem locks
 serialize concurrent processes without surviving network waits. Recovery resumes
 bounded cleanup; missing completed state fails closed. Legacy journals and raw
-protocol-one IDs retain their prior encodings and semantics. The new APIs do not
-yet select or rotate a managed store automatically for ordinary CLI/MCP calls.
+protocol-one IDs retain their prior encodings and semantics. Automatic local store
+selection and registration now use the shared coordinator described below.
+Automatic close and rotation remain open.
 
 Activation additionally requires an irreversible durable decoder promise. The
 actual application confirms its compiled fingerprint, the physical writer fsyncs
@@ -236,10 +272,703 @@ reporting failure retains the completed status for the next owner turn. The fram
 and receiver each retain sufficient accounting through their independent
 lifetimes, without another shared wrapper or completion ingress queue.
 
-P17.11 remains unchecked. In addition to final workspace qualification, its open
-gates include automatic durable CLI/MCP ownership and bounded rotation, managed
-domain epoch batching, sustained principal churn across finite registry slots,
-and the full adapter recovery workflows. General trusted assignment proof for a
+Qualification on macOS arm64, 2026-09-06: **698 tests across 57 targets pass**, with
+zero failed, ignored or filtered tests, using
+`bash scripts/cargo.sh test --workspace --all-targets --locked --offline -- --test-threads=4`.
+Strict all-target workspace Clippy, the separate production no-panic gate,
+documentation targets, formatting and the complete workspace release build pass.
+Architecture checks resolve **333 links**, preserve all **37 imported Hecate
+source hashes**, and validate **15 frozen vocabularies**. The external dependency
+inventory remains the same 203 packages. The managed stream and snapshot-feedback
+paths add no explicit `Arc` wrapper or new physical owner/thread. Qualification
+logs are `/tmp/focal-managed-final-{tests,clippy,production,doctests,format,contracts,release}.log`,
+with counts in `/tmp/focal-managed-final-counts.json`.
+
+Coverage includes independent processes reserving distinct durable ordinals,
+request/receipt publication crash cuts, exact lost-control retry, shared
+domain/cursor acknowledgment at capacity, seals across a leader change, generation
+reuse, checkpoint plus WAL-tail recovery and unchanged legacy receipt recovery.
+The real three-voter QUIC workflow restarts with one voter isolated, recovers an
+exact ACK and retired-request result, and commits a new managed domain request.
+Existing learners recover through both entries and V5 snapshots after persisting
+their floor. Physical-owner tests prove snapshot-specific local rejection,
+cancellation, remote refusal, same-term retransmission, obsolete feedback fencing
+and charge release; a test-only counter observes the actual snapshot rejection
+branch without changing production fields or fixture deadlines. The earlier
+unrestricted-parallel timing limitation remains open.
+
+P17.11 remains unchecked. Its open gates include bounded automatic close/rotation,
+managed domain epoch batching, sustained principal churn across finite registry
+slots and the full adapter recovery qualification. General trusted assignment proof for a
 fresh learner whose bootstrap membership excludes today's leader and future
 persistent-format transitions also remain required. The full P00–P20 goal remains
 active; this increment does not establish the deployment or scale gates.
+
+## Automatic local managed requests and lifecycle audit
+
+Normal CLI mutations now use the shared durable ownership coordinator. First use
+selects a free slot and registers it; subsequent calls reserve and prepare
+internally. Successful output shows object IDs; unresolved work receives a copyable
+recovery command. Normal use needs no
+epoch or stream configuration. A successfully flushed result is marked delivered
+on disk before maintenance ACKs the contiguous delivered prefix. A broken output
+stream, timeout or noncommitted domain result leaves its exact operation pending;
+later successes cannot retire that gap. Cleanup failure after successful output
+is deferred. `request pending/inspect/retry` recover IDs; `request seal` (alias
+`abandon`) explicitly fences a request without canceling a business claim.
+
+MCP uses a separate managed store with explicit `request.reserve`, discovery and
+consumed-result `request.acknowledge`. Reservation executes no business work;
+lost reservation output is recovered through `request.pending`. Tool completion,
+inspection, retry and cancellation do not acknowledge consumption. Sealing returns
+the earlier result or a durable fence and likewise needs explicit consumption
+ACK. CLI discovery can recover either local store. Legacy unqualified IDs, raw
+protocol-one requests and explicit path journals preserve their semantics. The
+server's managed persisted format is unchanged by this adapter increment.
+[15](15-managed-request-streams.md#automatic-local-ownership-and-result-delivery)
+records the delivery contract and remaining close/rotation limits.
+
+The new default managed path requires an owner-private data directory (`0700`).
+Existing permissive roots are rejected with an actionable error; no permissions
+are silently changed. Explicit legacy path behavior remains available. The
+[manual guide](../manual-cli.md) documents this compatibility boundary.
+
+Focused CLI qualification passes all eight existing/new manual tests, including
+40 ordinary mutations across the default 32-request window, broken stdout,
+unobserved-prefix retention, WAL restart, exact retry and flags/JSON/YAML parity.
+This is separate from the **698-test prior qualification record above**. The
+subsequent offline/locked workspace all-target run passed **731 tests across 58
+targets**, with no failures, ignored tests or filtered tests, using four test
+threads per target. Its five real MCP executable tests include lost responses,
+cross-adapter recovery, independent result consumption, retirement across the
+bounded window, and evidence lifecycle checks. The final supersession admission
+guard extension separately passes the complete 66-test Core suite; the historical
+decoder/replay behavior remains unchanged.
+
+The final human-output cleanup separately passes all eight manual/managed CLI
+integration tests. Successful commands leave stderr quiet. A failed output stream
+retains its exact receipt and prints recovery guidance; a closed stderr cannot
+prevent submission, replace a domain error or retire an unobserved result.
+
+The same increment passes strict workspace all-target Clippy, the production
+no-panic/unchecked-operation lint gate, formatting, doctests, and the offline/locked
+optimized `focal` build. The release executable's claim help also succeeds. Updated skill
+content and its pinned hashes pass both client and MCP contract tests. Logs are
+`/tmp/focal-managed-adapters-final-{tests,clippy,production,doctests,format}.log`,
+with separate `client-skills`, `mcp-skills`, `release` and `help` logs under that prefix. This is
+regression evidence for the implemented increment, not global-scale qualification.
+
+A fresh Hecate/Sylk lifecycle audit found and closed an admission gap: a Receipt
+requirement could declare evidence or a quality bar that its automatic delivery
+Pass did not evaluate. New client/Core admission now restricts Receipt to pure
+whole-work delivery; evidence and quality require separate Test, Inspection or
+Contract requirements. New acknowledgment/whole-work begin/completion on a
+historical malformed Receipt contract also fail explicitly. Previously committed
+versioned intents replay their original result, including historical Pass; the
+fix neither rewrites old truth nor makes unrelated WAL history unrecoverable.
+The focused Core suite passes 66 tests, including prior-format legacy/managed
+prepared-intent replay and checkpoint recovery, pure Receipt completion and the
+separate deterministic-then-agentic quality path.
+
+The source audit does not establish P20 completion. Trusted child-cause admission,
+challenge target/proof contracts, authorized corrective versus consultation
+follow-up issuance by authorized participants, and authenticated peer evaluator submission remain required.
+See the [source-to-implementation traceability](13-cli-and-agent-implementation-plan.md#source-lifecycle-traceability-2026-09-06).
+
+## Coherent validation context and lifecycle contract integration
+
+The architecture now specifies separate transition/authority tables, exact
+per-artifact targets, multiple response cycles, atomic aggregate consequences,
+short-circuit and late-result rules, and the asymmetric result-artifact/result-
+testament audit path. The first response's generation advances its claim to
+TestamentGenerated while attaching its work artifacts; response posting remains
+a later, independent fact. Agentic-only checks need no synthetic programmatic
+Pass. A declared programmatic-plus-quality check still requires the real
+programmatic Pass before quality evaluation. Participants execute their own
+capabilities; no Focal launcher or mandatory evaluator subclaim is introduced.
+
+The storage plan preserves frozen historical DTOs, hashes, prepared-command
+replay semantics and exact receipts. A bounded successor decoder requirement and
+committed per-group activation precede new lifecycle formats. In particular,
+historical open evidence sets cannot be migrated to Attached by interpreting the
+old ArtifactAttached event as testament attachment. L1 executable transition
+fixtures and L2–L8 implementation/qualification remain open.
+
+The additive implemented read is `Client::validation_context`, exposed as
+`focal get validation ID --context` and MCP `validation.context`. It uses at most
+three existing reads and returns a pinned requirement, its owning claim, optional
+current closing testament with exact manifest, and a bounded run/verdict page.
+Every component has the same token; cursor expiry fails without a fresh-prefix
+restart. Initial absence differs from a missing referenced parent. Existing
+receipt adoption does not rebind old testament/run evidence. Both aggregate JSON
+size and total wait time are bounded; owned/borrowed values add no explicit Arc.
+No new persisted or wire format, managed mutation ordinal, execution lease or
+inferred artifact target is introduced.
+
+The catalogue now contains 19 authored operations plus six recovery tools. Both
+packaged skills are version 3 with pinned content hashes and the new read listed
+as an actual dependency. Twelve focused SDK tests and fourteen real CLI/MCP
+integration tests pass, including both MCP protocol profiles, exact pagination,
+CLI/MCP context parity, before/after testament closure, missing data, and restart
+with expired cursors. The prior 731-test qualification above remains the record
+for the earlier managed-adapter increment.
+
+Final context-increment qualification, macOS arm64, 2026-09-06: the offline/locked
+workspace all-target run passes **744 tests across 58 targets**, with zero failed,
+ignored or filtered tests. Strict workspace all-target Clippy, the production
+no-panic/unchecked-operation gate, doctests and formatting checks pass. The
+architecture checker verifies 434 links, 37 unchanged imported source hashes and
+15 frozen vocabularies. The complete workspace run includes both updated skill
+contract tests. Logs use `/tmp/focal-lifecycle-context-` with `workspace.log`,
+`counts.json`, `adapters.log`, `unit.log`, `clippy.log`, `production.log`,
+`doctests.log`, `format-check.log` and `contracts.log`. These results qualify the
+implemented snapshot-inspection increment; they do not qualify new lifecycle
+mutation formats or global-scale deployment.
+
+The optimized `focal` binary also builds offline/locked and exposes the new
+`get validation --context` option in its actual help. Release build and help logs
+are `/tmp/focal-lifecycle-context-release.log` and
+`/tmp/focal-lifecycle-context-release-help.log`.
+
+## Current CLI/MCP and README qualification
+
+The shared authored registry now contains **34 operations**. MCP can additionally
+expose six managed-recovery, five artifact-transfer, four durable-watch and
+32 local-administration tools when their corresponding backends are present.
+Four packaged skills pin the live contracts: claims version 7, evidence version 6,
+validation version 2 and cluster version 1. The validation instructions explicitly
+distinguish the supported agentic check from the still-unsupported agentic-only
+`quality_bar` admission, and never ask a participant to invent a programmatic Pass.
+
+The implemented interface includes atomic claim batches, authenticated peer
+evidence and verdict submission, optional filters for every list family, bounded
+singular claim selection, validator-contract reads, fixed-prefix graph traversal,
+durable watches, a bounded read-only claim wait, and explicit durable monitors.
+JSON/YAML and field flags share typed builders and revision/run fences. Offline
+schemas, examples, input validation and frozen request files use that same
+contract. Help and all five shell completions expose the filters applicable to
+each family; unsupported filters still return the structured input error.
+
+Named local/remote participant contexts preserve their own request and upload
+history. Large transfers retain exact source bytes and final command identity;
+inspection and cancellation preserve unknown outcomes and server terminal fences.
+Root and installed-application administration use their own configuration-fenced
+durable identities. A joined physical owner exposes authorized local diagnostics;
+that does not give it the founder's invitation-signing key or Runtime standing.
+These behaviors, bounded output/backpressure and restart/reconciliation are
+covered by executable SDK, CLI and MCP tests. The live contract and remaining
+limitations are in [19](19-cli-mcp-implementation.md), [the manual](../manual-cli.md),
+[MCP documentation](../mcp.md), and [cluster administration](../cluster-admin.md).
+
+The [project README](../../README.md) now explains the peer domain and roles,
+source installation, actual local defaults, a live quickstart and resumable demo,
+human input formats, MCP/skills, memory and disk durability, and deployment steps.
+Three Mermaid diagrams show peer evidence flow, the current claim lifecycle and
+the commit/publication path. The independent four-family lifecycle and geographic
+deployment remain explicitly identified as targets. The diagrams were reviewed
+against source; no rendered Mermaid visual check is claimed.
+
+The first storage-migration prerequisite is also implemented: Core checkpoint and
+Session legacy/managed prepared-entry paths use an explicit top-level V1 codec.
+It preserves existing writer bytes and checks schema before nested decoding,
+requires complete input consumption, borrows maps for encoding and moves decoded
+allocations into the authoritative Core. Twenty-three fixed original-writer
+fixtures retain actual checkpoint, input, receipt, delta and effect bytes; their
+generator and capture/source provenance are checked in. Tests cover replay at
+each restart boundary, exact duplicates, malformed/trailing data and failure
+before Core/graph/managed-receipt publication. This freezes the exercised envelope
+and State layout, **not** every nested model DTO or the historical reducer.
+[The storage contract](18-lifecycle-storage-upgrade.md) retains those requirements
+and the successor floor/activation/migration work.
+
+The final all-target workspace run on macOS arm64, 2026-09-06, passes **888 tests
+across 66 targets**, with zero failed, ignored or filtered tests. The invocation
+is `bash scripts/cargo.sh test --workspace --all-targets --no-fail-fast --offline --locked -- --test-threads=4`.
+Strict workspace all-target Clippy, the separate production no-panic and unchecked-
+operation gate, doctests, formatting and `git diff --check` also pass. The
+architecture checker verifies **454 links, 37 unchanged imported source hashes
+and 15 frozen vocabularies**. The complete workspace release build passes.
+
+The resulting optimized binary passes 22 README smoke-check commands in fresh
+private temporary directories: local startup, generated example submission,
+exact get/post and filtered listing, summary counts, shutdown/restart with the
+same posted claim, flags/JSON/YAML submission as three distinct durable intents,
+all four unfiltered lists, schema discovery and help. Running the demo twice
+recovers identical JSON with the same claim and proof. The live check report is
+`/private/tmp/focal-readme-smoke.json`; the release build log is
+`/tmp/focal-cli-mcp-release.log`. These are local checks of the documented commands,
+not a clean-host dependency installation or rendered diagram test.
+
+Two control-host setup calls initially returned the protocol's `OutcomeUnknown`
+under concurrent fixtures. Their isolated original eight-test suite passed.
+The fixture now retries the **same** request ID and content, rediscovers the
+quorum-ready leader, and verifies the committed receipt within one bounded setup
+deadline. Minority, authorization and failure assertions retain their direct
+calls; production timeouts and retry behavior were not widened. Two stale CLI
+expectations were also corrected: recovery commands include their saved client
+context, and joined nodes have a local administration socket. Their tests still
+check exact request recovery and refusal to forge privileges or issue invitations.
+
+The dependency inventory contains 206 external packages. The cached RustSec scan
+passes advisories, bans, licenses and sources with ten existing duplicate-version
+warnings and no suppressed advisories; it is not a fresh online audit. Local logs
+use `/tmp/focal-cli-mcp-` with `workspace.log`, `counts.json`, `clippy.log`,
+`production.log`, `doctests.log` and `dependencies.log`. These results establish
+the exercised current profile. Independent object lifecycles, typed external
+validator definitions, challenge/consult continuations, trusted child causes,
+deployment activation, credential renewal, request-history reclamation and the
+six deployment journeys remain required work in the active full plan.
+
+## Nested V1 storage and command identity
+
+The complete Core checkpoint graph now uses explicit historical model codecs:
+all four objects and lifecycles, relations/scopes, evidence sets, validation
+runs/attempts, monitors, identity indexes, epoch windows and retained legacy
+receipts. Scalar vocabulary codes and Postcard variant ordinals are frozen
+separately. Borrowed views encode current rows without cloning their data;
+decoding moves each row into its final map or vector. Untrusted collection
+counts do not authorize eager vector allocation, and content-reference length
+remains metadata. Historical absent states, manifest order, duplicate collection
+semantics and stored hashes are preserved rather than normalized by admission.
+
+Both prepared command families use the same frozen nested codecs for all 29
+commands, new-object inputs, authority/custody facts and request identities.
+Legacy and managed domain intent hashing now share one explicit V1 algorithm,
+including the original domain separator, big-endian fields, fixed schema/tag,
+body length and exact Postcard body. Legacy hashing serializes the body once
+and hashes it directly, retaining one body vector and eliminating its former
+second preimage vector. Managed hashing retains its allocation-free streaming
+path, with a fixed 1 KiB stack buffer for scalar bytes and direct bulk byte
+updates to BLAKE3. Other managed receipt/control hashing retains its original
+serialized contract while sharing the buffered digest implementation.
+
+The existing actual workflow fixture set remains unchanged. Two additional
+corpora preserve bytes captured from the pre-change compiled writers, with
+generator sources and source/rlib/executable identities. Fifteen nested data
+files cover every current nested enum and collection family, including 20 claim
+statuses, 42 validation kind/phase/mode combinations and all twelve command
+results. Seventy-one command data files cover 58 populated/alternate command
+shapes and both input/prepared/hash families. These are serialization-valid
+synthetic values, deliberately including states not admissible as new work;
+they are codec/hash evidence, not fabricated reducer histories or service-ready
+snapshots. The [storage contract](18-lifecycle-storage-upgrade.md) links both
+corpora and describes their exact scope.
+
+The old `FOCALSS1`/`FOCALSS2` readers now reject trailing bytes before publication.
+V1 retains its initial decoded Core to establish its missing prefix and complete
+restoration, eliminating a second full decode. Tests restore both original
+envelope formats, preserve the exact Core and duplicate receipt, and reject
+suffixes without changing the live Core/graph. No new object, command, wire,
+receipt, checkpoint or decoder-floor encoding is introduced by these changes.
+
+The all-target workspace run passes **916 tests across 66 targets**, with zero
+failed, ignored or filtered tests, on macOS arm64, 2026-09-06. The invocation is
+`bash scripts/cargo.sh test --workspace --all-targets --no-fail-fast --offline --locked -- --test-threads=4`.
+That includes **164 focused tests**: 31 Model, 76 Core and 57 Ledger.
+Coverage includes every original command tag and top-level field, both saved
+canonical hash families, all nested checkpoint maps, complete-body/schema
+rejection, original mixed legacy/managed replay after every checkpoint, exact
+receipts/deltas/effects, and buffered hashing across scalar/bulk boundaries.
+Strict workspace all-target Clippy, the separate production no-panic and
+unchecked-operation gate, formatting and `git diff --check` pass. The complete
+workspace release build passes. Documentation checks complete for all 19
+library targets (currently zero doctest examples). The architecture checker
+verifies **458 links, 37 unchanged imported source hashes and 15 frozen
+vocabularies**. Local evidence uses `/tmp/focal-v1-codecs-` with `workspace.log`,
+`counts.json`, `clippy.log`, `production.log`, `doctests.log` and `release.log`.
+No dependency package or explicit `Arc` is added by this storage increment.
+The decode-budget review traces the existing checked `snapshot_bytes * 64 + 4096`
+Recovery/Completion reservation through restoration and the separately charged
+published Core/graph; this is a source audit, not a new measured memory bound.
+
+An optimized local hashing comparison on Rust 1.94.1/macOS arm64 verifies all
+58 saved identities against the original algorithm, the new legacy path and
+the managed path before timing. Nine rotating samples of 1,000 warm calls give
+the following representative medians. These measure hashing CPU time only;
+the structured command corpus is synthetic, and the 64 KiB inline case exceeds
+the default inline admission limit.
+
+| Input | Original legacy algorithm | Frozen legacy path | Frozen managed path |
+|---|---:|---:|---:|
+| Tiny operation | 304 ns | 329 ns | 281 ns |
+| Rich structured claim | 10.666 µs | 11.984 µs | 17.844 µs |
+| Captured artifact | 790 ns | 804 ns | 819 ns |
+| Derived 4 KiB inline artifact | 3.778 µs | 3.860 µs | 3.746 µs |
+| Derived 64 KiB inline artifact | 46.069 µs | 28.475 µs | 27.224 µs |
+
+The legacy path avoids a second command traversal and preimage allocation, but
+the frozen structured encoding still costs about 12% on the rich-claim case.
+Managed hashing retains its two traversals to avoid a payload-sized allocation;
+its column is not a comparison against the original managed algorithm. Bulk
+byte serialization and buffering remove the much larger regressions found in
+the first streaming implementation. This does not establish application
+throughput or allocation bounds. Exact executable/library identities, benchmark
+source and both final outputs are in the local
+`/private/tmp/focal-command-hash-final-bench*` artifacts.
+
+L2 remains open. Historical reducer/admission execution, surrounding Session
+metadata/delta/effect/managed-receipt formats, original key ordering and successor
+floor/activation still require their explicit version boundaries and checks.
+The implemented codecs do not enable new lifecycle states or complete L1–L8.
+
+## Historical V1 execution
+
+The Core now selects execution from each prepared entry's explicit schema.
+Direct, tracked and serial-oracle apply, pending audit, epoch planning, scoped
+workers and serial fallback use the same selected V1 rules. Managed replay and
+audit carry an explicit `Replay(Version)` through staging; new proposals select
+`AdmitV1`. The original reducer, validation scheduling and graph implementations
+belong to [execution_v1](../../crates/focal-core/src/execution_v1.rs), while the
+stricter current Receipt policy belongs to the separate admission module. This
+removes dependence on a future process-wide default without copying the reducer
+or adding another mutable state owner.
+
+[Immutable model semantics](../../crates/focal-model/src/semantics_v1.rs) pin the
+original terminal/activity classification, lifecycle event mapping, verdict
+severity, typed relation interpretation, all 29 command revision targets and
+managed key validity. Existing public convenience methods delegate to those
+rules. The manifest hash now pins its original schema header explicitly. Domain
+content admission, generated testaments, deltas and prepared records retain
+schema 1. Historical command-size guards use the already frozen input codecs.
+Old namespace, actor, receipt and evaluator checks still run inside the reducer;
+the new Receipt admission policy is not retroactively applied during replay.
+
+Both legacy and managed pending candidates reject unknown prepared schemas
+before acceptance or publication. Candidate reuse still checks its original
+basis, hashes and output provenance. Changed owner limits cannot authorize
+publication of an earlier candidate. There is no new serialized profile field,
+wire operation, decoder-floor promise, lifecycle activation or daemon executor.
+No dependency, production panic or explicit `Arc` is introduced.
+
+The all-target workspace run passes **931 tests across 66 targets**, with zero
+failed, ignored or filtered tests, on macOS arm64, 2026-09-06. The invocation is
+`bash scripts/cargo.sh test --workspace --all-targets --no-fail-fast --offline --locked -- --test-threads=4`.
+That includes **179 focused tests**: 39 Model, 83 Core and 57 Ledger.
+Eight new semantic tests cover all twenty claim statuses, four verdict severities,
+all fifteen relation kinds against typed target alternatives, ordered relation
+lookups, both rounds of the 29-command corpus, managed identity boundaries and
+fixed manifest hashes captured before extraction. Seven new Core tests cover
+the original admitted mixed history through direct, epoch and forced fallback
+execution; one unpublished legacy/managed pending prefix with independent
+audits; historical stronger Receipt replay; unknown prepared/candidate schemas;
+and changed-owner provenance rejection. Exact checkpoint, receipt, delta and
+effect bytes remain equal to the captured workflow. The stronger Receipt test
+is a differential extension, not a newly captured original-writer history.
+Strict workspace all-target Clippy, the separate production no-panic and
+unchecked-operation gate, formatting and `git diff --check` pass. The complete
+workspace release build passes. Documentation checks complete for all 19 library
+targets (currently zero doctest examples). The architecture checker verifies
+**472 links, 37 unchanged imported source hashes and 15 frozen vocabularies**.
+Local qualification logs use `/tmp/focal-v1-execution-` with `focused.log`,
+`workspace.log`, `counts.json`, `clippy.log`, `production.log`, `doctests.log`
+and `release.log`.
+
+A real binary compatibility check runs the complete standalone demo with the
+previous release, reopens the same durable directory with the new release, then
+reopens it with the previous release again. All three JSON reports are identical:
+the same Satisfied claim, sequence 13, Pass verdict, artifact reference and status
+history. The report and exact executable hashes are preserved in
+`/tmp/focal-v1-execution-binary-compat.json`. The previous executable remains at
+`/private/tmp/focal-before-execution-v1/focal`, with its checksum and capture
+metadata. This checks the exercised real workflow in both directions before a
+successor floor exists; it does not qualify a future downgrade after activation.
+
+This completes the explicit historical execution boundary, not L2 or the new
+four-family lifecycle. The original content/state/output types and key orderings
+remain immutable V1 contracts; successor representations and projections must
+respect them. Surrounding Session codecs and acknowledgment/placement hashes,
+broader historical failure/agentic fixtures, the successor floor, all-voter
+activation and independent lifecycle behavior remain required. The exact next
+storage boundaries are recorded in [the upgrade contract](18-lifecycle-storage-upgrade.md).
+
+## Executable successor lifecycle contract
+
+The [new model module](../../crates/focal-model/src/lifecycle/mod.rs) implements
+the successor domain contract independently from stored V1 types and historical
+execution. It has no serialization, numeric tags, new service commands or durable
+activation. The existing CLI/MCP surface continues to use its current profile.
+No dependency or explicit `Arc` is added. Handler plans are borrowed; response
+status plans move the original manifest, and bounded index/audit buffers use
+fallible reservation. Full owner publication and resource permits remain separate.
+
+The contract checks Actor roles, immutable identity/revision, execution receipts,
+exact response/artifact targets, declared definitions, evaluator generations,
+attempts, deadlines and expressly required policy evidence. An enrolled Node
+cannot act as a participant. Artifact receipt is independent from response closing;
+closing prepares an exact response and all attachment replacements together.
+Posting, claimant receipt and evaluation remain distinct. An eligible evaluator's
+actual checked begin advances the response/artifact/claim without another issuer
+invocation. Agentic-only checks enter quality directly; programmatic-plus-quality
+retains the real first-phase evidence. Only Error advances a bounded retry or
+fallback. Optional outcomes stay visible without becoming required failures.
+
+Aggregation requires one exact artifact ID/digest for all required checks of a
+slot and an independently checked pure delivery result. Slot-presence declaration
+indexes are explicit and collision checked. Already successful alternative slots
+are considered before failing the claim; a later response cannot repair an old
+terminal cut. Required checks on an optional slot can fail that artifact without
+failing the response or claim. Already-begun unrelated checks can still contribute
+where the claim remains open, while the failed response retains its original cut.
+The incremental coverage index does not scan other response manifests per result.
+
+Claim receipt adoption before first delivery no longer strands TestamentGenerated:
+the replacement entitlement's first eligible response can advance acknowledgment
+under explicit lineage, while stale response and evaluator authority still reject.
+Local completion records its exact sealing position before remaining graph waits.
+Audit closure binds that same position, requires complete accepted attempt history,
+accounts for begun Observe checks and explicit suppression/fences, and reserves
+bounded completion storage. It never invents a result for a Ready or fenced check.
+Result artifacts remain evaluator-owned Generated evidence; the claimant's audit
+testament ends at Posted and cannot feed ordinary response acceptance.
+
+L1 remains open for complete Required non-artifact acceptance indexing,
+DependencyFailed/Deadlocked graph witnesses and immutable successor relation
+checks. The current predicate inputs are effective owner views, not wire-supplied
+permissions. L2–L5 still need successor storage activation, complete histories,
+creation/diagnostic cut positions, atomic core/graph/index publication, reserved
+proof/history/output budgets, and the actual shared CLI/MCP mutation/read path.
+The executable native exchange does not claim that end-to-end integration is done.
+
+The full all-target workspace qualification passes **988 tests across 66 targets**,
+with zero failed, ignored or filtered tests, on macOS arm64, 2026-09-06:
+`bash scripts/cargo.sh test --workspace --all-targets --no-fail-fast --offline --locked -- --test-threads=4`.
+The Model target passes 96 tests, including 57 new contract tests: 14 claim,
+7 evidence, 18 validation, 13 aggregation, 3 audit, one shared identity guard and
+one real two-Actor contract exchange. The aggregation permutations use explicitly
+test-only result factories; the cross-family exchange uses actual checked begin,
+receipt and report transitions. Existing historical codec/replay, storage,
+network, human CLI and both MCP profile tests still pass. This is native/local
+qualification, not a multi-region scale measurement or successor wire exchange.
+Strict all-target workspace Clippy, formatting and `git diff --check` pass.
+The test and count records are `/tmp/focal-lifecycle-workspace.log` and
+`/tmp/focal-lifecycle-counts.json`; the Clippy log is
+`/tmp/focal-lifecycle-clippy.log`.
+
+The separate production no-panic/unchecked-operation gate passes, as does the
+complete workspace release build. Documentation checks pass for all 19 library
+targets (currently zero doctest examples). The architecture checker verifies
+482 links, 37 unchanged imported source hashes and 15 frozen vocabularies.
+Logs are `/tmp/focal-lifecycle-production.log`,
+`/tmp/focal-lifecycle-doctests.log` and `/tmp/focal-lifecycle-release.log`.
+No geographic scale, throughput or recovery-memory bound is inferred from these
+checks. The complete P00–P20/L1–L8 goal remains active.
+
+## Owned acceptance, graph and scope contracts
+
+Claim generation now retains complete owned acceptance, graph and lineage
+declarations plus creation position. Acceptance cannot be reconstructed from a
+smaller supplied slot list. Every declared Required pure Receipt check must be
+represented by an exact accepted proof; the canonical delivery witness retains
+the complete proof set. The bounded registry pins evaluation content, target,
+generation and receipt before exposure. Admission gates receipt acquisition;
+sealed Required Increment targets must have final outcomes before whole-work
+entry. Closing/posting/receiving a response can proceed while increments finish.
+Response entry and received-target readiness reuse the claim's actual checked
+increment and receipt guard. Final audit sealing is independent of increment
+sealing, remains possible after business completion, and requires every registered
+evaluation and its full accepted history. Two increments of one declaration
+retain distinct artifact-ID/digest targets in aggregation and audit ordering.
+
+The graph contract captures a complete bounded effective closure and computes
+the least fixed point. It distinguishes DependsOn failure propagation from Awaits
+and runtime monitor predicates. Private proofs bind every read revision, canonical
+originating dependency cause, and deadline-triggered SCC victim. Consequences
+cannot precede the creation, terminal, local-seal or scope facts represented in
+the snapshot. Monitor roots and owned children live in the claim's bounded registry;
+registration does not reuse a graph captured before adding the new edges. Named
+rebind requires an actual compatible Supersedes relation. Monitor settlement and
+owner release occur once; owner release cannot omit an unreleased owned child.
+Public root generation cannot create an unregistered Claim-caused child: the
+joint child-generation path installs ownership before returning that child.
+Succession plans check compatible identities, explicit lineage, bounded acyclic
+closure and effective read fences, preserving an already-terminal predecessor.
+
+The real two-Actor exchange now includes a running Required Increment during
+response closing, refusal of premature whole-work entry, actual evaluation
+completion, independent artifact/response/claim outcomes, an audit bundle closed
+while a runtime terminal wait remains, and later graph release. These are native
+contract transitions; no handler is launched and no successor service command or
+durable format is installed. Complete creation-lineage validation, owned-tree
+terminal/fencing fanout, persistent authoritative registries, affected-only graph
+indexes and atomic owner publication remain required under L1–L5.
+
+Native stream V1 adapters now cover twelve types and all nine cursor operations.
+The original-writer fixture corpus has 37 data files and preserved source/build
+identities. Eight codec tests compare exact historical bytes, enum variants,
+truncation, normalization, untrusted collection counts and enclosing suffix rules.
+The adapters are not yet wired into Ledger Session snapshots, metadata entries
+or managed cursor contracts; the surrounding L2 migration remains open.
+
+README now provides the purpose and domain roles, source installation, local
+restart and complete demo workflows, flags/JSON/YAML input, MCP launch/configuration,
+four diagrams, RAM/WAL ownership and the six deployment stages. The laptop path
+is explicitly local WAL; replicated groups add Raft. Current versus target
+lifecycles and deployment guarantees are labeled. Its command smoke record remains
+the executed 22-command run documented above; this increment additionally checks
+local links and the MCP JSON example without inventing release binaries or scale
+measurements.
+
+This increment passes **1,037 tests across 66 workspace targets**, with zero failed,
+ignored or filtered tests on macOS arm64, 2026-09-06. The Model target has 137 tests:
+41 new cases beyond the prior 96. Native stream adds eight original-format codec
+tests. The focused Model/Stream run passes 164 tests including its 19 existing
+delivery tests. The full command was
+`bash scripts/cargo.sh test --workspace --all-targets --no-fail-fast --offline --locked -- --test-threads=4`;
+records are `/tmp/focal-acceptance-workspace.log`,
+`/tmp/focal-acceptance-model-stream.log` and `/tmp/focal-acceptance-counts.json`.
+Strict workspace all-target Clippy and the separate production no-panic/unchecked-
+operation gate pass (`/tmp/focal-acceptance-clippy.log` and
+`/tmp/focal-acceptance-production.log`). Formatting and diff checks pass. The
+architecture check verifies 488 links, 37 unchanged Hecate imports and 15 frozen
+vocabularies; the native cursor corpus's 37 files total 106,290 bytes and match
+their recorded SHA-256 values. No dependency or explicit `Arc` is added by this
+increment. This does not establish successor storage activation, complete CLI/MCP
+lifecycle integration or geographic-scale qualification.
+
+## Session V1 envelopes and output identities
+
+The actual Session readers and writers now use explicit V1 representations for
+all seven metadata entry tags and all five snapshot tags. Frozen Model output,
+managed receipt/control and cursor DTOs, native stream types, Directory placement
+types and 24 private Ledger row/envelope types compose through their owning crates.
+Membership configurations and changes use explicit local adapters; Consensus
+does not acquire a Model dependency. Existing wire Serde representations remain
+unchanged. Managed receipt/control hashes, membership request hashes, placement
+record identity and placement digests use the same frozen bytes and original
+schema/domain headers. Managed admission/replay byte limits and Delta retention
+sizes also select V1; allocation accounting still measures current owned state.
+
+SS3/SS4/SS5 checkpoint writing borrows cursor records, cursor receipts, retained
+deltas, membership, placement and request slots directly. It eliminates their
+temporary cloned graphs and the separate outer payload buffer. The existing
+eight-MiB output limit is checked before fallible final-vector reservation. Core
+bytes are released before an optional retained checkpoint copy. Recovery retains
+its owner-funded Completion reservation and constructs final collections directly.
+The conservative reservation formulas are unchanged; this increment does not
+claim measured throughput, reduced configured budgets or geographic scale.
+
+Original output capture preceded live writer replacement. The new Model corpus
+has 24 row files, the Directory corpus 49 data files, and the Session corpus
+170 outputs totaling 2,993,005 bytes. The latter preserves 119 original source
+identities, the exact capture generator and an immutable executable hash. Its
+original generator is outside the executable test tree. Broad synthetic variants
+are labeled separately from the actual SS3→SS4→SS5 admitted history; original
+SS1/SS2 envelopes and reader normalization/suffix probes are also identified.
+See the [storage contract](18-lifecycle-storage-upgrade.md#32-surrounding-session-formats-and-output-identities)
+and [Session corpus](../../crates/focal-ledger/fixtures/durable-session-v1/README.md).
+
+Eleven focused Session tests pass: all row/envelope variants and original hashes;
+actual writer byte parity, disk restart and exact retries; all five snapshot
+readers and subsequent log/delta replay; refusal before application publication;
+and original managed-input/retention byte thresholds. CU1/CU2/CM1 retain their
+original tolerant body-suffix replay. MC1/PL1/MU1/MS1 and SS1–SS5 retain exact-body
+checks. No successor descriptor, application tag, floor or lifecycle activation
+is installed by this compatibility increment. L2–L5 and the full objective remain
+open.
+
+The Session increment passes **1,062 tests across 66 workspace targets**, with
+zero failures, ignored or filtered tests. This is the build preceding the
+subsequent decoder-transition source changes. The complete run and count record
+are `/tmp/focal-session-v1-workspace.log` and `/tmp/focal-session-v1-counts.json`;
+the eleven targeted tests are in `/tmp/focal-session-v1-storage-tests.log`.
+The production no-panic/unchecked-operation gate passes in
+`/tmp/focal-session-v1-production.log`. Formatting and diff checks pass. Fixture
+verification confirms all 170 Session outputs and 119 preserved sources, all 24
+Model output files (332,655 bytes), and all 49 Directory files (13,738 bytes).
+The architecture checker verifies 496 links, 37 unchanged imports and 15 frozen
+vocabularies. The Session increment adds no dependency or explicit `Arc`.
+
+## Bounded decoder transition
+
+Consensus now supports exactly one ordered transition from an original durable
+floor to a registered successor. Trusted composition confirms the complete compiled
+pair; it cannot replace an earlier registration, bypass the baseline promise, or
+advertise support from a caller-provided version flag. Fresh transitioned recovery
+requires that full pair before application output or Raft participation, including
+votes and reads. The predecessor remains supported after transition; the effective
+required decoder is the successor. Matching retries preserve pending work.
+
+`RecordKind::DecoderTransition` appends ordinal 7, preserving ordinals 0–6. The
+fixed 74-byte payload is `FOCALDT1`, big-endian schema 1, predecessor and successor
+fingerprints; its index and term are zero. The existing Completion-lane disk owner
+persists it through one retained `WalAppend` receipt. Only observing successful
+fsync publishes readiness. Checkpoint rewriting retains both the original floor
+and transition in order, including when another logical group triggers rewriting.
+There is no new disk worker, dependency or explicit `Arc`.
+
+Eight new consensus regressions and one WAL format test qualify the fixed layout,
+unknown/malformed history refusal, pair-only recovery, guarded participation,
+monotone confirmation while baseline persistence is pending, real delayed fsync
+under Ordinary memory pressure, repeated and conflicting retries, abandoned
+callers, both ambiguous-fsync cuts, and own/other-group checkpoint retention with
+the exact application suffix. The focused Log/Consensus run passes 65 tests.
+
+An [actual preserved older executable](../../crates/focal-consensus/fixtures/decoder-transition-old-binary/README.md)
+accepts the unchanged and original-floor controls, then refuses the transition
+twice before compaction and twice after each of two compaction paths. All six
+refusals report physical `invalid durable record` without a panic or application
+report, and leave every file's name, length and SHA-256 unchanged. Original
+application snapshot bytes survive both rewrites. This is real binary evidence,
+separate from the reconstructed old-enum test. The record preserves the helper,
+exact selected library/compiler identities, commands, outcomes, file manifests
+and independently checked WAL frames; all 74 evidence-file hashes verify.
+
+The combined increment passes **1,071 tests across 66 workspace targets**, with
+zero failures, ignored or filtered tests. Records are
+`/tmp/focal-decoder-transition-workspace.log` and
+`/tmp/focal-decoder-transition-counts.json`. Strict workspace all-target Clippy,
+the separate production no-panic/unchecked-operation gate, formatting and diff
+checks pass; their logs use `/tmp/focal-decoder-transition-`. This qualification
+precedes the subsequent native validation-definition ownership refactor.
+
+The transition mechanism is dormant in production Session, which still confirms
+only its unchanged managed V1 descriptor. The experiment's successor is explicitly
+test-only. No lifecycle-V2 descriptor, decoder, wire shape or activation is claimed.
+Actual successor owner state, complete lifecycle histories, all-voter activation,
+learner admission fences, CLI/MCP integration and geographic qualification remain
+required under the [storage plan](18-lifecycle-storage-upgrade.md).
+
+## Owned native validation definitions and retained evaluation state
+
+Native `Declaration` now owns its slot text and ordered handler policies.
+`Declaration::prepare` checks the complete borrowed input without allocating and
+returns a construction plan with checked requested row/buffer bytes. Building the
+plan uses fallible exact reservation; `retained_bytes` reports actual capacities.
+The future Core owner must reserve its budget before construction and reconcile
+actual retained allocations. This increment does not install that accounting.
+
+`EvaluationState` is a reference-free, independently retainable row. A temporary
+`Evaluation` view borrows the definition only while checking transitions;
+`bind` and `into_state` allocate nothing and copy no policy buffers. A private
+semantic stamp covers every actual immutable declaration field. It prevents a
+caller from substituting different handlers, attempt policies, deadlines or
+targets under the same supplied content binding. Exact independently reconstructed
+definitions can rebind. Acceptance declarations, evaluation registration, result
+capabilities and audit membership carry the same guard, including late results
+against a sealed audit. No mutable detached-state access bypasses the check.
+The stamp is an internal consistency guard with no durable or wire identity.
+
+Five new regressions cover dropping all construction inputs and declaration
+owners across Error/retry, programmatic Pass and quality Pass; 22 same-binding
+semantic substitutions; preallocation bounds and charges; alternate-definition
+materialization, registration and results; and substitutions at audit sealing and
+late result admission. The existing multiple-Required-Receipt test still verifies
+missing, duplicate and complete exact proof sets. See
+[retention tests](../../crates/focal-model/src/lifecycle/validation_retention_tests.rs),
+[acceptance tests](../../crates/focal-model/src/lifecycle/aggregation_tests.rs), and
+[audit tests](../../crates/focal-model/src/lifecycle/audit_tests.rs).
+
+Qualification passes **231 focused tests**: 148 Model and 83 Core, with zero
+failed, ignored or filtered tests, plus both crates' doc-test targets. Strict
+workspace all-target Clippy and the separate production no-panic/unchecked-operation
+gate pass. Logs are `/tmp/focal-owned-validation-focused.log`,
+`/tmp/focal-owned-validation-clippy.log`, and
+`/tmp/focal-owned-validation-production.log`. The preceding 1,071-test workspace
+run remains evidence for the earlier decoder-transition build; it is not relabeled
+as a run of this refactor. No dependency or explicit `Arc` is added.
+
+This completes the independent definition/state ownership prerequisite in
+[the successor owner sequence](18-lifecycle-storage-upgrade.md#61-concrete-successor-owner-integration).
+It does not activate successor storage, extend live CLI/MCP behavior or close L1.
+The sole Core owner, mandatory complete creation-lineage checks, joint child/control
+publication, versioned durable representations and activation remain required.

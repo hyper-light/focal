@@ -188,6 +188,9 @@ fn listed(reply: OwnedResponse) -> ListPage {
     }
 }
 
+#[path = "fleet_summary_owner_tests.rs"]
+mod summary_owner_tests;
+
 #[path = "fleet_reconciliation_owner_tests.rs"]
 mod reconciliation_tests;
 #[test]
@@ -256,3 +259,12 @@ fn quorum_list_requires_fresh_barrier_and_continuations_keep_the_committed_prefi
         owner.close();
     }
 }
+
+#[path = "fleet_traversal_tests.rs"]
+mod traversal_tests;
+
+#[path = "fleet_monitor_owner_tests.rs"]
+mod monitor_owner_tests;
+
+#[path = "fleet_selection_tests.rs"]
+mod selection_tests;

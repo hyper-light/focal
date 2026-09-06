@@ -1,0 +1,128 @@
+use serde::{Deserialize, Serialize};
+
+// The serialized discriminants are explicit u16 values, never Rust variant ordinals.
+macro_rules! vocabulary {
+    ($name:ident { $($variant:ident = $number:literal),+ $(,)? }) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[repr(u16)]
+        pub enum $name { $($variant = $number),+ }
+        impl $name {
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+            pub const fn code(self) -> u16 { self as u16 }
+            pub fn from_code(code: u16) -> Option<Self> { match code { $($number => Some(Self::$variant),)+ _ => None } }
+        }
+        impl Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok,S::Error> { serializer.serialize_u16(self.code()) }
+        }
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self,D::Error> {
+                let code = u16::deserialize(deserializer)?;
+                Self::from_code(code).ok_or_else(|| serde::de::Error::custom(concat!("unknown critical ", stringify!($name))))
+            }
+        }
+    };
+}
+vocabulary!(ObjectKind { Claim=1, Testament=2, Validation=3, Artifact=4 });
+vocabulary!(ClaimStatus { Generated=1, Posted=2, Received=3, Progressed=4,
+    TestamentGenerated=5, TestamentAcknowledged=6, Validating=7, Satisfied=8,
+    PostFailed=9, ReceiptFailed=10, TestamentGenerationFailed=11,
+    ValidationIncomplete=12, ValidationFailed=13, ValidationErrored=14,
+    Cancelled=15, Expired=16, Revoked=17, Superseded=18, DependencyFailed=19, Deadlocked=20 });
+impl ClaimStatus {
+    pub const fn is_terminal(self) -> bool {
+        match self {
+            Self::Generated
+            | Self::Posted
+            | Self::Received
+            | Self::Progressed
+            | Self::TestamentGenerated
+            | Self::TestamentAcknowledged
+            | Self::Validating => false,
+            Self::Satisfied
+            | Self::PostFailed
+            | Self::ReceiptFailed
+            | Self::TestamentGenerationFailed
+            | Self::ValidationIncomplete
+            | Self::ValidationFailed
+            | Self::ValidationErrored
+            | Self::Cancelled
+            | Self::Expired
+            | Self::Revoked
+            | Self::Superseded
+            | Self::DependencyFailed
+            | Self::Deadlocked => true,
+        }
+    }
+    pub const fn is_active(self) -> bool {
+        !self.is_terminal()
+    }
+}
+vocabulary!(ActionType { Work=1, Consultation=2, Challenge=3, Feedback=4, Approval=5, Summon=6, Handoff=7, Evaluation=8, Correction=9, Teardown=10 });
+vocabulary!(ScopeKind { File=1, Symbol=2, Api=3, TestSurface=4, Component=5, UxSurface=6 });
+vocabulary!(RelationKind { Issuer=1, Subject=2, Evaluator=3, ClaimAction=4, Supersedes=5, DependsOn=6, Awaits=7, CausedBy=8, Refines=9, ConflictsWith=10, DerivedFrom=11, Reviews=12, Amends=13, ContributedBy=14, Invalidates=15 });
+impl RelationKind {
+    pub const fn is_override(self) -> bool {
+        match self {
+            Self::Supersedes | Self::Invalidates => true,
+            Self::Issuer
+            | Self::Subject
+            | Self::Evaluator
+            | Self::ClaimAction
+            | Self::DependsOn
+            | Self::Awaits
+            | Self::CausedBy
+            | Self::Refines
+            | Self::ConflictsWith
+            | Self::DerivedFrom
+            | Self::Reviews
+            | Self::Amends
+            | Self::ContributedBy => false,
+        }
+    }
+}
+vocabulary!(ValidationKind { Receipt=1, Test=2, Inspection=3, Integration=4, Contract=5, Design=6, Regression=7 });
+vocabulary!(ValidationPhase { Admission=1, Increment=2, WholeWork=3 });
+vocabulary!(ValidationMode { Observe=1, Required=2 });
+vocabulary!(VerdictValue { Pass=1, Fail=2, Incomplete=3, Error=4 });
+impl VerdictValue {
+    pub const fn severity(self) -> u8 {
+        match self {
+            Self::Pass => 0,
+            Self::Incomplete => 1,
+            Self::Error => 2,
+            Self::Fail => 3,
+        }
+    }
+}
+vocabulary!(Confidence { Hint=1, Tentative=2, Committed=3, Consensus=4 });
+vocabulary!(OutcomeKind { Complete=1, Partial=2, Refused=3, Impossible=4, Interrupted=5, Failed=6 });
+vocabulary!(ContentClass { Document=1, Evidence=2, Checkpoint=3 });
+vocabulary!(Disposition { Retryable=1, Terminal=2 });
+vocabulary!(ErrorCode { InvalidSchema=1, InvalidNamespace=2, InvalidRelation=3, InvalidCause=4, WrongActor=5, StaleReceipt=6, StaleEvaluator=7, IdempotencyConflict=8, RequestHistoryExpired=9, RequestEpochNotAdmitted=10, UnknownObject=11, ObjectIdConflict=12, Capacity=13, EvidenceNotDurable=14, ConflictingVerdict=15, DeadlineNotDue=16, RevisionConflict=17, InvalidManifest=18, InvalidTransition=19, UnsupportedSchema=20, EmptyRequiredSet=21, InvalidEpoch=22, PartialDuplicateBatch=23, MissingDeadline=24, InvalidHandler=25, StandingDenied=26 });
+vocabulary!(LifecycleAction { Generated=1, Posted=2, Received=3, Progressed=4, TestamentGenerated=5, TestamentAcknowledged=6, Validating=7, Satisfied=8, PostFailed=9, ReceiptFailed=10, TestamentGenerationFailed=11, ValidationIncomplete=12, ValidationFailed=13, ValidationErrored=14, Cancelled=15, Expired=16, Revoked=17, Superseded=18, DependencyFailed=19, Deadlocked=20, EvidenceOpened=21, ArtifactAttached=22, ValidationScheduled=23, ValidationVerdict=24, ReceiptAdopted=25, ScopeRegistered=26, ScopeReleased=27, ScopeRebound=28, EpochAdmitted=29, EpochFloorAdvanced=30, LocalCompleted=31 });
+impl From<ClaimStatus> for LifecycleAction {
+    fn from(status: ClaimStatus) -> Self {
+        match status {
+            ClaimStatus::Generated => Self::Generated,
+            ClaimStatus::Posted => Self::Posted,
+            ClaimStatus::Received => Self::Received,
+            ClaimStatus::Progressed => Self::Progressed,
+            ClaimStatus::TestamentGenerated => Self::TestamentGenerated,
+            ClaimStatus::TestamentAcknowledged => Self::TestamentAcknowledged,
+            ClaimStatus::Validating => Self::Validating,
+            ClaimStatus::Satisfied => Self::Satisfied,
+            ClaimStatus::PostFailed => Self::PostFailed,
+            ClaimStatus::ReceiptFailed => Self::ReceiptFailed,
+            ClaimStatus::TestamentGenerationFailed => Self::TestamentGenerationFailed,
+            ClaimStatus::ValidationIncomplete => Self::ValidationIncomplete,
+            ClaimStatus::ValidationFailed => Self::ValidationFailed,
+            ClaimStatus::ValidationErrored => Self::ValidationErrored,
+            ClaimStatus::Cancelled => Self::Cancelled,
+            ClaimStatus::Expired => Self::Expired,
+            ClaimStatus::Revoked => Self::Revoked,
+            ClaimStatus::Superseded => Self::Superseded,
+            ClaimStatus::DependencyFailed => Self::DependencyFailed,
+            ClaimStatus::Deadlocked => Self::Deadlocked,
+        }
+    }
+}

@@ -1,15 +1,33 @@
 mod args;
 mod authored;
+mod claim_wait;
+pub(crate) mod cluster;
+pub(crate) mod command_tree;
+pub(crate) mod context;
+pub(crate) mod discovery;
 mod documents;
 mod download;
+pub(super) mod errors;
+mod graph;
+mod lifecycle;
+mod managed;
 mod mcp;
+mod monitor;
 mod output;
 mod reads;
 mod reconcile;
+mod request_files;
 #[cfg(test)]
 mod tests;
+mod upload;
+mod upload_control;
+mod validators;
+mod watch;
 use args::*;
-pub(super) use args::{Commands, RequestArgs};
+pub(super) use args::{Commands, RequestArgs, RequestCommand};
+pub(super) fn check_request_file(path: &std::path::Path) -> Result<()> {
+    request_files::check(path)
+}
 use focal_client::{Client, ClientError, RetryPolicy, UnixTransport, input::*, pending::*};
 use focal_model::*;
 use focal_node::{config::Settings, embedded::decode_identity};
@@ -18,6 +36,19 @@ pub(super) use mcp::serve;
 use std::{io::Write, path::PathBuf};
 
 type Result<T> = std::result::Result<T, CliError>;
+fn validation_context_error(
+    error: focal_client::validation_context::ValidationContextError,
+) -> CliError {
+    use focal_client::validation_context::ValidationContextError;
+    match error {
+        ValidationContextError::Client(error) => CliError::Client(error),
+        ValidationContextError::NotFound => CliError::NotFound,
+        ValidationContextError::InvalidRequest => {
+            CliError::Input("invalid validation context query".into())
+        }
+        ValidationContextError::Capacity => CliError::Document(InputError::Capacity),
+    }
+}
 #[derive(Debug, thiserror::Error)]
 pub(super) enum CliError {
     #[error("{0}")]
@@ -29,11 +60,17 @@ pub(super) enum CliError {
     #[error(transparent)]
     Pending(#[from] PendingError),
     #[error(transparent)]
+    Managed(#[from] focal_client::managed_store::ManagedStoreError),
+    #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("object not found at the observed ledger prefix")]
     NotFound,
     #[error("more than one claim matches; use list claims or an exact ID")]
     Ambiguous,
+    #[error("singular claim selection is incomplete; narrow the filters or use list claims")]
+    Incomplete,
+    #[error("claim wait ended {0:?}; latest observed state was written to stdout")]
+    WaitUnfinished(focal_client::claim_wait::ClaimWaitCondition),
     #[error("invalid or inconsistent server response")]
     InvalidResponse,
     #[error("mutation did not commit: {0:?}; its exact request remains journaled")]
@@ -43,66 +80,87 @@ pub(super) enum CliError {
     #[error(transparent)]
     Other(Box<dyn std::error::Error + Send + Sync>),
 }
-impl CliError {
-    pub(super) fn exit_code(&self) -> i32 {
-        match self {
-            Self::Input(_) | Self::Document(_) => 2,
-            Self::Client(ClientError::Access(AccessError::Unauthorized)) => 3,
-            Self::NotFound => 4,
-            Self::Ambiguous | Self::Domain(_) => 5,
-            Self::Pending(PendingError::Locked) => 6,
-            Self::Client(ClientError::OutcomeUnknown { .. }) | Self::Unconfirmed => 7,
-            _ => 1,
-        }
-    }
-}
 pub(super) struct Context {
-    client: Client<UnixTransport>,
+    client: Client<context::Transport>,
     build: BuildContext,
     operation: OperationContext,
     root: PathBuf,
+    admin_root: Option<PathBuf>,
+    invocation: Option<String>,
 }
 impl Context {
-    fn open(settings: &Settings) -> Result<Self> {
+    fn open(settings: &Settings, selection: Option<&str>) -> Result<Self> {
+        match context::selected(settings, selection)? {
+            Some((profile, history, name)) => {
+                let mut context = context::connect(profile, history)?;
+                context.invocation = Self::recovery_invocation(
+                    &settings
+                        .data_dir()
+                        .map_err(|e| CliError::Other(Box::new(e)))?,
+                    &name,
+                );
+                Ok(context)
+            }
+            None => Self::open_local(settings),
+        }
+    }
+    fn open_local(settings: &Settings) -> Result<Self> {
         let root = settings
             .data_dir()
             .map_err(|e| CliError::Other(Box::new(e)))?;
-        // Joined Unix ingress authenticates the enrolled local principal, while
-        // IDENTITY retains the founder's issuer. Until an authenticated client
-        // context is exposed, never journal or query under that wrong identity.
-        for marker in ["JOIN", "JOIN.initialized"] {
-            match std::fs::symlink_metadata(root.join(marker)) {
-                Ok(_) => return Err(CliError::Input(
-                    "manual client context on a joined node is unsupported until authenticated client contexts are available".into(),
-                )),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
         let identity =
             decode_identity(&root.join("IDENTITY")).map_err(|e| CliError::Other(Box::new(e)))?;
+        // NETWORK also proves joined identity if its private JOIN files are
+        // lost. Never fall back to the founder's issuer in that case.
+        let actor =
+            focal_node::network_join::local_unix_principal(&root, &identity, context::now()?)
+                .map_err(|error| {
+                    CliError::Input(format!("invalid local node client context: {error}"))
+                })?;
         let limits = WireLimits::default();
         let transport = UnixTransport::connect(root.join("focal.sock"), limits.clone())
             .map_err(|e| CliError::Other(Box::new(e)))?;
         Ok(Self {
-            client: Client::new(transport, RetryPolicy::default(), limits, 1)?,
+            client: Client::new(
+                context::Transport::Unix(transport),
+                RetryPolicy::default(),
+                limits,
+                1,
+            )?,
             build: BuildContext {
                 ledger: identity.ledger,
-                actor: identity.issuer,
+                actor,
                 root: identity.root,
                 policy_revision: 1,
             },
             operation: OperationContext {
                 cluster: identity.cluster,
-                principal: identity.issuer,
+                principal: actor,
                 ledger: identity.ledger,
             },
+            invocation: Self::recovery_invocation(&root, "local"),
+            admin_root: Some(root.clone()),
             root,
         })
     }
+    fn recovery_invocation(root: &std::path::Path, selection: &str) -> Option<String> {
+        let root = if root.is_absolute() {
+            root.to_owned()
+        } else {
+            std::env::current_dir().ok()?.join(root)
+        };
+        let path = root
+            .to_str()
+            .filter(|path| !path.chars().any(char::is_control))?;
+        Some(format!(
+            "focal --data-dir '{}' --client-context '{}'",
+            path.replace('\'', "'\\''"),
+            selection.replace('\'', "'\\''")
+        ))
+    }
     fn envelope(&self, operation: Operation) -> Result<RequestEnvelope> {
         Ok(RequestEnvelope {
-            protocol: PROTOCOL_VERSION,
+            protocol: participant_protocol(&operation),
             ledger: self.build.ledger,
             route_epoch: RouteEpoch(1),
             request_epoch: RequestEpoch(1),
@@ -123,14 +181,48 @@ pub(super) fn run(
     runtime: &tokio::runtime::Runtime,
     settings: &Settings,
     command: Commands,
+    selection: Option<&str>,
 ) -> Result<()> {
-    let context = Context::open(settings)?;
+    let context = Context::open(settings, selection)?;
     let command = match command {
+        Commands::Claim {
+            command: ClaimCommand::Wait(args),
+        } => return claim_wait::run(runtime, &context, args),
+        Commands::Monitor {
+            command: monitor::MonitorCommand::Get(args),
+        } => return monitor::get(runtime, &context, args),
+        Commands::Watch { command } => return watch::run(runtime, &context, command),
+        Commands::Ledger { command } => return graph::run(runtime, &context, command),
+        Commands::Validator { command } => return validators::run(runtime, &context, command),
+        Commands::Artifact {
+            command: ArtifactCommand::Upload { command },
+        } => return upload_control::run(runtime, &context, command),
         Commands::Get { command } => return reads::get(runtime, &context, command),
         Commands::List { command } => return reads::list(runtime, &context, command),
+        Commands::Artifact {
+            command: ArtifactCommand::Register(args),
+        } if args
+            .payload_file
+            .as_ref()
+            .is_some_and(|path| path != std::path::Path::new("-")) =>
+        {
+            return upload::register(runtime, &context, *args);
+        }
+        Commands::Submit {
+            command: SubmitCommand::Artifact(args),
+        } if args
+            .payload_file
+            .as_ref()
+            .is_some_and(|path| path != std::path::Path::new("-")) =>
+        {
+            return upload::artifact(runtime, &context, args);
+        }
         command => command,
     };
     let (authored, options) = authored::mutation(command)?;
+    if options.operation.is_none() {
+        return managed::submit(runtime, &context, authored, options);
+    }
     let focal_client::operations::PlannedOperation::Mutation(command) =
         authored.build(&context.build, &mut random_id)?
     else {
@@ -144,10 +236,36 @@ fn submit(
     command: Command,
     options: MutationOptions,
 ) -> Result<()> {
-    let request = context.envelope(Operation::Submit {
+    let mut request = context.envelope(Operation::Submit {
         expected_revision: options.expected_revision.map(ObjectRevision),
         command,
     })?;
+    if let Operation::Submit {
+        command,
+        expected_revision,
+    } = &mut request.operation
+        && expected_revision.is_none()
+        && matches!(
+            command,
+            Command::AcknowledgeTestament { .. }
+                | Command::BeginWholeWorkValidation { .. }
+                | Command::BeginIncrementValidation { .. }
+                | Command::CompleteWholeWork { .. }
+        )
+    {
+        let claim = command
+            .claim_id()
+            .ok_or(InputError::Invalid("claim is required"))?;
+        *expected_revision = Some(
+            runtime
+                .block_on(context.client.claim_revision(
+                    context.build.ledger,
+                    claim,
+                    request.request_id,
+                ))?
+                .ok_or(InputError::Invalid("claim was not found"))?,
+        );
+    }
     let epoch = context.envelope(Operation::OpenEpoch {
         epoch: RequestEpoch(1),
     })?;
@@ -212,28 +330,57 @@ fn drive(
     }
     output::journal(journal, format)
 }
+pub(super) fn status(
+    runtime: &tokio::runtime::Runtime,
+    settings: &Settings,
+    selection: Option<&str>,
+) -> Result<()> {
+    let context = Context::open(settings, selection)?;
+    let request = context.envelope(Operation::Read(ReadRequest {
+        consistency: ReadConsistency::Linearizable,
+        query: ReadQuery::Objects(Vec::new()),
+        max_items: 1,
+    }))?;
+    let reply = runtime.block_on(context.client.request(request))?;
+    super::output_response(reply).map_err(CliError::Other)
+}
+
+pub(super) fn schema_validate(
+    settings: &Settings,
+    selection: Option<&str>,
+    operation: &str,
+    input: DocumentInput,
+) -> Result<()> {
+    let context = Context::open(settings, selection)?;
+    discovery::validate(operation, input, Some(&context))
+}
 pub(super) fn request(
     runtime: &tokio::runtime::Runtime,
     settings: &Settings,
     args: RequestArgs,
+    selection: Option<&str>,
 ) -> Result<()> {
     match (args.file, args.command) {
-        (Some(file), None) => {
-            let request: RequestEnvelope =
-                serde_json::from_slice(&documents::read_bytes(&file, 1024 * 1024)?)
-                    .map_err(|e| CliError::Input(e.to_string()))?;
-            let root = settings
-                .data_dir()
-                .map_err(|e| CliError::Other(Box::new(e)))?;
-            let remote = UnixRemote::new(root.join("focal.sock"), WireLimits::default())
-                .map_err(|e| CliError::Other(Box::new(e)))?;
-            let response = runtime
-                .block_on(remote.request(&request))
-                .map_err(|e| CliError::Other(Box::new(e)))?;
-            super::output_response(response).map_err(CliError::Other)
+        (None, Some(RequestCommand::Build(args))) => {
+            request_files::build(settings, selection, args)
         }
-        (None, Some(RequestCommand::Retry { operation, output })) => {
-            let context = Context::open(settings)?;
+        (None, Some(RequestCommand::Check { file })) => request_files::check(&file),
+        (None, Some(RequestCommand::Send { file })) => {
+            request_files::send(runtime, settings, selection, &file)
+        }
+        (Some(file), None) => request_files::send(runtime, settings, selection, &file),
+        (
+            None,
+            Some(RequestCommand::Retry {
+                operation: Some(operation),
+                operation_id: None,
+                output,
+            }),
+        ) => {
+            let context = Context::open(settings, selection)?;
+            if upload::resume_legacy(runtime, &context, &operation, output.format)? {
+                return Ok(());
+            }
             let mut journal = OperationJournal::open(&operation, &context.operation)?;
             writeln!(
                 std::io::stderr().lock(),
@@ -246,18 +393,80 @@ pub(super) fn request(
             None,
             Some(RequestCommand::Inspect {
                 operation,
+                operation_id: None,
                 remote,
                 output,
             }),
         ) => {
-            let context = Context::open(settings)?;
-            let journal = OperationJournal::open(operation, &context.operation)?;
+            let context = Context::open(settings, selection)?;
+            let journal = OperationJournal::open(
+                operation.ok_or_else(|| CliError::Input("operation path is required".into()))?,
+                &context.operation,
+            )?;
             if remote {
                 reconcile::inspect(runtime, &context, &journal, output.format)
             } else {
                 output::journal(&journal, output.format)
             }
         }
+        (
+            None,
+            Some(RequestCommand::Retry {
+                operation: None,
+                operation_id: Some(id),
+                output,
+            }),
+        ) => managed::retry(
+            runtime,
+            &Context::open(settings, selection)?,
+            &id,
+            output.format,
+        ),
+        (
+            None,
+            Some(RequestCommand::Inspect {
+                operation: None,
+                operation_id: Some(id),
+                remote,
+                output,
+            }),
+        ) => managed::inspect(
+            runtime,
+            &Context::open(settings, selection)?,
+            &id,
+            remote,
+            output.format,
+        ),
+        (None, Some(RequestCommand::Reserve { output })) => {
+            managed::reserve(runtime, &Context::open(settings, selection)?, output.format)
+        }
+        (None, Some(RequestCommand::Pending { output })) => {
+            managed::pending(&Context::open(settings, selection)?, output.format)
+        }
+        (
+            None,
+            Some(RequestCommand::Acknowledge {
+                operation_id,
+                output,
+            }),
+        ) => managed::acknowledge(
+            runtime,
+            &Context::open(settings, selection)?,
+            &operation_id,
+            output.format,
+        ),
+        (
+            None,
+            Some(RequestCommand::Seal {
+                operation_id,
+                output,
+            }),
+        ) => managed::seal(
+            runtime,
+            &Context::open(settings, selection)?,
+            &operation_id,
+            output.format,
+        ),
         (
             None,
             Some(RequestCommand::Status {
@@ -268,12 +477,12 @@ pub(super) fn request(
         ) => {
             let query =
                 focal_client::operations::RequestStatusDocument { epoch, request_id }.build()?;
-            let context = Context::open(settings)?;
+            let context = Context::open(settings, selection)?;
             reconcile::query(runtime, &context, query, output.format)
         }
         (None, Some(RequestCommand::Epoch { epoch, output })) => {
             let query = focal_client::operations::RequestEpochDocument { epoch }.build()?;
-            let context = Context::open(settings)?;
+            let context = Context::open(settings, selection)?;
             reconcile::query(runtime, &context, query, output.format)
         }
         _ => Err(CliError::Input(

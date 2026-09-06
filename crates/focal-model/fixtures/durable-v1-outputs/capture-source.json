@@ -1,0 +1,247 @@
+{
+  "rustc": "rustc 1.94.1 (e408947bf 2026-03-25)\nbinary: rustc\ncommit-hash: e408947bfd200af42db322daf0fadfe7e26d3bd1\ncommit-date: 2026-03-25\nhost: aarch64-apple-darwin\nrelease: 1.94.1\nLLVM version: 21.1.8\n",
+  "source_files": [
+    {
+      "path": "Cargo.lock",
+      "sha256": "1cdc2b87a2e4f473faaf8c2217c479ec8afafdfd4280292241ddba3fa4d66c93"
+    },
+    {
+      "path": "Cargo.toml",
+      "sha256": "8731bfe4f39e8232a783a6a810693bb39976de496fb681ca6f5204131d017565"
+    },
+    {
+      "path": "crates/focal-model/Cargo.toml",
+      "sha256": "7236c62d34212115522cc9025fd11b8ec4fac08456eb96c014d454e95ee205ff"
+    },
+    {
+      "path": "crates/focal-model/src/canonical.rs",
+      "sha256": "1981a68f0146bb6f0ae68c8cf6453fca653b99f668fb3a6902634b6f55fb78fb"
+    },
+    {
+      "path": "crates/focal-model/src/command.rs",
+      "sha256": "8a593b9134ab2255f2333feb544e92f05c4aadcaa5fba65b2b68384fc16b07aa"
+    },
+    {
+      "path": "crates/focal-model/src/digest.rs",
+      "sha256": "fad79b9079fc94b7b2aa8c5a681655fd5ca889aca66ab9573c3401b15e3b2681"
+    },
+    {
+      "path": "crates/focal-model/src/durable_v1/collections.rs",
+      "sha256": "12d7ed725fc3e825f18eee59cfa01dcbb11f45498fcda459b18009c2003c3c1c"
+    },
+    {
+      "path": "crates/focal-model/src/durable_v1/commands.rs",
+      "sha256": "9ae0f1adbf09035735893d5056b47be162b9735b14641ef03443a297f8599d24"
+    },
+    {
+      "path": "crates/focal-model/src/durable_v1/commands_tests.rs",
+      "sha256": "acd65830b56ad84820912a28076036e7af81ac57d15f1a437c877b0cd5bf9e4f"
+    },
+    {
+      "path": "crates/focal-model/src/durable_v1/inputs.rs",
+      "sha256": "53d54e5323941fb3511585b3df37a94dcc0cf08828d70a65899646f6fd102bb1"
+    },
+    {
+      "path": "crates/focal-model/src/durable_v1/inputs_tests.rs",
+      "sha256": "5850f7ebc22378d981e96460eee348b4bbea59ba77b9d7639b266a2b8b444d3d"
+    },
+    {
+      "path": "crates/focal-model/src/durable_v1/leaves.rs",
+      "sha256": "b79223275bc9bbb67717dbae2b1a625e99ece1eb034e2d8d9e59fb368ddf936f"
+    },
+    {
+      "path": "crates/focal-model/src/durable_v1/lifecycle.rs",
+      "sha256": "ba2bf4ac53872c8b3b35a9fda81efd5a3b1922d9ad3a0f8db48699f82acbbda5"
+    },
+    {
+      "path": "crates/focal-model/src/durable_v1/lifecycle_tests.rs",
+      "sha256": "a1e727b8be3aa52e0b977aad16f102c2af56d314115f7ca8954fe5ad2ef13081"
+    },
+    {
+      "path": "crates/focal-model/src/durable_v1/mod.rs",
+      "sha256": "43f7851df8f4a899f194f28e3b3b613b99eaba0380241795c4301d125bc7a848"
+    },
+    {
+      "path": "crates/focal-model/src/durable_v1/objects.rs",
+      "sha256": "2721f1aadab356e56d8e9b155b56437463a353ca8f28979b930d19d17099023c"
+    },
+    {
+      "path": "crates/focal-model/src/durable_v1/objects_tests.rs",
+      "sha256": "40180a761027f0cfd0fe8e4590c9bfe65c77151a9beee32d3479433ad3e89036"
+    },
+    {
+      "path": "crates/focal-model/src/durable_v1/tests.rs",
+      "sha256": "3599db05977b222e3ec81d8167bc8aee8c777b1f2eded6579b22260535e564cb"
+    },
+    {
+      "path": "crates/focal-model/src/durable_v1/vocabulary.rs",
+      "sha256": "65deb37f3efb1d3088ad57ef9a5911b38ade5fdcef83462e917842c187ceec72"
+    },
+    {
+      "path": "crates/focal-model/src/ids.rs",
+      "sha256": "23008e268e85846964926049119aa5548ef997268376f69cc34004220504c3a9"
+    },
+    {
+      "path": "crates/focal-model/src/lib.rs",
+      "sha256": "a630afe87cfab30534356575e10a8c65f8d37ce933fef206d12d80c619e35b07"
+    },
+    {
+      "path": "crates/focal-model/src/lifecycle/acceptance.rs",
+      "sha256": "bf80277319ceedf68a11b3738c0dd2c782db9ee0f2a80c11162ca28497b6704f"
+    },
+    {
+      "path": "crates/focal-model/src/lifecycle/aggregation.rs",
+      "sha256": "d151015fcb335d23819e909f1017e75edc4a307eb832167e1221ff302428d9e8"
+    },
+    {
+      "path": "crates/focal-model/src/lifecycle/aggregation_tests.rs",
+      "sha256": "ede7dd47e153dbcdf9c6e52ca73a957ae6647121e10a71a6fa5a774fde561c06"
+    },
+    {
+      "path": "crates/focal-model/src/lifecycle/audit.rs",
+      "sha256": "6af2705a6496d5900ed85714cca3ec9640d7917c2199c0d7a70e0e21c50ee5a3"
+    },
+    {
+      "path": "crates/focal-model/src/lifecycle/audit_tests.rs",
+      "sha256": "460adcc6f90847720285fdad292c37650aab93e84ef96e371cf9fb7574cc2318"
+    },
+    {
+      "path": "crates/focal-model/src/lifecycle/claim.rs",
+      "sha256": "bc9f70804031b157a148534f31966df191c9cb6ec85c2114aa2c35023b858943"
+    },
+    {
+      "path": "crates/focal-model/src/lifecycle/claim_tests.rs",
+      "sha256": "90abf4dacde8251808391704f4ea7a3480b7b3ce1a84fae45d622cfb568c186b"
+    },
+    {
+      "path": "crates/focal-model/src/lifecycle/evidence.rs",
+      "sha256": "63cb3b8ac7f4d354d7aee04639b5e72468bc9a083beedde775d28e9e53735dca"
+    },
+    {
+      "path": "crates/focal-model/src/lifecycle/evidence_tests.rs",
+      "sha256": "ae10f52fdc5a8bfbba15e0de23151571e857f8bc2ab04e18e588a34acb4a5f9d"
+    },
+    {
+      "path": "crates/focal-model/src/lifecycle/exchange_tests.rs",
+      "sha256": "9c1a64ddc95e2bd618a39527677c810d98dbea139f41f3c2199fffa2b23b4e7d"
+    },
+    {
+      "path": "crates/focal-model/src/lifecycle/graph.rs",
+      "sha256": "852616b72363fac67f631b1551279527f9e822a2e912d91a629f0bf5653396b4"
+    },
+    {
+      "path": "crates/focal-model/src/lifecycle/graph_tests.rs",
+      "sha256": "a0b07a4f660e6ff731fc64822fc1c343df3260688d3c062d544b254f1486b7da"
+    },
+    {
+      "path": "crates/focal-model/src/lifecycle/mod.rs",
+      "sha256": "4e2575031828434d36aecf3d6cf3b802b2722ee8b41ff6f81a95ccdc076284c9"
+    },
+    {
+      "path": "crates/focal-model/src/lifecycle/scope.rs",
+      "sha256": "48c25bce8cc3c8f91186daeab614c147744172cac4b4f96ad71c4c5c1b770d2b"
+    },
+    {
+      "path": "crates/focal-model/src/lifecycle/scope_tests.rs",
+      "sha256": "37d4b15ec8ae57aca692a0d84026f9bf7eaaa44782a70e72e6380b35c4914689"
+    },
+    {
+      "path": "crates/focal-model/src/lifecycle/succession.rs",
+      "sha256": "b2406f5586a8ff48c9a7d292757e1bf08a12d508e35b45cae8873eee738a3484"
+    },
+    {
+      "path": "crates/focal-model/src/lifecycle/succession_tests.rs",
+      "sha256": "eb0decdcfbf14f1775670bb4c2cca7682d8e54bdd84263c3b8d81b746de85809"
+    },
+    {
+      "path": "crates/focal-model/src/lifecycle/validation.rs",
+      "sha256": "78326f55a28154aa501b3d8e059a36c5c404e4a01750a8c75927129c6de051a4"
+    },
+    {
+      "path": "crates/focal-model/src/lifecycle/validation_tests.rs",
+      "sha256": "1cabd20cc79737215510efdc100463c780934f2ff77c3a46b631de9d1d4fe6e2"
+    },
+    {
+      "path": "crates/focal-model/src/managed.rs",
+      "sha256": "0628e723d3ba2e3dfbe169c7b3a18dd89c5e30feafa21fc5a32135df3e667c49"
+    },
+    {
+      "path": "crates/focal-model/src/managed_tests.rs",
+      "sha256": "3860937f0ba09b6ab8abee8e6f577ccf413b1005fbf6b7a57dfc4852b57aa7ae"
+    },
+    {
+      "path": "crates/focal-model/src/objects.rs",
+      "sha256": "b0095aa787d9817c394adc48899f28be32a18d4f85eea60736715f8a8375a597"
+    },
+    {
+      "path": "crates/focal-model/src/reconciliation.rs",
+      "sha256": "862c7b9c1dfa4a4264d8080a23e734c39535175633c0be730623ca485928b2a5"
+    },
+    {
+      "path": "crates/focal-model/src/semantics_v1.rs",
+      "sha256": "bc344626830c0bde2f08ef971713d7d5f06138b3eba74e576b9bb08687b37453"
+    },
+    {
+      "path": "crates/focal-model/src/semantics_v1_tests.rs",
+      "sha256": "fb55d437599051816f582fffa619a59f7d7d49cc2471463bfd52761c6f07866b"
+    },
+    {
+      "path": "crates/focal-model/src/tests.rs",
+      "sha256": "b5adbb8bc08e45dbffefb896bd4fb995ce9d5071a9c7360884a64c2422371fc9"
+    },
+    {
+      "path": "crates/focal-model/src/validation_read.rs",
+      "sha256": "c349bb3a8b419dfd0be733af63dd6eacb751215b6c14bb5afd1ff4924171d890"
+    },
+    {
+      "path": "crates/focal-model/src/vocabulary.rs",
+      "sha256": "a5fb8a2d90a0016a7df14ddc097e577a7259e46fad4bb14b55d7518a5d7b37a0"
+    },
+    {
+      "path": "rust-toolchain.toml",
+      "sha256": "c07cdb6cac85a9e5a7d9b832145d791c04ffb58e8e45859942363f2bffed3ebc"
+    }
+  ],
+  "rlibs": [
+    {
+      "crate": "focal_model",
+      "path": "target/debug/deps/libfocal_model-7810d853602e5c07.rlib",
+      "sha256": "853cde5ed34b7bad434922cc5f88c8e7edcbc47f372a92cd20e590cf307bfe48"
+    },
+    {
+      "crate": "serde",
+      "path": "target/debug/deps/libserde-893d8c76b1ce26e1.rlib",
+      "sha256": "493e22a212181073dbdf3e127495813702d9989958945f2ccb88fb2386f553b4"
+    },
+    {
+      "crate": "postcard",
+      "path": "target/debug/deps/libpostcard-379aea4f900dfe85.rlib",
+      "sha256": "bcabbf11ee14ee82870bcb6f1d0cd38b6e8978db94fc6685ba8a7f342ac10a29"
+    }
+  ],
+  "command": [
+    "rustc",
+    "--edition=2024",
+    "--crate-name",
+    "capture_model_outputs_v1",
+    "crates/focal-model/fixtures/durable-v1-outputs/generator.rs.txt",
+    "-L",
+    "dependency=target/debug/deps",
+    "--extern",
+    "focal_model=target/debug/deps/libfocal_model-7810d853602e5c07.rlib",
+    "--extern",
+    "serde=target/debug/deps/libserde-893d8c76b1ce26e1.rlib",
+    "--extern",
+    "postcard=target/debug/deps/libpostcard-379aea4f900dfe85.rlib",
+    "-o",
+    "/tmp/focal-capture-model-outputs-v1"
+  ],
+  "generator_sha256": "90f73c26025cb6b3a38add4744f8318ed223a762f3cd77a2b307feeeb82d38e8",
+  "run_command": [
+    "/tmp/focal-capture-model-outputs-v1",
+    "crates/focal-model/fixtures/durable-v1-outputs",
+    "crates/focal-core/fixtures/durable-v1-nested"
+  ],
+  "capture_exit": 0,
+  "source_archive_sha256": "880cf2b1cafb380ecc0baa795714d91e79cab595763b5185d36567ba3041916e"
+}

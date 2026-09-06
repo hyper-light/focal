@@ -76,38 +76,29 @@ fn stream(
     file: &mut File,
     mut read: impl FnMut(u64, u32) -> Result<ContentChunk>,
 ) -> Result<()> {
-    let mut offset = 0u64;
-    loop {
-        let chunk = read(offset, PAGE_BYTES)?;
-        let length = u64::try_from(chunk.bytes.len()).map_err(|_| CliError::InvalidResponse)?;
-        let through = offset
-            .checked_add(length)
-            .ok_or(CliError::InvalidResponse)?;
-        if chunk.offset != offset
-            || chunk.bytes.len() > PAGE_BYTES as usize
-            || through > content.length
-            || chunk.eof != (through == content.length)
-            || (chunk.bytes.is_empty() && !chunk.eof)
-        {
-            return Err(CliError::InvalidResponse);
-        }
-        // The authenticated server verifies each manifest/chunk. ContentRef.root
-        // addresses the manifest tree, and is not a digest of these raw bytes.
-        file.write_all(&chunk.bytes)?;
-        if chunk.eof {
-            return Ok(());
-        }
-        offset = through;
+    let mut download = focal_client::artifact_transfer::PayloadDownload::new(
+        content.clone(),
+        content.length,
+        PAGE_BYTES,
+    )
+    .map_err(|_| CliError::InvalidResponse)?;
+    while !download.complete() {
+        let chunk = read(download.offset(), PAGE_BYTES)?;
+        download.accept(&chunk, file).map_err(|error| match error {
+            focal_client::artifact_transfer::TransferError::Io(error) => CliError::Io(error),
+            _ => CliError::InvalidResponse,
+        })?;
     }
+    Ok(())
 }
 
-struct Temporary {
-    file: File,
+pub(super) struct Temporary {
+    pub(super) file: File,
     path: Option<PathBuf>,
     parent: File,
 }
 impl Temporary {
-    fn create(output: &Path) -> Result<Self> {
+    pub(super) fn create(output: &Path) -> Result<Self> {
         if output.file_name().is_none() {
             return Err(CliError::Input("output must name a new file".into()));
         }
@@ -150,7 +141,7 @@ impl Temporary {
         }
         Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists).into())
     }
-    fn install(mut self, output: &Path) -> Result<()> {
+    pub(super) fn install(mut self, output: &Path) -> Result<()> {
         self.file.sync_all()?;
         let path = self.path.as_ref().ok_or(CliError::InvalidResponse)?;
         // Same-directory publication never replaces an existing output. Once

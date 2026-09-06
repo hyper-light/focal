@@ -19,9 +19,22 @@ pub enum ResultKind {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum InputKind {
+    MonitorRegister,
+    MonitorGet,
+    Summary,
+    ClaimGet,
+    ClaimWait,
+    Validator,
+    Traversal,
     Claim,
+    ClaimBatch,
     Testament,
     Artifact,
+    ArtifactRegister,
+    TestamentReceive,
+    IncrementValidation,
+    ValidationVerdict,
+    Supersede,
     ClaimId,
     Progress,
     Cancel,
@@ -77,6 +90,156 @@ macro_rules! descriptor {
         };
     };
 }
+descriptor!(
+    CLAIM_WAIT,
+    "claim.wait",
+    ClaimWait,
+    Some(ObjectKind::Claim),
+    Read,
+    false,
+    false,
+    "Observe fresh claim state until satisfied, terminal or released for at most 30 seconds. Pending is an observer deadline; Unmet records terminal non-satisfaction. No monitor, timer, work or request journal is created."
+);
+descriptor!(
+    MONITOR_GET,
+    "monitor.get",
+    MonitorGet,
+    None,
+    Read,
+    false,
+    false,
+    "Read an exact committed monitor at a fresh quorum prefix. Missing, pending and released are distinct facts; release does not establish a particular timeout or success reason."
+);
+descriptor!(
+    MONITOR_REGISTER,
+    "monitor.register",
+    MonitorRegister,
+    None,
+    Mutation,
+    true,
+    false,
+    "Register bounded durable wait predicates under an active claim you issued, with an explicit timer, generation and deadline. This records a monitor; it does not launch work or turn a client timeout into a committed timer event."
+);
+descriptor!(
+    LEDGER_SUMMARY,
+    "ledger.summary",
+    Summary,
+    None,
+    Read,
+    false,
+    false,
+    "Read scalar committed counts for claims, testaments, artifacts, validations, evidence sets and validation runs after a fresh quorum barrier in the selected ledger. No graph download, historical lease or global totals."
+);
+descriptor!(
+    LEDGER_TRAVERSE,
+    "ledger.traverse",
+    Traversal,
+    None,
+    Read,
+    false,
+    false,
+    "Read bounded breadth-first graph pages at one immutable prefix. Preserve all query fields with the opaque cursor; cumulative truncation is explicit and never a complete graph."
+);
+descriptor!(
+    VALIDATOR_LIST,
+    "validator.list",
+    Validator,
+    None,
+    List,
+    false,
+    false,
+    "List recorded external handler contracts grouped by immutable validation requirement. All filters are optional; preserve filters and limits with cursors. Focal does not install or execute these handlers."
+);
+descriptor!(
+    VALIDATOR_GET,
+    "validator.get",
+    Validator,
+    None,
+    List,
+    false,
+    false,
+    "Inspect a pinned handler ID/version and the requirements that reference it. Returns a bounded binding page, not an installed implementation or an execution grant."
+);
+descriptor!(
+    CLAIM_SUBMIT_BATCH,
+    "claim.submit_batch",
+    ClaimBatch,
+    None,
+    Mutation,
+    true,
+    false,
+    "Generate 1..64 immutable claims atomically under one saved operation identity. Cross-claim dependencies are permitted; posting is a separate operation."
+);
+descriptor!(
+    ARTIFACT_REGISTER,
+    "artifact.register",
+    ArtifactRegister,
+    None,
+    Mutation,
+    true,
+    false,
+    "Register independently generated evidence under the authenticated producer, including external validation reports. Does not attach it to a work testament."
+);
+descriptor!(
+    TESTAMENT_RECEIVE,
+    "testament.receive",
+    TestamentReceive,
+    None,
+    Mutation,
+    true,
+    false,
+    "Claim issuer records receipt of the exact current closing testament. Delivery validation is distinct from quality acceptance."
+);
+descriptor!(
+    VALIDATION_BEGIN,
+    "validation.begin",
+    ClaimId,
+    None,
+    Mutation,
+    true,
+    false,
+    "Claim issuer begins whole-work validation of the acknowledged testament. This records runs; participants invoke their own tools."
+);
+descriptor!(
+    VALIDATION_BEGIN_INCREMENT,
+    "validation.begin_increment",
+    IncrementValidation,
+    None,
+    Mutation,
+    true,
+    false,
+    "Claim issuer begins a pinned incremental check against an attached artifact and the current evidence manifest. Participants invoke the validator externally."
+);
+descriptor!(
+    VALIDATION_COMPLETE,
+    "validation.complete",
+    ClaimId,
+    None,
+    Mutation,
+    true,
+    false,
+    "Claim issuer requests deterministic aggregation of committed whole-work results. It cannot supply a desired outcome."
+);
+descriptor!(
+    VALIDATION_SUBMIT,
+    "validation.submit",
+    ValidationVerdict,
+    None,
+    Mutation,
+    true,
+    false,
+    "Designated participant submits its actual external verdict with pinned run, attempt, handler, manifest, receipt and evidence. Focal does not execute the validator."
+);
+descriptor!(
+    CLAIM_SUPERSEDE,
+    "claim.supersede",
+    Supersede,
+    None,
+    Mutation,
+    true,
+    true,
+    "Generate a compatible immutable successor, preserving prior proof and explicitly linking the predecessor."
+);
 descriptor!(
     CLAIM_SUBMIT,
     "claim.submit",
@@ -160,12 +323,12 @@ descriptor!(
 descriptor!(
     CLAIM_GET,
     "claim.get",
-    Get,
+    ClaimGet,
     Some(ObjectKind::Claim),
     Read,
     false,
     false,
-    "Read an exact claim ID at an authoritative or previously pinned prefix."
+    "Read one exact claim ID, or prove one unique match for conjunctive claim filters at a fresh fixed prefix. Ambiguous, incomplete and absent results are distinct."
 );
 descriptor!(
     TESTAMENT_GET,
@@ -186,6 +349,16 @@ descriptor!(
     false,
     false,
     "Read an exact artifact descriptor and payload reference. This operation does not fetch large bytes."
+);
+descriptor!(
+    VALIDATION_CONTEXT,
+    "validation.context",
+    Get,
+    Some(ObjectKind::Validation),
+    Read,
+    false,
+    false,
+    "Read a validation, its claim, current closing testament and a page of recorded runs at one fixed prefix. This grants no execution lease and does not infer an artifact target."
 );
 descriptor!(
     VALIDATION_GET,
@@ -262,6 +435,7 @@ pub fn descriptors() -> &'static [OperationDescriptor] {
     &[
         ARTIFACT_GET,
         ARTIFACT_LIST,
+        ARTIFACT_REGISTER,
         ARTIFACT_SUBMIT,
         CLAIM_CANCEL,
         CLAIM_GET,
@@ -269,15 +443,30 @@ pub fn descriptors() -> &'static [OperationDescriptor] {
         CLAIM_POST,
         CLAIM_PROGRESS,
         CLAIM_SUBMIT,
+        CLAIM_SUBMIT_BATCH,
+        CLAIM_SUPERSEDE,
+        CLAIM_WAIT,
         EVIDENCE_BEGIN,
+        LEDGER_SUMMARY,
+        LEDGER_TRAVERSE,
+        MONITOR_GET,
+        MONITOR_REGISTER,
         RECEIPT_ACQUIRE,
         REQUEST_EPOCH,
         REQUEST_STATUS,
         TESTAMENT_GET,
         TESTAMENT_LIST,
+        TESTAMENT_RECEIVE,
         TESTAMENT_SUBMIT,
+        VALIDATION_BEGIN,
+        VALIDATION_BEGIN_INCREMENT,
+        VALIDATION_COMPLETE,
+        VALIDATION_CONTEXT,
         VALIDATION_GET,
         VALIDATION_LIST,
+        VALIDATION_SUBMIT,
+        VALIDATOR_GET,
+        VALIDATOR_LIST,
     ]
 }
 pub fn find(name: &str) -> Option<&'static OperationDescriptor> {
@@ -290,18 +479,34 @@ pub fn parse_json(name: &str, bytes: &[u8]) -> Result<AuthoredOperation, InputEr
         };
     }
     match name {
+        "validator.list" => document!(ValidatorList),
+        "validator.get" => document!(ValidatorGet),
+        "ledger.summary" => document!(LedgerSummary),
+        "monitor.register" => document!(MonitorRegister),
+        "monitor.get" => document!(MonitorGet),
+        "ledger.traverse" => document!(LedgerTraverse),
         "claim.submit" => document!(ClaimSubmit),
+        "claim.submit_batch" => document!(ClaimSubmitBatch),
         "testament.submit" => document!(TestamentSubmit),
         "artifact.submit" => document!(ArtifactSubmit),
+        "artifact.register" => document!(ArtifactRegister),
+        "testament.receive" => document!(TestamentReceive),
+        "validation.begin" => document!(ValidationBegin),
+        "validation.begin_increment" => document!(ValidationBeginIncrement),
+        "validation.complete" => document!(ValidationComplete),
+        "validation.submit" => document!(ValidationSubmit),
+        "claim.supersede" => document!(ClaimSupersede),
         "claim.post" => document!(ClaimPost),
         "claim.progress" => document!(ClaimProgress),
         "claim.cancel" => document!(ClaimCancel),
         "receipt.acquire" => document!(ReceiptAcquire),
         "evidence.begin" => document!(EvidenceBegin),
         "claim.get" => document!(ClaimGet),
+        "claim.wait" => document!(ClaimWait),
         "testament.get" => document!(TestamentGet),
         "artifact.get" => document!(ArtifactGet),
         "validation.get" => document!(ValidationGet),
+        "validation.context" => document!(ValidationContext),
         "claim.list" => document!(ClaimList),
         "testament.list" => document!(TestamentList),
         "artifact.list" => document!(ArtifactList),
@@ -328,11 +533,68 @@ pub struct ApplicationResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OperationOutput {
-    Mutation { reply: MutationReply },
-    Read { page: ReadPage },
-    List { page: ListPage },
-    Reconcile { reply: ReconcileReply },
-    Error { code: String, detail: String },
+    ClaimWait {
+        result: crate::claim_wait::ClaimWaitResult,
+    },
+    Monitor {
+        page: focal_wire::MonitorPage,
+    },
+    Summary {
+        summary: focal_wire::LedgerSummary,
+    },
+    Watch {
+        status: crate::watch::WatchStatus,
+        delivery: Option<Box<crate::watch::WatchDelivery>>,
+    },
+    Watches {
+        names: Vec<String>,
+    },
+    Traversal {
+        page: focal_wire::TraversalPage,
+    },
+    Mutation {
+        reply: MutationReply,
+    },
+    Read {
+        page: ReadPage,
+    },
+    List {
+        page: ListPage,
+    },
+    Reconcile {
+        reply: ReconcileReply,
+    },
+    Error {
+        code: String,
+        detail: String,
+    },
+    Managed {
+        receipt: focal_model::ManagedReceipt,
+    },
+    ManagedRequest {
+        state: String,
+    },
+    ManagedRequests {
+        operation_ids: Vec<String>,
+    },
+    ManagedReconcile {
+        reply: focal_wire::RequestStreamReadReply,
+    },
+    Administration {
+        result: crate::admin::AdminResult,
+    },
+    ValidationContext {
+        context: Box<crate::validation_context::ValidationContext>,
+    },
+    Upload {
+        progress: crate::artifact_transfer::UploadProgress,
+    },
+    ArtifactPayload {
+        artifact: focal_model::ArtifactId,
+        token: focal_wire::ReadToken,
+        content_hash: focal_model::ContentHash,
+        chunk: focal_wire::ContentChunk,
+    },
 }
 impl ApplicationResult {
     pub fn is_error(&self) -> bool {

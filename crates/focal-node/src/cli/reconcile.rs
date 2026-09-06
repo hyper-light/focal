@@ -58,12 +58,14 @@ struct Output<'a> {
     reply: &'a ReconcileReply,
 }
 fn render(reply: &ReconcileReply, format: OutputFormat) -> Result<()> {
-    if matches!(format, OutputFormat::Json) {
-        return super::super::print_json(&Output {
-            schema_version: 1,
-            reply,
-        })
-        .map_err(CliError::Other);
+    if matches!(format, OutputFormat::Json | OutputFormat::Yaml) {
+        return output::structured(
+            &Output {
+                schema_version: 1,
+                reply,
+            },
+            format,
+        );
     }
     let mut out = std::io::stdout().lock();
     writeln!(out, "PRINCIPAL\t{}", reply.page.principal)?;

@@ -18,6 +18,8 @@ use std::{
 mod managed_protocol_tests;
 #[path = "managed_tests.rs"]
 mod managed_tests;
+#[path = "peer_mutations_tests.rs"]
+mod peer_mutations_tests;
 
 fn ledger() -> LedgerId {
     LedgerId {

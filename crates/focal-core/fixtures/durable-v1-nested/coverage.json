@@ -1,0 +1,172 @@
+{
+  "kind": "Synthetic serialization corpus; not an admitted ledger history or service-ready snapshot.",
+  "counts": {
+    "claims": 20,
+    "validations": 42,
+    "artifacts": 5,
+    "testaments": 24,
+    "evidence_sets": 4,
+    "validation_runs": 15,
+    "monitors": 3,
+    "identities": 91,
+    "epoch_windows": 3,
+    "receipts": 14
+  },
+  "fixed_code_sets": {
+    "ObjectKind": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "ClaimStatus": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20
+    ],
+    "ActionType": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10
+    ],
+    "ScopeKind": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "RelationKind": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15
+    ],
+    "ValidationKind": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "ValidationPhase": [
+      1,
+      2,
+      3
+    ],
+    "ValidationMode": [
+      1,
+      2
+    ],
+    "VerdictValue": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "Confidence": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "OutcomeKind": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "ContentClass": [
+      1,
+      2,
+      3
+    ]
+  },
+  "serde_ordinal_sets": {
+    "RelationTarget": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "ArtifactPayload": [
+      0,
+      1
+    ],
+    "WaitPredicate": [
+      0,
+      1,
+      2
+    ],
+    "CommandResult": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11
+    ]
+  },
+  "shape_coverage": [
+    "All four StoredObject families with original content/hash/lifecycle field order",
+    "All Option variants and bool values in reachable nested models",
+    "Empty and nonempty maps, sets, histories, handlers, manifests, attempts and proof vectors",
+    "Inline empty and4096-byte payloads; three ContentRef classes, including u64::MAX length without payload allocation",
+    "Unsorted authored manifest order is preserved as a Vec",
+    "Nonuniform fixed-width hashes and high-bit16-byte identities",
+    "u64::MAX and u32::MAX counters, zero historical counters, varint boundaries127/128",
+    "One deliberately inconsistent stored artifact hash that must not be recomputed on decode",
+    "Receipt validation rows with quality/handlers/evidence contracts that present-day admission rejects"
+  ],
+  "excluded": [
+    "DomainOutcome/ErrorCode/Disposition and Delta/LifecycleAction/EffectIntent are not in this Core checkpoint graph",
+    "Prepared commands/AuthorityContext/Cause and managed stream registry receipts are outside this nested checkpoint corpus",
+    "No claim of valid causal graph, actual custody, admitted workflow, V2 lifecycle semantics or all malformed binary encodings"
+  ]
+}

@@ -1,0 +1,48 @@
+{
+  "cluster": "c36f7f119038c25f490fa176fa424edf",
+  "node": 1424377945831763734,
+  "stream": 0,
+  "generation": 2,
+  "segment": 0,
+  "byte": 6547,
+  "sequence": 3,
+  "checksum": 1496646179,
+  "records": [
+    {
+      "group": "43a70409f2c90462d29884944e84f33d",
+      "kind": 4,
+      "index": 0,
+      "term": 0,
+      "payload_bytes": 64,
+      "payload_sha256": "a3ef31e553c920c765d27861bdde058d3331e0e21d1f7f1286cc7938c4bfa0cf",
+      "record_sha256": "955596a8df0bd045e80c90c3cf6dd184d4625e2af84f6aff500806e33f8d7dff",
+      "frame_offset": 72,
+      "frame_sequence": 1,
+      "payload_prefix_hex": "96decff99e869ae2"
+    },
+    {
+      "group": "43a70409f2c90462d29884944e84f33d",
+      "kind": 3,
+      "index": 14,
+      "term": 1,
+      "payload_bytes": 6276,
+      "payload_sha256": "c3f5fac21b8cd81eeaf5c2d2215f58141ddabfe394405cc710a50d920193d998",
+      "record_sha256": "ff95c6b2595ed91652f9bf4eb38a0e296a63c87ac5d663d8a37b1f61d41dde85",
+      "frame_offset": 176,
+      "frame_sequence": 2,
+      "payload_prefix_hex": "0aee30464f43414c"
+    },
+    {
+      "group": "43a70409f2c90462d29884944e84f33d",
+      "kind": 1,
+      "index": 14,
+      "term": 1,
+      "payload_bytes": 14,
+      "payload_sha256": "b2ca8c22e9761b56971858e16b63a29be12cbde60a56fb99298eb44199afdb3f",
+      "record_sha256": "4f6b83de2b2dac76c7e69da316533f653230d77e62f62f890004346c9416673f",
+      "frame_offset": 6493,
+      "frame_sequence": 3,
+      "payload_prefix_hex": "08011096decff99e"
+    }
+  ]
+}

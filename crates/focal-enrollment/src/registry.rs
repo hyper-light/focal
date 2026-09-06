@@ -5,6 +5,9 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+#[path = "registry_admin.rs"]
+mod admin;
+pub use admin::{EnrolledCredentialStatus, InvitationStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnrollmentLimits {
@@ -962,7 +965,7 @@ fn record_charge(record: &InviteMetadata) -> Result<usize, EnrollmentError> {
 fn token_hash(secret: &[u8]) -> Fingerprint {
     hash("focal.enrollment.invitation-secret.v1", secret)
 }
-fn assigned(
+pub(crate) fn assigned(
     cluster: ClusterId,
     role: EnrollmentRole,
     next_node: u64,

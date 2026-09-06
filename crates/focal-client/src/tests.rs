@@ -49,6 +49,95 @@ fn policy() -> RetryPolicy {
 }
 
 #[tokio::test]
+async fn authentication_errors_are_distinct_but_cannot_erase_an_unknown_write() {
+    struct Authentication {
+        first_unknown: std::sync::atomic::AtomicBool,
+    }
+    impl ClientTransport for Authentication {
+        fn request<'a>(
+            &'a self,
+            _: Option<&'a RouteHint>,
+            _: &'a RequestEnvelope,
+        ) -> TransportFuture<'a> {
+            Box::pin(async {
+                if self
+                    .first_unknown
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
+                    Err(WireError::Connection)
+                } else {
+                    Err(WireError::Authentication)
+                }
+            })
+        }
+    }
+    for first_unknown in [false, true] {
+        let client = Client::new(
+            Authentication {
+                first_unknown: std::sync::atomic::AtomicBool::new(first_unknown),
+            },
+            policy(),
+            WireLimits::default(),
+            1,
+        )
+        .unwrap();
+        let original = request();
+        let error = client.request(original.clone()).await.unwrap_err();
+        if first_unknown {
+            let ClientError::OutcomeUnknown { request } = error else {
+                panic!("unknown write lost its identity")
+            };
+            assert_eq!(*request, original);
+        } else {
+            assert!(matches!(error, ClientError::Unauthenticated));
+            assert_eq!(failure::client(&error).code, "unauthenticated");
+        }
+    }
+    assert_eq!(
+        failure::access(&AccessError::Unauthorized).code,
+        "unauthorized"
+    );
+}
+
+#[test]
+fn missing_time_driver_and_panicking_transport_do_not_unwind_or_replace_write_identity() {
+    struct Panics;
+    impl ClientTransport for Panics {
+        fn request<'a>(
+            &'a self,
+            _: Option<&'a RouteHint>,
+            _: &'a RequestEnvelope,
+        ) -> TransportFuture<'a> {
+            Box::pin(async { panic!("injected transport dependency failure") })
+        }
+    }
+    for timers in [false, true] {
+        let mut builder = tokio::runtime::Builder::new_current_thread();
+        if timers {
+            builder.enable_all();
+        }
+        let runtime = builder.build().unwrap();
+        let client = Client::new(Panics, policy(), WireLimits::default(), 1).unwrap();
+        let original = request();
+        let result = runtime.block_on(client.request(original.clone()));
+        let Err(ClientError::OutcomeUnknown { request: retained }) = result else {
+            panic!("write outcome must remain unknown")
+        };
+        assert_eq!(*retained, original);
+        let mut read = original;
+        read.operation = Operation::Read(ReadRequest {
+            consistency: ReadConsistency::Linearizable,
+            query: ReadQuery::Objects(vec![]),
+            max_items: 1,
+        });
+        assert!(matches!(
+            runtime.block_on(client.request(read)),
+            Err(ClientError::Transport)
+        ));
+    }
+}
+
+#[tokio::test]
 async fn embedded_transport_checks_managed_syntax_capability_before_dispatch() {
     struct Legacy;
     impl RequestHandler for Legacy {
@@ -380,3 +469,6 @@ fn unrepresentable_retry_deadlines_are_rejected_before_scheduling() {
         std::task::Poll::Ready(Err(ClientError::Transport))
     ));
 }
+
+#[path = "retry_uncertainty_tests.rs"]
+mod retry_uncertainty;

@@ -1,0 +1,74 @@
+{
+  "time": "2026-09-06T16:05:43.499578+00:00",
+  "old_binary": "/private/tmp/focal-before-execution-v1/focal",
+  "old_sha256": "da54f8b8be83766555f72397ecf3a8a1bfae970995fa388b6285296e1260c4d4",
+  "demo_returncode": 0,
+  "identity_returncode": 0,
+  "baseline_files": [
+    {
+      "path": "IDENTITY",
+      "bytes": 162,
+      "sha256": "edab56adf47cfd3a2eeec98950c3fa7bf6c036ae1472288e282f0d210a366a1e"
+    },
+    {
+      "path": "IDENTITY.initialized",
+      "bytes": 32,
+      "sha256": "a44abfa005671ab7990904b9a3ab067c8a576c78a8684543e930e097fea984a7"
+    },
+    {
+      "path": "LOCK",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "POLICY",
+      "bytes": 4,
+      "sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+    },
+    {
+      "path": "POLICY.initialized",
+      "bytes": 27,
+      "sha256": "b032750e8b0aa615fb313d789c42bd2365ba7a37c09d2c4a0a8317058ee043bc"
+    },
+    {
+      "path": "content/LOCK",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "content/objects/f9385765332540f1d7645d0015f93771/65ce001e9f400caf6abdc38ec30bd9ea2ca95401ee22778e0d1a0cb9c88ab9ad.manifest",
+      "bytes": 111,
+      "sha256": "da300aa3f38d7a7ba0610d761d7669dd939647d8fc8d5e19afca2595787e6729"
+    },
+    {
+      "path": "content/objects/f9385765332540f1d7645d0015f93771/7ca8ac78a2179f4a9a04c9ff19ede02d71817abcad37496497d54083f9141a24.chunk",
+      "bytes": 35,
+      "sha256": "23ca25e0994296a9dca244c72c4429e0f02b485fe36c5ad6ff359805bff6ca21"
+    },
+    {
+      "path": "content/staging/fb8117f07f60b3eb18ffebf2625a01e7.meta",
+      "bytes": 56,
+      "sha256": "b671e4f7185cba3157db4328bfa3914a22b26a17c28a718fbd65f8fafbe2c806"
+    },
+    {
+      "path": "wal/CURRENT",
+      "bytes": 49,
+      "sha256": "32ffcfe8ecc1b6b84fe7999e2a24ff85b22760e00357ebf46d4d7753bf15a360"
+    },
+    {
+      "path": "wal/INITIALIZED",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "wal/LOCK",
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "wal/wal-00000000000000000002-00000000000000000000.seg",
+      "bytes": 6547,
+      "sha256": "454aa8b97ae7738618f7a87de11a0b6c2b3e21c00d6f8a5f66d8c55ebe16e863"
+    }
+  ]
+}

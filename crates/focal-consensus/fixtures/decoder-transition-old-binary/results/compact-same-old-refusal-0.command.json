@@ -1,0 +1,11 @@
+{
+  "command": [
+    "/private/tmp/focal-before-execution-v1/focal",
+    "--data-dir",
+    "/private/tmp/focal-refusal-results-20260906a/compact-same",
+    "demo"
+  ],
+  "returncode": 1,
+  "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "stderr_sha256": "6eb8d9178e310269cce8535e97196ff0930e362f787bef6d438c626ca61ca4c2"
+}

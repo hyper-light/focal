@@ -1,7 +1,7 @@
 use super::{CliError, Result, args::OutputFormat};
 use focal_client::pending::{OperationJournal, OperationStage};
 use focal_model::*;
-use focal_wire::{ListPage, ReadObject, ReadToken};
+use focal_wire::{ListPage, ReadObject, ReadToken, TraversalPage, TraversalStop};
 use serde::Serialize;
 use std::{io::Write, os::unix::ffi::OsStrExt};
 
@@ -26,8 +26,32 @@ pub(super) fn hex(bytes: &[u8]) -> String {
     }
     result
 }
-fn json(value: &impl Serialize) -> Result<()> {
-    super::super::print_json(value).map_err(CliError::Other)
+pub(super) fn structured(value: &impl Serialize, format: OutputFormat) -> Result<()> {
+    let mut output = std::io::stdout().lock();
+    structured_to(&mut output, value, format)?;
+    output.flush()?;
+    Ok(())
+}
+/// Serialize directly to the bounded page's sink. No intermediate JSON tree or
+/// second whole-result string is required for YAML output.
+pub(super) fn structured_to(
+    mut output: impl Write,
+    value: &impl Serialize,
+    format: OutputFormat,
+) -> Result<()> {
+    match format {
+        OutputFormat::Json => serde_json::to_writer_pretty(&mut output, value)
+            .map_err(|error| CliError::Other(Box::new(error)))?,
+        OutputFormat::Yaml => serde_saphyr::to_io_writer(&mut output, value)
+            .map_err(|error| CliError::Other(Box::new(error)))?,
+        OutputFormat::Table => {
+            return Err(CliError::Input(
+                "structured output requires json or yaml".into(),
+            ));
+        }
+    }
+    writeln!(output)?;
+    Ok(())
 }
 #[derive(Serialize)]
 struct UnconfirmedOutput<'a> {
@@ -45,16 +69,19 @@ pub(super) fn unconfirmed(
     format: OutputFormat,
 ) -> Result<()> {
     match format {
-        OutputFormat::Json => json(&UnconfirmedOutput {
-            schema_version: 1,
-            condition,
-            operation: journal.path().to_str(),
-            operation_path_bytes: journal.path().as_os_str().as_bytes(),
-            request: journal
-                .next_request()?
-                .map(|request| request.request_id.to_string()),
-            result: reply,
-        }),
+        OutputFormat::Json | OutputFormat::Yaml => structured(
+            &UnconfirmedOutput {
+                schema_version: 1,
+                condition,
+                operation: journal.path().to_str(),
+                operation_path_bytes: journal.path().as_os_str().as_bytes(),
+                request: journal
+                    .next_request()?
+                    .map(|request| request.request_id.to_string()),
+                result: reply,
+            },
+            format,
+        ),
         OutputFormat::Table => {
             let mut out = std::io::stdout().lock();
             writeln!(out, "CONDITION\t{condition}")?;
@@ -67,28 +94,25 @@ pub(super) fn unconfirmed(
     }
 }
 pub(super) fn journal(journal: &OperationJournal, format: OutputFormat) -> Result<()> {
-    let result = journal.receipt().map(|receipt| match &receipt.outcome {
-        CommandResult::Generated(ids) | CommandResult::Existing(ids) => serde_json::json!({"claims":ids.iter().map(ToString::to_string).collect::<Vec<_>>()}),
-        CommandResult::Claim { claim,status } => serde_json::json!({"claim":claim.to_string(),"status":status}),
-        CommandResult::Receipt { claim,fence } => serde_json::json!({"claim":claim.to_string(),"receipt":fence.receipt.to_string(),"receipt_epoch":fence.epoch}),
-        CommandResult::EvidenceSet(id) => serde_json::json!({"evidence_set":id.to_string()}),
-        CommandResult::Artifact(reference) => serde_json::json!({"artifact":reference.id.to_string(),"hash":reference.hash.to_string()}),
-        CommandResult::Testament(id) => serde_json::json!({"testament":id.to_string()}),
-        other => serde_json::json!({"outcome":other}),
-    });
+    let result = journal
+        .receipt()
+        .map(|receipt| command_result(&receipt.outcome));
     match format {
-        OutputFormat::Json => json(&JournalOutput {
-            schema_version: 1,
-            operation: journal.path().to_str(),
-            operation_path_bytes: journal.path().as_os_str().as_bytes(),
-            stage: journal.stage(),
-            result,
-            receipt: journal.receipt(),
-            epoch_receipt: journal.epoch_receipt(),
-            pending_request: journal
-                .next_request()?
-                .map(|request| request.request_id.to_string()),
-        }),
+        OutputFormat::Json | OutputFormat::Yaml => structured(
+            &JournalOutput {
+                schema_version: 1,
+                operation: journal.path().to_str(),
+                operation_path_bytes: journal.path().as_os_str().as_bytes(),
+                stage: journal.stage(),
+                result,
+                receipt: journal.receipt(),
+                epoch_receipt: journal.epoch_receipt(),
+                pending_request: journal
+                    .next_request()?
+                    .map(|request| request.request_id.to_string()),
+            },
+            format,
+        ),
         OutputFormat::Table => {
             let mut out = std::io::stdout().lock();
             writeln!(out, "OPERATION\t{:?}", journal.path())?;
@@ -102,6 +126,26 @@ pub(super) fn journal(journal: &OperationJournal, format: OutputFormat) -> Resul
             }
             Ok(())
         }
+    }
+}
+pub(super) fn command_result(outcome: &CommandResult) -> serde_json::Value {
+    match outcome {
+        CommandResult::Generated(ids) | CommandResult::Existing(ids) => {
+            serde_json::json!({"claims":ids.iter().map(ToString::to_string).collect::<Vec<_>>()})
+        }
+        CommandResult::Claim { claim, status } => {
+            serde_json::json!({"claim":claim.to_string(),"status":status})
+        }
+        CommandResult::Receipt { claim, fence } => {
+            serde_json::json!({"claim":claim.to_string(),"receipt":fence.receipt.to_string(),"receipt_epoch":fence.epoch})
+        }
+        CommandResult::Monitor(id) => serde_json::json!({"monitor":id.to_string()}),
+        CommandResult::EvidenceSet(id) => serde_json::json!({"evidence_set":id.to_string()}),
+        CommandResult::Artifact(reference) => {
+            serde_json::json!({"artifact":reference.id.to_string(),"hash":reference.hash.to_string()})
+        }
+        CommandResult::Testament(id) => serde_json::json!({"testament":id.to_string()}),
+        other => serde_json::json!({"outcome":other}),
     }
 }
 pub(super) fn key(object: &ReadObject) -> (ObjectKind, ObjectId) {
@@ -188,12 +232,15 @@ pub(super) fn object(token: ReadToken, object: &ReadObject, format: OutputFormat
         _ => None,
     };
     match format {
-        OutputFormat::Json => json(&GetOutput {
-            schema_version: 1,
-            token,
-            result: document(object),
-            cursor,
-        }),
+        OutputFormat::Json | OutputFormat::Yaml => structured(
+            &GetOutput {
+                schema_version: 1,
+                token,
+                result: document(object),
+                cursor,
+            },
+            format,
+        ),
         OutputFormat::Table => {
             let mut out = std::io::stdout().lock();
             writeln!(out, "KIND\tID\tSTATE/HASH\tDESCRIPTION")?;
@@ -228,16 +275,142 @@ pub(super) fn object(token: ReadToken, object: &ReadObject, format: OutputFormat
         }
     }
 }
+pub(super) fn validation_context(
+    context: &focal_client::validation_context::ValidationContext,
+    format: OutputFormat,
+) -> Result<()> {
+    let cursor = context
+        .next
+        .map(|after| super::reads::validation_cursor(context.token, context.validation_id, after))
+        .transpose()?;
+    match format {
+        OutputFormat::Json | OutputFormat::Yaml => {
+            #[derive(Serialize)]
+            struct ContextOutput<'a> {
+                schema_version: u16,
+                context: &'a focal_client::validation_context::ValidationContext,
+                cursor: Option<String>,
+            }
+            structured(
+                &ContextOutput {
+                    schema_version: 1,
+                    context,
+                    cursor,
+                },
+                format,
+            )
+        }
+        OutputFormat::Table => {
+            let mut out = std::io::stdout().lock();
+            let requirement = context.validation.content();
+            writeln!(out, "VALIDATION\t{}", context.validation_id)?;
+            writeln!(out, "DESCRIPTION\t{}", authored(&requirement.description))?;
+            writeln!(
+                out,
+                "REQUIREMENT\t{:?}/{:?}/{:?}",
+                requirement.kind, requirement.phase, requirement.mode
+            )?;
+            writeln!(out, "EVALUATOR\t{}", requirement.evaluator)?;
+            if let Some(bar) = &requirement.quality_bar {
+                writeln!(out, "QUALITY BAR\t{}", authored(bar))?;
+            }
+            for handler in &requirement.handlers {
+                writeln!(
+                    out,
+                    "HANDLER\t{}\tversion={}\tagentic={}",
+                    handler.id, handler.version, handler.agentic
+                )?;
+            }
+            writeln!(
+                out,
+                "CLAIM\t{}\t{:?}\t{}",
+                requirement.claim,
+                context.claim.lifecycle().status,
+                authored(&context.claim.content().description)
+            )?;
+            if let Some(receipt) = &context.claim.lifecycle().receipt {
+                writeln!(
+                    out,
+                    "CLAIM RECEIPT\t{}\tepoch={}\tholder={}",
+                    receipt.fence.receipt, receipt.fence.epoch, receipt.holder
+                )?;
+            }
+            match &context.testament {
+                Some(testament) => {
+                    writeln!(
+                        out,
+                        "CURRENT TESTAMENT\t{}\toutcome={:?}\t{}",
+                        testament.id,
+                        testament.value.content().outcome,
+                        authored(&testament.value.content().summary)
+                    )?;
+                    writeln!(
+                        out,
+                        "TESTAMENT GENERATED\tsequence={}",
+                        testament.value.lifecycle().created.0
+                    )?;
+                    let receipt = testament.value.content().receipt;
+                    writeln!(
+                        out,
+                        "TESTAMENT RECEIPT\t{}\tepoch={}",
+                        receipt.receipt, receipt.epoch
+                    )?;
+                    match testament.value.lifecycle().acknowledged {
+                        Some(sequence) => {
+                            writeln!(out, "TESTAMENT ACKNOWLEDGED\tsequence={}", sequence.0)?
+                        }
+                        None => writeln!(out, "TESTAMENT ACKNOWLEDGED\tnot recorded")?,
+                    }
+                    for artifact in &testament.value.content().artifacts {
+                        writeln!(out, "MANIFEST ARTIFACT\t{}\t{}", artifact.id, artifact.hash)?;
+                    }
+                }
+                None => writeln!(out, "CURRENT TESTAMENT\tnone")?,
+            }
+            writeln!(
+                out,
+                "RECORDED RESULTS\t{} records on this page; may refer to earlier evidence",
+                context.records.len()
+            )?;
+            for record in &context.records {
+                match &record.value {
+                    ValidationResultValue::Run(run) => writeln!(
+                        out,
+                        "RUN\tepoch={}\tphase={:?}\ttarget={}\tfinal={:?}",
+                        record.position.run.epoch,
+                        record.position.run.phase,
+                        record.position.run.target_hash,
+                        run.final_verdict
+                    )?,
+                    ValidationResultValue::Attempt(verdict) => writeln!(
+                        out,
+                        "ATTEMPT\tepoch={}\thandler={}\tattempt={}\tverdict={:?}",
+                        verdict.run.epoch, verdict.handler.id, verdict.attempt, verdict.value
+                    )?,
+                }
+            }
+            writeln!(out, "SEQUENCE\t{}", context.token.sequence.0)?;
+            if let Some(cursor) = cursor {
+                writeln!(out, "CURSOR\t{cursor}")?;
+            }
+            out.flush()?;
+            Ok(())
+        }
+    }
+}
 pub(super) fn page(page: ListPage, format: OutputFormat) -> Result<()> {
     let cursor = page.next.as_ref().map(|cursor| hex(&cursor.bytes));
     match format {
-        OutputFormat::Json => json(&PageOutput {
-            schema_version: 1,
-            token: page.token,
-            results: page.objects.iter().map(document).collect(),
-            cursor,
-            visited: page.visited,
-        }),
+        OutputFormat::Json | OutputFormat::Yaml => structured(
+            &PageOutput {
+                schema_version: 1,
+                token: page.token,
+                results: page.objects.iter().map(document).collect(),
+                cursor,
+                visited: page.visited,
+            },
+            format,
+        ),
         OutputFormat::Table => {
             let mut out = std::io::stdout().lock();
             writeln!(out, "KIND\tID\tSTATE/HASH\tDESCRIPTION")?;
@@ -252,6 +425,130 @@ pub(super) fn page(page: ListPage, format: OutputFormat) -> Result<()> {
             if let Some(cursor) = cursor {
                 writeln!(out, "CURSOR\t{cursor}")?;
             }
+            Ok(())
+        }
+    }
+}
+
+/// Same page fields as the one-page command, serialized from borrowed rows.
+/// The caller bounds the byte buffer and flushes it before following `next`.
+pub(super) fn page_stream_to(
+    page: &ListPage,
+    mut out: impl Write,
+    format: OutputFormat,
+) -> Result<()> {
+    struct Documents<'a>(&'a [ReadObject]);
+    impl Serialize for Documents<'_> {
+        fn serialize<S: serde::Serializer>(
+            &self,
+            serializer: S,
+        ) -> std::result::Result<S::Ok, S::Error> {
+            use serde::ser::SerializeSeq;
+            let mut rows = serializer.serialize_seq(Some(self.0.len()))?;
+            for object in self.0 {
+                rows.serialize_element(&document(object))?;
+            }
+            rows.end()
+        }
+    }
+    #[derive(Serialize)]
+    struct Page<'a> {
+        schema_version: u16,
+        token: ReadToken,
+        results: Documents<'a>,
+        cursor: Option<String>,
+        visited: u32,
+    }
+    let cursor = page.next.as_ref().map(|cursor| hex(&cursor.bytes));
+    match format {
+        OutputFormat::Table => {
+            writeln!(out, "KIND\tID\tSTATE/HASH\tDESCRIPTION")?;
+            for object in &page.objects {
+                row(&mut out, object)?;
+            }
+            writeln!(
+                out,
+                "SEQUENCE\t{}\tVISITED\t{}",
+                page.token.sequence.0, page.visited
+            )?;
+            if let Some(cursor) = cursor {
+                writeln!(out, "CURSOR\t{cursor}")?;
+            }
+        }
+        OutputFormat::Json => {
+            serde_json::to_writer(
+                &mut out,
+                &Page {
+                    schema_version: 1,
+                    token: page.token,
+                    results: Documents(&page.objects),
+                    cursor,
+                    visited: page.visited,
+                },
+            )
+            .map_err(|error| CliError::Other(Box::new(error)))?;
+            writeln!(out)?;
+        }
+        OutputFormat::Yaml => {
+            writeln!(out, "---")?;
+            structured_to(
+                &mut out,
+                &Page {
+                    schema_version: 1,
+                    token: page.token,
+                    results: Documents(&page.objects),
+                    cursor,
+                    visited: page.visited,
+                },
+                format,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn traversal(page: TraversalPage, format: OutputFormat) -> Result<()> {
+    let cursor = page.next.as_ref().map(|cursor| hex(&cursor.bytes));
+    match format {
+        OutputFormat::Json | OutputFormat::Yaml => {
+            #[derive(Serialize)]
+            struct Output<'a> {
+                schema_version: u16,
+                token: ReadToken,
+                results: Vec<ObjectOutput<'a>>,
+                cursor: Option<String>,
+                stop: TraversalStop,
+                visited: u32,
+                total_visits: u32,
+            }
+            structured(
+                &Output {
+                    schema_version: 1,
+                    token: page.token,
+                    results: page.objects.iter().map(document).collect(),
+                    cursor,
+                    stop: page.stop,
+                    visited: page.visited,
+                    total_visits: page.total_visits,
+                },
+                format,
+            )
+        }
+        OutputFormat::Table => {
+            let mut out = std::io::stdout().lock();
+            writeln!(out, "KIND\tID\tSTATE/HASH\tDESCRIPTION")?;
+            for object in &page.objects {
+                row(&mut out, object)?;
+            }
+            writeln!(
+                out,
+                "SEQUENCE\t{}\tSTOP\t{:?}\tVISITED\t{}\tTOTAL_VISITS\t{}",
+                page.token.sequence.0, page.stop, page.visited, page.total_visits
+            )?;
+            if let Some(cursor) = cursor {
+                writeln!(out, "CURSOR\t{cursor}")?;
+            }
+            out.flush()?;
             Ok(())
         }
     }

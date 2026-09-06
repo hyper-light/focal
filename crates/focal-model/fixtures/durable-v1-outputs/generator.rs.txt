@@ -1,0 +1,93 @@
+//! Standalone original-native writer. Run before switching managed hash writers.
+//! Its deliberate codec-only values include histories current admission rejects.
+use focal_model::*;
+use serde::Serialize;
+use std::{error::Error, fs, path::{Path, PathBuf}};
+fn dump<T: Serialize>(root: &Path, name: &str, value: &T) -> Result<(), Box<dyn Error>> {
+    fs::write(root.join(name), postcard::to_stdvec(value)?)?;
+    Ok(())
+}
+fn ledger() -> LedgerId { LedgerId { tenant: TenantId::from_u128(1), session: SessionId::from_u128(2) } }
+fn artifact(n: u128) -> ArtifactRef { ArtifactRef { id: ArtifactId::from_u128(n), hash: ContentHash([n as u8;32]) } }
+fn stream(n: u64) -> RequestStreamIdentity { RequestStreamIdentity { cluster: [3;16], ledger: ledger(), principal: ParticipantId::from_u128(4), slot: n as u32, generation: n } }
+fn key(n: u64) -> ManagedRequestKey { ManagedRequestKey { stream: stream(n), ordinal: n, id: RequestId::from_u128(u128::from(n)) } }
+fn main() -> Result<(), Box<dyn Error>> {
+    let root = PathBuf::from(std::env::args().nth(1).ok_or("missing output path")?);
+    let old = PathBuf::from(std::env::args().nth(2).ok_or("missing nested corpus path")?);
+    let receipt_map: std::collections::BTreeMap<RequestKey, MutationReceipt> = postcard::from_bytes(&fs::read(old.join("receipts.rows"))?)?;
+    let receipts: Vec<_> = receipt_map.into_values().collect();
+    let outcomes: Vec<CommandResult> = receipts.iter().map(|r| r.outcome.clone()).collect();
+    dump(&root, "command-results.rows", &outcomes)?;
+    let fence = ReceiptFence { receipt: ReceiptId::from_u128(5), epoch: u64::MAX };
+    let receipt = Receipt { fence, holder: ParticipantId::from_u128(6), acquired: SessionSeq(u64::MAX) };
+    let run = ValidationRunId { validation: ValidationId::from_u128(7), target_hash: ContentHash([8;32]), phase: ValidationPhase::Increment, epoch: u64::MAX };
+    let verdict = VerdictRecord { run, evaluator: ParticipantId::from_u128(9), attempt: u32::MAX, handler: HandlerRef { id: ValidatorId::from_u128(10), version: ContentHash([11;32]), agentic: true }, value: VerdictValue::Error, evidence: vec![artifact(12), artifact(13)], manifest: ContentHash([13;32]) };
+    let facts = vec![
+        DeltaFact::Status { previous: None, current: ClaimStatus::Generated, witness: None },
+        DeltaFact::Progress(String::new()), DeltaFact::Receipt(receipt), DeltaFact::EvidenceSet(EvidenceSetId::from_u128(14)), DeltaFact::Artifact(artifact(15)), DeltaFact::Testament { id: TestamentId::from_u128(16), hash: ContentHash([17;32]) }, DeltaFact::ValidationScheduled(run), DeltaFact::Verdict(verdict), DeltaFact::Scope(MonitorId::from_u128(18)), DeltaFact::Epoch(RequestEpoch(u64::MAX)), DeltaFact::LocalCompletion,
+        DeltaFact::Status { previous: Some(ClaimStatus::Validating), current: ClaimStatus::DependencyFailed, witness: Some(ClaimId::from_u128(19)) }, DeltaFact::Progress("status é\n\0".into()),
+    ];
+    dump(&root, "delta-facts.rows", &facts)?;
+    let deltas: Vec<_> = facts.iter().enumerate().map(|(i,fact)| Delta { schema: if i % 2 == 0 {0} else {u16::MAX}, id: DeltaId {ledger: ledger(), sequence: SessionSeq(u64::MAX), ordinal: i as u32}, action: LifecycleAction::ALL[i % LifecycleAction::ALL.len()], actor: ParticipantId::from_u128(20), claim: if i % 2 == 0 {None} else {Some(ClaimId::from_u128(21))}, fact: fact.clone() }).collect();
+    dump(&root, "deltas.rows", &deltas)?;
+    let handler = HandlerRef { id: ValidatorId::from_u128(22), version: ContentHash([23;32]), agentic: true };
+    let deadline = Deadline { timer: TimerId::from_u128(24), generation: u64::MAX, at: u64::MAX };
+    let effects = vec![EffectIntent::DispatchClaim { claim: ClaimId::from_u128(25) }, EffectIntent::ExecuteValidation { run, handler: handler.clone(), evaluator: ParticipantId::from_u128(26), attempt: u32::MAX, manifest: ContentHash([27;32]), quality_phase: true }, EffectIntent::CancelExecution { claim: ClaimId::from_u128(28), receipt: None }, EffectIntent::MonitorReleased { monitor: MonitorId::from_u128(29) }, EffectIntent::ScheduleDeadline { claim: ClaimId::from_u128(30), deadline }, EffectIntent::CancelExecution { claim: ClaimId::from_u128(31), receipt: Some(fence) }, EffectIntent::ExecuteValidation { run, handler: HandlerRef { agentic: false, ..handler }, evaluator: ParticipantId::from_u128(32), attempt: 0, manifest: ContentHash([0;32]), quality_phase: false }];
+    dump(&root, "effects.rows", &effects)?;
+    let reasons = vec![InformReason::Terminal(ClaimStatus::Satisfied), InformReason::Status(ClaimStatus::Received), InformReason::DependencyPending(ClaimId::from_u128(33)), InformReason::ValidationPending, InformReason::AlreadyApplied, InformReason::StandingDenied];
+    dump(&root, "inform-reasons.rows", &reasons)?;
+    let mut domain = Vec::new();
+    for code in ErrorCode::ALL { domain.push(DomainOutcome::Refuse { code:*code, detail: "refusal é\n".into() }); }
+    for reason in &reasons { for claim in [None, Some(ClaimId::from_u128(34))] { domain.push(DomainOutcome::Inform { claim, reason:reason.clone() }); } }
+    for receipt in &receipts { domain.push(DomainOutcome::Duplicate(Box::new(receipt.clone()))); }
+    dump(&root, "domain-outcomes.rows", &domain)?;
+    let filters = vec![CursorFilterSnapshot::All, CursorFilterSnapshot::Claims(vec![]), CursorFilterSnapshot::Claims(vec![ClaimId::from_u128(9),ClaimId::from_u128(1),ClaimId::from_u128(9)])];
+    let offsets = [CursorPositionOffsetSnapshot::Delta(0), CursorPositionOffsetSnapshot::Delta(u32::MAX), CursorPositionOffsetSnapshot::Resolved];
+    let mut modes = vec![CursorModeSnapshot::Live, CursorModeSnapshot::Seeding {snapshot:SessionSeq(0)}, CursorModeSnapshot::Seeding {snapshot:SessionSeq(u64::MAX)}, CursorModeSnapshot::Protected];
+    for reason in [CursorResyncReason::HistoryExpired, CursorResyncReason::LeaseExpired, CursorResyncReason::SlowConsumer, CursorResyncReason::SnapshotExpired, CursorResyncReason::ExplicitReset] { modes.push(CursorModeSnapshot::Resync {reason}); }
+    let mut records = Vec::new();
+    for filter in &filters { for mode in &modes { for offset in offsets { records.push(CursorRecordSnapshot { token: CursorTokenSnapshot {key:CursorConsumerKeySnapshot {ledger:ledger(),consumer:[35;16]},generation:u64::MAX,scope:ContentHash([36;32]),position:CursorPositionSnapshot {ledger:ledger(),sequence:SessionSeq(u64::MAX),offset}},filter:filter.clone(),expires_at:u64::MAX,mode:*mode}); } } }
+    dump(&root, "cursor-records.rows", &records)?;
+    let cursor_receipts: Vec<_> = std::iter::once(None).chain(records.iter().cloned().map(Some)).enumerate().map(|(i,record)| CursorMutationReceipt { ledger:ledger(), key:RequestKey {principal:ParticipantId::from_u128(37),epoch:RequestEpoch(u64::MAX),id:RequestId::from_u128(i as u128)},intent_hash:ContentHash([38;32]),revision:u64::MAX,domain_sequence:SessionSeq(u64::MAX),raft_index:u64::MAX,floor:SessionSeq(0),record}).collect();
+    dump(&root,"cursor-receipts.rows",&cursor_receipts)?;
+    let families = vec![ManagedRequestFamily::Domain,ManagedRequestFamily::Cursor];
+    dump(&root,"families.rows",&families)?;
+    let mut managed_outcomes: Vec<_> = outcomes.iter().cloned().map(ManagedReceiptOutcome::Domain).collect();
+    for record in std::iter::once(None).chain(records.iter().cloned().map(Some)) { managed_outcomes.push(ManagedReceiptOutcome::Cursor {revision:u64::MAX,floor:SessionSeq(0),record}); }
+    for family in &families { managed_outcomes.push(ManagedReceiptOutcome::Sealed {family:*family}); }
+    dump(&root,"managed-outcomes.rows",&managed_outcomes)?;
+    let managed: Vec<_> = managed_outcomes.iter().enumerate().map(|(i,outcome)| ManagedReceipt {key:key(i as u64),sequence:SessionSeq(u64::MAX),raft_index:if i%2==0 {0} else {u64::MAX},intent_hash:ContentHash([39;32]),outcome:outcome.clone()}).collect();
+    dump(&root,"managed-receipts.rows",&managed)?;
+    let hashes: Vec<_> = managed.iter().map(ManagedReceipt::content_hash).collect::<Result<_,_>>()?;
+    dump(&root,"managed-receipt-hashes.rows",&hashes)?;
+    let acks: Vec<_> = managed.iter().zip(&hashes).map(|(r,h)| ManagedReceiptAck {key:r.key,receipt_hash:*h}).collect();
+    dump(&root,"managed-acks.rows",&acks)?;
+    let commands = vec![RequestStreamCommand::Register {slot:0,expected_generation:0,owner:RequestId::from_u128(40),window:0},RequestStreamCommand::Acknowledge {stream:stream(u64::MAX),expected_revision:u64::MAX,through:u64::MAX,receipts:acks.clone()},RequestStreamCommand::Seal {key:key(u64::MAX),expected_revision:u64::MAX,family:ManagedRequestFamily::Domain,intent_hash:ContentHash([41;32])},RequestStreamCommand::Close {stream:stream(u64::MAX),expected_revision:u64::MAX,issued_through:u64::MAX},RequestStreamCommand::Register {slot:u32::MAX,expected_generation:u64::MAX,owner:RequestId::from_u128(42),window:u32::MAX},RequestStreamCommand::Acknowledge {stream:stream(0),expected_revision:0,through:0,receipts:vec![]},RequestStreamCommand::Seal {key:key(0),expected_revision:0,family:ManagedRequestFamily::Cursor,intent_hash:ContentHash([0;32])},RequestStreamCommand::Close {stream:stream(0),expected_revision:0,issued_through:0}];
+    dump(&root,"stream-commands.rows",&commands)?;
+    let controls: Vec<_> = commands.iter().enumerate().map(|(i,command)| RequestStreamControlInput {cluster:[43;16],ledger:ledger(),principal:ParticipantId::from_u128(44),id:RequestId::from_u128(i as u128),command:command.clone()}).collect();
+    dump(&root,"stream-inputs.rows",&controls)?;
+    let control_hashes: Vec<_> = controls.iter().map(RequestStreamControlInput::intent_hash).collect::<Result<_,_>>()?;
+    dump(&root,"stream-intent-hashes.rows",&control_hashes)?;
+    let states = vec![RequestStreamState::Vacant {slot:0,generation:0},RequestStreamState::Active {stream:stream(u64::MAX),owner:RequestId::from_u128(45),revision:u64::MAX,window:u32::MAX,acknowledged_through:u64::MAX},RequestStreamState::Vacant {slot:u32::MAX,generation:u64::MAX},RequestStreamState::Active {stream:stream(0),owner:RequestId::from_u128(0),revision:0,window:0,acknowledged_through:0}];
+    dump(&root,"stream-states.rows",&states)?;
+    let mut control_outcomes: Vec<_> = states.iter().copied().map(RequestStreamControlOutcome::Registered).collect();
+    control_outcomes.push(RequestStreamControlOutcome::Acknowledged {stream:stream(1),revision:u64::MAX,through:u64::MAX});
+    control_outcomes.extend(managed.iter().cloned().map(|r| RequestStreamControlOutcome::Sealed(Box::new(r))));
+    control_outcomes.push(RequestStreamControlOutcome::Closed {stream:stream(1),vacant_generation:u64::MAX});
+    dump(&root,"stream-outcomes.rows",&control_outcomes)?;
+    let control_receipts: Vec<_> = control_outcomes.iter().enumerate().map(|(i,outcome)| RequestStreamControlReceipt {cluster:[46;16],ledger:ledger(),principal:ParticipantId::from_u128(47),id:RequestId::from_u128(i as u128),intent_hash:ContentHash([48;32]),raft_index:u64::MAX,outcome:outcome.clone()}).collect();
+    dump(&root,"stream-receipts.rows",&control_receipts)?;
+    let queries = vec![RequestStreamQuery::Slot {slot:u32::MAX},RequestStreamQuery::Receipt {key:key(u64::MAX)}];
+    dump(&root,"stream-queries.rows",&queries)?;
+    let mut resolutions: Vec<_> = managed.iter().cloned().map(|r| ManagedReceiptResolution::Retained(Box::new(r))).collect();
+    resolutions.extend([ManagedReceiptResolution::Retired {through:u64::MAX},ManagedReceiptResolution::Unknown,ManagedReceiptResolution::StreamClosed {generation:u64::MAX}]);
+    dump(&root,"managed-resolutions.rows",&resolutions)?;
+    let mut reads: Vec<_> = states.iter().copied().map(RequestStreamReadResult::Slot).collect();
+    for resolution in resolutions { reads.push(RequestStreamReadResult::Receipt {key:key(u64::MAX),state:states[1],resolution}); }
+    dump(&root,"stream-read-results.rows",&reads)?;
+    let pages: Vec<_> = reads.into_iter().enumerate().map(|(i,result)| RequestStreamRead {schema:if i%2==0{0}else{u16::MAX},cluster:[49;16],ledger:ledger(),principal:ParticipantId::from_u128(50),sequence:SessionSeq(u64::MAX),raft_index:u64::MAX,result}).collect();
+    dump(&root,"stream-reads.rows",&pages)?;
+    let support = vec![ManagedFormatSupport {cluster:[0;16],ledger:ledger(),group:[0;16],node:0,configuration_index:0,voters:vec![],voters_outgoing:vec![],learners:vec![],learners_next:vec![],auto_leave:false,format_hash:ContentHash([0;32])},ManagedFormatSupport {cluster:[1;16],ledger:ledger(),group:[2;16],node:u64::MAX,configuration_index:u64::MAX,voters:vec![3,1,3],voters_outgoing:vec![2,1],learners:vec![5,4],learners_next:vec![7,6],auto_leave:true,format_hash:ContentHash([51;32])}];
+    dump(&root,"managed-format-support.rows",&support)?;
+    Ok(())
+}

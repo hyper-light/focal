@@ -290,8 +290,10 @@ pub fn verify_request(
             | Operation::RequestStreamRead { .. }
             | Operation::ManagedSupport { .. }
     );
-    if (managed && request.protocol != MANAGED_PROTOCOL_VERSION)
-        || (!managed && request.protocol != PROTOCOL_VERSION)
+    let participant = is_peer_request(&request);
+    if !participant
+        && ((managed && request.protocol != MANAGED_PROTOCOL_VERSION)
+            || (!managed && request.protocol != PROTOCOL_VERSION))
     {
         return Err(AccessError::UnsupportedProtocol);
     }
@@ -301,11 +303,15 @@ pub fn verify_request(
     {
         return Err(AccessError::InvalidRequest);
     }
-    let allowed = match capability(&request.operation) {
-        Capability::Actor => !matches!(peer.role(), PeerRole::Node { .. }),
-        Capability::Runtime => matches!(peer.role(), PeerRole::Runtime),
-        Capability::Evaluator => matches!(peer.role(), PeerRole::Runtime | PeerRole::Evaluator),
-        Capability::Replication => matches!(peer.role(), PeerRole::Node { .. }),
+    let allowed = if participant {
+        !matches!(peer.role(), PeerRole::Node { .. })
+    } else {
+        match capability(&request.operation) {
+            Capability::Actor => !matches!(peer.role(), PeerRole::Node { .. }),
+            Capability::Runtime => matches!(peer.role(), PeerRole::Runtime),
+            Capability::Evaluator => matches!(peer.role(), PeerRole::Runtime | PeerRole::Evaluator),
+            Capability::Replication => matches!(peer.role(), PeerRole::Node { .. }),
+        }
     };
     if !allowed {
         return Err(AccessError::Unauthorized);
@@ -352,15 +358,72 @@ pub fn verify_request(
             return Err(AccessError::Unauthorized);
         }
     }
-    let bytes = encode_payload(&request, limits.max_frame_bytes)
+    request_shape(&request, limits, Some(&peer))?;
+    Ok(VerifiedRequest { peer, request })
+}
+
+/// Local syntax and resource validation only. This neither authenticates a
+/// caller nor authorizes an operation, validates committed state, or negotiates
+/// a server capability. Managed ownership/control envelopes require their
+/// dedicated authenticated workflow and are deliberately unsupported here.
+pub fn check_request_shape(
+    request: &RequestEnvelope,
+    limits: &WireLimits,
+) -> Result<(), AccessError> {
+    limits.validate()?;
+    if matches!(
+        request.operation,
+        Operation::Control { .. }
+            | Operation::PeerControl { .. }
+            | Operation::NodeContact { .. }
+            | Operation::EnrollmentControl { .. }
+            | Operation::Raft { .. }
+            | Operation::Custody(_)
+            | Operation::Managed { .. }
+            | Operation::RequestStreamControl { .. }
+            | Operation::RequestStreamRead { .. }
+            | Operation::ManagedSupport { .. }
+    ) {
+        return Err(AccessError::UnsupportedOperation);
+    }
+    if !is_peer_request(request) && request.protocol != PROTOCOL_VERSION {
+        return Err(AccessError::UnsupportedProtocol);
+    }
+    if request.ledger.tenant.is_zero()
+        || request.ledger.session.is_zero()
+        || request.request_id.is_zero()
+        || request.request_epoch.0 == 0
+        || request.route_epoch.0 == 0
+    {
+        return Err(AccessError::InvalidRequest);
+    }
+    if matches!(
+        &request.operation,
+        Operation::Submit {
+            command: Command::RecordValidationVerdict { .. },
+            ..
+        }
+    ) {
+        return Err(AccessError::UnsupportedOperation);
+    }
+    request_shape(request, limits, None)
+}
+
+fn request_shape(
+    request: &RequestEnvelope,
+    limits: &WireLimits,
+    peer: Option<&AuthenticatedPeer>,
+) -> Result<(), AccessError> {
+    let bytes = encode_payload(request, limits.max_frame_bytes)
         .map_err(|_| AccessError::Capacity)?
         .len() as u64;
     let items = match &request.operation {
         Operation::RequestStreamControl { cluster, command } => {
+            let principal = peer.ok_or(AccessError::UnsupportedOperation)?.principal();
             crate::managed::validate_control_request(
                 *cluster,
                 request.ledger,
-                peer.principal(),
+                principal,
                 command,
                 limits.max_items,
             )?
@@ -375,7 +438,7 @@ pub fn verify_request(
                 }
                 if key.stream.cluster != *cluster
                     || key.stream.ledger != request.ledger
-                    || key.stream.principal != peer.principal()
+                    || peer.is_some_and(|peer| key.stream.principal != peer.principal())
                 {
                     return Err(AccessError::Unauthorized);
                 }
@@ -417,6 +480,30 @@ pub fn verify_request(
             }
             u64::from(list.max_visits.max(list.max_items))
         }
+        Operation::Traverse(query) => {
+            query.validate(request.ledger, limits)?;
+            u64::from(query.max_visits.max(query.max_items))
+        }
+        Operation::Monitor { id } => {
+            if id.is_zero() || request.route_epoch.0 == 0 {
+                return Err(AccessError::InvalidRequest);
+            }
+            MAX_MONITOR_ROOTS as u64
+        }
+        Operation::Summary => {
+            if request.route_epoch.0 == 0 {
+                return Err(AccessError::InvalidRequest);
+            }
+            1
+        }
+        Operation::Select(query) => {
+            query.validate(request.ledger, limits)?;
+            u64::from(query.query.max_visits.max(query.query.max_items))
+        }
+        Operation::Validators(query) => {
+            query.validate(limits)?;
+            u64::from(query.query.max_visits.max(query.query.max_items))
+        }
         Operation::Read(read) => {
             if read.max_items == 0 || read.max_items > limits.max_items {
                 return Err(AccessError::Capacity);
@@ -438,6 +525,24 @@ pub fn verify_request(
                     roots.as_slice()
                 }
                 ReadQuery::Scan { .. } => &[],
+                ReadQuery::SeedScan {
+                    claims,
+                    after,
+                    max_bytes,
+                } => {
+                    if *max_bytes < 1024
+                        || *max_bytes > 65536
+                        || *max_bytes > limits.max_frame_bytes
+                        || claims.len() > 256
+                        || claims.iter().any(|id| id.is_zero())
+                        || claims.windows(2).any(|pair| matches!(pair,[a,b] if a>=b))
+                        || (after.is_some()
+                            && !matches!(read.consistency, ReadConsistency::Exact(_)))
+                    {
+                        return Err(AccessError::InvalidRequest);
+                    }
+                    &[]
+                }
                 ReadQuery::ValidationResults { id, after } => {
                     if id.is_zero()
                         || after.is_some_and(|position| position.run.validation != *id)
@@ -528,7 +633,7 @@ pub fn verify_request(
             }
             // Trusted local Node grants have no certificate binding and cannot
             // announce a remotely routable identity.
-            if peer.certificate_fingerprint().is_none() {
+            if peer.is_some_and(|peer| peer.certificate_fingerprint().is_none()) {
                 return Err(AccessError::Unauthorized);
             }
             1
@@ -544,7 +649,7 @@ pub fn verify_request(
             if request.len() > MAX_ENROLLMENT_CONTROL_REQUEST_BYTES {
                 return Err(AccessError::Capacity);
             }
-            if peer.certificate_fingerprint().is_none() {
+            if peer.is_some_and(|peer| peer.certificate_fingerprint().is_none()) {
                 return Err(AccessError::Unauthorized);
             }
             1
@@ -575,11 +680,13 @@ pub fn verify_request(
             if credits.items > limits.max_items || credits.bytes > limits.max_frame_bytes {
                 return Err(AccessError::Capacity);
             }
-            let scope = stream_scope(&peer, request.ledger, filter)?;
+            let scope = peer
+                .map(|peer| stream_scope(peer, request.ledger, filter))
+                .transpose()?;
             let validate = |token: CursorToken| {
                 if token.key.ledger != request.ledger
                     || token.position.ledger != request.ledger
-                    || token.scope != scope
+                    || scope.is_some_and(|scope| token.scope != scope)
                 {
                     return Err(AccessError::Unauthorized);
                 }
@@ -721,7 +828,7 @@ pub fn verify_request(
     if bytes.saturating_add(items.saturating_mul(256)) > limits.max_cost {
         return Err(AccessError::Capacity);
     }
-    Ok(VerifiedRequest { peer, request })
+    Ok(())
 }
 
 /// Opaque storage identity for an upload. Role changes do not change ownership;
@@ -785,3 +892,7 @@ fn verify_authored_claims(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "auth_shape_tests.rs"]
+mod shape_tests;

@@ -1,0 +1,913 @@
+// Original native Session writer capture. This ignored test is an explicit
+// one-off generator, never an ordinary golden-test regeneration path.
+use std::io::Write;
+
+struct Capture {
+    root: std::path::PathBuf,
+    files: Vec<(String, usize, String, String)>,
+}
+impl Capture {
+    fn bytes(&mut self, name: &str, bytes: &[u8], shape: &str) {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(self.root.join(name))
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        self.files.push((
+            name.to_owned(),
+            bytes.len(),
+            blake3::hash(bytes).to_hex().to_string(),
+            shape.to_owned(),
+        ));
+    }
+    fn rows<T: Serialize>(&mut self, name: &str, values: &T, shape: &str) {
+        self.bytes(name, &postcard::to_stdvec(values).unwrap(), shape);
+    }
+    fn envelope<T: Serialize>(&mut self, name: &str, magic: &[u8], value: &T) -> Vec<u8> {
+        let mut bytes = magic.to_vec();
+        bytes.extend(postcard::to_stdvec(value).unwrap());
+        self.bytes(name, &bytes, std::any::type_name::<T>());
+        bytes
+    }
+    fn finish(self) {
+        let mut text = String::from("file\tbytes\tblake3\tshape\n");
+        for (name, size, digest, shape) in self.files {
+            text.push_str(&format!("{name}\t{size}\t{digest}\t{shape}\n"));
+        }
+        std::fs::write(self.root.join("capture-files.tsv"), text).unwrap();
+        std::fs::write(
+            self.root.join("capture-executable.txt"),
+            std::env::current_exe().unwrap().display().to_string(),
+        )
+        .unwrap();
+    }
+}
+fn native_rows<T: serde::de::DeserializeOwned>(relative: &str) -> T {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap();
+    postcard::from_bytes(&std::fs::read(root.join(relative)).unwrap()).unwrap()
+}
+fn native_copy<T: Serialize + serde::de::DeserializeOwned>(value: &T) -> T {
+    postcard::from_bytes(&postcard::to_stdvec(value).unwrap()).unwrap()
+}
+fn capture_membership() -> (
+    Vec<SessionMembershipRequest>,
+    Vec<SessionMembershipReceipt>,
+    Vec<MembershipContext>,
+) {
+    let ordinary = MembershipConfiguration {
+        voters: vec![1, 2],
+        learners: vec![3],
+        ..Default::default()
+    };
+    let joint = MembershipConfiguration {
+        voters: vec![1, 2],
+        learners: vec![4],
+        voters_outgoing: vec![1, 3],
+        learners_next: vec![3],
+        auto_leave: true,
+    };
+    let changes = [
+        MembershipChange::AddLearner { node: 4 },
+        MembershipChange::Promote { node: 3 },
+        MembershipChange::Remove { node: 2 },
+        MembershipChange::LeaveJoint,
+    ];
+    let mut requests = Vec::new();
+    let mut receipts = Vec::new();
+    let mut contexts = Vec::new();
+    for (i, change) in changes.into_iter().enumerate() {
+        let request = SessionMembershipRequest {
+            id: u128::try_from(i + 1).unwrap().to_be_bytes(),
+            expected_index: 127 + i as u64,
+            expected: if change == MembershipChange::LeaveJoint {
+                joint.clone()
+            } else {
+                ordinary.clone()
+            },
+            change,
+        };
+        let hash = request.hash().unwrap();
+        let configuration = change.apply_to(&request.expected).unwrap();
+        receipts.push(SessionMembershipReceipt {
+            id: request.id,
+            request_hash: hash,
+            index: 255 + i as u64,
+            term: 128 + i as u64,
+            configuration,
+        });
+        contexts.push(MembershipContext {
+            ledger: identity(),
+            id: request.id,
+            expected_index: request.expected_index,
+            change,
+            hash,
+        });
+        requests.push(request);
+    }
+    (requests, receipts, contexts)
+}
+fn capture_placements() -> Vec<StoredPlacement> {
+    use focal_directory::{DurabilityIntent, FailureClass, Placement, PlacementPolicy, RegionId};
+    let mut rows = Vec::new();
+    for (i, kind) in [
+        SessionFenceKind::Created,
+        SessionFenceKind::Cutover,
+        SessionFenceKind::Activated,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (j, survive) in [FailureClass::Node, FailureClass::Zone, FailureClass::Region]
+            .into_iter()
+            .enumerate()
+        {
+            let populated = j != 0;
+            let placement = PlacementSpec {
+                policy: PlacementPolicy {
+                    durability: DurabilityIntent {
+                        survive,
+                        max_failures: if populated { u16::MAX } else { 0 },
+                    },
+                    residency: if populated {
+                        [RegionId::from_u128(1), RegionId::from_u128(u128::MAX)]
+                            .into_iter()
+                            .collect()
+                    } else {
+                        Default::default()
+                    },
+                    home_regions: if populated {
+                        [RegionId::from_u128(2)].into_iter().collect()
+                    } else {
+                        Default::default()
+                    },
+                    required_memory: if populated { u64::MAX } else { 0 },
+                },
+                placement: Placement {
+                    voters: [(1, 128), (2, u64::MAX)].into_iter().collect(),
+                    materializers: [(1, 128), (2, u64::MAX), (3, 255)].into_iter().collect(),
+                    content_copies: [(1, 128), (2, u64::MAX), (4, 256)].into_iter().collect(),
+                    preferred_leader: 2,
+                },
+            };
+            let request = SessionPlacementRequest {
+                expected_index: if i == 0 { 0 } else { 128 },
+                expected_configuration_index: 255,
+                operation: OperationId::from_u128(100 + (i * 3 + j) as u128),
+                kind,
+                from_route: RouteEpoch(if i == 0 { 0 } else { 1 }),
+                to_route: RouteEpoch(if i == 0 { 1 } else { 2 }),
+                membership_epoch: if i == 0 { 1 } else { 128 },
+                placement_epoch: if i == 0 { 1 } else { 2 },
+                placement,
+            };
+            let record = PlacementRecord {
+                schema: 1,
+                ledger: identity(),
+                group: LogGroupId::from_u128(2),
+                genesis: ContentHash([71; 32]),
+                sequence: SessionSeq(127),
+                configuration: MembershipConfiguration {
+                    voters: vec![1, 2],
+                    learners: vec![3],
+                    ..Default::default()
+                },
+                request,
+            };
+            let encoded = encode_placement(&record).unwrap();
+            let fence = SessionFence {
+                kind,
+                ledger: identity(),
+                log_group: record.group,
+                operation: record.request.operation,
+                sequence: record.sequence,
+                index: RaftIndex(256 + i as u64),
+                term: RaftTerm(129 + j as u64),
+                from_route: record.request.from_route,
+                to_route: record.request.to_route,
+                membership_epoch: record.request.membership_epoch,
+                placement_epoch: record.request.placement_epoch,
+                placement_digest: focal_directory::placement_digest(&record.request.placement)
+                    .unwrap(),
+                record_hash: ContentHash(*blake3::hash(&encoded).as_bytes()),
+            };
+            rows.push(StoredPlacement { record, fence });
+        }
+    }
+    rows
+}
+fn capture_base(
+    populated: bool,
+    checkpoints: &[CursorCheckpoint],
+    receipts: &[CursorReceipt],
+    deltas: &[Delta],
+) -> SnapshotEnvelopeV2 {
+    let core = if populated {
+        include_bytes!("../../focal-core/fixtures/durable-v1-nested/broad.cp1").to_vec()
+    } else {
+        Core::new(identity(), Limits::default())
+            .encode_checkpoint()
+            .unwrap()
+    };
+    SnapshotEnvelopeV2 {
+        schema: 2,
+        ledger: identity(),
+        raft_index: if populated { 777 } else { 1 },
+        core,
+        cursors: checkpoints[if populated { 2 } else { 0 }].clone(),
+        cursor_meta: CursorMetadata {
+            receipts: if populated {
+                receipts.iter().cloned().map(|row| (row.key, row)).collect()
+            } else {
+                BTreeMap::new()
+            },
+            owners: if populated {
+                receipts
+                    .iter()
+                    .filter_map(|row| {
+                        row.record
+                            .as_ref()
+                            .map(|record| (record.token.key.consumer, row.key.principal))
+                    })
+                    .collect()
+            } else {
+                BTreeMap::new()
+            },
+        },
+        delta_floor: SessionSeq(if populated { 127 } else { 0 }),
+        deltas: if populated {
+            deltas.to_vec()
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+#[test]
+#[ignore = "one-off original writer capture; requires a new FOCAL_SESSION_CAPTURE_DIR"]
+fn capture_original_session_v1() {
+    let root = std::path::PathBuf::from(
+        std::env::var_os("FOCAL_SESSION_CAPTURE_DIR").expect("explicit capture destination"),
+    );
+    std::fs::create_dir(&root).expect("capture must use a fresh directory");
+    let mut capture = Capture {
+        root,
+        files: Vec::new(),
+    };
+    let commands: Vec<CursorCommand> =
+        native_rows("focal-stream/fixtures/durable-v1/cursor-commands.rows");
+    let records: Vec<CursorRecord> =
+        native_rows("focal-stream/fixtures/durable-v1/cursor-records.rows");
+    let checkpoints: Vec<CursorCheckpoint> =
+        native_rows("focal-stream/fixtures/durable-v1/cursor-checkpoints.rows");
+    let deltas: Vec<Delta> = native_rows("focal-model/fixtures/durable-v1-outputs/deltas.rows");
+    let managed: Vec<ManagedReceipt> =
+        native_rows("focal-model/fixtures/durable-v1-outputs/managed-receipts.rows");
+    let controls: Vec<RequestStreamControlInput> =
+        native_rows("focal-model/fixtures/durable-v1-outputs/stream-inputs.rows");
+    let control_receipts: Vec<RequestStreamControlReceipt> =
+        native_rows("focal-model/fixtures/durable-v1-outputs/stream-receipts.rows");
+    let states: Vec<RequestStreamState> =
+        native_rows("focal-model/fixtures/durable-v1-outputs/stream-states.rows");
+    let mut cursor_inputs = Vec::new();
+    let mut legacy = Vec::new();
+    let mut current = Vec::new();
+    let mut maintenance = Vec::new();
+    let mut managed_cursor = Vec::new();
+    let mut stream_envelopes = Vec::new();
+    for (i, command) in commands.iter().enumerate() {
+        let input = CursorInput {
+            ledger: identity(),
+            key: RequestKey {
+                principal: ParticipantId::from_u128(1 + i as u128),
+                epoch: RequestEpoch(127 + i as u64),
+                id: RequestId::from_u128(256 + i as u128),
+            },
+            intent_hash: ContentHash(
+                *blake3::hash(&postcard::to_stdvec(&command.operation).unwrap()).as_bytes(),
+            ),
+            command: command.clone(),
+        };
+        legacy.push(LegacyCursorEnvelope {
+            schema: 1,
+            ledger: identity(),
+            domain_sequence: SessionSeq(128 + i as u64),
+            trusted_control: i % 2 == 0,
+            input: input.clone(),
+        });
+        current.push(CursorEnvelope {
+            schema: 2,
+            ledger: identity(),
+            domain_sequence: SessionSeq(128 + i as u64),
+            replay_floor: SessionSeq(i as u64),
+            trusted_control: i % 2 == 0,
+            input: input.clone(),
+        });
+        maintenance.push(MaintenanceEnvelope {
+            schema: 1,
+            ledger: identity(),
+            domain_sequence: SessionSeq(128 + i as u64),
+            replay_floor: SessionSeq(i as u64),
+            command: command.clone(),
+        });
+        managed_cursor.push(ManagedCursorEnvelope {
+            schema: 1,
+            domain_sequence: SessionSeq(128 + i as u64),
+            replay_floor: SessionSeq(i as u64),
+            trusted_control: i % 2 == 0,
+            input: ManagedCursorInput {
+                key: managed[i % managed.len()].key,
+                intent_hash: input.intent_hash,
+                command: command.clone(),
+            },
+        });
+        cursor_inputs.push(input);
+    }
+    for input in &controls {
+        stream_envelopes.push(RequestStreamEnvelope {
+            schema: 1,
+            domain_sequence: SessionSeq(129),
+            input: input.clone(),
+        });
+    }
+    let mut cursor_receipts = Vec::new();
+    for i in 0..=records.len() {
+        cursor_receipts.push(CursorReceipt {
+            ledger: identity(),
+            key: RequestKey {
+                principal: ParticipantId::from_u128(1 + i as u128),
+                epoch: RequestEpoch(255),
+                id: RequestId::from_u128(512 + i as u128),
+            },
+            intent_hash: ContentHash([i as u8; 32]),
+            revision: 128 + i as u64,
+            domain_sequence: SessionSeq(256),
+            raft_index: 512 + i as u64,
+            floor: SessionSeq(127),
+            record: i.checked_sub(1).map(|index| records[index].clone()),
+        });
+    }
+    capture.rows(
+        "cursor-inputs.rows",
+        &cursor_inputs,
+        "Vec<CursorInput>: all 18 native cursor commands",
+    );
+    capture.rows(
+        "cursor-receipts.rows",
+        &cursor_receipts,
+        "Vec<CursorReceipt>: None and all 36 native cursor records",
+    );
+    capture.rows(
+        "cursor-metadata.rows",
+        &vec![
+            CursorMetadata::default(),
+            capture_base(true, &checkpoints, &cursor_receipts, &deltas).cursor_meta,
+        ],
+        "Vec<CursorMetadata>: empty/populated",
+    );
+    capture.rows(
+        "cursor-operation-hashes.rows",
+        &cursor_inputs
+            .iter()
+            .map(|input| input.intent_hash)
+            .collect::<Vec<_>>(),
+        "Vec<ContentHash>: original native operation hashes",
+    );
+    capture.rows(
+        "legacy-cursor-envelopes.rows",
+        &legacy,
+        "Vec<LegacyCursorEnvelope>",
+    );
+    capture.rows("cursor-envelopes.rows", &current, "Vec<CursorEnvelope>");
+    capture.rows(
+        "maintenance-envelopes.rows",
+        &maintenance,
+        "Vec<MaintenanceEnvelope>",
+    );
+    capture.rows(
+        "managed-cursor-inputs.rows",
+        &managed_cursor
+            .iter()
+            .map(|row| row.input.clone())
+            .collect::<Vec<_>>(),
+        "Vec<ManagedCursorInput>",
+    );
+    capture.rows(
+        "managed-cursor-envelopes.rows",
+        &managed_cursor,
+        "Vec<ManagedCursorEnvelope>",
+    );
+    capture.rows(
+        "stream-envelopes.rows",
+        &stream_envelopes,
+        "Vec<RequestStreamEnvelope>",
+    );
+    for (i, row) in legacy.iter().enumerate() {
+        capture.envelope(&format!("cu1-{i:02}.bin"), LEGACY_CURSOR_MAGIC, row);
+    }
+    for (i, row) in current.iter().enumerate() {
+        capture.envelope(&format!("cu2-{i:02}.bin"), CURSOR_MAGIC, row);
+    }
+    for (i, row) in maintenance.iter().enumerate() {
+        capture.envelope(&format!("cm1-{i:02}.bin"), CURSOR_MAINTENANCE_MAGIC, row);
+    }
+    for (i, row) in managed_cursor.iter().enumerate() {
+        capture.envelope(&format!("mu1-{i:02}.bin"), MANAGED_CURSOR_MAGIC, row);
+    }
+    for (i, row) in stream_envelopes.iter().enumerate() {
+        capture.envelope(&format!("ms1-{i:02}.bin"), REQUEST_STREAM_MAGIC, row);
+    }
+    let (membership_requests, membership_receipts, membership_contexts) = capture_membership();
+    capture.rows(
+        "membership-requests.rows",
+        &membership_requests,
+        "Vec<SessionMembershipRequest>: all four changes",
+    );
+    capture.rows(
+        "membership-request-hashes.rows",
+        &membership_requests
+            .iter()
+            .map(|request| request.hash().unwrap())
+            .collect::<Vec<_>>(),
+        "Vec<[u8;32]>: original membership request hashes",
+    );
+    capture.rows(
+        "membership-receipts.rows",
+        &membership_receipts,
+        "Vec<SessionMembershipReceipt>",
+    );
+    capture.rows(
+        "membership-contexts.rows",
+        &membership_contexts,
+        "Vec<MembershipContext>",
+    );
+    let membership_states: Vec<_> = std::iter::once(MembershipState::default())
+        .chain(membership_receipts.iter().map(|receipt| MembershipState {
+            configuration_index: receipt.index,
+            latest: Some(receipt.clone()),
+        }))
+        .collect();
+    capture.rows(
+        "membership-states.rows",
+        &membership_states,
+        "Vec<MembershipState>: None/all changes",
+    );
+    let views: Vec<_> = membership_states
+        .iter()
+        .map(|state| MembershipView {
+            configuration_index: state.configuration_index,
+            configuration: state
+                .latest
+                .as_ref()
+                .map_or_else(MembershipConfiguration::default, |receipt| {
+                    receipt.configuration.clone()
+                }),
+            latest: state.latest.clone(),
+        })
+        .collect();
+    capture.rows("membership-views.rows", &views, "Vec<MembershipView>");
+    for (i, row) in membership_contexts.iter().enumerate() {
+        capture.envelope(&format!("mc1-{i:02}.bin"), MEMBERSHIP_MAGIC, row);
+    }
+    let placements = capture_placements();
+    capture.rows(
+        "placement-requests.rows",
+        &placements
+            .iter()
+            .map(|row| row.record.request.clone())
+            .collect::<Vec<_>>(),
+        "Vec<SessionPlacementRequest>: 3 kinds x3 failure classes",
+    );
+    capture.rows(
+        "placement-records.rows",
+        &placements
+            .iter()
+            .map(|row| row.record.clone())
+            .collect::<Vec<_>>(),
+        "Vec<PlacementRecord>",
+    );
+    capture.rows(
+        "stored-placements.rows",
+        &placements,
+        "Vec<StoredPlacement>",
+    );
+    let placement_states = vec![
+        PlacementState::default(),
+        PlacementState {
+            active: Some(placements[0].clone()),
+            cutover: None,
+        },
+        PlacementState {
+            active: None,
+            cutover: Some(placements[3].clone()),
+        },
+        PlacementState {
+            active: Some(placements[8].clone()),
+            cutover: Some(placements[5].clone()),
+        },
+    ];
+    capture.rows(
+        "placement-states.rows",
+        &placement_states,
+        "Vec<PlacementState>: all active/cutover options",
+    );
+    for (i, row) in placements.iter().enumerate() {
+        capture.bytes(
+            &format!("pl1-{i:02}.bin"),
+            &encode_placement(&row.record).unwrap(),
+            "actual encode_placement",
+        );
+    }
+    let mut slots = Vec::new();
+    for (i, state) in states.iter().enumerate() {
+        slots.push(crate::request_streams::StreamSlotData {
+            principal: ParticipantId::from_u128(128 + i as u128),
+            state: *state,
+            latest: None,
+            rows: Vec::new(),
+        });
+    }
+    for (i, receipt) in control_receipts.iter().enumerate() {
+        slots.push(crate::request_streams::StreamSlotData {
+            principal: receipt.principal,
+            state: states[i % states.len()],
+            latest: Some(receipt.clone()),
+            rows: if i == 0 {
+                managed.clone()
+            } else {
+                vec![managed[i % managed.len()].clone()]
+            },
+        });
+    }
+    let requests = vec![
+        RequestStreamsCheckpoint::default(),
+        RequestStreamsCheckpoint {
+            activated: true,
+            slots: Vec::new(),
+        },
+        RequestStreamsCheckpoint {
+            activated: true,
+            slots,
+        },
+    ];
+    capture.rows(
+        "request-stream-slots.rows",
+        &requests[2].slots,
+        "Vec<StreamSlotData>: all state/latest/receipt branches",
+    );
+    capture.rows(
+        "request-stream-checkpoints.rows",
+        &requests,
+        "Vec<RequestStreamsCheckpoint>: false/empty-active/populated",
+    );
+    capture.rows(
+        "managed-receipt-hashes.rows",
+        &managed
+            .iter()
+            .map(|receipt| receipt.content_hash().unwrap())
+            .collect::<Vec<_>>(),
+        "Vec<ContentHash>: original managed receipt commitments",
+    );
+    capture.rows(
+        "stream-control-hashes.rows",
+        &controls
+            .iter()
+            .map(|input| input.intent_hash().unwrap())
+            .collect::<Vec<_>>(),
+        "Vec<ContentHash>: original stream control commitments",
+    );
+    let mut ss1 = Vec::new();
+    let mut ss2 = Vec::new();
+    let mut ss3 = Vec::new();
+    let mut ss4 = Vec::new();
+    let mut ss5 = Vec::new();
+    for populated in [false, true] {
+        let base = capture_base(populated, &checkpoints, &cursor_receipts, &deltas);
+        ss1.push(SnapshotEnvelope {
+            schema: 1,
+            ledger: base.ledger,
+            raft_index: base.raft_index,
+            core: base.core.clone(),
+        });
+        ss2.push(base);
+    }
+    for i in 0..membership_states.len() {
+        ss3.push(SnapshotEnvelopeV3 {
+            state: capture_base(i > 0, &checkpoints, &cursor_receipts, &deltas),
+            membership: native_copy(&membership_states[i]),
+        });
+    }
+    for (i, placement) in placement_states.iter().enumerate() {
+        ss4.push(SnapshotEnvelopeV4 {
+            state: native_copy(&ss3[if i == 0 { 0 } else { 4 }]),
+            placement: native_copy(placement),
+        });
+    }
+    for (i, requests) in requests.iter().enumerate() {
+        ss5.push(SnapshotEnvelopeV5 {
+            state: native_copy(&ss4[if i == 0 { 0 } else { 3 }]),
+            requests: requests.clone(),
+        });
+    }
+    capture.rows("snapshot-ss1.rows", &ss1, "Vec<SnapshotEnvelope>");
+    capture.rows("snapshot-ss2.rows", &ss2, "Vec<SnapshotEnvelopeV2>");
+    capture.rows("snapshot-ss3.rows", &ss3, "Vec<SnapshotEnvelopeV3>");
+    capture.rows("snapshot-ss4.rows", &ss4, "Vec<SnapshotEnvelopeV4>");
+    capture.rows("snapshot-ss5.rows", &ss5, "Vec<SnapshotEnvelopeV5>");
+    for (i, row) in ss1.iter().enumerate() {
+        capture.envelope(&format!("ss1-{i:02}.bin"), SNAPSHOT_MAGIC, row);
+    }
+    for (i, row) in ss2.iter().enumerate() {
+        capture.envelope(&format!("ss2-{i:02}.bin"), SNAPSHOT_V2_MAGIC, row);
+    }
+    for (i, row) in ss3.iter().enumerate() {
+        capture.envelope(&format!("ss3-{i:02}.bin"), SNAPSHOT_V3_MAGIC, row);
+    }
+    for (i, row) in ss4.iter().enumerate() {
+        capture.envelope(&format!("ss4-{i:02}.bin"), SNAPSHOT_V4_MAGIC, row);
+    }
+    for (i, row) in ss5.iter().enumerate() {
+        capture.envelope(&format!("ss5-{i:02}.bin"), SNAPSHOT_V5_MAGIC, row);
+    }
+    capture_real_history(&mut capture);
+    capture_reader_probes(&mut capture);
+    capture.finish();
+}
+
+fn capture_live_snapshot(capture: &mut Capture, name: &str, session: &mut Session) -> Vec<u8> {
+    let encoded = session.encode_checkpoint(false).unwrap().unwrap();
+    capture.bytes(
+        &format!("live-{name}.bin"),
+        &encoded.bytes,
+        "actual Session::encode_checkpoint writer output",
+    );
+    capture.rows(
+        &format!("live-{name}.context"),
+        &(
+            session.applied_raft,
+            session.status().term,
+            session.consensus.membership_configuration(),
+        ),
+        "(u64 index,u64 term,MembershipConfiguration)",
+    );
+    capture.bytes(
+        &format!("live-{name}.core"),
+        &session.core.encode_checkpoint().unwrap(),
+        "actual resulting Core checkpoint",
+    );
+    encoded.bytes
+}
+fn capture_real_history(capture: &mut Capture) {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = Session::open(
+        directory.path(),
+        identity(),
+        config(),
+        SessionLimits::default(),
+    )
+    .unwrap();
+    elect(&mut session);
+    let epoch_input = epoch(1);
+    session.submit_local(&epoch_input).unwrap();
+    let cursor = register(&session, 501, false);
+    session.submit_cursor_local(&cursor).unwrap();
+    capture.rows(
+        "live-epoch-input.bin",
+        &epoch_input,
+        "actual admitted AuthenticatedInput",
+    );
+    capture.rows(
+        "live-cursor-input.bin",
+        &cursor,
+        "actual admitted CursorInput",
+    );
+    let ss3 = capture_live_snapshot(capture, "ss3", &mut session);
+    let decoded: SnapshotEnvelopeV3 =
+        postcard::from_bytes(ss3.strip_prefix(SNAPSHOT_V3_MAGIC).unwrap()).unwrap();
+    let ss1 = SnapshotEnvelope {
+        schema: 1,
+        ledger: decoded.state.ledger,
+        raft_index: decoded.state.raft_index,
+        core: decoded.state.core.clone(),
+    };
+    capture.envelope("live-ss1.bin", SNAPSHOT_MAGIC, &ss1);
+    capture.envelope("live-ss2.bin", SNAPSHOT_V2_MAGIC, &decoded.state);
+    for (kind, operation) in [
+        (SessionFenceKind::Created, 601),
+        (SessionFenceKind::Cutover, 602),
+        (SessionFenceKind::Activated, 602),
+    ] {
+        let request = placement_request(&session, kind, operation);
+        session.propose_placement(&request).unwrap();
+        session.poll().unwrap();
+        assert!(session.placement_receipt(&request).unwrap().is_some());
+    }
+    capture_live_snapshot(capture, "ss4", &mut session);
+    let stream = stream_register(&mut session, 0, 4);
+    let domain = managed_claim(stream, 1);
+    let receipt = commit_managed(&mut session, &domain);
+    capture.rows(
+        "live-managed-input.bin",
+        &domain,
+        "actual admitted ManagedAuthenticatedInput",
+    );
+    capture.rows(
+        "live-managed-receipt.bin",
+        &receipt,
+        "actual committed ManagedReceipt",
+    );
+    let old = ack(
+        &session,
+        701,
+        Position::resolved(identity(), session.sequence()),
+    );
+    let cursor = ManagedCursorInput {
+        key: ManagedRequestKey {
+            stream,
+            ordinal: 2,
+            id: RequestId::from_u128(701),
+        },
+        intent_hash: old.intent_hash,
+        command: old.command,
+    };
+    session.propose_managed_cursor(&cursor, false).unwrap();
+    session.poll().unwrap();
+    let revision = match session
+        .request_streams
+        .state(stream.principal, stream.slot)
+        .unwrap()
+    {
+        RequestStreamState::Active { revision, .. } => revision,
+        _ => panic!("active stream"),
+    };
+    let seal = stream_control(
+        702,
+        RequestStreamCommand::Seal {
+            key: ManagedRequestKey {
+                stream,
+                ordinal: 3,
+                id: RequestId::from_u128(703),
+            },
+            expected_revision: revision,
+            family: ManagedRequestFamily::Domain,
+            intent_hash: ContentHash([84; 32]),
+        },
+    );
+    session.propose_request_stream(&seal).unwrap();
+    session.poll().unwrap();
+    assert!(session.request_stream_receipt(&seal).unwrap().is_some());
+    capture.rows(
+        "live-managed-cursor-input.bin",
+        &cursor,
+        "actual admitted ManagedCursorInput",
+    );
+    capture.rows(
+        "live-seal-input.bin",
+        &seal,
+        "actual admitted RequestStreamControlInput",
+    );
+    capture_live_snapshot(capture, "ss5", &mut session);
+    capture.rows(
+        "live-stream-state.bin",
+        &session.request_streams.checkpoint(),
+        "actual RequestStreamsCheckpoint including domain/cursor/sealed outcomes",
+    );
+}
+
+fn capture_reader_probes(capture: &mut Capture) {
+    for legacy in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = Session::open(
+            directory.path(),
+            identity(),
+            config(),
+            SessionLimits::default(),
+        )
+        .unwrap();
+        elect(&mut session);
+        session.submit_local(&epoch(1)).unwrap();
+        let input = register(&session, 801, false);
+        let mut bytes = if legacy {
+            capture.envelope(
+                "reader-cu1-canonical.bin",
+                LEGACY_CURSOR_MAGIC,
+                &LegacyCursorEnvelope {
+                    schema: 1,
+                    ledger: identity(),
+                    domain_sequence: session.sequence(),
+                    trusted_control: false,
+                    input,
+                },
+            )
+        } else {
+            capture.envelope(
+                "reader-cu2-canonical.bin",
+                CURSOR_MAGIC,
+                &CursorEnvelope {
+                    schema: 2,
+                    ledger: identity(),
+                    domain_sequence: session.sequence(),
+                    replay_floor: session.stream_bounds().floor,
+                    trusted_control: false,
+                    input,
+                },
+            )
+        };
+        bytes.extend_from_slice(&[0xff, 0x80, 0x00]);
+        let stem = if legacy { "reader-cu1" } else { "reader-cu2" };
+        capture.bytes(
+            &format!("{stem}-trailing.bin"),
+            &bytes,
+            "crafted historical suffix probe, not writer output",
+        );
+        let (receipt, _charge) = session.apply_cursor_entry(&bytes, 999).unwrap();
+        capture.rows(
+            &format!("{stem}-accepted.bin"),
+            &receipt,
+            "actual original apply_cursor_entry accepted trailing payload",
+        );
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let mut session = Session::open(
+        directory.path(),
+        identity(),
+        config(),
+        SessionLimits::default(),
+    )
+    .unwrap();
+    elect(&mut session);
+    session.submit_local(&epoch(1)).unwrap();
+    let input = register(&session, 802, false);
+    session.submit_cursor_local(&input).unwrap();
+    let envelope = MaintenanceEnvelope {
+        schema: 1,
+        ledger: identity(),
+        domain_sequence: session.sequence(),
+        replay_floor: session.stream_bounds().floor,
+        command: CursorCommand {
+            expected_revision: session.cursor_revision(),
+            now: 1000,
+            operation: CursorOperation::AdvanceFloor {
+                through: session.cursors.checkpoint().floor,
+            },
+        },
+    };
+    let mut bytes = capture.envelope(
+        "reader-cm1-canonical.bin",
+        CURSOR_MAINTENANCE_MAGIC,
+        &envelope,
+    );
+    bytes.extend_from_slice(&[0xff, 0x80, 0x00]);
+    capture.bytes(
+        "reader-cm1-trailing.bin",
+        &bytes,
+        "crafted historical suffix probe, not writer output",
+    );
+    session.apply_maintenance_entry(&bytes).unwrap();
+    capture.rows(
+        "reader-cm1-accepted.bin",
+        session.cursors.checkpoint(),
+        "actual original maintenance accepted trailing payload",
+    );
+    // All Session snapshot readers already reject an otherwise valid body's tail.
+    for version in 1..=5 {
+        let canonical = std::fs::read(capture.root.join(format!("live-ss{version}.bin"))).unwrap();
+        let context_name = if version < 3 {
+            "live-ss3.context".to_owned()
+        } else {
+            format!("live-ss{version}.context")
+        };
+        let (index, term, configuration): (u64, u64, MembershipConfiguration) =
+            postcard::from_bytes(&std::fs::read(capture.root.join(context_name)).unwrap()).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut fresh = Session::open(
+            directory.path(),
+            identity(),
+            config(),
+            SessionLimits::default(),
+        )
+        .unwrap();
+        if version == 5 {
+            elect(&mut fresh);
+            durable_managed_support(&mut fresh);
+        }
+        fresh
+            .restore_snapshot(&canonical, index, term, &configuration)
+            .unwrap();
+        let before = fresh.core.encode_checkpoint().unwrap();
+        let mut suffixed = canonical;
+        suffixed.extend_from_slice(&[0xff, 0x80, 0x00]);
+        assert!(matches!(
+            fresh.restore_snapshot(&suffixed, index, term, &configuration),
+            Err(LedgerError::Corrupt)
+        ));
+        assert_eq!(fresh.core.encode_checkpoint().unwrap(), before);
+        capture.bytes(
+            &format!("reader-ss{version}-trailing.bin"),
+            &suffixed,
+            "actual original restore_snapshot rejects suffix without core publication",
+        );
+    }
+}

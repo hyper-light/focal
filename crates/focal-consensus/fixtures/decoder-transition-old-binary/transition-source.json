@@ -1,0 +1,48 @@
+{
+  "time": "2026-09-06T16:14:47.260989+00:00",
+  "scope": "Implementation source preserved immediately after the successful helper and actual old-executable experiment. Original binary provenance is separate.",
+  "files": [
+    {
+      "path": "crates/focal-log/src/lib.rs",
+      "sha256": "e9d99f32b476347b38a671d40675d0a47e34e760c9b74b0ffc954775bb4059ee",
+      "bytes": 38529,
+      "snapshot": "transition-source/crates/focal-log/src/lib.rs.txt"
+    },
+    {
+      "path": "crates/focal-log/src/writer.rs",
+      "sha256": "a458d6f559f760e31dcc06fb149d2f5245812bba407f89b0ae9d3a82af82aa99",
+      "bytes": 40578,
+      "snapshot": "transition-source/crates/focal-log/src/writer.rs.txt"
+    },
+    {
+      "path": "crates/focal-consensus/src/lib.rs",
+      "sha256": "b4566823e31c2051394807c6d824b7650bd7d424400efffa35d0e08685b386ad",
+      "bytes": 42080,
+      "snapshot": "transition-source/crates/focal-consensus/src/lib.rs.txt"
+    },
+    {
+      "path": "crates/focal-consensus/src/decoder.rs",
+      "sha256": "b8ff956b28b6b1caccf18a74339850ea0c027f3ced8eade973cca80d5aa5f1f3",
+      "bytes": 13192,
+      "snapshot": "transition-source/crates/focal-consensus/src/decoder.rs.txt"
+    },
+    {
+      "path": "crates/focal-consensus/src/checkpoint.rs",
+      "sha256": "97d83f9f46982a198080c25a30c12cbb4216628b34df78111b8a062826f82562",
+      "bytes": 10723,
+      "snapshot": "transition-source/crates/focal-consensus/src/checkpoint.rs.txt"
+    },
+    {
+      "path": "crates/focal-consensus/src/persistence.rs",
+      "sha256": "901bb5880602177bcbba3681468daebaf54132c41d9883b5b980dbcb5593c6dc",
+      "bytes": 15474,
+      "snapshot": "transition-source/crates/focal-consensus/src/persistence.rs.txt"
+    },
+    {
+      "path": "crates/focal-consensus/src/memory.rs",
+      "sha256": "233733cd74b69aa27fa4b6e940776293c66868d9963366eee42cfd6a3ac115d3",
+      "bytes": 10991,
+      "snapshot": "transition-source/crates/focal-consensus/src/memory.rs.txt"
+    }
+  ]
+}

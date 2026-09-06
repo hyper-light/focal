@@ -1,0 +1,649 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 8c83acb..3c1ca87 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -153,6 +153,12 @@ dependencies = [
+  "cc",
+ ]
+ 
++[[package]]
++name = "base64"
++version = "0.22.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
++
+ [[package]]
+ name = "bit-vec"
+ version = "0.9.1"
+@@ -260,6 +266,15 @@ dependencies = [
+  "strsim",
+ ]
+ 
++[[package]]
++name = "clap_complete"
++version = "4.6.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "97bf4965940c2382204c0ded6dd3dd48c0c4e872f1e76fb1bf94f45991a2cb6a"
++dependencies = [
++ "clap",
++]
++
+ [[package]]
+ name = "clap_derive"
+ version = "4.6.4"
+@@ -445,6 +460,7 @@ version = "0.1.0"
+ dependencies = [
+  "blake3",
+  "focal-core",
++ "focal-evidence",
+  "focal-model",
+  "focal-wire",
+  "fs2",
+@@ -636,6 +652,7 @@ version = "0.1.0"
+ dependencies = [
+  "blake3",
+  "clap",
++ "clap_complete",
+  "focal-client",
+  "focal-consensus",
+  "focal-control",
+@@ -993,6 +1010,12 @@ version = "0.8.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "e5ce46fe64a9d73be07dcbe690a38ce1b293be448fd8ce1e6c1b8062c9f72c6a"
+ 
++[[package]]
++name = "nohash-hasher"
++version = "0.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
++
+ [[package]]
+ name = "nom"
+ version = "7.1.3"
+@@ -1544,11 +1567,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "3afb591f9cdb6223c88ba39269aff895620c7f0716dc42b705b5733d5c7c0823"
+ dependencies = [
+  "annotate-snippets",
++ "base64",
+  "encoding_rs_io",
+  "granit-parser",
++ "nohash-hasher",
+  "num-traits",
+  "serde_core",
+  "smallvec",
++ "zmij",
+ ]
+ 
+ [[package]]
+diff --git a/crates/focal-core/src/managed.rs b/crates/focal-core/src/managed.rs
+index 49a9c5f..aea11f7 100644
+--- a/crates/focal-core/src/managed.rs
++++ b/crates/focal-core/src/managed.rs
+@@ -116,6 +116,16 @@ impl Core {
+         pending: &PendingState,
+         input: &ManagedAuthenticatedInput,
+         max_bytes: usize,
++    ) -> Result<StagedManagedMutation, StagingError> {
++        self.stage_managed_bounded(pending, input, max_bytes, true)
++    }
++
++    fn stage_managed_bounded(
++        &self,
++        pending: &PendingState,
++        input: &ManagedAuthenticatedInput,
++        max_bytes: usize,
++        admission: bool,
+     ) -> Result<StagedManagedMutation, StagingError> {
+         let view = pending.view(self).map_err(|_| {
+             StagingError::Domain(refuse(
+@@ -124,7 +134,7 @@ impl Core {
+             ))
+         })?;
+         let recorder = Recorder::bounded(self.state.ledger, view.sequence, max_bytes);
+-        let result = self.stage_managed_recorded(input, view, &recorder);
++        let result = self.stage_managed_recorded(input, view, &recorder, admission);
+         if recorder.failed() {
+             Err(StagingError::Capacity)
+         } else {
+@@ -146,7 +156,7 @@ impl Core {
+             return Err(CoreError::StalePreparation);
+         }
+         let staged = self
+-            .stage_managed_pending_bounded(&PendingState::new(), &prepared.input, max_bytes)
++            .stage_managed_bounded(&PendingState::new(), &prepared.input, max_bytes, false)
+             .map_err(staging_error)?;
+         if staged.prepared != *prepared {
+             return Err(CoreError::Checksum);
+@@ -165,7 +175,7 @@ impl Core {
+         let view = pending.view(self)?;
+         staged.validate_basis(view, &self.limits)?;
+         let replay = self
+-            .stage_managed_pending_bounded(pending, &staged.prepared.input, max_bytes)
++            .stage_managed_bounded(pending, &staged.prepared.input, max_bytes, false)
+             .map_err(staging_error)?;
+         if staged.prepared != replay.prepared
+             || staged.result != replay.result
+@@ -202,6 +212,7 @@ impl Core {
+         input: &ManagedAuthenticatedInput,
+         view: CoreView<'_>,
+         recorder: &Recorder,
++        admission: bool,
+     ) -> Result<StagedManagedMutation, DomainOutcome> {
+         let state = access::ReadState::overlay(&self.state, view.prior, view.sequence, recorder);
+         if input.key.stream.ledger != state.ledger() {
+@@ -259,6 +270,9 @@ impl Core {
+                 .ok_or_else(|| refuse(ErrorCode::Capacity, "session sequence exhausted"))?,
+         );
+         let overlay = access::WriteState::overlay(&self.state, view.prior, sequence, recorder);
++        if admission {
++            reduce::validate_receipt_admission(&overlay, &input.command)?;
++        }
+         let (mut draft, outcome, deltas, effects) =
+             reduce::execute_managed_on(overlay, &self.limits, input, sequence)?;
+         let result = ManagedApplyResult {
+diff --git a/crates/focal-core/src/managed_tests.rs b/crates/focal-core/src/managed_tests.rs
+index 053bbf6..d8da902 100644
+--- a/crates/focal-core/src/managed_tests.rs
++++ b/crates/focal-core/src/managed_tests.rs
+@@ -133,6 +133,161 @@ fn managed_complete_workflow_matches_legacy_domain_state_and_replays_exactly() {
+     );
+ }
+ 
++#[test]
++fn historical_strong_receipt_replay_is_exact_but_new_acknowledgment_is_fenced() {
++    let mut legacy = setup();
++    let mut scoped = legacy.clone();
++    let initial_receipts = legacy.snapshot().receipts.clone();
++    let mut claim = new_claim(100);
++    let receipt = &mut claim.validations[0].content;
++    receipt.quality_bar = Some("Historical ignored quality requirement".into());
++    receipt.handlers = vec![
++        HandlerRef {
++            id: ValidatorId::from_u128(1),
++            version: ContentHash([1; 32]),
++            agentic: false,
++        },
++        HandlerRef {
++            id: ValidatorId::from_u128(2),
++            version: ContentHash([2; 32]),
++            agentic: true,
++        },
++    ];
++    receipt.evidence_schemas.insert(ContentHash([9; 32]));
++    claim.content.requirements[0].specification = receipt.specification_hash().unwrap();
++    let id = claim.id;
++    let receipt = ReceiptFence {
++        receipt: ReceiptId::from_u128(100),
++        epoch: 1,
++    };
++    let testament = TestamentId::from_u128(104);
++    let evidence_set = EvidenceSetId::from_u128(103);
++    let commands = [
++        (ISSUER, Command::GenerateClaim { claim }),
++        (ISSUER, Command::PostClaim { claim: id }),
++        (
++            WORKER,
++            Command::AcquireReceipt {
++                claim: id,
++                receipt: receipt.receipt,
++                epoch: 1,
++            },
++        ),
++        (
++            WORKER,
++            Command::BeginEvidenceSet {
++                claim: id,
++                receipt,
++                evidence_set,
++            },
++        ),
++        (
++            WORKER,
++            Command::CloseTestament {
++                claim: id,
++                receipt,
++                testament,
++                evidence_set,
++                manifest: vec![],
++                summary: "old close".into(),
++                confidence: Confidence::Committed,
++                outcome: OutcomeKind::Complete,
++            },
++        ),
++        (
++            ISSUER,
++            Command::AcknowledgeTestament {
++                claim: id,
++                testament,
++            },
++        ),
++        (ISSUER, Command::BeginWholeWorkValidation { claim: id }),
++        (ISSUER, Command::CompleteWholeWork { claim: id }),
++    ];
++    for (offset, (actor, command)) in commands.into_iter().enumerate() {
++        let guarded = matches!(
++            command,
++            Command::GenerateClaim { .. }
++                | Command::AcknowledgeTestament { .. }
++                | Command::BeginWholeWorkValidation { .. }
++                | Command::CompleteWholeWork { .. }
++        );
++        let ordinary = input(1000 + offset as u128, actor, command);
++        let scoped_input = managed(ordinary.clone());
++        if guarded {
++            assert!(matches!(
++                legacy.prepare(&ordinary),
++                Err(DomainOutcome::Refuse {
++                    code: ErrorCode::InvalidSchema,
++                    ..
++                })
++            ));
++            assert!(matches!(
++                scoped.stage_managed_pending_bounded(&PendingState::new(), &scoped_input, BYTES),
++                Err(StagingError::Domain(DomainOutcome::Refuse {
++                    code: ErrorCode::InvalidSchema,
++                    ..
++                }))
++            ));
++        }
++        // Construct the exact prior-format prepared intent, with the real
++        // canonical hash. Its historical reducer remains the recovery oracle.
++        let prepared = PreparedMutation {
++            schema: SCHEMA_MAJOR,
++            base: legacy.sequence(),
++            command_hash: command_hash(&ordinary).unwrap(),
++            input: ordinary.clone(),
++            footprint: Footprint {
++                ledger: ledger(),
++                session_exclusive: true,
++            },
++        };
++        let bytes = postcard::to_stdvec(&prepared).unwrap();
++        let prepared = postcard::from_bytes(&bytes).unwrap();
++        let old = legacy
++            .apply(SessionSeq(legacy.sequence().0 + 1), prepared)
++            .unwrap();
++        let prepared = PreparedManagedMutation {
++            schema: MANAGED_REQUEST_SCHEMA,
++            base: scoped.sequence(),
++            command_hash: managed_command_hash(&scoped_input).unwrap(),
++            input: scoped_input,
++            footprint: Footprint {
++                ledger: ledger(),
++                session_exclusive: true,
++            },
++        };
++        let bytes = postcard::to_stdvec(&prepared).unwrap();
++        let prepared = postcard::from_bytes(&bytes).unwrap();
++        let staged = scoped.replay_managed_bounded(&prepared, BYTES).unwrap();
++        scoped
++            .audit_managed_pending_stage(&PendingState::new(), &staged, BYTES)
++            .unwrap();
++        let result = scoped.publish_managed(staged).unwrap();
++        assert_eq!(result.outcome, old.receipt.outcome);
++        assert_eq!(result.deltas, old.deltas);
++        assert_eq!(result.effects, old.effects);
++        assert!(matches!(
++            legacy.prepare(&ordinary),
++            Err(DomainOutcome::Duplicate(_))
++        ));
++        let mut expected = legacy.snapshot().clone();
++        expected.receipts = initial_receipts.clone();
++        assert_eq!(&expected, scoped.snapshot());
++        legacy = Core::decode_checkpoint(&legacy.encode_checkpoint().unwrap()).unwrap();
++        scoped = Core::decode_checkpoint(&scoped.encode_checkpoint().unwrap()).unwrap();
++    }
++    // Historical committed Pass is preserved; recovery cannot revise old truth.
++    assert_eq!(
++        legacy.snapshot().claims[&id].lifecycle().status,
++        ClaimStatus::Satisfied
++    );
++    assert_eq!(
++        scoped.snapshot().claims[&id].lifecycle().status,
++        ClaimStatus::Satisfied
++    );
++}
++
+ #[test]
+ fn managed_admission_preserves_auth_revision_and_resource_checks_without_legacy_keys() {
+     let mut core = Core::new(
+@@ -345,7 +500,7 @@ fn managed_provenance_and_actual_accesses_never_alias_legacy_history() {
+     ));
+     let recorder = Recorder::new(ledger(), core.sequence(), 65_536);
+     let staged = core
+-        .stage_managed_recorded(&request, core.view(), &recorder)
++        .stage_managed_recorded(&request, core.view(), &recorder, true)
+         .unwrap();
+     let accesses = recorder.finish();
+     assert!(!accesses.session_exclusive);
+diff --git a/crates/focal-core/src/pending.rs b/crates/focal-core/src/pending.rs
+index bfa0a0f..4451ed8 100644
+--- a/crates/focal-core/src/pending.rs
++++ b/crates/focal-core/src/pending.rs
+@@ -437,6 +437,7 @@ impl Core {
+                 .ok_or_else(|| refuse(ErrorCode::Capacity, "session sequence exhausted"))?,
+         );
+         let overlay = access::WriteState::overlay(&self.state, prior, sequence, recorder);
++        reduce::validate_receipt_admission(&overlay, &input.command)?;
+         let (mut draft, outcome, deltas, effects) =
+             reduce::execute_on(overlay, &self.limits, input, sequence)?;
+         let receipt = MutationReceipt {
+diff --git a/crates/focal-core/src/reduce.rs b/crates/focal-core/src/reduce.rs
+index 2601e10..613ceaa 100644
+--- a/crates/focal-core/src/reduce.rs
++++ b/crates/focal-core/src/reduce.rs
+@@ -16,6 +16,53 @@ pub(crate) struct DomainInput<'a> {
+     pub command: &'a Command,
+     legacy_epoch: Option<RequestEpoch>,
+ }
++/// Additional admission policy for newly proposed work only. Historical intents
++/// replay through the frozen reducer below, preserving their original results.
++pub(crate) fn validate_receipt_admission(
++    state: &access::WriteState<'_>,
++    command: &Command,
++) -> Result<(), DomainOutcome> {
++    fn validation(value: &ValidationContent) -> Result<(), DomainOutcome> {
++        if value.kind == ValidationKind::Receipt
++            && (value.phase != ValidationPhase::WholeWork
++                || value.quality_bar.is_some()
++                || !value.handlers.is_empty()
++                || !value.evidence_schemas.is_empty())
++        {
++            return Err(refuse(
++                ErrorCode::InvalidSchema,
++                "receipt is whole-work delivery only; use a separate test, inspection or contract validation for evidence and quality",
++            ));
++        }
++        Ok(())
++    }
++    fn claim(value: &NewClaim) -> Result<(), DomainOutcome> {
++        value
++            .validations
++            .iter()
++            .try_for_each(|v| validation(&v.content))
++    }
++    match command {
++        Command::GenerateClaim { claim: value }
++        | Command::SupersedeClaim {
++            successor: value, ..
++        } => claim(value),
++        Command::GenerateClaimBatch { claims } => claims.iter().try_for_each(claim),
++        Command::AcknowledgeTestament { claim, .. }
++        | Command::BeginWholeWorkValidation { claim }
++        | Command::CompleteWholeWork { claim } => {
++            if let Some(value) = state.claims.get(claim) {
++                for requirement in &value.content().requirements {
++                    if let Some(value) = state.validations.get(&requirement.id) {
++                        validation(value.content())?;
++                    }
++                }
++            }
++            Ok(())
++        }
++        _ => Ok(()),
++    }
++}
+ pub(crate) fn execute_on<'a>(
+     state: access::WriteState<'a>,
+     limits: &'a Limits,
+diff --git a/crates/focal-core/src/tests.rs b/crates/focal-core/src/tests.rs
+index 271ddca..3e9462b 100644
+--- a/crates/focal-core/src/tests.rs
++++ b/crates/focal-core/src/tests.rs
+@@ -277,6 +277,125 @@ fn outcome_code(out: DomainOutcome) -> ErrorCode {
+     }
+ }
+ 
++#[test]
++fn new_receipt_requirements_cannot_silently_require_quality_or_schema() {
++    let mut core = setup();
++    let predecessor = new_claim(90);
++    let predecessor_id = predecessor.id;
++    apply(
++        &mut core,
++        input(90, ISSUER, Command::GenerateClaim { claim: predecessor }),
++    );
++    let before = core.normalized_bytes().unwrap();
++    for field in 0..3 {
++        let mut claim = new_claim(100);
++        edge(&mut claim, RelationKind::Supersedes, predecessor_id);
++        let receipt = &mut claim.validations[0].content;
++        match field {
++            0 => {
++                receipt.quality_bar = Some("Prove correctness".into());
++                receipt.handlers = vec![
++                    HandlerRef {
++                        id: ValidatorId::from_u128(1),
++                        version: ContentHash([1; 32]),
++                        agentic: false,
++                    },
++                    HandlerRef {
++                        id: ValidatorId::from_u128(2),
++                        version: ContentHash([2; 32]),
++                        agentic: true,
++                    },
++                ];
++            }
++            1 => receipt.handlers.push(HandlerRef {
++                id: ValidatorId::from_u128(1),
++                version: ContentHash([1; 32]),
++                agentic: false,
++            }),
++            _ => {
++                receipt.evidence_schemas.insert(ContentHash([9; 32]));
++            }
++        }
++        claim.content.requirements[0].specification = receipt.specification_hash().unwrap();
++        for command in [
++            Command::GenerateClaim {
++                claim: claim.clone(),
++            },
++            Command::GenerateClaimBatch {
++                claims: vec![claim.clone()],
++            },
++            Command::SupersedeClaim {
++                predecessor: predecessor_id,
++                successor: claim,
++            },
++        ] {
++            let command = input(100, ISSUER, command);
++            assert_eq!(
++                outcome_code(core.prepare(&command).unwrap_err()),
++                ErrorCode::InvalidSchema
++            );
++            assert!(matches!(
++                core.stage_pending_bounded(&PendingState::new(), &command, 16 * 1024 * 1024),
++                Err(StagingError::Domain(DomainOutcome::Refuse {
++                    code: ErrorCode::InvalidSchema,
++                    ..
++                }))
++            ));
++            let managed = ManagedAuthenticatedInput {
++                key: ManagedRequestKey {
++                    stream: RequestStreamIdentity {
++                        cluster: [9; 16],
++                        ledger: ledger(),
++                        principal: ISSUER,
++                        slot: 0,
++                        generation: 1,
++                    },
++                    ordinal: 1,
++                    id: command.request_id,
++                },
++                expected_revision: command.expected_revision,
++                authority: command.authority,
++                command: command.command,
++            };
++            assert!(matches!(
++                core.stage_managed_pending_bounded(
++                    &PendingState::new(),
++                    &managed,
++                    16 * 1024 * 1024
++                ),
++                Err(StagingError::Domain(DomainOutcome::Refuse {
++                    code: ErrorCode::InvalidSchema,
++                    ..
++                }))
++            ));
++            assert_eq!(core.normalized_bytes().unwrap(), before);
++        }
++    }
++    let mut successor = new_claim(100);
++    edge(&mut successor, RelationKind::Supersedes, predecessor_id);
++    apply(
++        &mut core,
++        input(
++            100,
++            ISSUER,
++            Command::SupersedeClaim {
++                predecessor: predecessor_id,
++                successor,
++            },
++        ),
++    );
++    assert_eq!(
++        core.snapshot().claims[&predecessor_id].lifecycle().status,
++        ClaimStatus::Superseded
++    );
++    assert_eq!(
++        core.snapshot().claims[&ClaimId::from_u128(100)]
++            .lifecycle()
++            .status,
++        ClaimStatus::Generated
++    );
++}
++
+ #[test]
+ fn complete_receipt_workflow_replays_exact_state_and_deltas() {
+     let mut core = setup();
+@@ -729,6 +848,130 @@ fn artifact_close_is_immutable_and_requires_verified_custody() {
+     assert_eq!(t.content_hash(), t.content().content_hash().unwrap());
+ }
+ 
++#[test]
++fn increment_retains_observed_manifest_when_later_attachment_is_pending() {
++    let mut core = setup();
++    let mut claim = new_claim(8100);
++    let id = claim.id;
++    let validation = ValidationId::from_u128(8101);
++    add_validation(
++        &mut claim,
++        8101,
++        ValidationMode::Required,
++        ValidationPhase::Increment,
++    );
++    receive(&mut core, claim);
++    let receipt = core.snapshot().claims[&id]
++        .lifecycle()
++        .receipt
++        .as_ref()
++        .unwrap()
++        .fence;
++    let set = EvidenceSetId::from_u128(8102);
++    apply(
++        &mut core,
++        input(
++            8103,
++            WORKER,
++            Command::BeginEvidenceSet {
++                claim: id,
++                receipt,
++                evidence_set: set,
++            },
++        ),
++    );
++    let attachment = |number: u128, payload: &[u8]| {
++        let artifact = NewArtifact {
++            id: ArtifactId::from_u128(number),
++            content: ArtifactContent {
++                ledger: ledger(),
++                schema: SCHEMA_MAJOR,
++                kind: "test_report".into(),
++                schema_hash: ContentHash([81; 32]),
++                metadata: vec![],
++                payload: ArtifactPayload::Inline(payload.to_vec()),
++                producer: WORKER,
++                receipt: Some(receipt),
++                inputs: BTreeSet::new(),
++                visibility: BTreeSet::new(),
++            },
++        };
++        let hash = artifact.content.content_hash().unwrap();
++        let mut request = input(
++            number,
++            WORKER,
++            Command::AttachArtifact {
++                claim: id,
++                receipt,
++                evidence_set: set,
++                artifact,
++            },
++        );
++        request.authority.evidence.push(EvidenceAttestation {
++            descriptor_hash: hash,
++            custody_revision: 1,
++            durable: true,
++            schema_valid: true,
++        });
++        request
++    };
++    apply(&mut core, attachment(8104, b"observed proof"));
++    let observed = core.snapshot().evidence_sets[&set].artifacts.clone();
++    let manifest = manifest_hash(&observed).unwrap();
++    let target = observed[0].hash;
++    let revision = core.snapshot().claims[&id].lifecycle().revision;
++    let mut pending = PendingState::new();
++    pending.reserve(2).unwrap();
++    let staged = core
++        .stage_pending(&pending, &attachment(8105, b"later proof"))
++        .unwrap();
++    let attached = staged.prepared().clone();
++    pending.accept(&core, staged).unwrap();
++    assert_eq!(
++        pending
++            .view(&core)
++            .unwrap()
++            .claim(&id)
++            .unwrap()
++            .lifecycle()
++            .revision,
++        revision
++    );
++    assert_eq!(core.snapshot().evidence_sets[&set].artifacts, observed);
++    // Participant ingress has already checked this exact committed observation.
++    // Additional attached evidence is not removal/replacement of that target.
++    let mut begin = input(
++        8106,
++        ISSUER,
++        Command::BeginIncrementValidation {
++            claim: id,
++            validation,
++            target,
++            manifest,
++        },
++    );
++    begin.expected_revision = Some(revision);
++    let staged = core.stage_pending(&pending, &begin).unwrap();
++    core.audit_pending_stage(&pending, &staged, EpochLimits::default())
++        .unwrap();
++    let began = staged.prepared().clone();
++    core.apply_serial(SessionSeq(core.sequence().0 + 1), attached)
++        .unwrap();
++    let result = core
++        .apply_serial(SessionSeq(core.sequence().0 + 1), began)
++        .unwrap();
++    let CommandResult::Validation(run) = result.receipt.outcome else {
++        panic!("expected actual scheduled run");
++    };
++    assert_eq!(run.target_hash, target);
++    assert_eq!(core.snapshot().runs[&run].manifest, manifest);
++    assert_ne!(
++        manifest_hash(&core.snapshot().evidence_sets[&set].artifacts).unwrap(),
++        manifest
++    );
++    assert_eq!(core.snapshot().evidence_sets[&set].artifacts.len(), 2);
++}
++
+ fn submit_verdict(
+     core: &mut Core,
+     run: ValidationRunId,

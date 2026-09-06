@@ -1,0 +1,1914 @@
+use crate::*;
+
+pub(crate) struct Reducer<'a> {
+    pub state: access::WriteState<'a>,
+    pub limits: &'a Limits,
+    pub input: DomainInput<'a>,
+    pub sequence: SessionSeq,
+    pub deltas: Vec<Delta>,
+    pub effects: Vec<EffectIntent>,
+}
+/// Only the real actor, authority and domain command reach the reducer. Managed
+/// request identity remains separate; no principal or legacy epoch is invented.
+pub(crate) struct DomainInput<'a> {
+    pub principal: ParticipantId,
+    pub authority: &'a AuthorityContext,
+    pub command: &'a Command,
+    legacy_epoch: Option<RequestEpoch>,
+}
+/// Additional admission policy for newly proposed work only. Historical intents
+/// replay through the frozen reducer below, preserving their original results.
+pub(crate) fn validate_receipt_admission(
+    state: &access::WriteState<'_>,
+    command: &Command,
+) -> Result<(), DomainOutcome> {
+    fn validation(value: &ValidationContent) -> Result<(), DomainOutcome> {
+        if value.kind == ValidationKind::Receipt
+            && (value.phase != ValidationPhase::WholeWork
+                || value.quality_bar.is_some()
+                || !value.handlers.is_empty()
+                || !value.evidence_schemas.is_empty())
+        {
+            return Err(refuse(
+                ErrorCode::InvalidSchema,
+                "receipt is whole-work delivery only; use a separate test, inspection or contract validation for evidence and quality",
+            ));
+        }
+        Ok(())
+    }
+    fn claim(value: &NewClaim) -> Result<(), DomainOutcome> {
+        value
+            .validations
+            .iter()
+            .try_for_each(|v| validation(&v.content))
+    }
+    match command {
+        Command::GenerateClaim { claim: value }
+        | Command::SupersedeClaim {
+            successor: value, ..
+        } => claim(value),
+        Command::GenerateClaimBatch { claims } => claims.iter().try_for_each(claim),
+        Command::AcknowledgeTestament { claim, .. }
+        | Command::BeginWholeWorkValidation { claim }
+        | Command::CompleteWholeWork { claim } => {
+            if let Some(value) = state.claims.get(claim) {
+                for requirement in &value.content().requirements {
+                    if let Some(value) = state.validations.get(&requirement.id) {
+                        validation(value.content())?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+pub(crate) fn execute_on<'a>(
+    state: access::WriteState<'a>,
+    limits: &'a Limits,
+    input: &'a AuthenticatedInput,
+    sequence: SessionSeq,
+) -> Result<
+    (
+        access::WriteState<'a>,
+        CommandResult,
+        Vec<Delta>,
+        Vec<EffectIntent>,
+    ),
+    DomainOutcome,
+> {
+    execute_domain_on(
+        state,
+        limits,
+        DomainInput {
+            principal: input.principal,
+            authority: &input.authority,
+            command: &input.command,
+            legacy_epoch: Some(input.request_epoch),
+        },
+        sequence,
+    )
+}
+pub(crate) fn execute_managed_on<'a>(
+    state: access::WriteState<'a>,
+    limits: &'a Limits,
+    input: &'a ManagedAuthenticatedInput,
+    sequence: SessionSeq,
+) -> Result<
+    (
+        access::WriteState<'a>,
+        CommandResult,
+        Vec<Delta>,
+        Vec<EffectIntent>,
+    ),
+    DomainOutcome,
+> {
+    execute_domain_on(
+        state,
+        limits,
+        DomainInput {
+            principal: input.key.stream.principal,
+            authority: &input.authority,
+            command: &input.command,
+            legacy_epoch: None,
+        },
+        sequence,
+    )
+}
+fn execute_domain_on<'a>(
+    state: access::WriteState<'a>,
+    limits: &'a Limits,
+    input: DomainInput<'a>,
+    sequence: SessionSeq,
+) -> Result<
+    (
+        access::WriteState<'a>,
+        CommandResult,
+        Vec<Delta>,
+        Vec<EffectIntent>,
+    ),
+    DomainOutcome,
+> {
+    let mut r = Reducer {
+        state,
+        limits,
+        input,
+        sequence,
+        deltas: Vec::new(),
+        effects: Vec::new(),
+    };
+    let result = r.command()?;
+    r.propagate()?;
+    r.state.check_capacity()?;
+    let objects = [
+        r.state.claims.len(),
+        r.state.validations.len(),
+        r.state.artifacts.len(),
+        r.state.testaments.len(),
+        r.state.evidence_sets.len(),
+        r.state.runs.len(),
+    ]
+    .into_iter()
+    .try_fold(0usize, |total, count| total.checked_add(count))
+    .ok_or_else(|| refuse(ErrorCode::Capacity, "object count overflow"))?;
+    if objects > limits.max_objects {
+        return Err(refuse(ErrorCode::Capacity, "object budget exhausted"));
+    }
+    Ok((r.state, result, r.deltas, r.effects))
+}
+impl Reducer<'_> {
+    fn free_id(&self, id: ObjectId) -> bool {
+        !id.is_zero()
+            && !self.state.claims.contains_key(&ClaimId(id.0))
+            && !self.state.validations.contains_key(&ValidationId(id.0))
+            && !self.state.artifacts.contains_key(&ArtifactId(id.0))
+            && !self.state.testaments.contains_key(&TestamentId(id.0))
+    }
+    fn generate(&mut self, claims: &[NewClaim]) -> Result<CommandResult, DomainOutcome> {
+        if claims.is_empty() || claims.len() > self.limits.max_batch {
+            return Err(refuse(ErrorCode::Capacity, "creation batch size"));
+        }
+        let mut all_ids = BTreeSet::new();
+        let mut hashes = BTreeSet::new();
+        let mut existing = Vec::new();
+        let new_ids: BTreeSet<_> = claims.iter().map(|c| c.id).collect();
+        for new in claims {
+            let c = &new.content;
+            if c.ledger != self.state.ledger() {
+                return Err(refuse(ErrorCode::InvalidNamespace, "claim namespace"));
+            }
+            if c.schema != SCHEMA_MAJOR {
+                return Err(refuse(ErrorCode::UnsupportedSchema, "claim schema"));
+            }
+            self.text(&c.description)?;
+            if c.occurrence.is_zero()
+                || c.relations.len() > self.limits.max_relations
+                || c.scopes.len() > self.limits.max_relations
+                || c.requirements.len() > self.limits.max_requirements
+            {
+                return Err(refuse(ErrorCode::Capacity, "claim fields exceed budget"));
+            }
+            for kind in [
+                RelationKind::Issuer,
+                RelationKind::Subject,
+                RelationKind::ClaimAction,
+                RelationKind::CausedBy,
+            ] {
+                if c.relations.iter().filter(|r| r.kind == kind).count() != 1 {
+                    return Err(refuse(
+                        ErrorCode::InvalidRelation,
+                        "claim needs exactly one issuer, subject, action and cause",
+                    ));
+                }
+            }
+            if c.issuer().is_none()
+                || c.subject().is_none()
+                || c.action().is_none()
+                || c.cause().is_none()
+            {
+                return Err(refuse(
+                    ErrorCode::InvalidRelation,
+                    "party/action/cause endpoint type",
+                ));
+            }
+            if c.issuer() != Some(self.input.principal) && !self.input.authority.runtime {
+                return Err(refuse(
+                    ErrorCode::WrongActor,
+                    "only issuer may author claim",
+                ));
+            }
+            if c.cause() != Some(self.input.authority.cause.clone()) {
+                return Err(refuse(
+                    ErrorCode::InvalidCause,
+                    "cause differs from authenticated turn",
+                ));
+            }
+            if c.issuer() == c.subject() && c.action() != Some(ActionType::Handoff) {
+                return Err(refuse(
+                    ErrorCode::InvalidRelation,
+                    "self targeting requires handoff action",
+                ));
+            }
+            for s in &c.scopes {
+                self.text(&s.key)?;
+                if s.key.is_empty() || s.key.trim() != s.key || s.key.contains('\0') {
+                    return Err(refuse(
+                        ErrorCode::InvalidSchema,
+                        "scope key is not normalized",
+                    ));
+                }
+            }
+            let hash = c.content_hash()?;
+            if !hashes.insert(hash) {
+                return Err(refuse(
+                    ErrorCode::PartialDuplicateBatch,
+                    "duplicate canonical content inside batch",
+                ));
+            }
+            if let Some(id) = self.state.identities.get(&(ObjectKind::Claim, hash)) {
+                existing.push(ClaimId(id.0))
+            }
+            if !all_ids.insert(ObjectId(new.id.0)) {
+                return Err(refuse(
+                    ErrorCode::ObjectIdConflict,
+                    "duplicate allocated ID",
+                ));
+            }
+            for v in &new.validations {
+                if !all_ids.insert(ObjectId(v.id.0)) {
+                    return Err(refuse(
+                        ErrorCode::ObjectIdConflict,
+                        "duplicate validation allocation",
+                    ));
+                }
+            }
+            if c.requirements.len() != new.validations.len() {
+                return Err(refuse(
+                    ErrorCode::InvalidRelation,
+                    "requirements must bind every created validation once",
+                ));
+            }
+            let mut required_receipt = false;
+            let mut requirement_ids = BTreeSet::new();
+            for reference in &c.requirements {
+                if !requirement_ids.insert(reference.id) {
+                    return Err(refuse(ErrorCode::InvalidRelation, "duplicate requirement"));
+                }
+                let v = new
+                    .validations
+                    .iter()
+                    .find(|v| v.id == reference.id)
+                    .ok_or_else(|| refuse(ErrorCode::InvalidRelation, "unbound requirement"))?;
+                if v.content.ledger != self.state.ledger()
+                    || v.content.claim != new.id
+                    || v.content.schema != SCHEMA_MAJOR
+                    || v.content.specification_hash()? != reference.specification
+                {
+                    return Err(refuse(
+                        ErrorCode::InvalidSchema,
+                        "validation specification mismatch",
+                    ));
+                }
+                self.text(&v.content.description)?;
+                if v.content.evaluator.is_zero()
+                    || v.content.handlers.len() > self.limits.max_requirements
+                    || v.content.evidence_schemas.len() > self.limits.max_relations
+                    || v.content.contributed_by.len() > self.limits.max_relations
+                {
+                    return Err(refuse(ErrorCode::Capacity, "validation fields"));
+                }
+                if let Some(q) = &v.content.quality_bar {
+                    self.text(q)?;
+                    if !v.content.handlers.iter().any(|h| h.agentic)
+                        || v.content.handlers.first().is_none_or(|h| h.agentic)
+                    {
+                        return Err(refuse(
+                            ErrorCode::InvalidHandler,
+                            "quality bar requires a programmatic phase before a pinned agentic evaluator",
+                        ));
+                    }
+                }
+                let agentic_positions: Vec<_> = v
+                    .content
+                    .handlers
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, handler)| handler.agentic)
+                    .map(|(index, _)| index)
+                    .collect();
+                if agentic_positions.len() > 1
+                    || agentic_positions
+                        .first()
+                        .is_some_and(|index| index.checked_add(1) != Some(v.content.handlers.len()))
+                {
+                    return Err(refuse(
+                        ErrorCode::InvalidHandler,
+                        "the optional agentic evaluator must be the last pinned handler",
+                    ));
+                }
+                if v.content.kind != ValidationKind::Receipt && v.content.handlers.is_empty() {
+                    return Err(refuse(
+                        ErrorCode::InvalidHandler,
+                        "non-receipt validation needs a pinned handler",
+                    ));
+                }
+                if v.content.kind == ValidationKind::Receipt
+                    && v.content.phase != ValidationPhase::WholeWork
+                {
+                    return Err(refuse(
+                        ErrorCode::InvalidSchema,
+                        "receipt validation is whole-work only",
+                    ));
+                }
+                if v.content.kind == ValidationKind::Receipt
+                    && v.content.phase == ValidationPhase::WholeWork
+                    && v.content.mode == ValidationMode::Required
+                {
+                    required_receipt = true
+                }
+            }
+            if !required_receipt {
+                return Err(refuse(
+                    ErrorCode::EmptyRequiredSet,
+                    "Required WholeWork receipt validation is mandatory",
+                ));
+            }
+            for r in &c.relations {
+                match (&r.kind, &r.target) {
+                    (
+                        RelationKind::Issuer | RelationKind::Subject,
+                        RelationTarget::Participant(p),
+                    ) if !p.is_zero() => {}
+                    (RelationKind::ClaimAction, RelationTarget::Action(_)) => {}
+                    (RelationKind::CausedBy, RelationTarget::Root(root)) if !root.is_zero() => {}
+                    (
+                        RelationKind::DependsOn
+                        | RelationKind::Awaits
+                        | RelationKind::CausedBy
+                        | RelationKind::Supersedes
+                        | RelationKind::Amends
+                        | RelationKind::Refines
+                        | RelationKind::ConflictsWith
+                        | RelationKind::DerivedFrom
+                        | RelationKind::Reviews,
+                        RelationTarget::Object(o),
+                    ) => {
+                        if o.ledger != self.state.ledger() {
+                            return Err(refuse(ErrorCode::InvalidNamespace, "cross-session edge"));
+                        }
+                        if o.kind != ObjectKind::Claim {
+                            return Err(refuse(
+                                ErrorCode::InvalidRelation,
+                                "claim relation requires claim endpoint",
+                            ));
+                        }
+                        let target = ClaimId(o.id.0);
+                        if !new_ids.contains(&target) && !self.state.claims.contains_key(&target) {
+                            return Err(refuse(
+                                ErrorCode::UnknownObject,
+                                "edge target does not exist",
+                            ));
+                        }
+                        if target == new.id
+                            && matches!(
+                                r.kind,
+                                RelationKind::CausedBy
+                                    | RelationKind::Supersedes
+                                    | RelationKind::Amends
+                            )
+                        {
+                            return Err(refuse(ErrorCode::InvalidRelation, "cyclic lineage"));
+                        }
+                    }
+                    (RelationKind::Invalidates, _) => {
+                        return Err(refuse(
+                            ErrorCode::StandingDenied,
+                            "rank override policy is not configured",
+                        ));
+                    }
+                    _ => {
+                        return Err(refuse(
+                            ErrorCode::InvalidRelation,
+                            "invalid authored claim relation",
+                        ));
+                    }
+                }
+            }
+        }
+        if !existing.is_empty() {
+            if existing.len() == claims.len() {
+                return Ok(CommandResult::Existing(existing));
+            }
+            return Err(refuse(
+                ErrorCode::PartialDuplicateBatch,
+                "partially duplicate creation batch requires explicit rebinding",
+            ));
+        }
+        if all_ids.iter().any(|id| !self.free_id(*id)) {
+            return Err(refuse(
+                ErrorCode::ObjectIdConflict,
+                "allocated object ID already exists",
+            ));
+        }
+        for new in claims {
+            let hash = new.content.content_hash()?;
+            for v in &new.validations {
+                let vh = v.content.content_hash()?;
+                self.state.validations.insert(
+                    v.id,
+                    Validation::new(
+                        v.content.clone(),
+                        vh,
+                        ValidationLifecycle {
+                            created: self.sequence,
+                            latest_epoch: 0,
+                        },
+                    ),
+                );
+                self.state
+                    .identities
+                    .insert((ObjectKind::Validation, vh), ObjectId(v.id.0));
+            }
+            self.state.claims.insert(
+                new.id,
+                Claim::new(
+                    new.content.clone(),
+                    hash,
+                    ClaimLifecycle {
+                        status: ClaimStatus::Generated,
+                        revision: ObjectRevision(1),
+                        created: self.sequence,
+                        history: vec![StatusFact {
+                            status: ClaimStatus::Generated,
+                            sequence: self.sequence,
+                        }],
+                        receipt: None,
+                        evidence_set: None,
+                        testament: None,
+                        local_complete: false,
+                        released: false,
+                        terminal_witness: None,
+                    },
+                ),
+            );
+            self.state
+                .identities
+                .insert((ObjectKind::Claim, hash), ObjectId(new.id.0));
+            self.emit(
+                Some(new.id),
+                LifecycleAction::Generated,
+                DeltaFact::Status {
+                    previous: None,
+                    current: ClaimStatus::Generated,
+                    witness: None,
+                },
+            )?;
+            if let Some(deadline) = new.content.deadline {
+                self.effect(EffectIntent::ScheduleDeadline {
+                    claim: new.id,
+                    deadline,
+                })?
+            }
+        }
+        crate::graph::check_acyclic(
+            &self.state,
+            &[
+                RelationKind::CausedBy,
+                RelationKind::Supersedes,
+                RelationKind::Amends,
+            ],
+            self.limits.max_graph_visits,
+        )?;
+        Ok(CommandResult::Generated(
+            claims.iter().map(|c| c.id).collect(),
+        ))
+    }
+    pub fn create_artifact(&mut self, new: &NewArtifact) -> Result<ArtifactRef, DomainOutcome> {
+        let c = &new.content;
+        if c.ledger != self.state.ledger() {
+            return Err(refuse(ErrorCode::InvalidNamespace, "artifact namespace"));
+        }
+        if c.schema != SCHEMA_MAJOR
+            || c.kind.is_empty()
+            || c.kind.len() > 128
+            || !c
+                .kind
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_./-".contains(&b))
+        {
+            return Err(refuse(ErrorCode::InvalidSchema, "artifact kind or schema"));
+        }
+        if c.metadata.len() > self.limits.max_inline_bytes
+            || c.inputs.len() > self.limits.max_relations
+            || c.visibility.len() > self.limits.max_relations
+        {
+            return Err(refuse(ErrorCode::Capacity, "artifact metadata"));
+        }
+        for v in &c.visibility {
+            self.text(v)?
+        }
+        if let ArtifactPayload::Inline(value) = &c.payload
+            && value.len() > self.limits.max_inline_bytes
+        {
+            return Err(refuse(ErrorCode::Capacity, "inline artifact bytes"));
+        }
+        for o in &c.inputs {
+            if o.ledger != self.state.ledger() {
+                return Err(refuse(
+                    ErrorCode::InvalidNamespace,
+                    "artifact input namespace",
+                ));
+            }
+            if !self.object_exists(o) {
+                return Err(refuse(ErrorCode::UnknownObject, "artifact input"));
+            }
+        }
+        let hash = c.content_hash()?;
+        let attestation = self
+            .input
+            .authority
+            .evidence
+            .iter()
+            .find(|a| a.descriptor_hash == hash && a.durable && a.schema_valid)
+            .ok_or_else(|| {
+                refuse(
+                    ErrorCode::EvidenceNotDurable,
+                    "schema-verified durable custody attestation required",
+                )
+            })?;
+        if let Some(id) = self.state.identities.get(&(ObjectKind::Artifact, hash)) {
+            return Ok(ArtifactRef {
+                id: ArtifactId(id.0),
+                hash,
+            });
+        }
+        if !self.free_id(ObjectId(new.id.0)) {
+            return Err(refuse(
+                ErrorCode::ObjectIdConflict,
+                "artifact ID already used",
+            ));
+        }
+        self.state.artifacts.insert(
+            new.id,
+            Artifact::new(
+                c.clone(),
+                hash,
+                ArtifactLifecycle {
+                    created: self.sequence,
+                    custody_revision: attestation.custody_revision,
+                },
+            ),
+        );
+        self.state
+            .identities
+            .insert((ObjectKind::Artifact, hash), ObjectId(new.id.0));
+        Ok(ArtifactRef { id: new.id, hash })
+    }
+    fn object_exists(&self, o: &ObjectRef) -> bool {
+        match o.kind {
+            ObjectKind::Claim => self.state.claims.contains_key(&ClaimId(o.id.0)),
+            ObjectKind::Testament => self.state.testaments.contains_key(&TestamentId(o.id.0)),
+            ObjectKind::Validation => self.state.validations.contains_key(&ValidationId(o.id.0)),
+            ObjectKind::Artifact => self.state.artifacts.contains_key(&ArtifactId(o.id.0)),
+        }
+    }
+    pub fn verify_artifacts(&self, refs: &[ArtifactRef]) -> Result<(), DomainOutcome> {
+        for r in refs {
+            if self
+                .state
+                .artifacts
+                .get(&r.id)
+                .is_none_or(|a| a.content_hash() != r.hash)
+            {
+                return Err(refuse(
+                    ErrorCode::InvalidManifest,
+                    "unknown artifact or hash mismatch",
+                ));
+            }
+        }
+        Ok(())
+    }
+    fn cycle_victim(&self, component: &BTreeSet<ClaimId>) -> Result<ClaimId, DomainOutcome> {
+        let mut oldest = None;
+        for id in component {
+            let claim = self.claim(*id)?;
+            let key = (claim.lifecycle().created, *id);
+            if oldest.is_none_or(|current| key < current) {
+                oldest = Some(key);
+            }
+        }
+        oldest
+            .map(|(_, id)| id)
+            .ok_or_else(|| refuse(ErrorCode::InvalidRelation, "empty cycle component"))
+    }
+    fn verify_error(&self, r: ArtifactRef) -> Result<(), DomainOutcome> {
+        self.verify_artifacts(&[r])?;
+        if self
+            .state
+            .artifacts
+            .get(&r.id)
+            .ok_or_else(|| refuse(ErrorCode::InvalidManifest, "error artifact missing"))?
+            .content()
+            .kind
+            != "error"
+        {
+            return Err(refuse(
+                ErrorCode::InvalidSchema,
+                "boundary failure requires typed error artifact",
+            ));
+        }
+        Ok(())
+    }
+    fn create_testament(
+        &mut self,
+        id: TestamentId,
+        content: TestamentContent,
+    ) -> Result<(), DomainOutcome> {
+        if !self.free_id(ObjectId(id.0)) {
+            return Err(refuse(
+                ErrorCode::ObjectIdConflict,
+                "testament ID already exists",
+            ));
+        }
+        self.verify_artifacts(&content.artifacts)?;
+        let claim = content.claim;
+        let set = content.evidence_set;
+        let hash = content.content_hash()?;
+        if self
+            .state
+            .identities
+            .contains_key(&(ObjectKind::Testament, hash))
+        {
+            return Err(refuse(
+                ErrorCode::ObjectIdConflict,
+                "testament content already exists",
+            ));
+        }
+        self.state.testaments.insert(
+            id,
+            Testament::new(
+                content,
+                hash,
+                TestamentLifecycle {
+                    created: self.sequence,
+                    acknowledged: None,
+                },
+            ),
+        );
+        self.state
+            .identities
+            .insert((ObjectKind::Testament, hash), ObjectId(id.0));
+        self.state
+            .evidence_sets
+            .get_mut(&set)
+            .ok_or_else(|| refuse(ErrorCode::InvalidManifest, "validated evidence set missing"))?
+            .closed = true;
+        let c = self.claim(claim)?;
+        let mut l = c.lifecycle().clone();
+        l.evidence_set = Some(set);
+        l.testament = Some(id);
+        self.state.claims.insert(claim, c.with_lifecycle(l));
+        self.emit(
+            Some(claim),
+            LifecycleAction::TestamentGenerated,
+            DeltaFact::Testament { id, hash },
+        )?;
+        Ok(())
+    }
+    fn cancel_tree(&mut self, root: ClaimId, status: ClaimStatus) -> Result<(), DomainOutcome> {
+        self.state.scratch(1)?;
+        let mut queue = vec![root];
+        let mut seen = BTreeSet::new();
+        while let Some(id) = queue.pop() {
+            if seen.contains(&id) {
+                continue;
+            }
+            self.state.scratch(1)?;
+            seen.insert(id);
+            if seen.len() > self.limits.max_graph_visits {
+                return Err(refuse(ErrorCode::Capacity, "cancellation closure budget"));
+            }
+            for (child, _) in self
+                .state
+                .claims
+                .iter()
+                .filter(|(_, c)| c.content().cause() == Some(Cause::Claim(id)))
+            {
+                self.state.scratch(1)?;
+                queue.push(*child);
+            }
+            if self.claim(id)?.lifecycle().status.is_active() {
+                self.status(
+                    id,
+                    if id == root {
+                        status
+                    } else {
+                        ClaimStatus::Cancelled
+                    },
+                    Some(root),
+                )?
+            }
+        }
+        Ok(())
+    }
+    pub fn propagate(&mut self) -> Result<(), DomainOutcome> {
+        let mut visits = 0usize;
+        loop {
+            let mut changes = Vec::new();
+            for (id, c) in &self.state.claims {
+                visits = visits
+                    .checked_add(1)
+                    .ok_or_else(|| refuse(ErrorCode::Capacity, "graph propagation count"))?;
+                if visits > self.limits.max_graph_visits {
+                    return Err(refuse(ErrorCode::Capacity, "graph propagation budget"));
+                }
+                if c.lifecycle().status.is_terminal() {
+                    continue;
+                }
+                let cause = c
+                    .content()
+                    .dependencies(RelationKind::DependsOn)
+                    .filter_map(|d| {
+                        self.state
+                            .claims
+                            .get(&d)
+                            .filter(|t| {
+                                t.lifecycle().status.is_terminal()
+                                    && t.lifecycle().status != ClaimStatus::Satisfied
+                            })
+                            .map(|t| (t.lifecycle().created, d))
+                    })
+                    .min();
+                if let Some((_, witness)) = cause {
+                    self.state.scratch(1)?;
+                    changes.push((*id, witness))
+                }
+            }
+            if changes.is_empty() {
+                break;
+            }
+            for (id, witness) in changes {
+                self.status(id, ClaimStatus::DependencyFailed, Some(witness))?
+            }
+        }
+        loop {
+            visits = visits
+                .checked_add(self.state.claims.len())
+                .and_then(|n| n.checked_add(self.state.monitors.len()))
+                .ok_or_else(|| refuse(ErrorCode::Capacity, "graph accounting overflow"))?;
+            if visits > self.limits.max_graph_visits {
+                return Err(refuse(ErrorCode::Capacity, "release propagation budget"));
+            }
+            let mut changed = false;
+            let satisfied = crate::graph::tracked_fixpoint(&self.state);
+            self.state.check_capacity()?;
+            for id in satisfied {
+                if self
+                    .state
+                    .claims
+                    .get(&id)
+                    .is_some_and(|claim| claim.lifecycle().status != ClaimStatus::Satisfied)
+                {
+                    self.status(id, ClaimStatus::Satisfied, None)?;
+                    changed = true;
+                }
+            }
+            let mut releasable = Vec::new();
+            for (id, c) in self.state.claims.iter() {
+                if c.lifecycle().status.is_terminal()
+                    && !c.lifecycle().released
+                    && !self.state.claims.values().any(|child| {
+                        child.content().cause() == Some(Cause::Claim(*id))
+                            && !child.lifecycle().released
+                    })
+                {
+                    self.state.scratch(1)?;
+                    releasable.push(*id);
+                }
+            }
+            for id in releasable {
+                let c = self.claim(id)?;
+                let mut l = c.lifecycle().clone();
+                l.released = true;
+                self.state.claims.insert(id, c.with_lifecycle(l));
+                changed = true;
+            }
+            let mut released = Vec::new();
+            for (id, monitor) in &self.state.monitors {
+                if monitor.released.is_some() {
+                    continue;
+                }
+                let owner = self.state.claims.get(&monitor.owner).ok_or_else(|| {
+                    refuse(ErrorCode::InvalidRelation, "monitor owner is missing")
+                })?;
+                if owner.lifecycle().released
+                    || monitor
+                        .roots
+                        .iter()
+                        .all(|predicate| crate::graph::predicate(&self.state, *predicate))
+                {
+                    self.state.scratch(1)?;
+                    released.push((*id, monitor.owner));
+                }
+            }
+            for (id, owner) in released {
+                self.state
+                    .monitors
+                    .get_mut(&id)
+                    .ok_or_else(|| refuse(ErrorCode::InvalidManifest, "monitor missing"))?
+                    .released = Some(self.sequence);
+                self.emit(
+                    Some(owner),
+                    LifecycleAction::ScopeReleased,
+                    DeltaFact::Scope(id),
+                )?;
+                self.effect(EffectIntent::MonitorReleased { monitor: id })?;
+                changed = true;
+            }
+            if !changed {
+                break;
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn effect(&mut self, effect: EffectIntent) -> Result<(), DomainOutcome> {
+        self.state.charge(&effect)?;
+        self.effects.push(effect);
+        Ok(())
+    }
+    pub fn emit(
+        &mut self,
+        claim: Option<ClaimId>,
+        action: LifecycleAction,
+        fact: DeltaFact,
+    ) -> Result<(), DomainOutcome> {
+        let ordinal = u32::try_from(self.deltas.len())
+            .map_err(|_| refuse(ErrorCode::Capacity, "delta ordinal exhausted"))?;
+        let delta = Delta {
+            schema: SCHEMA_MAJOR,
+            id: DeltaId {
+                ledger: self.state.ledger(),
+                sequence: self.sequence,
+                ordinal,
+            },
+            action,
+            actor: self.input.principal,
+            claim,
+            fact,
+        };
+        self.state.charge(&delta)?;
+        self.deltas.push(delta);
+        Ok(())
+    }
+    pub fn claim(&self, id: ClaimId) -> Result<Claim, DomainOutcome> {
+        let claim = self
+            .state
+            .claims
+            .get(&id)
+            .ok_or_else(|| refuse(ErrorCode::UnknownObject, "unknown claim"))?;
+        self.state.charge(claim)?;
+        Ok(claim.clone())
+    }
+    pub fn runtime(&self) -> Result<(), DomainOutcome> {
+        if self.input.authority.runtime {
+            Ok(())
+        } else {
+            Err(refuse(ErrorCode::WrongActor, "runtime authority required"))
+        }
+    }
+    pub fn allowed(&self, id: ClaimId, statuses: &[ClaimStatus]) -> Result<Claim, DomainOutcome> {
+        let claim = self.claim(id)?;
+        let status = claim.lifecycle().status;
+        if status.is_terminal() {
+            return Err(DomainOutcome::Inform {
+                claim: Some(id),
+                reason: InformReason::Terminal(status),
+            });
+        }
+        if !statuses.contains(&status) {
+            return Err(DomainOutcome::Inform {
+                claim: Some(id),
+                reason: InformReason::Status(status),
+            });
+        }
+        Ok(claim)
+    }
+    pub fn active(&self, id: ClaimId) -> Result<Claim, DomainOutcome> {
+        self.allowed(
+            id,
+            &[
+                ClaimStatus::Generated,
+                ClaimStatus::Posted,
+                ClaimStatus::Received,
+                ClaimStatus::Progressed,
+                ClaimStatus::TestamentGenerated,
+                ClaimStatus::TestamentAcknowledged,
+                ClaimStatus::Validating,
+            ],
+        )
+    }
+    pub fn holder(&self, claim: &Claim, fence: ReceiptFence) -> Result<(), DomainOutcome> {
+        let receipt = claim
+            .lifecycle()
+            .receipt
+            .as_ref()
+            .ok_or_else(|| refuse(ErrorCode::StaleReceipt, "no active receipt"))?;
+        if receipt.fence != fence {
+            return Err(refuse(
+                ErrorCode::StaleReceipt,
+                format!("current receipt epoch {}", receipt.fence.epoch),
+            ));
+        }
+        if receipt.holder != self.input.principal {
+            return Err(refuse(ErrorCode::WrongActor, "receipt holder required"));
+        }
+        Ok(())
+    }
+    pub fn issuer(&self, claim: &Claim) -> Result<(), DomainOutcome> {
+        if self.input.authority.runtime || claim.content().issuer() == Some(self.input.principal) {
+            Ok(())
+        } else {
+            Err(refuse(ErrorCode::WrongActor, "issuer authority required"))
+        }
+    }
+    pub fn text(&self, s: &str) -> Result<(), DomainOutcome> {
+        if s.len() > self.limits.max_text_bytes {
+            Err(refuse(ErrorCode::Capacity, "text length"))
+        } else {
+            Ok(())
+        }
+    }
+    pub fn status(
+        &mut self,
+        id: ClaimId,
+        status: ClaimStatus,
+        witness: Option<ClaimId>,
+    ) -> Result<(), DomainOutcome> {
+        let c = self.claim(id)?;
+        let mut l = c.lifecycle().clone();
+        if l.status.is_terminal() {
+            return Err(DomainOutcome::Inform {
+                claim: Some(id),
+                reason: InformReason::Terminal(l.status),
+            });
+        }
+        let previous = l.status;
+        l.status = status;
+        l.revision = ObjectRevision(
+            l.revision
+                .0
+                .checked_add(1)
+                .ok_or_else(|| refuse(ErrorCode::Capacity, "object revision exhausted"))?,
+        );
+        l.history.push(StatusFact {
+            status,
+            sequence: self.sequence,
+        });
+        l.terminal_witness = witness;
+        self.state.claims.insert(id, c.with_lifecycle(l));
+        self.emit(
+            Some(id),
+            status.into(),
+            DeltaFact::Status {
+                previous: Some(previous),
+                current: status,
+                witness,
+            },
+        )?;
+        if status.is_terminal() && status != ClaimStatus::Satisfied {
+            self.effect(EffectIntent::CancelExecution {
+                claim: id,
+                receipt: c.lifecycle().receipt.as_ref().map(|r| r.fence),
+            })?
+        }
+        Ok(())
+    }
+    fn result(&self, id: ClaimId) -> Result<CommandResult, DomainOutcome> {
+        Ok(CommandResult::Claim {
+            claim: id,
+            status: self.claim(id)?.lifecycle().status,
+        })
+    }
+    fn command(&mut self) -> Result<CommandResult, DomainOutcome> {
+        match self.input.command {
+            Command::NegotiateEpoch { epoch } => {
+                self.runtime()?;
+                if epoch.0 == 0 || Some(*epoch) != self.input.legacy_epoch {
+                    return Err(refuse(
+                        ErrorCode::InvalidEpoch,
+                        "epoch must match negotiation request",
+                    ));
+                }
+                let mut window = self
+                    .state
+                    .epochs
+                    .get_owned(&self.input.principal)?
+                    .unwrap_or(EpochWindow {
+                        minimum: *epoch,
+                        admitted: BTreeSet::new(),
+                    });
+                if *epoch < window.minimum {
+                    return Err(refuse(
+                        ErrorCode::RequestHistoryExpired,
+                        "generation below admitted floor",
+                    ));
+                }
+                if window.admitted.contains(epoch) {
+                    return Ok(CommandResult::EpochAdmitted(*epoch));
+                }
+                if let Some(last) = window.admitted.last() {
+                    if epoch.0
+                        != last
+                            .0
+                            .checked_add(1)
+                            .ok_or_else(|| refuse(ErrorCode::InvalidEpoch, "epoch exhausted"))?
+                    {
+                        return Err(refuse(
+                            ErrorCode::InvalidEpoch,
+                            "generations must be consecutive",
+                        ));
+                    }
+                } else if epoch.0 != 1 {
+                    return Err(refuse(
+                        ErrorCode::InvalidEpoch,
+                        "first generation must be one",
+                    ));
+                }
+                window.admitted.insert(*epoch);
+                self.state.epochs.insert(self.input.principal, window);
+                self.emit(
+                    None,
+                    LifecycleAction::EpochAdmitted,
+                    DeltaFact::Epoch(*epoch),
+                )?;
+                Ok(CommandResult::EpochAdmitted(*epoch))
+            }
+            Command::AdvanceEpochFloor { minimum } => {
+                self.runtime()?;
+                if self.input.legacy_epoch.is_none() {
+                    return Err(refuse(
+                        ErrorCode::InvalidEpoch,
+                        "managed requests cannot advance legacy epochs",
+                    ));
+                }
+                let window = self
+                    .state
+                    .epochs
+                    .get_mut(&self.input.principal)
+                    .ok_or_else(|| {
+                        refuse(
+                            ErrorCode::RequestEpochNotAdmitted,
+                            "no admitted generations",
+                        )
+                    })?;
+                if *minimum < window.minimum || !window.admitted.contains(minimum) {
+                    return Err(refuse(
+                        ErrorCode::InvalidEpoch,
+                        "floor must advance to admitted generation",
+                    ));
+                }
+                window.minimum = *minimum;
+                window.admitted.retain(|e| e >= minimum);
+                // Exact old receipts remain resolvable; an archive owner may later move them with custody.
+                self.emit(
+                    None,
+                    LifecycleAction::EpochFloorAdvanced,
+                    DeltaFact::Epoch(*minimum),
+                )?;
+                Ok(CommandResult::EpochFloorAdvanced(*minimum))
+            }
+            Command::GenerateClaim { claim } => self.generate(std::slice::from_ref(claim)),
+            Command::GenerateClaimBatch { claims } => self.generate(claims),
+            Command::PostClaim { claim: id } => {
+                let c = self.allowed(*id, &[ClaimStatus::Generated])?;
+                self.issuer(&c)?;
+                if c.content().requirements.iter().any(|r| {
+                    self.state.validations.get(&r.id).is_some_and(|v| {
+                        v.content().policy_revision > self.input.authority.policy_revision
+                    })
+                }) {
+                    return Err(DomainOutcome::Inform {
+                        claim: Some(*id),
+                        reason: InformReason::StandingDenied,
+                    });
+                }
+                self.status(*id, ClaimStatus::Posted, None)?;
+                self.schedule_phase(
+                    *id,
+                    ValidationPhase::Admission,
+                    c.content_hash(),
+                    manifest_hash(&[])?,
+                )?;
+                self.effect(EffectIntent::DispatchClaim { claim: *id })?;
+                self.result(*id)
+            }
+            Command::AcquireReceipt {
+                claim: id,
+                receipt,
+                epoch,
+            } => {
+                let c = self.allowed(*id, &[ClaimStatus::Posted])?;
+                if c.content().subject() != Some(self.input.principal) {
+                    return Err(refuse(
+                        ErrorCode::WrongActor,
+                        "only resolved subject can receive",
+                    ));
+                }
+                if !self.phase_passed(*id, ValidationPhase::Admission) {
+                    return Err(DomainOutcome::Inform {
+                        claim: Some(*id),
+                        reason: InformReason::ValidationPending,
+                    });
+                }
+                for d in c.content().dependencies(RelationKind::DependsOn) {
+                    if self.claim(d)?.lifecycle().status != ClaimStatus::Satisfied {
+                        return Err(DomainOutcome::Inform {
+                            claim: Some(*id),
+                            reason: InformReason::DependencyPending(d),
+                        });
+                    }
+                }
+                if *epoch != 1
+                    || receipt.is_zero()
+                    || self.state.claims.values().any(|c| {
+                        c.lifecycle()
+                            .receipt
+                            .as_ref()
+                            .is_some_and(|r| r.fence.receipt == *receipt)
+                    })
+                {
+                    return Err(refuse(
+                        ErrorCode::StaleReceipt,
+                        "new receipt must have unique ID and epoch one",
+                    ));
+                }
+                let r = Receipt {
+                    fence: ReceiptFence {
+                        receipt: *receipt,
+                        epoch: *epoch,
+                    },
+                    holder: self.input.principal,
+                    acquired: self.sequence,
+                };
+                let mut l = c.lifecycle().clone();
+                l.receipt = Some(r.clone());
+                self.state.claims.insert(*id, c.with_lifecycle(l));
+                self.status(*id, ClaimStatus::Received, None)?;
+                self.emit(
+                    Some(*id),
+                    LifecycleAction::Received,
+                    DeltaFact::Receipt(r.clone()),
+                )?;
+                Ok(CommandResult::Receipt {
+                    claim: *id,
+                    fence: r.fence,
+                })
+            }
+            Command::AdoptReceipt {
+                claim: id,
+                previous,
+                receipt,
+                holder,
+                epoch,
+            } => {
+                self.runtime()?;
+                let c = self.allowed(
+                    *id,
+                    &[
+                        ClaimStatus::Received,
+                        ClaimStatus::Progressed,
+                        ClaimStatus::TestamentGenerated,
+                        ClaimStatus::TestamentAcknowledged,
+                        ClaimStatus::Validating,
+                    ],
+                )?;
+                let old = c
+                    .lifecycle()
+                    .receipt
+                    .as_ref()
+                    .ok_or_else(|| refuse(ErrorCode::StaleReceipt, "no receipt"))?;
+                if old.fence != *previous
+                    || *epoch
+                        != previous
+                            .epoch
+                            .checked_add(1)
+                            .ok_or_else(|| refuse(ErrorCode::StaleReceipt, "epoch exhausted"))?
+                    || receipt.is_zero()
+                    || holder.is_zero()
+                {
+                    return Err(refuse(ErrorCode::StaleReceipt, "invalid adoption fence"));
+                }
+                if self.state.claims.values().any(|x| {
+                    x.lifecycle()
+                        .receipt
+                        .as_ref()
+                        .is_some_and(|r| r.fence.receipt == *receipt)
+                }) {
+                    return Err(refuse(
+                        ErrorCode::StaleReceipt,
+                        "receipt ID already allocated",
+                    ));
+                }
+                let r = Receipt {
+                    fence: ReceiptFence {
+                        receipt: *receipt,
+                        epoch: *epoch,
+                    },
+                    holder: *holder,
+                    acquired: self.sequence,
+                };
+                let mut l = c.lifecycle().clone();
+                l.receipt = Some(r.clone());
+                if let Some(id) = l.evidence_set
+                    && let Some(set) = self.state.evidence_sets.get_mut(&id)
+                    && !set.closed
+                {
+                    set.receipt = r.fence
+                }
+                self.state.claims.insert(*id, c.with_lifecycle(l));
+                self.emit(
+                    Some(*id),
+                    LifecycleAction::ReceiptAdopted,
+                    DeltaFact::Receipt(r.clone()),
+                )?;
+                Ok(CommandResult::Receipt {
+                    claim: *id,
+                    fence: r.fence,
+                })
+            }
+            Command::RecordProgress {
+                claim: id,
+                receipt,
+                message,
+            } => {
+                let c = self.allowed(*id, &[ClaimStatus::Received, ClaimStatus::Progressed])?;
+                self.holder(&c, *receipt)?;
+                self.text(message)?;
+                if c.lifecycle().status == ClaimStatus::Received {
+                    self.status(*id, ClaimStatus::Progressed, None)?
+                }
+                self.emit(
+                    Some(*id),
+                    LifecycleAction::Progressed,
+                    DeltaFact::Progress(message.clone()),
+                )?;
+                self.result(*id)
+            }
+            Command::BeginEvidenceSet {
+                claim: id,
+                receipt,
+                evidence_set,
+            } => {
+                let c = self.allowed(*id, &[ClaimStatus::Received, ClaimStatus::Progressed])?;
+                self.holder(&c, *receipt)?;
+                if evidence_set.is_zero()
+                    || self.state.evidence_sets.contains_key(evidence_set)
+                    || c.lifecycle().evidence_set.is_some()
+                {
+                    return Err(refuse(
+                        ErrorCode::ObjectIdConflict,
+                        "evidence set already exists for this receipt",
+                    ));
+                }
+                self.state.evidence_sets.insert(
+                    *evidence_set,
+                    EvidenceSet {
+                        id: *evidence_set,
+                        claim: *id,
+                        receipt: *receipt,
+                        artifacts: Vec::new(),
+                        closed: false,
+                    },
+                );
+                let mut l = c.lifecycle().clone();
+                l.evidence_set = Some(*evidence_set);
+                self.state.claims.insert(*id, c.with_lifecycle(l));
+                self.emit(
+                    Some(*id),
+                    LifecycleAction::EvidenceOpened,
+                    DeltaFact::EvidenceSet(*evidence_set),
+                )?;
+                Ok(CommandResult::EvidenceSet(*evidence_set))
+            }
+            Command::AttachArtifact {
+                claim: id,
+                receipt,
+                evidence_set,
+                artifact,
+            } => {
+                let c = self.allowed(*id, &[ClaimStatus::Received, ClaimStatus::Progressed])?;
+                self.holder(&c, *receipt)?;
+                let set = self
+                    .state
+                    .evidence_sets
+                    .get(evidence_set)
+                    .ok_or_else(|| refuse(ErrorCode::UnknownObject, "unknown evidence set"))?;
+                if set.claim != *id || set.receipt != *receipt || set.closed {
+                    return Err(refuse(
+                        ErrorCode::StaleReceipt,
+                        "evidence set closed or fenced",
+                    ));
+                }
+                if set.artifacts.len() >= self.limits.max_artifacts_per_set {
+                    return Err(refuse(ErrorCode::Capacity, "artifact manifest size"));
+                }
+                if artifact.content.receipt != Some(*receipt)
+                    || artifact.content.producer != self.input.principal
+                {
+                    return Err(refuse(
+                        ErrorCode::WrongActor,
+                        "artifact provenance must match holder",
+                    ));
+                }
+                let reference = self.create_artifact(artifact)?;
+                let set = self
+                    .state
+                    .evidence_sets
+                    .get_mut(evidence_set)
+                    .ok_or_else(|| refuse(ErrorCode::InvalidManifest, "checked set missing"))?;
+                if !set.artifacts.contains(&reference) {
+                    set.artifacts.push(reference);
+                    self.emit(
+                        Some(*id),
+                        LifecycleAction::ArtifactAttached,
+                        DeltaFact::Artifact(reference),
+                    )?
+                }
+                Ok(CommandResult::Artifact(reference))
+            }
+            Command::CloseTestament {
+                claim: id,
+                receipt,
+                testament,
+                evidence_set,
+                manifest,
+                summary,
+                confidence,
+                outcome,
+            } => {
+                let c = self.allowed(*id, &[ClaimStatus::Received, ClaimStatus::Progressed])?;
+                self.holder(&c, *receipt)?;
+                self.text(summary)?;
+                let set = self
+                    .state
+                    .evidence_sets
+                    .get(evidence_set)
+                    .ok_or_else(|| refuse(ErrorCode::UnknownObject, "unknown evidence set"))?;
+                if set.claim != *id || set.receipt != *receipt || set.closed {
+                    return Err(refuse(
+                        ErrorCode::StaleReceipt,
+                        "evidence set closed or fenced",
+                    ));
+                }
+                if set.artifacts != *manifest {
+                    return Err(refuse(
+                        ErrorCode::InvalidManifest,
+                        "close must contain the exact staged ordered manifest",
+                    ));
+                }
+                let content = TestamentContent {
+                    ledger: self.state.ledger(),
+                    schema: SCHEMA_MAJOR,
+                    claim: *id,
+                    receipt: *receipt,
+                    evidence_set: *evidence_set,
+                    artifacts: manifest.clone(),
+                    summary: summary.clone(),
+                    confidence: *confidence,
+                    outcome: *outcome,
+                };
+                self.create_testament(*testament, content)?;
+                self.status(*id, ClaimStatus::TestamentGenerated, None)?;
+                Ok(CommandResult::Testament(*testament))
+            }
+            Command::AcknowledgeTestament {
+                claim: id,
+                testament,
+            } => {
+                self.runtime()?;
+                let c = self.allowed(*id, &[ClaimStatus::TestamentGenerated])?;
+                if c.lifecycle().testament != Some(*testament) {
+                    return Err(refuse(
+                        ErrorCode::InvalidManifest,
+                        "testament is not the active close",
+                    ));
+                }
+                let t = self
+                    .state
+                    .testaments
+                    .get_owned(testament)?
+                    .ok_or_else(|| refuse(ErrorCode::UnknownObject, "unknown testament"))?;
+                self.verify_artifacts(&t.content().artifacts)?;
+                self.state.testaments.insert(
+                    *testament,
+                    t.with_lifecycle(TestamentLifecycle {
+                        created: t.lifecycle().created,
+                        acknowledged: Some(self.sequence),
+                    }),
+                );
+                self.status(*id, ClaimStatus::TestamentAcknowledged, None)?;
+                self.receipt_passes(
+                    *id,
+                    t.content_hash(),
+                    manifest_hash(&t.content().artifacts)?,
+                )?;
+                self.result(*id)
+            }
+            Command::BeginWholeWorkValidation { claim: id } => {
+                self.runtime()?;
+                let c = self.allowed(*id, &[ClaimStatus::TestamentAcknowledged])?;
+                if !self.phase_complete(*id, ValidationPhase::Increment) {
+                    return Err(DomainOutcome::Inform {
+                        claim: Some(*id),
+                        reason: InformReason::ValidationPending,
+                    });
+                }
+                let tid = c
+                    .lifecycle()
+                    .testament
+                    .ok_or_else(|| refuse(ErrorCode::InvalidManifest, "missing testament"))?;
+                let t = self.state.testaments.get(&tid).ok_or_else(|| {
+                    refuse(ErrorCode::InvalidManifest, "closed testament missing")
+                })?;
+                let hash = t.content_hash();
+                let manifest = manifest_hash(&t.content().artifacts)?;
+                self.status(*id, ClaimStatus::Validating, None)?;
+                self.schedule_phase(*id, ValidationPhase::WholeWork, hash, manifest)?;
+                self.result(*id)
+            }
+            Command::BeginIncrementValidation {
+                claim: id,
+                validation,
+                target,
+                manifest,
+            } => {
+                self.runtime()?;
+                self.allowed(
+                    *id,
+                    &[
+                        ClaimStatus::Received,
+                        ClaimStatus::Progressed,
+                        ClaimStatus::TestamentGenerated,
+                        ClaimStatus::TestamentAcknowledged,
+                    ],
+                )?;
+                let v = self
+                    .state
+                    .validations
+                    .get(validation)
+                    .ok_or_else(|| refuse(ErrorCode::UnknownObject, "unknown validation"))?;
+                if v.content().claim != *id || v.content().phase != ValidationPhase::Increment {
+                    return Err(refuse(
+                        ErrorCode::InvalidRelation,
+                        "increment validation requirement mismatch",
+                    ));
+                }
+                let run = self.schedule(*validation, *target, *manifest)?;
+                Ok(CommandResult::Validation(run))
+            }
+            Command::RecordValidationVerdict { verdict } => self.verdict(verdict),
+            Command::RecordFencedValidationVerdict { verdict, receipt } => {
+                let run = self
+                    .state
+                    .runs
+                    .get(&verdict.run)
+                    .ok_or_else(|| refuse(ErrorCode::UnknownObject, "fenced validation run"))?;
+                let claim = self.claim(run.claim)?;
+                if claim
+                    .lifecycle()
+                    .receipt
+                    .as_ref()
+                    .map(|current| current.fence)
+                    != *receipt
+                {
+                    return Err(refuse(
+                        ErrorCode::StaleReceipt,
+                        "verdict receipt generation changed",
+                    ));
+                }
+                self.verdict(verdict)
+            }
+            Command::CompleteWholeWork { claim: id } => {
+                self.runtime()?;
+                let c = self.allowed(*id, &[ClaimStatus::Validating])?;
+                if c.lifecycle().local_complete {
+                    return Err(DomainOutcome::Inform {
+                        claim: Some(*id),
+                        reason: InformReason::AlreadyApplied,
+                    });
+                }
+                let Some(value) = self.aggregate(*id) else {
+                    return Err(DomainOutcome::Inform {
+                        claim: Some(*id),
+                        reason: InformReason::ValidationPending,
+                    });
+                };
+                match value {
+                    VerdictValue::Pass => {
+                        let c = self.claim(*id)?;
+                        let mut l = c.lifecycle().clone();
+                        l.local_complete = true;
+                        self.state.claims.insert(*id, c.with_lifecycle(l));
+                        self.emit(
+                            Some(*id),
+                            LifecycleAction::LocalCompleted,
+                            DeltaFact::LocalCompletion,
+                        )?
+                    }
+                    VerdictValue::Fail => self.status(*id, ClaimStatus::ValidationFailed, None)?,
+                    VerdictValue::Error => {
+                        self.status(*id, ClaimStatus::ValidationErrored, None)?
+                    }
+                    VerdictValue::Incomplete => {
+                        self.status(*id, ClaimStatus::ValidationIncomplete, None)?
+                    }
+                }
+                self.propagate()?;
+                self.result(*id)
+            }
+            Command::FailPost {
+                claim: id,
+                evidence,
+            } => {
+                self.runtime()?;
+                self.allowed(*id, &[ClaimStatus::Generated, ClaimStatus::Posted])?;
+                self.verify_error(*evidence)?;
+                self.status(*id, ClaimStatus::PostFailed, None)?;
+                self.result(*id)
+            }
+            Command::FailReceipt {
+                claim: id,
+                evidence,
+            } => {
+                self.runtime()?;
+                self.allowed(*id, &[ClaimStatus::Posted])?;
+                self.verify_error(*evidence)?;
+                self.status(*id, ClaimStatus::ReceiptFailed, None)?;
+                self.result(*id)
+            }
+            Command::FailTestamentGeneration {
+                claim: id,
+                testament,
+                evidence_set,
+                error,
+                summary,
+            } => {
+                self.runtime()?;
+                let c = self.allowed(*id, &[ClaimStatus::Received, ClaimStatus::Progressed])?;
+                self.text(summary)?;
+                if error.content.kind != "error" {
+                    return Err(refuse(
+                        ErrorCode::InvalidSchema,
+                        "exceptional close needs error evidence",
+                    ));
+                }
+                let a = self.create_artifact(error)?;
+                let receipt = c
+                    .lifecycle()
+                    .receipt
+                    .as_ref()
+                    .ok_or_else(|| refuse(ErrorCode::StaleReceipt, "missing receipt"))?
+                    .fence;
+                if let Some(set) = self.state.evidence_sets.get(evidence_set) {
+                    if set.claim != *id || set.closed {
+                        return Err(refuse(
+                            ErrorCode::InvalidManifest,
+                            "failure evidence set mismatch",
+                        ));
+                    }
+                } else {
+                    self.state.evidence_sets.insert(
+                        *evidence_set,
+                        EvidenceSet {
+                            id: *evidence_set,
+                            claim: *id,
+                            receipt,
+                            artifacts: Vec::new(),
+                            closed: false,
+                        },
+                    );
+                }
+                let set = self
+                    .state
+                    .evidence_sets
+                    .get_mut(evidence_set)
+                    .ok_or_else(|| refuse(ErrorCode::InvalidManifest, "failure set missing"))?;
+                if !set.artifacts.contains(&a) {
+                    set.artifacts.push(a)
+                }
+                let artifacts = set.artifacts.clone();
+                let content = TestamentContent {
+                    ledger: self.state.ledger(),
+                    schema: SCHEMA_MAJOR,
+                    claim: *id,
+                    receipt,
+                    evidence_set: *evidence_set,
+                    artifacts,
+                    summary: summary.clone(),
+                    confidence: Confidence::Committed,
+                    outcome: OutcomeKind::Failed,
+                };
+                let hash = content.content_hash()?;
+                let manifest = manifest_hash(&content.artifacts)?;
+                self.create_testament(*testament, content)?;
+                let t = self.state.testaments.get_owned(testament)?.ok_or_else(|| {
+                    refuse(ErrorCode::InvalidManifest, "failure testament missing")
+                })?;
+                self.state.testaments.insert(
+                    *testament,
+                    t.with_lifecycle(TestamentLifecycle {
+                        created: self.sequence,
+                        acknowledged: Some(self.sequence),
+                    }),
+                );
+                self.emit(
+                    Some(*id),
+                    LifecycleAction::TestamentAcknowledged,
+                    DeltaFact::Testament {
+                        id: *testament,
+                        hash,
+                    },
+                )?;
+                self.receipt_passes(*id, hash, manifest)?;
+                self.status(*id, ClaimStatus::TestamentGenerationFailed, None)?;
+                self.result(*id)
+            }
+            Command::CancelClaim { claim: id, reason } => {
+                let c = self.active(*id)?;
+                self.issuer(&c)?;
+                self.text(reason)?;
+                self.cancel_tree(*id, ClaimStatus::Cancelled)?;
+                self.result(*id)
+            }
+            Command::RevokeClaim { claim: id, reason } => {
+                self.runtime()?;
+                self.active(*id)?;
+                self.text(reason)?;
+                self.cancel_tree(*id, ClaimStatus::Revoked)?;
+                self.result(*id)
+            }
+            Command::ExpireClaim {
+                claim: id,
+                timer,
+                generation,
+                fired_at,
+            } => {
+                self.runtime()?;
+                let c = self.claim(*id)?;
+                if c.lifecycle().status.is_terminal() {
+                    return Ok(CommandResult::Noop);
+                }
+                let Some(deadline) = c.content().deadline else {
+                    return Ok(CommandResult::Noop);
+                };
+                if deadline.timer != *timer || deadline.generation != *generation {
+                    return Ok(CommandResult::Noop);
+                }
+                if *fired_at < deadline.at || self.input.authority.logical_time < *fired_at {
+                    return Err(refuse(
+                        ErrorCode::DeadlineNotDue,
+                        "timer has not reached logged deadline",
+                    ));
+                }
+                if let Some(component) =
+                    crate::graph::cycle_containing(&self.state, *id, self.limits.max_graph_visits)?
+                {
+                    let victim = self.cycle_victim(&component)?;
+                    self.cancel_tree(victim, ClaimStatus::Deadlocked)?;
+                } else {
+                    self.cancel_tree(*id, ClaimStatus::Expired)?
+                }
+                self.result(*id)
+            }
+            Command::SupersedeClaim {
+                predecessor,
+                successor,
+            } => {
+                let c = self.claim(*predecessor)?;
+                self.issuer(&c)?;
+                if successor.content.issuer() != c.content().issuer()
+                    || successor.content.subject() != c.content().subject()
+                    || !successor
+                        .content
+                        .dependencies(RelationKind::Supersedes)
+                        .any(|id| id == *predecessor)
+                {
+                    return Err(refuse(
+                        ErrorCode::InvalidRelation,
+                        "compatible successor must explicitly supersede predecessor",
+                    ));
+                }
+                let result = self.generate(std::slice::from_ref(successor))?;
+                if c.lifecycle().status.is_active() {
+                    self.cancel_tree(*predecessor, ClaimStatus::Superseded)?
+                }
+                Ok(result)
+            }
+            Command::RegisterMonitor {
+                monitor,
+                owner,
+                roots,
+                deadline,
+            } => {
+                let c = self.active(*owner)?;
+                self.issuer(&c)?;
+                if monitor.is_zero() || self.state.monitors.contains_key(monitor) {
+                    return Err(refuse(
+                        ErrorCode::ObjectIdConflict,
+                        "monitor ID already exists",
+                    ));
+                }
+                if deadline.at <= self.input.authority.logical_time || deadline.timer.is_zero() {
+                    return Err(refuse(
+                        ErrorCode::MissingDeadline,
+                        "parked work requires future finite deadline",
+                    ));
+                }
+                if roots.is_empty()
+                    || roots.len() > self.limits.max_relations
+                    || self.state.monitors.len() >= self.limits.max_monitors
+                {
+                    return Err(refuse(ErrorCode::Capacity, "monitor budget"));
+                }
+                for root in roots {
+                    let id = match root {
+                        WaitPredicate::Satisfied(id)
+                        | WaitPredicate::Terminal(id)
+                        | WaitPredicate::Released(id) => *id,
+                    };
+                    self.claim(id)?;
+                }
+                self.state.monitors.insert(
+                    *monitor,
+                    Monitor {
+                        id: *monitor,
+                        owner: *owner,
+                        roots: roots.clone(),
+                        deadline: *deadline,
+                        registered: self.sequence,
+                        released: None,
+                    },
+                );
+                self.emit(
+                    Some(*owner),
+                    LifecycleAction::ScopeRegistered,
+                    DeltaFact::Scope(*monitor),
+                )?;
+                self.effect(EffectIntent::ScheduleDeadline {
+                    claim: *owner,
+                    deadline: *deadline,
+                })?;
+                Ok(CommandResult::Monitor(*monitor))
+            }
+            Command::RebindMonitor {
+                monitor,
+                predecessor,
+                successor,
+            } => {
+                self.runtime()?;
+                let new = self.claim(*successor)?;
+                if !new
+                    .content()
+                    .dependencies(RelationKind::Supersedes)
+                    .any(|id| id == *predecessor)
+                {
+                    return Err(refuse(
+                        ErrorCode::InvalidRelation,
+                        "monitor follows only explicit successor",
+                    ));
+                }
+                let m = self
+                    .state
+                    .monitors
+                    .get_mut(monitor)
+                    .ok_or_else(|| refuse(ErrorCode::UnknownObject, "unknown monitor"))?;
+                if m.released.is_some() {
+                    return Err(DomainOutcome::Inform {
+                        claim: Some(m.owner),
+                        reason: InformReason::AlreadyApplied,
+                    });
+                }
+                let mut replaced = false;
+                m.roots = m
+                    .roots
+                    .iter()
+                    .map(|r| match *r {
+                        WaitPredicate::Satisfied(id) if id == *predecessor => {
+                            replaced = true;
+                            WaitPredicate::Satisfied(*successor)
+                        }
+                        WaitPredicate::Terminal(id) if id == *predecessor => {
+                            replaced = true;
+                            WaitPredicate::Terminal(*successor)
+                        }
+                        WaitPredicate::Released(id) if id == *predecessor => {
+                            replaced = true;
+                            WaitPredicate::Released(*successor)
+                        }
+                        _ => *r,
+                    })
+                    .collect();
+                if !replaced {
+                    return Err(refuse(
+                        ErrorCode::InvalidRelation,
+                        "monitor does not reference predecessor",
+                    ));
+                }
+                let owner = m.owner;
+                self.emit(
+                    Some(owner),
+                    LifecycleAction::ScopeRebound,
+                    DeltaFact::Scope(*monitor),
+                )?;
+                Ok(CommandResult::Monitor(*monitor))
+            }
+            Command::ReleaseScope { claim: id } => {
+                self.runtime()?;
+                let c = self.claim(*id)?;
+                if !c.lifecycle().status.is_terminal()
+                    || self.state.claims.values().any(|x| {
+                        x.content().cause() == Some(Cause::Claim(*id)) && !x.lifecycle().released
+                    })
+                {
+                    return Err(DomainOutcome::Inform {
+                        claim: Some(*id),
+                        reason: InformReason::DependencyPending(*id),
+                    });
+                }
+                let mut l = c.lifecycle().clone();
+                l.released = true;
+                self.state.claims.insert(*id, c.with_lifecycle(l));
+                self.result(*id)
+            }
+            Command::RegisterArtifact { artifact } => {
+                self.runtime()?;
+                if artifact.content.producer != self.input.principal {
+                    return Err(refuse(
+                        ErrorCode::WrongActor,
+                        "artifact producer must be authenticated principal",
+                    ));
+                }
+                let reference = self.create_artifact(artifact)?;
+                self.emit(
+                    None,
+                    LifecycleAction::ArtifactAttached,
+                    DeltaFact::Artifact(reference),
+                )?;
+                Ok(CommandResult::Artifact(reference))
+            }
+            Command::ExpireMonitor {
+                monitor,
+                timer,
+                generation,
+                fired_at,
+            } => {
+                self.runtime()?;
+                let m = self
+                    .state
+                    .monitors
+                    .get_owned(monitor)?
+                    .ok_or_else(|| refuse(ErrorCode::UnknownObject, "monitor deadline"))?;
+                if m.released.is_some()
+                    || m.deadline.timer != *timer
+                    || m.deadline.generation != *generation
+                {
+                    return Ok(CommandResult::Noop);
+                }
+                if *fired_at < m.deadline.at || self.input.authority.logical_time < *fired_at {
+                    return Err(refuse(ErrorCode::DeadlineNotDue, "monitor timer not due"));
+                }
+                if let Some(component) = crate::graph::cycle_containing(
+                    &self.state,
+                    m.owner,
+                    self.limits.max_graph_visits,
+                )? {
+                    let victim = self.cycle_victim(&component)?;
+                    self.cancel_tree(victim, ClaimStatus::Deadlocked)?;
+                } else {
+                    self.cancel_tree(m.owner, ClaimStatus::Expired)?
+                }
+                Ok(CommandResult::Monitor(*monitor))
+            }
+        }
+    }
+}

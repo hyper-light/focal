@@ -73,9 +73,54 @@ pub fn serve<T: ClientTransport + 'static, R: Read + Send + 'static, W: Write + 
     };
     // Reserve before constructing serde schema trees. Protocol takes its own
     // measured resident charge before this temporary admission is released.
+    let tool_count = focal_client::operations::descriptors()
+        .len()
+        .checked_add(6)
+        .and_then(|n| {
+            n.checked_add(if backend.has_admin() {
+                crate::catalog_admin::TOOL_COUNT
+            } else {
+                0
+            })
+        })
+        .and_then(|n| {
+            n.checked_add(if backend.has_uploads() {
+                crate::catalog_transfer::TOOL_COUNT
+            } else {
+                0
+            })
+        })
+        .and_then(|n| {
+            n.checked_add(if backend.has_watches() {
+                crate::catalog_watch::TOOL_COUNT
+            } else {
+                0
+            })
+        })
+        .ok_or(ProtocolError::Capacity)?;
+    // Covers each retained pruned input/output tree and one temporary shared
+    // definition tree. The composition test measures the complete catalogue.
+    let construction_bytes = tool_count
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(512 * 1024))
+        .ok_or(ProtocolError::Capacity)?;
     let catalog_admission = budget
-        .reserve(BudgetKind::Control, BudgetLane::Ordinary, 4 * MIB)?
+        .reserve(
+            BudgetKind::Control,
+            BudgetLane::Ordinary,
+            construction_bytes,
+        )?
         .commit();
+    let mut tools = crate::catalog::catalog()?;
+    if backend.has_admin() {
+        crate::catalog_admin::append(&mut tools)?;
+    }
+    if backend.has_uploads() {
+        crate::catalog_transfer::append(&mut tools)?;
+    }
+    if backend.has_watches() {
+        crate::catalog_watch::append(&mut tools)?;
+    }
     let mut protocol = Protocol::new(
         limits,
         budget.clone(),
@@ -83,7 +128,7 @@ pub fn serve<T: ClientTransport + 'static, R: Read + Send + 'static, W: Write + 
             name: "focal".into(),
             version: env!("CARGO_PKG_VERSION").into(),
         },
-        crate::catalog::catalog()?,
+        tools,
     )?;
     drop(catalog_admission);
     let decoder = FrameDecoder::new(limits.max_frame_bytes, budget.clone())?;

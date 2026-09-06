@@ -1,0 +1,769 @@
+use super::super::{
+    aggregation::{AcceptancePolicy, EvaluationRegistry},
+    claim::{
+        BoundaryFailure, ClaimCut, ClaimDefinition, ClaimIntent, PostingStanding, PredicateState,
+    },
+    evidence::{Diagnostic, EvidenceFailure},
+    graph, scope, succession, validation as v,
+};
+use super::*;
+use crate::{
+    ArtifactId, ContentHash, Deadline, EvidenceAttestation, HandlerRef, LedgerId, ObjectId,
+    ObjectRevision, SessionId, TenantId, TimerId, ValidationKind, ValidationMode, ValidationPhase,
+    ValidatorId, VerdictValue,
+};
+
+fn binding(id: u128) -> Binding {
+    Binding {
+        ledger: LedgerId {
+            tenant: TenantId::from_u128(1),
+            session: SessionId::from_u128(1),
+        },
+        object: ObjectId::from_u128(id),
+        content: ContentHash([7; 32]),
+        revision: ObjectRevision(1),
+    }
+}
+fn issuer() -> ParticipantId {
+    ParticipantId::from_u128(10)
+}
+fn evaluator() -> ParticipantId {
+    ParticipantId::from_u128(11)
+}
+fn deadline() -> Deadline {
+    Deadline {
+        timer: TimerId::from_u128(1),
+        generation: 1,
+        at: 100,
+    }
+}
+fn receipt() -> v::Declaration {
+    v::Declaration::new(
+        Principal::Actor(issuer()),
+        v::DeclarationSpec {
+            binding: binding(900),
+            claim: ClaimId::from_u128(1),
+            issuer: issuer(),
+            declaration_index: 900,
+            kind: ValidationKind::Receipt,
+            phase: ValidationPhase::WholeWork,
+            mode: ValidationMode::Required,
+            target: v::TargetDeclaration::Delivery,
+            program: v::Program::Delivery,
+            deadline: deadline(),
+        },
+        v::Limits {
+            handlers: 2,
+            attempts: 4,
+            slot_bytes: 32,
+        },
+    )
+    .unwrap()
+}
+fn acceptance_limits() -> super::super::aggregation::Limits {
+    super::super::aggregation::Limits {
+        max_slots: 4,
+        max_checks: 8,
+        max_results: 16,
+        max_updates: 8,
+    }
+}
+fn claim(declarations: &[v::Declaration]) -> ClaimState {
+    let mut c = ClaimState::generate(
+        Principal::Actor(issuer()),
+        ClaimDefinition {
+            binding: binding(1),
+            issuer: issuer(),
+            subject: evaluator(),
+            deadline: None,
+            max_responses: 2,
+            created: SessionSeq(1),
+            graph: graph::Declaration::empty(),
+            lineage: succession::Lineage::root(binding(1), crate::RootCommandId::from_u128(1))
+                .unwrap(),
+            acceptance: AcceptancePolicy::new(
+                binding(1),
+                issuer(),
+                &[],
+                declarations,
+                acceptance_limits(),
+            )
+            .unwrap(),
+            scope_limits: scope::ScopeLimits {
+                scopes: 8,
+                roots: 32,
+                children: 8,
+            },
+        },
+    )
+    .unwrap();
+    c.apply(
+        &c.binding(),
+        Principal::Actor(issuer()),
+        ClaimIntent::Post {
+            standing: PostingStanding {
+                binding: c.binding(),
+                standing: PredicateState::Passed,
+                target: PredicateState::Passed,
+            },
+        },
+    )
+    .unwrap();
+    c
+}
+fn fail_claim(c: &mut ClaimState) {
+    let reference = ArtifactRef {
+        id: ArtifactId::from_u128(999),
+        hash: ContentHash([9; 32]),
+    };
+    c.report_boundary_failure(
+        &c.binding(),
+        Principal::Actor(issuer()),
+        BoundaryFailure::Post,
+        Diagnostic {
+            reason: EvidenceFailure::Structure,
+            artifact: reference,
+        },
+        &EvidenceAttestation {
+            descriptor_hash: reference.hash,
+            custody_revision: 1,
+            durable: true,
+            schema_valid: true,
+        },
+        ClaimCut {
+            position: SessionSeq(5),
+            cause: reference.hash,
+        },
+    )
+    .unwrap();
+}
+fn declaration<'a>(
+    id: u128,
+    handlers: &'a [v::HandlerPolicy<'a>],
+    mode: ValidationMode,
+) -> v::Declaration {
+    declaration_at(id, handlers, mode, v::TargetDeclaration::Admission)
+}
+fn declaration_at<'a>(
+    id: u128,
+    handlers: &'a [v::HandlerPolicy<'a>],
+    mode: ValidationMode,
+    target: v::TargetDeclaration<'a>,
+) -> v::Declaration {
+    declaration_at_deadline(id, handlers, mode, target, deadline())
+}
+fn declaration_at_deadline<'a>(
+    id: u128,
+    handlers: &'a [v::HandlerPolicy<'a>],
+    mode: ValidationMode,
+    target: v::TargetDeclaration<'a>,
+    deadline: Deadline,
+) -> v::Declaration {
+    v::Declaration::new(
+        Principal::Actor(issuer()),
+        v::DeclarationSpec {
+            binding: binding(id),
+            claim: ClaimId::from_u128(1),
+            issuer: issuer(),
+            declaration_index: u32::try_from(id).unwrap(),
+            kind: ValidationKind::Test,
+            phase: if target == v::TargetDeclaration::Increment {
+                ValidationPhase::Increment
+            } else {
+                ValidationPhase::Admission
+            },
+            mode,
+            target,
+            program: v::Program::Programmatic {
+                check: v::PhasePolicy {
+                    evaluator: evaluator(),
+                    definition: ContentHash([8; 32]),
+                    handlers,
+                    required_policy: None,
+                },
+                quality: None,
+            },
+            deadline,
+        },
+        v::Limits {
+            handlers: 2,
+            attempts: 4,
+            slot_bytes: 32,
+        },
+    )
+    .unwrap()
+}
+fn evaluation<'a>(d: &'a v::Declaration) -> v::Evaluation<'a> {
+    v::Evaluation::materialize(
+        Principal::Actor(issuer()),
+        d,
+        v::Materialization {
+            binding: d.binding(),
+            target: v::Target::Admission { claim: binding(1) },
+            slot_name: None,
+            generation: 1,
+            receipt: None,
+        },
+    )
+    .unwrap()
+}
+fn owner(e: &v::Evaluation<'_>) -> v::OwnerState {
+    v::OwnerState {
+        evaluation: e.binding(),
+        target: e.target(),
+        parent: v::ParentState::Open,
+        readiness: v::Readiness::AdmissionPosted,
+        cohort: v::Cohort::Open,
+        authority: v::Authority {
+            evaluator: evaluator(),
+            definition: ContentHash([8; 32]),
+            generation: 1,
+            receipt: None,
+            deadline: e.deadline(),
+            policy_evidence: None,
+            state: v::AuthorityState::Live,
+        },
+        logical_time: 1,
+    }
+}
+fn seal<'a>(e: &v::Evaluation<'a>) -> v::Evaluation<'a> {
+    let o = v::OwnerState {
+        cohort: v::Cohort::Sealed {
+            cause: ContentHash([9; 32]),
+        },
+        parent: v::ParentState::Failed {
+            cause: ContentHash([9; 32]),
+        },
+        ..owner(e)
+    };
+    e.record_seal(&e.binding(), &o).unwrap()
+}
+fn report<'a>(e: &v::Evaluation<'a>, value: VerdictValue, id: u128) -> v::Transition<'a> {
+    let o = v::OwnerState {
+        cohort: v::Cohort::Sealed {
+            cause: ContentHash([9; 32]),
+        },
+        parent: v::ParentState::Failed {
+            cause: ContentHash([9; 32]),
+        },
+        ..owner(e)
+    };
+    let attempt = e.current_attempt().unwrap();
+    let reference = ArtifactRef {
+        id: ArtifactId::from_u128(id),
+        hash: binding(id).content,
+    };
+    let facts = v::EvidenceFacts {
+        binding: binding(id),
+        claim: e.claim(),
+        validation: e.validation(),
+        target: e.target(),
+        generation: e.generation(),
+        attempt,
+        producer: evaluator(),
+        value,
+        kind: if matches!(value, VerdictValue::Pass | VerdictValue::Fail) {
+            v::EvidenceKind::Proof
+        } else {
+            v::EvidenceKind::Diagnostic
+        },
+        schema: ContentHash([3; 32]),
+        custody_revision: Some(1),
+    };
+    e.report(
+        Principal::Actor(evaluator()),
+        &e.binding(),
+        &o,
+        v::Report {
+            generation: 1,
+            attempt,
+            value,
+            evidence: reference,
+        },
+        &facts,
+    )
+    .unwrap()
+}
+
+#[test]
+fn audit_rejects_same_binding_definition_substitution_at_seal_and_late_record() {
+    let handler = HandlerRef {
+        id: ValidatorId::from_u128(1),
+        version: ContentHash([2; 32]),
+        agentic: false,
+    };
+    let changed_handler = HandlerRef {
+        version: ContentHash([4; 32]),
+        ..handler
+    };
+    let steps = [v::HandlerPolicy {
+        handler: &handler,
+        attempts: 1,
+        proof_schema: ContentHash([3; 32]),
+        diagnostic_schema: ContentHash([3; 32]),
+    }];
+    let changed_steps = [v::HandlerPolicy {
+        handler: &changed_handler,
+        ..steps[0]
+    }];
+    let changed_policy = [v::HandlerPolicy {
+        attempts: 2,
+        ..steps[0]
+    }];
+    let declarations = [receipt(), declaration(2, &steps, ValidationMode::Observe)];
+    let alternatives = [
+        declaration(2, &changed_steps, ValidationMode::Observe),
+        declaration(2, &changed_policy, ValidationMode::Observe),
+        declaration_at_deadline(
+            2,
+            &steps,
+            ValidationMode::Observe,
+            v::TargetDeclaration::Admission,
+            Deadline {
+                at: 101,
+                ..deadline()
+            },
+        ),
+    ];
+    let ready = evaluation(&declarations[1]);
+    let running = ready
+        .begin(
+            Principal::Actor(evaluator()),
+            &ready.binding(),
+            &owner(&ready),
+        )
+        .unwrap()
+        .next;
+    let running = seal(&running);
+    let mut c = claim(&declarations);
+    let mut registry = EvaluationRegistry::new(&c, acceptance_limits()).unwrap();
+    registry.register(&ready).unwrap();
+    let targets = registry.seal_targets();
+    fail_claim(&mut c);
+    let limits = Limits {
+        evaluations: 1,
+        results: 2,
+    };
+    let mut cohort =
+        AuditCohort::seal(&c, &targets, SessionSeq(5), &[running], &[], limits).unwrap();
+    for alternative in &alternatives {
+        let other_ready = evaluation(alternative);
+        assert_eq!(other_ready.binding(), ready.binding());
+        assert_eq!(other_ready.target(), ready.target());
+        assert_eq!(other_ready.generation(), ready.generation());
+        let other_running = other_ready
+            .begin(
+                Principal::Actor(evaluator()),
+                &other_ready.binding(),
+                &owner(&other_ready),
+            )
+            .unwrap()
+            .next;
+        let other_running = seal(&other_running);
+        assert_eq!(
+            AuditCohort::seal(&c, &targets, SessionSeq(5), &[other_running], &[], limits,)
+                .unwrap_err(),
+            ContractError::StaleEvaluation,
+        );
+        let substituted = report(&other_running, VerdictValue::Pass, 20);
+        assert_eq!(
+            cohort.record(&substituted.next),
+            Err(ContractError::InvalidTarget),
+        );
+        assert_eq!(cohort.result_count(), 0);
+        assert!(!cohort.complete());
+    }
+    let original = report(&running, VerdictValue::Pass, 20);
+    cohort.record(&original.next).unwrap();
+    assert!(cohort.complete());
+    assert_eq!(cohort.result_count(), 1);
+}
+
+#[test]
+fn audit_waits_for_begun_observe_and_records_suppressed_ready_without_verdict() {
+    let h = HandlerRef {
+        id: ValidatorId::from_u128(1),
+        version: ContentHash([2; 32]),
+        agentic: false,
+    };
+    let steps = [v::HandlerPolicy {
+        handler: &h,
+        attempts: 1,
+        proof_schema: ContentHash([3; 32]),
+        diagnostic_schema: ContentHash([3; 32]),
+    }];
+    let declarations = [
+        receipt(),
+        declaration(2, &steps, ValidationMode::Required),
+        declaration(3, &steps, ValidationMode::Observe),
+    ];
+    let ready = evaluation(&declarations[1]);
+    let observed_ready = evaluation(&declarations[2]);
+    let running = observed_ready
+        .begin(
+            Principal::Actor(evaluator()),
+            &observed_ready.binding(),
+            &owner(&observed_ready),
+        )
+        .unwrap()
+        .next;
+    let mut c = claim(&declarations);
+    let mut registry = EvaluationRegistry::new(&c, acceptance_limits()).unwrap();
+    registry.register(&ready).unwrap();
+    registry.register(&observed_ready).unwrap();
+    assert_eq!(
+        registry.register(&running),
+        Err(ContractError::InvalidTransition)
+    );
+    let targets = registry.seal_targets();
+    assert!(
+        AuditCohort::seal(
+            &c,
+            &targets,
+            SessionSeq(5),
+            &[ready, running],
+            &[],
+            Limits {
+                evaluations: 2,
+                results: 2
+            }
+        )
+        .is_err()
+    );
+    fail_claim(&mut c);
+    let ready = seal(&ready);
+    let running = seal(&running);
+    assert!(matches!(
+        AuditCohort::seal(
+            &c,
+            &targets,
+            SessionSeq(6),
+            &[running, ready],
+            &[],
+            Limits {
+                evaluations: 2,
+                results: 2
+            }
+        ),
+        Err(ContractError::InvalidCut)
+    ));
+    let mut cohort = AuditCohort::seal(
+        &c,
+        &targets,
+        SessionSeq(5),
+        &[running, ready],
+        &[],
+        Limits {
+            evaluations: 2,
+            results: 2,
+        },
+    )
+    .unwrap();
+    assert!(!cohort.complete());
+    let finished = report(&running, VerdictValue::Fail, 20);
+    let result = finished.result.unwrap();
+    assert_eq!(
+        ResultArtifact::from_result(result).unwrap().producer(),
+        evaluator()
+    );
+    assert_eq!(
+        ResultArtifact::from_result(result).unwrap().reference().id,
+        ArtifactId::from_u128(20)
+    );
+    cohort.record(&finished.next).unwrap();
+    assert!(cohort.complete());
+    assert_eq!(cohort.result_count(), 1);
+    assert_eq!(cohort.members()[0].state(), State::Ready);
+    assert!(cohort.members()[0].suppression().is_some());
+    let mut bundle =
+        ResultTestament::generate(binding(30), Principal::Actor(issuer()), cohort).unwrap();
+    assert_eq!(bundle.state(), ResultTestamentState::Generated);
+    assert_eq!(bundle.results(), &[result]);
+    assert_eq!(
+        bundle.post(Principal::Actor(evaluator()), &bundle.binding()),
+        Err(ContractError::WrongActor)
+    );
+    assert_eq!(
+        bundle.post(Principal::Node(issuer()), &bundle.binding()),
+        Err(ContractError::WrongActor)
+    );
+    bundle
+        .post(Principal::Actor(issuer()), &bundle.binding())
+        .unwrap();
+    assert_eq!(bundle.state(), ResultTestamentState::Posted);
+    assert_eq!(
+        bundle.post(Principal::Actor(issuer()), &bundle.binding()),
+        Err(ContractError::InvalidTransition)
+    );
+    assert_eq!(c.status(), crate::ClaimStatus::PostFailed);
+}
+
+#[test]
+fn audit_reserves_attempts_and_rejects_missing_or_duplicate_history() {
+    let h = HandlerRef {
+        id: ValidatorId::from_u128(1),
+        version: ContentHash([2; 32]),
+        agentic: false,
+    };
+    let steps = [v::HandlerPolicy {
+        handler: &h,
+        attempts: 2,
+        proof_schema: ContentHash([3; 32]),
+        diagnostic_schema: ContentHash([3; 32]),
+    }];
+    let declarations = [receipt(), declaration(2, &steps, ValidationMode::Observe)];
+    let ready = evaluation(&declarations[1]);
+    let running = ready
+        .begin(
+            Principal::Actor(evaluator()),
+            &ready.binding(),
+            &owner(&ready),
+        )
+        .unwrap()
+        .next;
+    let error = report(&running, VerdictValue::Error, 20);
+    let running = seal(&error.next);
+    let mut c = claim(&declarations);
+    let mut registry = EvaluationRegistry::new(&c, acceptance_limits()).unwrap();
+    registry.register(&ready).unwrap();
+    let targets = registry.seal_targets();
+    fail_claim(&mut c);
+    let limits = Limits {
+        evaluations: 1,
+        results: 2,
+    };
+    assert!(AuditCohort::seal(&c, &targets, SessionSeq(5), &[running], &[], limits).is_err());
+    let first = error.result.unwrap();
+    assert!(
+        AuditCohort::seal(
+            &c,
+            &targets,
+            SessionSeq(5),
+            &[running],
+            &[first, first],
+            limits
+        )
+        .is_err()
+    );
+    assert!(matches!(
+        AuditCohort::seal(
+            &c,
+            &targets,
+            SessionSeq(5),
+            &[running],
+            &[first],
+            Limits {
+                results: 1,
+                ..limits
+            }
+        ),
+        Err(ContractError::Capacity)
+    ));
+    let mut cohort =
+        AuditCohort::seal(&c, &targets, SessionSeq(5), &[running], &[first], limits).unwrap();
+    let final_result = report(&running, VerdictValue::Pass, 21);
+    cohort.record(&final_result.next).unwrap();
+    assert!(cohort.complete());
+    assert!(cohort.record(&final_result.next).is_err());
+    let bundle =
+        ResultTestament::generate(binding(30), Principal::Actor(issuer()), cohort).unwrap();
+    assert_eq!(bundle.results(), &[first, final_result.result.unwrap()]);
+}
+
+#[test]
+fn explicit_deadline_fence_closes_begun_audit_without_inventing_a_result() {
+    let h = HandlerRef {
+        id: ValidatorId::from_u128(1),
+        version: ContentHash([2; 32]),
+        agentic: false,
+    };
+    let steps = [v::HandlerPolicy {
+        handler: &h,
+        attempts: 1,
+        proof_schema: ContentHash([3; 32]),
+        diagnostic_schema: ContentHash([3; 32]),
+    }];
+    let declarations = [receipt(), declaration(2, &steps, ValidationMode::Observe)];
+    let ready = evaluation(&declarations[1]);
+    let begun = ready
+        .begin(
+            Principal::Actor(evaluator()),
+            &ready.binding(),
+            &owner(&ready),
+        )
+        .unwrap()
+        .next;
+    let begun = seal(&begun);
+    let mut c = claim(&declarations);
+    let mut registry = EvaluationRegistry::new(&c, acceptance_limits()).unwrap();
+    registry.register(&ready).unwrap();
+    let targets = registry.seal_targets();
+    fail_claim(&mut c);
+    let mut cohort = AuditCohort::seal(
+        &c,
+        &targets,
+        SessionSeq(5),
+        &[begun],
+        &[],
+        Limits {
+            evaluations: 1,
+            results: 1,
+        },
+    )
+    .unwrap();
+    assert!(!cohort.complete());
+    let fence = v::AuthorityFence {
+        reason: v::FenceReason::Deadline(deadline()),
+        cause: ContentHash([9; 32]),
+    };
+    let current = owner(&begun);
+    let fenced_owner = v::OwnerState {
+        authority: v::Authority {
+            state: v::AuthorityState::Fenced(fence),
+            ..current.authority
+        },
+        logical_time: 100,
+        ..current
+    };
+    let fenced = begun.record_fence(&begun.binding(), &fenced_owner).unwrap();
+    cohort.record(&fenced).unwrap();
+    assert!(cohort.complete());
+    assert_eq!(cohort.result_count(), 0);
+    assert_eq!(cohort.members()[0].state(), State::Validating);
+    assert_eq!(cohort.members()[0].fence(), Some(fence));
+    let bundle =
+        ResultTestament::generate(binding(30), Principal::Actor(issuer()), cohort).unwrap();
+    assert!(bundle.results().is_empty());
+}
+
+#[test]
+fn audit_rejects_omitted_registered_evaluation_and_an_equal_length_substitution() {
+    let handler = HandlerRef {
+        id: ValidatorId::from_u128(1),
+        version: ContentHash([2; 32]),
+        agentic: false,
+    };
+    let steps = [v::HandlerPolicy {
+        handler: &handler,
+        attempts: 1,
+        proof_schema: ContentHash([3; 32]),
+        diagnostic_schema: ContentHash([3; 32]),
+    }];
+    let declarations = [
+        receipt(),
+        declaration(2, &steps, ValidationMode::Required),
+        declaration(3, &steps, ValidationMode::Observe),
+        declaration(4, &steps, ValidationMode::Observe),
+    ];
+    let mut c = claim(&declarations);
+    let first = evaluation(&declarations[1]);
+    let second = evaluation(&declarations[2]);
+    let unregistered = evaluation(&declarations[3]);
+    let mut registry = EvaluationRegistry::new(&c, acceptance_limits()).unwrap();
+    registry.register(&first).unwrap();
+    registry.register(&second).unwrap();
+    let targets = registry.seal_targets();
+    fail_claim(&mut c);
+    let first = seal(&first);
+    let second = seal(&second);
+    let unregistered = seal(&unregistered);
+    let limits = Limits {
+        evaluations: 3,
+        results: 3,
+    };
+    assert_eq!(
+        AuditCohort::seal(&c, &targets, SessionSeq(5), &[first], &[], limits).unwrap_err(),
+        ContractError::InvalidManifest
+    );
+    assert_eq!(
+        AuditCohort::seal(
+            &c,
+            &targets,
+            SessionSeq(5),
+            &[first, unregistered],
+            &[],
+            limits
+        )
+        .unwrap_err(),
+        ContractError::StaleEvaluation
+    );
+    assert_eq!(
+        AuditCohort::seal(&c, &targets, SessionSeq(5), &[first, first], &[], limits).unwrap_err(),
+        ContractError::InvalidManifest
+    );
+    let cohort =
+        AuditCohort::seal(&c, &targets, SessionSeq(5), &[second, first], &[], limits).unwrap();
+    assert!(cohort.complete());
+    assert_eq!(cohort.members().len(), 2);
+    assert_eq!(cohort.result_count(), 0);
+}
+
+#[test]
+fn audit_keeps_distinct_increment_artifacts_under_one_declaration_and_generation() {
+    let handler = HandlerRef {
+        id: ValidatorId::from_u128(1),
+        version: ContentHash([2; 32]),
+        agentic: false,
+    };
+    let steps = [v::HandlerPolicy {
+        handler: &handler,
+        attempts: 1,
+        proof_schema: ContentHash([3; 32]),
+        diagnostic_schema: ContentHash([3; 32]),
+    }];
+    let declarations = [
+        receipt(),
+        declaration_at(
+            2,
+            &steps,
+            ValidationMode::Required,
+            v::TargetDeclaration::Increment,
+        ),
+    ];
+    let mut c = claim(&declarations);
+    let mut registry = EvaluationRegistry::new(&c, acceptance_limits()).unwrap();
+    let materialize = |artifact| {
+        v::Evaluation::materialize(
+            Principal::Actor(issuer()),
+            &declarations[1],
+            v::Materialization {
+                binding: declarations[1].binding(),
+                target: v::Target::Increment {
+                    claim: binding(1),
+                    artifact: binding(artifact),
+                },
+                slot_name: None,
+                generation: 1,
+                receipt: Some(crate::ReceiptFence {
+                    receipt: crate::ReceiptId::from_u128(1),
+                    epoch: 1,
+                }),
+            },
+        )
+        .unwrap()
+    };
+    let first = materialize(10);
+    let second = materialize(11);
+    registry.register(&first).unwrap();
+    registry.register(&second).unwrap();
+    let targets = registry.seal_targets();
+    fail_claim(&mut c);
+    let first = seal(&first);
+    let second = seal(&second);
+    let cohort = AuditCohort::seal(
+        &c,
+        &targets,
+        SessionSeq(5),
+        &[second, first],
+        &[],
+        Limits {
+            evaluations: 2,
+            results: 2,
+        },
+    )
+    .unwrap();
+    assert!(cohort.complete());
+    assert_eq!(cohort.members().len(), 2);
+    assert_eq!(cohort.members()[0].key().target, first.target());
+    assert_eq!(cohort.members()[1].key().target, second.target());
+}

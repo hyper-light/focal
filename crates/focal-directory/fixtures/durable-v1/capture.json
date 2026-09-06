@@ -1,0 +1,385 @@
+{
+  "schema": 1,
+  "capture_kind": "Actual original live native Serde writer compiled from source before durable_v1 module or placement_digest modifications",
+  "compiler": "rustc 1.94.1 (e408947bf 2026-03-25)",
+  "source_files": "source-files.json",
+  "cargo_lock": {
+    "path": "Cargo.lock",
+    "sha256": "1cdc2b87a2e4f473faaf8c2217c479ec8afafdfd4280292241ddba3fa4d66c93",
+    "bytes": 52352
+  },
+  "generator": {
+    "path": "crates/focal-directory/fixtures/durable-v1/generator.rs.txt",
+    "sha256": "46b8645d84f5628e24973cf0e8b03c79deb9399541b801b1bfc410715cc07ea6",
+    "bytes": 9159
+  },
+  "linked_build_identities": [
+    {
+      "path": "/private/tmp/libfocal_directory_original_v1_capture.rlib",
+      "sha256": "4b26c100049aa50c8d89d408443f4af107671934523144e8c8459b5edb8b2733",
+      "bytes": 5369400
+    },
+    {
+      "path": "/private/tmp/focal-directory-v1-capture",
+      "sha256": "acc6565b42b6e7e78797a896346e856231f70d018d509664290b5d6806c85e1c",
+      "bytes": 676472
+    },
+    {
+      "path": "target/release/deps/libfocal_model-7d9ee679eb35f5ab.rlib",
+      "sha256": "1352bfbdc8aae5b3de62eaf4ca41271682f74809623745cce7c202ce0baadb17",
+      "bytes": 12322200
+    },
+    {
+      "path": "target/release/deps/libfocal_enrollment-bd8f6399a7d709d6.rlib",
+      "sha256": "a2dbc18f42deb738a79a7c66c02c2bc61a6c9cbc5a5a588a576c851b46a06b97",
+      "bytes": 2487776
+    },
+    {
+      "path": "target/release/deps/libfocal_memory-a4eae974ea7eb54c.rlib",
+      "sha256": "3ad4e3e992b8aa85179271314ae24c04a83b706081daae873a9111fe8cf19c2a",
+      "bytes": 717520
+    },
+    {
+      "path": "target/release/deps/libserde-85aa4195ed6972a8.rlib",
+      "sha256": "8bac8488784e7f61487b86a2ba2cb196cea4dbad24128051178a60588a2c194b",
+      "bytes": 975464
+    },
+    {
+      "path": "target/release/deps/libpostcard-690a52ff8069fe6b.rlib",
+      "sha256": "f5990dac51b5ddffeed3091227609a7058bbef9fb5a74bd6b7e19e65f4c2f5cb",
+      "bytes": 620456
+    },
+    {
+      "path": "target/release/deps/libblake3-0ead7da9b61c9140.rlib",
+      "sha256": "8a50d0268a7a934c8e7e24ca2f57d3d8b216e53ed91cdb3811b91c8a3b7af502",
+      "bytes": 390568
+    }
+  ],
+  "identity_note": "Local paths name mutable build artifacts. SHA-256 identifies the actual linked artifacts, not the path. Original input sources are retained separately for reconstruction.",
+  "library_compile": [
+    "rustc",
+    "--edition=2024",
+    "--crate-name",
+    "focal_directory",
+    "--crate-type",
+    "rlib",
+    "-C",
+    "opt-level=3",
+    "-C",
+    "metadata=focal_directory_original_v1_capture",
+    "crates/focal-directory/src/lib.rs",
+    "-L",
+    "dependency=target/release/deps",
+    "--extern",
+    "focal_model=target/release/deps/libfocal_model-7d9ee679eb35f5ab.rlib",
+    "--extern",
+    "focal_enrollment=target/release/deps/libfocal_enrollment-bd8f6399a7d709d6.rlib",
+    "--extern",
+    "focal_memory=target/release/deps/libfocal_memory-a4eae974ea7eb54c.rlib",
+    "--extern",
+    "serde=target/release/deps/libserde-85aa4195ed6972a8.rlib",
+    "--extern",
+    "postcard=target/release/deps/libpostcard-690a52ff8069fe6b.rlib",
+    "--extern",
+    "blake3=target/release/deps/libblake3-0ead7da9b61c9140.rlib",
+    "-o",
+    "/private/tmp/libfocal_directory_original_v1_capture.rlib"
+  ],
+  "generator_compile": [
+    "rustc",
+    "--edition=2024",
+    "-C",
+    "opt-level=3",
+    "--crate-name",
+    "focal_directory_v1_capture",
+    "crates/focal-directory/fixtures/durable-v1/generator.rs.txt",
+    "-L",
+    "dependency=target/release/deps",
+    "--extern",
+    "focal_directory=/private/tmp/libfocal_directory_original_v1_capture.rlib",
+    "--extern",
+    "focal_model=target/release/deps/libfocal_model-7d9ee679eb35f5ab.rlib",
+    "--extern",
+    "serde=target/release/deps/libserde-85aa4195ed6972a8.rlib",
+    "--extern",
+    "postcard=target/release/deps/libpostcard-690a52ff8069fe6b.rlib",
+    "-o",
+    "/private/tmp/focal-directory-v1-capture"
+  ],
+  "capture_command": [
+    "/private/tmp/focal-directory-v1-capture",
+    "crates/focal-directory/fixtures/durable-v1"
+  ],
+  "counts": {
+    "cluster-ids": 4,
+    "region-ids": 4,
+    "zone-ids": 4,
+    "partition-ids": 4,
+    "log-group-ids": 4,
+    "operation-ids": 4,
+    "work-ids": 4,
+    "namespace-keys": 3,
+    "namespace-ranges": 4,
+    "node-enrollments": 3,
+    "node-loads": 3,
+    "node-records": 6,
+    "failure-classes": 3,
+    "durability-intents": 9,
+    "placement-policies": 18,
+    "placements": 3,
+    "placement-specs": 18,
+    "placement-digests": 18,
+    "session-fence-kinds": 3,
+    "session-fences": 9,
+    "replica-ready": 3,
+    "delegation-fences": 4
+  },
+  "files": {
+    "cluster-ids.rows": {
+      "path": "crates/focal-directory/fixtures/durable-v1/cluster-ids.rows",
+      "sha256": "b522e798111d964ed6ae4d400266d14cbdcd4979ba7cb8ea1af9bab89d87e00a",
+      "bytes": 65
+    },
+    "delegation-fences.rows": {
+      "path": "crates/focal-directory/fixtures/durable-v1/delegation-fences.rows",
+      "sha256": "da5120d2229e33d86473ae49c0ed6fbb8c43da91a5067718cc075246072c102d",
+      "bytes": 793
+    },
+    "distinct-delegation-fence.bin": {
+      "path": "crates/focal-directory/fixtures/durable-v1/distinct-delegation-fence.bin",
+      "sha256": "843a3a4830db2b5ba30c2c773a17ce7069e8a02157b007fb32a9ce17580acf78",
+      "bytes": 196
+    },
+    "distinct-node-enrollment.bin": {
+      "path": "crates/focal-directory/fixtures/durable-v1/distinct-node-enrollment.bin",
+      "sha256": "cf58d33623c75c5adb11c8564840dc235d2109c51f6a0ecfc9e68f629ee22ee2",
+      "bytes": 127
+    },
+    "distinct-node-load.bin": {
+      "path": "crates/focal-directory/fixtures/durable-v1/distinct-node-load.bin",
+      "sha256": "e8d9fa6e3c0e842df1594d9d938fe91df999f179e899899448aff5de6284381c",
+      "bytes": 5
+    },
+    "distinct-replica-ready.bin": {
+      "path": "crates/focal-directory/fixtures/durable-v1/distinct-replica-ready.bin",
+      "sha256": "46a8e70beb329402c216dbe69fdecde1bbe434e6d7ccae75585f92b66ea565fa",
+      "bytes": 116
+    },
+    "distinct-session-fence.bin": {
+      "path": "crates/focal-directory/fixtures/durable-v1/distinct-session-fence.bin",
+      "sha256": "32e5cdf7f15218228436fa933932a7dacf7ae9247290724b61d8b592f027c730",
+      "bytes": 136
+    },
+    "durability-intents.rows": {
+      "path": "crates/focal-directory/fixtures/durable-v1/durability-intents.rows",
+      "sha256": "ed871148c1da2fb407b9890a1f90075cc8126e8200ce728192844e8216d5eccd",
+      "bytes": 25
+    },
+    "failure-classes.rows": {
+      "path": "crates/focal-directory/fixtures/durable-v1/failure-classes.rows",
+      "sha256": "df9f188da1208f692545737aa3a6eacae9f3db9f258fdf2bbcb87e3ae9b6c4a2",
+      "bytes": 4
+    },
+    "log-group-ids.rows": {
+      "path": "crates/focal-directory/fixtures/durable-v1/log-group-ids.rows",
+      "sha256": "b522e798111d964ed6ae4d400266d14cbdcd4979ba7cb8ea1af9bab89d87e00a",
+      "bytes": 65
+    },
+    "namespace-keys.rows": {
+      "path": "crates/focal-directory/fixtures/durable-v1/namespace-keys.rows",
+      "sha256": "8b05d608e8e4956f9f97dae4b682d8e139b0216a2f15073b0c5fb469749f99bd",
+      "bytes": 97
+    },
+    "namespace-ranges.rows": {
+      "path": "crates/focal-directory/fixtures/durable-v1/namespace-ranges.rows",
+      "sha256": "afbc6dc12dbe488735e7613bdca76cda57ba95be45aa90d078b7f12a0d4b1daf",
+      "bytes": 229
+    },
+    "node-enrollments.rows": {
+      "path": "crates/focal-directory/fixtures/durable-v1/node-enrollments.rows",
+      "sha256": "a09cf66fa47e73deac9b292e42c31504f167ffcf9d0f51c131638eed8ffb7ebe",
+      "bytes": 415
+    },
+    "node-loads.rows": {
+      "path": "crates/focal-directory/fixtures/durable-v1/node-loads.rows",
+      "sha256": "0ca1cec717a1c4530b32b59ac081dff8f0b108c836c4236dc621581ee54fc948",
+      "bytes": 61
+    },
+    "node-records.rows": {
+      "path": "crates/focal-directory/fixtures/durable-v1/node-records.rows",
+      "sha256": "77a454d7bc8e20a573f1e2c8b4f58a48cb9b8ac10c373f37d1edc3c842ecc7da",
+      "bytes": 985
+    },
+    "operation-ids.rows": {
+      "path": "crates/focal-directory/fixtures/durable-v1/operation-ids.rows",
+      "sha256": "b522e798111d964ed6ae4d400266d14cbdcd4979ba7cb8ea1af9bab89d87e00a",
+      "bytes": 65
+    },
+    "partition-ids.rows": {
+      "path": "crates/focal-directory/fixtures/durable-v1/partition-ids.rows",
+      "sha256": "b522e798111d964ed6ae4d400266d14cbdcd4979ba7cb8ea1af9bab89d87e00a",
+      "bytes": 65
+    },
+    "placement-00.bin": {
+      "path": "crates/focal-directory/fixtures/durable-v1/placement-00.bin",
+      "sha256": "3e7077fd2f66d689e0cee6a7cf5b37bf2dca7c979af356d0a31cbc5c85605c7d",
+      "bytes": 9
+    },
+    "placement-01.bin": {
+      "path": "crates/focal-directory/fixtures/durable-v1/placement-01.bin",
+      "sha256": "2f974faf0d37addbc64e2da05154055d32f9f767fb6d45754de985eefef2a49a",
+      "bytes": 168
+    },
+    "placement-02.bin": {
+      "path": "crates/focal-directory/fixtures/durable-v1/placement-02.bin",
+      "sha256": "6866094edd388699c77fccdca769f65a60d35cc09e2ea317be12fdb6b191c6b3",
+      "bytes": 279
+    },
+    "placement-03.bin": {
+      "path": "crates/focal-directory/fixtures/durable-v1/placement-03.bin",
+      "sha256": "0efe87327b302f232053251660a8bda100c2269176beaf7da66f6e42344736ee",
+      "bytes": 114
+    },
+    "placement-04.bin": {
+      "path": "crates/focal-directory/fixtures/durable-v1/placement-04.bin",
+      "sha256": "2e58ee7f74135798cd293dff4d565cb1baab1ac61446916c760d39e4f66051d7",
+      "bytes": 65
+    },
+    "placement-05.bin": {
+      "path": "crates/focal-directory/fixtures/durable-v1/placement-05.bin",
+      "sha256": "80e50a09f23ecce58e016be306087ddf54fa0065c7c5c5b7fea92118f931fbcf",
+      "bytes": 386
+    },
+    "placement-06.bin": {
+      "path": "crates/focal-directory/fixtures/durable-v1/placement-06.bin",
+      "sha256": "a536aa3cede6ea3c1f3e0357c3c60e0f216a8c89b853df13b29daa8f85065dfb",
+      "bytes": 9
+    },
+    "placement-07.bin": {
+      "path": "crates/focal-directory/fixtures/durable-v1/placement-07.bin",
+      "sha256": "b4034ef9d3a0d6bef067a5e898e3b7167a338b3941a777ee5f7d8117c41f4a64",
+      "bytes": 168
+    },
+    "placement-08.bin": {
+      "path": "crates/focal-directory/fixtures/durable-v1/placement-08.bin",
+      "sha256": "4a507d9e5e5bbaf239667c1a4cc49c7d4507016a0b240283a84ff28efb9a01f9",
+      "bytes": 279
+    },
+    "placement-09.bin": {
+      "path": "crates/focal-directory/fixtures/durable-v1/placement-09.bin",
+      "sha256": "86785d6c35557d03fc0460c54bd527c90510046955a35f2c21e8a161493c4165",
+      "bytes": 114
+    },
+    "placement-10.bin": {
+      "path": "crates/focal-directory/fixtures/durable-v1/placement-10.bin",
+      "sha256": "c4faf5328b6a816a02d5ece0a65a916949c6fa2f4ee7b54cc3881b73eef38d72",
+      "bytes": 65
+    },
+    "placement-11.bin": {
+      "path": "crates/focal-directory/fixtures/durable-v1/placement-11.bin",
+      "sha256": "471188cb9c54b360cb874d9664c19ba1e26554c919ba913a580e057454d25aa6",
+      "bytes": 386
+    },
+    "placement-12.bin": {
+      "path": "crates/focal-directory/fixtures/durable-v1/placement-12.bin",
+      "sha256": "4322fd2bc0a137d1375b37b3b2e2b4715b3d3dd7ca9682438d4fea0f8437fad3",
+      "bytes": 9
+    },
+    "placement-13.bin": {
+      "path": "crates/focal-directory/fixtures/durable-v1/placement-13.bin",
+      "sha256": "a59fd2768cf430d08869bcbabb1153c9184a3d53a74d6f888ddc33d994ffc375",
+      "bytes": 168
+    },
+    "placement-14.bin": {
+      "path": "crates/focal-directory/fixtures/durable-v1/placement-14.bin",
+      "sha256": "c47aff93d487669df7008b3c33f32442ce5976034588196656fc6ca409de51c4",
+      "bytes": 279
+    },
+    "placement-15.bin": {
+      "path": "crates/focal-directory/fixtures/durable-v1/placement-15.bin",
+      "sha256": "9368ca069c002c1a851f094de70a93e9a6c3c9b6cff2a5b88edd1d7f61f84f2d",
+      "bytes": 114
+    },
+    "placement-16.bin": {
+      "path": "crates/focal-directory/fixtures/durable-v1/placement-16.bin",
+      "sha256": "6a4d3f0f14d8d2b6de7f5e5fe8a57c3572d75f0290dd5df8c008693125abc604",
+      "bytes": 65
+    },
+    "placement-17.bin": {
+      "path": "crates/focal-directory/fixtures/durable-v1/placement-17.bin",
+      "sha256": "0f0bc4055b721485ae94bb78ad5974e3ca760efee1817b72051d35ef380d02e0",
+      "bytes": 386
+    },
+    "placement-digests.rows": {
+      "path": "crates/focal-directory/fixtures/durable-v1/placement-digests.rows",
+      "sha256": "619554ae4642e07eb8378f20b4a694681ce47cefaf2b948e92f11a5be05ee47c",
+      "bytes": 577
+    },
+    "placement-policies.rows": {
+      "path": "crates/focal-directory/fixtures/durable-v1/placement-policies.rows",
+      "sha256": "c19cb456359efe417969ecbe949cb0691994de336d1a8dfaf9de539dd99065d4",
+      "bytes": 1048
+    },
+    "placement-specs.rows": {
+      "path": "crates/focal-directory/fixtures/durable-v1/placement-specs.rows",
+      "sha256": "c65ed332753d724d88e2ae3058e5d7ef7caaaf78152d9a567c245f1727f16bb3",
+      "bytes": 3064
+    },
+    "placements.rows": {
+      "path": "crates/focal-directory/fixtures/durable-v1/placements.rows",
+      "sha256": "23b937d887d86fe8bab467694319e29774c12f57f3b43793475b4e09cf724a6f",
+      "bytes": 337
+    },
+    "region-ids.rows": {
+      "path": "crates/focal-directory/fixtures/durable-v1/region-ids.rows",
+      "sha256": "b522e798111d964ed6ae4d400266d14cbdcd4979ba7cb8ea1af9bab89d87e00a",
+      "bytes": 65
+    },
+    "replica-ready.rows": {
+      "path": "crates/focal-directory/fixtures/durable-v1/replica-ready.rows",
+      "sha256": "67cedfd59e92f1a783016f2dc47d0cef63c39c7c5da7078d154c26754f496af8",
+      "bytes": 385
+    },
+    "session-fence-kinds.rows": {
+      "path": "crates/focal-directory/fixtures/durable-v1/session-fence-kinds.rows",
+      "sha256": "df9f188da1208f692545737aa3a6eacae9f3db9f258fdf2bbcb87e3ae9b6c4a2",
+      "bytes": 4
+    },
+    "session-fences.rows": {
+      "path": "crates/focal-directory/fixtures/durable-v1/session-fences.rows",
+      "sha256": "22333a43b401a5eaa5094590f0c558e9c4a8aa2cda08e69f5766ebea8a82241f",
+      "bytes": 1414
+    },
+    "unsorted-duplicate-placement.input": {
+      "path": "crates/focal-directory/fixtures/durable-v1/unsorted-duplicate-placement.input",
+      "sha256": "a619459cacf84bf0565113f3479212552f4ab7a55fab9418fd2cf83ee29e0a13",
+      "bytes": 18
+    },
+    "unsorted-duplicate-placement.normalized": {
+      "path": "crates/focal-directory/fixtures/durable-v1/unsorted-duplicate-placement.normalized",
+      "sha256": "44ec3e394c6d3116dff18565457014c18398348e9b92d9321b9207aa90a8a056",
+      "bytes": 14
+    },
+    "unsorted-duplicate-policy.input": {
+      "path": "crates/focal-directory/fixtures/durable-v1/unsorted-duplicate-policy.input",
+      "sha256": "94b8ea2d7d1edbe9725fb252dce12ee00129a7c4124b74cdd070e077e459f617",
+      "bytes": 101
+    },
+    "unsorted-duplicate-policy.normalized": {
+      "path": "crates/focal-directory/fixtures/durable-v1/unsorted-duplicate-policy.normalized",
+      "sha256": "1095bd936f8a80662c4de3364cfb75bf36726b804aa23739c68df21651c0d95b",
+      "bytes": 69
+    },
+    "work-ids.rows": {
+      "path": "crates/focal-directory/fixtures/durable-v1/work-ids.rows",
+      "sha256": "b522e798111d964ed6ae4d400266d14cbdcd4979ba7cb8ea1af9bab89d87e00a",
+      "bytes": 65
+    },
+    "zone-ids.rows": {
+      "path": "crates/focal-directory/fixtures/durable-v1/zone-ids.rows",
+      "sha256": "b522e798111d964ed6ae4d400266d14cbdcd4979ba7cb8ea1af9bab89d87e00a",
+      "bytes": 65
+    }
+  },
+  "supplemental_capture": "Five distinct-field sentinel files were captured by the same original library after codec source addition. All 44 initial files were simultaneously regenerated and verified byte-identical before publishing these additions."
+}

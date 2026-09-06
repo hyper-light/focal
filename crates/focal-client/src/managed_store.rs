@@ -71,11 +71,14 @@ impl Default for ManagedStoreLimits {
     }
 }
 impl ManagedStoreLimits {
-    fn validate(self) -> Result<(), ManagedStoreError> {
-        let bytes = u64::from(self.window)
+    pub(crate) fn reserved_bytes(self) -> Result<u64, ManagedStoreError> {
+        u64::from(self.window)
             .checked_mul(SLOT_BYTES)
             .and_then(|bytes| bytes.checked_add(ROOT_BYTES))
-            .ok_or(ManagedStoreError::Capacity)?;
+            .ok_or(ManagedStoreError::Capacity)
+    }
+    pub(crate) fn validate(self) -> Result<(), ManagedStoreError> {
+        let bytes = self.reserved_bytes()?;
         if self.window == 0 || self.window > 256 || bytes > self.max_reserved_bytes {
             return Err(ManagedStoreError::Capacity);
         }
@@ -265,6 +268,67 @@ pub struct ManagedOperationStore {
     limits: ManagedStoreLimits,
 }
 impl ManagedOperationStore {
+    /// Only the coordinator's durable Initialize phase can invoke this: it has
+    /// not exposed this child for allocation or transmission yet.
+    pub(crate) fn finish_initialization(
+        root: &Path,
+        context: OperationContext,
+        limits: ManagedStoreLimits,
+        registration: &RequestStreamControlInput,
+        receipt: &RequestStreamControlReceipt,
+    ) -> Result<Self, ManagedStoreError> {
+        let directory = Directory::resume_managed_creation(root)?;
+        let mut state = if directory.exists(STATE)? {
+            decode::<State>(&directory.read(STATE, STATE_MAGIC, STATE_BYTES)?)?
+        } else {
+            State {
+                schema: 1,
+                context,
+                limits,
+                registration: registration.clone(),
+                registered: None,
+                revision: 0,
+                frontier: 0,
+                retired: 0,
+                garbage_through: 0,
+                stopped: false,
+                closed: false,
+                entries: Vec::new(),
+                control: None,
+                last_control: None,
+            }
+        };
+        state.validate(context, limits)?;
+        if state.registration != *registration
+            || state.frontier != 0
+            || state.control.is_some()
+            || state.stopped
+            || state.last_control.is_some()
+        {
+            return Err(ManagedStoreError::Corrupt);
+        }
+        validate_registration(&state, receipt)?;
+        if state
+            .registered
+            .as_ref()
+            .is_some_and(|saved| saved != receipt)
+        {
+            return Err(ManagedStoreError::ReceiptMismatch);
+        }
+        state.registered = Some(receipt.clone());
+        state.revision = 1;
+        directory.write(
+            STATE,
+            STATE_MAGIC,
+            &encode(&state, STATE_BYTES)?,
+            directory.exists(STATE)?,
+        )?;
+        Ok(Self {
+            root: root.into(),
+            context,
+            limits,
+        })
+    }
     pub fn create(
         root: impl AsRef<Path>,
         context: OperationContext,

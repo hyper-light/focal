@@ -227,6 +227,46 @@ pub struct JoinKey {
     _directory: PrivateDirectory,
 }
 impl JoinKey {
+    /// Verify already installed joining material without opening a directory,
+    /// generating a key, or repairing persistence. Inputs are decoded private
+    /// record payloads, bounded by the existing enrollment message limit.
+    /// This proves the saved identity binding, not current registry activation.
+    pub fn inspect_saved(
+        key_bytes: &[u8],
+        receipt_bytes: &[u8],
+        cluster: ClusterId,
+        ca_certificate: &[u8],
+        now: i64,
+    ) -> Result<(EnrollmentReceipt, Fingerprint), EnrollmentError> {
+        let bundle: JoinKeyBundle = decode(key_bytes)?;
+        let receipt: EnrollmentReceipt = decode(receipt_bytes)?;
+        if cluster == [0; 16] || bundle.cluster != cluster || receipt.identity.cluster != cluster {
+            return Err(EnrollmentError::WrongCluster);
+        }
+        if bundle.schema != 1 || bundle.request == [0; 16] {
+            return Err(EnrollmentError::Corrupt);
+        }
+        let csr = verified_csr(&bundle.csr)?;
+        let key = KeyPair::try_from(bundle.key.0.as_slice())?;
+        if key.subject_public_key_info() != csr.public_key.subject_public_key_info()
+            || receipt.request != bundle.request
+            || receipt.csr_hash != hash("focal.enrollment.csr.v1", &bundle.csr)
+            || receipt.public_key != csr_key_hash(&bundle.csr)?
+            || receipt.issued_at > now
+            || receipt.expires_at <= now
+            || receipt.identity
+                != crate::registry::assigned(
+                    cluster,
+                    receipt.identity.role,
+                    receipt.identity.node_id.unwrap_or(1),
+                    receipt.public_key,
+                )
+        {
+            return Err(EnrollmentError::Unauthorized);
+        }
+        verify_issued(&receipt, ca_certificate)?;
+        Ok((receipt, *blake3::hash(&bundle.csr).as_bytes()))
+    }
     pub fn open_or_create(
         path: impl AsRef<Path>,
         cluster: ClusterId,

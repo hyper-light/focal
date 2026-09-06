@@ -1,0 +1,121 @@
+use focal_model::{ClaimId, ContentHash, LedgerId, SessionId, SessionSeq, TenantId};
+use focal_stream::*;
+use serde::Serialize;
+use std::{collections::BTreeMap, path::Path};
+
+fn ledger(value: u128) -> LedgerId {
+    LedgerId { tenant: TenantId::from_u128(value), session: SessionId::from_u128(value) }
+}
+fn hash(seed: u8) -> ContentHash {
+    ContentHash(std::array::from_fn(|index| seed.wrapping_add(index as u8)))
+}
+fn save<T: Serialize + ?Sized>(root: &Path, name: &str, value: &T) {
+    let path = root.join(name);
+    assert!(!path.exists(), "do not overwrite a captured original");
+    std::fs::write(path, postcard::to_stdvec(value).unwrap()).unwrap();
+}
+fn raw(root: &Path, name: &str, bytes: &[u8]) {
+    let path = root.join(name);
+    assert!(!path.exists(), "do not overwrite a captured original");
+    std::fs::write(path, bytes).unwrap();
+}
+fn main() {
+    let argument = std::env::args().nth(1).expect("output directory");
+    let root = Path::new(&argument);
+    std::fs::create_dir_all(root).unwrap();
+    let ids = vec![ConsumerId::from_u128(0), ConsumerId::from_u128(1), ConsumerId::from_u128(1 << 127), ConsumerId::from_u128(u128::MAX)];
+    let keys: Vec<_> = ids.iter().enumerate().map(|(index, consumer)| ConsumerKey { ledger: ledger(index as u128), consumer: *consumer }).collect();
+    let offsets = vec![PositionOffset::Delta(0), PositionOffset::Delta(127), PositionOffset::Delta(128), PositionOffset::Delta(u32::MAX), PositionOffset::Resolved];
+    let mut positions = Vec::new();
+    for namespace in [ledger(0), ledger(1)] {
+        for sequence in [0, 1, 127, 128, u64::MAX] {
+            for offset in &offsets {
+                positions.push(Position { ledger: namespace, sequence: SessionSeq(sequence), offset: *offset });
+            }
+        }
+    }
+    let tokens: Vec<_> = positions.iter().enumerate().map(|(index, position)| CursorToken {
+        key: ConsumerKey { ledger: if index == 1 { ledger(99) } else { position.ledger }, consumer: ids[index % ids.len()] },
+        generation: if index % 2 == 0 { 0 } else { u64::MAX },
+        scope: if index == 0 { ContentHash::default() } else { hash(index as u8) }, position: *position,
+    }).collect();
+    let filters = vec![
+        DeltaFilter::All,
+        DeltaFilter::Claims(Default::default()),
+        DeltaFilter::Claims([9, 1, 3, 9].map(ClaimId::from_u128).into_iter().collect()),
+        DeltaFilter::Claims((0..128).rev().map(ClaimId::from_u128).collect()),
+    ];
+    let reasons = vec![ResyncReason::HistoryExpired, ResyncReason::LeaseExpired, ResyncReason::SlowConsumer, ResyncReason::SnapshotExpired, ResyncReason::ExplicitReset];
+    let mut modes = vec![CursorMode::Live, CursorMode::Seeding { snapshot: SessionSeq(0) }, CursorMode::Seeding { snapshot: SessionSeq(u64::MAX) }];
+    modes.extend(reasons.iter().map(|reason| CursorMode::Resync { reason: *reason }));
+    modes.push(CursorMode::Protected);
+    let mut records = Vec::new();
+    for (index, mode) in modes.iter().enumerate() {
+        for (filter_index, filter) in filters.iter().enumerate() {
+            records.push(CursorRecord { token: tokens[index * filters.len() + filter_index], filter: filter.clone(), expires_at: if filter_index % 2 == 0 { 0 } else { u64::MAX }, mode: mode.clone() });
+        }
+    }
+    let valid_record = CursorRecord {
+        token: CursorToken { key: ConsumerKey { ledger: ledger(1), consumer: ids[1] }, generation: 1, scope: hash(70), position: Position::origin(ledger(1)) },
+        filter: DeltaFilter::All, expires_at: 100, mode: CursorMode::Live,
+    };
+    let checkpoints = vec![
+        CursorCheckpoint { schema: 1, ledger: ledger(1), revision: 0, clock: 0, floor: SessionSeq(0), consumers: BTreeMap::new() },
+        CursorCheckpoint { schema: 1, ledger: ledger(1), revision: 1, clock: 1, floor: SessionSeq(0), consumers: BTreeMap::from([(ids[1], valid_record.clone())]) },
+        CursorCheckpoint { schema: u16::MAX, ledger: ledger(0), revision: u64::MAX, clock: u64::MAX, floor: SessionSeq(u64::MAX), consumers: records.iter().enumerate().rev().map(|(index, record)| (ConsumerId::from_u128(index as u128), record.clone())).collect() },
+    ];
+    let mut operations = Vec::new();
+    for rich in [true, false] {
+        let consumer = if rich { ids[3] } else { ids[0] };
+        let scope = if rich { hash(90) } else { ContentHash::default() };
+        let filter = if rich { filters[3].clone() } else { filters[1].clone() };
+        let start = if rich { *positions.last().unwrap() } else { positions[0] };
+        let token = if rich { *tokens.last().unwrap() } else { tokens[1] };
+        let generation = if rich { u64::MAX } else { 0 };
+        let expires_at = if rich { u64::MAX } else { 0 };
+        let snapshot = SessionSeq(if rich { u64::MAX } else { 0 });
+        operations.extend([
+            CursorOperation::Register { consumer, scope, filter: filter.clone(), start, expires_at },
+            CursorOperation::Acknowledge { token },
+            CursorOperation::Renew { consumer, generation, expires_at },
+            CursorOperation::BeginSeed { consumer, scope, filter: filter.clone(), snapshot, expires_at },
+            CursorOperation::CompleteSeed { consumer, generation, snapshot },
+            CursorOperation::RequireResync { consumer, generation, reason: if rich { ResyncReason::ExplicitReset } else { ResyncReason::HistoryExpired } },
+            CursorOperation::AdvanceFloor { through: snapshot },
+            CursorOperation::RegisterProtected { consumer, scope, filter, start },
+            CursorOperation::AcknowledgeAndRenew { token, expires_at },
+        ]);
+    }
+    let commands: Vec<_> = operations.iter().enumerate().map(|(index, operation)| CursorCommand {
+        expected_revision: if index % 2 == 0 { 0 } else { u64::MAX }, now: if index % 3 == 0 { 128 } else { u64::MAX }, operation: operation.clone(),
+    }).collect();
+    save(root, "consumer-ids.rows", &ids);
+    save(root, "consumer-keys.rows", &keys);
+    save(root, "position-offsets.rows", &offsets);
+    save(root, "positions.rows", &positions);
+    save(root, "cursor-tokens.rows", &tokens);
+    save(root, "delta-filters.rows", &filters);
+    save(root, "resync-reasons.rows", &reasons);
+    save(root, "cursor-modes.rows", &modes);
+    save(root, "cursor-records.rows", &records);
+    save(root, "cursor-checkpoints.rows", &checkpoints);
+    save(root, "cursor-commands.rows", &commands);
+    save(root, "cursor-operations.rows", &operations);
+    for (index, operation) in operations.iter().enumerate() { save(root, &format!("operation-{index:02}.bin"), operation); }
+    for (index, checkpoint) in checkpoints.iter().enumerate() { save(root, &format!("checkpoint-{index:02}.bin"), checkpoint); }
+
+    // These two inputs intentionally use sequences instead of sorted collections
+    // to pin the original reader's normalization. They are reader probes, not
+    // alleged output from a BTreeSet/BTreeMap writer.
+    let mut duplicate_filter = vec![1]; // Original DeltaFilter::Claims ordinal.
+    duplicate_filter.extend(postcard::to_stdvec(&[9, 1, 9, 3].map(ClaimId::from_u128).to_vec()).unwrap());
+    let decoded_filter: DeltaFilter = postcard::from_bytes(&duplicate_filter).unwrap();
+    raw(root, "unsorted-duplicate-filter.input", &duplicate_filter);
+    save(root, "unsorted-duplicate-filter.normalized", &decoded_filter);
+    let rows = vec![(ids[3], records[0].clone()), (ids[1], valid_record), (ids[3], records[1].clone())];
+    let duplicate_checkpoint = postcard::to_stdvec(&(1u16, ledger(1), 127u64, 128u64, SessionSeq(0), rows)).unwrap();
+    let decoded_checkpoint: CursorCheckpoint = postcard::from_bytes(&duplicate_checkpoint).unwrap();
+    raw(root, "unsorted-duplicate-checkpoint.input", &duplicate_checkpoint);
+    save(root, "unsorted-duplicate-checkpoint.normalized", &decoded_checkpoint);
+    println!("captured ids={} keys={} offsets={} positions={} tokens={} filters={} reasons={} modes={} records={} checkpoints={} commands={} operations={}", ids.len(), keys.len(), offsets.len(), positions.len(), tokens.len(), filters.len(), reasons.len(), modes.len(), records.len(), checkpoints.len(), commands.len(), operations.len());
+}

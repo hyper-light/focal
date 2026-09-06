@@ -149,6 +149,9 @@ impl RequestHandler for LocalHost {
     fn supports_managed_requests(&self) -> bool {
         true
     }
+    fn supports_participant_requests(&self) -> bool {
+        true
+    }
     fn handle(
         &self,
         request: VerifiedRequest,
@@ -160,7 +163,10 @@ impl RequestHandler for LocalHost {
             let fallback = request.request().reply(Response::Error(
                 if matches!(
                     request.request().operation,
-                    Operation::Reconcile(_) | Operation::RequestStreamRead { .. }
+                    Operation::Summary
+                        | Operation::Monitor { .. }
+                        | Operation::Reconcile(_)
+                        | Operation::RequestStreamRead { .. }
                 ) {
                     AccessError::Unavailable
                 } else {
@@ -183,6 +189,13 @@ impl RequestHandler for LocalHost {
                         None => return OwnedResponse::new(full),
                     }
                 }
+                Operation::Monitor { .. } => crate::monitor_reads::RESPONSE_BYTES,
+                Operation::Summary => {
+                    match crate::ledger_summary::response_bytes(self.limits.max_frame_bytes) {
+                        Some(bytes) => bytes,
+                        None => return OwnedResponse::new(full),
+                    }
+                }
                 Operation::Reconcile(query) => match crate::reconciliation::response_bytes(
                     query,
                     self.limits.max_frame_bytes,
@@ -191,7 +204,19 @@ impl RequestHandler for LocalHost {
                     Some(bytes) => bytes,
                     None => return OwnedResponse::new(full),
                 },
-                Operation::Read(_) | Operation::List(_) => self.limits.max_frame_bytes as usize,
+                Operation::Read(ReadRequest {
+                    query: ReadQuery::SeedScan { max_bytes, .. },
+                    ..
+                }) => match ((*max_bytes).min(self.limits.max_frame_bytes) as usize).checked_mul(2)
+                {
+                    Some(bytes) => bytes,
+                    None => return OwnedResponse::new(full),
+                },
+                Operation::Read(_)
+                | Operation::List(_)
+                | Operation::Select(_)
+                | Operation::Traverse(_)
+                | Operation::Validators(_) => self.limits.max_frame_bytes as usize,
                 Operation::Stream(stream) => {
                     stream.credits().bytes.min(self.limits.max_frame_bytes) as usize
                 }
@@ -247,7 +272,8 @@ impl RequestHandler for LocalHost {
                         | RequestStreamCommand::Seal { .. }
                         | RequestStreamCommand::Close { .. },
                     ..
-                } => BudgetLane::Completion,
+                }
+                | Operation::Monitor { .. } => BudgetLane::Completion,
                 _ => BudgetLane::Ordinary,
             };
             let Ok(charge) = self.budget.reserve(BudgetKind::Pending, lane, bytes) else {
@@ -384,7 +410,9 @@ fn dispatch(
     } else if request.route_epoch != RouteEpoch(1)
         && matches!(
             request.operation,
-            Operation::Reconcile(_)
+            Operation::Summary
+                | Operation::Monitor { .. }
+                | Operation::Reconcile(_)
                 | Operation::Managed { .. }
                 | Operation::RequestStreamControl { .. }
                 | Operation::RequestStreamRead { .. }
@@ -414,9 +442,19 @@ fn dispatch(
                         .as_secs(),
                     evidence: Vec::new(),
                 };
+                let protocol = verified.request().protocol;
                 let mut input = verified.into_authenticated(authority)?;
                 if let Some(known) = known_receipt(&node.session, &input)? {
                     return Ok(Response::Submitted(known));
+                }
+                if let Some(runtime) = crate::participant_ingress::authority(
+                    &node.session,
+                    protocol,
+                    input.principal,
+                    &input.command,
+                    input.expected_revision,
+                )? {
+                    input.authority.runtime = runtime;
                 }
                 input.authority.evidence = attest(node, &input.command)?;
                 node.session
@@ -436,6 +474,23 @@ fn dispatch(
                 crate::managed_requests::local(node, views, streams, verified, limits)
             }
             Operation::ManagedSupport { .. } => Err(AccessError::UnsupportedOperation),
+            Operation::Monitor { id } => crate::monitor_reads::local(
+                &mut node.session,
+                principal,
+                request.request_id,
+                *id,
+                request.route_epoch,
+                limits,
+            )
+            .map(Response::Monitor),
+            Operation::Summary => crate::ledger_summary::local(
+                &mut node.session,
+                principal,
+                request.request_id,
+                request.route_epoch,
+                limits,
+            )
+            .map(Response::Summary),
             Operation::Reconcile(query) => crate::reconciliation::local(
                 &mut node.session,
                 principal,
@@ -469,6 +524,53 @@ fn dispatch(
                     )
                 })
                 .map(Response::Listed),
+            Operation::Select(list) => selection_scope(peer, node.session.ledger(), list)
+                .and_then(|scope| {
+                    views.selection(
+                        &mut node.session,
+                        crate::reads::ListReadContext {
+                            principal,
+                            scope,
+                            request_id: request.request_id,
+                            barrier: None,
+                        },
+                        list,
+                        limits,
+                    )
+                })
+                .map(Response::Listed),
+            Operation::Validators(list) => validator_scope(peer, node.session.ledger(), list)
+                .and_then(|scope| {
+                    views.validators(
+                        &mut node.session,
+                        crate::reads::ListReadContext {
+                            principal,
+                            scope,
+                            request_id: request.request_id,
+                            barrier: None,
+                        },
+                        list,
+                        limits,
+                    )
+                })
+                .map(Response::Validators),
+            Operation::Traverse(traversal) => {
+                traversal_scope(peer, node.session.ledger(), traversal)
+                    .and_then(|scope| {
+                        views.traverse(
+                            &mut node.session,
+                            crate::reads::ListReadContext {
+                                principal,
+                                scope,
+                                request_id: request.request_id,
+                                barrier: None,
+                            },
+                            traversal,
+                            limits,
+                        )
+                    })
+                    .map(Response::Traversed)
+            }
             Operation::Upload(upload) => upload_content(node, peer, upload).map(Response::Upload),
             Operation::Download {
                 content,
@@ -613,6 +715,10 @@ pub(crate) fn attest(
         schema_valid: true,
     }])
 }
+
+#[cfg(test)]
+#[path = "local_summary_tests.rs"]
+mod summary_tests;
 
 #[cfg(test)]
 #[path = "reconciliation_tests.rs"]

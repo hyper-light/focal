@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimBatchDocument {
+    pub claims: Vec<ClaimDocument>,
+}
+
 /// Human spellings are separate from the model's frozen numeric enum encodings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -102,6 +108,23 @@ pub struct ArtifactDocument {
     pub claim: String,
     pub receipt: ReceiptDocument,
     pub evidence_set: String,
+    #[serde(default)]
+    pub id: Option<String>,
+    pub kind: String,
+    pub schema_hash: String,
+    #[serde(default)]
+    pub metadata: Vec<u8>,
+    pub payload: PayloadDocument,
+    #[serde(default)]
+    pub inputs: Vec<ObjectReferenceDocument>,
+    #[serde(default)]
+    pub visibility: Vec<String>,
+}
+/// Independent evidence, including externally produced evaluation reports.
+/// Producer and custody are derived by authenticated ingress.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisterArtifactDocument {
     #[serde(default)]
     pub id: Option<String>,
     pub kind: String,

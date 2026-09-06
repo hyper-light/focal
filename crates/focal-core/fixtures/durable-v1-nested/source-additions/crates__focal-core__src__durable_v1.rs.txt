@@ -1,0 +1,230 @@
+//! Existing durable envelopes, selected explicitly by their enclosing V1 magic.
+//!
+//! This freezes the envelope/State/limits field order independently of the live
+//! Core layout, and requires exact consumption. Nested model objects, command
+//! bodies and replay semantics still use the existing V1 model: they have NOT
+//! been migrated or independently frozen here. A successor must introduce its
+//! own nested codecs and execution selection before changing those contracts.
+//! Borrowed encoding never clones the authoritative maps or payloads. Decoding
+//! moves the original allocations into the one Core; Session owns its existing
+//! decode/recovery allowance throughout the operation.
+use crate::*;
+use serde::de::DeserializeOwned;
+
+const SCHEMA_V1: u16 = 1;
+const CHECKPOINT_MAGIC: &[u8] = b"FOCALCP1";
+
+// A single field declaration fixes the borrowed and owned envelope together.
+// The nested types deliberately remain explicit existing model types, rather
+// than aliases presented as independently frozen DTO definitions.
+macro_rules! state_v1 {
+    ($($field:ident: $ty:ty),+ $(,)?) => {
+        #[derive(Serialize)]
+        struct StateRefV1<'a> { $($field: &'a $ty),+ }
+        #[derive(Deserialize)]
+        struct StateV1 { $($field: $ty),+ }
+        impl<'a> From<&'a State> for StateRefV1<'a> {
+            fn from(state: &'a State) -> Self {
+                let State { $($field),+ } = state;
+                Self { $($field),+ }
+            }
+        }
+        impl From<StateV1> for State {
+            fn from(state: StateV1) -> Self {
+                let StateV1 { $($field),+ } = state;
+                Self { $($field),+ }
+            }
+        }
+    };
+}
+state_v1! {
+    ledger: LedgerId,
+    sequence: SessionSeq,
+    claims: BTreeMap<ClaimId, Claim>,
+    validations: BTreeMap<ValidationId, Validation>,
+    artifacts: BTreeMap<ArtifactId, Artifact>,
+    testaments: BTreeMap<TestamentId, Testament>,
+    evidence_sets: BTreeMap<EvidenceSetId, EvidenceSet>,
+    runs: BTreeMap<ValidationRunId, ValidationRun>,
+    monitors: BTreeMap<MonitorId, Monitor>,
+    identities: BTreeMap<(ObjectKind, ContentHash), ObjectId>,
+    epochs: BTreeMap<ParticipantId, EpochWindow>,
+    receipts: BTreeMap<RequestKey, MutationReceipt>,
+}
+
+macro_rules! limits_v1 {
+    ($($field:ident),+ $(,)?) => {
+        #[derive(Serialize, Deserialize)]
+        struct LimitsV1 { $($field: usize),+ }
+        impl From<&Limits> for LimitsV1 {
+            fn from(limits: &Limits) -> Self {
+                let Limits { $($field),+ } = limits;
+                Self { $($field: *$field),+ }
+            }
+        }
+        impl From<LimitsV1> for Limits {
+            fn from(limits: LimitsV1) -> Self {
+                let LimitsV1 { $($field),+ } = limits;
+                Self { $($field),+ }
+            }
+        }
+    };
+}
+limits_v1! {
+    max_objects,
+    max_command_bytes,
+    max_text_bytes,
+    max_relations,
+    max_requirements,
+    max_batch,
+    max_artifacts_per_set,
+    max_inline_bytes,
+    max_requests,
+    max_monitors,
+    max_graph_visits,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CoreV1<S> {
+    state: S,
+    limits: LimitsV1,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PreparedV1<I> {
+    schema: u16,
+    base: SessionSeq,
+    input: I,
+    command_hash: ContentHash,
+    footprint: FootprintV1,
+}
+#[derive(Serialize, Deserialize)]
+struct FootprintV1 {
+    ledger: LedgerId,
+    session_exclusive: bool,
+}
+impl From<&Footprint> for FootprintV1 {
+    fn from(value: &Footprint) -> Self {
+        let Footprint {
+            ledger,
+            session_exclusive,
+        } = value;
+        Self {
+            ledger: *ledger,
+            session_exclusive: *session_exclusive,
+        }
+    }
+}
+impl From<FootprintV1> for Footprint {
+    fn from(value: FootprintV1) -> Self {
+        Self {
+            ledger: value.ledger,
+            session_exclusive: value.session_exclusive,
+        }
+    }
+}
+
+fn schema(value: u16) -> Result<(), CoreError> {
+    if value == SCHEMA_V1 {
+        Ok(())
+    } else {
+        Err(CoreError::UnsupportedSchema(value))
+    }
+}
+fn version_prefix(bytes: &[u8]) -> Result<&[u8], CoreError> {
+    let (version, rest): (u16, _) = postcard::take_from_bytes(bytes)?;
+    schema(version)?;
+    Ok(rest)
+}
+fn decode_exact<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CoreError> {
+    let (value, rest) = postcard::take_from_bytes(bytes)?;
+    if !rest.is_empty() {
+        return Err(CoreError::Codec(postcard::Error::DeserializeBadEncoding));
+    }
+    Ok(value)
+}
+
+pub(super) fn encode_checkpoint(core: &Core) -> Result<Vec<u8>, CoreError> {
+    let Core { state, limits } = core;
+    let payload = postcard::to_allocvec(&(
+        SCHEMA_V1,
+        CoreV1 {
+            state: StateRefV1::from(state),
+            limits: LimitsV1::from(limits),
+        },
+    ))?;
+    let mut bytes = Vec::new();
+    let length = CHECKPOINT_MAGIC
+        .len()
+        .checked_add(32)
+        .and_then(|n| n.checked_add(payload.len()))
+        .ok_or(CoreError::Exhausted)?;
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| CoreError::Exhausted)?;
+    bytes.extend_from_slice(CHECKPOINT_MAGIC);
+    bytes.extend_from_slice(blake3::hash(&payload).as_bytes());
+    bytes.extend_from_slice(&payload);
+    Ok(bytes)
+}
+pub(super) fn decode_checkpoint(bytes: &[u8]) -> Result<Core, CoreError> {
+    let tail = bytes
+        .strip_prefix(CHECKPOINT_MAGIC)
+        .ok_or(CoreError::Checksum)?;
+    let (checksum, payload) = tail.split_at_checked(32).ok_or(CoreError::Checksum)?;
+    if blake3::hash(payload).as_bytes() != checksum {
+        return Err(CoreError::Checksum);
+    }
+    // Read the version before allocating any nested collection. An unknown
+    // schema does not authorize decoding its body as the V1 model.
+    let core: CoreV1<StateV1> = decode_exact(version_prefix(payload)?)?;
+    Ok(Core {
+        state: core.state.into(),
+        limits: core.limits.into(),
+    })
+}
+
+macro_rules! prepared_codec {
+    ($prepared:ident, $input:ty) => {
+        impl $prepared {
+            /// Encode the existing V1 prepared body, without its Session magic.
+            /// The caller retains its admitted staging/encoding allowance.
+            pub fn encode_v1(&self) -> Result<Vec<u8>, CoreError> {
+                let Self {
+                    schema: version,
+                    base,
+                    input,
+                    command_hash,
+                    footprint,
+                } = self;
+                schema(*version)?;
+                Ok(postcard::to_allocvec(&PreparedV1 {
+                    schema: *version,
+                    base: *base,
+                    input,
+                    command_hash: *command_hash,
+                    footprint: FootprintV1::from(footprint),
+                })?)
+            }
+            /// Decode one complete V1 body. Neither trailing bytes nor a new
+            /// schema can be interpreted as a historical prepared mutation.
+            pub fn decode_v1(bytes: &[u8]) -> Result<Self, CoreError> {
+                version_prefix(bytes)?;
+                let value: PreparedV1<$input> = decode_exact(bytes)?;
+                Ok(Self {
+                    schema: value.schema,
+                    base: value.base,
+                    input: value.input,
+                    command_hash: value.command_hash,
+                    footprint: value.footprint.into(),
+                })
+            }
+        }
+    };
+}
+prepared_codec!(PreparedMutation, AuthenticatedInput);
+prepared_codec!(PreparedManagedMutation, ManagedAuthenticatedInput);
+
+#[cfg(test)]
+#[path = "durable_v1_tests.rs"]
+mod tests;

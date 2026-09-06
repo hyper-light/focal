@@ -28,6 +28,13 @@ use std::{
 use zeroize::Zeroizing;
 
 const MAGIC: &[u8; 8] = b"FCLINV01";
+const CLIENT_MAGIC: &[u8; 8] = b"FCLCLI01";
+#[path = "client_join.rs"]
+mod client;
+pub use client::{ClientInvitation, PendingClientJoin};
+#[path = "joined_context.rs"]
+mod joined_context;
+pub use joined_context::{joined_unix_principal, local_unix_principal};
 const MAX_BUNDLE: usize = 48 * 1024;
 const MAX_JOURNAL: usize = 60 * 1024;
 #[derive(Debug, thiserror::Error)]
@@ -134,13 +141,16 @@ impl NodeInvitation {
         &self.invitation
     }
     pub fn validate(&self) -> Result<(), JoinError> {
+        self.validate_role(EnrollmentRole::Node)
+    }
+    fn validate_role(&self, role: EnrollmentRole) -> Result<(), JoinError> {
         if self.name.is_empty()
             || self.name.len() > 63
             || !self
                 .name
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-            || self.invitation.role() != EnrollmentRole::Node
+            || self.invitation.role() != role
             || self.invitation.cluster() != self.genesis.founder.cluster
         {
             return Err(JoinError::Invalid);
@@ -163,7 +173,10 @@ impl NodeInvitation {
         Ok(())
     }
     pub fn encode(&self) -> Result<Zeroizing<Vec<u8>>, JoinError> {
-        self.validate()?;
+        self.encode_role(EnrollmentRole::Node)
+    }
+    fn encode_role(&self, role: EnrollmentRole) -> Result<Zeroizing<Vec<u8>>, JoinError> {
+        self.validate_role(role)?;
         let token = self.invitation.expose_token()?;
         let value = BundleRef {
             schema: 1,
@@ -180,17 +193,27 @@ impl NodeInvitation {
         bytes
             .try_reserve_exact(size.checked_add(40).ok_or(JoinError::Capacity)?)
             .map_err(|_| JoinError::Capacity)?;
-        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(match role {
+            EnrollmentRole::Node => MAGIC,
+            EnrollmentRole::Client => CLIENT_MAGIC,
+        });
         bytes.extend_from_slice(blake3::hash(&payload).as_bytes());
         bytes.extend_from_slice(&payload);
         Ok(bytes)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self, JoinError> {
+        Self::decode_role(bytes, EnrollmentRole::Node)
+    }
+    fn decode_role(bytes: &[u8], role: EnrollmentRole) -> Result<Self, JoinError> {
         if bytes.len() > MAX_BUNDLE {
             return Err(JoinError::Capacity);
         }
         let payload = bytes.get(40..).ok_or(JoinError::Invalid)?;
-        if bytes.get(..8) != Some(MAGIC.as_slice())
+        let magic = match role {
+            EnrollmentRole::Node => MAGIC,
+            EnrollmentRole::Client => CLIENT_MAGIC,
+        };
+        if bytes.get(..8) != Some(magic.as_slice())
             || bytes.get(8..40) != Some(blake3::hash(payload).as_bytes().as_slice())
         {
             return Err(JoinError::Invalid);
@@ -199,11 +222,13 @@ impl NodeInvitation {
         if !tail.is_empty() || value.schema != 1 {
             return Err(JoinError::Invalid);
         }
-        Self::new(
-            value.name,
-            value.genesis,
-            Invitation::parse(&value.token.0)?,
-        )
+        let value = Self {
+            name: value.name,
+            genesis: value.genesis,
+            invitation: Invitation::parse(&value.token.0)?,
+        };
+        value.validate_role(role)?;
+        Ok(value)
     }
     pub fn load(path: impl AsRef<Path>) -> Result<Self, JoinError> {
         Self::decode(&read_private(path.as_ref(), MAX_BUNDLE)?)

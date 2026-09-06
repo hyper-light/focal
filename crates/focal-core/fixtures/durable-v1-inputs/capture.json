@@ -1,0 +1,80 @@
+{
+  "captured_utc": "2026-09-06T13:55:00.741920+00:00",
+  "phase": "After nested checkpoint freeze; before command/input/canonical codec integration. No intervening Cargo rebuild.",
+  "compiler": "rustc 1.94.1 (e408947bf 2026-03-25)",
+  "scope": "Synthetic serialization/canonical-hash vectors only; prepared structs are constructed, not reducer-admitted. No replay or Session validity claimed.",
+  "generator_source": "generator.rs.txt",
+  "generator_source_sha256": "f7b95448c4f094437a44c1f31ba42a083eb3ce8c4acfa593dd6742e5992e7803",
+  "original_linked_writer_sha256": "7fd5fd266ec84e6f145b581a113f7249a8ed6b78941072650445424013cbdc74",
+  "compile_argv": [
+    "rustc",
+    "--edition=2024",
+    "/private/tmp/focal-v1-inputs-capture.rs",
+    "-L",
+    "dependency=target/debug/deps",
+    "-o",
+    "/private/tmp/focal-v1-inputs-capture",
+    "--extern",
+    "focal_core=target/debug/deps/libfocal_core-0028036b02fcce20.rlib",
+    "--extern",
+    "focal_model=target/debug/deps/libfocal_model-cb3954b4b4571b14.rlib",
+    "--extern",
+    "serde=target/debug/deps/libserde-ec682fc9ba85454a.rlib",
+    "--extern",
+    "postcard=target/debug/deps/libpostcard-355a74c06a2f301c.rlib",
+    "--extern",
+    "blake3=target/debug/deps/libblake3-f34f8f1e7b9fb786.rlib"
+  ],
+  "original_matched_rlibs": {
+    "focal_core": {
+      "crate": "focal_core",
+      "path": "target/debug/deps/libfocal_core-0028036b02fcce20.rlib",
+      "bytes": 11035584,
+      "sha256": "a403d5b35c19d8cfb1481587336c6f5370fd98be9b45ba55f8f1411672cbdf46",
+      "mtime_ns": 1788702624806910553
+    },
+    "focal_model": {
+      "crate": "focal_model",
+      "path": "target/debug/deps/libfocal_model-cb3954b4b4571b14.rlib",
+      "bytes": 8514904,
+      "sha256": "f9131ced88fd4f20b8686324633b053c4d1f5bac9aeb59838d1b51fe7048e9bf",
+      "mtime_ns": 1788702623940550844
+    },
+    "serde": {
+      "crate": "serde",
+      "path": "target/debug/deps/libserde-ec682fc9ba85454a.rlib",
+      "bytes": 901560,
+      "sha256": "3b0ab3aa044dcb63207c1c4598d6ed1f61586722c43407e83eb694e8575e49e2",
+      "mtime_ns": 1788640639807919227
+    },
+    "postcard": {
+      "crate": "postcard",
+      "path": "target/debug/deps/libpostcard-355a74c06a2f301c.rlib",
+      "bytes": 533640,
+      "sha256": "3cb34a5ecc63f18ad7726ff038b1c1c6afa5b0273fe0e60af0a1e1e979e93eab",
+      "mtime_ns": 1788640672964123521
+    },
+    "blake3": {
+      "crate": "blake3",
+      "path": "target/debug/deps/libblake3-f34f8f1e7b9fb786.rlib",
+      "bytes": 1171456,
+      "sha256": "2b0f1596852635db8926126773d2331a216d8b3f2d3c3a82726a58f3f4a2d9d7",
+      "mtime_ns": 1788670029165155415
+    }
+  },
+  "source_manifest_sha256": "40d56f27b09dfd24d02103fb81b932ef558ab68c6c186bb52cbf335b00041ddc",
+  "corpus_manifest_sha256": "1a7cd8bef3827c68f82bd31b4875ad08eaea520edbdcd110381c4dd29fa895f3",
+  "source_checkpoint": {
+    "path": "../durable-v1-nested/broad.cp1",
+    "sha256": "0f2c14436d9e849f659bb4619dd959470ec4bc35de6e2d6cc07622943e2c4072"
+  },
+  "counts": {
+    "commands": 58,
+    "legacy_inputs": 58,
+    "managed_inputs": 58,
+    "legacy_prepared": 58,
+    "managed_prepared": 58,
+    "data_files": 71,
+    "data_bytes": 576697
+  }
+}

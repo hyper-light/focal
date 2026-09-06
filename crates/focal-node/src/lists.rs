@@ -32,6 +32,54 @@ impl ReadViews {
         request: &ListRequest,
         limits: &WireLimits,
     ) -> Result<ListPage, AccessError> {
+        self.list_selected(session, context, request, None, None, limits)
+    }
+
+    pub fn validators(
+        &mut self,
+        session: &mut Session,
+        context: ListReadContext,
+        request: &ValidatorRequest,
+        limits: &WireLimits,
+    ) -> Result<ListPage, AccessError> {
+        request.validate(limits)?;
+        self.list_selected(
+            session,
+            context,
+            &request.query,
+            Some(request),
+            None,
+            limits,
+        )
+    }
+
+    pub fn selection(
+        &mut self,
+        session: &mut Session,
+        context: ListReadContext,
+        request: &SelectionRequest,
+        limits: &WireLimits,
+    ) -> Result<ListPage, AccessError> {
+        request.validate(session.ledger(), limits)?;
+        self.list_selected(
+            session,
+            context,
+            &request.query,
+            None,
+            Some(&request.predicates),
+            limits,
+        )
+    }
+
+    fn list_selected(
+        &mut self,
+        session: &mut Session,
+        context: ListReadContext,
+        request: &ListRequest,
+        validator: Option<&ValidatorRequest>,
+        predicates: Option<&SelectionPredicates>,
+        limits: &WireLimits,
+    ) -> Result<ListPage, AccessError> {
         request.filter.validate()?;
         if request.max_items == 0
             || request.max_visits == 0
@@ -96,7 +144,11 @@ impl ReadViews {
         }
         let (objects, after, visited, more) = select(
             view,
-            &request.filter,
+            Selection {
+                filter: &request.filter,
+                validator,
+                predicates,
+            },
             position.as_ref().map(|position| &position.after),
             request.max_items,
             request.max_visits,
@@ -207,15 +259,26 @@ impl Candidate {
     }
 }
 
+struct Selection<'a> {
+    filter: &'a ListFilter,
+    validator: Option<&'a ValidatorRequest>,
+    predicates: Option<&'a SelectionPredicates>,
+}
+
 fn select(
     view: &GraphSnapshot,
-    filter: &ListFilter,
+    selection: Selection<'_>,
     after: Option<&GraphKey>,
     max_items: u32,
     max_visits: u32,
     now: u64,
     limits: &WireLimits,
 ) -> Result<(Vec<ReadObject>, Option<GraphKey>, u32, bool), AccessError> {
+    let Selection {
+        filter,
+        validator,
+        predicates,
+    } = selection;
     let scan = index(filter, view.ledger());
     let max_bytes = usize::try_from(limits.max_cost).map_err(|_| AccessError::Capacity)?;
     let output_limit = (limits.max_frame_bytes as usize)
@@ -270,7 +333,7 @@ fn select(
                 {
                     return Ok((Candidate::full(), 0));
                 }
-                if !matches_filter(object, filter) {
+                if !matches_filter(object, filter) || predicates.is_some_and(|predicate| !matches_predicates(object, predicate)) || validator.is_some_and(|query| !matches!(object, GraphObject::Validation(value) if query.matches(value.content()))) {
                     return Ok((Candidate::skipped(), bytes));
                 }
                 let size = object_wire_size(object)?;
@@ -384,3 +447,12 @@ fn matches_filter(object: &GraphObject, filter: &ListFilter) -> bool {
 #[cfg(test)]
 #[path = "lists_tests.rs"]
 mod tests;
+
+fn matches_predicates(object: &GraphObject, predicates: &SelectionPredicates) -> bool {
+    match object {
+        GraphObject::Claim(value) => predicates.claim(value),
+        GraphObject::Testament(value) => predicates.testament(value),
+        GraphObject::Artifact(value) => predicates.artifact(value),
+        GraphObject::Validation(value) => predicates.created(value.lifecycle().created),
+    }
+}

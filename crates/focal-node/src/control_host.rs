@@ -935,7 +935,8 @@ impl<V: AuthorityVerifier> Owner<V> {
                     }
                 }
                 ControlRpc::Read(query) => {
-                    if matches!(&query, ControlRead::Receipt(id) if id.client != principal.0) {
+                    if matches!(&query, ControlRead::Receipt(id) | ControlRead::AdminReceipt {id} if id.client != principal.0)
+                    {
                         return Err(ControlFailure::Unauthorized);
                     }
                     self.nonce = self.nonce.checked_add(1).ok_or(ControlFailure::Capacity)?;

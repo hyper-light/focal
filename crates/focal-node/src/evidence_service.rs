@@ -942,6 +942,9 @@ impl RequestHandler for FleetService {
     fn supports_managed_requests(&self) -> bool {
         true
     }
+    fn supports_participant_requests(&self) -> bool {
+        true
+    }
     fn handle(
         &self,
         request: VerifiedRequest,

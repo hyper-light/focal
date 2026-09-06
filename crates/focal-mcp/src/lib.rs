@@ -10,7 +10,12 @@
     )
 )]
 //! Bounded owned MCP protocol state; transport and business execution are supplied by the host.
+mod admin;
 mod backend;
+mod catalog_admin;
+mod catalog_transfer;
+mod catalog_watch;
+pub use admin::{AdminAction, AdminBackend, AdminChange, AdminError};
 mod catalog;
 mod codec;
 mod json;

@@ -1,0 +1,10 @@
+{
+  "command": [
+    "/private/tmp/focal-decoder-refusal-hvuffg_d/helper",
+    "compact-same",
+    "/private/tmp/focal-refusal-results-20260906a/compact-same"
+  ],
+  "returncode": 0,
+  "stdout_sha256": "68e701cb13e2554647d1ffe070d7ea7ba20f113b55a6d32d5100229b347d4ad1",
+  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}

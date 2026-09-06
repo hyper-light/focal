@@ -1,0 +1,374 @@
+use crate::*;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+
+/// Created by trusted ingress after authentication; wire clients must not supply this context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorityContext {
+    pub runtime: bool,
+    pub cause: Cause,
+    pub policy_revision: u64,
+    pub logical_time: u64,
+    pub evidence: Vec<EvidenceAttestation>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthenticatedInput {
+    pub ledger: LedgerId,
+    pub principal: ParticipantId,
+    pub request_epoch: RequestEpoch,
+    pub request_id: RequestId,
+    pub expected_revision: Option<ObjectRevision>,
+    pub authority: AuthorityContext,
+    pub command: Command,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Command {
+    NegotiateEpoch {
+        epoch: RequestEpoch,
+    },
+    AdvanceEpochFloor {
+        minimum: RequestEpoch,
+    },
+    GenerateClaim {
+        claim: NewClaim,
+    },
+    GenerateClaimBatch {
+        claims: Vec<NewClaim>,
+    },
+    PostClaim {
+        claim: ClaimId,
+    },
+    AcquireReceipt {
+        claim: ClaimId,
+        receipt: ReceiptId,
+        epoch: u64,
+    },
+    AdoptReceipt {
+        claim: ClaimId,
+        previous: ReceiptFence,
+        receipt: ReceiptId,
+        holder: ParticipantId,
+        epoch: u64,
+    },
+    RecordProgress {
+        claim: ClaimId,
+        receipt: ReceiptFence,
+        message: String,
+    },
+    BeginEvidenceSet {
+        claim: ClaimId,
+        receipt: ReceiptFence,
+        evidence_set: EvidenceSetId,
+    },
+    AttachArtifact {
+        claim: ClaimId,
+        receipt: ReceiptFence,
+        evidence_set: EvidenceSetId,
+        artifact: NewArtifact,
+    },
+    CloseTestament {
+        claim: ClaimId,
+        receipt: ReceiptFence,
+        testament: TestamentId,
+        evidence_set: EvidenceSetId,
+        manifest: Vec<ArtifactRef>,
+        summary: String,
+        confidence: Confidence,
+        outcome: OutcomeKind,
+    },
+    AcknowledgeTestament {
+        claim: ClaimId,
+        testament: TestamentId,
+    },
+    BeginWholeWorkValidation {
+        claim: ClaimId,
+    },
+    BeginIncrementValidation {
+        claim: ClaimId,
+        validation: ValidationId,
+        target: ContentHash,
+        manifest: ContentHash,
+    },
+    RecordValidationVerdict {
+        verdict: VerdictRecord,
+    },
+    CompleteWholeWork {
+        claim: ClaimId,
+    },
+    FailPost {
+        claim: ClaimId,
+        evidence: ArtifactRef,
+    },
+    FailReceipt {
+        claim: ClaimId,
+        evidence: ArtifactRef,
+    },
+    FailTestamentGeneration {
+        claim: ClaimId,
+        testament: TestamentId,
+        evidence_set: EvidenceSetId,
+        error: NewArtifact,
+        summary: String,
+    },
+    CancelClaim {
+        claim: ClaimId,
+        reason: String,
+    },
+    RevokeClaim {
+        claim: ClaimId,
+        reason: String,
+    },
+    ExpireClaim {
+        claim: ClaimId,
+        timer: TimerId,
+        generation: u64,
+        fired_at: u64,
+    },
+    SupersedeClaim {
+        predecessor: ClaimId,
+        successor: NewClaim,
+    },
+    RegisterMonitor {
+        monitor: MonitorId,
+        owner: ClaimId,
+        roots: BTreeSet<WaitPredicate>,
+        deadline: Deadline,
+    },
+    RebindMonitor {
+        monitor: MonitorId,
+        predecessor: ClaimId,
+        successor: ClaimId,
+    },
+    ReleaseScope {
+        claim: ClaimId,
+    },
+    RegisterArtifact {
+        artifact: NewArtifact,
+    },
+    ExpireMonitor {
+        monitor: MonitorId,
+        timer: TimerId,
+        generation: u64,
+        fired_at: u64,
+    },
+    /// Appended v1 command: receipt adoption and verdict admission share the
+    /// same ordered log. None matches only a claim that still has no receipt.
+    RecordFencedValidationVerdict {
+        verdict: VerdictRecord,
+        receipt: Option<ReceiptFence>,
+    },
+}
+impl Command {
+    /// Frozen append-only command tags for canonical request identity.
+    pub const fn code(&self) -> u16 {
+        match self {
+            Self::NegotiateEpoch { .. } => 1,
+            Self::AdvanceEpochFloor { .. } => 2,
+            Self::GenerateClaim { .. } => 3,
+            Self::GenerateClaimBatch { .. } => 4,
+            Self::PostClaim { .. } => 5,
+            Self::AcquireReceipt { .. } => 6,
+            Self::AdoptReceipt { .. } => 7,
+            Self::RecordProgress { .. } => 8,
+            Self::BeginEvidenceSet { .. } => 9,
+            Self::AttachArtifact { .. } => 10,
+            Self::CloseTestament { .. } => 11,
+            Self::AcknowledgeTestament { .. } => 12,
+            Self::BeginWholeWorkValidation { .. } => 13,
+            Self::BeginIncrementValidation { .. } => 14,
+            Self::RecordValidationVerdict { .. } => 15,
+            Self::CompleteWholeWork { .. } => 16,
+            Self::FailPost { .. } => 17,
+            Self::FailReceipt { .. } => 18,
+            Self::FailTestamentGeneration { .. } => 19,
+            Self::CancelClaim { .. } => 20,
+            Self::RevokeClaim { .. } => 21,
+            Self::ExpireClaim { .. } => 22,
+            Self::SupersedeClaim { .. } => 23,
+            Self::RegisterMonitor { .. } => 24,
+            Self::RebindMonitor { .. } => 25,
+            Self::ReleaseScope { .. } => 26,
+            Self::RegisterArtifact { .. } => 27,
+            Self::ExpireMonitor { .. } => 28,
+            Self::RecordFencedValidationVerdict { .. } => 29,
+        }
+    }
+    pub const fn claim_id(&self) -> Option<ClaimId> {
+        match self {
+            Self::GenerateClaim { claim } => Some(claim.id),
+            Self::SupersedeClaim { predecessor, .. } => Some(*predecessor),
+            Self::PostClaim { claim }
+            | Self::AcquireReceipt { claim, .. }
+            | Self::AdoptReceipt { claim, .. }
+            | Self::RecordProgress { claim, .. }
+            | Self::BeginEvidenceSet { claim, .. }
+            | Self::AttachArtifact { claim, .. }
+            | Self::CloseTestament { claim, .. }
+            | Self::AcknowledgeTestament { claim, .. }
+            | Self::BeginWholeWorkValidation { claim }
+            | Self::BeginIncrementValidation { claim, .. }
+            | Self::CompleteWholeWork { claim }
+            | Self::FailPost { claim, .. }
+            | Self::FailReceipt { claim, .. }
+            | Self::FailTestamentGeneration { claim, .. }
+            | Self::CancelClaim { claim, .. }
+            | Self::RevokeClaim { claim, .. }
+            | Self::ExpireClaim { claim, .. }
+            | Self::ReleaseScope { claim } => Some(*claim),
+            Self::RegisterMonitor { owner, .. } => Some(*owner),
+            _ => None,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct RequestKey {
+    pub principal: ParticipantId,
+    pub epoch: RequestEpoch,
+    pub id: RequestId,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CommandResult {
+    EpochAdmitted(RequestEpoch),
+    EpochFloorAdvanced(RequestEpoch),
+    Generated(Vec<ClaimId>),
+    Existing(Vec<ClaimId>),
+    Claim { claim: ClaimId, status: ClaimStatus },
+    Receipt { claim: ClaimId, fence: ReceiptFence },
+    EvidenceSet(EvidenceSetId),
+    Artifact(ArtifactRef),
+    Testament(TestamentId),
+    Validation(ValidationRunId),
+    Monitor(MonitorId),
+    Noop,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationReceipt {
+    pub ledger: LedgerId,
+    pub key: RequestKey,
+    pub sequence: SessionSeq,
+    pub command_hash: ContentHash,
+    pub outcome: CommandResult,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InformReason {
+    Terminal(ClaimStatus),
+    Status(ClaimStatus),
+    DependencyPending(ClaimId),
+    ValidationPending,
+    AlreadyApplied,
+    StandingDenied,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DomainOutcome {
+    Refuse {
+        code: ErrorCode,
+        detail: String,
+    },
+    Inform {
+        claim: Option<ClaimId>,
+        reason: InformReason,
+    },
+    Duplicate(Box<MutationReceipt>),
+}
+impl DomainOutcome {
+    pub fn refuse(code: ErrorCode, detail: impl Into<String>) -> Self {
+        Self::Refuse {
+            code,
+            detail: detail.into(),
+        }
+    }
+}
+impl std::fmt::Display for DomainOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+impl std::error::Error for DomainOutcome {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Delta {
+    pub schema: u16,
+    pub id: DeltaId,
+    pub action: LifecycleAction,
+    pub actor: ParticipantId,
+    pub claim: Option<ClaimId>,
+    pub fact: DeltaFact,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeltaFact {
+    Status {
+        previous: Option<ClaimStatus>,
+        current: ClaimStatus,
+        witness: Option<ClaimId>,
+    },
+    Progress(String),
+    Receipt(Receipt),
+    EvidenceSet(EvidenceSetId),
+    Artifact(ArtifactRef),
+    Testament {
+        id: TestamentId,
+        hash: ContentHash,
+    },
+    ValidationScheduled(ValidationRunId),
+    Verdict(VerdictRecord),
+    Scope(MonitorId),
+    Epoch(RequestEpoch),
+    LocalCompletion,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EffectIntent {
+    DispatchClaim {
+        claim: ClaimId,
+    },
+    ExecuteValidation {
+        run: ValidationRunId,
+        handler: HandlerRef,
+        evaluator: ParticipantId,
+        attempt: u32,
+        manifest: ContentHash,
+        quality_phase: bool,
+    },
+    CancelExecution {
+        claim: ClaimId,
+        receipt: Option<ReceiptFence>,
+    },
+    MonitorReleased {
+        monitor: MonitorId,
+    },
+    ScheduleDeadline {
+        claim: ClaimId,
+        deadline: Deadline,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Limits {
+    pub max_objects: usize,
+    pub max_command_bytes: usize,
+    pub max_text_bytes: usize,
+    pub max_relations: usize,
+    pub max_requirements: usize,
+    pub max_batch: usize,
+    pub max_artifacts_per_set: usize,
+    pub max_inline_bytes: usize,
+    pub max_requests: usize,
+    pub max_monitors: usize,
+    pub max_graph_visits: usize,
+}
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_objects: 100_000,
+            max_command_bytes: 1024 * 1024,
+            max_text_bytes: 16 * 1024,
+            max_relations: 256,
+            max_requirements: 64,
+            max_batch: 256,
+            max_artifacts_per_set: 1024,
+            max_inline_bytes: 16 * 1024,
+            max_requests: 100_000,
+            max_monitors: 10_000,
+            max_graph_visits: 1_000_000,
+        }
+    }
+}

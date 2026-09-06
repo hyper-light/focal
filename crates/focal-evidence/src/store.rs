@@ -8,6 +8,11 @@ use std::path::{Path, PathBuf};
 
 const MANIFEST_MAGIC: &[u8] = b"focal.evidence.manifest\0\x01\0";
 const UPLOAD_SCHEMA: u16 = 1;
+#[path = "upload_terminal.rs"]
+mod terminal;
+/// Permanent scoped upload IDs retained as small terminal records. Active
+/// admission reserves its completion slot. No clock-based eviction is safe.
+pub const MAX_TERMINAL_UPLOADS: usize = 65_536;
 
 /// Format bounds shared by storage, peer transfer and cold replica recovery.
 pub const MAX_TRANSFER_CHUNK_BYTES: usize = 1024 * 1024;
@@ -65,6 +70,8 @@ pub enum ContentError {
     Capacity,
     #[error("unknown upload")]
     MissingUpload,
+    #[error("upload identity is durably finished and cannot be reopened")]
+    FinishedUpload,
     #[error("upload offset differs from the durable offset {0}")]
     Offset(u64),
     #[error("upload is incomplete: {received} of {expected} bytes")]
@@ -167,6 +174,7 @@ pub struct ContentStore {
     limits: StoreLimits,
     uploads: BTreeMap<UploadId, Upload>,
     staged_bytes: u64,
+    terminal_uploads: usize,
     failed: bool,
     _writer_lock: File,
 }
@@ -216,6 +224,7 @@ impl ContentStore {
             limits,
             uploads: BTreeMap::new(),
             staged_bytes: 0,
+            terminal_uploads: 0,
             failed: false,
             _writer_lock: lock,
         };
@@ -328,6 +337,9 @@ impl ContentStore {
             } else {
                 Err(ContentError::Invalid)
             };
+        }
+        if terminal::contains(&self.meta_path(id), id)? {
+            return Err(ContentError::FinishedUpload);
         }
         self.reserve_upload(length)?;
         let staged_bytes = self
@@ -515,22 +527,32 @@ impl ContentStore {
         result
     }
     fn finish_inner(&mut self, id: UploadId) -> Result<(), ContentError> {
-        let Some(upload) = self.uploads.get(&id) else {
-            return Ok(());
-        };
-        let length = upload.meta.expected_length;
+        let length = self
+            .uploads
+            .get(&id)
+            .map(|upload| upload.meta.expected_length);
+        if length.is_none() {
+            if terminal::contains(&self.meta_path(id), id)? {
+                return terminal::remove_part(&self.part_path(id));
+            }
+            self.reserve_terminal_slot()?;
+        }
         let staged_bytes = self
             .staged_bytes
-            .checked_sub(length)
+            .checked_sub(length.unwrap_or(0))
             .ok_or(ContentError::Corrupt)?;
-        // Remove metadata first, then data: a crash can leave only a safe orphan.
-        fs::remove_file(self.meta_path(id))?;
-        sync_directory(&self.root.join("staging"))?;
-        fs::remove_file(self.part_path(id))?;
-        sync_directory(&self.root.join("staging"))?;
+        let terminal_uploads = self
+            .terminal_uploads
+            .checked_add(1)
+            .filter(|count| *count <= MAX_TERMINAL_UPLOADS)
+            .ok_or(ContentError::Capacity)?;
+        // Publish the durable replay fence before releasing bytes or the live
+        // handle. A delayed Begin can never reconstruct this scoped identity.
+        terminal::install(&self.meta_path(id), id)?;
+        self.terminal_uploads = terminal_uploads;
         self.uploads.remove(&id);
         self.staged_bytes = staged_bytes;
-        Ok(())
+        terminal::remove_part(&self.part_path(id))
     }
 
     /// Delivers only checksum-verified chunks, so a corrupt later chunk cannot cause
@@ -705,6 +727,7 @@ impl ContentStore {
     }
 
     fn reserve_upload(&self, length: u64) -> Result<(), ContentError> {
+        self.reserve_terminal_slot()?;
         if length > self.limits.max_content_bytes
             || self.uploads.len() >= self.limits.max_uploads
             || self
@@ -712,6 +735,16 @@ impl ContentStore {
                 .checked_add(length)
                 .ok_or(ContentError::Capacity)?
                 > self.limits.max_staging_bytes
+        {
+            return Err(ContentError::Capacity);
+        }
+        Ok(())
+    }
+    fn reserve_terminal_slot(&self) -> Result<(), ContentError> {
+        if self
+            .terminal_uploads
+            .checked_add(self.uploads.len())
+            .is_none_or(|count| count >= MAX_TERMINAL_UPLOADS)
         {
             return Err(ContentError::Capacity);
         }
@@ -732,12 +765,42 @@ impl ContentStore {
     fn recover_uploads(&mut self) -> Result<(), ContentError> {
         for entry in fs::read_dir(self.root.join("staging"))? {
             let entry = entry?;
+            if entry.path().extension().and_then(|x| x.to_str()) == Some("terminal") {
+                terminal::discard_pending(&entry.path())?;
+                continue;
+            }
             if entry.path().extension().and_then(|x| x.to_str()) != Some("meta") {
                 continue;
             }
-            let bytes = read_bounded(&entry.path(), self.limits.max_manifest_bytes)?;
-            let meta: UploadMeta = postcard::from_bytes(&bytes)?;
-            if meta.schema != UPLOAD_SCHEMA || entry.path() != self.meta_path(meta.id) {
+            let bytes = read_bounded(
+                &entry.path(),
+                self.limits.max_manifest_bytes.max(terminal::RECORD_BYTES),
+            )?;
+            if let Some(id) = terminal::decode(&bytes)? {
+                if entry.path() != self.meta_path(id) {
+                    return Err(ContentError::Corrupt);
+                }
+                terminal::contains(&entry.path(), id)?;
+                self.terminal_uploads = self
+                    .terminal_uploads
+                    .checked_add(1)
+                    .filter(|count| *count <= MAX_TERMINAL_UPLOADS)
+                    .ok_or(ContentError::Capacity)?;
+                if self
+                    .terminal_uploads
+                    .checked_add(self.uploads.len())
+                    .is_none_or(|count| count > MAX_TERMINAL_UPLOADS)
+                {
+                    return Err(ContentError::Capacity);
+                }
+                terminal::remove_part(&self.part_path(id))?;
+                continue;
+            }
+            let (meta, remaining): (UploadMeta, &[u8]) = postcard::take_from_bytes(&bytes)?;
+            if !remaining.is_empty()
+                || meta.schema != UPLOAD_SCHEMA
+                || entry.path() != self.meta_path(meta.id)
+            {
                 return Err(ContentError::Corrupt);
             }
             self.reserve_upload(meta.expected_length)?;
@@ -1025,7 +1088,8 @@ mod tests {
         let reference = store.seal(old_upload).unwrap();
         store.finish(old_upload).unwrap();
         let staging = root.path().join("staging");
-        fs::remove_dir(&staging).unwrap();
+        let retained_staging = root.path().join("retained-staging");
+        fs::rename(&staging, &retained_staging).unwrap();
         fs::write(&staging, b"injected unavailable directory").unwrap();
         assert!(matches!(
             store.begin(
@@ -1038,7 +1102,7 @@ mod tests {
             Err(ContentError::Io(_))
         ));
         fs::remove_file(&staging).unwrap();
-        fs::create_dir(&staging).unwrap();
+        fs::rename(&retained_staging, &staging).unwrap();
         assert!(matches!(
             store.begin(
                 UploadId([1; 16]),

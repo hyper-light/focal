@@ -120,6 +120,8 @@ P03/P04 include enough snapshots and local custody to support crash tests; P12 e
 
 **Files:** `crates/focal-evidence/src/{chunks,manifest,registry,dispatch,verdict}.rs`, `crates/focal-core/src/validation.rs`, `tests/evidence/`, `examples/validated_claim.rs`.
 
+**Execution scope:** validation execution, registration and handler queues below belong to participant-owned tools or optional Rust embedding helpers. Focal records pinned contracts, evidence and authorized verdicts; it does not launch agents/workers or invoke providers. Peer evaluation uses ordinary claims/testaments. The [peer-validation contract](16-peer-validation-contract.md) also requires the missing independent artifact/testament/validation lifecycles and compatible migration; current run records alone do not complete P05.
+
 - [ ] P05.1 Implement resumable bounded artifact upload with length/digest/schema validation, staging quotas and cancellation. Seal a manifest only after bytes meet the session's durability placement contract.
 - [ ] P05.2 Implement generated/unattached artifacts and immutable attachment manifests. Close testament only when all referenced evidence is available and authorized. A failed upload cannot create a dangling successful close.
 - [ ] P05.3 Implement testament confidence, success/failure/partial result shapes, and immutable terminal correction through supersession/amendment. Duplicate attachments are normalized before constructing a close; conflicting duplicate names/IDs reject.
@@ -136,6 +138,8 @@ P03/P04 include enough snapshots and local custody to support crash tests; P12 e
 ## 8. P06 — Graph satisfaction, parked work, and execution lifecycle
 
 **Files:** `crates/focal-ledger/src/{monitor,execution,deadline}.rs`, `crates/focal-core/src/satisfaction.rs`, `tests/graph/`, `tests/runtime/`.
+
+**Ownership scope:** execution expectations, assignments and parked continuations mean durable participant protocol fences and participant-owned recovery state. They are not a Focal job scheduler. Internal graph/timer maintenance remains deterministic ledger work; any external tool invocation or corrective/follow-up authorship belongs to an authorized participant under [16](16-peer-validation-contract.md).
 
 - [ ] P06.1 Implement the brute-force least-fixpoint oracle first. Encode `awaits` terminality and `depends_on` satisfaction/failure separately. Include mixed cycles, self-edge checks, supersession, terminal failures and shared descendants.
 - [ ] P06.2 Build per-parked-scope blocking closures and SCC condensation; maintain separate graph-monitor and serving-cache subscriber indexes. Dispatch only to affected monitors.

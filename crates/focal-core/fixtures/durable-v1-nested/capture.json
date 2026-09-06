@@ -1,0 +1,64 @@
+{
+  "date": "2026-09-06",
+  "capture_phase": "before nested checkpoint codec integration; source captured before new model codec module, rlibs retained without intervening Cargo rebuild",
+  "compiler": "rustc 1.94.1 (e408947bf 2026-03-25)",
+  "generator_source_sha256": "70cad1fbc4d32db1b4ad2fe25d13aa006c9696b6c094f92208fcb41f32c4daa8",
+  "original_linked_writer_sha256": "2951e162fcfab1abffe2439d9d49f538d13cd39fbce15375715f0ac4354c251b",
+  "rlibs": {
+    "focal_core": {
+      "file": "libfocal_core-a251f0b8041eb9b3.rlib",
+      "bytes": 9643696,
+      "sha256_at_capture": "e6ee06d20d84addeca587821f37caafa63792c2a99f0146b4e444b5bdc427392"
+    },
+    "focal_model": {
+      "file": "libfocal_model-7810d853602e5c07.rlib",
+      "bytes": 6584488,
+      "sha256_at_capture": "1cd88c150972a7756f89b0073ba69442dac9c8f2284bba447edf919fb199e904"
+    },
+    "blake3": {
+      "file": "libblake3-f34f8f1e7b9fb786.rlib",
+      "bytes": 1171456,
+      "sha256_at_capture": "2b0f1596852635db8926126773d2331a216d8b3f2d3c3a82726a58f3f4a2d9d7"
+    },
+    "serde": {
+      "file": "libserde-cef5f3890a7943ab.rlib",
+      "bytes": 900824,
+      "sha256_at_capture": "9744ddf1be40201233231c3c205cd9fe2f53fed8512d22f0451a54158e171673"
+    },
+    "postcard": {
+      "file": "libpostcard-379aea4f900dfe85.rlib",
+      "bytes": 533640,
+      "sha256_at_capture": "bcabbf11ee14ee82870bcb6f1d0cd38b6e8978db94fc6685ba8a7f342ac10a29"
+    }
+  },
+  "compile_argv": [
+    "rustc",
+    "--edition=2024",
+    "/private/tmp/focal-v1-nested-capture.rs",
+    "-L",
+    "dependency=/Users/adalundhe/Projects/focal/target/debug/deps",
+    "-o",
+    "/private/tmp/focal-v1-nested-capture",
+    "--extern",
+    "focal_core=/Users/adalundhe/Projects/focal/target/debug/deps/libfocal_core-a251f0b8041eb9b3.rlib",
+    "--extern",
+    "focal_model=/Users/adalundhe/Projects/focal/target/debug/deps/libfocal_model-7810d853602e5c07.rlib",
+    "--extern",
+    "blake3=/Users/adalundhe/Projects/focal/target/debug/deps/libblake3-f34f8f1e7b9fb786.rlib",
+    "--extern",
+    "serde=/Users/adalundhe/Projects/focal/target/debug/deps/libserde-cef5f3890a7943ab.rlib",
+    "--extern",
+    "postcard=/Users/adalundhe/Projects/focal/target/debug/deps/libpostcard-379aea4f900dfe85.rlib"
+  ],
+  "source_identity": {
+    "git_base": "31198c225b5ab6fb7c0414fe423d069701b9c9a2",
+    "source_manifest": "source-manifest.json",
+    "source_manifest_sha256": "2f2e84bff47f07963f683096bfa990e55271b98ec31c393bdc5b44874a88fc61",
+    "tracked_patch": "source.patch",
+    "tracked_patch_sha256": "91548ae7d27bec8d2d55c3b56f3426b6fcc109ddfcba13a058654f3d288b9b2c",
+    "reconstruction_verified_files": 33
+  },
+  "generator_source_path": "generator.rs.txt",
+  "scope": "Original nested Core/model V1 serialization after the top-level envelope codec was introduced and before nested object codecs. Synthetic serializable state; no replay, admission or service restore claimed.",
+  "corpus_manifest_sha256": "9764a5a9c306812f8b023b506351412f2c6127fc57e332b22ad1538f4c5b52fb"
+}

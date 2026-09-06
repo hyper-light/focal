@@ -32,6 +32,9 @@ impl RequestHandler for ManagedService {
     fn supports_managed_requests(&self) -> bool {
         true
     }
+    fn supports_participant_requests(&self) -> bool {
+        true
+    }
     fn handle(&self, request: VerifiedRequest) -> HandlerFuture<'_> {
         Box::pin(async move { self.handle_accounted(request).await.into_envelope() })
     }

@@ -12,8 +12,18 @@ pub(crate) struct ReadViews {
     started: Instant,
     route_epoch: RouteEpoch,
     list_key: Option<zeroize::Zeroizing<[u8; 32]>>,
+    traversals: BTreeMap<u64, traversal::SavedTraversal>,
+    traversal_nonce: u64,
 }
 impl ReadViews {
+    #[cfg(test)]
+    pub(crate) fn traversal_count(&self) -> usize {
+        self.traversals.len()
+    }
+    #[cfg(test)]
+    pub(crate) fn expire_test_views(&mut self) {
+        self.started = Instant::now() - std::time::Duration::from_secs(31);
+    }
     pub fn new() -> Self {
         Self::with_route_epoch(RouteEpoch(1))
     }
@@ -23,6 +33,8 @@ impl ReadViews {
             started: Instant::now(),
             route_epoch,
             list_key: None,
+            traversals: BTreeMap::new(),
+            traversal_nonce: 0,
         }
     }
     pub fn advance(&mut self, session: &mut Session) -> Result<u64, AccessError> {
@@ -32,6 +44,7 @@ impl ReadViews {
             .advance_read_clock(now)
             .map_err(super::host::access)?;
         self.views.retain(|_, view| view.expires_at() > now);
+        self.traversals.retain(|_, saved| saved.expires_at() > now);
         Ok(now)
     }
     pub fn read(
@@ -141,7 +154,61 @@ impl ReadViews {
                     next = Some(ObjectKey { kind, id });
                 }
             }
-            ReadQuery::Traverse { .. } => return Err(AccessError::UnsupportedOperation),
+            ReadQuery::SeedScan {
+                after,
+                claims,
+                max_bytes,
+            } => {
+                if *max_bytes < 1024 || *max_bytes > 65536 {
+                    return Err(AccessError::InvalidRequest);
+                }
+                let mut seed_limits = limits.clone();
+                seed_limits.max_frame_bytes = (*max_bytes).min(limits.max_frame_bytes);
+                (objects, next) =
+                    seed::read(view, claims, *after, read.max_items, now, &seed_limits)?;
+            }
+            ReadQuery::Traverse { roots, depth } => {
+                if roots.is_empty() || roots.len() > MAX_TRAVERSAL_ROOTS {
+                    return Err(AccessError::InvalidRequest);
+                }
+                let mut roots = roots.clone();
+                roots.sort();
+                roots.dedup();
+                let query = focal_graph::GraphTraversalQuery {
+                    root: *roots.first().ok_or(AccessError::InvalidRequest)?,
+                    direction: focal_graph::Direction::Forward,
+                    relations: Default::default(),
+                    authority_scope: ContentHash::default(),
+                };
+                let result = view
+                    .traverse_roots(
+                        &roots,
+                        &query,
+                        focal_memory::TraversalLimits {
+                            max_depth: u32::from(*depth),
+                            max_nodes: MAX_TRAVERSAL_NODES as usize,
+                            max_edges: MAX_TRAVERSAL_EDGES as usize,
+                            max_state_bytes: 1024 * 1024,
+                        },
+                        ReadBudget {
+                            max_items: read.max_items as usize,
+                            max_bytes: (limits.max_frame_bytes as usize).saturating_sub(1024),
+                            max_edge_visits: limits.max_items as usize,
+                        },
+                        None,
+                        now,
+                    )
+                    .map_err(graph_error)?;
+                // The legacy response cannot communicate truncation/cursors.
+                if result.stop != focal_memory::TraversalStop::Complete {
+                    return Err(AccessError::Capacity);
+                }
+                for page in &result.objects {
+                    for row in page.items() {
+                        push(&row.key, &row.value)?;
+                    }
+                }
+            }
             ReadQuery::ValidationResults { id, after } => {
                 if after.is_some() && !matches!(read.consistency, ReadConsistency::Exact(_)) {
                     return Err(AccessError::InvalidRequest);
@@ -167,6 +234,10 @@ impl ReadViews {
 
 #[path = "lists.rs"]
 mod lists;
+#[path = "seed_reads.rs"]
+mod seed;
+#[path = "traversal_reads.rs"]
+mod traversal;
 #[path = "validation_reads.rs"]
 mod validation_results;
 pub(crate) use lists::ListReadContext;

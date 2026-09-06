@@ -12,6 +12,7 @@
 )]
 //! Node composition and user-facing deployment intent.
 pub mod cluster;
+pub mod cluster_admin;
 pub mod config;
 pub mod content_host;
 pub mod control_host;
@@ -51,4 +52,8 @@ mod managed_support;
 
 mod managed_requests;
 
+mod participant_ingress;
 mod snapshot_feedback;
+
+mod ledger_summary;
+mod monitor_reads;

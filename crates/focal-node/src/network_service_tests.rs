@@ -1,4 +1,6 @@
 use super::*;
+#[path = "client_join_service_tests.rs"]
+mod client_join;
 
 #[test]
 fn network_service_requires_runtime_before_starting_physical_owners() {
@@ -593,7 +595,16 @@ async fn joined_service_receives_committed_root_learner_and_restarts_without_led
     assert!(peer.handles.ledger.is_none());
     assert_eq!(peer.handles.fleet.status().installed, 0);
     assert!(!peer.handles.fleet.status().stopped);
-    assert!(peer.status.admin_socket.is_none());
+    assert_eq!(
+        peer.status.admin_socket.as_deref(),
+        Some(
+            peer_settings
+                .data_dir()
+                .unwrap()
+                .join(ADMIN_SOCKET)
+                .as_path()
+        )
+    );
     assert!(!peer_dir.path().join("POLICY").exists());
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {

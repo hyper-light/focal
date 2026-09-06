@@ -176,6 +176,16 @@ impl ControlReplica {
             ControlRead::Authority => self.machine.authority_estimate()?,
             ControlRead::Configuration => 2048 * 16 + 4096,
             ControlRead::Contacts => self.machine.contact_charge(),
+            ControlRead::InvitationPage { limit, .. } => {
+                if *limit == 0 || *limit > 64 {
+                    return Err(ControlError::Invalid);
+                }
+                usize::from(*limit)
+                    .checked_mul(1024)
+                    .ok_or(ControlError::Capacity)?
+            }
+            ControlRead::Invitation { .. } | ControlRead::PrepareRevocation { .. } => 4096,
+            ControlRead::AdminReceipt { .. } => 2048 * 16 + 4096,
             ControlRead::StateAndAuthority => {
                 return self
                     .read_charge(&ControlRead::State)?
@@ -194,6 +204,64 @@ impl ControlReplica {
             return Err(ControlError::NotReady);
         }
         match query {
+            ControlRead::AdminReceipt { id } => Ok(ControlReadResult::AdminReceipt {
+                configuration: self.configuration(),
+                enrollment_revision: self
+                    .enrollment()
+                    .ok_or(ControlError::WrongOwner)?
+                    .revision(),
+                receipt: self.receipt(*id)?,
+            }),
+            ControlRead::InvitationPage {
+                after,
+                limit,
+                expected_revision,
+            } => {
+                let registry = self.enrollment().ok_or(ControlError::WrongOwner)?;
+                if expected_revision.is_some_and(|revision| revision != registry.revision()) {
+                    return Err(focal_directory::DirectoryError::CompareFailed.into());
+                }
+                let (entries, next) = registry.invitation_page(*after, *limit)?;
+                Ok(ControlReadResult::Invitations {
+                    identity: self.identity,
+                    applied_index: self.applied_index,
+                    revision: registry.revision(),
+                    entries,
+                    next,
+                })
+            }
+            ControlRead::Invitation { id } => {
+                let registry = self.enrollment().ok_or(ControlError::WrongOwner)?;
+                let mut entries = Vec::new();
+                entries
+                    .try_reserve_exact(1)
+                    .map_err(|_| ControlError::Capacity)?;
+                if let Some(value) = registry.invitation_status(*id) {
+                    entries.push(value);
+                }
+                Ok(ControlReadResult::Invitations {
+                    identity: self.identity,
+                    applied_index: self.applied_index,
+                    revision: registry.revision(),
+                    entries,
+                    next: None,
+                })
+            }
+            ControlRead::PrepareRevocation { id } => {
+                let registry = self.enrollment().ok_or(ControlError::WrongOwner)?;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| ControlError::NotReady)?
+                    .as_secs();
+                let command = registry
+                    .prepare_revoke(*id, i64::try_from(now).map_err(|_| ControlError::NotReady)?)?;
+                Ok(ControlReadResult::PreparedRevocation {
+                    identity: self.identity,
+                    applied_index: self.applied_index,
+                    invitation: *id,
+                    command,
+                })
+            }
             ControlRead::Configuration => {
                 Ok(ControlReadResult::Configuration(self.configuration()))
             }

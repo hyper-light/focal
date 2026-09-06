@@ -348,6 +348,36 @@ async fn pinned_enrollment_unknown_reply_restart_installs_exact_node_without_mem
     assert_eq!(joined.directory.identity(), &assigned);
     assert_eq!(joined.state.genesis.founder, founder);
     assert_eq!(joined.state.advertise, advertise);
+    // A live physical owner keeps its locks; Unix context discovery is a
+    // read-only verification of its installed key/receipt, not another owner.
+    let key_path = disk.path().join("JOIN/node-key/join-key.bin");
+    let receipt_path = disk.path().join("JOIN/node-key/enrollment.bin");
+    let original_key = fs::read(&key_path).unwrap();
+    let original_receipt = fs::read(&receipt_path).unwrap();
+    assert_eq!(
+        joined_unix_principal(disk.path(), &assigned, now()).unwrap(),
+        focal_model::ParticipantId(receipt.identity.principal)
+    );
+    assert_eq!(fs::read(&key_path).unwrap(), original_key);
+    assert_eq!(fs::read(&receipt_path).unwrap(), original_receipt);
+    let mut forged = receipt.clone();
+    forged.identity.principal = [99; 16];
+    let mut record = b"FCLKEY01".to_vec();
+    record.extend_from_slice(&postcard::to_stdvec(&forged).unwrap());
+    let checksum = *blake3::hash(&record).as_bytes();
+    record.extend_from_slice(&checksum);
+    fs::write(&receipt_path, &record).unwrap();
+    assert!(joined_unix_principal(disk.path(), &assigned, now()).is_err());
+    fs::write(&receipt_path, &original_receipt).unwrap();
+    fs::remove_file(&key_path).unwrap();
+    assert!(joined_unix_principal(disk.path(), &assigned, now()).is_err());
+    assert!(!key_path.exists());
+    fs::write(&key_path, &original_key).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
     let request = joined.discovery_request().unwrap();
     assert_eq!(request.ledger, joined.state.genesis.root_namespace);
     let Operation::PeerControl { group, request } = request.operation else {
@@ -369,6 +399,9 @@ async fn pinned_enrollment_unknown_reply_restart_installs_exact_node_without_mem
     assert_eq!(joined.receipt, receipt);
     assert_eq!(joined.contact_request().unwrap(), contact);
     drop(joined);
+    fs::remove_dir_all(disk.path().join("JOIN")).unwrap();
+    fs::remove_file(disk.path().join("JOIN.initialized")).unwrap();
+    assert!(local_unix_principal(disk.path(), &assigned, now()).is_err());
     client.close();
     server.close();
     task.await.unwrap();

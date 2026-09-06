@@ -2,9 +2,13 @@
 
 Status: **proposed Focal implementation contract, 2026-09-05**. This specifies what the Rust implementation must build; no behavior below is claimed to exist today. “Inherited” identifies Hecate semantics. “Focal decision” completes a missing contract or explicitly changes a source restriction. Implementers use this document when imported historical prose conflicts.
 
+Focal is a **peer-to-peer claims ledger**, not a job system. Participants own their agents, tools, skills and execution. The claim issuer invokes validating tools or skills outside Focal; the respondent supplies a testament and artifacts; the issuer or designated peer submits the verdict. Focal checks authenticated standing, evidence, immutable targets and lifecycle, and commits the resulting facts. It does not launch agents, assign worker processes or call a model provider. Asking another agent to evaluate is ordinary claim/testament work. This user-directed boundary supersedes inherited Hecate harness execution assumptions.
+
 The canonical term is **testament**. A **validation** is a requirement; a **validator** implements an evaluation; a **verdict** records the evaluation result; an **artifact** supplies evidence. These are separate concepts and types.
 
 Primary sources: [Ledger architecture](reference/hecate/docs/architecture/LEDGER.md), [Ledger core](reference/hecate/docs/specs/LEDGER_CORE.md), [Ledger substrate](reference/hecate/docs/specs/LEDGER_SUBSTRATE.md), [Wire format](reference/hecate/docs/specs/WIRE_FORMAT.md), [IAM](reference/hecate/docs/specs/IAM.md), [Rank](reference/hecate/docs/specs/RANK.md), [Agent runtime](reference/hecate/docs/specs/AGENTS_RUNTIME.md). Hecate is docs-only; [GAPS §0](reference/hecate/docs/GAPS.md) identifies its tests as obligations.
+
+The [peer validation and four-family lifecycle contract](16-peer-validation-contract.md) specifies the required participant authority, evidence binding and persisted-model migration. It is implementation scope, not a claim that those new APIs or lifecycle fields already exist.
 
 ## 1. Scope, topology and durable truth
 
@@ -34,7 +38,7 @@ One session's mutation history has one authoritative order under the consistency
 | `ContentHash` | Versioned canonical BLAKE3 digest, 256 bits | Derived identity/dedup value; never an object address |
 | `ReceiptId` | Unique durable claim execution entitlement | Ledger-minted with epoch; only one current holder |
 | `EvidenceSetId` | Receipt-scoped staging identity | Logged allocation; not a terminal testament ID |
-| `ValidationRunId` | `(ValidationId, target_hash, phase, run_epoch)` | Durable schedule record; pinned evidence/version |
+| `ValidationRunId` | `(ValidationId, target_hash, phase, run_epoch)` | Durable evaluation-attempt identity; pinned evidence/version, not an executable job |
 | `RequestEpoch` | Durable admitted request generation, scoped to principal/session | Server-negotiated and logged; hides bounded-history mechanics from users |
 | `RequestId` | Opaque 128-bit client retry identity inside its admitted epoch | Reused on transport retry; never reused for different commands |
 | `SessionSeq` | Authoritative session history coordinate | Assigned by ordering/commit layer |
@@ -110,9 +114,9 @@ A closed testament contains `LedgerId`, `ClaimId`, receipt provenance, `Evidence
 
 `Confidence` is `Hint`, `Tentative`, `Committed`, `Consensus`, preserving Hecate's vocabulary. A confidence label never overrides a required verdict or acts as a quorum assertion.
 
-The evidence set is mutable only through append-only staging commands under its active receipt. Closing freezes a manifest and durably creates the preallocated `TestamentId` with its separately computed content digest. The immutable testament's lifecycle records acknowledgement and evaluation progress separately. Artifact additions after close require a new evidence set and a new testament; no “patch result JSON” API exists.
+The evidence set is mutable only through append-only staging commands under its active receipt. Closing freezes a manifest and durably creates the preallocated `TestamentId` with its separately computed content digest. The current Rust testament lifecycle stores creation and acknowledgment positions; a separate posted/validating/terminal testament lifecycle is still missing. Artifact additions after close require a new evidence set and a new testament; no “patch result JSON” API exists.
 
-**Focal decision D-03:** a claim has one active closing testament attempt per receipt epoch. A failed or superseded claim is corrected with a new claim linked by `supersedes`/`amends`; its predecessor's terminal record remains unchanged. Resubmission after a transport timeout uses the original `(RequestEpoch, RequestId)`, allocated object IDs and identical close manifest.
+**Initial Focal profile D-03 (not full upstream equivalence):** the current implementation has one active closing testament attempt per receipt epoch. A failed or superseded claim is corrected with a new claim linked by `supersedes`/`amends`; its predecessor's terminal record remains unchanged. Resubmission after a transport timeout uses the original `(RequestEpoch, RequestId)`, allocated object IDs and identical close manifest.
 
 ### 3.3 Validation requirement and verdict
 
@@ -143,6 +147,42 @@ Standard initial kinds: `document`, `test_report`, `inspection_report`, `validat
 `ErrorArtifact` contains a closed error code, phase, affected references, bounded diagnostic/document ref and `Disposition`. `Retryable` can contain a derived retry hint and retry deadline; `Terminal` names the authority/rule that makes retry pointless. Machine decisions never parse diagnostic strings. Internal Rust functions still return typed `Result`; the service/claim boundary converts operational failure into durable evidence when a durable claim exists.
 
 Artifact attachment/close acknowledgement requires the referenced bytes to meet their promised durability and integrity contract. Staging references are pinned until close, abandonment or recorded custody transfer. A reference to unreplicated process memory is not durable evidence.
+
+### 3.5 Four coordinated lifecycle families: implementation gap
+
+Claims, testaments, artifacts and validations each require their own lifecycle.
+They share one ordered ledger and atomic propagation, not one copied claim status
+or four independent databases. Sylk's
+[artifact/validation contract](../../../sylk/docs/ARTIFACTS_AND_VALIDATIONS.md)
+§§2, 5, 7 and 11 and its
+[testament/claim contract](../../../sylk/docs/CLAIMS_AND_TESTAMENTS_LIFECYCLE.md)
+§§3.3, 5 and 6 make this explicit. Execution remains participant-owned under the
+peer-to-peer boundary above; their orchestrator/dispatcher implementations are
+not requirements to add a Focal worker service.
+
+| Family | Current persisted Rust model | Required work still absent |
+| --- | --- | --- |
+| Claim | Status/history, receipt, active evidence set/testament, local completion and graph release | Integrate the distinct child lifecycle transitions without bypassing the existing dependency least-fixpoint rule |
+| Testament | `created` and optional `acknowledged` | Own generated/posted/received/validating and terminal outcome history; precise propagation from attached evidence |
+| Artifact | `created` and `custody_revision`; immutable payload and staging/manifest membership | Own generated, optional claimant receipt, attached, validating and terminal validation/failure lifecycle with per-transition authority |
+| Validation | `created` and `latest_epoch`, plus durable run/attempt/verdict records | Complete independently queryable lifecycle/phase history and exact artifact-target binding; attempts alone are not the full family lifecycle |
+
+The existing [model](../../crates/focal-model/src/objects.rs) and run projections
+must not be advertised as already satisfying that matrix. Custody proves storage,
+not artifact receipt or validation. A claim-level `TestamentGenerated` or
+`Validating` fact is not a substitute for the testament's own status. A failing
+artifact and its triggered testament/claim consequences must publish atomically,
+while preserving the distinct failure reasons and independently retained proof.
+
+D-03's current single-close profile also does not implement Sylk's allowance for
+another posted testament to satisfy missing or failed requirements in the same
+transaction. The richer multi-testament contract needs explicit identity,
+aggregation, authority and replay rules before changing the frozen implementation.
+Existing historical records cannot be retroactively relabeled as if those absent
+transitions had been stored. Required model/codec migration must preserve old
+bytes, reject unsupported writers before new records are introduced, and expose
+historical information limits truthfully. The graph least-fixpoint, immutable
+content and terminal proof rules remain in force throughout that migration.
 
 ## 4. Relations and graph mutation
 
@@ -186,12 +226,15 @@ There is deliberately no `generated_failed` status: invalid canonical generation
 
 ### 5.2 State transition table
 
+This is the original single-response command profile retained for existing records.
+The new four-family profile uses [17's transition and authority tables](17-lifecycle-state-and-authority.md), including independent response posting and causal-cut aggregation. [18](18-lifecycle-storage-upgrade.md) defines the activation boundary; its new rules must not reinterpret old WAL or receipts. Runtime/effect terminology in this original table describes the existing embedding protocol, not permission for Focal to launch participants or author their work.
+
 Every row executes through the sequencer using effective state. “Active execution” below means `received | progressed`; “open” means any active status. All emitted facts are ordered inside one committed mutation. Operations absent from this table cannot alter claim status.
 
 | Command/input | Permitted prior state | Next state | Required effects and disposition |
 |---|---|---|---|
 | `GenerateClaim` / `GenerateClaimBatch` | No existing content identity, or exact retry | `generated` | Validate preallocated IDs and full batch; freeze content/requirements/edges atomically; identical repost returns existing opaque ID |
-| `PostClaim` | `generated` | `posted` | Resolve current standing/target availability; activate admission validation scheduling; directed post fact |
+| `PostClaim` | `generated` | `posted` | Resolve current standing/target availability; record admission validation eligibility/runs; directed post fact |
 | `FailPost` | `generated` or `posted` | `post_failed` | Record final typed targeting/admission failure and runtime error evidence |
 | `AcquireReceipt` | `posted` | `received` | Admission requirements passed; dependencies permit start; mint holder+epoch entitlement; emit receipt fact |
 | `FailReceipt` | `posted` | `receipt_failed` | Final bounded delivery failure/overflow disposition; durable runtime failure evidence |
@@ -259,7 +302,7 @@ A terminal claim's status never changes again. Adding a later review or correcti
 
 If current policy tightens after generation, posting either succeeds under that version or returns Inform/Yield requesting explicit successor content with the newly required validations. It does not mutate the generated claim. A snapshot/requirement revision used in a decision is recorded as a replay input, separate from content identity.
 
-The registry stores stable validator ID, implementation/version digest, parameter schema, supported kinds/phases, evaluator capability, evidence schema, bounded concurrency, priority and timeout policy. Claims pin the resolved chain. Process-local function pointers are never persisted. The current registry cannot change old claims on restart.
+A validator declaration identifies its stable ID, implementation/version digest, parameter schema, supported kinds/phases, designated evaluator, evidence schema and attempt/deadline policy. Claims pin that contract; a declaration does not install executable code, create a worker registry or grant execution rights. The participant resolves and invokes its own tool/skill outside Focal. Any local concurrency or executable registration belongs to that participant. Process-local function pointers are never persisted, and a changed declaration cannot change old claims on restart.
 
 New validators default to Observe in configuration. Promotion to Required is a reviewed configuration change affecting newly resolved claim content; existing claims need explicit supersession to adopt it. Observe failures are recorded but influence neither readiness nor satisfaction. Required policy validators are explicit exceptions to a new optional validator's Observe default and must be identified as such during requirement resolution.
 
@@ -267,19 +310,21 @@ New validators default to Observe in configuration. Promotion to Required is a r
 
 ### 6.2 Two-phase evaluation and attempts
 
-1. Create a durable `ValidationRun` referencing exact immutable evidence and pinned chain. Enqueue execution only after the schedule mutation commits.
-2. Execute the selected deterministic handler outside the sequencer in a bounded tracked scope.
-3. Persist its typed verdict and evidence. On Pass, proceed to the quality-bar phase if present. On Fail or Incomplete, finish the requirement with that outcome.
-4. On Error, record the failed attempt and try the next pinned handler according to priority, bounded attempt count and remaining deadline.
-5. If deterministic handlers errored and an explicitly configured agentic fallback exists, dispatch that fallback with the errors included. Otherwise finish Error.
-6. Agentic quality evaluation receives claim, target testament/increment, pending requirement and evidence manifest as one coherent entry point. It produces the same verdict shape.
-7. Accept only the designated evaluator's current run epoch. Record final verdict before scheduling aggregate completion or notifying a waiter.
+1. Record the exact `ValidationRun`, immutable target/manifest, designated evaluator, pinned implementation contract and attempt fence. This is replayable protocol state; it neither queues nor launches an external worker.
+2. The issuer or its authorized evaluator invokes the selected validating tool/skill in its own environment after observing the committed fence. Focal receives the resulting evidence and verdict, not an instruction to execute arbitrary code.
+3. Focal verifies and persists the typed verdict and evidence. When the requirement declares a programmatic phase followed by quality evaluation, only its actual Pass makes that quality phase eligible; Fail or Incomplete finishes that requirement. An explicitly agentic-only requirement may enter its quality phase directly, with real quality evidence and no synthetic programmatic Pass. Structural/schema admission remains mandatory for both forms.
+4. On Error, the participant may invoke the next pinned fallback within the attempt and deadline contract. Focal records the attempt transition and rejects out-of-order or stale results; it does not run the fallback.
+5. Agentic evaluation or fallback by another peer uses an ordinary claim addressed to that peer, with declared evidence, parentage and validation requirements. The peer responds with testament/artifacts. A transport response or receipt alone cannot stand in for the required quality judgment.
+6. The issuer/designated evaluator reads the exact evaluation evidence and submits the fenced verdict through its authorized interface. Direct issuer evaluation remains valid when the pinned requirement assigns that issuer; no separate framework or worker installation is required.
+7. Focal accepts only the designated evaluator's current attempt/run/receipt fence. Its deterministic aggregation and graph rules establish lifecycle outcomes from accepted facts. Participants observe the committed result to continue their own work.
 
 A deterministic Fail cannot be bypassed by trying a more lenient handler. Fallback-on-Incomplete is also prohibited by default; missing evidence requires new work/testament rather than a hidden reinterpretation. Every fallback path is in the immutable resolved execution policy. Validator retry does not re-execute an already accepted result during replay.
 
-Receipt validation is pure: it verifies acknowledged response arrival and passes on success or failure testimony. It does not prove dispatch ownership, quality, approval or satisfaction. The active receipt record enforces execution ownership separately.
+Receipt validation is pure: it verifies acknowledged response arrival and passes on success or failure testimony. New Receipt requirements cannot declare handlers, evidence schemas or a quality bar; those require a separate work validation. It does not prove dispatch ownership, quality, approval or satisfaction. The active receipt record enforces execution ownership separately.
 
 **Focal decision D-07:** every claim has at least one Required WholeWork receipt validation. Additional Required validations depend on its action profile. This removes accidental empty-set satisfaction while allowing a receipt-only consultation to complete once its answer arrives.
+
+The existing `focal-runtime` crate is an optional participant-owned Rust execution helper. Its bounded pool and reconciliation tests describe that embedding, not a mandatory Focal daemon scheduler, peer launcher or provider bridge. Core run/attempt records and legacy effect names remain protocol facts and hints. Deploying the ledger does not authorize it to execute participant work. Participant tool execution, external-effect idempotency and continuation storage stay with the participant; Focal retains evidence, verdict and graph authority.
 
 ### 6.3 Aggregation and work dependencies
 
@@ -287,7 +332,7 @@ Aggregate only when all Required runs in the applicable phase have final verdict
 
 If every Required WholeWork verdict passes but work dependencies remain unresolved, record `LocalOutcome::Succeeded` and keep public status `validating`. The dependency engine alone can then commit `satisfied`. A local failure is terminal immediately and propagates through DependsOn edges. Admission/Increment local outcomes cannot satisfy the whole claim.
 
-An increment's failing validation rejects that increment with immutable evidence and may lead to corrective claims; it does not immediately terminalize the enclosing work claim. Whole-work validations still judge the closing testament. Source-control merge, disk writing and increment application belong to their owning services; the ledger proves their decisions and outcomes.
+An increment's failing validation rejects that increment with immutable evidence and may lead an authorized participant to author corrective claims; it does not immediately terminalize the enclosing work claim. Whole-work validations still judge the closing testament. Source-control merge, disk writing and increment application belong to their owning services; the ledger proves their decisions and outcomes.
 
 ## 7. Graph satisfaction and parked scopes
 

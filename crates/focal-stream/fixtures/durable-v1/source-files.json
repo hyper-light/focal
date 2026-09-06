@@ -1,0 +1,37 @@
+{
+  "crates/focal-stream/Cargo.toml": {
+    "sha256": "8a3a44b9f3f16ed9196e5bcea9f842df4d45db4078f1b4e1642a5039c8f81b8e",
+    "bytes": 352,
+    "snapshot": "source-snapshot/Cargo.toml.txt"
+  },
+  "crates/focal-stream/README.md": {
+    "sha256": "313f4c62e137c1a3d996d633df1bead5a724247380f677a5046a870eb020b47a",
+    "bytes": 7216,
+    "snapshot": "source-snapshot/README.md.txt"
+  },
+  "crates/focal-stream/src/consumer.rs": {
+    "sha256": "37425416f14ba934d12b3b1f5eb7664844d28119bf7453c275f877f794914e1a",
+    "bytes": 3935,
+    "snapshot": "source-snapshot/src/consumer.rs.txt"
+  },
+  "crates/focal-stream/src/cursor.rs": {
+    "sha256": "3d25eb2bf9fcdbdb6f2df7f18fb903032db7da9683aa9bb11b57673a52e24799",
+    "bytes": 4801,
+    "snapshot": "source-snapshot/src/cursor.rs.txt"
+  },
+  "crates/focal-stream/src/lib.rs": {
+    "sha256": "e12e42911017ceb72ab0395ab6914d0163189a2325c43d328766a6afde63016b",
+    "bytes": 2428,
+    "snapshot": "source-snapshot/src/lib.rs.txt"
+  },
+  "crates/focal-stream/src/registry.rs": {
+    "sha256": "bb5218c1987a82a4afbf97a8f3fdc2bde7b0852fb1a08eea3ccf81ffa0a5d1f8",
+    "bytes": 21434,
+    "snapshot": "source-snapshot/src/registry.rs.txt"
+  },
+  "crates/focal-stream/src/subscription.rs": {
+    "sha256": "50e8c754116df2f1d89d72798193e1aec054a78de0d2b119e13b43db7d0f1767",
+    "bytes": 23318,
+    "snapshot": "source-snapshot/src/subscription.rs.txt"
+  }
+}

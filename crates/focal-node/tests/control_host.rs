@@ -206,6 +206,38 @@ impl Rig {
     async fn state(&self, index: usize) -> ControlSnapshot {
         self.state_on_leader(index).await.1
     }
+    async fn commit_on_leader(
+        &self,
+        mut index: usize,
+        request: ControlRequest,
+        excluded: u64,
+    ) -> (usize, ControlReceipt) {
+        // A successful setup read is not a lease on the leader. Preserve the
+        // exact command and request ID across short host deadlines or elections;
+        // the tests below still exercise minority/refusal boundaries directly.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match self.hosts[index]
+                    .submit(peer(PeerRole::Runtime), request.clone())
+                    .await
+                {
+                    Ok(receipt) => {
+                        assert_eq!(receipt.request, request.id);
+                        return (index, receipt);
+                    }
+                    Err(
+                        ControlFailure::OutcomeUnknown
+                        | ControlFailure::Unavailable
+                        | ControlFailure::NotLeader { .. }
+                        | ControlFailure::NotReady,
+                    ) => index = self.leader(excluded).await,
+                    Err(error) => panic!("unexpected setup mutation failure: {error:?}"),
+                }
+            }
+        })
+        .await
+        .expect("exact setup mutation did not commit within five seconds")
+    }
     async fn state_on_leader(&self, mut index: usize) -> (usize, ControlSnapshot) {
         // A completed ReadIndex is not an owner lease. These eventual-state
         // assertions rediscover on transient leadership loss, while direct
@@ -331,17 +363,15 @@ async fn eventual_state_rediscovers_majority_after_cached_owner_loses_quorum() {
     let mut rig = Rig::new(root_bootstrap(&authority), GROUP);
     rig.hosts[0].campaign().await.unwrap();
     let stale = rig.leader(0).await;
-    rig.hosts[stale]
-        .submit(peer(PeerRole::Runtime), request(1, region(0, 1)))
-        .await
-        .unwrap();
+    let (stale, _) = rig
+        .commit_on_leader(stale, request(1, region(0, 1)), 0)
+        .await;
     let excluded = rig.hosts[stale].progress().node;
     rig.isolated.store(excluded, Ordering::SeqCst);
     let majority = rig.leader(excluded).await;
-    let committed = rig.hosts[majority]
-        .submit(peer(PeerRole::Runtime), request(2, region(1, 2)))
-        .await
-        .unwrap();
+    let (_, committed) = rig
+        .commit_on_leader(majority, request(2, region(1, 2)), excluded)
+        .await;
     assert_eq!(committed.revisions.root, 2);
     // A cached owner is not a lease: this read must still refuse minority state.
     assert!(
@@ -960,10 +990,7 @@ async fn membership_requires_runtime_and_returns_only_committed_configuration_re
             Err(ControlFailure::Unauthorized)
         ));
     }
-    let added = rig.hosts[leader]
-        .submit(peer(PeerRole::Runtime), add.clone())
-        .await
-        .unwrap();
+    let (leader, added) = rig.commit_on_leader(leader, add.clone(), 0).await;
     let ControlReadResult::Configuration(after) = rig.hosts[leader]
         .read(
             peer(PeerRole::Runtime),

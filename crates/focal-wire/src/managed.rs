@@ -40,7 +40,7 @@ pub fn managed_request_identity(
     let Operation::Managed { key, operation } = &request.operation else {
         return Err(WireError::InvalidFrame);
     };
-    if request.protocol != MANAGED_PROTOCOL_VERSION
+    if (request.protocol != MANAGED_PROTOCOL_VERSION && !is_peer_request(request))
         || request.request_epoch != RequestEpoch(1)
         || request.route_epoch.0 == 0
         || request.request_id != key.id
@@ -599,7 +599,7 @@ pub(crate) fn validate_managed_error(
     route: RouteEpoch,
     error: &AccessError,
 ) -> Result<(), WireError> {
-    if request.protocol != MANAGED_PROTOCOL_VERSION
+    if (request.protocol != MANAGED_PROTOCOL_VERSION && !is_peer_request(request))
         || request.request_epoch != RequestEpoch(1)
         || route != request.route_epoch
     {

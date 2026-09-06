@@ -1,0 +1,43 @@
+Durable claims, evidence, and validation ledger
+
+Usage: focal [OPTIONS] <COMMAND>
+
+Commands:
+  context     Save and select authenticated client connections independently of node enrollment
+  mcp         Serve agent tools over a bounded, durable stdio MCP connection
+  start       Run the durable service, using saved network settings on restart
+  cluster     Inspect and administer the selected physical node through its local socket
+  join        Persist a pinned enrollment and physical identity, then exit
+  demo        Run/resume the real claim/testament/validator example with exclusive local ownership
+  status      Read the running service's authoritative published prefix
+  request     Inspect or retry saved requests, query your receipt/epoch state, or send a wire file
+  monitor     Register and inspect durable owner-authorized wait predicates
+  watch       Follow durable ledger changes; acknowledge only flushed output
+  validator   Inspect pinned external validator contracts recorded by claims
+  ledger      Explore bounded graph pages at an immutable ledger prefix
+  submit      Submit authored work or evidence using flags, JSON, or YAML
+  get         Read an authoritative object from the running service
+  list        List matching objects with optional filters and bounded pages
+  claim       Post, report progress, wait for, or cancel a claim
+  receipt     Acquire a receipt as the authenticated subject of the claim
+  evidence    Begin a receipt-fenced evidence set
+  testament   Acknowledge a response as its claimant; this does not establish quality
+  validation  Record evaluation lifecycle facts; invoke tools outside Focal
+  artifact    Register immutable evidence or inspect and cancel durable payload uploads
+  identity    Show identity metadata without opening or modifying the ledger
+  schema      Inspect released operation and built-in schema contracts without opening a ledger
+  completion  Generate shell completions from this binary's actual command tree
+  deployment  Offline placement solver; planning does not activate a durability guarantee
+  help        Print this message or the help of the given subcommand(s)
+
+Options:
+      --config <CONFIG>
+          Load node and connection defaults from a YAML configuration file
+      --data-dir <DATA_DIR>
+          Use this directory for node identity, durable ledger and local client state
+      --client-context <CLIENT_CONTEXT>
+          Use a named ledger connection; cluster administration requires a Unix context
+  -h, --help
+          Print help
+  -V, --version
+          Print version

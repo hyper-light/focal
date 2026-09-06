@@ -1,0 +1,173 @@
+{
+  "writer": "original native model Serde/Postcard and original managed hashes",
+  "files": [
+    {
+      "file": "command-results.rows",
+      "bytes": 300,
+      "sha256": "f8ad919723dd7b21279a05f59397696cb5ee6e9e617c92cc17cbf22f116f6e3c",
+      "container": "Vec<CommandResult>",
+      "rows": 14
+    },
+    {
+      "file": "cursor-receipts.rows",
+      "bytes": 24718,
+      "sha256": "1437199a7c85c83e33d56218e0abd065386f6656efbe058bcbb07019e4ab6e86",
+      "container": "Vec<CursorMutationReceipt>",
+      "rows": 82
+    },
+    {
+      "file": "cursor-records.rows",
+      "bytes": 13402,
+      "sha256": "21a9e285ce06cd2d9e5ffbfaf5225eb81ab5225bcde55e0749c6f63680d5d049",
+      "container": "Vec<CursorRecordSnapshot>",
+      "rows": 81
+    },
+    {
+      "file": "delta-facts.rows",
+      "bytes": 558,
+      "sha256": "5be21686efc955c7a14b767b3be9865e552ef3622b95c40085349ef2e20a8707",
+      "container": "Vec<DeltaFact>",
+      "rows": 13
+    },
+    {
+      "file": "deltas.rows",
+      "bytes": 1472,
+      "sha256": "377791709cfbbaeb6a181d0dec9aabf97ef03fa00aa6624073c21c041227a1bf",
+      "container": "Vec<Delta>",
+      "rows": 13
+    },
+    {
+      "file": "domain-outcomes.rows",
+      "bytes": 2349,
+      "sha256": "28f36dcb71df1c9c872c76cf6a659dc9b98a214eb37072cf9d3b26a3cf3b2faf",
+      "container": "Vec<DomainOutcome>",
+      "rows": 52
+    },
+    {
+      "file": "effects.rows",
+      "bytes": 472,
+      "sha256": "8ebf7bf15e5411388e3cdf8afcbe738e7f8115048c0e4030dd986a5506a0062e",
+      "container": "Vec<EffectIntent>",
+      "rows": 7
+    },
+    {
+      "file": "families.rows",
+      "bytes": 3,
+      "sha256": "9463926d4640a53a0cf1ac00657361f5a6d64fbc554df30721cdacf503aebc2b",
+      "container": "Vec<ManagedRequestFamily>",
+      "rows": 2
+    },
+    {
+      "file": "inform-reasons.rows",
+      "bytes": 25,
+      "sha256": "e853cf8c36cae21abbabd54b8222129b92b082fd464c582fbf654ba8297b1564",
+      "container": "Vec<InformReason>",
+      "rows": 6
+    },
+    {
+      "file": "managed-acks.rows",
+      "bytes": 11271,
+      "sha256": "b5efa6ea396c55faa775da1445c9defb01d1884c40122204279c5f02505d6335",
+      "container": "Vec<ManagedReceiptAck>",
+      "rows": 98
+    },
+    {
+      "file": "managed-format-support.rows",
+      "bytes": 234,
+      "sha256": "691dc9ec1df905e6fc04e5157aefe00430b3b9e8f86d300312face0ba2022e80",
+      "container": "Vec<ManagedFormatSupport>",
+      "rows": 2
+    },
+    {
+      "file": "managed-outcomes.rows",
+      "bytes": 14785,
+      "sha256": "365dd5757df859b28f07929130c7cd0e7dfc3652c381c8936585f302dc9cf7f3",
+      "container": "Vec<ManagedReceiptOutcome>",
+      "rows": 98
+    },
+    {
+      "file": "managed-receipt-hashes.rows",
+      "bytes": 3137,
+      "sha256": "41983729ebf559778d1ba12d6b54e2d070ef88374ee95ed5e015ffaf71209372",
+      "container": "Vec<ContentHash>",
+      "rows": 98
+    },
+    {
+      "file": "managed-receipts.rows",
+      "bytes": 27574,
+      "sha256": "510f94a050b0164824d2bc3e0ac4d041322ff63170d702eb58ab33cb4662b764",
+      "container": "Vec<ManagedReceipt>",
+      "rows": 98
+    },
+    {
+      "file": "managed-resolutions.rows",
+      "bytes": 27695,
+      "sha256": "8b7f9816be3490e1ac882d514b8dde0b0c37d650278e48ee0cf0679c5211893f",
+      "container": "Vec<ManagedReceiptResolution>",
+      "rows": 101
+    },
+    {
+      "file": "stream-commands.rows",
+      "bytes": 11935,
+      "sha256": "55a0b63e26a9184aeef07419937ff9c98375bd848663055d825184f5e1e019e6",
+      "container": "Vec<RequestStreamCommand>",
+      "rows": 8
+    },
+    {
+      "file": "stream-inputs.rows",
+      "bytes": 12575,
+      "sha256": "cd48ded5a39c388b200678d4e4d70bd079259636dcdb45d487305e1d21008b8d",
+      "container": "Vec<RequestStreamControlInput>",
+      "rows": 8
+    },
+    {
+      "file": "stream-intent-hashes.rows",
+      "bytes": 257,
+      "sha256": "fcac46a4f5d322db9b7980fe5940a820bc5501e96273679e7c734efd52bf74c4",
+      "container": "Vec<ContentHash>",
+      "rows": 8
+    },
+    {
+      "file": "stream-outcomes.rows",
+      "bytes": 28066,
+      "sha256": "d83b9b018027338c38e878b8785b546d85f737c1245ff82d42419b39dd9243e4",
+      "container": "Vec<RequestStreamControlOutcome>",
+      "rows": 104
+    },
+    {
+      "file": "stream-queries.rows",
+      "bytes": 113,
+      "sha256": "3f439f7670d7eac1d75889f3674016d891eb9d658f16a85ddf9175d8f39983a5",
+      "container": "Vec<RequestStreamQuery>",
+      "rows": 2
+    },
+    {
+      "file": "stream-read-results.rows",
+      "bytes": 50852,
+      "sha256": "c9fc450b4d3958163a9f5868abad44bb87ec1408969203e5a375bb3b72c21fa9",
+      "container": "Vec<RequestStreamReadResult>",
+      "rows": 105
+    },
+    {
+      "file": "stream-reads.rows",
+      "bytes": 59881,
+      "sha256": "dbefc0c470336fcf3997495c045e2657a4b44fb1ae46416604ea2757042e75cb",
+      "container": "Vec<RequestStreamRead>",
+      "rows": 105
+    },
+    {
+      "file": "stream-receipts.rows",
+      "bytes": 40754,
+      "sha256": "88dd55a76d715e265ffbcaf877d766542a47dffb3e4c498eb663ab42b925b282",
+      "container": "Vec<RequestStreamControlReceipt>",
+      "rows": 104
+    },
+    {
+      "file": "stream-states.rows",
+      "bytes": 227,
+      "sha256": "f110560cb163887398e3e0b39da957a25660d17dd4bdbf59ee11d32f81644ddf",
+      "container": "Vec<RequestStreamState>",
+      "rows": 4
+    }
+  ]
+}

@@ -21,6 +21,9 @@ struct Adapter {
     name: String,
     version: String,
     recovery_contract_version: u16,
+    transfer_contract_version: u16,
+    watch_contract_version: u16,
+    administration_contract_version: u16,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +41,9 @@ struct Skill {
     references: Vec<String>,
     required_operations: Vec<Required>,
     required_recovery_tools: Vec<Required>,
+    required_transfer_tools: Vec<Required>,
+    required_watch_tools: Vec<Required>,
+    required_admin_tools: Vec<Required>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -74,11 +80,14 @@ fn resource(path: &str, digest: &str) -> String {
 fn packaged_skills_pin_real_application_versions_and_complete_relative_resources() {
     let manifest: Manifest =
         serde_json::from_slice(&fs::read(root().join("manifest.json")).unwrap()).unwrap();
-    assert_eq!(manifest.schema_version, 1);
+    assert_eq!(manifest.schema_version, 2);
     assert_eq!(manifest.adapter.name, "focal-mcp");
     assert_eq!(manifest.adapter.version, env!("CARGO_PKG_VERSION"));
-    assert_eq!(manifest.adapter.recovery_contract_version, 1);
-    assert_eq!(manifest.skills.len(), 2);
+    assert_eq!(manifest.adapter.recovery_contract_version, 2);
+    assert_eq!(manifest.adapter.transfer_contract_version, 1);
+    assert_eq!(manifest.adapter.watch_contract_version, 1);
+    assert_eq!(manifest.adapter.administration_contract_version, 1);
+    assert_eq!(manifest.skills.len(), 4);
     let mut resources = BTreeSet::new();
     let mut reference_content = String::new();
     for item in &manifest.resources {
@@ -89,7 +98,15 @@ fn packaged_skills_pin_real_application_versions_and_complete_relative_resources
     let mut names = BTreeSet::new();
     for skill in manifest.skills {
         assert!(names.insert(skill.name.clone()));
-        assert_eq!(skill.version, 1);
+        assert_eq!(
+            skill.version,
+            match skill.name.as_str() {
+                "focal-claims" => 7,
+                "focal-evidence" => 6,
+                "focal-validation" => 2,
+                _ => 1,
+            }
+        );
         assert_eq!(skill.path, format!("{}/SKILL.md", skill.name));
         let content = resource(&skill.path, &skill.blake3);
         assert!(content.starts_with(&format!("---\nname: {}\ndescription: ", skill.name)));
@@ -116,6 +133,7 @@ fn packaged_skills_pin_real_application_versions_and_complete_relative_resources
                 );
             };
             assert_eq!(descriptor.version, operation.version, "{}", operation.name);
+            assert_eq!(operation.version, 1);
             assert!(
                 content.contains(&format!("`{}`", operation.name)),
                 "unused skill requirement: {}",
@@ -134,6 +152,27 @@ fn packaged_skills_pin_real_application_versions_and_complete_relative_resources
             );
             all_operations.insert(operation.name);
         }
+        for watch in skill.required_watch_tools {
+            assert_eq!(watch.version, manifest.adapter.watch_contract_version);
+            assert!(content.contains(&format!("`{}`", watch.name)));
+            assert!(reference_content.contains(&format!("`{}`", watch.name)));
+        }
+        let mut administration = BTreeSet::new();
+        for tool in skill.required_admin_tools {
+            assert_eq!(
+                tool.version,
+                manifest.adapter.administration_contract_version
+            );
+            assert!(tool.name.starts_with("cluster."));
+            assert!(administration.insert(tool.name.clone()));
+            assert!(content.contains(&format!("`{}`", tool.name)));
+        }
+        assert_eq!(administration.is_empty(), skill.name != "focal-cluster");
+        for transfer in skill.required_transfer_tools {
+            assert_eq!(transfer.version, manifest.adapter.transfer_contract_version);
+            assert!(content.contains(&format!("`{}`", transfer.name)));
+            assert!(reference_content.contains(&format!("`{}`", transfer.name)));
+        }
         let mut recovery = BTreeSet::new();
         for operation in skill.required_recovery_tools {
             assert!(recovery.insert(operation.name.clone()));
@@ -143,14 +182,28 @@ fn packaged_skills_pin_real_application_versions_and_complete_relative_resources
             );
             assert!(reference_content.contains(&format!("`{}`", operation.name)));
         }
-        assert_eq!(
-            recovery,
-            BTreeSet::from(["request.inspect".to_owned(), "request.retry".to_owned()])
-        );
+        let expected_recovery = if skill.name == "focal-cluster" {
+            BTreeSet::new()
+        } else {
+            BTreeSet::from([
+                "request.inspect".to_owned(),
+                "request.retry".to_owned(),
+                "request.reserve".to_owned(),
+                "request.pending".to_owned(),
+                "request.acknowledge".to_owned(),
+                "request.seal".to_owned(),
+            ])
+        };
+        assert_eq!(recovery, expected_recovery);
     }
     assert_eq!(
         names,
-        BTreeSet::from(["focal-claims".to_owned(), "focal-evidence".to_owned()])
+        BTreeSet::from([
+            "focal-claims".to_owned(),
+            "focal-evidence".to_owned(),
+            "focal-validation".to_owned(),
+            "focal-cluster".to_owned()
+        ])
     );
     assert_eq!(
         all_operations,

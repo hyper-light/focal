@@ -33,6 +33,44 @@ fn bounded<T: serde::Serialize>(value: &T) -> Result<(), InputError> {
     let size = postcard::experimental::serialized_size(value).map_err(|_| InputError::Capacity)?;
     count(size, MAX_INPUT_BYTES)
 }
+impl ClaimBatchDocument {
+    pub fn build(
+        self,
+        context: &BuildContext,
+        ids: &mut impl IdGenerator,
+    ) -> Result<Command, InputError> {
+        context.validate()?;
+        if self.claims.is_empty() || self.claims.len() > 64 {
+            return Err(InputError::Invalid("claim batch must contain 1..64 claims"));
+        }
+        bounded(&self)?;
+        let mut claims = Vec::new();
+        claims
+            .try_reserve_exact(self.claims.len())
+            .map_err(|_| InputError::Capacity)?;
+        let mut identities = BTreeSet::new();
+        for document in self.claims {
+            let Command::GenerateClaim { claim } = document.build(context, ids)? else {
+                return Err(InputError::Invalid(
+                    "claim builder returned another command",
+                ));
+            };
+            for id in
+                std::iter::once(claim.id.0).chain(claim.validations.iter().map(|value| value.id.0))
+            {
+                if !identities.insert(id) {
+                    return Err(InputError::Invalid(
+                        "duplicate object identity across claim batch",
+                    ));
+                }
+            }
+            claims.push(claim);
+        }
+        let command = Command::GenerateClaimBatch { claims };
+        bounded(&command)?;
+        Ok(command)
+    }
+}
 impl ClaimDocument {
     pub fn build(
         self,
@@ -177,6 +215,16 @@ impl ValidationDocument {
         let kind = parse_validation_kind(&self.kind)?;
         let phase = parse_validation_phase(&self.phase)?;
         let mode = parse_validation_mode(&self.mode)?;
+        if kind == ValidationKind::Receipt
+            && (phase != ValidationPhase::WholeWork
+                || self.quality_bar.is_some()
+                || !self.handlers.is_empty()
+                || !self.evidence_schemas.is_empty())
+        {
+            return Err(InputError::Invalid(
+                "receipt is whole_work delivery only; use a separate test, inspection or contract validation for evidence and quality",
+            ));
+        }
         let evaluator = resolve_participant(&self.evaluator, context)?;
         let policy_revision = self.policy_revision.unwrap_or(context.policy_revision);
         if policy_revision != context.policy_revision {
@@ -318,6 +366,43 @@ impl ArtifactDocument {
         context: &BuildContext,
         ids: &mut impl IdGenerator,
     ) -> Result<Command, InputError> {
+        bounded(&self)?;
+        let claim = ClaimId(parse_id(&self.claim)?);
+        let receipt = self.receipt.build()?;
+        let evidence_set = EvidenceSetId(parse_id(&self.evidence_set)?);
+        let document = RegisterArtifactDocument {
+            id: self.id,
+            kind: self.kind,
+            schema_hash: self.schema_hash,
+            metadata: self.metadata,
+            payload: self.payload,
+            inputs: self.inputs,
+            visibility: self.visibility,
+        };
+        let artifact = document.build_artifact(context, ids, Some(receipt))?;
+        Ok(Command::AttachArtifact {
+            claim,
+            receipt,
+            evidence_set,
+            artifact,
+        })
+    }
+}
+impl RegisterArtifactDocument {
+    pub fn build(
+        self,
+        context: &BuildContext,
+        ids: &mut impl IdGenerator,
+    ) -> Result<Command, InputError> {
+        self.build_artifact(context, ids, None)
+            .map(|artifact| Command::RegisterArtifact { artifact })
+    }
+    fn build_artifact(
+        self,
+        context: &BuildContext,
+        ids: &mut impl IdGenerator,
+        receipt: Option<ReceiptFence>,
+    ) -> Result<NewArtifact, InputError> {
         context.validate()?;
         count(self.inputs.len(), 256)?;
         count(self.visibility.len(), 256)?;
@@ -331,7 +416,6 @@ impl ArtifactDocument {
         {
             return Err(InputError::Invalid("artifact kind"));
         }
-        let receipt = self.receipt.build()?;
         let payload = self.payload.build()?;
         let mut inputs = BTreeSet::new();
         for input in self.inputs {
@@ -351,24 +435,19 @@ impl ArtifactDocument {
                 return Err(InputError::Invalid("duplicate visibility"));
             }
         }
-        Ok(Command::AttachArtifact {
-            claim: ClaimId(parse_id(&self.claim)?),
-            receipt,
-            evidence_set: EvidenceSetId(parse_id(&self.evidence_set)?),
-            artifact: NewArtifact {
-                id: ArtifactId(allocated(self.id, ids)?),
-                content: ArtifactContent {
-                    ledger: context.ledger,
-                    schema: SCHEMA_MAJOR,
-                    kind: self.kind,
-                    schema_hash: parse_hash(&self.schema_hash)?,
-                    metadata: self.metadata,
-                    payload,
-                    producer: context.actor,
-                    receipt: Some(receipt),
-                    inputs,
-                    visibility,
-                },
+        Ok(NewArtifact {
+            id: ArtifactId(allocated(self.id, ids)?),
+            content: ArtifactContent {
+                ledger: context.ledger,
+                schema: SCHEMA_MAJOR,
+                kind: self.kind,
+                schema_hash: parse_hash(&self.schema_hash)?,
+                metadata: self.metadata,
+                payload,
+                producer: context.actor,
+                receipt,
+                inputs,
+                visibility,
             },
         })
     }

@@ -172,7 +172,7 @@ impl SessionPlacementRequest {
                 return Err(LedgerError::PlacementConflict);
             }
         }
-        if postcard::experimental::serialized_size(self)? > MAX_PLACEMENT_BYTES {
+        if postcard::experimental::serialized_size(&focal_model::durable_v1::Ref(self))? > MAX_PLACEMENT_BYTES {
             return Err(LedgerError::Capacity);
         }
         Ok(())
@@ -411,7 +411,7 @@ impl Session {
                 PLACEMENT_WORKSPACE,
             )?
             .commit();
-        let (record, tail): (PlacementRecord, _) = postcard::take_from_bytes(
+        let (record, tail): (PlacementRecord, _) = durable_session_v1::take(
             data.strip_prefix(PLACEMENT_MAGIC)
                 .ok_or(LedgerError::Corrupt)?,
         )?;
@@ -600,21 +600,5 @@ fn placement_charge(value: &impl Serialize) -> Result<usize, LedgerError> {
         .ok_or(LedgerError::Capacity)
 }
 fn encode_placement(record: &PlacementRecord) -> Result<Vec<u8>, LedgerError> {
-    let length = postcard::experimental::serialized_size(record)?
-        .checked_add(PLACEMENT_MAGIC.len())
-        .filter(|n| *n <= MAX_PLACEMENT_BYTES)
-        .ok_or(LedgerError::Capacity)?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(length)
-        .map_err(|_| LedgerError::Capacity)?;
-    bytes.extend_from_slice(PLACEMENT_MAGIC);
-    bytes.resize(length, 0);
-    postcard::to_slice(
-        record,
-        bytes
-            .get_mut(PLACEMENT_MAGIC.len()..)
-            .ok_or(LedgerError::Corrupt)?,
-    )?;
-    Ok(bytes)
+    durable_session_v1::encode(PLACEMENT_MAGIC, record, MAX_PLACEMENT_BYTES)
 }

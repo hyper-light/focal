@@ -1,0 +1,198 @@
+[
+  {
+    "crate": "focal_core",
+    "path": "target/debug/deps/libfocal_core-0028036b02fcce20.rlib",
+    "bytes": 11035584,
+    "sha256": "a403d5b35c19d8cfb1481587336c6f5370fd98be9b45ba55f8f1411672cbdf46",
+    "mtime_ns": 1788702624806910553
+  },
+  {
+    "crate": "focal_core",
+    "path": "target/debug/deps/libfocal_core-35c105e0daea5d4a.rlib",
+    "bytes": 4770304,
+    "sha256": "20fd412218d541ff85e655a8b4938b8149f3f7c2557f55d4ea07f2ec13d150d9",
+    "mtime_ns": 1788640641469552800
+  },
+  {
+    "crate": "focal_core",
+    "path": "target/debug/deps/libfocal_core-7ab5003c659bf94d.rlib",
+    "bytes": 36783960,
+    "sha256": "21a1ca76767d64712f5928d95a4dc97d51bd90620521c9363f7aff6330857856",
+    "mtime_ns": 1788670034824311182
+  },
+  {
+    "crate": "focal_core",
+    "path": "target/debug/deps/libfocal_core-91b6f0cb1cd26fa0.rlib",
+    "bytes": 4774968,
+    "sha256": "ad79e821bf679cab5d59abb89656428d64b120c258dbc784e9e785577b34e761",
+    "mtime_ns": 1788642891922858953
+  },
+  {
+    "crate": "focal_core",
+    "path": "target/debug/deps/libfocal_core-a251f0b8041eb9b3.rlib",
+    "bytes": 9643696,
+    "sha256": "e6ee06d20d84addeca587821f37caafa63792c2a99f0146b4e444b5bdc427392",
+    "mtime_ns": 1788701647857546399
+  },
+  {
+    "crate": "focal_core",
+    "path": "target/debug/deps/libfocal_core-d7a35cf91d8322d3.rlib",
+    "bytes": 4775432,
+    "sha256": "49e12899942782e45bb37c06f1b68f5b349f95a84140874b6538fb593d0768fc",
+    "mtime_ns": 1788642789579759991
+  },
+  {
+    "crate": "focal_core",
+    "path": "target/debug/deps/libfocal_core-e95784d63892ceeb.rlib",
+    "bytes": 8976456,
+    "sha256": "87708a5f3a31916cced7152695e15e9d3164ec490866666d15a057ac4f7d10be",
+    "mtime_ns": 1788677647381129317
+  },
+  {
+    "crate": "focal_model",
+    "path": "target/debug/deps/libfocal_model-39018d2ec0ab5e15.rlib",
+    "bytes": 9304496,
+    "sha256": "3cb7b08d4b8fea6a2365dff675ca4e6c3d16a822b7c5831abfd8e1fdc4517322",
+    "mtime_ns": 1788670033363802440
+  },
+  {
+    "crate": "focal_model",
+    "path": "target/debug/deps/libfocal_model-7810d853602e5c07.rlib",
+    "bytes": 6584488,
+    "sha256": "1cd88c150972a7756f89b0073ba69442dac9c8f2284bba447edf919fb199e904",
+    "mtime_ns": 1788669992822780957
+  },
+  {
+    "crate": "focal_model",
+    "path": "target/debug/deps/libfocal_model-851348f3e41fe022.rlib",
+    "bytes": 6584488,
+    "sha256": "6e04418728f98f38012fec6b291a55bc9db9e828fbe6b9e229edbeaddb33486e",
+    "mtime_ns": 1788673877607911700
+  },
+  {
+    "crate": "focal_model",
+    "path": "target/debug/deps/libfocal_model-9542fb38585235d3.rlib",
+    "bytes": 4271040,
+    "sha256": "a3c951a401f4441dae10291de45561a4e29120f7c8f921f044d89ba58e8ad798",
+    "mtime_ns": 1788640940655303453
+  },
+  {
+    "crate": "focal_model",
+    "path": "target/debug/deps/libfocal_model-b2ceb293c5da2a10.rlib",
+    "bytes": 4267712,
+    "sha256": "442a1a158d14ee142907c220ac57fce4b3ed8dc3ae6f57caca9cb8a66b4ddc71",
+    "mtime_ns": 1788640640989820904
+  },
+  {
+    "crate": "focal_model",
+    "path": "target/debug/deps/libfocal_model-cb3954b4b4571b14.rlib",
+    "bytes": 8514904,
+    "sha256": "f9131ced88fd4f20b8686324633b053c4d1f5bac9aeb59838d1b51fe7048e9bf",
+    "mtime_ns": 1788702623940550844
+  },
+  {
+    "crate": "focal_model",
+    "path": "target/debug/deps/libfocal_model-fdbdeb2cbe899da4.rlib",
+    "bytes": 4267648,
+    "sha256": "a482b60c5a686bcdcd99671e05c307b4d3dfd4ae3e20ba9cabafe7c31f3acb94",
+    "mtime_ns": 1788640791422160116
+  },
+  {
+    "crate": "serde",
+    "path": "target/debug/deps/libserde-2162bed84ed3908a.rlib",
+    "bytes": 1051848,
+    "sha256": "8708d03c1a80d04057e1c6af7d75c6137853340bf7f58028c21a00282fd1d395",
+    "mtime_ns": 1788670031564489115
+  },
+  {
+    "crate": "serde",
+    "path": "target/debug/deps/libserde-893d8c76b1ce26e1.rlib",
+    "bytes": 901560,
+    "sha256": "493e22a212181073dbdf3e127495813702d9989958945f2ccb88fb2386f553b4",
+    "mtime_ns": 1788640939749864644
+  },
+  {
+    "crate": "serde",
+    "path": "target/debug/deps/libserde-90e90f4a66d88cfe.rlib",
+    "bytes": 901560,
+    "sha256": "80028bec94cfad59ca68a9c9dd003331949c9e56bc8add381dd665881adbcc5f",
+    "mtime_ns": 1788640677150148989
+  },
+  {
+    "crate": "serde",
+    "path": "target/debug/deps/libserde-cef5f3890a7943ab.rlib",
+    "bytes": 900824,
+    "sha256": "9744ddf1be40201233231c3c205cd9fe2f53fed8512d22f0451a54158e171673",
+    "mtime_ns": 1788643205170341618
+  },
+  {
+    "crate": "serde",
+    "path": "target/debug/deps/libserde-ec682fc9ba85454a.rlib",
+    "bytes": 901560,
+    "sha256": "3b0ab3aa044dcb63207c1c4598d6ed1f61586722c43407e83eb694e8575e49e2",
+    "mtime_ns": 1788640639807919227
+  },
+  {
+    "crate": "postcard",
+    "path": "target/debug/deps/libpostcard-06ed42e7b012a88c.rlib",
+    "bytes": 533640,
+    "sha256": "e20e87bb0c5200cd33a9ee93d78964c845180bd1752cf5f0c75cefa0d5556e84",
+    "mtime_ns": 1788640939994688254
+  },
+  {
+    "crate": "postcard",
+    "path": "target/debug/deps/libpostcard-07f966d27358cfb0.rlib",
+    "bytes": 533640,
+    "sha256": "889aacb0b53e18c2217e5479186dca6659786df89bd3146c87ec5d61853f89ac",
+    "mtime_ns": 1788640790002041584
+  },
+  {
+    "crate": "postcard",
+    "path": "target/debug/deps/libpostcard-355a74c06a2f301c.rlib",
+    "bytes": 533640,
+    "sha256": "3cb34a5ecc63f18ad7726ff038b1c1c6afa5b0273fe0e60af0a1e1e979e93eab",
+    "mtime_ns": 1788640672964123521
+  },
+  {
+    "crate": "postcard",
+    "path": "target/debug/deps/libpostcard-379aea4f900dfe85.rlib",
+    "bytes": 533640,
+    "sha256": "bcabbf11ee14ee82870bcb6f1d0cd38b6e8978db94fc6685ba8a7f342ac10a29",
+    "mtime_ns": 1788643208853882655
+  },
+  {
+    "crate": "postcard",
+    "path": "target/debug/deps/libpostcard-50894ad1297860e3.rlib",
+    "bytes": 562144,
+    "sha256": "3d0329b40278d88a83edb69cc0fdea031b48f753d9cd27a0ded0d588673f27c4",
+    "mtime_ns": 1788670031874983117
+  },
+  {
+    "crate": "postcard",
+    "path": "target/debug/deps/libpostcard-c3273dfdba02bb41.rlib",
+    "bytes": 533640,
+    "sha256": "aa030812ad83dbdbc4e9171e72ba3ddcb367af284533cc475b9f6a1ad6fe8416",
+    "mtime_ns": 1788640640134794707
+  },
+  {
+    "crate": "postcard",
+    "path": "target/debug/deps/libpostcard-ce21e857ef0d0cab.rlib",
+    "bytes": 533640,
+    "sha256": "71dadb29bf4c58bffac0b7e68b51787730117262d42a03b8136ee85a9aa39cf2",
+    "mtime_ns": 1788640677371964866
+  },
+  {
+    "crate": "blake3",
+    "path": "target/debug/deps/libblake3-f2396448715842b9.rlib",
+    "bytes": 644880,
+    "sha256": "c15484dc07da78630643a822b960bacff82919e5872fd093d73f75e5720d0057",
+    "mtime_ns": 1788640638266472381
+  },
+  {
+    "crate": "blake3",
+    "path": "target/debug/deps/libblake3-f34f8f1e7b9fb786.rlib",
+    "bytes": 1171456,
+    "sha256": "2b0f1596852635db8926126773d2331a216d8b3f2d3c3a82726a58f3f4a2d9d7",
+    "mtime_ns": 1788670029165155415
+  }
+]

@@ -47,7 +47,7 @@ pub(super) fn read_document<T: DeserializeOwned>(
     Ok(parse_document(&read_bytes(path, MAX_INPUT_BYTES)?, format)?)
 }
 impl DocumentInput {
-    fn load<T: DeserializeOwned>(self, field_flags: bool) -> Result<Option<T>> {
+    pub(super) fn load<T: DeserializeOwned>(self, field_flags: bool) -> Result<Option<T>> {
         let supplied = self.json.is_some() || self.yaml.is_some() || self.file.is_some();
         if supplied && field_flags {
             return Err(CliError::Input(
@@ -144,6 +144,35 @@ pub(super) fn claim(args: ClaimArgs) -> Result<(ClaimDocument, MutationOptions)>
         },
         args.mutation,
     ))
+}
+pub(super) fn claim_batch(args: ClaimBatchArgs) -> Result<(ClaimBatchDocument, MutationOptions)> {
+    let fields = !args.claim_json.is_empty() || !args.claim_file.is_empty();
+    if let Some(document) = args.input.load(fields)? {
+        return Ok((document, args.mutation));
+    }
+    let count = args
+        .claim_json
+        .len()
+        .checked_add(args.claim_file.len())
+        .ok_or(InputError::Capacity)?;
+    if count == 0 || count > 64 {
+        return Err(InputError::Invalid("claim batch must contain 1..64 claims").into());
+    }
+    let mut claims = Vec::new();
+    let mut bytes = 0usize;
+    claims
+        .try_reserve_exact(count)
+        .map_err(|_| InputError::Capacity)?;
+    for path in args.claim_file {
+        let input = read_bytes(&path, MAX_INPUT_BYTES)?;
+        charge_input(&mut bytes, input.len())?;
+        claims.push(parse_document(&input, input_format(&path, None)?)?);
+    }
+    for input in args.claim_json {
+        charge_input(&mut bytes, input.len())?;
+        claims.push(parse_document(input.as_bytes(), InputFormat::Json)?);
+    }
+    Ok((ClaimBatchDocument { claims }, args.mutation))
 }
 fn charge_input(total: &mut usize, additional: usize) -> Result<()> {
     *total = total

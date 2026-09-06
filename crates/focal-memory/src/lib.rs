@@ -27,6 +27,8 @@ mod arena;
 mod budget;
 mod content;
 mod index;
+#[cfg(test)]
+mod owned_range_tests;
 mod owner;
 mod range;
 mod snapshot;

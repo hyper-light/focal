@@ -1,0 +1,62 @@
+{
+  "artifacts.rows": {
+    "bytes": 5953,
+    "sha256": "58b74eb4704c3cc4a9c858777abaa715783d665825f971c75417891a9b01e9bc"
+  },
+  "broad.cp1": {
+    "bytes": 57291,
+    "sha256": "0f2c14436d9e849f659bb4619dd959470ec4bc35de6e2d6cc07622943e2c4072"
+  },
+  "claims.rows": {
+    "bytes": 14824,
+    "sha256": "25d80f0c8aa837b943362ce1784960583af321734a5fc7b78e87e53ed2c5896f"
+  },
+  "command-results.rows": {
+    "bytes": 300,
+    "sha256": "7d98f9cadb79b4451cf3310505e463d4f540cceec9dad7f57e4238b0ae147a7c"
+  },
+  "empty.cp1": {
+    "bytes": 111,
+    "sha256": "48a2c6a49ee7e11989a2a9c9ae4a054303494802e0bb1a58da3f32d83f7066ad"
+  },
+  "epochs.rows": {
+    "bytes": 89,
+    "sha256": "d343d6e3f7ee824f9ee99da93bd004126ccc904d0cd18522d1740b12d1065afb"
+  },
+  "evidence-sets.rows": {
+    "bytes": 481,
+    "sha256": "a67d51835128792ee5e603f3e63ff3513f3dda87660323ff8ba86012d708c7a7"
+  },
+  "identities.rows": {
+    "bytes": 4460,
+    "sha256": "4540bd231d336fc19751c5e219f1a143bda812450feebad26ce4b53cedf5f194"
+  },
+  "limits.bin": {
+    "bytes": 27,
+    "sha256": "155fd24b19a6f3c9fc537731a5a3c150bcebcc1339fdb0fb7ca40de2151a98fe"
+  },
+  "monitors.rows": {
+    "bytes": 332,
+    "sha256": "b598ef366a1b87191fd34236bbe9b3ffe6892b85e7c96f004ba61e929fee8fb9"
+  },
+  "receipts.rows": {
+    "bytes": 2382,
+    "sha256": "5349e5f918b61c46cb231853ccc018bbba3983a841ac16f52fa39f678b1f2cf5"
+  },
+  "runs.rows": {
+    "bytes": 12781,
+    "sha256": "42176f6e730f125d226dcf94afe8504b3a36a915186f365d39208fc6dfa3d9f2"
+  },
+  "state.bin": {
+    "bytes": 57223,
+    "sha256": "a3f2c2653b989378efb1cc793b53da7a91ba6fa5a386108af9fa523057a14d99"
+  },
+  "testaments.rows": {
+    "bytes": 5103,
+    "sha256": "a9a54098e5be0a5dff9920a80ac156cd22762297000ac9229760095402a4fc55"
+  },
+  "validations.rows": {
+    "bytes": 10783,
+    "sha256": "e322e39414250ec50917e5aa89e53a68c6684c7a3267b1a906e4a1af4e434580"
+  }
+}

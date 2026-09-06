@@ -1,0 +1,2 @@
+focal: [operation_failed] WAL: WAL corruption at /private/tmp/focal-refusal-results-20260906a/compact-same/wal/wal-00000000000000000003-00000000000000000000.seg:256: invalid durable record
+  caused by: WAL corruption at /private/tmp/focal-refusal-results-20260906a/compact-same/wal/wal-00000000000000000003-00000000000000000000.seg:256: invalid durable record

@@ -131,6 +131,9 @@ impl RequestHandler for DataService {
     fn supports_managed_requests(&self) -> bool {
         true
     }
+    fn supports_participant_requests(&self) -> bool {
+        true
+    }
     fn handle(&self, request: VerifiedRequest) -> HandlerFuture<'_> {
         Box::pin(async move { self.handle_accounted(request).await.into_envelope() })
     }
@@ -426,22 +429,16 @@ impl NetworkService {
         }
         let identity = prepared.directory.identity().clone();
         let root = prepared.directory.root().to_path_buf();
-        let admin_handler = prepared
-            .enrollment
-            .as_ref()
-            .map(|enrollment| {
-                LocalNetworkAdmin::new(
-                    &prepared.directory,
-                    prepared.state.genesis.root,
-                    prepared.state.advertise,
-                    enrollment.clone(),
-                    prepared
-                        .budget
-                        .child(16 * 1024 * 1024, 4 * 1024 * 1024)
-                        .map_err(|_| AccessError::Capacity)?,
-                )
-            })
-            .transpose()?;
+        let admin_handler = Some(LocalNetworkAdmin::for_node(
+            &prepared.directory,
+            prepared.state.genesis.root,
+            prepared.state.advertise,
+            prepared.enrollment.clone(),
+            prepared
+                .budget
+                .child(16 * 1024 * 1024, 4 * 1024 * 1024)
+                .map_err(|_| AccessError::Capacity)?,
+        )?);
         // Start the reaper before moving the directory out of Prepared. A
         // thread-spawn failure therefore drops WAL/control before their LOCK.
         let owners = OwnerGate::start(&prepared.budget)?;
@@ -541,7 +538,7 @@ impl NetworkService {
             },
             WireLimits::default(),
         )?;
-        let admin = if let Some(handler) = admin_handler {
+        let mut admin = if let Some(handler) = admin_handler {
             let path = root.join(ADMIN_SOCKET);
             clean_socket(&path, &root)?;
             Some((
@@ -680,6 +677,14 @@ impl NetworkService {
             budget.child(128 * 1024 * 1024, 32 * 1024 * 1024)?,
             4,
         )?;
+        if let Some((server, handler)) = admin.take() {
+            admin = Some((
+                server,
+                handler
+                    .with_control(control.clone())?
+                    .with_fleet(fleet.clone())?,
+            ));
+        }
         let data = DataService {
             control: control.clone(),
             root_group: state.genesis.root.group,

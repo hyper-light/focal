@@ -1,0 +1,338 @@
+//! Immutable correction lineage and a checked, revision-bound succession plan.
+//! A successor is a new claim, including when its predecessor is already terminal.
+use super::claim::{ClaimCut, ClaimState};
+use super::{Binding, ContractError, Principal};
+use crate::{Cause, ClaimId, ClaimStatus, ObjectKind, ObjectRef, RootCommandId};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CorrectionKind {
+    Supersedes,
+    Amends,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Correction {
+    pub kind: CorrectionKind,
+    pub predecessor: ObjectRef,
+}
+
+/// Frozen alongside the claim. The binding pins its owner and immutable content;
+/// this module does not allocate successor wire numbers or canonical hash rules.
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(Clone))]
+pub struct Lineage {
+    binding: Binding,
+    cause: Cause,
+    corrections: Vec<Correction>,
+}
+
+impl Lineage {
+    pub fn root(binding: Binding, root: RootCommandId) -> Result<Self, ContractError> {
+        Self::new(binding, Cause::Root(root), &[], 0)
+    }
+    pub fn new(
+        binding: Binding,
+        cause: Cause,
+        corrections: &[Correction],
+        max_relations: usize,
+    ) -> Result<Self, ContractError> {
+        if binding.ledger.tenant.is_zero()
+            || binding.ledger.session.is_zero()
+            || binding.object.is_zero()
+        {
+            return Err(ContractError::InvalidTarget);
+        }
+        match cause {
+            Cause::Root(root) if root.is_zero() => return Err(ContractError::InvalidTarget),
+            Cause::Claim(claim) if claim.is_zero() || claim.0 == binding.object.0 => {
+                return Err(ContractError::InvalidTarget);
+            }
+            _ => {}
+        }
+        if corrections.len() > max_relations {
+            return Err(ContractError::Capacity);
+        }
+        for correction in corrections {
+            if correction.predecessor.ledger != binding.ledger {
+                return Err(ContractError::WrongLedger);
+            }
+            if correction.predecessor.kind != ObjectKind::Claim
+                || correction.predecessor.id.is_zero()
+                || correction.predecessor.id == binding.object
+            {
+                return Err(ContractError::InvalidTarget);
+            }
+        }
+        let mut stored = Vec::new();
+        stored
+            .try_reserve_exact(corrections.len())
+            .map_err(|_| ContractError::Capacity)?;
+        stored.extend_from_slice(corrections);
+        stored.sort_unstable();
+        for pair in stored.windows(2) {
+            if let [a, b] = pair
+                && a == b
+            {
+                return Err(ContractError::InvalidTarget);
+            }
+        }
+        Ok(Self {
+            binding,
+            cause,
+            corrections: stored,
+        })
+    }
+    pub fn check_binding(&self, binding: &Binding) -> Result<(), ContractError> {
+        self.binding.check(binding)
+    }
+    pub fn cause(&self) -> &Cause {
+        &self.cause
+    }
+    pub fn corrections(&self) -> &[Correction] {
+        &self.corrections
+    }
+    fn target(&self, edge: usize) -> Option<ClaimId> {
+        let offset = match self.cause {
+            Cause::Claim(claim) if edge == 0 => return Some(claim),
+            Cause::Claim(_) => edge.checked_sub(1)?,
+            Cause::Root(_) => edge,
+        };
+        self.corrections
+            .get(offset)
+            .map(|correction| ClaimId(correction.predecessor.id.0))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    pub nodes: usize,
+    pub edge_visits: usize,
+}
+
+/// A result of real successor existence/identity/lineage checks. The owner must
+/// publish the new successor, this lineage and predecessor consequences together.
+#[derive(Debug)]
+pub struct SuccessionPlan {
+    predecessor: Binding,
+    successor: Binding,
+    principal: Principal,
+    cut: ClaimCut,
+    reads: Vec<Binding>,
+}
+
+impl SuccessionPlan {
+    pub fn prepare(
+        principal: Principal,
+        predecessor: &ClaimState,
+        successor: &ClaimState,
+        ancestors: &[&ClaimState],
+        cut: ClaimCut,
+        limits: Limits,
+    ) -> Result<Self, ContractError> {
+        principal.require_actor(predecessor.issuer())?;
+        if predecessor.binding().ledger != successor.binding().ledger {
+            return Err(ContractError::WrongLedger);
+        }
+        if predecessor.binding().object == successor.binding().object
+            || successor.issuer() != predecessor.issuer()
+            || successor.subject() != predecessor.subject()
+        {
+            return Err(ContractError::InvalidTarget);
+        }
+        if successor.status() != ClaimStatus::Generated
+            || successor.created() != cut.position
+            || cut.position.0 == 0
+            || predecessor.created() >= cut.position
+            || predecessor
+                .local_sealed_at()
+                .is_some_and(|sequence| sequence > cut.position)
+        {
+            return Err(ContractError::InvalidCut);
+        }
+        let predecessor_ref = ObjectRef::claim(
+            predecessor.binding().ledger,
+            ClaimId(predecessor.binding().object.0),
+        );
+        if !successor.lineage().corrections().iter().any(|correction| {
+            correction.kind == CorrectionKind::Supersedes
+                && correction.predecessor == predecessor_ref
+        }) {
+            return Err(ContractError::InvalidTarget);
+        }
+        for pair in ancestors.windows(2) {
+            if let [a, b] = pair
+                && a.binding().object >= b.binding().object
+            {
+                return Err(ContractError::InvalidTarget);
+            }
+        }
+        let length = ancestors
+            .len()
+            .checked_add(2)
+            .ok_or(ContractError::Capacity)?;
+        if length > limits.nodes {
+            return Err(ContractError::Capacity);
+        }
+        let mut rows = Vec::new();
+        rows.try_reserve_exact(length)
+            .map_err(|_| ContractError::Capacity)?;
+        rows.push(predecessor);
+        rows.push(successor);
+        rows.extend_from_slice(ancestors);
+        rows.sort_unstable_by_key(|row| row.binding().object);
+        for row in &rows {
+            if row.binding().ledger != predecessor.binding().ledger {
+                return Err(ContractError::WrongLedger);
+            }
+            if row.created() > cut.position
+                || row
+                    .local_sealed_at()
+                    .is_some_and(|sequence| sequence > cut.position)
+                || row
+                    .scopes()
+                    .release_cut()
+                    .is_some_and(|value| value.position > cut.position)
+            {
+                return Err(ContractError::InvalidCut);
+            }
+        }
+        for pair in rows.windows(2) {
+            if let [a, b] = pair
+                && a.binding().object == b.binding().object
+            {
+                return Err(ContractError::InvalidTarget);
+            }
+        }
+        let mut colors = Vec::new();
+        colors
+            .try_reserve_exact(length)
+            .map_err(|_| ContractError::Capacity)?;
+        colors.resize(length, 0u8);
+        let mut stack = Vec::new();
+        stack
+            .try_reserve_exact(length)
+            .map_err(|_| ContractError::Capacity)?;
+        let start = rows
+            .binary_search_by_key(&successor.binding().object, |row| row.binding().object)
+            .map_err(|_| ContractError::InvalidTarget)?;
+        stack.push((start, 0usize));
+        *colors.get_mut(start).ok_or(ContractError::InvalidTarget)? = 1;
+        let mut visits = 0usize;
+        while let Some((index, edge)) = stack.last().copied() {
+            let row = rows.get(index).ok_or(ContractError::InvalidTarget)?;
+            let target = row.lineage().target(edge);
+            let Some(target) = target else {
+                *colors.get_mut(index).ok_or(ContractError::InvalidTarget)? = 2;
+                stack.pop();
+                continue;
+            };
+            visits = visits.checked_add(1).ok_or(ContractError::Capacity)?;
+            if visits > limits.edge_visits {
+                return Err(ContractError::Capacity);
+            }
+            let frame = stack.last_mut().ok_or(ContractError::InvalidTarget)?;
+            frame.1 = edge.checked_add(1).ok_or(ContractError::Capacity)?;
+            let next = rows
+                .binary_search_by_key(&crate::ObjectId(target.0), |row| row.binding().object)
+                .map_err(|_| ContractError::InvalidTarget)?;
+            // Every immutable lineage edge must refer to a claim that existed
+            // when its source was created, not merely before this succession.
+            // Equal positions remain legal for an acyclic atomic creation batch.
+            if rows
+                .get(next)
+                .ok_or(ContractError::InvalidTarget)?
+                .created()
+                > row.created()
+            {
+                return Err(ContractError::InvalidCut);
+            }
+            match colors.get(next).copied() {
+                Some(0) => {
+                    *colors.get_mut(next).ok_or(ContractError::InvalidTarget)? = 1;
+                    stack.push((next, 0));
+                }
+                Some(1) => return Err(ContractError::InvalidTarget),
+                Some(2) => {}
+                _ => return Err(ContractError::InvalidTarget),
+            }
+        }
+        let mut reads = Vec::new();
+        reads
+            .try_reserve_exact(length)
+            .map_err(|_| ContractError::Capacity)?;
+        for row in &rows {
+            reads.push(row.binding());
+        }
+        // Check revision capacity before preparing publication. Terminal
+        // predecessors are immutable and need no replacement row.
+        if !predecessor.status().is_terminal() {
+            predecessor.binding().next()?;
+        }
+        Ok(Self {
+            predecessor: predecessor.binding(),
+            successor: successor.binding(),
+            principal,
+            cut,
+            reads,
+        })
+    }
+
+    /// Rechecks every predecessor/ancestor read at the effective publication
+    /// boundary. Reading an old snapshot never grants authority over current rows.
+    pub fn apply(
+        self,
+        predecessor: &mut ClaimState,
+        successor: &ClaimState,
+        ancestors: &[&ClaimState],
+    ) -> Result<(), ContractError> {
+        predecessor.binding().check(&self.predecessor)?;
+        successor.binding().check(&self.successor)?;
+        self.principal.require_actor(predecessor.issuer())?;
+        if ancestors
+            .len()
+            .checked_add(2)
+            .ok_or(ContractError::Capacity)?
+            != self.reads.len()
+        {
+            return Err(ContractError::InvalidTarget);
+        }
+        for pair in ancestors.windows(2) {
+            if let [a, b] = pair
+                && a.binding().object >= b.binding().object
+            {
+                return Err(ContractError::InvalidTarget);
+            }
+        }
+        for expected in &self.reads {
+            let actual = if expected.object == predecessor.binding().object {
+                predecessor.binding()
+            } else if expected.object == successor.binding().object {
+                successor.binding()
+            } else {
+                ancestors
+                    .get(
+                        ancestors
+                            .binary_search_by_key(&expected.object, |row| row.binding().object)
+                            .map_err(|_| ContractError::InvalidTarget)?,
+                    )
+                    .ok_or(ContractError::InvalidTarget)?
+                    .binding()
+            };
+            actual.check(expected)?;
+        }
+        predecessor.supersede_verified(&self.predecessor, self.cut)
+    }
+    pub fn predecessor(&self) -> Binding {
+        self.predecessor
+    }
+    pub fn successor(&self) -> Binding {
+        self.successor
+    }
+    pub fn reads(&self) -> &[Binding] {
+        &self.reads
+    }
+}
+
+#[cfg(test)]
+#[path = "succession_tests.rs"]
+mod tests;

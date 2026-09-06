@@ -20,6 +20,11 @@ an embedded database or an async runtime.
 - `prepare_batch` builds and accounts an unpublished candidate before a durable
   proposal. Dropping it cancels the candidate. `publish` checks owner/base-root
   provenance and performs no allocation. The owner must serialize this interval.
+- `prepare_batch_with` and `prepare_after_with` support values without `Clone`.
+  New entries move directly into prepared pages. Only retained entries in touched
+  pages invoke the supplied fallible copier, after reserving those pages' complete
+  charge. `PreparedRange::entries` exposes the complete ordered pending prefix.
+  Existing `Clone` callers use the same preparation path.
 - Snapshot owners retain roots in a bounded lease registry. Callers receive
   weak leases; `advance_clock` reaps expired roots even when a caller retains
   the handle. Weak handle metadata stays charged until its last clone drops.
@@ -46,7 +51,13 @@ archived boundary explicitly.
 
 Memory charges cover engine-owned allocation capacity and conservative
 bookkeeping. Generic keys/values supply their dynamic heap charge; arbitrary
-`Clone` implementations cannot be measured automatically. Shared content is
+`Clone` implementations and supplied copiers cannot be measured automatically.
+A fallible copier must preserve the source and its meaning, fit its resulting key
+and value allocations within the entry's recorded heap charge, and separately
+account any temporary workspace. Failure drops the entire candidate and its
+provisional charges. `SnapshotLease::project_next` can inspect non-`Clone` values
+without allocating a response or allowing the borrowed entry to escape.
+Shared content is
 accounted separately from entry-owned lifecycle bytes. Responses retain their
 charge until dropped. These counters are not a claim about exact process RSS or
 allocator fragmentation. Collections use safe standard allocation facilities;

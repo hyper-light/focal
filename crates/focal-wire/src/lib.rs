@@ -19,22 +19,28 @@ mod handler;
 mod list;
 mod managed;
 mod message;
+mod peer_mutations;
 mod peers;
 mod reconcile;
 mod transport;
+mod traversal;
 #[cfg(unix)]
 mod unix;
+mod validators;
 pub use auth::*;
 pub use frame::*;
 pub use handler::*;
 pub use list::*;
 pub use managed::*;
 pub use message::*;
+pub use peer_mutations::*;
 pub use peers::*;
 pub use reconcile::*;
 pub use transport::*;
+pub use traversal::*;
 #[cfg(unix)]
 pub use unix::*;
+pub use validators::*;
 #[cfg(test)]
 mod tests;
 
@@ -74,3 +80,11 @@ pub(crate) async fn transport_exchange<T>(
     })
     .await
 }
+
+mod monitor;
+mod summary;
+pub use monitor::{MAX_MONITOR_ROOTS, MonitorPage};
+pub use summary::LedgerSummary;
+
+mod selection;
+pub use selection::*;

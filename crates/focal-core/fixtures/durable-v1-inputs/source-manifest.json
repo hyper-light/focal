@@ -1,0 +1,385 @@
+{
+  "captured_utc": "2026-09-06T13:52:52.813914+00:00",
+  "git_base": "31198c225b5ab6fb7c0414fe423d069701b9c9a2",
+  "scope": "Source snapshot immediately before command/input/canonical frozen-codec increment; checkpoints already use frozen nested codecs. Each file is preserved verbatim as .txt; source additions may occur in unrelated modules while capture runs.",
+  "files": [
+    {
+      "path": "Cargo.toml",
+      "snapshot": "source-snapshot/Cargo.toml.txt",
+      "bytes": 1718,
+      "sha256": "8731bfe4f39e8232a783a6a810693bb39976de496fb681ca6f5204131d017565"
+    },
+    {
+      "path": "Cargo.lock",
+      "snapshot": "source-snapshot/Cargo.lock.txt",
+      "bytes": 52352,
+      "sha256": "1cdc2b87a2e4f473faaf8c2217c479ec8afafdfd4280292241ddba3fa4d66c93"
+    },
+    {
+      "path": "crates/focal-core/Cargo.toml",
+      "snapshot": "source-snapshot/crates/focal-core/Cargo.toml.txt",
+      "bytes": 386,
+      "sha256": "12e8b032fcff0d308f896f57118e5bd61b2da2ac5f19b2976fd602129d8a381e"
+    },
+    {
+      "path": "crates/focal-core/src/access.rs",
+      "snapshot": "source-snapshot/crates/focal-core/src/access.rs.txt",
+      "bytes": 29422,
+      "sha256": "f8e6bf11feef82f2238da832d9ccafdc71310deaececdcac944aeabed118086a"
+    },
+    {
+      "path": "crates/focal-core/src/access_tests.rs",
+      "snapshot": "source-snapshot/crates/focal-core/src/access_tests.rs.txt",
+      "bytes": 12241,
+      "sha256": "f38b35dc0b7810a53d75a08e0023f7d46b94b2f308bc7b6a43fe80d56ed2b41f"
+    },
+    {
+      "path": "crates/focal-core/src/durable_v1.rs",
+      "snapshot": "source-snapshot/crates/focal-core/src/durable_v1.rs.txt",
+      "bytes": 8823,
+      "sha256": "05f4d15ccb6a0e91d1ffed57f789ab955759c32b1281a5fb638274eddd5e638b"
+    },
+    {
+      "path": "crates/focal-core/src/durable_v1_tests.rs",
+      "snapshot": "source-snapshot/crates/focal-core/src/durable_v1_tests.rs.txt",
+      "bytes": 12225,
+      "sha256": "68b3bed17cb087e52129b7ef262e63d8a57c8f9b16275fd603264a2df3aa2773"
+    },
+    {
+      "path": "crates/focal-core/src/epoch.rs",
+      "snapshot": "source-snapshot/crates/focal-core/src/epoch.rs.txt",
+      "bytes": 26565,
+      "sha256": "74d1a2e42cd07ec926119bc89d83484bb61ec26b1b0ecb61a56c52028680b400"
+    },
+    {
+      "path": "crates/focal-core/src/epoch_tests.rs",
+      "snapshot": "source-snapshot/crates/focal-core/src/epoch_tests.rs.txt",
+      "bytes": 12605,
+      "sha256": "2d096827c7679c5be01be2aea1b50078c3a138d9836ff075d5dc726102b7cb8a"
+    },
+    {
+      "path": "crates/focal-core/src/graph.rs",
+      "snapshot": "source-snapshot/crates/focal-core/src/graph.rs.txt",
+      "bytes": 6893,
+      "sha256": "e6735442bbddedea86f43ea09ca135cebfa5df38f852d868d514695326d7bf9d"
+    },
+    {
+      "path": "crates/focal-core/src/lib.rs",
+      "snapshot": "source-snapshot/crates/focal-core/src/lib.rs.txt",
+      "bytes": 11688,
+      "sha256": "3b4db55744315bb6d31caf8c407fa0299dadaaed79178be6ff341d5a4fb1aad4"
+    },
+    {
+      "path": "crates/focal-core/src/managed.rs",
+      "snapshot": "source-snapshot/crates/focal-core/src/managed.rs.txt",
+      "bytes": 12508,
+      "sha256": "8b5f2a543a9014eebfc96347c063782eefd573b643c7f5a66fee624cfd209774"
+    },
+    {
+      "path": "crates/focal-core/src/managed_tests.rs",
+      "snapshot": "source-snapshot/crates/focal-core/src/managed_tests.rs.txt",
+      "bytes": 18502,
+      "sha256": "80f8a5b069aed419661e4972f853ab49c7c3583d1b65191c72c8277136e4b9cb"
+    },
+    {
+      "path": "crates/focal-core/src/overlay.rs",
+      "snapshot": "source-snapshot/crates/focal-core/src/overlay.rs.txt",
+      "bytes": 7595,
+      "sha256": "f81b760f4ef0c49335fb7664aebdd271c5cf660965dead2f3a30cceb7e391059"
+    },
+    {
+      "path": "crates/focal-core/src/pending.rs",
+      "snapshot": "source-snapshot/crates/focal-core/src/pending.rs.txt",
+      "bytes": 17641,
+      "sha256": "4e2c7a579bbfa0f519756f82584bd961a243e9f06d140dadb0fe0a5026bd20f9"
+    },
+    {
+      "path": "crates/focal-core/src/pending_tests.rs",
+      "snapshot": "source-snapshot/crates/focal-core/src/pending_tests.rs.txt",
+      "bytes": 7526,
+      "sha256": "7fb48b278d9954c7c2693b20e0c611991e3e51aaf0e9a6180e70f31dd14cd818"
+    },
+    {
+      "path": "crates/focal-core/src/reconciliation.rs",
+      "snapshot": "source-snapshot/crates/focal-core/src/reconciliation.rs.txt",
+      "bytes": 7694,
+      "sha256": "c47ab495b44a0e37cb8f0f93014883ce2b45fe1e6845d0b90e28d588e4a24c8b"
+    },
+    {
+      "path": "crates/focal-core/src/reconciliation_tests.rs",
+      "snapshot": "source-snapshot/crates/focal-core/src/reconciliation_tests.rs.txt",
+      "bytes": 7873,
+      "sha256": "7e591d4ca39437a01570eedb7013af5f4bf9869ebe2af98562d1fec5373c20e8"
+    },
+    {
+      "path": "crates/focal-core/src/reduce.rs",
+      "snapshot": "source-snapshot/crates/focal-core/src/reduce.rs.txt",
+      "bytes": 75037,
+      "sha256": "5bfb6b2a70b55c1aea22fe088b4e413299c40a9d8d031fae58345823caffab2a"
+    },
+    {
+      "path": "crates/focal-core/src/tests.rs",
+      "snapshot": "source-snapshot/crates/focal-core/src/tests.rs.txt",
+      "bytes": 68727,
+      "sha256": "cfbf2ce7868191179681714b7788be6f7edd95e0f76dcc7213fe22ef1c701058"
+    },
+    {
+      "path": "crates/focal-core/src/validation.rs",
+      "snapshot": "source-snapshot/crates/focal-core/src/validation.rs.txt",
+      "bytes": 15375,
+      "sha256": "c3a29b501acc0e413ce6a8c9cb5951d605d939714b3d5cc3e348db52241d3eaf"
+    },
+    {
+      "path": "crates/focal-model/Cargo.toml",
+      "snapshot": "source-snapshot/crates/focal-model/Cargo.toml.txt",
+      "bytes": 326,
+      "sha256": "7236c62d34212115522cc9025fd11b8ec4fac08456eb96c014d454e95ee205ff"
+    },
+    {
+      "path": "crates/focal-model/src/canonical.rs",
+      "snapshot": "source-snapshot/crates/focal-model/src/canonical.rs.txt",
+      "bytes": 10062,
+      "sha256": "9216c1faba8a628929f4d56d77fb71f82052bb3dc66d3111e0f7e49432afe06d"
+    },
+    {
+      "path": "crates/focal-model/src/command.rs",
+      "snapshot": "source-snapshot/crates/focal-model/src/command.rs.txt",
+      "bytes": 10794,
+      "sha256": "7d98db788176e0f9b3fa05b7375a7947ecdf3479325cfe6a6e723279f71e9f7c"
+    },
+    {
+      "path": "crates/focal-model/src/durable_v1/collections.rs",
+      "snapshot": "source-snapshot/crates/focal-model/src/durable_v1/collections.rs.txt",
+      "bytes": 5287,
+      "sha256": "58886e8bc8b97fcfcea1ee8d2fcc76332dcaf406f1426dbdfe78ef47dfead61b"
+    },
+    {
+      "path": "crates/focal-model/src/durable_v1/leaves.rs",
+      "snapshot": "source-snapshot/crates/focal-model/src/durable_v1/leaves.rs.txt",
+      "bytes": 1872,
+      "sha256": "f27eefcc97a4446954cce86a553c63a67bc60e77867b14d05b63bc9836bd7e77"
+    },
+    {
+      "path": "crates/focal-model/src/durable_v1/lifecycle.rs",
+      "snapshot": "source-snapshot/crates/focal-model/src/durable_v1/lifecycle.rs.txt",
+      "bytes": 8169,
+      "sha256": "ba2bf4ac53872c8b3b35a9fda81efd5a3b1922d9ad3a0f8db48699f82acbbda5"
+    },
+    {
+      "path": "crates/focal-model/src/durable_v1/lifecycle_tests.rs",
+      "snapshot": "source-snapshot/crates/focal-model/src/durable_v1/lifecycle_tests.rs.txt",
+      "bytes": 14978,
+      "sha256": "a1e727b8be3aa52e0b977aad16f102c2af56d314115f7ca8954fe5ad2ef13081"
+    },
+    {
+      "path": "crates/focal-model/src/durable_v1/mod.rs",
+      "snapshot": "source-snapshot/crates/focal-model/src/durable_v1/mod.rs.txt",
+      "bytes": 2850,
+      "sha256": "c786ec75645f19a386cf483a17b92c19c1f0e57b091500010fb290dc5482433a"
+    },
+    {
+      "path": "crates/focal-model/src/durable_v1/objects.rs",
+      "snapshot": "source-snapshot/crates/focal-model/src/durable_v1/objects.rs.txt",
+      "bytes": 5938,
+      "sha256": "2721f1aadab356e56d8e9b155b56437463a353ca8f28979b930d19d17099023c"
+    },
+    {
+      "path": "crates/focal-model/src/durable_v1/objects_tests.rs",
+      "snapshot": "source-snapshot/crates/focal-model/src/durable_v1/objects_tests.rs.txt",
+      "bytes": 13347,
+      "sha256": "40180a761027f0cfd0fe8e4590c9bfe65c77151a9beee32d3479433ad3e89036"
+    },
+    {
+      "path": "crates/focal-model/src/durable_v1/tests.rs",
+      "snapshot": "source-snapshot/crates/focal-model/src/durable_v1/tests.rs.txt",
+      "bytes": 5658,
+      "sha256": "3599db05977b222e3ec81d8167bc8aee8c777b1f2eded6579b22260535e564cb"
+    },
+    {
+      "path": "crates/focal-model/src/durable_v1/vocabulary.rs",
+      "snapshot": "source-snapshot/crates/focal-model/src/durable_v1/vocabulary.rs.txt",
+      "bytes": 3777,
+      "sha256": "c643f9acb22edb0325eaf3a75168a1ad112fddc6508b432f57ac076122f958d7"
+    },
+    {
+      "path": "crates/focal-model/src/ids.rs",
+      "snapshot": "source-snapshot/crates/focal-model/src/ids.rs.txt",
+      "bytes": 2793,
+      "sha256": "23008e268e85846964926049119aa5548ef997268376f69cc34004220504c3a9"
+    },
+    {
+      "path": "crates/focal-model/src/lib.rs",
+      "snapshot": "source-snapshot/crates/focal-model/src/lib.rs.txt",
+      "bytes": 735,
+      "sha256": "515d1c573de07f1ef34c24df4c3b747249a2acd29c5480c3bb1525ca6d2d7b7b"
+    },
+    {
+      "path": "crates/focal-model/src/managed.rs",
+      "snapshot": "source-snapshot/crates/focal-model/src/managed.rs.txt",
+      "bytes": 11182,
+      "sha256": "e3db3bd3cf3fa4cf1d2aaec1f1428dad827c55a0b87681393a404953d0a5daa2"
+    },
+    {
+      "path": "crates/focal-model/src/managed_tests.rs",
+      "snapshot": "source-snapshot/crates/focal-model/src/managed_tests.rs.txt",
+      "bytes": 7797,
+      "sha256": "3860937f0ba09b6ab8abee8e6f577ccf413b1005fbf6b7a57dfc4852b57aa7ae"
+    },
+    {
+      "path": "crates/focal-model/src/objects.rs",
+      "snapshot": "source-snapshot/crates/focal-model/src/objects.rs.txt",
+      "bytes": 10155,
+      "sha256": "bf40539022facb38eb93076244161c67e82890e6691f0b9afdd2359e9ebb9bba"
+    },
+    {
+      "path": "crates/focal-model/src/reconciliation.rs",
+      "snapshot": "source-snapshot/crates/focal-model/src/reconciliation.rs.txt",
+      "bytes": 6694,
+      "sha256": "862c7b9c1dfa4a4264d8080a23e734c39535175633c0be730623ca485928b2a5"
+    },
+    {
+      "path": "crates/focal-model/src/tests.rs",
+      "snapshot": "source-snapshot/crates/focal-model/src/tests.rs.txt",
+      "bytes": 6128,
+      "sha256": "b5adbb8bc08e45dbffefb896bd4fb995ce9d5071a9c7360884a64c2422371fc9"
+    },
+    {
+      "path": "crates/focal-model/src/validation_read.rs",
+      "snapshot": "source-snapshot/crates/focal-model/src/validation_read.rs.txt",
+      "bytes": 1241,
+      "sha256": "c349bb3a8b419dfd0be733af63dd6eacb751215b6c14bb5afd1ff4924171d890"
+    },
+    {
+      "path": "crates/focal-model/src/vocabulary.rs",
+      "snapshot": "source-snapshot/crates/focal-model/src/vocabulary.rs.txt",
+      "bytes": 6904,
+      "sha256": "b431c0b337efd5b97ab6934cf450f55811d04c6d1adfa0521840afaa263027fa"
+    },
+    {
+      "path": "crates/focal-ledger/Cargo.toml",
+      "snapshot": "source-snapshot/crates/focal-ledger/Cargo.toml.txt",
+      "bytes": 827,
+      "sha256": "12ee58fad7d31e3b3fe711bb2107b1e047c16401761b0403abfcc10f7ea431e7"
+    },
+    {
+      "path": "crates/focal-ledger/src/apply_epoch.rs",
+      "snapshot": "source-snapshot/crates/focal-ledger/src/apply_epoch.rs.txt",
+      "bytes": 15790,
+      "sha256": "2157691a078cb6cba27c8c17ffb02c8cace22002e4f69f7ed15122faa6ca5e8a"
+    },
+    {
+      "path": "crates/focal-ledger/src/cursor_maintenance.rs",
+      "snapshot": "source-snapshot/crates/focal-ledger/src/cursor_maintenance.rs.txt",
+      "bytes": 6990,
+      "sha256": "fa8a73b11772fd5d0118b06d6c746f98fdb8ad9b5f808fb97eaef1e40a1f8db5"
+    },
+    {
+      "path": "crates/focal-ledger/src/cursor_session.rs",
+      "snapshot": "source-snapshot/crates/focal-ledger/src/cursor_session.rs.txt",
+      "bytes": 40314,
+      "sha256": "5c6afa46da30a1ef69adc422f6813006e4867b381cdc988304713559abc77fe9"
+    },
+    {
+      "path": "crates/focal-ledger/src/cursor_tests.rs",
+      "snapshot": "source-snapshot/crates/focal-ledger/src/cursor_tests.rs.txt",
+      "bytes": 25188,
+      "sha256": "4d84bab1b4938ab3bd90fc8e8dbc55353d10c79a59ea19128a9b982341fb4bff"
+    },
+    {
+      "path": "crates/focal-ledger/src/durable_v1_tests.rs",
+      "snapshot": "source-snapshot/crates/focal-ledger/src/durable_v1_tests.rs.txt",
+      "bytes": 4340,
+      "sha256": "5418414f803911c539988c0dd2f3e4f512cdec03563100cda46ae54c176460e2"
+    },
+    {
+      "path": "crates/focal-ledger/src/epoch_session_tests.rs",
+      "snapshot": "source-snapshot/crates/focal-ledger/src/epoch_session_tests.rs.txt",
+      "bytes": 12395,
+      "sha256": "85d1ce5c1e283169fd5f54d0eec7c22518571cd9cefc05da8101b931fe11d031"
+    },
+    {
+      "path": "crates/focal-ledger/src/evidence_snapshot.rs",
+      "snapshot": "source-snapshot/crates/focal-ledger/src/evidence_snapshot.rs.txt",
+      "bytes": 8582,
+      "sha256": "86e383b2f8ad85a41e805128683d15310debe968a95e8cfb986de7c1730c65dd"
+    },
+    {
+      "path": "crates/focal-ledger/src/evidence_snapshot_tests.rs",
+      "snapshot": "source-snapshot/crates/focal-ledger/src/evidence_snapshot_tests.rs.txt",
+      "bytes": 5351,
+      "sha256": "2b68af820007e44523218b83eb81b343f9aca4a35fa40330af5e6324fbb397a3"
+    },
+    {
+      "path": "crates/focal-ledger/src/lib.rs",
+      "snapshot": "source-snapshot/crates/focal-ledger/src/lib.rs.txt",
+      "bytes": 774,
+      "sha256": "f254e0a3ba909bf2665f778007fa93b379c62f67db09607f8f324b43f7331377"
+    },
+    {
+      "path": "crates/focal-ledger/src/managed_session.rs",
+      "snapshot": "source-snapshot/crates/focal-ledger/src/managed_session.rs.txt",
+      "bytes": 29359,
+      "sha256": "759894f5ab2a51f83add10f5295029f899bdf7c41f91160e94bf632d576826ba"
+    },
+    {
+      "path": "crates/focal-ledger/src/managed_support.rs",
+      "snapshot": "source-snapshot/crates/focal-ledger/src/managed_support.rs.txt",
+      "bytes": 10706,
+      "sha256": "082873a34f53bce7dc3a11efd10af59e53b3deb0ddfa9b0cb0424844a3eae8c4"
+    },
+    {
+      "path": "crates/focal-ledger/src/managed_tests.rs",
+      "snapshot": "source-snapshot/crates/focal-ledger/src/managed_tests.rs.txt",
+      "bytes": 37786,
+      "sha256": "bd67af33ad74359c498d288ce8b4ef703d03b7c9d0c1f94912f53b00256e4227"
+    },
+    {
+      "path": "crates/focal-ledger/src/membership_session.rs",
+      "snapshot": "source-snapshot/crates/focal-ledger/src/membership_session.rs.txt",
+      "bytes": 8664,
+      "sha256": "7000806091a548aaf0a7c51bab04b9da523c76258bc54e9b62c6976e527e2cdf"
+    },
+    {
+      "path": "crates/focal-ledger/src/membership_tests.rs",
+      "snapshot": "source-snapshot/crates/focal-ledger/src/membership_tests.rs.txt",
+      "bytes": 9048,
+      "sha256": "bb98cdac8b64d3b24666dd4af7ef9ecc03182a67178dd2e89fa4f1b6aaadde07"
+    },
+    {
+      "path": "crates/focal-ledger/src/placement_session.rs",
+      "snapshot": "source-snapshot/crates/focal-ledger/src/placement_session.rs.txt",
+      "bytes": 23816,
+      "sha256": "0704f97a9fbd7148c7830c5d5bd1009c72aa508fed06e75aaa1a116936852a57"
+    },
+    {
+      "path": "crates/focal-ledger/src/placement_tests.rs",
+      "snapshot": "source-snapshot/crates/focal-ledger/src/placement_tests.rs.txt",
+      "bytes": 10610,
+      "sha256": "8da7cdf3fd19f05c5aa35d9eb7d3ddf58de25611d36f8de8bdacdfcee99ffe6b"
+    },
+    {
+      "path": "crates/focal-ledger/src/reconciliation.rs",
+      "snapshot": "source-snapshot/crates/focal-ledger/src/reconciliation.rs.txt",
+      "bytes": 9221,
+      "sha256": "53d9c41c1ed09619bd6420baddbb615200947761d5fbae8c3637826ed94fb20c"
+    },
+    {
+      "path": "crates/focal-ledger/src/reconciliation_session_tests.rs",
+      "snapshot": "source-snapshot/crates/focal-ledger/src/reconciliation_session_tests.rs.txt",
+      "bytes": 11607,
+      "sha256": "6446851b3ae5536fadd5843c142eee6f89730ec2fd6cdfa0b4f889dcabc46678"
+    },
+    {
+      "path": "crates/focal-ledger/src/request_streams.rs",
+      "snapshot": "source-snapshot/crates/focal-ledger/src/request_streams.rs.txt",
+      "bytes": 38480,
+      "sha256": "ed0298662027a1ac6c74a97f305ed3467bff73bdbfeff42d6fd1806e97cd79ea"
+    },
+    {
+      "path": "crates/focal-ledger/src/session.rs",
+      "snapshot": "source-snapshot/crates/focal-ledger/src/session.rs.txt",
+      "bytes": 53903,
+      "sha256": "dd8d90a4d0482d1188373b92f45225662e418d00a5c667810a2bae57cc698834"
+    }
+  ]
+}

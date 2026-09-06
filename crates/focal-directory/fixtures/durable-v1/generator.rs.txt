@@ -1,0 +1,88 @@
+// Original live Serde capture. Test utility, deliberately not production code.
+use focal_directory::*;
+use focal_model::{ContentHash, LedgerId, RaftIndex, RaftTerm, RouteEpoch, SessionId, SessionSeq, TenantId};
+use serde::Serialize;
+use std::{collections::{BTreeMap, BTreeSet}, path::Path};
+
+fn ledger(n: u128) -> LedgerId { LedgerId { tenant: TenantId::from_u128(n), session: SessionId::from_u128(n + 1) } }
+fn hash(seed: u8) -> ContentHash { ContentHash(std::array::from_fn(|index| seed.wrapping_add(index as u8))) }
+fn save<T: Serialize>(root: &Path, name: &str, value: &T) {
+    let path = root.join(name);
+    assert!(!path.exists(), "do not overwrite original capture");
+    std::fs::write(path, postcard::to_stdvec(value).unwrap()).unwrap();
+}
+fn main() {
+    let output = std::env::args().nth(1).expect("output directory");
+    let root = Path::new(&output);
+    std::fs::create_dir_all(root).unwrap();
+    let ids = [0, 1, 1 << 127, u128::MAX];
+    macro_rules! ids { ($($name:ident => $file:literal),+) => {$({
+        let rows: Vec<_> = ids.into_iter().map($name::from_u128).collect();
+        save(root, $file, &rows);
+    })+}; }
+    ids!(ClusterId => "cluster-ids.rows", RegionId => "region-ids.rows", ZoneId => "zone-ids.rows", PartitionId => "partition-ids.rows", LogGroupId => "log-group-ids.rows", OperationId => "operation-ids.rows", WorkId => "work-ids.rows");
+    let keys = vec![NamespaceKey::MIN, NamespaceKey::of(ledger(1)), NamespaceKey([255; 32])];
+    save(root, "namespace-keys.rows", &keys);
+    let ranges = vec![NamespaceRange::all(), NamespaceRange { start: keys[1], end: Some(keys[2]) }, NamespaceRange { start: keys[2], end: Some(keys[0]) }, NamespaceRange { start: keys[1], end: Some(keys[1]) }];
+    save(root, "namespace-ranges.rows", &ranges);
+    let mut enrollments = Vec::new();
+    let mut loads = Vec::new();
+    for (index, (n, eligible)) in [(0, false), (1, true), (u64::MAX, false)].into_iter().enumerate() {
+        enrollments.push(NodeEnrollment { node: n, generation: n, region: RegionId::from_u128(u128::from(n)), zone: ZoneId::from_u128(u128::from(n)), endpoint: if index == 0 { String::new() } else { "quic://例.example:9000/🙂".repeat(index) }, identity: hash(index as u8), authority_epoch: n, attestation: hash(20 + index as u8), eligible });
+        loads.push(NodeLoad { node: n, generation: n, report: n, available_memory: n, active_weight: n });
+    }
+    save(root, "node-enrollments.rows", &enrollments);
+    save(root, "node-loads.rows", &loads);
+    let records: Vec<_> = enrollments.iter().flat_map(|enrollment| [NodeRecord { enrollment: enrollment.clone(), load: None }, NodeRecord { enrollment: enrollment.clone(), load: Some(loads[2]) }]).collect();
+    save(root, "node-records.rows", &records);
+    let classes = vec![FailureClass::Node, FailureClass::Zone, FailureClass::Region];
+    save(root, "failure-classes.rows", &classes);
+    let intents: Vec<_> = classes.iter().flat_map(|survive| [0, 1, u16::MAX].map(|max_failures| DurabilityIntent { survive: *survive, max_failures })).collect();
+    save(root, "durability-intents.rows", &intents);
+    let policies: Vec<_> = intents.iter().flat_map(|durability| [
+        PlacementPolicy { durability: *durability, residency: BTreeSet::new(), home_regions: BTreeSet::new(), required_memory: 0 },
+        PlacementPolicy { durability: *durability, residency: [255, 0, 1, 255].into_iter().map(RegionId::from_u128).collect(), home_regions: [u128::MAX, 128, 1].into_iter().map(RegionId::from_u128).collect(), required_memory: u64::MAX },
+    ]).collect();
+    save(root, "placement-policies.rows", &policies);
+    let placements = vec![
+        Placement { voters: BTreeMap::new(), materializers: BTreeMap::new(), content_copies: BTreeMap::new(), preferred_leader: 0 },
+        Placement { voters: [(3, 7), (1, 2), (128, u64::MAX)].into_iter().collect(), materializers: [(1, 99), (u64::MAX, 1)].into_iter().collect(), content_copies: [(u64::MAX, 0), (128, 1), (3, 7)].into_iter().collect(), preferred_leader: u64::MAX },
+        Placement { voters: (0..130).rev().map(|n| (n, n + 1)).collect(), materializers: [(1, 1)].into_iter().collect(), content_copies: [(1, 1)].into_iter().collect(), preferred_leader: 1 },
+    ];
+    save(root, "placements.rows", &placements);
+    let specs: Vec<_> = policies.iter().enumerate().map(|(index, policy)| PlacementSpec { policy: policy.clone(), placement: placements[index % placements.len()].clone() }).collect();
+    save(root, "placement-specs.rows", &specs);
+    for (index, spec) in specs.iter().enumerate() { save(root, &format!("placement-{index:02}.bin"), spec); }
+    let digests: Vec<_> = specs.iter().map(|spec| placement_digest(spec).unwrap()).collect();
+    save(root, "placement-digests.rows", &digests);
+    let kinds = vec![SessionFenceKind::Created, SessionFenceKind::Cutover, SessionFenceKind::Activated];
+    save(root, "session-fence-kinds.rows", &kinds);
+    let fences: Vec<_> = kinds.iter().flat_map(|kind| [0, 1, u64::MAX].map(|n| SessionFence { kind: *kind, ledger: ledger(u128::from(n)), log_group: LogGroupId::from_u128(u128::from(n)), operation: OperationId::from_u128(u128::from(n)), sequence: SessionSeq(n), index: RaftIndex(n), term: RaftTerm(n), from_route: RouteEpoch(n), to_route: RouteEpoch(n), membership_epoch: n, placement_epoch: n, placement_digest: hash(33), record_hash: hash(34) })).collect();
+    save(root, "session-fences.rows", &fences);
+    let ready: Vec<_> = [0, 1, u64::MAX].into_iter().map(|n| ReplicaReady { ledger: ledger(u128::from(n)), operation: OperationId::from_u128(u128::from(n)), route_epoch: RouteEpoch(n), node: n, node_generation: n, through: SessionSeq(n), custody: hash(40), attestation: hash(41) }).collect();
+    save(root, "replica-ready.rows", &ready);
+    let delegations: Vec<_> = ranges.iter().enumerate().map(|(index, namespace)| DelegationFence { cluster: ClusterId::from_u128(index as u128), operation: OperationId::from_u128(u128::MAX), source: PartitionId::from_u128(3), destination: PartitionId::from_u128(4), namespace: *namespace, from_epoch: 0, to_epoch: u64::MAX, sealed_revision: 128, checkpoint: hash(50), destination_ready: hash(51) }).collect();
+    save(root, "delegation-fences.rows", &delegations);
+
+    // Distinct per-field sentinels detect swaps between fields sharing a type.
+    save(root, "distinct-node-load.bin", &NodeLoad { node: 11, generation: 12, report: 13, available_memory: 14, active_weight: 15 });
+    save(root, "distinct-node-enrollment.bin", &NodeEnrollment { node: 11, generation: 12, region: RegionId::from_u128(13), zone: ZoneId::from_u128(14), endpoint: "quic://original.example:15".into(), identity: hash(16), authority_epoch: 17, attestation: hash(18), eligible: true });
+    save(root, "distinct-session-fence.bin", &SessionFence { kind: SessionFenceKind::Activated, ledger: ledger(11), log_group: LogGroupId::from_u128(13), operation: OperationId::from_u128(14), sequence: SessionSeq(15), index: RaftIndex(16), term: RaftTerm(17), from_route: RouteEpoch(18), to_route: RouteEpoch(19), membership_epoch: 20, placement_epoch: 21, placement_digest: hash(22), record_hash: hash(23) });
+    save(root, "distinct-replica-ready.bin", &ReplicaReady { ledger: ledger(11), operation: OperationId::from_u128(13), route_epoch: RouteEpoch(14), node: 15, node_generation: 16, through: SessionSeq(17), custody: hash(18), attestation: hash(19) });
+    save(root, "distinct-delegation-fence.bin", &DelegationFence { cluster: ClusterId::from_u128(11), operation: OperationId::from_u128(12), source: PartitionId::from_u128(13), destination: PartitionId::from_u128(14), namespace: NamespaceRange { start: NamespaceKey::of(ledger(15)), end: Some(NamespaceKey::of(ledger(17))) }, from_epoch: 19, to_epoch: 20, sealed_revision: 21, checkpoint: hash(22), destination_ready: hash(23) });
+
+    // Crafted inputs, not output claimed to originate from a canonical map/set
+    // writer. Normalized files come from original live decode then live encode.
+    #[derive(Serialize)]
+    struct RawPlacement { voters: Vec<(u64,u64)>, materializers: Vec<(u64,u64)>, content_copies: Vec<(u64,u64)>, preferred_leader: u64 }
+    let value = RawPlacement { voters: vec![(9, 1), (1, 2), (9, 3)], materializers: vec![(2, 8), (0, 9)], content_copies: vec![(3, 5), (3, 6)], preferred_leader: 9 };
+    save(root, "unsorted-duplicate-placement.input", &value);
+    let decoded: Placement = postcard::from_bytes(&postcard::to_stdvec(&value).unwrap()).unwrap();
+    save(root, "unsorted-duplicate-placement.normalized", &decoded);
+    #[derive(Serialize)]
+    struct RawPolicy { durability: DurabilityIntent, residency: Vec<RegionId>, home_regions: Vec<RegionId>, required_memory: u64 }
+    let value = RawPolicy { durability: intents[0], residency: [9, 1, 9].into_iter().map(RegionId::from_u128).collect(), home_regions: [9, 2, 9].into_iter().map(RegionId::from_u128).collect(), required_memory: 3 };
+    save(root, "unsorted-duplicate-policy.input", &value);
+    let decoded: PlacementPolicy = postcard::from_bytes(&postcard::to_stdvec(&value).unwrap()).unwrap();
+    save(root, "unsorted-duplicate-policy.normalized", &decoded);
+}

@@ -9,6 +9,12 @@
     clippy::disallowed_macros
 )]
 //! Contracted network CLI, real child processes and durable private join state.
+#[path = "support/cli_client_context.rs"]
+mod client_context;
+#[path = "support/cli_cluster.rs"]
+mod cluster;
+#[path = "support/cli_replicas.rs"]
+mod replicas;
 use focal_node::network_join::NodeInvitation;
 use serde_json::{Value, json};
 use std::{
@@ -39,7 +45,7 @@ fn success(root: &Path, args: &[&str]) -> (Value, Output) {
     let output = command(root, args);
     assert!(
         output.status.success(),
-        "{}",
+        "arguments {args:?}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     (serde_json::from_slice(&output.stdout).unwrap(), output)
@@ -197,8 +203,8 @@ fn founder_invite_join_and_network_restart_preserve_identity_without_exposing_se
     assert_eq!(std::fs::read(&invitation).unwrap(), original);
     let (peer_server, _) = start(peer.path(), None);
     assert_eq!(success(peer.path(), &["identity"]).0, joined);
-    // Sharing the original domain IDs must never give this machine the
-    // founder's local Runtime identity or its invitation administration socket.
+    // Every physical owner has local diagnostics. Sharing domain IDs must never
+    // grant the founder's Runtime identity or invitation-signing authority.
     let forged = json!({"protocol":1,"ledger":identity["ledger"],"route_epoch":1,"request_epoch":1,"request_id":vec![41;16],"operation":{"Submit":{"expected_revision":null,"command":{"NegotiateEpoch":{"epoch":1}}}}});
     let file = peer.path().join("forged-runtime.json");
     std::fs::write(&file, serde_json::to_vec(&forged).unwrap()).unwrap();
@@ -207,7 +213,11 @@ fn founder_invite_join_and_network_restart_preserve_identity_without_exposing_se
             .status
             .success()
     );
-    assert!(!peer.path().join("focal-admin.sock").exists());
+    assert!(peer.path().join("focal-admin.sock").exists());
+    assert_eq!(
+        success(peer.path(), &["cluster", "node", "identity"]).0["result"]["identity"]["node"],
+        joined["node"]
+    );
     let refused = command(
         peer.path(),
         &[
@@ -221,6 +231,7 @@ fn founder_invite_join_and_network_restart_preserve_identity_without_exposing_se
     );
     assert!(!refused.status.success());
     assert_redacted(&refused, &token);
+    assert!(!peer.path().join("forged.invite").exists());
     drop(peer_server);
     let (_peer_server, _) = start(peer.path(), None);
     assert_eq!(success(peer.path(), &["identity"]).0, joined);

@@ -31,14 +31,15 @@ focal-stream = { version = "0.1.0", path = "../focal-stream" }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 blake3.workspace = true
 clap.workspace = true
+clap_complete = "=4.6.6"
 getrandom.workspace = true
 fs2.workspace = true
 postcard.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_saphyr.workspace = true
+serde_saphyr = { workspace = true, features = ["serialize"] }
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-std"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 # Listener shutdown observes the final runtime owner. Reaudit Quinn's endpoint/
 # connection socket-before-runtime drop ordering before changing this version.

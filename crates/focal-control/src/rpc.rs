@@ -13,6 +13,20 @@ pub enum ControlRead {
     /// Trusted controller view: both exports describe one exact applied prefix.
     /// This compound selector is excluded from Node-only PeerControl ingress.
     StateAndAuthority,
+    InvitationPage {
+        after: Option<[u8; 16]>,
+        limit: u16,
+        expected_revision: Option<u64>,
+    },
+    Invitation {
+        id: [u8; 16],
+    },
+    PrepareRevocation {
+        id: [u8; 16],
+    },
+    AdminReceipt {
+        id: ControlRequestId,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(
@@ -43,7 +57,14 @@ impl ControlRpc {
             return Err(ControlError::Invalid);
         }
         let query = decode(rest, limit)?;
-        if matches!(query, ControlRead::StateAndAuthority) {
+        if matches!(
+            query,
+            ControlRead::StateAndAuthority
+                | ControlRead::InvitationPage { .. }
+                | ControlRead::Invitation { .. }
+                | ControlRead::PrepareRevocation { .. }
+                | ControlRead::AdminReceipt { .. }
+        ) {
             return Err(ControlError::Invalid);
         }
         Ok(query)
@@ -80,6 +101,24 @@ pub enum ControlReadResult {
     StateAndAuthority {
         snapshot: Box<ControlSnapshot>,
         authority: Option<ControlAuthoritySnapshot>,
+    },
+    Invitations {
+        identity: ControlIdentity,
+        applied_index: u64,
+        revision: u64,
+        entries: Vec<focal_enrollment::InvitationStatus>,
+        next: Option<[u8; 16]>,
+    },
+    PreparedRevocation {
+        identity: ControlIdentity,
+        applied_index: u64,
+        invitation: [u8; 16],
+        command: focal_enrollment::EnrollmentCommand,
+    },
+    AdminReceipt {
+        configuration: ControlConfiguration,
+        enrollment_revision: u64,
+        receipt: Option<ControlReceipt>,
     },
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -244,5 +283,37 @@ mod tests {
             ControlRpc::decode_read_only(&[1; 65], 64),
             Err(ControlError::Capacity)
         ));
+        for (tag, query) in [
+            (
+                7,
+                ControlRead::InvitationPage {
+                    after: None,
+                    limit: 1,
+                    expected_revision: None,
+                },
+            ),
+            (8, ControlRead::Invitation { id: [1; 16] }),
+            (9, ControlRead::PrepareRevocation { id: [1; 16] }),
+            (
+                10,
+                ControlRead::AdminReceipt {
+                    id: ControlRequestId {
+                        client: [1; 16],
+                        sequence: 1,
+                    },
+                },
+            ),
+        ] {
+            let bytes = ControlRpc::Read(query.clone()).encode(128).unwrap();
+            assert_eq!(bytes.get(..2), Some([1, tag].as_slice()));
+            assert_eq!(
+                ControlRpc::decode(&bytes, 128).unwrap(),
+                ControlRpc::Read(query)
+            );
+            assert!(matches!(
+                ControlRpc::decode_read_only(&bytes, 128),
+                Err(ControlError::Invalid)
+            ));
+        }
     }
 }
