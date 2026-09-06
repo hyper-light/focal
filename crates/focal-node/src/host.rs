@@ -401,6 +401,7 @@ fn dispatch(
             | Operation::Control { .. }
             | Operation::PeerControl { .. }
             | Operation::NodeContact { .. }
+            | Operation::EnrollmentControl { .. }
             | Operation::Custody(_) => Err(AccessError::UnsupportedOperation),
         }
     };

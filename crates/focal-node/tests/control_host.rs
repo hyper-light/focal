@@ -253,6 +253,37 @@ fn registry(snapshot: &ControlSnapshot) -> EnrollmentRegistry {
     };
     EnrollmentRegistry::restore(enrollment, CLUSTER, EnrollmentLimits::default()).unwrap()
 }
+
+#[tokio::test]
+async fn directory_bootstrap_authorization_requires_a_fresh_root_quorum() {
+    use focal_node::directory_bootstrap::{DirectoryBootstrapError, FirstDirectoryPlan};
+    let directory = tempfile::tempdir().unwrap();
+    let authority = BootstrapAuthority::open_or_create(
+        directory.path().join("ca"),
+        CLUSTER,
+        vec!["localhost".into()],
+        now(),
+    )
+    .unwrap();
+    let mut rig = Rig::new(root_bootstrap(&authority), GROUP);
+    let leader = rig.leader(0).await;
+    let plan = FirstDirectoryPlan::derive(CLUSTER, 1).unwrap();
+    // The quorum is live, but no real delegation/grant exists in this root.
+    assert!(matches!(
+        rig.hosts[leader].prepare_directory(plan).await,
+        Err(DirectoryBootstrapError::Unauthorized)
+    ));
+    let old_leader = rig.hosts[leader].progress().node;
+    rig.isolated.store(old_leader, Ordering::SeqCst);
+    // Even denial must be evaluated behind this request's new barrier. A
+    // previously completed read cannot authorize a later startup request.
+    assert!(matches!(
+        rig.hosts[leader].prepare_directory(plan).await,
+        Err(DirectoryBootstrapError::Unavailable)
+    ));
+    rig.isolated.store(0, Ordering::SeqCst);
+    rig.stop().await;
+}
 fn join_request(
     authority: &BootstrapAuthority,
     invitation: &Invitation,
@@ -676,6 +707,217 @@ async fn owned_control_response_retains_input_and_export_budgets_until_delivery_
     owner.join().unwrap();
 }
 
+#[tokio::test]
+async fn follower_root_observation_exports_one_durable_prefix_and_retains_delivery_budget_after_stop()
+ {
+    let data = tempfile::tempdir().unwrap();
+    let authority = BootstrapAuthority::open_or_create(
+        data.path().join("ca"),
+        CLUSTER,
+        vec!["localhost".into()],
+        now(),
+    )
+    .unwrap();
+    let key = JoinKey::open_or_create(data.path().join("key"), CLUSTER).unwrap();
+    let founder = FoundingEnrollmentDraft::open_or_create(
+        data.path().join("founder"),
+        &authority,
+        &key,
+        1,
+        OPERATOR,
+        EnrollmentLimits::default(),
+        now(),
+    )
+    .unwrap();
+    let root = RootDirectory::new(ClusterId(CLUSTER), RootConfig::default(), budget()).unwrap();
+    let bootstrap = ControlBootstrap::root(&root, founder.registry()).unwrap();
+    let options = ControlOptions::new(NodeConfig::single(1, CLUSTER, GROUP));
+    let path = data.path().join("log");
+    let mut replica =
+        ControlReplica::open(options.clone(), bootstrap.clone(), budget(), &path).unwrap();
+    replica.drain(&RejectUnverifiedEvidence).unwrap();
+    replica.campaign().unwrap();
+    replica.drain(&RejectUnverifiedEvidence).unwrap();
+    let commit = |replica: &mut ControlReplica, request: ControlRequest| {
+        let id = request.id;
+        replica.submit(request, &RejectUnverifiedEvidence).unwrap();
+        for _ in 0..8 {
+            replica.drain(&RejectUnverifiedEvidence).unwrap();
+            if let Some(receipt) = replica.receipt(id).unwrap() {
+                return receipt;
+            }
+        }
+        panic!("single-voter control proposal did not durably publish");
+    };
+    let region = commit(&mut replica, request(1, region(0, 1)));
+    let contact = commit(
+        &mut replica,
+        request(
+            2,
+            ControlCommand::NodeContact(NodeContactCommand {
+                node: 1,
+                principal: OPERATOR,
+                certificate_fingerprint: certificate_fingerprint(&founder.receipt().certificate),
+                advertise: "127.0.0.1:7443".parse().unwrap(),
+                expected_generation: 0,
+                decided_at: now(),
+            }),
+        ),
+    );
+    let configuration = replica.configuration();
+    let membership = commit(
+        &mut replica,
+        request(
+            3,
+            ControlCommand::Membership(ControlMembershipCommand {
+                expected_configuration_index: configuration.configuration_index,
+                expected: configuration.configuration,
+                change: MembershipChange::AddLearner { node: 2 },
+            }),
+        ),
+    );
+    replica.checkpoint().unwrap();
+    drop(replica);
+    // Reopen without campaigning. All exported rows are recovered from disk,
+    // while this owner has no current leader or quorum-read authority.
+    let memory = budget();
+    let replica = ControlReplica::open(options, bootstrap, memory.clone(), &path).unwrap();
+    let mut config = ControlHostConfig::new(namespace());
+    config.tick = Duration::from_secs(1);
+    let (host, owner, outgoing) =
+        ControlHost::spawn(replica, RejectUnverifiedEvidence, config, memory.clone()).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while host.progress().applied_index != membership.committed_index {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(host.progress().leader, 0);
+    assert!(matches!(
+        host.read(
+            peer(PeerRole::Node { node_id: 1 }),
+            RequestId::from_u128(90),
+            ControlRead::State
+        )
+        .await,
+        Err(ControlFailure::NotLeader { .. })
+    ));
+    let before = memory.stats();
+    let exhausted = memory
+        .reserve(
+            focal_memory::BudgetKind::Control,
+            focal_memory::BudgetLane::Completion,
+            before.limit - before.used,
+        )
+        .unwrap()
+        .commit();
+    assert!(matches!(
+        host.observe_root().await,
+        Err(ControlFailure::Capacity)
+    ));
+    drop(exhausted);
+    assert_eq!(
+        memory.stats().by_kind[focal_memory::BudgetKind::Control as usize],
+        before.by_kind[focal_memory::BudgetKind::Control as usize]
+    );
+    let mut cancelled = Box::pin(host.observe_root());
+    drop(std::future::Future::poll(
+        cancelled.as_mut(),
+        &mut std::task::Context::from_waker(std::task::Waker::noop()),
+    ));
+    drop(cancelled);
+    // The FIFO barrier also covers an observation whose receiver disappeared
+    // before delivery; neither input nor exported state may leak its allowance.
+    drop(host.observe_root().await.unwrap());
+    assert_eq!(
+        memory.stats().by_kind[focal_memory::BudgetKind::Control as usize],
+        before.by_kind[focal_memory::BudgetKind::Control as usize]
+    );
+    let mut pending = Box::pin(host.observe_root());
+    let immediate = match std::future::Future::poll(
+        pending.as_mut(),
+        &mut std::task::Context::from_waker(std::task::Waker::noop()),
+    ) {
+        std::task::Poll::Ready(result) => Some(result.unwrap()),
+        std::task::Poll::Pending => None,
+    };
+    // A second FIFO observation proves the first was delivered. Keep it in
+    // its unpolled oneshot unless the owner already won the first poll race.
+    let delivered = host.observe_root().await.unwrap();
+    assert_eq!(
+        delivered.snapshot().applied_index,
+        membership.committed_index
+    );
+    assert_eq!(
+        delivered.contacts().applied_index,
+        delivered.snapshot().applied_index
+    );
+    assert_eq!(
+        delivered.configuration().applied_index,
+        delivered.snapshot().applied_index
+    );
+    assert_eq!(delivered.contacts().identity, delivered.snapshot().identity);
+    assert_eq!(
+        delivered.configuration().identity,
+        delivered.snapshot().identity
+    );
+    assert_eq!(delivered.snapshot().revisions.root, region.revisions.root);
+    assert_eq!(delivered.snapshot().revisions.enrollment, 1);
+    assert_eq!(registry(delivered.snapshot()).enrollments().count(), 1);
+    assert_eq!(delivered.contacts().contacts.records.len(), 1);
+    assert_eq!(
+        delivered.contacts().contacts.records[0].committed_index,
+        contact.committed_index
+    );
+    assert_eq!(
+        delivered.contacts().contacts.records[0].advertise,
+        "127.0.0.1:7443".parse().unwrap()
+    );
+    assert_eq!(
+        delivered.configuration().configuration_index,
+        membership.committed_index
+    );
+    assert_eq!(delivered.configuration().configuration.voters, vec![1]);
+    assert_eq!(delivered.configuration().configuration.learners, vec![2]);
+    let two = memory.stats();
+    assert!(
+        two.by_kind[focal_memory::BudgetKind::Control as usize]
+            > before.by_kind[focal_memory::BudgetKind::Control as usize]
+    );
+    drop(delivered);
+    let queued = memory.stats();
+    assert!(queued.used > before.used);
+    assert!(queued.used < two.used);
+    host.stop().await.unwrap();
+    owner.join().unwrap();
+    drop(outgoing);
+    let stopped = memory.stats();
+    assert!(
+        stopped.used > 0,
+        "unconsumed oneshot lost its exported-state reservation"
+    );
+    let observation = match immediate {
+        Some(value) => value,
+        None => pending.await.unwrap(),
+    };
+    assert_eq!(
+        memory.stats(),
+        stopped,
+        "delivery itself must not release the reservation"
+    );
+    assert_eq!(
+        observation.contacts().contacts.records[0].committed_index,
+        contact.committed_index
+    );
+    assert_eq!(
+        observation.configuration().configuration_index,
+        membership.committed_index
+    );
+    drop(observation);
+    assert_eq!(memory.stats().used, 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn membership_requires_runtime_and_returns_only_committed_configuration_receipts() {
     let keys = tempfile::tempdir().unwrap();
@@ -805,4 +1047,82 @@ async fn membership_requires_runtime_and_returns_only_committed_configuration_re
     let next = rig.leader(rig.hosts[leader].progress().node).await;
     assert_eq!(rig.hosts[next].progress().node, target);
     rig.stop().await;
+}
+
+#[tokio::test]
+async fn recovered_control_events_are_forwarded_once_and_keep_frames_charged_after_owner_stop() {
+    use focal_consensus::PbMessageExt;
+    let data = tempfile::tempdir().unwrap();
+    let authority = BootstrapAuthority::open_or_create(
+        data.path().join("ca"),
+        CLUSTER,
+        vec!["localhost".into()],
+        now(),
+    )
+    .unwrap();
+    let memory = budget();
+    let options = ControlOptions::new(NodeConfig::joining(
+        1,
+        CLUSTER,
+        GROUP,
+        vec![1, 2, 3],
+        vec![],
+    ));
+    let mut replica = ControlReplica::open(
+        options,
+        root_bootstrap(&authority),
+        memory.clone(),
+        data.path().join("log"),
+    )
+    .unwrap();
+    replica.drain(&RejectUnverifiedEvidence).unwrap();
+    replica.campaign().unwrap();
+    let initial = replica.drain(&RejectUnverifiedEvidence).unwrap();
+    // Use real raft-rs campaign output, already drained by a trusted startup
+    // owner. It must survive handoff even though RawNode no longer owns Ready.
+    let mut expected: Vec<_> = initial
+        .messages
+        .iter()
+        .map(|message| (message.to, message.write_to_bytes().unwrap()))
+        .collect();
+    expected.sort();
+    assert!(!expected.is_empty());
+    let mut config = ControlHostConfig::new(namespace());
+    config.tick = Duration::from_secs(1);
+    let (host, owner, mut outgoing) = ControlHost::spawn_recovered(
+        replica,
+        RejectUnverifiedEvidence,
+        config,
+        memory.clone(),
+        initial,
+    )
+    .unwrap();
+    let mut frames = Vec::new();
+    let mut actual = Vec::new();
+    for _ in 0..expected.len() {
+        let frame = tokio::time::timeout(Duration::from_secs(3), outgoing.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let Operation::Raft { group, message } = &frame.request.operation else {
+            panic!("replication frame");
+        };
+        assert_eq!(*group, GROUP);
+        actual.push((frame.target, message.clone()));
+        frames.push(frame);
+    }
+    actual.sort();
+    assert_eq!(actual, expected);
+    // An observation forces a later drain; it must not replay the initial batch.
+    drop(host.observe_root().await.unwrap());
+    assert!(matches!(
+        outgoing.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    host.stop().await.unwrap();
+    owner.join().unwrap();
+    drop(outgoing);
+    assert!(memory.stats().by_kind[focal_memory::BudgetKind::Control as usize] > 0);
+    drop(frames);
+    assert_eq!(memory.stats().used, 0);
 }

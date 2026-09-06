@@ -7,6 +7,8 @@ use focal_directory::{
     WorkMetadata,
 };
 use std::collections::BTreeMap;
+#[path = "fleet_management.rs"]
+pub(super) mod management;
 
 const QUEUED: usize = 1024;
 const RESERVED: usize = 128;
@@ -49,8 +51,13 @@ impl FleetReplication {
 }
 pub(super) struct Routed {
     pub ledger: LedgerId,
+    pub incarnation: u64,
     pub work: Work,
     pub _slot: Allocation,
+}
+pub(super) enum FleetInput {
+    Routed(Routed),
+    Management(management::ManagementWork),
 }
 pub(super) fn lane(work: &Work) -> BudgetLane {
     match class(work) {
@@ -60,7 +67,11 @@ pub(super) fn lane(work: &Work) -> BudgetLane {
 }
 fn class(work: &Work) -> WorkClass {
     match work {
-        Work::Stop(_) | Work::Transfer(..) | Work::Membership(..) => WorkClass::Control,
+        Work::Stop(_)
+        | Work::Transfer(..)
+        | Work::Membership(..)
+        | Work::Placement(..)
+        | Work::Evidence(..) => WorkClass::Control,
         Work::Probe(request, ..) if completion_request(request) => WorkClass::Completion,
         Work::Probe(..) => WorkClass::Query,
         Work::Request(request, ..) => match request.verified.request().operation {
@@ -98,7 +109,7 @@ impl ReplicaFleet {
         let allocation = budget
             .reserve(BudgetKind::Control, BudgetLane::Completion, bookkeeping)?
             .commit();
-        let shared_bytes = size_of::<Routed>()
+        let shared_bytes = size_of::<FleetInput>()
             .checked_add(size_of::<ReplicationFrame>())
             .and_then(|size| size.checked_add(128))
             .and_then(|size| QUEUED.checked_mul(size))
@@ -172,6 +183,10 @@ impl ReplicaFleet {
             .session
             .cluster_id();
         for replica in replicas {
+            let incarnation = u64::try_from(handles.len())
+                .ok()
+                .and_then(|count| count.checked_add(1))
+                .ok_or(LedgerError::Capacity)?;
             let writer = replica.session.shared_wal();
             if !wal_owners
                 .iter()
@@ -196,6 +211,7 @@ impl ReplicaFleet {
             let slots = items.child(replica.config.queue_items, replica.config.queue_items / 4)?;
             let sender = HostSender::Group {
                 ledger,
+                incarnation,
                 sender: sender.clone(),
                 slots,
                 _backing: backing.clone(),
@@ -210,6 +226,7 @@ impl ReplicaFleet {
                 outbound.clone(),
             )?;
             owner.nonblocking = true;
+            owner.incarnation = incarnation;
             owner.next_tick = now;
             owner.wake_at = now;
             handles.insert(ledger, host);
@@ -221,6 +238,7 @@ impl ReplicaFleet {
             deadlines,
             scheduler,
             nonce: 0,
+            management: None,
             _wal_owners: wal_owners,
             _allocation: allocation,
             _backing: backing.clone(),
@@ -245,6 +263,7 @@ struct GroupOwner {
     deadlines: BTreeMap<(Instant, LedgerId), ()>,
     scheduler: FairScheduler<Option<Routed>>,
     nonce: u128,
+    management: Option<management::ManagementOwner>,
     // Physical writers outlive every logical-session removal. A final handle
     // may join its disk thread only after the entire fleet has stopped; one
     // stalled session cannot block another by dropping the last writer handle.
@@ -253,7 +272,7 @@ struct GroupOwner {
     _backing: std::sync::Arc<Allocation>,
 }
 impl GroupOwner {
-    fn run(mut self, receiver: mpsc::Receiver<Routed>) {
+    fn run(mut self, receiver: mpsc::Receiver<FleetInput>) {
         let result = self.run_inner(receiver);
         if let Err(error) = result {
             use std::io::Write as _;
@@ -265,13 +284,18 @@ impl GroupOwner {
         for owner in self.sessions.values_mut() {
             owner.close();
         }
+        if let Some(management) = &mut self.management {
+            management.publish(self.sessions.len(), true);
+        }
     }
     fn stop_session(&mut self, ledger: LedgerId) {
         if let Some(mut owner) = self.sessions.remove(&ledger) {
+            self.deadlines.remove(&(owner.wake_at, ledger));
             owner.close();
         }
-        // Its timer is removed when it next becomes due. It cannot authorize
-        // another session or keep a stopped owner alive.
+        if let Some(management) = &mut self.management {
+            management.publish(self.sessions.len(), false);
+        }
     }
     fn reschedule(&mut self, ledger: LedgerId) -> Result<(), LedgerError> {
         if let Some(owner) = self.sessions.get_mut(&ledger) {
@@ -286,6 +310,9 @@ impl GroupOwner {
         let Some(owner) = self.sessions.get_mut(&routed.ledger) else {
             return Ok(());
         };
+        if owner.incarnation != routed.incarnation {
+            return Ok(());
+        }
         if let Work::Stop(response) = routed.work {
             // Shutdown intent does not mutate Raft. Admit it even while that
             // session's retained Ready fences ordinary/control state changes,
@@ -301,7 +328,9 @@ impl GroupOwner {
         let cost = match &routed.work {
             Work::Request(_, _, charge)
             | Work::Probe(_, _, charge)
-            | Work::Membership(_, charge) => charge.bytes().clamp(1, 65536) as u64,
+            | Work::Membership(_, charge)
+            | Work::Placement(_, charge)
+            | Work::Evidence(_, charge) => charge.bytes().clamp(1, 65536) as u64,
             _ => 1,
         };
         let metadata = WorkMetadata {
@@ -320,9 +349,30 @@ impl GroupOwner {
         let _ = self.scheduler.enqueue(metadata, Some(routed), 0);
         Ok(())
     }
-    fn run_inner(&mut self, receiver: mpsc::Receiver<Routed>) -> Result<(), LedgerError> {
+    fn input(&mut self, input: FleetInput) -> Result<bool, LedgerError> {
+        match input {
+            FleetInput::Routed(routed) => {
+                self.enqueue(routed)?;
+                Ok(false)
+            }
+            FleetInput::Management(work) => {
+                let Some(mut management) = self.management.take() else {
+                    return Ok(false);
+                };
+                let stop = management.handle(self, work);
+                self.management = Some(management);
+                Ok(stop)
+            }
+        }
+    }
+    fn run_inner(&mut self, receiver: mpsc::Receiver<FleetInput>) -> Result<(), LedgerError> {
         loop {
-            if self.sessions.is_empty() {
+            if self
+                .management
+                .as_ref()
+                .is_some_and(|owner| !owner.has_manager())
+                || (self.sessions.is_empty() && self.management.is_none())
+            {
                 return Ok(());
             }
             for _ in 0..SLICE {
@@ -342,7 +392,11 @@ impl GroupOwner {
             }
             for _ in 0..SLICE {
                 match receiver.try_recv() {
-                    Ok(routed) => self.enqueue(routed)?,
+                    Ok(input) => {
+                        if self.input(input)? {
+                            return Ok(());
+                        }
+                    }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
                 }
@@ -362,6 +416,9 @@ impl GroupOwner {
                     ScheduleOutcome::Work(mut dispatch) => {
                         let routed = dispatch.payload_mut().take().ok_or(LedgerError::Corrupt)?;
                         if let Some(owner) = self.sessions.get_mut(&routed.ledger) {
+                            if owner.incarnation != routed.incarnation {
+                                continue;
+                            }
                             match owner.accept(routed.work) {
                                 Ok(false) => self.reschedule(routed.ledger)?,
                                 Ok(true) | Err(_) => self.stop_session(routed.ledger),
@@ -395,7 +452,11 @@ impl GroupOwner {
                 .unwrap_or(Duration::from_millis(100))
                 .min(Duration::from_millis(100));
             match receiver.recv_timeout(wait) {
-                Ok(routed) => self.enqueue(routed)?,
+                Ok(input) => {
+                    if self.input(input)? {
+                        return Ok(());
+                    }
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
             }

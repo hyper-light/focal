@@ -46,6 +46,8 @@ and joins the writer before releasing the directory lock. Its single `Arc`
 exists only for this shared lifecycle across independent group owners; disk
 state has no mutex.
 
+`SharedWal::writer_id` exposes an opaque, process-local `WalWriterId` minted by the existing checked `OwnerId` counter. Managed owners use it to admit sessions only from a pre-retained physical writer set. It is neither a disk identity nor a serialized authority, and it introduces no shared allocation.
+
 The disk thread has an explicit 2MiB stack reservation. Checked container-size
 calculations cover the bounded ingress queue and concurrent batching metadata.
 

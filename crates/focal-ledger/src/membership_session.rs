@@ -124,6 +124,9 @@ impl Session {
         if self.membership_receipt(request)?.is_some() {
             return Ok(());
         }
+        if self.pending_placement.is_some() || self.placement_state.paused() {
+            return Err(LedgerError::Capacity);
+        }
         if request.expected_index != self.membership_state.configuration_index {
             return Err(LedgerError::MembershipConflict);
         }

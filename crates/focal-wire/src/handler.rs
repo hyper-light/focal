@@ -186,6 +186,7 @@ pub fn validate_response(
                 Operation::Control { .. }
                     | Operation::PeerControl { .. }
                     | Operation::NodeContact { .. }
+                    | Operation::EnrollmentControl { .. }
             ) || response.is_empty()
             {
                 return Err(WireError::InvalidFrame);

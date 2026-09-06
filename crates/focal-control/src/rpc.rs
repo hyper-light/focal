@@ -10,6 +10,9 @@ pub enum ControlRead {
     Authority,
     Configuration,
     Contacts,
+    /// Trusted controller view: both exports describe one exact applied prefix.
+    /// This compound selector is excluded from Node-only PeerControl ingress.
+    StateAndAuthority,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(
@@ -39,7 +42,11 @@ impl ControlRpc {
         if tag != 1 {
             return Err(ControlError::Invalid);
         }
-        decode(rest, limit)
+        let query = decode(rest, limit)?;
+        if matches!(query, ControlRead::StateAndAuthority) {
+            return Err(ControlError::Invalid);
+        }
+        Ok(query)
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +77,10 @@ pub enum ControlReadResult {
     Authority(Option<ControlAuthoritySnapshot>),
     Configuration(ControlConfiguration),
     Contacts(ContactSnapshot),
+    StateAndAuthority {
+        snapshot: Box<ControlSnapshot>,
+        authority: Option<ControlAuthoritySnapshot>,
+    },
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum ControlFailure {
@@ -106,6 +117,11 @@ impl From<ControlError> for ControlFailure {
             ControlError::Capacity
             | ControlError::Busy
             | ControlError::Memory(_)
+            | ControlError::Directory(focal_directory::DirectoryError::Capacity)
+            | ControlError::Directory(focal_directory::DirectoryError::Memory(
+                focal_memory::MemoryError::Capacity { .. }
+                | focal_memory::MemoryError::AllocationFailed,
+            ))
             | ControlError::Consensus(focal_consensus::ConsensusError::Capacity) => Self::Capacity,
             ControlError::Consensus(focal_consensus::ConsensusError::NotLeader { leader }) => {
                 Self::NotLeader { leader }
@@ -159,6 +175,31 @@ impl ControlReply {
 mod tests {
     use super::*;
     #[test]
+    fn directory_capacity_is_retryable_while_invariant_failures_remain_rejections() {
+        for error in [
+            focal_directory::DirectoryError::Capacity,
+            focal_directory::DirectoryError::Memory(focal_memory::MemoryError::Capacity {
+                requested: 4096,
+                available: 0,
+            }),
+            focal_directory::DirectoryError::Memory(focal_memory::MemoryError::AllocationFailed),
+        ] {
+            assert_eq!(
+                ControlFailure::from(ControlError::Directory(error)),
+                ControlFailure::Capacity
+            );
+        }
+        for error in [
+            focal_directory::DirectoryError::Invalid("authority checkpoint"),
+            focal_directory::DirectoryError::Memory(focal_memory::MemoryError::WrongArena),
+        ] {
+            assert_eq!(
+                ControlFailure::from(ControlError::Directory(error)),
+                ControlFailure::Rejected
+            );
+        }
+    }
+    #[test]
     fn peer_selector_preflight_never_decodes_submit_body_and_preserves_wire_ordinals() {
         assert_eq!(
             ControlRpc::Read(ControlRead::State).encode(64).unwrap(),
@@ -173,6 +214,20 @@ mod tests {
         assert_eq!(
             ControlRpc::Read(ControlRead::Authority).encode(64).unwrap(),
             vec![1, 3]
+        );
+        assert_eq!(
+            ControlRpc::Read(ControlRead::StateAndAuthority)
+                .encode(64)
+                .unwrap(),
+            vec![1, 6]
+        );
+        assert!(matches!(
+            ControlRpc::decode_read_only(&[1, 6], 64),
+            Err(ControlError::Invalid)
+        ));
+        assert_eq!(
+            ControlRpc::decode(&[1, 6], 64).unwrap(),
+            ControlRpc::Read(ControlRead::StateAndAuthority)
         );
         assert_eq!(
             ControlRpc::decode_read_only(&[1, 2], 64).unwrap(),

@@ -14,6 +14,8 @@ pub struct RegionRecord {
 pub struct Delegation {
     pub namespace: NamespaceRange,
     pub partition: PartitionId,
+    /// UNKNOWN delegates ownership without asserting geographic placement.
+    /// A known region must exist in the root's committed region registry.
     pub region: RegionId,
     pub log_group: LogGroupId,
     pub epoch: u64,
@@ -296,6 +298,7 @@ fn validate_root(state: &RootCheckpoint, config: RootConfig) -> Result<(), Direc
     }
     for (id, region) in &state.regions {
         if *id != region.id
+            || *id == RegionId::UNKNOWN
             || region.authority_epoch == 0
             || region.label.is_empty()
             || region.label.len() > config.max_label_bytes
@@ -315,7 +318,8 @@ fn validate_root(state: &RootCheckpoint, config: RootConfig) -> Result<(), Direc
         delegation.namespace.validate()?;
         if *start != delegation.namespace.start
             || delegation.epoch == 0
-            || !state.regions.contains_key(&delegation.region)
+            || (delegation.region != RegionId::UNKNOWN
+                && !state.regions.contains_key(&delegation.region))
         {
             return Err(DirectoryError::Invalid("delegation metadata"));
         }

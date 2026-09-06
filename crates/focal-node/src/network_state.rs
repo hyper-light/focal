@@ -113,7 +113,14 @@ pub struct NetworkState {
 }
 impl NetworkState {
     pub fn load(directory: &NodeDirectory) -> Result<Option<Self>, NodeError> {
-        let root = directory.root();
+        Self::load_from(directory.root(), directory.identity())
+    }
+    /// Read-only metadata access for an owned service component. Its physical
+    /// node owner retains the directory LOCK throughout this call and use.
+    pub(crate) fn load_from(
+        root: &Path,
+        identity: &NodeIdentity,
+    ) -> Result<Option<Self>, NodeError> {
         let path = root.join("NETWORK");
         if !path.exists() {
             if root.join("NETWORK.initialized").exists() {
@@ -132,7 +139,7 @@ impl NetworkState {
         if !trailing.is_empty() {
             return Err(NodeError::Identity);
         }
-        state.validate(directory.identity())?;
+        state.validate(identity)?;
         Ok(Some(state))
     }
     pub fn install(&self, directory: &NodeDirectory) -> Result<(), NodeError> {

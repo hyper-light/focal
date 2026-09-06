@@ -714,6 +714,159 @@ fn root_rejects_overlapping_delegations_without_global_session_rows() {
 }
 
 #[test]
+fn unknown_geography_delegates_without_region_rows_and_preserves_transfer_fences() {
+    let cluster = ClusterId::from_u128(1);
+    let mut root = RootDirectory::new(cluster, RootConfig::default(), budget()).unwrap();
+    let mut first = delegation(1, NamespaceRange::all());
+    first.region = RegionId::UNKNOWN;
+    let prepared = root
+        .prepare(
+            &RootCommand {
+                expected_revision: 0,
+                operation: RootOperation::Delegate {
+                    delegation: first.clone(),
+                },
+            },
+            &Evidence,
+        )
+        .unwrap();
+    root.publish(prepared).unwrap();
+    assert!(root.checkpoint().regions.is_empty());
+    let recovered = RootDirectory::restore(
+        postcard::from_bytes(&postcard::to_stdvec(root.checkpoint()).unwrap()).unwrap(),
+        RootConfig::default(),
+        budget(),
+    )
+    .unwrap();
+    assert_eq!(recovered.resolve(ledger(1, 1)), Some(&first));
+
+    let mut source =
+        DirectoryPartition::new(cluster, first, PartitionConfig::default(), budget()).unwrap();
+    let mut node = enrollment(1, 0);
+    node.zone = ZoneId([0; 16]);
+    apply(
+        &mut source,
+        PartitionOperation::Enroll {
+            node,
+            expected_generation: None,
+        },
+    );
+    create(&mut source, ledger(1, 1));
+    for class in [FailureClass::Zone, FailureClass::Region] {
+        let mut unsupported = initial_spec();
+        unsupported.policy.durability.survive = class;
+        assert!(verify_placement(&unsupported, &source.checkpoint().nodes, 31).is_err());
+    }
+    let operation = OperationId::from_u128(3);
+    apply(
+        &mut source,
+        PartitionOperation::SealForTransfer {
+            operation,
+            destination: PartitionId::from_u128(2),
+            next_epoch: 2,
+        },
+    );
+    let checkpoint = source.checkpoint().clone();
+    let mut destination = delegation(2, NamespaceRange::all());
+    destination.region = RegionId::UNKNOWN;
+    destination.epoch = 2;
+    let fence = DelegationFence {
+        cluster,
+        operation,
+        source: PartitionId::from_u128(1),
+        destination: destination.partition,
+        namespace: NamespaceRange::all(),
+        from_epoch: 1,
+        to_epoch: 2,
+        sealed_revision: source.revision(),
+        checkpoint: partition_checkpoint_digest(&checkpoint).unwrap(),
+        destination_ready: VERIFIED,
+    };
+    let transfer = |destination: Delegation, fence: DelegationFence| RootCommand {
+        expected_revision: root.revision(),
+        operation: RootOperation::Transfer {
+            start: NamespaceKey::MIN,
+            expected_epoch: 1,
+            destination,
+            fence,
+        },
+    };
+    let mut forged = fence.clone();
+    forged.destination_ready = ContentHash([1; 32]);
+    assert!(matches!(
+        root.prepare(&transfer(destination.clone(), forged), &Evidence),
+        Err(DirectoryError::UnverifiedAuthority)
+    ));
+    let mut missing_region = destination.clone();
+    missing_region.region = RegionId::from_u128(99);
+    assert!(matches!(
+        root.prepare(&transfer(missing_region, fence.clone()), &Evidence),
+        Err(DirectoryError::Invalid("delegation metadata"))
+    ));
+    let prepared = root
+        .prepare(&transfer(destination, fence), &Evidence)
+        .unwrap();
+    root.publish(prepared).unwrap();
+    let installed = DirectoryPartition::install_transferred(
+        checkpoint,
+        root.resolve(ledger(1, 1)).unwrap().clone(),
+        &Evidence,
+        PartitionConfig::default(),
+        budget(),
+    )
+    .unwrap();
+    assert_eq!(
+        installed.lookup(ledger(1, 1), 2).unwrap().partition,
+        PartitionId::from_u128(2)
+    );
+    assert!(root.checkpoint().regions.is_empty());
+}
+
+#[test]
+fn known_region_delegation_still_requires_registration_and_cas_epochs() {
+    let mut root =
+        RootDirectory::new(ClusterId::from_u128(1), RootConfig::default(), budget()).unwrap();
+    let delegate = |revision| RootCommand {
+        expected_revision: revision,
+        operation: RootOperation::Delegate {
+            delegation: delegation(1, NamespaceRange::all()),
+        },
+    };
+    assert!(matches!(
+        root.prepare(&delegate(0), &Evidence),
+        Err(DirectoryError::Invalid("delegation metadata"))
+    ));
+    let register = |id, expected_epoch, epoch, revision| RootCommand {
+        expected_revision: revision,
+        operation: RootOperation::RegisterRegion {
+            region: RegionRecord {
+                id,
+                label: "region-a".into(),
+                authority_epoch: epoch,
+            },
+            expected_epoch,
+        },
+    };
+    assert!(matches!(
+        root.prepare(&register(RegionId::UNKNOWN, None, 1, 0), &Evidence),
+        Err(DirectoryError::Invalid("region metadata"))
+    ));
+    let region = RegionId::from_u128(1);
+    let prepared = root
+        .prepare(&register(region, None, 1, 0), &Evidence)
+        .unwrap();
+    root.publish(prepared).unwrap();
+    assert!(matches!(
+        root.prepare(&register(region, Some(1), 3, 1), &Evidence),
+        Err(DirectoryError::StaleEpoch)
+    ));
+    let prepared = root.prepare(&delegate(1), &Evidence).unwrap();
+    root.publish(prepared).unwrap();
+    assert_eq!(root.resolve(ledger(1, 1)).unwrap().region, region);
+    assert_eq!(root.checkpoint().regions[&region].authority_epoch, 1);
+}
+
+#[test]
 fn prepared_partition_updates_are_atomic_and_do_not_allocate_at_publication() {
     let allowance = budget();
     let mut directory = partition(allowance.clone(), 1, NamespaceRange::all());
@@ -808,4 +961,103 @@ fn recovery_rejects_malformed_pending_fences_and_checkpoint_epochs() {
         DirectoryPartition::restore(malformed, PartitionConfig::default(), budget()),
         Err(DirectoryError::Phase)
     ));
+}
+
+#[test]
+fn empty_domain_placement_uses_increasing_raft_fences_without_invented_mutations() {
+    let mut directory = partition(budget(), 1, NamespaceRange::all());
+    nodes(&mut directory);
+    let session = ledger(7, 9);
+    let spec = initial_spec();
+    let mut created = fence(&spec, SessionFenceKind::Created, session, 1, 0, 1);
+    created.index = RaftIndex(10);
+    apply(
+        &mut directory,
+        PartitionOperation::CreateSession {
+            ledger: session,
+            log_group: created.log_group,
+            placement: spec.clone(),
+            authority: created,
+        },
+    );
+    change(
+        &mut directory,
+        session,
+        SessionChange::Plan {
+            operation: OperationId::from_u128(2),
+            desired: spec.clone(),
+        },
+    );
+    change(
+        &mut directory,
+        session,
+        SessionChange::BeginPreparation {
+            operation: OperationId::from_u128(2),
+        },
+    );
+    let mut cutover = fence(&spec, SessionFenceKind::Cutover, session, 2, 0, 2);
+    cutover.membership_epoch = 1;
+    cutover.index = RaftIndex(11);
+    let mut stale = cutover.clone();
+    stale.index = RaftIndex(10);
+    assert!(matches!(
+        attempt(
+            &directory,
+            session,
+            SessionChange::Cutover {
+                operation: OperationId::from_u128(2),
+                authority: stale
+            }
+        ),
+        Err(DirectoryError::StaleEpoch)
+    ));
+    change(
+        &mut directory,
+        session,
+        SessionChange::Cutover {
+            operation: OperationId::from_u128(2),
+            authority: cutover,
+        },
+    );
+    change(
+        &mut directory,
+        session,
+        SessionChange::Ready {
+            ready: ReplicaReady {
+                ledger: session,
+                operation: OperationId::from_u128(2),
+                route_epoch: RouteEpoch(2),
+                node: 1,
+                node_generation: 1,
+                through: SessionSeq(0),
+                custody: VERIFIED,
+                attestation: VERIFIED,
+            },
+        },
+    );
+    let mut activated = fence(&spec, SessionFenceKind::Activated, session, 2, 0, 2);
+    activated.membership_epoch = 1;
+    activated.index = RaftIndex(12);
+    change(
+        &mut directory,
+        session,
+        SessionChange::Activate {
+            operation: OperationId::from_u128(2),
+            authority: activated,
+        },
+    );
+    assert_eq!(
+        directory.get(session).unwrap().unwrap().authority.sequence,
+        SessionSeq(0)
+    );
+    let recovered = DirectoryPartition::restore(
+        directory.checkpoint().clone(),
+        PartitionConfig::default(),
+        budget(),
+    )
+    .unwrap();
+    assert_eq!(
+        recovered.get(session).unwrap().unwrap().route_epoch,
+        RouteEpoch(2)
+    );
 }

@@ -235,8 +235,18 @@ impl AuthorityRegistry {
         }
         let extra = match &command.operation {
             AuthorityOperation::AdvanceClock => 0,
-            AuthorityOperation::GrantNode { grant, .. } => {
+            AuthorityOperation::GrantNode {
+                grant,
+                expected_generation,
+            } => {
                 validate_node_shape(grant, self.config, true)?;
+                let old = self.root.state.nodes.get(&grant.enrollment.node);
+                if old.map(|entry| entry.enrollment.generation) != *expected_generation {
+                    return Err(DirectoryError::CompareFailed);
+                }
+                if old.is_none() && self.root.state.nodes.len() >= self.config.max_nodes {
+                    return Err(DirectoryError::Capacity);
+                }
                 add(
                     tree_row::<(u64, NodeTopologyGrant)>(),
                     grant.enrollment.endpoint.capacity(),
@@ -244,6 +254,11 @@ impl AuthorityRegistry {
             }
             AuthorityOperation::BootstrapGroup { grant } => {
                 validate_group_shape(grant, &self.root.state.anchor, self.config)?;
+                if !self.root.state.groups.contains_key(&grant.group)
+                    && self.root.state.groups.len() >= self.config.max_groups
+                {
+                    return Err(DirectoryError::Capacity);
+                }
                 group_charge(grant)?
             }
             AuthorityOperation::ChangeGroup { proof } => {
@@ -427,8 +442,10 @@ fn validate_node_shape(
     let n = &grant.enrollment;
     if n.node == 0
         || n.generation == 0
-        || n.region.0 == [0; 16]
-        || n.zone.0 == [0; 16]
+        // Zero means unknown geography. Node-level placement needs no invented
+        // region/zone facts; geographic promises still reject these sentinels.
+        || (n.region.0 == [0; 16] && n.zone.0 != [0; 16])
+        || (n.region.0 == [0; 16] && n.authority_epoch != 1)
         || n.authority_epoch == 0
         || n.endpoint.is_empty()
         || n.endpoint.len() > config.max_endpoint_bytes

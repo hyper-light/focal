@@ -15,6 +15,28 @@ pub const MAX_TRANSFER_MANIFEST_BYTES: usize = 1024 * 1024;
 pub const MAX_TRANSFER_CONTENT_BYTES: u64 =
     (MAX_TRANSFER_MANIFEST_BYTES as u64 / 33) * MAX_TRANSFER_CHUNK_BYTES as u64;
 
+/// Immutable local records used by the custody owner. Writing a record alone
+/// grants no readiness authority; that owner must verify its bound contents.
+#[derive(Debug, Clone, Copy)]
+pub enum CustodyRecordKind {
+    Checkpoint,
+    Manifest,
+}
+impl CustodyRecordKind {
+    fn directory(self) -> &'static str {
+        match self {
+            Self::Checkpoint => "checkpoints",
+            Self::Manifest => "custody",
+        }
+    }
+    fn limit(self) -> usize {
+        match self {
+            Self::Checkpoint => 8 * 1024 * 1024,
+            Self::Manifest => 16 * 1024,
+        }
+    }
+}
+
 #[path = "transfer.rs"]
 mod transfer;
 pub use transfer::TransferManifest;
@@ -187,6 +209,8 @@ impl ContentStore {
         })?;
         durable_directory(&root.join("staging"))?;
         durable_directory(&root.join("objects"))?;
+        durable_directory(&root.join("checkpoints"))?;
+        durable_directory(&root.join("custody"))?;
         let mut store = Self {
             root,
             limits,
@@ -206,6 +230,8 @@ impl ContentStore {
             }
         }
         sync_directory(&store.root.join("objects"))?;
+        sync_directory(&store.root.join("checkpoints"))?;
+        sync_directory(&store.root.join("custody"))?;
         sync_directory(&store.root.join("staging"))?;
         // Re-sync created ancestors left visible by a previous mkdir/sync
         // failure; filesystem root itself is not a newly created entry.
@@ -217,6 +243,54 @@ impl ContentStore {
             }
         }
         Ok(store)
+    }
+
+    /// Content-addressed immutable custody metadata. The caller reserves read
+    /// scratch up to the kind's format bound before retrying an existing record.
+    /// Records are retained across reopen and are never removed by upload or
+    /// transfer expiration. A failed write cannot return a durable record hash.
+    pub fn install_custody_record(
+        &mut self,
+        kind: CustodyRecordKind,
+        bytes: &[u8],
+    ) -> Result<ContentHash, ContentError> {
+        self.check()?;
+        if bytes.is_empty() || bytes.len() > kind.limit() {
+            return Err(ContentError::Capacity);
+        }
+        let hash = ContentHash(*blake3::hash(bytes).as_bytes());
+        let path = self
+            .root
+            .join(kind.directory())
+            .join(format!("{hash}.record"));
+        if let Err(error) = install_verified_chunk(&path, bytes, hash) {
+            if matches!(error, ContentError::Io(_)) {
+                self.failed = true;
+            }
+            return Err(error);
+        }
+        Ok(hash)
+    }
+    /// Reading a recorded manifest never creates a trusted custody witness.
+    /// A new process must repeat the snapshot/content verification protocol.
+    pub fn read_custody_record(
+        &self,
+        kind: CustodyRecordKind,
+        hash: ContentHash,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, ContentError> {
+        self.check()?;
+        let bytes = read_bounded(
+            &self
+                .root
+                .join(kind.directory())
+                .join(format!("{hash}.record")),
+            max_bytes.min(kind.limit()),
+        )?;
+        if ContentHash(*blake3::hash(&bytes).as_bytes()) != hash {
+            return Err(ContentError::Corrupt);
+        }
+        Ok(bytes)
     }
 
     pub fn begin(
@@ -775,6 +849,75 @@ mod tests {
             chunk_bytes: 4,
             max_manifest_bytes: 2048,
         }
+    }
+    #[test]
+    fn custody_records_are_bounded_immutable_and_checksum_checked_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoint = b"exact checkpoint bytes";
+        let hash;
+        {
+            let mut store = ContentStore::open(dir.path(), limits()).unwrap();
+            hash = store
+                .install_custody_record(CustodyRecordKind::Checkpoint, checkpoint)
+                .unwrap();
+            assert_eq!(
+                store
+                    .install_custody_record(CustodyRecordKind::Checkpoint, checkpoint)
+                    .unwrap(),
+                hash
+            );
+            assert!(matches!(
+                store.read_custody_record(CustodyRecordKind::Checkpoint, hash, 1),
+                Err(ContentError::Capacity)
+            ));
+            assert!(matches!(
+                store.install_custody_record(CustodyRecordKind::Manifest, &[0; 16 * 1024 + 1]),
+                Err(ContentError::Capacity)
+            ));
+        }
+        let mut reopened = ContentStore::open(dir.path(), limits()).unwrap();
+        assert_eq!(
+            reopened
+                .read_custody_record(CustodyRecordKind::Checkpoint, hash, 4096)
+                .unwrap(),
+            checkpoint
+        );
+        std::fs::write(
+            dir.path()
+                .join("checkpoints")
+                .join(format!("{hash}.record")),
+            b"bad checkpoint",
+        )
+        .unwrap();
+        assert!(matches!(
+            reopened.read_custody_record(CustodyRecordKind::Checkpoint, hash, 4096),
+            Err(ContentError::Corrupt)
+        ));
+        assert!(matches!(
+            reopened.install_custody_record(CustodyRecordKind::Checkpoint, checkpoint),
+            Err(ContentError::Corrupt)
+        ));
+    }
+    #[test]
+    fn custody_record_io_failure_never_returns_success_and_requires_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ContentStore::open(dir.path(), limits()).unwrap();
+        std::fs::remove_dir(dir.path().join("custody")).unwrap();
+        assert!(matches!(
+            store.install_custody_record(CustodyRecordKind::Manifest, b"verified prefix"),
+            Err(ContentError::Io(_))
+        ));
+        assert!(matches!(
+            store.install_custody_record(CustodyRecordKind::Manifest, b"verified prefix"),
+            Err(ContentError::Failed)
+        ));
+        drop(store);
+        let mut reopened = ContentStore::open(dir.path(), limits()).unwrap();
+        assert!(
+            reopened
+                .install_custody_record(CustodyRecordKind::Manifest, b"verified prefix")
+                .is_ok()
+        );
     }
     #[test]
     fn durable_resume_retry_and_seal_are_idempotent() {

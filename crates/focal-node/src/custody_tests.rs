@@ -179,8 +179,8 @@ fn session_transfer_namespaces_policy_fences_and_expiry_share_one_budget() {
     changed.policy_revision = 2;
     changed.route_epoch = RouteEpoch(2);
     receiver.install_policy(changed).unwrap();
-    assert_eq!(receiver.retained(), (1, 8));
-    assert!(budget.stats().used < before);
+    assert_eq!(receiver.retained(), (2, 16));
+    assert_eq!(budget.stats().used, before);
     assert!(matches!(
         receiver.request(&custody(la, 7, CustodyRequest::Seal { transfer })),
         Err(AccessError::Unavailable)
@@ -507,23 +507,29 @@ async fn one_actor_hosts_multiple_ledgers_and_external_seal_never_attests_custod
         assert!(matches!(denied, Err(AccessError::UnsupportedOperation)));
     }
     let a_ref = host
-        .seal_upload(request(
-            a,
-            1,
-            None,
-            4,
-            Operation::Upload(UploadRequest::Seal { upload }),
-        ))
+        .seal_upload(
+            policy(a).scope(),
+            request(
+                a,
+                1,
+                None,
+                4,
+                Operation::Upload(UploadRequest::Seal { upload }),
+            ),
+        )
         .await
         .unwrap();
     let b_ref = host
-        .seal_upload(request(
-            b,
-            1,
-            None,
-            4,
-            Operation::Upload(UploadRequest::Seal { upload }),
-        ))
+        .seal_upload(
+            policy(b).scope(),
+            request(
+                b,
+                1,
+                None,
+                4,
+                Operation::Upload(UploadRequest::Seal { upload }),
+            ),
+        )
         .await
         .unwrap();
     assert_ne!(a_ref.domain, b_ref.domain);
@@ -603,13 +609,16 @@ async fn one_actor_hosts_multiple_ledgers_and_external_seal_never_attests_custod
     recovered.install_policy(policy(a)).await.unwrap();
     assert_eq!(
         recovered
-            .seal_upload(request(
-                a,
-                1,
-                None,
-                4,
-                Operation::Upload(UploadRequest::Seal { upload })
-            ))
+            .seal_upload(
+                policy(a).scope(),
+                request(
+                    a,
+                    1,
+                    None,
+                    4,
+                    Operation::Upload(UploadRequest::Seal { upload })
+                )
+            )
             .await
             .unwrap(),
         a_ref
@@ -651,6 +660,20 @@ fn policy_capacity_and_memory_rejection_leave_all_installed_facts_unchanged() {
     );
     let mut next = initial.clone();
     next.policy_revision = 2;
+    assert_eq!(
+        owner.replace_policy(None, next.clone()),
+        Err(AccessError::Unavailable)
+    );
+    assert_eq!(
+        owner.replace_policy(
+            Some(CustodyScope {
+                ledger: ledger(1, 2),
+                ..initial.scope()
+            }),
+            next.clone()
+        ),
+        Err(AccessError::Unavailable)
+    );
     let pressure = budget
         .reserve(
             BudgetKind::Control,
@@ -658,10 +681,49 @@ fn policy_capacity_and_memory_rejection_leave_all_installed_facts_unchanged() {
             budget.stats().limit - budget.stats().used,
         )
         .unwrap();
-    assert_eq!(owner.install_policy(next), Err(AccessError::Capacity));
+    assert_eq!(
+        owner.replace_policy(Some(initial.scope()), next.clone()),
+        Err(AccessError::Capacity)
+    );
     assert_eq!(owner.installed(initial.ledger), Some(&initial));
     drop(pressure);
+    owner
+        .replace_policy(Some(initial.scope()), next.clone())
+        .unwrap();
+    owner
+        .replace_policy(Some(initial.scope()), next.clone())
+        .unwrap();
+    assert_eq!(owner.installed(initial.ledger), Some(&next));
+    assert_eq!(
+        owner.replace_policy(Some(next.scope()), initial),
+        Err(AccessError::Unavailable)
+    );
     drop(owner);
+    assert_eq!(budget.stats().used, 0);
+}
+
+#[test]
+fn policy_update_without_timer_rejects_before_enqueue_and_releases_reservation() {
+    let root = tempfile::tempdir().unwrap();
+    let budget = memory();
+    let (host, owner) = ContentHost::spawn(
+        ContentStore::open(root.path(), limits()).unwrap(),
+        CustodyConfig::new(1),
+        WireLimits::default(),
+        budget.clone(),
+    )
+    .unwrap();
+    let initial = budget.stats().used;
+    let no_time = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    assert_eq!(
+        no_time.block_on(host.replace_policy(None, policy(ledger(1, 1)))),
+        Err(AccessError::Unavailable)
+    );
+    assert_eq!(budget.stats().used, initial);
+    drop(host);
+    owner.join().unwrap();
     assert_eq!(budget.stats().used, 0);
 }
 

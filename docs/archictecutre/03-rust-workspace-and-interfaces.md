@@ -189,6 +189,26 @@ A completed result references evidence, typed disposition, and the same token. T
 - Pin canonical hashing version in content identities. Schema upgrades may read old versions, but cannot reinterpret old committed statuses or change replay results.
 - Rolling upgrade feature activation is a committed capability fence after all voting and serving members can decode the new format. Downgrade is permitted only before activating incompatible persisted features.
 
+The current `focal-wire::Operation` registry is below. Registered tags are explicit protocol identifiers; the current postcard envelope separately encodes the Rust enum's zero-based ordinal. Preserve both columns when appending operations. Registered tags alone do not make reordering the enum compatible.
+
+| Operation | Registered tag | Postcard ordinal |
+|---|---:|---:|
+| Submit | 1 | 0 |
+| Read | 2 | 1 |
+| Subscribe | 3 | 2 |
+| Raft | 4 | 3 |
+| OpenEpoch | 5 | 4 |
+| Stream | 6 | 5 |
+| Upload | 7 | 6 |
+| Download | 8 | 7 |
+| Control | 9 | 8 |
+| Custody | 10 | 9 |
+| PeerControl | 11 | 10 |
+| NodeContact | 12 | 11 |
+| EnrollmentControl | 13 | 12 |
+
+`EnrollmentControl` permits the immutable genesis founder's certificate and dedicated signer principal to read enrollment state and submit enrollment decisions through the current root leader. The receiver checks the pinned root identity, active committed enrollment, permitted command and principal, and a fresh quorum read before releasing a result, including a cached receipt. Its request payload is bounded at 128 KiB. It grants no general Runtime, placement, or membership authority. `NodeContact` commits only certificate-bound reachability; `PeerControl` accepts bounded metadata reads. `RootObservation` is a local owned export of one durable prefix, has no wire selector, and supplies no quorum authority.
+
 ## 10. Configuration is a product interface
 
 See [08](08-stepped-complexity-and-deployment.md). Most users should never learn SessionSeq, arena generations, materializer epochs, routing cuts, Raft tuning, or checkpoint watermarks. The runtime derives those from resource budgets, topology, and measured costs.

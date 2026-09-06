@@ -7,7 +7,7 @@ use focal_enrollment::{
     EnrollmentRegistry, EnrollmentRole, Invitation, InviteOptions, JoinKey, JoinPreparation,
     server_fingerprint,
 };
-use focal_memory::MemoryBudget;
+use focal_memory::{BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::{
     ContentHash, LedgerId, RaftIndex, RaftTerm, RouteEpoch, SessionId, SessionSeq, TenantId,
 };
@@ -214,6 +214,96 @@ fn ledger() -> LedgerId {
         tenant: TenantId([1; 16]),
         session: SessionId([2; 16]),
     }
+}
+
+#[test]
+fn node_capability_allows_unknown_geography_without_promising_zone_or_region_survival() {
+    let mut fixture = Fixture::new();
+    for node in 2..=5 {
+        let mut grant = fixture.grant(node);
+        grant.enrollment.region = if node == 2 {
+            RegionId([0; 16])
+        } else {
+            RegionId::from_u128(node as u128)
+        };
+        grant.enrollment.zone = if node <= 3 {
+            ZoneId([0; 16])
+        } else {
+            ZoneId::from_u128(node as u128)
+        };
+        fixture.commit(AuthorityOperation::GrantNode {
+            grant,
+            expected_generation: None,
+        });
+    }
+    let node = fixture.authority.node(2).unwrap();
+    fixture
+        .authority
+        .verifier(&fixture.enrollment, &[], fixture.now)
+        .unwrap()
+        .verify_enrollment(&node.enrollment)
+        .unwrap();
+    let nodes = fixture
+        .authority
+        .checkpoint()
+        .nodes
+        .iter()
+        .map(|(id, grant)| {
+            (
+                *id,
+                NodeRecord {
+                    enrollment: grant.enrollment.clone(),
+                    load: Some(NodeLoad {
+                        node: *id,
+                        generation: 1,
+                        report: 1,
+                        available_memory: 1024,
+                        active_weight: *id,
+                    }),
+                },
+            )
+        })
+        .collect();
+    let mut policy = PlacementPolicy {
+        durability: DurabilityIntent {
+            survive: FailureClass::Node,
+            max_failures: 1,
+        },
+        residency: Default::default(),
+        home_regions: Default::default(),
+        required_memory: 1,
+    };
+    let plan = propose_placement(&nodes, &policy, 31).unwrap();
+    assert!(plan.spec.placement.voters.contains_key(&2));
+    policy.durability.survive = FailureClass::Region;
+    let regional = propose_placement(&nodes, &policy, 31).unwrap();
+    assert!(!regional.spec.placement.voters.contains_key(&2));
+    assert!(regional.spec.placement.voters.contains_key(&3));
+    policy.durability.survive = FailureClass::Zone;
+    assert!(matches!(
+        propose_placement(&nodes, &policy, 31),
+        Err(DirectoryError::NoPlacement)
+    ));
+    policy.durability.max_failures = 0;
+    let zonal = propose_placement(&nodes, &policy, 31).unwrap();
+    assert_eq!(zonal.spec.placement.preferred_leader, 4);
+    let mut bad = plan.spec;
+    bad.policy.residency.insert(RegionId([0; 16]));
+    assert!(verify_placement(&bad, &nodes, 31).is_err());
+    let mut bad = fixture.grant(2);
+    bad.enrollment.region = RegionId([0; 16]);
+    assert!(
+        fixture
+            .authority
+            .prepare(
+                &fixture.command(AuthorityOperation::GrantNode {
+                    grant: bad,
+                    expected_generation: None,
+                }),
+                &fixture.enrollment
+            )
+            .is_err()
+    );
 }
 
 #[test]
@@ -597,12 +687,10 @@ fn grant_capacity_namespace_and_explicit_generations_fail_without_publication() 
         grant: fixture.grant(3),
         expected_generation: None,
     });
-    assert!(
-        fixture
-            .authority
-            .prepare(&second, &fixture.enrollment)
-            .is_err()
-    );
+    assert!(matches!(
+        fixture.authority.prepare(&second, &fixture.enrollment),
+        Err(DirectoryError::Capacity)
+    ));
     assert_eq!(memory.stats().used, charged);
     assert_eq!(fixture.authority.checkpoint(), &before);
     let mut group = fixture.session_group();
@@ -631,4 +719,82 @@ fn grant_capacity_namespace_and_explicit_generations_fail_without_publication() 
         Err(DirectoryError::StaleNode)
     ));
     assert_eq!(fixture.authority.checkpoint(), &before);
+}
+
+#[test]
+fn full_authority_maps_reject_growth_before_reservation_without_blocking_existing_nodes() {
+    let mut fixture = Fixture::new();
+    let memory = budget();
+    fixture.authority = AuthorityRegistry::new(
+        fixture.authority.checkpoint().anchor.clone(),
+        AuthorityConfig {
+            max_nodes: 1,
+            max_groups: 1,
+            ..AuthorityConfig::default()
+        },
+        memory.clone(),
+    )
+    .unwrap();
+    fixture.commit(AuthorityOperation::GrantNode {
+        grant: fixture.grant(2),
+        expected_generation: None,
+    });
+    let original = fixture.authority.checkpoint().clone();
+    let extra = fixture.command(AuthorityOperation::GrantNode {
+        grant: fixture.grant(3),
+        expected_generation: None,
+    });
+    let mut replacement = fixture.grant(2);
+    replacement.enrollment.generation = 2;
+    let change = fixture.command(AuthorityOperation::GrantNode {
+        grant: replacement.clone(),
+        expected_generation: Some(1),
+    });
+    let pressure = memory
+        .reserve(
+            BudgetKind::Control,
+            BudgetLane::Completion,
+            memory.stats().limit - memory.stats().used,
+        )
+        .unwrap();
+    // A candidate allocation would return DirectoryError::Memory instead. The
+    // full-map result must come before reserving or cloning that candidate.
+    assert!(matches!(
+        fixture.authority.prepare(&extra, &fixture.enrollment),
+        Err(DirectoryError::Capacity)
+    ));
+    assert!(matches!(
+        fixture.authority.prepare(&change, &fixture.enrollment),
+        Err(DirectoryError::Memory(
+            focal_memory::MemoryError::Capacity { .. }
+        ))
+    ));
+    assert_eq!(fixture.authority.checkpoint(), &original);
+    drop(pressure);
+    fixture.commit(AuthorityOperation::GrantNode {
+        grant: replacement,
+        expected_generation: Some(1),
+    });
+    assert_eq!(fixture.authority.node(2).unwrap().enrollment.generation, 2);
+    let mut group = fixture.session_group();
+    group.voters = BTreeMap::from([(2, 2)]);
+    fixture.commit(AuthorityOperation::BootstrapGroup {
+        grant: group.clone(),
+    });
+    let before = fixture.authority.checkpoint().clone();
+    group.group = LogGroupId([64; 16]);
+    let extra = fixture.command(AuthorityOperation::BootstrapGroup { grant: group });
+    let pressure = memory
+        .reserve(
+            BudgetKind::Control,
+            BudgetLane::Completion,
+            memory.stats().limit - memory.stats().used,
+        )
+        .unwrap();
+    assert!(matches!(
+        fixture.authority.prepare(&extra, &fixture.enrollment),
+        Err(DirectoryError::Capacity)
+    ));
+    assert_eq!(fixture.authority.checkpoint(), &before);
+    drop(pressure);
 }

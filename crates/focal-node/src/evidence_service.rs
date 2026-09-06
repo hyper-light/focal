@@ -3,13 +3,13 @@
 use crate::{
     config::Placement,
     content_host::ContentHost,
-    custody::CustodyScope,
+    custody::{CustodyPolicy, CustodyScope},
     placement::{self, NodeFacts, PlacementPlan},
 };
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::*;
 use focal_wire::*;
-use futures_util::{StreamExt, stream::FuturesUnordered};
+use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, oneshot};
 const MAX_REPORT_BYTES: usize = 1024 * 1024;
 const JOB_BYTES: usize = 8 * 1024 * 1024;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EvidencePlacement {
     scope: CustodyScope,
     voters: BTreeSet<u64>,
@@ -54,6 +54,22 @@ impl EvidencePlacement {
     }
     pub fn scope(&self) -> CustodyScope {
         self.scope
+    }
+    pub fn custody_policy(&self) -> CustodyPolicy {
+        CustodyPolicy {
+            ledger: self.scope.ledger,
+            route_epoch: self.scope.route_epoch,
+            policy_revision: self.scope.policy_revision,
+            peers: self.voters.union(&self.copies).copied().collect(),
+        }
+    }
+    fn bytes(&self) -> Result<usize, AccessError> {
+        self.voters
+            .len()
+            .checked_add(self.copies.len())
+            .and_then(|n| n.checked_mul(128))
+            .and_then(|n| n.checked_add(512))
+            .ok_or(AccessError::Capacity)
     }
 }
 
@@ -118,17 +134,84 @@ struct Job {
     kind: JobKind,
     _allocation: Allocation,
 }
+struct PlacementRow {
+    placement: EvidencePlacement,
+    _allocation: Allocation,
+}
+struct Replacement {
+    expected: Option<CustodyScope>,
+    row: PlacementRow,
+    reply: oneshot::Sender<Result<(), AccessError>>,
+}
+enum Completed {
+    Seal {
+        scope: Option<CustodyScope>,
+        result: Result<ContentRef, AccessError>,
+        reply: oneshot::Sender<Result<ContentRef, AccessError>>,
+        _allocation: Allocation,
+    },
+    Attest {
+        scope: Option<CustodyScope>,
+        result: Box<Result<EvidencedRequest, AccessError>>,
+        reply: oneshot::Sender<Result<EvidencedRequest, AccessError>>,
+    },
+}
+impl Completed {
+    fn send(self, placements: &BTreeMap<LedgerId, PlacementRow>) {
+        let current = |scope: Option<CustodyScope>| {
+            scope.is_some_and(|scope| {
+                placements
+                    .get(&scope.ledger)
+                    .is_some_and(|row| row.placement.scope == scope)
+            })
+        };
+        match self {
+            Self::Seal {
+                scope,
+                result,
+                reply,
+                _allocation,
+            } => {
+                let result = result.and_then(|value| {
+                    if current(scope) {
+                        Ok(value)
+                    } else {
+                        Err(AccessError::Unavailable)
+                    }
+                });
+                let _ = reply.send(result);
+            }
+            Self::Attest {
+                scope,
+                result,
+                reply,
+            } => {
+                let result = (*result).and_then(|value| {
+                    if current(scope) {
+                        Ok(value)
+                    } else {
+                        Err(AccessError::Unavailable)
+                    }
+                });
+                let _ = reply.send(result);
+            }
+        }
+    }
+}
 #[derive(Clone)]
 pub struct EvidenceCoordinator {
     sender: mpsc::Sender<Job>,
+    control: mpsc::Sender<Replacement>,
     budget: MemoryBudget,
 }
 pub struct EvidenceDriver {
     receiver: mpsc::Receiver<Job>,
+    control: mpsc::Receiver<Replacement>,
     content: ContentHost,
     node: u64,
-    placements: BTreeMap<LedgerId, EvidencePlacement>,
+    placements: BTreeMap<LedgerId, PlacementRow>,
     concurrency: usize,
+    budget: MemoryBudget,
     _configuration: Allocation,
 }
 impl EvidenceCoordinator {
@@ -141,11 +224,7 @@ impl EvidenceCoordinator {
         budget: MemoryBudget,
         concurrency: usize,
     ) -> Result<(Self, EvidenceDriver), AccessError> {
-        if node == 0
-            || !(1..=64).contains(&concurrency)
-            || placements.is_empty()
-            || placements.len() > 1024
-        {
+        if node == 0 || !(1..=64).contains(&concurrency) || placements.len() > 1024 {
             return Err(AccessError::InvalidRequest);
         }
         let configuration_bytes = placements
@@ -165,7 +244,7 @@ impl EvidenceCoordinator {
                     .and_then(|queue| n.checked_add(queue))
             })
             .ok_or(AccessError::Capacity)?;
-        let configuration = budget
+        let mut configuration = budget
             .reserve(
                 BudgetKind::Control,
                 BudgetLane::Completion,
@@ -173,27 +252,41 @@ impl EvidenceCoordinator {
             )
             .map_err(|_| AccessError::Capacity)?
             .commit();
-        let count = placements.len();
-        let placements: BTreeMap<_, _> = placements
-            .into_iter()
-            .map(|p| (p.scope.ledger, p))
-            .collect();
-        if placements.len() != count
-            || placements
-                .values()
-                .any(|p| !p.voters.contains(&node) && !p.copies.contains(&node))
-        {
-            return Err(AccessError::InvalidRequest);
+        let mut rows = BTreeMap::new();
+        for placement in placements {
+            if (!placement.voters.contains(&node) && !placement.copies.contains(&node))
+                || rows.contains_key(&placement.scope.ledger)
+                || placement.voters.union(&placement.copies).count() > 1024
+            {
+                return Err(AccessError::InvalidRequest);
+            }
+            let allocation = configuration
+                .split_off(placement.bytes()?)
+                .map_err(|_| AccessError::Capacity)?;
+            rows.insert(
+                placement.scope.ledger,
+                PlacementRow {
+                    placement,
+                    _allocation: allocation,
+                },
+            );
         }
         let (sender, receiver) = mpsc::channel(concurrency);
+        let (control, updates) = mpsc::channel(1);
         Ok((
-            Self { sender, budget },
+            Self {
+                sender,
+                control,
+                budget: budget.clone(),
+            },
             EvidenceDriver {
                 receiver,
+                control: updates,
                 content,
                 node,
-                placements,
+                placements: rows,
                 concurrency,
+                budget,
                 _configuration: configuration,
             },
         ))
@@ -230,54 +323,191 @@ impl EvidenceCoordinator {
         self.admit(request, JobKind::Attest(send))?;
         receive.await.map_err(|_| AccessError::OutcomeUnknown)?
     }
+    /// Install a verified committed placement through the existing owner. The
+    /// capacity-one completion mailbox remains available while data jobs stall.
+    /// A canceled response is unknown; retry the complete target and expected
+    /// scope to reconcile content installation before placement publication.
+    pub async fn replace_placement(
+        &self,
+        expected: Option<CustodyScope>,
+        placement: EvidencePlacement,
+    ) -> Result<(), AccessError> {
+        let allocation = self
+            .budget
+            .reserve(
+                BudgetKind::Control,
+                BudgetLane::Completion,
+                placement
+                    .bytes()?
+                    .checked_mul(2)
+                    .and_then(|n| n.checked_add(4096))
+                    .ok_or(AccessError::Capacity)?,
+            )
+            .map_err(|_| AccessError::Capacity)?
+            .commit();
+        let (reply, receive) = oneshot::channel();
+        self.control
+            .try_send(Replacement {
+                expected,
+                row: PlacementRow {
+                    placement,
+                    _allocation: allocation,
+                },
+                reply,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => AccessError::Capacity,
+                mpsc::error::TrySendError::Closed(_) => AccessError::Unavailable,
+            })?;
+        receive.await.map_err(|_| AccessError::OutcomeUnknown)?
+    }
 }
 impl EvidenceDriver {
-    pub async fn run(mut self, pool: &PeerConnectionPool) -> Result<(), AccessError> {
+    pub async fn run(self, pool: &PeerConnectionPool) -> Result<(), AccessError> {
         if tokio::runtime::Handle::try_current().is_err() {
             return Err(AccessError::Unavailable);
         }
+        std::panic::AssertUnwindSafe(self.run_inner(pool))
+            .catch_unwind()
+            .await
+            .map_err(|_| AccessError::Unavailable)?
+    }
+    async fn run_inner(mut self, pool: &PeerConnectionPool) -> Result<(), AccessError> {
+        let content = self.content.clone();
         let mut tasks = FuturesUnordered::new();
         let mut receiving = true;
-        while receiving || !tasks.is_empty() {
+        let mut updates = true;
+        while receiving || updates || !tasks.is_empty() {
             tokio::select! {
+                biased;
+                update = self.control.recv(), if updates => {
+                    if let Some(update) = update {
+                        let result = self.replace(update.expected, update.row).await;
+                        let _ = update.reply.send(result);
+                    } else {updates=false;}
+                }
                 job = self.receiver.recv(), if receiving && tasks.len() < self.concurrency => {
                     if let Some(job) = job {
-                        tasks.push(process(&self.content, pool, self.node, &self.placements, job));
+                        let placement = self.snapshot(job.request.request().ledger, job.request.request().route_epoch);
+                        tasks.push(process(&content, pool, self.node, placement, job));
                     } else { receiving = false; }
                 }
-                _ = tasks.next(), if !tasks.is_empty() => {}
+                done = tasks.next(), if !tasks.is_empty() => {
+                    if let Some(done) = done {done.send(&self.placements);}
+                }
             }
         }
         Ok(())
     }
+    fn snapshot(&self, ledger: LedgerId, route: RouteEpoch) -> Result<PlacementRow, AccessError> {
+        let row = self
+            .placements
+            .get(&ledger)
+            .filter(|row| row.placement.scope.route_epoch == route)
+            .ok_or(AccessError::Unavailable)?;
+        let allocation = self
+            .budget
+            .reserve(
+                BudgetKind::Pending,
+                BudgetLane::Ordinary,
+                row.placement.bytes()?,
+            )
+            .map_err(|_| AccessError::Capacity)?
+            .commit();
+        Ok(PlacementRow {
+            placement: row.placement.clone(),
+            _allocation: allocation,
+        })
+    }
+    async fn replace(
+        &mut self,
+        expected: Option<CustodyScope>,
+        mut row: PlacementRow,
+    ) -> Result<(), AccessError> {
+        let next = &row.placement;
+        if (!next.voters.contains(&self.node) && !next.copies.contains(&self.node))
+            || next.voters.union(&next.copies).count() > 1024
+        {
+            return Err(AccessError::InvalidRequest);
+        }
+        if let Some(current) = self.placements.get(&next.scope.ledger) {
+            if current.placement != *next
+                && (expected != Some(current.placement.scope)
+                    || next.scope.route_epoch < current.placement.scope.route_epoch
+                    || next.scope.policy_revision < current.placement.scope.policy_revision
+                    || next.scope == current.placement.scope)
+            {
+                return Err(AccessError::Unavailable);
+            }
+        } else if expected.is_some() {
+            return Err(AccessError::Unavailable);
+        } else if self.placements.len() >= 1024 {
+            return Err(AccessError::Capacity);
+        }
+        // The row and temporary policy are admitted before the content CAS.
+        // Cancellation after its receipt leaves content ahead, which rejects old
+        // jobs; an exact retry reconciles it. There is no two-owner transaction.
+        let _staging = row
+            ._allocation
+            .split_off(
+                next.bytes()?
+                    .checked_add(4096)
+                    .ok_or(AccessError::Capacity)?,
+            )
+            .map_err(|_| AccessError::Capacity)?;
+        self.content
+            .replace_policy(expected, next.custody_policy())
+            .await?;
+        self.placements.insert(row.placement.scope.ledger, row);
+        Ok(())
+    }
 }
+
+#[cfg(test)]
+#[path = "evidence_service_tests.rs"]
+mod tests;
 async fn process(
     content: &ContentHost,
     pool: &PeerConnectionPool,
     node: u64,
-    placements: &BTreeMap<LedgerId, EvidencePlacement>,
+    placement: Result<PlacementRow, AccessError>,
     job: Job,
-) {
-    let placement = placements
-        .get(&job.request.request().ledger)
-        .filter(|p| p.scope.route_epoch == job.request.request().route_epoch);
+) -> Completed {
+    let scope = placement.as_ref().ok().map(|row| row.placement.scope);
     match job.kind {
         JobKind::Seal(response) => {
-            let result = match placement {
-                Some(placement) => seal(content, pool, node, placement, &job.request).await,
-                None => Err(AccessError::Unavailable),
+            let result = match &placement {
+                Ok(row) => seal(content, pool, node, &row.placement, &job.request).await,
+                Err(error) => Err(error.clone()),
             };
-            let _ = response.send(result);
-            drop(job._allocation);
+            drop(job.request);
+            Completed::Seal {
+                scope,
+                result,
+                reply: response,
+                _allocation: job._allocation,
+            }
         }
         JobKind::Attest(response) => {
-            let result = match placement {
-                Some(placement) => {
-                    attest(content, pool, node, placement, job.request, job._allocation).await
+            let result = match &placement {
+                Ok(row) => {
+                    attest(
+                        content,
+                        pool,
+                        node,
+                        &row.placement,
+                        job.request,
+                        job._allocation,
+                    )
+                    .await
                 }
-                None => Err(AccessError::Unavailable),
+                Err(error) => Err(error.clone()),
             };
-            let _ = response.send(result);
+            Completed::Attest {
+                scope,
+                result: Box::new(result),
+                reply: response,
+            }
         }
     }
 }
@@ -288,7 +518,9 @@ async fn seal(
     placement: &EvidencePlacement,
     request: &VerifiedRequest,
 ) -> Result<ContentRef, AccessError> {
-    let reference = content.seal_upload(request.clone()).await?;
+    let reference = content
+        .seal_upload(placement.scope, request.clone())
+        .await?;
     replicate(
         content,
         pool,
@@ -298,6 +530,7 @@ async fn seal(
         &reference,
     )
     .await?;
+    content.check_policy(placement.scope).await?;
     Ok(reference)
 }
 fn artifact(operation: &Operation) -> Option<&NewArtifact> {
@@ -363,6 +596,7 @@ async fn attest(
         }
         _ => return Err(AccessError::Capacity),
     }
+    content.check_policy(placement.scope).await?;
     let request_bytes = postcard::experimental::serialized_size(request.request())
         .map_err(|_| AccessError::InvalidRequest)?
         .checked_mul(32)

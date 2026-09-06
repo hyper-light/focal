@@ -19,8 +19,9 @@ use tokio::sync::{mpsc, oneshot};
 
 pub type ControlFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, ControlFailure>> + Send + 'a>>;
-/// The router authenticates as this private signer's Runtime principal and may
-/// select a replacement leader. State reads must use the owner's ReadIndex API.
+/// The router binds this private signer's dedicated sequence principal, using
+/// either local Runtime authority or the immutable founder's narrow remote
+/// enrollment grant. State reads must use the owner's ReadIndex API.
 /// Endpoint discovery never changes this pinned identity or grants membership.
 pub trait EnrollmentControl: Send + Sync {
     fn identity(&self) -> ControlIdentity;
@@ -81,7 +82,8 @@ pub enum QuorumEnrollmentError {
 #[derive(Clone, Debug)]
 pub struct QuorumEnrollmentConfig {
     pub root: ControlIdentity,
-    /// Dedicated server-owned Runtime principal; do not share its sequence stream.
+    /// Dedicated server-owned signer principal; do not share its sequence stream.
+    /// Remote use requires the immutable founder's narrow enrollment grant.
     pub principal: ParticipantId,
     pub server_name: String,
     /// Server-owned certificate grants; no tenant grant comes from a CSR.

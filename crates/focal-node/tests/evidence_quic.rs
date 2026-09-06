@@ -8,9 +8,10 @@
     clippy::disallowed_macros
 )]
 //! Actual placed evidence copies, private coordinator witnesses and Raft attachment over mTLS QUIC.
-use focal_consensus::NodeConfig;
+use focal_consensus::{DurableNode, NodeConfig};
 use focal_evidence::{ContentStore, StoreLimits};
 use focal_ledger::{Session, SessionLimits};
+use focal_log::{SharedWal, WalIdentity, WalOptions, WalWriterLimits};
 use focal_memory::MemoryBudget;
 use focal_model::*;
 use focal_node::{
@@ -18,9 +19,15 @@ use focal_node::{
     content_host::{ContentHost, ContentOwner},
     custody::{CustodyConfig, CustodyPolicy},
     evidence_service::{EvidenceCoordinator, EvidencePlacement, FleetService},
-    fleet::{ReplicaConfig, ReplicaHost, ReplicaOwner},
+    fleet::{
+        FleetManager, FleetReplica, FleetReplication, FleetTenant, ManagedFleetConfig,
+        ReplicaConfig, ReplicaFleet, ReplicaHost, ReplicaOwner, ReplicationFrame,
+    },
+    managed_service::ManagedService,
     placement::{self, NodeFacts},
-    replication::drive_replication,
+    replication::{
+        ReplicationDriverError, ReplicationReport, drive_fleet_replication, drive_replication,
+    },
 };
 use focal_wire::*;
 use rcgen::{
@@ -154,8 +161,40 @@ impl Pki {
         QuicConnector::bind("127.0.0.1:0".parse().unwrap(), tls, wire_limits()).unwrap()
     }
 }
+#[derive(Clone)]
+enum TestService {
+    Single(FleetService),
+    Managed(ManagedService),
+}
+impl RequestHandler for TestService {
+    fn handle(&self, request: VerifiedRequest) -> HandlerFuture<'_> {
+        Box::pin(async move { self.handle_accounted(request).await.into_envelope() })
+    }
+    fn handle_accounted(&self, request: VerifiedRequest) -> OwnedHandlerFuture<'_> {
+        match self {
+            Self::Single(service) => service.handle_accounted(request),
+            Self::Managed(service) => service.handle_accounted(request),
+        }
+    }
+}
+enum TestReplication {
+    Single(tokio::sync::mpsc::Receiver<ReplicationFrame>),
+    Managed(FleetReplication),
+}
+impl TestReplication {
+    async fn drive(
+        self,
+        pool: &PeerConnectionPool,
+    ) -> Result<ReplicationReport, ReplicationDriverError> {
+        match self {
+            Self::Single(channel) => drive_replication(channel, pool, 4).await,
+            Self::Managed(channel) => drive_fleet_replication(channel, pool, 4).await,
+        }
+    }
+}
 struct Replica {
     host: ReplicaHost,
+    manager: Option<FleetManager>,
     owner: Option<ReplicaOwner>,
     content: ContentHost,
     content_owner: Option<ContentOwner>,
@@ -173,7 +212,7 @@ struct Fleet {
     revision: u64,
 }
 impl Fleet {
-    async fn open(path: &Path) -> Self {
+    async fn open(path: &Path, managed: bool) -> Self {
         let pki = Pki::new();
         let identities: Vec<_> = (1..=3)
             .map(|id| pki.issue(format!("evidence-{id}.focal.test"), true))
@@ -227,21 +266,78 @@ impl Fleet {
                 1 => 10,
                 _ => 100,
             };
-            let mut session = Session::open(
-                path.join(id.to_string()).join("ledger"),
-                ledger(),
-                config,
-                SessionLimits::default(),
-            )
-            .unwrap();
+            let mut resources = None;
+            let mut session = if managed {
+                let budget = MemoryBudget::new(1024 * 1024 * 1024, 256 * 1024 * 1024).unwrap();
+                let tenant = budget.child(512 * 1024 * 1024, 128 * 1024 * 1024).unwrap();
+                let wal = SharedWal::open_with_budget(
+                    path.join(id.to_string()).join("ledger"),
+                    WalOptions::new(WalIdentity {
+                        node: id,
+                        cluster: [91; 16],
+                        stream: 0,
+                    }),
+                    WalWriterLimits::default(),
+                    budget.child(256 * 1024 * 1024, 64 * 1024 * 1024).unwrap(),
+                )
+                .unwrap();
+                let node = DurableNode::open_on_wal_in(config, wal.clone(), &tenant).unwrap();
+                let session =
+                    Session::from_node_in(ledger(), node, SessionLimits::default(), &tenant)
+                        .unwrap();
+                resources = Some((budget, tenant, wal));
+                session
+            } else {
+                Session::open(
+                    path.join(id.to_string()).join("ledger"),
+                    ledger(),
+                    config,
+                    SessionLimits::default(),
+                )
+                .unwrap()
+            };
             if id == 1 {
                 session.campaign().unwrap();
             }
             let mut config = ReplicaConfig::new(ROOT);
             config.tick = Duration::from_millis(20);
             config.request_timeout = Duration::from_secs(1);
-            let (host, owner, channel) =
-                ReplicaHost::spawn(session, config, wire_limits()).unwrap();
+            let (host, owner, channel, manager) = if let Some((budget, tenant, wal)) = resources {
+                let (manager, owner, channel) = ReplicaFleet::spawn_managed(
+                    id,
+                    [91; 16],
+                    vec![wal],
+                    vec![FleetTenant {
+                        tenant: ledger().tenant,
+                        weight: 1,
+                        budget: tenant,
+                    }],
+                    budget,
+                    wire_limits(),
+                    ManagedFleetConfig {
+                        max_sessions: 4,
+                        management_queue: 8,
+                    },
+                )
+                .unwrap();
+                let host = manager
+                    .install(1, FleetReplica { session, config })
+                    .await
+                    .unwrap()
+                    .value()
+                    .host()
+                    .clone();
+                (
+                    host,
+                    owner,
+                    TestReplication::Managed(channel),
+                    Some(manager),
+                )
+            } else {
+                let (host, owner, channel) =
+                    ReplicaHost::spawn(session, config, wire_limits()).unwrap();
+                (host, owner, TestReplication::Single(channel), None)
+            };
             let allowance = MemoryBudget::new(128 * 1024 * 1024, 32 * 1024 * 1024).unwrap();
             let store =
                 ContentStore::open(path.join(id.to_string()).join("content"), store_limits())
@@ -262,10 +358,17 @@ impl Fleet {
                 2,
             )
             .unwrap();
-            let service = FleetService {
-                replica: host.clone(),
-                content: content.clone(),
-                evidence,
+            let service = match &manager {
+                Some(manager) => TestService::Managed(ManagedService::new(
+                    manager.clone(),
+                    content.clone(),
+                    evidence,
+                )),
+                None => TestService::Single(FleetService {
+                    replica: host.clone(),
+                    content: content.clone(),
+                    evidence,
+                }),
             };
             let peers = PeerRegistry::new(16).unwrap();
             for (source, peer) in identities.iter().enumerate() {
@@ -335,6 +438,7 @@ impl Fleet {
             routes.insert(id, endpoint.clone());
             pending.push((
                 host,
+                manager,
                 owner,
                 channel,
                 content,
@@ -349,6 +453,7 @@ impl Fleet {
         let mut replicas = Vec::new();
         for (
             host,
+            manager,
             owner,
             channel,
             content,
@@ -363,15 +468,14 @@ impl Fleet {
             pool.replace_routes(1, routes.clone()).unwrap();
             let sending = pool.clone();
             let driver = tokio::spawn(async move {
-                let (replication, evidence) = tokio::join!(
-                    drive_replication(channel, &sending, 4),
-                    evidence_driver.run(&sending)
-                );
+                let (replication, evidence) =
+                    tokio::join!(channel.drive(&sending), evidence_driver.run(&sending));
                 assert!(replication.unwrap().peak_inflight <= 4);
                 evidence.unwrap();
             });
             replicas.push(Replica {
                 host,
+                manager,
                 owner: Some(owner),
                 content,
                 content_owner: Some(content_owner),
@@ -473,6 +577,9 @@ impl Fleet {
     async fn stop_ordering(&mut self, index: usize) {
         if let Some(owner) = self.replicas[index].owner.take() {
             self.replicas[index].host.stop().await.unwrap();
+            if let Some(manager) = &self.replicas[index].manager {
+                manager.shutdown().await.unwrap();
+            }
             owner.join().unwrap();
         }
     }
@@ -667,8 +774,15 @@ fn attach(id: u128, reference: &ContentRef) -> RequestEnvelope {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn placed_copies_artifact_attachment_and_cold_leader_pull_use_real_quic() {
+    evidence_scenario(false).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn managed_routing_preserves_custody_artifact_retry_and_cold_leader_failover_over_quic() {
+    evidence_scenario(true).await;
+}
+async fn evidence_scenario(managed: bool) {
     let data = tempfile::tempdir().unwrap();
-    let mut fleet = Fleet::open(data.path()).await;
+    let mut fleet = Fleet::open(data.path(), managed).await;
     let leader = fleet.leader().await;
     assert_eq!(leader, 0);
     let mut bytes = br#"{"passed":7,"failed":0,"skipped":1}"#.to_vec();

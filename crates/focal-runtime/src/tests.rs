@@ -338,16 +338,26 @@ fn drive_until(
     session: &mut Session,
     predicate: impl Fn(&Runtime, &Session) -> bool,
 ) {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(3);
+    let mut drives = 0;
+    let mut longest_drive = Duration::ZERO;
     loop {
-        runtime.drive_local(session).unwrap();
+        let before_drive = Instant::now();
+        let report = runtime.drive_local(session).unwrap();
+        drives += 1;
+        longest_drive = longest_drive.max(before_drive.elapsed());
         if predicate(runtime, session) {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "runtime failed to progress at {:?}",
-            status(session)
+            "runtime failed to progress at {:?}: elapsed={:?}, drives={drives}, longest_drive={longest_drive:?}, sequence={:?}, last_report={report:?}, pending={:?}, runs={:?}",
+            status(session),
+            started.elapsed(),
+            session.sequence(),
+            runtime.pending_input(),
+            session.read_at_least(SessionSeq(0)).unwrap().runs,
         );
         std::thread::sleep(Duration::from_millis(1));
     }

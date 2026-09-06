@@ -36,3 +36,5 @@ The implementation plan is executable without inventing a distributed consistenc
 Complete P00–P04 in the [implementation plan](05-implementation-plan.md) for a durable laptop ledger: establish the Rust workspace and model; implement the deterministic serial ledger; persist its log; restart and recover. P05 adds the complete generated → posted → received → testament → validation → satisfied demonstration with immutable evidence. Preserve the final command and read interfaces so replication and partitioning extend this slice.
 
 The production objective additionally requires all distributed, multi-region, memory-bound, security, operational, and stepped-complexity gates through P16. A working laptop demo is an intermediate milestone.
+
+The [network startup guide](../network-startup.md) documents the implemented founder, invitation, join, and restart commands. Joined nodes currently replicate root metadata as learners; application placement and stronger durability remain required work.

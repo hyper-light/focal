@@ -15,6 +15,7 @@ focal-consensus = { version = "0.1.0", path = "../focal-consensus" }
 focal-graph = { version = "0.1.0", path = "../focal-graph" }
 focal-memory = { version = "0.1.0", path = "../focal-memory" }
 focal-stream = { version = "0.1.0", path = "../focal-stream" }
+focal-directory = { version = "0.1.0", path = "../focal-directory" }
 blake3.workspace = true
 postcard.workspace = true
 serde.workspace = true

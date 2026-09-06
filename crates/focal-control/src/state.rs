@@ -277,6 +277,43 @@ impl Machine {
         options: &ControlOptions,
     ) -> Result<PreparedMachine, ControlError> {
         match (self, command) {
+            (
+                Self::Root {
+                    enrollment,
+                    authority: Some(authority),
+                    ..
+                },
+                ControlCommand::Membership(ControlMembershipCommand {
+                    change: focal_consensus::MembershipChange::AddLearner { node },
+                    ..
+                }),
+            ) => {
+                // Re-evaluate this prerequisite at the serialized admission
+                // point: a journaled intent cannot override a later quarantine
+                // or enrollment revocation. Exact receipts resolve beforehand.
+                let live = authority.registry.node(*node).is_some_and(|grant| {
+                    grant.enrollment.eligible
+                        && grant.expires_at > authority.decided_at
+                        && enrollment.enrollments().any(|receipt| {
+                            receipt.identity.role == focal_enrollment::EnrollmentRole::Node
+                                && receipt.identity.node_id == Some(*node)
+                                && receipt.identity.principal == grant.principal
+                                && focal_model::ContentHash(focal_enrollment::server_fingerprint(
+                                    &receipt.certificate,
+                                )) == grant.enrollment.identity
+                                && receipt.issued_at <= authority.decided_at
+                                && receipt.expires_at > authority.decided_at
+                                && matches!(
+                                    enrollment.invitation_revoked(receipt.invitation),
+                                    Ok(false)
+                                )
+                        })
+                });
+                if !live {
+                    return Err(focal_directory::DirectoryError::CompareFailed.into());
+                }
+                Ok(PreparedMachine::Membership)
+            }
             (_, ControlCommand::Membership(_)) => Ok(PreparedMachine::Membership),
             (
                 Self::Root {
@@ -406,7 +443,10 @@ impl Machine {
                 })
             }
             (_, ControlCommand::ActivateAuthority(_)) if self.authority().is_some() => {
-                Err(focal_directory::DirectoryError::Duplicate.into())
+                // Activation compares against absence. Exact committed retries
+                // are resolved before preparation; a new activation intent has
+                // lost its precondition and can safely refresh its plan.
+                Err(focal_directory::DirectoryError::CompareFailed.into())
             }
             (
                 Self::Root {
@@ -417,9 +457,17 @@ impl Machine {
                 },
                 ControlCommand::Authority(command),
             ) => {
+                // A superseded durable intent must report its failed compare
+                // before an advanced decision clock obscures that precondition.
+                if command.expected_revision != authority.registry.revision()
+                    || command.enrollment_revision != enrollment.revision()
+                {
+                    return Err(focal_directory::DirectoryError::CompareFailed.into());
+                }
                 authority.check_time(command.decided_at)?;
                 if let focal_directory::AuthorityOperation::GrantNode { grant, .. } =
                     &command.operation
+                    && grant.enrollment.region.0 != [0; 16]
                     && !directory
                         .checkpoint()
                         .regions
@@ -444,6 +492,12 @@ impl Machine {
                 },
                 ControlCommand::VerifiedRoot(command),
             ) => {
+                // A newer directory decision can advance verification time
+                // without changing the authority or enrollment revision.
+                // Preserve the failed compare so saved intents can replan.
+                if directory.revision() != command.command.expected_revision {
+                    return Err(focal_directory::DirectoryError::CompareFailed.into());
+                }
                 let verifier = authority.verifier(Some(enrollment), &command.evidence)?;
                 Ok(PreparedMachine::Root {
                     update: directory.prepare(&command.command, &verifier)?,
@@ -457,6 +511,9 @@ impl Machine {
                 },
                 ControlCommand::VerifiedPartition(command),
             ) => {
+                if directory.revision() != command.command.expected_revision {
+                    return Err(focal_directory::DirectoryError::CompareFailed.into());
+                }
                 let verifier = authority.verifier(None, &command.evidence)?;
                 Ok(PreparedMachine::Partition {
                     update: directory.prepare(&command.command, &verifier)?,

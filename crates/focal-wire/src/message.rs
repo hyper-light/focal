@@ -108,9 +108,18 @@ pub enum Operation {
         expected_generation: u64,
         advertise: std::net::SocketAddr,
     },
+    /// Only the immutable genesis founder may use the enrollment owner's
+    /// dedicated sequence stream. The root reauthorizes the certificate and
+    /// permits enrollment commands/state reads only; Node is never Runtime.
+    EnrollmentControl {
+        group: [u8; 16],
+        genesis: [u8; 32],
+        request: Vec<u8>,
+    },
 }
 /// Read-only metadata selectors contain no variable-length collections.
 pub const MAX_PEER_CONTROL_REQUEST_BYTES: usize = 64;
+pub const MAX_ENROLLMENT_CONTROL_REQUEST_BYTES: usize = 128 * 1024;
 impl Operation {
     /// IDs are registered protocol values, independent of Rust enum layout.
     pub fn registered_tag(&self) -> u16 {
@@ -127,6 +136,7 @@ impl Operation {
             Self::Custody(_) => 10,
             Self::PeerControl { .. } => 11,
             Self::NodeContact { .. } => 12,
+            Self::EnrollmentControl { .. } => 13,
         }
     }
     pub fn is_mutation(&self) -> bool {
@@ -139,6 +149,7 @@ impl Operation {
                 | Self::Control { .. }
                 | Self::Custody(_)
                 | Self::NodeContact { .. }
+                | Self::EnrollmentControl { .. }
         )
     }
 }

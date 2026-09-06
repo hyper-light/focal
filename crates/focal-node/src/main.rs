@@ -16,6 +16,9 @@ use focal_node::{
     config::Settings,
     embedded::{EmbeddedNode, decode_identity},
     host::LocalHost,
+    network_admin::{ADMIN_SOCKET, AdminCommand, admin_wire_limits},
+    network_join::{NodeInvitation, PendingJoin},
+    network_state::{network_requested, resolve_addresses},
     placement::{self, NodeFacts},
 };
 use focal_wire::*;
@@ -24,6 +27,7 @@ use std::{
     collections::BTreeSet,
     fs::File,
     io::{Read, Write},
+    net::SocketAddr,
     path::{Path, PathBuf},
 };
 
@@ -45,8 +49,27 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Commands {
-    /// Run the durable local service. Local clients authenticate through OS credentials.
-    Start,
+    /// Run the durable service, using saved network settings on restart.
+    Start {
+        #[arg(long)]
+        advertise: Option<String>,
+        #[arg(long)]
+        listen: Option<SocketAddr>,
+    },
+    /// Administer the running founder through its authenticated local socket.
+    Cluster {
+        #[command(subcommand)]
+        command: ClusterCommand,
+    },
+    /// Persist a pinned enrollment and physical identity, then exit.
+    Join {
+        #[arg(long)]
+        invite_file: PathBuf,
+        #[arg(long)]
+        advertise: String,
+        #[arg(long)]
+        listen: Option<SocketAddr>,
+    },
     /// Run/resume the real claim/testament/validator example with exclusive local ownership.
     Demo,
     /// Read the running service's authoritative published prefix.
@@ -59,6 +82,16 @@ enum Commands {
     Deployment {
         #[command(subcommand)]
         command: DeploymentCommand,
+    },
+}
+#[derive(Subcommand)]
+enum ClusterCommand {
+    /// Write a private one-node invitation; retrying the same name is exact.
+    Invite {
+        #[arg(long)]
+        node: String,
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 #[derive(Subcommand)]
@@ -109,7 +142,30 @@ async fn run() -> Result<()> {
     }
     settings.validate()?;
     match args.command {
-        Commands::Start => start(settings).await,
+        Commands::Start { advertise, listen } => {
+            if let Some(advertise) = advertise {
+                settings.node.advertise = Some(advertise);
+            }
+            if let Some(listen) = listen {
+                settings.node.listen = Some(listen);
+            }
+            settings.validate()?;
+            start(settings).await
+        }
+        Commands::Cluster {
+            command: ClusterCommand::Invite { node, output },
+        } => invite(&settings, &node, &output).await,
+        Commands::Join {
+            invite_file,
+            advertise,
+            listen,
+        } => {
+            settings.node.advertise = Some(advertise);
+            if let Some(listen) = listen {
+                settings.node.listen = Some(listen);
+            }
+            join(&settings, &invite_file).await
+        }
         Commands::Demo => {
             let mut node = EmbeddedNode::open(&settings)?;
             let report = focal_node::demo::run(&mut node)?;
@@ -204,6 +260,9 @@ fn output_response(reply: ResponseEnvelope) -> Result<()> {
     }
 }
 async fn start(settings: Settings) -> Result<()> {
+    if network_requested(&settings.data_dir()?, &settings) {
+        return start_network(settings).await;
+    }
     let node = EmbeddedNode::open(&settings)?;
     let path = node.root().join("focal.sock");
     // The exclusive data-directory owner may clean its socket after a crash, but
@@ -258,6 +317,57 @@ async fn start(settings: Settings) -> Result<()> {
     tokio::time::timeout(std::time::Duration::from_secs(30), cleanup)
         .await
         .map_err(|_| "shutdown deadline exceeded; recovery will replay the durable log")?
+}
+async fn invite(settings: &Settings, name: &str, output: &Path) -> Result<()> {
+    let root = settings.data_dir()?;
+    let identity = decode_identity(&root.join("IDENTITY"))?;
+    let command = AdminCommand::invitation(name)?;
+    let request = command.request(&identity)?;
+    let reply = UnixRemote::new(root.join(ADMIN_SOCKET), admin_wire_limits())?
+        .request(&request)
+        .await?;
+    let bytes = match reply.result {
+        Response::Control { response } => zeroize::Zeroizing::new(response),
+        Response::Error(error) => return Err(error.into()),
+        _ => return Err("invalid local invitation response".into()),
+    };
+    let bundle = NodeInvitation::decode(&bytes)?;
+    if bundle.name() != name || bundle.genesis().founder != identity {
+        return Err("invitation response belongs to another founder or node name".into());
+    }
+    bundle.write_new(output)?;
+    print_json(&serde_json::json!({"condition":"InvitationWritten","node":name,"output":output}))
+}
+async fn start_network(settings: Settings) -> Result<()> {
+    let service = focal_node::network_service::NetworkService::open(&settings).await?;
+    service
+        .run_until(shutdown_signal(), |status| {
+            let json = serde_json::to_string_pretty(status).map_err(std::io::Error::other)?;
+            writeln!(std::io::stdout().lock(), "{json}")
+        })
+        .await?;
+    Ok(())
+}
+async fn join(settings: &Settings, invite_file: &Path) -> Result<()> {
+    let bundle = NodeInvitation::load(invite_file)?;
+    let (listen, advertise) = resolve_addresses(settings).await?;
+    let pending = PendingJoin::open(settings, bundle, listen, advertise)?;
+    let bind = if advertise.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    }
+    .parse()?;
+    let client = focal_enrollment::EnrollmentClient::bind(
+        bind,
+        focal_enrollment::TransportLimits::default(),
+    )?;
+    let receipt = pending
+        .redeem(&client, focal_node::network_bootstrap::unix_time()?)
+        .await;
+    client.close();
+    let joined = pending.install(receipt?, focal_node::network_bootstrap::unix_time()?)?;
+    print_json(joined.directory.identity())
 }
 async fn shutdown_signal() -> std::io::Result<()> {
     #[cfg(unix)]

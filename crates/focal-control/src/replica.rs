@@ -176,11 +176,18 @@ impl ControlReplica {
             ControlRead::Authority => self.machine.authority_estimate()?,
             ControlRead::Configuration => 2048 * 16 + 4096,
             ControlRead::Contacts => self.machine.contact_charge(),
+            ControlRead::StateAndAuthority => {
+                return self
+                    .read_charge(&ControlRead::State)?
+                    .checked_add(self.read_charge(&ControlRead::Authority)?)
+                    .ok_or(ControlError::Capacity);
+            }
         };
         charge(bytes.checked_add(4096).ok_or(ControlError::Capacity)?, 4)
     }
-    /// Local committed data only. The host must complete a matching ReadIndex
-    /// first and retain its read allocation through encoding/delivery.
+    /// Local committed data only. A host claiming a linearizable result must
+    /// first complete a matching ReadIndex. Every export retains its read
+    /// allocation through consumption or encoding/delivery.
     pub fn read_local(&self, query: &ControlRead) -> Result<ControlReadResult, ControlError> {
         self.check()?;
         if !self.drained {
@@ -219,6 +226,17 @@ impl ControlReplica {
                 self.machine
                     .export_authority(self.identity, self.applied_index)?,
             )),
+            ControlRead::StateAndAuthority => Ok(ControlReadResult::StateAndAuthority {
+                snapshot: Box::new(ControlSnapshot {
+                    identity: self.identity,
+                    applied_index: self.applied_index,
+                    revisions: self.machine.revisions(),
+                    state: self.machine.export()?,
+                }),
+                authority: self
+                    .machine
+                    .export_authority(self.identity, self.applied_index)?,
+            }),
             ControlRead::Membership => {
                 let status = self.node.status();
                 Ok(ControlReadResult::Membership(ControlMembership {
@@ -291,6 +309,15 @@ impl ControlReplica {
             return Err(ControlError::NotReady);
         }
         self.retries.lookup(id)
+    }
+    /// Local committed retry position for a trusted component's stable client.
+    /// Resolve recovery and any outstanding intent before deriving its successor.
+    pub fn latest_receipt(&self, client: [u8; 16]) -> Result<Option<ControlReceipt>, ControlError> {
+        self.check()?;
+        if !self.drained {
+            return Err(ControlError::NotReady);
+        }
+        self.retries.latest(client)
     }
     pub fn campaign(&mut self) -> Result<(), ControlError> {
         self.check()?;

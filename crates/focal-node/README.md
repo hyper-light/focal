@@ -4,7 +4,7 @@
 
 Async ingress submits to a bounded queue and one blocking owner. The owner performs admission, fsync, publication and snapshot capture in order. A vanished caller cannot cancel an admitted mutation. `OutcomeUnknown` requires retrying the same request ID, epoch and operation. A periodic owner task expires graph views and durably advances due projection leases; an idle disconnected client cannot indefinitely pin the tail. Owner or listener failure initiates service shutdown. Shutdown stops ingress and checkpoints within a 30-second grace period; a timeout exits for crash recovery.
 
-The executable currently provides `start`, `status`, `identity`, `request`, the exclusive embedded `demo`, and offline `deployment explain`/`deployment schema`. Network cluster commands are under implementation. Local startup rejects network configuration instead of claiming it has activated replication.
+The executable provides local service commands and the live founder/invitation/join workflow described in [Start and join a network](../../docs/network-startup.md). A network start uses saved authenticated endpoints and the same physical identity; plain local startup remains the default before networking is requested. Offline `deployment explain` and `deployment schema` do not apply placement changes.
 
 ## Durable subscriptions
 
@@ -33,11 +33,29 @@ Tests include actual binary startup, Unix credentials, SIGKILL, WAL recovery, ex
 
 ## Grouped session ownership
 
-`fleet::ReplicaFleet` installs multiple authorized sessions in one physical node worker. It accepts existing sessions and tenant budgets, verifies their node/cluster identity and budget ancestry, and returns one host per ledger plus a replication receiver. A bounded ingress queue feeds weighted tenant scheduling; timer, ingress and dispatch slices are bounded so one busy session cannot monopolize the loop. Stopping one session leaves the others running. This is a composition API; dynamic discovery, placement and operator cluster commands remain separate integration work.
+`fleet::ReplicaFleet::spawn` installs an initial set of authorized sessions in one physical worker. `spawn_managed` starts an empty worker with a bounded session count, management queue, tenant registry and pre-retained physical WAL set. Both use the same weighted tenant scheduler and bounded timer, ingress and dispatch slices. A retained asynchronous WAL write delays its own session while unrelated sessions remain runnable.
 
-Construct the physical `SharedWal` with a node budget, each `DurableNode` with `open_on_wal_in`, and its `Session` with `from_node_in` under the same tenant budget. Session, consensus, graph, stream and ingress charges then roll up to the tenant and node. Idle sessions allocate publication queues only when needed. Completion commands use one exhaustive classification through byte admission, queue slots, scheduling and consensus; ordinary pressure cannot consume their reserved capacity. The WAL has its own node allowance because its disk owner serves multiple tenants.
+Construct each physical `SharedWal` under the node budget, each `DurableNode` with `open_on_wal_in`, and its `Session` with `from_node_in` under the registered tenant budget. Dynamic installation checks node, cluster, ledger, budget ancestry, configured route and exact process-local writer identity before enqueueing. An invalid candidate is returned to the caller. Every approved physical writer remains owned until the entire fleet stops, so retiring its last logical session cannot join a stalled disk thread on the shared worker.
 
-`FleetReplication` owns the outbound receiver and its storage allowance. Its receiver, host clones and the worker share one lifetime guard; dropping the owner alone does not release reachable channel backing. The grouped tests exercise both remaining-host and remaining-receiver drop orders, 48 idle sessions, tenant pressure, multiple concurrent session quorums, physical-node isolation and WAL restart. They establish bounded composition behavior, not a throughput target. Session apply and disk waiting remain synchronous inside the worker.
+One trusted controller owns consecutive management sequence numbers. `FleetManager::install(sequence, FleetReplica)` returns an incarnation and host. A canceled or lost reply may still have installed the session: use `inspect(ledger)` or `retry_install(sequence)` before opening another logical WAL lease. Only the latest successful management operation has an exact retry receipt; older operations return `RetryExpired`, conflicting reuse returns `Conflict`, and gaps return `OutOfOrder`. These receipts describe local process ownership, not committed placement authority. After process restart the controller reconciles durable placement and reconstructs authorized sessions.
+
+Replacement requires stopping the old host, then `remove(next_sequence, ledger, incarnation)`, then installing a newly constructed session. Removal requires the exact stopped incarnation and never deletes or truncates its WAL. The trusted controller must already hold unassignment authority. Old queued work and old host clones cannot address the replacement even when the ledger and group IDs match. Dropping the last manager stops its fleet; explicit `shutdown` plus `ReplicaOwner::join` provides orderly owner teardown. Interrupted proposals retain their existing unknown-outcome semantics.
+
+Management replies retain their queue slot and byte permit through delivery. Each installed incarnation owns its metadata allowance inside the existing progress watch, including after owner shutdown while a host or delayed reply survives. `FleetReplication`, all hosts, the manager and the worker share one physical queue allowance. That single existing `Arc<Allocation>` is necessary because these independent lifetimes outlive different session watches; no per-session shared-allocation wrapper is added.
+
+`ManagedService` routes every verified application ledger through that same bounded installation registry. Tenant authorization precedes lookup. A short watch borrow clones one current host and ends before any await; ordinary Raft/read requests do not use a management RPC. The selected incarnation stays fixed through receipt lookup, evidence custody and proposal, so an in-flight artifact cannot migrate to a replacement owner. The existing `FleetService` implements the evidence path without duplication. Custody requests still use committed content-copy policy on nodes without a local application replica. Empty, stopped and quiesced application routes return typed unavailability.
+
+The service retains a manager clone. `FleetManager::stop_all` first quiesces routing and new installation, then stops one current incarnation at a time and shuts down the worker. It clones neither the full map nor a lock guard across awaits. Host stop errors remain unknown, and the caller supplies an overall grace deadline. Canceling `stop_all` leaves the fleet quiesced; resume it or invoke immediate `shutdown`, then join the physical owner. The latter remains a fail-stop operation and does not promise per-session checkpoints.
+
+`ReplicaHost::propose_placement` is a trusted in-process operation. It waits for durable session application and a fresh quorum ReadIndex before returning `PlacementReply`. `into_witness` transfers the opaque, separately charged `CommittedPlacement` to the control proof owner. A Node transport identity alone cannot call it. Preserve the exact placement request after an unknown outcome. A committed cutover closes application/probe ingress and queued reads/streams; Raft traffic continues. Activation with a new route leaves old serving metadata closed until trusted removal/reinstallation supplies that route. Recovered active routes must match the installation configuration.
+
+Completion commands use one exhaustive classification through byte admission, queue slots, scheduling and consensus. Ordinary pressure cannot consume their reserved capacity. Tests cover 48 idle sessions, tenant pressure, multiple concurrent quorums, physical-node isolation, WAL restart, canceled installation, bounded receipts, stale-incarnation rejection, committed placement replay, route fencing and retained-writer shutdown. These establish bounded composition behavior, not global throughput or automatic placement reconciliation.
+
+## Initial directory owner
+
+A `FirstDirectoryPlan` describes stable coordinates. Only a committed root-owner ReadIndex can mint its `PartitionBootstrapPermit`. `ControlHost::spawn_directory(permit, wal, budget)` returns the host, physical owner and `DirectoryReplication` synchronously. The caller registers that owner before awaiting readiness. Its one bounded thread performs WAL recovery and authority activation, then enters the ordinary control loop; there is no detached bootstrap task or second bootstrap thread.
+
+Initial progress identifies the assigned group/node with zero leader and applied prefix. Startup failure closes ingress and marks progress stopped. The existing private progress watch owns the fixed stack and channel allowance, and both escaped host clones and `DirectoryReplication` retain it. `drive_directory_replication` keeps this receiver alive through pending sends. Tests pause the real WAL to verify that registration precedes blocking recovery and exercise success/failure drop orders. This is one initial physical metadata owner; grouping many metadata partitions remains separate work.
 
 ## Replicated enrollment owner
 
@@ -47,7 +65,7 @@ A dedicated signer principal has one durable consecutive request stream. Before 
 
 `invite`, `redeem`, `revoke`, and `authorize_certificate` read the root through a quorum barrier and validate its public CA against the local signing key. A prepared certificate never becomes a successful response. The host implements `focal_enrollment::JoinHandler` for the existing pinned TLS enrollment listener. Retain `authority.server_identity()` before moving the authority into the driver. Certificate authorization returns only the assigned Node or Actor grant with server-owned tenant scopes; voter membership and Runtime authority are separate decisions. Callers must propagate revocations to live transport registries.
 
-The queue, pending/reply allocations, journal and checkpoint restoration are bounded under the supplied `MemoryBudget`. Completed replies retain their reservation until received. The driver owns signing and private-file IO sequentially; the process may run it on a dedicated executor. Private CA custody remains at that signer and its explicitly pinned bootstrap endpoint. Root leader replacement is supported through routing; automatic CA migration, renewal and operator CLI wiring are separate work. Existing `RootEnrollment` remains the local founding compatibility owner.
+The queue, pending/reply allocations, journal and checkpoint restoration are bounded under the supplied `MemoryBudget`. Completed replies retain their reservation until received. The driver owns signing and private-file IO sequentially; the process may run it on a dedicated executor. Private CA custody remains at that signer and its explicitly pinned bootstrap endpoint. Root leader replacement is supported through routing, and the live service wires local invitation administration through this owner. Automatic CA migration and credential renewal remain separate work. Existing `RootEnrollment` remains the local founding compatibility owner.
 
 The quorum enrollment tests use three actual disk-backed control replicas and authenticated peer dispatch. They cover minority refusal, leader replacement, lost submit/commit responses, exact token/CSR recovery after signer and root restart, concurrent metadata comparison changes, missing private state, expiry, revocation, rogue CAs, grant roles, and queue accounting. TLS pin-before-token and wire bounds are independently covered by the enrollment transport tests.
 
@@ -86,12 +104,15 @@ with a real ReadIndex barrier. Runtime-only control writes remain separate.
 Connections and handshakes have bounded admission and deadlines; the connection
 bookkeeping reservation is not a measurement of all Quinn buffer memory.
 
-These are tested composition APIs. Invitation/join CLI wiring, learner-to-voter
-promotion, live directory authority installation, expanded-root service recovery
-and geographic placement remain unfinished. `FoundingNetwork` explicitly refuses
-an already expanded root or the legacy local enrollment bootstrap; it cannot
-reset either into a new one-voter deployment. The executable still exposes the
-local service described above.
+The live service wires founder startup, private invitation administration,
+durable joining, authenticated contact/capability publication and root learner
+admission. Every node runs a bounded managed fleet; the founder also commits and
+opens the initial directory partition on the shared WAL. Its recovery path preserves expanded root membership; the strict
+single-owner `FoundingNetwork::open` convenience API refuses an expanded root
+rather than resetting it. See [Start and join a network](../../docs/network-startup.md)
+for the executable workflow and restart rules. Application placement, root voter
+promotion, evidence-copy placement and geographic deployment qualification remain
+unfinished. Joining a root learner does not strengthen application durability.
 
 
 ## Durable joining identity
@@ -120,8 +141,11 @@ The resulting value creates no WAL, voter, domain replica, topology or Runtime
 grant. `discover_root` performs a Node-only `PeerControl::Read(State)` against the
 pinned founder endpoint, verifies the returned root identity and reauthorizes its
 own certificate against that current root registry. It does not silently follow
-untrusted endpoint hints. Membership admission, replicated serving, credential
-renewal and CLI composition remain separate work.
+untrusted endpoint hints. The [live network service](../../docs/network-startup.md)
+then publishes the authenticated contact and capability and admits the node as a
+root metadata learner. This does not grant an application replica, voter role or
+evidence-copy assignment. Credential renewal and application placement remain
+unfinished.
 
 These APIs use owned state and introduce no Arc. Fixed file/frame limits bound
 this bootstrap path; they do not provide complete node-wide allocator accounting.

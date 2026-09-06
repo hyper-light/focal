@@ -72,6 +72,10 @@ pub struct WalWriterStats {
 /// handle, so the final handle can drain/join with unconsumed receipts present.
 #[derive(Clone)]
 pub struct SharedWal(Arc<Handle>);
+/// Opaque process-local writer provenance. Never serialized or reused after
+/// reopening, even when the physical path and durable WalIdentity are equal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalWriterId(focal_memory::OwnerId);
 #[cfg(feature = "test-support")]
 pub struct WalPause {
     resume: mpsc::SyncSender<()>,
@@ -83,6 +87,7 @@ impl WalPause {
     }
 }
 struct Handle {
+    owner: WalWriterId,
     sender: Option<mpsc::SyncSender<Command>>,
     thread: Option<JoinHandle<()>>,
     options: WalOptions,
@@ -356,6 +361,9 @@ impl SharedWal {
     pub fn is_same_writer(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
+    pub fn writer_id(&self) -> WalWriterId {
+        self.0.owner
+    }
     pub fn is_budgeted_within(&self, parent: &MemoryBudget) -> bool {
         self.0.budget.is_within(parent)
     }
@@ -378,6 +386,7 @@ impl SharedWal {
         {
             return Err(LogError::Capacity);
         }
+        let owner = WalWriterId(focal_memory::OwnerId::new().map_err(|_| LogError::Capacity)?);
         let capacity = limits
             .queue_items
             .checked_add(CONTROL_SLOTS)
@@ -441,6 +450,7 @@ impl SharedWal {
             ))
             .spawn(move || writer.run(receiver))?;
         Ok(Self(Arc::new(Handle {
+            owner,
             sender: Some(sender),
             thread: Some(thread),
             options,
@@ -682,6 +692,24 @@ impl WalLease {
         records: &[Record],
         lane: BudgetLane,
     ) -> Result<WalAppend, LogError> {
+        self.batch_async_in(records, lane, false)
+    }
+    /// Queues the same atomic checkpoint rewrite as the synchronous API. The
+    /// receipt resolves only after its CURRENT fence; dropping it does not
+    /// cancel an admitted rewrite or release the writer's owned batch permits.
+    pub fn rewrite_checkpoint_async_in(
+        &mut self,
+        records: &[Record],
+        lane: BudgetLane,
+    ) -> Result<WalAppend, LogError> {
+        self.batch_async_in(records, lane, true)
+    }
+    fn batch_async_in(
+        &mut self,
+        records: &[Record],
+        lane: BudgetLane,
+        checkpoint: bool,
+    ) -> Result<WalAppend, LogError> {
         let allocation = reserve(&self.shared.0.budget, BudgetKind::Pending, lane, 1024)?;
         let (sender, receiver) = oneshot::channel();
         let (completed, completion) = mpsc::sync_channel(1);
@@ -690,7 +718,7 @@ impl WalLease {
             self.generation,
             records,
             Reply::Async(sender, completed),
-            false,
+            checkpoint,
             lane,
         )?;
         Ok(WalAppend {

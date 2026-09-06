@@ -559,7 +559,7 @@ fn apply_session(
             authority,
         } => {
             validate_transition_fence(session, *operation, authority, SessionFenceKind::Cutover)?;
-            if authority.sequence <= session.authority.sequence
+            if authority.sequence < session.authority.sequence
                 || authority.index <= session.authority.index
                 || authority.term < session.authority.term
             {
@@ -589,7 +589,7 @@ fn apply_session(
             validate_transition_fence(session, *operation, authority, SessionFenceKind::Activated)?;
             let plan = session.pending.as_ref().ok_or(DirectoryError::Phase)?;
             let barrier = plan.barrier.as_ref().ok_or(DirectoryError::NotReady)?;
-            if authority.sequence <= barrier.sequence
+            if authority.sequence < barrier.sequence
                 || authority.index <= barrier.index
                 || authority.term < barrier.term
             {
@@ -652,11 +652,7 @@ fn validate_transition_fence(
     validate_fence(fence, &pending.desired)
 }
 fn validate_fence(fence: &SessionFence, spec: &PlacementSpec) -> Result<(), DirectoryError> {
-    if fence.sequence.0 == 0
-        || fence.index.0 == 0
-        || fence.term.0 == 0
-        || !types::nonzero_hash(fence.record_hash)
-    {
+    if fence.index.0 == 0 || fence.term.0 == 0 || !types::nonzero_hash(fence.record_hash) {
         return Err(DirectoryError::UnverifiedAuthority);
     }
     if fence.placement_digest != placement_digest(spec)? {
@@ -824,7 +820,7 @@ fn validate_partition(
                     barrier,
                     SessionFenceKind::Cutover,
                 )?;
-                if barrier.sequence <= session.authority.sequence
+                if barrier.sequence < session.authority.sequence
                     || barrier.index <= session.authority.index
                     || barrier.term < session.authority.term
                 {

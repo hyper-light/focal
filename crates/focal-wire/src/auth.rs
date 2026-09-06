@@ -35,6 +35,10 @@ impl AuthenticatedPeer {
             fingerprint: None,
         })
     }
+    /// Borrowed scope check for trusted service routers before ledger lookup.
+    pub fn permits_tenant(&self, tenant: TenantId) -> bool {
+        self.grant.tenants.contains(&tenant)
+    }
     pub fn principal(&self) -> ParticipantId {
         self.grant.principal
     }
@@ -54,6 +58,25 @@ pub struct PeerRegistry {
     max_peers: usize,
 }
 impl PeerRegistry {
+    /// Replace a complete server-owned grant projection atomically. Validate
+    /// before locking; existing requests must never see a partial rebuild.
+    pub fn replace_grants(&self, next: BTreeMap<[u8; 32], PeerGrant>) -> Result<(), AccessError> {
+        if next.len() > self.max_peers {
+            return Err(AccessError::Capacity);
+        }
+        for (fingerprint, grant) in &next {
+            if *fingerprint == [0; 32] {
+                return Err(AccessError::InvalidRequest);
+            }
+            validate_grant(grant)?;
+        }
+        let previous = {
+            let mut grants = self.grants.write().map_err(|_| AccessError::Unavailable)?;
+            std::mem::replace(&mut *grants, next)
+        };
+        drop(previous);
+        Ok(())
+    }
     pub fn new(max_peers: usize) -> Result<Self, AccessError> {
         if max_peers == 0 || max_peers > 1_000_000 {
             return Err(AccessError::Capacity);
@@ -125,6 +148,7 @@ pub enum Capability {
 pub fn capability(operation: &Operation) -> Capability {
     match operation {
         Operation::Raft { .. }
+        | Operation::EnrollmentControl { .. }
         | Operation::Custody(_)
         | Operation::PeerControl { .. }
         | Operation::NodeContact { .. } => Capability::Replication,
@@ -353,6 +377,22 @@ pub fn verify_request(
             }
             // Trusted local Node grants have no certificate binding and cannot
             // announce a remotely routable identity.
+            if peer.certificate_fingerprint().is_none() {
+                return Err(AccessError::Unauthorized);
+            }
+            1
+        }
+        Operation::EnrollmentControl {
+            group,
+            genesis,
+            request,
+        } => {
+            if *group == [0; 16] || *genesis == [0; 32] || request.is_empty() {
+                return Err(AccessError::InvalidRequest);
+            }
+            if request.len() > MAX_ENROLLMENT_CONTROL_REQUEST_BYTES {
+                return Err(AccessError::Capacity);
+            }
             if peer.certificate_fingerprint().is_none() {
                 return Err(AccessError::Unauthorized);
             }

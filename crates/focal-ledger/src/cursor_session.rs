@@ -189,7 +189,10 @@ impl Session {
         }
         // A single cursor candidate serializes controls with domain reservations:
         // every tail forecast observes exactly the committed set of retention pins.
-        if !self.pending.is_empty() || self.pending_maintenance.is_some() {
+        if !self.pending.is_empty()
+            || self.pending_maintenance.is_some()
+            || self.pending_placement.is_some()
+        {
             return Err(LedgerError::Capacity);
         }
         if postcard::experimental::serialized_size(input)? > self.limits.core.max_command_bytes {
@@ -317,6 +320,9 @@ impl Session {
         }
         let meta_bytes = reference_charge(&self.cursor_meta)?
             .checked_add(reference_charge(input)?)
+            .and_then(|n| {
+                n.checked_add(self.placement_charge.as_ref().map_or(0, Allocation::bytes))
+            })
             .and_then(|n| n.checked_mul(3))
             .ok_or(LedgerError::Capacity)?;
         let _scratch =
@@ -579,15 +585,33 @@ impl DeltaSource for Session {
     }
 }
 
+struct EncodedCheckpoint {
+    bytes: Vec<u8>,
+    retained: Option<(Vec<u8>, Allocation)>,
+    _scratch: Allocation,
+}
 impl Session {
     /// Snapshot domain, cursor outcomes and the complete retained history tail
     /// together. Failure leaves the previous durable checkpoint/log authoritative.
     pub fn checkpoint(&mut self) -> Result<(), LedgerError> {
+        let Some(encoded) = self.encode_checkpoint(false)? else {
+            return Ok(());
+        };
+        self.consensus
+            .checkpoint(self.applied_raft, encoded.bytes)?;
+        Ok(())
+    }
+    fn encode_checkpoint(
+        &mut self,
+        retain_bytes: bool,
+    ) -> Result<Option<EncodedCheckpoint>, LedgerError> {
         self.check()?;
         if !self.pending.is_empty()
             || self.pending_cursor.is_some()
             || self.pending_maintenance.is_some()
             || self.pending_membership.is_some()
+            || self.pending_placement.is_some()
+            || self.pending_evidence.is_some()
         {
             return Err(LedgerError::Capacity);
         }
@@ -598,15 +622,19 @@ impl Session {
             if self.sequence() != SessionSeq(0) || self.cursor_revision() != 0 {
                 return Err(LedgerError::Corrupt);
             }
-            return Ok(());
+            return Ok(None);
         }
         self.graph.audit(self.core.snapshot())?;
         let tail_charge = self.deltas.iter().try_fold(0usize, |sum, d| {
             sum.checked_add(reference_charge(&d.delta)?)
                 .ok_or(LedgerError::Capacity)
         })?;
+        let cursor_state_charge = reference_charge(self.cursors.checkpoint())?;
+        let placement_state_charge = reference_charge(&self.placement_state)?;
         let amount = reference_charge(self.core.snapshot())?
             .checked_add(reference_charge(&self.cursor_meta)?)
+            .and_then(|n| n.checked_add(cursor_state_charge))
+            .and_then(|n| n.checked_add(placement_state_charge))
             .and_then(|n| n.checked_add(tail_charge))
             .and_then(|n| {
                 n.checked_add(self.membership_charge.as_ref().map_or(0, Allocation::bytes))
@@ -615,7 +643,8 @@ impl Session {
             .ok_or(LedgerError::Capacity)?;
         let _scratch = self
             .budget
-            .reserve(BudgetKind::Recovery, BudgetLane::Completion, amount)?;
+            .reserve(BudgetKind::Recovery, BudgetLane::Completion, amount)?
+            .commit();
         let envelope = SnapshotEnvelopeV2 {
             schema: 2,
             ledger: self.ledger,
@@ -636,10 +665,47 @@ impl Session {
                 latest: self.membership_state.latest.clone(),
             },
         };
-        let mut bytes = SNAPSHOT_V3_MAGIC.to_vec();
-        bytes.extend(postcard::to_stdvec(&envelope)?);
-        self.consensus.checkpoint(self.applied_raft, bytes)?;
-        Ok(())
+        let mut bytes = if self.placement_state.latest().is_some() {
+            SNAPSHOT_V4_MAGIC.to_vec()
+        } else {
+            SNAPSHOT_V3_MAGIC.to_vec()
+        };
+        if self.placement_state.latest().is_some() {
+            bytes.extend(postcard::to_stdvec(&SnapshotEnvelopeV4 {
+                state: envelope,
+                placement: PlacementState {
+                    active: self.placement_state.active.clone(),
+                    cutover: self.placement_state.cutover.clone(),
+                },
+            })?);
+        } else {
+            bytes.extend(postcard::to_stdvec(&envelope)?);
+        }
+        if bytes.len() > 8 * 1024 * 1024 {
+            return Err(LedgerError::Capacity);
+        }
+        let retained = if retain_bytes {
+            let allocation = self
+                .budget
+                .reserve(
+                    BudgetKind::Recovery,
+                    BudgetLane::Completion,
+                    bytes.len().checked_add(4096).ok_or(LedgerError::Capacity)?,
+                )?
+                .commit();
+            let mut copy = Vec::new();
+            copy.try_reserve_exact(bytes.len())
+                .map_err(|_| LedgerError::Capacity)?;
+            copy.extend_from_slice(&bytes);
+            Some((copy, allocation))
+        } else {
+            None
+        };
+        Ok(Some(EncodedCheckpoint {
+            bytes,
+            retained,
+            _scratch,
+        }))
     }
 
     fn restore_snapshot(
@@ -650,7 +716,16 @@ impl Session {
         configuration: &MembershipConfiguration,
     ) -> Result<(), LedgerError> {
         let mut membership = MembershipState::default();
-        let envelope = if let Some(data) = data.strip_prefix(SNAPSHOT_V3_MAGIC) {
+        let mut placement = PlacementState::default();
+        let envelope = if let Some(data) = data.strip_prefix(SNAPSHOT_V4_MAGIC) {
+            let (envelope, remaining): (SnapshotEnvelopeV4, _) = postcard::take_from_bytes(data)?;
+            if !remaining.is_empty() || envelope.state.state.schema != 2 {
+                return Err(LedgerError::Corrupt);
+            }
+            membership = envelope.state.membership;
+            placement = envelope.placement;
+            envelope.state.state
+        } else if let Some(data) = data.strip_prefix(SNAPSHOT_V3_MAGIC) {
             let (envelope, remaining): (SnapshotEnvelopeV3, _) = postcard::take_from_bytes(data)?;
             if !remaining.is_empty() {
                 return Err(LedgerError::Corrupt);
@@ -699,6 +774,9 @@ impl Session {
         } else {
             return Err(LedgerError::Corrupt);
         };
+        if self.placement_state.latest().is_some() && placement.latest().is_none() {
+            return Err(LedgerError::Corrupt);
+        }
         if envelope.ledger != self.ledger
             || envelope.raft_index != index
             || envelope.cursors.ledger != self.ledger
@@ -736,6 +814,20 @@ impl Session {
             None
         };
         let recovered = Core::decode_checkpoint(&envelope.core)?;
+        self.validate_placement_snapshot(&placement, index, term, recovered.sequence())?;
+        let placement_charge = if placement.latest().is_some() {
+            Some(
+                self.budget
+                    .reserve(
+                        BudgetKind::Control,
+                        BudgetLane::Completion,
+                        placement_charge(&placement)?,
+                    )?
+                    .commit(),
+            )
+        } else {
+            None
+        };
         if recovered.snapshot().ledger != self.ledger
             || envelope.delta_floor > recovered.sequence()
             || envelope.delta_floor < envelope.cursors.floor
@@ -877,6 +969,9 @@ impl Session {
         self.pending_cursor = None;
         self.pending_maintenance = None;
         self.pending_membership = None;
+        self.pending_placement = None;
+        self.placement_state = placement;
+        self.placement_charge = placement_charge;
         self.membership_state = membership;
         self.membership_charge = membership_charge;
         self.graph = graph;

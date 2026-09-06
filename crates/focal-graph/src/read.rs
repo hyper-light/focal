@@ -4,6 +4,14 @@ use std::collections::{BTreeSet, VecDeque};
 pub type GraphPage = ReadPage<GraphKey, GraphValue>;
 pub type GraphScanContinuation = ScanContinuation<GraphKey>;
 
+/// Fixed-size projection; the canonical descriptor hash also covers inline
+/// artifact bytes retained by the corresponding session checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactEvidence {
+    pub artifact: ArtifactRef,
+    pub content: Option<ContentRef>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GraphScan {
     Objects(Option<ObjectKind>),
@@ -55,6 +63,45 @@ impl GraphSnapshot {
     }
     pub fn expires_at(&self) -> u64 {
         self.lease.expires_at()
+    }
+    pub fn artifact_after(
+        &self,
+        after: Option<ArtifactId>,
+        now: u64,
+    ) -> Result<Option<ArtifactEvidence>, GraphError> {
+        let query = self.scan_query(&GraphScan::Objects(Some(ObjectKind::Artifact)))?;
+        let start = after.map_or_else(
+            || GraphKey::Object(ObjectKind::Artifact, ObjectId::default()),
+            |id| GraphKey::Object(ObjectKind::Artifact, ObjectId(id.0)),
+        );
+        let end = query.end.ok_or(GraphError::IndexMismatch)?;
+        self.lease
+            .project_next(&start, after.is_some(), &end, now, |entry| {
+                let (GraphKey::Object(ObjectKind::Artifact, id), GraphValue::Object(object)) =
+                    (&entry.key, &entry.value)
+                else {
+                    return Err(GraphError::IndexMismatch);
+                };
+                let GraphObject::Artifact(artifact) = object.as_ref() else {
+                    return Err(GraphError::IndexMismatch);
+                };
+                if artifact.content().ledger != self.ledger
+                    || artifact.lifecycle().created > self.sequence()
+                {
+                    return Err(GraphError::Prefix);
+                }
+                Ok(ArtifactEvidence {
+                    artifact: ArtifactRef {
+                        id: ArtifactId(id.0),
+                        hash: artifact.content_hash(),
+                    },
+                    content: match &artifact.content().payload {
+                        ArtifactPayload::Inline(_) => None,
+                        ArtifactPayload::Content(reference) => Some(reference.clone()),
+                    },
+                })
+            })?
+            .transpose()
     }
     pub fn get(&self, reference: ObjectRef, now: u64) -> Result<GraphPage, GraphError> {
         self.namespace(reference)?;

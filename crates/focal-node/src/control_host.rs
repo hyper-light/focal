@@ -25,6 +25,8 @@ pub struct ControlHostConfig {
     pub replication_queue: usize,
     pub tick: Duration,
     pub request_timeout: Duration,
+    /// Trusted immutable-genesis pin; absent means remote enrollment is denied.
+    pub enrollment_authority: Option<crate::network_control::FounderControlAuthority>,
 }
 impl ControlHostConfig {
     pub fn new(namespace: LedgerId) -> Self {
@@ -36,6 +38,7 @@ impl ControlHostConfig {
             replication_queue: 128,
             tick: Duration::from_millis(100),
             request_timeout: Duration::from_secs(5),
+            enrollment_authority: None,
         }
     }
     fn validate(&self) -> Result<(), ControlError> {
@@ -65,14 +68,62 @@ pub struct ControlProgress {
     pub dropped_replication: u64,
     pub stopped: bool,
 }
+struct ControlProgressState {
+    value: ControlProgress,
+    // A directory owner uses its existing watch to retain fixed queue/stack
+    // accounting through escaped host and egress lifetimes.
+    _allocation: Option<Allocation>,
+}
 pub struct ControlReplicationFrame {
     pub target: u64,
     pub request: RequestEnvelope,
     // Retained until transport finishes, including connection setup/retries.
     _charge: Allocation,
 }
+#[path = "directory_bootstrap_owner.rs"]
+mod directory_bootstrap_owner;
+pub use directory_bootstrap_owner::DirectoryReplication;
+#[path = "directory_bootstrap_host.rs"]
+mod directory_bootstrap_host;
+use directory_bootstrap_host::{DirectoryReply, PendingDirectory};
+#[path = "directory_authority_host.rs"]
+mod directory_authority_host;
+use directory_authority_host::{PendingAuthority, RefreshReply};
+
+#[path = "local_intent_host.rs"]
+mod local_intent_host;
+use local_intent_host::LocalIntentWrite;
+pub(crate) use local_intent_host::{LocalIntentError, save_local_intent};
+
 enum Work {
+    PersistLocalIntent(Box<LocalIntentWrite>),
     Request(Box<VerifiedRequest>, oneshot::Sender<Completed>, Allocation),
+    ObserveRoot(
+        oneshot::Sender<Result<RootObservation, ControlFailure>>,
+        Allocation,
+    ),
+    PrepareSessionProof {
+        witness: Box<focal_ledger::CommittedPlacement>,
+        window: crate::placement_proof::ProofWindow,
+        response: oneshot::Sender<
+            Result<
+                crate::placement_proof::SessionProofPermit,
+                crate::placement_proof::PlacementProofError,
+            >,
+        >,
+        _input: Allocation,
+    },
+    PrepareDirectory {
+        plan: crate::directory_bootstrap::FirstDirectoryPlan,
+        response: DirectoryReply,
+        input: Allocation,
+    },
+    RefreshDirectory {
+        permit: Box<crate::directory_bootstrap::PartitionBootstrapPermit>,
+        response: RefreshReply,
+        input: Allocation,
+        reply_charge: Allocation,
+    },
     Campaign(oneshot::Sender<Result<(), ControlFailure>>),
     Stop(oneshot::Sender<Result<(), ControlFailure>>),
 }
@@ -92,12 +143,38 @@ impl Completed {
 pub struct ControlHost {
     sender: mpsc::SyncSender<Work>,
     peers: mpsc::SyncSender<Work>,
-    progress: watch::Receiver<ControlProgress>,
+    progress: watch::Receiver<ControlProgressState>,
     config: ControlHostConfig,
     limits: WireLimits,
     budget: MemoryBudget,
 }
 pub struct ControlOwner(JoinHandle<()>);
+
+/// One durable local prefix for transport reconstruction. This observation
+/// grants neither a current quorum read nor permission to change membership.
+/// Its owned allowance remains live until the observer releases every view.
+pub struct RootObservation {
+    snapshot: ControlSnapshot,
+    contacts: ContactSnapshot,
+    configuration: ControlConfiguration,
+    authority: Option<focal_directory::AuthorityCheckpoint>,
+    _input: Allocation,
+    _state: Allocation,
+}
+impl RootObservation {
+    pub fn snapshot(&self) -> &ControlSnapshot {
+        &self.snapshot
+    }
+    pub fn contacts(&self) -> &ContactSnapshot {
+        &self.contacts
+    }
+    pub fn configuration(&self) -> &ControlConfiguration {
+        &self.configuration
+    }
+    pub fn authority(&self) -> Option<&focal_directory::AuthorityCheckpoint> {
+        self.authority.as_ref()
+    }
+}
 impl ControlOwner {
     pub fn join(self) -> Result<(), ControlFailure> {
         self.0.join().map_err(|_| ControlFailure::Unavailable)
@@ -109,6 +186,10 @@ enum Waiting {
         context: Vec<u8>,
         query: ControlRead,
     },
+    Enrollment {
+        context: Vec<u8>,
+        request: Option<Box<ControlRequest>>,
+    },
 }
 struct Pending {
     header: ResponseEnvelope,
@@ -116,21 +197,87 @@ struct Pending {
     waiting: Waiting,
     term: u64,
     deadline: Instant,
+    enrollment: bool,
+    root_peer: Option<RootPeer>,
     _charge: Allocation,
+}
+#[derive(Clone, Copy)]
+struct RootPeer {
+    node: u64,
+    principal: [u8; 16],
+    fingerprint: [u8; 32],
 }
 struct Owner<V> {
     replica: ControlReplica,
+    initial: Option<ControlEvents>,
     verifier: V,
     config: ControlHostConfig,
     limits: WireLimits,
     budget: MemoryBudget,
     pending: VecDeque<Pending>,
+    directory: Option<PendingDirectory>,
+    authority_refresh: Option<PendingAuthority>,
     outbound: async_mpsc::Sender<ControlReplicationFrame>,
-    progress: watch::Sender<ControlProgress>,
+    progress: watch::Sender<ControlProgressState>,
     nonce: u64,
     dropped: u64,
 }
 impl ControlHost {
+    /// Validate a durable session-owner witness against this control owner's
+    /// installed authority. The witness retains its export allowance while
+    /// queued; the returned permit owns its allowance through signing/delivery.
+    /// The clock is sampled by the owner at dispatch, never trusted from a peer.
+    /// This local capability is deliberately absent from the wire RPC.
+    pub async fn prepare_session_proof(
+        &self,
+        witness: focal_ledger::CommittedPlacement,
+        window: crate::placement_proof::ProofWindow,
+    ) -> Result<
+        crate::placement_proof::SessionProofPermit,
+        crate::placement_proof::PlacementProofError,
+    > {
+        use crate::placement_proof::PlacementProofError;
+        let input = self
+            .budget
+            .reserve(BudgetKind::Control, BudgetLane::Completion, 512)
+            .map_err(|_| PlacementProofError::Capacity)?
+            .commit();
+        let (response, receive) = oneshot::channel();
+        self.sender
+            .try_send(Work::PrepareSessionProof {
+                // The witness already owns its full structural export charge.
+                // Boxing keeps unrelated bounded queue entries small.
+                witness: Box::new(witness),
+                window,
+                response,
+                _input: input,
+            })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => PlacementProofError::Capacity,
+                mpsc::TrySendError::Disconnected(_) => PlacementProofError::Unavailable,
+            })?;
+        receive
+            .await
+            .map_err(|_| PlacementProofError::Unavailable)?
+    }
+    /// Trusted in-process observation, deliberately absent from the wire RPC.
+    /// Followers can rebuild authenticated replication routes without first
+    /// asking the same unavailable quorum they need those routes to reach.
+    pub async fn observe_root(&self) -> Result<RootObservation, ControlFailure> {
+        let charge = self
+            .budget
+            .reserve(BudgetKind::Control, BudgetLane::Completion, 512)
+            .map_err(|_| ControlFailure::Capacity)?
+            .commit();
+        let (send, receive) = oneshot::channel();
+        self.sender
+            .try_send(Work::ObserveRoot(send, charge))
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => ControlFailure::Capacity,
+                mpsc::TrySendError::Disconnected(_) => ControlFailure::Unavailable,
+            })?;
+        receive.await.map_err(|_| ControlFailure::Unavailable)?
+    }
     pub fn wire_limits() -> WireLimits {
         WireLimits {
             max_frame_bytes: 10 * 1024 * 1024,
@@ -151,29 +298,83 @@ impl ControlHost {
         ),
         ControlError,
     > {
+        Self::spawn_inner(replica, verifier, config, budget, None)
+    }
+    /// Resume a replica already drained by trusted startup authentication. Its
+    /// owned recovery output is consumed once by the normal framing path before
+    /// any subsequent drain, rather than discarded before routes are installed.
+    pub fn spawn_recovered<V: AuthorityVerifier + Send + 'static>(
+        replica: ControlReplica,
+        verifier: V,
+        config: ControlHostConfig,
+        budget: MemoryBudget,
+        initial: ControlEvents,
+    ) -> Result<
+        (
+            Self,
+            ControlOwner,
+            async_mpsc::Receiver<ControlReplicationFrame>,
+        ),
+        ControlError,
+    > {
+        if initial.applied_index != replica.applied_index() {
+            return Err(ControlError::Invalid);
+        }
+        Self::spawn_inner(replica, verifier, config, budget, Some(initial))
+    }
+    fn spawn_inner<V: AuthorityVerifier + Send + 'static>(
+        replica: ControlReplica,
+        verifier: V,
+        config: ControlHostConfig,
+        budget: MemoryBudget,
+        initial: Option<ControlEvents>,
+    ) -> Result<
+        (
+            Self,
+            ControlOwner,
+            async_mpsc::Receiver<ControlReplicationFrame>,
+        ),
+        ControlError,
+    > {
         config.validate()?;
+        if config
+            .enrollment_authority
+            .as_ref()
+            .is_some_and(|authority| {
+                authority.identity() != replica.identity()
+                    || authority.namespace() != config.namespace
+            })
+        {
+            return Err(ControlError::WrongOwner);
+        }
         let limits = Self::wire_limits();
         let (sender, receiver) = mpsc::sync_channel(config.queue_items);
         let (peers, incoming) = mpsc::sync_channel(config.replication_queue);
         let (outbound, outgoing) = async_mpsc::channel(config.replication_queue);
         let status = replica.status();
-        let (progress, changes) = watch::channel(ControlProgress {
-            identity: replica.identity(),
-            node: status.node_id,
-            leader: status.leader_id,
-            term: status.term,
-            applied_index: replica.applied_index(),
-            revisions: replica.revisions(),
-            dropped_replication: 0,
-            stopped: false,
+        let (progress, changes) = watch::channel(ControlProgressState {
+            value: ControlProgress {
+                identity: replica.identity(),
+                node: status.node_id,
+                leader: status.leader_id,
+                term: status.term,
+                applied_index: replica.applied_index(),
+                revisions: replica.revisions(),
+                dropped_replication: 0,
+                stopped: false,
+            },
+            _allocation: None,
         });
         let owner = Owner {
             replica,
+            initial,
             verifier,
             config: config.clone(),
             limits: limits.clone(),
             budget: budget.clone(),
             pending: VecDeque::new(),
+            directory: None,
+            authority_refresh: None,
             outbound,
             progress,
             nonce: 0,
@@ -197,11 +398,11 @@ impl ControlHost {
         ))
     }
     pub fn progress(&self) -> ControlProgress {
-        self.progress.borrow().clone()
+        self.progress.borrow().value.clone()
     }
     pub async fn closed(&self) {
         let mut changes = self.progress.clone();
-        while !changes.borrow().stopped {
+        while !changes.borrow().value.stopped {
             if changes.changed().await.is_err() {
                 break;
             }
@@ -387,10 +588,63 @@ impl<V: AuthorityVerifier> Owner<V> {
         while let Some(pending) = self.pending.pop_front() {
             self.finish(pending, Err(ControlFailure::OutcomeUnknown));
         }
+        if let Some(pending) = self.directory.take() {
+            pending.finish(Err(
+                crate::directory_bootstrap::DirectoryBootstrapError::Unavailable,
+            ));
+        }
+        if let Some(pending) = self.authority_refresh.take() {
+            pending.stop();
+        }
         self.publish_progress(true);
     }
     fn work(&mut self, work: Work) -> Result<bool, ControlError> {
         match work {
+            Work::PersistLocalIntent(write) => write.persist(),
+            Work::RefreshDirectory {
+                permit,
+                response,
+                input,
+                reply_charge,
+            } => {
+                self.drain()?;
+                self.refresh_directory(permit, response, input, reply_charge);
+                self.drain()?;
+            }
+            Work::PrepareDirectory {
+                plan,
+                response,
+                input,
+            } => {
+                self.drain()?;
+                self.prepare_directory(plan, response, input);
+                self.drain()?;
+            }
+            Work::PrepareSessionProof {
+                witness,
+                window,
+                response,
+                _input,
+            } => {
+                self.drain()?;
+                let result = crate::network_bootstrap::unix_time()
+                    .map_err(|_| crate::placement_proof::PlacementProofError::Unavailable)
+                    .and_then(|now| {
+                        crate::placement_proof::prepare_session_proof(
+                            &self.replica,
+                            &witness,
+                            window,
+                            now,
+                            &self.budget,
+                        )
+                    });
+                let _ = response.send(result);
+            }
+            Work::ObserveRoot(response, input) => {
+                self.drain()?;
+                let result = self.observe_root(input);
+                let _ = response.send(result);
+            }
             Work::Request(request, response, charge) => {
                 self.request(*request, response, charge);
                 self.drain()?;
@@ -417,6 +671,71 @@ impl<V: AuthorityVerifier> Owner<V> {
         }
         Ok(false)
     }
+    fn observe_root(&self, input: Allocation) -> Result<RootObservation, ControlFailure> {
+        if self.replica.identity().scope != ControlScope::Root {
+            return Err(ControlFailure::WrongOwner);
+        }
+        let mut bytes = [
+            ControlRead::State,
+            ControlRead::Contacts,
+            ControlRead::Configuration,
+        ]
+        .iter()
+        .try_fold(0usize, |bytes, query| {
+            bytes
+                .checked_add(self.replica.read_charge(query)?)
+                .ok_or(ControlError::Capacity)
+        })
+        .map_err(ControlFailure::from)?;
+        if let Some(authority) = self.replica.authority() {
+            // Compact serialized keys can be much smaller than nested tree
+            // nodes. Use the registry's structural heap bound for this clone.
+            let size = authority
+                .charged_bytes()
+                .map_err(|_| ControlFailure::Capacity)?;
+            bytes = size
+                .checked_add(4096)
+                .and_then(|n| bytes.checked_add(n))
+                .ok_or(ControlFailure::Capacity)?;
+        }
+        let state = self
+            .budget
+            .reserve(BudgetKind::Control, BudgetLane::Completion, bytes)
+            .map_err(|_| ControlFailure::Capacity)?
+            .commit();
+        let ControlReadResult::State(snapshot) = self
+            .replica
+            .read_local(&ControlRead::State)
+            .map_err(ControlFailure::from)?
+        else {
+            return Err(ControlFailure::WrongOwner);
+        };
+        let ControlReadResult::Contacts(contacts) = self
+            .replica
+            .read_local(&ControlRead::Contacts)
+            .map_err(ControlFailure::from)?
+        else {
+            return Err(ControlFailure::WrongOwner);
+        };
+        let ControlReadResult::Configuration(configuration) = self
+            .replica
+            .read_local(&ControlRead::Configuration)
+            .map_err(ControlFailure::from)?
+        else {
+            return Err(ControlFailure::WrongOwner);
+        };
+        Ok(RootObservation {
+            snapshot,
+            contacts,
+            configuration,
+            authority: self
+                .replica
+                .authority()
+                .map(|authority| authority.checkpoint().clone()),
+            _input: input,
+            _state: state,
+        })
+    }
     fn request(
         &mut self,
         verified: VerifiedRequest,
@@ -427,13 +746,43 @@ impl<V: AuthorityVerifier> Owner<V> {
             .request()
             .reply(Response::Error(AccessError::OutcomeUnknown));
         let mut waiting = None;
+        let enrollment = matches!(
+            verified.request().operation,
+            Operation::EnrollmentControl { .. }
+        );
         let mut peer_accepted = false;
         let peer_rpc = matches!(verified.request().operation, Operation::Raft { .. });
+        let root_peer = if self.replica.identity().scope == ControlScope::Root
+            && matches!(
+                verified.request().operation,
+                Operation::Raft { .. } | Operation::PeerControl { .. }
+            ) {
+            match (
+                verified.peer().role(),
+                verified.peer().certificate_fingerprint(),
+            ) {
+                (PeerRole::Node { node_id }, Some(fingerprint)) => Some(RootPeer {
+                    node: node_id,
+                    principal: verified.peer().principal().0,
+                    fingerprint,
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        };
         let result = (|| -> Result<ControlReply, ControlFailure> {
             let request = verified.request();
             let principal = verified.peer().principal();
             if request.ledger != self.config.namespace {
                 return Err(ControlFailure::Unauthorized);
+            }
+            if let Some(peer) = root_peer {
+                // A request can outlive the transport grant that admitted it.
+                // Publish available durable state before checking its enrollment
+                // and check again when a queued read completes.
+                self.drain().map_err(ControlFailure::from)?;
+                self.authorize_root_peer(peer)?;
             }
             if let Operation::Raft { group, message } = &request.operation {
                 let PeerRole::Node { node_id } = verified.peer().role() else {
@@ -451,6 +800,11 @@ impl<V: AuthorityVerifier> Owner<V> {
             }
             let contact = matches!(request.operation, Operation::NodeContact { .. });
             let (group, bytes, read_only): (&[u8; 16], &[u8], bool) = match &request.operation {
+                Operation::EnrollmentControl { group, request, .. }
+                    if matches!(verified.peer().role(), PeerRole::Node { .. }) =>
+                {
+                    (group, request, false)
+                }
                 Operation::NodeContact { group, .. }
                     if matches!(verified.peer().role(), PeerRole::Node { .. }) =>
                 {
@@ -475,7 +829,13 @@ impl<V: AuthorityVerifier> Owner<V> {
             }
             // Decode the read selector without ever deserializing a node-supplied
             // Submit body, even when it contains adversarial collection hints.
-            let rpc = if contact {
+            let rpc = if enrollment {
+                self.config
+                    .enrollment_authority
+                    .as_ref()
+                    .ok_or(ControlFailure::Unauthorized)?
+                    .decode(&self.replica, &verified)?
+            } else if contact {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_err(|_| ControlFailure::Unavailable)?
@@ -494,8 +854,36 @@ impl<V: AuthorityVerifier> Owner<V> {
                 ControlRpc::decode(bytes, self.replica.limits().max_command_bytes)
                     .map_err(ControlFailure::from)?
             };
-            if self.pending.len() >= self.config.pending_requests {
+            if self
+                .pending
+                .len()
+                .checked_add(usize::from(self.directory.is_some()))
+                .and_then(|count| count.checked_add(usize::from(self.authority_refresh.is_some())))
+                .is_none_or(|count| count >= self.config.pending_requests)
+            {
                 return Err(ControlFailure::Capacity);
+            }
+            if enrollment {
+                let command = match rpc {
+                    ControlRpc::Read(ControlRead::State) => None,
+                    ControlRpc::Submit(request) => Some(Box::new(request)),
+                    _ => return Err(ControlFailure::Unauthorized),
+                };
+                self.nonce = self.nonce.checked_add(1).ok_or(ControlFailure::Capacity)?;
+                let mut context = b"focal.control.enrollment.v1\0".to_vec();
+                context.extend_from_slice(&self.nonce.to_be_bytes());
+                context.extend_from_slice(&principal.0);
+                context.extend_from_slice(&request.request_id.0);
+                // Even a cached exact receipt is behind a fresh quorum barrier.
+                // A former leader cannot authorize against stale revocation.
+                self.replica
+                    .read_index(context.clone())
+                    .map_err(ControlFailure::from)?;
+                waiting = Some(Waiting::Enrollment {
+                    context,
+                    request: command,
+                });
+                return Err(ControlFailure::Unavailable);
             }
             match rpc {
                 ControlRpc::Transfer(request) => {
@@ -581,6 +969,8 @@ impl<V: AuthorityVerifier> Owner<V> {
                 waiting,
                 term: self.replica.status().term,
                 deadline,
+                enrollment,
+                root_peer,
                 _charge: charge,
             });
         } else {
@@ -592,15 +982,72 @@ impl<V: AuthorityVerifier> Owner<V> {
         // before it on every exit. Frames/replies below allocate new encoded
         // buffers under their own permits, retained through transport send.
         let _source_allocation;
-        let mut events = self.replica.drain(&self.verifier)?;
+        let mut events = match self.initial.take() {
+            Some(events) => events,
+            None => self.replica.drain(&self.verifier)?,
+        };
         _source_allocation = events.take_allocation();
         let status = self.replica.status();
+        self.complete_directory(&events);
+        self.complete_authority_refresh(&events);
         for _ in 0..self.pending.len() {
-            let Some(pending) = self.pending.pop_front() else {
+            let Some(mut pending) = self.pending.pop_front() else {
                 return Err(ControlError::Failed);
             };
             let mut read_charge = None;
-            let ready = match &pending.waiting {
+            let mut enrolled_write = None;
+            let ready = match &mut pending.waiting {
+                Waiting::Enrollment { context, request }
+                    if pending.term == status.term
+                        && status.role == StateRole::Leader
+                        && events.read_states.iter().any(|read| {
+                            &read.context == context && read.index <= self.replica.applied_index()
+                        }) =>
+                {
+                    let result = (|| {
+                        self.config
+                            .enrollment_authority
+                            .as_ref()
+                            .ok_or(ControlFailure::Unauthorized)?
+                            .authorize_current(&self.replica)?;
+                        if let Some(request) = request.take() {
+                            match self
+                                .replica
+                                .submit(*request, &self.verifier)
+                                .map_err(ControlFailure::from)?
+                            {
+                                ControlSubmission::Existing(receipt) => {
+                                    Ok(Some(ControlReply::Committed(receipt)))
+                                }
+                                ControlSubmission::Pending(id) => {
+                                    enrolled_write = Some(id);
+                                    Ok(None)
+                                }
+                            }
+                        } else {
+                            let bytes = self
+                                .replica
+                                .read_charge(&ControlRead::State)
+                                .map_err(ControlFailure::from)?;
+                            read_charge = Some(
+                                self.budget
+                                    .reserve(BudgetKind::Control, BudgetLane::Ordinary, bytes)
+                                    .map_err(|_| ControlFailure::Capacity)?
+                                    .commit(),
+                            );
+                            self.replica
+                                .read_local(&ControlRead::State)
+                                .map(ControlReply::Read)
+                                .map(Some)
+                                .map_err(ControlFailure::from)
+                        }
+                    })();
+                    match result {
+                        Ok(None) => None,
+                        Ok(Some(reply)) => Some(Ok(reply)),
+                        Err(error) => Some(Err(error)),
+                    }
+                }
                 Waiting::Write(id) => self
                     .replica
                     .receipt(*id)?
@@ -634,7 +1081,25 @@ impl<V: AuthorityVerifier> Owner<V> {
                 }
                 _ => None,
             };
+            if let Some(id) = enrolled_write {
+                pending.waiting = Waiting::Write(id);
+            }
             if let Some(result) = ready {
+                let result = if pending.enrollment {
+                    self.config
+                        .enrollment_authority
+                        .as_ref()
+                        .ok_or(ControlFailure::Unauthorized)
+                        .and_then(|authority| authority.authorize_current(&self.replica))
+                        .and(result)
+                } else {
+                    result
+                };
+                let result = if let Some(peer) = pending.root_peer {
+                    self.authorize_root_peer(peer).and(result)
+                } else {
+                    result
+                };
                 self.finish_charged(pending, result, read_charge.take());
             } else if pending.response.is_closed() {
                 drop(pending);
@@ -704,6 +1169,16 @@ impl<V: AuthorityVerifier> Owner<V> {
         self.publish_progress(false);
         Ok(())
     }
+    fn authorize_root_peer(&self, peer: RootPeer) -> Result<(), ControlFailure> {
+        let enrollment = self
+            .replica
+            .enrollment()
+            .ok_or(ControlFailure::Unauthorized)?;
+        let now = crate::network_bootstrap::unix_time().map_err(|_| ControlFailure::Unavailable)?;
+        authorize_node_contact(enrollment, peer.node, peer.principal, peer.fingerprint, now)
+            .map(|_| ())
+            .map_err(|_| ControlFailure::Unauthorized)
+    }
     fn finish(&self, pending: Pending, result: Result<ControlReply, ControlFailure>) {
         self.finish_charged(pending, result, None);
     }
@@ -743,15 +1218,17 @@ impl<V: AuthorityVerifier> Owner<V> {
     }
     fn publish_progress(&self, stopped: bool) {
         let status = self.replica.status();
-        self.progress.send_replace(ControlProgress {
-            identity: self.replica.identity(),
-            node: status.node_id,
-            leader: status.leader_id,
-            term: status.term,
-            applied_index: self.replica.applied_index(),
-            revisions: self.replica.revisions(),
-            dropped_replication: self.dropped,
-            stopped,
+        self.progress.send_modify(|state| {
+            state.value = ControlProgress {
+                identity: self.replica.identity(),
+                node: status.node_id,
+                leader: status.leader_id,
+                term: status.term,
+                applied_index: self.replica.applied_index(),
+                revisions: self.replica.revisions(),
+                dropped_replication: self.dropped,
+                stopped,
+            }
         });
     }
 }
@@ -769,3 +1246,7 @@ fn access_failure(error: AccessError) -> ControlFailure {
         _ => ControlFailure::Unavailable,
     }
 }
+
+#[cfg(test)]
+#[path = "control_host_auth_tests.rs"]
+mod auth_tests;

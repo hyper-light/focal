@@ -20,6 +20,7 @@
 mod membership;
 mod memory;
 pub use membership::*;
+mod checkpoint;
 mod persistence;
 mod storage;
 
@@ -208,6 +209,7 @@ pub struct DurableNode {
     raw_allocation: Option<Allocation>,
     recovered_allocation: Option<Allocation>,
     persistence: Option<persistence::PendingDrain>,
+    checkpoint: Option<Box<checkpoint::PendingCheckpoint>>,
     // Drop after any pending Ready/output payloads, including owner cancellation.
     active_allocation: Option<Allocation>,
 }
@@ -389,6 +391,7 @@ impl DurableNode {
             active_allocation: None,
             recovered_allocation,
             persistence: None,
+            checkpoint: None,
         };
         // Rebuild committed membership before elections or network messages can
         // run. Application replay is retained for the caller's first drain.
@@ -475,9 +478,20 @@ impl DurableNode {
     /// Install the application's complete state at its delivered prefix, retaining
     /// the Raft suffix until the new WAL generation and fence are durable.
     pub fn checkpoint(&mut self, index: u64, data: Vec<u8>) -> Result<(), ConsensusError> {
-        self.guarded_in(data.capacity(), 0, BudgetLane::Completion, |replica| {
-            replica.checkpoint_inner(index, data)
-        })
+        self.begin_checkpoint(index, data)?;
+        self.finish_checkpoint()
+    }
+    /// Term of a fully published durable prefix, independent of a newer
+    /// election term. Snapshot-prefix consumers must not substitute status.term.
+    pub fn published_term(&self, index: u64) -> Result<u64, ConsensusError> {
+        self.check()?;
+        if self.persistence_pending() {
+            return Err(ConsensusError::PersistencePending);
+        }
+        if index == 0 || index > self.delivered_index {
+            return Err(ConsensusError::CheckpointIndex);
+        }
+        self.raw.store().term(index).map_err(Into::into)
     }
     fn campaign_inner(&mut self) -> Result<(), ConsensusError> {
         self.check()?;
@@ -691,6 +705,11 @@ impl DurableNode {
         self.raw.report_snapshot(node, status);
         Ok(())
     }
+    /// Immutable bootstrap membership validated against the durable identity
+    /// record on every open. This is independent of the current configuration.
+    pub fn bootstrap_membership(&self) -> (&[u64], &[u64]) {
+        (&self.config.voters, &self.config.learners)
+    }
     pub fn status(&self) -> NodeStatus {
         let conf = &self.raw.store().conf_state;
         NodeStatus {
@@ -775,68 +794,6 @@ impl DurableNode {
             *delivered_index = entry.index;
         }
         Ok(())
-    }
-    /// The application provides its complete state (or verified content manifest)
-    /// at this prefix. Retain all suffix entries; replace the WAL generation only
-    /// after the checkpoint generation and its fence are durably installed.
-    fn checkpoint_inner(&mut self, index: u64, data: Vec<u8>) -> Result<(), ConsensusError> {
-        self.check()?;
-        if index == 0
-            || index != self.delivered_index
-            || index > self.raw.store().hard_state.commit
-            || self.raw.has_ready()
-        {
-            return Err(ConsensusError::CheckpointIndex);
-        }
-        if data.len() > 8 * 1024 * 1024 {
-            return Err(ConsensusError::Capacity);
-        }
-        let term = self.raw.store().term(index)?;
-        let mut snapshot = Snapshot::default();
-        snapshot.mut_metadata().index = index;
-        snapshot.mut_metadata().term = term;
-        snapshot
-            .mut_metadata()
-            .set_conf_state(self.raw.store().conf_state.clone());
-        snapshot.data = data;
-        let result = (|| {
-            let prepared = self.raw.store().prepare_snapshot(&snapshot)?;
-            let mut retained = vec![
-                identity_record(&self.config)?,
-                proto_record(
-                    self.config.group_id,
-                    RecordKind::Snapshot,
-                    index,
-                    term,
-                    &snapshot,
-                )?,
-            ];
-            for entry in self.raw.store().entries.iter().filter(|e| e.index > index) {
-                retained.push(proto_record(
-                    self.config.group_id,
-                    RecordKind::Entry,
-                    entry.index,
-                    entry.term,
-                    entry,
-                )?);
-            }
-            let hs = &self.raw.store().hard_state;
-            retained.push(proto_record(
-                self.config.group_id,
-                RecordKind::HardState,
-                hs.commit,
-                hs.term,
-                hs,
-            )?);
-            self.wal
-                .rewrite_checkpoint_in(&retained, BudgetLane::Completion)?;
-            self.raw.mut_store().compact_prepared(prepared)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            self.failed = true;
-        }
-        result
     }
     pub fn inject_fault_once(&mut self, point: FaultPoint) {
         self.wal.inject_fault_once(point);

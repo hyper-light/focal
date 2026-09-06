@@ -90,6 +90,8 @@ pub enum LedgerError {
     Capacity,
     #[error("membership request identity or configuration precondition changed")]
     MembershipConflict,
+    #[error("placement request conflicts with the committed session lifecycle")]
+    PlacementConflict,
     #[error("session is stopped after application failure; reopen to recover")]
     Failed,
     #[error("persisted ledger identity, format or prefix mismatch")]
@@ -174,6 +176,10 @@ pub struct Session {
     membership_state: MembershipState,
     membership_charge: Option<Allocation>,
     pending_membership: Option<PendingMembership>,
+    placement_state: PlacementState,
+    placement_charge: Option<Allocation>,
+    pending_placement: Option<PendingPlacementRecord>,
+    pending_evidence: Option<Box<DurableEvidenceSnapshot>>,
     last_term: u64,
     was_leader: bool,
     ready_term: Option<u64>,
@@ -318,6 +324,10 @@ impl Session {
             membership_state: MembershipState::default(),
             membership_charge: None,
             pending_membership: None,
+            placement_state: PlacementState::default(),
+            placement_charge: None,
+            pending_placement: None,
+            pending_evidence: None,
             last_term: 0,
             was_leader: false,
             ready_term: None,
@@ -388,6 +398,8 @@ impl Session {
             .saturating_add(usize::from(self.pending_cursor.is_some()))
             .saturating_add(usize::from(self.pending_maintenance.is_some()))
             .saturating_add(usize::from(self.pending_membership.is_some()))
+            .saturating_add(usize::from(self.pending_placement.is_some()))
+            .saturating_add(usize::from(self.pending_evidence.is_some()))
     }
 
     /// Explicitly local committed-prefix view; callers needing a linearizable read
@@ -491,7 +503,10 @@ impl Session {
             )));
         }
         if self.effective()?.receipt(&key).is_none()
-            && (self.pending_cursor.is_some() || self.pending_maintenance.is_some())
+            && (self.pending_cursor.is_some()
+                || self.pending_maintenance.is_some()
+                || self.pending_placement.is_some()
+                || self.placement_state.paused())
         {
             return Err(LedgerError::Capacity);
         }
@@ -660,12 +675,22 @@ impl Session {
 
     pub fn poll(&mut self) -> Result<SessionEvents, LedgerError> {
         self.check()?;
+        if self.consensus.checkpoint_pending() {
+            self.consensus.finish_checkpoint()?;
+        }
         let acquired = self.consensus.drain().map_err(LedgerError::from);
         let result = acquired.and_then(|events| self.apply_events(events));
         self.finish_poll(result)
     }
     pub fn try_poll(&mut self) -> Result<Option<SessionEvents>, LedgerError> {
         self.check()?;
+        if self.consensus.checkpoint_pending() {
+            match self.consensus.try_finish_checkpoint() {
+                Ok(false) => return Ok(None),
+                Ok(true) => {}
+                Err(error) => return self.finish_poll(Err(error.into())).map(Some),
+            }
+        }
         match self.consensus.try_drain() {
             Ok(None) => Ok(None),
             Ok(Some(events)) => {
@@ -690,6 +715,7 @@ impl Session {
             self.pending_cursor = None;
             self.pending_maintenance = None;
             self.pending_membership = None;
+            self.pending_placement = None;
         }
         self.release_empty_slots()?;
         result
@@ -705,6 +731,7 @@ impl Session {
             self.pending_cursor = None;
             self.pending_maintenance = None;
             self.pending_membership = None;
+            self.pending_placement = None;
             self.ready_term = None;
             self.readiness_requested = None;
             self.last_term = status.term;
@@ -753,10 +780,34 @@ impl Session {
                 &snapshot.configuration,
             )?;
         }
+        let mut membership_events = events.membership.into_iter().peekable();
+        let mut placement_configuration = membership_events
+            .peek()
+            .map(|entry| entry.before.clone())
+            .unwrap_or_else(|| self.consensus.membership_configuration());
         let mut offset = 0usize;
         while let Some(entry) = events.committed.get(offset) {
             if entry.index <= self.applied_raft {
                 return Err(LedgerError::Corrupt);
+            }
+            while membership_events
+                .peek()
+                .is_some_and(|membership| membership.index < entry.index)
+            {
+                let membership = membership_events.next().ok_or(LedgerError::Corrupt)?;
+                placement_configuration = membership.after.clone();
+                self.apply_membership(membership)?;
+            }
+            if entry.data.starts_with(PLACEMENT_MAGIC) {
+                self.apply_placement_entry(
+                    &entry.data,
+                    entry.index,
+                    entry.term,
+                    &placement_configuration,
+                )?;
+                self.applied_raft = entry.index;
+                offset = offset.checked_add(1).ok_or(LedgerError::Capacity)?;
+                continue;
             }
             if entry.data.starts_with(CURSOR_MAINTENANCE_MAGIC) {
                 self.apply_maintenance_entry(&entry.data)?;
@@ -772,7 +823,7 @@ impl Session {
                 offset = offset.checked_add(1).ok_or(LedgerError::Capacity)?;
                 continue;
             }
-            if !entry.data.starts_with(ENTRY_MAGIC) {
+            if self.placement_state.paused() || !entry.data.starts_with(ENTRY_MAGIC) {
                 return Err(LedgerError::Corrupt);
             }
             let tail = events.committed.get(offset..).ok_or(LedgerError::Corrupt)?;
@@ -787,7 +838,7 @@ impl Session {
         }
         // Membership metadata is independent of domain command application, but
         // follows its own strictly ordered Raft indices and the snapshot fence.
-        for membership in events.membership {
+        for membership in membership_events {
             self.apply_membership(membership)?;
         }
         self.applied_raft = self.applied_raft.max(events.applied_index);
@@ -896,6 +947,8 @@ include!("apply_epoch.rs");
 include!("cursor_session.rs");
 include!("cursor_maintenance.rs");
 include!("membership_session.rs");
+include!("placement_session.rs");
+include!("evidence_snapshot.rs");
 
 #[cfg(test)]
 mod tests {
@@ -1247,4 +1300,6 @@ mod tests {
     include!("cursor_tests.rs");
     include!("epoch_session_tests.rs");
     include!("membership_tests.rs");
+    include!("placement_tests.rs");
+    include!("evidence_snapshot_tests.rs");
 }

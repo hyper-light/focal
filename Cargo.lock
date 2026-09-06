@@ -565,6 +565,7 @@ dependencies = [
  "blake3",
  "focal-consensus",
  "focal-core",
+ "focal-directory",
  "focal-graph",
  "focal-memory",
  "focal-model",

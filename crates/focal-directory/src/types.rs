@@ -18,6 +18,11 @@ identifier!(
     OperationId,
     WorkId
 );
+impl RegionId {
+    /// Geography has not been established. This value is never a registered
+    /// region, residency choice, or independently promised failure domain.
+    pub const UNKNOWN: Self = Self([0; 16]);
+}
 
 /// Canonical tenant/session bytes, without ambient hashing or per-claim keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -73,7 +78,9 @@ impl NamespaceRange {
 pub struct NodeEnrollment {
     pub node: u64,
     pub generation: u64,
+    /// Zero is unknown, never a usable failure domain or residency claim.
     pub region: RegionId,
+    /// Zero is unknown. A known zone requires a known enclosing region.
     pub zone: ZoneId,
     pub endpoint: String,
     pub identity: ContentHash,

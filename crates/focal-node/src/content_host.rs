@@ -3,10 +3,12 @@
 use crate::custody::{
     Accounted, CustodyConfig, CustodyPolicy, CustodyScope, CustodyStore, content_error,
 };
+use crate::custody_prefix::{CustodyVerification, CustodyVerificationProgress, VerifiedCustody};
 use focal_evidence::{ContentError, ContentStore, TransferManifest, UploadId};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::*;
 use focal_wire::*;
+use futures_util::FutureExt;
 use std::{
     future::Future,
     pin::Pin,
@@ -32,10 +34,13 @@ impl ContentOwner {
 enum Command {
     Request(Box<VerifiedRequest>),
     Install(CustodyPolicy),
+    Replace(Option<CustodyScope>, CustodyPolicy),
+    Check(CustodyScope),
     Export(CustodyScope, ContentRef),
     Chunk(CustodyScope, ContentRef, usize),
     Read(CustodyScope, ContentRef, usize),
-    Seal(Box<VerifiedRequest>),
+    Seal(CustodyScope, Box<VerifiedRequest>),
+    Verify(Box<CustodyVerification>),
     Stop,
 }
 enum Output {
@@ -44,6 +49,7 @@ enum Output {
     Bytes(Accounted<Vec<u8>>),
     LocalSeal(ContentRef),
     Done,
+    Verification(CustodyVerificationProgress),
 }
 struct Work {
     command: Command,
@@ -51,6 +57,41 @@ struct Work {
     _allocation: Allocation,
 }
 impl ContentHost {
+    /// Trusted, exact-prefix verification. The target comes from the committed
+    /// session snapshot, while expected_active fences concurrent ingress-policy
+    /// replacement. This operation does not install or strengthen active policy.
+    pub async fn begin_verification(
+        &self,
+        snapshot: focal_ledger::DurableEvidenceSnapshot,
+        expected_active: Option<CustodyScope>,
+    ) -> Result<CustodyVerificationProgress, AccessError> {
+        let verification = CustodyVerification::new(snapshot, expected_active, &self.budget)?;
+        self.advance_verification(Box::new(verification)).await
+    }
+    pub async fn advance_verification(
+        &self,
+        verification: Box<CustodyVerification>,
+    ) -> Result<CustodyVerificationProgress, AccessError> {
+        match self.call(Command::Verify(verification), 0, true).await? {
+            Output::Verification(progress) => Ok(progress),
+            _ => Err(AccessError::Unavailable),
+        }
+    }
+    pub async fn verify_prefix(
+        &self,
+        snapshot: focal_ledger::DurableEvidenceSnapshot,
+        expected_active: Option<CustodyScope>,
+    ) -> Result<VerifiedCustody, AccessError> {
+        let mut progress = self.begin_verification(snapshot, expected_active).await?;
+        loop {
+            match progress {
+                CustodyVerificationProgress::Complete(witness) => return Ok(*witness),
+                CustodyVerificationProgress::Pending(verification) => {
+                    progress = self.advance_verification(verification).await?;
+                }
+            }
+        }
+    }
     pub fn spawn(
         store: ContentStore,
         config: CustodyConfig,
@@ -134,6 +175,8 @@ impl ContentHost {
         control: bool,
     ) -> Result<Output, AccessError> {
         tokio::runtime::Handle::try_current().map_err(|_| AccessError::Unavailable)?;
+        std::panic::catch_unwind(|| drop(tokio::time::sleep(Duration::ZERO)))
+            .map_err(|_| AccessError::Unavailable)?;
         let allocation = self
             .budget
             .reserve(
@@ -158,8 +201,10 @@ impl ContentHost {
                 mpsc::TrySendError::Full(_) => AccessError::Capacity,
                 mpsc::TrySendError::Disconnected(_) => AccessError::Unavailable,
             })?;
-        tokio::time::timeout(self.timeout, receive)
+        std::panic::AssertUnwindSafe(async { tokio::time::timeout(self.timeout, receive).await })
+            .catch_unwind()
             .await
+            .map_err(|_| AccessError::OutcomeUnknown)?
             .map_err(|_| AccessError::OutcomeUnknown)?
             .map_err(|_| AccessError::OutcomeUnknown)?
     }
@@ -170,6 +215,32 @@ impl ContentHost {
             .checked_mul(128)
             .ok_or(AccessError::Capacity)?;
         match self.call(Command::Install(policy), charge, true).await? {
+            Output::Done => Ok(()),
+            _ => Err(AccessError::Unavailable),
+        }
+    }
+    /// Trusted committed placement installation; no wire caller can invoke it.
+    /// Exact-target retries reconcile a response lost after the content CAS.
+    pub async fn replace_policy(
+        &self,
+        expected: Option<CustodyScope>,
+        policy: CustodyPolicy,
+    ) -> Result<(), AccessError> {
+        let bytes = policy
+            .peers
+            .len()
+            .checked_mul(128)
+            .ok_or(AccessError::Capacity)?;
+        match self
+            .call(Command::Replace(expected, policy), bytes, true)
+            .await?
+        {
+            Output::Done => Ok(()),
+            _ => Err(AccessError::Unavailable),
+        }
+    }
+    pub(crate) async fn check_policy(&self, scope: CustodyScope) -> Result<(), AccessError> {
+        match self.call(Command::Check(scope), 0, true).await? {
             Output::Done => Ok(()),
             _ => Err(AccessError::Unavailable),
         }
@@ -247,6 +318,7 @@ impl ContentHost {
     /// establish required remote custody before returning UploadReply::Sealed.
     pub(crate) async fn seal_upload(
         &self,
+        scope: CustodyScope,
         request: VerifiedRequest,
     ) -> Result<ContentRef, AccessError> {
         if !matches!(
@@ -255,7 +327,10 @@ impl ContentHost {
         ) {
             return Err(AccessError::InvalidRequest);
         }
-        match self.call(Command::Seal(Box::new(request)), 0, true).await? {
+        match self
+            .call(Command::Seal(scope, Box::new(request)), 0, true)
+            .await?
+        {
             Output::LocalSeal(value) => Ok(value),
             _ => Err(AccessError::Unavailable),
         }
@@ -300,6 +375,14 @@ fn execute(
             owner.install_policy(policy)?;
             Ok(Output::Done)
         }
+        Command::Replace(expected, policy) => {
+            owner.replace_policy(expected, policy)?;
+            Ok(Output::Done)
+        }
+        Command::Check(scope) => {
+            owner.check_policy(scope)?;
+            Ok(Output::Done)
+        }
         Command::Export(scope, content) => {
             owner.export_manifest(scope, content).map(Output::Manifest)
         }
@@ -309,8 +392,10 @@ fn execute(
         Command::Read(scope, content, limit) => {
             owner.read_bytes(scope, content, limit).map(Output::Bytes)
         }
-        Command::Seal(request) => {
-            owner.authorize(&request)?;
+        Command::Seal(scope, request) => {
+            if owner.authorize(&request)? != scope {
+                return Err(AccessError::Unavailable);
+            }
             let Operation::Upload(UploadRequest::Seal { upload }) = &request.request().operation
             else {
                 return Err(AccessError::InvalidRequest);
@@ -343,6 +428,9 @@ fn execute(
                 .map_err(content_error)
         }
         Command::Stop => Ok(Output::Done),
+        Command::Verify(verification) => verification
+            .advance(owner, budget)
+            .map(Output::Verification),
         Command::Request(request) => handle_request(owner, &request, limits, budget)
             .map(|reply| Output::Response(Box::new(reply))),
     }

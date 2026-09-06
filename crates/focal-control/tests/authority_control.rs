@@ -207,6 +207,278 @@ fn evidence(snapshot: &ControlAuthoritySnapshot, now: i64) -> ControlEvidence {
         proofs: vec![],
     }
 }
+
+fn activated_roots(path: &Path) -> Group {
+    let ca =
+        BootstrapAuthority::open_or_create(path.join("ca"), CLUSTER, vec!["localhost".into()], NOW)
+            .unwrap();
+    let key = JoinKey::open_or_create(path.join("key"), CLUSTER).unwrap();
+    let founder = FoundingEnrollmentDraft::open_or_create(
+        path.join("founder"),
+        &ca,
+        &key,
+        1,
+        [5; 16],
+        EnrollmentLimits::default(),
+        NOW,
+    )
+    .unwrap();
+    let directory =
+        RootDirectory::new(ClusterId(CLUSTER), RootConfig::default(), budget()).unwrap();
+    let bootstrap = ControlBootstrap::root(&directory, founder.registry()).unwrap();
+    let mut roots = Group::open(&path.join("root"), bootstrap, ROOT);
+    roots.commit(ControlCommand::ActivateAuthority(
+        AuthorityActivation::Root {
+            expected_root_revision: 0,
+            expected_enrollment_revision: 1,
+            decided_at: NOW,
+        },
+    ));
+    roots
+}
+
+#[test]
+fn compound_controller_read_preserves_exact_prefix_and_combined_allowance_after_replay() {
+    let dirs = tempfile::tempdir().unwrap();
+    let mut roots = activated_roots(dirs.path());
+    let before = roots.snapshot();
+    roots.commit(ControlCommand::VerifiedRoot(VerifiedRootCommand {
+        command: RootCommand {
+            expected_revision: 0,
+            operation: RootOperation::RegisterRegion {
+                region: RegionRecord {
+                    id: RegionId([1; 16]),
+                    label: "region".into(),
+                    authority_epoch: 1,
+                },
+                expected_epoch: None,
+            },
+        },
+        evidence: evidence(&before, NOW + 1),
+    }));
+    roots.restart();
+    let authoritative = roots.snapshot();
+    let replica = &roots.replicas[roots.leader];
+    let combined = replica
+        .read_charge(&ControlRead::StateAndAuthority)
+        .unwrap();
+    assert_eq!(
+        combined,
+        replica.read_charge(&ControlRead::State).unwrap()
+            + replica.read_charge(&ControlRead::Authority).unwrap()
+    );
+    let budget = budget();
+    let _allowance = budget
+        .reserve(
+            focal_memory::BudgetKind::Control,
+            focal_memory::BudgetLane::Completion,
+            combined,
+        )
+        .unwrap()
+        .commit();
+    let ControlReadResult::StateAndAuthority {
+        snapshot,
+        authority: Some(authority),
+    } = replica.read_local(&ControlRead::StateAndAuthority).unwrap()
+    else {
+        panic!("compound controller view")
+    };
+    assert_eq!(authority, authoritative);
+    assert_eq!(snapshot.applied_index, authority.applied_index);
+    assert_eq!(snapshot.identity, authority.identity);
+    assert_eq!(snapshot.revisions.root, 1);
+    assert_eq!(authority.decided_at, NOW + 1);
+    let ControlReadResult::State(state) = replica.read_local(&ControlRead::State).unwrap() else {
+        panic!("state")
+    };
+    assert_eq!(*snapshot, state);
+}
+
+#[test]
+fn saved_verified_root_compare_precedes_newer_committed_clock_after_restart() {
+    let dirs = tempfile::tempdir().unwrap();
+    let mut roots = activated_roots(dirs.path());
+    let snapshot = roots.snapshot();
+    let saved = ControlRequest {
+        id: ControlRequestId {
+            client: [10; 16],
+            sequence: 1,
+        },
+        acknowledged_through: 0,
+        command: ControlCommand::VerifiedRoot(VerifiedRootCommand {
+            command: RootCommand {
+                expected_revision: 0,
+                operation: RootOperation::Delegate {
+                    delegation: Delegation {
+                        namespace: NamespaceRange::all(),
+                        partition: PartitionId([3; 16]),
+                        region: RegionId::UNKNOWN,
+                        log_group: LogGroupId(PART),
+                        epoch: 1,
+                        activation: None,
+                    },
+                },
+            },
+            evidence: evidence(&snapshot, NOW),
+        }),
+    };
+    let journal = dirs.path().join("saved-root-intent");
+    std::fs::write(&journal, postcard::to_stdvec(&saved).unwrap()).unwrap();
+    roots.commit(ControlCommand::VerifiedRoot(VerifiedRootCommand {
+        command: RootCommand {
+            expected_revision: 0,
+            operation: RootOperation::RegisterRegion {
+                region: RegionRecord {
+                    id: RegionId([1; 16]),
+                    label: "registered".into(),
+                    authority_epoch: 1,
+                },
+                expected_epoch: None,
+            },
+        },
+        evidence: evidence(&snapshot, NOW + 1),
+    }));
+    let newer = roots.snapshot();
+    assert_eq!(newer.authority.revision, snapshot.authority.revision);
+    assert_eq!(newer.enrollment, snapshot.enrollment);
+    assert_eq!(newer.decided_at, NOW + 1);
+    roots.restart();
+    let mut restored: ControlRequest =
+        postcard::from_bytes(&std::fs::read(&journal).unwrap()).unwrap();
+    assert_eq!(restored, saved);
+    assert!(matches!(
+        roots.replicas[roots.leader].submit(restored.clone(), &AttemptedBypass),
+        Err(ControlError::Directory(DirectoryError::CompareFailed))
+    ));
+    assert_eq!(
+        roots.replicas[roots.leader].receipt(restored.id).unwrap(),
+        None
+    );
+
+    // Updating the failed comparison alone cannot authorize a clock regression.
+    let ControlCommand::VerifiedRoot(command) = &mut restored.command else {
+        panic!("saved verified root command")
+    };
+    command.command.expected_revision = 1;
+    assert!(matches!(
+        roots.replicas[roots.leader].submit(restored.clone(), &AttemptedBypass),
+        Err(ControlError::Directory(DirectoryError::ClockRegression))
+    ));
+    let ControlCommand::VerifiedRoot(command) = &mut restored.command else {
+        panic!("saved verified root command")
+    };
+    command.evidence.decided_at = NOW + 1;
+    let committed = roots.commit(restored.command);
+    assert_eq!(committed.revisions.root, 2);
+}
+
+#[test]
+fn saved_verified_partition_compare_precedes_newer_committed_clock_after_restart() {
+    let dirs = tempfile::tempdir().unwrap();
+    let mut roots = activated_roots(dirs.path());
+    let snapshot = roots.snapshot();
+    let delegation = Delegation {
+        namespace: NamespaceRange::all(),
+        partition: PartitionId([3; 16]),
+        region: RegionId::UNKNOWN,
+        log_group: LogGroupId(PART),
+        epoch: 1,
+        activation: None,
+    };
+    roots.commit(ControlCommand::VerifiedRoot(VerifiedRootCommand {
+        command: RootCommand {
+            expected_revision: 0,
+            operation: RootOperation::Delegate {
+                delegation: delegation.clone(),
+            },
+        },
+        evidence: evidence(&snapshot, NOW),
+    }));
+    let snapshot = roots.snapshot();
+    let directory = DirectoryPartition::new(
+        ClusterId(CLUSTER),
+        delegation,
+        PartitionConfig::default(),
+        budget(),
+    )
+    .unwrap();
+    let mut parts = Group::open(
+        &dirs.path().join("partition"),
+        ControlBootstrap::partition(&directory),
+        PART,
+    );
+    parts.commit(ControlCommand::ActivateAuthority(
+        AuthorityActivation::Partition {
+            expected_partition_revision: 0,
+            snapshot: snapshot.clone(),
+        },
+    ));
+    let saved = ControlRequest {
+        id: ControlRequestId {
+            client: [10; 16],
+            sequence: 1,
+        },
+        acknowledged_through: 0,
+        command: ControlCommand::VerifiedPartition(VerifiedPartitionCommand {
+            command: PartitionCommand {
+                expected_revision: 0,
+                delegation_epoch: 1,
+                operation: PartitionOperation::SealForTransfer {
+                    operation: OperationId([1; 16]),
+                    destination: PartitionId([4; 16]),
+                    next_epoch: 2,
+                },
+            },
+            evidence: evidence(&snapshot, NOW),
+        }),
+    };
+    let journal = dirs.path().join("saved-partition-intent");
+    std::fs::write(&journal, postcard::to_stdvec(&saved).unwrap()).unwrap();
+    let ControlCommand::VerifiedPartition(mut newer) = saved.command.clone() else {
+        panic!("saved verified partition command")
+    };
+    newer.evidence.decided_at = NOW + 1;
+    newer.command.operation = PartitionOperation::SealForTransfer {
+        operation: OperationId([2; 16]),
+        destination: PartitionId([5; 16]),
+        next_epoch: 2,
+    };
+    parts.commit(ControlCommand::VerifiedPartition(newer));
+    let newer = parts.snapshot();
+    assert_eq!(newer.authority.revision, snapshot.authority.revision);
+    assert_eq!(newer.enrollment, snapshot.enrollment);
+    assert_eq!(newer.decided_at, NOW + 1);
+    parts.restart();
+    let mut restored: ControlRequest =
+        postcard::from_bytes(&std::fs::read(&journal).unwrap()).unwrap();
+    assert_eq!(restored, saved);
+    assert!(matches!(
+        parts.replicas[parts.leader].submit(restored.clone(), &AttemptedBypass),
+        Err(ControlError::Directory(DirectoryError::CompareFailed))
+    ));
+    assert_eq!(
+        parts.replicas[parts.leader].receipt(restored.id).unwrap(),
+        None
+    );
+    let ControlCommand::VerifiedPartition(command) = &mut restored.command else {
+        panic!("saved verified partition command")
+    };
+    command.command.expected_revision = 1;
+    assert!(matches!(
+        parts.replicas[parts.leader].submit(restored, &AttemptedBypass),
+        Err(ControlError::Directory(DirectoryError::ClockRegression))
+    ));
+    let seal = parts.replicas[parts.leader]
+        .partition()
+        .unwrap()
+        .checkpoint()
+        .sealed
+        .as_ref()
+        .unwrap();
+    assert_eq!(seal.operation, OperationId([2; 16]));
+    assert_eq!(seal.destination, PartitionId([5; 16]));
+}
+
 #[test]
 fn quorum_activation_installed_topology_revocation_and_checkpoint_replay_are_authoritative() {
     let dirs = tempfile::tempdir().unwrap();
@@ -311,6 +583,13 @@ fn quorum_activation_installed_topology_revocation_and_checkpoint_replay_are_aut
         );
     }
     roots.next += 1;
+    // Another controller's stale activation is a definite failed comparison,
+    // while the exact committed activation above retains its original receipt.
+    let stale_activation = roots.request(activation.command.clone());
+    assert!(matches!(
+        roots.replicas[roots.leader].submit(stale_activation, &AttemptedBypass),
+        Err(ControlError::Directory(DirectoryError::CompareFailed))
+    ));
     let snapshot = roots.snapshot();
     assert_eq!(snapshot.source, original_identity);
     let legacy = roots.request(ControlCommand::Root(RootCommand {
@@ -361,10 +640,35 @@ fn quorum_activation_installed_topology_revocation_and_checkpoint_replay_are_aut
             .submit(request, &AttemptedBypass)
             .is_err()
     );
-    roots.commit(ControlCommand::Authority(AuthorityCommand {
+    let mut stale_grant = roots.request(ControlCommand::Authority(AuthorityCommand {
         expected_revision: snapshot.authority.revision,
         enrollment_revision: 1,
         decided_at: NOW,
+        operation: AuthorityOperation::GrantNode {
+            grant: grant.clone(),
+            expected_generation: None,
+        },
+    }));
+    stale_grant.id = ControlRequestId {
+        client: [10; 16],
+        sequence: 1,
+    };
+    stale_grant.acknowledged_through = 0;
+    roots.commit(ControlCommand::Authority(AuthorityCommand {
+        expected_revision: snapshot.authority.revision,
+        enrollment_revision: 1,
+        decided_at: NOW + 1,
+        operation: AuthorityOperation::AdvanceClock,
+    }));
+    assert!(matches!(
+        roots.replicas[roots.leader].submit(stale_grant, &AttemptedBypass),
+        Err(ControlError::Directory(DirectoryError::CompareFailed))
+    ));
+    let snapshot = roots.snapshot();
+    roots.commit(ControlCommand::Authority(AuthorityCommand {
+        expected_revision: snapshot.authority.revision,
+        enrollment_revision: 1,
+        decided_at: NOW + 1,
         operation: AuthorityOperation::GrantNode {
             grant: grant.clone(),
             expected_generation: None,

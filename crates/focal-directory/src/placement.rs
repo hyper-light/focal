@@ -90,6 +90,7 @@ pub fn propose_placement(
         .filter_map(|node| {
             let load = node.load?;
             (node.enrollment.eligible
+                && failure_domain(&node.enrollment, policy.durability.survive).is_ok()
                 && (policy.residency.is_empty()
                     || policy.residency.contains(&node.enrollment.region))
                 && load.generation == node.enrollment.generation
@@ -165,6 +166,17 @@ pub fn verify_placement(
     nodes: &BTreeMap<u64, NodeRecord>,
     max_members: usize,
 ) -> Result<(), DirectoryError> {
+    if spec
+        .policy
+        .residency
+        .iter()
+        .chain(&spec.policy.home_regions)
+        .any(|region| region.0 == [0; 16])
+    {
+        return Err(DirectoryError::Invalid(
+            "unknown region in placement policy",
+        ));
+    }
     let placement = &spec.placement;
     for members in [
         &placement.voters,

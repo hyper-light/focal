@@ -139,6 +139,16 @@ impl CustodyStore {
     /// The caller is the trusted control owner. Equal facts retry exactly;
     /// changed facts must move a route or policy fence forward without regression.
     pub fn install_policy(&mut self, policy: CustodyPolicy) -> Result<(), AccessError> {
+        let expected = self.installed(policy.ledger).map(CustodyPolicy::scope);
+        self.replace_policy(expected, policy)
+    }
+    /// Compare against the exact installed generation. Repeating the complete
+    /// target is idempotent after a lost response; a stale different target fails.
+    pub fn replace_policy(
+        &mut self,
+        expected: Option<CustodyScope>,
+        policy: CustodyPolicy,
+    ) -> Result<(), AccessError> {
         if policy.ledger.tenant.is_zero()
             || policy.ledger.session.is_zero()
             || policy.route_epoch.0 == 0
@@ -154,15 +164,21 @@ impl CustodyStore {
             if old == &policy {
                 return Ok(());
             }
-            if policy.route_epoch < old.route_epoch
+            if expected != Some(old.scope())
+                || policy.route_epoch < old.route_epoch
                 || policy.policy_revision < old.policy_revision
                 || (policy.route_epoch == old.route_epoch
                     && policy.policy_revision == old.policy_revision)
             {
                 return Err(AccessError::Unavailable);
             }
-        } else if self.policies.len() >= self.config.max_policies {
-            return Err(AccessError::Capacity);
+        } else {
+            if expected.is_some() {
+                return Err(AccessError::Unavailable);
+            }
+            if self.policies.len() >= self.config.max_policies {
+                return Err(AccessError::Capacity);
+            }
         }
         let bytes = policy
             .peers
@@ -179,10 +195,19 @@ impl CustodyStore {
                 _allocation: allocation,
             },
         );
-        self.transfers
-            .retain(|(scope, _, _), _| scope.ledger != ledger);
-        self.exports.retain(|(scope, _), _| scope.ledger != ledger);
-        self.recount()?;
+        // Old descriptors keep their quotas and immutable bytes until their
+        // existing lease expires. Every subsequent operation checks the current
+        // scope before accessing them; retirement never deletes content or
+        // silently releases a transfer's retained custody.
+        Ok(())
+    }
+    pub fn check_policy(&self, scope: CustodyScope) -> Result<(), AccessError> {
+        let policy = self
+            .installed(scope.ledger)
+            .ok_or(AccessError::Unauthorized)?;
+        if policy.scope() != scope {
+            return Err(AccessError::Unavailable);
+        }
         Ok(())
     }
     pub fn authorize(&self, verified: &VerifiedRequest) -> Result<CustodyScope, AccessError> {
@@ -200,12 +225,7 @@ impl CustodyStore {
         scope: CustodyScope,
         content: &ContentRef,
     ) -> Result<(), AccessError> {
-        let installed = self
-            .installed(scope.ledger)
-            .ok_or(AccessError::Unauthorized)?;
-        if installed.scope() != scope {
-            return Err(AccessError::Unavailable);
-        }
+        self.check_policy(scope)?;
         if content.domain != ContentDomainId(scope.ledger.tenant.0) {
             return Err(AccessError::Unauthorized);
         }

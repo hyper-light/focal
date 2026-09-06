@@ -235,6 +235,51 @@ impl PeerConnectionPool {
             _ => Err(PeerSendError::InvalidRequest),
         }
     }
+    /// Only the installed, trusted route table is enumerated. No response can
+    /// add an endpoint. A strictly increasing cursor bounds changing snapshots
+    /// without allocating a second route table.
+    pub fn next_route_target(&self, after: u64) -> Result<Option<u64>, PeerSendError> {
+        let state = self.state.lock().map_err(|_| PeerSendError::Closed)?;
+        if state.closed {
+            return Err(PeerSendError::Closed);
+        }
+        Ok(state
+            .routes
+            .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+            .next()
+            .map(|(node, _)| *node))
+    }
+    /// Node-only discovery/contact RPCs. Owner-side authorization remains
+    /// mandatory; routing is neither a membership grant nor Runtime authority.
+    pub async fn send_peer_control(
+        &self,
+        target: u64,
+        request: &RequestEnvelope,
+    ) -> Result<Vec<u8>, PeerSendError> {
+        if !matches!(
+            request.operation,
+            Operation::PeerControl { .. } | Operation::NodeContact { .. }
+        ) {
+            return Err(PeerSendError::InvalidRequest);
+        }
+        match self.exchange(target, request).await? {
+            Response::Control { response } => Ok(response),
+            _ => Err(PeerSendError::InvalidRequest),
+        }
+    }
+    pub async fn send_enrollment_control(
+        &self,
+        target: u64,
+        request: &RequestEnvelope,
+    ) -> Result<Vec<u8>, PeerSendError> {
+        if !matches!(request.operation, Operation::EnrollmentControl { .. }) {
+            return Err(PeerSendError::InvalidRequest);
+        }
+        match self.exchange(target, request).await? {
+            Response::Control { response } => Ok(response),
+            _ => Err(PeerSendError::InvalidRequest),
+        }
+    }
     async fn exchange(
         &self,
         target: u64,
@@ -265,6 +310,22 @@ impl PeerConnectionPool {
         let valid_operation = match &request.operation {
             Operation::Raft { group, message } => *group != [0; 16] && !message.is_empty(),
             Operation::Custody(_) => true,
+            Operation::PeerControl { group, request } => {
+                *group != [0; 16]
+                    && !request.is_empty()
+                    && request.len() <= MAX_PEER_CONTROL_REQUEST_BYTES
+            }
+            Operation::NodeContact { group, .. } => *group != [0; 16],
+            Operation::EnrollmentControl {
+                group,
+                genesis,
+                request,
+            } => {
+                *group != [0; 16]
+                    && *genesis != [0; 32]
+                    && !request.is_empty()
+                    && request.len() <= MAX_ENROLLMENT_CONTROL_REQUEST_BYTES
+            }
             _ => false,
         };
         if target == 0
@@ -301,7 +362,9 @@ impl PeerConnectionPool {
                 };
                 match remote.request(request).await {
                     Ok(response) => match response.result {
-                        value @ (Response::PeerAccepted | Response::Custody(_)) => {
+                        value @ (Response::PeerAccepted
+                        | Response::Custody(_)
+                        | Response::Control { .. }) => {
                             if slot.retired.load(Ordering::Acquire) {
                                 return Err(PeerSendError::RouteChanged);
                             }

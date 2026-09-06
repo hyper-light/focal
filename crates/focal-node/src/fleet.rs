@@ -24,9 +24,20 @@ use std::{
 };
 use tokio::sync::{mpsc as async_mpsc, oneshot, watch};
 
+#[path = "fleet_evidence.rs"]
+mod evidence_owner;
 #[path = "fleet_group.rs"]
 mod grouped;
+#[path = "fleet_placement.rs"]
+mod placement_owner;
+use evidence_owner::{EvidenceCall, PendingEvidenceCall};
+pub use grouped::management::{
+    FleetError, FleetIncarnation, FleetInstallFailure, FleetInstallation, FleetManager,
+    FleetRemoval, FleetReply, FleetStatus, ManagedFleetConfig,
+};
 pub use grouped::{FleetReplica, FleetReplication, FleetTenant, ReplicaFleet, ReplicaFleetParts};
+pub use placement_owner::{CommittedPlacement, PlacementReply, SessionPlacementRequest};
+use placement_owner::{PendingPlacementCall, PlacementCall};
 
 #[cfg(test)]
 #[path = "fleet_completion_tests.rs"]
@@ -44,7 +55,11 @@ mod async_tests;
 #[path = "fleet_membership_tests.rs"]
 mod membership_tests;
 
-#[derive(Clone, Debug)]
+#[cfg(test)]
+#[path = "fleet_evidence_tests.rs"]
+mod evidence_tests;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplicaConfig {
     pub root: RootCommandId,
     pub route_epoch: RouteEpoch,
@@ -97,6 +112,8 @@ enum Work {
     ),
     Transfer(u64, oneshot::Sender<Result<(), LedgerError>>),
     Membership(Box<MembershipCall>, Allocation),
+    Placement(Box<PlacementCall>, Allocation),
+    Evidence(Box<EvidenceCall>, Allocation),
     Stop(oneshot::Sender<Result<(), LedgerError>>),
 }
 pub(crate) struct ReceiptProbe {
@@ -163,47 +180,62 @@ enum HostSender {
     Direct(mpsc::SyncSender<Work>),
     Group {
         ledger: LedgerId,
-        sender: mpsc::SyncSender<grouped::Routed>,
+        incarnation: u64,
+        sender: mpsc::SyncSender<grouped::FleetInput>,
         slots: MemoryBudget,
         _backing: std::sync::Arc<Allocation>,
     },
 }
 impl HostSender {
-    fn try_send(&self, work: Work) -> Result<(), mpsc::TrySendError<Work>> {
+    fn try_send(&self, work: Work) -> Result<(), HostQueueError> {
         match self {
-            Self::Direct(sender) => sender.try_send(work),
+            Self::Direct(sender) => sender.try_send(work).map_err(host_queue_error),
             Self::Group {
                 ledger,
+                incarnation,
                 sender,
                 slots,
                 ..
             } => {
                 let lane = grouped::lane(&work);
                 let Ok(slot) = slots.reserve(BudgetKind::Pending, lane, 1) else {
-                    return Err(mpsc::TrySendError::Full(work));
+                    return Err(HostQueueError::Full);
                 };
                 sender
-                    .try_send(grouped::Routed {
+                    .try_send(grouped::FleetInput::Routed(grouped::Routed {
                         ledger: *ledger,
+                        incarnation: *incarnation,
                         work,
                         _slot: slot.commit(),
-                    })
-                    .map_err(|error| match error {
-                        mpsc::TrySendError::Full(routed) => mpsc::TrySendError::Full(routed.work),
-                        mpsc::TrySendError::Disconnected(routed) => {
-                            mpsc::TrySendError::Disconnected(routed.work)
-                        }
-                    })
+                    }))
+                    .map_err(host_queue_error)
             }
         }
+    }
+}
+enum HostQueueError {
+    Full,
+    Disconnected,
+}
+fn host_queue_error<T>(error: mpsc::TrySendError<T>) -> HostQueueError {
+    match error {
+        mpsc::TrySendError::Full(_) => HostQueueError::Full,
+        mpsc::TrySendError::Disconnected(_) => HostQueueError::Disconnected,
     }
 }
 #[derive(Clone)]
 pub struct ReplicaHost {
     sender: HostSender,
-    progress: watch::Receiver<ReplicaProgress>,
+    progress: watch::Receiver<ProgressState>,
     budget: MemoryBudget,
     client_frame_bytes: u32,
+    request_timeout: Duration,
+}
+struct ProgressState {
+    value: ReplicaProgress,
+    // The existing watch owns the allocation across owner, cloned handles and
+    // delayed replies. Replacing only value preserves incarnation accounting.
+    _allocation: Option<Allocation>,
 }
 pub struct ReplicaOwner(JoinHandle<()>);
 impl ReplicaOwner {
@@ -251,8 +283,11 @@ struct Owner {
     runtime: Option<focal_runtime::Runtime>,
     pending: VecDeque<Pending>,
     memberships: VecDeque<PendingMembershipCall>,
+    placement: Option<PendingPlacementCall>,
+    evidence: Option<PendingEvidenceCall>,
     outbound: async_mpsc::Sender<ReplicationFrame>,
-    progress: watch::Sender<ReplicaProgress>,
+    progress: watch::Sender<ProgressState>,
+    incarnation: u64,
     nonce: u64,
     dropped: u64,
     budget: MemoryBudget,
@@ -336,14 +371,23 @@ impl ReplicaHost {
         sender: HostSender,
         outbound: async_mpsc::Sender<ReplicationFrame>,
     ) -> Result<(Self, Owner), LedgerError> {
+        if session
+            .active_route()
+            .is_some_and(|route| route != config.route_epoch)
+        {
+            return Err(LedgerError::PlacementConflict);
+        }
         let status = session.status();
-        let (progress, changes) = watch::channel(ReplicaProgress {
-            node: status.node_id,
-            leader: status.leader_id,
-            term: status.term,
-            sequence: session.sequence(),
-            dropped_replication: 0,
-            stopped: false,
+        let (progress, changes) = watch::channel(ProgressState {
+            value: ReplicaProgress {
+                node: status.node_id,
+                leader: status.leader_id,
+                term: status.term,
+                sequence: session.sequence(),
+                dropped_replication: 0,
+                stopped: false,
+            },
+            _allocation: None,
         });
         let views = ReadViews::with_route_epoch(config.route_epoch);
         let streams = Streams::in_budget(&budget).map_err(|_| LedgerError::Capacity)?;
@@ -355,6 +399,7 @@ impl ReplicaHost {
             .max_frame_bytes
             .min(WireLimits::default().max_frame_bytes);
         let client_frame_bytes = client_limits.max_frame_bytes;
+        let request_timeout = config.request_timeout;
         let owner = Owner {
             session,
             config,
@@ -365,8 +410,11 @@ impl ReplicaHost {
             runtime,
             pending: VecDeque::new(),
             memberships: VecDeque::new(),
+            placement: None,
+            evidence: None,
             outbound,
             progress,
+            incarnation: 0,
             nonce: 0,
             dropped: 0,
             budget: budget.clone(),
@@ -381,19 +429,20 @@ impl ReplicaHost {
                 progress: changes,
                 budget,
                 client_frame_bytes,
+                request_timeout,
             },
             owner,
         ))
     }
     pub fn progress(&self) -> ReplicaProgress {
-        self.progress.borrow().clone()
+        self.progress.borrow().value.clone()
     }
     pub fn memory_stats(&self) -> focal_memory::BudgetStats {
         self.budget.stats()
     }
     pub async fn closed(&self) {
         let mut changes = self.progress.clone();
-        while !changes.borrow().stopped {
+        while !changes.borrow().value.stopped {
             if changes.changed().await.is_err() {
                 break;
             }
@@ -406,8 +455,8 @@ impl ReplicaHost {
         self.sender
             .try_send(Work::Transfer(target, send))
             .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => LedgerError::Capacity,
-                mpsc::TrySendError::Disconnected(_) => LedgerError::Failed,
+                HostQueueError::Full => LedgerError::Capacity,
+                HostQueueError::Disconnected => LedgerError::Failed,
             })?;
         receive.await.map_err(|_| LedgerError::Failed)?
     }
@@ -454,8 +503,8 @@ impl ReplicaHost {
                 charge,
             ))
             .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => LedgerError::Capacity,
-                mpsc::TrySendError::Disconnected(_) => LedgerError::Failed,
+                HostQueueError::Full => LedgerError::Capacity,
+                HostQueueError::Disconnected => LedgerError::Failed,
             })?;
         receive.await.map_err(|_| LedgerError::OutcomeUnknown)?
     }
@@ -465,8 +514,8 @@ impl ReplicaHost {
         self.sender
             .try_send(Work::Stop(send))
             .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => LedgerError::Capacity,
-                mpsc::TrySendError::Disconnected(_) => LedgerError::Failed,
+                HostQueueError::Full => LedgerError::Capacity,
+                HostQueueError::Disconnected => LedgerError::Failed,
             })?;
         receive.await.map_err(|_| LedgerError::Failed)?
     }
@@ -547,8 +596,8 @@ impl ReplicaHost {
             Ok(()) => receive
                 .await
                 .unwrap_or_else(|_| OwnedResponse::new(unknown)),
-            Err(mpsc::TrySendError::Full(_)) => OwnedResponse::new(full),
-            Err(mpsc::TrySendError::Disconnected(_)) => OwnedResponse::new(closed),
+            Err(HostQueueError::Full) => OwnedResponse::new(full),
+            Err(HostQueueError::Disconnected) => OwnedResponse::new(closed),
         }
     }
     /// Only checks the locally published immutable receipt. A miss never grants
@@ -579,8 +628,8 @@ impl ReplicaHost {
         self.sender
             .try_send(Work::Probe(Box::new(request), send, charge))
             .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => AccessError::Capacity,
-                mpsc::TrySendError::Disconnected(_) => AccessError::Unavailable,
+                HostQueueError::Full => AccessError::Capacity,
+                HostQueueError::Disconnected => AccessError::Unavailable,
             })?;
         receive.await.map_err(|_| AccessError::Unavailable)?
     }
@@ -635,9 +684,11 @@ impl Owner {
             .advance(&mut self.session)
             .map_err(|_| LedgerError::Failed)?;
         self.expire_pending();
+        self.progress_evidence()?;
         if self.session.has_ready() {
             self.drain_with_runtime(self.stopping.is_none())?;
         }
+        self.progress_evidence()?;
         if let Some((_, deadline)) = self.stopping.as_ref() {
             let expired = Instant::now() >= *deadline;
             if expired && self.session.has_ready() {
@@ -666,7 +717,8 @@ impl Owner {
         Ok(false)
     }
     fn group_deadline(&self) -> Result<Instant, LedgerError> {
-        if self.session.persistence_pending() || self.stopping.is_some() {
+        if self.session.persistence_pending() || self.stopping.is_some() || self.evidence.is_some()
+        {
             return Instant::now()
                 .checked_add(Duration::from_millis(1))
                 .ok_or(LedgerError::Failed);
@@ -698,6 +750,13 @@ impl Owner {
             Work::Membership(call, charge) => {
                 self.accept_membership(*call, charge);
                 self.drain()?;
+            }
+            Work::Placement(call, charge) => {
+                self.accept_placement(*call, charge);
+                self.drain()?;
+            }
+            Work::Evidence(call, charge) => {
+                self.accept_evidence(*call, charge)?;
             }
             Work::Stop(response) => {
                 if self.nonblocking {
@@ -740,6 +799,13 @@ impl Owner {
         Ok(())
     }
     fn close(&mut self) {
+        if let Some(pending) = self.evidence.take() {
+            let _ = self.session.cancel_checkpoint_evidence();
+            pending.finish(Err(LedgerError::OutcomeUnknown));
+        }
+        if let Some(pending) = self.placement.take() {
+            pending.finish(Err(LedgerError::OutcomeUnknown));
+        }
         while let Some(pending) = self.memberships.pop_front() {
             self.finish_membership(pending, Err(LedgerError::OutcomeUnknown));
         }
@@ -754,13 +820,15 @@ impl Owner {
     }
     fn publish_progress(&self, stopped: bool) {
         let status = self.session.status();
-        self.progress.send_replace(ReplicaProgress {
-            node: status.node_id,
-            leader: status.leader_id,
-            term: status.term,
-            sequence: self.session.sequence(),
-            dropped_replication: self.dropped,
-            stopped,
+        self.progress.send_modify(|state| {
+            state.value = ReplicaProgress {
+                node: status.node_id,
+                leader: status.leader_id,
+                term: status.term,
+                sequence: self.session.sequence(),
+                dropped_replication: self.dropped,
+                stopped,
+            }
         });
     }
     fn request(
@@ -804,7 +872,7 @@ impl Owner {
                 waiting = Some((WaitingFor::PeerPersistence, deadline));
                 return Ok(Response::Error(AccessError::Unavailable));
             }
-            if request.route_epoch != self.config.route_epoch {
+            if !self.serves_route(request.route_epoch) {
                 return Err(AccessError::Unavailable);
             }
             match &request.operation {
@@ -919,12 +987,26 @@ impl Owner {
             let _ = response.send(finish_response(header, charge));
         }
     }
+    // Serving metadata belongs to the installed placement. A committed cutover
+    // closes it, and activation requires trusted reinstallation with the new
+    // route/policy. Consensus traffic continues to catch up while it is closed.
+    fn serves_route(&self, route: RouteEpoch) -> bool {
+        route == self.config.route_epoch
+            && self
+                .session
+                .active_route()
+                .is_none_or(|active| active == route)
+            && self
+                .session
+                .placement()
+                .is_none_or(|fence| fence.kind != focal_ledger::SessionFenceKind::Cutover)
+    }
     fn probe_receipt(&self, verified: &VerifiedRequest) -> Result<Option<Response>, AccessError> {
         let request = verified.request();
         if request.ledger != self.session.ledger() {
             return Err(AccessError::Unauthorized);
         }
-        if request.route_epoch != self.config.route_epoch {
+        if !self.serves_route(request.route_epoch) {
             return Err(AccessError::Unavailable);
         }
         let input = verified.clone().into_authenticated(AuthorityContext {
@@ -1007,10 +1089,20 @@ impl Owner {
     }
     fn resolve(&mut self, events: &SessionEvents) -> Result<(), LedgerError> {
         self.resolve_memberships(events)?;
+        self.resolve_placement(events)?;
         let status = self.session.status();
         let count = self.pending.len();
         for _ in 0..count {
             let mut pending = self.pending.pop_front().ok_or(LedgerError::Corrupt)?;
+            if !self.serves_route(pending.header.route_epoch)
+                && !matches!(
+                    pending.waiting,
+                    WaitingFor::Mutation(_) | WaitingFor::PeerPersistence
+                )
+            {
+                pending.finish(Response::Error(AccessError::Unavailable));
+                continue;
+            }
             let result = match &mut pending.waiting {
                 WaitingFor::PeerPersistence => Some(Response::PeerAccepted),
                 WaitingFor::Mutation(key) => self
@@ -1074,6 +1166,7 @@ impl Owner {
         Ok(())
     }
     fn expire_pending(&mut self) {
+        self.expire_placement();
         let now = Instant::now();
         let count = self.memberships.len();
         for _ in 0..count {

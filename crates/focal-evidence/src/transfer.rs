@@ -19,6 +19,9 @@ impl TransferManifest {
     pub fn chunks(&self) -> usize {
         self.manifest.chunks.len()
     }
+    pub fn stream_digest(&self) -> ContentHash {
+        self.manifest.stream_digest
+    }
     pub fn chunk_length(&self, index: usize) -> Result<usize, ContentError> {
         usize::try_from(
             self.manifest

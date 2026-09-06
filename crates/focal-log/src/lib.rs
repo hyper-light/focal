@@ -141,7 +141,7 @@ pub struct Wal {
 mod writer;
 #[cfg(feature = "test-support")]
 pub use writer::WalPause;
-pub use writer::{SharedWal, WalAppend, WalLease, WalWriterLimits, WalWriterStats};
+pub use writer::{SharedWal, WalAppend, WalLease, WalWriterId, WalWriterLimits, WalWriterStats};
 
 /// Faults are injected at actual durability boundaries for crash-model tests.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

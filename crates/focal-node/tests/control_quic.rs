@@ -11,7 +11,10 @@
 use focal_consensus::NodeConfig;
 use focal_control::*;
 use focal_directory::*;
-use focal_enrollment::{BootstrapAuthority, EnrollmentLimits, EnrollmentRegistry};
+use focal_enrollment::{
+    BootstrapAuthority, EnrollmentCommand, EnrollmentLimits, EnrollmentRegistry, EnrollmentRole,
+    Invitation, InviteOptions, JoinKey, JoinPreparation, JoinRequest,
+};
 use focal_memory::MemoryBudget;
 use focal_model::{
     LedgerId, ParticipantId, RequestEpoch, RequestId, RouteEpoch, SessionId, TenantId,
@@ -110,6 +113,14 @@ impl Identity {
     fn tls(&self) -> TlsIdentity {
         TlsIdentity::from_pkcs8(vec![self.certificate.clone()], self.key.clone())
     }
+    fn connector(&self, roots: &[Vec<u8>]) -> QuicConnector {
+        QuicConnector::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            client_tls(self.tls(), roots.to_vec(), &limits()).unwrap(),
+            limits(),
+        )
+        .unwrap()
+    }
 }
 struct Pki {
     certificate: Certificate,
@@ -126,16 +137,11 @@ impl Pki {
             key,
         }
     }
-    fn issue(&self, name: String, node: bool) -> Identity {
+    fn issue(&self, name: String) -> Identity {
         let key = KeyPair::generate().unwrap();
         let mut params = CertificateParams::new(vec![name.clone()]).unwrap();
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-        if node {
-            params
-                .extended_key_usages
-                .push(ExtendedKeyUsagePurpose::ServerAuth);
-        }
         let issuer = Issuer::from_ca_cert_der(self.certificate.der(), &self.key).unwrap();
         let certificate = params.signed_by(&key, &issuer).unwrap();
         Identity {
@@ -147,14 +153,87 @@ impl Pki {
     fn roots(&self) -> Vec<Vec<u8>> {
         vec![self.certificate.der().to_vec()]
     }
-    fn connector(&self, id: &Identity) -> QuicConnector {
-        QuicConnector::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            client_tls(id.tls(), self.roots(), &limits()).unwrap(),
-            limits(),
-        )
-        .unwrap()
+}
+
+fn drain_seed_replicas(replicas: &mut [(ControlReplica, MemoryBudget)]) {
+    for _ in 0..16 {
+        let mut messages = Vec::new();
+        for (replica, _) in replicas.iter_mut() {
+            messages.extend(replica.drain(&RejectUnverifiedEvidence).unwrap().messages);
+        }
+        if messages.is_empty() {
+            break;
+        }
+        for message in messages {
+            let target = replicas
+                .iter_mut()
+                .find(|(replica, _)| replica.status().node_id == message.to)
+                .unwrap();
+            target.0.step(message).unwrap();
+        }
     }
+}
+
+fn commit_seed_enrollment(
+    replicas: &mut [(ControlReplica, MemoryBudget)],
+    sequence: u64,
+    command: EnrollmentCommand,
+) {
+    let id = ControlRequestId {
+        client: [104; 16],
+        sequence,
+    };
+    replicas[0]
+        .0
+        .submit(
+            ControlRequest {
+                id,
+                acknowledged_through: sequence - 1,
+                command: ControlCommand::Enrollment(command),
+            },
+            &RejectUnverifiedEvidence,
+        )
+        .unwrap();
+    drain_seed_replicas(replicas);
+    let receipt = replicas[0].0.receipt(id).unwrap().unwrap();
+    for (replica, _) in replicas {
+        assert_eq!(replica.receipt(id).unwrap(), Some(receipt));
+    }
+}
+
+fn pinned_join_request(
+    authority: &BootstrapAuthority,
+    invitation: &Invitation,
+    key: &JoinKey,
+    now: i64,
+) -> JoinRequest {
+    let mut client = rustls::ClientConnection::new(
+        Arc::new(invitation.client_config().unwrap()),
+        rustls::pki_types::ServerName::try_from(invitation.trust().server_name.clone()).unwrap(),
+    )
+    .unwrap();
+    let mut server = rustls::ServerConnection::new(Arc::new(
+        authority.server_identity().server_config().unwrap(),
+    ))
+    .unwrap();
+    for _ in 0..32 {
+        if client.wants_write() {
+            let mut bytes = Vec::new();
+            client.write_tls(&mut bytes).unwrap();
+            server.read_tls(&mut std::io::Cursor::new(bytes)).unwrap();
+            server.process_new_packets().unwrap();
+        }
+        if server.wants_write() {
+            let mut bytes = Vec::new();
+            server.write_tls(&mut bytes).unwrap();
+            client.read_tls(&mut std::io::Cursor::new(bytes)).unwrap();
+            client.process_new_packets().unwrap();
+        }
+        if !client.is_handshaking() && !server.is_handshaking() {
+            return invitation.request_after_tls(&client, key, now).unwrap();
+        }
+    }
+    panic!("seed enrollment TLS handshake did not finish");
 }
 struct Replica {
     host: ControlHost,
@@ -210,23 +289,13 @@ async fn three_metadata_owners_use_mutual_tls_with_majority_retry_and_scoped_ope
     let enrollment = EnrollmentRegistry::new(
         CLUSTER,
         authority.ca_certificate().to_vec(),
-        4,
+        1,
         EnrollmentLimits::default(),
     )
     .unwrap();
     let bootstrap = ControlBootstrap::root(&root, &enrollment).unwrap();
-    let pki = Pki::new();
-    let identities: Vec<_> = (1..=3)
-        .map(|id| pki.issue(format!("control-{id}.focal.test"), true))
-        .collect();
-    let operator = pki.issue("operator.focal.test".into(), false);
-    let actor = pki.issue("actor.focal.test".into(), false);
-    let operator_connector = pki.connector(&operator);
-    let actor_connector = pki.connector(&actor);
-    let mut routes = BTreeMap::new();
-    let mut pending = Vec::new();
-    for (index, identity) in identities.iter().enumerate() {
-        let id = index as u64 + 1;
+    let mut seeded = Vec::new();
+    for id in 1..=3 {
         let mut config = NodeConfig::single(id, CLUSTER, GROUP);
         config.voters = vec![1, 2, 3];
         let allowance = budget();
@@ -237,21 +306,100 @@ async fn three_metadata_owners_use_mutual_tls_with_majority_retry_and_scoped_ope
             data.path().join(id.to_string()),
         )
         .unwrap();
+        seeded.push((replica, allowance));
+    }
+    seeded[0].0.campaign().unwrap();
+    drain_seed_replicas(&mut seeded);
+    let mut identities = Vec::new();
+    let mut receipts = Vec::new();
+    // Trusted setup commits each invitation and admission in all actual root
+    // logs before TLS owners start. Certificate grants alone cannot authorize
+    // a Node RPC against the root's committed enrollment registry.
+    for node in 1..=3 {
+        let key = JoinKey::open_or_create(data.path().join(format!("key{node}")), CLUSTER).unwrap();
+        let draft = seeded[0]
+            .0
+            .enrollment()
+            .unwrap()
+            .prepare_invitation(
+                &authority,
+                InviteOptions {
+                    endpoint: "127.0.0.1:7443".into(),
+                    server_name: "localhost".into(),
+                    role: EnrollmentRole::Node,
+                    expires_at: now + 600,
+                },
+                now,
+            )
+            .unwrap();
+        commit_seed_enrollment(&mut seeded, (node - 1) * 2 + 1, draft.command().clone());
+        let invitation = draft.release(seeded[0].0.enrollment().unwrap()).unwrap();
+        let request = pinned_join_request(&authority, &invitation, &key, now);
+        let JoinPreparation::Commit(command) = seeded[0]
+            .0
+            .enrollment()
+            .unwrap()
+            .prepare_join(&authority, &request, now)
+            .unwrap()
+        else {
+            panic!("expected a new shared enrollment");
+        };
+        commit_seed_enrollment(&mut seeded, (node - 1) * 2 + 2, command);
+        let receipt = seeded[0]
+            .0
+            .enrollment()
+            .unwrap()
+            .release(&request, now)
+            .unwrap();
+        assert_eq!(receipt.identity.node_id, Some(node));
+        let material = key
+            .complete(&receipt, authority.ca_certificate(), now)
+            .unwrap();
+        identities.push(Identity {
+            certificate: receipt.certificate.clone(),
+            key: material.private_key_der().to_vec(),
+            name: receipt.identity.server_name.clone(),
+        });
+        receipts.push(receipt);
+    }
+    for (replica, _) in &seeded {
+        assert_eq!(replica.enrollment().unwrap().revision(), 6);
+        for receipt in &receipts {
+            replica
+                .enrollment()
+                .unwrap()
+                .authorize_certificate(&receipt.certificate, now)
+                .unwrap();
+        }
+    }
+    // Local tenant roles remain independently granted test principals. Trust
+    // both issuers for TLS; only the enrollment CA supplies the Node identities.
+    let pki = Pki::new();
+    let mut roots = pki.roots();
+    roots.push(authority.ca_certificate().to_vec());
+    let operator = pki.issue("operator.focal.test".into());
+    let actor = pki.issue("actor.focal.test".into());
+    let operator_connector = operator.connector(&roots);
+    let actor_connector = actor.connector(&roots);
+    let mut routes = BTreeMap::new();
+    let mut pending = Vec::new();
+    for (index, (identity, (replica, allowance))) in identities.iter().zip(seeded).enumerate() {
+        let id = index as u64 + 1;
         let mut config = ControlHostConfig::new(namespace());
         config.tick = Duration::from_millis(25);
         config.request_timeout = Duration::from_millis(400);
         let (host, owner, channel) =
             ControlHost::spawn(replica, RejectUnverifiedEvidence, config, allowance).unwrap();
         let peers = PeerRegistry::new(8).unwrap();
-        for (source, identity) in identities.iter().enumerate() {
+        for receipt in &receipts {
             peers
                 .register_certificate(
-                    &identity.certificate,
+                    &receipt.certificate,
                     PeerGrant {
-                        principal: ParticipantId::from_u128(source as u128 + 1),
+                        principal: ParticipantId(receipt.identity.principal),
                         tenants: BTreeSet::from([namespace().tenant]),
                         role: PeerRole::Node {
-                            node_id: source as u64 + 1,
+                            node_id: receipt.identity.node_id.unwrap(),
                         },
                     },
                 )
@@ -269,7 +417,7 @@ async fn three_metadata_owners_use_mutual_tls_with_majority_retry_and_scoped_ope
                 )
                 .unwrap();
         }
-        let tls = server_tls(identity.tls(), pki.roots(), &limits()).unwrap();
+        let tls = server_tls(identity.tls(), roots.clone(), &limits()).unwrap();
         let server = Arc::new(
             QuicServer::bind("127.0.0.1:0".parse().unwrap(), tls, peers, limits()).unwrap(),
         );
@@ -278,7 +426,7 @@ async fn three_metadata_owners_use_mutual_tls_with_majority_retry_and_scoped_ope
         let serving = tokio::spawn(async move { serving_server.serve(handler).await });
         let pool = Arc::new(
             PeerConnectionPool::new(
-                pki.connector(identity),
+                identity.connector(&roots),
                 PeerPoolLimits {
                     max_routes: 3,
                     max_connections: 3,
@@ -323,7 +471,6 @@ async fn three_metadata_owners_use_mutual_tls_with_majority_retry_and_scoped_ope
             remote,
         });
     }
-    replicas[0].host.campaign().await.unwrap();
     let first = leader(&replicas, usize::MAX).await;
     let ControlReply::Committed(receipt) =
         call(&replicas[first].remote, ControlRpc::Submit(request(1, 0))).await
@@ -333,7 +480,7 @@ async fn three_metadata_owners_use_mutual_tls_with_majority_retry_and_scoped_ope
     assert_eq!(receipt.revisions.root, 1);
     // Enrolled nodes discover public control state and membership through the
     // same quorum barrier, without receiving operator/control-write authority.
-    let node_connector = pki.connector(&identities[0]);
+    let node_connector = identities[0].connector(&roots);
     let node_remote = node_connector
         .connect(
             replicas[first].server.local_addr().unwrap(),

@@ -76,8 +76,31 @@ Persisted formats currently read:
 - `FOCALCU1`: initial cursor command envelope (legacy floor reconstruction).
 - `FOCALCU2`: cursor command envelope with the authoritative replay floor.
 - `FOCALCM1`: bounded internal lease-clock maintenance, without client receipts.
+- `FOCALMC1`: session membership-change context.
+- `FOCALPL1`: committed placement lifecycle record.
 - `FOCALSS1`: legacy core-only checkpoint.
 - `FOCALSS2`: core, cursor metadata and retained-tail checkpoint.
+- `FOCALSS3`: adds committed membership metadata.
+- `FOCALSS4`: additionally retains the active placement and latest cutover.
+
+`propose_placement` records an owner-authorized Created → Cutover → Activated
+lifecycle in the same Raft group. Each request binds the exact placement,
+configuration index and previous placement index. Its resulting fence receives
+its index, term, record hash and domain prefix only during committed apply.
+`SessionSeq` does not advance: an empty ledger can move using increasing Raft
+indices at domain prefix zero. A pending placement serializes admission; a
+committed Cutover pauses new domain mutations until Activated. Hosts must check
+wire route epochs against `active_route()` after activation. Cursor completion
+metadata may still advance without changing the sealed domain prefix.
+
+`placement_witness` exports an opaque `CommittedPlacement` with its own allocation.
+It cannot be deserialized or constructed from caller-provided facts. Its immutable
+genesis binds cluster, ledger, group and the original persisted voter/learner sets.
+The latest active and cutover records support exact retries through restart;
+older retired operations require reconciliation against the current view. Node
+proof producers must additionally verify committed group and enrollment grants
+before signing. This witness attests log authorization, not complete artifact
+custody; it does not substitute for a verified `ReplicaReady` custody seal.
 
 The same one-voter and multi-voter application paths implement these rules.
 Cursor controls currently serialize with pending domain proposals; this avoids

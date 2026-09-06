@@ -177,6 +177,16 @@ impl RetryState {
         }
         Ok(window.receipts.get(&id.sequence).copied())
     }
+    pub fn latest(&self, client: [u8; 16]) -> Result<Option<ControlReceipt>, ControlError> {
+        let Some(window) = self.checkpoint.get(&client) else {
+            return Ok(None);
+        };
+        let receipt = window
+            .receipts
+            .get(&window.highest)
+            .ok_or(ControlError::Corrupt("client window lost latest receipt"))?;
+        Ok(Some(*receipt))
+    }
 }
 fn retry_charge(state: &RetryCheckpoint) -> Result<usize, ControlError> {
     let receipts = state.values().try_fold(0usize, |sum, window| {

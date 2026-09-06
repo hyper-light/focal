@@ -1,4 +1,5 @@
 //! Bounded egress from the session owner to authenticated peer connections.
+use crate::control_host::{ControlReplicationFrame, DirectoryReplication};
 use crate::fleet::{FleetReplication, ReplicationFrame};
 use focal_wire::{PeerConnectionPool, PeerSendError};
 use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
@@ -47,15 +48,56 @@ pub async fn drive_fleet_replication(
     drive(Receiver::Fleet(receiver), pool, max_inflight).await
 }
 
+pub async fn drive_control_replication(
+    receiver: mpsc::Receiver<ControlReplicationFrame>,
+    pool: &PeerConnectionPool,
+    max_inflight: usize,
+) -> Result<ReplicationReport, ReplicationDriverError> {
+    drive(Receiver::Control(receiver), pool, max_inflight).await
+}
+
+/// Directory startup retains its fixed channel allowance through this owned
+/// receiver and all outstanding sends, without an extra shared wrapper.
+pub async fn drive_directory_replication(
+    receiver: DirectoryReplication,
+    pool: &PeerConnectionPool,
+    max_inflight: usize,
+) -> Result<ReplicationReport, ReplicationDriverError> {
+    drive(Receiver::Directory(receiver), pool, max_inflight).await
+}
+
+enum Frame {
+    Session(ReplicationFrame),
+    Control(ControlReplicationFrame),
+}
+impl Frame {
+    fn target(&self) -> u64 {
+        match self {
+            Self::Session(frame) => frame.target,
+            Self::Control(frame) => frame.target,
+        }
+    }
+    fn request(&self) -> &focal_wire::RequestEnvelope {
+        match self {
+            Self::Session(frame) => &frame.request,
+            Self::Control(frame) => &frame.request,
+        }
+    }
+}
+
 enum Receiver {
     Single(mpsc::Receiver<ReplicationFrame>),
     Fleet(FleetReplication),
+    Control(mpsc::Receiver<ControlReplicationFrame>),
+    Directory(DirectoryReplication),
 }
 impl Receiver {
-    async fn recv(&mut self) -> Option<ReplicationFrame> {
+    async fn recv(&mut self) -> Option<Frame> {
         match self {
-            Self::Single(receiver) => receiver.recv().await,
-            Self::Fleet(receiver) => receiver.recv().await,
+            Self::Single(receiver) => receiver.recv().await.map(Frame::Session),
+            Self::Fleet(receiver) => receiver.recv().await.map(Frame::Session),
+            Self::Control(receiver) => receiver.recv().await.map(Frame::Control),
+            Self::Directory(receiver) => receiver.recv().await.map(Frame::Control),
         }
     }
 }
@@ -80,7 +122,7 @@ async fn drive(
                 if let Some(frame) = frame {
                     report.attempted = report.attempted.saturating_add(1);
                     tasks.push(AssertUnwindSafe(async move {
-                        let result = pool.send(frame.target, &frame.request).await;
+                        let result = pool.send(frame.target(), frame.request()).await;
                         // Keep the whole frame, especially its Allocation, alive
                         // across connection setup, retries and response receipt.
                         drop(frame);

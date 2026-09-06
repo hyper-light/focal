@@ -9,7 +9,7 @@ use crate::{
     node_directory::NodeDirectory,
     quorum_enrollment::{QuorumEnrollmentConfig, QuorumEnrollmentDriver, QuorumEnrollmentHost},
 };
-use focal_control::{ControlBootstrap, ControlOptions, ControlReplica};
+use focal_control::{ControlBootstrap, ControlEvents, ControlOptions, ControlReplica};
 use focal_directory::{RootConfig, RootDirectory};
 use focal_enrollment::{
     BootstrapAuthority, CredentialMaterial, EnrollmentLimits, FoundingEnrollmentDraft, JoinKey,
@@ -64,20 +64,30 @@ pub type NetworkResult<T> = Result<T, NetworkError>;
 pub struct FoundingNetwork {
     pub state: NetworkState,
     pub control: ControlReplica,
+    pub(crate) recovered: ControlEvents,
     pub credentials: CredentialMaterial,
     pub enrollment_identity: CredentialMaterial,
+    pub receipt: focal_enrollment::EnrollmentReceipt,
     pub enrollment: QuorumEnrollmentHost,
     pub enrollment_driver: QuorumEnrollmentDriver,
     pub budget: MemoryBudget,
     pub wal: SharedWal,
     // Bootstrap metadata is bounded and retained with its owner, not separately
     // shared. The signer and control owner account for their own retained state.
-    _bootstrap_allocation: Allocation,
+    pub(crate) _bootstrap_allocation: Allocation,
     // The physical directory is released after every owned store/driver.
     pub directory: NodeDirectory,
 }
 impl FoundingNetwork {
     pub async fn open(settings: &Settings) -> NetworkResult<Self> {
+        Self::open_inner(settings, true).await
+    }
+    /// Recover durable state without demanding a local one-voter election.
+    /// The foreground service starts transports and establishes quorum readiness.
+    pub async fn prepare(settings: &Settings) -> NetworkResult<Self> {
+        Self::open_inner(settings, false).await
+    }
+    async fn open_inner(settings: &Settings, local_readiness: bool) -> NetworkResult<Self> {
         tokio::runtime::Handle::try_current().map_err(|_| NetworkError::RuntimeRequired)?;
         let directory = NodeDirectory::open(settings)?;
         let identity = directory.identity();
@@ -211,26 +221,29 @@ impl FoundingNetwork {
         }
         // Recovery precedes election; this founding constructor cannot reset an
         // established multi-voter group to one voter after its quorum disappears.
-        control.drain(&NoDirectoryAuthority)?;
+        let mut recovered = control.drain(&NoDirectoryAuthority)?;
+        if local_readiness && !recovered.messages.is_empty() {
+            return Err(NodeError::Identity.into());
+        }
         let status = control.status();
-        if status.voters != [identity.node] || !status.learners.is_empty() {
+        if local_readiness && (status.voters != [identity.node] || !status.learners.is_empty()) {
             return Err(NetworkError::ReplicatedRoot);
         }
-        control.campaign()?;
-        for _ in 0..4 {
-            if !control.drain(&NoDirectoryAuthority)?.messages.is_empty() {
-                return Err(NodeError::Identity.into());
+        if local_readiness {
+            control.campaign()?;
+            for _ in 0..4 {
+                if !control.drain(&NoDirectoryAuthority)?.messages.is_empty() {
+                    return Err(NodeError::Identity.into());
+                }
             }
-        }
-        const BARRIER: &[u8] = b"focal.network.genesis-ready.v1";
-        control.read_index(BARRIER.to_vec())?;
-        let events = control.drain(&NoDirectoryAuthority)?;
-        if !events
-            .read_states
-            .iter()
-            .any(|barrier| barrier.context == BARRIER && barrier.index <= control.applied_index())
-        {
-            return Err(NetworkError::QuorumUnavailable);
+            const BARRIER: &[u8] = b"focal.network.genesis-ready.v1";
+            control.read_index(BARRIER.to_vec())?;
+            recovered = control.drain(&NoDirectoryAuthority)?;
+            if !recovered.read_states.iter().any(|barrier| {
+                barrier.context == BARRIER && barrier.index <= control.applied_index()
+            }) {
+                return Err(NetworkError::QuorumUnavailable);
+            }
         }
         // Recovery may include revocation after genesis. The immutable founding
         // draft cannot override the live committed registry's authorization.
@@ -263,6 +276,7 @@ impl FoundingNetwork {
             QuorumEnrollmentHost::create(authority, signer_path, config, allowance)?
         };
         state.install(&directory)?;
+        let receipt = founder.receipt().clone();
         drop(founder);
         drop(key);
         drop(saved);
@@ -271,8 +285,10 @@ impl FoundingNetwork {
         Ok(Self {
             state,
             control,
+            recovered,
             credentials,
             enrollment_identity,
+            receipt,
             enrollment,
             enrollment_driver,
             budget,
