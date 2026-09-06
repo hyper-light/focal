@@ -1,55 +1,79 @@
 # focal
 
-**Durable coordination for people, agents, and the work they ask of each other.**
+**An inter-agent communication protocol and event-driven ledger for coordinating agent swarms.**
 
-[Install](#install-from-source) · [Quickstart](#start-locally) ·
+[Install](#install) · [Quickstart](#start-locally) ·
 [Objects and lifecycles](#claims-testaments-artifacts-and-validations) ·
 [CLI](#use-the-cli) · [MCP](#use-it-with-agents-through-mcp) ·
 [Storage](#how-durability-and-memory-fit-together) ·
 [Deployment](#grow-without-changing-the-domain-model)
 
-Focal is a Rust protocol and claims ledger. A participant issues a directed claim
-with explicit acceptance requirements. Its respondent supplies artifacts and a
-testament describing the result. Designated evaluators record checks against that
-exact evidence, and the ledger derives whether the requirements and dependencies
-are satisfied. The history remains inspectable and recoverable after a restart.
+Focal facilitates robust, predictable, efficient, and scalable coordination and
+communication among agent swarms. Its design spans a single node on a laptop
+through massively distributed deployments, adding configuration and operational
+concepts only as each deployment needs them.
 
-Use it to make a request such as “fix this regression and prove the tests pass”
-trackable across tools and participants: who asked, who accepted, what was
-delivered, which version was checked, and what actually passed. The CLI serves
-people and shell scripts; MCP exposes the same typed operations to agents.
+Participants exchange directed **claims**, respond with **testaments**, supply
+**artifacts** as evidence, and record **validations** against that exact evidence.
+The ledger preserves the ordered history and derives acceptance from declared
+requirements and dependencies. Participants can react to new work, results, and
+changes in responsibility without losing the record of what happened.
 
-Participants run their own tools, skills, scripts, and agents in any language.
-Focal records authorized facts and verifies their consistency; it does not launch
-workers or choose a participant's agent framework.
+A request such as “fix this regression and prove the tests pass” becomes
+inspectable across tools and participants: who asked, who accepted, what was
+delivered, which version was checked, and what actually passed. Agents invoke
+their own tools, skills, scripts, and frameworks in any language. People use the
+CLI to participate and inspect progress; MCP exposes typed operations to agents.
 
-The implementation includes a durable local service, authenticated networking,
-replicated ledger components, evidence custody, CLI, and stdio MCP server. Full
-independent object lifecycles and automatic deployment across regions are still
-being implemented. The [implementation record](docs/archictecutre/09-implementation-status.md)
-separates executed checks from the remaining plan.
+Active state lives primarily in RAM, with disk writes for durability and
+replicated logs for coordination across nodes. The repository implements the
+local service, authenticated networking, replication, evidence custody, CLI, and
+stdio MCP server. The [implementation record](docs/archictecutre/09-implementation-status.md)
+tracks qualification and the remaining work on independent lifecycles and global
+deployment.
 
-## Install from source
+## Install
 
-Use Rust through rustup, Bash, and a native protobuf compiler. The checkout pins
-**Rust 1.94.1**; rustup selects that toolchain when building.
-Install protobuf with `brew install protobuf` on macOS, or
-`sudo apt-get install protobuf-compiler` on Debian/Ubuntu.
+**One prebuilt `focal` executable contains the server, CLI client, and MCP server.**
+Running it requires no Rust toolchain, protobuf compiler, Python, or source checkout.
+
+Download the binary for your machine and `SHA256SUMS` from
+[Releases](https://github.com/hyper-light/focal/releases). The release pipeline
+builds these assets on their native architectures:
+
+| Platform | Processor | Binary |
+|---|---|---|
+| macOS 15+ | Apple silicon | `focal-macos-arm64` |
+| macOS 15+ | Intel | `focal-macos-x64` |
+| Linux (glibc, Ubuntu 24.04+) | x86_64 | `focal-linux-x64` |
+| Linux (glibc, Ubuntu 24.04+) | ARM64 | `focal-linux-arm64` |
+| Linux (static musl) | x86_64 | `focal-linux-x64-musl` |
+| Linux (static musl) | ARM64 | `focal-linux-arm64-musl` |
+
+For example, after downloading the Apple silicon binary and checksums into the
+same directory:
 
 ```sh
-git clone https://github.com/hyper-light/focal.git
-cd focal
-bash scripts/cargo.sh build --release -p focal-node --bin focal --locked
-export PATH="$PWD/target/release:$PATH"
+shasum -a 256 focal-macos-arm64
+# Compare the digest with the focal-macos-arm64 entry in SHA256SUMS.
+mkdir -p "$HOME/.local/bin"
+install -m 755 focal-macos-arm64 "$HOME/.local/bin/focal"
+export PATH="$HOME/.local/bin:$PATH"
+focal --version
 focal --help
 ```
 
-The `export` applies to this shell. Add that absolute directory to your shell's
-PATH configuration, or copy the binary into a directory already on PATH. Source
-builds are the installation path documented here. Local qualification runs on
-macOS arm64; CI is configured for Linux x86_64 and macOS arm64. Packaged releases
-and Windows support remain unqualified. See [building and verification](docs/building.md)
-for compiler and dependency details.
+Substitute your platform's filename; on Linux, `sha256sum` also prints the digest.
+Add `$HOME/.local/bin` to your shell's PATH configuration to retain it in future
+terminals. Start the server with `focal start`; use this same executable for client
+commands and `focal mcp serve`.
+
+Release packaging is implemented in the [release workflow](.github/workflows/release.yml).
+The first tagged release has not been published by this work; all six platform
+jobs must build and pass server, CLI, crash recovery, and MCP checks before
+publication. Windows support still requires its native transport and durable
+filesystem port. [Building from source](docs/building.md) is an optional
+contributor workflow, not an installation prerequisite.
 
 ## Start locally
 
@@ -139,17 +163,40 @@ authorized holder and generation. The **evaluator** is the participant designate
 to check the evidence. One participant may fill multiple permitted roles, but
 reading a claim or enrolling a physical node grants no evaluation authority.
 
+### How two agents coordinate
+
+Agent A requests a regression fix from Agent B. In this example, A also takes the
+designated evaluator role. Each agent runs its own tools; Focal records their
+exchanges and makes the resulting events available to both.
+
 ```mermaid
-flowchart LR
-    I[Issuer] -->|issues acceptance contract| C[Claim]
-    C -->|posted request| S[Subject]
-    S -->|performs work externally| A[Work artifacts]
-    A -->|exact manifest| T[Testament]
-    T -->|exact response evidence| E[Designated evaluator]
-    E -->|invokes its own tool, skill, or code| P[Result artifacts]
-    P -->|proof for the pinned run| V[Validation verdict]
-    V -->|required outcomes and graph predicates| C
+sequenceDiagram
+    participant A as Agent A · requester and evaluator
+    participant B as Agent B · respondent
+    Note over A,B: All exchanges below are recorded through Focal
+    A->>B: Claim: fix the regression, tests must pass
+    B-->>A: Execution receipt: I accept responsibility
+    Note over B: B attempts the work with its own tools
+    alt B reports completed work
+        B->>B: Retain work artifacts and author testament
+    else B reports failed or partial work
+        B->>B: Retain error artifacts and author testament
+    end
+    B-->>A: Authored testament: outcome, summary, exact artifact references
+    A->>B: Testament receipt: I received your report
+    Note over A: A inspects the evidence and runs<br/>the declared tools, scripts, or skills
+    A-->>B: Recorded validation results and proof artifacts
+    Note over A,B: Focal derives acceptance from required results and dependencies<br/>Both agents can inspect the history
 ```
+
+**Agent B always authors a testament when its work completes or fails.**
+Failures, errors, refusals, interruptions, and partial work must be reported with
+error artifacts; partial results can accompany them. Focal does not create a
+testament when B receives the claim. The receipt records responsibility;
+the testament records B's account of what happened. The arrows show logical
+agent-to-agent exchanges: each participant submits to, or reads from, the ledger.
+A completion statement is still subject to the declared validation requirements.
+Focal derives whether the claim is satisfied from those results and its dependencies.
 
 A validator definition names the evaluator, check kind, phase, required/observe
 mode, pinned handler identity/version, and accepted evidence schemas. An agentic
@@ -168,37 +215,14 @@ required completion. Claim satisfaction also accounts for declared dependencies;
 it is not a caller-supplied success flag. Artifacts submitted as evaluation proof
 remain separate from the respondent's already-frozen manifest.
 
-### Lifecycle and coordination
+### Independent lifecycles
 
-The current implementation's main **claim** path, including validation outcomes:
-
-```mermaid
-stateDiagram-v2
-    [*] --> Generated: submit claim
-    Generated --> Posted: claim post
-    Posted --> Received: receipt acquire
-    Received --> Progressed: claim progress
-    Received --> TestamentGenerated: submit testament
-    Progressed --> TestamentGenerated: submit testament
-    TestamentGenerated --> TestamentAcknowledged: testament receive
-    TestamentAcknowledged --> Validating: validation begin
-    Validating --> Satisfied: validation complete, pass and dependencies met
-    Validating --> ValidationFailed: validation complete, required failure
-    Validating --> ValidationIncomplete: validation complete, required incomplete
-    Validating --> ValidationErrored: validation complete, required error
-    Satisfied --> [*]
-    ValidationFailed --> [*]
-    ValidationIncomplete --> [*]
-    ValidationErrored --> [*]
-```
-
-This is a selected path, not the whole transition table: explicit cancellation,
-supersession, expiration, admission failures, and dependency failures have their
-own guarded terminal outcomes. Submitting a testament does not itself run a
-validator or establish success. The issuer invokes `validation complete` after
-the required verdicts are recorded; when dependencies remain, satisfaction can
-follow later as they resolve. A recorded failing verdict is a successful write
-of that result.
+The exchange above shows who acts and what they exchange. Each object also keeps
+its own history: accepting responsibility, delivering evidence, and establishing
+that a claim is satisfied are distinct events. Submitting a testament does not
+run a validator or establish success. When dependencies remain, claim satisfaction
+can follow later as they resolve. Cancellation, expiration and failed checks have
+their own guarded outcomes.
 
 The intended model gives **all four object families their own coordinated
 lifecycles**: artifacts can be produced and checked independently, testaments
@@ -208,34 +232,13 @@ artifact/testament state. The [four-family state and authority contract](docs/ar
 and [compatible storage migration](docs/archictecutre/18-lifecycle-storage-upgrade.md)
 define the remaining work; those target states are not yet available commands.
 
-The following **target lifecycle** view shows why those histories are separate.
-Each row is a selected successful path. Dotted arrows coordinate objects without
-making their statuses interchangeable:
-
-```mermaid
-flowchart TB
-    subgraph Claim
-        C1[Received] --> C2[TestamentGenerated] --> C3[TestamentAcknowledged]
-        C3 --> C4[Validating] --> C5[Locally complete]
-        C5 -->|graph predicates hold| C6[Satisfied]
-    end
-    subgraph WorkArtifact[Work artifact]
-        A1[Generated] --> A2[Attached] --> A3[Validating] --> A4[Validated]
-    end
-    subgraph ResponseTestament[Response testament]
-        T1[Generated] --> T2[Posted] --> T3[Received] --> T4[Validating] --> T5[Validated]
-    end
-    subgraph Validation
-        V1[Ready] -->|begin programmatic check| V2[Validating] -->|pass| V3[Validated]
-    end
-    A2 -. exact frozen manifest .-> T1
-    T1 -. first response .-> C2
-    T3 -. delivery observation .-> C3
-    T3 -. enables eligible checks .-> V1
-    V3 -. all required checks on this artifact .-> A4
-    A4 -. all required response slots .-> T5
-    T5 -. acceptance witnesses .-> C5
-```
+An internal Rust owner now retains complete validator definitions alongside
+claims and independent evaluation records in custom RAM storage. Posting a claim
+makes its Admission checks ready; the designated evaluator can then begin them.
+Creation, posting, cancellation and supersession publish their related records,
+evaluation fences and history together. This owner is not activated in the
+service: native durable recovery and transactions for reports, results and
+evidence remain under implementation.
 
 For example, an artifact can exist before the respondent closes a testament.
 Receiving that testament makes its exact evidence eligible for whole-work checks;

@@ -161,7 +161,7 @@ fn response(
     link: ResponseLink,
     event: ResponseEvent,
 ) -> Result<(), ContractError> {
-    claim.record_response(&claim.binding(), actor, link, event)
+    claim.record_response(&claim.binding(), actor, link, ReportStamp::fixture(), event)
 }
 fn first_response() -> (ClaimState, ResponseLink) {
     let mut claim = received();
@@ -1017,12 +1017,6 @@ fn boundary_failures_require_real_durable_evidence_and_the_narrow_phase_writer()
             SUBJECT,
             ClaimStatus::ReceiptFailed,
         ),
-        (
-            received(),
-            BoundaryFailure::Closing { receipt: fence(1) },
-            SUBJECT,
-            ClaimStatus::TestamentGenerationFailed,
-        ),
     ] {
         for principal in [Principal::Actor(OTHER), Principal::Node(writer)] {
             let mut claim = original.clone();
@@ -1069,6 +1063,313 @@ fn boundary_failures_require_real_durable_evidence_and_the_narrow_phase_writer()
             .unwrap();
         assert_eq!(claim.status(), status);
     }
+}
+
+fn response_diagnostic(claim: &ClaimState) -> ResponseDiagnostic {
+    use crate::CanonicalContent;
+    let parent = Parent::from_claim(claim).unwrap();
+    let content = crate::ArtifactContent {
+        ledger: parent.ledger,
+        schema: 1,
+        kind: "error".into(),
+        schema_hash: ContentHash([20; 32]),
+        metadata: vec![],
+        payload: crate::ArtifactPayload::Inline(b"tool failed; no requested work product".to_vec()),
+        producer: parent.holder,
+        receipt: Some(parent.receipt),
+        inputs: std::collections::BTreeSet::new(),
+        visibility: std::collections::BTreeSet::new(),
+    };
+    let hash = content.content_hash().unwrap();
+    let artifact = crate::Artifact::new(
+        content,
+        hash,
+        crate::ArtifactLifecycle {
+            created: SessionSeq(1),
+            custody_revision: 1,
+        },
+    );
+    let diagnostic = Diagnostic {
+        reason: super::super::evidence::EvidenceFailure::Work,
+        artifact: ArtifactRef {
+            id: ArtifactId::from_u128(200),
+            hash,
+        },
+    };
+    ResponseDiagnostic::record(
+        &parent,
+        Principal::Actor(parent.holder),
+        parent.receipt,
+        diagnostic,
+        (diagnostic.artifact.id, &artifact),
+        &EvidenceAttestation {
+            descriptor_hash: hash,
+            custody_revision: 1,
+            durable: true,
+            schema_valid: true,
+        },
+    )
+    .unwrap()
+}
+
+fn authored_response(
+    claim: &ClaimState,
+    summary: &str,
+    outcome: crate::OutcomeKind,
+    diagnostics: &[ResponseDiagnostic],
+) -> super::super::evidence::Response {
+    use super::super::evidence::{CloseReport, Response, ResponseIdentity, ResponseLimits};
+    let parent = Parent::from_claim(claim).unwrap();
+    Response::close(
+        ResponseIdentity {
+            binding: Binding {
+                object: ObjectId::from_u128(100),
+                revision: ObjectRevision(1),
+                ..claim.binding()
+            },
+            claim: parent.claim,
+            receipt: parent.receipt,
+            cycle: parent.next_cycle,
+            prior: parent.latest_response,
+        },
+        &parent,
+        Principal::Actor(parent.holder),
+        &[],
+        &[],
+        CloseReport {
+            summary,
+            confidence: crate::Confidence::Committed,
+            outcome,
+            diagnostics,
+            limits: ResponseLimits {
+                artifacts: 0,
+                diagnostics: 4,
+                summary_bytes: 1024,
+                construction_bytes: 64 * 1024,
+            },
+        },
+    )
+    .unwrap()
+    .response
+}
+
+#[test]
+fn a_receipt_and_a_closing_incident_never_generate_or_terminalize_a_response() {
+    use super::super::evidence::ResponseState;
+    let mut claim = received();
+    assert_eq!(claim.response_count(), 0);
+    assert_eq!(claim.latest_response(), None);
+    assert_eq!(claim.status(), ClaimStatus::Received);
+    let diagnostic = response_diagnostic(&claim);
+    let before = claim.clone();
+    for principal in [
+        Principal::Actor(ISSUER),
+        Principal::Actor(OTHER),
+        Principal::Node(SUBJECT),
+    ] {
+        assert_eq!(
+            claim.plan_closing_failure(&claim.binding(), principal, diagnostic, cut(1)),
+            Err(ContractError::WrongActor)
+        );
+    }
+    assert_eq!(
+        claim.plan_closing_failure(
+            &claim.binding(),
+            Principal::Actor(SUBJECT),
+            diagnostic,
+            cut(0)
+        ),
+        Err(ContractError::InvalidCut)
+    );
+    let incident = claim
+        .plan_closing_failure(
+            &claim.binding(),
+            Principal::Actor(SUBJECT),
+            diagnostic,
+            cut(1),
+        )
+        .unwrap();
+    assert_eq!(claim, before);
+    assert_eq!(incident.claim(), claim.binding());
+    assert_eq!(*incident.diagnostic(), diagnostic);
+    assert_eq!(incident.cut(), cut(1));
+    claim.apply_closing_incident(&incident).unwrap();
+    assert_eq!(claim.response_count(), 0);
+    assert_eq!(claim.status(), ClaimStatus::Received);
+    assert_eq!(claim.terminal_cut(), None);
+    assert_eq!(claim.local_sealed_at(), None);
+    assert!(!claim.local_complete());
+    assert_eq!(
+        claim.apply_closing_incident(&incident),
+        Err(ContractError::StaleRevision)
+    );
+
+    let mut testament = authored_response(
+        &claim,
+        "The tool failed; the error artifact explains why no binary was produced.",
+        crate::OutcomeKind::Failed,
+        &[diagnostic],
+    );
+    assert_eq!(testament.state(), ResponseState::Generated);
+    assert!(testament.manifest().is_empty());
+    claim
+        .observe_response(&claim.binding(), Principal::Actor(SUBJECT), &testament)
+        .unwrap();
+    assert_eq!(claim.status(), ClaimStatus::TestamentGenerated);
+    assert_eq!(claim.terminal_cut(), None);
+    let parent = Parent::from_claim(&claim).unwrap();
+    testament
+        .apply(
+            testament
+                .plan_post(
+                    &testament.identity().binding,
+                    &parent,
+                    Principal::Actor(SUBJECT),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+    claim
+        .observe_response(&claim.binding(), Principal::Actor(SUBJECT), &testament)
+        .unwrap();
+    assert_eq!(testament.state(), ResponseState::Posted);
+    assert_eq!(claim.status(), ClaimStatus::TestamentGenerated);
+    assert_eq!(
+        claim.received_report(
+            testament.identity().binding,
+            parent.receipt,
+            testament.report_stamp()
+        ),
+        Err(ContractError::InvalidTarget)
+    );
+    testament
+        .apply(
+            testament
+                .plan_receive(
+                    &testament.identity().binding,
+                    &parent,
+                    Principal::Actor(ISSUER),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+    claim
+        .observe_response(&claim.binding(), Principal::Actor(ISSUER), &testament)
+        .unwrap();
+    assert_eq!(claim.status(), ClaimStatus::TestamentAcknowledged);
+    assert_eq!(testament.state(), ResponseState::Received);
+    assert_eq!(testament.reported_outcome(), crate::OutcomeKind::Failed);
+    assert_eq!(testament.diagnostics()[0], diagnostic);
+    assert_eq!(testament.terminal(), None);
+    assert_eq!(claim.terminal_cut(), None);
+    assert!(!claim.local_complete());
+    claim
+        .received_report(
+            testament.identity().binding,
+            parent.receipt,
+            testament.report_stamp(),
+        )
+        .unwrap();
+}
+
+#[test]
+fn claim_observation_rejects_substituted_reports_and_stale_incident_publication() {
+    let mut claim = received();
+    let diagnostic = response_diagnostic(&claim);
+    let incident = claim
+        .plan_closing_failure(
+            &claim.binding(),
+            Principal::Actor(SUBJECT),
+            diagnostic,
+            cut(1),
+        )
+        .unwrap();
+    let original = authored_response(
+        &claim,
+        "I completed the work.",
+        crate::OutcomeKind::Complete,
+        &[],
+    );
+    let mut alternate = authored_response(
+        &claim,
+        "I failed to complete the work.",
+        crate::OutcomeKind::Failed,
+        &[diagnostic],
+    );
+    assert_eq!(original.identity(), alternate.identity());
+    claim
+        .observe_response(&claim.binding(), Principal::Actor(SUBJECT), &original)
+        .unwrap();
+    let parent = Parent::from_claim(&claim).unwrap();
+    alternate
+        .apply(
+            alternate
+                .plan_post(
+                    &alternate.identity().binding,
+                    &parent,
+                    Principal::Actor(SUBJECT),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+    let before = claim.clone();
+    assert_eq!(
+        claim.observe_response(&claim.binding(), Principal::Actor(SUBJECT), &alternate),
+        Err(ContractError::ContentConflict)
+    );
+    assert_eq!(
+        claim.apply_closing_incident(&incident),
+        Err(ContractError::StaleRevision)
+    );
+    assert_eq!(claim, before);
+    let mut original = original;
+    original
+        .apply(
+            original
+                .plan_post(
+                    &original.identity().binding,
+                    &parent,
+                    Principal::Actor(SUBJECT),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+    claim
+        .observe_response(&claim.binding(), Principal::Actor(SUBJECT), &original)
+        .unwrap();
+    original
+        .apply(
+            original
+                .plan_receive(
+                    &original.identity().binding,
+                    &parent,
+                    Principal::Actor(ISSUER),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+    claim
+        .observe_response(&claim.binding(), Principal::Actor(ISSUER), &original)
+        .unwrap();
+    alternate
+        .apply(
+            alternate
+                .plan_receive(
+                    &alternate.identity().binding,
+                    &parent,
+                    Principal::Actor(ISSUER),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        claim.received_report(
+            alternate.identity().binding,
+            parent.receipt,
+            alternate.report_stamp()
+        ),
+        Err(ContractError::ContentConflict)
+    );
 }
 
 #[test]

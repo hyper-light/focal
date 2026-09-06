@@ -378,6 +378,7 @@ fn testament_builder_is_admitted_by_core_without_granting_artifact_custody() {
             5,
         ),
     );
+    assert!(core.snapshot().testaments.is_empty());
     apply(
         &mut core,
         envelope(
@@ -422,7 +423,52 @@ fn testament_builder_is_admitted_by_core_without_granting_artifact_custody() {
         id(20),
         id(21)
     );
-    let testament: TestamentDocument = parse_document(yaml.as_bytes(), InputFormat::Yaml).unwrap();
+    let mut testament: TestamentDocument =
+        parse_document(yaml.as_bytes(), InputFormat::Yaml).unwrap();
+    for outcome in ["partial", "refused", "impossible", "interrupted", "failed"] {
+        let mut report = testament.clone();
+        report.outcome = outcome.into();
+        assert!(report.build(&worker, &mut ids()).is_err(), "{outcome}");
+    }
+    assert!(core.snapshot().testaments.is_empty());
+    let diagnostic = ArtifactDocument {
+        claim: id(10),
+        receipt: testament.receipt.clone(),
+        evidence_set: id(21),
+        id: Some(id(24)),
+        kind: "error".into(),
+        schema_hash: "ab".repeat(32),
+        metadata: vec![],
+        payload: PayloadDocument::Text {
+            text: r#"{"reason":"work was interrupted before the report could be produced"}"#.into(),
+        },
+        inputs: vec![],
+        visibility: vec![],
+    }
+    .build(&worker, &mut ids())
+    .unwrap();
+    let Command::AttachArtifact { artifact, .. } = &diagnostic else {
+        panic!("expected an artifact attachment");
+    };
+    let hash = artifact.content.content_hash().unwrap();
+    let mut admitted_diagnostic = envelope(&worker, diagnostic, 9);
+    // A client cannot grant custody. This fixture represents the service's
+    // attestation after storing and checking the diagnostic bytes.
+    admitted_diagnostic
+        .authority
+        .evidence
+        .push(EvidenceAttestation {
+            descriptor_hash: hash,
+            custody_revision: 1,
+            durable: true,
+            schema_valid: true,
+        });
+    apply(&mut core, admitted_diagnostic);
+    testament.manifest.push(ArtifactReferenceDocument {
+        id: id(24),
+        hash: hash.to_string(),
+    });
+    testament.summary = "Work interrupted; attached diagnostic describes the failure".into();
     apply(
         &mut core,
         envelope(&worker, testament.build(&worker, &mut ids()).unwrap(), 8),
@@ -438,6 +484,44 @@ fn testament_builder_is_admitted_by_core_without_granting_artifact_custody() {
         OutcomeKind::Interrupted
     );
     assert!(core.snapshot().runs.is_empty());
+}
+
+#[test]
+fn a_full_default_evidence_set_can_be_authored_through_json_and_yaml() {
+    // The service can stage 1024 artifacts. A lower client close limit stranded
+    // valid sets, including a diagnostic appended after the 256th work artifact.
+    let maximum = Limits::default().max_artifacts_per_set;
+    let mut report = TestamentDocument {
+        id: Some(id(25)),
+        claim: id(10),
+        receipt: ReceiptDocument {
+            id: id(20),
+            epoch: 1,
+        },
+        evidence_set: id(21),
+        manifest: (1..=maximum)
+            .map(|n| ArtifactReferenceDocument {
+                id: id(n as u128),
+                hash: "ab".repeat(32),
+            })
+            .collect(),
+        summary: "Partial work and a final error artifact".into(),
+        confidence: "committed".into(),
+        outcome: "partial".into(),
+    };
+    let expected = report.clone().build(&context(), &mut ids()).unwrap();
+    // JSON is also valid YAML, and exercises the YAML parser's independent
+    // collection and node bounds for the largest supported manifest.
+    let bytes = serde_json::to_vec(&report).unwrap();
+    for format in [InputFormat::Json, InputFormat::Yaml] {
+        let parsed: TestamentDocument = parse_document(&bytes, format).unwrap();
+        assert_eq!(parsed.build(&context(), &mut ids()).unwrap(), expected);
+    }
+    report.manifest.push(ArtifactReferenceDocument {
+        id: id(maximum as u128 + 1),
+        hash: "ab".repeat(32),
+    });
+    assert!(report.build(&context(), &mut ids()).is_err());
 }
 
 #[test]

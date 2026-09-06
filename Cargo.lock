@@ -509,10 +509,13 @@ name = "focal-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "focal-evidence",
+ "focal-memory",
  "focal-model",
  "postcard",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
 ]
 
@@ -558,6 +561,7 @@ name = "focal-evidence"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "focal-memory",
  "focal-model",
  "fs2",
  "postcard",

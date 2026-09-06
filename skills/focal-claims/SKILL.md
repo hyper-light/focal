@@ -31,7 +31,7 @@ For a **consultation or challenge**, first read the [peer-work branch](../refere
 
 1. For a posted claim assigned to the authenticated participant, use `receipt.acquire` with the intended nonzero receipt epoch from current claim state. Use epoch one for a first acquisition. Completion: preserve the returned receipt ID and epoch as a pair; a stale or denied acquisition gives no standing to perform fenced mutations.
 2. Record material progress with `claim.progress` under that exact receipt. Completion: the ledger records progress; the claim remains open until its lifecycle says otherwise.
-3. Deliver actual work through `focal-evidence`. Report success only to the degree proved by the returned lifecycle and validation records. A committed submission, a complete-looking summary and a `confidence` label do not establish satisfaction.
+3. After work completes or fails, use `focal-evidence` to deliver the actual outputs or diagnostics and author the response testament. Receipt acquisition records responsibility only. Report success only to the degree proved by the returned lifecycle and validation records. A committed submission, a complete-looking summary and a `confidence` label do not establish satisfaction.
 
 ## Cancellation and recovery
 

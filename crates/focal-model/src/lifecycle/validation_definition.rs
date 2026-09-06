@@ -3,9 +3,15 @@
 //! it is not a content identity, persisted hash, or successor wire allocation.
 use super::*;
 
+#[path = "validation_definition_memory.rs"]
+mod memory;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::lifecycle) struct DefinitionStamp([u8; 32]);
 impl DefinitionStamp {
+    pub(in crate::lifecycle) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
     #[cfg(test)]
     pub(in crate::lifecycle) fn fixture() -> Self {
         Self([0; 32])

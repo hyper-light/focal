@@ -65,6 +65,13 @@ fn request(id: u128, operation: Operation) -> VerifiedRequest {
     .unwrap()
 }
 fn artifact_request(id: u128, payload: ArtifactPayload) -> VerifiedRequest {
+    artifact_with_schema(id, payload, focal_evidence::test_report_schema())
+}
+fn artifact_with_schema(
+    id: u128,
+    payload: ArtifactPayload,
+    schema_hash: ContentHash,
+) -> VerifiedRequest {
     request(
         id,
         Operation::Submit {
@@ -76,7 +83,7 @@ fn artifact_request(id: u128, payload: ArtifactPayload) -> VerifiedRequest {
                         ledger: ledger(),
                         schema: SCHEMA_MAJOR,
                         kind: "test_report".into(),
-                        schema_hash: focal_evidence::test_report_schema(),
+                        schema_hash,
                         metadata: vec![],
                         payload,
                         producer: ParticipantId::from_u128(9),
@@ -116,6 +123,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_bytes(&report())
+    }
+    fn with_bytes(bytes: &[u8]) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let budget = MemoryBudget::new(128 * 1024 * 1024, 32 * 1024 * 1024).unwrap();
         let mut store = ContentStore::open(directory.path(), store_limits()).unwrap();
@@ -125,11 +135,11 @@ impl Fixture {
                 id,
                 ContentDomainId(ledger().tenant.0),
                 ContentClass::Evidence,
-                report().len() as u64,
+                bytes.len() as u64,
                 None,
             )
             .unwrap();
-        store.append(id, 0, &report()).unwrap();
+        store.append(id, 0, bytes).unwrap();
         let reference = store.seal(id).unwrap();
         let (host, owner) = ContentHost::spawn(
             store,
@@ -151,6 +161,94 @@ impl Fixture {
         self.owner.join().unwrap();
         assert_eq!(self.budget.stats().used, 0);
     }
+}
+
+#[tokio::test]
+async fn error_diagnostics_are_shape_checked_for_inline_and_durable_content() {
+    let diagnostic = br#"{"code":"tool_unavailable","message":"The tool could not run","details":"No work result was produced"}"#;
+    let fixture = Fixture::with_bytes(diagnostic);
+    let (coordinator, driver) =
+        EvidenceCoordinator::channel(fixture.host.clone(), 1, vec![], fixture.budget.clone(), 1)
+            .unwrap();
+    let pool = pool();
+    let exercise = async {
+        let placement = placement(1, &[1]);
+        coordinator
+            .replace_placement(None, placement.clone())
+            .await
+            .unwrap();
+        for payload in [
+            ArtifactPayload::Inline(diagnostic.to_vec()),
+            ArtifactPayload::Content(fixture.reference.clone()),
+        ] {
+            let witnessed = coordinator
+                .attest(artifact_with_schema(
+                    88,
+                    payload,
+                    focal_evidence::error_report_schema(),
+                ))
+                .await
+                .unwrap();
+            let attestation = witnessed
+                .witness
+                .validate(&witnessed.request, placement.scope(), &[1])
+                .unwrap();
+            assert!(attestation.durable && attestation.schema_valid);
+            assert_eq!(attestation.custody_revision, 1);
+        }
+        for payload in [
+            ArtifactPayload::Inline(diagnostic.to_vec()),
+            ArtifactPayload::Content(fixture.reference.clone()),
+        ] {
+            assert!(matches!(
+                coordinator
+                    .attest(artifact_with_schema(
+                        89,
+                        payload,
+                        focal_evidence::test_report_schema()
+                    ))
+                    .await,
+                Err(AccessError::InvalidRequest)
+            ));
+        }
+        assert!(matches!(
+            coordinator
+                .attest(artifact_with_schema(
+                    90,
+                    ArtifactPayload::Inline(diagnostic.to_vec()),
+                    ContentHash::default()
+                ))
+                .await,
+            Err(AccessError::UnsupportedOperation)
+        ));
+        assert!(matches!(
+            coordinator
+                .attest(artifact_with_schema(
+                    91,
+                    ArtifactPayload::Inline(br#"{"code":"x","message":" "}"#.to_vec()),
+                    focal_evidence::error_report_schema()
+                ))
+                .await,
+            Err(AccessError::InvalidRequest)
+        ));
+        let mut oversized = fixture.reference.clone();
+        oversized.length = 65537;
+        assert!(matches!(
+            coordinator
+                .attest(artifact_with_schema(
+                    92,
+                    ArtifactPayload::Content(oversized),
+                    focal_evidence::error_report_schema()
+                ))
+                .await,
+            Err(AccessError::Capacity)
+        ));
+        drop(coordinator);
+    };
+    let (result, ()) = tokio::join!(driver.run(&pool), exercise);
+    result.unwrap();
+    pool.close();
+    fixture.close().await;
 }
 fn pool() -> PeerConnectionPool {
     let identity = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();

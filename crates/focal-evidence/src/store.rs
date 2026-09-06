@@ -45,6 +45,9 @@ impl CustodyRecordKind {
 #[path = "transfer.rs"]
 mod transfer;
 pub use transfer::TransferManifest;
+#[path = "native_artifact.rs"]
+mod native_artifact;
+pub use native_artifact::*;
 
 #[derive(Debug, Clone)]
 pub struct StoreLimits {

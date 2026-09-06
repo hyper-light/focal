@@ -2,13 +2,19 @@
 
 See [cluster administration](cluster-admin.md) for authenticated local operator inspection, root and application membership, invitation management, and exact admin-request recovery.
 
+Install the [prebuilt `focal` binary](../README.md#install) for your platform. The
+same executable supplies the server, human CLI and MCP server; no source checkout
+or compiler is required to run it. The [release procedure](../scripts/release/README.md)
+describes downloadable CI artifacts while the first tagged release is pending.
+[Building from source](building.md) is an optional contributor workflow.
+
 The `focal` binary connects to the running local service through its authenticated Unix socket. Start it in one terminal:
 
 ```sh
 focal --data-dir /tmp/focal-manual start
 ```
 
-Use the same `--data-dir` in another terminal. The examples below abbreviate that common option. `--config FILE` and `--data-dir DIR` work before or after subcommands. `--help` lists the flags at each level. Build with `bash scripts/cargo.sh build -p focal-node --bin focal --locked --offline`; the development binary is `target/debug/focal`.
+Use the same `--data-dir` in another terminal. The examples below abbreviate that common option. `--config FILE` and `--data-dir DIR` work before or after subcommands. `--help` lists the flags at each level.
 
 ## Offline schemas, examples and completion
 
@@ -23,6 +29,7 @@ focal schema get claim.submit --direction input
 focal schema get claim.submit --direction output
 focal schema example claim.submit > claim.json
 focal schema get test-report
+focal schema get error-report
 focal schema get domain-registry
 ```
 
@@ -33,7 +40,8 @@ fields or trusted authority. The output schema describes the shared
 `ApplicationResult` envelope, not the human CLI table, CLI journal output or JSON-RPC
 transport wrapper. Nested frozen wire results still require their typed decoder's
 semantic checks, as the schema descriptions state. Built-in test-report and
-domain-registry output remain compatible; `--direction` applies only to operations.
+domain-registry output remain compatible; error-report supplies a bounded diagnostic
+contract. `--direction` applies only to operations.
 
 Examples pass through the real typed input decoder and serializer, including
 defaults. The claim example is a self-targeted handoff with a pure receipt
@@ -112,7 +120,10 @@ Choose field flags or one document. Documents cannot override issuer, trusted ca
 
 ## Deliver artifacts and a testament
 
-Use the IDs printed by each preceding step:
+The current receipt holder is the respondent and authors the testament after its
+work completes or fails. Acquiring a receipt records responsibility; it never
+creates a testament. The respondent supplies the summary, outcome and exact
+evidence references. Use the IDs printed by each preceding step:
 
 ```sh
 focal claim post CLAIM_ID
@@ -136,6 +147,60 @@ focal submit testament --claim CLAIM_ID \
   --summary 'Checked report attached' --confidence committed --outcome complete
 ```
 
+For unsuccessful work, use this alternative in place of the successful report and
+testament above. The error-report schema describes tool failures, refusals and
+interruptions without assuming any test ran. Obtain its exact hash with
+`focal schema get error-report` and substitute it for `ERROR_SCHEMA_HASH`:
+
+```sh
+focal submit artifact --claim CLAIM_ID \
+  --receipt RECEIPT_ID --receipt-epoch 1 --evidence-set EVIDENCE_SET_ID \
+  --kind error --schema-hash ERROR_SCHEMA_HASH \
+  --text '{"code":"tool_unavailable","message":"The required tool could not run","details":"No test result was produced"}'
+
+focal submit testament --claim CLAIM_ID \
+  --receipt RECEIPT_ID --receipt-epoch 1 --evidence-set EVIDENCE_SET_ID \
+  --artifact ERROR_ARTIFACT_ID:ERROR_DESCRIPTOR_HASH \
+  --summary 'The tool could not run; the failure diagnostic is attached' \
+  --confidence committed --outcome failed
+```
+
+Use a truthful code/message and the returned artifact ID and descriptor hash.
+`code` and `message` are required nonblank strings, limited to 128 and 4096 UTF-8
+bytes. Optional `details` is a string up to 32768 UTF-8 bytes or `null`. The complete
+JSON payload is limited to 64 KiB; unknown and duplicate fields are rejected. A
+successful schema check verifies this shape, not whether the diagnosis is true.
+
+For tests that actually ran and failed, the original test-report schema remains
+usable: submit `--kind error --schema-hash SCHEMA_HASH` with real counts such as
+`--text '{"passed":0,"failed":1,"skipped":0}'`. Use the corresponding returned
+artifact reference in the testament. Do not invent test counts for a tool that
+could not execute.
+
+Every non-`complete` outcome—`partial`, `refused`, `impossible`, `interrupted` or
+`failed`—requires at least one durable `kind=error` artifact produced by the current
+holder under this claim's current receipt and evidence set. A summary alone is
+insufficient. Partial outputs can accompany the diagnostic; include **every**
+staged artifact in the exact original order when closing the set. `committed`
+expresses confidence in the reported account, including a failure account; it
+does not declare the work successful. The current storage model permits one
+closing testament per claim, so these success and failure examples are alternatives.
+
+The claimant receives the failure testament and its designated evaluator checks
+the exact diagnostic evidence under the claim's declared requirements. Read its
+manifest and retrieve the referenced bytes before evaluation:
+
+```sh
+focal get testament TESTAMENT_ID --format json
+focal list artifacts --testament TESTAMENT_ID
+focal get artifact ERROR_ARTIFACT_ID --output ./error-report.json
+```
+
+Continue with the receive and validation steps below. The reported `failed`
+outcome does not itself submit a validation verdict or bypass those steps. Declare
+substantive test or inspection requirements when authoring the claim: the pure
+receipt requirement in the introductory example proves delivery only.
+
 `--artifact` repeats in manifest order; `--manifest-file FILE` accepts a JSON/YAML array of `{id, hash}` references. A testament can instead be supplied with `--json`, `--yaml` or `--file`:
 
 ```yaml
@@ -152,7 +217,14 @@ confidence: committed
 outcome: complete
 ```
 
-Artifacts accept the same document modes. An inline payload document is `{type: text, text: ...}` or `{type: inline, bytes: [...]}`; a content payload contains an existing immutable content reference. Inline payloads and opaque metadata are each limited to 16 KiB. `submit artifact --payload-file FILE` stages the complete file in a private durable transfer journal, uploads it through custody, then attaches its immutable reference. Interrupted retries preserve the exact staged bytes even if the original file changes or disappears. The transfer limit is 64 MiB; this release's built-in test-report schema attestation accepts at most 1 MiB. Transfer capacity does not bypass schema or custody admission. Arbitrary schema registration remains open. `artifact register --payload-file FILE` uses the same durable 64-MiB staging/upload path before registering independent proof; its schema admission remains subject to the actual installed validator bound.
+Artifacts accept the same document modes. An inline payload document is `{type: text, text: ...}` or `{type: inline, bytes: [...]}`; a content payload contains an existing immutable content reference. Inline payloads and opaque metadata are each limited to 16 KiB. `submit artifact --payload-file FILE` stages the complete file in a private durable transfer journal, uploads it through custody, then attaches its immutable reference. Interrupted retries preserve the exact staged bytes even if the original file changes or disappears. The transfer limit is 64 MiB; this release's built-in test-report schema attestation accepts at most 1 MiB. Transfer capacity does not bypass schema or custody admission. `artifact register --payload-file FILE` uses the same durable 64-MiB staging/upload path before registering independent proof; its schema admission remains subject to the actual installed validator bound.
+
+Schema meaning and the chosen validating tool or skill are a participant contract.
+The schema hash pins the payload shape; `kind` names the artifact's role. Thus a
+test-report payload with failing counts or a generic error-report can be a typed
+`error` artifact. Current service ingress admits those two pinned schemas. Arbitrary schema
+registration is not yet exposed: a participant's agreement or a supplied hash
+cannot install a schema validator or assert trusted custody/schema validity.
 
 Inspect or cancel a saved transfer using the `upload_id` reported by an interrupted upload:
 
@@ -204,6 +276,13 @@ already-closed manifest. `artifact register` supports inline `--text`, bounded
 references and `--visibility`; the service still verifies its supported schema and
 custody. `submit validation` and `artifact register` also accept one strict
 `--json`, `--yaml` or `--file` authored document instead of field flags.
+
+For a failure testament, validate its exact error artifact just as you validate
+successful work evidence. A conclusive failed test supports `fail`; `error`
+describes an evaluator/tool failure to establish the result. Keep those separate
+from the respondent's reported outcome and artifact kind. The designated evaluator
+(which may be the claimant) records the actual authorized verdict and its own proof;
+Focal does not manufacture either participant's account.
 
 `testament receive`, `validation begin` and `validation complete` use the observed
 claim revision when `--expected-revision` is omitted. That fence is persisted with

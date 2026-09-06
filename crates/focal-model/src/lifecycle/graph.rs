@@ -4,6 +4,8 @@
 //! every row read while proving them. The owner publishes the complete consequence
 //! set atomically; this module does not publish or read a clock.
 use super::claim::{ClaimState, ClaimTerminalCut};
+#[path = "graph_memory.rs"]
+mod memory;
 use super::{Binding, ContractError};
 use crate::{ClaimId, ClaimStatus, ContentHash, Deadline, SessionSeq, WaitPredicate};
 

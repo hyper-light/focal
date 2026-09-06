@@ -89,7 +89,18 @@ fn generated_response(id: u128, artifacts: &[(u32, u128)]) -> Response {
         Principal::Actor(p.holder),
         &artifacts,
         &manifest,
-        8,
+        crate::lifecycle::evidence::CloseReport {
+            summary: "The respondent completed the work cycle.",
+            confidence: crate::Confidence::Committed,
+            outcome: crate::OutcomeKind::Complete,
+            diagnostics: &[],
+            limits: crate::lifecycle::evidence::ResponseLimits {
+                artifacts: 8,
+                diagnostics: 8,
+                summary_bytes: 1024,
+                construction_bytes: 64 * 1024,
+            },
+        },
     )
     .unwrap()
     .response

@@ -86,6 +86,7 @@ fn completion_uses_actual_tree_and_output_errors_remain_fallible() {
         assert!(script.contains("completion"), "{shell:?}");
         if matches!(shell, Shell::Bash | Shell::Zsh) {
             assert!(script.contains("validation.context"), "{shell:?}");
+            assert!(script.contains("error-report"), "{shell:?}");
         }
         assert!(script.contains("operation-id"), "{shell:?}");
         assert!(script.contains("input-format"), "{shell:?}");
@@ -99,4 +100,37 @@ fn completion_uses_actual_tree_and_output_errors_remain_fallible() {
     assert!(bounded.write_all(b"d").is_err());
     assert_eq!(bounded.inner, b"abc");
     assert!(completion_to(Shell::Bash, &mut LimitedWriter::new(Vec::new(), 1)).is_err());
+}
+
+#[test]
+fn error_schema_discovery_exposes_exact_pinned_contract_and_valid_example() {
+    let mut bytes = Vec::new();
+    get("error-report", None, &mut bytes).unwrap();
+    let schema: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(schema["name"], "focal.error_report.v1");
+    assert_eq!(
+        schema["hash"],
+        focal_evidence::error_report_schema().to_string()
+    );
+    assert_eq!(
+        schema["descriptor"].as_str().unwrap().as_bytes(),
+        focal_evidence::ERROR_REPORT_SCHEMA
+    );
+    assert_eq!(schema["max_payload_bytes"], 65536);
+    focal_evidence::verify_builtin_schema(
+        focal_evidence::error_report_schema(),
+        &serde_json::to_vec(&schema["example"]).unwrap(),
+    )
+    .unwrap();
+    assert!(get("error-report", Some(Direction::Input), &mut Vec::new()).is_err());
+    let mut bytes = Vec::new();
+    list(OutputFormat::Json, &mut bytes).unwrap();
+    let catalog: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        catalog["builtins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "error-report")
+    );
 }

@@ -1,6 +1,8 @@
 //! Immutable correction lineage and a checked, revision-bound succession plan.
 //! A successor is a new claim, including when its predecessor is already terminal.
 use super::claim::{ClaimCut, ClaimState};
+#[path = "succession_memory.rs"]
+mod memory;
 use super::{Binding, ContractError, Principal};
 use crate::{Cause, ClaimId, ClaimStatus, ObjectKind, ObjectRef, RootCommandId};
 
@@ -84,6 +86,9 @@ impl Lineage {
     }
     pub fn check_binding(&self, binding: &Binding) -> Result<(), ContractError> {
         self.binding.check(binding)
+    }
+    pub fn binding(&self) -> Binding {
+        self.binding
     }
     pub fn cause(&self) -> &Cause {
         &self.cause

@@ -54,7 +54,7 @@ commands! {
     CompleteWholeWork => ("validation.complete",Actor,AuthoredTool,"Issuer standing, revision fence and actual required run completion/graph checks; never caller passing assertion.","Claim"),
     FailPost => ("claim.fail_post",Runtime,WireAvailable,"Trusted post failure with real registered evidence.","Claim"),
     FailReceipt => ("receipt.fail",Runtime,WireAvailable,"Trusted receipt failure with real registered evidence.","Claim"),
-    FailTestamentGeneration => ("testament.fail_generation",Runtime,WireAvailable,"Trusted generation failure with durable error artifact.","Testament"),
+    FailTestamentGeneration => ("testament.fail_generation",Runtime,LegacyReplayOnly,"Historical runtime-generated failure testimony; new proposals must use respondent-authored testament.submit with error artifacts.","Testament"),
     CancelClaim => ("claim.cancel",Actor,AuthoredTool,"Authorized claim control and bounded reason.","Claim"),
     RevokeClaim => ("claim.revoke",Runtime,WireAvailable,"Trusted revocation policy and nonempty reason.","Claim"),
     ExpireClaim => ("claim.expire",Runtime,WireAvailable,"Trusted fired timer/generation/logical-time fence.","Claim"),

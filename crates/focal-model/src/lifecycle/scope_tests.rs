@@ -63,6 +63,38 @@ fn cancel(owner: &mut ClaimState, sequence: u64) {
         )
         .unwrap();
 }
+fn cancel_owned(parent: &mut ClaimState, child: &mut ClaimState, sequence: u64) {
+    use super::super::{creation::EffectiveClaims, ownership};
+    struct View<'a>(&'a [ClaimState], SessionSeq);
+    impl EffectiveClaims for View<'_> {
+        fn ledger(&self) -> crate::LedgerId {
+            self.0[0].binding().ledger
+        }
+        fn prefix(&self) -> SessionSeq {
+            self.1
+        }
+        fn claim(&self, id: ClaimId) -> Option<&ClaimState> {
+            self.0.iter().find(|row| row.binding().object.0 == id.0)
+        }
+    }
+    let rows = [parent.clone(), child.clone()];
+    let view = View(&rows, SessionSeq(sequence - 1));
+    let plan = ownership::CancellationPlan::prepare(
+        &view,
+        parent.binding(),
+        Principal::Actor(parent.issuer()),
+        cut(sequence),
+        ownership::Limits {
+            nodes: 2,
+            edge_visits: 1,
+            bytes: 4096,
+        },
+    )
+    .unwrap();
+    plan.check(&view).unwrap();
+    parent.apply_cancellation(&plan.transitions()[0]).unwrap();
+    child.apply_cancellation(&plan.transitions()[1]).unwrap();
+}
 fn register(owner: &mut ClaimState, target: &ClaimState, roots: &[WaitPredicate]) {
     let graph = snapshot(&[owner, target]);
     let plan = Registry::prepare_register(owner, authority(owner, 2), registration(roots), &graph)
@@ -432,8 +464,7 @@ fn parent_release_requires_every_owned_child_released_and_is_irreversible() {
             cut(2),
         )
         .unwrap();
-    cancel(&mut parent, 3);
-    cancel(&mut child, 3);
+    cancel_owned(&mut parent, &mut child, 3);
     let graph = snapshot(&[&parent, &child]);
     assert_eq!(
         Registry::prepare_release_owner(&parent, &graph, &[&child], cut(4)).unwrap_err(),

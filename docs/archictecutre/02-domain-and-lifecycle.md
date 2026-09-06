@@ -1,6 +1,6 @@
 # Focal domain and lifecycle contract
 
-Status: **proposed Focal implementation contract, 2026-09-05**. This specifies what the Rust implementation must build; no behavior below is claimed to exist today. “Inherited” identifies Hecate semantics. “Focal decision” completes a missing contract or explicitly changes a source restriction. Implementers use this document when imported historical prose conflicts.
+Status: **Focal implementation contract, 2026-09-06**. This specifies the Rust implementation target; explicit implementation notes distinguish the running V1 ledger and the unactivated native owner from remaining work. “Inherited” identifies Hecate semantics. “Focal decision” completes a missing contract or explicitly changes a source restriction. Implementers use this document when imported historical prose conflicts.
 
 Focal is a **peer-to-peer claims ledger**, not a job system. Participants own their agents, tools, skills and execution. The claim issuer invokes validating tools or skills outside Focal; the respondent supplies a testament and artifacts; the issuer or designated peer submits the verdict. Focal checks authenticated standing, evidence, immutable targets and lifecycle, and commits the resulting facts. It does not launch agents, assign worker processes or call a model provider. Asking another agent to evaluate is ordinary claim/testament work. This user-directed boundary supersedes inherited Hecate harness execution assumptions.
 
@@ -112,9 +112,18 @@ Claim lifecycle contains status, ordered status history, creation/post/receipt p
 
 A closed testament contains `LedgerId`, `ClaimId`, receipt provenance, `EvidenceSetId`, an immutable ordered artifact manifest, bounded summary/document ref, `Confidence`, and `OutcomeKind`. The outcome vocabulary is `Complete`, `Partial`, `Refused`, `Impossible`, `Interrupted`, `Failed`; it describes testimony and does not set claim satisfaction.
 
+The current respondent authors a testament whenever its work completes or fails.
+Every non-Complete report includes actual typed error artifacts; any partial work
+can accompany them. Inability to produce a requested output does not prevent
+reporting what happened. Receipt acquisition records responsibility and creates
+no testament. An absent or unreachable respondent's deadline can produce an
+infrastructure timeout fact, never testimony attributed to that respondent.
+The claimant receives the authored report, and designated evaluators then assess
+its evidence under the immutable requirements.
+
 `Confidence` is `Hint`, `Tentative`, `Committed`, `Consensus`, preserving Hecate's vocabulary. A confidence label never overrides a required verdict or acts as a quorum assertion.
 
-The evidence set is mutable only through append-only staging commands under its active receipt. Closing freezes a manifest and durably creates the preallocated `TestamentId` with its separately computed content digest. The current Rust testament lifecycle stores creation and acknowledgment positions; a separate posted/validating/terminal testament lifecycle is still missing. Artifact additions after close require a new evidence set and a new testament; no “patch result JSON” API exists.
+The evidence set is mutable only through append-only staging commands under its active receipt. The respondent's explicit close freezes its authored report and manifest and durably creates the preallocated `TestamentId` with its separately computed content digest. The persisted V1 testament lifecycle stores creation and acknowledgment positions. The native response contract defines separate generated/posted/received/validating and terminal states; durable service activation remains work in [18](18-lifecycle-storage-upgrade.md). Artifact additions after close require a new evidence set and a new testament; no “patch result JSON” API exists.
 
 **Initial Focal profile D-03 (not full upstream equivalence):** the current implementation has one active closing testament attempt per receipt epoch. A failed or superseded claim is corrected with a new claim linked by `supersedes`/`amends`; its predecessor's terminal record remains unchanged. Resubmission after a transport timeout uses the original `(RequestEpoch, RequestId)`, allocated object IDs and identical close manifest.
 
@@ -144,7 +153,7 @@ An artifact descriptor includes `LedgerId`, open namespaced `ArtifactKind`, pinn
 
 Standard initial kinds: `document`, `test_report`, `inspection_report`, `validation_verdict`, `increment_descriptor`, `error`, `allocation_result`, `approval_evidence`. Register schema ownership and bounded metadata for each; extending a kind does not require extending lifecycle enums.
 
-`ErrorArtifact` contains a closed error code, phase, affected references, bounded diagnostic/document ref and `Disposition`. `Retryable` can contain a derived retry hint and retry deadline; `Terminal` names the authority/rule that makes retry pointless. Machine decisions never parse diagnostic strings. Internal Rust functions still return typed `Result`; the service/claim boundary converts operational failure into durable evidence when a durable claim exists.
+`ErrorArtifact` contains a closed error code, phase, affected references, bounded diagnostic/document ref and `Disposition`. `Retryable` can contain a derived retry hint and retry deadline; `Terminal` names the authority/rule that makes retry pointless. Machine decisions never parse diagnostic strings. Internal Rust functions still return typed `Result`. The participant or infrastructure owner records its own operational failure as durable evidence under its authenticated identity; infrastructure diagnostics never substitute for a respondent-authored testament.
 
 Artifact attachment/close acknowledgement requires the referenced bytes to meet their promised durability and integrity contract. Staging references are pinned until close, abandonment or recorded custody transfer. A reference to unreplicated process memory is not durable evidence.
 
@@ -160,7 +169,7 @@ or four independent databases. Sylk's
 peer-to-peer boundary above; their orchestrator/dispatcher implementations are
 not requirements to add a Focal worker service.
 
-| Family | Current persisted Rust model | Required work still absent |
+| Family | Current persisted Rust model | Required persisted/runtime integration |
 | --- | --- | --- |
 | Claim | Status/history, receipt, active evidence set/testament, local completion and graph release | Integrate the distinct child lifecycle transitions without bypassing the existing dependency least-fixpoint rule |
 | Testament | `created` and optional `acknowledged` | Own generated/posted/received/validating and terminal outcome history; precise propagation from attached evidence |
@@ -240,7 +249,7 @@ Every row executes through the sequencer using effective state. “Active execut
 | `FailReceipt` | `posted` | `receipt_failed` | Final bounded delivery failure/overflow disposition; durable runtime failure evidence |
 | `RecordProgress` | Active execution | `progressed` | Bounded observational fact; no satisfaction/release effect |
 | `BeginEvidenceSet` / `AttachArtifact` | Active execution | Unchanged | Current receipt only; validate/pin evidence; append immutable references |
-| `CloseTestament` | Active execution | `testament_generated` | Current receipt; atomically freeze manifest/content; stop evidence appends |
+| `CloseTestament` | Active execution | `testament_generated` | Current holder explicitly authors outcome/summary/evidence; non-Complete reports include typed error artifacts; atomically freeze report and manifest; stop evidence appends |
 | `AcknowledgeTestament` | `testament_generated` | `testament_acknowledged` | Verify authoritative attachment/durability; receipt validations pass exactly once |
 | `BeginWholeWorkValidation` | `testament_acknowledged` | `validating` | Pin runs/evidence/versions; enqueue bounded external execution effects |
 | `RecordValidationVerdict` | `posted` for admission; `received` through `validating` for increment; `validating` for whole work; isolated Observe run as below | Unchanged until phase aggregation | Current authorized run only; record evidence and schedule error-only fallback if applicable |
@@ -248,7 +257,7 @@ Every row executes through the sequencer using effective state. “Active execut
 | `CompleteWholeWork` | `validating` | `validation_failed` | Required final Fail exists; preserve other final outcomes |
 | `CompleteWholeWork` | `validating` | `validation_errored` | No Fail, but required final Error exists |
 | `CompleteWholeWork` | `validating` | `validation_incomplete` | No Fail/Error, but required final Incomplete exists |
-| `FailTestamentGeneration` | Active execution | `testament_generation_failed` | Runtime records typed handler failure and an immutable failure testament/evidence bundle |
+| `FailTestamentGeneration` (historical replay only) | Active execution | `testament_generation_failed` | Retained V1 interpretation; new admission refuses runtime-generated testimony |
 | `CancelClaim` | Open | `cancelled` | Authorized cancellation; record reason; cancel child execution/scopes; release only after terminalization obligations |
 | `ExpireClaim` | Open | `expired` | Logged matching timer generation; immutable timeout artifact |
 | `RevokeClaim` | Open | `revoked` | Logged authoritative revocation; fence receipt/validator effects; record authority reason |
@@ -263,7 +272,17 @@ Admission verdict Fail/Error/Incomplete does not use whole-work terminal states:
 
 For `FailPost` from `generated`, the failure means the canonical obligation existed but activation failed permanently. Transient transport/provider capacity does not immediately terminalize a claim that is still within an explicit retry budget. A `receipt_failed` overflow is the source-mandated terminal result once the bounded dispatch policy declines further retries; error disposition still informs the issuer's choice to issue a successor.
 
-`FailTestamentGeneration` is a runtime-owned exceptional close: it emits an immutable failed testament and error artifacts even though the ordinary agent closure did not finish. The terminal state records which boundary failed. Creation, acknowledgement and receipt-pass facts for that failure testament are ordered within the same mutation; these describe the testament object and do not advance the claim through successful closure states or transiently satisfy it.
+`FailTestamentGeneration` is a retained historical V1 exceptional close. Its old
+reducer emitted and acknowledged failure testimony in one mutation; replay and
+exact retained retries must preserve those results. **New proposals cannot use
+it.** The current receipt holder authors `CloseTestament` after work completes
+or fails, with explicit summary, confidence, outcome and exact evidence. Partial,
+Refused, Impossible, Interrupted and Failed reports must include a durable typed
+`error` artifact. Ordinary receipt and designated evaluation follow; reporting a
+failure does not itself choose the claim's aggregate outcome. Receipt acquisition
+never creates a testament. The independent successor contract in [17](17-lifecycle-state-and-authority.md)
+also keeps assembly/submission incidents nonterminal so they cannot suppress the
+respondent's eventual testimony.
 
 ### 5.3 Repeated, conflicting and stale operations
 
@@ -371,6 +390,31 @@ A claim expiry outside a qualifying wait SCC yields `expired`. Timers carry gene
 Every blocking runtime scope must have a finite effective deadline inherited from its claim or the host's declared work budget. Registration logs that deadline before parking. A closed wait cycle without a reachable deadline is not admitted as an indefinitely parked scope; report the missing bounded-work prerequisite. Deadline-free historical/generated graph records may exist, but cannot silently become permanent live waits.
 
 Cancellation propagates through the durable ownership tree, not every informational graph edge. Terminalize or explicitly detach owned child work under policy, cancel/fence validator executions, then release the scope. Consult answers and unrelated reviewers must not be cancelled merely because they share an informational relation.
+
+The [native Core transactions](18-lifecycle-storage-upgrade.md#62-concrete-ram-owner-and-publication-seam)
+implement claim creation, posting, Admission entry and control against the actual
+effective RAM prefix. Child creation publishes its parent's registration in the same candidate;
+all Cause/Supersedes/Amends ancestry is checked, including earlier pending claims
+and every proposed batch component. Cancellation requires the selected root's
+issuer and follows every stored owned child, including descendants of an already
+terminal claim. Each registration is checked against actual child identity,
+content, immutable cause and creation position. Private authority tokens cancel
+nonterminal descendants without impersonating their issuers. Earlier terminal
+cuts and local seals remain intact. Direct cancellation of a parent with owned
+children cannot bypass this complete plan.
+
+This native operation does not release a scope or detach children. Complete
+definitions and independent evaluation rows now share that authoritative range.
+Cancellation and supersession resolve actual evaluation registrations and record
+authority fences atomically, including earlier pending evaluations. Fencing
+preserves lifecycle state and terminal results without fabricating a verdict or
+respondent testimony. Adoption fences and result/evidence admission remain open. Ordinary
+required-check failure must continue to permit eligible begun late reports.
+The current native owner has no Session, CLI/MCP or durable codec entrypoint;
+the running V1 ledger retains its frozen execution behavior. Runtime-monitor
+registration/rebind/release and the remaining four-family consequences are
+model contracts awaiting that owner integration. A `Satisfied` runtime predicate
+can block a monitor without acquiring immutable `DependsOn` failure propagation.
 
 All closure counts, edge visits and retained tokens are budgeted per scope/session/owner. A large fleet does not justify an unbounded single-session closure. Budget exhaustion yields typed admission/backpressure and observable accounting; it never silently truncates the dependency graph or claims successful release.
 

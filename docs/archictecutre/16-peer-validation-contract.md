@@ -127,8 +127,13 @@ storage concern.
 Represent generation, posting, receipt, validating, validated, incomplete, failed
 and errored as distinct recorded lifecycle facts. Generation freezes the response
 and its artifact bindings; posting activates that response for the claimant;
-receipt is committed by the claimant. A failed or partial response uses the same
-testament mechanism and carries its evidence.
+receipt is committed by the claimant. The respondent must author a testament
+after its work finishes or fails; receipt of the claim does not create one. A
+failed or partial response uses the same testament mechanism, with explicit
+summary, confidence and reported outcome, and must include real error artifacts.
+Diagnostics remain inspectable when the requested work artifact is absent.
+Native diagnostic references are separate from work-slot bindings: reporting an
+error does not supply an otherwise missing output or prove a requirement passed.
 The first response's generation advances the claim to TestamentGenerated in the
 same commit as its manifest attachment. Posting changes the testament's own state;
 it does not defer that already-durable claim fact or invent a TestamentPosted claim

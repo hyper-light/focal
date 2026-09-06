@@ -687,24 +687,26 @@ pub(crate) fn attest(
     if artifact.content.ledger != node.identity.ledger {
         return Err(AccessError::Unauthorized);
     }
+    let maximum = focal_evidence::builtin_schema_limit(artifact.content.schema_hash)
+        .map_err(|_| AccessError::UnsupportedOperation)?;
+    let stored;
     let bytes = match &artifact.content.payload {
-        ArtifactPayload::Inline(bytes) if bytes.len() <= 16 * 1024 => bytes.clone(),
+        ArtifactPayload::Inline(bytes) if bytes.len() <= 16 * 1024 => bytes.as_slice(),
         ArtifactPayload::Content(reference)
             if reference.domain == ContentDomainId(node.identity.ledger.tenant.0) =>
         {
-            node.content
-                .read_bytes(reference, 1024 * 1024)
-                .map_err(|_| AccessError::InvalidRequest)?
+            stored = node
+                .content
+                .read_bytes(reference, maximum)
+                .map_err(|_| AccessError::InvalidRequest)?;
+            stored.as_slice()
         }
         _ => return Err(AccessError::InvalidRequest),
     };
-    // Current ingress supports the pinned test-report schema. Arbitrary schemas
-    // require a registered validator, never a caller-supplied `schema_valid` bit.
-    if artifact.content.schema_hash != focal_evidence::test_report_schema() {
-        return Err(AccessError::UnsupportedOperation);
-    }
-    let _: focal_evidence::TestReport =
-        serde_json::from_slice(&bytes).map_err(|_| AccessError::InvalidRequest)?;
+    // Shape admission grants no claim verdict. Arbitrary schema hashes cannot
+    // supply a caller-authored `schema_valid` bit or install a validator.
+    focal_evidence::verify_builtin_schema(artifact.content.schema_hash, bytes)
+        .map_err(|_| AccessError::InvalidRequest)?;
     Ok(vec![EvidenceAttestation {
         descriptor_hash: artifact
             .content

@@ -11,7 +11,7 @@
   "resources": [
     {
       "path": "references/workflow-contract.md",
-      "blake3": "46b74419895e534d16833c147967a6614d9cf4899ff71fe9d008fea1438f7017"
+      "blake3": "8b0c89d08578ba6546a16101fe596a0a4ba1816d639fec519b17f40384e5a435"
     },
     {
       "path": "references/admin-workflow.md",
@@ -21,9 +21,9 @@
   "skills": [
     {
       "name": "focal-claims",
-      "version": 7,
+      "version": 8,
       "path": "focal-claims/SKILL.md",
-      "blake3": "f18a3517cdfe50c75bd670d7bf8f070af81043e64d8fce4c49b6027faa6b6cf9",
+      "blake3": "39565f2be27e619b010a4379d793c56fe5e5498a51476eeb8cafcaaca35a435c",
       "references": [
         "references/workflow-contract.md"
       ],
@@ -154,9 +154,9 @@
     },
     {
       "name": "focal-evidence",
-      "version": 6,
+      "version": 7,
       "path": "focal-evidence/SKILL.md",
-      "blake3": "5b83bd19df287a29d355f8863837315e661569a07d2922e8263b897d095dbefc",
+      "blake3": "9803a35794afa1bfe8a683ac552456c82dd5e9b07120c83d385f1e187b643873",
       "references": [
         "references/workflow-contract.md"
       ],
@@ -312,7 +312,7 @@
     },
     {
       "name": "focal-validation",
-      "version": 2,
+      "version": 3,
       "path": "focal-validation/SKILL.md",
       "blake3": "75748af3608662e09fafee6b957a55c1ae9647b3936188f4b62fe44348c61be1",
       "references": [

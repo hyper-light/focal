@@ -52,7 +52,7 @@ pub(crate) fn operation_names() -> PossibleValuesParser {
 }
 fn schema_names() -> PossibleValuesParser {
     PossibleValuesParser::new(
-        ["test-report", "domain-registry"]
+        ["test-report", "error-report", "domain-registry"]
             .into_iter()
             .chain(operations::descriptors().iter().map(|value| value.name)),
     )
@@ -186,6 +186,40 @@ fn get(name: &str, direction: Option<Direction>, output: &mut dyn Write) -> Resu
             )?;
             Ok(())
         }
+        "error-report" => {
+            #[derive(Serialize)]
+            struct Report<'a> {
+                schema_version: u16,
+                name: &'a str,
+                hash: String,
+                descriptor: &'a str,
+                max_payload_bytes: usize,
+                example: ReportExample<'a>,
+            }
+            #[derive(Serialize)]
+            struct ReportExample<'a> {
+                code: &'a str,
+                message: &'a str,
+                details: &'a str,
+            }
+            let descriptor = std::str::from_utf8(focal_evidence::ERROR_REPORT_SCHEMA)
+                .map_err(|_| CliError::Input("invalid built-in error-report schema".into()))?;
+            json(
+                output,
+                &Report {
+                    schema_version: 1,
+                    name: "focal.error_report.v1",
+                    hash: focal_evidence::error_report_schema().to_string(),
+                    descriptor,
+                    max_payload_bytes: focal_evidence::ERROR_REPORT_MAX_BYTES,
+                    example: ReportExample {
+                        code: "tool_unavailable",
+                        message: "The required tool could not run",
+                        details: "No test result was produced",
+                    },
+                },
+            )
+        }
         _ => Err(CliError::Input("unknown released schema name".into())),
     }
 }
@@ -243,21 +277,24 @@ fn list(format: OutputFormat, output: &mut dyn Write) -> Result<()> {
             #[derive(Serialize)]
             struct Inventory {
                 schema_version: u16,
-                builtins: [&'static str; 2],
+                builtins: [&'static str; 3],
                 operations: Catalog,
             }
             super::output::structured_to(
                 output,
                 &Inventory {
                     schema_version: 1,
-                    builtins: ["test-report", "domain-registry"],
+                    builtins: ["test-report", "error-report", "domain-registry"],
                     operations: Catalog,
                 },
                 format,
             )
         }
         OutputFormat::Table => {
-            writeln!(output, "BUILT-IN SCHEMAS\ntest-report\ndomain-registry")?;
+            writeln!(
+                output,
+                "BUILT-IN SCHEMAS\ntest-report\nerror-report\ndomain-registry"
+            )?;
             writeln!(
                 output,
                 "\nOPERATION                 MODE      EXAMPLE  DESCRIPTION"

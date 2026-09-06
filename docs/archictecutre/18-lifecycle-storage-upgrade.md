@@ -4,7 +4,10 @@ Status: storage upgrade contract, 2026-09-06. The V1 checkpoint graph, prepared
 inputs, canonical command identity and explicit historical execution boundary
 below are implemented, along with surrounding Session format isolation and
 output identities. Consensus also has the bounded one-transition floor mechanism;
-production Session still registers only V1. The successor decoder, activation and
+production Session still registers only V1. Typed `Core<NativeState>` transactions
+now retain complete definitions, post claims, begin Admission evaluations and
+fence evaluations during control changes over custom RAM storage (§6.2),
+without a native codec or Session entrypoint. The successor decoder, activation and
 lifecycle migration remain open. This is the storage
 prerequisite for L2–L5 in
 [the peer validation contract](16-peer-validation-contract.md), not permission to
@@ -200,7 +203,7 @@ validation and graph-propagation rules belong to the explicit internal
 managed staging/replay **and `epoch::execute_entry`** select it. The epoch path
 is actual committed/follower execution, so changing only the public Core apply
 method would leave replay dependent on current semantics. Today's
-admission-only Receipt restrictions remain separate from historical execution. Version
+admission-only Receipt and respondent-report restrictions remain separate from historical execution. Version
 selection comes from the decoded entry contract, never a process-wide active
 profile. Compare final rows, deltas, effects, hashes and receipts across serial,
 epoch and managed replay before adding any successor execution rules.
@@ -219,7 +222,11 @@ candidate already prepared under it:
 
 The boundary owns the existing implementation files through explicit module
 paths; it does not forward to mutable default rules. The extracted
-`validate_receipt_admission` runs only on new proposal paths. Managed replay
+`admission::validate_admission` runs only on new proposal paths. It rejects new
+runtime-generated failure testimony and requires actual diagnostic evidence for
+new non-Complete respondent reports. The original `FailTestamentGeneration`
+execution remains available to historical direct, epoch and managed replay;
+retained exact retries resolve before new-admission policy. Managed replay
 carries an explicit `Replay(Version)` value through staging, while new proposals
 select `AdmitV1`. Both families count admission bytes through the frozen input
 codec. The historical reducer still performs its original domain checks.
@@ -535,20 +542,21 @@ contract at the wire boundary. Changing model aliases used by old `ReadObject`,
 
 ### 6.1 Concrete successor owner integration
 
-Independent native validation ownership is implemented. The next owner increment
-must close the remaining gaps: current Core overlays require `Clone + Serialize`,
-and `ClaimState::generate` can create correction lineage before the only complete
-ancestry check in `SuccessionPlan`. Copying those native objects into a parallel
-mutable map would not fix the owner. Use this dependency order:
+Independent native validation ownership and initial native Core transactions
+are implemented. V1 overlays retain their original `Clone + Serialize` contract;
+the specialized native owner uses fallible row copies and the existing custom
+RAM store instead. Production native claim creation now requires the complete creation
+plan. The implementation and remaining dependency order are:
 
-1. **Implemented: retain definitions and evaluations independently.** An immutable
+1. **Implemented model values: independently owned definitions and evaluations.** An immutable
    [Declaration](../../crates/focal-model/src/lifecycle/validation_definition.rs)
    owns slot text and ordered handler policies once. `Declaration::prepare`
    validates all input without allocation and reports checked requested row/buffer
    bytes; `DeclarationPlan::build` reserves those buffers fallibly.
-   `Declaration::retained_bytes` measures actual capacities. The future owner must
-   reserve before construction and reconcile actual capacity and allocator overhead
-   before retaining the row; these methods alone are not budget integration.
+   `Declaration::retained_bytes` measures actual capacities. Its copy APIs also
+   report requested/actual dynamic bytes and allocation counts. Core charges the
+   owned definitions and retained neighbor copies; future ingress must reserve
+   before decoding/construction and reconcile capacity and allocator overhead.
    [EvaluationState](../../crates/focal-model/src/lifecycle/validation.rs) contains
    no references. `bind` and `into_state` create and detach a temporary checked
    view without allocation or policy copies. A private semantic stamp includes all
@@ -557,16 +565,41 @@ mutable map would not fix the owner. Use this dependency order:
    check that stamp. Exact reconstructed definitions are accepted; changed policies
    under the same supplied binding are rejected. This guard has no wire/content
    identity or successor durable representation.
-2. **Create the sole successor owner inside Core.** Keep existing V1 Core and its
-   execution immutable. Add successor row ownership, effective-prefix reads and
-   bounded staging in Core, initially unreachable from Session. Session's eventual
-   activation selects exactly one Core version; it must never run V1 and successor
+   Respondent reports now use the same owned construction discipline in
+   [evidence_report](../../crates/focal-model/src/lifecycle/evidence_report.rs).
+   `Response::prepare_close` validates explicit summary, confidence, outcome,
+   exact work bindings and separately verified error references before allocation.
+   `ClosePreparation::build` reserves and copies bounded buffers once;
+   `retained_bytes` measures the resulting capacities. No production `Clone` or
+   per-response `Arc` is required. The owner must publish the response and every
+   work attachment atomically, and retain any closing incident with its claim
+   revision. Non-Complete reports remain eligible even with no requested work
+   slots produced. A closing incident does not terminalize or fabricate testimony.
+
+   The successor durable schema must encode summary, confidence, all six reported
+   outcomes, exact work-slot bindings, separately ordered diagnostic references,
+   respondent/receipt/cycle identity and incident cuts. Include every immutable
+   report field in canonical identity. Import V1 reports without inferring missing
+   slots, retroactively reclassifying artifacts or replacing historical hashes.
+   Test report mutation under a reused external binding, missing-output failure
+   reports, error-only reports, requester receipt, owned buffer pressure and exact
+   history across restart. Current native semantic stamps are in-memory guards,
+   not the durable encoding. Budget completion evidence when admitting work;
+   domain manifest headroom alone does not reserve node memory or disk capacity.
+2. **Implemented owner: creation, posting, Admission entry and control fences.**
+   `Core<NativeState>` owns claims and compact registration sets, full immutable
+   declarations, independent evaluations, metadata, successful outcomes and typed
+   events in one `RangeStore`; §6.2 describes its preparation/publication API.
+   Existing V1 Core and execution remain separate specializations. Native
+   effective-prefix reads and bounded staging are unreachable from Session.
+   Session's eventual activation selects exactly one Core version; it must never
+   run V1 and successor
    owners as independent mutable authorities for the same ledger. Import moves
    old rows into explicitly historical representations within that selected owner.
    Native lifecycle state replaces a row's historical representation only through
    its defined versioned transition; it does not mirror it beside an editable old
    object. Retained V1 receipts and their exact outcomes remain historical facts.
-3. **Make creation checks mandatory.** A shared creation plan owns proposed
+3. **Implemented: mandatory creation checks.** The shared creation plan owns proposed
    definitions and borrows the sole owner's complete effective lookup, including
    earlier pending writes. It checks new-ID absence and uniqueness, resolves every
    Cause/Supersedes/Amends endpoint, validates compatible identities, and traverses
@@ -575,30 +608,41 @@ mutable map would not fix the owner. Use this dependency order:
    equal creation positions are permitted only for acyclic relations within the
    same atomic creation batch. Preserve stricter published-predecessor succession
    chronology. Pin positive reads and absence observations, and recheck them at
-   publication. Existing public constructors must consume this private proof;
-   adding an optional checked constructor while leaving a bypass is insufficient.
-4. **Publish child ownership and control consequences together.** Creation installs
-   a child and its parent's ownership registration in the same candidate. Later
-   cancellation derives the complete owned closure from stored registries and
-   evaluation fences from complete acceptance registration, including pending
-   rows. It does not impersonate a child's issuer. Already-terminal children keep
-   their original fact; informational relations and unrelated consults do not
-   become ownership edges. Ordinary blocking validation failure preserves eligible
-   begun checks, while explicit control/adoption fences old authority. Scope
-   release waits for every owned obligation and occurs once.
-5. **Reuse the existing transaction discipline.** Extend tracked row/absence and
-   complete-set observations, bounded row patches, candidate audit, graph
+   publication through exact immutable root provenance. Unchecked `generate` and
+   `generate_child` entrypoints are test-only; the internal constructor is not a
+   public production bypass.
+4. **Implemented owned closure and cancellation/supersession fences.** Creation installs
+   a child and its parent's ownership registration in the same candidate. Native
+   cancellation derives the complete owned closure from stored registries,
+   including earlier pending rows. Root-issuer authority yields private child
+   cancellation tokens. Already-terminal children keep their original cuts and
+   seals, while traversal continues through them; informational relations and
+   unrelated consults do not become ownership edges. This command does not release
+   scopes. Cancellation and supersession resolve every evaluation through the
+   stored registration set and publish applicable authority fences in the same
+   candidate. Terminal evaluation facts remain unchanged. Receipt adoption and
+   result/evidence transactions remain open; ordinary blocking validation failure
+   must preserve eligible begun checks. Scope release still waits for every owned
+   obligation and occurs once.
+5. **Extend the transaction discipline to the remaining families.** Extend tracked
+   row/absence and complete-set observations, bounded row patches, candidate audit, graph
    projection and exact request outcomes. Precharge changed rows, graph traversal,
    histories and output before retaining them. Every fallible check precedes joint
    publication. A stale positive read, newly conflicting pending ID or exhausted
    allowance leaves every object, registry, graph and result unchanged. Do not
    obtain this property by cloning the complete Core or creating another service.
 
-Owner-level tests must cover missing direct/transitive creation endpoints, cycles
+The [native owner test source](../../crates/focal-core/src/native/tests.rs) exercises
+the owner's creation/lineage, pending closure, exact retries, publication,
+memory pressure and pinned-read cases. Qualification results belong in
+[implementation status](09-implementation-status.md); source presence is not a
+passing-test claim. Complete owner-level qualification must cover missing
+direct/transitive creation endpoints, cycles
 in a disconnected batch component, valid same-batch ancestry, duplicate/existing
 IDs, impossible historical chronology, stale ancestry and new pending-ID conflicts.
-They must also order child/evaluation creation against cancellation, preserve
-terminal descendants and unrelated peers, distinguish result-before-cancel from
+Owner-level qualification must also order evaluation creation against
+cancellation and preserve terminal descendants and unrelated peers. The remaining
+result transactions must distinguish result-before-cancel from
 cancel-before-result, fence old adoption receipts, and preserve authorized late
 begun results after ordinary required-check failure. Capacity refusal must show
 no partial child registration, fencing, scope release or request outcome. A
@@ -607,64 +651,244 @@ actual Core owner tests; manually composing model proof tokens is not equivalent
 
 ### 6.2 Concrete RAM owner and publication seam
 
-Use the existing `Core` container with a default state parameter, `Core<S = State>`,
-when introducing the native owner. Current V1 constructors, methods and codecs
-remain specialized to the default state. A separate `Core<NativeState>` constructor
-starts empty and exposes no arbitrary insertion of caller-constructed lifecycle
-rows. This is an implementation plan, not an installed production version. It
-avoids a mutable native sidecar and keeps native state outside the V1 codec at
-compile time. Later Session activation selects one owner; it must not retain both
-as writable representations of the same ledger.
+**Implemented typed owner transactions; production activation remains open.**
+[Core](../../crates/focal-core/src/lib.rs) now has the sealed state parameter
+`Core<S = State>`. V1 constructors, execution and codecs remain specialized to the
+default state. [Core<NativeState>](../../crates/focal-core/src/native.rs) starts
+empty through `new_native(ledger, range, limits, budget)` and exposes no arbitrary
+row insertion. It is an in-process owner with no Serde implementation, wire tag,
+WAL writer, recovery decoder or Session/CLI/MCP entrypoint. Later activation must
+select one writable owner for a ledger; it cannot maintain an editable V1 mirror
+alongside native truth.
 
-Reuse [RangeStore](../../crates/focal-memory/src/range.rs) for native prepared
-versions. It already checks process-local owner identity and exact base-root
-provenance, supports unpublished predecessor chains, and publishes by an
-allocation-free root replacement. Native claims and their transaction outcomes
-must inhabit the same canonical range so publication cannot expose only one side.
-Acceptance, scope and child registries stay within their authoritative rows.
-Do not feed native values into the old `Backing<V: Clone + Serialize>` or use
-V1 serialization to invent a native candidate identity.
+The owner uses one [RangeStore](../../crates/focal-memory/src/range.rs) with keys
+for metadata, claims, validation definitions, evaluations, request outcomes and
+`(sequence, ordinal)` events. A candidate's rows, registry changes, counts, outcome
+and events share one immutable prepared root. Each full immutable `Declaration`
+owns its ordered handler/policy buffers once. `AcceptancePolicy` keeps the complete
+declared-check manifest and semantic stamps, while a compact
+[RegistrationSet](../../crates/focal-model/src/lifecycle/registration.rs) beside
+the claim records actual evaluation membership without duplicating definitions.
+Graph declarations, scope roots and owned-child registries remain claim-owned.
+There is no second mutable authority for relationships or ancestors.
 
-**Implemented storage prerequisite:** `prepare_batch_with` and
-`prepare_after_with` accept an explicit fallible copier for retained values in
-touched pages. Newly supplied changes move directly into prepared pages. Native
-rows need not implement infallible `Clone`. Preparation reserves each page's
-complete charge before invoking the copier. The row's heap estimate must
-conservatively cover copied key/value capacities and allocator overhead;
-changed-row construction still needs its own earlier admission reservation.
-`PreparedRange::entries` provides a borrowed, ordered view of the entire candidate.
-`SnapshotLease::project_next` permits non-`Clone` values while preserving lease
-checks and preventing a borrowed row from escaping. Pinned reads remain unchanged,
-and foreign or stale candidates cannot publish. The existing shared immutable
-page/root lifetime stays inside storage; this extension adds no `Arc` site or
-per-object shared policy wrapper. Native Core integration remains open.
+A declared check is not an evaluation run. Independent `EvaluationState` rows
+are keyed by claim, validation ID, target identity and generation, and retain the
+exact target content, revision and receipt binding. Temporary evaluation views
+bind to their actual retained definition without copying policy buffers. Create
+retains every declared check, including Observe checks; only eligible target
+materialization creates an evaluation. The currently implemented target entry is
+Admission. Receipt, Increment and WholeWork definitions are retained but their
+native owner materialization paths remain open.
 
-The alternative Arena/StableIndex composition is not currently sufficient for
-this transaction: Arena has no prepared multi-slot publication, and StableIndex
-allocates tree nodes during insertion. Combining their present mutation APIs would
-allow publication to fail after earlier rows changed. RangeStore provides the
-required existing publication seam, with its documented O(number of pages)
-directory-copy cost. Address that directory cost during scale work; this choice
-does not qualify Meta-scale throughput.
+| Native API | Current contract |
+|---|---|
+| `prepare_native(context, input, pending)` | Authenticate the request principal, validate the ordered candidate chain and trusted monotonic logical time, then resolve against the actual effective root |
+| `NativeCommand::Create { claims, declarations }` | Require revision one, new IDs and the exact full declaration cohort for each acceptance manifest; assign creation positions and atomically retain claims, definitions and checked parent/predecessor consequences |
+| `NativeCommand::Post { expected }` | Resolve all retained definitions, perform issuer-authorized posting and atomically register Ready evaluations for every Admission declaration |
+| `NativeCommand::BeginAdmission { claim, key, expected }` | Resolve the exact retained evaluation and registration, derive readiness/authority/deadline from owner state and begin as the declared evaluator |
+| `NativeCommand::Cancel { expected }` | Check the root issuer and revision, traverse the complete stored owned tree through terminal descendants, and publish nonterminal claim cancellations plus evaluation authority fences; no implicit scope release |
+| `NativePreparation::Existing { outcome, committed }` | Return an exact successful request match; `committed: false` identifies an earlier pending candidate and must await that candidate's durability |
+| `NativePrepared::claim` / `definition` / `evaluation` / `recorded` | Read the complete prepared version, including all predecessors and independent evaluation rows |
+| `publish_native(prepared)` | Replace the root without allocation; foreign, stale or out-of-order refusal returns ownership of the intact candidate in `NativePublishError` |
+| `pin_native` / `NativeRead::with_claim` / `with_definition` / `with_evaluation` / `recorded` | Read one expiring fixed prefix through checked projection; release or clock advancement permits obsolete storage reclamation |
 
-The first native Core transaction must include root, owned-child and successor
-creation plus cancellation of the actual owned closure. Stage parent registration
-and new children in the same candidate. Assign creation positions inside Core,
-resolve all lineage from its actual effective root, and retain outcomes with the
-changed rows. Derived child cancellation uses checked ownership authority rather
-than pretending to be each child's issuer. Preserve prior terminal cuts and
-unrelated informational peers. Evaluation creation must subsequently extend this
-same registry and cancellation path with its authority fences; it cannot be added
-through an unregistered parallel map.
+Preparation validates every supplied pending candidate's process-local owner and
+exact predecessor-root provenance. This fences both existing-row reads and
+observed ID absence. A sibling fork cannot masquerade as the same prefix. The
+creation plan checks every proposed component, including disconnected cycles and
+same-batch ancestry; a missing endpoint is an error. An actual Supersedes successor
+must be compatible, and a published predecessor must be older. Terminal
+predecessors retain their original status and terminal cut. Child creation and
+parent registration are inseparable. Cancellation uses checked registry identity,
+content, creation position and immutable Cause, including children staged earlier
+in the pending chain. It preserves terminal descendants and unrelated peers.
 
-Use explicit native row-copy plans to report and reserve dynamic storage before
-copying changed claims or retained entries in touched pages. Reserve traversal,
-candidate, history and outcome space before construction. Ordinary admission must
-leave Completion capacity for committed terminal cleanup. Storage should retain
-the existing budget permits with candidate pages and release them on rejection.
-Count limits and an unowned byte allowance are not substitutes for those permits.
-Test these properties through actual Core preparation, effective reads, candidate
-audit and publication before assigning any successor wire or durable tags.
+Creation rejects missing, extra, duplicate and semantically substituted full
+definitions, even when a caller reuses an external content stamp. Posting does
+not treat Admission as already passed: it produces Ready evaluation rows and
+complete membership in the same candidate as the Posted claim. Begin requires
+the retained evaluator identity, exact expected evaluation revision and current
+claim state. The participant supplies no readiness boolean, `Passed` predicate,
+`OwnerState` or evaluator grant. `NativeContext` is supplied by the trusted owner;
+its logical time cannot regress against the effective prefix. An exact retained
+retry returns its original outcome and accepted time. A definition that requires
+`required_policy` currently refuses begin until actual stored grant resolution is
+implemented; absence of a grant is never converted to permission.
+
+Cancellation and supersession obtain evaluation membership from the stored
+registry, including earlier pending evaluations. They check each row against its
+retained definition and registration before publishing authority fences together
+with claim control changes. Fencing preserves an evaluation's recorded lifecycle
+facts and original terminal results; it does not invent a result or testify for
+the respondent. Cancellation continues through terminal owned descendants and
+does not release their scopes. Adoption-specific fences remain future work.
+
+Successful request keys and their private semantic intent fingerprints are stored
+with the rows they produced. A changed intent under the same key is rejected;
+an exact retry does not create another sequence. Published and pending matches
+are explicitly distinguished. These fingerprints are neither V1 hashes nor a
+specified successor wire identity. Native semantic refusals currently return
+errors without retaining request outcomes; their eventual transport/durable
+contract remains to be defined.
+
+History preserves the transaction's model phases: each new claim has a `Created`
+event at revision one, followed by each `ChildRegistered` event in child-ID order,
+then any `Superseded`, `Cancelled` or `Posted` transition. Registration records the exact
+child binding captured in the ownership registry and each successive parent
+revision. Events include their before/after binding and resulting status;
+preparation checks that the final reconstructed binding equals the stored row.
+`NativeFact` distinguishes claim transitions, retained definitions and evaluation
+transitions. Evaluation facts preserve target/generation identity, before/after
+binding, state, phase, applicable attempt and authority fence. `NativeOutcome`
+records definition/evaluation changes and the exact event count. All facts and
+final rows publish together, including a parent with several new children or an
+evaluation fenced by a control change. Report/result/evidence causal history is
+not yet implemented by this owner.
+
+The [preparation implementation](../../crates/focal-core/src/native/prepare.rs)
+holds a real `MemoryBudget` Pending permit for its bounded model workspace,
+changes buffer and event-construction scratch before constructing replacement
+rows. Creation, posting and evaluator entry use the Ordinary
+lane; cancellation uses Completion. Input definitions are already owned when
+passed in, and their retained size is bounded before planning; a future ingress
+must also reserve its decoding/construction buffers. Explicit claim, declaration
+and registration copies account for dynamic capacities and allocator overhead;
+registration growth charges old and replacement buffers together.
+`prepare_batch_with` and
+`prepare_after_with` reserve candidate pages before copying retained neighbors in
+touched pages; newly supplied values move into those pages. The copier rejects
+actual heap/allocator growth beyond the retained row's page charge. Candidate
+pages retain their permits when temporary planning reservations are dropped.
+Refusal or candidate drop cannot alter published rows or their prefix.
+
+Large claim/registration, declaration, evaluation and event rows use private, fallibly
+allocated single-element containers so small outcomes and history do not occupy
+their larger slots. Complete containers, nested capacities and allocator overhead
+are precharged; moving new rows preserves their owned buffers. Retained
+touched-page copies remain fallible and independent, and the reference-free
+evaluation payload copies by value. Stored event bindings omit repeated ledger
+identity and expand into exact public facts without allocation. This adds neither
+per-object `Arc` nor infallible boxing.
+
+Publication itself performs no allocation or I/O. Its caller must establish the
+durability barrier first; this typed API does not prove that a log was synced.
+Failed publication retains the candidate for retry or explicit drop. Completion
+headroom is bounded, so new cancellation preparation can still refuse capacity;
+an already-prepared candidate needs no new allocation to publish. Default native
+limits are internal owner limits, not new mandatory operator configuration.
+Precharge/reconciliation and pressure behavior require the owner-level
+qualification recorded in [09](09-implementation-status.md).
+
+Pinned reads use `SnapshotLease::project_next`, preserve lease/clock checks and
+prevent borrowed rows from escaping a projection. The caller owns allocation of
+any projected output and must enforce its output budget and ingress visibility
+policy. Owned claims, definitions and registration sets do not implement
+production `Clone`; evaluation state is a reference-free `Copy` value. This owner
+adds no per-object `Arc`; shared budget and immutable page/root lifetimes remain
+within the existing memory subsystem.
+
+**Next authoritative transaction work:** add report/result/evidence admission,
+respondent-authored close and attachments, diagnostic facts, receipt acquisition
+and adoption, Increment/WholeWork materialization, aggregation, graph consequences,
+audit seals and complete request/history results to this same mechanism. Resolve
+real stored policy grants before enabling checks that require them. Ordinary
+required-check failure must retain authorized begun late results. Explicit
+cancellation must not become scope release or fabricate respondent testimony.
+
+Native snapshots, prepared commands, import provenance, decoder identity, shared
+WAL/Ready integration and quorum activation still require §§4–7. Current native
+snapshots are RAM read leases, not durable checkpoint bytes. No current CLI or
+MCP operation selects this owner.
+
+RangeStore supplies the existing atomic publication primitive that Arena and
+StableIndex individually lack. Its root directory still has an O(number of pages)
+copy cost. Native claim/outcome counts, retained events, snapshot lifetimes and
+per-command graph bounds remain subject to owner memory capacity; no native
+history retirement or automatic sharding is introduced here. Directory costs,
+large-graph behavior, retention, sharding, failure-domain placement and global
+throughput/operations remain scale work. This increment does not qualify the
+laptop-to-Meta-scale objective.
+
+### 6.3 Next owner slice: Admission results and receipt eligibility
+
+Close the existing Admission loop before claiming native respondent work can
+start. A claim with no Required Admission checks may eventually take the direct
+receipt path, but that path cannot stand in for completing already-begun checks.
+Implement the following together, through the existing range publication seam:
+
+1. **Retain actual proof and diagnostic artifacts.** Add independently owned
+   artifact rows and bounded construction/copy accounting. Resolve producer,
+   schema, descriptor hash, exact target, handler attempt and verified custody
+   from retained owner facts. `EvidenceFacts` is a trusted model input, not a
+   participant-authored wire shape. The Core adapter must construct it only from
+   the verified artifact/custody rows. Keep evaluator evidence distinct from a
+   respondent's frozen closing manifest. Admission must reserve completion
+   evidence capacity before beginning work; later durability integration must
+   commit evidence custody before acknowledging the corresponding fact.
+2. **Add native result publication.** Resolve the actual evaluation key, expected
+   revision, phase, handler attempt, evaluator, receipt/generation and declared
+   evidence schemas. Feed only checked facts to the existing validation contract.
+   Publish proof/diagnostic records, accepted attempt history, next evaluation
+   state, parent consequences and request outcome atomically. Error may advance
+   only declared bounded retries/fallbacks; a programmatic pass must still honor
+   a required quality phase. Adapt typed event construction to retain terminal
+   states explicitly; the current materialize/begin/fence helper's
+   `current_attempt()` call deliberately does not support terminal reporting.
+3. **Build a report-specific authority frame.** Do not reuse `admission_owner`
+   unchanged: its Posted/no-receipt requirement is correct for starting Admission.
+   An already-begun Observe check may finish after receipt acquisition, and an
+   eligible begun sibling may finish after a required check makes the parent
+   PostFailed. Derive that permission from the retained begun state and live
+   exact authority, while cancellation, supersession, expiry and applicable
+   adoption fences continue to refuse stale results. Non-control parent progress
+   must neither revoke a valid begun chain nor allow a new begin.
+4. **Derive Admission from the compact registry.** The existing `AdmissionDecision`
+   is produced through `ClaimAggregation`, whose legacy construction duplicates
+   policy/registration storage and cannot initialize itself by registering
+   already-started evaluation rows. Add a checked read-only projection over the
+   native claim, actual complete `RegistrationSet`, retained declarations and
+   evaluation/result rows. It must return the private Admission decision consumed
+   by the claim owner without introducing another mutable policy or summary
+   authority. Preserve Required versus Observe semantics and exact definition,
+   target, generation and receipt membership.
+5. **Retain the originating result cut.** Current `EvaluationState` does not
+   retain an accepted result's publication sequence. Store that sequence and
+   event ordinal with immutable accepted-result history before deriving earliest
+   blocking cause or revisiting a claim after another check. Use the prepared
+   sequence for pending facts. A later projection must not assign an old failure
+   the current transaction's cut or repaint its first terminal cause.
+6. **Consume real receipt eligibility.** Only after the required Admission
+   projection succeeds may the actual respondent acquire responsibility through
+   a checked native claim transition. Resolve graph/start predicates and current
+   receipt generation from the owner, never participant-provided success flags.
+   Receipt acquisition must create no response testament. The respondent later
+   authors that testament after its work attempt, retaining errors and failures
+   as artifacts when unsuccessful.
+
+Receipt acquisition also requires complete owner-gathered dependency, scope and
+owned-child closure. Add graph snapshot construction preflight and actual-capacity
+accounting before consuming its private `Start` token; the current graph model
+has no owner-facing byte allowance for this construction.
+
+The following respondent-evidence increment must maintain an owner-controlled
+current-receipt/cycle artifact index. A participant's supplied manifest cannot
+establish that the evidence set is complete. Adapt `ResponseDiagnostic::record`
+to a checked native artifact/custody view, add bounded response copying, precharge
+claim response-history growth and preserve separate diagnostic headroom.
+`Response::prepare_close` then checks the explicit outcome, current holder,
+receipt/cycle and exact work/diagnostic manifest before response creation,
+attachments and claim observation publish together. Response posting and the
+claimant's receipt remain separate transitions.
+
+Qualify actual owner chains for Required pass/failure, Observe late completion,
+programmatic-to-quality transitions, Error fallback, proof/custody substitution,
+wrong evaluator and stale attempt, pending result-before-control versus
+control-before-result, receipt-before-late-report, stable first failure cuts,
+duplicate exact requests, and atomic refusal under completion-memory pressure.
+Keep native codecs, replay/import and Session activation gated until these facts
+have their explicit durable representation and the remaining object transactions
+are integrated.
 
 ## 7. Import facts without inventing history
 

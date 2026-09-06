@@ -1,5 +1,4 @@
 use super::*;
-use std::sync::mpsc;
 
 const HASH: [u8; 32] = [41; 32];
 
@@ -101,40 +100,12 @@ pub(super) fn configured(shared: &SharedWal, budget: &MemoryBudget, group: u8) -
     node.drain().unwrap();
     node
 }
-/// A real bounded replay channel holds the existing disk owner. No timer or
-/// scheduler race substitutes for proving that the floor has not been fsynced.
-pub(super) fn pause(
-    shared: &SharedWal,
-) -> (mpsc::SyncSender<()>, std::thread::JoinHandle<WalLease>) {
-    let mut lease = shared.lease(LogicalLogId([250; 16])).unwrap();
-    let records: Vec<_> = (1..=3)
-        .map(|index| Record {
-            log: LogicalLogId([250; 16]),
-            kind: RecordKind::Entry,
-            index,
-            term: 1,
-            payload: vec![1],
-        })
-        .collect();
-    lease.append_in(&records, BudgetLane::Completion).unwrap();
-    let (entered, entry) = mpsc::sync_channel(1);
-    let (resume, resumed) = mpsc::sync_channel(1);
-    let worker = std::thread::spawn(move || {
-        let mut first = true;
-        lease
-            .replay(|_| {
-                if first {
-                    first = false;
-                    entered.send(()).unwrap();
-                    resumed.recv().unwrap();
-                }
-                Ok(())
-            })
-            .unwrap();
-        lease
-    });
-    entry.recv().unwrap();
-    (resume, worker)
+/// The physical disk owner acknowledges this pause after completing earlier
+/// commands. Unlike a blocked replay visitor, it cannot still reserve another
+/// buffered record after acknowledgement. Dropping the guard resumes the owner
+/// if an assertion fails, and the retained-budget checks remain exact.
+pub(super) fn pause(shared: &SharedWal) -> focal_log::WalPause {
+    shared.pause_for_test().unwrap()
 }
 
 #[test]
@@ -150,7 +121,7 @@ fn floor_advertisement_waits_for_real_fsync_and_uses_completion_under_ordinary_p
     node.drain().unwrap();
     node.propose(b"committed-before-floor".to_vec()).unwrap();
     let index = node.drain().unwrap().applied_index;
-    let (resume, worker) = pause(&wal);
+    let paused = pause(&wal);
     let stats = budget.stats();
     let pressure = budget
         .reserve(
@@ -183,8 +154,7 @@ fn floor_advertisement_waits_for_real_fsync_and_uses_completion_under_ordinary_p
         node.begin_checkpoint(index, vec![2]),
         Err(ConsensusError::PersistencePending)
     ));
-    resume.send(()).unwrap();
-    drop(worker.join().unwrap());
+    paused.resume().unwrap();
     node.finish_decoder_floor().unwrap();
     assert!(node.decoder_floor_ready(HASH));
     node.checkpoint(index, b"checkpoint-retains-floor".to_vec())
@@ -219,12 +189,11 @@ fn lost_floor_waiter_reopens_with_requirement_and_checkpoint_tail_keeps_exact_sc
     other.drain().unwrap();
     other.propose(b"other-group".to_vec()).unwrap();
     other.drain().unwrap();
-    let (resume, worker) = pause(&wal);
+    let paused = pause(&wal);
     node.begin_decoder_floor(HASH).unwrap();
     assert!(!node.try_finish_decoder_floor().unwrap());
     drop(node); // An admitted append continues after the application waiter is gone.
-    resume.send(()).unwrap();
-    drop(worker.join().unwrap());
+    paused.resume().unwrap();
     wal.stats().unwrap(); // FIFO barrier proves the abandoned write has finished.
     let mut node = DurableNode::open_on_wal_in(
         NodeConfig::single(1, [1; 16], [2; 16]),

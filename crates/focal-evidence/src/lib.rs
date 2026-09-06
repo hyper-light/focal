@@ -11,7 +11,9 @@
     )
 )]
 //! Immutable, verified evidence custody and pinned validator implementations.
+mod schemas;
 mod store;
 mod validators;
+pub use schemas::*;
 pub use store::*;
 pub use validators::*;

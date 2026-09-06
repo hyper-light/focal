@@ -122,7 +122,7 @@ pub(crate) enum SubmitCommand {
     Claim(ClaimArgs),
     /// Generate an atomic batch; each claim retains its own pinned requirements.
     Claims(ClaimBatchArgs),
-    /// Close an existing evidence set with its exact artifact manifest.
+    /// Report completed or failed work with your exact artifact manifest.
     Testament(TestamentArgs),
     /// Attach an immutable artifact to an open, receipt-fenced evidence set.
     Artifact(ArtifactArgs),
@@ -190,7 +190,7 @@ pub(crate) struct TestamentArgs {
     pub receipt_epoch: Option<u64>,
     #[arg(long)]
     pub evidence_set: Option<String>,
-    /// Repeat artifact ID:descriptor hash in manifest order.
+    /// Repeat artifact ID:descriptor hash in manifest order; include errors for unsuccessful work.
     #[arg(long)]
     pub artifact: Vec<String>,
     #[arg(long, conflicts_with = "artifact")]
@@ -199,6 +199,7 @@ pub(crate) struct TestamentArgs {
     pub summary: Option<String>,
     #[arg(long)]
     pub confidence: Option<String>,
+    /// complete, partial, refused, impossible, interrupted, or failed. Non-complete requires error evidence.
     #[arg(long)]
     pub outcome: Option<String>,
     #[command(flatten)]

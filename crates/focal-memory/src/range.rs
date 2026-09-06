@@ -604,19 +604,31 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
     }
 
     /// Publish after durable commitment. The owner must serialize preparations
-    /// across the log barrier; a stale or foreign candidate is rejected intact.
+    /// across the log barrier; refusal leaves the published root unchanged.
+    /// Use `publish_recoverable` to retain the refused candidate itself.
     pub fn publish(&mut self, prepared: PreparedRange<K, V>) -> Result<(), MemoryError> {
+        self.publish_recoverable(prepared)
+            .map_err(|(error, _)| error)
+    }
+
+    /// As `publish`, but returns ownership of a refused candidate. The caller
+    /// can inspect or discard the complete candidate without losing its permits.
+    pub fn publish_recoverable(
+        &mut self,
+        prepared: PreparedRange<K, V>,
+    ) -> Result<(), (MemoryError, PreparedRange<K, V>)> {
         if prepared.root.range != self.id() {
-            return Err(MemoryError::WrongRange);
+            return Err((MemoryError::WrongRange, prepared));
         }
         if prepared.base.prefix != self.prefix() {
-            return Err(MemoryError::StalePreparation {
+            let error = MemoryError::StalePreparation {
                 prepared_at: prepared.base.prefix,
                 current_prefix: self.prefix(),
-            });
+            };
+            return Err((error, prepared));
         }
         if !Arc::ptr_eq(&prepared.base, &self.root) {
-            return Err(MemoryError::WrongRange);
+            return Err((MemoryError::WrongRange, prepared));
         }
         self.root = prepared.root;
         Ok(())

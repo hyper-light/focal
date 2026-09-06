@@ -36,6 +36,10 @@ The [Session storage increment](#session-v1-envelopes-and-output-identities)
 records the subsequent frozen surrounding formats and borrowed checkpoint writer.
 The [decoder transition](#bounded-decoder-transition) adds the durable local
 upgrade mechanism; production Session still selects only V1.
+The [validation ownership increment](#owned-native-validation-definitions-and-retained-evaluation-state)
+removes native definition/state self-reference. The subsequent
+[RAM preparation increment](#fallible-owned-ram-preparation-and-lineage-chronology)
+supports non-Clone values through the existing atomic storage path.
 
 | Package | Concrete implementation | Remaining acceptance work |
 |---|---|---|
@@ -972,3 +976,394 @@ This completes the independent definition/state ownership prerequisite in
 It does not activate successor storage, extend live CLI/MCP behavior or close L1.
 The sole Core owner, mandatory complete creation-lineage checks, joint child/control
 publication, versioned durable representations and activation remain required.
+
+## Fallible owned RAM preparation and lineage chronology
+
+The existing RAM range owner now accepts non-`Clone` values through
+`prepare_batch_with` and `prepare_after_with`. Incoming `Put` entries move directly
+into final candidate pages; they are not copied. Only retained entries in touched
+pages invoke the explicit fallible copier, after the full page allocation has been
+reserved. Unchanged pages preserve their existing shared lifetime. Failure drops
+every provisional page and permit without changing published state or pinned reads.
+The recorded heap charge must conservatively cover the copied key/value capacities
+and allocator overhead; any additional copier workspace belongs to its caller.
+
+`PreparedRange::entries` exposes the complete ordered unpublished prefix.
+`SnapshotLease::project_next` no longer requires `Clone` and still prevents borrowed
+entries from escaping its checked lease lifetime. Existing Clone preparation APIs
+delegate through the same implementation. Owner identity, exact base-root lineage,
+ordered chain validation and allocation-free publication remain intact. The change
+adds no per-object wrapper or additional `Arc` site. The page directory still costs
+O(number of pages) to copy; this is not scale qualification.
+
+Seven [owned-range regressions](../../crates/focal-memory/src/owned_range_tests.rs)
+cover moved payload pointers, exact selective-copy sets, reservation before copier
+entry, failure after earlier pages have already been prepared, pinned snapshot
+isolation, complete-page deletion, effective pending iteration, foreign/stale
+candidate refusal and real Ordinary/Completion exhaustion. Publication succeeds
+after the final remaining budget has been reserved by other work. These exercise
+the real memory primitive, not a mock owner.
+
+Separately, native `SuccessionPlan` now checks chronology on every traversed
+Cause/Supersedes/Amends edge, including targets already visited by DFS. A historical
+claim cannot refer to a claim created later merely because both precede today's
+successor. Five [regressions](../../crates/focal-model/src/lifecycle/succession_tests.rs)
+cover direct and transitive violations, already-visited targets, valid ordered
+history, same-cut acyclic references and same-cut cycles. Mandatory checked
+creation against the future Core registry remains open; this correction strengthens
+the existing succession path only.
+
+The first workspace attempt exposed a test synchronization race: a blocked replay
+visitor signaled before the disk owner necessarily reserved its next buffered
+record, changing the test's observed memory by exactly 319 bytes. The floor and
+transition tests now use the existing acknowledged physical `WalPause` test seam.
+Their exact retained-memory and real pending-fsync assertions remain unchanged;
+no sleeps or relaxed comparisons substitute for the barrier. Consensus enables
+the already-existing `focal-log/test-support` development feature; production
+dependencies and behavior do not change. Thirteen focused decoder tests pass after
+this correction. The first-attempt log is retained separately as
+`/tmp/focal-owned-range-workspace-first-attempt.log`.
+
+The [Core ownership plan](18-lifecycle-storage-upgrade.md#62-concrete-ram-owner-and-publication-seam)
+now identifies the existing RAM publication path, an explicitly specialized native
+Core, complete effective-state creation checks, and joint owned-child/control
+transactions. The storage prerequisite is implemented; the native Core transaction,
+durable representations, activation and richer lifecycle CLI/MCP path remain open.
+
+
+## Respondent-authored testimony, diagnostic evidence and binary delivery
+
+The README now introduces Focal as an inter-agent communication protocol and
+event-driven ledger and uses one two-party exchange diagram. Requester and
+respondent have separate lanes: directed claim, execution receipt, participant
+work, respondent-authored testament, claimant receipt, participant validation and
+derived acceptance. Both old sprawling diagrams were removed. Mermaid 11.12.0
+and cached Chromium rendered the new diagram at desktop and narrow widths;
+inspection found no clipping or overlap. The first render caught an unescaped
+semicolon, corrected before the successful render. Narrow screens still need
+zoom for comfortable reading. Rendering artifacts are in
+`/private/tmp/focal-readme-mermaid-viul94z9`; no project dependency was added.
+
+### Running service and shared CLI/MCP
+
+New admission rejects historical runtime-synthesized `FailTestamentGeneration`.
+The current receipt holder must submit ordinary testimony after work completes
+or fails, with its own summary, confidence, explicit outcome and exact manifest.
+Every non-Complete outcome requires a real durable error artifact. Core verifies
+its effective committed/pending row, ledger, receipt, producer, schema and hash;
+CLI/MCP builders reject empty unsuccessful reports before submission. Historical
+V1 reducers, hashes, checkpoint layouts, command tags and exact retained retries
+remain unchanged. Direct, epoch and managed replay tests preserve the old rules.
+
+At the last available artifact slot, new admission preserves diagnostic headroom
+unless an eligible diagnostic is already retained. An error-shaped artifact with
+zero custody cannot consume that reserved slot, and content deduplication cannot
+repair old custody by supplying a new attestation. Both legacy and managed
+proposal paths see pending rows. The shared authored manifest bound now matches
+the default 1024-artifact Core set bound; previously its 256 limit could strand a
+larger staged set. Full-size JSON/YAML close input is covered by regression tests.
+
+A pre-policy full manifest without usable diagnostic evidence cannot be backfilled
+under frozen V1. Its historical replay remains valid, but a new unsupported failure
+report is refused. A versioned continuation/migration is still needed for that
+case. Manifest headroom does not reserve all node/global object, request, memory,
+evidence-storage or disk capacity; complete resource reservation for terminal
+reporting remains native-owner work under [18](18-lifecycle-storage-upgrade.md).
+
+The service now admits a pinned language-agnostic `error-report` payload as well
+as the original `test-report`. Errors carry required bounded code/message and
+optional details, with object-only strict JSON, duplicate/unknown-field refusal,
+fixed blank-codepoint semantics, and a 64-KiB encoded limit. Shape checking retains
+no field strings and decides no verdict. Local and replicated custody use the
+same checker and schema-specific content read bounds. Local inline attestation
+now borrows bytes instead of cloning them. Existing test-report identity and
+parsing behavior remain unchanged. `focal schema get error-report` exposes its
+exact descriptor/hash/example; list and shell completion discovery include it.
+MCP submits the same typed artifact, though payload-schema lookup currently
+remains CLI discovery. Runtime/tool failure needs no invented test counts.
+
+Actual CLI success and failed-test workflows pass. The MCP failure workflow
+submits a real tool-unavailable diagnostic, retains explicit Failed/Tentative
+respondent testimony, receives it, invokes an acceptance check in the participant
+process, records separate proof and a failing verdict, restarts server and MCP,
+and verifies unchanged evidence, report and exact retained retry. These adapter
+tests use one authenticated participant's self-handoff roles; separate-principal
+and receipt-adoption authority is covered by Core/native tests. The 18-test actual
+CLI/MCP suite passed before complete workspace qualification.
+
+### Independent native contract
+
+Native responses now own their bounded summary, confidence, one of all six
+reported outcomes, work-slot manifest and separate typed diagnostic references.
+`ClosePreparation` checks before allocation, reports construction charge and
+builds fallibly; actual retained capacities are inspectable. Transitions reuse
+owned buffers and need no new `Arc` or production `Clone`. Diagnostic tokens
+verify actual owner-resolved artifact metadata and custody; diagnostics never
+stand in for missing requested work. A failed response with no work slots remains
+receivable and inspectable before MissingSlot is assessed at evaluation.
+
+Private report stamps prevent changed reports from reusing a binding in response
+transitions, claim observations or validation readiness. A closing incident is a
+checked publication plan retaining a real diagnostic and a new claim revision;
+it does not terminalize the claim or fabricate a testament. Eight new native
+regressions cover these facts and the existing pending-Increment exchange remains
+valid. The 161-test model suite passed. Native owner storage, versioned encoding
+and independent-lifecycle CLI/MCP activation remain open.
+
+### Prebuilt binary distribution
+
+The [release workflow](../../.github/workflows/release.yml) now builds one raw
+`focal` server/client/MCP executable for each of six native macOS/Linux targets.
+No end-user source checkout, Rust, protobuf compiler or Python is required.
+Collection requires every platform, SHA256SUMS and matching provenance. Manual
+runs produce CI artifacts; intentional version-tag runs upload and verify an
+unpublished draft before publication. Existing releases are never overwritten.
+Eleven Python orchestration tests pass, including incomplete/altered asset sets
+and failed publication verification. No tag or public release was created.
+[20](20-binary-distribution.md) records native Windows implementation work and
+clean-machine/platform-release qualification, which remain open.
+
+### Verification notes
+
+The first current workspace run found one new test fixture using the issuer to
+register a worker-produced historical artifact. Correcting the fixture principal
+preserved the zero-custody rejection being tested; all fifteen Core admission
+regressions subsequently passed. A later workspace run found a read-pagination
+fixture that still closed an empty Interrupted report. It now uses a Complete
+delivery account; the test's pagination, recorded-validation and recovery assertions
+are unchanged, and its submission helper prints the actual refusal on failure.
+The focused test passes. A workspace audit found no other unintended live
+non-Complete/empty-manifest fixture; historical and refusal fixtures stay intact.
+Clippy also identified one needless test clone,
+replaced by a borrowed slice. All-target Clippy, the separate production no-panic
+lint gate, formatting and architecture source/link checks then passed.
+
+The prior owned-range workspace run's fleet test observed a legitimate unknown
+outcome while opening a healthy leader epoch under load. The healthy setup paths
+now use the fixture's existing bounded exact-request retry helper; the isolated
+partition still makes one uncertain request and retains its original assertion.
+No production timeout or outcome assertion was relaxed. Full-workspace evidence
+for the combined increment is recorded below only after execution completes.
+
+
+Final qualification on the local macOS arm64 checkout:
+
+- `bash scripts/cargo.sh test --workspace --offline --locked -- --test-threads=4`
+  passed **1,121 tests across 66 unit/integration targets**, followed by all doc
+  tests. Evidence: `/tmp/focal-authored-report-workspace.log`. This includes the
+  earlier owned-range, validation-ownership, chronology, decoder-pause and fleet
+  fixture corrections as well as this report/diagnostic increment.
+- Packaged claims/evidence/validation instructions were then aligned with the
+  corrected reporting obligation. Their versions are 8/7/3; cluster remains 1.
+  The shared reference pins the real error-report descriptor hash and example
+  for MCP-only participants without inventing a schema tool/resource. Manifest
+  digests were refreshed. **47 focused evidence/MCP library tests passed** after
+  that instruction update, including one added hash/example regression:
+  `/tmp/focal-authored-report-skill-contracts.log`.
+- `bash scripts/cargo.sh build --release -p focal-node --bin focal --offline --locked`
+  produced a Mach-O arm64 `target/release/focal`. Its SHA-256 is
+  `4a83e4602b2dc906ff91557d7e707a565c940db2a2e657a4cc35e698b237efd3`.
+  The actual binary passed `python3.14 scripts/release/smoke.py target/release/focal`:
+  real server, CLI, MCP, abrupt process kill and exact acknowledged-write recovery.
+  Build/smoke logs: `/tmp/focal-authored-report-release-build.log` and
+  `/tmp/focal-authored-report-release-smoke.log`.
+- Eleven release-script tests passed, and the authored diagram was rendered and
+  visually inspected. These checks do not substitute for the six hosted native
+  release lanes, clean-machine installation, Windows execution, or publication.
+
+The first and second current workspace failure logs remain separately available
+as `/tmp/focal-authored-report-workspace-first-attempt.log` and
+`/tmp/focal-authored-report-workspace-second-attempt.log`; neither is represented
+as a passing run. This increment adds no production `Arc` site, changes no frozen
+V1 bytes or replay interpretation, and does not claim the native owner migration
+or global deployment plan is complete.
+
+## Native claim owner, atomic lineage and owned cancellation — 2026-09-06
+
+The first transaction in [18 §6.2](18-lifecycle-storage-upgrade.md#62-concrete-ram-owner-and-publication-seam)
+now runs through the actual [Core owner](../../crates/focal-core/src/native.rs).
+`Core<S = State>` has a sealed state parameter: the default retains V1 APIs and
+codecs, while `Core<NativeState>` owns a custom `RangeStore`. It has no native
+Serde implementation or arbitrary row insertion, and no Session/CLI/MCP path
+selects it yet. It is an in-process publication boundary, not an installed native
+WAL or a second editable representation of the V1 ledger.
+
+Implemented facts:
+
+- Core assigns creation positions and admits root, owned-child and successor
+  proposals through one mandatory complete-lineage plan. Every Cause, Supersedes
+  and Amends endpoint resolves from the actual committed/prepared root. New-ID
+  absence, disconnected cycles, same-batch ancestry, historical chronology and
+  exact parent receipt/revision authority are checked before publication. Raw
+  claim constructors are restricted to model internals/test fixtures.
+- Parent child registries and successor consequences publish with new rows.
+  Cancellation authenticates the selected root's issuer once, follows the entire
+  stored owned tree through terminal descendants, and uses private derived
+  authority for live children. It preserves prior terminal cuts, unrelated peers
+  and unreleased scopes; it does not impersonate descendant issuers or fabricate
+  respondent testimony.
+- Metadata, claims, retained successful request outcomes and history events share
+  one canonical range root. Native intent fingerprints cover the complete
+  immutable proposal, including private acceptance stamps. Exact retries identify
+  whether the original outcome is pending or committed. Different intents under
+  one key refuse; no outcome or history becomes visible ahead of its rows.
+- History records creation at revision one, every owned-child registration with
+  its captured child binding and successive parent revision, then supersession
+  or cancellation. One atomic sequence includes these explicit phases and its
+  event count. Ledger-local stored bindings expand into exact public bindings
+  without allocating or repeating the ledger identity in every stored field.
+- Real MemoryBudget permits precede model workspace, changes/history buffers and
+  claim-container construction. Fallible copies expose retained/requested byte
+  and allocation counts. Actual capacities are reconciled, including scope
+  replacement buffers before installation. Large claim rows have a private
+  fallibly allocated owner so smaller range entries do not use claim-sized slots;
+  claim policies move without duplicating their buffers. No per-object Arc or
+  infallible boxing is introduced.
+- The complete pending chain must have exact owner/root provenance. Publication
+  allocates nothing and returns an intact refused candidate. Fixed-prefix leases
+  keep earlier facts visible until release/expiry; failed preparation and dropped
+  suffixes reclaim their permits without changing the live root. The caller must
+  establish durability before calling publication and account projected output.
+
+Owner tests cover atomic parent/child/outcome/history visibility, full lineage
+against pending state, successor replacement, reverse-ID registration history,
+exact replay and conflicting intents, foreign and stale forks, reordered
+publication, suffix drop, terminal-descendant preservation, real memory pressure,
+publication with no remaining budget, mid-neighbor-copy failure, and lease expiry.
+Model tests additionally exercise different-issuer descendants, complete-row
+token checks, all nested copy failure positions and actual-capacity refusal before
+scope installation.
+
+The first complete workspace attempt found a stale client skill-contract fixture
+still expecting versions 7/6/2 after the prior reporting update installed 8/7/3.
+The fixture now matches the installed claims/evidence/validation versions while
+retaining its digest, schema and required-operation checks. The failed run is
+retained as `/tmp/focal-native-owner-workspace-first-attempt.log`.
+
+Remaining work: store full immutable validation declarations and independently
+owned evaluation rows in the same authoritative registry; add response, artifact,
+aggregation, graph, audit, authority-fence and retained-refusal transactions;
+qualify native encoding, import, recovery and Session activation. The current
+owner still reserves a conservative per-attempt peak, retains history without a
+native retirement policy, and uses RangeStore's linear page-directory rewrite.
+It does not establish global capacity, automatic sharding or multi-region
+deployment qualification. The broader implementation goal remains open.
+
+Qualification completed on the local macOS arm64 checkout:
+
+- `bash scripts/cargo.sh test --workspace --offline --locked -- --test-threads=4`
+  passed **1,171 tests across 66 unit/integration targets**, followed by all doc
+  tests. Evidence: `/tmp/focal-native-owner-workspace.log`. The run includes the
+  current skill instructions, actual CLI/MCP failure-reporting workflows,
+  replication/recovery tests and frozen V1 fixtures.
+- A final owner regression then exercised a live grandchild below a superseded
+  child: cancellation reaches the grandchild while retaining the child's original
+  binding and terminal cut, and leaving the unrelated successor alone. All
+  **18 focused native-owner tests passed**, including that additional regression:
+  `/tmp/focal-native-owner-final-tests.log`. The complete model suite also passed
+  **193 tests**, including 19 mandatory-creation, six owned-cancellation and seven
+  copy/identity regressions.
+- All-target Clippy, the separate production no-panic gate, formatting and diff
+  checks passed. Production evidence: `/tmp/focal-native-owner-production.log`;
+  all-target lint evidence: `/tmp/focal-native-owner-clippy.log`. The architecture
+  checker verified **541 links, 37 imported source hashes and 15 frozen domain
+  vocabularies**. No V1 durable tag, wire ordinal or replay interpretation changed.
+
+No release build or hosted cross-platform release qualification was performed for
+this native-owner increment. The prior binary smoke belongs to the preceding
+reporting/distribution increment and is not represented as native activation.
+
+## Native definitions, Admission entry and evaluation control — 2026-09-06
+
+The [native Core owner](../../crates/focal-core/src/native.rs) now retains complete
+validation declarations and independent evaluation rows in the same range as
+claims, successful request outcomes and typed history. This extends the previous
+creation/cancellation increment; it does not activate a successor Session codec.
+
+Implemented facts:
+
+- `Create { claims, declarations }` requires the complete immutable declaration
+  cohort for every acceptance manifest. Missing, extra, duplicate, orphaned,
+  retained-ID and semantic substitutions refuse atomically. Full definition
+  intent participates in request identity. Each declaration owns its handler and
+  slot buffers; temporary evaluation views borrow that actual stored definition.
+- A compact claim-owned `RegistrationSet` records actual evaluation membership
+  without copying acceptance policies or handler definitions. Evaluation keys
+  distinguish claim, definition, target and generation; retained rows additionally
+  pin complete content, revision and receipt identity. Child registration preserves
+  an existing parent's evaluation membership.
+- `Post` resolves the retained definitions, checks the actual Generated claim and
+  its authenticated issuer, then stages Posted and every Admission Ready row and
+  registration together. The baseline native posting policy permits a structurally
+  valid claim addressed to a nonzero participant; it assumes no global participant
+  registry and manufactures no configurable policy grant. Posting starts neither
+  respondent work nor a validator and creates no testament.
+- `BeginAdmission` checks the current claim, exact registration, evaluation
+  revision, designated evaluator, definition, generation and deadline. It enters
+  the declared programmatic or direct-agentic phase without running any handler.
+  A trusted `NativeContext` supplies monotonic logical time independently of
+  participant intent. Exact retries retain the original accepted time and pending
+  or committed outcome. Additional `required_policy` grants remain unsupported;
+  their absence refuses entry.
+- Cancellation resolves evaluations for every owned transition, including already
+  terminal descendants. Supersession uses a private token from the actual checked
+  creation plan. It fences only a predecessor newly transitioned to Superseded;
+  Amends and succession of a terminal predecessor do not invent new control.
+  Fences preserve validation state, existing terminal results and earlier fences.
+  They produce no verdict, respondent testament or implicit scope release.
+- Typed history distinguishes declaration retention, claim transitions and
+  evaluation Materialized, Begun and AuthorityFenced facts. Exact bindings,
+  target/generation, phase, applicable attempt and fence cause share their rows'
+  publication. Fixed-prefix reads include full definitions and independent
+  evaluations; stale or foreign candidate publication retains ownership on refusal.
+- The owner precharges temporary descriptors, row/event containers, policy heaps
+  and simultaneous old/replacement registration buffers. Extra-row descriptors
+  allocate lazily and grow fallibly. Actual allocator capacities are reconciled
+  before retention. A lint check found evaluation history was padding every range
+  row; fallible event indirection now prevents that inflation and charges its full
+  heap. No per-object `Arc`, infallible boxing or production panic was introduced.
+
+Focused owner tests cover pending Create → Post → Begin → Cancel, both evaluator
+phases, actor/node and revision/time/target refusals, exact complete definitions,
+parent registry preservation, Required and Observe membership, supersession versus
+Amends, pinned reads, global and per-claim limits, request reuse after refusal,
+ordinary/completion pressure, allocation-free publication and retained-neighbor
+copy failures. Staging tests separately check lazy allocation, growth refusal,
+preserved facts across retry, singleton charges and complete outer reservation.
+
+Remaining work: native receipt acquisition/adoption, evidence custody and artifact
+rows, respondent-authored response close and diagnostics, result admission,
+Increment/WholeWork materialization, aggregation, graph/scope consequences, audit
+seals and retained semantic refusals. The result path must handle terminal
+evaluation history explicitly rather than using the current nonterminal
+materialize/begin/fence helper. Stored grants, native snapshots and prepared
+commands, versioned recovery/import, WAL integration and Session activation also
+remain open. The currently running CLI/MCP continues to use V1. This increment
+does not qualify history retirement, automatic sharding, global throughput or
+cross-platform release deployment; the overall implementation goal stays open.
+
+Qualification completed on the local macOS arm64 checkout:
+
+- The full workspace command
+  `bash scripts/cargo.sh test --workspace --offline --locked -- --test-threads=4`
+  passed **1,222 tests across 66 unit/integration targets**, followed by all
+  **19 doc-test targets**. This includes **144 Core tests** and **215 model
+  tests**, the frozen V1 corpora, replication/recovery and actual CLI/MCP
+  failure-evidence/retry workflows. Evidence:
+  `/tmp/focal-native-admission-workspace.log`.
+- All **46 focused native tests** passed, including 19 Admission owner cases,
+  seven staging/memory cases and the claim/owned-container regressions.
+  Evidence: `/tmp/focal-native-admission-final-tests.log`.
+- All-target Clippy and the separate production no-panic gate passed:
+  `/tmp/focal-native-admission-clippy-final.log` and
+  `/tmp/focal-native-admission-production.log`. The earlier layout finding is
+  retained separately in `/tmp/focal-native-admission-clippy.log`; it is not a
+  passing lint run. Formatting and diff checks passed. The architecture checker
+  verified **544 links, 37 imported hashes and 15 frozen vocabularies**.
+- The README's two-agent sequence was visually checked at desktop and narrow
+  sizes. It places authored testimony after the respondent's work attempt and
+  makes failure/error artifacts available for the claimant's assessment.
+
+No release build, native durability activation or hosted release qualification
+was performed for this increment. The next concrete integration order and
+identified model interfaces are recorded in storage-plan §6.3.

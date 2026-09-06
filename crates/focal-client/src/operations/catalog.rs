@@ -258,7 +258,7 @@ descriptor!(
     Mutation,
     true,
     false,
-    "Close an evidence set with a receipt-fenced testament and exact artifact manifest."
+    "The respondent submits its own account after work completes or fails, with an exact artifact manifest. Non-complete outcomes require durable error artifacts. Receipt and claimant validation are separate operations."
 );
 descriptor!(
     ARTIFACT_SUBMIT,

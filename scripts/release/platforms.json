@@ -1,0 +1,11 @@
+{
+  "musl_image": "rust:1.94.1-alpine@sha256:77237dd363a0b127bb5ef532c2d64c0deb380b738e43a9c4bdac73398d6d0a08",
+  "include": [
+    {"target": "aarch64-apple-darwin", "runner": "macos-15", "asset": "focal-macos-arm64", "musl": false, "runtime": "macOS 15 or later"},
+    {"target": "x86_64-apple-darwin", "runner": "macos-15-intel", "asset": "focal-macos-x64", "musl": false, "runtime": "macOS 15 or later"},
+    {"target": "x86_64-unknown-linux-gnu", "runner": "ubuntu-24.04", "asset": "focal-linux-x64", "musl": false, "runtime": "Linux with glibc 2.39 or later"},
+    {"target": "aarch64-unknown-linux-gnu", "runner": "ubuntu-24.04-arm", "asset": "focal-linux-arm64", "musl": false, "runtime": "Linux with glibc 2.39 or later"},
+    {"target": "x86_64-unknown-linux-musl", "runner": "ubuntu-24.04", "asset": "focal-linux-x64-musl", "musl": true, "runtime": "Linux; statically linked musl"},
+    {"target": "aarch64-unknown-linux-musl", "runner": "ubuntu-24.04-arm", "asset": "focal-linux-arm64-musl", "musl": true, "runtime": "Linux; statically linked musl"}
+  ]
+}

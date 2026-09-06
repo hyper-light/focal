@@ -296,7 +296,13 @@ impl Core {
         );
         let overlay = access::WriteState::overlay(&self.state, view.prior, sequence, recorder);
         if matches!(mode, ManagedStage::AdmitV1) {
-            admission::validate_receipt_admission(&overlay, &input.command)?;
+            admission::validate_admission(
+                &overlay,
+                &self.limits,
+                input.key.stream.principal,
+                &input.authority,
+                &input.command,
+            )?;
         }
         let (mut draft, outcome, deltas, effects) =
             rules.execute_managed_on(overlay, &self.limits, input, sequence)?;

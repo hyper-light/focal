@@ -21,10 +21,10 @@ separately. Unknown outcomes retain the original expanded command.
 | `submit claim` | `claim.submit` | Generate an immutable claim and its pinned requirements as the authenticated issuer. |
 | `submit claims` | `claim.submit_batch` | Atomically generate 1–64 immutable claims, including intra-batch dependencies, under one durable request identity. |
 | `claim post ID` | `claim.post` | Post an admitted generated claim. |
-| `receipt acquire ID` | `receipt.acquire` | Acquire work as the allowed subject. |
+| `receipt acquire ID` | `receipt.acquire` | Acquire responsibility as the allowed subject; create no testament. |
 | `evidence begin --claim ID` | `evidence.begin` | Open an evidence set under the exact execution receipt. |
 | `submit artifact` | `artifact.submit` | Register and attach verified evidence under the holder's receipt and evidence set. |
-| `submit testament` | `testament.submit` | Close the evidence set with its exact artifact manifest and immutable testament. |
+| `submit testament` | `testament.submit` | Respondent authors an explicit outcome, summary and confidence after success or failure, freezing the exact artifact manifest. Every non-Complete outcome requires a durable error artifact. |
 | `testament receive ID --claim ID` | `testament.receive` | Issuer records receipt of the exact current testament. This is delivery acknowledgment. |
 | `validation begin --claim ID` | `validation.begin` | Issuer pins whole-work validation runs over the acknowledged response. |
 | `validation begin-increment` | `validation.begin_increment` | Issuer pins an incremental requirement to an already attached artifact and an observed evidence manifest. |
@@ -39,6 +39,16 @@ filters are optional. `get claim --source` enforces singular selection; use a li
 for multiple matches. `get validation ID --context` and `validation.context`
 return the requirement, claim, available closing testament, and bounded result
 history at one fixed read prefix. This read does not execute a validator.
+
+The respondent must report failed, refused, impossible, interrupted and partial
+work through an ordinary testament. A summary or status flag cannot replace
+error evidence. The shared builder refuses non-Complete empty manifests; Core
+checks the actual committed or pending error row's ID/hash, ledger, current
+receipt, producer, schema and durable custody, as well as the exact evidence set.
+Only the claimant receives the report; designated evaluators then record what
+their checks establish. Those facts determine acceptance independently of the
+respondent's reported outcome. New `FailTestamentGeneration` requests are refused;
+that old runtime-synthesized response is a historical replay operation only.
 
 ### Admission profile and durable compatibility
 

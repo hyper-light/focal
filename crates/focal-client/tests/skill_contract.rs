@@ -101,9 +101,9 @@ fn packaged_skills_pin_real_application_versions_and_complete_relative_resources
         assert_eq!(
             skill.version,
             match skill.name.as_str() {
-                "focal-claims" => 7,
-                "focal-evidence" => 6,
-                "focal-validation" => 2,
+                "focal-claims" => 8,
+                "focal-evidence" => 7,
+                "focal-validation" => 3,
                 _ => 1,
             }
         );

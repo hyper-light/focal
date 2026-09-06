@@ -11,10 +11,14 @@
 //! outcome; a new request cannot reset an object by replaying a lifecycle event.
 
 pub mod aggregation;
+pub mod artifact_descriptor;
 pub mod audit;
 pub mod claim;
+pub mod creation;
 pub mod evidence;
 pub mod graph;
+mod memory;
+pub mod ownership;
 pub mod scope;
 pub mod succession;
 pub mod validation;

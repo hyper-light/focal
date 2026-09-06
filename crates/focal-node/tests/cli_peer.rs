@@ -93,6 +93,25 @@ fn id(value: u128) -> String {
 
 #[test]
 fn actual_cli_external_verdict_completes_after_pinned_evidence_and_preserves_history() {
+    authored_workflow(false);
+}
+
+#[test]
+fn actual_cli_failed_work_preserves_respondent_testament_and_claimant_verdict() {
+    authored_workflow(true);
+}
+
+fn authored_workflow(failed: bool) {
+    let expected_verdict = if failed {
+        VerdictValue::Fail
+    } else {
+        VerdictValue::Pass
+    };
+    let expected_status = if failed {
+        ClaimStatus::ValidationFailed
+    } else {
+        ClaimStatus::Satisfied
+    };
     let root = tempfile::tempdir_in("/tmp").unwrap();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let server = start(root.path());
@@ -179,6 +198,7 @@ fn actual_cli_external_verdict_completes_after_pinned_evidence_and_preserves_his
     }
     assert_eq!(graph_count, 3);
     let received = cli(root.path(), &["receipt", "acquire", &claim_id]);
+    assert!(context(root.path(), &validation_id).testament.is_none());
     let receipt = received["result"]["receipt"].as_str().unwrap();
     let opened = cli(
         root.path(),
@@ -194,7 +214,11 @@ fn actual_cli_external_verdict_completes_after_pinned_evidence_and_preserves_his
         ],
     );
     let evidence_set = opened["result"]["evidence_set"].as_str().unwrap();
-    let report = r#"{"passed":3,"failed":0,"skipped":0}"#;
+    let report = if failed {
+        r#"{"passed":3,"failed":1,"skipped":0}"#
+    } else {
+        r#"{"passed":3,"failed":0,"skipped":0}"#
+    };
     let artifact = cli(
         root.path(),
         &[
@@ -209,7 +233,7 @@ fn actual_cli_external_verdict_completes_after_pinned_evidence_and_preserves_his
             "--evidence-set",
             evidence_set,
             "--kind",
-            "test-report",
+            if failed { "error" } else { "test-report" },
             "--schema-hash",
             &schema,
             "--text",
@@ -237,14 +261,32 @@ fn actual_cli_external_verdict_completes_after_pinned_evidence_and_preserves_his
             "--artifact",
             &reference,
             "--summary",
-            "Report produced",
+            if failed {
+                "Regression persists; the attached test report records the failure"
+            } else {
+                "Report produced"
+            },
             "--confidence",
             "committed",
             "--outcome",
-            "complete",
+            if failed { "failed" } else { "complete" },
         ],
     );
     let testament = closed["result"]["testament"].as_str().unwrap();
+    let reported = context(root.path(), &validation_id);
+    assert_eq!(
+        reported.claim.lifecycle().status,
+        ClaimStatus::TestamentGenerated
+    );
+    assert!(reported.records.is_empty());
+    assert_eq!(
+        reported.testament.as_ref().unwrap().value.content().outcome,
+        if failed {
+            focal_model::OutcomeKind::Failed
+        } else {
+            focal_model::OutcomeKind::Complete
+        }
+    );
     cli(
         root.path(),
         &["testament", "receive", testament, "--claim", &claim_id],
@@ -267,7 +309,7 @@ fn actual_cli_external_verdict_completes_after_pinned_evidence_and_preserves_his
     let evaluation = TestReportValidator
         .evaluate(report.as_bytes(), None)
         .unwrap();
-    assert_eq!(evaluation.value, VerdictValue::Pass);
+    assert_eq!(evaluation.value, expected_verdict);
     let proof = cli(
         root.path(),
         &[
@@ -315,7 +357,7 @@ fn actual_cli_external_verdict_completes_after_pinned_evidence_and_preserves_his
             "--receipt-epoch",
             "1",
             "--value",
-            "pass",
+            if failed { "fail" } else { "pass" },
             "--evidence",
             &proof_ref,
         ],
@@ -325,8 +367,8 @@ fn actual_cli_external_verdict_completes_after_pinned_evidence_and_preserves_his
         &["validation", "complete", "--claim", &claim_id],
     );
     let completed = context(root.path(), &validation_id);
-    assert_eq!(completed.claim.lifecycle().status, ClaimStatus::Satisfied);
-    assert!(completed.records.iter().any(|record| matches!(&record.value,ValidationResultValue::Attempt(value) if value.value==VerdictValue::Pass)));
+    assert_eq!(completed.claim.lifecycle().status, expected_status);
+    assert!(completed.records.iter().any(|record| matches!(&record.value,ValidationResultValue::Attempt(value) if value.value==expected_verdict)));
     assert_eq!(
         completed
             .testament
@@ -355,7 +397,7 @@ fn actual_cli_external_verdict_completes_after_pinned_evidence_and_preserves_his
             .claim
             .lifecycle()
             .status,
-        ClaimStatus::Satisfied
+        expected_status
     );
     let make = |base: u128| json!({"id":id(base),"occurrence":id(base+1),"target":"self","action":"handoff","description":"Atomic plan member","validations":[{"id":id(base+2),"kind":"receipt","phase":"whole_work","mode":"required","description":"Receive response","evaluator":"self"}]});
     let mut first = make(500);
@@ -396,7 +438,8 @@ fn actual_cli_external_verdict_completes_after_pinned_evidence_and_preserves_his
     let _server = start(root.path());
     let recovered = context(root.path(), &validation_id);
     assert_eq!(recovered.records, completed.records);
-    assert_eq!(recovered.claim.lifecycle().status, ClaimStatus::Satisfied);
+    assert_eq!(recovered.claim.lifecycle().status, expected_status);
+    assert_eq!(recovered.testament, completed.testament);
     assert_eq!(
         cli(root.path(), &["get", "claim", &id(500)])["result"]["id"],
         id(500)

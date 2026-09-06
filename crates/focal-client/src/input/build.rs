@@ -332,9 +332,15 @@ impl TestamentDocument {
         ids: &mut impl IdGenerator,
     ) -> Result<Command, InputError> {
         context.validate()?;
-        count(self.manifest.len(), 256)?;
+        count(self.manifest.len(), 1024)?;
         bounded(&self)?;
         text(&self.summary, true)?;
+        let outcome = parse_outcome(&self.outcome)?;
+        if outcome != OutcomeKind::Complete && self.manifest.is_empty() {
+            return Err(InputError::Invalid(
+                "an unsuccessful testament requires a durable error artifact in its manifest",
+            ));
+        }
         let mut manifest = Vec::new();
         let mut seen = BTreeSet::new();
         for reference in self.manifest {
@@ -355,7 +361,7 @@ impl TestamentDocument {
             manifest,
             summary: self.summary,
             confidence: parse_confidence(&self.confidence)?,
-            outcome: parse_outcome(&self.outcome)?,
+            outcome,
         })
     }
 }

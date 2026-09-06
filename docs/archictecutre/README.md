@@ -42,6 +42,7 @@ states or mutations are already implemented.
 | [17 — Lifecycle state and authority](17-lifecycle-state-and-authority.md) | Exact target transitions, writers, response alternatives, short-circuit/late-result rules, asymmetric audit evidence and historical distinctions |
 | [18 — Lifecycle storage upgrade and decoder transition](18-lifecycle-storage-upgrade.md) | Existing format/reducer audit, explicit successor decoder floor and activation, immutable historical replay and migration qualification |
 | [19 — CLI and MCP implementation contracts](19-cli-mcp-implementation.md) | Peer operation admission, durable retry, external validation, named authenticated contexts, and explicit remaining lifecycle and deployment work |
+| [20 — Native binary distribution](20-binary-distribution.md) | One prebuilt server/client/MCP executable, native release matrix and integrity gates, Windows implementation and installation qualification |
 | [Hecate source snapshot](reference/README.md) | Imported architecture and supporting specs, original provenance and hashes |
 
 ## Authority and current status

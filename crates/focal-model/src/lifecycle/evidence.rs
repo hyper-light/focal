@@ -10,6 +10,11 @@ use crate::{
     TestamentId,
 };
 
+#[path = "evidence_report.rs"]
+mod report;
+pub(super) use report::ReportStamp;
+pub use report::{ClosePreparation, CloseReport, ResponseDiagnostic, ResponseLimits};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkArtifactState {
     Generated,
@@ -146,7 +151,7 @@ impl Parent {
         }
         Ok(())
     }
-    fn require_open_response(&self) -> Result<(), ContractError> {
+    pub(super) fn require_open_response(&self) -> Result<(), ContractError> {
         if self.local_complete
             || !matches!(
                 self.status,
@@ -174,6 +179,8 @@ pub struct SlotBinding {
 /// Typed failure records use real durable diagnostics, never a placeholder hash.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvidenceFailure {
+    /// A respondent-reported execution error or other reason work did not complete.
+    Work,
     Production,
     Structure,
     Metadata,
@@ -473,108 +480,27 @@ pub struct ResponseIdentity {
     pub prior: Option<TestamentId>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(Clone))]
 pub struct Response {
     identity: ResponseIdentity,
     respondent: ParticipantId,
     state: ResponseState,
     manifest: Vec<SlotBinding>,
+    report: report::ReportedWork,
+    stamp: ReportStamp,
     terminal: Option<super::aggregation::ResponseOutcome>,
 }
 
 /// Bounded replacements are checked in full before a close can be published.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(test, derive(Clone))]
 pub struct ClosePlan {
     pub response: Response,
     pub attachments: Vec<WorkArtifact>,
 }
 
 impl Response {
-    pub fn close(
-        identity: ResponseIdentity,
-        parent: &Parent,
-        principal: Principal,
-        current: &[WorkArtifact],
-        expected_manifest: &[SlotBinding],
-        max_artifacts: usize,
-    ) -> Result<ClosePlan, ContractError> {
-        parent.check_identity(identity.binding.ledger, identity.claim)?;
-        if identity.binding.object.is_zero() {
-            return Err(ContractError::InvalidTarget);
-        }
-        parent.check_receipt(identity.receipt)?;
-        parent.require_open_response()?;
-        principal.require_actor(parent.holder)?;
-        if identity.cycle != parent.next_cycle
-            || identity.prior != parent.latest_response
-            || identity.cycle.checked_add(1).is_none()
-        {
-            return Err(ContractError::InvalidManifest);
-        }
-        if current.len() > max_artifacts || expected_manifest.len() > max_artifacts {
-            return Err(ContractError::Capacity);
-        }
-        if current.len() != expected_manifest.len() {
-            return Err(ContractError::InvalidManifest);
-        }
-        let mut previous_slot = None;
-        for (artifact, expected) in current.iter().zip(expected_manifest) {
-            parent.check_identity(artifact.binding.ledger, artifact.claim)?;
-            parent.check_receipt(artifact.receipt)?;
-            if artifact.producer != parent.holder {
-                return Err(ContractError::WrongActor);
-            }
-            if artifact.cycle != identity.cycle {
-                return Err(ContractError::InvalidManifest);
-            }
-            if !matches!(
-                artifact.state,
-                WorkArtifactState::Generated | WorkArtifactState::Received
-            ) || artifact.attachment.is_some()
-            {
-                return Err(ContractError::InvalidTransition);
-            }
-            if artifact.slot != expected.slot
-                || artifact.reference() != expected.artifact
-                || previous_slot.is_some_and(|prior| prior >= artifact.slot)
-            {
-                return Err(ContractError::InvalidManifest);
-            }
-            artifact.binding.next()?;
-            previous_slot = Some(artifact.slot);
-        }
-        let mut manifest = Vec::new();
-        let mut attachments = Vec::new();
-        manifest
-            .try_reserve_exact(current.len())
-            .map_err(|_| ContractError::Capacity)?;
-        attachments
-            .try_reserve_exact(current.len())
-            .map_err(|_| ContractError::Capacity)?;
-        for artifact in current {
-            manifest.push(SlotBinding {
-                slot: artifact.slot,
-                artifact: artifact.reference(),
-            });
-            attachments.push(WorkArtifact {
-                binding: artifact.binding.next()?,
-                state: WorkArtifactState::Attached,
-                attachment: Some(identity.binding),
-                ..*artifact
-            });
-        }
-        Ok(ClosePlan {
-            response: Self {
-                identity,
-                respondent: parent.holder,
-                state: ResponseState::Generated,
-                manifest,
-                terminal: None,
-            },
-            attachments,
-        })
-    }
-
     pub fn identity(&self) -> ResponseIdentity {
         self.identity
     }
@@ -657,6 +583,7 @@ impl Response {
         acceptance: &super::aggregation::ClaimDecision<'_>,
     ) -> Result<Parent, ContractError> {
         claim.check_increment_entry(acceptance)?;
+        claim.received_report(self.identity.binding, self.identity.receipt, self.stamp)?;
         Parent::from_claim(claim)
     }
 
@@ -742,6 +669,7 @@ impl Response {
     fn plan(&self, next: ResponseState) -> Result<ResponseTransition, ContractError> {
         Ok(ResponseTransition {
             expected: self.identity.binding,
+            stamp: self.stamp,
             before: self.state,
             next,
             binding: self.identity.binding.next()?,
@@ -788,6 +716,9 @@ impl Response {
 
     pub fn apply(&mut self, transition: ResponseTransition) -> Result<(), ContractError> {
         self.identity.binding.check(&transition.expected)?;
+        if self.stamp != transition.stamp {
+            return Err(ContractError::ContentConflict);
+        }
         if self.state != transition.before {
             return Err(ContractError::InvalidTransition);
         }
@@ -826,6 +757,7 @@ impl Response {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResponseTransition {
     expected: Binding,
+    stamp: ReportStamp,
     before: ResponseState,
     next: ResponseState,
     binding: Binding,
@@ -887,6 +819,7 @@ impl super::claim::ClaimState {
                 cycle: identity.cycle,
                 prior: identity.prior,
             },
+            response.stamp,
             event,
         )
     }

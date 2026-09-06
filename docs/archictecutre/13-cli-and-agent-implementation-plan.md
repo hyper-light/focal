@@ -243,3 +243,13 @@ authorizes a corrective, and no monitor becomes an autonomous corrective author.
 First land the source/operation inventory and strict input/query contracts. Then deliver an actual laptop CLI workflow, including unrestricted-within-ledger listing and exact pending-operation recovery. Add MCP and skills over that verified path. In parallel, finish the existing founder placement/custody/activation work, then extend the same commands to real multi-node journeys. Do not defer ownership, no-panic gates, authentication, pagination or retries until after adapters ship.
 
 For each increment update [09](09-implementation-status.md) with executable command names, precise limitations, tests and measured resource bounds. The active goal is complete only after the applicable acceptance gates in P00–P20 pass, including deployment and scale qualification; writing this extension or exposing a parser alone does not complete it.
+
+
+## Native binary delivery requirement
+
+P15/P18 require a prebuilt cross-platform server and client. The same `focal`
+executable supplies server, CLI and MCP. Source builds are an optional contributor
+path. [20](20-binary-distribution.md) defines the implemented six-platform Unix
+release pipeline and the remaining native Windows filesystem/transport port,
+clean-machine installation, actual platform execution and tagged-publication
+gates. A configured workflow is not proof that its platform runs have passed.

@@ -158,7 +158,7 @@ All named mutation commands below are unimplemented CLI surfaces. The table cove
 | 16 `CompleteWholeWork` | `admin claims complete ID` | System transition after satisfaction preconditions; not a force-success switch | W/I Runtime |
 | 17 `FailPost` | `admin claims fail-post ID` | Durable error artifact reference | W/I Runtime |
 | 18 `FailReceipt` | `admin claims fail-receipt ID` | Durable error artifact reference | W/I Runtime |
-| 19 `FailTestamentGeneration` | `admin testaments fail --claim ID` | Exact testament/evidence-set identity plus error artifact and summary | W/I Runtime |
+| 19 `FailTestamentGeneration` | No new CLI surface | Historical runtime-synthesized testimony only; new admission refuses it. Respondents submit ordinary testaments with error evidence. | Replay only; supersedes the original Runtime proposal |
 | 20 `CancelClaim` | `claim cancel ID --reason TEXT` | Authorized cancellation, recorded lifecycle | W Actor |
 | 21 `RevokeClaim` | `admin claims revoke ID --reason TEXT` | Trusted lifecycle change | W/I Runtime |
 | 22 `ExpireClaim` | Internal timer dispatch; optional operator diagnostic | Exact timer, generation and fired time; no client-selected logical clock | W/I Runtime |

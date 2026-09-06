@@ -12,12 +12,18 @@
 
 #[path = "acceptance.rs"]
 mod acceptance;
+#[path = "aggregation_admission.rs"]
+mod admission;
+#[path = "registration.rs"]
+mod registration;
 #[cfg(test)]
 pub(crate) use acceptance::acceptance_for;
 pub use acceptance::{
     AcceptancePolicy, DeclaredObligation, EvaluationRegistry, ObligationTarget,
     RegisteredEvaluation, SealedTargets,
 };
+pub use admission::{AdmissionLimits, AdmissionView, PublishedAdmissionResult, project_admission};
+pub use registration::RegistrationSet;
 
 use super::evidence::ResponseEvaluation;
 use super::validation::{AcceptedResult, Phase, Target};
@@ -926,19 +932,32 @@ pub enum AdmissionOutcome {
     Passed,
     Blocked(TerminalCut),
 }
+#[derive(Debug)]
 pub struct AdmissionDecision<'a> {
-    aggregate: &'a ClaimAggregation,
+    binding: Binding,
+    acceptance: &'a AcceptancePolicy,
+    outcome: AdmissionOutcome,
+    blocking_publication: Option<(SessionSeq, u32)>,
 }
 impl AdmissionDecision<'_> {
     pub fn binding(&self) -> Binding {
-        self.aggregate.claim
+        self.binding
     }
     pub fn acceptance(&self) -> &AcceptancePolicy {
-        &self.aggregate.policy
+        self.acceptance
     }
     pub fn outcome(&self) -> AdmissionOutcome {
-        let aggregate = self.aggregate;
-        if let Some(witness) = aggregate
+        self.outcome
+    }
+    /// Exact publication provenance for the selected native blocking result.
+    /// Older ClaimAggregation witnesses contain no event ordinal and return None.
+    pub fn blocking_publication(&self) -> Option<(SessionSeq, u32)> {
+        self.blocking_publication
+    }
+}
+impl ClaimAggregation {
+    fn admission_outcome(&self) -> AdmissionOutcome {
+        if let Some(witness) = self
             .accepted
             .iter()
             .filter(|w| {
@@ -954,7 +973,7 @@ impl AdmissionDecision<'_> {
                 cause,
             });
         }
-        if aggregate.obligations_complete(ObligationTarget::Admission, &aggregate.accepted, true) {
+        if self.obligations_complete(ObligationTarget::Admission, &self.accepted, true) {
             AdmissionOutcome::Passed
         } else {
             AdmissionOutcome::Pending
@@ -1066,7 +1085,12 @@ impl ClaimAggregation {
     }
 
     pub fn admission(&self) -> AdmissionDecision<'_> {
-        AdmissionDecision { aggregate: self }
+        AdmissionDecision {
+            binding: self.claim,
+            acceptance: &self.policy,
+            outcome: self.admission_outcome(),
+            blocking_publication: None,
+        }
     }
     pub fn registry(&self) -> &EvaluationRegistry {
         &self.registry

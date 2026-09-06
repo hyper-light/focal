@@ -207,7 +207,7 @@ fn fixture(name: &str) -> Value {
             json!({"claim":id(10),"receipt":{"id":id(13),"epoch":1},"evidence_set":id(14),"id":id(15),"kind":"text","schema_hash":hash(5),"payload":{"type":"text","text":"Verified report"}})
         }
         "testament.submit" => {
-            json!({"id":id(16),"claim":id(10),"receipt":{"id":id(13),"epoch":1},"evidence_set":id(14),"manifest":[],"summary":"Stopped work","confidence":"tentative","outcome":"interrupted"})
+            json!({"id":id(16),"claim":id(10),"receipt":{"id":id(13),"epoch":1},"evidence_set":id(14),"manifest":[],"summary":"Requested notice delivered","confidence":"committed","outcome":"complete"})
         }
         name if name.ends_with(".list") => json!({}),
         name if name.ends_with(".get") => json!({"id":id(10)}),

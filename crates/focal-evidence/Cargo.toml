@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 focal-model = { version = "0.1.0", path = "../focal-model" }
+focal-memory = { version = "0.1.0", path = "../focal-memory" }
 blake3.workspace = true
 fs2.workspace = true
 postcard.workspace = true

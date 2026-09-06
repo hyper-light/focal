@@ -14,6 +14,8 @@
 //! time, IDs and evaluator results are inputs. Owned row updates publish atomically.
 mod access;
 mod admission;
+#[cfg(test)]
+mod admission_tests;
 mod durable_v1;
 mod epoch;
 mod execution;
@@ -21,6 +23,7 @@ mod execution_v1;
 #[cfg(test)]
 mod execution_v1_tests;
 mod managed;
+pub mod native;
 mod overlay;
 mod pending;
 mod reconciliation;
@@ -102,10 +105,26 @@ pub enum CoreError {
     #[error("counter exhausted")]
     Exhausted,
 }
+mod state_kind {
+    pub trait Sealed {}
+}
+/// The owner has exactly one representation. Native rows cannot enter a V1
+/// checkpoint or acquire the legacy mutation APIs through a mutable sidecar.
+pub trait CoreState: state_kind::Sealed {
+    type Limits;
+}
+impl state_kind::Sealed for State {}
+impl CoreState for State {
+    type Limits = Limits;
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Core {
-    state: State,
-    limits: Limits,
+#[serde(bound(
+    serialize = "S: Serialize, S::Limits: Serialize",
+    deserialize = "S: Deserialize<'de>, S::Limits: Deserialize<'de>"
+))]
+pub struct Core<S: CoreState = State> {
+    state: S,
+    limits: S::Limits,
 }
 impl Core {
     pub fn new(ledger: LedgerId, limits: Limits) -> Self {

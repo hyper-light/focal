@@ -50,6 +50,27 @@ Use the discovered input/output schemas rather than generating fields from a too
 
 Nested results retain the frozen model encoding (byte-array IDs/hashes and numeric vocabularies). Convert identifiers to hexadecimal for authored fields. The implemented `focal schema get domain-registry` command prints the vocabulary mapping; its schema lookup is a local CLI operation, not an advertised MCP tool.
 
+The respondent must call `testament.submit` after work completes or fails;
+`receipt.acquire` creates no testament. Non-Complete reports require a durable
+`kind: "error"` artifact in the exact manifest. Obtain the pinned diagnostic
+descriptor, hash and example with `focal schema get error-report`, then submit
+that payload through the ordinary `artifact.submit` tool. A tool failure can use:
+
+```json
+{"code":"tool_unavailable","message":"The required tool could not run","details":"No test result was produced"}
+```
+
+The same payload contract works in every participant language and framework. A real failed-test
+report can instead use the existing test-report schema with its actual counts.
+
+The claimant receives the testament and its designated evaluator inspects the
+exact error bytes, runs its own check, and submits separately registered proof
+with the resulting verdict. Successfully recording a failure is a successful
+mutation, not proof of claim satisfaction. The native lifecycle target keeps
+diagnostics separate from work slots; the current wire profile still uses the
+single exact closing manifest. Built-in payload-schema lookup is currently CLI
+discovery; this MCP adapter does not advertise a schema resource or lookup tool.
+
 | Purpose | Actual tools |
 | --- | --- |
 | Claim operations | `claim.submit`, `claim.submit_batch`, `claim.post`, `claim.progress`, `claim.cancel`, `claim.supersede` |
@@ -133,13 +154,31 @@ An admitted mutation can still commit; cancellation preserves its recovery oblig
 
 Follow [focal-evidence](../skills/focal-evidence/SKILL.md): acquire the claim's current receipt, open an evidence set, attach actual artifacts, then close a testament with its exact ordered artifact ID/descriptor-hash manifest. Every step is a separate durable operation. Copy the receipt ID and epoch together and reuse the same fence. The descriptor hash is distinct from a content-manifest root or a digest of raw payload bytes.
 
-The service currently verifies the built-in test-report schema. Obtain its descriptor and exact hash through the implemented CLI:
+The service verifies the pinned test-report and error-report schemas. Obtain their
+descriptors and exact hashes through the CLI:
 
 ```sh
-target/debug/focal --data-dir /tmp/focal-mcp-example schema get test-report
+focal schema get test-report
+focal schema get error-report
 ```
 
-Use that hash in the discovered `artifact.submit` schema with `kind: "test-report"` and a text payload such as `{"passed":1,"failed":0,"skipped":0}`. Inline text/bytes and metadata are each limited to 16 KiB. The installed test-report validator accepts a content-backed JSON payload up to 1 MiB. Content transfers are independently bounded at 64 MiB; successful storage does not grant schema admission beyond the actual validator’s limit. Schema registration is not an MCP operation. `artifact.get` returns the descriptor/reference; `artifact.download` returns bounded payload pages. The [manual CLI](manual-cli.md#deliver-artifacts-and-a-testament) automatically stages larger `--payload-file` inputs and uses the same upload journal before attachment.
+Use the test-report hash in the discovered `artifact.submit` schema with `kind: "test-report"` and a text payload such as `{"passed":1,"failed":0,"skipped":0}`. Inline text/bytes and metadata are each limited to 16 KiB. The installed test-report validator accepts a content-backed JSON payload up to 1 MiB. Content transfers are independently bounded at 64 MiB; successful storage does not grant schema admission beyond the actual validator’s limit. Schema registration is not an MCP operation. `artifact.get` returns the descriptor/reference; `artifact.download` returns bounded payload pages. The [manual CLI](manual-cli.md#deliver-artifacts-and-a-testament) automatically stages larger `--payload-file` inputs and uses the same upload journal before attachment.
+
+For unavailable tools, refusals or interruptions, submit a truthful error-report
+with `kind: "error"`; no test counts are required. Its JSON object has nonblank
+`code` (at most 128 UTF-8 bytes), nonblank `message` (4096 bytes), and optional
+`details` (a string up to 32768 bytes or `null`). The complete payload is at most
+64 KiB. Unknown/duplicate fields and positional arrays are rejected. The
+[packaged reporting contract](../skills/references/workflow-contract.md#built-in-error-report-v1)
+pins the exact hash and example for participants without CLI access. MCP exposes
+no payload-schema discovery resource. An older server's refusal requires retaining
+the real diagnostic and operation ID, never substituting invented test counts.
+
+The current respondent authors the testament after work completes or fails;
+acquiring its execution receipt creates no testimony. Every non-`complete`
+outcome requires a durable error artifact in the exact response manifest. The
+requester then receives that account, and its designated evaluator checks the
+actual work and diagnostic evidence before supplying a separate verdict.
 
 A committed testament close means `TestamentGenerated`. The issuer separately uses `testament.receive`, then `validation.begin` for whole-work runs or `validation.begin_increment` for a saved increment requirement and actual attached target. `validation.context`/`validation.get` expose the recorded run fences. The designated evaluator executes its tool, skill or code externally, registers actual proof with `artifact.register`, and supplies exact artifact ID/hash pairs to `validation.submit`. Finally the issuer may call `validation.complete`; Core checks stored results and graph constraints. These are real protocol-3 operations with owner authorization, not caller assertions of success. Each mutation has its own durable operation ID.
 

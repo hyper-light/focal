@@ -4,6 +4,8 @@
 //! edges, since a new edge can create a cycle. Durable suffix subscriptions and
 //! transition histories belong to the publishing owner.
 use super::claim::{ClaimCut, ClaimState, ClaimTerminalCut};
+#[path = "scope_memory.rs"]
+mod memory;
 use super::graph::Snapshot;
 use super::succession::CorrectionKind;
 use super::{Binding, ContractError, Principal};
@@ -129,9 +131,49 @@ pub struct Transition {
     reads: Vec<Binding>,
     event: Event,
 }
+const ALLOCATION: usize = 4 * std::mem::size_of::<usize>();
+
 impl Transition {
     pub fn event(&self) -> Event {
         self.event
+    }
+    /// Actual provisional replacement plus its complete read buffer, while the
+    /// original registry is still retained. Native preparation checks this peak
+    /// against its reserved allowance before installing the replacement.
+    pub(super) fn allocation_charge(&self) -> Result<usize, ContractError> {
+        use crate::lifecycle::memory as bytes;
+        let allocations = bytes::add(
+            self.replacement.heap_allocations()?,
+            usize::from(self.reads.capacity() != 0),
+        )?;
+        let mut charge = bytes::add(
+            std::mem::size_of::<Self>(),
+            self.replacement.retained_heap_bytes()?,
+        )?;
+        charge = bytes::add(charge, bytes::array::<Binding>(self.reads.capacity())?)?;
+        bytes::add(
+            charge,
+            allocations
+                .checked_mul(ALLOCATION)
+                .ok_or(ContractError::Capacity)?,
+        )
+    }
+    #[cfg(test)]
+    pub(super) fn test_extra_read_capacity(&mut self, extra: usize) -> Result<(), ContractError> {
+        if extra != 0 {
+            let capacity = self
+                .reads
+                .capacity()
+                .checked_add(extra)
+                .ok_or(ContractError::Capacity)?;
+            let additional = capacity
+                .checked_sub(self.reads.len())
+                .ok_or(ContractError::Capacity)?;
+            self.reads
+                .try_reserve_exact(additional)
+                .map_err(|_| ContractError::Capacity)?;
+        }
+        Ok(())
     }
     pub(super) fn check(
         &self,

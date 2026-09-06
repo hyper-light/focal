@@ -17,7 +17,6 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 
-const MAX_REPORT_BYTES: usize = 1024 * 1024;
 const JOB_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -584,24 +583,26 @@ async fn attest(
     if artifact.content.ledger != placement.scope.ledger {
         return Err(AccessError::Unauthorized);
     }
-    if artifact.content.schema_hash != focal_evidence::test_report_schema() {
-        return Err(AccessError::UnsupportedOperation);
-    }
+    let maximum = focal_evidence::builtin_schema_limit(artifact.content.schema_hash)
+        .map_err(|_| AccessError::UnsupportedOperation)?;
     match &artifact.content.payload {
         ArtifactPayload::Inline(bytes) if bytes.len() <= 16 * 1024 => {
             // Inline bytes are part of the command itself. The receiving Raft
             // owner checks this placement's voters and publishes only on quorum.
-            let _: focal_evidence::TestReport =
-                serde_json::from_slice(bytes).map_err(|_| AccessError::InvalidRequest)?;
+            focal_evidence::verify_builtin_schema(artifact.content.schema_hash, bytes)
+                .map_err(|_| AccessError::InvalidRequest)?;
         }
         ArtifactPayload::Content(reference) => {
+            if reference.length > u64::try_from(maximum).map_err(|_| AccessError::Capacity)? {
+                return Err(AccessError::Capacity);
+            }
             ensure_local(content, pool, node, placement, custody_id, reference).await?;
             replicate(content, pool, node, placement, custody_id, reference).await?;
             let bytes = content
-                .read_bytes(placement.scope, reference.clone(), MAX_REPORT_BYTES)
+                .read_bytes(placement.scope, reference.clone(), maximum)
                 .await?;
-            let _: focal_evidence::TestReport =
-                serde_json::from_slice(bytes.value()).map_err(|_| AccessError::InvalidRequest)?;
+            focal_evidence::verify_builtin_schema(artifact.content.schema_hash, bytes.value())
+                .map_err(|_| AccessError::InvalidRequest)?;
         }
         _ => return Err(AccessError::Capacity),
     }

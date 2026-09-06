@@ -11,6 +11,9 @@ use crate::{
     VerdictValue,
 };
 
+#[path = "validation_admission.rs"]
+mod admission;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Ready,
@@ -246,6 +249,7 @@ impl ResponseReadiness {
             }
         }
         let identity = response.identity();
+        claim.received_report(identity.binding, identity.receipt, response.report_stamp())?;
         Self::checked(
             identity.binding,
             identity.claim,
@@ -525,7 +529,7 @@ pub struct Evaluation<'a> {
 /// Independently retainable native evaluation row. Every field is private; a
 /// temporary view can only be recovered by checking its actual owned definition.
 /// This has no wire representation or durable identity contract yet.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EvaluationState {
     definition: DefinitionStamp,
     binding: Binding,
@@ -575,6 +579,81 @@ impl EvaluationState {
     pub fn generation(&self) -> u64 {
         self.generation
     }
+    pub fn phase(&self) -> Phase {
+        self.phase
+    }
+    pub fn receipt(&self) -> Option<ReceiptFence> {
+        self.receipt
+    }
+    pub fn has_begun(&self) -> bool {
+        self.begun
+    }
+    pub fn fence(&self) -> Option<AuthorityFence> {
+        self.fence
+    }
+    pub fn last_result(&self) -> Option<AcceptedResult> {
+        self.last_result
+    }
+    pub fn sealed(&self) -> Option<ContentHash> {
+        self.sealed
+    }
+
+    /// Derive control from an actual checked ownership closure. A caller cannot
+    /// manufacture an OwnerState to cancel another claim's evaluation here.
+    /// Terminal results and an earlier authority fence remain exact history.
+    pub fn cancel(
+        self,
+        declaration: &Declaration,
+        cancellation: &super::ownership::Cancellation<'_>,
+    ) -> Result<Self, ContractError> {
+        let evaluation = self.bind(declaration)?;
+        let claim = cancellation.claim();
+        claim.acceptance().check_declaration(declaration)?;
+        if evaluation.claim().0 != claim.binding().object.0
+            || evaluation.ledger() != claim.binding().ledger
+        {
+            return Err(ContractError::InvalidTarget);
+        }
+        if self.state.is_terminal() || self.fence.is_some() {
+            return Ok(self);
+        }
+        let mut next = self;
+        next.binding = self.binding.next()?;
+        next.fence = Some(AuthorityFence {
+            reason: FenceReason::Cancellation,
+            cause: cancellation.cut().cause,
+        });
+        Ok(next)
+    }
+
+    /// Only a creation plan that actually changes an open predecessor to
+    /// Superseded grants this control. An Amends link or a successor of an
+    /// already-terminal predecessor does not manufacture a new fence.
+    pub fn supersede(
+        self,
+        declaration: &Declaration,
+        previous: &super::claim::ClaimState,
+        supersession: &super::creation::Supersession,
+    ) -> Result<Self, ContractError> {
+        supersession.check(previous)?;
+        let evaluation = self.bind(declaration)?;
+        previous.acceptance().check_declaration(declaration)?;
+        if evaluation.claim().0 != previous.binding().object.0
+            || evaluation.ledger() != previous.binding().ledger
+        {
+            return Err(ContractError::InvalidTarget);
+        }
+        if self.state.is_terminal() || self.fence.is_some() {
+            return Ok(self);
+        }
+        let mut next = self;
+        next.binding = self.binding.next()?;
+        next.fence = Some(AuthorityFence {
+            reason: FenceReason::Supersession,
+            cause: supersession.cut().cause,
+        });
+        Ok(next)
+    }
 }
 
 // Read-only access preserves existing getter ergonomics. There is deliberately
@@ -587,6 +666,92 @@ impl std::ops::Deref for Evaluation<'_> {
 }
 
 impl<'a> Evaluation<'a> {
+    /// Native Admission materialization derives its target and receipt absence
+    /// from the actual owning claim. Other target families require their own
+    /// response/artifact owner proof and cannot enter through this helper.
+    pub fn materialize_admission(
+        principal: Principal,
+        declaration: &'a Declaration,
+        claim: &super::claim::ClaimState,
+        generation: u64,
+    ) -> Result<Self, ContractError> {
+        claim.acceptance().check_declaration(declaration)?;
+        if declaration.target() != TargetDeclaration::Admission
+            || claim.status() != crate::ClaimStatus::Posted
+            || claim.local_complete()
+            || claim.receipt().is_some()
+        {
+            return Err(ContractError::InvalidTransition);
+        }
+        Self::materialize(
+            principal,
+            declaration,
+            Materialization {
+                binding: declaration.binding(),
+                target: Target::Admission {
+                    claim: claim.binding(),
+                },
+                slot_name: None,
+                generation,
+                receipt: None,
+            },
+        )
+    }
+
+    /// Installed facts for the native Admission begin path. The publishing
+    /// owner supplies only its effective claim and committed logical time; no
+    /// participant override chooses readiness, deadline or evaluator authority.
+    pub fn admission_owner(
+        &self,
+        claim: &super::claim::ClaimState,
+        logical_time: u64,
+    ) -> Result<OwnerState, ContractError> {
+        claim.acceptance().check_declaration(self.declaration)?;
+        let Target::Admission { claim: target } = self.target else {
+            return Err(ContractError::InvalidTarget);
+        };
+        Binding {
+            revision: target.revision,
+            ..claim.binding()
+        }
+        .check(&target)?;
+        if claim.binding().revision < target.revision {
+            return Err(ContractError::StaleRevision);
+        }
+        if claim.status() != crate::ClaimStatus::Posted
+            || claim.local_complete()
+            || claim.receipt().is_some()
+            || self.receipt.is_some()
+        {
+            return Err(ContractError::InvalidTransition);
+        }
+        let policy = self.declaration.policy(self.phase)?;
+        if policy.required_policy.is_some() {
+            return Err(ContractError::InvalidPolicy);
+        }
+        Ok(OwnerState {
+            evaluation: self.binding,
+            target: self.target,
+            parent: ParentState::Open,
+            readiness: Readiness::AdmissionPosted,
+            cohort: self
+                .sealed
+                .map_or(Cohort::Open, |cause| Cohort::Sealed { cause }),
+            authority: Authority {
+                evaluator: policy.evaluator,
+                definition: policy.definition,
+                generation: self.generation,
+                receipt: None,
+                deadline: self.declaration.spec.deadline,
+                policy_evidence: None,
+                state: self
+                    .fence
+                    .map_or(AuthorityState::Live, AuthorityState::Fenced),
+            },
+            logical_time,
+        })
+    }
+
     pub fn materialize(
         principal: Principal,
         declaration: &'a Declaration,

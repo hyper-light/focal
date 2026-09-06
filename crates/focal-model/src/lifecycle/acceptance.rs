@@ -3,6 +3,12 @@
 //! materialization goes through `materialize`; sealing closes the increment target
 //! set, not the independently progressing evaluation lifecycles.
 use super::{CheckPolicy, Limits, SlotPolicy, reserved, same_content, validate_policies};
+#[path = "acceptance_intent.rs"]
+mod intent;
+#[path = "acceptance_memory.rs"]
+mod memory;
+#[path = "acceptance_support.rs"]
+mod support;
 use crate::lifecycle::validation::{
     AcceptedResult, Declaration, DefinitionStamp, Evaluation, Materialization, Target,
     TargetDeclaration,
@@ -200,25 +206,7 @@ impl AcceptancePolicy {
         Ok(())
     }
     pub(super) fn copy(&self) -> Result<Self, ContractError> {
-        let mut slots = reserved(self.slots.len())?;
-        for slot in &self.slots {
-            let mut checks = reserved(slot.checks.len())?;
-            checks.extend_from_slice(&slot.checks);
-            slots.push(OwnedSlot {
-                slot: slot.slot,
-                missing_declaration_index: slot.missing_declaration_index,
-                mode: slot.mode,
-                checks,
-            });
-        }
-        let mut declarations = reserved(self.declarations.len())?;
-        declarations.extend_from_slice(&self.declarations);
-        Ok(Self {
-            claim: self.claim,
-            issuer: self.issuer,
-            slots,
-            declarations,
-        })
+        self.try_copy(self.copy_charge()?)
     }
     pub(super) fn declaration(
         &self,
@@ -343,7 +331,7 @@ impl RegisteredEvaluation {
             && self.receipt == result.receipt()
     }
 }
-fn same_target(left: Target, right: Target) -> bool {
+pub(super) fn same_target(left: Target, right: Target) -> bool {
     match (left, right) {
         (Target::Admission { claim: left }, Target::Admission { claim: right })
         | (Target::Delivery { response: left }, Target::Delivery { response: right }) => {

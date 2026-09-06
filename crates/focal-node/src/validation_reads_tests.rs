@@ -4,10 +4,11 @@ use focal_ledger::Submission;
 
 fn submit(node: &mut EmbeddedNode, label: &str, actor: ParticipantId, command: Command) {
     let input = crate::demo::request(&node.identity, label, actor, command, vec![]);
-    assert!(matches!(
-        node.session.submit_local(&input).unwrap(),
-        Submission::Committed(_)
-    ));
+    let result = node.session.submit_local(&input).unwrap();
+    assert!(
+        matches!(result, Submission::Committed(_)),
+        "{label}: {result:?}"
+    );
 }
 fn read_page(
     views: &mut ReadViews,
@@ -179,7 +180,7 @@ fn exact_validation_results_pin_publication_and_recover_from_wal_and_checkpoint(
             manifest: vec![],
             summary: "closed delivery".into(),
             confidence: Confidence::Tentative,
-            outcome: OutcomeKind::Interrupted,
+            outcome: OutcomeKind::Complete,
         },
     );
     let before_ack = read_page(

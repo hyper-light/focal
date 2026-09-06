@@ -175,7 +175,7 @@ fn transition_waits_for_actual_fsync_under_pressure_and_retries_cannot_replace_i
     node.confirm_decoder_pair(BEFORE, AFTER).unwrap();
     node.campaign().unwrap();
     let index = node.drain().unwrap().applied_index;
-    let (resume, worker) = pause(&wal);
+    let paused = pause(&wal);
     let stats = budget.stats();
     let pressure = budget
         .reserve(
@@ -218,8 +218,7 @@ fn transition_waits_for_actual_fsync_under_pressure_and_retries_cannot_replace_i
         node.begin_checkpoint(index, vec![1]),
         Err(ConsensusError::PersistencePending)
     ));
-    resume.send(()).unwrap();
-    drop(worker.join().unwrap());
+    paused.resume().unwrap();
     node.finish_decoder_floor().unwrap();
     assert!(node.decoder_floor_ready(BEFORE));
     assert!(node.decoder_floor_ready(AFTER));
@@ -241,12 +240,11 @@ fn abandoned_transition_and_both_group_checkpoints_preserve_original_order_and_t
     node.begin_decoder_floor(BEFORE).unwrap();
     node.finish_decoder_floor().unwrap();
     node.confirm_decoder_pair(BEFORE, AFTER).unwrap();
-    let (resume, worker) = pause(&wal);
+    let paused = pause(&wal);
     node.begin_decoder_transition().unwrap();
     assert!(!node.try_finish_decoder_floor().unwrap());
     drop(node);
-    resume.send(()).unwrap();
-    drop(worker.join().unwrap());
+    paused.resume().unwrap();
     wal.stats().unwrap();
     let mut node = DurableNode::open_on_wal_in(
         NodeConfig::single(1, [1; 16], [2; 16]),

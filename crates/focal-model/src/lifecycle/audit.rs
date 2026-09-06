@@ -38,6 +38,9 @@ impl ResultArtifact {
     pub fn result(&self) -> AcceptedResult {
         self.result
     }
+    pub fn result_ref(&self) -> &AcceptedResult {
+        &self.result
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

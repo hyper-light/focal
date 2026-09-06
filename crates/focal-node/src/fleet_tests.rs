@@ -235,13 +235,7 @@ async fn quorum_commit_read_barrier_partition_retry_and_restart_use_the_real_own
             epoch: RequestEpoch(1),
         },
     );
-    let first = dispatch(
-        &fleet.hosts[leader],
-        actor(),
-        epoch.clone(),
-        &ReplicaHost::wire_limits(),
-    )
-    .await;
+    let first = fleet.retry_exact(leader, &epoch).await;
     let Response::Submitted(MutationReply::Committed(receipt)) = &first.result else {
         panic!("{first:?}");
     };
@@ -269,13 +263,7 @@ async fn quorum_commit_read_barrier_partition_retry_and_restart_use_the_real_own
         "{isolated:?}"
     );
     let replacement = fleet.leader(Some(leader)).await;
-    let committed = dispatch(
-        &fleet.hosts[replacement],
-        actor(),
-        next.clone(),
-        &ReplicaHost::wire_limits(),
-    )
-    .await;
+    let committed = fleet.retry_exact(replacement, &next).await;
     let Response::Submitted(MutationReply::Committed(receipt)) = &committed.result else {
         panic!("{committed:?}");
     };

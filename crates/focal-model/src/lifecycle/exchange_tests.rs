@@ -264,7 +264,18 @@ fn two_actors_progress_four_families_then_close_audit_without_launching_executio
             slot: 0,
             artifact: generated.reference(),
         }],
-        1,
+        e::CloseReport {
+            summary: "The respondent completed work; the increment check is still running.",
+            confidence: Confidence::Committed,
+            outcome: OutcomeKind::Complete,
+            diagnostics: &[],
+            limits: e::ResponseLimits {
+                artifacts: 1,
+                diagnostics: 8,
+                summary_bytes: 1024,
+                construction_bytes: 64 * 1024,
+            },
+        },
     )
     .unwrap();
     let mut response = plan.response;

@@ -8,6 +8,66 @@ The issuer or designated evaluator invokes validation tools, skills, scripts or 
 
 Keep the four object families distinct: a claim states an obligation, an artifact carries independently visible evidence, a testament closes an exact response manifest, and a validation declares a check with separate run/verdict evidence. Custody is not claimant receipt, manifest inclusion is not a passing check, and testament generation is not claim satisfaction. Public peer evaluation operations use the current single-response reducer. Independent artifact/testament lifecycle histories remain incomplete. Report only facts actually recorded; never infer missing per-artifact receipt or evaluation events from the claim's status.
 
+## Report completed or unsuccessful work
+
+The current receipt holder authors the response testament when its work completes
+or fails. Acquiring the execution receipt creates no testimony. Record a factual
+summary and explicit `complete`, `partial`, `refused`, `impossible`, `interrupted`
+or `failed` outcome. Every non-`complete` account requires at least one durable
+`kind: "error"` artifact produced by that holder under the same claim, current
+receipt and evidence set. Partial outputs may accompany it. Close the exact full
+ordered manifest only after every referenced attachment is committed; the current
+storage model permits one closing testament per claim.
+
+Use real diagnostic evidence when no work result was produced. A tool that never
+ran supplies no test counts: use the built-in error-report below instead. For
+tests that actually ran and failed, the existing test-report schema with truthful
+counts can also be submitted with `kind: "error"`. Artifact kind, respondent
+outcome and evaluator verdict are separate fields with separate purposes.
+
+The requester acknowledges the exact response with `testament.receive`; this
+neither creates the response nor establishes quality. The designated evaluator
+retrieves its bound work and error artifacts, performs the declared checks, and
+registers its own proof before `validation.submit`. An unsuccessful account does
+not bypass receipt or evaluation, and its outcome cannot stand in for a verdict.
+Preserve the original evidence and operation ID if a submission remains unknown
+or is refused; report the remaining reporting obligation rather than inventing a
+committed response.
+
+### Built-in error-report v1
+
+Schema hash: `add7b85a5a6fac7b753f85551b38c7ef913e55cd8c896c63bb00c6db19b00ab4`.
+This reviewed payload contract is pinned here for MCP-only participants. When the
+CLI is available, `focal schema get error-report` returns the descriptor, exact
+hash, limit and example. `focal schema get test-report` describes actual test
+counts. MCP currently exposes neither payload-schema resource discovery nor a
+schema registration tool; `tools/list` describes the authored operation inputs.
+
+An illustrative diagnostic payload is:
+
+```json
+{"code":"tool_unavailable","message":"The required tool could not run","details":"No test result was produced"}
+```
+
+Replace these statements with the actual incident. Supply this JSON as the text
+payload of `artifact.submit`, with the pinned `schema_hash`, `kind: "error"`, and
+the current claim/receipt/evidence set. Retain the committed artifact ID and
+descriptor hash for `testament.submit`; neither the schema hash nor a raw payload
+digest is that descriptor hash.
+
+The object requires nonblank `code` and `message` strings, at most 128 and 4096
+decoded UTF-8 bytes. Optional `details` is a string up to 32768 decoded UTF-8 bytes
+or `null`. The descriptor fixes which whitespace code points count as blank. The
+complete encoded JSON is bounded at 64 KiB; unknown/duplicate fields and positional
+arrays are invalid. Inline artifact payloads retain their separate 16-KiB bound;
+larger valid reports use the transfer branch. Artifact admission proves shape and
+custody, not the diagnosis's truth or the outcome of a claim.
+
+If an older server refuses this schema, preserve the real evidence and exact
+operation ID and report the unsupported capability. Use the exact saved request
+for transport recovery. Never substitute fabricated test counts or change an
+already-bound request's payload to make it pass admission.
+
 ## Before a mutation
 
 Call `request.reserve` with no arguments and retain its returned `operation_id` before calling a mutation tool. Registration is automatic. Reservation creates no business work and is **not idempotent**: if its output is lost, use `request.pending` to discover outstanding IDs. An unprepared reservation can be inspected or explicitly sealed. Each separate mutation—submit, post, acquire, begin, attach, close—needs its own reserved ID. The JSON-RPC request ID only correlates a transport call.
@@ -46,7 +106,7 @@ List filters are optional and conjunctive. Preserve the same filters across cont
 
 For a payload beyond the inline bound, retain a caller-chosen nonzero lowercase 32-hex `upload_id`, its exact byte length and BLAKE3 digest of the raw stream. This is a transfer identity, separate from a managed business `operation_id`. Call `upload.begin` with that metadata and the intended content class. Append contiguous chunks of at most 64 KiB using `upload.append` with byte `offset` and hexadecimal `bytes_hex`. Exact old bytes may be retried after response loss; altered metadata or bytes conflict. The returned `staged` and `received` counts distinguish owned local bytes from server progress.
 
-Call `upload.seal` after all bytes are staged. Only the actual custody-gated server reply supplies a `reference`; reserve a separate operation ID and pass that exact reference to `artifact.submit` or `artifact.register`. Sealing content does not commit either domain operation. The current transfer bound is 64 MiB; the installed test-report schema’s structural attestation bound is 1 MiB, so larger content storage does not imply artifact admission. Obtain the actual installed schema hash and capability before uploading evidence for it.
+Call `upload.seal` after all bytes are staged. Only the actual custody-gated server reply supplies a `reference`; reserve a separate operation ID and pass that exact reference to `artifact.submit` or `artifact.register`. Sealing content does not commit either domain operation. The current transfer bound is 64 MiB; structural attestation is bounded at 1 MiB for test-report and 64 KiB for error-report, so larger content storage does not imply artifact admission. Obtain the actual installed schema hash and capability before uploading evidence for it.
 
 Retain the upload ID across process restarts. Resume through the same tools and exact bytes; `upload.begin` with identical metadata also reports saved progress. MCP cancellation stops the wait and preserves durable recovery. `upload.cancel` stops this journal’s transfer work and requests removal of current server staging without deleting immutable content, retracting an attachment or canceling a claim. On the current supporting server, cancellation persists terminal metadata before staging removal, so delayed Begin/Append/Seal cannot revive the scoped ID after restart. `cancel_acknowledged` remains a legacy-compatible RPC acknowledgment, not cross-version capability proof. Preserve terminal metadata in backups: the server bounds live plus terminal IDs at 65,536 and has no time-based reclamation. Future reclamation requires a generation fence; managed `request.seal` has a separate business-request admission contract. Saved local bytes and IDs remain quota-accounted after completion/cancel; capacity errors require preserving that history, not deleting initialized files.
 

@@ -15,6 +15,7 @@ slog.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+focal-log = { version = "0.1.0", path = "../focal-log", features = ["test-support"] }
 tempfile.workspace = true
 
 [lints]

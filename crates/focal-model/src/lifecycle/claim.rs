@@ -3,11 +3,17 @@
 //! consume facts verified by the response/manifest contract. Graph eligibility,
 //! immutable standing policy and aggregation witnesses require owner validation
 //! before publication; these methods do not invent those witnesses.
-use super::evidence::Diagnostic;
+use super::evidence::{Diagnostic, Parent, ReportStamp, ResponseDiagnostic};
+#[path = "claim_memory.rs"]
+mod memory;
+#[path = "claim_posting.rs"]
+mod posting;
 use super::{Binding, ContractError, Principal};
 use super::{aggregation, graph, scope, succession, validation};
+#[cfg(test)]
+use crate::ClaimId;
 use crate::{
-    ClaimId, ClaimStatus, ContentHash, Deadline, EvidenceAttestation, ParticipantId, ReceiptFence,
+    ClaimStatus, ContentHash, Deadline, EvidenceAttestation, ParticipantId, ReceiptFence,
     SessionSeq, TestamentId,
 };
 
@@ -50,6 +56,7 @@ pub struct ResponseLink {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ResponseRecord {
     link: ResponseLink,
+    stamp: ReportStamp,
     posted: bool,
     received: bool,
 }
@@ -82,7 +89,29 @@ pub struct PostingStanding {
 pub enum BoundaryFailure {
     Post,
     Receipt,
-    Closing { receipt: ReceiptFence },
+}
+
+/// A real failure to assemble or publish a response is an incident, not a
+/// fabricated response or a validation verdict. The owner must publish this
+/// record atomically with its checked claim revision change. A subsequent
+/// respondent-authored failure response remains an ordinary response cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClosingIncident {
+    expected: Binding,
+    next: Binding,
+    diagnostic: ResponseDiagnostic,
+    cut: ClaimCut,
+}
+impl ClosingIncident {
+    pub fn claim(&self) -> Binding {
+        self.expected
+    }
+    pub fn diagnostic(&self) -> &ResponseDiagnostic {
+        &self.diagnostic
+    }
+    pub fn cut(&self) -> ClaimCut {
+        self.cut
+    }
 }
 
 /// Actor intents cannot select an aggregate status or impersonate an evaluator.
@@ -117,25 +146,11 @@ pub(super) enum ResponseEvent {
 /// They are deliberately not Actor intents or an arbitrary requested status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DerivedClaimFact {
-    EvaluatorBegan {
-        receipt: ReceiptFence,
-    },
-    LocalCompletion {
-        sequence: SessionSeq,
-    },
-    GraphSatisfied {
-        cut: ClaimCut,
-    },
-    PostFailed {
-        cut: ClaimCut,
-    },
-    ReceiptFailed {
-        cut: ClaimCut,
-    },
-    ClosingFailed {
-        receipt: ReceiptFence,
-        cut: ClaimCut,
-    },
+    EvaluatorBegan { receipt: ReceiptFence },
+    LocalCompletion { sequence: SessionSeq },
+    GraphSatisfied { cut: ClaimCut },
+    PostFailed { cut: ClaimCut },
+    ReceiptFailed { cut: ClaimCut },
 }
 
 /// Complete immutable generation input. Graph, lineage and acceptance cannot be
@@ -176,6 +191,9 @@ pub struct ClaimState {
 }
 
 impl ClaimState {
+    /// Historical contract fixtures may deliberately construct malformed rows.
+    /// Production construction is exclusively through `creation::CreationPlan`.
+    #[cfg(test)]
     pub fn generate(
         principal: Principal,
         definition: ClaimDefinition,
@@ -186,7 +204,7 @@ impl ClaimState {
         Self::generate_defined(principal, definition)
     }
 
-    fn generate_defined(
+    pub(super) fn generate_defined(
         principal: Principal,
         definition: ClaimDefinition,
     ) -> Result<Self, ContractError> {
@@ -242,6 +260,7 @@ impl ClaimState {
             terminal_cut: None,
         })
     }
+    #[cfg(test)]
     pub fn generate_child(
         &mut self,
         expected: &Binding,
@@ -376,6 +395,42 @@ impl ClaimState {
         Ok(())
     }
 
+    pub(super) fn cancellation_binding(
+        &self,
+        cut: ClaimCut,
+    ) -> Result<Option<Binding>, ContractError> {
+        cut.check()?;
+        if cut.position < self.created
+            || self
+                .local_sealed_at
+                .is_some_and(|sealed| cut.position < sealed)
+        {
+            return Err(ContractError::InvalidCut);
+        }
+        if terminal(self.status) {
+            Ok(None)
+        } else {
+            self.binding.next().map(Some)
+        }
+    }
+
+    /// Apply derived ownership authority to a copied current row. The Core owner
+    /// publishes the complete checked plan atomically; this releases no scope.
+    pub fn apply_cancellation(
+        &mut self,
+        cancellation: &super::ownership::Cancellation<'_>,
+    ) -> Result<(), ContractError> {
+        cancellation.check(self)?;
+        if let Some(binding) = cancellation.next_binding() {
+            let cut = cancellation.cut();
+            self.binding = binding;
+            self.status = ClaimStatus::Cancelled;
+            self.local_sealed_at.get_or_insert(cut.position);
+            self.terminal_cut = Some(ClaimTerminalCut::Explicit(cut));
+        }
+        Ok(())
+    }
+
     pub fn apply(
         &mut self,
         expected: &Binding,
@@ -386,6 +441,11 @@ impl ClaimState {
         match intent {
             ClaimIntent::Cancel { cut } | ClaimIntent::Revoke { cut } => {
                 principal.require_actor(self.issuer)?;
+                if matches!(intent, ClaimIntent::Cancel { .. })
+                    && !self.scopes.children().is_empty()
+                {
+                    return Err(ContractError::InvalidTransition);
+                }
                 let status = if matches!(intent, ClaimIntent::Cancel { .. }) {
                     ClaimStatus::Cancelled
                 } else {
@@ -593,6 +653,7 @@ impl ClaimState {
     ) -> Result<(), ContractError> {
         self.open(expected)?;
         if diagnostic.artifact.id.is_zero()
+            || custody.custody_revision == 0
             || !custody.durable
             || !custody.schema_valid
             || custody.descriptor_hash != diagnostic.artifact.hash
@@ -608,12 +669,50 @@ impl ClaimState {
                 principal.require_actor(self.subject)?;
                 DerivedClaimFact::ReceiptFailed { cut }
             }
-            BoundaryFailure::Closing { receipt } => {
-                principal.require_actor(self.receipt_matches(receipt)?.holder)?;
-                DerivedClaimFact::ClosingFailed { receipt, cut }
-            }
         };
         self.apply_derived(expected, fact)
+    }
+
+    /// Checks an incident before any mutation. Work failure itself is reported
+    /// through Response::close; this path is for trouble producing that report.
+    pub fn plan_closing_failure(
+        &self,
+        expected: &Binding,
+        principal: Principal,
+        diagnostic: ResponseDiagnostic,
+        cut: ClaimCut,
+    ) -> Result<ClosingIncident, ContractError> {
+        self.open(expected)?;
+        self.working()?;
+        let parent = Parent::from_claim(self)?;
+        parent.require_open_response()?;
+        principal.require_actor(parent.holder)?;
+        diagnostic.check_parent(&parent)?;
+        cut.check()?;
+        if cut.position < self.created {
+            return Err(ContractError::InvalidCut);
+        }
+        Ok(ClosingIncident {
+            expected: self.binding,
+            next: self.binding.next()?,
+            diagnostic,
+            cut,
+        })
+    }
+
+    /// The incident and its diagnostic must be retained by the same owner
+    /// publication. Status, response collection and terminal cut stay unchanged.
+    pub fn apply_closing_incident(
+        &mut self,
+        incident: &ClosingIncident,
+    ) -> Result<(), ContractError> {
+        self.open(&incident.expected)?;
+        self.working()?;
+        incident
+            .diagnostic
+            .check_parent(&Parent::from_claim(self)?)?;
+        self.binding = incident.next;
+        Ok(())
     }
 
     /// Consume the least-fixpoint proof against all exact effective read rows.
@@ -739,6 +838,24 @@ impl ClaimState {
         }
     }
 
+    pub(super) fn received_report(
+        &self,
+        response: Binding,
+        receipt: ReceiptFence,
+        stamp: ReportStamp,
+    ) -> Result<(), ContractError> {
+        self.received_response(response, receipt)?;
+        let row = self
+            .responses
+            .iter()
+            .find(|row| row.link.testament.0 == response.object.0)
+            .ok_or(ContractError::InvalidTarget)?;
+        if row.stamp != stamp {
+            return Err(ContractError::ContentConflict);
+        }
+        Ok(())
+    }
+
     /// Apply only a decision produced by the checked aggregate. The token pins
     /// exact acceptance/terminal evidence; the owner publishes both records in
     /// the same commit. This does not satisfy graph predicates on its own.
@@ -861,6 +978,7 @@ impl ClaimState {
         expected: &Binding,
         principal: Principal,
         link: ResponseLink,
+        stamp: ReportStamp,
         event: ResponseEvent,
     ) -> Result<(), ContractError> {
         self.open(expected)?;
@@ -909,6 +1027,7 @@ impl ClaimState {
                     .map_err(|_| ContractError::Capacity)?;
                 self.responses.push(ResponseRecord {
                     link,
+                    stamp,
                     posted: false,
                     received: false,
                 });
@@ -931,6 +1050,9 @@ impl ClaimState {
                     .ok_or(ContractError::InvalidTarget)?;
                 if row.link != link {
                     return Err(ContractError::InvalidTarget);
+                }
+                if row.stamp != stamp {
+                    return Err(ContractError::ContentConflict);
                 }
                 match event {
                     ResponseEvent::Posted if !row.posted && !row.received => {
@@ -1002,14 +1124,6 @@ impl ClaimState {
                     return Err(ContractError::InvalidTransition);
                 }
                 self.terminalize(ClaimStatus::ReceiptFailed, cut)
-            }
-            DerivedClaimFact::ClosingFailed { receipt, cut } => {
-                self.working()?;
-                self.receipt_matches(receipt)?;
-                if !matches!(self.status, ClaimStatus::Received | ClaimStatus::Progressed) {
-                    return Err(ContractError::InvalidTransition);
-                }
-                self.terminalize(ClaimStatus::TestamentGenerationFailed, cut)
             }
         }
     }
