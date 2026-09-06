@@ -103,6 +103,7 @@ impl ControlHost {
                             pending: VecDeque::new(),
                             directory: None,
                             authority_refresh: None,
+                            snapshot_feedback: Default::default(),
                             outbound,
                             progress: progress.clone(),
                             nonce: 0,

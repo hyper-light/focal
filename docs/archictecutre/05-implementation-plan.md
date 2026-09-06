@@ -4,6 +4,8 @@ Status: implementation in progress; see the [implementation evidence and remaini
 
 The target is Rust, custom RAM-primary state, disk durability, one laptop through global distribution, and [stepped configuration complexity](08-stepped-complexity-and-deployment.md). Hecate is the semantic reference; Sylk supplies behavior and regression fixtures, not Go code to transliterate.
 
+The user's 2026-09-05 extension adds manual domain/cluster CLI commands, equivalent flag/JSON/YAML input, optional list filters, skills, MCP tools, and evidence-backed challenge/consult workflows. The active goal now includes P17–P20. [Source research](11-cli-spec-research.md), [agent workflow research](12-agent-tools-and-workflows.md), and the [detailed extension](13-cli-and-agent-implementation-plan.md) are required contracts; existing P00–P16 scope and acceptance gates remain in force.
+
 ## 1. Delivery rules and dependencies
 
 Each package produces a runnable vertical slice or a conformance artifact consumed by the next package. Completion requires code, interface documentation, meaningful tests, failure behavior, resource accounting, and a reproducible demonstration. An implementation-only package that leaves its acknowledgement semantics undefined is incomplete.
@@ -27,6 +29,10 @@ Each package produces a runnable vertical slice or a conformance artifact consum
 | P14 | P06–P13 | Recorded correctness, fault, resource and capacity qualification |
 | P15 | P07–P14 | Operational release: upgrades, restore, packaging and runbooks |
 | P16 | P00–P15 | Six-stage deployment progression with measured minimal user decisions |
+| P17 | P01–P03, P05, P07 | Shared authored-input operations, bounded filtered queries/results, durable client intent recovery |
+| P18 | P17; P08/P09/P13/P15 for administration | Complete manual domain and cluster CLI using flags, JSON and YAML |
+| P19 | P17, verified P20 workflow policy | Authorized MCP tools and reusable skills over the same operation contract |
+| P20 | P02, P05, P06, P17 | Evidence-backed challenge responses/corrections and satisfactory consult/follow-up workflows |
 
 P03/P04 include enough snapshots and local custody to support crash tests; P12 extends them into distributed archival retirement. P08 should reuse a session-log interface introduced at P04, preserving the local public semantics. P10 can progress while P08/P09 are built. P16's interface requirements constrain P00 onward; it is not a final layer of UI polish.
 
@@ -298,12 +304,25 @@ P03/P04 include enough snapshots and local custody to support crash tests; P12 e
 
 **Acceptance:** every DC test in [08](08-stepped-complexity-and-deployment.md) passes; documentation matches actual CLI output; no engine mode fork, manual data conversion, silent weakened guarantee, or requirement to understand internal partition mechanics appears in the normal journey.
 
-## 19. Parallel work ownership
+## 19. P17–P20 — Manual and agent-facing operations
+
+The [detailed implementation extension](13-cli-and-agent-implementation-plan.md) defines file boundaries, numbered tasks, dependency order, acceptance and failure tests for each package:
+
+- **P17:** one strict authored-operation schema; authenticated conversion to existing wire commands; optional indexed read filters, exact-prefix cursors and complete validation run/result projections; durable exact mutation retry state.
+- **P18:** manual `submit/get/list/watch` and legal lifecycle verbs; artifact upload/download; context/schema/help/completions; complete cluster and deployment operations; actual binary tests and six-stage operator journeys.
+- **P19:** MCP schemas and transports with bounded input/output and server-side capabilities; durable mutation IDs independent of RPC IDs; parity tests; reusable skills calling the same client operations.
+- **P20:** challenge/consult intent and lineage, artifact/validation requirements, receipt-fenced execution, policy-authorized corrective or follow-up claims, nested parked work and crash-safe completion.
+
+List relationship filters such as `--claim` and `--testament` must be optional. JSON/YAML are alternative encodings of authored input, not an authority bypass. Cluster readiness must reflect committed placement and custody. The challenge/consult failure policy must follow [12](12-agent-tools-and-workflows.md); copying Sylk's receipt-only defaults would not satisfy the user's stronger proof/work requirement.
+
+**Acceptance:** all detailed P17–P20 gates pass alongside the original packages. An agent and a human can perform the same legal proof workflow and recover from a lost reply without duplicate work or invented completion. Documentation distinguishes executable commands from remaining planned commands.
+
+## 20. Parallel work ownership
 
 After P01, one workstream can implement pure lifecycle/oracle work while another implements arenas and disk framing against reviewed contracts. After P04, evidence/validator integration and protocol/consensus integration can proceed independently. P10 has its own serial-equivalence gate and must not delay a correct serial distributed prototype.
 
 Shared schema, receipt, sequence and visibility changes require joint review because they affect every owner. Allocate one owner per crate family; use small integration fixtures across seams rather than duplicating model definitions in each workstream. Deployability, resource accounting and fault tests are part of each package, not deferred to an unspecified hardening phase.
 
-## 20. Completion record for each package
+## 21. Completion record for each package
 
 Record: implementation revision; exact contracts implemented; commands executed; tests and seeds; demonstrated workload; known limitations; resource budget derivations; compatibility/upgrade impact; and links to updated architecture sections. Mark a package complete only when its acceptance conditions are met. If a design is revised, update [07](07-decisions-and-traceability.md) and downstream packages before implementing the new semantics.

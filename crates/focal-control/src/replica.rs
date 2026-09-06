@@ -362,6 +362,19 @@ impl ControlReplica {
         self.node.report_snapshot(peer, status)?;
         Ok(())
     }
+    /// A delayed transport completion applies only to the same leader term and
+    /// exact pending snapshot index still owned by this replica.
+    pub fn report_snapshot_at(
+        &mut self,
+        peer: u64,
+        term: u64,
+        index: u64,
+        status: focal_consensus::SnapshotStatus,
+    ) -> Result<(), ControlError> {
+        self.check()?;
+        self.node.report_snapshot_at(peer, term, index, status)?;
+        Ok(())
+    }
 
     pub fn submit(
         &mut self,

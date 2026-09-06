@@ -33,6 +33,11 @@ impl<H: RequestHandler> ClientTransport for EmbeddedTransport<H> {
         request: &'a RequestEnvelope,
     ) -> TransportFuture<'a> {
         Box::pin(async move {
+            if request.protocol == MANAGED_PROTOCOL_VERSION
+                && !self.handler.supports_managed_requests()
+            {
+                return Err(WireError::Access(AccessError::UnsupportedProtocol));
+            }
             // Exercise the identical versioned codec, limits, and authorization seam.
             let bytes = encode_payload(request, self.limits.max_frame_bytes)?;
             let request = decode_payload(&bytes)?;

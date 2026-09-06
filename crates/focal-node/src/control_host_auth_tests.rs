@@ -189,6 +189,7 @@ async fn root_read_rechecks_enrollment_when_its_quorum_barrier_completes() {
         pending: VecDeque::new(),
         directory: None,
         authority_refresh: None,
+        snapshot_feedback: Default::default(),
         outbound,
         progress,
         nonce: 0,

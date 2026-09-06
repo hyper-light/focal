@@ -41,6 +41,14 @@ pub struct GraphSnapshot {
     budget: MemoryBudget,
     config: RangeConfig,
 }
+
+/// One fixed-size index projection. Object contents remain borrowed inside the
+/// snapshot until a caller explicitly materializes a matching result.
+pub struct GraphCandidate {
+    pub key: GraphKey,
+    pub object: Option<ObjectRef>,
+    pub bytes: usize,
+}
 impl GraphSnapshot {
     pub(crate) fn new(
         ledger: LedgerId,
@@ -61,8 +69,89 @@ impl GraphSnapshot {
     pub fn sequence(&self) -> SessionSeq {
         SessionSeq(self.lease.prefix())
     }
+    pub fn ledger(&self) -> LedgerId {
+        self.ledger
+    }
     pub fn expires_at(&self) -> u64 {
         self.lease.expires_at()
+    }
+    pub fn next_candidate(
+        &self,
+        query: &GraphScan,
+        after: Option<&GraphKey>,
+        now: u64,
+    ) -> Result<Option<GraphCandidate>, GraphError> {
+        let query = self.scan_query(query)?;
+        let start = query.start.ok_or(GraphError::IndexMismatch)?;
+        let end = query.end.ok_or(GraphError::IndexMismatch)?;
+        if after.is_some_and(|key| key < &start || key >= &end) {
+            return Err(MemoryError::QueryMismatch.into());
+        }
+        self.lease
+            .project_next(
+                after.unwrap_or(&start),
+                after.is_some(),
+                &end,
+                now,
+                |entry| {
+                    let object = match (&entry.key, &entry.value) {
+                        (GraphKey::Object(kind, id), GraphValue::Object(_)) => Some(ObjectRef {
+                            ledger: self.ledger,
+                            kind: *kind,
+                            id: *id,
+                        }),
+                        (_, GraphValue::Reference(reference)) => Some(*reference),
+                        (_, GraphValue::Edge(edge)) if edge.relation == GraphRelation::Evidence => {
+                            match edge.target {
+                                RelationTarget::Object(reference) => Some(reference),
+                                _ => None,
+                            }
+                        }
+                        (_, GraphValue::Edge(_)) => None,
+                        _ => return Err(GraphError::IndexMismatch),
+                    };
+                    Ok(GraphCandidate {
+                        key: entry.key.clone(),
+                        object,
+                        bytes: entry
+                            .heap_bytes
+                            .checked_add(size_of::<Entry<GraphKey, GraphValue>>())
+                            .ok_or(GraphError::Overflow)?,
+                    })
+                },
+            )?
+            .transpose()
+    }
+
+    /// Borrow one exact object without cloning its payload or relations. The
+    /// callback cannot retain a borrow after the pinned page is released.
+    pub fn project_object<R>(
+        &self,
+        reference: ObjectRef,
+        now: u64,
+        project: impl FnOnce(&GraphObject, usize) -> R,
+    ) -> Result<Option<R>, GraphError> {
+        self.namespace(reference)?;
+        let key = GraphKey::object(reference);
+        let end = next_ref(reference).map_or(
+            GraphKey::ByClaim(ClaimId::default(), ObjectKind::Claim, ObjectId::default()),
+            GraphKey::object,
+        );
+        self.lease
+            .project_next(&key, false, &end, now, |entry| {
+                let GraphValue::Object(object) = &entry.value else {
+                    return Err(GraphError::IndexMismatch);
+                };
+                if entry.key != key {
+                    return Err(GraphError::IndexMismatch);
+                }
+                let bytes = entry
+                    .heap_bytes
+                    .checked_add(size_of::<Entry<GraphKey, GraphValue>>())
+                    .ok_or(GraphError::Overflow)?;
+                Ok(project(object, bytes))
+            })?
+            .transpose()
     }
     pub fn artifact_after(
         &self,

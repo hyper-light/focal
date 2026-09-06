@@ -427,6 +427,16 @@ async fn cancelling_controller_run_withdraws_live_and_unpolled_peer_projections(
     assert!(listener.local_addr().is_ok());
     assert!(!host.progress().stopped);
 
+    // Canceling the controller withdraws its grants immediately, but an
+    // admitted local journal write still owns its lock until the physical
+    // control owner finishes. A later FIFO owner request settles that write
+    // and drops its abandoned reply before a replacement reopens the journal.
+    drop(host.observe_root().await.unwrap());
+    assert!(matches!(
+        registry.authenticate(fingerprint),
+        Err(AccessError::Unauthorized)
+    ));
+
     seed_peer_registry(
         &network.state,
         &network.receipt,

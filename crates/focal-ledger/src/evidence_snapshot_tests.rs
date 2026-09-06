@@ -30,7 +30,12 @@ fn custody_export_requires_applied_placement_and_pins_only_its_checkpoint_prefix
         snapshot.prefix().checkpoint,
         ContentHash(*blake3::hash(snapshot.checkpoint()).as_bytes())
     );
-    assert!(snapshot.artifact_after(None, 0).unwrap().is_none());
+    assert!(
+        snapshot
+            .artifact_after(None, snapshot.elapsed_clock().unwrap())
+            .unwrap()
+            .is_none()
+    );
     session
         .submit_local(&input(
             1,
@@ -40,7 +45,12 @@ fn custody_export_requires_applied_placement_and_pins_only_its_checkpoint_prefix
         ))
         .unwrap();
     assert!(session.sequence() > snapshot.prefix().sequence);
-    assert!(snapshot.artifact_after(None, 1).unwrap().is_none());
+    assert!(
+        snapshot
+            .artifact_after(None, snapshot.elapsed_clock().unwrap())
+            .unwrap()
+            .is_none()
+    );
     assert!(matches!(
         snapshot.artifact_after(None, 30_000),
         Err(LedgerError::Graph(GraphError::Memory(
@@ -92,4 +102,41 @@ fn checkpoint_reserves_large_retained_placement_before_cloning_or_persistence() 
     let snapshot = session.checkpoint_evidence(0, 30_000).unwrap();
     assert_eq!(snapshot.prefix().route, RouteEpoch(2));
     assert_eq!(snapshot.prefix().artifacts, 0);
+}
+
+#[test]
+fn snapshot_reader_clock_is_monotone_and_capture_ttl_cannot_be_restarted() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session =
+        Session::open(dir.path(), identity(), config(), SessionLimits::default()).unwrap();
+    elect(&mut session);
+    session
+        .propose_placement(&placement_request(&session, SessionFenceKind::Created, 1))
+        .unwrap();
+    session.poll().unwrap();
+    let snapshot = session.checkpoint_evidence(1_000, 30_000).unwrap();
+    let advanced = snapshot.elapsed_clock().unwrap() + 5_000;
+    snapshot.artifact_after(None, advanced).unwrap();
+    assert!(matches!(
+        session.checkpoint_evidence(1_000, 30_000),
+        Err(LedgerError::Graph(GraphError::Memory(
+            MemoryError::ClockRegression {
+                supplied: 1_000,
+                ..
+            }
+        )))
+    ));
+    let mut next = session.checkpoint_evidence(advanced, 30_000).unwrap();
+    assert_eq!(next.prefix().sequence, snapshot.prefix().sequence);
+    // Deterministically age the private capture anchor instead of assuming a
+    // complete checkpoint fsync will finish inside a tiny wall-clock timeout.
+    next.captured_at = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(31))
+        .unwrap();
+    assert!(matches!(
+        next.elapsed_clock(),
+        Err(LedgerError::Graph(GraphError::Memory(
+            MemoryError::LeaseExpired
+        )))
+    ));
 }

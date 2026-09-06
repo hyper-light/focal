@@ -122,6 +122,7 @@ struct Replica {
 }
 struct Fleet {
     replicas: Vec<Replica>,
+    actor_connector: QuicConnector,
     routes: BTreeMap<u64, PeerEndpoint>,
     revision: u64,
 }
@@ -390,6 +391,7 @@ impl Fleet {
         }
         Self {
             replicas,
+            actor_connector: actor,
             routes,
             revision: 1,
         }
@@ -586,3 +588,6 @@ async fn quorum_retry_and_recovery(grouped: bool) {
     );
     fleet.stop().await;
 }
+
+#[path = "fleet_quic/managed.rs"]
+mod managed;

@@ -37,12 +37,14 @@ struct Fixture {
     outgoing: FleetReplication,
     wals: Vec<SharedWal>,
     budget: MemoryBudget,
+    observations: async_mpsc::Receiver<LedgerId>,
 }
 fn fixture(path: &std::path::Path) -> Fixture {
     let budget = MemoryBudget::new(768 * 1024 * 1024, 256 * 1024 * 1024).unwrap();
     let tenant = budget.child(384 * 1024 * 1024, 128 * 1024 * 1024).unwrap();
     let mut wals = Vec::new();
     let mut replicas = Vec::new();
+    let (observe, observations) = async_mpsc::channel(4);
     for index in 1..=2 {
         let wal = SharedWal::open_with_budget(
             path.join(index.to_string()),
@@ -107,6 +109,7 @@ fn fixture(path: &std::path::Path) -> Fixture {
         let mut config = ReplicaConfig::new(RootCommandId::from_u128(147));
         config.tick = Duration::from_secs(1);
         config.request_timeout = Duration::from_millis(500);
+        config.checkpoint_observer = Some(CheckpointObserver(observe.clone()));
         replicas.push(FleetReplica { session, config });
         wals.push(wal);
     }
@@ -128,6 +131,7 @@ fn fixture(path: &std::path::Path) -> Fixture {
         outgoing,
         wals,
         budget,
+        observations,
     }
 }
 async fn read(fixture: &Fixture, index: u128) {
@@ -152,17 +156,24 @@ async fn read(fixture: &Fixture, index: u128) {
     assert!(matches!(response.result, Response::Read(_)), "{response:?}");
 }
 async fn pending_export(
-    fixture: &Fixture,
+    fixture: &mut Fixture,
     ttl: Duration,
 ) -> tokio::task::JoinHandle<Result<focal_ledger::DurableEvidenceSnapshot, LedgerError>> {
     let host = fixture.hosts[&ledger(1)].clone();
-    let mut progress = host.progress.clone();
-    progress.borrow_and_update();
+    while fixture.observations.try_recv().is_ok() {}
     let export = tokio::spawn(async move { host.checkpoint_evidence(ttl).await });
-    tokio::time::timeout(Duration::from_millis(250), progress.changed())
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            // This signal follows successful snapshot preparation and its
+            // first pending disk poll. Ordinary Raft/read progress cannot
+            // satisfy the causal precondition for the independent-writer test.
+            if fixture.observations.recv().await.unwrap() == ledger(1) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
     assert!(
         !export.is_finished(),
         "paused physical writer must not return a checkpoint witness"
@@ -185,11 +196,11 @@ async fn shutdown(fixture: Fixture) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn checkpoint_waits_for_exact_writer_fence_while_another_writer_commits_and_reopens() {
     let directory = tempfile::tempdir().unwrap();
-    let fixture = fixture(directory.path());
+    let mut fixture = fixture(directory.path());
     read(&fixture, 1).await;
     read(&fixture, 2).await;
     let pause = fixture.wals[0].pause_for_test().unwrap();
-    let export = pending_export(&fixture, Duration::from_secs(5)).await;
+    let export = pending_export(&mut fixture, Duration::from_secs(5)).await;
     let committed = tokio::time::timeout(
         Duration::from_millis(300),
         dispatch(
@@ -253,11 +264,11 @@ async fn checkpoint_waits_for_exact_writer_fence_while_another_writer_commits_an
 async fn expired_cancelled_and_timed_out_exports_release_interest_without_releasing_the_disk_gate()
 {
     let directory = tempfile::tempdir().unwrap();
-    let fixture = fixture(directory.path());
+    let mut fixture = fixture(directory.path());
     read(&fixture, 1).await;
     read(&fixture, 2).await;
     let pause = fixture.wals[0].pause_for_test().unwrap();
-    let export = pending_export(&fixture, Duration::from_millis(30)).await;
+    let export = pending_export(&mut fixture, Duration::from_millis(30)).await;
     tokio::time::sleep(Duration::from_millis(60)).await;
     read(&fixture, 2).await;
     pause.resume().unwrap();
@@ -270,7 +281,7 @@ async fn expired_cancelled_and_timed_out_exports_release_interest_without_releas
     read(&fixture, 1).await;
 
     let pause = fixture.wals[0].pause_for_test().unwrap();
-    let export = pending_export(&fixture, Duration::from_secs(5)).await;
+    let export = pending_export(&mut fixture, Duration::from_secs(5)).await;
     export.abort();
     assert!(matches!(export.await, Err(error) if error.is_cancelled()));
     read(&fixture, 2).await;
@@ -278,7 +289,7 @@ async fn expired_cancelled_and_timed_out_exports_release_interest_without_releas
     read(&fixture, 1).await;
 
     let pause = fixture.wals[0].pause_for_test().unwrap();
-    let export = pending_export(&fixture, Duration::from_secs(5)).await;
+    let export = pending_export(&mut fixture, Duration::from_secs(5)).await;
     assert!(matches!(
         export.await.unwrap(),
         Err(LedgerError::OutcomeUnknown)
@@ -292,11 +303,11 @@ async fn expired_cancelled_and_timed_out_exports_release_interest_without_releas
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn checkpoint_stop_deadline_leaves_other_sessions_available_until_writer_recovery() {
     let directory = tempfile::tempdir().unwrap();
-    let fixture = fixture(directory.path());
+    let mut fixture = fixture(directory.path());
     read(&fixture, 1).await;
     read(&fixture, 2).await;
     let pause = fixture.wals[0].pause_for_test().unwrap();
-    let export = pending_export(&fixture, Duration::from_secs(5)).await;
+    let export = pending_export(&mut fixture, Duration::from_secs(5)).await;
     let stopped =
         tokio::time::timeout(Duration::from_millis(800), fixture.hosts[&ledger(1)].stop())
             .await

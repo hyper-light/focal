@@ -443,10 +443,16 @@ checksum = "0ce7134b9999ecaf8bcd65542e436736ef32ddca1b3e06094cb6ec5755203b80"
 name = "focal-client"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "focal-core",
  "focal-model",
  "focal-wire",
+ "fs2",
  "postcard",
+ "serde",
+ "serde-saphyr",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
 ]
@@ -592,6 +598,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "focal-mcp"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "focal-client",
+ "focal-core",
+ "focal-memory",
+ "focal-model",
+ "focal-wire",
+ "getrandom 0.3.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "focal-memory"
 version = "0.1.0"
 
@@ -612,6 +636,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "clap",
+ "focal-client",
  "focal-consensus",
  "focal-control",
  "focal-directory",
@@ -620,6 +645,7 @@ dependencies = [
  "focal-graph",
  "focal-ledger",
  "focal-log",
+ "focal-mcp",
  "focal-memory",
  "focal-model",
  "focal-runtime",

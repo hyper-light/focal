@@ -585,7 +585,10 @@ fn default_lane(records: &[Record]) -> Result<BudgetLane, LogError> {
     if records.iter().any(|record| {
         !matches!(
             record.kind,
-            RecordKind::HardState | RecordKind::Configuration | RecordKind::Identity
+            RecordKind::HardState
+                | RecordKind::Configuration
+                | RecordKind::Identity
+                | RecordKind::DecoderFloor
         )
     }) {
         return Ok(BudgetLane::Ordinary);

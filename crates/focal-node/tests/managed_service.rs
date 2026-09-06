@@ -46,6 +46,16 @@ fn request(id: u128) -> RequestEnvelope {
         },
     }
 }
+fn reconcile(id: u128) -> RequestEnvelope {
+    RequestEnvelope {
+        request_id: RequestId::from_u128(99),
+        operation: Operation::Reconcile(ReconcileQuery::Receipt {
+            epoch: RequestEpoch(1),
+            request: RequestId::from_u128(1),
+        }),
+        ..request(id)
+    }
+}
 fn candidate(wal: &SharedWal, tenant: &MemoryBudget, id: u128) -> FleetReplica {
     let node = DurableNode::open_on_wal_in(
         NodeConfig::single(1, CLUSTER, ledger(id).session.0),
@@ -153,6 +163,19 @@ async fn one_handler_routes_live_installations_without_management_round_trips_an
         ),
         "{first:?}"
     );
+    let first_status = dispatch(
+        &service,
+        actor(1),
+        reconcile(1),
+        &ReplicaHost::wire_limits(),
+    )
+    .await;
+    let Response::Submitted(MutationReply::Committed(expected)) = &first.result else {
+        panic!("receipt")
+    };
+    assert!(
+        matches!(&first_status.result,Response::Reconciled(reply) if matches!(&reply.page.result,ReconcileResult::Receipt { resolution:ReceiptResolution::Committed(receipt),.. } if **receipt==*expected))
+    );
     drop(installed);
     let second = {
         let reply = manager
@@ -207,6 +230,32 @@ async fn one_handler_routes_live_installations_without_management_round_trips_an
         .result,
         Response::Error(_)
     ));
+    assert_eq!(
+        dispatch(
+            original.host(),
+            actor(1),
+            reconcile(1),
+            &ReplicaHost::wire_limits()
+        )
+        .await
+        .result,
+        Response::Error(AccessError::Unavailable)
+    );
+    let retained_status = dispatch_accounted(
+        &service,
+        actor(1),
+        reconcile(1),
+        &ReplicaHost::wire_limits(),
+    )
+    .await;
+    let (Response::Reconciled(recovered), Response::Reconciled(original_status)) =
+        (&retained_status.envelope().result, &first_status.result)
+    else {
+        panic!("reconciled")
+    };
+    assert_eq!(recovered.page, original_status.page);
+    assert_eq!(recovered.token, original_status.token);
+    assert!(recovered.applied_index >= original_status.applied_index);
     let retained =
         dispatch_accounted(&service, actor(1), request(1), &ReplicaHost::wire_limits()).await;
     assert_eq!(retained.envelope(), &first);
@@ -234,5 +283,10 @@ async fn one_handler_routes_live_installations_without_management_round_trips_an
         "delivered response lost the tenant/node allowance"
     );
     drop(retained);
+    assert!(
+        budget.stats().used > 0,
+        "reconciliation response lost its allowance on teardown"
+    );
+    drop(retained_status);
     assert_eq!(budget.stats().used, 0);
 }

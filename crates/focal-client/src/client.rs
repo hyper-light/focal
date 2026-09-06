@@ -155,6 +155,85 @@ impl<T: ClientTransport> Client<T> {
             _ => Err(ClientError::InvalidResponse),
         }
     }
+    /// Submit an already journaled managed request. The journal owns filesystem
+    /// work; this method only waits for the authenticated wire result.
+    pub async fn submit_managed(
+        &self,
+        request: RequestEnvelope,
+        context: crate::pending::OperationContext,
+    ) -> Result<ManagedReply, ClientError> {
+        let (key, _, _) = focal_wire::managed_request_identity(&request)
+            .map_err(|_| ClientError::Configuration)?;
+        if key.stream.cluster != context.cluster
+            || key.stream.principal != context.principal
+            || key.stream.ledger != context.ledger
+        {
+            return Err(ClientError::Configuration);
+        }
+        match self.request(request).await?.result {
+            Response::Managed(reply) => Ok(reply),
+            _ => Err(ClientError::InvalidResponse),
+        }
+    }
+    pub async fn request_stream_control(
+        &self,
+        request: RequestEnvelope,
+        context: crate::pending::OperationContext,
+    ) -> Result<RequestStreamControlReply, ClientError> {
+        if !matches!(request.operation, Operation::RequestStreamControl { cluster, .. } if cluster == context.cluster)
+            || request.ledger != context.ledger
+            || context.principal.is_zero()
+            || context.cluster == [0; 16]
+        {
+            return Err(ClientError::Configuration);
+        }
+        match self.request(request).await?.result {
+            Response::RequestStreamControlled(reply)
+                if reply.receipt.principal == context.principal =>
+            {
+                Ok(reply)
+            }
+            _ => Err(ClientError::InvalidResponse),
+        }
+    }
+    pub async fn request_stream_read(
+        &self,
+        request: RequestEnvelope,
+        context: crate::pending::OperationContext,
+    ) -> Result<RequestStreamReadReply, ClientError> {
+        if !matches!(request.operation, Operation::RequestStreamRead { cluster, .. } if cluster == context.cluster)
+            || request.ledger != context.ledger
+            || context.principal.is_zero()
+            || context.cluster == [0; 16]
+        {
+            return Err(ClientError::Configuration);
+        }
+        match self.request(request).await?.result {
+            Response::RequestStreamRead(reply) if reply.page.principal == context.principal => {
+                Ok(reply)
+            }
+            _ => Err(ClientError::InvalidResponse),
+        }
+    }
+    /// Reconcile only the adapter's authenticated principal. A transport can
+    /// validate reply shape without knowing that identity; this entry point
+    /// additionally binds it before exposing any historical receipt.
+    pub async fn reconcile(
+        &self,
+        request: RequestEnvelope,
+        expected_principal: ParticipantId,
+    ) -> Result<ReconcileReply, ClientError> {
+        if !matches!(request.operation, Operation::Reconcile(_)) || expected_principal.is_zero() {
+            return Err(ClientError::Configuration);
+        }
+        // request() binds every other field against the actual routed envelope,
+        // whose route epoch may advance through authenticated route discovery.
+        let response = self.request(request).await?;
+        match response.result {
+            Response::Reconciled(reply) if reply.page.principal == expected_principal => Ok(reply),
+            _ => Err(ClientError::InvalidResponse),
+        }
+    }
     pub async fn subscribe(
         &self,
         request: RequestEnvelope,

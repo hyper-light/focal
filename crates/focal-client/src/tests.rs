@@ -48,6 +48,130 @@ fn policy() -> RetryPolicy {
     }
 }
 
+#[tokio::test]
+async fn embedded_transport_checks_managed_syntax_capability_before_dispatch() {
+    struct Legacy;
+    impl RequestHandler for Legacy {
+        fn handle(&self, request: VerifiedRequest) -> HandlerFuture<'_> {
+            assert_eq!(request.request().protocol, PROTOCOL_VERSION);
+            Box::pin(async move {
+                request
+                    .request()
+                    .reply(Response::Error(AccessError::Unavailable))
+            })
+        }
+    }
+    let peer = AuthenticatedPeer::local(PeerGrant {
+        principal: ParticipantId::from_u128(3),
+        tenants: [request().ledger.tenant].into_iter().collect(),
+        role: PeerRole::Actor,
+    })
+    .unwrap();
+    let transport = EmbeddedTransport::new(peer, Legacy, WireLimits::default()).unwrap();
+    let mut managed = request();
+    managed.protocol = MANAGED_PROTOCOL_VERSION;
+    managed.request_epoch = RequestEpoch(1);
+    managed.operation = Operation::RequestStreamRead {
+        cluster: [1; 16],
+        query: RequestStreamQuery::Slot { slot: 0 },
+    };
+    assert!(matches!(
+        transport.request(None, &managed).await,
+        Err(WireError::Access(AccessError::UnsupportedProtocol))
+    ));
+    assert!(matches!(
+        transport.request(None, &request()).await.unwrap().result,
+        Response::Error(AccessError::Unavailable)
+    ));
+}
+
+#[tokio::test]
+async fn reconciliation_binds_expected_principal_after_transport_shape_validation() {
+    struct Observe {
+        principal: ParticipantId,
+    }
+    impl ClientTransport for Observe {
+        fn request<'a>(
+            &'a self,
+            _route: Option<&'a RouteHint>,
+            request: &'a RequestEnvelope,
+        ) -> TransportFuture<'a> {
+            Box::pin(async move {
+                let Operation::Reconcile(ReconcileQuery::Epoch { epoch }) = request.operation
+                else {
+                    panic!("unexpected query")
+                };
+                Ok(request.reply(Response::Reconciled(ReconcileReply {
+                    applied_index: 20,
+                    token: ReadToken {
+                        ledger: request.ledger,
+                        sequence: SessionSeq(12),
+                        route_epoch: request.route_epoch,
+                    },
+                    page: ReconcilePage {
+                        schema: RECONCILE_SCHEMA,
+                        ledger: request.ledger,
+                        principal: self.principal,
+                        sequence: SessionSeq(12),
+                        result: ReconcileResult::Epoch(EpochReconciliation {
+                            epoch,
+                            minimum: Some(RequestEpoch(1)),
+                            latest_admitted: Some(RequestEpoch(7)),
+                            admitted: true,
+                        }),
+                    },
+                })))
+            })
+        }
+    }
+    let query = RequestEnvelope {
+        operation: Operation::Reconcile(ReconcileQuery::Epoch {
+            epoch: RequestEpoch(7),
+        }),
+        ..request()
+    };
+    let expected = ParticipantId::from_u128(3);
+    let valid = Client::new(
+        Observe {
+            principal: expected,
+        },
+        policy(),
+        WireLimits::default(),
+        1,
+    )
+    .unwrap();
+    assert_eq!(
+        valid
+            .reconcile(query.clone(), expected)
+            .await
+            .unwrap()
+            .page
+            .principal,
+        expected
+    );
+    let wrong = Client::new(
+        Observe {
+            principal: ParticipantId::from_u128(4),
+        },
+        policy(),
+        WireLimits::default(),
+        1,
+    )
+    .unwrap();
+    assert!(matches!(
+        wrong.reconcile(query.clone(), expected).await,
+        Err(ClientError::InvalidResponse)
+    ));
+    assert!(matches!(
+        valid.reconcile(query, ParticipantId::default()).await,
+        Err(ClientError::Configuration)
+    ));
+    assert!(matches!(
+        valid.reconcile(request(), expected).await,
+        Err(ClientError::Configuration)
+    ));
+}
+
 struct LostReply {
     requests: Mutex<Vec<RequestEnvelope>>,
     always_fail: bool,

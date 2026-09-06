@@ -189,7 +189,8 @@ impl Session {
         }
         // A single cursor candidate serializes controls with domain reservations:
         // every tail forecast observes exactly the committed set of retention pins.
-        if !self.pending.is_empty()
+        if self.pending_managed.is_some()
+            || !self.pending.is_empty()
             || self.pending_maintenance.is_some()
             || self.pending_placement.is_some()
         {
@@ -212,8 +213,11 @@ impl Session {
         };
         let mut data = CURSOR_MAGIC.to_vec();
         data.extend(postcard::to_stdvec(&envelope)?);
-        let candidate =
-            self.build_cursor_candidate(&envelope, ContentHash(*blake3::hash(&data).as_bytes()))?;
+        let candidate = self.build_cursor_candidate(
+            &envelope,
+            ContentHash(*blake3::hash(&data).as_bytes()),
+            false,
+        )?;
         self.consensus.propose_in(data, BudgetLane::Completion)?;
         self.pending_cursor = Some(candidate);
         Ok(CursorSubmission::Pending(input.key))
@@ -222,6 +226,7 @@ impl Session {
         &self,
         envelope: &CursorEnvelope,
         entry_hash: ContentHash,
+        committed: bool,
     ) -> Result<CursorCandidate, LedgerError> {
         let input = &envelope.input;
         if envelope.schema != 2
@@ -328,7 +333,12 @@ impl Session {
         let _scratch =
             self.budget
                 .reserve(BudgetKind::Pending, BudgetLane::Completion, meta_bytes)?;
-        let prepared = self.cursors.prepare(&input.command, self.sequence())?;
+        let prepared = if committed {
+            self.cursors
+                .prepare_committed(&input.command, self.sequence())?
+        } else {
+            self.cursors.prepare(&input.command, self.sequence())?
+        };
         // A lease clock advance can release projection pins, never protected pins.
         let receipt = CursorReceipt {
             ledger: self.ledger,
@@ -422,7 +432,7 @@ impl Session {
                     input: old.input,
                 }
             };
-            self.build_cursor_candidate(&envelope, digest)?
+            self.build_cursor_candidate(&envelope, digest, true)?
         };
         candidate.receipt.raft_index = raft_index;
         candidate
@@ -606,7 +616,8 @@ impl Session {
         retain_bytes: bool,
     ) -> Result<Option<EncodedCheckpoint>, LedgerError> {
         self.check()?;
-        if !self.pending.is_empty()
+        if self.pending_managed.is_some()
+            || !self.pending.is_empty()
             || self.pending_cursor.is_some()
             || self.pending_maintenance.is_some()
             || self.pending_membership.is_some()
@@ -631,10 +642,12 @@ impl Session {
         })?;
         let cursor_state_charge = reference_charge(self.cursors.checkpoint())?;
         let placement_state_charge = reference_charge(&self.placement_state)?;
+        let request_stream_charge = self.request_streams.checkpoint_charge()?;
         let amount = reference_charge(self.core.snapshot())?
             .checked_add(reference_charge(&self.cursor_meta)?)
             .and_then(|n| n.checked_add(cursor_state_charge))
             .and_then(|n| n.checked_add(placement_state_charge))
+            .and_then(|n| n.checked_add(request_stream_charge))
             .and_then(|n| n.checked_add(tail_charge))
             .and_then(|n| {
                 n.checked_add(self.membership_charge.as_ref().map_or(0, Allocation::bytes))
@@ -665,12 +678,25 @@ impl Session {
                 latest: self.membership_state.latest.clone(),
             },
         };
-        let mut bytes = if self.placement_state.latest().is_some() {
+        let mut bytes = if self.request_streams.activated {
+            SNAPSHOT_V5_MAGIC.to_vec()
+        } else if self.placement_state.latest().is_some() {
             SNAPSHOT_V4_MAGIC.to_vec()
         } else {
             SNAPSHOT_V3_MAGIC.to_vec()
         };
-        if self.placement_state.latest().is_some() {
+        if self.request_streams.activated {
+            bytes.extend(postcard::to_stdvec(&SnapshotEnvelopeV5 {
+                state: SnapshotEnvelopeV4 {
+                    state: envelope,
+                    placement: PlacementState {
+                        active: self.placement_state.active.clone(),
+                        cutover: self.placement_state.cutover.clone(),
+                    },
+                },
+                requests: self.request_streams.checkpoint(),
+            })?);
+        } else if self.placement_state.latest().is_some() {
             bytes.extend(postcard::to_stdvec(&SnapshotEnvelopeV4 {
                 state: envelope,
                 placement: PlacementState {
@@ -717,7 +743,23 @@ impl Session {
     ) -> Result<(), LedgerError> {
         let mut membership = MembershipState::default();
         let mut placement = PlacementState::default();
-        let envelope = if let Some(data) = data.strip_prefix(SNAPSHOT_V4_MAGIC) {
+        let mut requests = RequestStreamsCheckpoint::default();
+        let envelope = if let Some(data) = data.strip_prefix(SNAPSHOT_V5_MAGIC) {
+            if !self.consensus.decoder_floor_ready(managed_format_hash()) {
+                return Err(LedgerError::Corrupt);
+            }
+            let (envelope, remaining): (SnapshotEnvelopeV5, _) = postcard::take_from_bytes(data)?;
+            if !remaining.is_empty()
+                || envelope.state.state.state.schema != 2
+                || !envelope.requests.activated
+            {
+                return Err(LedgerError::Corrupt);
+            }
+            membership = envelope.state.state.membership;
+            placement = envelope.state.placement;
+            requests = envelope.requests;
+            envelope.state.state.state
+        } else if let Some(data) = data.strip_prefix(SNAPSHOT_V4_MAGIC) {
             let (envelope, remaining): (SnapshotEnvelopeV4, _) = postcard::take_from_bytes(data)?;
             if !remaining.is_empty() || envelope.state.state.schema != 2 {
                 return Err(LedgerError::Corrupt);
@@ -967,6 +1009,10 @@ impl Session {
         )?;
         self.clear_pending();
         self.pending_cursor = None;
+        self.pending_managed = None;
+        self.managed_support = ManagedSupportCache::default();
+        self.request_streams
+            .restore(requests, recovered.sequence(), index, &self.budget)?;
         self.pending_maintenance = None;
         self.pending_membership = None;
         self.pending_placement = None;

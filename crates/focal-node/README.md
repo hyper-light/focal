@@ -6,6 +6,8 @@ Async ingress submits to a bounded queue and one blocking owner. The owner perfo
 
 The executable provides local service commands and the live founder/invitation/join workflow described in [Start and join a network](../../docs/network-startup.md). A network start uses saved authenticated endpoints and the same physical identity; plain local startup remains the default before networking is requested. Offline `deployment explain` and `deployment schema` do not apply placement changes.
 
+Successful network shutdown also waits for Quinn to release the listener socket, within the existing 30-second grace period and after stopping the physical owners. Closing an `Endpoint` alone leaves its connection drivers alive temporarily. The listener replaces Quinn's required shared runtime allocation with a delegating runtime whose final drop signals completion; its fixed bookkeeping allowance stays with that runtime through cancellation. Quinn is pinned to 0.11.11 because this guarantee relies on its endpoint and connection states dropping socket ownership before runtime ownership. A dependency upgrade must recheck that ordering and the immediate-rebind regression.
+
 ## Durable subscriptions
 
 Open a request epoch with `Operation::OpenEpoch`, then use `Operation::Stream`:

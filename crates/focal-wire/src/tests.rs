@@ -14,6 +14,11 @@ use std::{
     time::Duration,
 };
 
+#[path = "managed_protocol_tests.rs"]
+mod managed_protocol_tests;
+#[path = "managed_tests.rs"]
+mod managed_tests;
+
 fn ledger() -> LedgerId {
     LedgerId {
         tenant: TenantId::from_u128(1),

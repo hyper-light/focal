@@ -77,6 +77,12 @@ impl Frame {
             Self::Control(frame) => frame.target,
         }
     }
+    fn complete(&mut self, accepted: bool) {
+        match self {
+            Self::Session(frame) => frame.report_snapshot(accepted),
+            Self::Control(frame) => frame.report_snapshot(accepted),
+        }
+    }
     fn request(&self) -> &focal_wire::RequestEnvelope {
         match self {
             Self::Session(frame) => &frame.request,
@@ -119,10 +125,11 @@ async fn drive(
     while receiving || !tasks.is_empty() {
         tokio::select! {
             frame = receiver.recv(), if receiving && tasks.len() < max_inflight => {
-                if let Some(frame) = frame {
+                if let Some(mut frame) = frame {
                     report.attempted = report.attempted.saturating_add(1);
                     tasks.push(AssertUnwindSafe(async move {
                         let result = pool.send(frame.target(), frame.request()).await;
+                        frame.complete(result.is_ok());
                         // Keep the whole frame, especially its Allocation, alive
                         // across connection setup, retries and response receipt.
                         drop(frame);

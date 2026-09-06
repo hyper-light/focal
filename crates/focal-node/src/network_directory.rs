@@ -93,7 +93,6 @@ impl DirectoryStartup {
     }
 }
 
-
 async fn refresh_authority(
     plan: FirstDirectoryPlan,
     root: &ControlHost,
@@ -111,20 +110,29 @@ async fn refresh_authority(
             let outcome = match root.prepare_directory(plan).await {
                 Ok(permit) => {
                     let valid_until = permit.expires_at();
-                    directory.refresh_directory(permit).await.map(|receipt| (receipt, valid_until))
+                    directory
+                        .refresh_directory(permit)
+                        .await
+                        .map(|receipt| (receipt, valid_until))
                 }
                 Err(error) => Err(error),
             };
             match outcome {
                 Ok((receipt, valid_until)) => {
-                    if receipt.root != root.progress().identity || receipt.root_index < installed_index {
+                    if receipt.root != root.progress().identity
+                        || receipt.root_index < installed_index
+                    {
                         return Err(DirectoryBootstrapError::Inconsistent.into());
                     }
                     installed_index = receipt.root_index;
                     expires_at = valid_until;
                 }
-                Err(DirectoryBootstrapError::Unauthorized | DirectoryBootstrapError::Unavailable
-                    | DirectoryBootstrapError::NotReady | DirectoryBootstrapError::Capacity) => {}
+                Err(
+                    DirectoryBootstrapError::Unauthorized
+                    | DirectoryBootstrapError::Unavailable
+                    | DirectoryBootstrapError::NotReady
+                    | DirectoryBootstrapError::Capacity,
+                ) => {}
                 Err(error) => return Err(error.into()),
             }
         }

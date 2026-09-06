@@ -9,10 +9,7 @@ use focal_evidence::{ContentStore, StoreLimits, UploadId};
 use focal_ledger::{Session, SessionLimits, SessionPlacementRequest, Submission};
 use focal_model::*;
 use focal_wire::WireLimits;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    time::Duration,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 fn ledger() -> LedgerId {
     LedgerId {
@@ -339,6 +336,8 @@ fn preparing_scope_keeps_active_ingress_and_rejects_policy_change_mid_verificati
 async fn canceled_continuation_releases_owned_charge_and_expired_or_dropped_snapshot_fails() {
     let dir = tempfile::tempdir().unwrap();
     let (mut session, store, _) = fixture(dir.path());
+    let clock = std::time::Instant::now();
+    let now = || u64::try_from(clock.elapsed().as_millis()).unwrap();
     let budget = memory();
     let (host, owner) = ContentHost::spawn(
         store,
@@ -349,7 +348,7 @@ async fn canceled_continuation_releases_owned_charge_and_expired_or_dropped_snap
     .unwrap();
     let baseline = budget.stats().used;
     let progress = host
-        .begin_verification(session.checkpoint_evidence(0, 30_000).unwrap(), None)
+        .begin_verification(session.checkpoint_evidence(now(), 30_000).unwrap(), None)
         .await
         .unwrap();
     assert!(matches!(progress, CustodyVerificationProgress::Pending(_)));
@@ -357,17 +356,20 @@ async fn canceled_continuation_releases_owned_charge_and_expired_or_dropped_snap
     drop(progress);
     assert_eq!(budget.stats().used, baseline);
 
-    let expired_snapshot = session.checkpoint_evidence(0, 100).unwrap();
-    // Delay before creating the verification continuation: a new consumer
-    // must not restart the TTL of a snapshot retained by an idle caller.
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    let state = CustodyVerification::new(expired_snapshot, None, &budget).unwrap();
+    let expired_snapshot = session.checkpoint_evidence(now(), 30_000).unwrap();
+    // Expire the owner's actual registry before a new continuation is created.
+    // This has no fast-fsync assumption. Elapsed capture TTL during stalled IO
+    // is separately exercised by the grouped physical-writer regression.
+    let expired_at = expired_snapshot.expires_at();
+    session.advance_read_clock(expired_at).unwrap();
     assert!(matches!(
-        host.advance_verification(Box::new(state)).await,
+        host.verify_prefix(expired_snapshot, None).await,
         Err(AccessError::SnapshotExpired)
     ));
     assert_eq!(budget.stats().used, baseline);
-    let snapshot = session.checkpoint_evidence(0, 30_000).unwrap();
+    let snapshot = session
+        .checkpoint_evidence(expired_at + now(), 30_000)
+        .unwrap();
     drop(session);
     assert!(matches!(
         host.verify_prefix(snapshot, None).await,
@@ -382,10 +384,12 @@ async fn canceled_continuation_releases_owned_charge_and_expired_or_dropped_snap
 fn admission_pressure_and_wrong_physical_owner_fail_before_sealing() {
     let dir = tempfile::tempdir().unwrap();
     let (mut session, store, _) = fixture(dir.path());
+    let clock = std::time::Instant::now();
+    let now = || u64::try_from(clock.elapsed().as_millis()).unwrap();
     let budget = MemoryBudget::new(RESIDENT_BYTES - 1, 0).unwrap();
     assert!(matches!(
         CustodyVerification::new(
-            session.checkpoint_evidence(0, 30_000).unwrap(),
+            session.checkpoint_evidence(now(), 30_000).unwrap(),
             None,
             &budget
         ),
@@ -401,7 +405,7 @@ fn admission_pressure_and_wrong_physical_owner_fail_before_sealing() {
     let budget = memory();
     let mut owner = CustodyStore::new(store, CustodyConfig::new(2), budget.clone()).unwrap();
     let state = CustodyVerification::new(
-        session.checkpoint_evidence(0, 30_000).unwrap(),
+        session.checkpoint_evidence(now(), 30_000).unwrap(),
         None,
         &budget,
     )

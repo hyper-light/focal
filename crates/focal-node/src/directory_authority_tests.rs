@@ -221,11 +221,92 @@ fn owner(
         pending: VecDeque::new(),
         directory: None,
         authority_refresh: None,
+        snapshot_feedback: Default::default(),
         outbound,
         progress,
         nonce: 0,
         dropped: 0,
     }
+}
+
+#[tokio::test]
+async fn stop_commits_admitted_refresh_without_starting_a_postcommit_read_before_checkpoint() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut network, plan) = prepared_network(directory.path()).await;
+    let budget = budget();
+    let opened = authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget)
+        .unwrap()
+        .open(network.wal.clone(), &budget)
+        .unwrap();
+    let revision = network.control.authority().unwrap().revision();
+    commit(
+        &mut network.control,
+        5,
+        ControlCommand::Authority(AuthorityCommand {
+            expected_revision: revision,
+            enrollment_revision: 1,
+            decided_at: unix_time().unwrap(),
+            operation: AuthorityOperation::AdvanceClock,
+        }),
+    );
+    let permit =
+        authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget).unwrap();
+    let mut owner = owner(opened.into_replica(), plan, budget.clone());
+    let change = Box::new(
+        permit
+            .prepare_refresh(&owner.replica, unix_time().unwrap(), &budget)
+            .unwrap(),
+    );
+    let request = change.request.as_ref().unwrap().clone();
+    assert_eq!(
+        owner
+            .replica
+            .submit(request.clone(), &NoDirectoryAuthority)
+            .unwrap(),
+        ControlSubmission::Pending(request.id)
+    );
+    assert!(owner.replica.receipt(request.id).unwrap().is_none());
+    let mut input = budget
+        .reserve(BudgetKind::Control, BudgetLane::Completion, 2048)
+        .unwrap()
+        .commit();
+    let reply_charge = input.split_off(512).unwrap();
+    let (response, receive) = oneshot::channel();
+    owner.authority_refresh = Some(PendingAuthority {
+        phase: Some(RefreshPhase::Writing(change)),
+        context: None,
+        term: owner.replica.status().term,
+        deadline: Instant::now() + Duration::from_secs(5),
+        response: Some(response),
+        reply_charge: Some(reply_charge),
+        _input: input,
+    });
+    // Exactly the production Stop path: the final drain commits the admitted
+    // write. It must not start the refresh's additional ReadIndex afterward,
+    // which would leave RawNode Ready and invalidate the following checkpoint.
+    let (response, stopped) = oneshot::channel();
+    assert!(owner.work(Work::Stop(response)).unwrap());
+    assert_eq!(stopped.await.unwrap(), Ok(()));
+    let (reply, charge) = receive.await.unwrap();
+    assert!(matches!(reply, Err(DirectoryBootstrapError::Unavailable)));
+    drop(charge);
+    let receipt = owner.replica.receipt(request.id).unwrap().unwrap();
+    assert_eq!(receipt.request, request.id);
+    drop(owner);
+    assert_eq!(budget.stats().used, 0);
+    let mut reopened =
+        authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget)
+            .unwrap()
+            .open(network.wal.clone(), &budget)
+            .unwrap()
+            .into_replica();
+    assert_eq!(reopened.receipt(request.id).unwrap(), Some(receipt));
+    assert_eq!(
+        reopened.submit(request, &NoDirectoryAuthority).unwrap(),
+        ControlSubmission::Existing(receipt)
+    );
+    drop(reopened);
+    assert_eq!(budget.stats().used, 0);
 }
 
 #[tokio::test]

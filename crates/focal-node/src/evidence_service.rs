@@ -79,6 +79,7 @@ pub struct EvidenceWitness {
     scope: CustodyScope,
     request: RequestId,
     epoch: RequestEpoch,
+    managed: Option<ManagedRequestKey>,
     principal: ParticipantId,
     descriptor: ContentHash,
     voters: BTreeSet<u64>,
@@ -101,6 +102,7 @@ impl EvidenceWitness {
             || request.route_epoch != scope.route_epoch
             || self.request != request.request_id
             || self.epoch != request.request_epoch
+            || self.managed != managed_key(&request.operation)
             || self.principal != verified.peer().principal()
             || self.voters.len() != voters.len()
             || voters.iter().any(|id| !self.voters.contains(id))
@@ -533,17 +535,39 @@ async fn seal(
     content.check_policy(placement.scope).await?;
     Ok(reference)
 }
-fn artifact(operation: &Operation) -> Option<&NewArtifact> {
+fn managed_key(operation: &Operation) -> Option<ManagedRequestKey> {
     match operation {
-        Operation::Submit {
-            command:
-                Command::AttachArtifact { artifact, .. } | Command::RegisterArtifact { artifact },
+        Operation::Managed { key, .. } => Some(*key),
+        _ => None,
+    }
+}
+fn custody_request_id(request: &VerifiedRequest) -> Result<RequestId, AccessError> {
+    let Some(key) = managed_key(&request.request().operation) else {
+        return Ok(request.request().request_id);
+    };
+    let bytes = postcard::to_stdvec(&key).map_err(|_| AccessError::InvalidRequest)?;
+    let hash = blake3::derive_key("focal.evidence.managed-transfer-request.v1", &bytes);
+    let id: [u8; 16] = hash
+        .get(..16)
+        .ok_or(AccessError::InvalidRequest)?
+        .try_into()
+        .map_err(|_| AccessError::InvalidRequest)?;
+    Ok(RequestId(id))
+}
+fn artifact(operation: &Operation) -> Option<&NewArtifact> {
+    let command = match operation {
+        Operation::Submit { command, .. }
+        | Operation::Managed {
+            operation: ManagedOperation::Submit { command, .. },
             ..
-        } => Some(artifact),
-        Operation::Submit {
-            command: Command::FailTestamentGeneration { error, .. },
-            ..
-        } => Some(error),
+        } => command,
+        _ => return None,
+    };
+    match command {
+        Command::AttachArtifact { artifact, .. } | Command::RegisterArtifact { artifact } => {
+            Some(artifact)
+        }
+        Command::FailTestamentGeneration { error, .. } => Some(error),
         _ => None,
     }
 }
@@ -555,6 +579,7 @@ async fn attest(
     request: VerifiedRequest,
     mut allocation: Allocation,
 ) -> Result<EvidencedRequest, AccessError> {
+    let custody_id = custody_request_id(&request)?;
     let artifact = artifact(&request.request().operation).ok_or(AccessError::InvalidRequest)?;
     if artifact.content.ledger != placement.scope.ledger {
         return Err(AccessError::Unauthorized);
@@ -570,24 +595,8 @@ async fn attest(
                 serde_json::from_slice(bytes).map_err(|_| AccessError::InvalidRequest)?;
         }
         ArtifactPayload::Content(reference) => {
-            ensure_local(
-                content,
-                pool,
-                node,
-                placement,
-                request.request().request_id,
-                reference,
-            )
-            .await?;
-            replicate(
-                content,
-                pool,
-                node,
-                placement,
-                request.request().request_id,
-                reference,
-            )
-            .await?;
+            ensure_local(content, pool, node, placement, custody_id, reference).await?;
+            replicate(content, pool, node, placement, custody_id, reference).await?;
             let bytes = content
                 .read_bytes(placement.scope, reference.clone(), MAX_REPORT_BYTES)
                 .await?;
@@ -615,6 +624,7 @@ async fn attest(
         scope: placement.scope,
         request: request.request().request_id,
         epoch: request.request().request_epoch,
+        managed: managed_key(&request.request().operation),
         principal: request.peer().principal(),
         descriptor: artifact
             .content
@@ -929,6 +939,9 @@ pub struct FleetService {
     pub evidence: EvidenceCoordinator,
 }
 impl RequestHandler for FleetService {
+    fn supports_managed_requests(&self) -> bool {
+        true
+    }
     fn handle(
         &self,
         request: VerifiedRequest,

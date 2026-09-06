@@ -235,7 +235,8 @@ async fn serve_authenticated_connection_inner<H: RequestHandler + Clone>(
             .map_err(|_| WireError::Connection)?;
         let hello: Hello = read_frame(&mut recv, FrameKind::Hello, 4096).await?;
         require_end(&mut recv).await?;
-        let negotiated = match limits.negotiate(&hello) {
+        let negotiated = match limits.negotiate_managed(&hello, handler.supports_managed_requests())
+        {
             Ok(value) => value,
             Err(error) => {
                 write_frame(
@@ -284,7 +285,11 @@ async fn serve_authenticated_connection_inner<H: RequestHandler + Clone>(
                         let peer=registry.authenticate(fingerprint)?;
                         let request:RequestEnvelope=read_frame(&mut recv,FrameKind::Request,limits.max_frame_bytes).await?;require_end(&mut recv).await?;
                         if matches!(request.operation,Operation::Raft{..}){send.set_priority(10).map_err(|_|WireError::Connection)?;}
-                        let response=dispatch_accounted(&handler,peer,request,&limits).await;
+                        let response = if negotiated.accepts_protocol(request.protocol) {
+                            dispatch_accounted(&handler,peer,request,&limits).await
+                        } else {
+                            OwnedResponse::new(request.reply(Response::Error(AccessError::UnsupportedProtocol)))
+                        };
                         send_owned_response(send,response,limits.max_frame_bytes).await
                     };
                     let _=transport_exchange(async {
@@ -393,7 +398,7 @@ impl QuicConnector {
                 .await
                 .map_err(|_| WireError::Connection)?;
             let hello = Hello {
-                versions: vec![PROTOCOL_VERSION],
+                versions: vec![MANAGED_PROTOCOL_VERSION, PROTOCOL_VERSION],
                 max_frame_bytes: self.limits.max_frame_bytes,
                 max_items: self.limits.max_items,
             };
@@ -409,8 +414,10 @@ impl QuicConnector {
         let negotiated = tokio::time::timeout(self.limits.request_timeout, handshake)
             .await
             .map_err(|_| WireError::Timeout)??;
-        if negotiated.protocol != PROTOCOL_VERSION
-            || negotiated.max_frame_bytes > self.limits.max_frame_bytes
+        if !matches!(
+            negotiated.protocol,
+            PROTOCOL_VERSION | MANAGED_PROTOCOL_VERSION
+        ) || negotiated.max_frame_bytes > self.limits.max_frame_bytes
             || negotiated.max_items > self.limits.max_items
         {
             return Err(WireError::InvalidFrame);
@@ -459,6 +466,9 @@ impl QuicRemote {
         &self,
         request: &RequestEnvelope,
     ) -> Result<ResponseEnvelope, WireError> {
+        if !self.negotiated.accepts_protocol(request.protocol) {
+            return Err(WireError::Access(AccessError::UnsupportedProtocol));
+        }
         let lane = if matches!(request.operation, Operation::Raft { .. }) {
             &self.capacity.control
         } else {

@@ -10,7 +10,8 @@
         clippy::disallowed_macros
     )
 )]
-use clap::{Parser, Subcommand};
+mod cli;
+use clap::{Parser, Subcommand, ValueEnum};
 use focal_model::*;
 use focal_node::{
     config::Settings,
@@ -49,6 +50,11 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Commands {
+    /// Serve agent tools over a bounded, durable stdio MCP connection.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
     /// Run the durable service, using saved network settings on restart.
     Start {
         #[arg(long)]
@@ -74,15 +80,39 @@ enum Commands {
     Demo,
     /// Read the running service's authoritative published prefix.
     Status,
-    /// Send an explicit versioned request; retry the same file after an unknown outcome.
-    Request { file: PathBuf },
+    /// Inspect or retry saved requests, query your receipt/epoch state, or send a wire file.
+    Request(cli::RequestArgs),
+    #[command(flatten)]
+    Manual(Box<cli::Commands>),
     /// Show identity metadata without opening or modifying the ledger.
     Identity,
+    /// Inspect built-in schema contracts without opening a ledger.
+    Schema {
+        #[command(subcommand)]
+        command: SchemaCommand,
+    },
     /// Offline placement solver; planning does not activate a durability guarantee.
     Deployment {
         #[command(subcommand)]
         command: DeploymentCommand,
     },
+}
+#[derive(Subcommand)]
+enum McpCommand {
+    /// Use this node's authenticated local context and durable operation store.
+    Serve,
+}
+#[derive(Subcommand)]
+enum SchemaCommand {
+    Get {
+        #[arg(value_enum)]
+        name: SchemaName,
+    },
+}
+#[derive(Clone, Copy, ValueEnum)]
+enum SchemaName {
+    TestReport,
+    DomainRegistry,
 }
 #[derive(Subcommand)]
 enum ClusterCommand {
@@ -113,35 +143,55 @@ fn main() {
             let _ = writeln!(std::io::stderr().lock(), "  caused by: {cause}");
             source = cause.source();
         }
-        std::process::exit(1);
+        let code = error
+            .downcast_ref::<cli::CliError>()
+            .map_or(1, cli::CliError::exit_code);
+        std::process::exit(code);
     }
 }
 fn execute() -> Result<()> {
+    let args = Args::parse();
+    if matches!(&args.command, Commands::Mcp { .. }) {
+        let settings = load_settings(args.config.as_deref(), args.data_dir)?;
+        return cli::serve(&settings).map_err(Into::into);
+    }
+    let service = matches!(&args.command, Commands::Start { .. });
     // Tokio's fallible builder can still unwind when an OS worker cannot be
     // started. Contain that dependency boundary before acquiring node state.
     let runtime = std::panic::catch_unwind(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
+        // A manual invocation owns one sequential network conversation. Avoid
+        // starting a worker pool for every get/list/submit process.
+        let mut builder = if service {
+            tokio::runtime::Builder::new_multi_thread()
+        } else {
+            tokio::runtime::Builder::new_current_thread()
+        };
+        builder.enable_all().build()
     })
     .map_err(|_| "async runtime initialization failed")??;
-    let result = runtime.block_on(run());
+    let result = run(&runtime, args);
     // A timed-out blocking owner must not make Runtime::drop wait forever.
     // Normal service shutdown has already joined its owner before returning.
     runtime.shutdown_background();
     result
 }
-async fn run() -> Result<()> {
-    let args = Args::parse();
-    let mut settings = match args.config {
-        Some(path) => Settings::from_yaml(std::str::from_utf8(&read_file(&path, 64 * 1024)?)?)?,
+fn load_settings(config: Option<&Path>, data_dir: Option<PathBuf>) -> Result<Settings> {
+    let mut settings = match config {
+        Some(path) => Settings::from_yaml(std::str::from_utf8(&read_file(path, 64 * 1024)?)?)?,
         None => Settings::default(),
     };
-    if let Some(data_dir) = args.data_dir {
+    if let Some(data_dir) = data_dir {
         settings.node.data_dir = Some(data_dir);
     }
     settings.validate()?;
+    Ok(settings)
+}
+fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
+    let mut settings = load_settings(args.config.as_deref(), args.data_dir)?;
     match args.command {
+        Commands::Mcp {
+            command: McpCommand::Serve,
+        } => cli::serve(&settings).map_err(Into::into),
         Commands::Start { advertise, listen } => {
             if let Some(advertise) = advertise {
                 settings.node.advertise = Some(advertise);
@@ -150,11 +200,11 @@ async fn run() -> Result<()> {
                 settings.node.listen = Some(listen);
             }
             settings.validate()?;
-            start(settings).await
+            runtime.block_on(start(settings))
         }
         Commands::Cluster {
             command: ClusterCommand::Invite { node, output },
-        } => invite(&settings, &node, &output).await,
+        } => runtime.block_on(invite(&settings, &node, &output)),
         Commands::Join {
             invite_file,
             advertise,
@@ -164,7 +214,7 @@ async fn run() -> Result<()> {
             if let Some(listen) = listen {
                 settings.node.listen = Some(listen);
             }
-            join(&settings, &invite_file).await
+            runtime.block_on(join(&settings, &invite_file))
         }
         Commands::Demo => {
             let mut node = EmbeddedNode::open(&settings)?;
@@ -173,6 +223,30 @@ async fn run() -> Result<()> {
             print_json(&report)
         }
         Commands::Identity => print_json(&decode_identity(&settings.data_dir()?.join("IDENTITY"))?),
+        Commands::Schema {
+            command:
+                SchemaCommand::Get {
+                    name: SchemaName::TestReport,
+                },
+        } => print_json(&serde_json::json!({
+            "schema_version":1,"name":"focal.test_report.v1",
+            "hash":focal_evidence::test_report_schema().to_string(),
+            "descriptor":std::str::from_utf8(focal_evidence::TEST_REPORT_SCHEMA)?,
+            "example":{"passed":1,"failed":0,"skipped":0}
+        })),
+        Commands::Schema {
+            command:
+                SchemaCommand::Get {
+                    name: SchemaName::DomainRegistry,
+                },
+        } => {
+            writeln!(
+                std::io::stdout().lock(),
+                "{}",
+                include_str!("../../../config/schema/domain-registry-v1.json")
+            )?;
+            Ok(())
+        }
         Commands::Status => {
             let root = settings.data_dir()?;
             let identity = decode_identity(&root.join("IDENTITY"))?;
@@ -190,21 +264,12 @@ async fn run() -> Result<()> {
                     max_items: 1,
                 }),
             };
-            let reply = UnixRemote::new(root.join("focal.sock"), WireLimits::default())?
-                .request(&request)
-                .await?;
+            let remote = UnixRemote::new(root.join("focal.sock"), WireLimits::default())?;
+            let reply = runtime.block_on(remote.request(&request))?;
             output_response(reply)
         }
-        Commands::Request { file } => {
-            let request: RequestEnvelope = serde_json::from_slice(&read_file(&file, 1024 * 1024)?)?;
-            let reply = UnixRemote::new(
-                settings.data_dir()?.join("focal.sock"),
-                WireLimits::default(),
-            )?
-            .request(&request)
-            .await?;
-            output_response(reply)
-        }
+        Commands::Request(args) => Ok(cli::request(runtime, &settings, args)?),
+        Commands::Manual(command) => Ok(cli::run(runtime, &settings, *command)?),
         Commands::Deployment {
             command: DeploymentCommand::Schema,
         } => {

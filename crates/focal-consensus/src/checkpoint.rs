@@ -60,11 +60,15 @@ impl DurableNode {
                 .filter(|entry| entry.index > index)
                 .count()
                 .checked_add(3)
+                .and_then(|count| count.checked_add(usize::from(self.required_decoder.is_some())))
                 .ok_or(ConsensusError::Capacity)?;
             records
                 .try_reserve_exact(count)
                 .map_err(|_| ConsensusError::Capacity)?;
             records.push(identity_record(&self.config)?);
+            if let Some(hash) = self.required_decoder {
+                records.push(decoder::floor_record(self.config.group_id, hash)?);
+            }
             records.push(proto_record(
                 self.config.group_id,
                 RecordKind::Snapshot,

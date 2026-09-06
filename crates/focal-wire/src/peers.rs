@@ -267,6 +267,19 @@ impl PeerConnectionPool {
             _ => Err(PeerSendError::InvalidRequest),
         }
     }
+    pub async fn send_managed_support(
+        &self,
+        target: u64,
+        request: &RequestEnvelope,
+    ) -> Result<focal_model::ManagedFormatSupport, PeerSendError> {
+        if !matches!(request.operation, Operation::ManagedSupport { .. }) {
+            return Err(PeerSendError::InvalidRequest);
+        }
+        match self.exchange(target, request).await? {
+            Response::ManagedSupport(fact) if fact.node == target => Ok(fact),
+            _ => Err(PeerSendError::InvalidRequest),
+        }
+    }
     pub async fn send_enrollment_control(
         &self,
         target: u64,
@@ -310,6 +323,7 @@ impl PeerConnectionPool {
         let valid_operation = match &request.operation {
             Operation::Raft { group, message } => *group != [0; 16] && !message.is_empty(),
             Operation::Custody(_) => true,
+            Operation::ManagedSupport { group } => *group != [0; 16],
             Operation::PeerControl { group, request } => {
                 *group != [0; 16]
                     && !request.is_empty()
@@ -330,7 +344,12 @@ impl PeerConnectionPool {
         };
         if target == 0
             || !valid_operation
-            || request.protocol != PROTOCOL_VERSION
+            || request.protocol
+                != if matches!(request.operation, Operation::ManagedSupport { .. }) {
+                    MANAGED_PROTOCOL_VERSION
+                } else {
+                    PROTOCOL_VERSION
+                }
             || request.request_epoch.0 == 0
             || request.request_id.is_zero()
             || postcard::experimental::serialized_size(request)
@@ -364,7 +383,8 @@ impl PeerConnectionPool {
                     Ok(response) => match response.result {
                         value @ (Response::PeerAccepted
                         | Response::Custody(_)
-                        | Response::Control { .. }) => {
+                        | Response::Control { .. }
+                        | Response::ManagedSupport(_)) => {
                             if slot.retired.load(Ordering::Acquire) {
                                 return Err(PeerSendError::RouteChanged);
                             }

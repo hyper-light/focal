@@ -40,8 +40,15 @@ pub mod placement;
 pub mod placement_proof;
 pub mod quorum_enrollment;
 mod reads;
+mod reconciliation;
 pub mod replication;
 pub mod session_registration;
 mod streams;
 #[cfg(test)]
 mod streams_tests;
+
+mod managed_support;
+
+mod managed_requests;
+
+mod snapshot_feedback;

@@ -50,6 +50,11 @@ impl OwnedResponse {
     }
 }
 pub trait RequestHandler: Send + Sync + 'static {
+    /// Local implementation capability only. Group activation remains a
+    /// committed, configuration-fenced decision in the authoritative owner.
+    fn supports_managed_requests(&self) -> bool {
+        false
+    }
     fn handle(&self, request: VerifiedRequest) -> HandlerFuture<'_>;
     fn handle_accounted(&self, request: VerifiedRequest) -> OwnedHandlerFuture<'_> {
         Box::pin(async move { OwnedResponse::new(self.handle(request).await) })
@@ -68,6 +73,9 @@ where
 // Compatibility for callers that intentionally share a dynamically dispatched
 // handler. Concrete actor handles pass directly to servers without allocation.
 impl RequestHandler for std::sync::Arc<dyn RequestHandler> {
+    fn supports_managed_requests(&self) -> bool {
+        self.as_ref().supports_managed_requests()
+    }
     fn handle(&self, request: VerifiedRequest) -> HandlerFuture<'_> {
         self.as_ref().handle(request)
     }
@@ -123,8 +131,21 @@ pub async fn dispatch_accounted(
             )));
         }
     };
-    if let (Operation::Stream(stream), Response::Stream(reply)) =
-        (&request.operation, &response.envelope().result)
+    let delivery = match (&request.operation, &response.envelope().result) {
+        (Operation::Stream(stream), Response::Stream(reply)) => Some((stream, reply)),
+        (
+            Operation::Managed {
+                operation: ManagedOperation::Cursor(stream),
+                ..
+            },
+            Response::Managed(ManagedReply {
+                stream: Some(reply),
+                ..
+            }),
+        ) => Some((stream, reply)),
+        _ => None,
+    };
+    if let Some((stream, reply)) = delivery
         && stream_scope(&peer, request.ledger, stream.filter()).ok() != Some(reply.cursor.scope)
     {
         return OwnedResponse::new(request.reply(Response::Error(AccessError::OutcomeUnknown)));
@@ -180,6 +201,37 @@ pub fn validate_response(
             && principal.is_none_or(|p| receipt.key.principal == p)
     };
     match &response.result {
+        Response::Managed(reply) => crate::managed::validate_managed_reply(
+            request,
+            response.route_epoch,
+            reply,
+            principal,
+            limits,
+        )?,
+        Response::RequestStreamControlled(reply) => crate::managed::validate_control_reply(
+            request,
+            response.route_epoch,
+            reply,
+            principal,
+            limits,
+        )?,
+        Response::RequestStreamRead(reply) => crate::managed::validate_stream_read(
+            request,
+            response.route_epoch,
+            reply,
+            principal,
+            limits,
+        )?,
+        Response::ManagedSupport(fact) => {
+            crate::managed::validate_support(request, response.route_epoch, fact, limits)?
+        }
+        Response::Reconciled(reply) => crate::reconcile::validate_reconciliation(
+            request,
+            response.route_epoch,
+            reply,
+            principal,
+            limits,
+        )?,
         Response::Control { response } => {
             if !matches!(
                 request.operation,
@@ -221,16 +273,159 @@ pub fn validate_response(
                 _ => {}
             }
         }
+        Response::Listed(page) => {
+            let Operation::List(list) = &request.operation else {
+                return Err(WireError::InvalidFrame);
+            };
+            if page.token.ledger != request.ledger
+                || page.token.route_epoch != response.route_epoch
+                || page.objects.len() > list.max_items.min(limits.max_items) as usize
+                || page.visited > list.max_visits
+                || page.objects.len() > page.visited as usize
+                || page.next.as_ref().is_some_and(|cursor| {
+                    cursor.bytes.is_empty() || cursor.bytes.len() > MAX_LIST_CURSOR_BYTES
+                })
+                || (page.next.is_some() && page.visited == 0)
+            {
+                return Err(WireError::InvalidFrame);
+            }
+            validate_objects(&page.objects, request.ledger)?;
+            if page.objects.iter().any(|object| match object {
+                ReadObject::Claim { .. } => list.filter.kind != ObjectKind::Claim,
+                ReadObject::Testament { .. } => list.filter.kind != ObjectKind::Testament,
+                ReadObject::Validation { .. } => list.filter.kind != ObjectKind::Validation,
+                ReadObject::Artifact { .. } => list.filter.kind != ObjectKind::Artifact,
+                ReadObject::ValidationResults { .. } => true,
+            }) {
+                return Err(WireError::InvalidFrame);
+            }
+        }
         Response::Read(page) => {
             let Operation::Read(read) = &request.operation else {
                 return Err(WireError::InvalidFrame);
             };
-            validate_page(page, request.ledger, read.max_items.min(limits.max_items))?;
+            if page.token.route_epoch != response.route_epoch {
+                return Err(WireError::InvalidFrame);
+            }
+            validate_page(
+                page,
+                request.ledger,
+                read.max_items.min(limits.max_items),
+                matches!(read.query, ReadQuery::ValidationResults { .. }),
+            )?;
+            match &read.query {
+                ReadQuery::Objects(references) => {
+                    if references.len() > read.max_items.min(limits.max_items) as usize {
+                        return Err(WireError::InvalidFrame);
+                    }
+                    validate_object_selection(page, references, request.ledger)?;
+                }
+                ReadQuery::ValidationResults { id, after } => {
+                    if page.next.is_some() || page.objects.len() > 1 {
+                        return Err(WireError::InvalidFrame);
+                    }
+                    if let Some(object) = page.objects.first() {
+                        let ReadObject::ValidationResults {
+                            id: actual,
+                            value,
+                            records,
+                            next,
+                        } = object
+                        else {
+                            return Err(WireError::InvalidFrame);
+                        };
+                        if actual != id
+                            || records.len() > read.max_items.min(limits.max_items) as usize
+                            || next.is_some_and(|position| {
+                                records.last().is_none_or(|last| last.position != position)
+                            })
+                        {
+                            return Err(WireError::InvalidFrame);
+                        }
+                        let mut previous = *after;
+                        let mut header: Option<&ValidationRunSummary> = None;
+                        let mut prior_attempt: Option<(&VerdictRecord, usize)> = None;
+                        for result in records {
+                            if result.position.run.validation != *id
+                                || result.position.run.phase != value.content().phase
+                                || result.position.run.epoch == 0
+                                || result.position.run.epoch > value.lifecycle().latest_epoch
+                                || previous.is_some_and(|prior| prior >= result.position)
+                            {
+                                return Err(WireError::InvalidFrame);
+                            }
+                            if let Some(prior) =
+                                previous.filter(|prior| prior.run == result.position.run)
+                            {
+                                let expected = match prior.attempt {
+                                    None => Some(0),
+                                    Some(ordinal) => ordinal.checked_add(1),
+                                };
+                                if result.position.attempt != expected {
+                                    return Err(WireError::InvalidFrame);
+                                }
+                            } else if result.position.attempt.is_some() {
+                                return Err(WireError::InvalidFrame);
+                            }
+                            match (&result.value, result.position.attempt) {
+                                (ValidationResultValue::Run(run), None)
+                                    if run.id == result.position.run
+                                        && run.claim == value.content().claim
+                                        && run.evaluator == value.content().evaluator =>
+                                {
+                                    validate_run_summary(value.content(), run)?;
+                                    header = Some(run);
+                                    prior_attempt = None;
+                                }
+                                (ValidationResultValue::Attempt(attempt), Some(ordinal))
+                                    if attempt.run == result.position.run
+                                        && attempt.evaluator == value.content().evaluator =>
+                                {
+                                    let index =
+                                        validate_attempt(value.content(), attempt, ordinal)?;
+                                    if let Some(run) = header.filter(|run| run.id == attempt.run)
+                                        && (attempt.manifest != run.manifest
+                                            || ordinal >= run.attempt_count
+                                            || (run.final_verdict.is_some()
+                                                && ordinal.checked_add(1)
+                                                    == Some(run.attempt_count)
+                                                && (run.final_verdict != Some(attempt.value)
+                                                    || index != run.handler_index as usize)))
+                                    {
+                                        return Err(WireError::InvalidFrame);
+                                    }
+                                    if let Some((prior, prior_index)) =
+                                        prior_attempt.filter(|(prior, _)| prior.run == attempt.run)
+                                        && (prior.manifest != attempt.manifest
+                                            || next_handler(value.content(), prior, prior_index)
+                                                != Some(index))
+                                    {
+                                        return Err(WireError::InvalidFrame);
+                                    }
+                                    prior_attempt = Some((attempt, index));
+                                }
+                                _ => return Err(WireError::InvalidFrame),
+                            }
+                            previous = Some(result.position);
+                        }
+                    }
+                }
+                _ if page
+                    .objects
+                    .iter()
+                    .any(|object| matches!(object, ReadObject::ValidationResults { .. })) =>
+                {
+                    return Err(WireError::InvalidFrame);
+                }
+                _ => {}
+            }
             match &read.consistency {
                 ReadConsistency::Exact(token) if page.token != *token => {
                     return Err(WireError::InvalidFrame);
                 }
-                ReadConsistency::AtLeast(token) if page.token.sequence < token.sequence => {
+                ReadConsistency::AtLeast(token)
+                    if token.ledger != request.ledger || page.token.sequence < token.sequence =>
+                {
                     return Err(WireError::InvalidFrame);
                 }
                 _ => {}
@@ -250,7 +445,7 @@ pub fn validate_response(
                 return Err(WireError::InvalidFrame);
             }
             if let Some(seed) = &batch.seed {
-                validate_page(seed, request.ledger, sub.credits.items)?;
+                validate_page(seed, request.ledger, sub.credits.items, false)?;
                 if seed.token != batch.token || !sub.seed {
                     return Err(WireError::InvalidFrame);
                 }
@@ -273,73 +468,7 @@ pub fn validate_response(
             let Operation::Stream(stream) = &request.operation else {
                 return Err(WireError::InvalidFrame);
             };
-            if reply.token.ledger != request.ledger
-                || reply.cursor.key.ledger != request.ledger
-                || reply.cursor.position.ledger != request.ledger
-                || reply.cursor.position.sequence > reply.token.sequence
-                || reply.cursor.same_stream(reply.acknowledged).is_err()
-                || reply.acknowledged.position > reply.cursor.position
-            {
-                return Err(WireError::InvalidFrame);
-            }
-            let expected = match stream {
-                StreamRequest::Open { consumer, .. } => {
-                    if reply.cursor.key.consumer != *consumer {
-                        return Err(WireError::InvalidFrame);
-                    }
-                    None
-                }
-                StreamRequest::Poll { cursor, .. } | StreamRequest::CompleteSeed { cursor, .. } => {
-                    Some(*cursor)
-                }
-            };
-            if expected.is_some_and(|cursor| {
-                cursor.same_stream(reply.cursor).is_err() || cursor.position > reply.cursor.position
-            }) {
-                return Err(WireError::InvalidFrame);
-            }
-            let mut count = 0u32;
-            let mut bytes = 0usize;
-            let mut position = expected.map(|c| c.position);
-            for event in &reply.events {
-                let cursor = match event {
-                    StreamEvent::Delta { cursor, delta } => {
-                        count = count.saturating_add(1);
-                        bytes = bytes
-                            .saturating_add(encode_payload(event, limits.max_frame_bytes)?.len());
-                        if delta.id.ledger != request.ledger
-                            || cursor.position != Position::after_delta(delta.id)
-                        {
-                            return Err(WireError::InvalidFrame);
-                        }
-                        *cursor
-                    }
-                    StreamEvent::Resolved { cursor } => {
-                        if cursor.position.offset != PositionOffset::Resolved {
-                            return Err(WireError::InvalidFrame);
-                        }
-                        *cursor
-                    }
-                    StreamEvent::Resync { cursor, .. } => *cursor,
-                };
-                if cursor.same_stream(reply.cursor).is_err()
-                    || cursor.position > reply.cursor.position
-                    || position.is_some_and(|p| cursor.position < p)
-                {
-                    return Err(WireError::InvalidFrame);
-                }
-                position = Some(cursor.position);
-            }
-            let credits = stream.credits();
-            if count > credits.items
-                || bytes > credits.bytes as usize
-                || reply.events.len() > (limits.max_items as usize).saturating_add(1)
-            {
-                return Err(WireError::Limit);
-            }
-            if let Some(seed) = &reply.seed {
-                validate_page(seed, request.ledger, credits.items)?;
-            }
+            validate_stream_response(stream, reply, request.ledger, response.route_epoch, limits)?;
         }
         Response::Upload(reply) => {
             let valid = match (&request.operation, reply) {
@@ -447,6 +576,12 @@ pub fn validate_response(
                 return Err(WireError::InvalidFrame);
             }
         }
+        Response::Error(
+            error @ (AccessError::ManagedRetired { .. }
+            | AccessError::ManagedClosed { .. }
+            | AccessError::ManagedConflict
+            | AccessError::ManagedNotRegistered),
+        ) => crate::managed::validate_managed_error(request, response.route_epoch, error)?,
         Response::Error(AccessError::RouteChanged(route))
             if route.endpoint.len() > 512
                 || route.server_name.len() > 253
@@ -463,20 +598,236 @@ pub fn validate_response(
     }
     Ok(())
 }
-fn validate_page(page: &ReadPage, ledger: LedgerId, max_items: u32) -> Result<(), WireError> {
+fn validate_object_selection(
+    page: &ReadPage,
+    references: &[ObjectRef],
+    ledger: LedgerId,
+) -> Result<(), WireError> {
+    if page.next.is_some()
+        || references
+            .iter()
+            .any(|reference| reference.ledger != ledger)
+    {
+        return Err(WireError::InvalidFrame);
+    }
+    // The owner visits references in request order and omits missing objects.
+    // Consume that same ordered subsequence without a set or extra allocation.
+    // An explicitly repeated request reference may return a repeated object;
+    // unsolicited duplicates, reordering and foreign keys cannot match.
+    let mut remaining = references.iter();
+    for object in &page.objects {
+        let (kind, id) = match object {
+            ReadObject::Claim { id, .. } => (ObjectKind::Claim, ObjectId(id.0)),
+            ReadObject::Testament { id, .. } => (ObjectKind::Testament, ObjectId(id.0)),
+            ReadObject::Artifact { id, .. } => (ObjectKind::Artifact, ObjectId(id.0)),
+            ReadObject::Validation { id, .. } => (ObjectKind::Validation, ObjectId(id.0)),
+            ReadObject::ValidationResults { .. } => return Err(WireError::InvalidFrame),
+        };
+        if !remaining.any(|reference| reference.kind == kind && reference.id == id) {
+            return Err(WireError::InvalidFrame);
+        }
+    }
+    Ok(())
+}
+fn validate_page(
+    page: &ReadPage,
+    ledger: LedgerId,
+    max_items: u32,
+    validation_results: bool,
+) -> Result<(), WireError> {
     if page.token.ledger != ledger || page.objects.len() > max_items as usize {
         return Err(WireError::InvalidFrame);
     }
-    for object in &page.objects {
+    if !validation_results
+        && page
+            .objects
+            .iter()
+            .any(|object| matches!(object, ReadObject::ValidationResults { .. }))
+    {
+        return Err(WireError::InvalidFrame);
+    }
+    validate_objects(&page.objects, ledger)
+}
+fn validate_objects(objects: &[ReadObject], ledger: LedgerId) -> Result<(), WireError> {
+    for object in objects {
         let object_ledger = match object {
             ReadObject::Claim { value, .. } => value.content().ledger,
             ReadObject::Testament { value, .. } => value.content().ledger,
             ReadObject::Validation { value, .. } => value.content().ledger,
             ReadObject::Artifact { value, .. } => value.content().ledger,
+            ReadObject::ValidationResults { value, .. } => value.content().ledger,
         };
         if object_ledger != ledger {
             return Err(WireError::InvalidFrame);
         }
+    }
+    Ok(())
+}
+
+fn validate_run_summary(
+    spec: &ValidationContent,
+    run: &ValidationRunSummary,
+) -> Result<(), WireError> {
+    if spec.kind == ValidationKind::Receipt {
+        if run.id.phase != ValidationPhase::WholeWork
+            || run.handler_index != 0
+            || run.quality_phase
+            || run.attempt_count != 1
+            || run.final_verdict != Some(VerdictValue::Pass)
+        {
+            return Err(WireError::InvalidFrame);
+        }
+        return Ok(());
+    }
+    let handler = spec
+        .handlers
+        .get(run.handler_index as usize)
+        .ok_or(WireError::InvalidFrame)?;
+    if run.attempt_count as usize > spec.handlers.len()
+        || run.quality_phase != (handler.agentic && spec.quality_bar.is_some())
+        || (run.attempt_count == 0 && (run.final_verdict.is_some() || run.handler_index != 0))
+    {
+        return Err(WireError::InvalidFrame);
+    }
+    Ok(())
+}
+fn validate_attempt(
+    spec: &ValidationContent,
+    attempt: &VerdictRecord,
+    ordinal: u32,
+) -> Result<usize, WireError> {
+    if attempt.attempt != ordinal {
+        return Err(WireError::InvalidFrame);
+    }
+    if spec.kind == ValidationKind::Receipt {
+        // Exact implicit receipt handler used by Core::receipt_passes. Receipt
+        // rows prove delivery only; they have no user-configured handler slot.
+        let receipt = HandlerRef {
+            id: ValidatorId::from_u128(1),
+            version: ContentHash(*blake3::hash(b"focal.builtin.receipt.v1").as_bytes()),
+            agentic: false,
+        };
+        if ordinal != 0
+            || attempt.handler != receipt
+            || attempt.value != VerdictValue::Pass
+            || !attempt.evidence.is_empty()
+        {
+            return Err(WireError::InvalidFrame);
+        }
+        return Ok(0);
+    }
+    let index = if attempt.handler.agentic && spec.quality_bar.is_some() {
+        spec.handlers
+            .len()
+            .checked_sub(1)
+            .ok_or(WireError::InvalidFrame)?
+    } else {
+        ordinal as usize
+    };
+    if ordinal as usize >= spec.handlers.len()
+        || spec.handlers.get(index) != Some(&attempt.handler)
+        || index < ordinal as usize
+        || (ordinal == 0 && index != 0)
+    {
+        return Err(WireError::InvalidFrame);
+    }
+    Ok(index)
+}
+fn next_handler(spec: &ValidationContent, prior: &VerdictRecord, index: usize) -> Option<usize> {
+    let quality_phase = prior.handler.agentic && spec.quality_bar.is_some();
+    let next = index.checked_add(1)?;
+    match prior.value {
+        VerdictValue::Error if !quality_phase => spec
+            .handlers
+            .iter()
+            .enumerate()
+            .skip(next)
+            .find(|(_, handler)| spec.quality_bar.is_none() || !handler.agentic)
+            .map(|(index, _)| index),
+        VerdictValue::Pass if !quality_phase && spec.quality_bar.is_some() => spec
+            .handlers
+            .iter()
+            .enumerate()
+            .skip(next)
+            .find(|(_, handler)| handler.agentic)
+            .map(|(index, _)| index),
+        _ => None,
+    }
+}
+
+pub(crate) fn validate_stream_response(
+    stream: &StreamRequest,
+    reply: &StreamReply,
+    ledger: LedgerId,
+    route: RouteEpoch,
+    limits: &WireLimits,
+) -> Result<(), WireError> {
+    if reply.token.route_epoch != route {
+        return Err(WireError::InvalidFrame);
+    }
+    if reply.token.ledger != ledger
+        || reply.cursor.key.ledger != ledger
+        || reply.cursor.position.ledger != ledger
+        || reply.cursor.position.sequence > reply.token.sequence
+        || reply.cursor.same_stream(reply.acknowledged).is_err()
+        || reply.acknowledged.position > reply.cursor.position
+    {
+        return Err(WireError::InvalidFrame);
+    }
+    let expected = match stream {
+        StreamRequest::Open { consumer, .. } => {
+            if reply.cursor.key.consumer != *consumer {
+                return Err(WireError::InvalidFrame);
+            }
+            None
+        }
+        StreamRequest::Poll { cursor, .. } | StreamRequest::CompleteSeed { cursor, .. } => {
+            Some(*cursor)
+        }
+    };
+    if expected.is_some_and(|cursor| {
+        cursor.same_stream(reply.cursor).is_err() || cursor.position > reply.cursor.position
+    }) {
+        return Err(WireError::InvalidFrame);
+    }
+    let mut count = 0u32;
+    let mut bytes = 0usize;
+    let mut position = expected.map(|c| c.position);
+    for event in &reply.events {
+        let cursor = match event {
+            StreamEvent::Delta { cursor, delta } => {
+                count = count.saturating_add(1);
+                bytes = bytes.saturating_add(encode_payload(event, limits.max_frame_bytes)?.len());
+                if delta.id.ledger != ledger || cursor.position != Position::after_delta(delta.id) {
+                    return Err(WireError::InvalidFrame);
+                }
+                *cursor
+            }
+            StreamEvent::Resolved { cursor } => {
+                if cursor.position.offset != PositionOffset::Resolved {
+                    return Err(WireError::InvalidFrame);
+                }
+                *cursor
+            }
+            StreamEvent::Resync { cursor, .. } => *cursor,
+        };
+        if cursor.same_stream(reply.cursor).is_err()
+            || cursor.position > reply.cursor.position
+            || position.is_some_and(|p| cursor.position < p)
+        {
+            return Err(WireError::InvalidFrame);
+        }
+        position = Some(cursor.position);
+    }
+    let credits = stream.credits();
+    if count > credits.items
+        || bytes > credits.bytes as usize
+        || reply.events.len() > (limits.max_items as usize).saturating_add(1)
+    {
+        return Err(WireError::Limit);
+    }
+    if let Some(seed) = &reply.seed {
+        validate_page(seed, ledger, credits.items, false)?;
     }
     Ok(())
 }

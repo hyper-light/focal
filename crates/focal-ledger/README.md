@@ -7,6 +7,19 @@ admission. Candidates do not copy the whole core. Publication moves prepared
 roots after commitment. A lost reply can be retried with the original
 request key; an uncommitted proposal is never reported as success.
 
+`reconcile_at_least` reads the authenticated principal's scalar epoch window and
+an optional retained domain or cursor mutation receipt after publication of a required
+domain prefix. Its host must first establish a fresh ReadIndex barrier. The
+lookup neither proposes a command nor sees pending rows. Retained outcomes remain
+exact below the admission floor; absent older keys report `BelowFloor`, and all
+other absent keys report `Unknown`. Neither absence proves that a request never
+committed. Cursor responses preserve the original recorded token, filter, expiry,
+mode, metadata revision and Raft index even after the consumer advances. Their
+read DTOs preserve the original receipt's binary encoding; no stream state or log
+schema changes are required. Epoch ownership,
+receipt retirement and journal garbage collection still require their own durable
+protocols; this query does not authorize any of them.
+
 Cursor metadata uses the same Raft group and durable log. `submit_cursor` admits
 an authenticated projection command, and `submit_cursor_control` additionally
 admits trusted retention maintenance and protected service consumers. Both use
@@ -173,3 +186,58 @@ foreign graph ancestry before publishing an earlier prefix, and verify admission
 capacity rollback and pending-row reclamation. A populated-core regression fills
 ordinary admission while an 8 MiB completion reserve commits an epoch update;
 the reference-state charge already exceeds that entire completion reserve.
+
+Managed requests use a separate, scoped namespace without changing legacy epoch
+or receipt encodings. `propose_managed` applies the same authenticated Core reducer;
+`propose_managed_cursor` uses the same consumer registry and owner checks. Their
+shared receipt window is keyed by cluster, ledger, principal, slot, generation,
+ordinal and independent request ID. The registry retains exact domain or cursor
+outcomes. Managed metadata does not advance `SessionSeq`.
+
+`propose_request_stream` registers a vacant generation, acknowledges an exact
+contiguous receipt-hash manifest, seals an ordinal, or closes a completed stream.
+Only controls advance the stream CAS revision. A seal returns an earlier retained
+outcome if it exists; otherwise its committed negative fence prevents later work.
+Controls serialize against effective pending domain/cursor work and use the
+completion allowance. Close requires an acknowledged prefix plus a contiguous
+sealed tail, so it cannot discard an unacknowledged committed result. Closing keeps
+the last generation; registration increments it with checked arithmetic. Consumer
+retention obligations survive receipt acknowledgment.
+
+`RequestStreamLimits` bounds remembered principal/slot pairs, each window and
+retained bytes. Closed pairs keep their generation fence and count toward this
+bound. Preparation copies one bounded slot, not the complete registry. Managed
+domain publication currently admits one staged mutation at a time; batching remains
+a future throughput increment. `request_stream_read` returns a borrowed local view;
+hosts establish ReadIndex first and hold its reported allowance through delivery.
+Retired receipts and closed generations are explicit fences. Future unregistered
+generations remain unknown.
+
+Managed persistence adds `FOCALMD1`, `FOCALMU1`, `FOCALMS1` and `FOCALSS5`. V5 wraps
+the previous checkpoint and retains registry generations, floors, outcomes and
+latest control receipts; old snapshots and entries remain readable. Before
+advertising managed replay support, `begin_managed_support` installs an irreversible
+per-group decoder floor through the existing physical WAL owner. Normal polling
+finishes its fsync; `managed_support` never advertises before that completion.
+Opening or reading a legacy session alone does not install the floor. Recovery
+confirms the actual compiled decoder before Raft may vote or emit replay output.
+Checkpoint rewrites retain the floor, preventing a later older binary from voting
+without the new decoder even before any managed request commits.
+
+Only authenticated per-peer support facts can populate the bounded support cache.
+Initial activation requires every current voter, including both joint sets, to
+match the exact published configuration and decoder fingerprint. Committed
+activation and the durable floors retain that guarantee after leader restart;
+new writes need the current quorum, without waiting for an offline voter's fresh
+capability response. Every subsequent learner addition or promotion requires its
+durable promise. Membership changes invalidate the observation cache.
+A prospective learner may report its actual immutable bootstrap configuration at
+index zero, bound to the same cluster/group; this permits initial catch-up but
+cannot substitute for a current voter's fact or authorize promotion before catch-up.
+No Runtime/Actor payload can declare another node compatible.
+
+An existing learner can receive its first managed history without having answered
+a support probe. Session fences that entry or V5 snapshot before Raft persistence,
+installs its local floor, and returns `PersistencePending` until fsync completes.
+The transport reports rejected snapshots through `report_snapshot` so Raft retries
+after the floor becomes ready. No managed output is exposed before this fence.

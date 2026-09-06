@@ -11,6 +11,7 @@ pub(crate) struct ReadViews {
     views: BTreeMap<(ParticipantId, SessionSeq), GraphSnapshot>,
     started: Instant,
     route_epoch: RouteEpoch,
+    list_key: Option<zeroize::Zeroizing<[u8; 32]>>,
 }
 impl ReadViews {
     pub fn new() -> Self {
@@ -21,6 +22,7 @@ impl ReadViews {
             views: BTreeMap::new(),
             started: Instant::now(),
             route_epoch,
+            list_key: None,
         }
     }
     pub fn advance(&mut self, session: &mut Session) -> Result<u64, AccessError> {
@@ -140,6 +142,16 @@ impl ReadViews {
                 }
             }
             ReadQuery::Traverse { .. } => return Err(AccessError::UnsupportedOperation),
+            ReadQuery::ValidationResults { id, after } => {
+                if after.is_some() && !matches!(read.consistency, ReadConsistency::Exact(_)) {
+                    return Err(AccessError::InvalidRequest);
+                }
+                if let Some(result) =
+                    validation_results::read(view, *id, *after, read.max_items, now, limits)?
+                {
+                    objects.push(result);
+                }
+            }
         }
         Ok(ReadPage {
             token: ReadToken {
@@ -152,6 +164,12 @@ impl ReadViews {
         })
     }
 }
+
+#[path = "lists.rs"]
+mod lists;
+#[path = "validation_reads.rs"]
+mod validation_results;
+pub(crate) use lists::ListReadContext;
 fn convert(kind: ObjectKind, id: ObjectId, value: &GraphObject) -> Result<ReadObject, AccessError> {
     Ok(match (kind, value) {
         (ObjectKind::Claim, GraphObject::Claim(value)) => ReadObject::Claim {

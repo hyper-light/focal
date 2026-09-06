@@ -69,6 +69,7 @@ fn class(work: &Work) -> WorkClass {
     match work {
         Work::Stop(_)
         | Work::Transfer(..)
+        | Work::ManagedSupport(..)
         | Work::Membership(..)
         | Work::Placement(..)
         | Work::Evidence(..) => WorkClass::Control,
@@ -76,7 +77,11 @@ fn class(work: &Work) -> WorkClass {
         Work::Probe(..) => WorkClass::Query,
         Work::Request(request, ..) => match request.verified.request().operation {
             Operation::Raft { .. } => WorkClass::Apply,
-            Operation::Read(_) | Operation::Stream(_) => WorkClass::Query,
+            Operation::Read(_)
+            | Operation::Stream(_)
+            | Operation::Reconcile(_)
+            | Operation::RequestStreamRead { .. }
+            | Operation::ManagedSupport { .. } => WorkClass::Query,
             _ if completion_request(&request.verified) => WorkClass::Completion,
             _ => WorkClass::Append,
         },
@@ -328,6 +333,7 @@ impl GroupOwner {
         let cost = match &routed.work {
             Work::Request(_, _, charge)
             | Work::Probe(_, _, charge)
+            | Work::ManagedSupport(_, charge)
             | Work::Membership(_, charge)
             | Work::Placement(_, charge)
             | Work::Evidence(_, charge) => charge.bytes().clamp(1, 65536) as u64,

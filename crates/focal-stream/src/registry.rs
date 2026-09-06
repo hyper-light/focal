@@ -206,6 +206,28 @@ impl CursorRegistry {
         command: &CursorCommand,
         published: SessionSeq,
     ) -> Result<PreparedCursorUpdate, StreamError> {
+        let lane = if matches!(command.operation, CursorOperation::Register { .. }) {
+            BudgetLane::Ordinary
+        } else {
+            BudgetLane::Completion
+        };
+        self.prepare_in(command, published, lane)
+    }
+    /// Rebuild an already committed command under the completion allowance.
+    /// Validation is identical; this cannot be used as pre-proposal admission.
+    pub fn prepare_committed(
+        &self,
+        command: &CursorCommand,
+        published: SessionSeq,
+    ) -> Result<PreparedCursorUpdate, StreamError> {
+        self.prepare_in(command, published, BudgetLane::Completion)
+    }
+    fn prepare_in(
+        &self,
+        command: &CursorCommand,
+        published: SessionSeq,
+        lane: BudgetLane,
+    ) -> Result<PreparedCursorUpdate, StreamError> {
         let old = &self.root.checkpoint;
         if command.expected_revision != old.revision {
             return Err(StreamError::StalePreparation);
@@ -232,11 +254,6 @@ impl CursorRegistry {
                 add(row_charge(), filter.charge()?)?
             }
             _ => 0,
-        };
-        let lane = if matches!(command.operation, CursorOperation::Register { .. }) {
-            BudgetLane::Ordinary
-        } else {
-            BudgetLane::Completion
         };
         let allocation = self
             .budget
@@ -277,7 +294,7 @@ impl CursorRegistry {
         command: &CursorCommand,
         published: SessionSeq,
     ) -> Result<(), StreamError> {
-        let prepared = self.prepare(command, published)?;
+        let prepared = self.prepare_committed(command, published)?;
         self.publish(prepared)
     }
 }

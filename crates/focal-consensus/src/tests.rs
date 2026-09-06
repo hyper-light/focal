@@ -156,6 +156,51 @@ fn checkpoint_restart_keeps_snapshot_and_tail() {
     assert_eq!(events.committed.len(), 1);
     assert_eq!(events.committed[0].data, b"second");
 }
+
+#[test]
+fn delayed_snapshot_feedback_cannot_release_another_term_peer_or_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config(1);
+    cfg.learners = vec![2];
+    let mut node = DurableNode::open(cfg, dir.path()).unwrap();
+    node.campaign().unwrap();
+    let index = node.drain().unwrap().applied_index;
+    node.checkpoint(index, b"snapshot-prefix".to_vec()).unwrap();
+    let term = node.status().term;
+    node.step(Message {
+        from: 2,
+        to: 1,
+        term,
+        msg_type: MessageType::MsgHeartbeatResponse as i32,
+        ..Message::default()
+    })
+    .unwrap();
+    let events = node.drain().unwrap();
+    let snapshot = events
+        .messages
+        .iter()
+        .find(|m| m.get_msg_type() == MessageType::MsgSnapshot)
+        .unwrap();
+    assert_eq!(snapshot.get_snapshot().get_metadata().index, index);
+    assert_eq!(node.raw.raft.prs().get(2).unwrap().pending_snapshot, index);
+    for (peer, expected_term, expected_index) in [
+        (3, term, index),
+        (2, term + 1, index),
+        (2, term, index + 1),
+        (2, term, 0),
+    ] {
+        node.report_snapshot_at(peer, expected_term, expected_index, SnapshotStatus::Failure)
+            .unwrap();
+        assert_eq!(node.raw.raft.prs().get(2).unwrap().pending_snapshot, index);
+    }
+    node.report_snapshot_at(2, term, index, SnapshotStatus::Failure)
+        .unwrap();
+    assert_eq!(node.raw.raft.prs().get(2).unwrap().pending_snapshot, 0);
+    assert_eq!(
+        node.raw.raft.prs().get(2).unwrap().state,
+        raft::ProgressState::Probe
+    );
+}
 struct Cluster {
     dirs: Vec<tempfile::TempDir>,
     nodes: Vec<DurableNode>,
@@ -736,7 +781,8 @@ fn protobuf_preflight_accounts_repeated_structs_without_bulk_payload_multiplier(
         ..Default::default()
     };
     let encoded = message.write_to_bytes().unwrap();
-    let scratch = memory::message_scratch(&encoded).unwrap();
+    let scratch = decode_message_charge(&encoded).unwrap();
+    assert_eq!(scratch, memory::message_scratch(&encoded).unwrap());
     assert!(scratch > encoded.len() * 32);
     assert!(scratch >= memory::message_bytes(&message).unwrap());
     let mut snapshot = Snapshot {
@@ -755,5 +801,9 @@ fn protobuf_preflight_accounts_repeated_structs_without_bulk_payload_multiplier(
         memory::replay_scratch(&oversized),
         Err(ConsensusError::Capacity)
     ));
-    assert!(memory::message_scratch(&[0x3a, 0xff, 0xff, 0xff]).is_err());
+    assert!(decode_message_charge(&[0x3a, 0xff, 0xff, 0xff]).is_err());
+    assert!(matches!(
+        decode_message_charge(&vec![0; 9 * 1024 * 1024 + 1]),
+        Err(ConsensusError::Capacity)
+    ));
 }

@@ -21,6 +21,7 @@ mod membership;
 mod memory;
 pub use membership::*;
 mod checkpoint;
+mod decoder;
 mod persistence;
 mod storage;
 
@@ -136,6 +137,10 @@ pub enum ConsensusError {
     Failed,
     #[error("durability is outstanding; poll try_drain before mutating this group")]
     PersistencePending,
+    #[error("the application has not confirmed this group's required decoder")]
+    DecoderUnconfirmed,
+    #[error("the application decoder differs from the immutable group decoder floor")]
+    DecoderMismatch,
     #[error("Raft dependency failed internally; node stopped until recovery")]
     DependencyFailure,
     #[error("checkpoint is not at the delivered committed prefix")]
@@ -210,6 +215,9 @@ pub struct DurableNode {
     recovered_allocation: Option<Allocation>,
     persistence: Option<persistence::PendingDrain>,
     checkpoint: Option<Box<checkpoint::PendingCheckpoint>>,
+    required_decoder: Option<[u8; 32]>,
+    confirmed_decoder: Option<[u8; 32]>,
+    decoder_write: Option<decoder::PendingDecoderFloor>,
     // Drop after any pending Ready/output payloads, including owner cancellation.
     active_allocation: Option<Allocation>,
 }
@@ -284,6 +292,7 @@ impl DurableNode {
         let mut wal = shared.lease(LogicalLogId(config.group_id))?;
         let mut storage = RamLog::new(&config, budget.clone())?;
         let mut persisted_config = None;
+        let mut required_decoder = None;
         let mut replay_error = None;
         wal.replay(|record| {
             if replay_error.is_none() {
@@ -300,7 +309,12 @@ impl DurableNode {
                             BudgetLane::Completion,
                             bytes,
                         )?;
-                        replay_record(&mut storage, &mut persisted_config, record)
+                        replay_record(
+                            &mut storage,
+                            &mut persisted_config,
+                            &mut required_decoder,
+                            record,
+                        )
                     })();
                     if let Err(error) = replay {
                         replay_error = Some(error);
@@ -324,7 +338,10 @@ impl DurableNode {
                 ));
             }
         } else {
-            if storage.last_index()? > 0 || storage.hard_state != HardState::default() {
+            if storage.last_index()? > 0
+                || storage.hard_state != HardState::default()
+                || required_decoder.is_some()
+            {
                 return Err(ConsensusError::Corruption("missing group identity"));
             }
             wal.append_in(&[identity_record(&config)?], BudgetLane::Completion)?;
@@ -392,11 +409,16 @@ impl DurableNode {
             recovered_allocation,
             persistence: None,
             checkpoint: None,
+            required_decoder,
+            confirmed_decoder: None,
+            decoder_write: None,
         };
         // Rebuild committed membership before elections or network messages can
         // run. Application replay is retained for the caller's first drain.
-        let events = node.drain()?;
-        node.recovered_events = Some(events);
+        if node.required_decoder.is_none() {
+            let events = node.drain()?;
+            node.recovered_events = Some(events);
+        }
         Ok(node)
     }
 
@@ -474,6 +496,29 @@ impl DurableNode {
         status: SnapshotStatus,
     ) -> Result<(), ConsensusError> {
         self.guarded(|replica| replica.report_snapshot_inner(node, status))
+    }
+    /// Apply delayed transport feedback only to the snapshot still pending for
+    /// this peer in this leadership term. Acceptance never proves installation.
+    pub fn report_snapshot_at(
+        &mut self,
+        node: u64,
+        term: u64,
+        index: u64,
+        status: SnapshotStatus,
+    ) -> Result<(), ConsensusError> {
+        self.check()?;
+        if index == 0
+            || self.raw.raft.term != term
+            || self
+                .raw
+                .raft
+                .prs()
+                .get(node)
+                .is_none_or(|progress| progress.pending_snapshot != index)
+        {
+            return Ok(());
+        }
+        self.report_snapshot(node, status)
     }
     /// Install the application's complete state at its delivered prefix, retaining
     /// the Raft suffix until the new WAL generation and fence are durable.
@@ -598,13 +643,11 @@ impl DurableNode {
         peer_node_id: u64,
         encoded: &[u8],
     ) -> Result<(), ConsensusError> {
+        self.check()?;
         if self.persistence_pending() {
             return Err(ConsensusError::PersistencePending);
         }
-        if encoded.len() > 9 * 1024 * 1024 {
-            return Err(ConsensusError::Capacity);
-        }
-        let scratch = memory::message_scratch(encoded)?;
+        let scratch = decode_message_charge(encoded)?;
         let _decode = memory::reserve(
             &self.budget,
             BudgetKind::Pending,
@@ -728,6 +771,7 @@ impl DurableNode {
     /// entry in its current term. Ingress uses this to defer readiness probes.
     pub fn has_committed_current_term(&self) -> bool {
         !self.failed
+            && self.decoder_confirmed()
             && !self.persistence_pending()
             && self
                 .raw
@@ -858,6 +902,14 @@ impl DurableNode {
     }
 
     fn check(&self) -> Result<(), ConsensusError> {
+        self.check_state()?;
+        if !self.decoder_confirmed() {
+            Err(ConsensusError::DecoderUnconfirmed)
+        } else {
+            Ok(())
+        }
+    }
+    fn check_state(&self) -> Result<(), ConsensusError> {
         if self.failed {
             Err(ConsensusError::Failed)
         } else if self.raw.raft.term == u64::MAX || self.raw.store().last_index()? == u64::MAX {
@@ -914,6 +966,7 @@ fn snapshot_event(snapshot: &Snapshot) -> AppliedSnapshot {
 fn replay_record(
     storage: &mut RamLog,
     config: &mut Option<NodeConfig>,
+    required_decoder: &mut Option<[u8; 32]>,
     record: Record,
 ) -> Result<(), ConsensusError> {
     match record.kind {
@@ -922,6 +975,14 @@ fn replay_record(
                 return Err(ConsensusError::Corruption("duplicate group identity"));
             }
             *config = Some(postcard::from_bytes(&record.payload)?);
+        }
+        RecordKind::DecoderFloor => {
+            if config.is_none() || required_decoder.is_some() {
+                return Err(ConsensusError::Corruption(
+                    "duplicate or unbound decoder floor",
+                ));
+            }
+            *required_decoder = Some(decoder::decode_floor(&record)?);
         }
         RecordKind::Entry => {
             let entry = decode_proto::<Entry>(&record.payload)?;
@@ -1005,6 +1066,18 @@ fn validate_conf_state(conf: &ConfState) -> Result<(), ConsensusError> {
         ));
     }
     Ok(())
+}
+
+/// Compute bounded decoding workspace without allocating a protobuf message.
+/// The caller must reserve and retain this allowance before `decode_message`,
+/// then authenticate its decoded sender before any application or Raft mutation.
+/// This shares the exact structural preflight used by `step_authenticated`;
+/// repeated entries and snapshot membership count independently of bulk bytes.
+pub fn decode_message_charge(bytes: &[u8]) -> Result<usize, ConsensusError> {
+    if bytes.len() > 9 * 1024 * 1024 {
+        return Err(ConsensusError::Capacity);
+    }
+    memory::message_scratch(bytes)
 }
 
 /// Maximum admitted serialized peer message. QUIC ingress separately enforces

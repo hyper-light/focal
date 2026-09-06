@@ -24,8 +24,10 @@ struct Running {
     task: tokio::task::JoinHandle<Result<(), ServiceError>>,
 }
 impl Running {
-    async fn start(settings: &Settings) -> Self {
-        let service = NetworkService::open(settings).await.unwrap();
+    async fn start(settings: &TestSettings) -> Self {
+        Self::from_service(settings.open().await.unwrap()).await
+    }
+    async fn from_service(service: NetworkService) -> Self {
         let handles = service.handles();
         let (stop, receive) = oneshot::channel();
         let (ready, status) = oneshot::channel();
@@ -73,15 +75,112 @@ impl Drop for Running {
         }
     }
 }
-fn settings(root: &Path) -> Settings {
+struct TestSettings {
+    value: Settings,
+    // Keep the physical reservation throughout startup, client creation, and
+    // restart. Quinn receives a duplicate handle to this same bound socket,
+    // never an address obtained by closing a temporary socket.
+    socket: std::net::UdpSocket,
+}
+impl std::ops::Deref for TestSettings {
+    type Target = Settings;
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+impl TestSettings {
+    async fn open(&self) -> Result<NetworkService, ServiceError> {
+        NetworkService::open_with_socket(&self.value, Some(self.socket.try_clone().unwrap())).await
+    }
+}
+fn settings(root: &Path) -> TestSettings {
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let address = socket.local_addr().unwrap();
-    drop(socket);
     let mut settings = Settings::default();
     settings.node.data_dir = Some(root.to_path_buf());
     settings.node.listen = Some(address);
     settings.node.advertise = Some(address.to_string());
-    settings
+    TestSettings {
+        value: settings,
+        socket,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reserved_listener_survives_client_creation_and_releases_after_shutdown() {
+    let directory = tempfile::tempdir().unwrap();
+    let settings = settings(directory.path());
+    let address = settings.socket.local_addr().unwrap();
+    // This was the failing fixture order: choose a server port, then create an
+    // ephemeral enrollment client before opening the service. The reservation
+    // must stay live throughout both client creation and async node recovery.
+    let client = focal_enrollment::EnrollmentClient::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        focal_enrollment::TransportLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        std::net::UdpSocket::bind(address).unwrap_err().kind(),
+        std::io::ErrorKind::AddrInUse
+    );
+    let service = settings.open().await.unwrap();
+    assert_eq!(service.status().listen, address);
+    // No test reservation may mask a retained driver socket in this assertion.
+    drop(settings);
+    let running = Running::from_service(service).await;
+    running.stop().await;
+    let rebound = std::net::UdpSocket::bind(address);
+    assert!(
+        rebound.is_ok(),
+        "completed service retained UDP listener {address}: {rebound:?}"
+    );
+    drop(client);
+}
+
+#[tokio::test]
+async fn reserved_listener_must_match_the_persisted_listen_address() {
+    let directory = tempfile::tempdir().unwrap();
+    let settings = settings(directory.path());
+    let wrong = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    assert_ne!(
+        wrong.local_addr().unwrap(),
+        settings.socket.local_addr().unwrap()
+    );
+    assert!(matches!(
+        NetworkService::open_with_socket(&settings, Some(wrong)).await,
+        Err(ServiceError::Owner(
+            "listener socket address differs from node state"
+        ))
+    ));
+    assert!(!directory.path().join("focal.sock").exists());
+    assert!(!directory.path().join(ADMIN_SOCKET).exists());
+    drop(NodeDirectory::open(&settings).unwrap());
+}
+
+#[tokio::test]
+async fn interrupted_listener_shutdown_preserves_the_release_fence() {
+    let directory = tempfile::tempdir().unwrap();
+    let fixture = settings(directory.path());
+    let settings = fixture.value.clone();
+    let address = fixture.socket.local_addr().unwrap();
+    let mut service = fixture.open().await.unwrap();
+    drop(fixture);
+    {
+        let shutdown = service.listener.shutdown();
+        let mut shutdown = std::pin::pin!(shutdown);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        // On this current-thread runtime, Quinn cannot release its driver until
+        // we yield. Interrupting the first wait must not discard its completion
+        // receiver and make the next shutdown report a false success.
+        assert!(shutdown.as_mut().poll(&mut context).is_pending());
+    }
+    tokio::time::timeout(Duration::from_secs(5), service.listener.shutdown())
+        .await
+        .unwrap();
+    service.listener.shutdown().await;
+    drop(std::net::UdpSocket::bind(address).unwrap());
+    drop(service);
+    wait_unlocked(&settings).await;
 }
 fn wire_request(ledger: LedgerId, id: u128, operation: Operation) -> RequestEnvelope {
     RequestEnvelope {
@@ -117,7 +216,7 @@ fn missing_runtime_drivers_fail_before_ingress_and_release_started_owners() {
         .build()
         .unwrap();
     assert!(matches!(
-        no_time.block_on(NetworkService::open(&settings)),
+        no_time.block_on(settings.open()),
         Err(ServiceError::Runtime)
     ));
     assert!(!directory.path().join("IDENTITY").exists());
@@ -126,7 +225,7 @@ fn missing_runtime_drivers_fail_before_ingress_and_release_started_owners() {
         .build()
         .unwrap();
     assert!(matches!(
-        no_io.block_on(NetworkService::open(&settings)),
+        no_io.block_on(settings.open()),
         Err(ServiceError::Wire(WireError::Connection))
     ));
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -134,13 +233,13 @@ fn missing_runtime_drivers_fail_before_ingress_and_release_started_owners() {
         .build()
         .unwrap();
     runtime.block_on(wait_unlocked(&settings));
-    let service = runtime.block_on(NetworkService::open(&settings)).unwrap();
+    let service = runtime.block_on(settings.open()).unwrap();
     assert!(matches!(
         no_time.block_on(service.run_until(std::future::pending(), |_| Ok(()))),
         Err(ServiceError::Runtime)
     ));
     runtime.block_on(wait_unlocked(&settings));
-    let service = runtime.block_on(NetworkService::open(&settings)).unwrap();
+    let service = runtime.block_on(settings.open()).unwrap();
     {
         let future = service.run_until(std::future::pending(), |_| Ok(()));
         let mut future = std::pin::pin!(future);
@@ -151,7 +250,7 @@ fn missing_runtime_drivers_fail_before_ingress_and_release_started_owners() {
         ));
     }
     runtime.block_on(wait_unlocked(&settings));
-    let service = runtime.block_on(NetworkService::open(&settings)).unwrap();
+    let service = runtime.block_on(settings.open()).unwrap();
     let (stop, receive) = oneshot::channel();
     {
         let running = service.run_until(
@@ -181,7 +280,7 @@ fn missing_runtime_drivers_fail_before_ingress_and_release_started_owners() {
 async fn callback_unwind_still_stops_and_joins_all_physical_owners() {
     let directory = tempfile::tempdir().unwrap();
     let settings = settings(directory.path());
-    let service = NetworkService::open(&settings).await.unwrap();
+    let service = settings.open().await.unwrap();
     let result = tokio::time::timeout(
         Duration::from_secs(10),
         service.run_until(std::future::pending(), |_| {
@@ -258,13 +357,18 @@ async fn service_recovers_revocation_before_binding_any_ingress() {
     assert!(founding.control.receipt(id).unwrap().is_some());
     drop(founding);
     assert!(matches!(
-        NetworkService::open(&settings).await,
+        settings.open().await,
         Err(ServiceError::Bootstrap(NetworkError::Enrollment(
             focal_enrollment::EnrollmentError::Revoked
         )))
     ));
     assert!(!directory.path().join("focal.sock").exists());
     assert!(!directory.path().join(ADMIN_SOCKET).exists());
+    let TestSettings {
+        value: settings,
+        socket,
+    } = settings;
+    drop(socket);
     drop(std::net::UdpSocket::bind(settings.node.listen.unwrap()).unwrap());
     drop(NodeDirectory::open(&settings).unwrap());
 }
@@ -569,4 +673,13 @@ async fn joined_service_receives_committed_root_learner_and_restarts_without_led
     assert!(!peer_dir.path().join("POLICY").exists());
     peer.stop().await;
     founder.stop().await;
+    // Both endpoints handled live QUIC connections. Successful shutdown must
+    // release their sockets, not merely their public Endpoint handles. Remove
+    // our reservations before checking so a lingering driver cannot be hidden.
+    let founder_address = founder_settings.node.listen.unwrap();
+    let peer_address = peer_settings.node.listen.unwrap();
+    drop(founder_settings);
+    drop(peer_settings);
+    drop(std::net::UdpSocket::bind(founder_address).unwrap());
+    drop(std::net::UdpSocket::bind(peer_address).unwrap());
 }

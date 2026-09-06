@@ -16,6 +16,31 @@ the uncommitted suffix. A pending duplicate is **not a durable acknowledgment**:
 composition layer waits for the original proposal's commitment/publication. The
 older cloned pending-state oracle is compiled only for unit tests.
 
+`Core::reconcile` observes one authenticated principal's committed epoch window
+and, optionally, one exact domain request receipt. It does not read pending
+versions or clone the epoch set. A retained receipt wins even below the floor;
+an absent receipt below the floor means new admission is fenced, without claiming
+that the request never committed. All other absence remains `Unknown`.
+The returned borrowed view exposes a checked output allowance before its fallible
+owned copy. Hosts obtain a fresh quorum barrier and retain that allowance through
+response delivery; this local accessor cannot establish quorum authority.
+
+`stage_managed_pending_bounded` takes a real `ManagedAuthenticatedInput`, whose
+cluster/ledger/principal/slot/generation/ordinal identity is separate from legacy
+request epochs. A borrowed reducer adapter shares all actor, authority, revision
+and domain checks without manufacturing a legacy key. Managed execution rejects
+legacy epoch controls and writes no legacy epoch or receipt rows. Its owned row
+version participates in the same effective pending view. Staging, independent
+replay/audit and publication bind the exact prefix, state/limits digest, input and
+complete deterministic output. The result is not a receipt until the enclosing
+ledger assigns its actual committed Raft index.
+
+The session's committed stream registry must enforce stream registration,
+generation, ordinal window, exact duplicate outcomes and retirement for both
+domain and cursor requests. Core alone cannot prove those admission conditions.
+Its managed publication API currently handles one command at a time; integrating
+managed commands into bounded multi-command epochs remains a separate execution
+step. Legacy key/input/receipt and Core checkpoint encodings are unchanged.
 
 `stage_pending_bounded` uses a recorder with an explicit byte ceiling and no access
 trace allocations. It accounts input copies, changed rows, graph scratch and

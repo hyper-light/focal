@@ -15,12 +15,14 @@ mod projection;
 mod read;
 #[cfg(test)]
 mod tests;
+mod validation_results;
 use focal_core::{CoreView, RowPatch, State};
 use focal_memory::*;
 use focal_model::*;
 pub use projection::reference_charge;
 pub use read::*;
 use serde::{Deserialize, Serialize};
+pub use validation_results::ValidationResultCandidate;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GraphError {
@@ -58,6 +60,9 @@ pub enum GraphKey {
     Deadline(u64, ClaimId, TimerId, u64),
     Required(ClaimId, ValidationPhase, ValidationId),
     End,
+    /// Appended rows; the previous End sentinel still terminates old indexes.
+    ValidationResult(ValidationId, ValidationResultPosition),
+    ValidationResultsEnd,
 }
 impl GraphKey {
     pub fn object(reference: ObjectRef) -> Self {
@@ -83,6 +88,7 @@ pub enum GraphValue {
     Object(Box<GraphObject>),
     Reference(ObjectRef),
     Edge(GraphEdge),
+    ValidationResult(Box<ValidationResult>),
 }
 
 #[derive(Debug, Clone, Copy)]

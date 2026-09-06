@@ -15,8 +15,10 @@
 mod access;
 mod epoch;
 mod graph;
+mod managed;
 mod overlay;
 mod pending;
+mod reconciliation;
 mod reduce;
 #[cfg(test)]
 mod tests;
@@ -25,7 +27,11 @@ pub use access::{AccessFootprint, AccessKey, StateTable, TrackedResult};
 pub use epoch::{EpochError, EpochLimits, EpochOutput, EpochPlan, EpochReport};
 use focal_model::*;
 pub use graph::least_fixpoint;
+pub use managed::{ManagedApplyResult, PreparedManagedMutation, StagedManagedMutation};
 pub use pending::{CoreView, PendingState, RowPatch, StagedMutation, StagingError};
+pub use reconciliation::{
+    ReceiptResolutionView, ReconcileResultView, ReconciliationError, ReconciliationView,
+};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::collections::VecDeque;

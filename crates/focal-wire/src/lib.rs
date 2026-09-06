@@ -16,16 +16,22 @@
 mod auth;
 mod frame;
 mod handler;
+mod list;
+mod managed;
 mod message;
 mod peers;
+mod reconcile;
 mod transport;
 #[cfg(unix)]
 mod unix;
 pub use auth::*;
 pub use frame::*;
 pub use handler::*;
+pub use list::*;
+pub use managed::*;
 pub use message::*;
 pub use peers::*;
+pub use reconcile::*;
 pub use transport::*;
 #[cfg(unix)]
 pub use unix::*;

@@ -287,6 +287,8 @@ async fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() 
         )
         .unwrap(),
     );
+    let listener_residency = network_budget.stats().used;
+    assert!(listener_residency > 0);
     let outside = listener.clone();
     let outside_data = host.clone();
     std::thread::spawn(move || {
@@ -546,9 +548,10 @@ async fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() 
             .is_err()
     );
     // Closed transient handshakes/enrollment exchanges release their owned
-    // reservations; only this established data connection remains resident.
+    // reservations; only the listener runtime and this established data
+    // connection remain resident.
     tokio::time::timeout(Duration::from_secs(2), async {
-        while network_budget.stats().used != 64 * 1024 {
+        while network_budget.stats().used != listener_residency + 64 * 1024 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
@@ -575,7 +578,10 @@ async fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() 
     remote.close();
     listener.close();
     service.await.unwrap().unwrap();
-    assert_eq!(network_budget.stats().used, 0);
+    // close() ends ingress; the still-owned Endpoint retains its runtime charge.
+    // NetworkService additionally waits for final socket/runtime release.
+    assert_eq!(network_budget.stats().used, listener_residency);
+    drop(listener);
     enrollment.stop().await.unwrap();
     signing.await.unwrap().unwrap();
     host.stop().await.unwrap();

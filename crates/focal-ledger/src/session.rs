@@ -1,3 +1,6 @@
+use crate::request_streams::{
+    ManagedError, PreparedStream, RequestStreamLimits, RequestStreams, RequestStreamsCheckpoint,
+};
 use focal_consensus::{ConsensusError, DurableNode, Message, NodeConfig, NodeStatus, StateRole};
 use focal_core::{
     ApplyResult, Core, CoreError, CoreView, EpochError, EpochLimits, EpochOutput, EpochReport,
@@ -40,6 +43,7 @@ pub struct SessionLimits {
     pub cursors: RegistryConfig,
     /// Dedicated exact cursor outcomes; domain receipts cannot consume these slots.
     pub cursor_receipts: usize,
+    pub request_streams: RequestStreamLimits,
 }
 
 impl Default for SessionLimits {
@@ -62,12 +66,17 @@ impl Default for SessionLimits {
             graph: GraphConfig::default(),
             cursors: RegistryConfig::default(),
             cursor_receipts: 8192,
+            request_streams: RequestStreamLimits::default(),
         }
     }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum LedgerError {
+    #[error("managed request: {0}")]
+    Managed(#[from] ManagedError),
+    #[error("reconciliation: {0}")]
+    Reconciliation(#[from] focal_core::ReconciliationError),
     #[error("epoch: {0}")]
     Epoch(#[from] EpochError),
     #[error("stream: {0}")]
@@ -116,6 +125,8 @@ pub struct SessionEvents {
     pub messages: Vec<Message>,
     pub committed: Vec<ApplyResult>,
     pub cursor_committed: Vec<CursorReceipt>,
+    pub managed_committed: Vec<ManagedCommitted>,
+    pub request_stream_committed: Vec<RequestStreamControlReceipt>,
     pub read_barriers: Vec<(Vec<u8>, SessionSeq)>,
     _charges: Vec<Allocation>,
 }
@@ -172,6 +183,9 @@ pub struct Session {
     cursor_meta: CursorMetadata,
     cursor_charge: Allocation,
     pending_cursor: Option<CursorCandidate>,
+    request_streams: RequestStreams,
+    managed_support: ManagedSupportCache,
+    pending_managed: Option<Box<PendingManaged>>,
     pending_maintenance: Option<MaintenanceCandidate>,
     membership_state: MembershipState,
     membership_charge: Option<Allocation>,
@@ -235,7 +249,7 @@ impl Session {
     }
     fn from_node_budget(
         ledger: LedgerId,
-        consensus: DurableNode,
+        mut consensus: DurableNode,
         limits: SessionLimits,
         budget: MemoryBudget,
     ) -> Result<Self, LedgerError> {
@@ -251,6 +265,9 @@ impl Session {
         {
             return Err(LedgerError::Capacity);
         }
+        // A recovered decoder floor blocks every Raft action until the actual
+        // application owner confirms its compiled persistent-format descriptor.
+        consensus.confirm_decoder(managed_format_hash())?;
         let core = Core::new(ledger, limits.core.clone());
         let core_charge = budget
             .reserve(
@@ -297,6 +314,9 @@ impl Session {
                 reference_charge(&cursor_meta)?,
             )?
             .commit();
+        let consensus_cluster = consensus.cluster_id();
+        let request_streams =
+            RequestStreams::new(consensus_cluster, ledger, limits.request_streams)?;
         let mut session = Self {
             ledger,
             core,
@@ -319,6 +339,9 @@ impl Session {
             cursors,
             cursor_meta,
             cursor_charge,
+            request_streams,
+            managed_support: ManagedSupportCache::default(),
+            pending_managed: None,
             pending_cursor: None,
             pending_maintenance: None,
             membership_state: MembershipState::default(),
@@ -365,7 +388,31 @@ impl Session {
     }
     pub fn step(&mut self, message: Message) -> Result<(), LedgerError> {
         self.check()?;
+        self.fence_managed_message(&message)?;
         self.consensus.step(message)?;
+        Ok(())
+    }
+    /// Trusted transport feedback for this exact physical group incarnation.
+    /// Ingress acceptance is not snapshot application or a quorum acknowledgment.
+    pub fn report_snapshot(
+        &mut self,
+        node: u64,
+        status: focal_consensus::SnapshotStatus,
+    ) -> Result<(), LedgerError> {
+        self.check()?;
+        self.consensus.report_snapshot(node, status)?;
+        Ok(())
+    }
+    pub fn report_snapshot_at(
+        &mut self,
+        node: u64,
+        term: u64,
+        index: u64,
+        status: focal_consensus::SnapshotStatus,
+    ) -> Result<(), LedgerError> {
+        self.check()?;
+        self.consensus
+            .report_snapshot_at(node, term, index, status)?;
         Ok(())
     }
     pub fn step_authenticated(
@@ -374,8 +421,28 @@ impl Session {
         encoded: &[u8],
     ) -> Result<(), LedgerError> {
         self.check()?;
-        self.consensus.step_authenticated(peer_node_id, encoded)?;
-        Ok(())
+        if self.consensus.decoder_floor_ready(managed_format_hash()) {
+            self.consensus.step_authenticated(peer_node_id, encoded)?;
+            return Ok(());
+        }
+        if self.consensus.persistence_pending() {
+            return Err(ConsensusError::PersistencePending.into());
+        }
+        // Inspect first managed history before passing it into Raft. The same
+        // structural preflight as normal ingress reserves all decoded storage;
+        // authentication precedes any durable decoder-floor mutation.
+        let bytes = focal_consensus::decode_message_charge(encoded)?;
+        let _decode = self
+            .budget
+            .reserve(BudgetKind::Pending, BudgetLane::Completion, bytes)?;
+        let message = focal_consensus::decode_message(encoded)?;
+        if peer_node_id == 0 || message.from != peer_node_id {
+            return Err(ConsensusError::MalformedMessage(
+                "Raft sender does not match authenticated peer",
+            )
+            .into());
+        }
+        self.step(message)
     }
     pub fn status(&self) -> NodeStatus {
         self.consensus.status()
@@ -396,6 +463,7 @@ impl Session {
         self.pending
             .len()
             .saturating_add(usize::from(self.pending_cursor.is_some()))
+            .saturating_add(usize::from(self.pending_managed.is_some()))
             .saturating_add(usize::from(self.pending_maintenance.is_some()))
             .saturating_add(usize::from(self.pending_membership.is_some()))
             .saturating_add(usize::from(self.pending_placement.is_some()))
@@ -414,6 +482,25 @@ impl Session {
 
     pub fn receipt(&self, key: &RequestKey) -> Option<&MutationReceipt> {
         self.core.snapshot().receipts.get(key)
+    }
+
+    /// The authenticated host supplies the principal and a fresh ReadIndex's
+    /// minimum domain prefix. This only enforces local publication of that
+    /// prefix; it never creates a quorum proof or observes speculative rows.
+    pub fn reconcile_at_least(
+        &self,
+        ledger: LedgerId,
+        principal: ParticipantId,
+        query: &ReconcileQuery,
+        minimum_sequence: SessionSeq,
+    ) -> Result<crate::ReconciliationView<'_>, LedgerError> {
+        self.read_at_least(minimum_sequence)?;
+        let domain = self.core.reconcile(ledger, principal, query)?;
+        let cursor = match domain.result {
+            focal_core::ReconcileResultView::Receipt { key, .. } => self.cursor_receipt(&key),
+            focal_core::ReconcileResultView::Epoch(_) => None,
+        };
+        Ok(crate::ReconciliationView::new(domain, cursor))
     }
 
     fn effective(&self) -> Result<CoreView<'_>, LedgerError> {
@@ -503,7 +590,8 @@ impl Session {
             )));
         }
         if self.effective()?.receipt(&key).is_none()
-            && (self.pending_cursor.is_some()
+            && (self.pending_managed.is_some()
+                || self.pending_cursor.is_some()
                 || self.pending_maintenance.is_some()
                 || self.pending_placement.is_some()
                 || self.placement_state.paused())
@@ -629,7 +717,7 @@ impl Session {
         Ok(())
     }
     fn release_empty_slots(&mut self) -> Result<(), LedgerError> {
-        if self.pending.is_empty() {
+        if self.pending.is_empty() && self.pending_managed.is_none() {
             self.pending = VecDeque::new();
             self.pending_rows.release_empty();
             self.apply_workspace = None;
@@ -713,6 +801,7 @@ impl Session {
             self.failed = true;
             self.clear_pending();
             self.pending_cursor = None;
+            self.pending_managed = None;
             self.pending_maintenance = None;
             self.pending_membership = None;
             self.pending_placement = None;
@@ -729,6 +818,7 @@ impl Session {
         if self.last_term != status.term || self.was_leader != leader {
             self.clear_pending();
             self.pending_cursor = None;
+            self.pending_managed = None;
             self.pending_maintenance = None;
             self.pending_membership = None;
             self.pending_placement = None;
@@ -750,6 +840,45 @@ impl Session {
             .cursor_committed
             .try_reserve_exact(events.committed.len())
             .map_err(|_| LedgerError::Capacity)?;
+        let managed_count = events
+            .committed
+            .iter()
+            .filter(|entry| {
+                entry.data.starts_with(MANAGED_DOMAIN_MAGIC)
+                    || entry.data.starts_with(MANAGED_CURSOR_MAGIC)
+            })
+            .count();
+        let control_count = events
+            .committed
+            .iter()
+            .filter(|entry| entry.data.starts_with(REQUEST_STREAM_MAGIC))
+            .count();
+        let managed_slots = if managed_count != 0 || control_count != 0 {
+            Some(
+                self.managed_charge(
+                    managed_count
+                        .checked_mul(size_of::<ManagedCommitted>())
+                        .and_then(|n| {
+                            n.checked_add(
+                                control_count
+                                    .checked_mul(size_of::<RequestStreamControlReceipt>())?,
+                            )
+                        })
+                        .and_then(|n| n.checked_add(256))
+                        .ok_or(LedgerError::Capacity)?,
+                )?,
+            )
+        } else {
+            None
+        };
+        result
+            .managed_committed
+            .try_reserve_exact(managed_count)
+            .map_err(|_| LedgerError::Capacity)?;
+        result
+            .request_stream_committed
+            .try_reserve_exact(control_count)
+            .map_err(|_| LedgerError::Capacity)?;
         result
             ._charges
             .try_reserve_exact(
@@ -757,9 +886,13 @@ impl Session {
                     .committed
                     .len()
                     .checked_add(usize::from(event_charge.is_some()))
+                    .and_then(|n| n.checked_add(usize::from(managed_slots.is_some())))
                     .ok_or(LedgerError::Capacity)?,
             )
             .map_err(|_| LedgerError::Capacity)?;
+        if let Some(charge) = managed_slots {
+            result._charges.push(charge);
+        }
         if let Some(charge) = event_charge {
             result._charges.push(charge);
         }
@@ -797,6 +930,11 @@ impl Session {
                 let membership = membership_events.next().ok_or(LedgerError::Corrupt)?;
                 placement_configuration = membership.after.clone();
                 self.apply_membership(membership)?;
+            }
+            if self.apply_managed_entry(&entry.data, entry.index, &mut result)? {
+                self.applied_raft = entry.index;
+                offset = offset.checked_add(1).ok_or(LedgerError::Capacity)?;
+                continue;
             }
             if entry.data.starts_with(PLACEMENT_MAGIC) {
                 self.apply_placement_entry(
@@ -943,6 +1081,8 @@ fn readiness_context(term: u64) -> Vec<u8> {
     bytes
 }
 
+include!("managed_session.rs");
+include!("managed_support.rs");
 include!("apply_epoch.rs");
 include!("cursor_session.rs");
 include!("cursor_maintenance.rs");
@@ -1302,4 +1442,6 @@ mod tests {
     include!("membership_tests.rs");
     include!("placement_tests.rs");
     include!("evidence_snapshot_tests.rs");
+    include!("reconciliation_session_tests.rs");
+    include!("managed_tests.rs");
 }

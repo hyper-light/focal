@@ -128,6 +128,9 @@ struct DataService {
     ledger: ManagedService,
 }
 impl RequestHandler for DataService {
+    fn supports_managed_requests(&self) -> bool {
+        true
+    }
     fn handle(&self, request: VerifiedRequest) -> HandlerFuture<'_> {
         Box::pin(async move { self.handle_accounted(request).await.into_envelope() })
     }
@@ -404,8 +407,23 @@ impl NetworkService {
     /// directory lock remains owned until every worker has joined, even if this
     /// future is canceled after the first worker starts.
     pub async fn open(settings: &Settings) -> Result<Self, ServiceError> {
+        Self::open_with_socket(settings, None).await
+    }
+    // Tests retain ephemeral listener reservations and transfer the actual
+    // socket here. Production startup uses the same TLS/listener construction.
+    async fn open_with_socket(
+        settings: &Settings,
+        socket: Option<std::net::UdpSocket>,
+    ) -> Result<Self, ServiceError> {
         require_runtime()?;
         let prepared = Prepared::open(settings).await?;
+        if let Some(socket) = &socket
+            && socket.local_addr().map_err(WireError::from)? != prepared.state.listen
+        {
+            return Err(ServiceError::Owner(
+                "listener socket address differs from node state",
+            ));
+        }
         let identity = prepared.directory.identity().clone();
         let root = prepared.directory.root().to_path_buf();
         let admin_handler = prepared
@@ -467,8 +485,12 @@ impl NetworkService {
             budget.child(128 * 1024 * 1024, 32 * 1024 * 1024)?,
         )?;
         let limits = ControlHost::wire_limits();
-        let listener = NetworkListener::bind(
-            state.listen,
+        let socket = match socket {
+            Some(socket) => socket,
+            None => std::net::UdpSocket::bind(state.listen).map_err(WireError::from)?,
+        };
+        let listener = NetworkListener::from_socket(
+            socket,
             &credentials,
             signing_identity.as_ref(),
             &state.sponsor.ca_certificate,
@@ -752,6 +774,7 @@ impl NetworkService {
             directory?;
             control?;
             content?;
+            self.listener.shutdown().await;
             Ok::<(), ServiceError>(())
         };
         // A future may be moved to another runtime between polls. Contain the
@@ -837,6 +860,8 @@ impl NetworkService {
             }
         };
         let controller = controller.run(&self.pool, &self.handles.control, &self.registry);
+        let managed_support =
+            crate::managed_support::drive(&self.handles.fleet, &self.pool, &self.budget);
         let ready = async {
             if let Some(ledger) = &self.handles.ledger {
                 loop {
@@ -877,6 +902,7 @@ impl NetworkService {
             admin,
             controller,
             directory_driver,
+            managed_support,
             control_driver,
             ledger_driver,
             evidence_driver,
@@ -892,6 +918,7 @@ impl NetworkService {
             result=&mut admin=>result.map_err(ServiceError::Wire).and(Err(ServiceError::Owner("admin listener ended"))),
             result=&mut controller=>result.map_err(ServiceError::Controller).and(Err(ServiceError::Owner("controller ended"))),
             result=&mut directory_driver=>result,
+            _=&mut managed_support=>Err(ServiceError::Owner("managed capability driver ended")),
             result=&mut control_driver=>result.map_err(ServiceError::from).and(Err(ServiceError::Owner("control egress ended"))),
             result=&mut ledger_driver=>result.map_err(ServiceError::from).and(Err(ServiceError::Owner("ledger egress ended"))),
             _=&mut evidence_driver=>Err(ServiceError::Owner("evidence driver ended")),

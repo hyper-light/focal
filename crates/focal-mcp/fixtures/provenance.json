@@ -1,0 +1,44 @@
+{
+  "retrieved": "2026-09-05",
+  "repository": "https://github.com/modelcontextprotocol/modelcontextprotocol",
+  "commit": "e76e9c572c6f2bfcb730357101acc90f2f802e02",
+  "schemas": [
+    {
+      "file": "2026-07-28.schema.json",
+      "sha256": "ef70b61f99b6d2e5e3b46863822eab08dff6a45bedc7a08914e0e5b133f40203",
+      "bytes": 181474,
+      "source": "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/e76e9c572c6f2bfcb730357101acc90f2f802e02/schema/2026-07-28/schema.json",
+      "blake3": "a9b0d7971bb5b2ca22f35e8953a4378d58c5016708c3b717103c2495ee51b7c1"
+    },
+    {
+      "file": "2025-11-25.schema.json",
+      "sha256": "268a5f82ba70fd7e4b6dc4aa1e64f116f74b4d0edcb69dc046829c79dd4e97e7",
+      "bytes": 174323,
+      "source": "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/e76e9c572c6f2bfcb730357101acc90f2f802e02/schema/2025-11-25/schema.json",
+      "blake3": "b82c75b42652bcd796883a5ce1726ebc36990e903c669f47eb9545eaf39384da"
+    }
+  ],
+  "sources": [
+    {
+      "file": "2026-07-28.schema.ts",
+      "sha256": "742750af0bb8c716e7030c4977c992b55d1adc4407e9e66997db5846baedc2cd",
+      "bytes": 98426,
+      "source": "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/e76e9c572c6f2bfcb730357101acc90f2f802e02/schema/2026-07-28/schema.ts",
+      "blake3": "8491622da70c6e88fb7a1b862df60db7422c9547a04cd1f7af66d6886b5fb90c"
+    },
+    {
+      "file": "2025-11-25.schema.ts",
+      "sha256": "e74b56e73b2e37bdb595f74ba22e428ad7f07aa3519355ba661d681298ed38ac",
+      "bytes": 66671,
+      "source": "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/e76e9c572c6f2bfcb730357101acc90f2f802e02/schema/2025-11-25/schema.ts",
+      "blake3": "b12af36e1b21067c895856d6d3727c0928f14b3c5e22532b7bc7802fd5f0cd76"
+    },
+    {
+      "file": "UPSTREAM-LICENSE",
+      "sha256": "0382b0057770ca05e9c350a50aa3b1c1fea84da0bc81d723bf00b9aa841be58a",
+      "bytes": 12227,
+      "source": "https://raw.githubusercontent.com/modelcontextprotocol/modelcontextprotocol/e76e9c572c6f2bfcb730357101acc90f2f802e02/LICENSE",
+      "blake3": "fd12707e19e104da035c74958a676b0567b7dc2df01875ae07f058b79e59422f"
+    }
+  ]
+}

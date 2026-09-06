@@ -124,7 +124,11 @@ impl Session {
         if self.membership_receipt(request)?.is_some() {
             return Ok(());
         }
-        if self.pending_placement.is_some() || self.placement_state.paused() {
+        self.managed_membership_guard(request.change)?;
+        if self.pending_managed.is_some()
+            || self.pending_placement.is_some()
+            || self.placement_state.paused()
+        {
             return Err(LedgerError::Capacity);
         }
         if request.expected_index != self.membership_state.configuration_index {
@@ -174,6 +178,7 @@ impl Session {
         if applied.term == 0 || applied.index <= self.membership_state.configuration_index {
             return Err(LedgerError::Corrupt);
         }
+        self.managed_support = ManagedSupportCache::default();
         let Some(encoded) = applied.context.strip_prefix(MEMBERSHIP_MAGIC) else {
             // Bootstrap and compatibility Raft changes still fence later intents.
             self.membership_state = MembershipState {

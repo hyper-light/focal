@@ -365,6 +365,8 @@ Every delta includes schema version, session/position/ordinal, closed lifecycle 
 
 ## 10. Required domain conformance fixtures
 
+The user additionally requires manual and agent-facing challenge/consult workflows. [12](12-agent-tools-and-workflows.md) records the Hecate/Sylk source behavior and deliberate Focal policy, with executable work in P17–P20 of [13](13-cli-and-agent-implementation-plan.md). Challenges require a responding agent's artifacts and accepted validations; qualifying proof failure can produce a policy-authorized corrective claim. Consultations require satisfactory requested work and normally use linked follow-up consultations. A timeout, missing transport reply or mere receipt cannot establish substantive success or justify automatic corrective issuance. All follow-ups retain immutable parentage and pass the existing standing/rank rules; none is an imperative hidden inside a read, CLI parser or MCP adapter.
+
 The implementation plan must provide executable fixtures for these behaviors; imported prose alone is not evidence:
 
 1. Durable generated claim cannot execute before post; admission failure prevents receipt.

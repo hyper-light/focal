@@ -218,6 +218,9 @@ impl Drop for Fleet {
     }
 }
 
+#[path = "fleet_reconciliation_tests.rs"]
+mod reconciliation_tests;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quorum_commit_read_barrier_partition_retry_and_restart_use_the_real_owner() {
     let root = tempfile::tempdir().unwrap();

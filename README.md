@@ -15,4 +15,6 @@ bash scripts/cargo.sh run -p focal-node --bin focal -- demo --data-dir /tmp/foca
 
 Repeat the command to recover and verify the same proof. To run the local service, use `focal start`; `focal status` reads its published prefix. `focal demo` opens the directory exclusively, so stop a running service before using that embedded example. `focal request REQUEST.json` sends a versioned request to the service; preserve the same file when retrying an unknown outcome.
 
+The [manual CLI guide](docs/manual-cli.md) covers `submit claim/testament/artifact` with flags, JSON or YAML; `get` and optional-filter `list` commands; artifact downloads; validation results; and durable `request inspect/retry` recovery. The [source-backed CLI and agent plan](docs/archictecutre/13-cli-and-agent-implementation-plan.md) tracks the remaining cluster, remote-tool and challenge/consult work. `focal mcp serve` exposes the same typed operations through a bounded stdio adapter; see [the MCP guide and agent skills](docs/mcp.md).
+
 Source builds require Rust and protobuf; see [building and verification](docs/building.md). A local acknowledgment means the write is synced to this disk. The single-node default does not survive loss of that disk.

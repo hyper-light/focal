@@ -147,13 +147,18 @@ pub enum Capability {
 }
 pub fn capability(operation: &Operation) -> Capability {
     match operation {
-        Operation::Raft { .. }
+        Operation::ManagedSupport { .. }
+        | Operation::Raft { .. }
         | Operation::EnrollmentControl { .. }
         | Operation::Custody(_)
         | Operation::PeerControl { .. }
         | Operation::NodeContact { .. } => Capability::Replication,
         Operation::Control { .. } => Capability::Runtime,
-        Operation::Submit { command, .. } => match command {
+        Operation::Submit { command, .. }
+        | Operation::Managed {
+            operation: ManagedOperation::Submit { command, .. },
+            ..
+        } => match command {
             Command::NegotiateEpoch { .. }
             | Command::AdvanceEpochFloor { .. }
             | Command::AdoptReceipt { .. }
@@ -210,26 +215,12 @@ impl VerifiedRequest {
         // The sole actor-triggered runtime intent is own-principal epoch admission;
         // no command, principal, cause, or extra authority can be supplied with it.
         authority.runtime = matches!(self.peer.role(), PeerRole::Runtime) || epoch_allocation;
-        let verify_claim = |claim: &NewClaim| {
-            if claim.content.ledger != self.request.ledger
-                || claim.content.cause() != Some(authority.cause.clone())
-                || (!authority.runtime && claim.content.issuer() != Some(self.peer.principal()))
-            {
-                Err(AccessError::Unauthorized)
-            } else {
-                Ok(())
-            }
-        };
-        match &command {
-            Command::GenerateClaim { claim } => verify_claim(claim)?,
-            Command::GenerateClaimBatch { claims } => {
-                for claim in claims {
-                    verify_claim(claim)?;
-                }
-            }
-            Command::SupersedeClaim { successor, .. } => verify_claim(successor)?,
-            _ => {}
-        }
+        verify_authored_claims(
+            &command,
+            self.request.ledger,
+            self.peer.principal(),
+            &authority,
+        )?;
         Ok(AuthenticatedInput {
             ledger: self.request.ledger,
             principal: self.peer.principal(),
@@ -237,6 +228,47 @@ impl VerifiedRequest {
             request_id: self.request.request_id,
             expected_revision,
             authority,
+            command,
+        })
+    }
+    pub fn into_managed(
+        self,
+        mut authority: AuthorityContext,
+    ) -> Result<ManagedAuthenticatedInput, AccessError> {
+        let Operation::Managed {
+            key,
+            operation:
+                ManagedOperation::Submit {
+                    expected_revision,
+                    command,
+                },
+        } = self.request.operation
+        else {
+            return Err(AccessError::InvalidRequest);
+        };
+        authority.runtime = matches!(self.peer.role(), PeerRole::Runtime);
+        verify_authored_claims(
+            &command,
+            self.request.ledger,
+            self.peer.principal(),
+            &authority,
+        )?;
+        Ok(ManagedAuthenticatedInput {
+            key,
+            expected_revision,
+            authority,
+            command,
+        })
+    }
+    pub fn into_request_stream_control(self) -> Result<RequestStreamControlInput, AccessError> {
+        let Operation::RequestStreamControl { cluster, command } = self.request.operation else {
+            return Err(AccessError::InvalidRequest);
+        };
+        Ok(RequestStreamControlInput {
+            cluster,
+            ledger: self.request.ledger,
+            principal: self.peer.principal(),
+            id: self.request.request_id,
             command,
         })
     }
@@ -251,7 +283,16 @@ pub fn verify_request(
     if !peer.grant.tenants.contains(&request.ledger.tenant) {
         return Err(AccessError::Unauthorized);
     }
-    if request.protocol != PROTOCOL_VERSION {
+    let managed = matches!(
+        request.operation,
+        Operation::Managed { .. }
+            | Operation::RequestStreamControl { .. }
+            | Operation::RequestStreamRead { .. }
+            | Operation::ManagedSupport { .. }
+    );
+    if (managed && request.protocol != MANAGED_PROTOCOL_VERSION)
+        || (!managed && request.protocol != PROTOCOL_VERSION)
+    {
         return Err(AccessError::UnsupportedProtocol);
     }
     if request.ledger.session.is_zero()
@@ -269,6 +310,19 @@ pub fn verify_request(
     if !allowed {
         return Err(AccessError::Unauthorized);
     }
+    if matches!(
+        request.operation,
+        Operation::Reconcile(_)
+            | Operation::RequestStreamControl { .. }
+            | Operation::RequestStreamRead { .. }
+            | Operation::Managed {
+                operation: ManagedOperation::Cursor(_),
+                ..
+            }
+    ) && !matches!(peer.role(), PeerRole::Actor | PeerRole::Runtime)
+    {
+        return Err(AccessError::Unauthorized);
+    }
     // Legacy verdicts remain decodable for durable replay. New remote outcomes
     // must carry the receipt fence, so adoption cannot race an evaluator reply.
     if matches!(
@@ -276,14 +330,93 @@ pub fn verify_request(
         Operation::Submit {
             command: Command::RecordValidationVerdict { .. },
             ..
+        } | Operation::Managed {
+            operation: ManagedOperation::Submit {
+                command: Command::RecordValidationVerdict { .. },
+                ..
+            },
+            ..
         }
     ) {
         return Err(AccessError::UnsupportedOperation);
+    }
+    if managed && (request.request_epoch != RequestEpoch(1) || request.route_epoch.0 == 0) {
+        return Err(AccessError::InvalidRequest);
+    }
+    if let Operation::Managed { key, .. } = &request.operation {
+        managed_request_identity(&request).map_err(|error| match error {
+            WireError::Access(error) => error,
+            _ => AccessError::InvalidRequest,
+        })?;
+        if key.stream.principal != peer.principal() {
+            return Err(AccessError::Unauthorized);
+        }
     }
     let bytes = encode_payload(&request, limits.max_frame_bytes)
         .map_err(|_| AccessError::Capacity)?
         .len() as u64;
     let items = match &request.operation {
+        Operation::RequestStreamControl { cluster, command } => {
+            crate::managed::validate_control_request(
+                *cluster,
+                request.ledger,
+                peer.principal(),
+                command,
+                limits.max_items,
+            )?
+        }
+        Operation::RequestStreamRead { cluster, query } => {
+            if *cluster == [0; 16] {
+                return Err(AccessError::InvalidRequest);
+            }
+            if let RequestStreamQuery::Receipt { key } = query {
+                if !key.is_valid() {
+                    return Err(AccessError::InvalidRequest);
+                }
+                if key.stream.cluster != *cluster
+                    || key.stream.ledger != request.ledger
+                    || key.stream.principal != peer.principal()
+                {
+                    return Err(AccessError::Unauthorized);
+                }
+            }
+            1
+        }
+        Operation::ManagedSupport { group } => {
+            if *group == [0; 16] {
+                return Err(AccessError::InvalidRequest);
+            }
+            1
+        }
+        Operation::Reconcile(query) => {
+            let epoch = match query {
+                ReconcileQuery::Epoch { epoch } => epoch,
+                ReconcileQuery::Receipt { epoch, request } => {
+                    if request.is_zero() {
+                        return Err(AccessError::InvalidRequest);
+                    }
+                    epoch
+                }
+            };
+            if epoch.0 == 0 || request.route_epoch.0 == 0 {
+                return Err(AccessError::InvalidRequest);
+            }
+            1
+        }
+        Operation::List(list) => {
+            list.filter.validate()?;
+            if list.max_items == 0
+                || list.max_items > limits.max_items
+                || list.max_visits == 0
+                || list.max_visits > limits.max_items
+                || list.cursor.as_ref().is_some_and(|cursor| {
+                    cursor.bytes.is_empty() || cursor.bytes.len() > MAX_LIST_CURSOR_BYTES
+                })
+            {
+                return Err(AccessError::Capacity);
+            }
+            u64::from(list.max_visits.max(list.max_items))
+        }
         Operation::Read(read) => {
             if read.max_items == 0 || read.max_items > limits.max_items {
                 return Err(AccessError::Capacity);
@@ -305,6 +438,16 @@ pub fn verify_request(
                     roots.as_slice()
                 }
                 ReadQuery::Scan { .. } => &[],
+                ReadQuery::ValidationResults { id, after } => {
+                    if id.is_zero()
+                        || after.is_some_and(|position| position.run.validation != *id)
+                        || (after.is_some()
+                            && !matches!(read.consistency, ReadConsistency::Exact(_)))
+                    {
+                        return Err(AccessError::InvalidRequest);
+                    }
+                    &[]
+                }
             };
             if refs.len() > limits.max_items as usize {
                 return Err(AccessError::Capacity);
@@ -341,6 +484,14 @@ pub fn verify_request(
         }
         Operation::Submit {
             command: Command::GenerateClaimBatch { claims },
+            ..
+        }
+        | Operation::Managed {
+            operation:
+                ManagedOperation::Submit {
+                    command: Command::GenerateClaimBatch { claims },
+                    ..
+                },
             ..
         } => {
             if claims.len() > limits.max_items as usize {
@@ -410,7 +561,11 @@ pub fn verify_request(
             }
             1
         }
-        Operation::Stream(stream) => {
+        Operation::Stream(stream)
+        | Operation::Managed {
+            operation: ManagedOperation::Cursor(stream),
+            ..
+        } => {
             let filter = stream.filter();
             if matches!(filter,DeltaFilter::Claims(claims) if claims.len()>limits.max_items as usize)
             {
@@ -600,4 +755,33 @@ pub fn stream_scope(
     let mut hash = blake3::Hasher::new_derive_key("focal.subscription.authenticated-scope.v1");
     hash.update(&bytes);
     Ok(ContentHash(*hash.finalize().as_bytes()))
+}
+
+fn verify_authored_claims(
+    command: &Command,
+    ledger: LedgerId,
+    principal: ParticipantId,
+    authority: &AuthorityContext,
+) -> Result<(), AccessError> {
+    let verify_claim = |claim: &NewClaim| {
+        if claim.content.ledger != ledger
+            || claim.content.cause() != Some(authority.cause.clone())
+            || (!authority.runtime && claim.content.issuer() != Some(principal))
+        {
+            Err(AccessError::Unauthorized)
+        } else {
+            Ok(())
+        }
+    };
+    match command {
+        Command::GenerateClaim { claim } => verify_claim(claim)?,
+        Command::GenerateClaimBatch { claims } => {
+            for claim in claims {
+                verify_claim(claim)?;
+            }
+        }
+        Command::SupersedeClaim { successor, .. } => verify_claim(successor)?,
+        _ => {}
+    }
+    Ok(())
 }

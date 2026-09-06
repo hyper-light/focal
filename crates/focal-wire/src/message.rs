@@ -5,6 +5,9 @@ pub use focal_stream::{
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u16 = 1;
+/// Explicit syntax capability for independently registered request streams.
+/// Legacy envelopes and handshake structures retain their original encoding.
+pub const MANAGED_PROTOCOL_VERSION: u16 = 2;
 pub const ALPN: &[u8] = b"focal/1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,8 +34,19 @@ pub enum ReadConsistency {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReadQuery {
     Objects(Vec<ObjectRef>),
-    Scan { after: Option<ObjectKey> },
-    Traverse { roots: Vec<ObjectRef>, depth: u16 },
+    Scan {
+        after: Option<ObjectKey>,
+    },
+    Traverse {
+        roots: Vec<ObjectRef>,
+        depth: u16,
+    },
+    /// Fixed-prefix requirement and bounded run-summary/verdict records.
+    /// A continuation must use Exact with the preceding read token.
+    ValidationResults {
+        id: ValidationId,
+        after: Option<ValidationResultPosition>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +130,27 @@ pub enum Operation {
         genesis: [u8; 32],
         request: Vec<u8>,
     },
+    List(crate::ListRequest),
+    /// Read only this authenticated principal's epoch or retained request
+    /// receipt at an authoritative committed prefix. Absence is not abort proof.
+    Reconcile(ReconcileQuery),
+    Managed {
+        key: ManagedRequestKey,
+        operation: crate::ManagedOperation,
+    },
+    RequestStreamControl {
+        cluster: [u8; 16],
+        command: RequestStreamCommand,
+    },
+    RequestStreamRead {
+        cluster: [u8; 16],
+        query: RequestStreamQuery,
+    },
+    /// The authenticated node reports its actual installed decoder and current
+    /// applied membership. This is never an aggregate activation certificate.
+    ManagedSupport {
+        group: [u8; 16],
+    },
 }
 /// Read-only metadata selectors contain no variable-length collections.
 pub const MAX_PEER_CONTROL_REQUEST_BYTES: usize = 64;
@@ -137,6 +172,12 @@ impl Operation {
             Self::PeerControl { .. } => 11,
             Self::NodeContact { .. } => 12,
             Self::EnrollmentControl { .. } => 13,
+            Self::List(_) => 14,
+            Self::Reconcile(_) => 15,
+            Self::Managed { .. } => 16,
+            Self::RequestStreamControl { .. } => 17,
+            Self::RequestStreamRead { .. } => 18,
+            Self::ManagedSupport { .. } => 19,
         }
     }
     pub fn is_mutation(&self) -> bool {
@@ -150,6 +191,8 @@ impl Operation {
                 | Self::Custody(_)
                 | Self::NodeContact { .. }
                 | Self::EnrollmentControl { .. }
+                | Self::Managed { .. }
+                | Self::RequestStreamControl { .. }
         )
     }
 }
@@ -193,10 +236,28 @@ pub enum MutationReply {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReadObject {
-    Claim { id: ClaimId, value: Claim },
-    Testament { id: TestamentId, value: Testament },
-    Validation { id: ValidationId, value: Validation },
-    Artifact { id: ArtifactId, value: Artifact },
+    Claim {
+        id: ClaimId,
+        value: Claim,
+    },
+    Testament {
+        id: TestamentId,
+        value: Testament,
+    },
+    Validation {
+        id: ValidationId,
+        value: Validation,
+    },
+    Artifact {
+        id: ArtifactId,
+        value: Artifact,
+    },
+    ValidationResults {
+        id: ValidationId,
+        value: Validation,
+        records: Vec<ValidationResult>,
+        next: Option<ValidationResultPosition>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -394,6 +455,10 @@ pub enum AccessError {
     SnapshotExpired,
     ResyncRequired { floor: Option<DeltaId> },
     UnsupportedOperation,
+    ManagedRetired { through: u64 },
+    ManagedClosed { generation: u64 },
+    ManagedConflict,
+    ManagedNotRegistered,
 }
 impl AccessError {
     pub fn registered_tag(&self) -> u16 {
@@ -409,6 +474,10 @@ impl AccessError {
             Self::SnapshotExpired => 9,
             Self::ResyncRequired { .. } => 10,
             Self::UnsupportedOperation => 11,
+            Self::ManagedRetired { .. } => 12,
+            Self::ManagedClosed { .. } => 13,
+            Self::ManagedConflict => 14,
+            Self::ManagedNotRegistered => 15,
         }
     }
 }
@@ -434,6 +503,12 @@ pub enum Response {
     Content(ContentChunk),
     Control { response: Vec<u8> },
     Custody(CustodyReply),
+    Listed(crate::ListPage),
+    Reconciled(crate::ReconcileReply),
+    Managed(crate::ManagedReply),
+    RequestStreamControlled(crate::RequestStreamControlReply),
+    RequestStreamRead(crate::RequestStreamReadReply),
+    ManagedSupport(ManagedFormatSupport),
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponseEnvelope {
@@ -456,6 +531,18 @@ pub struct Negotiated {
     pub protocol: u16,
     pub max_frame_bytes: u32,
     pub max_items: u32,
+}
+impl Negotiated {
+    pub fn accepts_protocol(self, requested: u16) -> bool {
+        matches!(
+            (self.protocol, requested),
+            (PROTOCOL_VERSION, PROTOCOL_VERSION)
+                | (
+                    MANAGED_PROTOCOL_VERSION,
+                    PROTOCOL_VERSION | MANAGED_PROTOCOL_VERSION
+                )
+        )
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HelloReply {
@@ -502,14 +589,30 @@ impl WireLimits {
         Ok(())
     }
     pub fn negotiate(&self, hello: &Hello) -> Result<Negotiated, AccessError> {
-        if hello.versions.len() > 16 || !hello.versions.contains(&PROTOCOL_VERSION) {
+        self.negotiate_managed(hello, false)
+    }
+    /// Advertising syntax support grants no managed-log activation authority.
+    /// The session owner separately verifies its current voters' replay support.
+    pub fn negotiate_managed(
+        &self,
+        hello: &Hello,
+        managed: bool,
+    ) -> Result<Negotiated, AccessError> {
+        if hello.versions.len() > 16 {
             return Err(AccessError::UnsupportedProtocol);
         }
+        let protocol = if managed && hello.versions.contains(&MANAGED_PROTOCOL_VERSION) {
+            MANAGED_PROTOCOL_VERSION
+        } else if hello.versions.contains(&PROTOCOL_VERSION) {
+            PROTOCOL_VERSION
+        } else {
+            return Err(AccessError::UnsupportedProtocol);
+        };
         if hello.max_frame_bytes < 1024 || hello.max_items == 0 {
             return Err(AccessError::InvalidRequest);
         }
         Ok(Negotiated {
-            protocol: PROTOCOL_VERSION,
+            protocol,
             max_frame_bytes: self.max_frame_bytes.min(hello.max_frame_bytes),
             max_items: self.max_items.min(hello.max_items),
         })

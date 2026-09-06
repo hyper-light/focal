@@ -14,12 +14,18 @@
 mod canonical;
 mod command;
 mod ids;
+mod managed;
 mod objects;
+mod reconciliation;
+mod validation_read;
 mod vocabulary;
 pub use canonical::*;
 pub use command::*;
 pub use ids::*;
+pub use managed::*;
 pub use objects::*;
+pub use reconciliation::*;
+pub use validation_read::*;
 pub use vocabulary::*;
 pub const SCHEMA_MAJOR: u16 = 1;
 #[cfg(test)]

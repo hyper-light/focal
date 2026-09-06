@@ -136,7 +136,7 @@ async fn serve_unix<H: RequestHandler>(
     handler: H,
 ) -> Result<(), WireError> {
     let hello: Hello = read_frame(&mut stream, FrameKind::Hello, 4096).await?;
-    let negotiated = match limits.negotiate(&hello) {
+    let negotiated = match limits.negotiate_managed(&hello, handler.supports_managed_requests()) {
         Ok(value) => value,
         Err(error) => {
             write_frame(
@@ -163,8 +163,11 @@ async fn serve_unix<H: RequestHandler>(
     let mut limits = limits;
     limits.max_frame_bytes = negotiated.max_frame_bytes;
     limits.max_items = negotiated.max_items;
-    let response =
-        dispatch_accounted(&handler, AuthenticatedPeer::local(grant)?, request, &limits).await;
+    let response = if negotiated.accepts_protocol(request.protocol) {
+        dispatch_accounted(&handler, AuthenticatedPeer::local(grant)?, request, &limits).await
+    } else {
+        OwnedResponse::new(request.reply(Response::Error(AccessError::UnsupportedProtocol)))
+    };
     write_frame(
         &mut stream,
         FrameKind::Response,
@@ -210,7 +213,11 @@ impl UnixRemote {
             return Err(WireError::Authentication);
         }
         let hello = Hello {
-            versions: vec![PROTOCOL_VERSION],
+            versions: if request.protocol == MANAGED_PROTOCOL_VERSION {
+                vec![MANAGED_PROTOCOL_VERSION]
+            } else {
+                vec![PROTOCOL_VERSION]
+            },
             max_frame_bytes: self.limits.max_frame_bytes,
             max_items: self.limits.max_items,
         };
@@ -220,7 +227,10 @@ impl UnixRemote {
             HelloReply::Accepted(value) => value,
             HelloReply::Rejected(error) => return Err(error.into()),
         };
-        if negotiated.protocol != PROTOCOL_VERSION
+        if !matches!(
+            negotiated.protocol,
+            PROTOCOL_VERSION | MANAGED_PROTOCOL_VERSION
+        ) || !negotiated.accepts_protocol(request.protocol)
             || negotiated.max_frame_bytes > self.limits.max_frame_bytes
             || negotiated.max_items > self.limits.max_items
         {

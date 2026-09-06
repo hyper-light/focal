@@ -13,6 +13,8 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+focal-client = { version = "0.1.0", path = "../focal-client" }
+focal-mcp = { version = "0.1.0", path = "../focal-mcp" }
 focal-consensus = { version = "0.1.0", path = "../focal-consensus" }
 focal-control = { version = "0.1.0", path = "../focal-control" }
 focal-directory = { version = "0.1.0", path = "../focal-directory" }
@@ -38,7 +40,9 @@ serde_saphyr.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+# Listener shutdown observes the final runtime owner. Reaudit Quinn's endpoint/
+# connection socket-before-runtime drop ordering before changing this version.
+quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 zeroize = "1.8"
 
 [dev-dependencies]

@@ -3,15 +3,75 @@ use crate::*;
 pub(crate) struct Reducer<'a> {
     pub state: access::WriteState<'a>,
     pub limits: &'a Limits,
-    pub input: &'a AuthenticatedInput,
+    pub input: DomainInput<'a>,
     pub sequence: SessionSeq,
     pub deltas: Vec<Delta>,
     pub effects: Vec<EffectIntent>,
+}
+/// Only the real actor, authority and domain command reach the reducer. Managed
+/// request identity remains separate; no principal or legacy epoch is invented.
+pub(crate) struct DomainInput<'a> {
+    pub principal: ParticipantId,
+    pub authority: &'a AuthorityContext,
+    pub command: &'a Command,
+    legacy_epoch: Option<RequestEpoch>,
 }
 pub(crate) fn execute_on<'a>(
     state: access::WriteState<'a>,
     limits: &'a Limits,
     input: &'a AuthenticatedInput,
+    sequence: SessionSeq,
+) -> Result<
+    (
+        access::WriteState<'a>,
+        CommandResult,
+        Vec<Delta>,
+        Vec<EffectIntent>,
+    ),
+    DomainOutcome,
+> {
+    execute_domain_on(
+        state,
+        limits,
+        DomainInput {
+            principal: input.principal,
+            authority: &input.authority,
+            command: &input.command,
+            legacy_epoch: Some(input.request_epoch),
+        },
+        sequence,
+    )
+}
+pub(crate) fn execute_managed_on<'a>(
+    state: access::WriteState<'a>,
+    limits: &'a Limits,
+    input: &'a ManagedAuthenticatedInput,
+    sequence: SessionSeq,
+) -> Result<
+    (
+        access::WriteState<'a>,
+        CommandResult,
+        Vec<Delta>,
+        Vec<EffectIntent>,
+    ),
+    DomainOutcome,
+> {
+    execute_domain_on(
+        state,
+        limits,
+        DomainInput {
+            principal: input.key.stream.principal,
+            authority: &input.authority,
+            command: &input.command,
+            legacy_epoch: None,
+        },
+        sequence,
+    )
+}
+fn execute_domain_on<'a>(
+    state: access::WriteState<'a>,
+    limits: &'a Limits,
+    input: DomainInput<'a>,
     sequence: SessionSeq,
 ) -> Result<
     (
@@ -903,10 +963,10 @@ impl Reducer<'_> {
         })
     }
     fn command(&mut self) -> Result<CommandResult, DomainOutcome> {
-        match &self.input.command {
+        match self.input.command {
             Command::NegotiateEpoch { epoch } => {
                 self.runtime()?;
-                if epoch.0 == 0 || *epoch != self.input.request_epoch {
+                if epoch.0 == 0 || Some(*epoch) != self.input.legacy_epoch {
                     return Err(refuse(
                         ErrorCode::InvalidEpoch,
                         "epoch must match negotiation request",
@@ -958,6 +1018,12 @@ impl Reducer<'_> {
             }
             Command::AdvanceEpochFloor { minimum } => {
                 self.runtime()?;
+                if self.input.legacy_epoch.is_none() {
+                    return Err(refuse(
+                        ErrorCode::InvalidEpoch,
+                        "managed requests cannot advance legacy epochs",
+                    ));
+                }
                 let window = self
                     .state
                     .epochs

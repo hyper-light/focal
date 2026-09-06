@@ -121,6 +121,8 @@ impl Owner {
             pending.finish(Err(LedgerError::OutcomeUnknown));
             return Ok(());
         }
+        #[cfg(test)]
+        let prepared_now = !pending.started;
         if !pending.started {
             if self.session.persistence_pending()
                 || self.session.has_ready()
@@ -143,7 +145,13 @@ impl Owner {
             pending.started = true;
         }
         match self.session.try_finish_checkpoint_evidence() {
-            Ok(None) => self.evidence = Some(pending),
+            Ok(None) => {
+                #[cfg(test)]
+                if prepared_now {
+                    self.observe_checkpoint_pending();
+                }
+                self.evidence = Some(pending);
+            }
             Ok(Some(snapshot)) => pending.finish(Ok(snapshot)),
             Err(error) => {
                 let failed = matches!(error, LedgerError::Consensus(_));

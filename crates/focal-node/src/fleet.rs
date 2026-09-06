@@ -4,12 +4,14 @@
 use crate::{custody::CustodyScope, evidence_service::EvidenceWitness};
 use crate::{
     host::{access, finish_response, known_receipt},
-    reads::ReadViews,
+    reads::{ListReadContext, ReadViews},
     streams::{PendingStream, Streams},
 };
 use focal_consensus::PbMessageExt as _;
 use focal_consensus::StateRole;
-use focal_ledger::{LedgerError, Session, SessionEvents, Submission};
+use focal_ledger::{
+    LedgerError, ManagedSubmission, RequestStreamSubmission, Session, SessionEvents, Submission,
+};
 pub use focal_ledger::{MembershipView, SessionMembershipReceipt, SessionMembershipRequest};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::*;
@@ -26,6 +28,10 @@ use tokio::sync::{mpsc as async_mpsc, oneshot, watch};
 
 #[path = "fleet_evidence.rs"]
 mod evidence_owner;
+#[path = "fleet_managed_support.rs"]
+mod managed_support_owner;
+pub use managed_support_owner::ManagedSupportReply;
+use managed_support_owner::SupportCall;
 #[path = "fleet_group.rs"]
 mod grouped;
 #[path = "fleet_placement.rs"]
@@ -69,7 +75,20 @@ pub struct ReplicaConfig {
     pub replication_queue: usize,
     pub tick: Duration,
     pub request_timeout: Duration,
+    #[cfg(test)]
+    checkpoint_observer: Option<CheckpointObserver>,
 }
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct CheckpointObserver(async_mpsc::Sender<LedgerId>);
+#[cfg(test)]
+impl PartialEq for CheckpointObserver {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.same_channel(&other.0)
+    }
+}
+#[cfg(test)]
+impl Eq for CheckpointObserver {}
 impl ReplicaConfig {
     pub fn new(root: RootCommandId) -> Self {
         Self {
@@ -81,6 +100,8 @@ impl ReplicaConfig {
             replication_queue: 128,
             tick: Duration::from_millis(100),
             request_timeout: Duration::from_secs(5),
+            #[cfg(test)]
+            checkpoint_observer: None,
         }
     }
 }
@@ -88,7 +109,13 @@ impl ReplicaConfig {
 pub struct ReplicationFrame {
     pub target: u64,
     pub request: RequestEnvelope,
+    snapshot: Option<oneshot::Sender<focal_consensus::SnapshotStatus>>,
     _charge: Allocation,
+}
+impl ReplicationFrame {
+    pub(crate) fn report_snapshot(&mut self, accepted: bool) {
+        crate::snapshot_feedback::complete(&mut self.snapshot, accepted);
+    }
 }
 #[derive(Clone, Debug)]
 pub struct ReplicaProgress {
@@ -112,6 +139,7 @@ enum Work {
     ),
     Transfer(u64, oneshot::Sender<Result<(), LedgerError>>),
     Membership(Box<MembershipCall>, Allocation),
+    ManagedSupport(Box<SupportCall>, Allocation),
     Placement(Box<PlacementCall>, Allocation),
     Evidence(Box<EvidenceCall>, Allocation),
     Stop(oneshot::Sender<Result<(), LedgerError>>),
@@ -141,6 +169,7 @@ impl MembershipReply {
 }
 struct PendingMembershipCall {
     call: MembershipCall,
+    proposed: bool,
     context: Option<Vec<u8>>,
     term: u64,
     deadline: Instant,
@@ -170,8 +199,21 @@ impl PendingMembershipCall {
 /// client-supplied priority bit. Admission of new work stays ordinary; progress
 /// and termination of existing work can consume the completion allowance.
 fn completion_request(request: &VerifiedRequest) -> bool {
-    let Operation::Submit { command, .. } = &request.request().operation else {
-        return false;
+    let command = match &request.request().operation {
+        Operation::RequestStreamControl {
+            command:
+                RequestStreamCommand::Acknowledge { .. }
+                | RequestStreamCommand::Seal { .. }
+                | RequestStreamCommand::Close { .. },
+            ..
+        }
+        | Operation::ManagedSupport { .. } => return true,
+        Operation::Submit { command, .. }
+        | Operation::Managed {
+            operation: ManagedOperation::Submit { command, .. },
+            ..
+        } => command,
+        _ => return false,
     };
     focal_ledger::mutation_lane(command) == BudgetLane::Completion
 }
@@ -229,6 +271,7 @@ pub struct ReplicaHost {
     progress: watch::Receiver<ProgressState>,
     budget: MemoryBudget,
     client_frame_bytes: u32,
+    client_max_items: u32,
     request_timeout: Duration,
 }
 struct ProgressState {
@@ -248,11 +291,42 @@ impl ReplicaOwner {
 #[allow(clippy::large_enum_variant)]
 enum WaitingFor {
     Mutation(RequestKey),
+    ManagedMutation {
+        key: ManagedRequestKey,
+        intent: ContentHash,
+        family: ManagedRequestFamily,
+    },
+    ManagedStream {
+        stream: PendingStream,
+        key: ManagedRequestKey,
+        intent: ContentHash,
+    },
+    RequestStreamControl {
+        input: Box<RequestStreamControlInput>,
+        context: Option<Vec<u8>>,
+    },
+    RequestStreamRead {
+        context: Vec<u8>,
+        principal: ParticipantId,
+        cluster: [u8; 16],
+        query: RequestStreamQuery,
+    },
     PeerPersistence,
     Read {
         context: Vec<u8>,
         principal: ParticipantId,
         read: ReadRequest,
+    },
+    List {
+        context: Vec<u8>,
+        principal: ParticipantId,
+        scope: ContentHash,
+        list: ListRequest,
+    },
+    Reconcile {
+        context: Vec<u8>,
+        principal: ParticipantId,
+        query: ReconcileQuery,
     },
     Stream(PendingStream),
 }
@@ -283,13 +357,19 @@ struct Owner {
     runtime: Option<focal_runtime::Runtime>,
     pending: VecDeque<Pending>,
     memberships: VecDeque<PendingMembershipCall>,
+    deferred_managed: VecDeque<managed_support_owner::DeferredManaged>,
+    deferred_backing: Option<Allocation>,
+    snapshot_feedback: crate::snapshot_feedback::SnapshotFeedback,
     placement: Option<PendingPlacementCall>,
     evidence: Option<PendingEvidenceCall>,
     outbound: async_mpsc::Sender<ReplicationFrame>,
     progress: watch::Sender<ProgressState>,
     incarnation: u64,
     nonce: u64,
+    support_cursor: u64,
     dropped: u64,
+    #[cfg(test)]
+    dropped_snapshots: u64,
     budget: MemoryBudget,
     nonblocking: bool,
     stopping: Option<(oneshot::Sender<Result<(), LedgerError>>, Instant)>,
@@ -399,6 +479,7 @@ impl ReplicaHost {
             .max_frame_bytes
             .min(WireLimits::default().max_frame_bytes);
         let client_frame_bytes = client_limits.max_frame_bytes;
+        let client_max_items = client_limits.max_items;
         let request_timeout = config.request_timeout;
         let owner = Owner {
             session,
@@ -410,13 +491,19 @@ impl ReplicaHost {
             runtime,
             pending: VecDeque::new(),
             memberships: VecDeque::new(),
+            deferred_managed: VecDeque::new(),
+            deferred_backing: None,
+            snapshot_feedback: crate::snapshot_feedback::SnapshotFeedback::default(),
             placement: None,
             evidence: None,
             outbound,
             progress,
             incarnation: 0,
             nonce: 0,
+            support_cursor: 0,
             dropped: 0,
+            #[cfg(test)]
+            dropped_snapshots: 0,
             budget: budget.clone(),
             nonblocking: false,
             stopping: None,
@@ -429,6 +516,7 @@ impl ReplicaHost {
                 progress: changes,
                 budget,
                 client_frame_bytes,
+                client_max_items,
                 request_timeout,
             },
             owner,
@@ -521,6 +609,9 @@ impl ReplicaHost {
     }
 }
 impl RequestHandler for ReplicaHost {
+    fn supports_managed_requests(&self) -> bool {
+        true
+    }
     fn handle(
         &self,
         request: VerifiedRequest,
@@ -544,9 +635,18 @@ impl ReplicaHost {
         request: VerifiedRequest,
         witness: Option<EvidenceWitness>,
     ) -> OwnedResponse {
-        let unknown = request
-            .request()
-            .reply(Response::Error(AccessError::OutcomeUnknown));
+        let unknown = request.request().reply(Response::Error(
+            if matches!(
+                request.request().operation,
+                Operation::Reconcile(_)
+                    | Operation::RequestStreamRead { .. }
+                    | Operation::ManagedSupport { .. }
+            ) {
+                AccessError::Unavailable
+            } else {
+                AccessError::OutcomeUnknown
+            },
+        ));
         let full = request
             .request()
             .reply(Response::Error(AccessError::Capacity));
@@ -555,7 +655,28 @@ impl ReplicaHost {
             .reply(Response::Error(AccessError::Unavailable));
         let replication = matches!(request.request().operation, Operation::Raft { .. });
         let response_bytes = match &request.request().operation {
-            Operation::Read(_) => self.client_frame_bytes as usize,
+            Operation::Reconcile(query) => match crate::reconciliation::response_bytes(
+                query,
+                self.client_frame_bytes,
+                self.client_max_items,
+            ) {
+                Some(bytes) => bytes,
+                None => return OwnedResponse::new(full),
+            },
+            operation @ (Operation::Managed { .. }
+            | Operation::RequestStreamControl { .. }
+            | Operation::RequestStreamRead { .. }) => {
+                match crate::managed_requests::response_bytes(
+                    operation,
+                    self.client_frame_bytes,
+                    self.client_max_items,
+                ) {
+                    Some(bytes) => bytes,
+                    None => return OwnedResponse::new(full),
+                }
+            }
+            Operation::ManagedSupport { .. } => 32 * 1024 + 1024,
+            Operation::Read(_) | Operation::List(_) => self.client_frame_bytes as usize,
             Operation::Stream(stream) => {
                 stream.credits().bytes.min(self.client_frame_bytes) as usize
             }
@@ -635,6 +756,12 @@ impl ReplicaHost {
     }
 }
 impl Owner {
+    #[cfg(test)]
+    fn observe_checkpoint_pending(&self) {
+        if let Some(observer) = &self.config.checkpoint_observer {
+            let _ = observer.0.try_send(self.session.ledger());
+        }
+    }
     fn run(mut self, receiver: mpsc::Receiver<Work>) {
         let mut next_tick = Instant::now();
         let result = (|| -> Result<(), LedgerError> {
@@ -651,6 +778,7 @@ impl Owner {
                         if self.accept(work)? {
                             return Ok(());
                         }
+                        self.progress_managed()?;
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
@@ -675,7 +803,8 @@ impl Owner {
         self.views
             .advance(&mut self.session)
             .map_err(|_| LedgerError::Failed)?;
-        self.drain()
+        self.drain()?;
+        self.progress_managed()
     }
     /// Shared-worker progress never waits on a disk receipt. The exact Ready
     /// remains inside Session until its WAL owner reports a completed fence.
@@ -689,6 +818,10 @@ impl Owner {
             self.drain_with_runtime(self.stopping.is_none())?;
         }
         self.progress_evidence()?;
+        if !self.session.persistence_pending() {
+            self.poll_snapshot_feedback()?;
+        }
+        self.progress_managed()?;
         if let Some((_, deadline)) = self.stopping.as_ref() {
             let expired = Instant::now() >= *deadline;
             if expired && self.session.has_ready() {
@@ -729,6 +862,17 @@ impl Owner {
         Ok(self.next_tick)
     }
     fn accept(&mut self, work: Work) -> Result<bool, LedgerError> {
+        match self.managed_gate(&work) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.defer_managed(work)?;
+                return Ok(false);
+            }
+            Err(error) => {
+                managed_support_owner::reject_managed_work(work, error);
+                return Ok(false);
+            }
+        }
         match work {
             Work::Request(request, response, charge) => {
                 self.request(request.verified, response, charge, request.witness);
@@ -747,6 +891,7 @@ impl Owner {
                 self.drain()?;
                 let _ = response.send(result);
             }
+            Work::ManagedSupport(call, charge) => self.accept_managed_support(*call, charge),
             Work::Membership(call, charge) => {
                 self.accept_membership(*call, charge);
                 self.drain()?;
@@ -799,6 +944,8 @@ impl Owner {
         Ok(())
     }
     fn close(&mut self) {
+        self.close_managed();
+        self.snapshot_feedback = crate::snapshot_feedback::SnapshotFeedback::default();
         if let Some(pending) = self.evidence.take() {
             let _ = self.session.cancel_checkpoint_evidence();
             pending.finish(Err(LedgerError::OutcomeUnknown));
@@ -814,7 +961,15 @@ impl Owner {
             let _ = response.send(Err(LedgerError::OutcomeUnknown));
         }
         while let Some(pending) = self.pending.pop_front() {
-            pending.finish(Response::Error(AccessError::OutcomeUnknown));
+            let error = if matches!(
+                pending.waiting,
+                WaitingFor::Reconcile { .. } | WaitingFor::RequestStreamRead { .. }
+            ) {
+                AccessError::Unavailable
+            } else {
+                AccessError::OutcomeUnknown
+            };
+            pending.finish(Response::Error(error));
         }
         self.publish_progress(true);
     }
@@ -872,10 +1027,191 @@ impl Owner {
                 waiting = Some((WaitingFor::PeerPersistence, deadline));
                 return Ok(Response::Error(AccessError::Unavailable));
             }
+            if let Operation::ManagedSupport { group } = &request.operation {
+                let PeerRole::Node { node_id } = peer.role() else {
+                    return Err(AccessError::Unauthorized);
+                };
+                let status = self.session.status();
+                if (!status.voters.contains(&node_id) && !status.learners.contains(&node_id))
+                    || *group != self.session.group_id()
+                    || request.route_epoch != self.config.route_epoch
+                {
+                    return Err(AccessError::Unauthorized);
+                }
+                return self
+                    .session
+                    .managed_support()
+                    .map(Response::ManagedSupport)
+                    .map_err(access);
+            }
             if !self.serves_route(request.route_epoch) {
                 return Err(AccessError::Unavailable);
             }
             match &request.operation {
+                Operation::Managed {
+                    operation: ManagedOperation::Submit { .. },
+                    ..
+                } => {
+                    if self.pending.len() == self.config.pending_clients {
+                        return Err(AccessError::Capacity);
+                    }
+                    let (key, family, intent) = managed_request_identity(request)
+                        .map_err(|_| AccessError::InvalidRequest)?;
+                    if let Some(known) = crate::managed_requests::reply(
+                        &self.session,
+                        &key,
+                        intent,
+                        family,
+                        None,
+                        &self.client_limits,
+                    )? {
+                        return Ok(known);
+                    }
+                    let needs_evidence = matches!(
+                        &request.operation,
+                        Operation::Managed {
+                            operation: ManagedOperation::Submit {
+                                command: Command::AttachArtifact { .. }
+                                    | Command::RegisterArtifact { .. }
+                                    | Command::FailTestamentGeneration { .. },
+                                ..
+                            },
+                            ..
+                        }
+                    );
+                    let evidence = if needs_evidence {
+                        vec![
+                            witness
+                                .as_ref()
+                                .ok_or(AccessError::UnsupportedOperation)?
+                                .validate(
+                                    &verified,
+                                    CustodyScope {
+                                        ledger: self.session.ledger(),
+                                        route_epoch: self.config.route_epoch,
+                                        policy_revision: self.config.policy_revision,
+                                    },
+                                    &self.session.status().voters,
+                                )?,
+                        ]
+                    } else {
+                        Vec::new()
+                    };
+                    let authority = AuthorityContext {
+                        runtime: false,
+                        cause: Cause::Root(self.config.root),
+                        policy_revision: self.config.policy_revision,
+                        logical_time: wall_ms().map_err(access)? / 1000,
+                        evidence,
+                    };
+                    let input = verified.into_managed(authority)?;
+                    match self.session.propose_managed(&input).map_err(access)? {
+                        ManagedSubmission::Committed(receipt) => {
+                            Ok(Response::Managed(ManagedReply {
+                                receipt: *receipt,
+                                stream: None,
+                            }))
+                        }
+                        ManagedSubmission::Pending(key) => {
+                            waiting = Some((
+                                WaitingFor::ManagedMutation {
+                                    key,
+                                    intent,
+                                    family,
+                                },
+                                deadline,
+                            ));
+                            Ok(Response::Error(AccessError::OutcomeUnknown))
+                        }
+                        ManagedSubmission::Domain(_) => Err(AccessError::InvalidRequest),
+                    }
+                }
+                Operation::Managed {
+                    operation: ManagedOperation::Cursor(stream),
+                    ..
+                } => {
+                    if self.pending.len() == self.config.pending_clients {
+                        return Err(AccessError::Capacity);
+                    }
+                    let (key, family, intent) = managed_request_identity(request)
+                        .map_err(|_| AccessError::InvalidRequest)?;
+                    if let Some(receipt) = self
+                        .session
+                        .managed_receipt(&key, intent, family)
+                        .map_err(access)?
+                        && matches!(receipt.outcome, ManagedReceiptOutcome::Sealed { .. })
+                    {
+                        return Ok(Response::Managed(ManagedReply {
+                            receipt: crate::managed_requests::receipt_copy(
+                                receipt,
+                                &self.client_limits,
+                            )?,
+                            stream: None,
+                        }));
+                    }
+                    let stream = self.streams.begin(
+                        &mut self.session,
+                        peer,
+                        request,
+                        stream,
+                        &self.client_limits,
+                    )?;
+                    waiting = Some((
+                        WaitingFor::ManagedStream {
+                            stream,
+                            key,
+                            intent,
+                        },
+                        deadline,
+                    ));
+                    Ok(Response::Error(AccessError::OutcomeUnknown))
+                }
+                Operation::RequestStreamControl { .. } => {
+                    if self.pending.len() == self.config.pending_clients {
+                        return Err(AccessError::Capacity);
+                    }
+                    let input = verified.into_request_stream_control()?;
+                    match self
+                        .session
+                        .propose_request_stream(&input)
+                        .map_err(access)?
+                    {
+                        RequestStreamSubmission::Committed(_)
+                        | RequestStreamSubmission::Pending(_) => {}
+                    }
+                    waiting = Some((
+                        WaitingFor::RequestStreamControl {
+                            input: Box::new(input),
+                            context: None,
+                        },
+                        deadline,
+                    ));
+                    Ok(Response::Error(AccessError::OutcomeUnknown))
+                }
+                Operation::RequestStreamRead { cluster, query } => {
+                    if self.pending.len() == self.config.pending_clients {
+                        return Err(AccessError::Capacity);
+                    }
+                    if *cluster != self.session.cluster_id() {
+                        return Err(AccessError::Unauthorized);
+                    }
+                    self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
+                    let mut context = b"focal.replica.managed.read.v1\0".to_vec();
+                    context.extend_from_slice(&self.nonce.to_be_bytes());
+                    context.extend_from_slice(&peer.principal().0);
+                    context.extend_from_slice(&request.request_id.0);
+                    self.session.read_index(context.clone()).map_err(access)?;
+                    waiting = Some((
+                        WaitingFor::RequestStreamRead {
+                            context,
+                            principal: peer.principal(),
+                            cluster: *cluster,
+                            query: *query,
+                        },
+                        deadline,
+                    ));
+                    Ok(Response::Error(AccessError::Unavailable))
+                }
                 Operation::Submit { .. } | Operation::OpenEpoch { .. } => {
                     if self.pending.len() == self.config.pending_clients {
                         return Err(AccessError::Capacity);
@@ -936,6 +1272,70 @@ impl Owner {
                     )?;
                     waiting = Some((WaitingFor::Stream(pending), deadline));
                     Ok(Response::Error(AccessError::Unavailable))
+                }
+                Operation::Reconcile(query) => {
+                    if !self.session.is_authoritative() {
+                        return Err(AccessError::Unavailable);
+                    }
+                    if self.pending.len() == self.config.pending_clients {
+                        return Err(AccessError::Capacity);
+                    }
+                    self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
+                    let mut context = b"focal.replica.reconcile.v1\0".to_vec();
+                    context.extend_from_slice(&self.nonce.to_be_bytes());
+                    context.extend_from_slice(&peer.principal().0);
+                    context.extend_from_slice(&request.request_id.0);
+                    self.session.read_index(context.clone()).map_err(access)?;
+                    waiting = Some((
+                        WaitingFor::Reconcile {
+                            context,
+                            principal: peer.principal(),
+                            query: *query,
+                        },
+                        deadline,
+                    ));
+                    Ok(Response::Error(AccessError::Unavailable))
+                }
+                Operation::List(list) => {
+                    let scope = list_scope(peer, self.session.ledger(), &list.filter)?;
+                    if list.cursor.is_none() {
+                        if !self.session.is_authoritative() {
+                            return Err(AccessError::Unavailable);
+                        }
+                        if self.pending.len() == self.config.pending_clients {
+                            return Err(AccessError::Capacity);
+                        }
+                        self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
+                        let mut context = b"focal.replica.list.v1\0".to_vec();
+                        context.extend_from_slice(&self.nonce.to_be_bytes());
+                        context.extend_from_slice(&peer.principal().0);
+                        context.extend_from_slice(&request.request_id.0);
+                        self.session.read_index(context.clone()).map_err(access)?;
+                        waiting = Some((
+                            WaitingFor::List {
+                                context,
+                                principal: peer.principal(),
+                                scope,
+                                list: list.clone(),
+                            },
+                            deadline,
+                        ));
+                        Ok(Response::Error(AccessError::Unavailable))
+                    } else {
+                        self.views
+                            .list(
+                                &mut self.session,
+                                ListReadContext {
+                                    principal: peer.principal(),
+                                    scope,
+                                    request_id: request.request_id,
+                                    barrier: None,
+                                },
+                                list,
+                                &self.client_limits,
+                            )
+                            .map(Response::Listed)
+                    }
                 }
                 Operation::Read(read) => {
                     if matches!(read.consistency, ReadConsistency::Linearizable) {
@@ -1009,6 +1409,18 @@ impl Owner {
         if !self.serves_route(request.route_epoch) {
             return Err(AccessError::Unavailable);
         }
+        if let Operation::Managed { .. } = &request.operation {
+            let (key, family, intent) =
+                managed_request_identity(request).map_err(|_| AccessError::InvalidRequest)?;
+            return crate::managed_requests::reply(
+                &self.session,
+                &key,
+                intent,
+                family,
+                None,
+                &self.client_limits,
+            );
+        }
         let input = verified.clone().into_authenticated(AuthorityContext {
             runtime: false,
             cause: Cause::Root(self.config.root),
@@ -1041,6 +1453,20 @@ impl Owner {
         }
         self.resolve(&events)?;
         for message in &events.messages {
+            let snapshot = match self.snapshot_feedback.begin(message, &self.budget) {
+                Ok(snapshot) => snapshot,
+                Err(_) => {
+                    // Metadata admission also cannot strand Raft in Snapshot.
+                    self.session.report_snapshot_at(
+                        message.to,
+                        message.term,
+                        message.get_snapshot().get_metadata().index,
+                        focal_consensus::SnapshotStatus::Failure,
+                    )?;
+                    self.dropped = self.dropped.saturating_add(1);
+                    continue;
+                }
+            };
             let size = message.compute_size() as usize;
             // Oversized snapshots require the chunked snapshot transport. They
             // cannot be silently treated as installed or acknowledged.
@@ -1048,6 +1474,10 @@ impl Owner {
                 .checked_add(128)
                 .is_none_or(|n| n > self.limits.max_frame_bytes as usize)
             {
+                #[cfg(test)]
+                if snapshot.is_some() {
+                    self.dropped_snapshots = self.dropped_snapshots.saturating_add(1);
+                }
                 self.dropped = self.dropped.saturating_add(1);
                 continue;
             }
@@ -1061,12 +1491,17 @@ impl Owner {
                 self.dropped = self.dropped.saturating_add(1);
                 continue;
             };
-            let message_bytes = message.write_to_bytes().map_err(|_| LedgerError::Corrupt)?;
+            let Ok(message_bytes) = message.write_to_bytes() else {
+                drop(snapshot);
+                self.dropped = self.dropped.saturating_add(1);
+                continue;
+            };
             self.nonce = self.nonce.checked_add(1).ok_or(LedgerError::Capacity)?;
             let id = ((u128::from(self.session.status().node_id) << 64) | u128::from(self.nonce))
                 .to_be_bytes();
             let frame = ReplicationFrame {
                 target: message.to,
+                snapshot,
                 _charge: charge.commit(),
                 request: RequestEnvelope {
                     protocol: PROTOCOL_VERSION,
@@ -1084,8 +1519,15 @@ impl Owner {
                 self.dropped = self.dropped.saturating_add(1);
             }
         }
+        self.poll_snapshot_feedback()?;
         self.publish_progress(false);
         Ok(())
+    }
+    fn poll_snapshot_feedback(&mut self) -> Result<(), LedgerError> {
+        self.snapshot_feedback
+            .poll(self.session.status().term, |peer, term, index, status| {
+                self.session.report_snapshot_at(peer, term, index, status)
+            })
     }
     fn resolve(&mut self, events: &SessionEvents) -> Result<(), LedgerError> {
         self.resolve_memberships(events)?;
@@ -1097,7 +1539,9 @@ impl Owner {
             if !self.serves_route(pending.header.route_epoch)
                 && !matches!(
                     pending.waiting,
-                    WaitingFor::Mutation(_) | WaitingFor::PeerPersistence
+                    WaitingFor::Mutation(_)
+                        | WaitingFor::ManagedMutation { .. }
+                        | WaitingFor::PeerPersistence
                 )
             {
                 pending.finish(Response::Error(AccessError::Unavailable));
@@ -1105,6 +1549,115 @@ impl Owner {
             }
             let result = match &mut pending.waiting {
                 WaitingFor::PeerPersistence => Some(Response::PeerAccepted),
+                WaitingFor::ManagedMutation {
+                    key,
+                    intent,
+                    family,
+                } => match crate::managed_requests::reply(
+                    &self.session,
+                    key,
+                    *intent,
+                    *family,
+                    None,
+                    &self.client_limits,
+                ) {
+                    Ok(reply) => reply,
+                    Err(error) => Some(Response::Error(error)),
+                },
+                WaitingFor::ManagedStream {
+                    stream,
+                    key,
+                    intent,
+                } if self.stopping.is_none() => {
+                    match self.streams.advance(
+                        &mut self.session,
+                        &mut self.views,
+                        stream,
+                        events,
+                        &self.client_limits,
+                    ) {
+                        Ok(Some(delivery)) => match crate::managed_requests::reply(
+                            &self.session,
+                            key,
+                            *intent,
+                            ManagedRequestFamily::Cursor,
+                            Some(delivery),
+                            &self.client_limits,
+                        ) {
+                            Ok(reply) => reply,
+                            Err(error) => Some(Response::Error(error)),
+                        },
+                        Ok(None) => None,
+                        Err(error) => Some(Response::Error(error)),
+                    }
+                }
+                WaitingFor::RequestStreamRead {
+                    context,
+                    principal,
+                    cluster,
+                    query,
+                } if pending.term == status.term && self.session.is_authoritative() => events
+                    .read_barriers
+                    .iter()
+                    .find(|(value, _)| value == context)
+                    .map(|(_, prefix)| {
+                        crate::managed_requests::read_after_barrier(
+                            &self.session,
+                            *principal,
+                            *cluster,
+                            query,
+                            *prefix,
+                            pending.header.route_epoch,
+                            &self.client_limits,
+                        )
+                        .map(Response::RequestStreamRead)
+                        .unwrap_or_else(Response::Error)
+                    }),
+                WaitingFor::RequestStreamControl { input, context }
+                    if pending.term == status.term
+                        && self.session.is_authoritative()
+                        && self.stopping.is_none() =>
+                {
+                    if let Some(context) = context {
+                        if events
+                            .read_barriers
+                            .iter()
+                            .any(|(value, _)| value == context)
+                        {
+                            match crate::managed_requests::control_reply(
+                                &self.session,
+                                input,
+                                pending.header.route_epoch,
+                                &self.client_limits,
+                            ) {
+                                Ok(reply) => reply,
+                                Err(error) => Some(Response::Error(error)),
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        match self.session.request_stream_receipt(input) {
+                            Ok(Some(_)) => {
+                                self.nonce =
+                                    self.nonce.checked_add(1).ok_or(LedgerError::Capacity)?;
+                                let mut next = b"focal.replica.managed.control.v1\0".to_vec();
+                                next.extend_from_slice(&self.nonce.to_be_bytes());
+                                next.extend_from_slice(&input.principal.0);
+                                next.extend_from_slice(&input.id.0);
+                                match self.session.read_index(next.clone()) {
+                                    Ok(()) => {
+                                        *context = Some(next);
+                                        None
+                                    }
+                                    Err(error) => Some(Response::Error(access(error))),
+                                }
+                            }
+                            Ok(None) => None,
+                            Err(error) => Some(Response::Error(access(error))),
+                        }
+                    }
+                }
                 WaitingFor::Mutation(key) => self
                     .session
                     .receipt(key)
@@ -1136,6 +1689,51 @@ impl Owner {
                             .map(Response::Read)
                             .unwrap_or_else(Response::Error)
                     }),
+                WaitingFor::Reconcile {
+                    context,
+                    principal,
+                    query,
+                } if pending.term == status.term && self.session.is_authoritative() => events
+                    .read_barriers
+                    .iter()
+                    .find(|(value, _)| value.as_slice() == context.as_slice())
+                    .map(|(_, prefix)| {
+                        crate::reconciliation::after_barrier(
+                            &self.session,
+                            *principal,
+                            query,
+                            *prefix,
+                            pending.header.route_epoch,
+                            &self.client_limits,
+                        )
+                        .map(Response::Reconciled)
+                        .unwrap_or_else(Response::Error)
+                    }),
+                WaitingFor::List {
+                    context,
+                    principal,
+                    scope,
+                    list,
+                } if pending.term == status.term && status.role == StateRole::Leader => events
+                    .read_barriers
+                    .iter()
+                    .find(|(value, _)| value.as_slice() == context.as_slice())
+                    .map(|(_, prefix)| {
+                        self.views
+                            .list(
+                                &mut self.session,
+                                ListReadContext {
+                                    principal: *principal,
+                                    scope: *scope,
+                                    request_id: pending.header.request_id,
+                                    barrier: Some(*prefix),
+                                },
+                                list,
+                                &self.client_limits,
+                            )
+                            .map(Response::Listed)
+                            .unwrap_or_else(Response::Error)
+                    }),
                 WaitingFor::Stream(stream) if self.stopping.is_none() => {
                     match self.streams.advance(
                         &mut self.session,
@@ -1154,8 +1752,12 @@ impl Owner {
                 pending.finish(result);
             } else if Instant::now() >= pending.deadline || status.term != pending.term {
                 let error = match &pending.waiting {
-                    WaitingFor::Mutation(_) => AccessError::OutcomeUnknown,
-                    WaitingFor::Stream(stream) => stream.interrupted(),
+                    WaitingFor::Mutation(_)
+                    | WaitingFor::ManagedMutation { .. }
+                    | WaitingFor::RequestStreamControl { .. } => AccessError::OutcomeUnknown,
+                    WaitingFor::Stream(stream) | WaitingFor::ManagedStream { stream, .. } => {
+                        stream.interrupted()
+                    }
                     _ => AccessError::Unavailable,
                 };
                 pending.finish(Response::Error(error));
@@ -1194,8 +1796,12 @@ impl Owner {
                 drop(pending);
             } else if now >= pending.deadline {
                 let error = match &pending.waiting {
-                    WaitingFor::Mutation(_) => AccessError::OutcomeUnknown,
-                    WaitingFor::Stream(stream) => stream.interrupted(),
+                    WaitingFor::Mutation(_)
+                    | WaitingFor::ManagedMutation { .. }
+                    | WaitingFor::RequestStreamControl { .. } => AccessError::OutcomeUnknown,
+                    WaitingFor::Stream(stream) | WaitingFor::ManagedStream { stream, .. } => {
+                        stream.interrupted()
+                    }
                     _ => AccessError::Unavailable,
                 };
                 pending.finish(Response::Error(error));
@@ -1227,18 +1833,38 @@ impl Owner {
             let deadline = Instant::now()
                 .checked_add(self.config.request_timeout)
                 .ok_or(LedgerError::Capacity)?;
+            let mut proposed = true;
             if let Some(request) = &call.request {
-                self.session.propose_membership(request)?;
+                match self.session.propose_membership(request) {
+                    Ok(()) => {}
+                    Err(LedgerError::Managed(focal_ledger::ManagedError::Unsupported))
+                        if matches!(
+                            request.change,
+                            focal_consensus::MembershipChange::AddLearner { .. }
+                                | focal_consensus::MembershipChange::Promote { .. }
+                        ) =>
+                    {
+                        let current = self.session.membership()?;
+                        if current.configuration_index != request.expected_index
+                            || current.configuration != request.expected
+                        {
+                            return Err(LedgerError::MembershipConflict);
+                        }
+                        proposed = false;
+                    }
+                    Err(error) => return Err(error),
+                }
             } else if !self.session.is_authoritative() {
                 return Err(LedgerError::NotReady {
                     leader: self.session.status().leader_id,
                 });
             }
-            Ok(deadline)
+            Ok((deadline, proposed))
         })();
         match admitted {
-            Ok(deadline) => self.memberships.push_back(PendingMembershipCall {
+            Ok((deadline, proposed)) => self.memberships.push_back(PendingMembershipCall {
                 call,
+                proposed,
                 context: None,
                 term: self.session.status().term,
                 deadline,
@@ -1271,6 +1897,30 @@ impl Owner {
             {
                 self.finish_membership(pending, Err(LedgerError::OutcomeUnknown));
                 continue;
+            }
+            if !pending.proposed {
+                if self.stopping.is_some() {
+                    self.finish_membership(pending, Err(LedgerError::OutcomeUnknown));
+                    continue;
+                }
+                let Some(request) = pending.call.request.as_ref() else {
+                    self.finish_membership(pending, Err(LedgerError::Corrupt));
+                    continue;
+                };
+                match self.session.propose_membership(request) {
+                    Ok(()) => pending.proposed = true,
+                    Err(
+                        LedgerError::Managed(focal_ledger::ManagedError::Unsupported)
+                        | LedgerError::Capacity,
+                    ) => {
+                        self.memberships.push_back(pending);
+                        continue;
+                    }
+                    Err(error) => {
+                        self.finish_membership(pending, Err(error));
+                        continue;
+                    }
+                }
             }
             let receipt_ready = match pending
                 .call
@@ -1331,3 +1981,7 @@ fn wall_ms() -> Result<u64, LedgerError> {
     )
     .map_err(|_| LedgerError::Failed)
 }
+
+#[cfg(test)]
+#[path = "fleet_list_tests.rs"]
+mod list_tests;

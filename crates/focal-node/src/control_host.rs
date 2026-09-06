@@ -77,8 +77,16 @@ struct ControlProgressState {
 pub struct ControlReplicationFrame {
     pub target: u64,
     pub request: RequestEnvelope,
+    snapshot: Option<oneshot::Sender<focal_consensus::SnapshotStatus>>,
     // Retained until transport finishes, including connection setup/retries.
     _charge: Allocation,
+}
+impl ControlReplicationFrame {
+    /// Transport acceptance releases snapshot flow control only. The separate
+    /// Raft response remains responsible for durable replication progress.
+    pub(crate) fn report_snapshot(&mut self, accepted: bool) {
+        crate::snapshot_feedback::complete(&mut self.snapshot, accepted);
+    }
 }
 #[path = "directory_bootstrap_owner.rs"]
 mod directory_bootstrap_owner;
@@ -217,6 +225,7 @@ struct Owner<V> {
     pending: VecDeque<Pending>,
     directory: Option<PendingDirectory>,
     authority_refresh: Option<PendingAuthority>,
+    snapshot_feedback: crate::snapshot_feedback::SnapshotFeedback,
     outbound: async_mpsc::Sender<ControlReplicationFrame>,
     progress: watch::Sender<ControlProgressState>,
     nonce: u64,
@@ -375,6 +384,7 @@ impl ControlHost {
             pending: VecDeque::new(),
             directory: None,
             authority_refresh: None,
+            snapshot_feedback: Default::default(),
             outbound,
             progress,
             nonce: 0,
@@ -585,6 +595,10 @@ impl<V: AuthorityVerifier> Owner<V> {
                 }
             }
         }));
+        self.stop_waiters();
+        self.publish_progress(true);
+    }
+    fn stop_waiters(&mut self) {
         while let Some(pending) = self.pending.pop_front() {
             self.finish(pending, Err(ControlFailure::OutcomeUnknown));
         }
@@ -596,7 +610,6 @@ impl<V: AuthorityVerifier> Owner<V> {
         if let Some(pending) = self.authority_refresh.take() {
             pending.stop();
         }
-        self.publish_progress(true);
     }
     fn work(&mut self, work: Work) -> Result<bool, ControlError> {
         match work {
@@ -658,6 +671,12 @@ impl<V: AuthorityVerifier> Owner<V> {
                 let _ = response.send(result);
             }
             Work::Stop(response) => {
+                // Stop follow-up reads/enrollment admissions before the final
+                // drain. Otherwise a committed refresh can enqueue a new
+                // ReadIndex during drain and invalidate the checkpoint fence.
+                // This releases caller interest only: admitted proposals and
+                // their prepared state remain owned by the replica below.
+                self.stop_waiters();
                 let result = self.drain().and_then(|_| {
                     if self.replica.has_pending() || self.replica.applied_index() == 0 {
                         Ok(())
@@ -1118,6 +1137,23 @@ impl<V: AuthorityVerifier> Owner<V> {
             drop(read_charge);
         }
         for message in events.messages {
+            // Register the exact current flight before any local operation can
+            // drop it. Replacing a prior receiver fences late transport results.
+            let snapshot = match self.snapshot_feedback.begin(&message, &self.budget) {
+                Ok(snapshot) => snapshot,
+                Err(_) => {
+                    if message.get_msg_type() == focal_consensus::MessageType::MsgSnapshot {
+                        self.replica.report_snapshot_at(
+                            message.to,
+                            message.term,
+                            message.get_snapshot().get_metadata().index,
+                            focal_consensus::SnapshotStatus::Failure,
+                        )?;
+                    }
+                    self.dropped = self.dropped.saturating_add(1);
+                    continue;
+                }
+            };
             let Some(bytes) = (message.compute_size() as usize)
                 .checked_mul(2)
                 .and_then(|n| n.checked_add(4096))
@@ -1159,6 +1195,7 @@ impl<V: AuthorityVerifier> Owner<V> {
                 .try_send(ControlReplicationFrame {
                     target: message.to,
                     request,
+                    snapshot,
                     _charge: charge.commit(),
                 })
                 .is_err()
@@ -1166,6 +1203,13 @@ impl<V: AuthorityVerifier> Owner<V> {
                 self.dropped = self.dropped.saturating_add(1);
             }
         }
+        // Drain has completed its persistence before reporting transport status.
+        // Register every newly emitted flight first: an old completion must not
+        // act on a newer snapshot for the same peer in this event prefix.
+        self.snapshot_feedback
+            .poll(status.term, |peer, term, index, result| {
+                self.replica.report_snapshot_at(peer, term, index, result)
+            })?;
         self.publish_progress(false);
         Ok(())
     }
@@ -1250,3 +1294,7 @@ fn access_failure(error: AccessError) -> ControlFailure {
 #[cfg(test)]
 #[path = "control_host_auth_tests.rs"]
 mod auth_tests;
+
+#[cfg(test)]
+#[path = "control_snapshot_tests.rs"]
+mod snapshot_tests;

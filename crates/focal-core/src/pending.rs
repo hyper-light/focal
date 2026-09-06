@@ -36,6 +36,10 @@ pub struct RowPatch<'a> {
     pub(crate) version: &'a RowVersion,
 }
 impl PendingState {
+    pub(crate) fn accept_managed_row(&mut self, ledger: LedgerId, version: RowVersion) {
+        self.ledger = Some(ledger);
+        self.rows.push(Some(version));
+    }
     pub fn new() -> Self {
         Self::default()
     }

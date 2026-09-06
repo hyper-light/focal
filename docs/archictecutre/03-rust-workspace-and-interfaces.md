@@ -25,8 +25,9 @@ Create crates at the work package that first needs them. Do not scaffold empty a
 | `focal-evidence` | Chunk ingest, content verification, custody, typed validator registry/execution | `chunks.rs`, `manifest.rs`, `registry.rs`, `dispatch.rs`, `verdict.rs` | model; ledger client seam only |
 | `focal-stream` | Subscription cursor, projection seed, credits, bounded replay/fanout | `cursor.rs`, `subscription.rs`, `seed.rs`, `fanout.rs` | model, ledger read seam |
 | `focal-wire` | Canonical domain codec and bounded network envelopes | `canonical.rs`, `frame.rs`, `version.rs`, `message.rs` | model |
-| `focal-client` | In-process/network client adapters, routing, retry, token propagation | `client.rs`, `embedded.rs`, `remote.rs`, `routing.rs` | model, wire |
-| `focal-node` | Runtime composition, authenticated transport, placement, budgets, boot/shutdown | `main.rs`, `config.rs`, `boot.rs`, `transport.rs`, `directory.rs`, `placement.rs`, `admission.rs` | Concrete adapters above |
+| `focal-client` | In-process/network adapters, typed authored operations, human DTO conversion, routing, durable retry and query token propagation | `client.rs`, `operations/`, `input/`, `pending/`, `query/`, transport adapters | model, wire |
+| `focal-node` | Runtime composition, authenticated transport, placement, budgets, boot/shutdown and thin manual CLI | `main.rs`, `cli/`, `config.rs`, `boot.rs`, `transport.rs`, `directory.rs`, `placement.rs`, `admission.rs` | Concrete adapters above |
+| `focal-mcp` (planned if a separate crate is warranted) | Bounded MCP protocol adapter and capability-scoped tool/resource registry | `server.rs`, `tools.rs`, `resources.rs`, `transport.rs`; no business reducer | client, chosen qualified MCP transport/codec |
 | `focal-archive` | Checkpoint/archive manifests, retrieval, retirement, restore | `checkpoint.rs`, `custody.rs`, `catalog.rs`, `restore.rs`, `gc.rs` | model, log, evidence; snapshot seam |
 | `focal-sim` | Deterministic driver, fault injection, reference oracle, reproducible histories | `driver.rs`, `network.rs`, `disk.rs`, `nemesis.rs`, `history.rs` | Production pure modules and adapters under test |
 
@@ -215,7 +216,11 @@ See [08](08-stepped-complexity-and-deployment.md). Most users should never learn
 
 The irreducible user choices are location/data custody, who may join, desired failure tolerance, and capacity/resource constraints. The same configuration schema grows through local, VM, Kubernetes, multi-AZ, regional, and global deployment. `explain` output states effective guarantees and why automatic placement or admission could not satisfy them.
 
-## 11. Repository checks
+## 11. Manual and agent adapters
+
+The added manual and agent interfaces follow [13](13-cli-and-agent-implementation-plan.md). Flag, JSON and YAML parsers compile through one typed application schema before building a wire request. MCP and skills call that same operation surface; they do not own reducer state. New query, receipt reconciliation, validation-result and child-cause admission seams require explicit protocol changes and authorization tests. Existing source arrays/enum tags remain compatible; readable CLI IDs belong in separate human DTOs. Adapter cancellation releases its owned buffers without canceling an already admitted durable mutation.
+
+## 12. Repository checks
 
 P00 introduces formatting, lint, dependency-direction checks, and deterministic test targets. Public mutation methods outside the canonical ingress are forbidden by visibility and architecture tests. Business-state crates prohibit ambient time and randomness and remain safe Rust initially.
 

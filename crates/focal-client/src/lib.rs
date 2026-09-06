@@ -12,16 +12,25 @@
 )]
 //! Embedded and remote clients preserving durable request identities across retries.
 mod client;
+pub mod input;
+pub mod managed_store;
+pub mod operation_store;
+pub mod operations;
+pub mod pending;
 mod transport;
 pub use client::*;
 pub use focal_wire::{
     AccessError, ContentChunk, Credits, MutationReply, ObjectKey, Operation, ReadConsistency,
-    ReadPage, ReadQuery, ReadRequest, ReadToken, RequestEnvelope, Response, ResponseEnvelope,
-    RouteHint, SubscribeRequest, SubscriptionBatch, UploadReply, UploadRequest, WireLimits,
+    ReadPage, ReadQuery, ReadRequest, ReadToken, ReconcileReply, RequestEnvelope, Response,
+    ResponseEnvelope, RouteHint, SubscribeRequest, SubscriptionBatch, UploadReply, UploadRequest,
+    WireLimits,
 };
 pub use focal_wire::{
     ConsumerId, CursorToken, DeltaFilter, Position, PositionOffset, StreamEvent, StreamReply,
     StreamRequest,
+};
+pub use focal_wire::{
+    ManagedOperation, ManagedReply, RequestStreamControlReply, RequestStreamReadReply,
 };
 pub use transport::*;
 #[cfg(test)]

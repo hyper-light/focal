@@ -296,16 +296,26 @@ pub fn manifest_hash(artifacts: &[ArtifactRef]) -> Result<ContentHash, Canonical
 /// Request identity deliberately excludes ingress timestamps and refreshed custody proofs.
 /// Postcard v1 field order is a frozen protocol schema; authored identity uses the encoder above.
 pub fn command_hash(input: &AuthenticatedInput) -> Result<ContentHash, CanonicalError> {
+    command_parts_hash(
+        input.ledger,
+        input.principal,
+        &input.expected_revision,
+        &input.command,
+    )
+}
+pub(crate) fn command_parts_hash(
+    ledger: LedgerId,
+    principal: ParticipantId,
+    expected_revision: &Option<ObjectRevision>,
+    command: &Command,
+) -> Result<ContentHash, CanonicalError> {
     let mut e = CanonicalEncoder::new();
     e.fixed(b"focal.command\0");
     e.u16(SCHEMA_MAJOR);
-    e.ledger(input.ledger);
-    e.fixed(&input.principal.0);
-    e.u16(input.command.code());
-    e.bytes(&postcard::to_allocvec(&(
-        &input.expected_revision,
-        &input.command,
-    ))?);
+    e.ledger(ledger);
+    e.fixed(&principal.0);
+    e.u16(command.code());
+    e.bytes(&postcard::to_allocvec(&(expected_revision, command))?);
     Ok(ContentHash(*blake3::hash(&e.finish()?).as_bytes()))
 }
 

@@ -70,3 +70,12 @@ lease reuse, final-handle shutdown with outstanding tickets, replay isolation,
 compaction, rollback on quota rejection, and all existing injected durability
 failure boundaries. These checks do not qualify drive firmware behavior or
 establish multi-region throughput.
+
+`RecordKind::DecoderFloor` appends enum ordinal 6 without changing older record
+encodings. Consensus uses it for an immutable group decoder fingerprint, persisted
+before advertising support and retained by every checkpoint. Older record decoders
+reject this new kind during the physical WAL validation scan, preventing a
+downgraded process from participating even before new application commands exist.
+The framing, checksum and durability fence remain unchanged. The WAL does not
+interpret application fingerprints; the consensus/application boundary verifies
+the owning group's exact requirement before releasing Raft output.

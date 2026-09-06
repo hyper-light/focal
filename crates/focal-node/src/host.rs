@@ -146,6 +146,9 @@ impl HostOwner {
     }
 }
 impl RequestHandler for LocalHost {
+    fn supports_managed_requests(&self) -> bool {
+        true
+    }
     fn handle(
         &self,
         request: VerifiedRequest,
@@ -154,14 +157,41 @@ impl RequestHandler for LocalHost {
     }
     fn handle_accounted(&self, request: VerifiedRequest) -> OwnedHandlerFuture<'_> {
         Box::pin(async move {
-            let fallback = request
-                .request()
-                .reply(Response::Error(AccessError::OutcomeUnknown));
+            let fallback = request.request().reply(Response::Error(
+                if matches!(
+                    request.request().operation,
+                    Operation::Reconcile(_) | Operation::RequestStreamRead { .. }
+                ) {
+                    AccessError::Unavailable
+                } else {
+                    AccessError::OutcomeUnknown
+                },
+            ));
             let full = request
                 .request()
                 .reply(Response::Error(AccessError::Capacity));
             let payload = match &request.request().operation {
-                Operation::Read(_) => self.limits.max_frame_bytes as usize,
+                operation @ (Operation::Managed { .. }
+                | Operation::RequestStreamControl { .. }
+                | Operation::RequestStreamRead { .. }) => {
+                    match crate::managed_requests::response_bytes(
+                        operation,
+                        self.limits.max_frame_bytes,
+                        self.limits.max_items,
+                    ) {
+                        Some(bytes) => bytes,
+                        None => return OwnedResponse::new(full),
+                    }
+                }
+                Operation::Reconcile(query) => match crate::reconciliation::response_bytes(
+                    query,
+                    self.limits.max_frame_bytes,
+                    self.limits.max_items,
+                ) {
+                    Some(bytes) => bytes,
+                    None => return OwnedResponse::new(full),
+                },
+                Operation::Read(_) | Operation::List(_) => self.limits.max_frame_bytes as usize,
                 Operation::Stream(stream) => {
                     stream.credits().bytes.min(self.limits.max_frame_bytes) as usize
                 }
@@ -174,6 +204,15 @@ impl RequestHandler for LocalHost {
                 request.request().operation,
                 Operation::Upload(_)
                     | Operation::Download { .. }
+                    | Operation::Managed {
+                        operation: ManagedOperation::Submit {
+                            command: Command::AttachArtifact { .. }
+                                | Command::RegisterArtifact { .. }
+                                | Command::FailTestamentGeneration { .. },
+                            ..
+                        },
+                        ..
+                    }
                     | Operation::Submit {
                         command: Command::AttachArtifact { .. }
                             | Command::RegisterArtifact { .. }
@@ -197,7 +236,18 @@ impl RequestHandler for LocalHost {
             // VerifiedRequest supplies capability-checked operation semantics;
             // no request payload can nominate its own admission priority.
             let lane = match &request.request().operation {
-                Operation::Submit { command, .. } => focal_ledger::mutation_lane(command),
+                Operation::Submit { command, .. }
+                | Operation::Managed {
+                    operation: ManagedOperation::Submit { command, .. },
+                    ..
+                } => focal_ledger::mutation_lane(command),
+                Operation::RequestStreamControl {
+                    command:
+                        RequestStreamCommand::Acknowledge { .. }
+                        | RequestStreamCommand::Seal { .. }
+                        | RequestStreamCommand::Close { .. },
+                    ..
+                } => BudgetLane::Completion,
                 _ => BudgetLane::Ordinary,
             };
             let Ok(charge) = self.budget.reserve(BudgetKind::Pending, lane, bytes) else {
@@ -276,6 +326,19 @@ pub(crate) fn known_receipt(
 }
 pub(crate) fn access(error: LedgerError) -> AccessError {
     match error {
+        LedgerError::Managed(error) => match error {
+            focal_ledger::ManagedError::Capacity => AccessError::Capacity,
+            focal_ledger::ManagedError::Unsupported => AccessError::UnsupportedOperation,
+            focal_ledger::ManagedError::InvalidIdentity => AccessError::Unauthorized,
+            focal_ledger::ManagedError::NotRegistered => AccessError::ManagedNotRegistered,
+            focal_ledger::ManagedError::Conflict => AccessError::ManagedConflict,
+            focal_ledger::ManagedError::Closed { generation } => {
+                AccessError::ManagedClosed { generation }
+            }
+            focal_ledger::ManagedError::Retired { through } => {
+                AccessError::ManagedRetired { through }
+            }
+        },
         LedgerError::Capacity => AccessError::Capacity,
         LedgerError::Behind => AccessError::Behind {
             published: SessionSeq(0),
@@ -318,6 +381,16 @@ fn dispatch(
     }
     let result = if request.ledger != node.identity.ledger {
         Err(AccessError::Unauthorized)
+    } else if request.route_epoch != RouteEpoch(1)
+        && matches!(
+            request.operation,
+            Operation::Reconcile(_)
+                | Operation::Managed { .. }
+                | Operation::RequestStreamControl { .. }
+                | Operation::RequestStreamRead { .. }
+        )
+    {
+        Err(AccessError::Unavailable)
     } else if request.route_epoch != RouteEpoch(1) {
         Err(AccessError::RouteChanged(RouteHint {
             epoch: RouteEpoch(1),
@@ -357,6 +430,21 @@ fn dispatch(
                     })
                     .map_err(access)
             })(),
+            Operation::Managed { .. }
+            | Operation::RequestStreamControl { .. }
+            | Operation::RequestStreamRead { .. } => {
+                crate::managed_requests::local(node, views, streams, verified, limits)
+            }
+            Operation::ManagedSupport { .. } => Err(AccessError::UnsupportedOperation),
+            Operation::Reconcile(query) => crate::reconciliation::local(
+                &mut node.session,
+                principal,
+                query,
+                request.request_id,
+                request.route_epoch,
+                limits,
+            )
+            .map(Response::Reconciled),
             Operation::Read(read) => views
                 .read(
                     &mut node.session,
@@ -366,6 +454,21 @@ fn dispatch(
                     limits,
                 )
                 .map(Response::Read),
+            Operation::List(list) => list_scope(peer, node.session.ledger(), &list.filter)
+                .and_then(|scope| {
+                    views.list(
+                        &mut node.session,
+                        crate::reads::ListReadContext {
+                            principal,
+                            scope,
+                            request_id: request.request_id,
+                            barrier: None,
+                        },
+                        list,
+                        limits,
+                    )
+                })
+                .map(Response::Listed),
             Operation::Upload(upload) => upload_content(node, peer, upload).map(Response::Upload),
             Operation::Download {
                 content,
@@ -465,7 +568,10 @@ fn upload_content(
             .map_err(content_error),
     }
 }
-fn attest(node: &EmbeddedNode, command: &Command) -> Result<Vec<EvidenceAttestation>, AccessError> {
+pub(crate) fn attest(
+    node: &EmbeddedNode,
+    command: &Command,
+) -> Result<Vec<EvidenceAttestation>, AccessError> {
     let artifact = match command {
         Command::AttachArtifact { artifact, .. } | Command::RegisterArtifact { artifact } => {
             Some(artifact)
@@ -507,6 +613,10 @@ fn attest(node: &EmbeddedNode, command: &Command) -> Result<Vec<EvidenceAttestat
         schema_valid: true,
     }])
 }
+
+#[cfg(test)]
+#[path = "reconciliation_tests.rs"]
+mod reconciliation_tests;
 
 #[cfg(test)]
 mod tests {

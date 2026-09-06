@@ -1,0 +1,25 @@
+[package]
+name = "focal-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+focal-memory = { version = "0.1.0", path = "../focal-memory" }
+focal-client = { version = "0.1.0", path = "../focal-client" }
+focal-model = { version = "0.1.0", path = "../focal-model" }
+focal-wire = { version = "0.1.0", path = "../focal-wire" }
+serde.workspace = true
+serde_json.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
+getrandom.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+focal-core = { version = "0.1.0", path = "../focal-core" }
+
+[lints]
+workspace = true

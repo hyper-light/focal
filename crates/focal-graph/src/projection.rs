@@ -214,6 +214,48 @@ fn evidence(rows: &mut Rows, ledger: LedgerId, set: &EvidenceSet) -> Result<(), 
     }
     Ok(())
 }
+fn run(rows: &mut Rows, id: ValidationRunId, run: &ValidationRun) -> Result<(), GraphError> {
+    if id != run.id {
+        return Err(GraphError::IndexMismatch);
+    }
+    let position = ValidationResultPosition {
+        run: id,
+        attempt: None,
+    };
+    let value = ValidationResultValue::Run(ValidationRunSummary {
+        id,
+        claim: run.claim,
+        evaluator: run.evaluator,
+        manifest: run.manifest,
+        handler_index: run.handler_index,
+        quality_phase: run.quality_phase,
+        attempt_count: u32::try_from(run.attempts.len()).map_err(|_| GraphError::Overflow)?,
+        final_verdict: run.final_verdict,
+    });
+    put(
+        rows,
+        GraphKey::ValidationResult(id.validation, position),
+        GraphValue::ValidationResult(Box::new(ValidationResult { position, value })),
+    )?;
+    for (ordinal, attempt) in run.attempts.iter().enumerate() {
+        if attempt.run != id {
+            return Err(GraphError::IndexMismatch);
+        }
+        let position = ValidationResultPosition {
+            run: id,
+            attempt: Some(u32::try_from(ordinal).map_err(|_| GraphError::Overflow)?),
+        };
+        put(
+            rows,
+            GraphKey::ValidationResult(id.validation, position),
+            GraphValue::ValidationResult(Box::new(ValidationResult {
+                position,
+                value: ValidationResultValue::Attempt(attempt.clone()),
+            })),
+        )?;
+    }
+    Ok(())
+}
 pub(crate) fn project(state: &State) -> Result<Rows, GraphError> {
     let mut rows = Rows::new();
     for (id, c) in &state.claims {
@@ -224,6 +266,9 @@ pub(crate) fn project(state: &State) -> Result<Rows, GraphError> {
     }
     for (id, v) in &state.validations {
         validation(&mut rows, *id, v)?
+    }
+    for (id, value) in &state.runs {
+        run(&mut rows, *id, value)?;
     }
     for (id, a) in &state.artifacts {
         artifact(&mut rows, *id, a)?
@@ -283,6 +328,14 @@ pub(crate) fn changes(
         }
         if let Some(v) = after.validations.get(&id) {
             validation(&mut new, id, v)?
+        }
+    }
+    for id in changed(&before.runs, &after.runs) {
+        if let Some(value) = before.runs.get(&id) {
+            run(&mut old, id, value)?;
+        }
+        if let Some(value) = after.runs.get(&id) {
+            run(&mut new, id, value)?;
         }
     }
     for id in changed(&before.artifacts, &after.artifacts) {
@@ -370,6 +423,7 @@ pub(crate) fn patch_charge(
     old!(claims, claim);
     old!(testaments, testament);
     old!(validations, validation);
+    old!(runs, run);
     old!(artifacts, artifact);
     old!(evidence_sets, evidence_set);
     old!(identities, identity);
@@ -398,6 +452,12 @@ pub(crate) fn patch_changes(
             validation(&mut old, *id, previous)?;
         }
         validation(&mut new, *id, value)?;
+    }
+    for (id, value) in patch.runs() {
+        if let Some(previous) = before.run(id) {
+            run(&mut old, *id, previous)?;
+        }
+        run(&mut new, *id, value)?;
     }
     for (id, value) in patch.artifacts() {
         if let Some(previous) = before.artifact(id) {

@@ -511,3 +511,48 @@ async fn replacement_admission_is_bounded_and_dropped_replies_retry_exactly() {
     drop(driver);
     fixture.close().await;
 }
+
+#[test]
+fn managed_artifact_custody_transfer_namespace_binds_the_full_stream_key() {
+    let legacy = artifact_request(77, ArtifactPayload::Inline(report()));
+    assert_eq!(
+        custody_request_id(&legacy).unwrap(),
+        RequestId::from_u128(77)
+    );
+    let (_, mut request) = legacy.into_parts();
+    let Operation::Submit {
+        expected_revision,
+        command,
+    } = request.operation
+    else {
+        panic!("submit")
+    };
+    request.protocol = MANAGED_PROTOCOL_VERSION;
+    let mut key = ManagedRequestKey {
+        stream: RequestStreamIdentity {
+            cluster: [1; 16],
+            ledger: ledger(),
+            principal: actor().principal(),
+            slot: 0,
+            generation: 1,
+        },
+        ordinal: 1,
+        id: request.request_id,
+    };
+    let operation = ManagedOperation::Submit {
+        expected_revision,
+        command,
+    };
+    request.operation = Operation::Managed {
+        key,
+        operation: operation.clone(),
+    };
+    let original = verify_request(actor(), request.clone(), &WireLimits::default()).unwrap();
+    let transfer = custody_request_id(&original).unwrap();
+    assert_eq!(custody_request_id(&original).unwrap(), transfer);
+    key.stream.slot = 1;
+    request.operation = Operation::Managed { key, operation };
+    let other = verify_request(actor(), request, &WireLimits::default()).unwrap();
+    assert_ne!(custody_request_id(&other).unwrap(), transfer);
+    assert!(artifact(&original.request().operation).is_some());
+}

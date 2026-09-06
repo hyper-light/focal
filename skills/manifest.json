@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "adapter": {
+    "name": "focal-mcp",
+    "version": "0.1.0",
+    "recovery_contract_version": 1
+  },
+  "resources": [
+    {
+      "path": "references/workflow-contract.md",
+      "blake3": "0a5ba65cc8decd97058b237dae317765074b5987765c3fe49a540dba3e4f92ee"
+    }
+  ],
+  "skills": [
+    {
+      "name": "focal-claims",
+      "version": 1,
+      "path": "focal-claims/SKILL.md",
+      "blake3": "e293f8e13c177a17179c1680170c1d9e87422dc4976fbb893926c02da1994cfb",
+      "references": ["references/workflow-contract.md"],
+      "required_operations": [
+        {"name": "claim.cancel", "version": 1},
+        {"name": "claim.get", "version": 1},
+        {"name": "claim.list", "version": 1},
+        {"name": "claim.post", "version": 1},
+        {"name": "claim.progress", "version": 1},
+        {"name": "claim.submit", "version": 1},
+        {"name": "receipt.acquire", "version": 1},
+        {"name": "request.epoch", "version": 1},
+        {"name": "request.status", "version": 1},
+        {"name": "validation.get", "version": 1},
+        {"name": "validation.list", "version": 1}
+      ],
+      "required_recovery_tools": [
+        {"name": "request.inspect", "version": 1},
+        {"name": "request.retry", "version": 1}
+      ]
+    },
+    {
+      "name": "focal-evidence",
+      "version": 1,
+      "path": "focal-evidence/SKILL.md",
+      "blake3": "707f8c4f1caf4f9928af25bab65240608c2ccdf745777e1f0fc194a4cb2889e4",
+      "references": ["references/workflow-contract.md"],
+      "required_operations": [
+        {"name": "artifact.get", "version": 1},
+        {"name": "artifact.list", "version": 1},
+        {"name": "artifact.submit", "version": 1},
+        {"name": "claim.get", "version": 1},
+        {"name": "evidence.begin", "version": 1},
+        {"name": "receipt.acquire", "version": 1},
+        {"name": "testament.get", "version": 1},
+        {"name": "testament.list", "version": 1},
+        {"name": "testament.submit", "version": 1},
+        {"name": "validation.get", "version": 1},
+        {"name": "validation.list", "version": 1}
+      ],
+      "required_recovery_tools": [
+        {"name": "request.inspect", "version": 1},
+        {"name": "request.retry", "version": 1}
+      ]
+    }
+  ]
+}

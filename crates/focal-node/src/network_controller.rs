@@ -301,17 +301,26 @@ impl RootAdmission {
     }
     #[cfg(test)]
     fn save(&mut self) -> Result<(), ControllerError> {
-        self.journal.as_mut().ok_or(ControllerError::Stopped)?
+        self.journal
+            .as_mut()
+            .ok_or(ControllerError::Stopped)?
             .replace(&postcard::to_stdvec(&self.intent)?)?;
         Ok(())
     }
     async fn save_on(&mut self, host: &ControlHost) -> Result<(), ControllerError> {
-        crate::control_host::save_local_intent(host, &mut self.journal, postcard::to_stdvec(&self.intent)?)
-            .await.map_err(|error| match error {
-                crate::control_host::LocalIntentError::Capacity => ControllerError::Capacity,
-                crate::control_host::LocalIntentError::Unavailable => ControllerError::Stopped,
-                crate::control_host::LocalIntentError::Persistence(error) => ControllerError::Enrollment(error),
-            })
+        crate::control_host::save_local_intent(
+            host,
+            &mut self.journal,
+            postcard::to_stdvec(&self.intent)?,
+        )
+        .await
+        .map_err(|error| match error {
+            crate::control_host::LocalIntentError::Capacity => ControllerError::Capacity,
+            crate::control_host::LocalIntentError::Unavailable => ControllerError::Stopped,
+            crate::control_host::LocalIntentError::Persistence(error) => {
+                ControllerError::Enrollment(error)
+            }
+        })
     }
     async fn advance(
         &mut self,

@@ -1,6 +1,6 @@
 # Implementation evidence and remaining work
 
-Updated 2026-09-05. The objective remains the complete P00–P16 plan. This record distinguishes executable components from integration and deployment qualification. No package is marked complete merely because its crate compiles. Imported Hecate references remain unchanged.
+Updated 2026-09-05. The objective is the complete P00–P20 plan: the original P00–P16 scope plus the user's manual CLI, skills, MCP, challenge and consultation extension in [13](13-cli-and-agent-implementation-plan.md). This record distinguishes executable components from integration and deployment qualification. No package is marked complete merely because its crate compiles. Imported Hecate references remain unchanged.
 
 | Package | Concrete implementation | Remaining acceptance work |
 |---|---|---|
@@ -21,6 +21,10 @@ Updated 2026-09-05. The objective remains the complete P00–P16 plan. This reco
 | P14 | Focused deterministic, corruption, concurrency and crash/restart tests; instrumented committed-prefix/receipt history checker; real CLI SIGKILL tests for writes, uploads and streams | Black-box linearizability exploration, full fault matrix, load runner, capacity evidence and long-duration mixed-fault runs |
 | P15 | Strict configuration parser and offline deployment explanation, persisted local identity/policy, foreground local and network services, private invitation/join CLI, bounded ingress and shutdown, build/check harness | Deployment plan/apply and live guarantee explanation, remaining cluster operations, metrics, packaging, rolling upgrades, release artifacts and executed runbooks |
 | P16 | Target deployment contracts and placement solver | All six real deployment journeys, operator walkthroughs and measured concept/configuration increments |
+| P17 | Strict shared claim/testament/artifact DTOs and JSON/YAML builders; indexed optional filters with authenticated fixed-prefix cursors; immutable validation run/attempt projections; private durable operation journals with concurrent fixed-epoch request identities; authenticated quorum-fenced request/epoch reconciliation | Complete operation/schema registry, remaining filters and lifecycle builders, safe epoch-floor advancement/GC and scoped child-cause admission |
+| P18 | Local `submit claim/testament/artifact` with flags/JSON/YAML/file input; all four `get/list` families; validation result pagination; post/progress/cancel, receipt acquisition and evidence begin; atomic artifact download; durable `request inspect/retry`, remote journal inspection and owner `request status/epoch`; built-in schema inspection; existing startup/enrollment/deployment commands; real binary lifecycle/restart tests and [manual guide](../manual-cli.md) | Authenticated remote contexts and joined-node principal selection, resumable upload convenience, complete lifecycle/cluster/deployment administration, watch/traversal, generated schema/completion surfaces and multi-node command journeys |
+| P19 | Bounded local stdio MCP server with current and compatibility profiles; 18 shared operations plus two durable recovery tools; caller-known operation IDs; two packaged skills with digest/version contracts; real executable and protocol conformance tests | Remote authenticated contexts, capability-projected discovery, complete nested schemas, content/evaluator/admin surfaces and external SDK interoperability |
+| P20 | Existing claim/testament/validation lifecycle and fenced runtime primitives; source policy audit | Complete challenge/consult constructors, proof/work acceptance policy, corrective/follow-up issuance, child-cause authority, nested continuation recovery and CLI/MCP journeys |
 
 Local focused tests currently establish these properties:
 
@@ -87,7 +91,7 @@ The founder now commits the first all-range directory delegation and its exact s
 
 `Session::checkpoint_evidence` preserves the exact durable checkpoint bytes and an immutable graph lease. The existing content owner advances bounded verification steps over retained artifact references and content chunks before installing the checkpoint and prefix manifest. The resulting `VerifiedCustody` is an opaque local witness: checkpoint, group/genesis, route, placement/membership epochs, sequence and Raft prefix remain bound together. An expected active custody scope is checked throughout verification without replacing the active serving policy. A prefix captured before later writes cannot prove their final cutover. Caller cancellation drops the owned continuation and its leases; restart must verify again before obtaining a trusted witness.
 
-The next placement slice must (1) commit the existing founder session’s group grant and Created fence; (2) sign and consume its actual witness in the initial directory; (3) persist/recover assignment intents before opening logical WAL leases and installing them into the managed fleet; (4) propagate authenticated authority snapshots and assigned directory routes; (5) copy and verify the exact final cutover checkpoint/content prefix; and (6) collect required live signatures, promote caught-up members, and commit directory/session activation fences before reporting stronger durability. General grouped directory ownership, delegation movement, geographic qualification and deployment plan/apply remain required. The current first-directory service refreshes its root authority on recovery; continuous authority installation is part of that next slice.
+The next placement slice must (1) commit the existing founder session’s group grant and Created fence; (2) sign and consume its actual witness in the initial directory; (3) persist/recover assignment intents before opening logical WAL leases and installing them into the managed fleet; (4) propagate authenticated authority snapshots and assigned directory routes; (5) copy and verify the exact final cutover checkpoint/content prefix; and (6) collect required live signatures, promote caught-up members, and commit directory/session activation fences before reporting stronger durability. General grouped directory ownership, delegation movement, geographic qualification and deployment plan/apply remain required. The first-directory service now refreshes its root authority both on recovery and continuously through the existing physical owner; general remote/grouped authority distribution remains open.
 
 Directory/custody qualification on macOS arm64, 2026-09-05: the final unfiltered workspace run passes **499 tests across 48 targets**, with no failed, ignored or filtered tests. Strict workspace all-target Clippy, the separate production no-panic gate, documentation targets, formatting, architecture/import contracts and the full workspace release build pass. Added coverage includes managed QUIC evidence routing, graceful quiescing against concurrent installation, durable first-directory startup/restart and real Unix routing, fresh root quorum admission, election-time readiness, interrupted authority installation, retained physical-owner/egress budgets, unknown-geography delegation, exact-prefix content corruption/expiry/cancellation checks, and checkpoint scratch pressure. Root and partition revision comparisons precede authority-clock validation, allowing saved stale intents to replan after restart while current intents still enforce clock monotonicity. No per-session or per-verification `Arc` wrapper or external dependency was added. These results establish the tested local behavior; stronger placement and scale claims still require the remaining plan.
 
@@ -99,8 +103,143 @@ Workspace qualification also exposed a stale-leader assumption in the partition-
 
 ## Recorded implementation decisions
 
+The continuing ownership cleanup adds three bounded mechanisms. First, the first directory installs newer root authority through its existing control queue and returns only after durable apply plus a fresh directory read barrier. An appended trusted `StateAndAuthority` query exports one exact applied prefix; Node-only peer reads cannot select it. Second, the founder-session registration helper derives a stable Created intent, group grant, enrollment and signed session registration from actual recovered Session state. Tests preserve preexisting claims and reject unsupported placement or revoked identity; the service registration controller and durable assignment journal are still required before this is automatic. Third, the grouped replica checkpoint API polls an owned physical WAL rewrite, preserving unrelated writer progress while cancellation retains admitted persistence. Direct synchronous checkpoint callers still use an explicit monotone read clock.
+
+Local root-intent journal writes now run on the existing control owner. Tests cover full/disconnected queues, payload spare-capacity accounting, canceled writes, lost completion and reopening. The full workspace run exposed stale test assumptions about resetting the snapshot clock and immediately reopening a canceled journal. Fixtures now use monotone clocks and an actual FIFO owner barrier; immediate grant withdrawal, real fsync-delay expiry, and unknown-write recovery remain enforced.
+
+Ownership/authority/checkpoint qualification on macOS arm64, 2026-09-05: the final unfiltered workspace run passes **515 tests across 48 targets**, with zero failed, ignored or filtered tests. Strict workspace all-target Clippy, the separate production no-panic gate, documentation targets, formatting, architecture contracts and the complete workspace release build pass. The architecture check resolves **291 links**, preserves all **37 imported source hashes**, and validates **15 frozen vocabularies**. No additional thread, task, external dependency or `Arc` wrapper was introduced for directory authority refresh, private intent persistence or grouped evidence export. The physical WAL remains a FIFO durability boundary; independent writers are necessary for IO isolation. This qualifies the exercised local behaviors, not the remaining global-scale or new CLI/MCP scope.
+
+The CLI/agent source research and P17–P20 tasks remain required work. The subsequent increments below implement the local CLI, MCP adapter and remote mutation-receipt lookup. Safe epoch-floor advancement and scoped child-cause admission remain open.
+
 Authored requirement identity excludes the allocated `ValidationId` and the generated parent `ClaimId` used to attach a requirement to its owner. `ValidationContent::specification_hash()` covers the authored specification; a claim hashes its ordered specification digests. The stored requirement references still contain their IDs, and a full validation object hash binds its parent claim. Authored semantic references, such as dependencies on a particular existing claim, remain hashed. This prevents allocated linkage IDs from defeating content deduplication while preserving relationship integrity. Frozen fixtures and fresh-allocation dedup tests cover this distinction.
 
 The implemented owned in-memory Raft storage follows TiKV's `raft-rs` 0.7 API; shared library `MemStorage` is not the authoritative application store. `SessionSeq` counts committed domain mutations and is distinct from the Raft index, which also includes elections, configuration changes, cursor metadata, maintenance and no-op entries.
 
 Internal prepared mutations and checkpoints use a schema-tagged pinned postcard representation. Authored object identity uses Focal's explicit canonical encoder. Changes to Rust enum order in internal persistent structures require a new compatible decoder/migration; an enum's canonical command code alone does not make an arbitrary serializer append-safe. Full rolling-format migration remains P15 work.
+
+
+## Manual CLI and bounded validation results
+
+The local binary now accepts `submit claim`, `submit testament`, and `submit artifact` through flags, JSON, YAML or bounded files/stdin. Shared `focal-client::input` builders derive authenticated issuer/producer, root cause and pinned validation specification hashes; they reject unknown/duplicate/spoofed fields and enforce the actual reducer contract. `--target` means subject; `--source` filters issuer. `self` resolves only the selected principal, including the domain's self-work restriction.
+
+`get/list` cover claims, testaments, artifacts and validations with no mandatory list filters. Family indexes and bounded residual visits avoid an unbounded client scan. MAC-protected list cursors bind principal, role, ledger, filters, route and exact prefix; empty filtered pages advance past visited rows. Artifact/testament filtering reads the immutable manifest. Singular filtered reads reject ambiguity and query-budget exhaustion. Validation queries return a requirement plus bounded immutable run summaries and individual verdict attempts, atomically projected with each domain publication and restored from WAL/checkpoint state. Their continuation reads the exact previous prefix. The default snapshot lease is 30 seconds; owner restart expires retained list views. One oversized result record returns Capacity without advancing its cursor.
+
+Each manual mutation persists the fully expanded request and a distinct epoch-admission request before transmission. Owner-private, checksummed journals retain exclusive filesystem locks across waits and survive lost epoch/business replies. Fixed epoch one permits independent processes without racing an epoch-floor advance; no automatic floor/receipt GC is claimed. Only a verified committed or duplicate receipt completes an operation. `request inspect/retry` reopens exact state; missing initialized state, mismatched context and ambiguous journal writes fail closed. Journal fsync and CLI file IO run on the main OS thread between network waits. Manual commands use a current-thread async runtime rather than starting a worker pool for each process. No new async actor, worker thread or `Arc` wrapper is introduced by this adapter.
+
+`claim post/progress/cancel`, `receipt acquire`, and `evidence begin` expose existing domain operations. Artifact downloads use at most 64 KiB network pages, server manifest/chunk verification and exact client offset/length/EOF checks; complete bytes are synced and atomically linked into a new private output file without overwriting an existing path. The content root addresses a manifest rather than raw byte concatenation. Independent client manifest-proof export and convenient resumable uploads remain open. JSON output uses fallible typed envelopes for paths and object results, retaining exact Unix path bytes. Joined-node local contexts explicitly reject before transmission until the adapter can resolve that node's actual authenticated principal and ledger.
+
+The [manual guide](../manual-cli.md) documents executable examples and limits. This increment does not automatically acknowledge a testament or run work validators in the foreground service. `TestamentGenerated` remains distinct from satisfaction. MCP/skills, complete challenge/consult workflow policy and corrective/follow-up issuance, remote contexts, remaining cluster operations and deployment/scale gates are still required.
+
+
+Full-suite qualification exposed and deterministically reproduced a control-owner shutdown race: committing an authority refresh during the final drain could queue a follow-up ReadIndex after the drain, leaving a new Raft Ready that invalidated the final checkpoint index. Stop now releases pending caller/read-refresh interest before its final drain, while already admitted replica proposals remain owned and durable. The regression proves that the refresh commits, checkpointing succeeds and restart returns the exact original receipt. No test retry or timeout was widened to hide the failure. Response validation also binds result rows to the immutable validation phase and pinned handler contract; cached graph row charges bound source work before result serialization or cloning.
+
+
+Final manual CLI qualification on macOS arm64, 2026-09-05: **561 tests across 51 all-target workspace targets pass**, with zero failed, ignored or filtered tests. Strict workspace all-target Clippy, the separate production no-panic gate, documentation tests, formatting and the complete workspace release build pass. New coverage includes flags/JSON/YAML canonical parity through the executable, all four optional-filter list families, exact testament manifests, validation run/verdict pagination across restart, source-query ambiguity, private journal corruption/lock/fsync recovery, lost epoch/business replies, atomic artifact publication, path handling and the deterministic control-owner shutdown regression. macOS rejects invalid-UTF-8 filenames before transmission; lossless JSON path serialization is tested without filesystem access, while the successful non-UTF-8 filesystem workflow is present for other Unix hosts and was not executed here. No external dependency version or package was added; Cargo.lock changes only dependency edges among packages already present. This is correctness/build evidence for the implemented scope, not global-scale or completed P17–P20 qualification.
+
+
+Final architecture checks resolve **309 links**, preserve all **37 imported Hecate source hashes**, and validate **15 frozen vocabularies**. [MCP protocol research](14-mcp-protocol-research.md) records the verified primary revision, compatibility choice, Rust ownership/transport tradeoffs and future conformance gates; it does not claim an implemented MCP server.
+
+
+The local MCP increment adds `focal mcp serve` over the existing authenticated Unix client. The shared Rust registry contains 16 authored operations and exhaustive coverage metadata for the 29 model commands plus wire/query/stream/upload/custody families. CLI lifecycle/read/list construction now uses those same builders. MCP adds `request.inspect` and `request.retry`, with caller-selected durable operation IDs independent of JSON-RPC IDs. Flags, JSON, YAML and MCP continue to compile into the existing frozen wire types; this increment adds no model or command ordinal.
+
+A private operation-ID store binds cluster/principal/ledger, operation version, authored intent and expected revision before generating IDs. It persists complete expanded epoch/business requests before transmission, retains exact replies in ordinary CLI journals, and conservatively reserves aggregate disk quota before admitting another ID. Initialization faults after complete prepared requests recover those same bytes; an incomplete durable ID claim without them fails closed. A separate context-bound bootstrap marker prevents a missing initialized store from silently resetting retry identity. Root catalog locks end before network waits; each operation owns its own journal lock. No automatic history eviction or epoch-floor advancement is introduced.
+
+The MCP process implements the pinned `2026-07-28` profile and explicit `2025-11-25` compatibility. Its protocol owner handles bounded framing, strict JSON structure, catalog pagination, active request IDs and cancellation. Input, ledger execution and output have separate owned threads and bounded channels. JSON serialization retains the actual response allocation through write/discard, including duplicate text and structured content. One business operation runs at a time while protocol control remains responsive. EOF and failed transport stop the process through the documented bounded shutdown seam. The [protocol implementation record](14-mcp-protocol-research.md#7-local-implementation-boundaries) records admission limits and the distinction from measured RSS.
+
+Exact object read responses now bind returned IDs/families/order to the requested references, reject unsolicited duplicates and continuations, and bind route/prefix fences. This closes a shared client verification gap found during MCP review. Existing repeated-request-reference semantics remain intact.
+
+The executable MCP workflow tests cover both profiles, all four read/list families, claim posting, receipt acquisition, progress, artifact/testament submission, immutable manifest binding, changed-intent/revision rejection, and CLI replay of an MCP journal with the identical receipt. Another test discards the first response, kills both processes, and recovers the same generated occurrence and single stored claim. Controlled transport tests apply a mutation through the actual Core while withholding the reply; cancellation suppresses its response, inspection retains the exact pending request, and restart recovers the original duplicate receipt without advancing Core sequence. Protocol tests pin upstream fixture digests and exercise malformed/oversized input, stale tokens, cursor fences, memory pressure and serialization failure.
+
+The released thin skills cover claim authoring and evidence/testament submission using discovered operation schemas. Their required tool names/versions and content are pinned by a local manifest contract test. Challenge proof obligations and normal consult follow-up are recorded as behavioral requirements; automatic remediation, trusted child-cause issuance, durable continuations and the associated end-to-end policy tests remain P20 work.
+
+This is verified local adapter progress, not completion of P17–P20. Remote credential contexts, capability-specific discovery, complete nested generated output schemas, external MCP client-distribution interoperability, large-content MCP transfer, evaluator/runtime/admin tool surfaces, safe request-history retirement, and all remaining cluster/deployment/scale qualification remain open. The MCP/client layers add no explicit `Arc` wrapper or external dependency package. The accompanying network shutdown fix replaces Quinn’s required runtime `Arc` allocation with a delegating runtime carrying an owned release signal; this is a dependency-required shared lifetime, documented in [the ownership policy](10-ownership-and-failure-policy.md).
+
+
+Qualification also found and corrected a real network shutdown race: Quinn can retain a UDP socket after its public endpoint has closed and its connections have left the drained map. The shared-port listener now observes final socket-owner release through Quinn's required runtime handle, with an owned completion allowance. Physical ledger owners stop first; listener release remains inside the existing shutdown deadline. The receiver survives cancellation and repeated shutdown is idempotent. Quinn is pinned to the audited 0.11.11 version, and its socket/runtime drop ordering must be reviewed on upgrade. Tests transfer a held UDP reservation into startup, exercise real peer traffic, and rebind immediately after successful shutdown without port-selection retries or sleeps.
+
+Additional operation-store fault tests cover the create-no-clobber hard-link window and partial initial journal creation. Recovery accepts only the expected same-directory temporary/destination inode pair, with exact private ownership, two links and a verified bounded frame before removing the temporary. An unready journal with no initialized record may resume from already saved complete envelopes; valid existing receipts survive, and corrupted, ready or initialized missing state is never reset. These tests reproduce the actual intermediate filesystem states rather than only injecting errors after complete high-level writes.
+
+
+Final local CLI/MCP qualification on macOS arm64, 2026-09-05: **616 tests across 55 targets pass**, with zero failed, ignored or filtered tests in the unfiltered workspace run. Strict all-target Clippy, the separate production no-panic policy, documentation targets, formatting, architecture contracts (**321 links, 37 imported hashes, 15 frozen vocabularies**) and the complete workspace release build pass. The external dependency package inventory is unchanged; Quinn's existing resolved version is now explicitly pinned for its audited shutdown lifetime. This increment is **verified progress** toward the active P00–P20 goal; the open requirements above remain required work.
+
+## Authenticated request reconciliation
+
+The next P17.10 increment appends `Operation::Reconcile` and `Response::Reconciled`. It queries the authenticated principal's epoch window or complete request key at a new quorum ReadIndex barrier. Replica owners bind the result to their current term, serving route, committed domain sequence and applied Raft index. The single-voter host uses the same query after its own read barrier; managed routing preserves the selected physical owner incarnation. Callers cannot select another principal or downgrade consistency to an old graph lease.
+
+The lookup spans both retained domain and cursor mutation receipts. Cursor metadata has a separate revision and can advance without changing the domain sequence, so the reply includes the actual applied Raft index. A cursor reply copies the original committed result, including its exact position, filter, mode and expiry; it never substitutes today's consumer state. The model's read DTO avoids a dependency cycle with the stream executor. Core and Session borrow retained state until response admission and copy only the bounded result. No reconciliation path clones an entire epoch set, graph, cursor registry or ledger.
+
+Retained results win even below the epoch floor. `BelowFloor` means that new admission is fenced at the committed prefix, with historical outcome unknown. All other missing results remain `Unknown`, including pending uncommitted proposals. Quorum loss, a stale owner/route or capacity exhaustion returns an operational error. The client validates query, principal, ledger, request key, route, sequence and cursor application bounds before exposing a result.
+
+The CLI exposes `request status`, `request epoch` and `request inspect --remote`. MCP exposes shared `request.status`/`request.epoch` operations and optional `remote: true` on `request.inspect`. Remote journal inspection always queries the business request, even if local recovery still awaits epoch admission. It checks a returned domain receipt's command hash and any saved receipt, rejects cursor-family collisions, and never advances or clears the journal. Exact retry remains the action that persists recovered receipts. Existing local inspection remains available without a remote request. The packaged skill contract now covers all 20 advertised tools and preserves these uncertainty rules.
+
+Safe concurrent ownership and retirement of each principal's epoch stream remain P17.11. Read-only observation cannot by itself authorize epoch-floor advancement, acknowledge another process's request or garbage-collect its recovery journal. Remote credential selection, broader lifecycle/workflow integration and the complete P00–P20 deployment gates remain required.
+
+Qualification on macOS arm64, 2026-09-05: **642 tests across 56 targets pass**, with zero failed, ignored or filtered tests. The complete invocation is `bash scripts/cargo.sh test --workspace --all-targets --locked --offline -- --test-threads=4`. Strict workspace all-target Clippy, the separate production no-panic gate, documentation targets, formatting, the complete workspace release build and architecture contracts (**325 links, 37 imported hashes, 15 frozen vocabularies**) pass. The 203-package external dependency inventory is unchanged. Reconciliation adds no explicit `Arc`, worker, actor, thread or dependency package. This is verified progress; only P17.10 is newly checked complete, and the full P00–P20 goal remains active.
+
+Qualification also exposed timing sensitivity in existing physical-owner tests under unrestricted parallel execution. One full run missed the independent-writer 300 ms deadline with both sessions still live; an earlier export returned `OutcomeUnknown` with a 500 ms request deadline. Focused cases passed unchanged, as did a four-thread full node control. Tracing did not distinguish OS scheduling from shared physical IO contention, so no release-path defect or fix is claimed. The checkpoint test now uses a bounded test-only notification after successful preparation and the first pending WAL poll, replacing a generic progress notification that did not establish actual checkpoint admission. All 250/300/500 ms deadlines and the independent-writer assertion remain unchanged; diagnostic traces were removed. The final full workspace qualification uses four test threads to control concurrent physical fixtures. Unrestricted-parallel timing stability remains a qualification limitation.
+
+The namespace audit also refines P17.11's implementation order in the plan. Legacy raw requests remain separate from new managed streams; ACKs and seals must cover both outcome families, and bounded slot reuse needs generation fencing. Client operation IDs require their own durable binding and explicit retirement contract. Deleting an acknowledged journal and accepting its ID as new would violate exact retry even if the server had safely retired the old receipt.
+
+## Managed request streams: implementation in progress
+
+The next increment implements the model, scoped Core reduction, Session registry,
+durable WAL/checkpoint state, protocol-two transport and private client store
+described in [15](15-managed-request-streams.md). Domain and cursor outcomes share
+a bounded ordinal window. Registration uses an exact generation CAS; receipts
+retain their original key, intent, outcome and applied index. Acknowledgment
+requires hashes of complete, locally durable receipts before atomically retiring
+the prefix. Sealing either returns the earlier committed outcome or commits an
+admission fence. Closing preserves the used generation. Ordinary outcome
+insertion does not advance the separate control CAS revision, and close does not
+require incrementing that revision at its maximum value.
+
+The filesystem store reserves canonical `m1` IDs before expanding a command,
+publishes immutable request and receipt bodies before catalogue completion flags,
+and persists its retired prefix before deleting bodies. Short filesystem locks
+serialize concurrent processes without surviving network waits. Recovery resumes
+bounded cleanup; missing completed state fails closed. Legacy journals and raw
+protocol-one IDs retain their prior encodings and semantics. The new APIs do not
+yet select or rotate a managed store automatically for ordinary CLI/MCP calls.
+
+Activation additionally requires an irreversible durable decoder promise. The
+actual application confirms its compiled fingerprint, the physical writer fsyncs
+the logical WAL floor, and only then can the Session advertise support. The first
+activation requires support from every voter, including both joint sets. Later
+membership changes guard learner addition and promotion. A committed activation
+therefore permits ordinary quorum availability after restart, without requiring
+every existing voter to be reachable again. Learners persist their own floor
+before accepting their first managed entry or snapshot. Untouched legacy groups
+remain free of the new floor; this first floor is immutable rather than a general
+multi-format upgrade protocol.
+
+Compatibility qualification uses an actual separately built binary from commit
+`974c8b52efd34031fd08e1ae8de145319ee49f63`. Before managed activation and again
+after checkpointing, that older binary refuses a ledger containing the durable
+decoder floor with a typed WAL corruption error and leaves every stored file's
+hash unchanged. Conversely, it opens an untouched legacy-format ledger created
+by the current code, completes the claim/artifact/validation workflow through
+domain sequence 13, and leaves state the current code can recover and checkpoint
+without introducing a floor. The isolated fixtures and machine-readable evidence
+are `/tmp/focal-legacy-qualification.ZAvfzH`,
+`/tmp/focal-managed-real-downgrade.json` and
+`/tmp/focal-managed-real-legacy-parity.json`. These are local qualification
+artifacts, not committed dependencies.
+
+Qualification also exposed missing snapshot transport feedback in the existing
+replication driver. A canceled, locally rejected or remotely rejected transfer
+could leave Raft's peer progress paused indefinitely. Ledger and cluster-control
+frames now carry owned completion senders, with bounded receiver metadata in
+their originating physical owner. Failed admission or sender loss reports
+failure; successful remote ingress reports transport completion. Current term,
+snapshot index and receiver replacement fence obsolete completions. Retryable
+reporting failure retains the completed status for the next owner turn. The frame
+and receiver each retain sufficient accounting through their independent
+lifetimes, without another shared wrapper or completion ingress queue.
+
+P17.11 remains unchecked. In addition to final workspace qualification, its open
+gates include automatic durable CLI/MCP ownership and bounded rotation, managed
+domain epoch batching, sustained principal churn across finite registry slots,
+and the full adapter recovery workflows. General trusted assignment proof for a
+fresh learner whose bootstrap membership excludes today's leader and future
+persistent-format transitions also remain required. The full P00–P20 goal remains
+active; this increment does not establish the deployment or scale gates.

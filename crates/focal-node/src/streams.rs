@@ -3,7 +3,10 @@
 //! exact durable receipt. This owner never polls or drops replication messages
 //! on the multi-voter path.
 use crate::{host::access, reads::ReadViews};
-use focal_ledger::{CursorInput, CursorSubmission, LedgerError, Session, SessionEvents};
+use focal_ledger::{
+    CursorInput, CursorSubmission, LedgerError, ManagedCursorInput, ManagedSubmission, Session,
+    SessionEvents,
+};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::*;
 use focal_stream::*;
@@ -16,6 +19,25 @@ const REPLY_OVERHEAD: usize = 512;
 // seed pages before cloning so a generous client frame credit remains bounded.
 const MAX_SEED_BYTES: u32 = 64 * 1024;
 
+#[derive(Clone, Copy)]
+enum StreamKey {
+    Legacy(RequestKey),
+    Managed(ManagedRequestKey),
+}
+impl StreamKey {
+    fn principal(self) -> ParticipantId {
+        match self {
+            Self::Legacy(key) => key.principal,
+            Self::Managed(key) => key.stream.principal,
+        }
+    }
+    fn id(self) -> RequestId {
+        match self {
+            Self::Legacy(key) => key.id,
+            Self::Managed(key) => key.id,
+        }
+    }
+}
 enum Stage {
     Barrier(Vec<u8>),
     Receipt,
@@ -27,7 +49,7 @@ enum Stage {
 pub(crate) struct PendingStream {
     ledger: LedgerId,
     route_epoch: RouteEpoch,
-    key: RequestKey,
+    key: StreamKey,
     scope: ContentHash,
     intent_hash: ContentHash,
     stream: StreamRequest,
@@ -91,18 +113,24 @@ impl Streams {
         if request.ledger != session.ledger() {
             return Err(AccessError::Unauthorized);
         }
-        if !matches!(&request.operation, Operation::Stream(value) if value == stream) {
-            return Err(AccessError::InvalidRequest);
-        }
+        let key = match &request.operation {
+            Operation::Stream(value) if value == stream => StreamKey::Legacy(RequestKey {
+                principal: peer.principal(),
+                epoch: request.request_epoch,
+                id: request.request_id,
+            }),
+            Operation::Managed {
+                key,
+                operation: ManagedOperation::Cursor(value),
+            } if value == stream && key.stream.principal == peer.principal() => {
+                StreamKey::Managed(*key)
+            }
+            _ => return Err(AccessError::InvalidRequest),
+        };
         if !session.is_authoritative() {
             return Err(AccessError::Unavailable);
         }
         let scope = stream_scope(peer, request.ledger, stream.filter())?;
-        let key = RequestKey {
-            principal: peer.principal(),
-            epoch: request.request_epoch,
-            id: request.request_id,
-        };
         let request_bytes = postcard::experimental::serialized_size(stream)
             .map_err(|_| AccessError::InvalidRequest)?;
         if request_bytes > limits.max_frame_bytes as usize {
@@ -137,15 +165,9 @@ impl Streams {
             .reserve(BudgetKind::Pending, BudgetLane::Ordinary, charge)
             .map_err(|_| AccessError::Capacity)?
             .commit();
-        let intent = postcard::to_stdvec(&(request.ledger, peer.principal(), stream))
+        let intent_hash = cursor_request_intent(request.ledger, peer.principal(), stream)
             .map_err(|_| AccessError::InvalidRequest)?;
-        let intent_hash = ContentHash(blake3::derive_key("focal.stream.intent.v1", &intent));
-        if session
-            .cursor_receipt(&key)
-            .is_some_and(|receipt| receipt.intent_hash != intent_hash)
-        {
-            return Err(AccessError::InvalidRequest);
-        }
+        original_cursor_token(session, key, intent_hash)?;
         self.next = self.next.checked_add(1).ok_or(AccessError::Unavailable)?;
         let mut context = b"focal.stream.read.v1\0".to_vec();
         context.extend_from_slice(&self.incarnation);
@@ -199,47 +221,49 @@ impl Streams {
             else {
                 return Ok(None);
             };
-            let original = session.cursor_receipt(&pending.key).cloned();
-            if original
-                .as_ref()
-                .is_some_and(|receipt| receipt.intent_hash != pending.intent_hash)
-            {
-                return Err(AccessError::InvalidRequest);
-            }
+            let original = original_cursor_token(session, pending.key, pending.intent_hash)?;
             let now = wall_ms()?.max(session.cursor_clock());
-            let operation = Self::operation(
-                session,
-                views,
-                pending,
-                original.as_ref(),
-                *prefix,
+            let operation =
+                Self::operation(session, views, pending, original, *prefix, now, limits)?;
+            let command = CursorCommand {
+                expected_revision: session.cursor_revision(),
                 now,
-                limits,
-            )?;
-            let input = CursorInput {
-                ledger: pending.ledger,
-                key: pending.key,
-                intent_hash: pending.intent_hash,
-                command: CursorCommand {
-                    expected_revision: session.cursor_revision(),
-                    now,
-                    operation,
-                },
+                operation,
             };
-            match session.submit_cursor(&input).map_err(cursor_error)? {
-                CursorSubmission::Committed(_) | CursorSubmission::Pending(_) => {
-                    pending.stage = Stage::Receipt
+            match pending.key {
+                StreamKey::Legacy(key) => {
+                    let input = CursorInput {
+                        ledger: pending.ledger,
+                        key,
+                        intent_hash: pending.intent_hash,
+                        command,
+                    };
+                    match session.submit_cursor(&input).map_err(cursor_error)? {
+                        CursorSubmission::Committed(_) | CursorSubmission::Pending(_) => {}
+                    }
+                }
+                StreamKey::Managed(key) => {
+                    let input = ManagedCursorInput {
+                        key,
+                        intent_hash: pending.intent_hash,
+                        command,
+                    };
+                    match session
+                        .propose_managed_cursor(&input, false)
+                        .map_err(cursor_error)?
+                    {
+                        ManagedSubmission::Committed(_) | ManagedSubmission::Pending(_) => {}
+                        ManagedSubmission::Domain(_) => return Err(AccessError::InvalidRequest),
+                    }
                 }
             }
+            pending.stage = Stage::Receipt;
         }
-        let Some(receipt) = session.cursor_receipt(&pending.key) else {
+        let Some(token) = original_cursor_token(session, pending.key, pending.intent_hash)? else {
             return Ok(None);
         };
-        if receipt.intent_hash != pending.intent_hash {
-            return Err(AccessError::InvalidRequest);
-        }
         let now = wall_ms()?.max(session.cursor_clock());
-        let reply = self.reply(session, pending, receipt, now, limits)?;
+        let reply = self.reply(session, pending, token, now, limits)?;
         pending.stage = Stage::Finished;
         Ok(Some(reply))
     }
@@ -249,7 +273,7 @@ impl Streams {
         session: &mut Session,
         views: &mut ReadViews,
         pending: &mut PendingStream,
-        original: Option<&focal_ledger::CursorReceipt>,
+        original: Option<CursorToken>,
         barrier: SessionSeq,
         now: u64,
         limits: &WireLimits,
@@ -273,10 +297,7 @@ impl Streams {
                 // Capture the immutable prefix before committing its tail pin.
                 // A retry uses its original snapshot; it cannot silently seed a
                 // newer prefix under the old consumer generation.
-                let prefix = original
-                    .as_ref()
-                    .and_then(|r| r.record.as_ref())
-                    .map(|r| r.token.position.sequence);
+                let prefix = original.map(|token| token.position.sequence);
                 let consistency = match prefix {
                     Some(sequence) if sequence != session.graph_sequence() => {
                         ReadConsistency::Exact(ReadToken {
@@ -299,13 +320,13 @@ impl Streams {
                     .saturating_sub(REPLY_OVERHEAD as u32);
                 let page = views.read(
                     session,
-                    pending.key.principal,
+                    pending.key.principal(),
                     &ReadRequest {
                         consistency,
                         query: ReadQuery::Scan { after: None },
                         max_items: credits.items,
                     },
-                    pending.key.id,
+                    pending.key.id(),
                     &seed_limits,
                 )?;
                 let snapshot = page.token.sequence;
@@ -341,7 +362,7 @@ impl Streams {
                 if original.is_none() {
                     check_cursor(
                         session,
-                        pending.key.principal,
+                        pending.key.principal(),
                         *cursor,
                         pending.stream.filter(),
                     )?;
@@ -364,7 +385,7 @@ impl Streams {
                 if original.is_none() {
                     check_cursor(
                         session,
-                        pending.key.principal,
+                        pending.key.principal(),
                         *cursor,
                         pending.stream.filter(),
                     )?;
@@ -382,15 +403,14 @@ impl Streams {
         &self,
         session: &Session,
         pending: &mut PendingStream,
-        receipt: &focal_ledger::CursorReceipt,
+        original: CursorToken,
         now: u64,
         limits: &WireLimits,
     ) -> Result<StreamReply, AccessError> {
-        let record = receipt.record.as_ref().ok_or(AccessError::Unavailable)?;
         let current = session
-            .cursor(record.token.key.consumer)
+            .cursor(original.key.consumer)
             .ok_or(AccessError::ResyncRequired { floor: None })?;
-        if record.token.same_stream(current.token).is_err() {
+        if original.same_stream(current.token).is_err() {
             return Err(AccessError::ResyncRequired { floor: None });
         }
         if current.expires_at <= now || matches!(current.mode, CursorMode::Resync { .. }) {
@@ -403,8 +423,8 @@ impl Streams {
         };
         let mut reply = StreamReply {
             token,
-            cursor: record.token,
-            acknowledged: record.token,
+            cursor: original,
+            acknowledged: original,
             seed: pending.seed.take(),
             events: Vec::new(),
         };
@@ -556,5 +576,59 @@ fn stream_error(error: StreamError) -> AccessError {
             AccessError::Unavailable
         }
         _ => AccessError::InvalidRequest,
+    }
+}
+
+fn original_cursor_token(
+    session: &Session,
+    key: StreamKey,
+    intent: ContentHash,
+) -> Result<Option<CursorToken>, AccessError> {
+    match key {
+        StreamKey::Legacy(key) => session
+            .cursor_receipt(&key)
+            .map(|receipt| {
+                if receipt.intent_hash != intent {
+                    return Err(AccessError::InvalidRequest);
+                }
+                receipt
+                    .record
+                    .as_ref()
+                    .map(|record| record.token)
+                    .ok_or(AccessError::Unavailable)
+            })
+            .transpose(),
+        StreamKey::Managed(key) => session
+            .managed_receipt(&key, intent, ManagedRequestFamily::Cursor)
+            .map_err(cursor_error)?
+            .map(|receipt| {
+                let ManagedReceiptOutcome::Cursor {
+                    record: Some(record),
+                    ..
+                } = &receipt.outcome
+                else {
+                    return Err(AccessError::InvalidRequest);
+                };
+                let token = record.token;
+                Ok(CursorToken {
+                    key: ConsumerKey {
+                        ledger: token.key.ledger,
+                        consumer: ConsumerId(token.key.consumer),
+                    },
+                    generation: token.generation,
+                    scope: token.scope,
+                    position: Position {
+                        ledger: token.position.ledger,
+                        sequence: token.position.sequence,
+                        offset: match token.position.offset {
+                            CursorPositionOffsetSnapshot::Delta(value) => {
+                                PositionOffset::Delta(value)
+                            }
+                            CursorPositionOffsetSnapshot::Resolved => PositionOffset::Resolved,
+                        },
+                    },
+                })
+            })
+            .transpose(),
     }
 }

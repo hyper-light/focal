@@ -54,6 +54,9 @@ pub enum RecordKind {
     Snapshot,
     Identity,
     Checkpoint,
+    /// Immutable application decoder requirement for one logical Raft group.
+    /// Appended at variant 6 so older WAL decoders reject the physical log.
+    DecoderFloor,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -846,6 +849,69 @@ fn cleanup_segments(directory: &Path, p: DurablePosition) -> Result<(), LogError
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn appended_decoder_floor_refuses_frozen_old_decoder_and_preserves_legacy_bytes() {
+        #[derive(Serialize, Deserialize)]
+        enum PreviousKind {
+            Entry,
+            HardState,
+            Configuration,
+            Snapshot,
+            Identity,
+            Checkpoint,
+        }
+        #[derive(Serialize, Deserialize)]
+        struct PreviousRecord {
+            log: LogicalLogId,
+            kind: PreviousKind,
+            index: u64,
+            term: u64,
+            payload: Vec<u8>,
+        }
+        for (kind, previous) in [
+            (RecordKind::Entry, PreviousKind::Entry),
+            (RecordKind::HardState, PreviousKind::HardState),
+            (RecordKind::Configuration, PreviousKind::Configuration),
+            (RecordKind::Snapshot, PreviousKind::Snapshot),
+            (RecordKind::Identity, PreviousKind::Identity),
+            (RecordKind::Checkpoint, PreviousKind::Checkpoint),
+        ] {
+            let current = Record {
+                log: LogicalLogId([1; 16]),
+                kind,
+                index: 3,
+                term: 2,
+                payload: vec![4, 5],
+            };
+            let old = PreviousRecord {
+                log: current.log,
+                kind: previous,
+                index: current.index,
+                term: current.term,
+                payload: current.payload.clone(),
+            };
+            assert_eq!(
+                postcard::to_allocvec(&current).unwrap(),
+                postcard::to_allocvec(&old).unwrap()
+            );
+        }
+        let floor = Record {
+            log: LogicalLogId([1; 16]),
+            kind: RecordKind::DecoderFloor,
+            index: 0,
+            term: 0,
+            payload: b"FOCALDF1".iter().copied().chain([41; 32]).collect(),
+        };
+        let encoded = postcard::to_allocvec(&floor).unwrap();
+        let mut expected = vec![1; 16];
+        expected.extend_from_slice(&[6, 0, 0, 40]);
+        expected.extend_from_slice(b"FOCALDF1");
+        expected.extend_from_slice(&[41; 32]);
+        assert_eq!(encoded, expected);
+        assert!(postcard::from_bytes::<PreviousRecord>(&encoded).is_err());
+        assert_eq!(postcard::from_bytes::<Record>(&encoded).unwrap(), floor);
+    }
+
     fn options() -> WalOptions {
         let mut o = WalOptions::new(WalIdentity {
             cluster: [7; 16],

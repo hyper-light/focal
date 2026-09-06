@@ -81,6 +81,13 @@ The amended algorithm is motivated by the references, not a claim to have implem
 | Global control scale | 00/04/08 | P09/P13/P14 | T22/T27/T30 |
 | Minimal intuitive deployment increments | 08 | P00/P15/P16 | DC01–DC20, T32 |
 | Operational recovery and upgrade | 06/08 | P15 | T10/T11/T26/T29 |
+| Ergonomic manual CLI with equivalent flags/JSON/YAML | 11/13 | P17/P18 | Golden typed-input equivalence; real binary/client tests; malformed-input bounds |
+| Optional filters on every object list | 11/13 | P17/P18 | Unfiltered and filtered fixed-prefix pages, zero-match advancement, tenant isolation |
+| Artifact bytes and complete validation results | 11/13 | P17/P18 | Immutable testament manifest lookup, verified/resumable transfer, historical run/attempt/verdict reads |
+| Complete cluster CLI with stepped complexity | 08/11/13 | P15/P16/P18 | Six actual operator journeys; plan/apply/resume; no enrollment-as-placement shortcut |
+| Skills and MCP over one operation contract | 12/13 | P17/P19 | Schema/capability conformance, adapter parity, exact retry after restart |
+| Proof-bearing challenges and corrective work | 02/12/13 | P05/P06/P17/P20 | Missing/invalid proof, authorized corrective lineage, duplicate outcome and restart |
+| Satisfactory consults and linked follow-ups | 02/12/13 | P06/P17/P20 | Nested consults, partial results, terminal races, no automatic timeout correction |
 
 T-identifiers are defined in [06](06-verification-and-operations.md); DC-identifiers in [08](08-stepped-complexity-and-deployment.md). Package acceptance adds concrete cases beyond this index.
 
@@ -101,3 +108,5 @@ T-identifiers are defined in [06](06-verification-and-operations.md); DC-identif
 | Byte compatibility with Hecate/Sylk | Not promised | Optional import/interoperability adapters require their own tested schema mapping |
 
 No missing deployment size justifies stopping the implementation plan. Defaults cover local use; users provide additional intent only when the next use case requires it. Scale and safety claims must follow measurements and active placement state.
+
+The [2026-09-05 CLI research](11-cli-spec-research.md) and [agent workflow audit](12-agent-tools-and-workflows.md) add explicit Focal choices. `--target` means subject and `--source` means issuer, with singular filtered reads rejecting ambiguity. They are not endpoint selectors. The user's challenge proof and consult work-quality requirements supersede weaker receipt-only source defaults. Corrective issuance remains an authorized, durable workflow with evidence; consultation normally produces targeted follow-up work. Hecate's later accepted `SKILLS_API` amendment treats optional TS/Python bindings as authoring-time document generators, so a Rust CLI/MCP/skill interface does not require an embedded script runtime. P17–P20 implement these choices without changing earlier persisted command ordinals or admitting caller-supplied lifecycle authority.

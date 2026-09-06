@@ -36,13 +36,14 @@ impl DurableNode {
     /// True from Ready acquisition until its full output prefix is released.
     /// Mutations return PersistencePending in this state; no Raft input is lost.
     pub fn persistence_pending(&self) -> bool {
-        self.persistence.is_some() || self.checkpoint.is_some()
+        self.persistence.is_some() || self.checkpoint.is_some() || self.decoder_write.is_some()
     }
     /// Read-only owner wake predicate, including a retained WAL receipt and
     /// newly queued Ready work that has not yet started persistence.
     pub fn has_ready(&self) -> bool {
         self.persistence.is_some()
             || self.checkpoint.is_some()
+            || self.decoder_write.is_some()
             || self.raw.has_ready()
             || self.recovered_events.is_some()
             || self.recovered_snapshot.is_some()
@@ -64,6 +65,9 @@ impl DurableNode {
 
     fn poll_drain(&mut self, blocking: bool) -> Result<Option<NodeEvents>, ConsensusError> {
         self.check()?;
+        if self.decoder_write.is_some() && !self.poll_decoder_floor(blocking)? {
+            return Ok(None);
+        }
         if self.checkpoint.is_some() {
             return Err(ConsensusError::PersistencePending);
         }

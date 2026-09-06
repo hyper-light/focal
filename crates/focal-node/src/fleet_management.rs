@@ -177,6 +177,20 @@ impl FleetManager {
         }
         Ok(entry.host.clone())
     }
+    /// Allocation-free traversal for node-owned background capabilities. A
+    /// returned host keeps that exact installed incarnation through an exchange.
+    pub(crate) fn next_host(&self, after: Option<LedgerId>) -> Option<(LedgerId, ReplicaHost)> {
+        let state = self.state.borrow();
+        if state.status.stopped || state.quiesced {
+            return None;
+        }
+        let lower = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+        state
+            .entries
+            .range((lower, std::ops::Bound::Unbounded))
+            .find(|(_, entry)| !entry.host.progress().stopped)
+            .map(|(ledger, entry)| (*ledger, entry.host.clone()))
+    }
     fn permit(&self) -> Result<ManagementPermit, FleetError> {
         if self.status().stopped {
             return Err(FleetError::Unavailable);
