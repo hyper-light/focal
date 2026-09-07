@@ -1,10 +1,16 @@
 use super::*;
-use focal_memory::{BudgetKind, BudgetLane, Change};
+#[cfg(test)]
+use focal_memory::Change;
+use focal_memory::{BudgetKind, BudgetLane};
 use focal_model::lifecycle::claim::ClaimCut;
 
 #[cfg(test)]
 #[path = "staging_tests.rs"]
 mod staging_tests;
+
+#[cfg(test)]
+#[path = "admission_gate_tests.rs"]
+mod admission_gate_tests;
 
 pub(super) const ALLOCATION: usize = 4 * size_of::<usize>();
 
@@ -50,7 +56,17 @@ pub(super) fn within(bytes: usize, max: usize) -> Result<(), NativeError> {
 /// silently admitted or charged after publication.
 fn copy(row: &Row) -> Result<Row, MemoryError> {
     match row {
+        Row::IncomingHead(row) => Ok(Row::IncomingHead(*row)),
+        Row::IncomingLink(row) => Ok(Row::IncomingLink(*row)),
+        Row::MissingResult(row) => row.copy().map(Row::MissingResult),
         Row::Meta(meta) => Ok(Row::Meta(*meta)),
+        Row::Receipt(receipt) => Ok(Row::Receipt(*receipt)),
+        Row::Cycle(cycle) => Ok(Row::Cycle(*cycle)),
+        Row::WorkSlot(id) => Ok(Row::WorkSlot(*id)),
+        Row::Work(row) => row.copy().map(Row::Work),
+        Row::Diagnostic(row) => row.copy().map(Row::Diagnostic),
+        Row::Response(row) => row.copy().map(Row::Response),
+        Row::DeliveryResult(row) => row.copy().map(Row::DeliveryResult),
         Row::Outcome(outcome) => Ok(Row::Outcome(*outcome)),
         Row::Event(event) => {
             #[cfg(test)]
@@ -155,20 +171,67 @@ pub(super) struct Extra {
 }
 pub(super) struct Extras {
     pub rows: Vec<Extra>,
+    pub journal: Option<Vec<NativeFact>>,
     max: usize,
     allowance: usize,
 }
 impl Extras {
-    fn new(max: usize, allowance: usize) -> Result<Self, NativeError> {
+    pub(super) fn new(max: usize, allowance: usize) -> Result<Self, NativeError> {
         within(array::<Extra>(max)?, allowance)?;
         Ok(Self {
             rows: Vec::new(),
+            journal: None,
             max,
             allowance,
         })
     }
-    pub fn events(&self) -> usize { self.rows.iter().filter(|row| row.fact.is_some()).count() }
-    pub fn push(&mut self, row: Extra) -> Result<(), NativeError> {
+    pub fn events(&self) -> usize {
+        match &self.journal {
+            Some(events) => events.len(),
+            None => self.rows.iter().filter(|row| row.fact.is_some()).count(),
+        }
+    }
+    pub fn begin_journal(
+        &mut self,
+        capacity: usize,
+        scratch: &mut Scratch,
+    ) -> Result<(), NativeError> {
+        if self.journal.is_some() || !self.rows.is_empty() {
+            return Err(ContractError::InvalidTransition.into());
+        }
+        self.journal = Some(scratch.reserve(capacity)?);
+        Ok(())
+    }
+    pub fn record(&mut self, fact: NativeFact) -> Result<(), NativeError> {
+        let events = self
+            .journal
+            .as_mut()
+            .ok_or(ContractError::InvalidTransition)?;
+        if events.len() == events.capacity() {
+            return Err(NativeError::Capacity("transaction history"));
+        }
+        events.push(fact);
+        Ok(())
+    }
+    pub fn replace(&mut self, mut row: Extra) -> Result<(), NativeError> {
+        if self.journal.is_none() {
+            return Err(ContractError::InvalidTransition.into());
+        }
+        let index = self
+            .rows
+            .iter()
+            .position(|old| old.key == row.key)
+            .ok_or(ContractError::InvalidTarget)?;
+        if let Some(fact) = row.fact.take() {
+            self.record(fact)?;
+        }
+        *self
+            .rows
+            .get_mut(index)
+            .ok_or(ContractError::InvalidTarget)? = row;
+        Ok(())
+    }
+    pub fn push(&mut self, mut row: Extra) -> Result<(), NativeError> {
         if self.rows.len() == self.max {
             return Err(NativeError::Capacity("native extra rows"));
         }
@@ -195,6 +258,11 @@ impl Extras {
             )?;
             replacement.append(&mut self.rows);
             self.rows = replacement;
+        }
+        if self.journal.is_some()
+            && let Some(fact) = row.fact.take()
+        {
+            self.record(fact)?;
         }
         self.rows.push(row);
         Ok(())
@@ -263,7 +331,70 @@ impl Core<NativeState> {
         pending: &[&NativePrepared],
         evidence: Option<&focal_evidence::VerifiedNativeArtifact>,
     ) -> Result<NativePreparation, NativeError> {
-        self.validate_native_chain(pending)?;
+        self.prepare_native_in(&self.state.budget, context, input, pending, evidence)
+    }
+
+    /// Trusted owner allocation source, either the owner's budget or one of its
+    /// descendants. A funded child lets planning and retained range pages spend
+    /// the same held capacity as custody verification. Temporary failures return
+    /// credit to that source; immutable published/pinned pages retain their debit.
+    ///
+    /// This does not establish an evaluation entitlement, reserve future row
+    /// slots, or authorize two pending forks to spend the same promised share.
+    /// Participant intent cannot select the source or widen the operation lane.
+    pub fn prepare_native_in(
+        &self,
+        source: &MemoryBudget,
+        context: NativeContext,
+        input: NativeInput,
+        pending: &[&NativePrepared],
+        evidence: Option<&focal_evidence::VerifiedNativeArtifact>,
+    ) -> Result<NativePreparation, NativeError> {
+        self.prepare_native_chain(source, context, input, pending.iter().copied(), evidence)
+    }
+
+    /// The managed owner supplies its borrowed queue iterator directly. No
+    /// temporary vector or reservation precedes exact retry lookup.
+    pub(super) fn prepare_native_chain<'a>(
+        &self,
+        source: &MemoryBudget,
+        context: NativeContext,
+        input: NativeInput,
+        pending: impl DoubleEndedIterator<Item = &'a NativePrepared> + ExactSizeIterator + Clone,
+        evidence: Option<&focal_evidence::VerifiedNativeArtifact>,
+    ) -> Result<NativePreparation, NativeError> {
+        if !source.is_within(&self.state.budget) {
+            return Err(MemoryError::InvalidConfiguration(
+                "native allocation source is outside owner budget",
+            )
+            .into());
+        }
+        match self.check_native_chain(context, input, pending)? {
+            Checked::Existing { outcome, committed } => {
+                Ok(NativePreparation::Existing { outcome, committed })
+            }
+            Checked::Fresh(fresh) => fresh
+                .build(source, evidence)
+                .map(NativePreparation::Prepared),
+        }
+    }
+
+    /// Resolve identity and the exact effective base before selecting resource
+    /// ownership. This step neither reserves memory nor constructs domain rows.
+    /// Its owned input and borrowed base cannot be replaced after checking.
+    pub(super) fn check_native_chain<'a, 'p: 'a>(
+        &'a self,
+        context: NativeContext,
+        input: NativeInput,
+        mut pending: impl DoubleEndedIterator<Item = &'p NativePrepared> + ExactSizeIterator + Clone,
+    ) -> Result<Checked<'a>, NativeError> {
+        let pending_count = pending.len();
+        if pending_count > self.limits.pending {
+            return Err(NativeError::Capacity("pending candidates"));
+        }
+        self.state
+            .rows
+            .validate_chain(pending.clone().map(|item| &item.range))?;
         context.principal.require_actor(input.request.principal)?;
         if input.request.principal.is_zero()
             || input.request.id.is_zero()
@@ -275,11 +406,11 @@ impl Core<NativeState> {
         let intent = intent::fingerprint(self.state.ledger, &input)?;
         let view = View {
             state: &self.state,
-            tail: pending.last().copied(),
+            tail: pending.next_back(),
         };
         if let Some(outcome) = as_outcome(view.get(Key::Outcome(input.request))) {
             return if outcome.intent == intent {
-                Ok(NativePreparation::Existing {
+                Ok(Checked::Existing {
                     outcome,
                     committed: outcome.sequence <= self.native_sequence(),
                 })
@@ -287,7 +418,7 @@ impl Core<NativeState> {
                 Err(NativeError::RequestConflict)
             };
         }
-        if pending.len() == self.limits.pending {
+        if pending_count == self.limits.pending {
             return Err(NativeError::Capacity("pending candidates"));
         }
         let mut meta = view.meta();
@@ -310,42 +441,254 @@ impl Core<NativeState> {
             cause: intent,
         };
         let operation = match &input.command {
+            NativeCommand::EnterWholeWork { .. } => NativeOperation::EnterWholeWork,
+            NativeCommand::SealIncrementTargets { .. } => NativeOperation::SealIncrementTargets,
+            NativeCommand::BeginIncrement { .. } => NativeOperation::BeginIncrement,
+            NativeCommand::ReportIncrement { .. } => NativeOperation::ReportIncrement,
+            NativeCommand::FailWorkProduction { .. } => NativeOperation::FailWorkProduction,
+            NativeCommand::RejectWork { .. } => NativeOperation::RejectWork,
+            NativeCommand::SubmitWork { .. } => NativeOperation::SubmitWork,
+            NativeCommand::SubmitDiagnostic { .. } => NativeOperation::SubmitDiagnostic,
+            NativeCommand::ReceiveWork { .. } => NativeOperation::ReceiveWork,
+            NativeCommand::CloseResponse { .. } => NativeOperation::CloseResponse,
+            NativeCommand::PostResponse { .. } => NativeOperation::PostResponse,
+            NativeCommand::ReceiveResponse { .. } => NativeOperation::ReceiveResponse,
             NativeCommand::Create { .. } => NativeOperation::Create,
+            NativeCommand::AcquireReceipt { .. } => NativeOperation::AcquireReceipt,
             NativeCommand::Cancel { .. } => NativeOperation::Cancel,
             NativeCommand::Post { .. } => NativeOperation::Post,
             NativeCommand::BeginAdmission { .. } => NativeOperation::BeginAdmission,
             NativeCommand::ReportAdmission { .. } => NativeOperation::ReportAdmission,
         };
-        let lane = if matches!(operation, NativeOperation::Cancel | NativeOperation::ReportAdmission) {
+        let lane = if matches!(
+            operation,
+            NativeOperation::Cancel
+                | NativeOperation::ReportAdmission
+                | NativeOperation::ReportIncrement
+        ) {
             BudgetLane::Completion
         } else {
             BudgetLane::Ordinary
         };
-        let extra_maximum = array::<Extra>(self.limits.range.max_batch_entries / 2)?;
-        let extra_allowance = add(extra_maximum, extra_maximum)?;
-        let changes_charge = add(
-            add(
-                array::<Change<Key, Row>>(self.limits.range.max_batch_entries)?,
-                array::<claim_changes::History>(self.limits.plan_nodes)?,
-            )?,
-            add(
-                containers(self.limits.plan_nodes)?,
-                event_containers(self.limits.range.max_batch_entries)?,
-            )?,
-        )?;
-        let reservation = self.state.budget.reserve(
-            BudgetKind::Pending,
+        Ok(Checked::Fresh(Fresh {
+            input,
+            context,
+            view,
+            meta,
+            sequence,
+            cut,
+            intent,
+            operation,
             lane,
-            add(
-                add(self.limits.preparation_bytes, changes_charge)?,
-                extra_allowance,
-            )?,
-        )?;
+            limits: self.limits,
+        }))
+    }
+}
+
+// The bounded native input stays on the stack. Boxing this capability would
+// allocate before the owner can select and reserve its construction source.
+#[allow(clippy::large_enum_variant)]
+pub(super) enum Checked<'a> {
+    Existing {
+        outcome: NativeOutcome,
+        committed: bool,
+    },
+    Fresh(Fresh<'a>),
+}
+
+/// Private admission capability tied to the actual committed/pending prefix.
+/// Keeping it borrowed prevents publication while source selection is pending.
+pub(super) struct Fresh<'a> {
+    input: NativeInput,
+    context: NativeContext,
+    view: View<'a>,
+    meta: Meta,
+    sequence: SessionSeq,
+    cut: ClaimCut,
+    intent: ContentHash,
+    operation: NativeOperation,
+    lane: BudgetLane,
+    limits: NativeLimits,
+}
+
+pub(super) enum Admission<'a> {
+    Begin {
+        key: EvaluationKey,
+        registered: super::admission_authority::Registered<'a>,
+        binding: Binding,
+        active: bool,
+    },
+    Report {
+        key: EvaluationKey,
+        registered: super::admission_authority::Registered<'a>,
+        authorization: validation::ReportAuthorization,
+        artifact: &'a NativeArtifactInput,
+    },
+}
+
+impl<'a> Fresh<'a> {
+    pub(super) fn authorize_admission(&self) -> Result<Option<Admission<'_>>, NativeError> {
+        match &self.input.command {
+            NativeCommand::BeginAdmission {
+                claim,
+                key,
+                expected,
+            }
+            | NativeCommand::BeginIncrement {
+                claim,
+                key,
+                expected,
+            } => {
+                let begin = if matches!(&self.input.command, NativeCommand::BeginIncrement { .. }) {
+                    super::increment_authority::begin
+                } else {
+                    super::admission_authority::begin
+                };
+                let begun = begin(
+                    &self.view,
+                    self.context,
+                    *claim,
+                    *key,
+                    *expected,
+                    self.limits,
+                )?;
+                Ok(Some(Admission::Begin {
+                    key: *key,
+                    binding: begun.next.binding(),
+                    active: begun.next.has_begun(),
+                    registered: begun.registered,
+                }))
+            }
+            NativeCommand::ReportAdmission {
+                claim,
+                key,
+                expected,
+                report,
+                artifact,
+            }
+            | NativeCommand::ReportIncrement {
+                claim,
+                key,
+                expected,
+                report,
+                artifact,
+            } => {
+                let authorize =
+                    if matches!(&self.input.command, NativeCommand::ReportIncrement { .. }) {
+                        super::increment_authority::report
+                    } else {
+                        super::admission_authority::report
+                    };
+                let (registered, authorization) = authorize(
+                    &self.view,
+                    self.context,
+                    *claim,
+                    *key,
+                    *expected,
+                    *report,
+                    artifact.get().ok_or(ContractError::MissingEvidence)?,
+                    self.limits,
+                )?;
+                Ok(Some(Admission::Report {
+                    key: *key,
+                    registered,
+                    authorization,
+                    artifact,
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub(super) fn view(&self) -> &View<'_> {
+        &self.view
+    }
+    pub(super) fn limits(&self) -> NativeLimits {
+        self.limits
+    }
+    pub(super) fn input(&self) -> &NativeInput {
+        &self.input
+    }
+    pub(super) fn source(&self) -> &'a MemoryBudget {
+        &self.view.state.budget
+    }
+    pub(super) fn authorize_work(
+        &self,
+    ) -> Result<Option<&focal_model::lifecycle::artifact_descriptor::ArtifactDescriptor>, NativeError>
+    {
+        super::work_artifacts::authorize(&self.view, self.context, &self.input.command, self.limits)
+    }
+
+    pub(super) fn build(
+        self,
+        source: &MemoryBudget,
+        evidence: Option<&focal_evidence::VerifiedNativeArtifact>,
+    ) -> Result<NativePrepared, NativeError> {
+        self.build_with_completion(source, evidence, None)
+    }
+
+    pub(super) fn build_with_completion(
+        self,
+        source: &MemoryBudget,
+        evidence: Option<&focal_evidence::VerifiedNativeArtifact>,
+        completion: Option<&super::completion_envelope::CompletionEnvelope>,
+    ) -> Result<NativePrepared, NativeError> {
+        let Self {
+            input,
+            context,
+            view,
+            mut meta,
+            sequence,
+            cut,
+            intent,
+            operation,
+            lane,
+            limits,
+        } = self;
+        if !source.is_within(&view.state.budget) {
+            return Err(MemoryError::InvalidConfiguration(
+                "native allocation source is outside owner budget",
+            )
+            .into());
+        }
+        let construction =
+            super::prepare_budget::ConstructionBudget::for_operation(operation, limits)?;
+        // Bound every possible admitted Begin/Report write against immutable
+        // storage limits. The bound is checked against the actual final plan;
+        // it is not itself a reservation for future reports.
+        let envelope = if matches!(
+            operation,
+            NativeOperation::BeginAdmission
+                | NativeOperation::ReportAdmission
+                | NativeOperation::BeginIncrement
+                | NativeOperation::ReportIncrement
+        ) {
+            Some(
+                view.state
+                    .rows
+                    .future_write_envelope(focal_memory::RangeWriteLimits {
+                        changed_keys: construction.max_changes,
+                        deleted_keys: 0,
+                        incoming_heap: add(
+                            construction.scratch_bytes,
+                            add(
+                                containers(construction.max_claim_rows)?,
+                                event_containers(construction.max_events)?,
+                            )?,
+                        )?,
+                        input_capacity: construction.max_changes,
+                    })?,
+            )
+        } else {
+            None
+        };
+        let reservation =
+            source.reserve(BudgetKind::Pending, lane, construction.pending_bytes()?)?;
         let mut scratch = Scratch {
             used: 0,
-            max: self.limits.preparation_bytes,
+            max: construction.scratch_bytes,
         };
-        let mut extras = Extras::new(self.limits.range.max_batch_entries / 2, extra_allowance)?;
+        let mut extras = Extras::new(construction.extras_count, construction.extras_bytes)?;
         let plan = transactions::prepare(
             input.command,
             input.request,
@@ -353,7 +696,7 @@ impl Core<NativeState> {
             context,
             cut,
             &view,
-            self.limits,
+            limits,
             &mut meta,
             &mut extras,
             &mut scratch,
@@ -363,9 +706,36 @@ impl Core<NativeState> {
             .iter()
             .filter(|row| matches!(row.key, Key::Definition(_)))
             .count();
-        let evaluations = extras.rows.iter().filter(|row| matches!(row.key, Key::Evaluation(_))).count();
-        let artifacts = extras.rows.iter().filter(|row| matches!(row.key, Key::Artifact(_))).count();
-        let results = extras.rows.iter().filter(|row| matches!(row.key, Key::Accepted(_))).count();
+        let evaluations = extras
+            .rows
+            .iter()
+            .filter(|row| matches!(row.key, Key::Evaluation(_)))
+            .count();
+        let artifacts = extras
+            .rows
+            .iter()
+            .filter(|row| matches!(row.key, Key::Artifact(_)))
+            .count();
+        let results = extras
+            .rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row.key,
+                    Key::Accepted(_) | Key::DeliveryResult(_) | Key::MissingResult(_)
+                )
+            })
+            .count();
+        let receipts = extras
+            .rows
+            .iter()
+            .filter(|row| matches!(row.key, Key::Receipt(_)))
+            .count();
+        let responses = extras
+            .rows
+            .iter()
+            .filter(|row| matches!(row.key, Key::Response(_)))
+            .count();
         let outcome = NativeOutcome {
             ledger: view.ledger(),
             request: input.request,
@@ -381,39 +751,61 @@ impl Core<NativeState> {
                 .map_err(|_| NativeError::Capacity("definitions count"))?,
             evaluations: u32::try_from(evaluations)
                 .map_err(|_| NativeError::Capacity("evaluations count"))?,
-            artifacts: u32::try_from(artifacts).map_err(|_| NativeError::Capacity("artifacts count"))?,
+            artifacts: u32::try_from(artifacts)
+                .map_err(|_| NativeError::Capacity("artifacts count"))?,
             results: u32::try_from(results).map_err(|_| NativeError::Capacity("results count"))?,
+            receipts: u32::try_from(receipts)
+                .map_err(|_| NativeError::Capacity("receipt count"))?,
+            responses: u32::try_from(responses)
+                .map_err(|_| NativeError::Capacity("response count"))?,
             events: u32::try_from(add(
-                claim_changes::event_count(&plan.rows, &view)?,
+                claim_changes::event_count(&plan.rows, &view, operation)?,
                 extras.events(),
             )?)
             .map_err(|_| NativeError::Capacity("event count"))?,
         };
+        construction.check_counts(
+            plan.rows.len(),
+            extras.rows.len(),
+            usize::try_from(outcome.events).map_err(|_| NativeError::Capacity("events"))?,
+        )?;
+        transactions::increment(
+            &mut meta.events,
+            usize::try_from(outcome.events).map_err(|_| NativeError::Capacity("events"))?,
+            limits.events,
+            "events",
+        )?;
         let changes = claim_changes::changes(
             plan,
             extras,
             meta,
             outcome,
             &view,
-            self.limits,
-            changes_charge,
+            limits,
+            construction.changes_bytes,
             &mut scratch,
         )?;
-        let range = match view.tail {
+        let range_plan = match view.tail {
             Some(tail) => {
-                self.state
+                view.state
                     .rows
-                    .prepare_after_with(&tail.range, sequence.0, changes, lane, copy)?
+                    .plan_after(&tail.range, sequence.0, changes, lane, usize::MAX)?
             }
-            None => self
+            None => view
                 .state
                 .rows
-                .prepare_batch_with(sequence.0, changes, lane, copy)?,
+                .plan_batch(sequence.0, changes, lane, usize::MAX)?,
         };
+        if let Some(envelope) = envelope {
+            envelope.check_plan(&range_plan)?;
+        }
+        if let Some(completion) = completion {
+            completion
+                .report_storage(outcome.changed != 0)?
+                .check_plan(&range_plan)?;
+        }
+        let range = range_plan.build_in_with(source, copy)?;
         drop(reservation);
-        Ok(NativePreparation::Prepared(NativePrepared {
-            range,
-            outcome,
-        }))
+        Ok(NativePrepared { range, outcome })
     }
 }

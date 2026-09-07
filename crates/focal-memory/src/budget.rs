@@ -4,6 +4,17 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+#[path = "budget_elastic.rs"]
+mod elastic;
+pub use elastic::ElasticFundedPool;
+
+#[cfg(test)]
+#[path = "budget_elastic_tests.rs"]
+mod elastic_tests;
+#[cfg(test)]
+#[path = "budget_interleaving_tests.rs"]
+mod interleaving_tests;
+
 /// Ordinary work cannot consume the reserved completion/control allowance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BudgetLane {
@@ -27,9 +38,11 @@ pub enum BudgetKind {
     Timer,
     Recovery,
     Control,
+    /// Unspent prepaid capacity and its non-spendable pool bookkeeping.
+    Reserved,
 }
 
-const KIND_COUNT: usize = BudgetKind::Control as usize + 1;
+const KIND_COUNT: usize = BudgetKind::Reserved as usize + 1;
 
 // Named counters make category access total, including during Drop.
 #[derive(Debug)]
@@ -47,6 +60,7 @@ struct KindCounters {
     timer: AtomicUsize,
     recovery: AtomicUsize,
     control: AtomicUsize,
+    reserved: AtomicUsize,
 }
 impl KindCounters {
     fn new() -> Self {
@@ -64,6 +78,7 @@ impl KindCounters {
             timer: AtomicUsize::new(0),
             recovery: AtomicUsize::new(0),
             control: AtomicUsize::new(0),
+            reserved: AtomicUsize::new(0),
         }
     }
     fn get(&self, kind: BudgetKind) -> &AtomicUsize {
@@ -81,6 +96,7 @@ impl KindCounters {
             BudgetKind::Timer => &self.timer,
             BudgetKind::Recovery => &self.recovery,
             BudgetKind::Control => &self.control,
+            BudgetKind::Reserved => &self.reserved,
         }
     }
     fn snapshot(&self) -> [usize; KIND_COUNT] {
@@ -98,6 +114,7 @@ impl KindCounters {
             self.timer.load(Ordering::Acquire),
             self.recovery.load(Ordering::Acquire),
             self.control.load(Ordering::Acquire),
+            self.reserved.load(Ordering::Acquire),
         ]
     }
 }
@@ -113,12 +130,68 @@ struct Counters {
     // its registering owner while detached replies still hold its permits.
     parent: Option<MemoryBudget>,
     depth: u8,
+    // A single owner-level pool holds its backing through the lifetime of every
+    // issued allocation and descendant budget. Never one pool per domain row.
+    // While in use, ancestor kinds are reclassified but its total stays held.
+    backing: Backing,
+}
+
+#[derive(Debug)]
+enum Backing {
+    None,
+    Fixed(Allocation),
+    Elastic(elastic::ElasticBacking),
+}
+
+impl Backing {
+    fn lane(&self) -> Option<BudgetLane> {
+        match self {
+            Self::None => None,
+            Self::Fixed(allocation) => Some(allocation.lane),
+            Self::Elastic(backing) => Some(backing.lane),
+        }
+    }
+
+    fn elastic(&self) -> Option<&elastic::ElasticBacking> {
+        match self {
+            Self::Elastic(backing) => Some(backing),
+            Self::None | Self::Fixed(_) => None,
+        }
+    }
+}
+
+impl Drop for Counters {
+    fn drop(&mut self) {
+        // Every issued allocation/descendant retains these counters. At final
+        // destruction its charge has therefore returned to Reserved. Fixed
+        // backing has its own Allocation drop; elastic backing is held once in
+        // the aggregate and must be refunded before the parent field drops.
+        if let Backing::Elastic(backing) = &self.backing
+            && let Some(parent) = &self.parent
+        {
+            parent.release_tree(BudgetKind::Reserved, backing.lane, backing.held_bytes());
+        }
+    }
 }
 
 /// Shareable accounting only: there is no shared mutable graph behind this
 /// handle. Reservations from independent owners use atomic bounded counters.
-#[derive(Clone, Debug)]
+/// A funded child's local usage counts issued permits while its ancestors
+/// continue to count the whole prepaid reservation in its original funding lane.
+#[derive(Clone)]
 pub struct MemoryBudget(Arc<Counters>);
+
+impl std::fmt::Debug for MemoryBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Do not recursively format both the parent and its backing permit;
+        // nested funded pools would duplicate the entire ancestry at each level.
+        f.debug_struct("MemoryBudget")
+            .field("stats", &self.stats())
+            .field("depth", &self.0.depth)
+            .field("funding_lane", &self.0.backing.lane())
+            .finish()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BudgetStats {
@@ -130,12 +203,18 @@ pub struct BudgetStats {
 }
 
 impl MemoryBudget {
+    /// Immutable allowance; reading it does not sample concurrent usage counters.
+    pub fn limit(&self) -> usize {
+        self.0.limit
+    }
+
     pub fn new(limit: usize, completion_reserve: usize) -> Result<Self, MemoryError> {
         Self::create(limit, completion_reserve, None)
     }
-    /// All successful reservations charge this child and every ancestor. A
-    /// parent's refusal rolls back the entire tentative reservation. Local
-    /// allowances can be larger than a parent; the strictest live limit wins.
+    /// Reservations charge this child and its ancestors up to any funded pool;
+    /// that pool's backing is already held above it. A parent's refusal rolls
+    /// back the entire tentative reservation. Local allowances can be larger
+    /// than a parent; the strictest live limit and funding-lane restriction win.
     pub fn child(&self, limit: usize, completion_reserve: usize) -> Result<Self, MemoryError> {
         Self::create(limit, completion_reserve, Some(self.clone()))
     }
@@ -168,6 +247,67 @@ impl MemoryBudget {
             kinds: KindCounters::new(),
             parent,
             depth,
+            backing: Backing::None,
+        })))
+    }
+
+    /// Reserve a reusable owner pool before accepting responsibility. Future
+    /// allocations spend its held capacity without seeking ancestor admission;
+    /// dropping or shrinking them returns credit to this pool, not other owners.
+    /// `capacity` is spendable; pool bookkeeping is additionally charged here.
+    ///
+    /// Ordinary funding can pay for subsequent Completion work while its entire
+    /// original ordinary charge stays held. Completion funding cannot pay for
+    /// Ordinary work, including through descendant budgets. One pool can serve
+    /// many evaluations; their individual entitlements still require an exclusive
+    /// owner-managed book. A pool alone does not prevent competing pending forks.
+    ///
+    /// This fixed pool retains its complete backing until the last budget handle,
+    /// descendant and issued allocation disappears. A small retained result can
+    /// therefore keep unused capacity held. It has no implicit trim or close and
+    /// provides accounting capacity, not physical allocation or disk durability.
+    pub fn funded_child(
+        &self,
+        funding_lane: BudgetLane,
+        capacity: usize,
+    ) -> Result<Self, MemoryError> {
+        if capacity == 0 {
+            return Err(MemoryError::InvalidConfiguration("empty funded pool"));
+        }
+        let depth = self
+            .0
+            .depth
+            .checked_add(1)
+            .filter(|depth| *depth <= 8)
+            .ok_or(MemoryError::InvalidConfiguration(
+                "memory budget hierarchy exceeds eight levels",
+            ))?;
+        let metadata = crate::checked_add(
+            crate::ALLOCATOR_OVERHEAD,
+            crate::checked_add(
+                size_of::<Counters>(),
+                crate::checked_mul(2, size_of::<usize>())?,
+            )?,
+        )?;
+        let backing = self
+            .reserve(
+                BudgetKind::Reserved,
+                funding_lane,
+                crate::checked_add(capacity, metadata)?,
+            )?
+            .commit();
+        Ok(Self(Arc::new(Counters {
+            limit: capacity,
+            ordinary_limit: match funding_lane {
+                BudgetLane::Ordinary => capacity,
+                BudgetLane::Completion => 0,
+            },
+            total: AtomicUsize::new(0),
+            ordinary: AtomicUsize::new(0),
+            kinds: KindCounters::new(),
+            parent: Some(self.clone()),
+            depth,
+            backing: Backing::Fixed(backing),
         })))
     }
 
@@ -191,36 +331,96 @@ impl MemoryBudget {
         lane: BudgetLane,
         bytes: usize,
     ) -> Result<(), MemoryError> {
-        if lane == BudgetLane::Ordinary {
-            reserve_counter(&self.0.ordinary, self.0.ordinary_limit, bytes)?;
+        if lane == BudgetLane::Ordinary && self.0.backing.lane() == Some(BudgetLane::Completion) {
+            return Err(MemoryError::InvalidConfiguration(
+                "completion funding cannot admit ordinary work",
+            ));
+        }
+        let elastic = self.0.backing.elastic();
+        if let Some(backing) = elastic {
+            // This credit, rather than a limit/usage snapshot, excludes a
+            // concurrent trim before any usage or category becomes visible.
+            backing.acquire(bytes)?;
+            #[cfg(test)]
+            if bytes != 0 {
+                interleaving_tests::pause(interleaving_tests::Step::Acquired, self);
+            }
+        }
+        if lane == BudgetLane::Ordinary
+            && let Err(error) = reserve_counter(&self.0.ordinary, self.0.ordinary_limit, bytes)
+        {
+            if let Some(backing) = elastic {
+                backing.release(bytes);
+            }
+            return Err(error);
         }
         if let Err(error) = reserve_counter(&self.0.total, self.0.limit, bytes) {
             if lane == BudgetLane::Ordinary {
                 self.0.ordinary.fetch_sub(bytes, Ordering::AcqRel);
             }
+            if let Some(backing) = elastic {
+                backing.release(bytes);
+            }
             return Err(error);
         }
         // A category can never exceed total, so this addition cannot overflow.
         self.0.kinds.get(kind).fetch_add(bytes, Ordering::AcqRel);
-        if let Some(parent) = &self.0.parent
-            && let Err(error) = parent.reserve_tree(kind, lane, bytes)
-        {
-            self.release_local(kind, lane, bytes);
-            return Err(error);
+        if let Some(parent) = &self.0.parent {
+            if self.0.backing.lane().is_some() {
+                // Local capacity is exclusively acquired before ancestor credit
+                // changes category. No ancestor total or lane admission occurs.
+                parent.reclassify_tree(BudgetKind::Reserved, kind, bytes);
+            } else if let Err(error) = parent.reserve_tree(kind, lane, bytes) {
+                self.release_local(kind, lane, bytes);
+                return Err(error);
+            }
         }
         Ok(())
     }
     fn release_local(&self, kind: BudgetKind, lane: BudgetLane, bytes: usize) {
         self.0.kinds.get(kind).fetch_sub(bytes, Ordering::AcqRel);
-        self.0.total.fetch_sub(bytes, Ordering::AcqRel);
         if lane == BudgetLane::Ordinary {
             self.0.ordinary.fetch_sub(bytes, Ordering::AcqRel);
+        }
+        // Return reusable capacity last, after its category/lane bookkeeping.
+        self.0.total.fetch_sub(bytes, Ordering::AcqRel);
+        if let Some(backing) = self.0.backing.elastic() {
+            #[cfg(test)]
+            if bytes != 0 {
+                interleaving_tests::pause(interleaving_tests::Step::RefundReady, self);
+            }
+            backing.release(bytes);
         }
     }
     fn release_tree(&self, kind: BudgetKind, lane: BudgetLane, bytes: usize) {
         let mut budget = Some(self);
         while let Some(current) = budget {
+            if current.0.backing.lane().is_some() {
+                // Restore ancestor credit BEFORE local capacity becomes reusable.
+                // Otherwise another thread could acquire it while Reserved is
+                // still empty, underflowing the category transfer.
+                if let Some(parent) = &current.0.parent {
+                    parent.reclassify_tree(kind, BudgetKind::Reserved, bytes);
+                }
+                current.release_local(kind, lane, bytes);
+                return;
+            }
             current.release_local(kind, lane, bytes);
+            budget = current.0.parent.as_ref();
+        }
+    }
+    /// Move an already-held charge through every category ledger. This must
+    /// cross funded boundaries without changing their totals or backing lanes.
+    /// Subtract before adding so even concurrent transfers cannot overfill a
+    /// category. The caller owns the entire source charge at every ancestor.
+    fn reclassify_tree(&self, from: BudgetKind, to: BudgetKind, bytes: usize) {
+        if from == to || bytes == 0 {
+            return;
+        }
+        let mut budget = Some(self);
+        while let Some(current) = budget {
+            current.0.kinds.get(from).fetch_sub(bytes, Ordering::AcqRel);
+            current.0.kinds.get(to).fetch_add(bytes, Ordering::AcqRel);
             budget = current.0.parent.as_ref();
         }
     }
@@ -276,8 +476,9 @@ fn reserve_counter(counter: &AtomicUsize, limit: usize, bytes: usize) -> Result<
         })
 }
 
-/// Admission owns this before publication/durability. Dropping it rolls back
-/// every byte automatically, including early returns and unwinding.
+/// Admission owns this before publication/durability. Dropping it returns every
+/// byte to its original source, including early returns and unwinding. For a
+/// funded source the ancestor reservation remains held for reuse by that pool.
 #[derive(Debug)]
 pub struct Reservation(Allocation);
 
@@ -291,7 +492,8 @@ impl Reservation {
     }
 }
 
-/// Ownership of an accounted allocation; dropping it releases the charge.
+/// Ownership of an accounted allocation. Dropping it returns capacity to its
+/// source: ordinary ancestry or the nearest funded pool's still-held backing.
 /// Attach it to the immutable page or other object whose lifetime it measures.
 #[derive(Debug)]
 pub struct Allocation {
@@ -342,9 +544,10 @@ impl Allocation {
             bytes,
         })
     }
-    /// Release temporary working capacity after its payload has been discarded,
+    /// Return temporary working capacity after its payload has been discarded,
     /// while retaining the remainder across an owned result/channel handoff.
-    /// Growing requires separate admission and cannot be hidden in this method.
+    /// Funded capacity returns to its pool. Growing requires separate admission
+    /// and cannot be hidden in this method.
     pub fn shrink_to(&mut self, bytes: usize) -> Result<(), MemoryError> {
         let released = self
             .bytes

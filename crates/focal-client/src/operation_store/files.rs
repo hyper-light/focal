@@ -1,10 +1,14 @@
 use super::StoreError;
-use fs2::FileExt;
+use crate::file_lock::FileLock;
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, Write},
     path::{Path, PathBuf},
 };
+
+#[cfg(all(test, unix))]
+#[path = "lock_tests.rs"]
+mod lock_tests;
 
 const MARKER: &str = "INITIALIZED";
 const INITIALIZED: &[u8; 8] = b"FCLOPS01";
@@ -30,7 +34,7 @@ impl Layout {
 
 pub(crate) struct Directory {
     path: PathBuf,
-    _lock: File,
+    _lock: FileLock,
     layout: Layout,
 }
 impl Directory {
@@ -85,7 +89,7 @@ impl Directory {
                 }
                 Err(error) => return Err(error.into()),
             }
-            let mut lock = options()
+            let lock = options()
                 .read(true)
                 .write(true)
                 .create(create)
@@ -98,15 +102,15 @@ impl Directory {
                     }
                 })?;
             check_open_file(&path, &lock, metadata.uid())?;
-            lock.try_lock_exclusive().map_err(|error| {
+            let lock = FileLock::acquire(lock).map_err(|error| {
                 if error.kind() == std::io::ErrorKind::WouldBlock {
                     StoreError::Locked
                 } else {
                     error.into()
                 }
             })?;
-            let initialized = read_marker_prefix(&mut lock, layout.marker())?;
-            lock.sync_all()?;
+            let initialized = read_marker_prefix(lock.file(), layout.marker())?;
+            lock.file().sync_all()?;
             File::open(parent)?.sync_all()?;
             Ok((
                 Self {
@@ -119,7 +123,7 @@ impl Directory {
         }
     }
     pub(crate) fn finish_coordinator(&self) -> Result<(), StoreError> {
-        let mut lock = &self._lock;
+        let mut lock = self._lock.file();
         lock.rewind()?;
         lock.write_all(self.layout.marker())?;
         lock.set_len(8)?;
@@ -164,7 +168,7 @@ impl Directory {
                 directory.check_path(&marker_path)?;
                 let mut marker = options().read(true).write(true).open(&marker_path)?;
                 check_open_file(&marker_path, &marker, fs::metadata(path)?.uid())?;
-                if !read_marker_prefix(&mut marker, MANAGED_INITIALIZED)? {
+                if !read_marker_prefix(&marker, MANAGED_INITIALIZED)? {
                     marker.rewind()?;
                     marker.write_all(MANAGED_INITIALIZED)?;
                     marker.set_len(8)?;
@@ -250,7 +254,7 @@ impl Directory {
                 .open(&lock_path)
                 .map_err(missing_is_corrupt)?;
             check_open_file(&lock_path, &lock, directory.uid())?;
-            lock.try_lock_exclusive().map_err(|error| {
+            let lock = FileLock::acquire(lock).map_err(|error| {
                 if error.kind() == std::io::ErrorKind::WouldBlock {
                     StoreError::Locked
                 } else {
@@ -258,7 +262,7 @@ impl Directory {
                 }
             })?;
             if create {
-                lock.sync_all()?;
+                lock.file().sync_all()?;
                 File::open(path)?.sync_all()?;
             }
             Ok(Self {
@@ -577,7 +581,7 @@ fn options() -> OpenOptions {
     }
     options
 }
-fn read_marker_prefix(file: &mut File, expected: &[u8; 8]) -> Result<bool, StoreError> {
+fn read_marker_prefix(mut file: &File, expected: &[u8; 8]) -> Result<bool, StoreError> {
     let length = usize::try_from(file.metadata()?.len()).map_err(|_| StoreError::Corrupt)?;
     if length > 8 {
         return Err(StoreError::Corrupt);

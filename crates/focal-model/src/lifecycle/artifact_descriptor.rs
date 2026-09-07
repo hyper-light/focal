@@ -3,12 +3,15 @@
 //! Core resolves input existence, inherited visibility, registered schemas and
 //! actual storage/provenance before admission. V1 content and codecs are unchanged.
 use super::{
-    Binding, ContractError, memory as bytes,
+    Binding, ContractError,
+    evidence::EvidenceFailure,
+    memory as bytes,
     validation::{Attempt, Phase, Target},
 };
 use crate::{
-    ArtifactId, ClaimId, ContentClass, ContentDomainId, ContentHash, LedgerId, ObjectId,
-    ObjectKind, ObjectRef, ObjectRevision, ParticipantId, ReceiptFence, ValidationId, VerdictValue,
+    ArtifactId, ArtifactRef, ClaimId, ContentClass, ContentDomainId, ContentHash, LedgerId,
+    ObjectId, ObjectKind, ObjectRef, ObjectRevision, ParticipantId, ReceiptFence, ValidationId,
+    VerdictValue,
 };
 
 /// Immutable provenance of a participant-authored validation result artifact.
@@ -22,6 +25,60 @@ pub struct ResultProvenance {
     pub generation: u64,
     pub attempt: Attempt,
     pub value: VerdictValue,
+}
+
+/// Immutable work-cycle identity. The owner checks it against the actual receipt
+/// and current cycle; it records authorship without granting submission authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkProvenance {
+    pub claim: ClaimId,
+    pub cycle: u32,
+    pub role: WorkRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkRole {
+    Output {
+        slot: u32,
+    },
+    Diagnostic {
+        reason: EvidenceFailure,
+    },
+    /// A claimant's observation failure, tied to the exact immutable work product.
+    ReceiptRejection {
+        artifact: ArtifactRef,
+        reason: EvidenceFailure,
+    },
+}
+
+impl WorkProvenance {
+    fn check(self, receipt: Option<ReceiptFence>, kind: &str) -> Result<(), ContractError> {
+        if self.claim.is_zero() || self.cycle == 0 || self.cycle.checked_add(1).is_none() {
+            return Err(ContractError::InvalidTarget);
+        }
+        if receipt.is_none_or(|receipt| receipt.receipt.is_zero() || receipt.epoch == 0) {
+            return Err(ContractError::StaleReceipt);
+        }
+        if matches!(
+            self.role,
+            WorkRole::Diagnostic { .. } | WorkRole::ReceiptRejection { .. }
+        ) && kind != "error"
+        {
+            return Err(ContractError::MissingEvidence);
+        }
+        if let WorkRole::ReceiptRejection { artifact, reason } = self.role {
+            if artifact.id.is_zero() || artifact.hash.0 == [0; 32] {
+                return Err(ContractError::InvalidTarget);
+            }
+            if !matches!(
+                reason,
+                EvidenceFailure::Structure | EvidenceFailure::Metadata
+            ) {
+                return Err(ContractError::InvalidPolicy);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ResultProvenance {
@@ -70,7 +127,10 @@ impl ResultProvenance {
                 binding(artifact)
             }
             Target::MissingSlot { response, .. } | Target::Delivery { response } => {
-                binding(response)
+                binding(response)?;
+                // These outcomes are derived without an external evaluator
+                // attempt. An authored artifact cannot invent that result role.
+                Err(ContractError::InvalidTarget)
             }
             Target::Admission { claim: target } => claim(target),
             Target::Increment {
@@ -113,6 +173,7 @@ pub struct ArtifactSpec<'a> {
     pub producer: ParticipantId,
     pub receipt: Option<ReceiptFence>,
     pub result: Option<ResultProvenance>,
+    pub work: Option<WorkProvenance>,
     pub inputs: &'a [ObjectRef],
     pub visibility: &'a [&'a str],
 }
@@ -146,6 +207,7 @@ pub struct ArtifactDescriptor {
     producer: ParticipantId,
     receipt: Option<ReceiptFence>,
     result: Option<ResultProvenance>,
+    work: Option<WorkProvenance>,
     inputs: Vec<ObjectRef>,
     visibility: Vec<String>,
     content_hash: ContentHash,
@@ -203,6 +265,12 @@ impl ArtifactDescriptor {
         }
         if let Some(result) = spec.result {
             result.check(spec.ledger, spec.producer)?;
+        }
+        if let Some(work) = spec.work {
+            if spec.result.is_some() {
+                return Err(ContractError::InvalidPolicy);
+            }
+            work.check(spec.receipt, spec.kind)?;
         }
         if spec.kind.len() > limits.kind_bytes
             || spec.metadata.len() > limits.metadata_bytes
@@ -309,6 +377,28 @@ impl ArtifactDescriptor {
     pub fn result_provenance(&self) -> Option<ResultProvenance> {
         self.result
     }
+    pub fn work_provenance(&self) -> Option<WorkProvenance> {
+        self.work
+    }
+    /// Bind this descriptor to the actual work cycle before custody. Existing
+    /// provenance can only be repeated identically; buffers are moved unchanged.
+    pub fn with_work_provenance(
+        mut self,
+        provenance: WorkProvenance,
+    ) -> Result<Self, ContractError> {
+        if self.result.is_some() {
+            return Err(ContractError::InvalidPolicy);
+        }
+        if self.work.is_some_and(|existing| existing != provenance) {
+            return Err(ContractError::ContentConflict);
+        }
+        provenance.check(self.receipt, &self.kind)?;
+        if self.work.is_none() {
+            self.work = Some(provenance);
+            self.content_hash = content_hash(&self);
+        }
+        Ok(self)
+    }
     /// Finish an unbound result descriptor before custody or publication. This
     /// consumes the descriptor without allocating or copying any owned buffer.
     /// An already declared role can only be supplied again identically.
@@ -316,6 +406,9 @@ impl ArtifactDescriptor {
         mut self,
         provenance: ResultProvenance,
     ) -> Result<Self, ContractError> {
+        if self.work.is_some() {
+            return Err(ContractError::InvalidPolicy);
+        }
         if self.result.is_some_and(|existing| existing != provenance) {
             return Err(ContractError::ContentConflict);
         }
@@ -469,6 +562,7 @@ impl ArtifactDescriptor {
             producer: self.producer,
             receipt: self.receipt,
             result: self.result,
+            work: self.work,
             inputs: copy(&self.inputs)?,
             visibility,
             content_hash: self.content_hash,
@@ -519,6 +613,7 @@ impl ArtifactPlan<'_> {
             producer: spec.producer,
             receipt: spec.receipt,
             result: spec.result,
+            work: spec.work,
             inputs: copy(spec.inputs)?,
             visibility,
             content_hash: ContentHash([0; 32]),
@@ -658,6 +753,40 @@ fn content_hash(descriptor: &ArtifactDescriptor) -> ContentHash {
                 VerdictValue::Incomplete => b"incomplete",
                 VerdictValue::Error => b"error",
             });
+        }
+    }
+    // Descriptors without work provenance retain their original native hashes.
+    // The optional role adds a domain-separated, length-framed suffix; repeated
+    // payloads in distinct cycles no longer require invented metadata to differ.
+    if let Some(work) = descriptor.work {
+        hash.field(b"focal/native/artifact-work/1");
+        hash.field(&work.claim.0);
+        hash.field(&work.cycle.to_be_bytes());
+        match work.role {
+            WorkRole::Output { slot } => {
+                hash.field(b"output");
+                hash.field(&slot.to_be_bytes());
+            }
+            WorkRole::Diagnostic { reason } => {
+                hash.field(b"diagnostic");
+                hash.field(match reason {
+                    EvidenceFailure::Work => b"work",
+                    EvidenceFailure::Production => b"production",
+                    EvidenceFailure::Structure => b"structure",
+                    EvidenceFailure::Metadata => b"metadata",
+                });
+            }
+            WorkRole::ReceiptRejection { artifact, reason } => {
+                hash.field(b"receipt-rejection");
+                hash.field(&artifact.id.0);
+                hash.field(&artifact.hash.0);
+                hash.field(match reason {
+                    EvidenceFailure::Work => b"work",
+                    EvidenceFailure::Production => b"production",
+                    EvidenceFailure::Structure => b"structure",
+                    EvidenceFailure::Metadata => b"metadata",
+                });
+            }
         }
     }
     ContentHash(*hash.0.finalize().as_bytes())

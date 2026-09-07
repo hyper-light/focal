@@ -2,25 +2,72 @@
 //! Session activation and a qualified native durable codec remain separate work.
 //! There is no native serde implementation, arbitrary row insertion, or second
 //! mutable representation alongside the legacy Core.
+mod admission_authority;
+#[cfg(test)]
+mod admission_authority_tests;
+mod admission_budget;
+mod admission_view;
 mod claim_changes;
+mod completion_book;
+mod completion_envelope;
+mod completion_index;
+mod completion_schemas;
+mod delivery;
+mod delivery_owned;
+#[cfg(test)]
+mod event_budget_tests;
+#[cfg(test)]
+mod funding_tests;
+mod graph_effects;
 mod history;
+mod incoming_graph;
+mod increment_authority;
+mod increment_seal;
+mod increments;
 mod intent;
+#[cfg(test)]
+mod layout_tests;
+mod missing_owned;
+mod missing_results;
 mod owned;
+mod owner;
 mod prepare;
-mod reporting;
-mod result_owned;
+mod prepare_budget;
+mod projection;
+mod projection_work;
+mod receipt;
+#[cfg(test)]
+mod receipt_tests;
 #[cfg(test)]
 mod report_tests;
+mod reporting;
+mod response_budget;
+mod response_owned;
+mod response_reads;
+#[cfg(test)]
+mod response_tests;
+mod responses;
+mod result_owned;
 #[cfg(test)]
 mod tests;
 mod transactions;
 #[cfg(test)]
 mod validation_tests;
+mod whole_work;
+mod work_artifacts;
+mod work_checks;
+mod work_failures;
+mod work_owned;
 
 use crate::{Core, CoreState, state_kind};
+pub use delivery_owned::NativeDeliveryResult;
+use delivery_owned::OwnedDeliveryResult;
 use focal_memory::{
     BudgetStats, MemoryBudget, MemoryError, PreparedRange, RangeConfig, RangeId, RangeStats,
     RangeStore, SnapshotLease,
+};
+use focal_model::lifecycle::evidence::{
+    self, EvidenceFailure, Response, ResponseState, WorkArtifactState,
 };
 use focal_model::lifecycle::{
     Binding, ContractError, Principal,
@@ -30,13 +77,24 @@ use focal_model::lifecycle::{
     validation,
 };
 use focal_model::{
-    ArtifactId, ClaimId, ClaimStatus, ContentHash, LedgerId, RequestKey, SessionSeq, TestamentId,
-    ValidationId,
+    ArtifactId, ClaimId, ClaimStatus, ContentHash, LedgerId, ParticipantId, ReceiptFence,
+    ReceiptId, RequestKey, SessionSeq, TestamentId, ValidationId,
 };
 use history::StoredEvent;
+pub use missing_owned::NativeMissingResult;
+use missing_owned::OwnedMissingResult;
 use owned::{OwnedClaim, OwnedDeclaration, OwnedEvaluation, OwnedEvent};
+pub use owner::{
+    NativeCandidate, NativeOwner, NativeOwnerError, NativeOwnerInitError, NativeStaging, NativeView,
+};
+pub use response_owned::NativeResponseRecord;
+use response_owned::OwnedResponse;
+use response_reads::{as_diagnostic, as_response, as_work};
+pub use responses::NativeResponseInput;
 pub use result_owned::{NativeAccepted, NativeArtifact, NativeArtifactInput};
 use result_owned::{OwnedAccepted, OwnedArtifact};
+pub use work_owned::{NativeDiagnostic, NativeWork};
+use work_owned::{OwnedDiagnostic, OwnedWork};
 
 /// Internal resource limits. Deployment profiles derive these from the node's
 /// allowance; they are not another set of mandatory end-user configuration.
@@ -49,11 +107,17 @@ pub struct NativeLimits {
     pub preparation_bytes: usize,
     pub claims: usize,
     pub outcomes: usize,
+    pub events: usize,
     pub definitions: usize,
     pub evaluations: usize,
     pub evaluations_per_claim: usize,
     pub artifacts: usize,
     pub results: usize,
+    pub receipts: usize,
+    pub responses: usize,
+    pub work_artifacts_per_cycle: usize,
+    pub diagnostics_per_cycle: usize,
+    pub response_summary_bytes: usize,
 }
 impl Default for NativeLimits {
     fn default() -> Self {
@@ -65,11 +129,17 @@ impl Default for NativeLimits {
             preparation_bytes: 4 * 1024 * 1024,
             claims: 1_000_000,
             outcomes: 1_000_000,
+            events: 16_000_000,
             definitions: 4_000_000,
             evaluations: 8_000_000,
             evaluations_per_claim: 4096,
             artifacts: 8_000_000,
             results: 8_000_000,
+            receipts: 8_000_000,
+            responses: 4_000_000,
+            work_artifacts_per_cycle: 256,
+            diagnostics_per_cycle: 64,
+            response_summary_bytes: 64 * 1024,
         }
     }
 }
@@ -108,6 +178,61 @@ pub struct NativeContext {
 }
 #[derive(Debug)]
 pub enum NativeCommand {
+    /// Explicit claimant request to assess the exact received response.
+    /// External check execution remains the evaluator's responsibility.
+    EnterWholeWork {
+        claim: Binding,
+        expected: Binding,
+    },
+    /// Claimant freezes Increment target membership before WholeWork entry.
+    /// Existing evaluations retain their independent completion authority.
+    SealIncrementTargets {
+        claim: Binding,
+    },
+    FailWorkProduction {
+        claim: Binding,
+        slot: u32,
+        diagnostic: focal_model::ArtifactRef,
+    },
+    RejectWork {
+        claim: Binding,
+        expected: Binding,
+        reason: EvidenceFailure,
+        artifact: NativeArtifactInput,
+    },
+    SubmitWork {
+        claim: Binding,
+        slot: u32,
+        artifact: NativeArtifactInput,
+    },
+    SubmitDiagnostic {
+        claim: Binding,
+        reason: EvidenceFailure,
+        artifact: NativeArtifactInput,
+    },
+    ReceiveWork {
+        claim: Binding,
+        expected: Binding,
+    },
+    CloseResponse {
+        claim: Binding,
+        response: Binding,
+        report: NativeResponseInput,
+    },
+    PostResponse {
+        claim: Binding,
+        expected: Binding,
+    },
+    ReceiveResponse {
+        claim: Binding,
+        expected: Binding,
+    },
+    /// First responsibility receipt. The owner assigns epoch one and retains the
+    /// unique ID allocation even after later authority changes.
+    AcquireReceipt {
+        expected: Binding,
+        receipt: ReceiptId,
+    },
     /// Core assigns every creation position. Definitions must begin at revision
     /// one; their immutable content and acceptance identities remain pinned.
     Create {
@@ -127,6 +252,18 @@ pub enum NativeCommand {
         key: EvaluationKey,
         expected: Binding,
     },
+    BeginIncrement {
+        claim: Binding,
+        key: EvaluationKey,
+        expected: Binding,
+    },
+    ReportIncrement {
+        claim: Binding,
+        key: EvaluationKey,
+        expected: Binding,
+        report: validation::Report,
+        artifact: NativeArtifactInput,
+    },
     ReportAdmission {
         claim: Binding,
         key: EvaluationKey,
@@ -137,6 +274,19 @@ pub enum NativeCommand {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeOperation {
+    EnterWholeWork,
+    SealIncrementTargets,
+    BeginIncrement,
+    ReportIncrement,
+    FailWorkProduction,
+    RejectWork,
+    SubmitWork,
+    SubmitDiagnostic,
+    ReceiveWork,
+    CloseResponse,
+    PostResponse,
+    ReceiveResponse,
+    AcquireReceipt,
     Create,
     Cancel,
     Post,
@@ -158,16 +308,29 @@ pub struct NativeOutcome {
     pub evaluations: u32,
     pub artifacts: u32,
     pub results: u32,
+    pub receipts: u32,
+    pub responses: u32,
     pub events: u32,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeEventKind {
+    Validating,
+    LocallyComplete,
+    ValidationIncomplete,
+    ValidationFailed,
+    ValidationErrored,
+    DependencyFailed,
     Created,
     ChildRegistered,
     Superseded,
     Cancelled,
     Posted,
     PostFailed,
+    Received,
+    Satisfied,
+    TestamentGenerated,
+    TestamentAcknowledged,
+    ResponseObserved,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeEvent {
@@ -178,8 +341,43 @@ pub struct NativeEvent {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeFact {
-    Artifact { binding: Binding },
-    Accepted { key: NativeResultKey },
+    Missing {
+        key: NativeResultKey,
+    },
+    Registrations {
+        claim: Binding,
+    },
+    Delivery {
+        key: NativeResultKey,
+    },
+    Work {
+        claim: ClaimId,
+        before: Option<Binding>,
+        after: Binding,
+        state: WorkArtifactState,
+    },
+    Diagnostic {
+        claim: ClaimId,
+        binding: Binding,
+        reason: EvidenceFailure,
+    },
+    Response {
+        claim: ClaimId,
+        before: Option<Binding>,
+        after: Binding,
+        state: ResponseState,
+    },
+    Receipt {
+        claim: Binding,
+        fence: ReceiptFence,
+        holder: ParticipantId,
+    },
+    Artifact {
+        binding: Binding,
+    },
+    Accepted {
+        key: NativeResultKey,
+    },
     Claim(NativeClaimEvent),
     Definition {
         binding: Binding,
@@ -200,6 +398,7 @@ pub enum NativeFact {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeEvaluationEventKind {
+    MissingTarget,
     Materialized,
     Begun,
     Reported,
@@ -288,6 +487,45 @@ impl EvaluationTarget {
     }
 }
 
+/// Immutable allocation of a first execution receipt. This row survives later
+/// receipt control so an old identity can never be recycled for another claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeReceipt {
+    pub claim: ClaimId,
+    pub fence: ReceiptFence,
+    pub holder: ParticipantId,
+    pub acquired: SessionSeq,
+}
+
+/// Exact owner-resolved responsibility and work cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct NativeCycleKey {
+    pub claim: ClaimId,
+    pub receipt: ReceiptId,
+    pub epoch: u64,
+    pub cycle: u32,
+}
+impl NativeCycleKey {
+    pub(super) fn of(parent: &evidence::Parent) -> Self {
+        Self {
+            claim: parent.claim,
+            receipt: parent.receipt.receipt,
+            epoch: parent.receipt.epoch,
+            cycle: parent.next_cycle,
+        }
+    }
+}
+/// Owner-maintained membership; every entry is retained under this exact cycle.
+/// Appending evidence edits one head and row, without copying a growing list.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct NativeCycle {
+    pub work_head: Option<ArtifactId>,
+    pub work_count: usize,
+    pub diagnostic_head: Option<ArtifactId>,
+    pub diagnostic_count: usize,
+    pub response: Option<TestamentId>,
+}
+
 /// Address of an immutable accepted attempt, separate from its mutable evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NativeResultKey {
@@ -298,8 +536,10 @@ impl NativeResultKey {
     pub fn of(result: validation::AcceptedResult) -> Self {
         Self {
             evaluation: EvaluationKey {
-                claim: result.claim(), validation: result.validation(),
-                target: EvaluationTarget::of(result.target()), generation: result.generation(),
+                claim: result.claim(),
+                validation: result.validation(),
+                target: EvaluationTarget::of(result.target()),
+                generation: result.generation(),
             },
             revision: result.binding().revision,
         }
@@ -308,6 +548,9 @@ impl NativeResultKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Key {
+    IncomingHead(ClaimId),
+    IncomingLink(ClaimId, ClaimId),
+    MissingResult(NativeResultKey),
     Meta,
     Claim(ClaimId),
     Definition(ValidationId),
@@ -315,6 +558,13 @@ enum Key {
     Artifact(ArtifactId),
     ArtifactIdentity(ContentHash),
     Accepted(NativeResultKey),
+    DeliveryResult(NativeResultKey),
+    Receipt(ReceiptId),
+    Cycle(NativeCycleKey),
+    Work(ArtifactId),
+    WorkSlot(NativeCycleKey, u32),
+    Diagnostic(ArtifactId),
+    Response(TestamentId),
     Outcome(RequestKey),
     Event(SessionSeq, u32),
     End,
@@ -323,14 +573,20 @@ enum Key {
 struct Meta {
     claims: usize,
     outcomes: usize,
+    events: usize,
     definitions: usize,
     evaluations: usize,
     artifacts: usize,
     results: usize,
+    receipts: usize,
+    responses: usize,
     logical_time: u64,
 }
 #[derive(Debug)]
 enum Row {
+    IncomingHead(incoming_graph::IncomingHead),
+    IncomingLink(incoming_graph::IncomingLink),
+    MissingResult(OwnedMissingResult),
     Meta(Meta),
     Claim(OwnedClaim),
     Definition(OwnedDeclaration),
@@ -338,6 +594,13 @@ enum Row {
     Artifact(OwnedArtifact),
     ArtifactIdentity(ArtifactId),
     Accepted(OwnedAccepted),
+    DeliveryResult(OwnedDeliveryResult),
+    Receipt(NativeReceipt),
+    Cycle(NativeCycle),
+    Work(OwnedWork),
+    WorkSlot(ArtifactId),
+    Diagnostic(OwnedDiagnostic),
+    Response(OwnedResponse),
     Outcome(NativeOutcome),
     Event(OwnedEvent),
 }
@@ -362,6 +625,9 @@ impl NativePrepared {
     }
     pub fn claim(&self, id: ClaimId) -> Option<&ClaimState> {
         as_claim(self.range.get(&Key::Claim(id)))
+    }
+    pub fn receipt(&self, id: ReceiptId) -> Option<NativeReceipt> {
+        as_receipt(self.range.get(&Key::Receipt(id)))
     }
     pub fn artifact(&self, id: ArtifactId) -> Option<&NativeArtifact> {
         as_artifact(self.range.get(&Key::Artifact(id)))
@@ -495,7 +761,7 @@ impl Core<NativeState> {
     pub fn new_native(
         ledger: LedgerId,
         range: RangeId,
-        limits: NativeLimits,
+        mut limits: NativeLimits,
         budget: MemoryBudget,
     ) -> Result<Self, NativeError> {
         if ledger.tenant.is_zero() || ledger.session.is_zero() {
@@ -507,15 +773,37 @@ impl Core<NativeState> {
             || limits.preparation_bytes == 0
             || limits.claims == 0
             || limits.outcomes == 0
+            || limits.events == 0
             || limits.definitions == 0
             || limits.evaluations == 0
             || limits.evaluations_per_claim == 0
             || limits.artifacts == 0
             || limits.results == 0
+            || limits.receipts == 0
+            || limits.responses == 0
+            || limits.work_artifacts_per_cycle == 0
+            || limits.diagnostics_per_cycle == 0
+            || limits.response_summary_bytes == 0
             || limits.range.max_batch_entries < 4
         {
             return Err(MemoryError::InvalidConfiguration("native limits must be nonzero").into());
         }
+        // Native mutations already bound nested row heaps through Scratch;
+        // moved claim/event singleton containers have their separate precharge.
+        // Preserve tighter node-derived limits and isolate larger admitted rows
+        // so an unrelated small write cannot copy their payloads as neighbors.
+        let entry_ceiling = prepare::add(
+            prepare::add(
+                limits.preparation_bytes,
+                prepare::add(
+                    OwnedClaim::container_charge(),
+                    OwnedEvent::container_charge(),
+                )?,
+            )?,
+            size_of::<focal_memory::Entry<Key, Row>>(),
+        )?;
+        limits.range.page_bytes = limits.range.page_bytes.min(64 * 1024);
+        limits.range.max_entry_bytes = limits.range.max_entry_bytes.min(entry_ceiling);
         let rows = RangeStore::new(range, 0, limits.range, budget.clone())?;
         Ok(Self {
             state: NativeState {
@@ -540,6 +828,9 @@ impl Core<NativeState> {
     }
     pub fn native_evaluation(&self, key: EvaluationKey) -> Option<&validation::EvaluationState> {
         as_evaluation(self.state.rows.get(&Key::Evaluation(key)))
+    }
+    pub fn native_receipt(&self, id: ReceiptId) -> Option<NativeReceipt> {
+        as_receipt(self.state.rows.get(&Key::Receipt(id)))
     }
     pub fn native_artifact(&self, id: ArtifactId) -> Option<&NativeArtifact> {
         as_artifact(self.state.rows.get(&Key::Artifact(id)))
@@ -627,8 +918,8 @@ struct View<'a> {
     state: &'a NativeState,
     tail: Option<&'a NativePrepared>,
 }
-impl View<'_> {
-    fn get(&self, key: Key) -> Option<&Row> {
+impl<'a> View<'a> {
+    fn get(&self, key: Key) -> Option<&'a Row> {
         match self.tail {
             Some(tail) => tail.range.get(&key),
             None => self.state.rows.get(&key),
@@ -669,26 +960,71 @@ impl EffectiveClaims for View<'_> {
 }
 
 fn as_artifact(row: Option<&Row>) -> Option<&NativeArtifact> {
-    match row { Some(Row::Artifact(value)) => value.get(), _ => None }
+    match row {
+        Some(Row::Artifact(value)) => value.get(),
+        _ => None,
+    }
 }
 fn as_result(row: Option<&Row>) -> Option<&NativeAccepted> {
-    match row { Some(Row::Accepted(value)) => value.get(), _ => None }
+    match row {
+        Some(Row::Accepted(value)) => value.get(),
+        _ => None,
+    }
 }
 impl NativeRead {
-    pub fn with_artifact<T>(&self, id: ArtifactId, now: u64,
+    pub fn with_artifact<T>(
+        &self,
+        id: ArtifactId,
+        now: u64,
         project: impl FnOnce(&NativeArtifact) -> T,
     ) -> Result<Option<T>, MemoryError> {
         let key = Key::Artifact(id);
-        self.lease.project_next(&key, false, &Key::End, now, |entry| {
-            if entry.key == key { as_artifact(Some(&entry.value)).map(project) } else { None }
-        }).map(Option::flatten)
+        self.lease
+            .project_next(&key, false, &Key::End, now, |entry| {
+                if entry.key == key {
+                    as_artifact(Some(&entry.value)).map(project)
+                } else {
+                    None
+                }
+            })
+            .map(Option::flatten)
     }
-    pub fn with_result<T>(&self, id: NativeResultKey, now: u64,
+    pub fn with_result<T>(
+        &self,
+        id: NativeResultKey,
+        now: u64,
         project: impl FnOnce(&NativeAccepted) -> T,
     ) -> Result<Option<T>, MemoryError> {
         let key = Key::Accepted(id);
-        self.lease.project_next(&key, false, &Key::End, now, |entry| {
-            if entry.key == key { as_result(Some(&entry.value)).map(project) } else { None }
-        }).map(Option::flatten)
+        self.lease
+            .project_next(&key, false, &Key::End, now, |entry| {
+                if entry.key == key {
+                    as_result(Some(&entry.value)).map(project)
+                } else {
+                    None
+                }
+            })
+            .map(Option::flatten)
+    }
+}
+
+fn as_receipt(row: Option<&Row>) -> Option<NativeReceipt> {
+    match row {
+        Some(Row::Receipt(value)) => Some(*value),
+        _ => None,
+    }
+}
+impl NativeRead {
+    pub fn receipt(&self, id: ReceiptId, now: u64) -> Result<Option<NativeReceipt>, MemoryError> {
+        let key = Key::Receipt(id);
+        self.lease
+            .project_next(&key, false, &Key::End, now, |entry| {
+                if entry.key == key {
+                    as_receipt(Some(&entry.value))
+                } else {
+                    None
+                }
+            })
+            .map(Option::flatten)
     }
 }

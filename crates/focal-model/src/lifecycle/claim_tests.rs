@@ -368,7 +368,14 @@ fn first_and_later_responses_record_independent_facts_without_phase_regression()
             (Principal::Actor(ISSUER), ResponseEvent::Received),
         ] {
             response(&mut claim, principal, later, event).unwrap();
-            assert_eq!(claim.status(), attained);
+            let expected = if attained == ClaimStatus::TestamentGenerated
+                && event == ResponseEvent::Received
+            {
+                ClaimStatus::TestamentAcknowledged
+            } else {
+                attained
+            };
+            assert_eq!(claim.status(), expected);
             assert!(!claim.local_complete());
         }
         if attained == ClaimStatus::TestamentGenerated {
@@ -379,7 +386,7 @@ fn first_and_later_responses_record_independent_facts_without_phase_regression()
                 ResponseEvent::Posted,
             )
             .unwrap();
-            assert_eq!(claim.status(), attained);
+            assert_eq!(claim.status(), ClaimStatus::TestamentAcknowledged);
             response(
                 &mut claim,
                 Principal::Actor(ISSUER),
@@ -392,6 +399,126 @@ fn first_and_later_responses_record_independent_facts_without_phase_regression()
         assert_eq!(claim.response_count(), 2);
         assert_eq!(claim.latest_response(), Some(later));
     }
+}
+
+#[test]
+fn receiving_the_second_authored_response_first_permits_evaluation_without_receiving_the_first() {
+    use super::super::evidence::{
+        CloseReport, Response, ResponseIdentity, ResponseLimits, ResponseState,
+    };
+
+    fn close_and_post(claim: &mut ClaimState, id: u128) -> Response {
+        let parent = Parent::from_claim(claim).unwrap();
+        let mut response = Response::close(
+            ResponseIdentity {
+                binding: Binding {
+                    object: ObjectId::from_u128(id),
+                    revision: ObjectRevision(1),
+                    ..claim.binding()
+                },
+                claim: parent.claim,
+                receipt: parent.receipt,
+                cycle: parent.next_cycle,
+                prior: parent.latest_response,
+            },
+            &parent,
+            Principal::Actor(SUBJECT),
+            &[],
+            &[],
+            CloseReport {
+                summary: "The requested work is complete.",
+                confidence: crate::Confidence::Committed,
+                outcome: crate::OutcomeKind::Complete,
+                diagnostics: &[],
+                limits: ResponseLimits {
+                    artifacts: 0,
+                    diagnostics: 0,
+                    summary_bytes: 128,
+                    construction_bytes: 64 * 1024,
+                },
+            },
+        )
+        .unwrap()
+        .response;
+        claim
+            .observe_response(&claim.binding(), Principal::Actor(SUBJECT), &response)
+            .unwrap();
+        let parent = Parent::from_claim(claim).unwrap();
+        let posted = response
+            .plan_post(
+                &response.identity().binding,
+                &parent,
+                Principal::Actor(SUBJECT),
+            )
+            .unwrap();
+        response.apply(posted).unwrap();
+        claim
+            .observe_response(&claim.binding(), Principal::Actor(SUBJECT), &response)
+            .unwrap();
+        response
+    }
+
+    let mut claim = received();
+    let entitlement = claim.receipt().unwrap();
+    let mut first = close_and_post(&mut claim, 101);
+    let mut second = close_and_post(&mut claim, 102);
+    assert_eq!(first.identity().cycle, 1);
+    assert_eq!(second.identity().cycle, 2);
+    assert_eq!(second.identity().prior, Some(TestamentId::from_u128(101)));
+    assert_eq!(claim.status(), ClaimStatus::TestamentGenerated);
+    assert_eq!(first.state(), ResponseState::Posted);
+    assert_eq!(second.state(), ResponseState::Posted);
+
+    let parent = Parent::from_claim(&claim).unwrap();
+    let received = second
+        .plan_receive(
+            &second.identity().binding,
+            &parent,
+            Principal::Actor(ISSUER),
+        )
+        .unwrap();
+    second.apply(received).unwrap();
+    claim
+        .observe_response(&claim.binding(), Principal::Actor(ISSUER), &second)
+        .unwrap();
+    assert_eq!(claim.status(), ClaimStatus::TestamentAcknowledged);
+    assert_eq!(first.state(), ResponseState::Posted);
+    assert_eq!(second.state(), ResponseState::Received);
+    assert_eq!(
+        claim.received_report(
+            first.identity().binding,
+            parent.receipt,
+            first.report_stamp()
+        ),
+        Err(ContractError::InvalidTarget)
+    );
+    apply(
+        &mut claim,
+        Principal::Actor(ISSUER),
+        TestIntent::RequestEvaluation,
+    )
+    .unwrap();
+    assert_eq!(claim.status(), ClaimStatus::Validating);
+    assert_eq!(first.state(), ResponseState::Posted);
+
+    let parent = Parent::from_claim(&claim).unwrap();
+    let received = first
+        .plan_receive(&first.identity().binding, &parent, Principal::Actor(ISSUER))
+        .unwrap();
+    first.apply(received).unwrap();
+    claim
+        .observe_response(&claim.binding(), Principal::Actor(ISSUER), &first)
+        .unwrap();
+    assert_eq!(claim.status(), ClaimStatus::Validating);
+    assert_eq!(claim.receipt(), Some(entitlement));
+    assert_eq!(claim.response_count(), 2);
+    assert_eq!(
+        claim.latest_response().unwrap().testament,
+        TestamentId::from_u128(102)
+    );
+    assert_eq!(first.state(), ResponseState::Received);
+    assert_eq!(second.state(), ResponseState::Received);
+    assert!(!claim.local_complete());
 }
 
 #[test]
@@ -1151,6 +1278,107 @@ fn authored_response(
     )
     .unwrap()
     .response
+}
+
+#[test]
+fn checked_response_history_keeps_late_receipt_separate_from_claimant_acceptance() {
+    use super::super::evidence::ResponseState;
+
+    let mut claim = received();
+    let mut testament = authored_response(
+        &claim,
+        "The requested work is complete.",
+        crate::OutcomeKind::Complete,
+        &[],
+    );
+    let substituted = authored_response(
+        &claim,
+        "A different report with the same externally supplied binding.",
+        crate::OutcomeKind::Complete,
+        &[],
+    );
+    assert_eq!(
+        claim.response_history(&testament),
+        Err(ContractError::InvalidTarget)
+    );
+    claim
+        .observe_response(&claim.binding(), Principal::Actor(SUBJECT), &testament)
+        .unwrap();
+    let history = claim.response_history(&testament).unwrap();
+    assert!(!history.posted());
+    assert!(!history.received());
+    assert_eq!(
+        claim.response_history(&substituted),
+        Err(ContractError::ContentConflict)
+    );
+
+    let parent = Parent::from_claim(&claim).unwrap();
+    let transition = testament
+        .plan_post(
+            &testament.identity().binding,
+            &parent,
+            Principal::Actor(SUBJECT),
+        )
+        .unwrap();
+    testament.apply(transition).unwrap();
+    assert!(!claim.response_history(&testament).unwrap().posted());
+    claim
+        .observe_response(&claim.binding(), Principal::Actor(SUBJECT), &testament)
+        .unwrap();
+    let history = claim.response_history(&testament).unwrap();
+    assert!(history.posted());
+    assert!(!history.received());
+
+    let mut adopted = claim.clone();
+    apply(
+        &mut adopted,
+        Principal::Actor(ISSUER),
+        ClaimIntent::AdoptReceipt {
+            previous: parent.receipt,
+            replacement: ReceiptEntitlement {
+                holder: OTHER,
+                fence: fence(2),
+            },
+        },
+    )
+    .unwrap();
+    assert_eq!(adopted.response_history(&testament).unwrap(), history);
+    assert_eq!(
+        adopted.received_report(
+            testament.identity().binding,
+            parent.receipt,
+            testament.report_stamp()
+        ),
+        Err(ContractError::StaleReceipt)
+    );
+
+    apply(
+        &mut claim,
+        Principal::Actor(ISSUER),
+        ClaimIntent::Cancel { cut: cut(10) },
+    )
+    .unwrap();
+    let terminal_claim = claim.clone();
+    let parent = Parent::from_claim(&claim).unwrap();
+    let transition = testament
+        .plan_receive(
+            &testament.identity().binding,
+            &parent,
+            Principal::Actor(ISSUER),
+        )
+        .unwrap();
+    testament.apply(transition).unwrap();
+    assert_eq!(testament.state(), ResponseState::Received);
+    assert_eq!(claim.response_history(&testament).unwrap(), history);
+    assert_eq!(claim, terminal_claim);
+    assert_eq!(
+        claim.received_report(
+            testament.identity().binding,
+            parent.receipt,
+            testament.report_stamp()
+        ),
+        Err(ContractError::InvalidTarget)
+    );
 }
 
 #[test]

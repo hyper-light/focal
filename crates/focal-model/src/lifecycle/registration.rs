@@ -64,6 +64,46 @@ impl RegistrationSet {
     pub fn rows(&self) -> &[RegisteredEvaluation] {
         &self.rows
     }
+    pub fn max_rows(&self) -> usize {
+        self.max_rows
+    }
+    /// A compact copy with enough checked spare entries for one atomic target
+    /// materialization. Registering that cohort then performs no buffer growth.
+    pub fn copy_with_additional_heap_bytes(
+        &self,
+        additional: usize,
+    ) -> Result<usize, ContractError> {
+        let count = bytes::add(self.rows.len(), additional)?;
+        bytes::fits(count, self.max_rows)?;
+        bytes::array::<RegisteredEvaluation>(count)
+    }
+    pub fn copy_with_additional_charge(&self, additional: usize) -> Result<usize, ContractError> {
+        bytes::add(
+            std::mem::size_of::<Self>(),
+            self.copy_with_additional_heap_bytes(additional)?,
+        )
+    }
+    pub fn try_copy_with_additional(
+        &self,
+        additional: usize,
+        max_bytes: usize,
+    ) -> Result<Self, ContractError> {
+        bytes::fits(self.copy_with_additional_charge(additional)?, max_bytes)?;
+        let count = bytes::add(self.rows.len(), additional)?;
+        let mut rows = bytes::reserve(count)?;
+        bytes::fits(rows.capacity(), count)?;
+        rows.extend_from_slice(&self.rows);
+        let copied = Self {
+            claim: self.claim,
+            policy: self.policy,
+            rows,
+            max_rows: self.max_rows,
+            sealed: self.sealed,
+            increments_sealed: self.increments_sealed,
+        };
+        bytes::fits(copied.retained_bytes()?, max_bytes)?;
+        Ok(copied)
+    }
     pub fn is_sealed(&self) -> bool {
         self.sealed
     }

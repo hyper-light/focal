@@ -68,6 +68,16 @@ pub struct AcceptancePolicy {
     declarations: Vec<DeclaredObligation>,
 }
 impl AcceptancePolicy {
+    /// Includes declared output slots with no explicit validation checks.
+    pub fn has_slot(&self, slot: u32) -> bool {
+        self.slots
+            .binary_search_by_key(&slot, |row| row.slot)
+            .is_ok()
+    }
+    pub fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
     pub fn new(
         claim: Binding,
         issuer: ParticipantId,

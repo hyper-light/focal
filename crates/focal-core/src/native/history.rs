@@ -37,8 +37,43 @@ pub(super) struct StoredEvent {
 }
 #[derive(Debug, Clone, Copy)]
 enum Fact {
-    Artifact { binding: Revision },
-    Accepted { key: NativeResultKey },
+    Missing {
+        key: NativeResultKey,
+    },
+    Registrations {
+        claim: Revision,
+    },
+    Delivery {
+        key: NativeResultKey,
+    },
+    Work {
+        claim: ClaimId,
+        before: Option<Revision>,
+        after: Revision,
+        state: WorkArtifactState,
+    },
+    Diagnostic {
+        claim: ClaimId,
+        binding: Revision,
+        reason: EvidenceFailure,
+    },
+    Response {
+        claim: ClaimId,
+        before: Option<Revision>,
+        after: Revision,
+        state: ResponseState,
+    },
+    Receipt {
+        claim: Revision,
+        fence: ReceiptFence,
+        holder: ParticipantId,
+    },
+    Artifact {
+        binding: Revision,
+    },
+    Accepted {
+        key: NativeResultKey,
+    },
     Claim {
         kind: NativeEventKind,
         owned_child: Option<Revision>,
@@ -66,7 +101,64 @@ enum Fact {
 impl StoredEvent {
     pub(super) fn pack(event: NativeEvent) -> Result<Self, ContractError> {
         let fact = match event.fact {
-            NativeFact::Artifact { binding } => Fact::Artifact { binding: Revision::pack(binding) },
+            NativeFact::Missing { key } => Fact::Missing { key },
+            NativeFact::Registrations { claim } => Fact::Registrations {
+                claim: Revision::pack(claim),
+            },
+            NativeFact::Delivery { key } => Fact::Delivery { key },
+            NativeFact::Work {
+                claim,
+                before,
+                after,
+                state,
+            } => {
+                if before.is_some_and(|value| value.ledger != after.ledger) {
+                    return Err(ContractError::WrongLedger);
+                }
+                Fact::Work {
+                    claim,
+                    before: before.map(Revision::pack),
+                    after: Revision::pack(after),
+                    state,
+                }
+            }
+            NativeFact::Diagnostic {
+                claim,
+                binding,
+                reason,
+            } => Fact::Diagnostic {
+                claim,
+                binding: Revision::pack(binding),
+                reason,
+            },
+            NativeFact::Response {
+                claim,
+                before,
+                after,
+                state,
+            } => {
+                if before.is_some_and(|value| value.ledger != after.ledger) {
+                    return Err(ContractError::WrongLedger);
+                }
+                Fact::Response {
+                    claim,
+                    before: before.map(Revision::pack),
+                    after: Revision::pack(after),
+                    state,
+                }
+            }
+            NativeFact::Receipt {
+                claim,
+                fence,
+                holder,
+            } => Fact::Receipt {
+                claim: Revision::pack(claim),
+                fence,
+                holder,
+            },
+            NativeFact::Artifact { binding } => Fact::Artifact {
+                binding: Revision::pack(binding),
+            },
             NativeFact::Accepted { key } => Fact::Accepted { key },
             NativeFact::Claim(row) => {
                 if row
@@ -135,7 +227,54 @@ impl StoredEvent {
             sequence: self.sequence,
             ordinal: self.ordinal,
             fact: match self.fact {
-                Fact::Artifact { binding } => NativeFact::Artifact { binding: binding.expand(ledger) },
+                Fact::Missing { key } => NativeFact::Missing { key },
+                Fact::Registrations { claim } => NativeFact::Registrations {
+                    claim: claim.expand(ledger),
+                },
+                Fact::Delivery { key } => NativeFact::Delivery { key },
+                Fact::Work {
+                    claim,
+                    before,
+                    after,
+                    state,
+                } => NativeFact::Work {
+                    claim,
+                    before: before.map(|value| value.expand(ledger)),
+                    after: after.expand(ledger),
+                    state,
+                },
+                Fact::Diagnostic {
+                    claim,
+                    binding,
+                    reason,
+                } => NativeFact::Diagnostic {
+                    claim,
+                    binding: binding.expand(ledger),
+                    reason,
+                },
+                Fact::Response {
+                    claim,
+                    before,
+                    after,
+                    state,
+                } => NativeFact::Response {
+                    claim,
+                    before: before.map(|value| value.expand(ledger)),
+                    after: after.expand(ledger),
+                    state,
+                },
+                Fact::Receipt {
+                    claim,
+                    fence,
+                    holder,
+                } => NativeFact::Receipt {
+                    claim: claim.expand(ledger),
+                    fence,
+                    holder,
+                },
+                Fact::Artifact { binding } => NativeFact::Artifact {
+                    binding: binding.expand(ledger),
+                },
                 Fact::Accepted { key } => NativeFact::Accepted { key },
                 Fact::Claim {
                     kind,
@@ -181,6 +320,104 @@ impl StoredEvent {
                     fence,
                 },
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native::report_tests::{ISSUER, binding, request};
+
+    fn event(fact: NativeFact) -> NativeEvent {
+        NativeEvent {
+            request: request(ISSUER, 91),
+            sequence: SessionSeq(77),
+            ordinal: 3,
+            fact,
+        }
+    }
+
+    fn roundtrip(fact: NativeFact) {
+        let expected = event(fact);
+        let stored = StoredEvent::pack(expected).unwrap();
+        assert_eq!(stored.expand(binding(1).ledger), expected);
+    }
+
+    #[test]
+    fn compact_independent_history_retains_all_states_revisions_and_failure_reasons() {
+        let claim = ClaimId::from_u128(42);
+        let before = binding(92);
+        let after = before.next().unwrap();
+        for previous in [None, Some(before)] {
+            for state in WorkArtifactState::ALL {
+                roundtrip(NativeFact::Work {
+                    claim,
+                    before: previous,
+                    after,
+                    state: *state,
+                });
+            }
+            for state in ResponseState::ALL {
+                roundtrip(NativeFact::Response {
+                    claim,
+                    before: previous,
+                    after,
+                    state: *state,
+                });
+            }
+        }
+        for reason in [
+            EvidenceFailure::Work,
+            EvidenceFailure::Production,
+            EvidenceFailure::Structure,
+            EvidenceFailure::Metadata,
+        ] {
+            roundtrip(NativeFact::Diagnostic {
+                claim,
+                binding: after,
+                reason,
+            });
+        }
+    }
+
+    #[test]
+    fn compact_work_and_response_history_reject_cross_ledger_revision_pairs() {
+        let claim = ClaimId::from_u128(42);
+        let before = binding(92);
+        for ledger in [
+            LedgerId {
+                tenant: focal_model::TenantId::from_u128(99),
+                ..before.ledger
+            },
+            LedgerId {
+                session: focal_model::SessionId::from_u128(99),
+                ..before.ledger
+            },
+        ] {
+            let after = Binding {
+                ledger,
+                ..before.next().unwrap()
+            };
+            for fact in [
+                NativeFact::Work {
+                    claim,
+                    before: Some(before),
+                    after,
+                    state: WorkArtifactState::Received,
+                },
+                NativeFact::Response {
+                    claim,
+                    before: Some(before),
+                    after,
+                    state: ResponseState::Posted,
+                },
+            ] {
+                assert!(matches!(
+                    StoredEvent::pack(event(fact)),
+                    Err(ContractError::WrongLedger)
+                ));
+            }
         }
     }
 }

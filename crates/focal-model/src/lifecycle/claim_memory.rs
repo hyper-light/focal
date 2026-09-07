@@ -4,6 +4,58 @@ use super::*;
 use crate::lifecycle::memory as bytes;
 
 impl ClaimState {
+    pub fn response_history_heap_bytes(&self) -> Result<usize, ContractError> {
+        bytes::array::<ResponseRecord>(self.responses.capacity())
+    }
+    pub fn response_history_heap_allocations(&self) -> usize {
+        bytes::allocation::<ResponseRecord>(self.responses.capacity())
+    }
+    pub fn max_response_history_heap_bytes(&self) -> Result<usize, ContractError> {
+        bytes::array::<ResponseRecord>(
+            usize::try_from(self.max_responses).map_err(|_| ContractError::Capacity)?,
+        )
+    }
+    fn next_response_capacity(&self) -> Result<usize, ContractError> {
+        let count = self
+            .responses
+            .len()
+            .checked_add(1)
+            .ok_or(ContractError::Capacity)?;
+        if u32::try_from(count).map_err(|_| ContractError::Capacity)? > self.max_responses {
+            return Err(ContractError::Capacity);
+        }
+        Ok(count)
+    }
+    fn copy_heap_with_response_capacity(&self, capacity: usize) -> Result<usize, ContractError> {
+        let base = self
+            .copy_heap_bytes()?
+            .checked_sub(bytes::array::<ResponseRecord>(self.responses.len())?)
+            .ok_or(ContractError::Capacity)?;
+        bytes::add(base, bytes::array::<ResponseRecord>(capacity)?)
+    }
+    /// Compact copy plus exactly one spare response-history entry. These are
+    /// requested dynamic capacities; the owner adds allocator metadata once.
+    pub fn copy_for_response_heap_bytes(&self) -> Result<usize, ContractError> {
+        self.copy_heap_with_response_capacity(self.next_response_capacity()?)
+    }
+    pub fn copy_for_response_heap_allocations(&self) -> Result<usize, ContractError> {
+        self.next_response_capacity()?;
+        bytes::add(
+            self.copy_heap_allocations()?
+                .checked_sub(bytes::allocation::<ResponseRecord>(self.responses.len()))
+                .ok_or(ContractError::Capacity)?,
+            1,
+        )
+    }
+    pub fn copy_for_response_charge(&self) -> Result<usize, ContractError> {
+        bytes::total::<Self>(self.copy_for_response_heap_bytes()?)
+    }
+    /// Retain one response-entry spare without allocating the history twice.
+    /// This preserves the row without applying or authorizing its next event;
+    /// observe_response still checks the exact respondent, report and sequence.
+    pub fn try_copy_for_response(&self, max_bytes: usize) -> Result<Self, ContractError> {
+        self.try_copy_with_response_capacity(self.next_response_capacity()?, max_bytes)
+    }
     /// Number of buffers requested by a compact copy, for owner allocator overhead.
     pub fn copy_heap_allocations(&self) -> Result<usize, ContractError> {
         let mut count = bytes::allocation::<ResponseRecord>(self.responses.len());
@@ -70,7 +122,20 @@ impl ClaimState {
     /// Allocator-reported capacities are checked again before returning; failure
     /// drops all provisional buffers and leaves the original row untouched.
     pub fn try_copy(&self, max_bytes: usize) -> Result<Self, ContractError> {
-        bytes::fits(self.copy_charge()?, max_bytes)?;
+        self.try_copy_with_response_capacity(self.responses.len(), max_bytes)
+    }
+    fn try_copy_with_response_capacity(
+        &self,
+        capacity: usize,
+        max_bytes: usize,
+    ) -> Result<Self, ContractError> {
+        bytes::fits(
+            bytes::total::<Self>(self.copy_heap_with_response_capacity(capacity)?)?,
+            max_bytes,
+        )?;
+        let mut responses = bytes::reserve(capacity)?;
+        bytes::fits(responses.capacity(), capacity)?;
+        responses.extend_from_slice(&self.responses);
         let copied = Self {
             binding: self.binding,
             issuer: self.issuer,
@@ -82,7 +147,7 @@ impl ClaimState {
             scopes: self.scopes.try_copy(self.scopes.copy_charge()?)?,
             status: self.status,
             receipt: self.receipt,
-            responses: bytes::copy(&self.responses)?,
+            responses,
             max_responses: self.max_responses,
             deadline: self.deadline,
             local_complete: self.local_complete,

@@ -50,14 +50,26 @@ fn descriptor(id: u128, payload: PayloadSpec<'_>) -> ArtifactDescriptor {
             payload,
             producer: EVALUATOR,
             receipt: None,
-            result: Some(focal_model::lifecycle::artifact_descriptor::ResultProvenance {
-                claim: ClaimId::from_u128(200), validation: ValidationId::from_u128(300),
-                target: Target::Admission { claim: binding(200) }, generation: 1,
-                attempt: v::Attempt { phase: v::Phase::Programmatic, index: 0,
-                    handler: ValidatorId::from_u128(7), version: ContentHash([7; 32]),
-                    evaluator: EVALUATOR, definition: ContentHash([9; 32]) },
-                value: VerdictValue::Fail,
-            }),
+            work: None,
+            result: Some(
+                focal_model::lifecycle::artifact_descriptor::ResultProvenance {
+                    claim: ClaimId::from_u128(200),
+                    validation: ValidationId::from_u128(300),
+                    target: Target::Admission {
+                        claim: binding(200),
+                    },
+                    generation: 1,
+                    attempt: v::Attempt {
+                        phase: v::Phase::Programmatic,
+                        index: 0,
+                        handler: ValidatorId::from_u128(7),
+                        version: ContentHash([7; 32]),
+                        evaluator: EVALUATOR,
+                        definition: ContentHash([9; 32]),
+                    },
+                    value: VerdictValue::Fail,
+                },
+            ),
             inputs: &[
                 ObjectRef::claim(ledger(), ClaimId::from_u128(200)),
                 ObjectRef {

@@ -22,9 +22,9 @@ const ACCEPTED_CONTAINER: usize = size_of::<NativeAccepted>() + ALLOCATION;
 #[derive(Debug)]
 pub struct NativeArtifactInput(Vec<ArtifactDescriptor>);
 
-/// Immutable descriptor and exact result-evidence metadata retained by Core.
-/// Only the owner can construct this after resolving the actual evaluation and
-/// checking the request-bound custody capability.
+/// Immutable descriptor and exact peer-authored provenance retained by Core.
+/// Only the owner can construct this after resolving its work/evaluation authority
+/// and checking the request-bound custody capability.
 #[derive(Debug)]
 pub struct NativeArtifact {
     descriptor: ArtifactDescriptor,
@@ -143,6 +143,23 @@ impl NativeArtifactInput {
 }
 
 impl NativeArtifact {
+    pub(super) fn from_work(
+        descriptor: ArtifactDescriptor,
+        custody: NativeLocalCustody,
+        request: focal_model::RequestKey,
+    ) -> Result<Self, ContractError> {
+        if descriptor.result_provenance().is_some() || descriptor.work_provenance().is_none() {
+            return Err(ContractError::MissingEvidence);
+        }
+        custody
+            .check(request, &descriptor)
+            .map_err(|_| ContractError::MissingEvidence)?;
+        Ok(Self {
+            descriptor,
+            custody,
+        })
+    }
+
     pub(super) fn new(
         descriptor: ArtifactDescriptor,
         custody: NativeLocalCustody,
@@ -161,18 +178,31 @@ impl NativeArtifact {
             return Err(ContractError::StaleReceipt);
         }
         let expected = focal_model::lifecycle::artifact_descriptor::ResultProvenance {
-            claim: facts.claim, validation: facts.validation, target: facts.target,
-            generation: facts.generation, attempt: facts.attempt, value: facts.value,
+            claim: facts.claim,
+            validation: facts.validation,
+            target: facts.target,
+            generation: facts.generation,
+            attempt: facts.attempt,
+            value: facts.value,
         };
         if descriptor.result_provenance() != Some(expected) {
             return Err(ContractError::MissingEvidence);
         }
         let kind = match facts.value {
-            focal_model::VerdictValue::Pass | focal_model::VerdictValue::Fail => focal_model::lifecycle::validation::EvidenceKind::Proof,
-            focal_model::VerdictValue::Incomplete | focal_model::VerdictValue::Error => focal_model::lifecycle::validation::EvidenceKind::Diagnostic,
+            focal_model::VerdictValue::Pass | focal_model::VerdictValue::Fail => {
+                focal_model::lifecycle::validation::EvidenceKind::Proof
+            }
+            focal_model::VerdictValue::Incomplete | focal_model::VerdictValue::Error => {
+                focal_model::lifecycle::validation::EvidenceKind::Diagnostic
+            }
         };
-        if facts.kind != kind { return Err(ContractError::MissingEvidence); }
-        Ok(Self { descriptor, custody })
+        if facts.kind != kind {
+            return Err(ContractError::MissingEvidence);
+        }
+        Ok(Self {
+            descriptor,
+            custody,
+        })
     }
     pub fn descriptor(&self) -> &ArtifactDescriptor {
         &self.descriptor
@@ -185,15 +215,24 @@ impl NativeArtifact {
     pub fn facts(&self) -> Option<EvidenceFacts> {
         let provenance = self.descriptor.result_provenance()?;
         Some(EvidenceFacts {
-            binding: self.descriptor.binding(), claim: provenance.claim,
-            validation: provenance.validation, target: provenance.target,
-            generation: provenance.generation, attempt: provenance.attempt,
-            producer: self.descriptor.producer(), value: provenance.value,
+            binding: self.descriptor.binding(),
+            claim: provenance.claim,
+            validation: provenance.validation,
+            target: provenance.target,
+            generation: provenance.generation,
+            attempt: provenance.attempt,
+            producer: self.descriptor.producer(),
+            value: provenance.value,
             kind: match provenance.value {
-                focal_model::VerdictValue::Pass | focal_model::VerdictValue::Fail => focal_model::lifecycle::validation::EvidenceKind::Proof,
-                focal_model::VerdictValue::Incomplete | focal_model::VerdictValue::Error => focal_model::lifecycle::validation::EvidenceKind::Diagnostic,
+                focal_model::VerdictValue::Pass | focal_model::VerdictValue::Fail => {
+                    focal_model::lifecycle::validation::EvidenceKind::Proof
+                }
+                focal_model::VerdictValue::Incomplete | focal_model::VerdictValue::Error => {
+                    focal_model::lifecycle::validation::EvidenceKind::Diagnostic
+                }
             },
-            schema: self.descriptor.schema_hash(), custody_revision: Some(self.custody.local_revision()),
+            schema: self.descriptor.schema_hash(),
+            custody_revision: Some(self.custody.local_revision()),
         })
     }
     fn copy(&self) -> Result<Self, MemoryError> {
@@ -232,7 +271,9 @@ impl NativeAccepted {
             ordinal,
         })
     }
-    pub(super) fn result_ref(&self) -> &AcceptedResult { self.artifact.result_ref() }
+    pub(super) fn result_ref(&self) -> &AcceptedResult {
+        self.artifact.result_ref()
+    }
     pub fn result(&self) -> AcceptedResult {
         self.artifact.result()
     }

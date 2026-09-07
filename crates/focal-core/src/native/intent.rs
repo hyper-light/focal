@@ -21,6 +21,112 @@ pub(super) fn fingerprint(
     hash.update(&input.request.epoch.0.to_le_bytes());
     hash.update(&input.request.id.0);
     match &input.command {
+        NativeCommand::EnterWholeWork { claim, expected } => {
+            hash.update(&[17]);
+            hash_binding(&mut hash, *claim);
+            hash_binding(&mut hash, *expected);
+        }
+        NativeCommand::SealIncrementTargets { claim } => {
+            hash.update(&[16]);
+            hash_binding(&mut hash, *claim);
+        }
+        NativeCommand::FailWorkProduction {
+            claim,
+            slot,
+            diagnostic,
+        } => {
+            hash.update(&[12]);
+            hash_binding(&mut hash, *claim);
+            hash.update(&slot.to_le_bytes());
+            hash.update(&diagnostic.id.0);
+            hash.update(&diagnostic.hash.0);
+        }
+        NativeCommand::RejectWork {
+            claim,
+            expected,
+            reason,
+            artifact,
+        } => {
+            hash.update(&[13]);
+            hash_binding(&mut hash, *claim);
+            hash_binding(&mut hash, *expected);
+            hash.update(&[match reason {
+                EvidenceFailure::Work => 0,
+                EvidenceFailure::Production => 1,
+                EvidenceFailure::Structure => 2,
+                EvidenceFailure::Metadata => 3,
+            }]);
+            hash.update(
+                &artifact
+                    .get()
+                    .ok_or(ContractError::MissingEvidence)?
+                    .intent_fingerprint()
+                    .0,
+            );
+        }
+        NativeCommand::SubmitWork {
+            claim,
+            slot,
+            artifact,
+        } => {
+            hash.update(&[6]);
+            hash_binding(&mut hash, *claim);
+            hash.update(&slot.to_le_bytes());
+            hash.update(
+                &artifact
+                    .get()
+                    .ok_or(ContractError::MissingEvidence)?
+                    .intent_fingerprint()
+                    .0,
+            );
+        }
+        NativeCommand::SubmitDiagnostic {
+            claim,
+            reason,
+            artifact,
+        } => {
+            hash.update(&[7]);
+            hash_binding(&mut hash, *claim);
+            hash.update(&[match reason {
+                EvidenceFailure::Work => 0,
+                EvidenceFailure::Production => 1,
+                EvidenceFailure::Structure => 2,
+                EvidenceFailure::Metadata => 3,
+            }]);
+            hash.update(
+                &artifact
+                    .get()
+                    .ok_or(ContractError::MissingEvidence)?
+                    .intent_fingerprint()
+                    .0,
+            );
+        }
+        NativeCommand::ReceiveWork { claim, expected }
+        | NativeCommand::PostResponse { claim, expected }
+        | NativeCommand::ReceiveResponse { claim, expected } => {
+            hash.update(&[match &input.command {
+                NativeCommand::ReceiveWork { .. } => 8,
+                NativeCommand::PostResponse { .. } => 10,
+                _ => 11,
+            }]);
+            hash_binding(&mut hash, *claim);
+            hash_binding(&mut hash, *expected);
+        }
+        NativeCommand::CloseResponse {
+            claim,
+            response,
+            report,
+        } => {
+            hash.update(&[9]);
+            hash_binding(&mut hash, *claim);
+            hash_binding(&mut hash, *response);
+            report.hash_into(&mut hash)?;
+        }
+        NativeCommand::AcquireReceipt { expected, receipt } => {
+            hash.update(&[5]);
+            hash_binding(&mut hash, *expected);
+            hash.update(&receipt.0);
+        }
         NativeCommand::Create {
             claims: proposals,
             declarations,
@@ -36,9 +142,32 @@ pub(super) fn fingerprint(
                 hash.update(&declaration.intent_fingerprint().0);
             }
         }
-        NativeCommand::ReportAdmission { claim, key, expected, report, artifact } => {
-            if key.target != EvaluationTarget::Admission { return Err(ContractError::InvalidTarget.into()); }
-            hash.update(&[4]);
+        NativeCommand::ReportAdmission {
+            claim,
+            key,
+            expected,
+            report,
+            artifact,
+        }
+        | NativeCommand::ReportIncrement {
+            claim,
+            key,
+            expected,
+            report,
+            artifact,
+        } => {
+            if matches!(&input.command, NativeCommand::ReportIncrement { .. }) {
+                let EvaluationTarget::Increment { artifact } = key.target else {
+                    return Err(ContractError::InvalidTarget.into());
+                };
+                hash.update(&[15]);
+                hash.update(&artifact.0);
+            } else {
+                if key.target != EvaluationTarget::Admission {
+                    return Err(ContractError::InvalidTarget.into());
+                }
+                hash.update(&[4]);
+            }
             hash_binding(&mut hash, *claim);
             hash.update(&key.claim.0);
             hash.update(&key.validation.0);
@@ -64,7 +193,13 @@ pub(super) fn fingerprint(
             }]);
             hash.update(&report.evidence.id.0);
             hash.update(&report.evidence.hash.0);
-            hash.update(&artifact.get().ok_or(ContractError::MissingEvidence)?.intent_fingerprint().0);
+            hash.update(
+                &artifact
+                    .get()
+                    .ok_or(ContractError::MissingEvidence)?
+                    .intent_fingerprint()
+                    .0,
+            );
         }
         NativeCommand::Cancel { expected } => {
             hash.update(&[1]);
@@ -78,11 +213,24 @@ pub(super) fn fingerprint(
             claim,
             key,
             expected,
+        }
+        | NativeCommand::BeginIncrement {
+            claim,
+            key,
+            expected,
         } => {
-            if key.target != EvaluationTarget::Admission {
-                return Err(ContractError::InvalidTarget.into());
+            if matches!(&input.command, NativeCommand::BeginIncrement { .. }) {
+                let EvaluationTarget::Increment { artifact } = key.target else {
+                    return Err(ContractError::InvalidTarget.into());
+                };
+                hash.update(&[14]);
+                hash.update(&artifact.0);
+            } else {
+                if key.target != EvaluationTarget::Admission {
+                    return Err(ContractError::InvalidTarget.into());
+                }
+                hash.update(&[3]);
             }
-            hash.update(&[3]);
             hash_binding(&mut hash, *claim);
             hash.update(&key.claim.0);
             hash.update(&key.validation.0);
@@ -97,8 +245,16 @@ pub(super) fn bound_input(
     command: &NativeCommand,
     limits: NativeLimits,
 ) -> Result<(), NativeError> {
-    if let NativeCommand::ReportAdmission { artifact, .. } = command {
+    if let NativeCommand::ReportAdmission { artifact, .. }
+    | NativeCommand::ReportIncrement { artifact, .. }
+    | NativeCommand::RejectWork { artifact, .. }
+    | NativeCommand::SubmitWork { artifact, .. }
+    | NativeCommand::SubmitDiagnostic { artifact, .. } = command
+    {
         within(artifact.heap_charge()?, limits.preparation_bytes)?;
+    }
+    if let NativeCommand::CloseResponse { report, .. } = command {
+        report.check_limits(limits)?;
     }
     if let NativeCommand::Create {
         claims: proposals,

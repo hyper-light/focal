@@ -233,12 +233,15 @@ and [compatible storage migration](docs/archictecutre/18-lifecycle-storage-upgra
 define the remaining work; those target states are not yet available commands.
 
 An internal Rust owner now retains complete validator definitions alongside
-claims and independent evaluation records in custom RAM storage. Posting a claim
-makes its Admission checks ready; the designated evaluator can then begin them.
-Creation, posting, cancellation and supersession publish their related records,
-evaluation fences and history together. This owner is not activated in the
-service: native durable recovery and transactions for reports, results and
-evidence remain under implementation.
+claims, independent evaluations and evidence in custom RAM storage. Designated
+evaluators can begin Admission checks and report results backed by artifact
+payloads verified against their schemas and synced to local disk. Each report
+publishes its evidence, attempt history, evaluation state and any admission failure
+together. A respondent can then acquire a receipt when the required admission
+checks and dependency predicates permit it. Receipt acquisition records
+responsibility and creates no testament. Guaranteed reporting capacity,
+replicated evidence placement and durable native service activation remain open;
+CLI and MCP still use the existing stored model.
 
 For example, an artifact can exist before the respondent closes a testament.
 Receiving that testament makes its exact evidence eligible for whole-work checks;

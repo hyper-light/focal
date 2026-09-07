@@ -1150,20 +1150,23 @@ fn admission_failure_is_a_typed_pre_receipt_cut_and_retains_first_commit() {
 }
 
 #[test]
-fn required_increment_requires_nonempty_sealed_complete_exact_target_set() {
+fn required_increment_requires_sealed_complete_exact_target_set_and_allows_empty_products() {
     use super::super::validation::TargetDeclaration as D;
     let declarations = [
         declaration_for(900, D::Delivery, ValidationMode::Required),
         declaration_for(20, D::Increment, ValidationMode::Required),
     ];
     let mut empty = acceptance_index(&declarations, ClaimStatus::Validating);
+    assert!(!empty.increments_ready());
     empty.seal_targets().unwrap();
     let delivered = delivered_for(&empty, 100, 1);
     assert_eq!(
         empty.apply(SessionSeq(1), &[delivered]).unwrap(),
-        AggregateOutcome::Pending
+        AggregateOutcome::LocalComplete {
+            sequence: SessionSeq(1)
+        }
     );
-    assert!(!empty.increments_ready());
+    assert!(empty.increments_ready());
     let first = nonartifact_evaluation(&declarations[1], Some(10), 1);
     let second = nonartifact_evaluation(&declarations[1], Some(11), 1);
     let mut aggregate = acceptance_index(&declarations, ClaimStatus::Validating);

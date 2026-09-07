@@ -39,6 +39,50 @@ impl Visits {
     }
 }
 
+/// Worst charged projection work for this complete registered cohort after all
+/// Admission members have a result. Retries replace `last_result`, so the bound
+/// does not multiply by each declaration's attempt count. It grants no memory,
+/// record slots or authority, and must be recomputed if membership changes.
+pub fn admission_completion_visits(
+    claim: &ClaimState,
+    registrations: &RegistrationSet,
+) -> Result<usize, ContractError> {
+    fn add(left: usize, right: usize) -> Result<usize, ContractError> {
+        left.checked_add(right).ok_or(ContractError::Capacity)
+    }
+    fn mul(left: usize, right: usize) -> Result<usize, ContractError> {
+        left.checked_mul(right).ok_or(ContractError::Capacity)
+    }
+    registrations.check(claim)?;
+    let policy = claim.acceptance();
+    let declarations = policy.declarations().len();
+    let rows = registrations.rows();
+    let mut visits = add(declarations, policy.slots.len())?;
+    for slot in &policy.slots {
+        visits = add(visits, slot.checks.len())?;
+    }
+    visits = add(visits, rows.len())?;
+    // Every declaration checks the complete manifest and scans all members.
+    let declaration_check = add(declarations, 1)?;
+    visits = add(visits, mul(declarations, declaration_check)?)?;
+    visits = add(visits, mul(declarations, rows.len())?)?;
+    // Every registration matches exactly one declaration in a valid cohort.
+    visits = add(visits, rows.len())?;
+    let mut admissions = 0usize;
+    for (position, row) in rows.iter().enumerate() {
+        if matches!(row.target(), Target::Admission { .. }) {
+            admissions = add(admissions, 1)?;
+            visits = add(visits, declaration_check)?;
+            // Publication uniqueness scans every earlier registration once.
+            visits = add(visits, position)?;
+        }
+    }
+    // Each earlier Admission member additionally resolves its evaluation and
+    // result: twice the number of ordered earlier/current Admission pairs.
+    let earlier = admissions.saturating_sub(1);
+    add(visits, mul(admissions, earlier)?)
+}
+
 fn publication<'a>(
     claim: &ClaimState,
     registered: RegisteredEvaluation,
@@ -184,17 +228,18 @@ pub fn project_admission<'a>(
                         }
                     }
                 }
-                if summary.mode() == ValidationMode::Required && published.result.is_terminal() {
-                    if let Some(cause) = cause(published.result, ValidationMode::Required)? {
-                        let cut = TerminalCut {
-                            sequence: published.sequence,
-                            cause,
-                        };
-                        if first.is_none_or(|(old, _)| {
-                            (cut.sequence, cut.cause.key) < (old.sequence, old.cause.key)
-                        }) {
-                            first = Some((cut, published.ordinal));
-                        }
+                if summary.mode() == ValidationMode::Required
+                    && published.result.is_terminal()
+                    && let Some(cause) = cause(published.result, ValidationMode::Required)?
+                {
+                    let cut = TerminalCut {
+                        sequence: published.sequence,
+                        cause,
+                    };
+                    if first.is_none_or(|(old, _)| {
+                        (cut.sequence, cut.cause.key) < (old.sequence, old.cause.key)
+                    }) {
+                        first = Some((cut, published.ordinal));
                     }
                 }
             }

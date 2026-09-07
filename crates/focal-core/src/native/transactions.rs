@@ -129,12 +129,44 @@ pub(super) fn prepare(
     scratch: &mut Scratch,
 ) -> Result<Plan, NativeError> {
     match command {
-        NativeCommand::ReportAdmission { claim, key, expected, report, artifact } => {
-            super::reporting::prepare(
-                claim, key, expected, report, artifact, request, evidence,
-                context, cut, view, limits, meta, extras, scratch,
-            )
+        NativeCommand::EnterWholeWork { claim, expected } => super::whole_work::enter(
+            view, context, claim, expected, cut, limits, meta, extras, scratch,
+        ),
+        NativeCommand::SealIncrementTargets { claim } => {
+            super::increment_seal::prepare(view, context, claim, limits, scratch)
         }
+        NativeCommand::SubmitWork { .. }
+        | NativeCommand::FailWorkProduction { .. }
+        | NativeCommand::RejectWork { .. }
+        | NativeCommand::SubmitDiagnostic { .. }
+        | NativeCommand::ReceiveWork { .. } => super::work_artifacts::prepare(
+            command, request, evidence, context, cut, view, limits, meta, extras, scratch,
+        ),
+        NativeCommand::CloseResponse { .. }
+        | NativeCommand::PostResponse { .. }
+        | NativeCommand::ReceiveResponse { .. } => {
+            super::responses::prepare(command, context, view, limits, meta, extras, scratch)
+        }
+        NativeCommand::AcquireReceipt { expected, receipt } => super::receipt::prepare(
+            expected, receipt, context, cut, view, limits, meta, extras, scratch,
+        ),
+        NativeCommand::ReportAdmission {
+            claim,
+            key,
+            expected,
+            report,
+            artifact,
+        }
+        | NativeCommand::ReportIncrement {
+            claim,
+            key,
+            expected,
+            report,
+            artifact,
+        } => super::reporting::prepare(
+            claim, key, expected, report, artifact, request, evidence, context, cut, view, limits,
+            meta, extras, scratch,
+        ),
         NativeCommand::Create {
             mut claims,
             declarations,
@@ -235,8 +267,10 @@ pub(super) fn prepare(
                     fact: Some(fact),
                 })?;
             }
+            let rows = plan.into_rows();
+            super::incoming_graph::stage_created(&rows, view, extras, scratch, limits)?;
             Ok(Plan {
-                rows: plan.into_rows(),
+                rows,
                 registry: None,
                 created,
             })
@@ -341,37 +375,22 @@ pub(super) fn prepare(
             claim,
             key,
             expected,
+        }
+        | NativeCommand::BeginIncrement {
+            claim,
+            key,
+            expected,
         } => {
-            if key.target != EvaluationTarget::Admission || key.claim.0 != claim.object.0 {
-                return Err(ContractError::InvalidTarget.into());
-            }
-            let parent = view.claim(key.claim).ok_or(ContractError::InvalidTarget)?;
-            parent.binding().check(&claim)?;
-            let definition = view.definition(key.validation)?;
-            parent.acceptance().check_declaration(definition)?;
-            let old = *view.evaluation(key)?;
-            let registry = view
-                .owned_claim(key.claim)?
-                .registrations()
-                .ok_or(ContractError::InvalidTarget)?;
-            registry.check(parent)?;
-            let registered = registry
-                .rows()
-                .iter()
-                .find(|row| key_for_registered(key.claim, **row) == key)
-                .ok_or(ContractError::InvalidTarget)?;
-            registered.check_state(old, definition)?;
-            let evaluation = old.bind(definition)?;
-            let owner = evaluation.admission_owner(parent, context.logical_time)?;
-            let transition = evaluation.begin(context.principal, &expected, &owner)?;
-            if transition.result.is_some() {
-                return Err(ContractError::InvalidTransition.into());
-            }
+            let begun = if matches!(key.target, EvaluationTarget::Increment { .. }) {
+                super::increment_authority::begin(view, context, claim, key, expected, limits)?
+            } else {
+                super::admission_authority::begin(view, context, claim, key, expected, limits)?
+            };
             extras.evaluation(
                 key.claim,
-                definition,
-                Some(old.binding()),
-                transition.next.into_state(),
+                begun.registered.definition,
+                Some(begun.registered.state.binding()),
+                begun.next,
                 scratch,
             )?;
             Ok(Plan {

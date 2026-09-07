@@ -336,6 +336,27 @@ impl Declaration {
     pub fn attempt_bound(&self) -> u32 {
         self.attempts
     }
+    /// Every declared external-result schema, in handler order: proof followed
+    /// by diagnostic for each check/fallback, then each quality/fallback. Pure
+    /// delivery has none. Repeated schemas remain repeated; an owner may perform
+    /// its own bounded deduplication when pinning verification contracts.
+    pub fn evidence_schemas(&self) -> impl Iterator<Item = ContentHash> + '_ {
+        let (check, quality): (&[OwnedHandlerPolicy], &[OwnedHandlerPolicy]) =
+            match &self.spec.program {
+                OwnedProgram::Delivery => (&[], &[]),
+                OwnedProgram::Programmatic { check, quality } => (
+                    &check.handlers,
+                    quality
+                        .as_ref()
+                        .map_or(&[], |quality| quality.handlers.as_slice()),
+                ),
+                OwnedProgram::Agentic { check } => (&check.handlers, &[]),
+            };
+        check
+            .iter()
+            .chain(quality)
+            .flat_map(|step| [step.proof_schema, step.diagnostic_schema])
+    }
     pub(super) fn policy(&self, phase: Phase) -> Result<&OwnedPhasePolicy, ContractError> {
         match (&self.spec.program, phase) {
             (OwnedProgram::Programmatic { check, .. }, Phase::Programmatic)

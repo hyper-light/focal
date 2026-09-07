@@ -15,6 +15,7 @@ pub mod admin;
 pub mod artifact_transfer;
 mod client;
 pub mod failure;
+mod file_lock;
 pub mod input;
 pub mod managed_requests;
 pub mod managed_store;

@@ -506,3 +506,73 @@ fn native_report_frame_does_not_invent_an_additional_policy_grant() {
     );
     assert!(evaluation.last_result().is_none());
 }
+
+#[test]
+fn native_begin_checks_future_quality_and_agentic_policy_without_changing_explicit_owners() {
+    let Program::Programmatic {
+        check,
+        quality: Some(mut quality),
+    } = programmatic(true)
+    else {
+        panic!("quality fixture");
+    };
+    quality.required_policy = Some(ContentHash([68; 32]));
+    for program in [
+        Program::Programmatic {
+            check,
+            quality: Some(quality),
+        },
+        Program::Agentic { check: quality },
+    ] {
+        let mut definitions = definitions(ValidationMode::Observe, false, false);
+        let mut spec = fixtures::specification(ValidationMode::Observe, program);
+        spec.binding = binding(202);
+        spec.declaration_index = 1;
+        spec.phase = ValidationPhase::Admission;
+        spec.target = TargetDeclaration::Admission;
+        definitions[1] =
+            Declaration::new(Principal::Actor(ISSUER), spec, fixtures::limits()).unwrap();
+        let claim = posted(&definitions);
+        let ready = ready(&claim, &definitions[1]);
+        assert_eq!(
+            ready.admission_owner(&claim, 1).unwrap_err(),
+            ContractError::InvalidPolicy
+        );
+        assert!(!ready.has_begun());
+        assert!(ready.last_result().is_none());
+
+        // Explicit checked owner frames remain able to supply actual installed
+        // grants. Native frame helpers never synthesize those facts themselves.
+        let owner = fixtures::owner_for(&ready);
+        let mut evaluation = ready
+            .begin(
+                Principal::Actor(owner.authority.evaluator),
+                &ready.binding(),
+                &owner,
+            )
+            .unwrap()
+            .next;
+        if matches!(program, Program::Programmatic { .. }) {
+            assert!(evaluation.admission_report_owner(&claim, 2).is_ok());
+            evaluation = report(&claim, evaluation, VerdictValue::Pass).next;
+            assert_eq!(evaluation.current_phase(), Phase::Quality);
+        }
+        assert_eq!(
+            evaluation.admission_report_owner(&claim, 2).unwrap_err(),
+            ContractError::InvalidPolicy
+        );
+        let owner = fixtures::owner_for(&evaluation);
+        let (report, evidence) = fixtures::report_parts(&evaluation, VerdictValue::Pass);
+        let terminal = evaluation
+            .report(
+                Principal::Actor(report.attempt.evaluator),
+                &evaluation.binding(),
+                &owner,
+                report,
+                &evidence,
+            )
+            .unwrap();
+        assert_eq!(terminal.next.state(), State::Validated);
+        assert!(terminal.result.unwrap().is_terminal());
+    }
+}

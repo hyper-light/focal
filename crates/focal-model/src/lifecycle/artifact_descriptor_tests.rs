@@ -35,6 +35,7 @@ fn spec() -> ArtifactSpec<'static> {
             epoch: 1,
         }),
         result: None,
+        work: None,
         inputs: &[],
         visibility: &["", "internal", "tenant/one"],
     }
@@ -883,8 +884,6 @@ fn result_identity_covers_each_attempt_field_verdict_and_exact_target_coordinate
                 ..artifact
             },
         },
-        Target::MissingSlot { response, slot: 0 },
-        Target::Delivery { response },
         Target::Admission {
             claim: target_binding(10),
         },
@@ -913,6 +912,16 @@ fn result_identity_covers_each_attempt_field_verdict_and_exact_target_coordinate
             baseline.intent_fingerprint(),
             "result field {index}"
         );
+    }
+    // Automatic target outcomes have no external result artifacts. Their hash
+    // branches remain exhaustive even though the constructor rejects the role.
+    for target in [
+        Target::MissingSlot { response, slot: 0 },
+        Target::Delivery { response },
+    ] {
+        let mut hash_probe = baseline.try_copy(baseline.copy_charge().unwrap()).unwrap();
+        hash_probe.result.as_mut().unwrap().target = target;
+        assert_ne!(content_hash(&hash_probe), baseline.content_hash());
     }
     // Evaluator and producer must agree at admission. Probe the private hash
     // directly to ensure both coordinates are encoded, rather than accidentally
@@ -1017,6 +1026,11 @@ fn result_provenance_rejects_forged_coordinates_before_allocation_or_role_bindin
         ),
     ];
     for (target, error) in [
+        (
+            Target::MissingSlot { response, slot: 0 },
+            ContractError::InvalidTarget,
+        ),
+        (Target::Delivery { response }, ContractError::InvalidTarget),
         (
             Target::Artifact {
                 response: foreign,
@@ -1123,4 +1137,328 @@ fn result_provenance_rejects_forged_coordinates_before_allocation_or_role_bindin
             assert_eq!(bytes::remaining_allocations(), Some(9));
         });
     }
+}
+
+fn work_provenance() -> WorkProvenance {
+    WorkProvenance {
+        claim: ClaimId::from_u128(700),
+        cycle: 1,
+        role: WorkRole::Output { slot: 0 },
+    }
+}
+
+#[test]
+fn work_identity_distinguishes_claim_cycle_slot_and_diagnostic_reason_without_metadata_changes() {
+    let base = work_provenance();
+    let original = build(ArtifactSpec {
+        kind: "error",
+        work: Some(base),
+        ..spec()
+    });
+    let mut hashes = std::collections::BTreeSet::new();
+    hashes.insert(original.content_hash());
+    for provenance in [
+        WorkProvenance {
+            claim: ClaimId::from_u128(701),
+            ..base
+        },
+        WorkProvenance { cycle: 2, ..base },
+        WorkProvenance {
+            role: WorkRole::Output { slot: 1 },
+            ..base
+        },
+        WorkProvenance {
+            role: WorkRole::Diagnostic {
+                reason: EvidenceFailure::Work,
+            },
+            ..base
+        },
+        WorkProvenance {
+            role: WorkRole::Diagnostic {
+                reason: EvidenceFailure::Production,
+            },
+            ..base
+        },
+        WorkProvenance {
+            role: WorkRole::Diagnostic {
+                reason: EvidenceFailure::Structure,
+            },
+            ..base
+        },
+        WorkProvenance {
+            role: WorkRole::Diagnostic {
+                reason: EvidenceFailure::Metadata,
+            },
+            ..base
+        },
+    ] {
+        let changed = build(ArtifactSpec {
+            kind: "error",
+            work: Some(provenance),
+            ..spec()
+        });
+        assert_eq!(changed.payload(), original.payload());
+        assert_eq!(changed.metadata(), original.metadata());
+        assert!(hashes.insert(changed.content_hash()));
+        assert_ne!(changed.intent_fingerprint(), original.intent_fingerprint());
+    }
+    let new_id = build(ArtifactSpec {
+        id: ArtifactId::from_u128(999),
+        kind: "error",
+        work: Some(base),
+        ..spec()
+    });
+    assert_eq!(new_id.content_hash(), original.content_hash());
+    assert_ne!(new_id.intent_fingerprint(), original.intent_fingerprint());
+}
+
+#[test]
+fn work_role_binding_moves_buffers_and_copy_preserves_exact_provenance() {
+    let plain = build(spec());
+    let kind = plain.kind().as_ptr();
+    let metadata = plain.metadata().as_ptr();
+    let old_hash = plain.content_hash();
+    let first = bytes::fail_after(0, || plain.with_work_provenance(work_provenance())).unwrap();
+    assert_eq!(first.kind().as_ptr(), kind);
+    assert_eq!(first.metadata().as_ptr(), metadata);
+    assert_ne!(first.content_hash(), old_hash);
+    let direct = build(ArtifactSpec {
+        work: Some(work_provenance()),
+        ..spec()
+    });
+    assert_eq!(first, direct);
+    let again = bytes::fail_after(0, || first.with_work_provenance(work_provenance())).unwrap();
+    assert_eq!(again, direct);
+    assert_eq!(again.kind().as_ptr(), kind);
+    let copy = again.try_copy(again.copy_charge().unwrap()).unwrap();
+    assert_eq!(copy.work_provenance(), Some(work_provenance()));
+    assert_eq!(copy, direct);
+    assert_eq!(
+        again
+            .with_work_provenance(WorkProvenance {
+                cycle: 2,
+                ..work_provenance()
+            })
+            .unwrap_err(),
+        ContractError::ContentConflict
+    );
+    assert_eq!(
+        copy.with_result_provenance(result()).unwrap_err(),
+        ContractError::InvalidPolicy
+    );
+    let result_bound = build(ArtifactSpec {
+        result: Some(result()),
+        ..spec()
+    });
+    assert_eq!(
+        result_bound
+            .with_work_provenance(work_provenance())
+            .unwrap_err(),
+        ContractError::InvalidPolicy
+    );
+}
+
+#[test]
+fn invalid_work_roles_refuse_before_allocating_or_changing_any_identity() {
+    let base = work_provenance();
+    for (invalid, expected) in [
+        (
+            ArtifactSpec {
+                work: Some(WorkProvenance {
+                    claim: ClaimId::from_u128(0),
+                    ..base
+                }),
+                ..spec()
+            },
+            ContractError::InvalidTarget,
+        ),
+        (
+            ArtifactSpec {
+                work: Some(WorkProvenance { cycle: 0, ..base }),
+                ..spec()
+            },
+            ContractError::InvalidTarget,
+        ),
+        (
+            ArtifactSpec {
+                work: Some(WorkProvenance {
+                    cycle: u32::MAX,
+                    ..base
+                }),
+                ..spec()
+            },
+            ContractError::InvalidTarget,
+        ),
+        (
+            ArtifactSpec {
+                receipt: None,
+                work: Some(base),
+                ..spec()
+            },
+            ContractError::StaleReceipt,
+        ),
+        (
+            ArtifactSpec {
+                result: Some(result()),
+                work: Some(base),
+                ..spec()
+            },
+            ContractError::InvalidPolicy,
+        ),
+        (
+            ArtifactSpec {
+                work: Some(WorkProvenance {
+                    role: WorkRole::Diagnostic {
+                        reason: EvidenceFailure::Work,
+                    },
+                    ..base
+                }),
+                ..spec()
+            },
+            ContractError::MissingEvidence,
+        ),
+    ] {
+        bytes::fail_after(0, || {
+            assert_eq!(
+                ArtifactDescriptor::prepare(invalid, limits()).unwrap_err(),
+                expected
+            );
+            assert_eq!(bytes::remaining_allocations(), Some(0));
+        });
+    }
+}
+
+#[test]
+fn claimant_rejection_identity_names_exact_work_and_cannot_be_a_respondent_diagnostic() {
+    let target = ArtifactRef {
+        id: ArtifactId::from_u128(800),
+        hash: ContentHash([81; 32]),
+    };
+    let provenance = WorkProvenance {
+        role: WorkRole::ReceiptRejection {
+            artifact: target,
+            reason: EvidenceFailure::Structure,
+        },
+        ..work_provenance()
+    };
+    let original = build(ArtifactSpec {
+        kind: "error",
+        work: Some(provenance),
+        ..spec()
+    });
+    let mut hashes = std::collections::BTreeSet::new();
+    hashes.insert(original.content_hash());
+    for role in [
+        WorkRole::ReceiptRejection {
+            artifact: ArtifactRef {
+                id: ArtifactId::from_u128(801),
+                ..target
+            },
+            reason: EvidenceFailure::Structure,
+        },
+        WorkRole::ReceiptRejection {
+            artifact: ArtifactRef {
+                hash: ContentHash([82; 32]),
+                ..target
+            },
+            reason: EvidenceFailure::Structure,
+        },
+        WorkRole::ReceiptRejection {
+            artifact: target,
+            reason: EvidenceFailure::Metadata,
+        },
+        WorkRole::Diagnostic {
+            reason: EvidenceFailure::Structure,
+        },
+    ] {
+        let changed = build(ArtifactSpec {
+            kind: "error",
+            work: Some(WorkProvenance { role, ..provenance }),
+            ..spec()
+        });
+        assert_eq!(changed.metadata(), original.metadata());
+        assert_eq!(changed.payload(), original.payload());
+        assert!(hashes.insert(changed.content_hash()));
+    }
+    let plain = build(ArtifactSpec {
+        kind: "error",
+        ..spec()
+    });
+    let metadata = plain.metadata().as_ptr();
+    let attached = bytes::fail_after(0, || plain.with_work_provenance(provenance)).unwrap();
+    assert_eq!(attached.metadata().as_ptr(), metadata);
+    assert_eq!(attached, original);
+    assert_eq!(
+        attached.try_copy(attached.copy_charge().unwrap()).unwrap(),
+        original
+    );
+}
+
+#[test]
+fn malformed_claimant_rejection_roles_refuse_before_allocation() {
+    let target = ArtifactRef {
+        id: ArtifactId::from_u128(800),
+        hash: ContentHash([81; 32]),
+    };
+    for (artifact, reason, expected) in [
+        (target, EvidenceFailure::Work, ContractError::InvalidPolicy),
+        (
+            target,
+            EvidenceFailure::Production,
+            ContractError::InvalidPolicy,
+        ),
+        (
+            ArtifactRef {
+                id: ArtifactId::from_u128(0),
+                ..target
+            },
+            EvidenceFailure::Structure,
+            ContractError::InvalidTarget,
+        ),
+        (
+            ArtifactRef {
+                hash: ContentHash([0; 32]),
+                ..target
+            },
+            EvidenceFailure::Metadata,
+            ContractError::InvalidTarget,
+        ),
+    ] {
+        let work = WorkProvenance {
+            role: WorkRole::ReceiptRejection { artifact, reason },
+            ..work_provenance()
+        };
+        bytes::fail_after(0, || {
+            assert_eq!(
+                ArtifactDescriptor::prepare(
+                    ArtifactSpec {
+                        kind: "error",
+                        work: Some(work),
+                        ..spec()
+                    },
+                    limits()
+                )
+                .unwrap_err(),
+                expected
+            );
+            assert_eq!(bytes::remaining_allocations(), Some(0));
+        });
+    }
+    assert_eq!(
+        ArtifactDescriptor::prepare(
+            ArtifactSpec {
+                work: Some(WorkProvenance {
+                    role: WorkRole::ReceiptRejection {
+                        artifact: target,
+                        reason: EvidenceFailure::Structure
+                    },
+                    ..work_provenance()
+                }),
+                ..spec()
+            },
+            limits()
+        )
+        .unwrap_err(),
+        ContractError::MissingEvidence
+    );
 }

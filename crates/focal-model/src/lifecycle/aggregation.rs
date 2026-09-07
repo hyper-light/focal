@@ -14,6 +14,8 @@
 mod acceptance;
 #[path = "aggregation_admission.rs"]
 mod admission;
+#[path = "aggregation_projection.rs"]
+mod projection;
 #[path = "registration.rs"]
 mod registration;
 #[cfg(test)]
@@ -22,7 +24,14 @@ pub use acceptance::{
     AcceptancePolicy, DeclaredObligation, EvaluationRegistry, ObligationTarget,
     RegisteredEvaluation, SealedTargets,
 };
-pub use admission::{AdmissionLimits, AdmissionView, PublishedAdmissionResult, project_admission};
+pub use admission::{
+    AdmissionLimits, AdmissionView, PublishedAdmissionResult, admission_completion_visits,
+    project_admission,
+};
+pub use projection::{
+    ProjectionLimits, ProjectionPlan, PublicationPosition, PublishedResponse, PublishedResult,
+    WholeWorkProjection, WholeWorkView, prepare_projection,
+};
 pub use registration::RegistrationSet;
 
 use super::evidence::ResponseEvaluation;
@@ -281,6 +290,16 @@ pub struct ResponseUpdate {
 }
 
 impl ResponseUpdate {
+    pub fn decision(&self) -> ResponseDecision<'_> {
+        ResponseDecision {
+            claim: self.claim,
+            response: self.delivery.response,
+            receipt: self.delivery.receipt,
+            sequence: self.sequence,
+            outcome: self.outcome,
+            artifacts: &self.artifacts,
+        }
+    }
     pub fn response_outcome(&self) -> ResponseOutcome {
         self.outcome
     }
@@ -310,6 +329,38 @@ impl ResponseUpdate {
 
     pub fn sequence(&self) -> SessionSeq {
         self.sequence
+    }
+}
+
+/// A checked borrowed publication proof, produced by an owned aggregate or by
+/// the actual-owner projection. There is no participant constructor.
+#[derive(Debug, Clone, Copy)]
+pub struct ResponseDecision<'a> {
+    claim: Binding,
+    response: Binding,
+    receipt: ReceiptFence,
+    sequence: SessionSeq,
+    outcome: ResponseOutcome,
+    artifacts: &'a [ArtifactDecision],
+}
+impl ResponseDecision<'_> {
+    pub fn claim_binding(&self) -> Binding {
+        self.claim
+    }
+    pub fn response_binding(&self) -> Binding {
+        self.response
+    }
+    pub fn receipt(&self) -> ReceiptFence {
+        self.receipt
+    }
+    pub fn sequence(&self) -> SessionSeq {
+        self.sequence
+    }
+    pub fn response_outcome(&self) -> ResponseOutcome {
+        self.outcome
+    }
+    pub fn outcome_for_slot(&self, slot: u32) -> Option<&ArtifactDecision> {
+        self.artifacts.iter().find(|decision| decision.slot == slot)
     }
 }
 
@@ -473,6 +524,24 @@ fn cause(
         slot_mode,
         evidence: result.evidence(),
     }))
+}
+
+fn missing_cause(response: TestamentId, slot: &acceptance::OwnedSlot) -> BlockingCause {
+    BlockingCause {
+        key: CauseKey {
+            target: CauseTarget::Response(response),
+            declaration_index: slot.missing_declaration_index,
+            generation: None,
+            attempt: None,
+            phase: CausePhase::MissingTarget,
+        },
+        slot: Some(slot.slot),
+        artifact: None,
+        kind: BlockingKind::Incomplete,
+        mode: ValidationMode::Required,
+        slot_mode: slot.mode,
+        evidence: None,
+    }
 }
 
 impl ResponseAggregation {
@@ -727,21 +796,7 @@ impl ResponseAggregation {
                     }) {
                         continue;
                     }
-                    let missing = BlockingCause {
-                        key: CauseKey {
-                            target: CauseTarget::Response(TestamentId(self.response.object.0)),
-                            declaration_index: policy.missing_declaration_index,
-                            generation: None,
-                            attempt: None,
-                            phase: CausePhase::MissingTarget,
-                        },
-                        slot: Some(policy.slot),
-                        artifact: None,
-                        kind: BlockingKind::Incomplete,
-                        mode: ValidationMode::Required,
-                        slot_mode: policy.mode,
-                        evidence: None,
-                    };
+                    let missing = missing_cause(TestamentId(self.response.object.0), policy);
                     if let Some(old) = causes.iter().find(|old| old.key == missing.key) {
                         if old != &missing {
                             return Err(ContractError::ConflictingCause);
@@ -983,36 +1038,100 @@ impl ClaimAggregation {
 
 /// A borrowed checked index decision, not a freely authored terminal status.
 pub struct ClaimDecision<'a> {
-    aggregate: &'a ClaimAggregation,
+    binding: Binding,
+    sequence: SessionSeq,
+    outcome: AggregateOutcome,
+    delivery: Option<DeliveryWitness>,
+    acceptance: &'a AcceptancePolicy,
+    delivery_results: &'a [AcceptedResult],
+    nonartifact: &'a [NonArtifactWitness],
+    increments_ready: bool,
+    coverage: CoverageView<'a>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SlotWitnessRef<'a> {
+    response: TestamentId,
+    slot: u32,
+    artifact: ArtifactRef,
+    checks: &'a [CheckWitness],
+}
+impl SlotWitnessRef<'_> {
+    pub fn response(&self) -> TestamentId {
+        self.response
+    }
+    pub fn slot(&self) -> u32 {
+        self.slot
+    }
+    pub fn artifact(&self) -> ArtifactRef {
+        self.artifact
+    }
+    pub fn checks(&self) -> &[CheckWitness] {
+        self.checks
+    }
+}
+
+enum CoverageView<'a> {
+    Owned(&'a [Option<SlotWitness>]),
+    Projected(&'a [projection::ProjectedWitness], &'a [CheckWitness]),
+}
+impl CoverageView<'_> {
+    fn iter(&self) -> impl Iterator<Item = SlotWitnessRef<'_>> {
+        let (owned, projected, checks) = match self {
+            Self::Owned(rows) => (*rows, &[][..], &[][..]),
+            Self::Projected(rows, checks) => (&[][..], *rows, *checks),
+        };
+        owned
+            .iter()
+            .filter_map(Option::as_ref)
+            .map(|row| SlotWitnessRef {
+                response: row.response,
+                slot: row.slot,
+                artifact: row.artifact,
+                checks: &row.checks,
+            })
+            .chain(projected.iter().scan(checks, |remaining, row| {
+                // The private projection validates this flat layout before issuing
+                // a decision, and exposes no mutation of either buffer afterward.
+                let (checks, tail) = remaining.split_at_checked(row.checks)?;
+                *remaining = tail;
+                Some(SlotWitnessRef {
+                    response: row.response,
+                    slot: row.slot,
+                    artifact: row.artifact,
+                    checks,
+                })
+            }))
+    }
 }
 
 impl ClaimDecision<'_> {
     pub fn binding(&self) -> Binding {
-        self.aggregate.claim
+        self.binding
     }
     pub fn sequence(&self) -> SessionSeq {
-        self.aggregate.sequence
+        self.sequence
     }
     pub fn outcome(&self) -> AggregateOutcome {
-        self.aggregate.outcome
+        self.outcome
     }
     pub fn delivery(&self) -> Option<DeliveryWitness> {
-        self.aggregate.delivery
+        self.delivery
     }
-    pub fn witnesses(&self) -> impl Iterator<Item = &SlotWitness> {
-        self.aggregate.witnesses()
+    pub fn witnesses(&self) -> impl Iterator<Item = SlotWitnessRef<'_>> {
+        self.coverage.iter()
     }
     pub fn acceptance(&self) -> &AcceptancePolicy {
-        &self.aggregate.policy
+        self.acceptance
     }
     pub fn delivery_results(&self) -> &[AcceptedResult] {
-        &self.aggregate.delivery_results
+        self.delivery_results
     }
     pub fn nonartifact_witnesses(&self) -> &[NonArtifactWitness] {
-        &self.aggregate.accepted
+        self.nonartifact
     }
     pub fn increments_ready(&self) -> bool {
-        self.aggregate.increments_ready()
+        self.increments_ready
     }
 }
 
@@ -1048,7 +1167,17 @@ impl ClaimAggregation {
         self.outcome
     }
     pub fn decision(&self) -> ClaimDecision<'_> {
-        ClaimDecision { aggregate: self }
+        ClaimDecision {
+            binding: self.claim,
+            sequence: self.sequence,
+            outcome: self.outcome,
+            delivery: self.delivery,
+            acceptance: &self.policy,
+            delivery_results: &self.delivery_results,
+            nonartifact: &self.accepted,
+            increments_ready: self.increments_ready(),
+            coverage: CoverageView::Owned(&self.coverage),
+        }
     }
     /// Rebind only to the actual private claim state after response lifecycle
     /// facts advanced its revision. Historical cuts and witnesses are unchanged.
@@ -1160,7 +1289,7 @@ impl ClaimAggregation {
                     return false;
                 }
             }
-            if !found {
+            if !found && target != ObligationTarget::Increment {
                 return false;
             }
         }

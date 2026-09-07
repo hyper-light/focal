@@ -1,10 +1,14 @@
 use super::{MAX_STATE_BYTES, TransferError};
-use fs2::FileExt;
+use crate::file_lock::FileLock;
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
 };
+
+#[cfg(all(test, unix))]
+#[path = "lock_tests.rs"]
+mod lock_tests;
 
 const MARKER: &str = "INITIALIZED";
 const PAYLOAD: &str = "payload.bin";
@@ -37,7 +41,7 @@ impl Layout {
 
 pub(super) struct Directory {
     path: PathBuf,
-    _lock: File,
+    _lock: FileLock,
     layout: Layout,
     #[cfg(test)]
     fault: std::cell::Cell<Option<Fault>>,
@@ -119,7 +123,7 @@ impl Directory {
                 .open(&lock_path)
                 .map_err(missing)?;
             check_open(&lock_path, &lock, metadata.uid())?;
-            lock.try_lock_exclusive().map_err(|e| {
+            let lock = FileLock::acquire(lock).map_err(|e| {
                 if e.kind() == std::io::ErrorKind::WouldBlock {
                     TransferError::Locked
                 } else {
@@ -127,7 +131,7 @@ impl Directory {
                 }
             })?;
             if create {
-                lock.sync_all()?;
+                lock.file().sync_all()?;
                 File::open(path)?.sync_all()?;
             }
             Ok(Self {
@@ -335,7 +339,7 @@ pub(super) fn bootstrap(
     parent: &Path,
     name: &str,
     context: crate::pending::OperationContext,
-) -> Result<(File, bool), TransferError> {
+) -> Result<(FileLock, bool), TransferError> {
     #[cfg(not(unix))]
     {
         let _ = (parent, name, context);
@@ -375,7 +379,7 @@ pub(super) fn bootstrap(
             .create_new(first)
             .open(&lock_path)?;
         check_open(&lock_path, &lock, metadata.uid())?;
-        lock.try_lock_exclusive().map_err(|error| {
+        let lock = FileLock::acquire(lock).map_err(|error| {
             if error.kind() == std::io::ErrorKind::WouldBlock {
                 TransferError::Locked
             } else {
@@ -399,7 +403,7 @@ pub(super) fn bootstrap(
             .ok_or(TransferError::Corrupt)?
             .copy_from_slice(&checksum);
         if first {
-            lock.sync_all()?;
+            lock.file().sync_all()?;
             File::open(parent)?.sync_all()?;
             let mut file = options().write(true).create_new(true).open(&marker)?;
             file.write_all(&value)?;

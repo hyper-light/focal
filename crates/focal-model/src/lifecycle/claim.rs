@@ -61,6 +61,23 @@ struct ResponseRecord {
     received: bool,
 }
 
+/// Exact authored history, checked against the private report stamp. These
+/// facts are observations of this claim's record, never participant input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::lifecycle) struct ResponseHistory {
+    posted: bool,
+    received: bool,
+}
+
+impl ResponseHistory {
+    pub(in crate::lifecycle) fn posted(self) -> bool {
+        self.posted
+    }
+    pub(in crate::lifecycle) fn received(self) -> bool {
+        self.received
+    }
+}
+
 /// Installed owner facts at one exact effective revision. These are resolved
 /// from immutable standing/admission declarations and the current graph, never
 /// accepted as participant-authored permission flags.
@@ -335,6 +352,11 @@ impl ClaimState {
     pub fn status(&self) -> ClaimStatus {
         self.status
     }
+    /// Native claim terminality; this does not couple independent object
+    /// receipt or audit transitions to the historical V1 status helpers.
+    pub fn is_terminal(&self) -> bool {
+        terminal(self.status)
+    }
     pub fn receipt(&self) -> Option<ReceiptEntitlement> {
         self.receipt
     }
@@ -354,6 +376,9 @@ impl ClaimState {
     }
     pub fn response_count(&self) -> usize {
         self.responses.len()
+    }
+    pub fn max_responses(&self) -> u32 {
+        self.max_responses
     }
 
     fn open(&self, expected: &Binding) -> Result<(), ContractError> {
@@ -856,6 +881,47 @@ impl ClaimState {
         Ok(())
     }
 
+    /// Check the complete immutable response link without treating a later
+    /// receipt observation as acceptance. Old receipt history remains readable
+    /// after adoption; the projection separately checks current eligibility.
+    pub(in crate::lifecycle) fn response_history(
+        &self,
+        response: &super::evidence::Response,
+    ) -> Result<ResponseHistory, ContractError> {
+        let identity = response.identity();
+        if identity.binding.ledger != self.binding.ledger {
+            return Err(ContractError::WrongLedger);
+        }
+        if identity.claim.0 != self.binding.object.0 {
+            return Err(ContractError::WrongObject);
+        }
+        let index = usize::try_from(identity.cycle)
+            .map_err(|_| ContractError::Capacity)?
+            .checked_sub(1)
+            .ok_or(ContractError::InvalidTarget)?;
+        let record = self
+            .responses
+            .get(index)
+            .ok_or(ContractError::InvalidTarget)?;
+        let link = ResponseLink {
+            testament: TestamentId(identity.binding.object.0),
+            content: identity.binding.content,
+            receipt: identity.receipt,
+            cycle: identity.cycle,
+            prior: identity.prior,
+        };
+        if record.link != link {
+            return Err(ContractError::InvalidTarget);
+        }
+        if record.stamp != response.report_stamp() {
+            return Err(ContractError::ContentConflict);
+        }
+        Ok(ResponseHistory {
+            posted: record.posted,
+            received: record.received,
+        })
+    }
+
     /// Apply only a decision produced by the checked aggregate. The token pins
     /// exact acceptance/terminal evidence; the owner publishes both records in
     /// the same commit. This does not satisfy graph predicates on its own.
@@ -1036,13 +1102,10 @@ impl ClaimState {
                 }
             }
             ResponseEvent::Posted | ResponseEvent::Received => {
-                // A replacement entitlement cannot acknowledge the abandoned
-                // first response. Its first eligible delivery advances the
-                // pending phase without rewriting either response's history.
-                let replacement_delivery = self
-                    .responses
-                    .first()
-                    .is_some_and(|first| first.link.receipt != entitlement.fence);
+                // Delivery order is independent of authored cycle order. The
+                // first actual receipt under the checked current entitlement
+                // advances the pending phase; other response histories remain
+                // unchanged, including an earlier still-unreceived response.
                 let row = self
                     .responses
                     .iter_mut()
@@ -1060,9 +1123,7 @@ impl ClaimState {
                     }
                     ResponseEvent::Received if row.posted && !row.received => {
                         row.received = true;
-                        if (link.cycle == 1 || replacement_delivery)
-                            && self.status == ClaimStatus::TestamentGenerated
-                        {
+                        if self.status == ClaimStatus::TestamentGenerated {
                             self.status = ClaimStatus::TestamentAcknowledged;
                         }
                     }

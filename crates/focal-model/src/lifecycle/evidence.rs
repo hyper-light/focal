@@ -151,7 +151,9 @@ impl Parent {
         }
         Ok(())
     }
-    pub(super) fn require_open_response(&self) -> Result<(), ContractError> {
+    /// Allocation-free owner preflight. This checks the effective claim state;
+    /// callers still resolve and validate the actual parent identity and receipt.
+    pub fn require_open_response(&self) -> Result<(), ContractError> {
         if self.local_complete
             || !matches!(
                 self.status,
@@ -190,6 +192,61 @@ pub enum EvidenceFailure {
 pub struct Diagnostic {
     pub reason: EvidenceFailure,
     pub artifact: ArtifactRef,
+}
+
+/// An exact failed work row frozen into a response without attachment or an
+/// invented successful output. Only checked closure of the complete owner set
+/// constructs these references. The diagnostic retains its actual producer role;
+/// claimant rejection evidence does not become a respondent-authored diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FailedWork {
+    binding: Binding,
+    slot: u32,
+    state: WorkArtifactState,
+    diagnostic: Diagnostic,
+}
+
+impl FailedWork {
+    fn from_artifact(artifact: &WorkArtifact) -> Result<Option<Self>, ContractError> {
+        match artifact.state {
+            WorkArtifactState::Generated | WorkArtifactState::Received => Ok(None),
+            WorkArtifactState::GenerationFailed | WorkArtifactState::ReceiptFailed => {
+                let diagnostic = artifact.diagnostic.ok_or(ContractError::MissingEvidence)?;
+                let valid = match artifact.state {
+                    WorkArtifactState::GenerationFailed => {
+                        diagnostic.reason == EvidenceFailure::Production
+                    }
+                    WorkArtifactState::ReceiptFailed => matches!(
+                        diagnostic.reason,
+                        EvidenceFailure::Structure | EvidenceFailure::Metadata
+                    ),
+                    _ => false,
+                };
+                if !valid {
+                    return Err(ContractError::InvalidPolicy);
+                }
+                Ok(Some(Self {
+                    binding: artifact.binding,
+                    slot: artifact.slot,
+                    state: artifact.state,
+                    diagnostic,
+                }))
+            }
+            _ => Err(ContractError::InvalidTransition),
+        }
+    }
+    pub fn binding(&self) -> Binding {
+        self.binding
+    }
+    pub fn slot(&self) -> u32 {
+        self.slot
+    }
+    pub fn state(&self) -> WorkArtifactState {
+        self.state
+    }
+    pub fn diagnostic(&self) -> Diagnostic {
+        self.diagnostic
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,6 +354,18 @@ impl WorkArtifact {
     }
     pub fn slot(&self) -> u32 {
         self.slot
+    }
+    pub fn claim(&self) -> ClaimId {
+        self.claim
+    }
+    pub fn cycle(&self) -> u32 {
+        self.cycle
+    }
+    pub fn producer(&self) -> ParticipantId {
+        self.producer
+    }
+    pub fn receipt(&self) -> ReceiptFence {
+        self.receipt
     }
     pub fn attachment(&self) -> Option<TestamentId> {
         self.attachment.map(|binding| TestamentId(binding.object.0))
@@ -432,6 +501,16 @@ impl WorkArtifact {
         expected: &Binding,
         update: &super::aggregation::ResponseUpdate,
     ) -> Result<Self, ContractError> {
+        self.apply_decision(expected, &update.decision())
+    }
+
+    /// Apply a private-backed projection view through the same exact attachment
+    /// and terminal-history guards as the retained aggregate fixture.
+    pub fn apply_decision(
+        &self,
+        expected: &Binding,
+        update: &super::aggregation::ResponseDecision<'_>,
+    ) -> Result<Self, ContractError> {
         use super::aggregation::ArtifactOutcome;
         self.binding.check(expected)?;
         let decision = update
@@ -440,7 +519,7 @@ impl WorkArtifact {
         if decision.claim().ledger != self.binding.ledger
             || decision.claim().object.0 != self.claim.0
             || decision.artifact() != self.reference()
-            || update.delivery().receipt() != self.receipt
+            || update.receipt() != self.receipt
         {
             return Err(ContractError::InvalidTarget);
         }
@@ -487,6 +566,7 @@ pub struct Response {
     respondent: ParticipantId,
     state: ResponseState,
     manifest: Vec<SlotBinding>,
+    failed_work: Vec<FailedWork>,
     report: report::ReportedWork,
     stamp: ReportStamp,
     terminal: Option<super::aggregation::ResponseOutcome>,
@@ -509,6 +589,9 @@ impl Response {
     }
     pub fn manifest(&self) -> &[SlotBinding] {
         &self.manifest
+    }
+    pub fn failed_work(&self) -> &[FailedWork] {
+        &self.failed_work
     }
     pub fn terminal(&self) -> Option<super::aggregation::ResponseOutcome> {
         self.terminal
@@ -682,6 +765,16 @@ impl Response {
         expected: &Binding,
         update: &super::aggregation::ResponseUpdate,
     ) -> Result<Option<ResponseTransition>, ContractError> {
+        self.plan_decision(expected, &update.decision())
+    }
+
+    /// Both aggregate implementations supply private-backed evidence views;
+    /// neither can bypass exact response identity or repaint a terminal cut.
+    pub fn plan_decision(
+        &self,
+        expected: &Binding,
+        update: &super::aggregation::ResponseDecision<'_>,
+    ) -> Result<Option<ResponseTransition>, ContractError> {
         use super::aggregation::{BlockingKind, ResponseOutcome};
         self.identity.binding.check(expected)?;
         let source = update.response_binding();
@@ -689,7 +782,7 @@ impl Response {
             || source.object != self.identity.binding.object
             || source.content != self.identity.binding.content
             || update.claim_binding().object.0 != self.identity.claim.0
-            || update.delivery().receipt() != self.identity.receipt
+            || update.receipt() != self.identity.receipt
         {
             return Err(ContractError::InvalidTarget);
         }
@@ -728,7 +821,10 @@ impl Response {
         Ok(())
     }
 
-    fn contains(&self, artifact: &WorkArtifact) -> Result<(), ContractError> {
+    pub(in crate::lifecycle) fn contains(
+        &self,
+        artifact: &WorkArtifact,
+    ) -> Result<(), ContractError> {
         if self.identity.binding.ledger != artifact.binding.ledger
             || self.identity.claim != artifact.claim
             || self.identity.receipt != artifact.receipt
@@ -828,3 +924,7 @@ impl super::claim::ClaimState {
 #[cfg(test)]
 #[path = "evidence_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "evidence_native_tests.rs"]
+mod native_tests;

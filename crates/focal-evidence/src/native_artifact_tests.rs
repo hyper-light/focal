@@ -48,6 +48,7 @@ fn specification(payload: PayloadSpec<'_>) -> ArtifactSpec<'_> {
         producer: request().principal,
         receipt: None,
         result: None,
+        work: None,
         inputs: &[],
         visibility: &["internal"],
     }
@@ -73,6 +74,251 @@ fn descriptor(spec: ArtifactSpec<'_>) -> ArtifactDescriptor {
 
 fn budget() -> MemoryBudget {
     MemoryBudget::new(32 * 1024 * 1024, 16 * 1024 * 1024).unwrap()
+}
+
+struct ChangingSchemas {
+    schema: ContentHash,
+    maximum: std::cell::Cell<usize>,
+    present: std::cell::Cell<bool>,
+    verifications: std::cell::Cell<usize>,
+}
+
+impl ChangingSchemas {
+    fn new(maximum: usize) -> Self {
+        Self {
+            schema: ContentHash([87; 32]),
+            maximum: std::cell::Cell::new(maximum),
+            present: std::cell::Cell::new(true),
+            verifications: std::cell::Cell::new(0),
+        }
+    }
+}
+
+impl NativeSchemaVerifier for ChangingSchemas {
+    fn maximum_bytes(&self, schema: ContentHash) -> Result<usize, crate::BuiltinSchemaError> {
+        if schema != self.schema || !self.present.get() {
+            return Err(crate::BuiltinSchemaError::Unsupported);
+        }
+        Ok(self.maximum.get())
+    }
+
+    fn verify(&self, schema: ContentHash, bytes: &[u8]) -> Result<(), crate::BuiltinSchemaError> {
+        self.verifications.set(self.verifications.get() + 1);
+        if bytes.len() > self.maximum_bytes(schema)? {
+            return Err(crate::BuiltinSchemaError::Capacity);
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn pinned_verification_budget_rejects_schema_and_maximum_changes_before_funding_or_io() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = store(root.path());
+    let registry = ChangingSchemas::new(REPORT.len() + 10);
+    let artifact = descriptor(ArtifactSpec {
+        schema_hash: registry.schema,
+        ..specification(PayloadSpec::Inline(REPORT))
+    });
+    let pinned = NativeVerificationBudget::for_schema(registry.schema, &registry).unwrap();
+    assert_eq!(pinned.schema(), registry.schema);
+    assert_eq!(pinned.maximum_bytes(), REPORT.len() + 10);
+    let before = files(root.path());
+    // Any attempted workspace debit would fail with Memory, exposing wrong
+    // validation order even if the reservation subsequently refunded itself.
+    let unfunded = MemoryBudget::new(1, 1).unwrap();
+    assert!(matches!(
+        store.verify_native_artifact_with_budget(
+            RequestKey {
+                principal: ParticipantId::from_u128(99),
+                ..request()
+            },
+            &artifact,
+            domain(),
+            &unfunded,
+            &registry,
+            &pinned,
+        ),
+        Err(NativeEvidenceError::WrongRequest)
+    ));
+    for maximum in [REPORT.len() + 9, REPORT.len() + 11] {
+        registry.maximum.set(maximum);
+        assert!(matches!(
+            pinned.check_schema(registry.schema, &registry),
+            Err(NativeEvidenceError::VerificationBudgetChanged)
+        ));
+        assert!(matches!(
+            store.verify_native_artifact_with_budget(
+                request(),
+                &artifact,
+                domain(),
+                &unfunded,
+                &registry,
+                &pinned,
+            ),
+            Err(NativeEvidenceError::VerificationBudgetChanged)
+        ));
+        assert_eq!(unfunded.stats().used, 0);
+        assert_eq!(registry.verifications.get(), 0);
+        assert_eq!(files(root.path()), before);
+    }
+    registry.maximum.set(pinned.maximum_bytes());
+    let different = descriptor(ArtifactSpec {
+        schema_hash: ContentHash([88; 32]),
+        ..specification(PayloadSpec::Inline(REPORT))
+    });
+    assert!(matches!(
+        store.verify_native_artifact_with_budget(
+            request(),
+            &different,
+            domain(),
+            &unfunded,
+            &registry,
+            &pinned,
+        ),
+        Err(NativeEvidenceError::VerificationBudgetChanged)
+    ));
+    registry.present.set(false);
+    assert!(matches!(
+        store.verify_native_artifact_with_budget(
+            request(),
+            &artifact,
+            domain(),
+            &unfunded,
+            &registry,
+            &pinned,
+        ),
+        Err(NativeEvidenceError::Schema(
+            crate::BuiltinSchemaError::Unsupported
+        ))
+    ));
+    assert_eq!(files(root.path()), before);
+    assert_eq!(registry.verifications.get(), 0);
+    registry.present.set(true);
+    let exact = MemoryBudget::new(pinned.peak_bytes(), pinned.peak_bytes()).unwrap();
+    let token = store
+        .verify_native_artifact_with_budget(
+            request(),
+            &artifact,
+            domain(),
+            &exact,
+            &registry,
+            &pinned,
+        )
+        .unwrap();
+    token.check(request(), &artifact).unwrap();
+    assert_eq!(registry.verifications.get(), 1);
+    assert_eq!(exact.stats().used, pinned.retained_bytes());
+    assert_eq!(token.retained_bytes(), pinned.retained_bytes());
+    drop(token);
+    assert_eq!(exact.stats().used, 0);
+}
+
+#[test]
+fn unknown_and_unbounded_verification_contracts_refuse_before_payload_access() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = store(root.path());
+    let registry = ChangingSchemas::new(REPORT.len());
+    let artifact = descriptor(ArtifactSpec {
+        schema_hash: registry.schema,
+        ..specification(PayloadSpec::Inline(REPORT))
+    });
+    let pinned = NativeVerificationBudget::for_schema(registry.schema, &registry).unwrap();
+    let unfunded = MemoryBudget::new(1, 1).unwrap();
+    let before = files(root.path());
+    for maximum in [MAX_TRANSFER_MANIFEST_BYTES + 1, usize::MAX] {
+        registry.maximum.set(maximum);
+        assert!(matches!(
+            NativeVerificationBudget::for_schema(registry.schema, &registry),
+            Err(NativeEvidenceError::Content(ContentError::Capacity))
+        ));
+        assert!(matches!(
+            store.verify_native_artifact(request(), &artifact, domain(), &unfunded, &registry),
+            Err(NativeEvidenceError::Content(ContentError::Capacity))
+        ));
+        assert!(matches!(
+            store.verify_native_artifact_with_budget(
+                request(),
+                &artifact,
+                domain(),
+                &unfunded,
+                &registry,
+                &pinned,
+            ),
+            Err(NativeEvidenceError::Content(ContentError::Capacity))
+        ));
+    }
+    assert!(matches!(
+        NativeVerificationBudget::for_schema(registry.schema, &BuiltinNativeSchemas),
+        Err(NativeEvidenceError::Schema(
+            crate::BuiltinSchemaError::Unsupported
+        ))
+    ));
+    assert!(matches!(
+        store.verify_native_artifact(
+            request(),
+            &artifact,
+            domain(),
+            &unfunded,
+            &BuiltinNativeSchemas,
+        ),
+        Err(NativeEvidenceError::Schema(
+            crate::BuiltinSchemaError::Unsupported
+        ))
+    ));
+    assert!(matches!(
+        NativeVerificationBudget::for_schema(ContentHash([0; 32]), &registry),
+        Err(NativeEvidenceError::Contract(
+            ContractError::InvalidManifest
+        ))
+    ));
+    assert_eq!(unfunded.stats().used, 0);
+    assert_eq!(registry.verifications.get(), 0);
+    assert_eq!(files(root.path()), before);
+}
+
+#[test]
+fn verification_budget_accepts_exact_maximum_and_explicit_empty_custom_contract() {
+    for (schema, maximum) in [
+        (crate::error_report_schema(), crate::ERROR_REPORT_MAX_BYTES),
+        (crate::test_report_schema(), crate::TEST_REPORT_MAX_BYTES),
+    ] {
+        let quote = NativeVerificationBudget::for_schema(schema, &BuiltinNativeSchemas).unwrap();
+        assert_eq!(quote.maximum_bytes(), maximum);
+        assert_eq!(
+            quote.peak_bytes(),
+            STORE_WORKSPACE + maximum + quote.retained_bytes()
+        );
+        assert_eq!(quote.retained_bytes(), size_of::<VerifiedNativeArtifact>());
+        quote.check_schema(schema, &BuiltinNativeSchemas).unwrap();
+    }
+    let registry = ChangingSchemas::new(MAX_TRANSFER_MANIFEST_BYTES);
+    let maximum = NativeVerificationBudget::for_schema(registry.schema, &registry).unwrap();
+    assert_eq!(maximum.maximum_bytes(), MAX_TRANSFER_MANIFEST_BYTES);
+    registry.maximum.set(0);
+    let empty = NativeVerificationBudget::for_schema(registry.schema, &registry).unwrap();
+    assert_eq!(empty.maximum_bytes(), 0);
+    let root = tempfile::tempdir().unwrap();
+    let mut store = store(root.path());
+    let artifact = descriptor(ArtifactSpec {
+        schema_hash: registry.schema,
+        ..specification(PayloadSpec::Inline(&[]))
+    });
+    let budget = MemoryBudget::new(empty.peak_bytes(), empty.peak_bytes()).unwrap();
+    let token = store
+        .verify_native_artifact_with_budget(
+            request(),
+            &artifact,
+            domain(),
+            &budget,
+            &registry,
+            &empty,
+        )
+        .unwrap();
+    assert_eq!(token.custody().payload().length, 0);
+    assert_eq!(budget.stats().used, empty.retained_bytes());
+    drop(token);
+    assert_eq!(budget.stats().used, 0);
 }
 
 fn uploaded(store: &mut ContentStore, payload: &[u8]) -> ContentRef {
@@ -155,15 +401,22 @@ fn verified_inline_content_survives_reopen_and_matches_original_upload_tree_byte
     );
     custody.check(request(), &descriptor).unwrap();
     let pointer_descriptor = descriptor_for_pointer(custody.payload());
+    let verification = NativeVerificationBudget::for_schema(
+        pointer_descriptor.schema_hash(),
+        &BuiltinNativeSchemas,
+    )
+    .unwrap();
     let verified = reopened
-        .verify_native_artifact(
+        .verify_native_artifact_with_budget(
             request(),
             &pointer_descriptor,
             domain(),
             &budget,
             &BuiltinNativeSchemas,
+            &verification,
         )
         .unwrap();
+    assert_eq!(verified.retained_bytes(), verification.retained_bytes());
     assert_eq!(verified.custody().payload(), custody.payload());
     assert_eq!(
         reopened.read_bytes(&native_ref, REPORT.len()).unwrap(),
@@ -465,16 +718,19 @@ fn memory_pressure_refuses_before_writes_and_completion_permit_releases_after_cu
     let mut store = store(root.path());
     let artifact = descriptor(specification(PayloadSpec::Inline(REPORT)));
     let before = files(root.path());
-    let workspace =
-        STORE_WORKSPACE + crate::ERROR_REPORT_MAX_BYTES + size_of::<VerifiedNativeArtifact>();
+    let verification =
+        NativeVerificationBudget::for_schema(artifact.schema_hash(), &BuiltinNativeSchemas)
+            .unwrap();
+    let workspace = verification.peak_bytes();
     let short = MemoryBudget::new(workspace - 1, workspace - 1).unwrap();
     assert!(matches!(
-        store.verify_native_artifact(
+        store.verify_native_artifact_with_budget(
             request(),
             &artifact,
             domain(),
             &short,
-            &BuiltinNativeSchemas
+            &BuiltinNativeSchemas,
+            &verification
         ),
         Err(NativeEvidenceError::Memory(MemoryError::Capacity { .. }))
     ));
@@ -490,12 +746,13 @@ fn memory_pressure_refuses_before_writes_and_completion_permit_releases_after_cu
         Err(MemoryError::Capacity { .. })
     ));
     let verified = store
-        .verify_native_artifact(
+        .verify_native_artifact_with_budget(
             request(),
             &artifact,
             domain(),
             &budget,
             &BuiltinNativeSchemas,
+            &verification,
         )
         .unwrap();
     assert_eq!(
@@ -503,6 +760,7 @@ fn memory_pressure_refuses_before_writes_and_completion_permit_releases_after_cu
         pressure.bytes() + verified.retained_bytes()
     );
     assert_eq!(budget.stats().ordinary_used, 1024);
+    assert_eq!(verified.retained_bytes(), verification.retained_bytes());
     let custody = verified.custody();
     drop(verified);
     assert_eq!(budget.stats().used, 1024);
@@ -547,6 +805,202 @@ fn local_content_and_manifest_limits_refuse_without_leaking_memory_or_staging_id
         assert_eq!(store.staged(), (0, 0));
         assert_eq!(files(root.path()), before);
     }
+}
+
+fn full_parent_with_funded_workspace() -> (MemoryBudget, MemoryBudget, focal_memory::Reservation) {
+    let parent = budget();
+    let workspace =
+        NativeVerificationBudget::for_schema(crate::error_report_schema(), &BuiltinNativeSchemas)
+            .unwrap()
+            .peak_bytes();
+    let pool = parent
+        .funded_child(BudgetLane::Ordinary, workspace)
+        .unwrap();
+    let free = parent.stats().limit - parent.stats().used;
+    let pressure = parent
+        .reserve(BudgetKind::Query, BudgetLane::Completion, free)
+        .unwrap();
+    assert_eq!(parent.stats().used, parent.stats().limit);
+    assert!(matches!(
+        parent.reserve(BudgetKind::Payload, BudgetLane::Completion, 1),
+        Err(MemoryError::Capacity { .. })
+    ));
+    (parent, pool, pressure)
+}
+
+#[test]
+fn funded_custody_succeeds_at_full_parent_and_returns_workspace_to_its_pool() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = store(root.path());
+    let artifact = descriptor(specification(PayloadSpec::Inline(REPORT)));
+    let (parent, pool, pressure) = full_parent_with_funded_workspace();
+    let parent_before = parent.stats();
+    let pool_before = pool.stats();
+    let verified = store
+        .verify_native_artifact(request(), &artifact, domain(), &pool, &BuiltinNativeSchemas)
+        .unwrap();
+    let retained = verified.retained_bytes();
+    assert_eq!(retained, size_of::<VerifiedNativeArtifact>());
+    assert_eq!(pool.stats().used, retained);
+    assert_eq!(pool.stats().ordinary_used, 0);
+    assert_eq!(pool.stats().by_kind[BudgetKind::Payload as usize], retained);
+    assert_eq!(parent.stats().used, parent_before.used);
+    assert_eq!(parent.stats().ordinary_used, parent_before.ordinary_used);
+    assert_eq!(
+        parent.stats().by_kind[BudgetKind::Payload as usize],
+        retained
+    );
+    assert_eq!(
+        parent.stats().by_kind[BudgetKind::Reserved as usize],
+        parent_before.by_kind[BudgetKind::Reserved as usize] - retained
+    );
+
+    // The verifier returned its entire temporary workspace without exposing it
+    // to unrelated parent admission. Another funded operation can spend it now.
+    let reused = pool
+        .reserve(
+            BudgetKind::Pending,
+            BudgetLane::Completion,
+            pool_before.limit - retained,
+        )
+        .unwrap();
+    assert_eq!(pool.stats().used, pool_before.limit);
+    assert_eq!(parent.stats().used, parent_before.used);
+    drop(reused);
+    assert_eq!(pool.stats().used, retained);
+
+    let before_check = (parent.stats(), pool.stats());
+    for wrong in [
+        RequestKey {
+            id: RequestId::from_u128(91),
+            ..request()
+        },
+        RequestKey {
+            epoch: RequestEpoch(2),
+            ..request()
+        },
+    ] {
+        assert!(matches!(
+            verified.check(wrong, &artifact),
+            Err(NativeEvidenceError::WrongRequest)
+        ));
+        assert!(matches!(
+            verified.custody().check(wrong, &artifact),
+            Err(NativeEvidenceError::WrongRequest)
+        ));
+    }
+    verified.check(request(), &artifact).unwrap();
+    assert_eq!((parent.stats(), pool.stats()), before_check);
+    let content = reference(verified.custody().payload());
+    drop(verified);
+    assert_eq!(pool.stats(), pool_before);
+    assert_eq!(parent.stats(), parent_before);
+    assert_eq!(store.staged(), (0, 0));
+
+    drop(store);
+    let reopened = ContentStore::open(root.path(), limits()).unwrap();
+    assert_eq!(reopened.read_bytes(&content, REPORT.len()).unwrap(), REPORT);
+    drop(pool);
+    assert_eq!(parent.stats().used, pressure.bytes());
+    assert_eq!(parent.stats().ordinary_used, 0);
+    drop(pressure);
+    assert_eq!(parent.stats().used, 0);
+}
+
+#[test]
+fn funded_schema_and_corrupt_content_refusals_restore_all_credit() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = store(root.path());
+    let actual = uploaded(&mut store, REPORT);
+    let artifact = descriptor_for_pointer(pointer(&actual));
+    let (parent, pool, pressure) = full_parent_with_funded_workspace();
+    let parent_before = parent.stats();
+    let pool_before = pool.stats();
+    let before_files = files(root.path());
+    let malformed = descriptor(specification(PayloadSpec::Inline(b"{}")));
+    assert!(matches!(
+        store.verify_native_artifact(
+            request(),
+            &malformed,
+            domain(),
+            &pool,
+            &BuiltinNativeSchemas
+        ),
+        Err(NativeEvidenceError::Schema(
+            crate::BuiltinSchemaError::Invalid
+        ))
+    ));
+    assert_eq!(pool.stats(), pool_before);
+    assert_eq!(parent.stats(), parent_before);
+    assert_eq!(files(root.path()), before_files);
+
+    let manifest = store.manifest(&actual).unwrap();
+    let chunk = root
+        .path()
+        .join("objects")
+        .join(hex(&actual.domain.0))
+        .join(format!("{}.chunk", manifest.chunks.last().unwrap().hash));
+    let original = fs::read(&chunk).unwrap();
+    let mut corrupt = original.clone();
+    corrupt[0] ^= 1;
+    fs::write(&chunk, &corrupt).unwrap();
+    let corrupt_files = files(root.path());
+    assert!(matches!(
+        store.verify_native_artifact(request(), &artifact, domain(), &pool, &BuiltinNativeSchemas),
+        Err(NativeEvidenceError::Content(ContentError::Corrupt))
+    ));
+    assert_eq!(pool.stats(), pool_before);
+    assert_eq!(parent.stats(), parent_before);
+    assert_eq!(files(root.path()), corrupt_files);
+    assert_eq!(store.staged(), (0, 0));
+
+    // Repair the actual bytes and reopen the store; no test-only custody fact
+    // substitutes for another real verification after the refusal.
+    fs::write(&chunk, original).unwrap();
+    drop(store);
+    let mut reopened = ContentStore::open(root.path(), limits()).unwrap();
+    let verified = reopened
+        .verify_native_artifact(request(), &artifact, domain(), &pool, &BuiltinNativeSchemas)
+        .unwrap();
+    verified.check(request(), &artifact).unwrap();
+    assert_eq!(verified.custody().payload(), pointer(&actual));
+    assert_eq!(reopened.read_bytes(&actual, REPORT.len()).unwrap(), REPORT);
+    drop(verified);
+    assert_eq!(pool.stats(), pool_before);
+    assert_eq!(parent.stats(), parent_before);
+    drop(pool);
+    assert_eq!(parent.stats().used, pressure.bytes());
+    drop(pressure);
+    assert_eq!(parent.stats().used, 0);
+}
+
+#[test]
+fn funded_custody_token_keeps_full_backing_after_the_pool_owner_drops() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = store(root.path());
+    let artifact = descriptor(specification(PayloadSpec::Inline(REPORT)));
+    let (parent, pool, pressure) = full_parent_with_funded_workspace();
+    let verified = store
+        .verify_native_artifact(request(), &artifact, domain(), &pool, &BuiltinNativeSchemas)
+        .unwrap();
+    let held = parent.stats();
+    let content = reference(verified.custody().payload());
+    drop(pool);
+    assert_eq!(parent.stats(), held);
+    assert_eq!(parent.stats().used, parent.stats().limit);
+    assert!(matches!(
+        parent.reserve(BudgetKind::Payload, BudgetLane::Completion, 1),
+        Err(MemoryError::Capacity { .. })
+    ));
+    verified.check(request(), &artifact).unwrap();
+    assert_eq!(store.read_bytes(&content, REPORT.len()).unwrap(), REPORT);
+    drop(verified);
+    assert_eq!(parent.stats().used, pressure.bytes());
+    assert_eq!(parent.stats().ordinary_used, 0);
+    assert_eq!(parent.stats().by_kind[BudgetKind::Payload as usize], 0);
+    assert_eq!(parent.stats().by_kind[BudgetKind::Reserved as usize], 0);
+    drop(pressure);
+    assert_eq!(parent.stats().used, 0);
 }
 
 #[test]

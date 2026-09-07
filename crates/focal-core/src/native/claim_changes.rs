@@ -9,17 +9,36 @@ pub(super) struct History {
     status: ClaimStatus,
 }
 
-pub(super) fn event_count(rows: &[ClaimState], view: &View<'_>) -> Result<usize, NativeError> {
+pub(super) fn event_count(
+    rows: &[ClaimState],
+    view: &View<'_>,
+    operation: NativeOperation,
+) -> Result<usize, NativeError> {
+    if operation == NativeOperation::EnterWholeWork {
+        return Ok(0);
+    }
     let mut count = 0;
     for row in rows {
         match view.claim(ClaimId(row.binding().object.0)) {
+            Some(_) if operation == NativeOperation::SealIncrementTargets => count = add(count, 1)?,
             None => {
                 count = add(count, 1)?;
                 if matches!(row.lineage().cause(), focal_model::Cause::Claim(_)) {
                     count = add(count, 1)?;
                 }
             }
-            Some(old) if old.status() != row.status() => count = add(count, 1)?,
+            Some(old)
+                if old.status() != row.status()
+                    || (old.binding() != row.binding()
+                        && matches!(
+                            operation,
+                            NativeOperation::CloseResponse
+                                | NativeOperation::PostResponse
+                                | NativeOperation::ReceiveResponse
+                        )) =>
+            {
+                count = add(count, 1)?
+            }
             Some(_) => {}
         }
     }
@@ -35,17 +54,31 @@ fn event(
     before: Option<Binding>,
     after: History,
 ) -> Result<(), NativeError> {
-    let item = NativeEvent {
-        request: outcome.request,
-        sequence: outcome.sequence,
-        ordinal: *ordinal,
-        fact: NativeFact::Claim(NativeClaimEvent {
+    record_fact(
+        changes,
+        outcome,
+        ordinal,
+        NativeFact::Claim(NativeClaimEvent {
             kind,
             owned_child,
             before,
             after: after.binding,
             status: after.status,
         }),
+    )
+}
+
+fn record_fact(
+    changes: &mut Vec<Change<Key, Row>>,
+    outcome: NativeOutcome,
+    ordinal: &mut u32,
+    fact: NativeFact,
+) -> Result<(), NativeError> {
+    let item = NativeEvent {
+        request: outcome.request,
+        sequence: outcome.sequence,
+        ordinal: *ordinal,
+        fact,
     };
     // An event count or capacity inconsistency must never invoke Vec growth.
     if *ordinal >= outcome.events || changes.len() == changes.capacity() {
@@ -80,6 +113,13 @@ pub(super) fn changes(
         mut registry,
         ..
     } = plan;
+    let journaled = extras.journal.is_some();
+    if journaled != (outcome.operation == NativeOperation::EnterWholeWork) {
+        return Err(ContractError::InvalidTransition.into());
+    }
+    if journaled {
+        check_journal(&rows, &extras, view, limits)?;
+    }
     let event_charge = event_containers(
         usize::try_from(outcome.events).map_err(|_| NativeError::Capacity("events"))?,
     )?;
@@ -127,7 +167,15 @@ pub(super) fn changes(
     let mut ordinal = 0;
     // A report publishes its artifact, evaluation and accepted result before the
     // derived claim failure. Existing command history retains its original order.
-    if outcome.operation == NativeOperation::ReportAdmission {
+    if journaled
+        || matches!(
+            outcome.operation,
+            NativeOperation::ReportAdmission
+                | NativeOperation::CloseResponse
+                | NativeOperation::PostResponse
+                | NativeOperation::ReceiveResponse
+        )
+    {
         append_extras(&mut changes, &mut extras, outcome, &mut ordinal)?;
     }
     // Match model preparation phases: creation, child registration in child-ID
@@ -192,13 +240,43 @@ pub(super) fn changes(
         )?;
     }
     for (row, mut state) in rows.into_iter().zip(history) {
-        if state.status != row.status() {
-            let kind = match row.status() {
-                ClaimStatus::Cancelled => NativeEventKind::Cancelled,
-                ClaimStatus::Superseded => NativeEventKind::Superseded,
-                ClaimStatus::Posted => NativeEventKind::Posted,
-                ClaimStatus::PostFailed => NativeEventKind::PostFailed,
-                _ => return Err(ContractError::InvalidTransition.into()),
+        if journaled {
+            state = History {
+                binding: row.binding(),
+                status: row.status(),
+            };
+        }
+        if outcome.operation == NativeOperation::SealIncrementTargets {
+            record_fact(
+                &mut changes,
+                outcome,
+                &mut ordinal,
+                NativeFact::Registrations {
+                    claim: row.binding(),
+                },
+            )?;
+        }
+        if state.binding != row.binding() {
+            let kind = if state.status == row.status()
+                && matches!(
+                    outcome.operation,
+                    NativeOperation::CloseResponse
+                        | NativeOperation::PostResponse
+                        | NativeOperation::ReceiveResponse
+                ) {
+                NativeEventKind::ResponseObserved
+            } else {
+                match row.status() {
+                    ClaimStatus::Cancelled => NativeEventKind::Cancelled,
+                    ClaimStatus::Superseded => NativeEventKind::Superseded,
+                    ClaimStatus::Posted => NativeEventKind::Posted,
+                    ClaimStatus::PostFailed => NativeEventKind::PostFailed,
+                    ClaimStatus::Received => NativeEventKind::Received,
+                    ClaimStatus::Satisfied => NativeEventKind::Satisfied,
+                    ClaimStatus::TestamentGenerated => NativeEventKind::TestamentGenerated,
+                    ClaimStatus::TestamentAcknowledged => NativeEventKind::TestamentAcknowledged,
+                    _ => return Err(ContractError::InvalidTransition.into()),
+                }
             };
             let before = state.binding;
             state.binding = before.next()?;
@@ -246,23 +324,133 @@ pub(super) fn changes(
 }
 
 fn append_extras(
-    changes: &mut Vec<Change<Key, Row>>, extras: &mut Extras,
-    outcome: NativeOutcome, ordinal: &mut u32,
+    changes: &mut Vec<Change<Key, Row>>,
+    extras: &mut Extras,
+    outcome: NativeOutcome,
+    ordinal: &mut u32,
 ) -> Result<(), NativeError> {
+    if let Some(mut journal) = extras.journal.take() {
+        for fact in journal.drain(..) {
+            record_fact(changes, outcome, ordinal, fact)?;
+        }
+    }
     for extra in extras.rows.drain(..) {
         let needed = if extra.fact.is_some() { 2 } else { 1 };
-        if changes.len().checked_add(needed).is_none_or(|count| count > changes.capacity()) {
+        if changes
+            .len()
+            .checked_add(needed)
+            .is_none_or(|count| count > changes.capacity())
+        {
             return Err(NativeError::Capacity("extra history preparation"));
         }
         if let Some(fact) = extra.fact {
-            if *ordinal >= outcome.events { return Err(NativeError::Capacity("extra history ordinal")); }
-            let event = NativeEvent { request: outcome.request, sequence: outcome.sequence, ordinal: *ordinal, fact };
+            if *ordinal >= outcome.events {
+                return Err(NativeError::Capacity("extra history ordinal"));
+            }
+            let event = NativeEvent {
+                request: outcome.request,
+                sequence: outcome.sequence,
+                ordinal: *ordinal,
+                fact,
+            };
             let stored = OwnedEvent::new(StoredEvent::pack(event)?)?;
             let heap = stored.heap_charge()?;
-            changes.push(Change::Put(Entry::new(Key::Event(outcome.sequence, *ordinal), Row::Event(stored), heap)));
-            *ordinal = ordinal.checked_add(1).ok_or(NativeError::Capacity("event ordinal"))?;
+            changes.push(Change::Put(Entry::new(
+                Key::Event(outcome.sequence, *ordinal),
+                Row::Event(stored),
+                heap,
+            )));
+            *ordinal = ordinal
+                .checked_add(1)
+                .ok_or(NativeError::Capacity("event ordinal"))?;
         }
         changes.push(Change::Put(Entry::new(extra.key, extra.row, extra.heap)));
+    }
+    Ok(())
+}
+
+/// Every intermediate model transition must remain inspectable even when one
+/// atomic transaction publishes only the final row. Verify a complete exact
+/// revision chain rather than guessing one transition from the final status.
+fn check_journal(
+    rows: &[ClaimState],
+    extras: &Extras,
+    view: &View<'_>,
+    limits: NativeLimits,
+) -> Result<(), NativeError> {
+    let journal = extras
+        .journal
+        .as_ref()
+        .ok_or(ContractError::InvalidTransition)?;
+    let mut visits = limits.plan_edges;
+    for fact in journal {
+        if let NativeFact::Claim(event) = fact {
+            visits = visits
+                .checked_sub(rows.len())
+                .ok_or(NativeError::Capacity("claim history visits"))?;
+            if !rows
+                .iter()
+                .any(|row| row.binding().object == event.after.object)
+            {
+                return Err(ContractError::InvalidTarget.into());
+            }
+        }
+    }
+    for row in rows {
+        let old = view
+            .claim(ClaimId(row.binding().object.0))
+            .ok_or(ContractError::InvalidTarget)?;
+        let mut binding = old.binding();
+        let mut status = old.status();
+        for fact in journal {
+            visits = visits
+                .checked_sub(1)
+                .ok_or(NativeError::Capacity("claim history visits"))?;
+            let NativeFact::Claim(event) = fact else {
+                continue;
+            };
+            if event.after.object != binding.object {
+                continue;
+            }
+            if event.owned_child.is_some()
+                || event.before != Some(binding)
+                || event.after != binding.next()?
+            {
+                return Err(ContractError::StaleRevision.into());
+            }
+            let valid = matches!(
+                (event.kind, event.status),
+                (
+                    NativeEventKind::Validating | NativeEventKind::LocallyComplete,
+                    ClaimStatus::Validating
+                ) | (NativeEventKind::Satisfied, ClaimStatus::Satisfied)
+                    | (
+                        NativeEventKind::ValidationIncomplete,
+                        ClaimStatus::ValidationIncomplete
+                    )
+                    | (
+                        NativeEventKind::ValidationFailed,
+                        ClaimStatus::ValidationFailed
+                    )
+                    | (
+                        NativeEventKind::ValidationErrored,
+                        ClaimStatus::ValidationErrored
+                    )
+                    | (
+                        NativeEventKind::DependencyFailed,
+                        ClaimStatus::DependencyFailed
+                    )
+            );
+            if !valid {
+                return Err(ContractError::InvalidTransition.into());
+            }
+            binding = event.after;
+            status = event.status;
+        }
+        binding.check(&row.binding())?;
+        if status != row.status() {
+            return Err(ContractError::InvalidTransition.into());
+        }
     }
     Ok(())
 }

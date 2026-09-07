@@ -5,6 +5,9 @@ use crate::lifecycle::claim::{
 use crate::lifecycle::{Principal, succession};
 use crate::{ObjectId, RootCommandId, SessionId};
 
+#[path = "graph_capture_tests.rs"]
+mod capture;
+
 fn limits() -> Limits {
     Limits {
         nodes: 32,

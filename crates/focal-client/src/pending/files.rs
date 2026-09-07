@@ -1,10 +1,14 @@
 use super::{MAX_STATE_BYTES, PendingError};
-use fs2::FileExt;
+use crate::file_lock::FileLock;
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
 };
+
+#[cfg(all(test, unix))]
+#[path = "lock_tests.rs"]
+mod lock_tests;
 
 const MAGIC: &[u8; 8] = b"FCLOP001";
 const RECORD: &str = "state.bin";
@@ -14,7 +18,7 @@ const FRAME_OVERHEAD: usize = 44;
 
 pub(super) struct Directory {
     path: PathBuf,
-    _lock: File,
+    _lock: FileLock,
     #[cfg(test)]
     fault: std::cell::Cell<Option<Fault>>,
 }
@@ -93,7 +97,7 @@ impl Directory {
                 .open(&lock_path)
                 .map_err(missing_is_corrupt)?;
             check_open_file(&lock_path, &lock, directory.uid())?;
-            lock.try_lock_exclusive().map_err(|error| {
+            let lock = FileLock::acquire(lock).map_err(|error| {
                 if error.kind() == std::io::ErrorKind::WouldBlock {
                     PendingError::Locked
                 } else {
@@ -101,7 +105,7 @@ impl Directory {
                 }
             })?;
             if create {
-                lock.sync_all()?;
+                lock.file().sync_all()?;
                 File::open(path)?.sync_all()?;
             }
             Ok(Self {

@@ -5,10 +5,11 @@ This freezes L1's domain decisions for [16](16-peer-validation-contract.md).
 The [lifecycle module](../../crates/focal-model/src/lifecycle/mod.rs) implements
 the role, state, target, aggregation and audit rules described in §11 below;
 L1's remaining owner-integration obligations keep that gate open. The first
-`Core<NativeState>` owner now retains claims, complete validation definitions,
-independent Admission evaluations and request outcomes in custom RAM storage.
-Posting and evaluator entry are checked owner transactions; cancellation and
-supersession atomically fence registered evaluations. These rules are
+`Core<NativeState>` owner retains claims, complete validation definitions,
+independent Admission/Increment/Receipt evaluations, evidence, responses and request
+outcomes in custom RAM storage. Posting, evaluator entry and result publication are
+checked owner transactions; cancellation and supersession atomically fence
+registered evaluations. These rules are
 not installed in the running ledger. [18](18-lifecycle-storage-upgrade.md) remains
 the prerequisite for storing or applying successor semantics. Existing records
 retain their original interpretation.
@@ -120,10 +121,10 @@ nonterminal claim, but Generated is not actionable.
 | Posted | Authorized final receipt-boundary failure | ReceiptFailed; a transport timeout alone is not this fact |
 | Received or Progressed | Current receipt holder records progress | Progressed; no local-completion or graph-release effect |
 | Received or Progressed | Respondent generates its first response and freezes its manifest | TestamentGenerated, atomically with response Generated and manifest attachment; response remains unposted |
-| TestamentGenerated | Respondent posts its first eligible response | Claim phase unchanged; the independently Posted response is now eligible for claimant receipt |
-| TestamentGenerated | Claimant receives that posted response | TestamentAcknowledged; record pure delivery validation |
+| TestamentGenerated | Respondent posts an eligible response | Claim phase unchanged; the independently Posted response is now eligible for claimant receipt |
+| TestamentGenerated | Claimant first receives an eligible posted response under the current receipt, regardless of authored cycle order | TestamentAcknowledged; record pure delivery validation without acknowledging any other response |
 | TestamentAcknowledged | Claimant requests aggregate entry or the committed designated evaluator begins its eligible whole-work check | Validating; affected response/artifact/check states advance together under their exact role guards |
-| TestamentGenerated, TestamentAcknowledged or Validating, before local completion | Eligible later response is generated, posted or received under its own fences | Claim's attained phase unchanged; record the separate response's transitions and exact lineage |
+| TestamentGenerated, TestamentAcknowledged or Validating, before local completion | Eligible later response is generated or posted, or received after the first actual claimant receipt | Claim's attained phase unchanged; record the separate response's transitions and exact lineage |
 | Validating | All required acceptance witnesses exist | Record local completion; Satisfied only when declared graph predicates also hold |
 | Validating | An uncovered required cause becomes terminal under §7 | ValidationIncomplete, ValidationFailed or ValidationErrored |
 | Received or Progressed | Current holder records an inability to assemble or submit its response, with a real diagnostic | Retain a nonterminal closing incident; preserve the opportunity to submit an ordinary respondent-authored failure response |
@@ -176,13 +177,18 @@ Generated → Attached is a valid path when closing wins the race with observati
 Do not manufacture Received. If observation commits first, record Received →
 Attached. A later structural receipt request cannot insert ReceiptFailed after
 Attached; malformed input detected by an actual check is instead its typed
-evaluation outcome. Schema-invalid new artifact envelopes are refused at admission,
-not accepted solely to construct a lifecycle failure.
+evaluation outcome. Claimant observation of a still-unattached artifact can occur
+after the claim becomes terminal; it preserves the artifact's original indexed
+receipt/cycle and does not change the claim. Schema-invalid new artifact envelopes
+are refused at admission, not accepted solely to construct a lifecycle failure.
 
 GenerationFailed and ReceiptFailed artifacts cannot also transition to Attached.
-The response's attachable manifest excludes them; bounded typed failure references
-may name them as the reason a declared slot is missing. Such references are not
-successful slot bindings. Missing required evidence is assessed when evaluation
+The response's attachable manifest excludes them. Its separate `failed_work`
+references freeze each exact failed binding, slot, state and diagnostic from the
+owner's complete work set. A production failure uses the actual respondent's
+Production diagnostic as its binding; a receipt failure retains the real rejected
+output and the claimant's structure/metadata diagnostic. Neither invents a product
+or supplies a successful slot binding. Missing required evidence is assessed when evaluation
 begins, not on the first streamed artifact, so producing artifact A before B does
 not prematurely fail the claim. No missing artifact object or placeholder hash is
 invented. Failure to create any durable artifact is recorded against the nearest
@@ -198,15 +204,36 @@ still has the mandatory Required WholeWork delivery check. Result artifacts use
 
 | Prior state | Writer and guard | Next state / atomic effects |
 |---|---|---|
-| Absent | Current respondent authors a bounded summary, confidence and reported outcome with exact work bindings and durable diagnostic references after its work ends | Generated + every listed work artifact Attached; freeze report, bindings and diagnostics and advance the first response's claim to TestamentGenerated |
+| Absent | Current respondent authors a bounded summary, confidence and reported outcome with exact work bindings and durable diagnostic references after its work ends | Generated + every attachable manifest artifact Attached; freeze report, bindings, failed-work references and diagnostics and advance the first response's claim to TestamentGenerated |
 | Generated | Respondent activates the exact frozen response under the same valid entitlement | Posted; claim retains its attained phase, with a posted-response fact |
-| Posted | Claimant acknowledges that exact response | Received; first response advances claim to TestamentAcknowledged; pure Receipt passes |
+| Posted | Claimant acknowledges that exact response under its matching receipt fence | Received; first response advances an open claim to TestamentAcknowledged; a terminal or locally complete claim remains unchanged; an eligible pre-deadline pure Receipt passes; see the deadline and late-observation rules below |
 | Received | Authorized evaluation begin | Validating + eligible artifact/check entry facts |
 | Validating | All its required slot groups have exact successful witnesses and delivery passed | Validated; derive claim aggregate under §7 |
 | Validating | Required slot absent or supported structural failure prevents supplying it | ValidationIncomplete; derive claim aggregate under §7 |
 | Validating | Required present artifact fails its standard, including quality failure | ValidationFailed; derive claim aggregate under §7 |
 | Validating | Required evaluator/tool/reader cannot establish a result after permitted retries | ValidationErrored; derive claim aggregate under §7 |
 | Any terminal response state | Later result, correction or retry | Original state/cause remains; evidence and successors use explicit relations |
+
+Native claimant receipt materializes each declared pure Receipt evaluation only
+for an open claim, using the actual received report stamp, receipt and cycle.
+Before its deadline it records an artifact-free Pass. At or after the deadline,
+the response still becomes Received but the evaluation remains Ready; no Pass or
+terminal failure is invented. Receipt after claim terminalization or local
+completion is observational only and does not create another evaluation.
+
+The same open-claim receipt registers every declared WholeWork slot check as
+Ready, including Observe checks. Its target pins the actual attached artifact's
+binding or an explicit MissingSlot when the frozen manifest lacks that slot.
+This does not begin a check or decide acceptance. Required Increment outcomes
+and target sealing gate subsequent WholeWork entry; missing evidence is assessed
+there, rather than treating receipt as an implicit validation failure.
+
+Authored cycle order does not impose delivery order. The first actual claimant
+receipt under the current entitlement advances a pending claim to
+TestamentAcknowledged, even if an earlier response is still Posted. Receiving
+that earlier response later preserves the attained claim phase. Each response's
+own received fact and exact evidence remain independent; receipt adoption still
+rejects delivery under an abandoned entitlement.
 
 Complete, Partial, Refused, Impossible, Interrupted and Failed are explicit
 respondent-authored outcomes. None defaults to Complete. Every non-Complete
@@ -215,10 +242,14 @@ current respondent, claim, receipt and work cycle. A response with diagnostics
 and no work-slot bindings is valid when no requested output could be produced.
 The claimant can receive and inspect it; MissingSlot is assessed at evaluation.
 
-Native responses retain diagnostic references separately from work-slot bindings.
-A diagnostic must not masquerade as an output that a requirement requested.
-Summary bytes, work references and diagnostic references are bounded and copied
-once after construction preflight. Private semantic identity guards bind both
+Native responses retain respondent diagnostics, failed-work references and
+attachable work-slot bindings separately. A diagnostic must not masquerade as a
+requested output. The exact Production diagnostic may occur in both a failed-work
+reference and the respondent's diagnostic list. A claimant rejection does not
+satisfy the respondent diagnostic requirement for a non-Complete report. Complete
+may coexist with failed-work references: that assertion cannot erase the failure
+or establish acceptance. Summary bytes and all three reference collections are
+bounded and copied once after construction preflight. Private semantic identity guards bind both
 report and evidence to prepared transitions and claim observations; a reused
 external binding cannot substitute a changed report. Storage must canonically
 encode the same authored fields under the successor format in [18](18-lifecycle-storage-upgrade.md).
@@ -248,7 +279,7 @@ posting and claimant receipt. It does not rewrite the original response's histor
 Multiple responses can be posted before the claimant chooses to evaluate them.
 There is no promise that a later response can repair a claim already failed by
 evaluation. Additional responses participate only under §7 at the exact committed
-prefix. The single active testament pointer in today's Core remains the old profile;
+prefix. The single active testament pointer in V1 Core remains the old profile;
 supporting this target requires new indexed lifecycle data and versioned commands.
 
 ## 6. Validation target, phases and outcome transitions
@@ -280,6 +311,21 @@ the other evidence-check kinds must not use Receipt as an evidence bypass.
 Admission and Increment retain distinct declared readiness/target rules; neither
 silently becomes whole-work evaluation of an unattached artifact. Their target
 variant is explicit and their records do not fill an unrelated WholeWork slot.
+A registered Increment can begin against its real ReceiptFailed output under live
+authority: claimant rejection prevents attachment and WholeWork progression, not
+that independent check. The evaluator must report the actual outcome; Focal does
+not synthesize Incomplete. No Increment result rehabilitates the rejected artifact
+or fills its response slot. GenerationFailed has no produced output and cannot
+materialize or begin an Increment.
+
+This keeps Sylk's terminal artifact states (§5.1) separate from independent
+validation state. Focal applies the Attached → Validating dispatch and
+short-circuit rules in
+[Sylk §§7.7 and 11.1](../../../sylk/docs/ARTIFACTS_AND_VALIDATIONS.md) to WholeWork
+validation. Extending them to forbid every Increment on a rejected output would
+leave a registered Required Increment without an attainable outcome, contrary to
+the phase boundary in [02 §6.3](02-domain-and-lifecycle.md). The source artifact
+still remains terminal; only the separate evaluation progresses.
 
 The semantic state set is Ready, Validating, ValidatingQualityBar, Validated,
 ValidationIncomplete, ValidationFailed, ValidationFailedNotRequired, Errored,
@@ -306,6 +352,16 @@ wire numbers.
 | ValidatingQualityBar | Designated evaluator reports conclusive Fail | QualityBarValidationFailed or QualityBarValidationFailedNotRequired |
 | ValidatingQualityBar | Evaluation cannot complete after its permitted attempts | Errored or ErroredNotRequired; not a quality Fail |
 | Terminal evaluation | Another result or new begin | Exact retry returns prior outcome; conflicting replacement rejected |
+
+Missing-slot settlement is a structural claimant operation. It checks the exact
+live claim, received report, frozen manifest, declared slot, receipt, generation
+and Required Increment gate. It invokes no handler, so a handler deadline or
+handler policy grant cannot delay that assessment or let an Observe omission
+block response entry. Required absence records an artifact-free Incomplete;
+Observe absence records suppression. An already explicitly fenced or sealed
+evaluation retains its original state without a new result. Required slot
+presence still has its independent consequence at response entry. Generic
+external Begin and Report retain their deadline, policy and authority checks.
 
 An Observe evaluation that establishes Incomplete retains that outcome as
 nonblocking, including its explicit mode. The blocking test is mode plus outcome,
@@ -382,10 +438,14 @@ increments need final outcomes before whole-work checks begin; a failing increme
 does not immediately terminalize the working claim, but constrains its eventual
 acceptance. Observe increments do not delay that entry. Final audit sealing closes
 all target registration separately; it never prevents already-begun evaluations
-from finishing under their live fences.
+from finishing under their live fences. `SealIncrementTargets` closes only new
+Increment target membership; already-registered Ready checks may still begin and
+begun checks may report. Respondent diagnostics and failure testimony remain
+possible. Starting a check on the last already-closed response cycle does not
+consume another response allowance.
 
-On a blocking artifact failure, Ready sibling checks on that artifact become
-ineligible to begin; they remain Ready with a suppression cause. If the claim also
+On a blocking WholeWork artifact validation failure, Ready sibling checks on that
+artifact become ineligible to begin; they remain Ready with a suppression cause. If the claim also
 terminalizes, other unbegun checks on that claim become ineligible. A failed artifact
 whose slot is covered by a valid alternative must not suppress unrelated work still
 needed by the open claim. No Skipped verdict or falsely terminal Ready status is
@@ -612,27 +672,100 @@ including pending rows, and publish authority fences with the claim control
 changes. Terminal evaluations retain their original facts; cancellation does not
 release scopes or manufacture respondent testimony.
 
-Claims, registrations, definitions, evaluations, successful outcomes and typed
-history share one prepared RAM root. Its actual effective view includes earlier
-pending candidates. Publication allocates nothing; a foreign/stale/out-of-order
-refusal retains the candidate. Exact pending retries remain pending and cannot
-serve as durable acknowledgments. The
+The owner also implements actual Admission reports with typed attempt provenance,
+schema-checked local custody and atomic artifact/result publication. Eligible
+begun siblings can report after an ordinary Required failure without changing the
+original claim cut. First receipt acquisition consumes checked Admission and graph
+start decisions; it creates responsibility, never a testament.
+
+[Respondent evidence transactions](../../crates/focal-core/src/native/work_artifacts.rs)
+retain work outputs and diagnostics with immutable claim, receipt, cycle and role
+provenance. An owner-held linked cycle index, including exact slot membership,
+provides the complete set for
+[response closure](../../crates/focal-core/src/native/responses.rs). `CloseResponse`
+requires the respondent's explicit summary, confidence and one of the six reported
+outcomes; every non-Complete outcome requires real respondent diagnostics. The
+attachable manifest includes every Generated/Received work binding; a separate
+frozen `failed_work` collection preserves every GenerationFailed/ReceiptFailed row.
+Every respondent diagnostic recorded for that cycle is also retained. Diagnostic
+and failed-work references never stand in for missing work-slot witnesses.
+[FailWorkProduction and RejectWork](../../crates/focal-core/src/native/work_failures.rs)
+now establish those failure rows with actual custody and exact producer/target
+provenance, without manufacturing a response or changing claim acceptance.
+Bounded fallible copying and precharged history growth precede the atomic Generated response, artifact
+attachments and claim observation. `PostResponse` and claimant `ReceiveResponse`
+remain separate operations. Claimant observation of an unattached work artifact or
+an already-posted response can progress after claim terminalization without
+changing the claim's state, history or original cut; receipt and identity guards
+still apply. Reported success or failure is not an acceptance verdict.
+
+For an open claim, `ReceiveResponse` also materializes the complete declared pure
+Receipt cohort from the actual received report and records eligible Pass results
+without artifacts, external attempts or an impersonated evaluator. Generation is
+the response cycle; authority pins the receipt, exact declaration and report stamp.
+At or after a declaration's deadline, receipt is still recorded but its evaluation
+remains Ready with no Pass. A late terminal/local-complete claim observation is
+for audit only and creates no new evaluation. The same candidate registers the
+complete [WholeWork cohort](../../crates/focal-core/src/native/work_checks.rs),
+including Required and Observe checks, against actual attached output bindings
+or MissingSlot targets. Both cohorts use one precharged registration copy. Work
+checks remain Ready even after their deadlines; no attempt, verdict or parent
+acceptance is invented. Native WholeWork Begin/report and aggregation remain open.
+
+[Native Increment ownership](../../crates/focal-core/src/native/increments.rs)
+now materializes every declared Increment check, including Observe, atomically
+with its actual Generated work output. Separate Ready evaluations pin the exact
+artifact, receipt and work-cycle generation; work submission invokes no handler.
+`BeginIncrement` and `ReportIncrement` resolve those retained rows and the declared
+evaluator. The managed owner funds the complete retry/fallback/quality report
+chain before Begin. Required failure records the Increment result without
+terminalizing the claim or changing artifact lifecycle. Registered checks on
+ReceiptFailed outputs retain the independent authority described in §6; closure
+and target sealing do not impersonate their evaluator.
+
+Increment results must inherit the target's visibility even when their authored
+input list is empty. For work with any Required Increment check, SubmitWork checks
+those restrictions against the derived report descriptor and traversal limits
+before exposure or custody I/O. This prevents publishing a Required target whose
+reports cannot fit. Observe-only work may still be submitted; an unfundable check
+cannot begin and does not block the claim. Before funding or rebuilding any grant,
+the owner checks the actual source again against the pinned limits, including room
+for a content-backed diagnostic. Borrowed registration, work,
+evaluation and result reads expose the actual effective or pinned prefix without
+copying complete collections. New registration still uses bounded scans per check;
+this is not a claim of constant-time cohort insertion or global-scale qualification.
+
+The Admission/Increment completion envelope prices complete response history and
+bounded append-only evaluation registration growth, preserving each held grant's original
+registration ordinal. Before first responsibility, the owner requires the full
+authored target count to fit its registry limits and the combined pure Receipt
+and WholeWork cohorts to fit one transaction. Static closing-size checks likewise reject
+unrepresentable attachment sets. These guards do not reserve the full respondent
+work/closing obligation or its future RAM, disk and replica capacity.
+
+Claims, registrations, definitions, evaluations, artifacts, responses, accepted
+results, successful outcomes and typed history share one prepared RAM root. Its
+actual effective view includes earlier pending candidates. Publication allocates
+nothing; a foreign/stale/out-of-order refusal retains the candidate. Exact pending
+retries remain pending and cannot serve as durable acknowledgments. The
 [native owner tests](../../crates/focal-core/src/native/tests.rs) exercise this
 boundary; qualification results are recorded separately in
 [09](09-implementation-status.md). No native codec, restart/import or Session
 activation is supplied by this in-process path.
 
-The remaining owner obligations keep L1 open: implement result/evidence admission,
-respondent reports, Increment and WholeWork materialization, receipt adoption,
-aggregation and audit transactions against that complete registry. Adoption must
-derive receipt/definition/generation fences from actual rows. Ordinary
-required-check failure must preserve authorized begun late reports. No native
-report/result/evidence transaction is yet exposed by Core. Broader standing and
-grant policy must likewise resolve actual stored facts; ingress must never accept
-participant permission flags. Start and graph release in the model consume checked
-proof tokens rather than caller-selected booleans.
-Acceptance and graph declarations freeze with claim generation. The live owner must retain
-the full histories, all simultaneous causes and exact acceptance witnesses, bind
+The remaining owner obligations keep L1 open: non-Receipt WholeWork
+entry/reporting; deadline/fence publication for expired Ready checks;
+receipt adoption; aggregation, graph consequences and audit transactions against
+the complete registry. Adoption must derive receipt/definition/generation fences
+from actual rows. These additional paths must preserve authorized begun late reports after ordinary required-check failure.
+Broader standing and grant policy must likewise resolve actual stored facts;
+ingress must never accept participant permission flags. Start and graph release
+in the model consume checked proof tokens rather than caller-selected booleans.
+Native codecs, WAL/Ready integration, Session activation and CLI/MCP dispatch remain
+open; these RAM transactions do not complete the L1–L8 storage rollout.
+
+Acceptance and graph declarations freeze with claim generation. The live owner
+must retain the full histories, all simultaneous causes and exact acceptance witnesses, bind
 creation/diagnostic terminal facts to commit positions, and publish response,
 artifact, validation, claim, graph and request results together under precharged
 capacity. The new claim owner has real preparation/page permits and expiring

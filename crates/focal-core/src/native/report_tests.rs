@@ -19,10 +19,10 @@ use focal_model::{
     TenantId, TimerId, ValidationKind, ValidationMode, ValidationPhase, ValidatorId, VerdictValue,
 };
 
-const ISSUER: ParticipantId = ParticipantId::from_u128(61);
-const SUBJECT: ParticipantId = ParticipantId::from_u128(62);
-const EVALUATOR: ParticipantId = ParticipantId::from_u128(63);
-const QUALITY: ParticipantId = ParticipantId::from_u128(64);
+pub(super) const ISSUER: ParticipantId = ParticipantId::from_u128(61);
+pub(super) const SUBJECT: ParticipantId = ParticipantId::from_u128(62);
+pub(super) const EVALUATOR: ParticipantId = ParticipantId::from_u128(63);
+pub(super) const QUALITY: ParticipantId = ParticipantId::from_u128(64);
 const PROOF: &[u8] = br#"{"passed":3,"failed":0,"skipped":0}"#;
 const FAILED_PROOF: &[u8] = br#"{"passed":0,"failed":1,"skipped":0}"#;
 const DIAGNOSTIC: &[u8] =
@@ -34,7 +34,7 @@ fn ledger() -> LedgerId {
         session: SessionId::from_u128(72),
     }
 }
-fn binding(id: u128) -> Binding {
+pub(super) fn binding(id: u128) -> Binding {
     Binding {
         ledger: ledger(),
         object: ObjectId::from_u128(id),
@@ -42,20 +42,20 @@ fn binding(id: u128) -> Binding {
         revision: ObjectRevision(1),
     }
 }
-fn request(actor: ParticipantId, id: u128) -> RequestKey {
+pub(super) fn request(actor: ParticipantId, id: u128) -> RequestKey {
     RequestKey {
         principal: actor,
         epoch: RequestEpoch(1),
         id: RequestId::from_u128(id),
     }
 }
-fn context(actor: ParticipantId, logical_time: u64) -> NativeContext {
+pub(super) fn context(actor: ParticipantId, logical_time: u64) -> NativeContext {
     NativeContext {
         principal: Principal::Actor(actor),
         logical_time,
     }
 }
-fn key(index: u32) -> EvaluationKey {
+pub(super) fn key(index: u32) -> EvaluationKey {
     EvaluationKey {
         claim: ClaimId::from_u128(1),
         validation: ValidationId::from_u128(100 + u128::from(index)),
@@ -77,7 +77,7 @@ fn native_limits() -> NativeLimits {
         ..NativeLimits::default()
     }
 }
-fn core() -> Core<NativeState> {
+pub(super) fn core() -> Core<NativeState> {
     Core::new_native(
         ledger(),
         RangeId(81),
@@ -169,7 +169,7 @@ fn definition(
     )
     .unwrap()
 }
-fn creation(
+pub(super) fn creation(
     id: u128,
     claim: u128,
     requirements: &[(ValidationMode, bool)],
@@ -236,13 +236,13 @@ fn creation(
         },
     }
 }
-fn post(id: u128, expected: Binding) -> NativeInput {
+pub(super) fn post(id: u128, expected: Binding) -> NativeInput {
     NativeInput {
         request: request(ISSUER, id),
         command: NativeCommand::Post { expected },
     }
 }
-fn begin(id: u128, claim: Binding, index: u32, expected: Binding) -> NativeInput {
+pub(super) fn begin(id: u128, claim: Binding, index: u32, expected: Binding) -> NativeInput {
     NativeInput {
         request: request(EVALUATOR, id),
         command: NativeCommand::BeginAdmission {
@@ -252,17 +252,21 @@ fn begin(id: u128, claim: Binding, index: u32, expected: Binding) -> NativeInput
         },
     }
 }
-fn prepared(result: Result<NativePreparation, NativeError>) -> NativePrepared {
+pub(super) fn prepared(result: Result<NativePreparation, NativeError>) -> NativePrepared {
     match result.unwrap() {
         NativePreparation::Prepared(value) => value,
         NativePreparation::Existing { .. } => panic!("new request unexpectedly replayed"),
     }
 }
-fn publish(core: &mut Core<NativeState>, time: u64, input: NativeInput) -> NativeOutcome {
+pub(super) fn publish(
+    core: &mut Core<NativeState>,
+    time: u64,
+    input: NativeInput,
+) -> NativeOutcome {
     let next = prepared(core.prepare_native(context(input.request.principal, time), input, &[]));
     core.publish_native(next).unwrap()
 }
-fn running(requirements: &[(ValidationMode, bool)]) -> Core<NativeState> {
+pub(super) fn running(requirements: &[(ValidationMode, bool)]) -> Core<NativeState> {
     let mut core = core();
     initialize(&mut core, requirements);
     core
@@ -276,7 +280,11 @@ fn initialize(core: &mut Core<NativeState>, requirements: &[(ValidationMode, boo
         publish(core, 30, begin(10 + u128::from(index), claim, index, state));
     }
 }
-fn artifact_spec(id: u128, producer: ParticipantId, value: VerdictValue) -> ArtifactSpec<'static> {
+pub(super) fn artifact_spec(
+    id: u128,
+    producer: ParticipantId,
+    value: VerdictValue,
+) -> ArtifactSpec<'static> {
     let diagnostic = matches!(value, VerdictValue::Error | VerdictValue::Incomplete);
     ArtifactSpec {
         ledger: ledger(),
@@ -299,11 +307,12 @@ fn artifact_spec(id: u128, producer: ParticipantId, value: VerdictValue) -> Arti
         producer,
         receipt: None,
         result: None,
+        work: None,
         inputs: &[],
         visibility: &["internal"],
     }
 }
-fn descriptor(spec: ArtifactSpec<'_>) -> ArtifactDescriptor {
+pub(super) fn descriptor(spec: ArtifactSpec<'_>) -> ArtifactDescriptor {
     ArtifactDescriptor::prepare(
         spec,
         ArtifactLimits {
@@ -320,13 +329,13 @@ fn descriptor(spec: ArtifactSpec<'_>) -> ArtifactDescriptor {
     .build()
     .unwrap()
 }
-struct Custody {
+pub(super) struct Custody {
     path: tempfile::TempDir,
     store: ContentStore,
     budget: MemoryBudget,
 }
 impl Custody {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let path = tempfile::tempdir().unwrap();
         let store = Self::open(path.path());
         Self {
@@ -374,12 +383,18 @@ fn report_input(
     artifact: ArtifactDescriptor,
 ) -> NativeInput {
     let attempt = state.bind(definition).unwrap().current_attempt().unwrap();
-    let artifact = artifact.with_result_provenance(
-        focal_model::lifecycle::artifact_descriptor::ResultProvenance {
-            claim: key.claim, validation: key.validation, target: state.target(),
-            generation: state.generation(), attempt, value,
-        }
-    ).unwrap();
+    let artifact = artifact
+        .with_result_provenance(
+            focal_model::lifecycle::artifact_descriptor::ResultProvenance {
+                claim: key.claim,
+                validation: key.validation,
+                target: state.target(),
+                generation: state.generation(),
+                attempt,
+                value,
+            },
+        )
+        .unwrap();
     let evidence = ArtifactRef {
         id: ArtifactId(artifact.binding().object.0),
         hash: artifact.content_hash(),
@@ -400,7 +415,7 @@ fn report_input(
         },
     }
 }
-fn report_for(
+pub(super) fn report_for(
     core: &Core<NativeState>,
     tail: Option<&NativePrepared>,
     id: u128,
@@ -436,7 +451,7 @@ fn report_for(
         artifact,
     )
 }
-fn copy_report(input: &NativeInput) -> NativeInput {
+pub(super) fn copy_report(input: &NativeInput) -> NativeInput {
     let NativeCommand::ReportAdmission {
         claim,
         key,
@@ -458,13 +473,13 @@ fn copy_report(input: &NativeInput) -> NativeInput {
         },
     }
 }
-fn verified(custody: &mut Custody, input: &NativeInput) -> VerifiedNativeArtifact {
+pub(super) fn verified(custody: &mut Custody, input: &NativeInput) -> VerifiedNativeArtifact {
     let NativeCommand::ReportAdmission { artifact, .. } = &input.command else {
         panic!("expected report")
     };
     custody.verify(input.request, artifact.get().unwrap())
 }
-fn report(
+pub(super) fn report(
     core: &Core<NativeState>,
     input: NativeInput,
     pending: &[&NativePrepared],
@@ -477,7 +492,7 @@ fn report(
         Some(custody),
     ))
 }
-fn events(core: &Core<NativeState>, outcome: NativeOutcome) -> Vec<NativeFact> {
+pub(super) fn events(core: &Core<NativeState>, outcome: NativeOutcome) -> Vec<NativeFact> {
     (0..outcome.events)
         .map(|ordinal| {
             let event = core.native_event(outcome.sequence, ordinal).unwrap();
@@ -893,9 +908,15 @@ fn only_final_error_exhaustion_fails_admission_at_its_actual_publication() {
     let second = core.native_artifact(ArtifactId::from_u128(472)).unwrap();
     assert_eq!(first.descriptor().payload(), second.descriptor().payload());
     assert_eq!(first.descriptor().metadata(), b"{}");
-    assert_eq!(first.descriptor().metadata(), second.descriptor().metadata());
+    assert_eq!(
+        first.descriptor().metadata(),
+        second.descriptor().metadata()
+    );
     assert_eq!(first.custody().payload(), second.custody().payload());
-    assert_ne!(first.descriptor().content_hash(), second.descriptor().content_hash());
+    assert_ne!(
+        first.descriptor().content_hash(),
+        second.descriptor().content_hash()
+    );
     assert_eq!(first.facts().unwrap().attempt.index, 0);
     assert_eq!(second.facts().unwrap().attempt.index, 1);
     let claim = core.native_claim(key(1).claim).unwrap();
@@ -1460,16 +1481,31 @@ fn content_pointer_report_verifies_actual_reopened_payload_before_owner_admissio
 fn actual_custody_cannot_authorize_missing_or_substituted_result_provenance() {
     let core = running(&[(ValidationMode::Required, false)]);
     let mut custody = Custody::new();
-    let original = report_for(&core, None, 161, 1, VerdictValue::Pass,
-        descriptor(artifact_spec(561, EVALUATOR, VerdictValue::Pass)));
-    let NativeCommand::ReportAdmission { artifact, .. } = &original.command else { panic!() };
+    let original = report_for(
+        &core,
+        None,
+        161,
+        1,
+        VerdictValue::Pass,
+        descriptor(artifact_spec(561, EVALUATOR, VerdictValue::Pass)),
+    );
+    let NativeCommand::ReportAdmission { artifact, .. } = &original.command else {
+        panic!()
+    };
     let provenance = artifact.get().unwrap().result_provenance().unwrap();
     let prefix = core.native_sequence();
     for case in 0..5 {
         let mut bad = copy_report(&original);
-        let NativeCommand::ReportAdmission { artifact, report, .. } = &mut bad.command else { panic!() };
+        let NativeCommand::ReportAdmission {
+            artifact, report, ..
+        } = &mut bad.command
+        else {
+            panic!()
+        };
         let plain = descriptor(artifact_spec(561, EVALUATOR, VerdictValue::Pass));
-        let changed = if case == 0 { plain } else {
+        let changed = if case == 0 {
+            plain
+        } else {
             let mut changed = provenance;
             match case {
                 1 => changed.attempt.index += 1,
@@ -1479,12 +1515,17 @@ fn actual_custody_cannot_authorize_missing_or_substituted_result_provenance() {
             }
             plain.with_result_provenance(changed).unwrap()
         };
-        report.evidence = ArtifactRef { id: changed.id(), hash: changed.content_hash() };
+        report.evidence = ArtifactRef {
+            id: changed.id(),
+            hash: changed.content_hash(),
+        };
         *artifact = NativeArtifactInput::new(changed).unwrap();
         let token = verified(&mut custody, &bad);
         let before = core.native_budget();
-        assert!(matches!(core.prepare_native_evidenced(context(EVALUATOR, 100), bad, &[], Some(&token)),
-            Err(NativeError::Contract(ContractError::MissingEvidence))));
+        assert!(matches!(
+            core.prepare_native_evidenced(context(EVALUATOR, 100), bad, &[], Some(&token)),
+            Err(NativeError::Contract(ContractError::MissingEvidence))
+        ));
         assert_eq!(core.native_budget(), before);
         assert_eq!(core.native_sequence(), prefix);
         assert!(core.native_outcome(original.request).is_none());

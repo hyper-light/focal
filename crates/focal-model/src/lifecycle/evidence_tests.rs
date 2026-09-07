@@ -377,6 +377,8 @@ fn failure_requires_real_durable_diagnostic_and_cannot_be_attached_or_repainted(
         cycle: 1,
         prior: None,
     };
+    // Failed work is retained separately; listing it as an attached output is
+    // a manifest error, even though that failure may be included in a response.
     assert_eq!(
         Response::close(
             id,
@@ -389,7 +391,7 @@ fn failure_requires_real_durable_diagnostic_and_cannot_be_attached_or_repainted(
             }],
             report(1)
         ),
-        Err(ContractError::InvalidTransition)
+        Err(ContractError::InvalidManifest)
     );
     let failed = WorkArtifact::generation_failed(
         binding(4),

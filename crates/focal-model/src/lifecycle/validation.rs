@@ -13,6 +13,12 @@ use crate::{
 
 #[path = "validation_admission.rs"]
 mod admission;
+#[path = "validation_delivery.rs"]
+mod delivery;
+#[path = "validation_increment.rs"]
+mod increment;
+#[path = "validation_work.rs"]
+mod work;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -140,8 +146,10 @@ pub struct DeclarationSpec<'a> {
 #[path = "validation_definition.rs"]
 mod definition;
 pub(super) use definition::DefinitionStamp;
+#[cfg(test)]
+use definition::OwnedHandlerPolicy;
+use definition::OwnedProgram;
 pub use definition::{Declaration, DeclarationPlan};
-use definition::{OwnedHandlerPolicy, OwnedProgram};
 
 fn validate_policy(
     policy: PhasePolicy<'_>,
@@ -429,6 +437,25 @@ pub struct Report {
     pub attempt: Attempt,
     pub value: VerdictValue,
     pub evidence: ArtifactRef,
+}
+
+/// A successful authority preflight for one exact current report attempt. It
+/// supplies the schema to verify before custody IO or funding selection; it is
+/// not evidence custody, an accepted verdict, or a publication capability.
+/// `report` repeats authority checks against its current immutable owner frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportAuthorization {
+    attempt: Attempt,
+    schema: ContentHash,
+    kind: EvidenceKind,
+}
+impl ReportAuthorization {
+    pub fn attempt(self) -> Attempt {
+        self.attempt
+    }
+    pub fn schema(self) -> ContentHash {
+        self.schema
+    }
 }
 
 /// Capability emitted only by an accepted transition. Intermediate attempts are
@@ -725,10 +752,24 @@ impl<'a> Evaluation<'a> {
         {
             return Err(ContractError::InvalidTransition);
         }
-        let policy = self.declaration.policy(self.phase)?;
-        if policy.required_policy.is_some() {
+        // This native owner frame has no installed policy-evidence registry.
+        // Qualify every reachable phase before responsibility begins: accepting
+        // a grant-free programmatic phase must not strand its required quality
+        // continuation. Explicit owner frames still check actual phase grants.
+        let requires_policy = match &self.declaration.spec.program {
+            OwnedProgram::Delivery => false,
+            OwnedProgram::Programmatic { check, quality } => {
+                check.required_policy.is_some()
+                    || quality
+                        .as_ref()
+                        .is_some_and(|quality| quality.required_policy.is_some())
+            }
+            OwnedProgram::Agentic { check } => check.required_policy.is_some(),
+        };
+        if requires_policy {
             return Err(ContractError::InvalidPolicy);
         }
+        let policy = self.declaration.policy(self.phase)?;
         Ok(OwnerState {
             evaluation: self.binding,
             target: self.target,
@@ -1091,14 +1132,16 @@ impl<'a> Evaluation<'a> {
         })
     }
 
-    pub fn report(
+    /// Check the exact frame, begun attempt, installed authority, actor and
+    /// report coordinates before allocating or inspecting result evidence.
+    /// This does not change state or validate the artifact's identity/custody.
+    pub fn authorize_report(
         &self,
         principal: Principal,
         expected: &Binding,
         owner: &OwnerState,
         report: Report,
-        evidence: &EvidenceFacts,
-    ) -> Result<Transition<'a>, ContractError> {
+    ) -> Result<ReportAuthorization, ContractError> {
         self.check_frame(expected, owner)?;
         let attempt = self.current_attempt()?;
         self.check_authority(owner, self.phase)?;
@@ -1111,7 +1154,37 @@ impl<'a> Evaluation<'a> {
             .handlers
             .get(self.handler)
             .ok_or(ContractError::InvalidPolicy)?;
-        self.check_evidence(report, evidence, step)?;
+        let (kind, schema) = match report.value {
+            VerdictValue::Pass | VerdictValue::Fail => (EvidenceKind::Proof, step.proof_schema),
+            VerdictValue::Incomplete | VerdictValue::Error => {
+                (EvidenceKind::Diagnostic, step.diagnostic_schema)
+            }
+        };
+        Ok(ReportAuthorization {
+            attempt,
+            schema,
+            kind,
+        })
+    }
+
+    pub fn report(
+        &self,
+        principal: Principal,
+        expected: &Binding,
+        owner: &OwnerState,
+        report: Report,
+        evidence: &EvidenceFacts,
+    ) -> Result<Transition<'a>, ContractError> {
+        let authorization = self.authorize_report(principal, expected, owner, report)?;
+        let attempt = authorization.attempt();
+        // The checked declaration is immutable; these lookups cannot change
+        // between preflight and transition and allocate no policy copies.
+        let policy = self.declaration.policy(self.phase)?;
+        let step = policy
+            .handlers
+            .get(self.handler)
+            .ok_or(ContractError::InvalidPolicy)?;
+        self.check_evidence(report, evidence, &authorization)?;
         let mut next = *self;
         next.stored.binding = self.binding.next()?;
         match report.value {
@@ -1200,7 +1273,7 @@ impl<'a> Evaluation<'a> {
         &self,
         report: Report,
         evidence: &EvidenceFacts,
-        step: &OwnedHandlerPolicy,
+        authorization: &ReportAuthorization,
     ) -> Result<(), ContractError> {
         if evidence.binding.ledger != self.binding.ledger {
             return Err(ContractError::WrongLedger);
@@ -1229,13 +1302,7 @@ impl<'a> Evaluation<'a> {
         if !matches!(evidence.custody_revision, Some(revision) if revision > 0) {
             return Err(ContractError::MissingEvidence);
         }
-        let expected = match report.value {
-            VerdictValue::Pass | VerdictValue::Fail => (EvidenceKind::Proof, step.proof_schema),
-            VerdictValue::Incomplete | VerdictValue::Error => {
-                (EvidenceKind::Diagnostic, step.diagnostic_schema)
-            }
-        };
-        if (evidence.kind, evidence.schema) != expected {
+        if (evidence.kind, evidence.schema) != (authorization.kind, authorization.schema) {
             return Err(ContractError::MissingEvidence);
         }
         Ok(())
@@ -1365,3 +1432,7 @@ pub(super) mod tests;
 #[cfg(test)]
 #[path = "validation_retention_tests.rs"]
 mod retention_tests;
+
+#[cfg(test)]
+#[path = "validation_authorization_tests.rs"]
+mod authorization_tests;

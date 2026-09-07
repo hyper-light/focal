@@ -26,20 +26,29 @@
 mod arena;
 mod budget;
 mod content;
+#[cfg(test)]
+mod funded_budget_tests;
 mod index;
 #[cfg(test)]
 mod owned_range_tests;
 mod owner;
 mod range;
+#[cfg(test)]
+mod range_elastic_tests;
 mod snapshot;
 mod traversal;
 
 pub use arena::{Arena, ArenaConfig, ArenaId, Handle};
-pub use budget::{Allocation, BudgetKind, BudgetLane, BudgetStats, MemoryBudget, Reservation};
+pub use budget::{
+    Allocation, BudgetKind, BudgetLane, BudgetStats, ElasticFundedPool, MemoryBudget, Reservation,
+};
 pub use content::{ImmutableContent, VersionedRecord};
 pub use index::StableIndex;
 pub use owner::OwnerId;
-pub use range::{Change, Entry, PreparedRange, RangeConfig, RangeId, RangeStats, RangeStore};
+pub use range::{
+    Change, Entry, PreparedRange, RangeConfig, RangeId, RangePreparationCharges,
+    RangePreparationPlan, RangeStats, RangeStore, RangeWriteEnvelope, RangeWriteLimits,
+};
 pub use snapshot::{ReadBudget, ReadPage, ScanContinuation, ScanQuery, SnapshotLease};
 pub use traversal::{
     TraversalContinuation, TraversalLimits, TraversalPage, TraversalQuery, TraversalStop,

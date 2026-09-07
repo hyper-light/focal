@@ -4,10 +4,13 @@
 //! every row read while proving them. The owner publishes the complete consequence
 //! set atomically; this module does not publish or read a clock.
 use super::claim::{ClaimState, ClaimTerminalCut};
+#[path = "graph_capture.rs"]
+mod capture;
 #[path = "graph_memory.rs"]
 mod memory;
 use super::{Binding, ContractError};
 use crate::{ClaimId, ClaimStatus, ContentHash, Deadline, SessionSeq, WaitPredicate};
+pub use capture::CapturePlan;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
@@ -176,212 +179,10 @@ fn hash_binding(hash: &mut blake3::Hasher, binding: Binding) {
 }
 
 impl Snapshot {
-    /// Supply the complete bounded closure in ClaimId order, including terminal
-    /// endpoints. Missing endpoints are refused rather than treated as settled.
+    /// Compatibility convenience for callers that already enforce their own
+    /// complete graph allowance. Native owners reserve a CapturePlan instead.
     pub fn capture(claims: &[&ClaimState], limits: Limits) -> Result<Self, ContractError> {
-        if claims.is_empty() || claims.len() > limits.nodes {
-            return Err(ContractError::Capacity);
-        }
-        let mut budget = Budget {
-            left: limits.visits,
-        };
-        let mut total_edges = 0usize;
-        let mut minimum_cut = SessionSeq(0);
-        let mut prior = None;
-        let ledger = claims
-            .first()
-            .ok_or(ContractError::InvalidTarget)?
-            .binding()
-            .ledger;
-        for claim in claims {
-            budget.visit()?;
-            if claim.binding().ledger != ledger {
-                return Err(ContractError::WrongLedger);
-            }
-            if prior.is_some_and(|old| old >= claim.binding().object) {
-                return Err(ContractError::InvalidManifest);
-            }
-            if claim.created().0 == 0 {
-                return Err(ContractError::InvalidCut);
-            }
-            minimum_cut = minimum_cut
-                .max(claim.created())
-                .max(claim.local_sealed_at().unwrap_or(SessionSeq(0)));
-            if let Some(cut) = claim.terminal_cut() {
-                minimum_cut = minimum_cut.max(match cut {
-                    ClaimTerminalCut::Explicit(cut) => cut.position,
-                    ClaimTerminalCut::Required(cut) => cut.sequence(),
-                    ClaimTerminalCut::Graph(cut) => cut.sequence(),
-                });
-            }
-            if let Some(cut) = claim.scopes().release_cut() {
-                minimum_cut = minimum_cut.max(cut.position);
-            }
-            for child in claim.scopes().children() {
-                budget.visit()?;
-                minimum_cut = minimum_cut.max(child.registered());
-            }
-            prior = Some(claim.binding().object);
-            total_edges = total_edges
-                .checked_add(claim.graph().obligations().len())
-                .ok_or(ContractError::Capacity)?;
-            for scope in claim.scopes().iter() {
-                budget.visit()?;
-                minimum_cut = minimum_cut.max(scope.registered());
-                if let Some(cut) = scope.release_cut() {
-                    minimum_cut = minimum_cut.max(cut.position);
-                }
-                if let Some(change) = scope.last_rebinding() {
-                    minimum_cut = minimum_cut.max(change.cut.position);
-                }
-                if scope.released().is_none() {
-                    total_edges = total_edges
-                        .checked_add(scope.roots().len())
-                        .ok_or(ContractError::Capacity)?;
-                }
-            }
-            if total_edges > limits.edges {
-                return Err(ContractError::Capacity);
-            }
-        }
-        let mut nodes = reserve(claims.len())?;
-        let mut edges = reserve(total_edges)?;
-        for (source, claim) in claims.iter().enumerate() {
-            let edges_start = edges.len();
-            for obligation in claim.graph().obligations() {
-                budget.visit()?;
-                let target = claims
-                    .binary_search_by_key(&obligation.target, |claim| id(claim.binding()))
-                    .map_err(|_| ContractError::InvalidTarget)?;
-                edges.push(Edge {
-                    source,
-                    target,
-                    predicate: match obligation.kind {
-                        Kind::DependsOn => Predicate::Satisfied,
-                        Kind::Awaits => Predicate::Terminal,
-                    },
-                    propagates_failure: obligation.kind == Kind::DependsOn,
-                    runtime: false,
-                });
-            }
-            for scope in claim
-                .scopes()
-                .iter()
-                .filter(|scope| scope.released().is_none())
-            {
-                for root in scope.roots() {
-                    budget.visit()?;
-                    let (target, predicate) = match *root {
-                        WaitPredicate::Satisfied(id) => (id, Predicate::Satisfied),
-                        WaitPredicate::Terminal(id) => (id, Predicate::Terminal),
-                        WaitPredicate::Released(id) => (id, Predicate::Released),
-                    };
-                    let target = claims
-                        .binary_search_by_key(&target, |claim| id(claim.binding()))
-                        .map_err(|_| ContractError::InvalidTarget)?;
-                    edges.push(Edge {
-                        source,
-                        target,
-                        predicate,
-                        propagates_failure: false,
-                        runtime: true,
-                    });
-                }
-            }
-            for child in claim.scopes().children() {
-                budget.visit()?;
-                let child_index = claims
-                    .binary_search_by_key(&child.id(), |claim| id(claim.binding()))
-                    .map_err(|_| ContractError::InvalidTarget)?;
-                let current = claims
-                    .get(child_index)
-                    .ok_or(ContractError::InvalidTarget)?
-                    .binding();
-                let declared = child.binding();
-                declared.check(&Binding {
-                    revision: declared.revision,
-                    ..current
-                })?;
-            }
-            let deadline = claim
-                .deadline()
-                .into_iter()
-                .chain(
-                    claim
-                        .scopes()
-                        .iter()
-                        .filter(|scope| scope.released().is_none())
-                        .map(|scope| scope.deadline()),
-                )
-                .min_by_key(|deadline| (deadline.at, deadline.timer, deadline.generation));
-            let origin = if claim.status().is_terminal() && claim.status() != ClaimStatus::Satisfied
-            {
-                match claim.terminal_cut() {
-                    Some(ClaimTerminalCut::Graph(cut))
-                        if cut.kind == FailureKind::DependencyFailed =>
-                    {
-                        Some(cut.origin)
-                    }
-                    _ => Some(Origin {
-                        binding: claim.binding(),
-                        created: claim.created(),
-                        terminal: claim.local_sealed_at().ok_or(ContractError::InvalidCut)?,
-                    }),
-                }
-            } else {
-                None
-            };
-            nodes.push(Node {
-                binding: claim.binding(),
-                created: claim.created(),
-                status: claim.status(),
-                local_complete: claim.local_complete(),
-                released: claim.scopes().released(),
-                deadline,
-                origin,
-                edges_start,
-                edges_end: edges.len(),
-            });
-        }
-        let mut incoming = reserve(total_edges)?;
-        incoming.extend_from_slice(&edges);
-        incoming
-            .sort_unstable_by_key(|edge| (edge.target, edge.source, edge.predicate, edge.runtime));
-        let mut satisfied = reserve(nodes.len())?;
-        satisfied.extend(
-            nodes
-                .iter()
-                .map(|node| node.status == ClaimStatus::Satisfied),
-        );
-        let mut graph = Self {
-            nodes,
-            edges,
-            incoming,
-            satisfied,
-            limits,
-            minimum_cut,
-        };
-        loop {
-            let mut changed = false;
-            for index in 0..graph.nodes.len() {
-                budget.visit()?;
-                let node = graph.node(index)?;
-                if graph.is_satisfied(index)? || node.status.is_terminal() || !node.local_complete {
-                    continue;
-                }
-                if graph.predicates(index, &mut budget)? {
-                    *graph
-                        .satisfied
-                        .get_mut(index)
-                        .ok_or(ContractError::InvalidTarget)? = true;
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-        Ok(graph)
+        Self::prepare_capture(claims, limits, usize::MAX)?.build()
     }
     fn node(&self, index: usize) -> Result<&Node, ContractError> {
         self.nodes.get(index).ok_or(ContractError::InvalidTarget)
@@ -523,6 +324,53 @@ impl Snapshot {
         &self,
         target: ClaimId,
     ) -> Result<DependencyFailure<'_>, ContractError> {
+        self.dependency_failure_with_budget(target, usize::MAX)
+    }
+
+    /// Peak temporary allocation, including the retained selected path. Native
+    /// owners reserve this before asking for a dependency-failure witness.
+    pub fn dependency_failure_charge(&self) -> Result<usize, ContractError> {
+        self.failure_charge(
+            self.nodes.len(),
+            self.nodes.len(),
+            self.nodes.len(),
+            self.nodes.len(),
+        )
+    }
+
+    fn failure_charge(
+        &self,
+        seen: usize,
+        stack: usize,
+        path: usize,
+        selected: usize,
+    ) -> Result<usize, ContractError> {
+        use super::memory as bytes;
+        const ALLOCATION: usize = 4 * size_of::<usize>();
+        let mut total = size_of::<DependencyFailure<'_>>();
+        for (heap, count) in [
+            (bytes::array::<bool>(seen)?, seen),
+            (bytes::array::<(usize, usize)>(stack)?, stack),
+            (bytes::array::<usize>(path)?, path),
+            (bytes::array::<usize>(selected)?, selected),
+        ] {
+            total = bytes::add(total, heap)?;
+            if count != 0 {
+                total = bytes::add(total, ALLOCATION)?;
+            }
+        }
+        Ok(total)
+    }
+
+    pub fn dependency_failure_with_budget(
+        &self,
+        target: ClaimId,
+        max_bytes: usize,
+    ) -> Result<DependencyFailure<'_>, ContractError> {
+        let charge = self.dependency_failure_charge()?;
+        if charge > max_bytes {
+            return Err(ContractError::Capacity);
+        }
         let target = self.index(target)?;
         if self.node(target)?.status.is_terminal() {
             return Err(ContractError::InvalidTransition);
@@ -535,6 +383,15 @@ impl Snapshot {
         let mut stack = reserve(self.nodes.len())?;
         let mut path = reserve(self.nodes.len())?;
         let mut selected_path = reserve(self.nodes.len())?;
+        if self.failure_charge(
+            seen.capacity(),
+            stack.capacity(),
+            path.capacity(),
+            selected_path.capacity(),
+        )? > charge
+        {
+            return Err(ContractError::Capacity);
+        }
         let mut selected = None;
         stack.push((target, 0usize));
         path.push(target);
