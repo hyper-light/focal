@@ -39,6 +39,7 @@ struct Action {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RespondentEnvelope {
+    record_buffers: Option<record_codec::EncodingLimits>,
     key: RespondentKey,
     parent: Binding,
     holder: ParticipantId,
@@ -357,6 +358,7 @@ impl RespondentEnvelope {
             transient(post.storage)?,
         )?;
         let envelope = Self {
+            record_buffers: None,
             key,
             parent: claim.binding(),
             holder: parent.holder,
@@ -405,7 +407,8 @@ impl RespondentEnvelope {
             retained_bytes = add(
                 retained_bytes,
                 multiply(
-                    crate::native::mutation::retained(action.storage)?,
+                    add(crate::native::mutation::retained(action.storage)?,
+                        self.record_buffers.map(|limits| record_codec::future_record_bytes(action.storage, limits)).transpose()?.unwrap_or(0))?,
                     self::count(count)?,
                 )?,
             )?;
@@ -424,6 +427,16 @@ impl RespondentEnvelope {
 
     pub(super) fn workspace_bytes(&self) -> usize {
         self.workspace
+    }
+
+    pub(super) fn with_record_buffers(mut self, limits: record_codec::EncodingLimits) -> Result<Self, NativeError> {
+        if self.record_buffers.is_some() { return Err(ContractError::InvalidTransition.into()); }
+        for action in [self.diagnostic, self.close, self.post] {
+            record_codec::future_record_bytes(action.storage, limits)?;
+        }
+        self.record_buffers = Some(limits);
+        self.demand(self.maximum)?;
+        Ok(self)
     }
     pub(super) fn construction(
         &self,

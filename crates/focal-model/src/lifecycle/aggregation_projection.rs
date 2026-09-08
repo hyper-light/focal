@@ -178,6 +178,36 @@ impl<'a, V: WholeWorkView> ProjectionPlan<'a, V> {
 }
 
 impl WholeWorkProjection<'_> {
+    /// Every entered response, in object order, without repeated searches or
+    /// additional allocation. The fallible item preserves slice integrity at
+    /// this borrowed boundary instead of silently omitting an invalid range.
+    pub fn response_decisions(
+        &self,
+    ) -> impl Iterator<Item = Result<ResponseDecision<'_>, ContractError>> {
+        self.responses.iter().filter(|row| row.started).map(|row| {
+            let end = row
+                .artifacts_start
+                .checked_add(row.artifacts_len)
+                .ok_or(ContractError::Capacity)?;
+            Ok(ResponseDecision {
+                claim: self.claim.binding(),
+                response: row.source.response.identity().binding,
+                receipt: row.source.response.identity().receipt,
+                sequence: self.sequence,
+                outcome: row.outcome,
+                artifacts: self
+                    .artifacts
+                    .get(row.artifacts_start..end)
+                    .ok_or(ContractError::InvalidTarget)?,
+            })
+        })
+    }
+    /// All attached artifact decisions in response/slot order. These borrow the
+    /// same checked projection as response_decisions and carry their own exact
+    /// response, slot, artifact and original terminal sequence.
+    pub fn artifact_decisions(&self) -> &[ArtifactDecision] {
+        &self.artifacts
+    }
     pub fn claim_decision(&self) -> ClaimDecision<'_> {
         ClaimDecision {
             binding: self.claim.binding(),

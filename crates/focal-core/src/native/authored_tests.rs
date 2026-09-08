@@ -599,8 +599,42 @@ pub(in crate::native) fn recovery_fixture() -> Core<NativeState> {
     let expected = core.native_claim(ClaimId::from_u128(1)).unwrap().binding();
     publish(&mut core, input(2, NativeCommand::Post { expected }));
     let reused = publish(&mut core, create(3, vec![proposal(1, 1)]));
-    assert_eq!((reused.created, reused.changed, reused.definitions, reused.events), (0, 0, 0, 0));
-    publish(&mut core, create(4, vec![proposal_with(2, 2, SUBJECT, ActionType::Consultation,
-        &[relation(RelationKind::Reviews, 1)])]));
+    assert_eq!(
+        (
+            reused.created,
+            reused.changed,
+            reused.definitions,
+            reused.events
+        ),
+        (0, 0, 0, 0)
+    );
+    publish(
+        &mut core,
+        create(
+            4,
+            vec![proposal_with(
+                2,
+                2,
+                SUBJECT,
+                ActionType::Consultation,
+                &[relation(RelationKind::Reviews, 1)],
+            )],
+        ),
+    );
     core
+}
+
+/// Exact authored inputs for the recorded-successor integration fixture. No
+/// synthetic lifecycle rows or guessed content hashes cross this test seam.
+pub(in crate::native) fn replay_fixture() -> (Core<NativeState>, [NativeInput; 3]) {
+    let first = proposal(1, 1);
+    let expected = first.content.binding();
+    (
+        core(),
+        [
+            create(1, vec![first]),
+            input(2, NativeCommand::Post { expected }),
+            create(3, vec![proposal(1, 1)]),
+        ],
+    )
 }

@@ -26,6 +26,7 @@ fn claim_event(
         return Ok(());
     }
     extras.record(NativeFact::Claim(NativeClaimEvent {
+        graph: None,
         kind,
         owned_child: None,
         before: Some(before),

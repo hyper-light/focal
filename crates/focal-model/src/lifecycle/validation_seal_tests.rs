@@ -17,6 +17,47 @@ fn fail_claim(claim: &mut ClaimState, definitions: &[Declaration]) {
 }
 
 #[test]
+fn recorded_claim_seal_rejects_substituted_cut_stamp_and_preserves_early_terminal_history() {
+    let definitions = definitions(ValidationMode::Observe, false, true);
+    let mut claim = posted(&definitions);
+    let begun = begin(&claim, ready(&claim, &definitions[1]));
+    let early_terminal = report(&claim, begun, VerdictValue::Pass).next.into_state();
+    let ready = ready(&claim, &definitions[1]).into_state();
+    fail_claim(&mut claim, &definitions);
+    let sealed = ready
+        .seal_claim(&definitions[1], &ready.binding(), &claim)
+        .unwrap()
+        .next();
+    crate::lifecycle::memory::fail_after(0, || {
+        sealed
+            .check_recorded_claim_seal(&definitions[1], &claim)
+            .unwrap();
+        early_terminal
+            .check_recorded_claim_seal(&definitions[1], &claim)
+            .unwrap();
+    });
+    assert_eq!(early_terminal.sealed(), None);
+    let original = sealed;
+    let mut corrupted = sealed;
+    corrupted.sealed = Some(ContentHash([222; 32]));
+    corrupted.suppression = Some(Suppression::CohortSealed(ContentHash([222; 32])));
+    assert_eq!(
+        corrupted.check_recorded_claim_seal(&definitions[1], &claim),
+        Err(ContractError::InvalidCut)
+    );
+    let mut corrupted = sealed;
+    corrupted.suppression = Some(Suppression::CohortSealed(ContentHash([223; 32])));
+    assert_eq!(
+        corrupted.check_recorded_claim_seal(&definitions[1], &claim),
+        Err(ContractError::InvalidCut)
+    );
+    assert_eq!(sealed, original);
+    sealed
+        .check_recorded_claim_seal(&definitions[1], &claim)
+        .unwrap();
+}
+
+#[test]
 fn seal_requires_actual_local_outcome_exact_owner_definition_and_expected_binding() {
     let definitions = definitions(ValidationMode::Observe, false, true);
     let mut claim = posted(&definitions);

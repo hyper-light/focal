@@ -419,6 +419,7 @@ pub(in crate::native) fn settle_scopes(
     let mut progressed = false;
     loop {
         remaining = remaining.checked_sub(1).ok_or(ContractError::Capacity)?;
+        let captured = capture(extras)?;
         let next = {
             let (current, snapshot) =
                 crate::native::claim_deadlines::freeze(original, changed, limits, scratch, visits)?;
@@ -495,6 +496,7 @@ pub(in crate::native) fn settle_scopes(
                             id: monitor.id(),
                             cut,
                         }),
+                        None,
                     )?;
                     within(heap(&next)?, heap(source)?)?;
                     selected = Some(next);
@@ -525,6 +527,7 @@ pub(in crate::native) fn settle_scopes(
                             source.binding(),
                             &next,
                             NativeEventKind::DependencyFailed,
+                            Some(captured),
                         )?;
                         selected = Some(next);
                     }
@@ -536,7 +539,13 @@ pub(in crate::native) fn settle_scopes(
                             let witness = snapshot.release(ClaimId(source.binding().object.0))?;
                             let mut next = copy(source, scratch)?;
                             next.graph_release(&source.binding(), &witness, &peers, cut.position)?;
-                            journal(extras, source.binding(), &next, NativeEventKind::Satisfied)?;
+                            journal(
+                                extras,
+                                source.binding(),
+                                &next,
+                                NativeEventKind::Satisfied,
+                                Some(captured),
+                            )?;
                             selected = Some(next);
                         }
                     }

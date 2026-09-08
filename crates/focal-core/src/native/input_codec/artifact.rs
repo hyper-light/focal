@@ -435,40 +435,85 @@ impl<'a> ArtifactBodyInput<'a> {
         let start = cursor.unread();
         let before = cursor.offset();
         cursor.visit(label_count.checked_add(1).ok_or(CodecError::Capacity)?)?;
-        for _ in 0..label_count { cursor.text(cursor.remaining())?; }
-        let length = cursor.offset().checked_sub(before).ok_or(CodecError::Capacity)?;
+        for _ in 0..label_count {
+            cursor.text(cursor.remaining())?;
+        }
+        let length = cursor
+            .offset()
+            .checked_sub(before)
+            .ok_or(CodecError::Capacity)?;
         let labels = start.get(..length).ok_or(CodecError::Truncated)?;
-        Ok(Self { source: Source { fields, inputs, input_count, labels, label_count, remaining: Cell::new(0) } })
+        Ok(Self {
+            source: Source {
+                fields,
+                inputs,
+                input_count,
+                labels,
+                label_count,
+                remaining: Cell::new(0),
+            },
+        })
     }
-    pub(in crate::native) fn fields(&self) -> ArtifactFields<'a> { self.source.fields }
+    pub(in crate::native) fn fields(&self) -> ArtifactFields<'a> {
+        self.source.fields
+    }
     pub(in crate::native) fn ownership_visits(&self) -> Result<usize, DecodeError> {
-        self.source.label_count.checked_mul(16).and_then(|n| n.checked_add(128))
+        self.source
+            .label_count
+            .checked_mul(16)
+            .and_then(|n| n.checked_add(128))
             .ok_or_else(|| CodecError::Capacity.into())
     }
-    pub(in crate::native) fn prepare(&mut self, limits: model::Limits, max_model_visits: usize,
-        max_source_visits: usize) -> Result<ArtifactBodyPlan<'_, 'a>, DecodeError> {
+    pub(in crate::native) fn prepare(
+        &mut self,
+        limits: model::Limits,
+        max_model_visits: usize,
+        max_source_visits: usize,
+    ) -> Result<ArtifactBodyPlan<'_, 'a>, DecodeError> {
         self.source.remaining.set(max_source_visits);
-        let descriptor = model::ArtifactDescriptor::prepare_source(&self.source, limits, max_model_visits)?;
-        let source_visits = max_source_visits.checked_sub(self.source.remaining.get()).ok_or(CodecError::Capacity)?;
-        if self.source.remaining.get() < source_visits { return Err(CodecError::Capacity.into()); }
+        let descriptor =
+            model::ArtifactDescriptor::prepare_source(&self.source, limits, max_model_visits)?;
+        let source_visits = max_source_visits
+            .checked_sub(self.source.remaining.get())
+            .ok_or(CodecError::Capacity)?;
+        if self.source.remaining.get() < source_visits {
+            return Err(CodecError::Capacity.into());
+        }
         let allocations = descriptor.construction_heap_allocations();
-        let bytes = allocations.checked_mul(super::super::prepare::ALLOCATION)
-            .and_then(|extra| extra.checked_add(descriptor.construction_charge())).ok_or(CodecError::Capacity)?;
+        let bytes = allocations
+            .checked_mul(super::super::prepare::ALLOCATION)
+            .and_then(|extra| extra.checked_add(descriptor.construction_charge()))
+            .ok_or(CodecError::Capacity)?;
         let quote = super::creation_content::BodyConstructionQuote {
-            bytes, allocations, model_inspection_visits: descriptor.inspection_visits(),
-            model_build_visits: descriptor.build_visits(), source_inspection_visits: source_visits,
+            bytes,
+            allocations,
+            model_inspection_visits: descriptor.inspection_visits(),
+            model_build_visits: descriptor.build_visits(),
+            source_inspection_visits: source_visits,
             source_build_visits: source_visits,
         };
-        Ok(ArtifactBodyPlan { source: &self.source, descriptor, quote })
+        Ok(ArtifactBodyPlan {
+            source: &self.source,
+            descriptor,
+            quote,
+        })
     }
 }
 impl ArtifactBodyPlan<'_, '_> {
-    pub(in crate::native) fn quote(&self) -> super::creation_content::BodyConstructionQuote { self.quote }
-    pub(in crate::native) fn fields(&self) -> ArtifactFields<'_> { self.descriptor.fields() }
-    pub(in crate::native) fn content_hash(&self) -> ContentHash { self.descriptor.content_hash() }
-    pub(in crate::native) fn build(self, max_bytes: usize, max_model_visits: usize) -> Result<model::ArtifactDescriptor, DecodeError> {
-        if max_bytes < self.quote.bytes || max_model_visits < self.quote.model_build_visits
-            || self.source.remaining.get() < self.quote.source_build_visits { return Err(CodecError::Capacity.into()); }
+    pub(in crate::native) fn quote(&self) -> super::creation_content::BodyConstructionQuote {
+        self.quote
+    }
+    pub(in crate::native) fn build(
+        self,
+        max_bytes: usize,
+        max_model_visits: usize,
+    ) -> Result<model::ArtifactDescriptor, DecodeError> {
+        if max_bytes < self.quote.bytes
+            || max_model_visits < self.quote.model_build_visits
+            || self.source.remaining.get() < self.quote.source_build_visits
+        {
+            return Err(CodecError::Capacity.into());
+        }
         let before = self.source.remaining.get();
         let charge = self.descriptor.construction_charge();
         let value = self.descriptor.build(charge, max_model_visits)?;

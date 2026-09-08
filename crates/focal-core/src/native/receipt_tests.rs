@@ -105,6 +105,7 @@ fn check_received(core: &Core<NativeState>, outcome: NativeOutcome, original: Bi
         events(core, outcome),
         vec![
             NativeFact::Claim(NativeClaimEvent {
+                graph: None,
                 kind: NativeEventKind::Received,
                 owned_child: None,
                 before: Some(original),

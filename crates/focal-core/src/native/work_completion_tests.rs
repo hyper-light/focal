@@ -3,6 +3,8 @@ use crate::native::report_tests::{self as reports, EVALUATOR, QUALITY};
 use focal_memory::{Allocation, BudgetKind, BudgetLane};
 use focal_model::lifecycle::{artifact_descriptor::ResultProvenance, graph};
 
+#[path = "work_graph_replay_tests.rs"]
+mod graph_replay_tests;
 #[path = "work_monitor_completion_tests.rs"]
 mod monitor_tests;
 
@@ -35,6 +37,65 @@ fn setup(mode: ValidationMode) -> (Fixture, EvaluationKey) {
     );
     (f, key)
 }
+
+#[test]
+fn recorded_begin_work_covers_actual_received_response_entry_and_derived_outputs() {
+    for mode in [ValidationMode::Required, ValidationMode::Observe] {
+        let (f, _) = setup(mode);
+        let view = f.owner.committed();
+        let sequence = view.sequence();
+        let first = view.event(sequence, 0).unwrap();
+        let outcome = view.recorded(first.invocation).unwrap();
+        assert_eq!(outcome.operation, NativeOperation::BeginWork);
+        let mut began = false;
+        let mut claim_entry = false;
+        let mut response_entry = false;
+        let mut work_entry = false;
+        let mut completed = false;
+        for ordinal in 0..outcome.events {
+            let fact = view.event(sequence, ordinal).unwrap().fact;
+            crate::native::record_codec::check_recorded_operation(outcome.operation, fact).unwrap();
+            began |= matches!(
+                fact,
+                NativeFact::Evaluation {
+                    kind: NativeEvaluationEventKind::Begun,
+                    ..
+                }
+            );
+            claim_entry |= matches!(
+                fact,
+                NativeFact::Claim(NativeClaimEvent {
+                    kind: NativeEventKind::Validating,
+                    ..
+                })
+            );
+            response_entry |= matches!(
+                fact,
+                NativeFact::Response {
+                    state: ResponseState::Validating,
+                    ..
+                }
+            );
+            work_entry |= matches!(
+                fact,
+                NativeFact::Work {
+                    state: WorkArtifactState::Validating,
+                    ..
+                }
+            );
+            completed |= matches!(
+                fact,
+                NativeFact::Claim(NativeClaimEvent {
+                    kind: NativeEventKind::LocallyComplete,
+                    ..
+                })
+            );
+        }
+        assert!(began && claim_entry && response_entry && work_entry);
+        assert_eq!(completed, mode == ValidationMode::Observe);
+    }
+}
+
 fn report(
     f: &Fixture,
     key: EvaluationKey,

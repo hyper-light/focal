@@ -47,8 +47,9 @@ pub use index::StableIndex;
 pub use owner::OwnerId;
 pub use range::{
     Change, Entry, PreparedRange, RangeConfig, RangeHydration, RangeHydrationLimits,
-    RangeHydrationLookup, RangeHydrationSource, RangeHydrationView, RangeId, RangePreparationCharges,
-    RangePreparationPlan, RangeStats, RangeStore, RangeWriteEnvelope, RangeWriteLimits,
+    RangeHydrationLookup, RangeHydrationSource, RangeHydrationView, RangeId,
+    RangePreparationCharges, RangePreparationPlan, RangeStats, RangeStore, RangeWriteEnvelope,
+    RangeWriteLimits,
 };
 pub use snapshot::{ReadBudget, ReadPage, ScanContinuation, ScanQuery, SnapshotLease};
 pub use traversal::{

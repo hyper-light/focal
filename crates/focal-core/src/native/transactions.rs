@@ -329,9 +329,11 @@ pub(super) fn prepare(
                 extras,
                 scratch,
             )?;
+            let registry =
+                super::control_graph::created_registries(&rows, view, extras, limits, scratch)?;
             Ok(Plan {
                 rows,
-                registry: RegistryOverrides::new(),
+                registry,
                 created,
             })
         }

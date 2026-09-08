@@ -127,6 +127,7 @@ fn register(
 fn record(extras: &mut Extras, before: Binding, next: &ClaimState, event: scope::Event) {
     extras
         .record(NativeFact::Claim(NativeClaimEvent {
+            graph: None,
             kind: NativeEventKind::Monitor(NativeMonitorEvent::from_scope(event).unwrap()),
             owned_child: None,
             before: Some(before),

@@ -61,7 +61,10 @@ impl RegistrationSet {
     /// Exact retained member allocation for precharging a detached claim row.
     /// A quote carries no registration authority or semantic validation.
     pub fn hydration_heap_charge_v1(count: usize) -> Result<usize, ContractError> {
-        bytes::add(bytes::array::<RegisteredEvaluation>(count)?, overhead(usize::from(count != 0))?)
+        bytes::add(
+            bytes::array::<RegisteredEvaluation>(count)?,
+            overhead(usize::from(count != 0))?,
+        )
     }
     pub fn snapshot_v1(&self) -> RegistrationSnapshotV1 {
         RegistrationSnapshotV1 {

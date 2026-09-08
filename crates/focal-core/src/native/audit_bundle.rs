@@ -170,15 +170,30 @@ impl OwnedResultTestament {
     /// Conservative fixed-field/hash work for the recovery consistency pass.
     /// Includes actual canonical audit hashing, every publication key and each
     /// result's binary search. The importer debits this before invoking recover.
-    pub(super) fn recovery_visits(members: usize, results: usize, publications: usize) -> Result<usize, NativeError> {
-        let search = usize::try_from(usize::BITS).map_err(|_| ContractError::Capacity)?
-            .checked_add(1).and_then(|value| value.checked_mul(256))
+    pub(super) fn recovery_visits(
+        members: usize,
+        results: usize,
+        publications: usize,
+    ) -> Result<usize, NativeError> {
+        let search = usize::try_from(usize::BITS)
+            .map_err(|_| ContractError::Capacity)?
+            .checked_add(1)
+            .and_then(|value| value.checked_mul(256))
             .ok_or(ContractError::Capacity)?;
-        add(1024, add(
-            members.checked_mul(2048).ok_or(ContractError::Capacity)?,
-            add(results.checked_mul(add(1024, search)?).ok_or(ContractError::Capacity)?,
-                publications.checked_mul(256).ok_or(ContractError::Capacity)?)?,
-        )?)
+        add(
+            1024,
+            add(
+                members.checked_mul(2048).ok_or(ContractError::Capacity)?,
+                add(
+                    results
+                        .checked_mul(add(1024, search)?)
+                        .ok_or(ContractError::Capacity)?,
+                    publications
+                        .checked_mul(256)
+                        .ok_or(ContractError::Capacity)?,
+                )?,
+            )?,
+        )
     }
 
     /// Install already hydrated historical values without invoking generation,
@@ -194,30 +209,45 @@ impl OwnedResultTestament {
         max_visits: usize,
     ) -> Result<(Self, usize), NativeError> {
         let cohort = testament.cohort();
-        let visits = Self::recovery_visits(cohort.members().len(), cohort.results().len(), publications.len())?;
-        if visits > max_visits { return Err(ContractError::Capacity.into()); }
+        let visits = Self::recovery_visits(
+            cohort.members().len(),
+            cohort.results().len(),
+            publications.len(),
+        )?;
+        if visits > max_visits {
+            return Err(ContractError::Capacity.into());
+        }
         if coordinates.generated.revision != ObjectRevision(1)
             || coordinates.generated.object.is_zero()
             || coordinates.generated.content == ContentHash([0; 32])
             || coordinates.generated.ledger != cohort.claim_binding().ledger
             || coordinates.captured_at < testament.sealed_at()
             || publications.len() != cohort.results().len()
-        { return Err(ContractError::InvalidManifest.into()); }
+        {
+            return Err(ContractError::InvalidManifest.into());
+        }
         let mut previous = None;
         for publication in &publications {
             if previous.is_some_and(|key| key >= publication.key)
                 || publication.position.sequence.0 == 0
                 || publication.position.sequence > coordinates.captured_at
-            { return Err(ContractError::InvalidCut.into()); }
+            {
+                return Err(ContractError::InvalidCut.into());
+            }
             previous = Some(publication.key);
         }
         for result in cohort.results() {
             let key = NativeResultKey::of(*result);
-            if publications.binary_search_by_key(&key, |publication| publication.key).is_err() {
+            if publications
+                .binary_search_by_key(&key, |publication| publication.key)
+                .is_err()
+            {
                 return Err(ContractError::MissingEvidence.into());
             }
         }
-        if content_hash(cohort, &publications, coordinates.captured_at)? != coordinates.generated.content {
+        if content_hash(cohort, &publications, coordinates.captured_at)?
+            != coordinates.generated.content
+        {
             return Err(ContractError::ContentConflict.into());
         }
         let record = NativeResultTestament {
@@ -231,10 +261,14 @@ impl OwnedResultTestament {
         record.generated_binding().check(&coordinates.generated)?;
         record.check()?;
         let actual = add(Self::container_charge(), record.heap_charge()?)?;
-        if actual > max_bytes { return Err(ContractError::Capacity.into()); }
+        if actual > max_bytes {
+            return Err(ContractError::Capacity.into());
+        }
         let owned = Self::new(record)?;
         let actual = owned.heap_charge()?;
-        if actual > max_bytes { return Err(ContractError::Capacity.into()); }
+        if actual > max_bytes {
+            return Err(ContractError::Capacity.into());
+        }
         Ok((owned, actual))
     }
 }
@@ -296,7 +330,11 @@ fn content_hash(
     hash.update(b"focal/native/result-testament-content/1");
     hash.update(&cohort.content_fingerprint()?.0);
     hash.update(&captured_at.0.to_le_bytes());
-    hash.update(&u64::try_from(publications.len()).map_err(|_| ContractError::Capacity)?.to_le_bytes());
+    hash.update(
+        &u64::try_from(publications.len())
+            .map_err(|_| ContractError::Capacity)?
+            .to_le_bytes(),
+    );
     for publication in publications {
         result_key(&mut hash, publication.key);
         hash.update(&publication.position.sequence.0.to_le_bytes());

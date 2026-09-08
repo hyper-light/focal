@@ -201,6 +201,7 @@ fn claim_fact(
 ) -> NativeFact {
     NativeFact::Claim(NativeClaimEvent {
         kind,
+        graph: None,
         owned_child,
         before,
         after: after.binding,

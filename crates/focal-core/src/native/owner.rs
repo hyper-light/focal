@@ -109,12 +109,13 @@ fn build_funded(
     evidence: Option<&VerifiedNativeArtifact>,
     custody: Option<(&mut ContentStore, ContentDomainId)>,
     schemas: &impl NativeSchemaVerifier,
-) -> Result<(NativePrepared, CandidateJournal), NativeError> {
+) -> Result<(NativePrepared, CandidateJournal, bool), NativeError> {
     let source = fresh.source();
     let publication_source = fresh.publication_source();
     let lane = fresh.lane();
     if let Some((key, spend)) = respondent::select(&fresh, book, schemas)? {
-        return respondent::build(fresh, book, evidence, custody, schemas, key, spend);
+        return respondent::build(fresh, book, evidence, custody, schemas, key, spend)
+            .map(|(prepared, journal)| (prepared, journal, true));
     }
     if let Some(deadline) = fresh.authorize_deadline()? {
         let funding = if deadline.begun {
@@ -136,7 +137,7 @@ fn build_funded(
             built.seals(),
             funding,
         )?;
-        return Ok((built.into_prepared(), CandidateJournal::single(journal)));
+        return Ok((built.into_prepared(), CandidateJournal::single(journal), deadline.begun));
     }
     match fresh.authorize_admission()? {
         Some(prepare::Admission::Begin {
@@ -192,6 +193,7 @@ fn build_funded(
                     Ok((
                         built.into_prepared(),
                         CandidateJournal::begin(journal, update),
+                        false,
                     ))
                 }
                 Err(error) => {
@@ -249,7 +251,7 @@ fn build_funded(
                 built.seals(),
                 JournalFunding::HeldCompletion,
             )?;
-            Ok((built.into_prepared(), CandidateJournal::single(journal)))
+            Ok((built.into_prepared(), CandidateJournal::single(journal), true))
         }
         Some(prepare::Admission::Begin {
             transition,
@@ -265,7 +267,7 @@ fn build_funded(
                 built.seals(),
                 JournalFunding::External { source, lane },
             )?;
-            Ok((built.into_prepared(), CandidateJournal::single(journal)))
+            Ok((built.into_prepared(), CandidateJournal::single(journal), false))
         }
         None => {
             let descriptor = fresh.authorize_work()?;
@@ -291,7 +293,7 @@ fn build_funded(
                 built.seals(),
                 JournalFunding::External { source, lane },
             )?;
-            Ok((built.into_prepared(), CandidateJournal::single(journal)))
+            Ok((built.into_prepared(), CandidateJournal::single(journal), false))
         }
     }
 }
@@ -340,12 +342,16 @@ pub enum NativeOwnerError {
     Native(#[from] NativeError),
     #[error("native input: {0}")]
     Input(#[from] super::input_codec::CodecError),
+    #[error("native recorded mutation: {0}")]
+    Record(#[source] super::record_codec::CodecError),
     #[error("candidate belongs to another native owner incarnation")]
     WrongOwner,
     #[error("native candidate is no longer pending")]
     UnknownCandidate,
     #[error("native candidates must publish in preparation order")]
     OutOfOrder,
+    #[error("resolve pending native candidates before taking committed state")]
+    PendingCandidates,
 }
 impl From<super::input_codec::DecodeError> for NativeOwnerError {
     fn from(error: super::input_codec::DecodeError) -> Self {
@@ -375,9 +381,21 @@ impl std::fmt::Display for NativeOwnerInitError {
 }
 impl std::error::Error for NativeOwnerInitError {}
 
+/// Refused ownership transfer keeps the identical owner and pending tickets.
+#[derive(Debug)]
+pub struct NativeOwnerIntoCoreError {
+    pub error: NativeOwnerError,
+    pub owner: NativeOwner,
+}
+impl std::fmt::Display for NativeOwnerIntoCoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.error.fmt(f) }
+}
+impl std::error::Error for NativeOwnerIntoCoreError {}
+
 #[derive(Debug)]
 struct Pending {
     candidate: NativeCandidate,
+    record: record_codec::PendingRecord,
     prepared: NativePrepared,
     journal: CandidateJournal,
 }
@@ -396,6 +414,7 @@ pub struct NativeOwner {
     pending: VecDeque<Pending>,
     core: Core<NativeState>,
     book: CompletionBook,
+    record_buffers: Option<record_codec::EncodingLimits>,
     faulted: bool,
     _queue_allocation: Allocation,
     incarnation: OwnerId,
@@ -410,11 +429,9 @@ impl std::fmt::Debug for NativeOwner {
             .finish_non_exhaustive()
     }
 }
-impl Drop for NativeOwner {
-    fn drop(&mut self) {
-        self.discard_all();
-    }
-}
+// Whole-owner destruction needs no journal rollback: pending records/pages
+// drop before Core and book, and every pool permit keeps its actual backing.
+// Explicit suffix discard still rolls back journals before further admission.
 
 impl NativeOwner {
     /// Takes exclusive ownership of a native Core. Previously issued snapshot
@@ -433,10 +450,32 @@ impl NativeOwner {
         core: Core<NativeState>,
         schemas: &impl NativeSchemaVerifier,
     ) -> Result<Self, NativeOwnerInitError> {
+        Self::with_record_profile(core, schemas, None)
+    }
+
+    /// Fund one retained encoded mutation buffer for each pending operation.
+    /// Existing evaluator/respondent responsibilities additionally reserve their
+    /// finite future record buffers before this owner accepts new traffic.
+    /// Transport, consensus staging, WAL admission and disk capacity remain the
+    /// enclosing service's separate obligations; refusal there retains tickets.
+    pub fn with_record_buffers(
+        core: Core<NativeState>,
+        schemas: &impl NativeSchemaVerifier,
+        encoding: record_codec::EncodingLimits,
+    ) -> Result<Self, NativeOwnerInitError> {
+        Self::with_record_profile(core, schemas, Some(encoding))
+    }
+
+    fn with_record_profile(
+        core: Core<NativeState>,
+        schemas: &impl NativeSchemaVerifier,
+        record_buffers: Option<record_codec::EncodingLimits>,
+    ) -> Result<Self, NativeOwnerInitError> {
         let resources = (|| {
             super::authored::check_storage(&core)?;
             let (incarnation, pending, allocation) = Self::allocate_queue(&core)?;
             let mut book = CompletionBook::new(&core.state.budget, core.limits)?;
+            if let Some(limits) = record_buffers { book = book.with_record_buffers(limits); }
             let view = View {
                 state: &core.state,
                 tail: None,
@@ -495,6 +534,7 @@ impl NativeOwner {
                 pending,
                 core,
                 book,
+                record_buffers,
                 faulted: false,
                 _queue_allocation: allocation,
                 incarnation,
@@ -687,7 +727,8 @@ impl NativeOwner {
                 {
                     return Err(NativeError::Capacity("pending candidates").into());
                 }
-                let (prepared, journal) =
+                let lane = fresh.lane();
+                let (prepared, journal, held_record) =
                     build_funded(fresh, &mut self.book, evidence, custody, schemas)?;
                 let source = View {
                     state: &self.core.state,
@@ -719,6 +760,19 @@ impl NativeOwner {
                     }
                     return Err(error.into());
                 }
+                let record_source = if held_record { self.book.source() } else { &self.core.state.budget };
+                let record = match record_codec::PendingRecord::reserve(&prepared, record_source,
+                    if held_record { BudgetLane::Completion } else { lane }, self.record_buffers) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        drop(prepared);
+                        if let Err(rollback) = self.book.rollback_candidate(journal) {
+                            self.faulted = true;
+                            return Err(rollback.into());
+                        }
+                        return Err(error);
+                    }
+                };
                 let candidate = NativeCandidate {
                     owner: self.incarnation,
                     serial,
@@ -726,6 +780,7 @@ impl NativeOwner {
                 let outcome = prepared.outcome();
                 self.pending.push_back(Pending {
                     candidate,
+                    record,
                     prepared,
                     journal,
                 });
@@ -754,6 +809,7 @@ impl NativeOwner {
             .ok_or(NativeOwnerError::UnknownCandidate)?;
         match self.core.publish_native(head.prepared) {
             Ok(outcome) => {
+                drop(head.record);
                 if let Err(error) = self.book.commit_candidate(head.journal) {
                     self.faulted = true;
                     return Err(error.into());
@@ -771,6 +827,7 @@ impl NativeOwner {
                 // the buffer, allocate, change the ticket, or reorder the chain.
                 self.pending.push_front(Pending {
                     candidate: head.candidate,
+                    record: head.record,
                     prepared: refused.prepared,
                     journal: head.journal,
                 });
@@ -792,6 +849,7 @@ impl NativeOwner {
             .ok_or(NativeOwnerError::UnknownCandidate)?;
         while self.pending.len() > position {
             if let Some(row) = self.pending.pop_back() {
+                drop(row.record);
                 drop(row.prepared);
                 if let Err(error) = self.book.rollback_candidate(row.journal) {
                     self.faulted = true;
@@ -813,6 +871,7 @@ impl NativeOwner {
     pub fn discard_all(&mut self) -> usize {
         let count = self.pending.len();
         while let Some(row) = self.pending.pop_back() {
+            drop(row.record);
             drop(row.prepared);
             if self.book.rollback_candidate(row.journal).is_err() {
                 self.faulted = true;
@@ -839,6 +898,36 @@ impl NativeOwner {
             state: &self.core.state,
             tail: None,
         })
+    }
+
+    /// Borrow the actual committed root for streaming checkpoint encoding.
+    /// Pending rows remain isolated; this borrow prevents concurrent mutation.
+    pub fn committed_core(&self) -> &Core<NativeState> { &self.core }
+
+    /// Transfer a fully reconciled committed Core without allocating or copying
+    /// rows. A pending or faulted owner is returned unchanged for reconciliation.
+    pub fn into_committed_core(self) -> Result<Core<NativeState>, NativeOwnerIntoCoreError> {
+        let error = if !self.pending.is_empty() { Some(NativeOwnerError::PendingCandidates) }
+            else if self.faulted { Some(NativeError::Capacity("completion owner requires reconstruction").into()) }
+            else { None };
+        if let Some(error) = error { return Err(NativeOwnerIntoCoreError { error, owner: self }); }
+        let Self { pending, core, book, _queue_allocation, .. } = self;
+        drop(pending);
+        drop(book);
+        drop(_queue_allocation);
+        Ok(core)
+    }
+
+    /// Encode the exact pending mutation using its preheld buffer permit. The
+    /// cached bytes remain owned by this ticket through retries; this does not
+    /// publish or acknowledge durability. A low work/byte cap or allocation
+    /// failure leaves the candidate and its permit available for retry.
+    pub fn encode_candidate(&mut self, candidate: NativeCandidate, limits: record_codec::EncodingLimits)
+        -> Result<&record_codec::FundedRecord, NativeOwnerError>
+    {
+        let position = self.position(candidate)?;
+        let pending = self.pending.get_mut(position).ok_or(NativeOwnerError::UnknownCandidate)?;
+        pending.record.encode(&pending.prepared, limits)
     }
 
     /// Includes all unpublished work. These observations are provisional and
@@ -881,6 +970,11 @@ impl NativeOwner {
     #[cfg(test)]
     pub(super) fn budget_for_test(&self) -> &MemoryBudget {
         &self.core.state.budget
+    }
+
+    #[cfg(test)]
+    pub(super) fn core_for_test(&self) -> &Core<NativeState> {
+        &self.core
     }
 
     /// Inspect acceptance from the actual effective prefix, including this

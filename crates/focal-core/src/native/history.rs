@@ -89,6 +89,7 @@ enum Fact {
     },
     Claim {
         kind: NativeEventKind,
+        graph: Option<NativeGraphCapture>,
         owned_child: Option<Revision>,
         before: Option<Revision>,
         after: Revision,
@@ -201,6 +202,7 @@ impl StoredEvent {
             },
             NativeFact::Accepted { key } => Fact::Accepted { key },
             NativeFact::Claim(row) => {
+                row.check_graph_capture(event.ordinal)?;
                 if row
                     .before
                     .is_some_and(|value| value.ledger != row.after.ledger)
@@ -212,6 +214,7 @@ impl StoredEvent {
                 }
                 Fact::Claim {
                     kind: row.kind,
+                    graph: row.graph,
                     owned_child: row.owned_child.map(Revision::pack),
                     before: row.before.map(Revision::pack),
                     after: Revision::pack(row.after),
@@ -340,11 +343,13 @@ impl StoredEvent {
                 Fact::Accepted { key } => NativeFact::Accepted { key },
                 Fact::Claim {
                     kind,
+                    graph,
                     owned_child,
                     before,
                     after,
                     status,
                 } => NativeFact::Claim(NativeClaimEvent {
+                    graph,
                     kind,
                     owned_child: owned_child.map(|value| value.expand(ledger)),
                     before: before.map(|value| value.expand(ledger)),

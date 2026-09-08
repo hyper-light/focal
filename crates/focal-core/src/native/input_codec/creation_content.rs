@@ -101,8 +101,11 @@ pub struct ClaimBodyPlan<'s, 'a> {
 impl<'a> ClaimBodyInput<'a> {
     pub(in crate::native) fn ownership_visits(&self) -> Result<usize, DecodeError> {
         use claim::ClaimSource;
-        self.source.scope_count().checked_add(self.source.slot_count())
-            .and_then(|n| n.checked_mul(16)).and_then(|n| n.checked_add(128))
+        self.source
+            .scope_count()
+            .checked_add(self.source.slot_count())
+            .and_then(|n| n.checked_mul(16))
+            .and_then(|n| n.checked_add(128))
             .ok_or_else(|| CodecError::Capacity.into())
     }
     pub fn inspect(bytes: &'a [u8], limits: BodyInspectionLimits) -> Result<Self, DecodeError> {

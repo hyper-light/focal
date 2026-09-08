@@ -88,6 +88,7 @@ fn real_owner_release_capability_preserves_terminal_truth_and_keeps_normal_guard
         source.binding(),
         released.claim(),
         NativeEventKind::OwnerReleased,
+        None,
     )
     .unwrap();
     let rows = prepare_released(released, core.limits, &mut extras, &mut scratch).unwrap();
@@ -130,6 +131,7 @@ fn pending_terminal_source_is_pinned_without_publishing_cancellation_or_release(
         source.binding(),
         released.claim(),
         NativeEventKind::OwnerReleased,
+        None,
     )
     .unwrap();
     let rows = prepare_released(released, core.limits, &mut extras, &mut scratch).unwrap();

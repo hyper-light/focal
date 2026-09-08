@@ -48,17 +48,43 @@ struct Fixture {
     serial: u128,
 }
 
-pub(in crate::native::record_codec) fn recovery_fixture(stage: u8) -> (Core<NativeState>, ContentStore, tempfile::TempDir) {
-    let mut fixture = Fixture::with_checks(true);
+pub(in crate::native::record_codec) fn recovery_fixture(
+    stage: u8,
+) -> (Core<NativeState>, ContentStore, tempfile::TempDir) {
+    recovery_fixture_with_checks(stage, true)
+}
+pub(in crate::native::record_codec) fn recovery_fixture_with_checks(
+    stage: u8,
+    checked: bool,
+) -> (Core<NativeState>, ContentStore, tempfile::TempDir) {
+    let mut fixture = Fixture::with_checks(checked);
     fixture.failed_response();
     if stage >= 1 {
-        fixture.apply(f::SUBJECT, NativeCommand::PostResponse { claim: fixture.claim(), expected: fixture.response() });
+        fixture.apply(
+            f::SUBJECT,
+            NativeCommand::PostResponse {
+                claim: fixture.claim(),
+                expected: fixture.response(),
+            },
+        );
     }
     if stage >= 2 {
-        fixture.apply(f::ISSUER, NativeCommand::ReceiveResponse { claim: fixture.claim(), expected: fixture.response() });
+        fixture.apply(
+            f::ISSUER,
+            NativeCommand::ReceiveResponse {
+                claim: fixture.claim(),
+                expected: fixture.response(),
+            },
+        );
     }
     if stage >= 3 {
-        fixture.apply(f::ISSUER, NativeCommand::EnterWholeWork { claim: fixture.claim(), expected: fixture.response() });
+        fixture.apply(
+            f::ISSUER,
+            NativeCommand::EnterWholeWork {
+                claim: fixture.claim(),
+                expected: fixture.response(),
+            },
+        );
     }
     (fixture.core, fixture.store, fixture._directory)
 }

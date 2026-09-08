@@ -4,7 +4,8 @@ use super::*;
 #[path = "range_hydration_phased.rs"]
 mod phased;
 pub use phased::{
-    RangeHydration, RangeHydrationLimits, RangeHydrationLookup, RangeHydrationSource, RangeHydrationView,
+    RangeHydration, RangeHydrationLimits, RangeHydrationLookup, RangeHydrationSource,
+    RangeHydrationView,
 };
 
 #[cfg(test)]

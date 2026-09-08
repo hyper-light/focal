@@ -552,6 +552,56 @@ impl Fixture {
 }
 
 #[test]
+fn borrowed_decision_iterators_cover_entered_responses_and_exact_artifacts_without_allocation() {
+    let mut fixture = Fixture::new(&[(ValidationMode::Required, 1)], false);
+    let first = fixture.receive(301, &[(0, 401)], 2);
+    let second = fixture.receive(300, &[(0, 400)], 3);
+    fixture.enter(first, 4);
+    {
+        let projection = fixture.projection();
+        memory::fail_after(0, || {
+            let mut decisions = projection.response_decisions();
+            let first = decisions.next().unwrap().unwrap();
+            assert_eq!(
+                first.response_binding().object.0,
+                TestamentId::from_u128(301).0
+            );
+            assert!(decisions.next().is_none());
+            assert_eq!(projection.artifact_decisions().len(), 1);
+            assert_eq!(
+                projection.artifact_decisions()[0].artifact().id,
+                ArtifactId::from_u128(401)
+            );
+        });
+    }
+    fixture.enter(second, 5);
+    fixture.begin(first, 1);
+    fixture.report(first, 1, VerdictValue::Pass, position(6, 1));
+    let projection = fixture.projection();
+    memory::fail_after(0, || {
+        let mut decisions = projection.response_decisions();
+        for id in [300, 301] {
+            let actual = decisions.next().unwrap().unwrap();
+            let expected = projection
+                .response_decision(TestamentId::from_u128(id))
+                .unwrap();
+            assert_eq!(actual.response_binding(), expected.response_binding());
+            assert_eq!(actual.response_outcome(), expected.response_outcome());
+            assert_eq!(actual.sequence(), expected.sequence());
+        }
+        assert!(decisions.next().is_none());
+        assert_eq!(projection.artifact_decisions().len(), 2);
+        let passed = projection
+            .artifact_decisions()
+            .iter()
+            .find(|value| value.artifact().id == ArtifactId::from_u128(401))
+            .unwrap();
+        assert_eq!(passed.outcome(), ArtifactOutcome::Passed);
+        assert_eq!(passed.sequence(), SessionSeq(6));
+    });
+}
+
+#[test]
 fn received_rows_remain_pending_and_entry_decides_zero_check_presence() {
     for present in [false, true] {
         let mut fixture = Fixture::new(&[(ValidationMode::Required, 0)], false);

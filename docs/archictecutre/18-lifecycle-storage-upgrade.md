@@ -3464,8 +3464,13 @@ accounting. The native decoded-row adapter and validator are now connected in
 [checkpoint recovery](../../crates/focal-core/src/native/record_codec/recovery.rs),
 with the phase order, custody boundary and scratch indices specified in
 [22](22-native-record-format.md#native-checkpoint-restoration). Their consolidated
-qualification is pending. Incremental mutation replay, Session provenance and
-activation remain separate requirements.
+qualification is recorded in [09](09-implementation-status.md#native-checkpoint-restoration--2026-09-07).
+The subsequent [incremental replay adapter](../../crates/focal-core/src/native/record_codec/replay.rs)
+constructs and validates an exact successor against that Core without executing
+the original command. Its graph capture provenance, funding transfers and
+restored-owner qualification are recorded in
+[09](09-implementation-status.md#native-incremental-replay-and-restored-owner-qualification--2026-09-08).
+Session provenance, durable buffer funding and activation remain separate requirements.
 
 The [scalar validation snapshots](../../crates/focal-model/src/lifecycle/validation_snapshot.rs)
 now preserve every retained EvaluationState and AcceptedResult field, including
@@ -3551,7 +3556,7 @@ The implemented construction stages and remaining integration are concrete:
    testament rows retain their actual original Generated binding/revision
    metadata; restoration must not infer it from a later lifecycle state or assume
    revision one. The trailer hashes every preceding byte using the BLAKE3
-   derive-key domain `focal.native.record.v1`, independently of physical WAL
+   derive-key domain `focal.native.record.v2`, independently of physical WAL
    checksums. The recorded range ID identifies the original process-local
    incarnation, which changes on restoration; recovery must prove and retain
    its mapping to the new owner instead of comparing it directly with a newly
@@ -3564,9 +3569,10 @@ The implemented construction stages and remaining integration are concrete:
    byte/row/work bounds. Its row iterator borrows opaque body slices and has an
    explicit work limit for each scan. A structural record is not decoded model
    state: a body labeled as one family may still contain invalid fields, foreign
-   references or fabricated history. Implement the bounded per-family decoders,
-   intrinsic model hydration and full native checks before accepting any of those
-   bodies. Artifact custody fields encode only the retained content-tree address
+   references or fabricated history. Bounded per-family decoders, intrinsic
+   model hydration and native checks now supply the complete checkpoint and
+   exact-predecessor incremental mutation paths. Their component qualification
+   does not activate durable service replay. Artifact custody fields encode only the retained content-tree address
    and observed local revision. They do not serialize a capability or prove
    availability on a follower or after restart; recover actual local
    content/placement evidence separately from accepted-result provenance.
@@ -3578,9 +3584,9 @@ The implemented construction stages and remaining integration are concrete:
    encoded-root buffer. Callback errors preserve their original value; partial
    output has no successful publication or durability acknowledgment. The
    borrowed-Core plan does not yet provide online scheduling from an accounted
-   fixed-prefix pin. Complete row decoding, native validation, checkpoint
-   persistence/retention and enclosing Session metadata remain required.
-4. **Validate the detached complete root.** Recompute every Meta count from actual
+   fixed-prefix pin. Complete checkpoint row decoding and native validation are
+   implemented; persistence/retention and enclosing Session metadata remain required.
+4. **Validate the detached complete root — implemented for Core checkpoints.** Recompute every Meta count from actual
    row families, including inactive links, result families and retired cycles.
    Validate identities, registration membership, reference/index completeness,
    contiguous accepted history and original event coordinates before import.
@@ -3594,8 +3600,8 @@ The implemented construction stages and remaining integration are concrete:
    Checkpoints retain this mapping alongside membership, placement, retirement and
    request-stream metadata. Preserve explicit activation/import base provenance.
 6. **Activate only the complete decoder.** Keep the existing physical WAL and
-   Ready persistence contract; complete native checkpoint decoding, the enclosing
-   Session checkpoint and decoder descriptors before registering the dormant
+   Ready persistence contract; connect incremental native replay to the durable
+   log and complete the enclosing Session checkpoint and decoder descriptors before registering the dormant
    mutation format. Encoding and
    structural inspection do not activate a native WAL decoder or live dispatch.
    Local decoder-floor promises do not establish replicated

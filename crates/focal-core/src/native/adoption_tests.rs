@@ -253,6 +253,7 @@ fn pending_adoption_changes_only_entitlement_and_retries_exactly_after_later_rec
     assert_eq!(
         view.event(outcome.sequence, 0).unwrap().fact,
         NativeFact::Claim(NativeClaimEvent {
+            graph: None,
             kind: NativeEventKind::ReceiptAdopted,
             owned_child: None,
             before: Some(before),

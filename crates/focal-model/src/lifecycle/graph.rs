@@ -10,9 +10,12 @@ mod capture;
 mod deadline;
 #[path = "graph_memory.rs"]
 mod memory;
+#[path = "graph_recorded.rs"]
+mod recorded;
 use super::{Binding, ContractError};
 use crate::{ClaimId, ClaimStatus, ContentHash, Deadline, SessionSeq, WaitPredicate};
 pub use capture::CapturePlan;
+pub use recorded::{RecordedEdge, RecordedGraph, RecordedNode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {

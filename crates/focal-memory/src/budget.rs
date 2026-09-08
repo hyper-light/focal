@@ -504,6 +504,21 @@ pub struct Allocation {
 }
 
 impl Allocation {
+    /// Check a transfer against its exact accounting owner. An ancestor,
+    /// descendant, equal-sized independent budget, category or lane cannot
+    /// substitute for the permit already held by the caller.
+    pub(crate) fn matches_exact(
+        &self,
+        source: &MemoryBudget,
+        kind: BudgetKind,
+        lane: BudgetLane,
+        bytes: usize,
+    ) -> bool {
+        Arc::ptr_eq(&self.budget.0, &source.0)
+            && self.kind == kind
+            && self.lane == lane
+            && self.bytes == bytes
+    }
     pub fn bytes(&self) -> usize {
         self.bytes
     }

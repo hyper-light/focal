@@ -11,9 +11,37 @@ pub(super) struct PendingCheckpoint {
     _allocation: Allocation,
 }
 
+// The source buffer always dies before its funding, including validation
+// refusal. Consensus snapshot/WAL copies have their own staging allowance.
+struct FundedCheckpointInput {
+    data: Vec<u8>,
+    allocation: Allocation,
+}
+
 impl DurableNode {
     pub fn checkpoint_pending(&self) -> bool {
         self.checkpoint.is_some()
+    }
+
+    /// Consume an already funded application checkpoint buffer. The original
+    /// allowance remains held through preparation and every refusal, without
+    /// another reservation for that caller-owned input. The independent Raft
+    /// snapshot and WAL copies still require the usual consensus staging.
+    /// This starts the same nonblocking checkpoint; completion requires its
+    /// actual durable fence through `try_finish_checkpoint`/`finish_checkpoint`.
+    pub fn begin_checkpoint_funded(
+        &mut self,
+        index: u64,
+        data: Vec<u8>,
+        allocation: Allocation,
+    ) -> Result<(), ConsensusError> {
+        let mut input = FundedCheckpointInput { data, allocation };
+        let overhead = if input.data.capacity() == 0 { 0 } else { const { 4 * size_of::<usize>() } };
+        let required = input.data.capacity().checked_add(overhead).ok_or(ConsensusError::Capacity)?;
+        if input.allocation.bytes() < required {
+            return Err(ConsensusError::Capacity);
+        }
+        self.begin_checkpoint(index, std::mem::take(&mut input.data))
     }
 
     /// Prepare an exact published-prefix checkpoint without waiting for disk.

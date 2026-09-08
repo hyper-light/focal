@@ -17,6 +17,7 @@ mod reconciliation;
 mod request_streams;
 pub use request_streams::{ManagedError, RequestStreamLimits, RequestStreamReadView};
 mod session;
+pub mod native_session;
 pub use focal_core::{Core, State};
 pub use focal_model::*;
 pub use reconciliation::ReconciliationView;

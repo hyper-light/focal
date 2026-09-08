@@ -442,6 +442,30 @@ impl DurableNode {
             replica.propose_inner(data)
         })
     }
+    /// Submit a caller-retained record without consuming its retry buffer.
+    /// The caller keeps that buffer funded until its own commit/rollback fence.
+    /// Raft's independent copy and fanout are admitted before allocation; a
+    /// capacity refusal leaves the original bytes available for an exact retry.
+    /// Success is proposal admission, never an index assignment or commit proof.
+    pub fn propose_borrowed_in(
+        &mut self,
+        data: &[u8],
+        lane: BudgetLane,
+    ) -> Result<(), ConsensusError> {
+        self.check_leader()?;
+        if data.is_empty() || data.len() > self.config.max_entry_bytes {
+            return Err(ConsensusError::Capacity);
+        }
+        self.guarded_in(data.len(), 0, lane, |replica| {
+            let mut owned = Vec::new();
+            owned.try_reserve_exact(data.len()).map_err(|_| ConsensusError::Capacity)?;
+            if owned.capacity() > data.len() {
+                return Err(ConsensusError::Capacity);
+            }
+            owned.extend_from_slice(data);
+            replica.propose_inner(owned)
+        })
+    }
     /// The authenticated envelope must bind cluster/group identity. Peer input is
     /// validated before Raft; unexpected dependency failures stop this replica.
     pub fn step(&mut self, message: Message) -> Result<(), ConsensusError> {
@@ -1124,6 +1148,8 @@ fn decode_proto<T: PbMessage + Default>(bytes: &[u8]) -> Result<T, ConsensusErro
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod borrowed_proposal_tests;
 
 #[cfg(test)]
 mod persistence_tests;

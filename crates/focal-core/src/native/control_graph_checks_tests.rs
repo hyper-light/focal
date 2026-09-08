@@ -275,6 +275,7 @@ fn duplicate_terminal_fact_cannot_hide_an_unjournaled_owner_release() {
     };
     assert!(released.scopes().released());
     let fake = NativeFact::Claim(NativeClaimEvent {
+        graph: None,
         kind: NativeEventKind::DependencyFailed,
         owned_child: None,
         before: Some(before),

@@ -32,7 +32,7 @@ const FAILED_PROOF: &[u8] = br#"{"passed":0,"failed":1,"skipped":0}"#;
 const DIAGNOSTIC: &[u8] =
     br#"{"code":"tool_unavailable","message":"The evaluator could not reach its tool."}"#;
 
-fn ledger() -> LedgerId {
+pub(super) fn ledger() -> LedgerId {
     LedgerId {
         tenant: TenantId::from_u128(71),
         session: SessionId::from_u128(72),

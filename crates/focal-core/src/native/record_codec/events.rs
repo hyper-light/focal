@@ -98,12 +98,18 @@ pub(super) fn event(s: &mut impl Sink, event: NativeEvent) -> Result<(), Error> 
             fixed::result_key(s, key)
         }
         NativeFact::Claim(v) => {
+            s.visit(1)?;
+            v.check_graph_capture(event.ordinal)
+                .map_err(|_| Error::InvalidTag("graph capture"))?;
             write_u8(s, 11)?;
             claim_kind(s, v.kind)?;
             f::optional_binding(s, v.owned_child)?;
             f::optional_binding(s, v.before)?;
             types::binding(s, v.after)?;
-            f::claim_status(s, v.status)
+            f::claim_status(s, v.status)?;
+            f::optional(s, v.graph, |sink, value| {
+                bytes::write_u32(sink, value.before_ordinal)
+            })
         }
         NativeFact::Definition {
             binding,

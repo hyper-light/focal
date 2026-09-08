@@ -7,6 +7,8 @@ mod journal_tests;
 
 #[path = "admission_graph_owner_tests.rs"]
 mod admission_graph_tests;
+#[path = "graph_capture_tests.rs"]
+mod graph_capture_tests;
 
 type ClaimSpec<'a> = (
     u128,

@@ -5,7 +5,10 @@ use super::{
     Arc, Change, Entry, PageDirectory, PreparedRange, RangeConfig, RangeStore, Root, groups,
     layout, merge_layout_charge, page_charge, root_charge, visit_merged,
 };
-use crate::{ALLOCATOR_OVERHEAD, BudgetLane, MemoryBudget, MemoryError, checked_add, checked_mul};
+use crate::{
+    ALLOCATOR_OVERHEAD, Allocation, BudgetKind, BudgetLane, MemoryBudget, MemoryError, checked_add,
+    checked_mul,
+};
 
 /// Additional accounting demand while the existing base, other candidates and
 /// pinned roots remain separately charged. Incoming payloads are conservatively
@@ -64,6 +67,13 @@ pub struct RangePreparationPlan<'a, K, V> {
     pub(super) charges: RangePreparationCharges,
 }
 
+// Inputs always drop before their incoming permit, including source/size
+// validation failures before the private builder begins allocating pages.
+pub(super) struct FundedPreparation<'a, K, V> {
+    pub(super) plan: RangePreparationPlan<'a, K, V>,
+    pub(super) input: Allocation,
+}
+
 impl<K: Ord + Clone, V> RangePreparationPlan<'_, K, V> {
     pub fn charges(&self) -> RangePreparationCharges {
         self.charges
@@ -102,7 +112,7 @@ impl<K: Ord + Clone, V> RangePreparationPlan<'_, K, V> {
     pub fn build_in_with<F>(
         self,
         source: &MemoryBudget,
-        mut copy: F,
+        copy: F,
     ) -> Result<PreparedRange<K, V>, MemoryError>
     where
         F: FnMut(&V) -> Result<V, MemoryError>,
@@ -112,7 +122,53 @@ impl<K: Ord + Clone, V> RangePreparationPlan<'_, K, V> {
                 "range funding source is outside its owner budget",
             ));
         }
-        self.store.prepare_planned_with(self, source, &mut copy)
+        let input = source
+            .reserve(
+                BudgetKind::Pending,
+                self.lane,
+                self.charges.input_pending_bytes(),
+            )?
+            .commit();
+        self.build_in_funded_with(source, input, copy)
+    }
+
+    /// Transfer the already held incoming write-set permit into this build.
+    /// It must have exactly `charges().input_pending_bytes()` bytes, Pending
+    /// category, this plan's lane, and the identical `source` budget. The source
+    /// must still be this range owner's budget or one of its descendants.
+    ///
+    /// No incoming reservation is repeated. Destination pages, directory nodes
+    /// and merge workspace retain their normal separate charges. Caller buffers
+    /// outside the owned write set remain independently funded. On every error,
+    /// all supplied rows are destroyed before the transferred credit returns;
+    /// the original published range and copier semantics remain unchanged.
+    pub fn build_in_funded_with<F>(
+        self,
+        source: &MemoryBudget,
+        input: Allocation,
+        mut copy: F,
+    ) -> Result<PreparedRange<K, V>, MemoryError>
+    where
+        F: FnMut(&V) -> Result<V, MemoryError>,
+    {
+        let funded = FundedPreparation { plan: self, input };
+        if !source.is_within(&funded.plan.store.budget) {
+            return Err(MemoryError::InvalidConfiguration(
+                "range funding source is outside its owner budget",
+            ));
+        }
+        if !funded.input.matches_exact(
+            source,
+            BudgetKind::Pending,
+            funded.plan.lane,
+            funded.plan.charges.input_pending_bytes(),
+        ) {
+            return Err(MemoryError::InvalidConfiguration(
+                "range input funding does not match its plan",
+            ));
+        }
+        let store = funded.plan.store;
+        store.prepare_planned_with(funded, source, &mut copy)
     }
 
     pub fn build_in(self, source: &MemoryBudget) -> Result<PreparedRange<K, V>, MemoryError>

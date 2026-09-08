@@ -17,14 +17,16 @@ mod checks;
 #[path = "authored_prepare.rs"]
 mod creation_work;
 pub(super) use checks::{check_plan, check_storage};
-pub(super) use checks::{pair as check_recorded_claim, declaration_pair as check_recorded_declaration};
+pub(super) use checks::{
+    declaration_pair as check_recorded_declaration, pair as check_recorded_claim,
+};
 pub(super) use creation_work::prepare;
 
 #[cfg(test)]
 #[path = "authored_tests.rs"]
 mod tests;
 #[cfg(test)]
-pub(super) use tests::recovery_fixture;
+pub(super) use tests::{recovery_fixture, replay_fixture};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeContentProfile {

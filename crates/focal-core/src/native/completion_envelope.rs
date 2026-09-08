@@ -291,6 +291,7 @@ impl SlotDemand {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct CompletionEnvelope {
+    record_buffers: Option<record_codec::EncodingLimits>,
     target: CompletionTarget,
     parent: Binding,
     policy: ContentHash,
@@ -890,6 +891,7 @@ impl CompletionEnvelope {
         };
         let slots = slot_demand.remaining(reports, failed_report.is_some())?;
         let result = Self {
+            record_buffers: None,
             target,
             parent: claim.binding(),
             policy: claim.acceptance().intent_fingerprint(),
@@ -996,13 +998,28 @@ impl CompletionEnvelope {
         self,
         usage: CompletionUse,
     ) -> Result<usize, NativeError> {
+        let storage = self.report_storage(usage)?;
+        let records = self.record_buffers.map(|limits| record_codec::future_record_bytes(storage, limits)).transpose()?.unwrap_or(0);
         add(
-            crate::native::mutation::retained(self.report_storage(usage)?)?,
+            add(crate::native::mutation::retained(storage)?, records)?,
             match usage {
                 CompletionUse::Regular => self.ordinary_journal_bytes,
                 CompletionUse::AdmissionFailure => self.failed_journal_bytes,
             },
         )
+    }
+
+    pub(super) fn with_record_buffers(mut self, limits: record_codec::EncodingLimits) -> Result<Self, NativeError> {
+        if self.record_buffers.is_some() { return Err(ContractError::InvalidTransition.into()); }
+        let regular = record_codec::future_record_bytes(self.ordinary_report, limits)?;
+        let records = if let Some(failed) = self.failed_report {
+            add(multiply(usize::try_from(self.reports.checked_sub(1).ok_or(ContractError::Capacity)?).map_err(|_| ContractError::Capacity)?, regular)?,
+                record_codec::future_record_bytes(failed, limits)?)?
+        } else { multiply(usize::try_from(self.reports).map_err(|_| ContractError::Capacity)?, regular)? };
+        self.retained = add(self.retained, records)?;
+        self.required = add(self.required, records)?;
+        self.record_buffers = Some(limits);
+        Ok(self)
     }
 
     /// A due deadline substitutes a smaller authority-only write for the

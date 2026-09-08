@@ -124,7 +124,7 @@ pub use missing_owned::NativeMissingResult;
 use missing_owned::OwnedMissingResult;
 use owned::{OwnedClaim, OwnedClaimContent, OwnedDeclaration, OwnedEvaluation, OwnedEvent};
 pub use owner::{
-    NativeCandidate, NativeOwner, NativeOwnerError, NativeOwnerInitError, NativeStaging, NativeView,
+    NativeCandidate, NativeOwner, NativeOwnerError, NativeOwnerInitError, NativeOwnerIntoCoreError, NativeStaging, NativeView,
 };
 pub use projection_quote::NativeProjectionQuote;
 pub use response_input::{
@@ -706,12 +706,38 @@ impl NativeEvent {
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeGraphCapture {
+    /// Exclusive current-journal boundary of the actual graph snapshot. A
+    /// batched reduction retains one shared boundary; recapture advances it.
+    pub before_ordinal: u32,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeClaimEvent {
     pub kind: NativeEventKind,
+    pub graph: Option<NativeGraphCapture>,
     pub owned_child: Option<Binding>,
     pub before: Option<Binding>,
     pub after: Binding,
     pub status: ClaimStatus,
+}
+impl NativeClaimEvent {
+    pub(super) fn check_graph_capture(self, ordinal: u32) -> Result<(), ContractError> {
+        let required = matches!(
+            self.kind,
+            NativeEventKind::DependencyFailed
+                | NativeEventKind::Deadlocked
+                | NativeEventKind::Satisfied
+                | NativeEventKind::Expired
+        );
+        if self.graph.is_some() != required
+            || self
+                .graph
+                .is_some_and(|capture| capture.before_ordinal > ordinal)
+        {
+            return Err(ContractError::InvalidCut);
+        }
+        Ok(())
+    }
 }
 
 /// Lookup identity; the retained row additionally pins full target content,
@@ -1114,7 +1140,10 @@ impl NativeRead {
 }
 
 /// Shared local and recovered owner configuration checks.
-fn checked_native_limits(ledger: LedgerId, mut limits: NativeLimits) -> Result<NativeLimits, NativeError> {
+fn checked_native_limits(
+    ledger: LedgerId,
+    mut limits: NativeLimits,
+) -> Result<NativeLimits, NativeError> {
     if ledger.tenant.is_zero() || ledger.session.is_zero() {
         return Err(ContractError::WrongLedger.into());
     }

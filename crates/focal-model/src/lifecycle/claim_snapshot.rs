@@ -109,7 +109,10 @@ impl ClaimState {
     /// This is a funding quote only; prepare_hydration_v1 validates every value
     /// against the actual retained Responses after the complete row is funded.
     pub fn hydration_response_heap_charge_v1(count: usize) -> Result<usize, ContractError> {
-        bytes::add(bytes::array::<ResponseRecord>(count)?, overhead(usize::from(count != 0))?)
+        bytes::add(
+            bytes::array::<ResponseRecord>(count)?,
+            overhead(usize::from(count != 0))?,
+        )
     }
     pub fn snapshot_v1(&self) -> ClaimSnapshotV1 {
         ClaimSnapshotV1 {

@@ -217,28 +217,48 @@ impl ContentStore {
         match descriptor.payload() {
             PayloadSpec::Inline(bytes) => {
                 if expected.class != ContentClass::Evidence
-                    || u64::try_from(bytes.len()).map_err(|_| ContentError::Capacity)? != expected.length {
+                    || u64::try_from(bytes.len()).map_err(|_| ContentError::Capacity)?
+                        != expected.length
+                {
                     return Err(ContractError::MissingEvidence.into());
                 }
             }
-            PayloadSpec::Content(pointer) if pointer != expected => return Err(ContractError::MissingEvidence.into()),
+            PayloadSpec::Content(pointer) if pointer != expected => {
+                return Err(ContractError::MissingEvidence.into());
+            }
             PayloadSpec::Content(_) => {}
         }
-        let mut allocation = budget.reserve(BudgetKind::Payload, BudgetLane::Completion, verification.peak_bytes())?.commit();
+        let mut allocation = budget
+            .reserve(
+                BudgetKind::Payload,
+                BudgetLane::Completion,
+                verification.peak_bytes(),
+            )?
+            .commit();
         {
             let bytes = self.read_bytes(&reference(expected), maximum)?;
-            if bytes.capacity() > maximum { return Err(ContentError::Capacity.into()); }
+            if bytes.capacity() > maximum {
+                return Err(ContentError::Capacity.into());
+            }
             if let PayloadSpec::Inline(inline) = descriptor.payload()
-                && inline != bytes.as_slice() {
+                && inline != bytes.as_slice()
+            {
                 return Err(ContractError::MissingEvidence.into());
             }
             schemas.verify(descriptor.schema_hash(), &bytes)?;
         }
         // The complete read/schema buffers have dropped before their permit is
         // reduced to the retained token. No raw encoded token can reach here.
-        let custody = NativeLocalCustody { request, descriptor: descriptor.intent_fingerprint(), payload: expected };
+        let custody = NativeLocalCustody {
+            request,
+            descriptor: descriptor.intent_fingerprint(),
+            payload: expected,
+        };
         allocation.shrink_to(verification.retained_bytes())?;
-        Ok(VerifiedNativeArtifact { custody, allocation })
+        Ok(VerifiedNativeArtifact {
+            custody,
+            allocation,
+        })
     }
 
     /// Verify and retain actual local evidence before entering native Core.

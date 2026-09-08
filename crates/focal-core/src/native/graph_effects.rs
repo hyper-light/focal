@@ -322,16 +322,30 @@ fn peers<'a>(
     Ok(())
 }
 
+/// Read at the actual snapshot boundary, before any consequence is appended.
+/// Only explicit journals have ordinal coordinates during graph preparation.
+pub(super) fn capture(extras: &Extras) -> Result<NativeGraphCapture, NativeError> {
+    let journal = extras
+        .journal
+        .as_ref()
+        .ok_or(ContractError::InvalidTransition)?;
+    Ok(NativeGraphCapture {
+        before_ordinal: u32::try_from(journal.len()).map_err(|_| ContractError::Capacity)?,
+    })
+}
+
 fn journal(
     extras: &mut Extras,
     before: Binding,
     after: &ClaimState,
     kind: NativeEventKind,
+    graph: Option<NativeGraphCapture>,
 ) -> Result<(), NativeError> {
     if before.next()? != after.binding() {
         return Err(ContractError::StaleRevision.into());
     }
     extras.record(NativeFact::Claim(NativeClaimEvent {
+        graph,
         kind,
         owned_child: None,
         before: Some(before),
@@ -935,6 +949,7 @@ fn prepare_with_prefix(
         plan.budget.graph_bytes = add(plan.budget.graph_bytes, charge)?;
     }
     let events_before = extras.events();
+    let captured = capture(extras)?;
     if plan.budget.charges.monitor_events != 0 {
         let original = monitors::original_sources(view, &plan.claims, scratch)?;
         let budget = plan.budget;
@@ -977,6 +992,7 @@ fn prepare_with_prefix(
                     source.binding(),
                     &changed,
                     NativeEventKind::DependencyFailed,
+                    Some(captured),
                 )?;
                 Some(changed)
             }
@@ -993,6 +1009,7 @@ fn prepare_with_prefix(
                         source.binding(),
                         &changed,
                         NativeEventKind::Satisfied,
+                        Some(captured),
                     )?;
                     Some(changed)
                 } else {
@@ -1036,7 +1053,13 @@ fn prepare_with_prefix(
         match snapshot.dependency_failure_with_budget(root_id, failure_charge) {
             Ok(failure) => {
                 root.dependency_failed(&before, &failure, &root_peers, cut.position)?;
-                journal(extras, before, &root, NativeEventKind::DependencyFailed)?;
+                journal(
+                    extras,
+                    before,
+                    &root,
+                    NativeEventKind::DependencyFailed,
+                    Some(captured),
+                )?;
             }
             Err(ContractError::InvalidTransition) => {
                 if root.status() == ClaimStatus::Validating
@@ -1045,7 +1068,13 @@ fn prepare_with_prefix(
                 {
                     let release = snapshot.release(root_id)?;
                     root.graph_release(&before, &release, &root_peers, cut.position)?;
-                    journal(extras, before, &root, NativeEventKind::Satisfied)?;
+                    journal(
+                        extras,
+                        before,
+                        &root,
+                        NativeEventKind::Satisfied,
+                        Some(captured),
+                    )?;
                 }
             }
             Err(error) => return Err(error.into()),

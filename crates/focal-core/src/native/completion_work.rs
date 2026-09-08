@@ -306,6 +306,7 @@ impl CompletionEnvelope {
         };
         let (parent_heap, registry_heap) = parent_bound(limits, parent, registry)?;
         let result = Self {
+            record_buffers: None,
             target: CompletionTarget::Work,
             parent: parent.binding(),
             policy: parent.acceptance().intent_fingerprint(),

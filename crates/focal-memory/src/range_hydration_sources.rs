@@ -95,8 +95,10 @@ impl<K: Ord + Clone, V> RangeHydration<K, V> {
                 BudgetLane::Completion,
                 checked_add(
                     checked_mul(2, ALLOCATOR_OVERHEAD)?,
-                    checked_mul(chunk_limit,
-                        checked_add(size_of::<Change<K, V>>(), size_of::<Allocation>())?)?,
+                    checked_mul(
+                        chunk_limit,
+                        checked_add(size_of::<Change<K, V>>(), size_of::<Allocation>())?,
+                    )?,
                 )?,
             )?;
             let mut payloads = bounded_vec(chunk_limit)?;
@@ -104,47 +106,66 @@ impl<K: Ord + Clone, V> RangeHydration<K, V> {
             let mut chunk: Vec<Change<K, V>> = bounded_vec(chunk_limit)?;
             let mut heap_bytes = 0;
             while chunk.len() < chunk_limit && constructed < expected_entries {
-                let item = match source.peek() {
-                    Some(Ok(item)) => item,
-                    Some(Err(error)) => return Err(error.clone()),
-                    None => return Err(cardinality()),
+                let (entry, allocation, actual) = {
+                    let item = match source.peek() {
+                        Some(Ok(item)) => item,
+                        Some(Err(error)) => return Err(error.clone()),
+                        None => return Err(cardinality()),
+                    };
+                    let key = item.key();
+                    if self.store.root.get(key).is_some() {
+                        return Err(MemoryError::InvalidConfiguration(
+                            "hydration phase key already exists",
+                        ));
+                    }
+                    if chunk.last().is_some_and(|last| last.key() >= key) {
+                        return Err(order());
+                    }
+                    if chunk
+                        .last()
+                        .is_some_and(|last| partition(last.key()) != partition(key))
+                    {
+                        break;
+                    }
+                    let prepared = item.prepare(RangeHydrationLookup {
+                        root: &self.store.root,
+                        staged: &chunk,
+                    })?;
+                    if &prepared.key != key {
+                        return Err(MemoryError::InvalidConfiguration(
+                            "hydration prepared key differs from source",
+                        ));
+                    }
+                    layout::check_entry::<K, V>(prepared.heap_bytes, config)?;
+                    let next_heap = checked_add(heap_bytes, prepared.heap_bytes)?;
+                    let next_charge = page_charge::<K, V>(checked_add(chunk.len(), 1)?, next_heap)?;
+                    if !chunk.is_empty() && next_charge > config.page_bytes {
+                        // Drop all dependency borrows before publishing the chunk.
+                        // The same source remains peeked for one re-preparation.
+                        break;
+                    }
+                    let allowance = prepared.heap_bytes;
+                    let mut allocation = self
+                        .store
+                        .budget
+                        .reserve(BudgetKind::Pending, BudgetLane::Completion, allowance)?
+                        .commit();
+                    let Entry {
+                        key,
+                        value: plan,
+                        heap_bytes: _,
+                    } = prepared;
+                    let (value, actual) = S::build(plan, allowance)?;
+                    let entry = Entry::new(key, value, actual);
+                    if actual > allowance {
+                        return Err(MemoryError::Capacity {
+                            requested: actual,
+                            available: allowance,
+                        });
+                    }
+                    allocation.shrink_to(actual)?;
+                    (entry, allocation, actual)
                 };
-                let key = item.key();
-                if self.store.root.get(key).is_some() {
-                    return Err(MemoryError::InvalidConfiguration("hydration phase key already exists"));
-                }
-                if chunk.last().is_some_and(|last| last.key() >= key) {
-                    return Err(order());
-                }
-                if chunk.last().is_some_and(|last| partition(last.key()) != partition(key)) {
-                    break;
-                }
-                let prepared = item.prepare(RangeHydrationLookup {
-                    root: &self.store.root,
-                    staged: &chunk,
-                })?;
-                if &prepared.key != key {
-                    return Err(MemoryError::InvalidConfiguration("hydration prepared key differs from source"));
-                }
-                layout::check_entry::<K, V>(prepared.heap_bytes, config)?;
-                let next_heap = checked_add(heap_bytes, prepared.heap_bytes)?;
-                let next_charge = page_charge::<K, V>(checked_add(chunk.len(), 1)?, next_heap)?;
-                if !chunk.is_empty() && next_charge > config.page_bytes {
-                    // Drop all dependency borrows before publishing the chunk.
-                    // The same source remains peeked for one re-preparation.
-                    break;
-                }
-                let allowance = prepared.heap_bytes;
-                let mut allocation = self.store.budget.reserve(
-                    BudgetKind::Pending, BudgetLane::Completion, allowance,
-                )?.commit();
-                let Entry { key, value: plan, .. } = prepared;
-                let (value, actual) = S::build(plan, allowance)?;
-                let entry = Entry::new(key, value, actual);
-                if actual > allowance {
-                    return Err(MemoryError::Capacity { requested: actual, available: allowance });
-                }
-                allocation.shrink_to(actual)?;
                 // The consumed plan no longer borrows either the source or any
                 // staged dependencies. The row remains under its local permit.
                 source.next().ok_or_else(cardinality)??;
@@ -175,12 +196,16 @@ impl<K: Ord + Clone, V> RangeHydration<K, V> {
                 None if constructed != expected_entries => return Err(cardinality()),
                 None => {}
             }
-            let next = self.store.prefix().checked_add(1).ok_or(
-                MemoryError::CounterExhausted("hydration construction prefix"),
-            )?;
-            let prepared = self.store.prepare_batch_with(
-                next, chunk, BudgetLane::Completion, &mut copy,
-            )?;
+            let next = self
+                .store
+                .prefix()
+                .checked_add(1)
+                .ok_or(MemoryError::CounterExhausted(
+                    "hydration construction prefix",
+                ))?;
+            let prepared =
+                self.store
+                    .prepare_batch_with(next, chunk, BudgetLane::Completion, &mut copy)?;
             self.store.publish(prepared)?;
         }
         match source.next() {
@@ -188,7 +213,9 @@ impl<K: Ord + Clone, V> RangeHydration<K, V> {
             Some(Ok(_)) => return Err(cardinality()),
             None => {}
         }
-        if self.store.len() != expected_total { return Err(cardinality()); }
+        if self.store.len() != expected_total {
+            return Err(cardinality());
+        }
         self.phases = checked_add(self.phases, 1)?;
         Ok(self)
     }

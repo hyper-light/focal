@@ -283,6 +283,33 @@ fn incomplete_reverse_links_and_closure_limits_refuse_without_partial_publicatio
                 )
                 .unwrap();
             core.state.rows.publish(bad).unwrap();
+            // Cancellation now discovers and settles ordinary dependencies in
+            // the same candidate. The malformed source must be refused at that
+            // actual boundary, before a detached cancelled root can be built.
+            let budget = core.state.budget.stats();
+            let prefix = core.state.rows.prefix();
+            assert!(matches!(
+                core.prepare_native(
+                    f::context(ISSUER, 100),
+                    NativeInput {
+                        request: f::request(ISSUER, 101),
+                        command: NativeCommand::Cancel {
+                            expected: core.native_claim(id).unwrap().binding(),
+                        },
+                    },
+                    &[],
+                ),
+                Err(NativeError::Contract(ContractError::InvalidManifest))
+            ));
+            assert_eq!(core.state.budget.stats(), budget);
+            assert_eq!(core.state.rows.prefix(), prefix);
+            for id in [1, 2] {
+                assert_eq!(
+                    core.native_claim(ClaimId::from_u128(id)).unwrap().status(),
+                    ClaimStatus::Generated
+                );
+            }
+            continue;
         }
         let candidate = cancel(&core, 1);
         let root = changed_root(&candidate, 1);

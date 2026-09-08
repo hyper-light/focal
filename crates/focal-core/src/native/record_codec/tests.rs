@@ -32,6 +32,35 @@ fn created(core: &Core<NativeState>) -> NativePrepared {
         &[],
     ))
 }
+
+#[test]
+fn graph_capture_format_has_an_explicit_version_boundary_from_dormant_native_v1() {
+    let mut core = fixture::core();
+    let prepared = created(&core);
+    let mut mutation = encode(&prepared);
+    assert_eq!(&mutation[8..10], &2u16.to_le_bytes());
+    mutation[8..10].copy_from_slice(&1u16.to_le_bytes());
+    let end = mutation.len() - 32;
+    let mut digest = blake3::Hasher::new_derive_key("focal.native.record.v1");
+    digest.update(&mutation[..end]);
+    mutation[end..].copy_from_slice(digest.finalize().as_bytes());
+    assert!(matches!(
+        StructuralRecord::inspect(&mutation, inspection(mutation.len())),
+        Err(CodecError::InvalidTag("record format"))
+    ));
+    core.publish_native(prepared).unwrap();
+    let plan = checkpoint::EncodingPlan::prepare(&core, limits()).unwrap();
+    let mut root = vec![0; plan.quote().bytes];
+    plan.write_into(&mut root).unwrap();
+    assert_eq!(&root[8..10], &2u16.to_le_bytes());
+    root[8..10].copy_from_slice(&1u16.to_le_bytes());
+    let end = root.len() - 32;
+    let mut digest = blake3::Hasher::new_derive_key("focal.native.checkpoint.v1");
+    digest.update(&root[..end]);
+    root[end..].copy_from_slice(digest.finalize().as_bytes());
+    assert!(checkpoint::StructuralCheckpoint::inspect(&root, inspection(root.len())).is_err());
+}
+
 #[test]
 fn real_records_preserve_exact_mutations_and_do_not_serialize_unchanged_rows() {
     let mut core = fixture::core();
@@ -204,7 +233,7 @@ fn corrupted_truncated_wrong_profile_and_outcome_records_refuse_before_import() 
         corrupt[index] ^= 0x80;
         assert!(StructuralRecord::inspect(&corrupt, inspection(corrupt.len())).is_err());
     }
-    for (offset, replacement) in [(0, 0), (8, 2), (10, 2)] {
+    for (offset, replacement) in [(0, 0), (8, 0), (10, 2)] {
         let mut corrupt = bytes.clone();
         corrupt[offset] = replacement;
         checksum(&mut corrupt);

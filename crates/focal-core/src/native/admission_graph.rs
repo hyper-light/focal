@@ -128,6 +128,7 @@ impl Proof {
     }
     pub(super) fn event(&self) -> NativeClaimEvent {
         NativeClaimEvent {
+            graph: None,
             kind: NativeEventKind::PostFailed,
             owned_child: None,
             before: Some(self.source()),

@@ -45,6 +45,7 @@ pub(super) fn prepare(
     let released = plan.apply(root, transition)?;
     extras.begin_journal(limits.range.max_batch_entries, scratch)?;
     extras.record(NativeFact::Claim(NativeClaimEvent {
+        graph: None,
         kind: NativeEventKind::OwnerReleased,
         owned_child: None,
         before: Some(source.binding()),
@@ -62,17 +63,6 @@ pub(super) fn prepare(
 /// Validate the complete original claim-only journal before the independently
 /// checked cohort suffix. The initiating release must remain first and unique;
 /// any subsequent terminal consequence retains its own checked graph cut.
-#[cfg(test)]
-pub(super) fn check_journal(
-    rows: &[ClaimState],
-    extras: &Extras,
-    view: &View<'_>,
-    outcome: NativeOutcome,
-    limits: NativeLimits,
-) -> Result<(), NativeError> {
-    check_journal_with_monitors(rows, extras, view, outcome, limits, 0)
-}
-
 pub(super) fn check_journal_with_monitors(
     rows: &[ClaimState],
     extras: &Extras,

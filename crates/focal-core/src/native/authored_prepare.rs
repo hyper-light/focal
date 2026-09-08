@@ -1,4 +1,4 @@
-use super::super::transactions::{Plan, RegistryOverrides, increment};
+use super::super::transactions::{Plan, increment};
 use super::*;
 
 fn claim_resolution(
@@ -366,9 +366,11 @@ pub(in crate::native) fn prepare(
         definitions,
         objects: total,
     });
+    let registry =
+        super::super::control_graph::created_registries(&rows, view, extras, limits, scratch)?;
     Ok(Plan {
         rows,
-        registry: RegistryOverrides::new(),
+        registry,
         created,
     })
 }

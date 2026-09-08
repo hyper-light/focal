@@ -592,6 +592,7 @@ dependencies = [
  "focal-consensus",
  "focal-core",
  "focal-directory",
+ "focal-evidence",
  "focal-graph",
  "focal-memory",
  "focal-model",

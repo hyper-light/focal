@@ -146,15 +146,26 @@ impl NativeArtifact {
     /// A decoder cannot mint custody. Only an actual locally verified token can
     /// restore this row, and both the original request and durable tree address
     /// must agree with the retained provenance.
-    pub(super) fn recover(descriptor: ArtifactDescriptor, custody: NativeLocalCustody,
+    pub(super) fn recover(
+        descriptor: ArtifactDescriptor,
+        custody: NativeLocalCustody,
         request: focal_model::RequestKey,
         expected: focal_model::lifecycle::artifact_descriptor::ContentPointer,
-        local_revision: u64) -> Result<Self, ContractError> {
-        custody.check(request, &descriptor).map_err(|_| ContractError::MissingEvidence)?;
-        if custody.payload() != expected || custody.local_revision() != local_revision || local_revision == 0 {
+        local_revision: u64,
+    ) -> Result<Self, ContractError> {
+        custody
+            .check(request, &descriptor)
+            .map_err(|_| ContractError::MissingEvidence)?;
+        if custody.payload() != expected
+            || custody.local_revision() != local_revision
+            || local_revision == 0
+        {
             return Err(ContractError::MissingEvidence);
         }
-        Ok(Self { descriptor, custody })
+        Ok(Self {
+            descriptor,
+            custody,
+        })
     }
 
     pub(super) fn from_work(

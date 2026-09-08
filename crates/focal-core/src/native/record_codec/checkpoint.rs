@@ -13,8 +13,8 @@ use bytes::Cursor;
 mod tests;
 
 pub const MAGIC: [u8; 8] = *b"FCNROOTS";
-pub const VERSION: u16 = 1;
-const HASH_DOMAIN: &str = "focal.native.checkpoint.v1";
+pub const VERSION: u16 = 2;
+pub(super) const HASH_DOMAIN: &str = "focal.native.checkpoint.v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CheckpointHeader {
@@ -114,6 +114,19 @@ impl<'a> EncodingPlan<'a> {
 
     pub fn quote(&self) -> EncodingQuote {
         self.quote
+    }
+
+    /// Identity of the actual borrowed root measured by this plan. Enclosing
+    /// checkpoint layers can bind their metadata before writing any bytes.
+    pub fn header(&self) -> Result<CheckpointHeader, CodecError> {
+        Ok(CheckpointHeader {
+            ledger: self.core.state.ledger,
+            profile: self.core.state.profile,
+            range: self.core.state.rows.id(),
+            prefix: self.core.native_sequence(),
+            rows: u64::try_from(self.quote.rows).map_err(|_| CodecError::Capacity)?,
+            hash: self.quote.hash,
+        })
     }
 
     /// A wrong-sized destination is refused before any byte is changed. Output

@@ -8,14 +8,14 @@ use crate::{ObjectId, RootCommandId, SessionId};
 #[path = "graph_capture_tests.rs"]
 mod capture;
 
-fn limits() -> Limits {
+pub(super) fn limits() -> Limits {
     Limits {
         nodes: 32,
         edges: 128,
         visits: 8192,
     }
 }
-fn cid(value: u128) -> ClaimId {
+pub(super) fn cid(value: u128) -> ClaimId {
     ClaimId::from_u128(value)
 }
 fn declaration(edges: &[(Kind, u128)]) -> Declaration {
@@ -29,7 +29,7 @@ fn declaration(edges: &[(Kind, u128)]) -> Declaration {
     edges.sort_unstable();
     Declaration::new(&edges, 128).unwrap()
 }
-fn claim(value: u128, created: u64, edges: &[(Kind, u128)]) -> ClaimState {
+pub(super) fn claim(value: u128, created: u64, edges: &[(Kind, u128)]) -> ClaimState {
     let mut definition: ClaimDefinition = crate::lifecycle::claim::tests::definition(4);
     definition.binding.object = ObjectId::from_u128(value);
     definition.binding.content = ContentHash([u8::try_from(value).unwrap(); 32]);
@@ -56,7 +56,7 @@ fn post(claim: &mut ClaimState) {
         )
         .unwrap();
 }
-fn cancel(claim: &mut ClaimState, sequence: u64) {
+pub(super) fn cancel(claim: &mut ClaimState, sequence: u64) {
     claim
         .apply(
             &claim.binding(),
@@ -70,7 +70,7 @@ fn cancel(claim: &mut ClaimState, sequence: u64) {
         )
         .unwrap();
 }
-fn local(claim: &mut ClaimState) {
+pub(super) fn local(claim: &mut ClaimState) {
     crate::lifecycle::claim::tests::local_projection_for_graph(claim);
 }
 

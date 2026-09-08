@@ -1,12 +1,13 @@
 use super::*;
 use crate::native::prepare::{Extra, Extras, Scratch};
-use focal_model::lifecycle::{claim::ClaimCut, graph};
+use focal_model::lifecycle::claim::ClaimCut;
+use focal_model::{Deadline, MonitorId, TimerId, WaitPredicate};
 
 fn prepared_plan(
     owner: &NativeOwner,
     expected: Binding,
     outcome: NativeOutcome,
-) -> (transactions::Plan, Extras, NativeLimits) {
+) -> (transactions::Plan, Extras, NativeLimits, usize) {
     let mut limits = f::core().limits;
     limits.plan_edges = 65_536;
     let source = owner.committed();
@@ -28,34 +29,42 @@ fn prepared_plan(
         &mut scratch,
     )
     .unwrap();
-    crate::native::scope_release::check_journal(
+    let index_rows = extras.rows.len();
+    crate::native::scope_release::check_journal_with_monitors(
         &plan.rows,
         &extras,
         source.source_view(),
         outcome,
         limits,
+        index_rows,
     )
     .unwrap();
-    (plan, extras, limits)
+    (plan, extras, limits, index_rows)
 }
 
 #[test]
 fn release_journal_requires_original_unique_owner_fact_and_ordered_actual_graph_consequences() {
     let mut owner = tree();
     for id in [4, 5] {
-        let mut dependent = f::creation(50 + id, id, &[], None);
-        let NativeCommand::Create { claims, .. } = &mut dependent.command else {
-            panic!("created dependent")
-        };
-        claims[0].definition.graph = graph::Declaration::new(
-            &[graph::Obligation {
-                kind: graph::Kind::DependsOn,
-                target: ClaimId::from_u128(3),
-            }],
-            1,
-        )
-        .unwrap();
-        commit(&mut owner, dependent);
+        commit(&mut owner, f::creation(50 + id, id, &[], None));
+        let expected = binding(&owner, id);
+        commit(
+            &mut owner,
+            NativeInput {
+                request: f::request(f::ISSUER, 60 + id),
+                command: NativeCommand::RegisterMonitor {
+                    expected,
+                    receipt: None,
+                    id: MonitorId::from_u128(70 + id),
+                    roots: vec![WaitPredicate::Released(ClaimId::from_u128(3))],
+                    deadline: Deadline {
+                        timer: TimerId::from_u128(80 + id),
+                        generation: 1,
+                        at: 1000,
+                    },
+                },
+            },
+        );
     }
     let expected = binding(&owner, 1);
     commit(
@@ -73,11 +82,25 @@ fn release_journal_requires_original_unique_owner_fact_and_ordered_actual_graph_
             .status(),
         ClaimStatus::Generated
     );
+    // Cancellation settles dependency failures immediately. These explicit
+    // Released predicates remain pending until the terminal leaf is released.
+    for id in [4, 5] {
+        assert!(
+            owner
+                .committed()
+                .claim(ClaimId::from_u128(id))
+                .unwrap()
+                .scopes()
+                .monitor(MonitorId::from_u128(70 + id))
+                .unwrap()
+                .active()
+        );
+    }
     let expected = binding(&owner, 3);
     let (candidate, outcome) = stage(&mut owner, release(expected, f::ISSUER, 51));
     let source = owner.committed();
     let view = source.source_view();
-    let (healthy, extras, limits) = prepared_plan(&owner, expected, outcome);
+    let (healthy, extras, limits, _) = prepared_plan(&owner, expected, outcome);
     let facts = extras.journal.as_ref().unwrap();
     assert_eq!(healthy.rows.len(), 3);
     assert_eq!(facts.len(), 3);
@@ -91,7 +114,14 @@ fn release_journal_requires_original_unique_owner_fact_and_ordered_actual_graph_
     assert!(matches!(
         facts[1],
         NativeFact::Claim(NativeClaimEvent {
-            kind: NativeEventKind::DependencyFailed,
+            kind: NativeEventKind::Monitor(NativeMonitorEvent::Released { .. }),
+            ..
+        })
+    ));
+    assert!(matches!(
+        facts[2],
+        NativeFact::Claim(NativeClaimEvent {
+            kind: NativeEventKind::Monitor(NativeMonitorEvent::Released { .. }),
             ..
         })
     ));
@@ -118,7 +148,7 @@ fn release_journal_requires_original_unique_owner_fact_and_ordered_actual_graph_
     let budget = owner.budget_stats();
     let range = owner.range_stats();
     for corruption in 0..11 {
-        let (mut plan, mut extras, _) = prepared_plan(&owner, expected, outcome);
+        let (mut plan, mut extras, _, index_rows) = prepared_plan(&owner, expected, outcome);
         let mut altered = outcome;
         match corruption {
             0 => extras.journal = None,
@@ -192,8 +222,10 @@ fn release_journal_requires_original_unique_owner_fact_and_ordered_actual_graph_
             _ => unreachable!(),
         }
         assert!(
-            crate::native::scope_release::check_journal(&plan.rows, &extras, view, altered, limits)
-                .is_err(),
+            crate::native::scope_release::check_journal_with_monitors(
+                &plan.rows, &extras, view, altered, limits, index_rows
+            )
+            .is_err(),
             "corruption {corruption}"
         );
     }

@@ -30,6 +30,9 @@ mod directory_tests;
 #[path = "range_envelope_tests.rs"]
 mod envelope_tests;
 #[cfg(test)]
+#[path = "range_funded_input_tests.rs"]
+mod funded_input_tests;
+#[cfg(test)]
 #[path = "range_funding_tests.rs"]
 mod funding_tests;
 #[path = "range_groups.rs"]
@@ -37,7 +40,8 @@ mod groups;
 #[path = "range_hydration.rs"]
 mod hydration;
 pub use hydration::{
-    RangeHydration, RangeHydrationLimits, RangeHydrationLookup, RangeHydrationSource, RangeHydrationView,
+    RangeHydration, RangeHydrationLimits, RangeHydrationLookup, RangeHydrationSource,
+    RangeHydrationView,
 };
 #[cfg(test)]
 #[path = "range_import_tests.rs"]
@@ -174,7 +178,7 @@ pub(crate) struct Page<K, V> {
 // early return, including failure before the first page is allocated.
 struct PendingChanges<K, V> {
     changes: std::vec::IntoIter<Change<K, V>>,
-    _reservation: crate::Reservation,
+    _allocation: Allocation,
 }
 
 struct PartitionFunding<'a, K, P> {
@@ -542,13 +546,14 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
 
     fn prepare_planned_with<F>(
         &self,
-        plan: RangePreparationPlan<'_, K, V>,
+        funded: preflight::FundedPreparation<'_, K, V>,
         source: &MemoryBudget,
         copy: &mut F,
     ) -> Result<PreparedRange<K, V>, MemoryError>
     where
         F: FnMut(&V) -> Result<V, MemoryError>,
     {
+        let preflight::FundedPreparation { plan, input } = funded;
         let RangePreparationPlan {
             base,
             prefix,
@@ -561,11 +566,7 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
         } = plan;
         let mut pending = PendingChanges {
             changes: changes.into_iter(),
-            _reservation: source.reserve(
-                BudgetKind::Pending,
-                lane,
-                charges.input_pending_bytes(),
-            )?,
+            _allocation: input,
         };
         // The plan bounds cumulative node construction, but only actual node
         // allocations spend that allowance. Shared subtrees keep their permits.

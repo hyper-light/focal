@@ -1,6 +1,10 @@
 //! Complete borrowed monitor registry snapshots. The model restores dispositions
 //! from recorded cuts; recovery never repeats discovery against today's graph.
-use super::{bytes::{Cursor, Error}, read_fields as fields, read_source::{Meter, Span, Values}};
+use super::{
+    bytes::{Cursor, Error},
+    read_fields as fields,
+    read_source::{Meter, Span, Values},
+};
 use focal_model::lifecycle::{ContractError, scope};
 use focal_model::{ClaimId, MonitorId, WaitPredicate};
 
@@ -26,7 +30,10 @@ pub(super) fn predicate(c: &mut Cursor<'_>) -> Result<WaitPredicate, Error> {
     }
 }
 fn child(c: &mut Cursor<'_>) -> Result<scope::OwnedChildSnapshotV1, Error> {
-    Ok(scope::OwnedChildSnapshotV1 { binding: fields::binding(c)?, registered: fields::sequence(c)? })
+    Ok(scope::OwnedChildSnapshotV1 {
+        binding: fields::binding(c)?,
+        registered: fields::sequence(c)?,
+    })
 }
 fn scope<'a>(c: &mut Cursor<'a>) -> Result<Scope<'a>, Error> {
     let id = MonitorId(c.fixed()?);
@@ -39,7 +46,17 @@ fn scope<'a>(c: &mut Cursor<'a>) -> Result<Scope<'a>, Error> {
     })?;
     let last_rebinding = fields::optional(c, fields::rebinding)?;
     let roots = Span::read_fixed(c, 17)?;
-    Ok(Scope { fields: scope::ScopeSnapshotV1 { id, roots: roots.count, deadline, registered, disposition, last_rebinding }, roots })
+    Ok(Scope {
+        fields: scope::ScopeSnapshotV1 {
+            id,
+            roots: roots.count,
+            deadline,
+            registered,
+            disposition,
+            last_rebinding,
+        },
+        roots,
+    })
 }
 impl<'a> Registry<'a> {
     pub(super) fn read(c: &mut Cursor<'a>) -> Result<Self, Error> {
@@ -50,35 +67,80 @@ impl<'a> Registry<'a> {
         let scopes = Span::read_with(c, scope)?;
         let children = Span::read_fixed(c, 96)?;
         Ok(Self {
-            fields: scope::RegistrySnapshotV1 { owner, limits, scopes: scopes.count, children: children.count, released, last_cut },
-            scopes, children,
+            fields: scope::RegistrySnapshotV1 {
+                owner,
+                limits,
+                scopes: scopes.count,
+                children: children.count,
+                released,
+                last_cut,
+            },
+            scopes,
+            children,
         })
     }
     pub(super) fn source<'m>(&self, meter: &'m Meter) -> RegistrySource<'m, 'a> {
         RegistrySource { raw: *self, meter }
     }
 }
-pub(super) struct RegistrySource<'m, 'a> { raw: Registry<'a>, meter: &'m Meter }
-pub(super) struct ScopeSource<'m, 'a> { raw: Scope<'a>, meter: &'m Meter }
-pub(super) struct Scopes<'m, 'a> { values: Values<'m, 'a, Scope<'a>>, meter: &'m Meter }
+pub(super) struct RegistrySource<'m, 'a> {
+    raw: Registry<'a>,
+    meter: &'m Meter,
+}
+pub(super) struct ScopeSource<'m, 'a> {
+    raw: Scope<'a>,
+    meter: &'m Meter,
+}
+pub(super) struct Scopes<'m, 'a> {
+    values: Values<'m, 'a, Scope<'a>>,
+    meter: &'m Meter,
+}
 impl<'m, 'a> Iterator for Scopes<'m, 'a> {
     type Item = Result<ScopeSource<'m, 'a>, ContractError>;
     fn next(&mut self) -> Option<Self::Item> {
-        self.values.next().map(|raw| raw.map(|raw| ScopeSource { raw, meter: self.meter }))
+        self.values.next().map(|raw| {
+            raw.map(|raw| ScopeSource {
+                raw,
+                meter: self.meter,
+            })
+        })
     }
 }
 impl scope::ScopeSnapshotSource for ScopeSource<'_, '_> {
-    fn fields(&self) -> scope::ScopeSnapshotV1 { self.raw.fields }
-    type Roots<'a> = Values<'a, 'a, WaitPredicate> where Self: 'a;
-    fn roots(&self) -> Self::Roots<'_> { Values::new(self.raw.roots, self.meter, predicate) }
+    fn fields(&self) -> scope::ScopeSnapshotV1 {
+        self.raw.fields
+    }
+    type Roots<'a>
+        = Values<'a, 'a, WaitPredicate>
+    where
+        Self: 'a;
+    fn roots(&self) -> Self::Roots<'_> {
+        Values::new(self.raw.roots, self.meter, predicate)
+    }
 }
 impl scope::RegistrySnapshotSource for RegistrySource<'_, '_> {
-    fn fields(&self) -> scope::RegistrySnapshotV1 { self.raw.fields }
-    type Scope<'a> = ScopeSource<'a, 'a> where Self: 'a;
-    type Scopes<'a> = Scopes<'a, 'a> where Self: 'a;
-    type Children<'a> = Values<'a, 'a, scope::OwnedChildSnapshotV1> where Self: 'a;
-    fn scopes(&self) -> Self::Scopes<'_> {
-        Scopes { values: Values::new(self.raw.scopes, self.meter, scope), meter: self.meter }
+    fn fields(&self) -> scope::RegistrySnapshotV1 {
+        self.raw.fields
     }
-    fn children(&self) -> Self::Children<'_> { Values::new(self.raw.children, self.meter, child) }
+    type Scope<'a>
+        = ScopeSource<'a, 'a>
+    where
+        Self: 'a;
+    type Scopes<'a>
+        = Scopes<'a, 'a>
+    where
+        Self: 'a;
+    type Children<'a>
+        = Values<'a, 'a, scope::OwnedChildSnapshotV1>
+    where
+        Self: 'a;
+    fn scopes(&self) -> Self::Scopes<'_> {
+        Scopes {
+            values: Values::new(self.raw.scopes, self.meter, scope),
+            meter: self.meter,
+        }
+    }
+    fn children(&self) -> Self::Children<'_> {
+        Values::new(self.raw.children, self.meter, child)
+    }
 }

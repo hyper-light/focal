@@ -107,13 +107,24 @@ impl OwnedResponse {
     /// Restore retained positions after model body hydration. This checks the
     /// complete relative lifecycle and immutable original generation binding;
     /// the importer separately proves the original events and full history.
-    pub(super) fn hydrate(response: Response, generated: focal_model::lifecycle::Binding,
-        received: Option<PublicationPosition>, entered: Option<PublicationPosition>) -> Result<Self, NativeError> {
+    pub(super) fn hydrate(
+        response: Response,
+        generated: focal_model::lifecycle::Binding,
+        received: Option<PublicationPosition>,
+        entered: Option<PublicationPosition>,
+    ) -> Result<Self, NativeError> {
         let current = response.identity().binding;
-        if (generated.ledger, generated.object, generated.content) != (current.ledger, current.object, current.content) {
+        if (generated.ledger, generated.object, generated.content)
+            != (current.ledger, current.object, current.content)
+        {
             return Err(ContractError::ContentConflict.into());
         }
-        let record = NativeResponseRecord { response, generated_revision: generated.revision, received, entered };
+        let record = NativeResponseRecord {
+            response,
+            generated_revision: generated.revision,
+            received,
+            entered,
+        };
         record.check()?;
         Ok(Self::wrap(record)?)
     }

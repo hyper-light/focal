@@ -705,6 +705,7 @@ fn owned_event_copy_preserves_exact_history_after_original_is_dropped() {
         sequence: SessionSeq(1),
         ordinal: 0,
         fact: NativeFact::Claim(NativeClaimEvent {
+            graph: None,
             kind: NativeEventKind::Created,
             before: None,
             after: claim.binding(),

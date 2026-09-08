@@ -4,28 +4,53 @@ use super::{CodecError, bytes::Cursor};
 use focal_model::lifecycle::ContractError;
 use std::cell::Cell;
 
+#[cfg(test)]
+#[path = "read_source_tests.rs"]
+mod tests;
+
 pub(super) struct Meter {
     remaining: Cell<usize>,
 }
 impl Meter {
     pub(super) fn new(visits: usize) -> Self {
-        Self { remaining: Cell::new(visits) }
+        Self {
+            remaining: Cell::new(visits),
+        }
     }
-    pub(super) fn remaining(&self) -> usize { self.remaining.get() }
+    pub(super) fn remaining(&self) -> usize {
+        self.remaining.get()
+    }
     pub(super) fn charge(&self, amount: usize) -> Result<(), CodecError> {
-        self.remaining.set(self.remaining.get().checked_sub(amount).ok_or(CodecError::Capacity)?);
+        self.remaining.set(
+            self.remaining
+                .get()
+                .checked_sub(amount)
+                .ok_or(CodecError::Capacity)?,
+        );
         Ok(())
     }
-    /// The local cursor receives only the remaining shared allowance. Reconcile
-    /// consumed work on success and refusal before another callback can run.
+    /// Loan the remaining allowance exclusively to the local cursor. A nested
+    /// use of this same meter cannot spend work already offered to that cursor.
+    /// Reconcile consumed work on success and refusal before the next callback.
     pub(super) fn read<'a, T>(
         &self,
         bytes: &'a [u8],
         read: impl FnOnce(&mut Cursor<'a>) -> Result<T, CodecError>,
     ) -> Result<(T, usize), CodecError> {
-        let mut cursor = Cursor::new(bytes, bytes.len(), self.remaining())?;
+        let available = self.remaining.replace(0);
+        let mut cursor = match Cursor::new(bytes, bytes.len(), available) {
+            Ok(cursor) => cursor,
+            Err(error) => {
+                self.remaining.set(available);
+                return Err(error);
+            }
+        };
         let value = read(&mut cursor);
-        self.charge(cursor.visits_used())?;
+        self.remaining.set(
+            available
+                .checked_sub(cursor.visits_used())
+                .ok_or(CodecError::Capacity)?,
+        );
         value.map(|value| (value, cursor.offset()))
     }
     /// Model plans report successful inspection work. A refused inspection has
@@ -34,21 +59,27 @@ impl Meter {
         &self,
         prepare: impl FnOnce(usize) -> Result<(T, usize), ContractError>,
     ) -> Result<T, ContractError> {
-        let available = self.remaining();
+        let available = self.remaining.replace(0);
         match prepare(available) {
-            Ok((value, used)) => { self.charge(used).map_err(model_error)?; Ok(value) }
-            Err(error) => { self.charge(available).map_err(model_error)?; Err(error) }
+            Ok((value, used)) => {
+                self.remaining
+                    .set(available.checked_sub(used).ok_or(ContractError::Capacity)?);
+                Ok(value)
+            }
+            Err(error) => Err(error),
         }
     }
     pub(super) fn budget<T>(
         &self,
         action: impl FnOnce(&mut focal_model::lifecycle::graph::VisitBudget) -> Result<T, ContractError>,
     ) -> Result<T, ContractError> {
-        let available = self.remaining();
+        let available = self.remaining.replace(0);
         let mut visits = focal_model::lifecycle::graph::VisitBudget::new(available);
         let result = action(&mut visits);
-        self.charge(available.checked_sub(visits.remaining()).ok_or(ContractError::Capacity)?)
-            .map_err(model_error)?;
+        if visits.remaining() > available {
+            return Err(ContractError::Capacity);
+        }
+        self.remaining.set(visits.remaining());
         result
     }
 }
@@ -69,7 +100,10 @@ impl<'a> Span<'a> {
     pub(super) fn read_fixed(cursor: &mut Cursor<'a>, width: usize) -> Result<Self, CodecError> {
         let count = cursor.count(cursor.remaining())?;
         let length = count.checked_mul(width).ok_or(CodecError::Capacity)?;
-        Ok(Self { count, bytes: cursor.take(length)? })
+        Ok(Self {
+            count,
+            bytes: cursor.take(length)?,
+        })
     }
     pub(super) fn read_with<T>(
         cursor: &mut Cursor<'a>,
@@ -79,9 +113,17 @@ impl<'a> Span<'a> {
         let tail = cursor.unread();
         let start = cursor.offset();
         cursor.visit(count.checked_add(1).ok_or(CodecError::Capacity)?)?;
-        for _ in 0..count { read(cursor)?; }
-        let length = cursor.offset().checked_sub(start).ok_or(CodecError::Capacity)?;
-        Ok(Self { count, bytes: tail.get(..length).ok_or(CodecError::Truncated)? })
+        for _ in 0..count {
+            read(cursor)?;
+        }
+        let length = cursor
+            .offset()
+            .checked_sub(start)
+            .ok_or(CodecError::Capacity)?;
+        Ok(Self {
+            count,
+            bytes: tail.get(..length).ok_or(CodecError::Truncated)?,
+        })
     }
 }
 
@@ -92,19 +134,32 @@ pub(super) struct Values<'m, 'a, T> {
     finished: bool,
 }
 impl<'m, 'a, T> Values<'m, 'a, T> {
-    pub(super) fn new(span: Span<'a>, meter: &'m Meter, read: fn(&mut Cursor<'a>) -> Result<T, CodecError>) -> Self {
-        Self { span, meter, read, finished: false }
+    pub(super) fn new(
+        span: Span<'a>,
+        meter: &'m Meter,
+        read: fn(&mut Cursor<'a>) -> Result<T, CodecError>,
+    ) -> Self {
+        Self {
+            span,
+            meter,
+            read,
+            finished: false,
+        }
     }
 }
 impl<T> Iterator for Values<'_, '_, T> {
     type Item = Result<T, ContractError>;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.finished { return None; }
+        if self.finished {
+            return None;
+        }
         let value = (|| {
             self.meter.charge(1)?;
             if self.span.count == 0 {
                 self.finished = true;
-                if !self.span.bytes.is_empty() { return Err(CodecError::TrailingBytes); }
+                if !self.span.bytes.is_empty() {
+                    return Err(CodecError::TrailingBytes);
+                }
                 return Ok(None);
             }
             let (value, offset) = self.meter.read(self.span.bytes, self.read)?;
@@ -115,7 +170,10 @@ impl<T> Iterator for Values<'_, '_, T> {
         match value {
             Ok(Some(value)) => Some(Ok(value)),
             Ok(None) => None,
-            Err(error) => { self.finished = true; Some(Err(model_error(error))) }
+            Err(error) => {
+                self.finished = true;
+                Some(Err(model_error(error)))
+            }
         }
     }
 }

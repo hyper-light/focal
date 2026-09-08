@@ -1,6 +1,6 @@
 # Native recorded mutations and recovery construction
 
-Status: dormant implementation, 2026-09-07. The running service still selects
+Status: dormant version 2 implementation, 2026-09-08. The running service still selects
 the frozen V1 application format. This document describes the new
 [record encoder](../../crates/focal-core/src/native/record_codec.rs), its
 allocation-free outer inspector and the construction boundary needed by recovery.
@@ -34,7 +34,7 @@ The ordered envelope is:
 | Field | Encoding |
 |---|---|
 | Magic | Eight bytes, `FCMUTATE` |
-| Version | `u16`, currently 1 |
+| Version | `u16`, currently 2 |
 | Content profile | `u8`: 0 projection-only; 1 complete authored V1 descriptors |
 | Ledger | Tenant ID followed by session ID, 16 bytes each |
 | Original range incarnation | 16-byte little-endian `RangeId` |
@@ -42,7 +42,7 @@ The ordered envelope is:
 | Exact outcome | Full outcome described below |
 | Changed-row count | `u32`, positive |
 | Changes | Exactly the declared number, in strictly increasing native key order |
-| Digest | 32-byte BLAKE3 digest of every preceding byte, derive-key context `focal.native.record.v1` |
+| Digest | 32-byte BLAKE3 digest of every preceding byte, derive-key context `focal.native.record.v2` |
 
 An outcome contains its ledger, namespaced invocation, native sequence, logical
 time, explicit operation tag, intent hash, and ten `u32` change counts: created
@@ -81,20 +81,29 @@ grammar with mutations but has a separate envelope:
 | Field | Encoding |
 |---|---|
 | Magic | Eight bytes, `FCNROOTS` |
-| Version | `u16`, currently 1 |
+| Version | `u16`, currently 2 |
 | Content profile | Same explicit profile tags as mutations |
 | Ledger | Tenant ID and session ID |
 | Original range incarnation | 16-byte little-endian `RangeId` |
 | Native prefix | `u64` |
 | Complete retained row count | `u64`, checked against decoder limits and host capacity |
 | Rows | Strictly ordered puts using the shared typed-key/body grammar |
-| Digest | BLAKE3 of all preceding bytes, derive-key context `focal.native.checkpoint.v1` |
+| Digest | BLAKE3 of all preceding bytes, derive-key context `focal.native.checkpoint.v2` |
 
 Genesis has prefix zero and no rows. A nonzero prefix requires a nonempty root,
 Meta and at least one retained outcome. Checkpoints reject deletions. The outer
 inspector enforces these structural conditions and exact row count, without
 treating them as proof of complete history or a valid model. Checkpoint and
 mutation envelopes cannot be substituted for one another.
+
+Version 2 adds the actual graph capture boundary to recorded claim consequences.
+The preceding dormant version 1 did not retain enough information to verify a
+graph consequence against its original snapshot: a batch can emit several facts
+from one capture, while a monitor or timer can capture again between facts.
+The current native inspector refuses the older envelope version explicitly;
+it does not guess a capture boundary or relabel old bytes. Neither dormant
+version has been activated in Session. The frozen live V1 application, wire,
+checkpoint and hash formats are separate and remain unchanged.
 
 The plan allocates no whole-root staging buffer, row index, snapshot or extra
 owner. It can write to an exactly sized, caller-funded destination or stream
@@ -219,9 +228,11 @@ owner, snapshot or pin. The verified native prefix is bound and the new owner
 returned only after exact cardinality and validation succeed.
 
 The [native checkpoint adapter](../../crates/focal-core/src/native/record_codec/recovery.rs)
-now connects complete body readers to this construction boundary. The current
-source increment is awaiting its consolidated qualification pass; the historical
-checks in [09](09-implementation-status.md) do not qualify these new readers.
+now connects complete body readers to this construction boundary. Its executed
+checkpoint qualification is recorded in
+[09](09-implementation-status.md#native-checkpoint-restoration--2026-09-07).
+The subsequent incremental replay qualification is recorded separately in
+[09](09-implementation-status.md#native-incremental-replay-and-restored-owner-qualification--2026-09-08).
 
 ### Native checkpoint restoration
 
@@ -286,6 +297,10 @@ and its entire temporary peak participates in recovery memory admission.
 
 Parsing, model work, source callbacks and dependency lookup use separate
 cumulative allowances across all phases and both preparation/build passes.
+An opaque cursor or model inspection exclusively borrows its offered work
+allowance; nested use of that same meter cannot spend it concurrently. Known
+model work can instead be debited in advance, leaving a separate remainder for
+source callbacks. Refused inspections retain their consumed work charges.
 Failure retains its original cause while dropping provisional rows, pages and
 scratch. The byte buffers containing the checkpoint remain caller-owned and
 must stay funded until restoration ends. No new per-object Arc is introduced;
@@ -300,15 +315,82 @@ the trusted checkpoint/log chain and original-to-fresh incarnation mapping.
 Restoration never invents missing historical roots or reruns today's authority
 to fill that gap.
 
+### Incremental native replay construction
+
+The current [replay implementation](../../crates/focal-core/src/native/record_codec/replay.rs)
+prepares one recorded mutation against the actual preceding Core. Its successor
+validation, replay and restored-owner component checks are qualified in
+[09](09-implementation-status.md#native-incremental-replay-and-restored-owner-qualification--2026-09-08).
+It is not registered with the running Session/WAL decoder.
+
+The enclosing recovery chain supplies the expected original range incarnation.
+Replay requires the recorded ledger, content profile, source incarnation and
+base prefix to match before construction. The returned candidate uses the
+current local Core incarnation; the original header and hash remain properties
+of the caller-owned log record. Publication still requires that same preceding
+root. This API never replays the participant command or uses current authority
+to reinterpret an old action.
+
+One canonical buffer retains the bounded mutation's borrowed encoded rows and
+their owned decoded values. A changed key takes precedence over the old root
+even while its row has not been built; a pending or deleted key cannot silently
+resolve to its predecessor. Unchanged acceptance policies are borrowed from the
+actual preceding claims. Changed claim policies are prepared from their original
+recorded bodies, with temporary construction funded separately.
+
+The same eight dependency phases construct the changed rows. A transaction-local
+scalar event index supplies original artifact publication coordinates and object
+history within this record. It does not copy event bodies or index the complete
+ledger. Existing content must pass the same read-only custody verification as
+checkpoint restoration. All row heaps share one transaction accounting owner;
+there is no retained accounting handle or reference-counted owner per row.
+
+Successor validation must preserve the already-validated base, reconcile exact
+metadata and outcome deltas, and check new event chains, indices, aggregates,
+seals and audit coverage against affected objects. Resumed validation cursors
+borrow their immutable declaration and retain their actual previous attempt,
+failure, programmatic evidence, suppression and seal state. They do not rescan
+every historical attempt or invoke a handler.
+
+Graph consequences retain `NativeGraphCapture { before_ordinal }`. That boundary
+includes precisely the current mutation's events with smaller ordinals, together
+with the already validated base. Facts produced by one frozen graph evaluation
+share its capture boundary; a subsequent recapture records its own boundary.
+The deadlock cut already retains the original trigger binding, separately from
+the selected victim, so replay does not introduce another trigger identity.
+Canonical graph verification must use that exact capture, including original
+path or strongly connected component witnesses. Searching older prefixes for
+any matching fingerprint would admit a stale witness and is forbidden.
+Control captures include every original creation/cancellation/posting root,
+including disconnected correction successors. Monitor releases are checked
+against the active roots before their event; timer consequences require the
+selected monitor to remain active with an unsettled predicate at its capture.
+Ordinary dependency and satisfaction propagation also occurs without monitors.
+A new claim that immediately fails retains its original empty registration
+membership before the independent cohort-seal suffix.
+
+After validation, rows move into the existing range preparation path. The
+captured write set and final candidate remain separate funded owners; only
+retained neighbors of touched pages are copied. Decoder buffers, row heaps,
+construction workspace and new pages remain charged through their handoffs.
+Range preparation accepts the already held, exact input permit from that same
+budget and lane. Its drop-ordered owner keeps rows funded on every failure;
+the incoming vector and payloads do not incur a second admission charge.
+Every refusal must leave the preceding root and its pinned reads unchanged.
+The record format can express deletion, but current native lifecycle operations
+retain their rows and history; physical deletion requires a separately defined
+retention operation and its successor invariants.
+
 Native integration still requires:
 
-1. Consolidated qualification of the connected decoder, root validator and
-   restart path, including arbitrary allocation/work refusals and corrupted
-   bodies with recomputed outer checksums. Reconstruct completion entitlements
-   from the restored owner before accepting new traffic.
-2. Mutation application against the exact preceding root, including deletions,
-   partial row changes and whole-prefix consistency. A checkpoint loader is not
-   an incremental redo implementation.
+1. Integrate the qualified restored-Core/`NativeOwner::with_schemas` path into
+   service startup before accepting new traffic. Evaluator and respondent RAM
+   credit recovery is covered by component pressure tests; complete service
+   recovery and durable completion-buffer funding remain required.
+2. Connect the qualified exact-predecessor mutation application to the trusted
+   durable log chain and map original range incarnations into restored owners.
+   Retention/deletion still needs its own operation and invariants; no current
+   native lifecycle operation physically deletes retained history.
 3. Online checkpoint ownership and the enclosing Session checkpoint metadata;
    encoded-buffer funding and the exact record-hash/ticket/Raft-index/native-prefix
    mapping. Publish committed heads only and discard only resolved suffixes.

@@ -6,7 +6,9 @@
 //! Structural inspection does not prove model validity, complete history, local
 //! evidence custody or permission to publish a recovered root.
 pub mod checkpoint;
-pub mod recovery;
+mod buffer;
+pub use buffer::FundedRecord;
+pub(in crate::native) use buffer::{PendingRecord, future as future_record_bytes};
 mod events;
 mod evidence;
 mod fixed;
@@ -20,16 +22,33 @@ mod read_evaluation;
 mod read_events;
 mod read_evidence;
 mod read_fields;
+mod read_history;
 mod read_index;
 mod read_rows;
 mod read_scopes;
 mod read_source;
-mod read_validate_audit;
 mod read_validate;
+mod read_validate_aggregate;
+mod read_validate_attempts;
+mod read_validate_audit;
+mod read_validate_evidence;
+pub mod recovery;
+pub mod replay;
+mod replay_index;
+mod replay_projection;
+mod replay_validate;
 mod rows;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(in crate::native) fn check_recorded_operation(
+    operation: NativeOperation,
+    fact: NativeFact,
+) -> Result<(), NativeError> {
+    replay_validate::check_operation_test(operation, fact)
+}
 
 use super::input_codec::{bytes, descriptors, types};
 use super::*;
@@ -43,8 +62,10 @@ pub use inspect::{
 };
 
 pub const MAGIC: [u8; 8] = *b"FCMUTATE";
-pub const VERSION: u16 = 1;
-const HASH_DOMAIN: &str = "focal.native.record.v1";
+// Version 2 records the actual graph snapshot boundary on consequence events.
+// These dormant native bytes are separate from the frozen live V1 formats.
+pub const VERSION: u16 = 2;
+const HASH_DOMAIN: &str = "focal.native.record.v2";
 
 #[derive(Debug, Clone, Copy)]
 pub struct EncodingLimits {

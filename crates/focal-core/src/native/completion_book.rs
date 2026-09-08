@@ -180,6 +180,7 @@ impl DeadlineLoan<'_> {
 
 #[derive(Debug)]
 pub(super) struct CompletionBook {
+    record_buffers: Option<record_codec::EncodingLimits>,
     entries: CompletionIndex<Grant>,
     respondents: CompletionIndex<RespondentGrant, RespondentKey>,
     protections: protections::Protections,
@@ -229,6 +230,7 @@ fn demand(envelope: CompletionEnvelope, credit: Credit) -> Result<Totals, Native
 impl Totals {
     fn replace(self, old: Self, new: Self) -> Result<Self, NativeError> {
         Ok(Self {
+            record_buffers: None,
             retained: add(sub(self.retained, old.retained)?, new.retained)?,
             workspace: self.workspace.max(new.workspace),
             reports: add(sub(self.reports, old.reports)?, new.reports)?,
@@ -260,6 +262,10 @@ impl CompletionBook {
 
     pub(super) fn source(&self) -> &MemoryBudget {
         self.pool.budget()
+    }
+    pub(super) fn with_record_buffers(mut self, limits: record_codec::EncodingLimits) -> Self {
+        self.record_buffers = Some(limits);
+        self
     }
     pub(super) fn check_health(&self) -> Result<(), NativeError> {
         self.entries.check_health()?;
@@ -392,6 +398,10 @@ impl CompletionBook {
         registration_index: usize,
         members: Option<GraphMembers>,
     ) -> Result<Journal, NativeError> {
+        let envelope = match self.record_buffers {
+            Some(limits) => envelope.with_record_buffers(limits)?,
+            None => envelope,
+        };
         if !envelope.supports_target(key.target)
             || envelope.has_graph() != members.is_some()
             || key.validation.0 != binding.object.0

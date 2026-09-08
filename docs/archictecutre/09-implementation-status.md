@@ -1,6 +1,6 @@
 # Implementation evidence and remaining work
 
-Updated 2026-09-07. The objective is the complete P00–P20 plan: the original P00–P16 scope plus the user's manual CLI, skills, MCP, challenge and consultation extension in [13](13-cli-and-agent-implementation-plan.md). This record distinguishes executable components from integration and deployment qualification. No package is marked complete merely because its crate compiles. Imported Hecate references remain unchanged. The current execution boundary is strictly peer-to-peer: Focal records claims, testament/artifact evidence and authenticated verdicts; participants invoke their own validating tools/skills or request evaluation from another peer through ordinary claims. Focal is not an agent/worker launcher or model-job scheduler. Existing optional execution helpers do not make participant execution a daemon responsibility.
+Updated 2026-09-08. The objective is the complete P00–P20 plan: the original P00–P16 scope plus the user's manual CLI, skills, MCP, challenge and consultation extension in [13](13-cli-and-agent-implementation-plan.md). This record distinguishes executable components from integration and deployment qualification. No package is marked complete merely because its crate compiles. Imported Hecate references remain unchanged. The current execution boundary is strictly peer-to-peer: Focal records claims, testament/artifact evidence and authenticated verdicts; participants invoke their own validating tools/skills or request evaluation from another peer through ordinary claims. Focal is not an agent/worker launcher or model-job scheduler. Existing optional execution helpers do not make participant execution a daemon responsibility.
 
 A source audit identifies a real four-family lifecycle gap in the active V1
 storage profile. Claim status/history and durable validation attempts exist, but testament lifecycle is
@@ -105,7 +105,14 @@ precharged range hydration and checked scalar validation restoration. The latest
 retains actual candidate writes and restores the remaining lifecycle histories.
 The subsequent [record encoding and phased construction increment](#native-record-encoding-and-phased-recovery-construction--2026-09-07)
 encodes those retained facts and adds a dependency-aware detached loader. Native
-row decoding, complete recovery and live server/CLI/MCP activation remain unfinished.
+row decoding and detached checkpoint restoration are now connected in the
+[checkpoint restoration increment](#native-checkpoint-restoration--2026-09-07),
+including history/aggregate validation and the consolidated qualification below.
+The subsequent [incremental replay batch](#native-incremental-replay-and-restored-owner-qualification--2026-09-08)
+connects native mutation construction and adds restored-owner pressure coverage.
+Its qualification status is recorded separately below. Durable service
+integration, completion-buffer funding and live server/CLI/MCP activation remain
+unfinished.
 
 The remaining delivery milestones are substantial and are not equally sized:
 
@@ -131,10 +138,17 @@ The remaining delivery milestones are substantial and are not equally sized:
 5. **Ship and qualify.** Publish and verify client/server binaries, finish platform
    support, execute operator runbooks and fault matrices, and measure capacity.
 
-Work is currently within the first milestone. Existing service, interface,
-networking and replication components provide foundations for the later ones;
-their presence is not evidence that the complete deployment goal is finished.
-No completion percentage or delivery date is established by this record.
+Work currently spans the unfinished lifecycle guarantees in milestone 1 and
+native persistence integration in milestone 2. The next user-visible acceptance gate is a
+two-participant CLI/MCP workflow on the corrected independent lifecycles: explicit
+successful or failed respondent testimony, error artifacts, designated checks,
+derived acceptance, and identical evidence/history after a service restart.
+That gate requires durable service replay and interface integration around the
+qualified Core checkpoint/replay components; component tests cannot satisfy it.
+Existing service, interface, networking and replication components provide
+foundations for later milestones; their presence is not evidence that the
+complete deployment goal is finished. No completion percentage or delivery date
+is established by this record.
 
 | Package | Concrete implementation | Remaining acceptance work |
 |---|---|---|
@@ -4936,7 +4950,7 @@ formatting completed. The last architecture pass checked **946 links**, all
 **37 imported source hashes**, and **15 frozen vocabularies**. These results
 apply to that earlier source increment, not the recovery work below.
 
-## Native checkpoint restoration — implementation awaiting qualification
+## Native checkpoint restoration — 2026-09-07
 
 The source now connects [complete row dispatch](../../crates/focal-core/src/native/record_codec/read_dispatch.rs)
 to [native checkpoint recovery](../../crates/focal-core/src/native/record_codec/recovery.rs).
@@ -4951,24 +4965,107 @@ The implementation resolves the policy/response/claim dependency cycle with a
 temporary funded acceptance policy derived from the original claim body and
 actual declarations. A bounded paged index retains borrowed claim spans and
 original artifact publication coordinates. Root validation uses a funded
-sequence bitmap and scalar history index to check coverage without a full
-event scan per object. Scratch indices drop before owner publication. Artifact
+sequence bitmap, logical-time array and scalar history index to check coverage
+without a full event scan per object. Scratch indices drop before owner publication. Artifact
 custody recovery reads and verifies existing local trees and schemas; it never
 recreates missing content from inline descriptor bytes.
 
-Regression cases are being added for explicit failed testimony with error
-artifacts, each delivery stage, independent validations, cold evidence-store
-reopen, authored content and reused identities, checksum-valid corrupted state,
-missing local evidence, work limits, memory refusal and full refund. **No tests,
-formatting, lint or contract checks have been run for this decoder increment.**
-The user requested completion of the functionality before consolidated
-validation, replacing repeated broad checks after individual edits.
+The complete-root validator checks retained handler retries/fallbacks, quality
+transitions, exact evidence schemas and original result publications. Funded
+model projections derive required outcomes chronologically, reject omitted or
+substituted terminal decisions, and preserve earlier cuts when optional results
+arrive later. Exact native cohort seals, receipt epochs, linked indices, authored
+identity mappings and frozen audit membership are checked before publication.
+Opaque parsers and model inspections borrow work allowances exclusively, so
+nested callbacks cannot spend the same allowance twice.
 
-This remains Core checkpoint restoration source, awaiting qualification. It
-does not supply incremental native mutation replay, completion entitlement
-reconstruction, Session checkpoint provenance, WAL/Raft prefix mapping, decoder
-activation, or live native CLI/MCP dispatch. The final-state checkpoint also
+Qualification on macOS arm64, 2026-09-07: **1,417 affected-library tests passed**
+(787 Core, 476 model, 115 memory and 39 evidence), with **50 new tests** and zero
+failed, ignored or filtered tests in the successful run. These cover explicit
+failed testimony with error artifacts, delivery stages, independent validations,
+cold evidence-store reopen, authored content and reused identities, malformed
+state with recomputed checksums, absent local evidence, cumulative work limits,
+memory refusal and refunds. A restored Core continues response delivery and
+claimant audit generation/posting with the exact uninterrupted history, then
+restores again. Qualification corrected original versus current claim revision
+handling and distinguished declared missing-slot validation results from
+structural missing-work causes. Strict workspace all-target Clippy, the
+production no-panic gate and formatting pass. Architecture checks verify
+**957 links**, all **37 imported source hashes** and **15 frozen vocabularies**.
+The full workspace test suite and other operating systems were not rerun.
+The functionality was connected before this consolidated validation pass;
+subsequent reruns resolved its concrete failures.
+
+This is Core checkpoint restoration. It does not supply incremental native
+mutation replay, Session checkpoint provenance, WAL/Raft prefix mapping, decoder
+activation, or live native CLI/MCP dispatch. The existing
+`NativeOwner::with_schemas` reconstructs evaluator/respondent RAM credits;
+connecting and qualifying that path after checkpoint recovery, and funding
+durable completion buffers, remain service integration work. The final-state checkpoint also
 cannot independently reconstruct every historical graph/root set; observable
 witnesses are checked, and the enclosing service must establish the trusted
 checkpoint/log chain. [22](22-native-record-format.md#native-checkpoint-restoration)
 records the construction order, accounting requirements and remaining integration.
+
+## Native incremental replay and restored-owner qualification — 2026-09-08
+
+This source batch adds [incremental native replay](../../crates/focal-core/src/native/record_codec/replay.rs)
+against an exact predecessor. It checks the ledger, profile, original range
+mapping and adjacent sequence before construction. One funded canonical change
+array masks changed and deleted base rows. Eight dependency phases construct
+the successor with actual local evidence custody, original publication indices,
+retained immutable policy borrowing and bounded changed-event lookups. It
+prepares an unpublished candidate; the enclosing service must still establish
+log provenance, persistence and publication barriers.
+
+Replay validates original object histories, authoring identities, receipt and
+response bindings, independent attempt progress, audit membership, linked
+indices and derived acceptance. Graph consequences retain their exact capture
+ordinal in the original event. A bounded scalar graph reconstruction checks
+canonical dependency paths, SCC decisions, monitor eligibility and release
+fingerprints at that boundary. Control batches preserve their complete original
+root union, including disconnected successors. Validation rejects omitted
+dependency and satisfaction consequences. This exposed a producer defect:
+control propagation previously depended on monitor presence. Create, Cancel
+and Post now settle ordinary dependency consequences independently of monitors.
+A newly created claim that fails in the same transaction retains its actual
+original empty registry before sealing, including the original binding and
+exact seal cut. Legacy and authored creation share this construction path.
+
+The dormant native record and checkpoint envelopes advance explicitly to
+version 2 because prior native events lacked graph capture provenance. Readers
+refuse dormant native version 1 instead of inferring a matching historical
+graph. Frozen live V1 formats, hashes and decoder registration remain unchanged;
+neither dormant native envelope is activated in the running service.
+
+The [range builder](../../crates/focal-memory/src/range_preflight.rs) accepts the
+already held exact input allowance from the same budget, category and lane.
+Incoming payloads move without a second admission charge. Source inputs remain
+funded through destruction on refusals; destination pages and workspaces retain
+their separate charges. Replay still accounts for encoded-row staging and copies
+only retained neighbors of touched pages. No per-object shared owner is added.
+
+New [restored-owner scenarios](../../crates/focal-core/src/native/record_codec/recovery_owner_tests.rs)
+connect actual checkpoint recovery to evaluator retries/quality checks and to
+pending failed respondent testimony, diagnostic closure and posting under full
+parent-memory pressure. They cover constructor refusal, retained credits, exact
+request retries and refunds. These are Core/RAM-owner checks; they do not prove
+WAL/Raft completion-buffer funding or native service restart.
+
+Qualification on macOS arm64, 2026-09-08: **1,460 affected-library tests passed**
+(822 Core, 480 model, 119 memory and 39 evidence), including **43 new tests**,
+with no failed, ignored or filtered tests in the successful runs. The complete
+functionality batch preceded consolidated verification; reruns addressed its
+concrete integration failures. Tests cover exact replay parity and recheckpoint,
+malformed records with recomputed checksums, original graph captures, full
+control membership, corruption refusal, local custody, independent validation
+progress, failed testimony, retained completion credits and memory refunds.
+Strict workspace all-target Clippy, the production no-panic gate, formatting and
+diff checks pass. Architecture checks verify **964 links**, all **37 imported
+source hashes** and **15 frozen vocabularies**. The full workspace test suite,
+Linux and other platforms were not rerun.
+
+Native Session/WAL replay, checkpoint provenance, encoded-buffer funding,
+quorum-prefix mapping and live CLI/MCP activation remain required before the
+two-participant restart acceptance gate. Passing these component tests does not
+qualify live native service recovery, regional deployment or throughput.

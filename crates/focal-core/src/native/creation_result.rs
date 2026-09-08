@@ -58,17 +58,29 @@ fn visit(remaining: &mut usize) -> Result<(), NativeError> {
 impl NativeCreationResult {
     /// Shared scalar restoration/owned-construction checks; no allocation or
     /// authority is conveyed by validating a recorded resolution entry.
-    pub(super) fn check_recorded_entry(entry: NativeCreatedObject, index: usize) -> Result<(), NativeError> {
-        let ordinal = u32::try_from(index).map_err(|_| NativeError::Capacity("creation result ordinal"))?;
-        if entry.ordinal != ordinal { return Err(ContractError::InvalidManifest.into()); }
+    pub(super) fn check_recorded_entry(
+        entry: NativeCreatedObject,
+        index: usize,
+    ) -> Result<(), NativeError> {
+        let ordinal =
+            u32::try_from(index).map_err(|_| NativeError::Capacity("creation result ordinal"))?;
+        if entry.ordinal != ordinal {
+            return Err(ContractError::InvalidManifest.into());
+        }
         if entry.requested.is_zero() || entry.resolved.is_zero() || entry.content.0 == [0; 32] {
             return Err(ContractError::InvalidTarget.into());
         }
-        if entry.schema != 1 { return Err(ContractError::InvalidPolicy.into()); }
+        if entry.schema != 1 {
+            return Err(ContractError::InvalidPolicy.into());
+        }
         Ok(())
     }
-    pub(super) fn recorded_entries_conflict(previous: NativeCreatedObject, entry: NativeCreatedObject) -> bool {
-        previous.family == entry.family && (previous.requested == entry.requested || previous.resolved == entry.resolved)
+    pub(super) fn recorded_entries_conflict(
+        previous: NativeCreatedObject,
+        entry: NativeCreatedObject,
+    ) -> bool {
+        previous.family == entry.family
+            && (previous.requested == entry.requested || previous.resolved == entry.resolved)
     }
     /// Exact scalar validation allowance for `count` distinct entries. Divide
     /// the even factor before multiplication so an intermediate product cannot

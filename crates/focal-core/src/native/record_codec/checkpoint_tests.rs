@@ -324,7 +324,7 @@ fn corrupted_headers_checksums_counts_and_every_truncation_refuse_without_import
         changed[index] ^= 0x80;
         assert!(StructuralCheckpoint::inspect(&changed, inspection(changed.len())).is_err());
     }
-    for (index, replacement) in [(0, 0), (8, 2), (10, 2)] {
+    for (index, replacement) in [(0, 0), (8, 0), (10, 2)] {
         let mut changed = bytes.clone();
         changed[index] = replacement;
         checksum(&mut changed);

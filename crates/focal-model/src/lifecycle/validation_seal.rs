@@ -59,6 +59,34 @@ impl SealTransition {
 }
 
 impl EvaluationState {
+    /// Check a retained cohort stamp against its actual owning claim. This is
+    /// intrinsic recovery validation, not authority to seal or report. Whether
+    /// an absent stamp is legal depends on the evaluation's original terminal
+    /// publication relative to the claim cut and is checked by the importer.
+    pub fn check_recorded_claim_seal(
+        self,
+        declaration: &Declaration,
+        claim: &ClaimState,
+    ) -> Result<(), ContractError> {
+        let evaluation = self.bind(declaration)?;
+        if self.binding.ledger != claim.binding().ledger {
+            return Err(ContractError::WrongLedger);
+        }
+        if evaluation.claim().0 != claim.binding().object.0 {
+            return Err(ContractError::WrongObject);
+        }
+        if let Some(recorded) = self.sealed
+            && recorded != claim_cause(claim)?
+        {
+            return Err(ContractError::InvalidCut);
+        }
+        if let Some(Suppression::CohortSealed(cause)) = self.suppression
+            && self.sealed != Some(cause)
+        {
+            return Err(ContractError::InvalidCut);
+        }
+        Ok(())
+    }
     /// Record this claim's original cohort seal without an actor-supplied owner
     /// frame. The publishing owner must resolve actual registry membership; this
     /// method proves the immutable declaration and claim frame and preserves

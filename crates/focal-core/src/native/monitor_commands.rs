@@ -145,6 +145,7 @@ pub(super) fn prepare(
     let changed = graph.apply(root, transition)?;
     extras.begin_journal(limits.range.max_batch_entries, scratch)?;
     extras.record(NativeFact::Claim(NativeClaimEvent {
+        graph: None,
         kind: NativeEventKind::Monitor(NativeMonitorEvent::from_scope(event)?),
         before: Some(source.binding()),
         after: changed.claim().binding(),

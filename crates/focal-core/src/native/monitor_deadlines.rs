@@ -181,6 +181,7 @@ pub(super) fn prepare(
         rounds = rounds.checked_sub(1).ok_or(ContractError::Capacity)?;
         visits.charge(1)?;
         let before = extras.events();
+        let captured = graph_effects::capture(extras)?;
         let (next, settled) = {
             let (current_rows, snapshot) =
                 freeze(&original, &changed, limits, scratch, &mut visits)?;
@@ -220,13 +221,13 @@ pub(super) fn prepare(
                     peers(&current_rows, binding, &mut victim_peers, &mut visits)?;
                     let mut next = copy(victim, scratch)?;
                     next.break_deadlock(&binding, &witness, &victim_peers, cut.position)?;
-                    record(extras, victim, &next, NativeEventKind::Deadlocked)?;
+                    record(extras, victim, &next, NativeEventKind::Deadlocked, captured)?;
                     (Some(next), false)
                 }
                 scope::MonitorDeadlineDecision::Expire(expiry) => {
                     let mut next = copy(actual, scratch)?;
                     next.expire_monitor(&actual.binding(), &expiry, &peer_rows)?;
-                    record(extras, actual, &next, NativeEventKind::Expired)?;
+                    record(extras, actual, &next, NativeEventKind::Expired, captured)?;
                     fence_expired(view, &next, limits, extras, scratch, &mut visits)?;
                     (Some(next), false)
                 }

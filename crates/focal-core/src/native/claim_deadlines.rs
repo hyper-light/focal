@@ -61,9 +61,11 @@ pub(super) fn record(
     source: &ClaimState,
     next: &ClaimState,
     kind: NativeEventKind,
+    graph: NativeGraphCapture,
 ) -> Result<(), NativeError> {
     source.binding().next()?.check(&next.binding())?;
     extras.record(NativeFact::Claim(NativeClaimEvent {
+        graph: Some(graph),
         kind,
         owned_child: None,
         before: Some(source.binding()),
@@ -234,6 +236,7 @@ fn propagate(
     scratch: &mut Scratch,
     visits: &mut graph::VisitBudget,
 ) -> Result<(), NativeError> {
+    let captured = super::graph_effects::capture(extras)?;
     let (current, snapshot) = freeze(original, changed, limits, scratch, visits)?;
     snapshot.check_cut(cut.position)?;
     let failure_charge = snapshot.dependency_failure_charge()?;
@@ -256,7 +259,13 @@ fn propagate(
             Ok(failure) => {
                 let mut next = copy(source, scratch)?;
                 next.dependency_failed(&source.binding(), &failure, &peer_rows, cut.position)?;
-                record(extras, source, &next, NativeEventKind::DependencyFailed)?;
+                record(
+                    extras,
+                    source,
+                    &next,
+                    NativeEventKind::DependencyFailed,
+                    captured,
+                )?;
                 Some(next)
             }
             Err(ContractError::InvalidTransition) => {
@@ -267,7 +276,7 @@ fn propagate(
                     let release = snapshot.release(id)?;
                     let mut next = copy(source, scratch)?;
                     next.graph_release(&source.binding(), &release, &peer_rows, cut.position)?;
-                    record(extras, source, &next, NativeEventKind::Satisfied)?;
+                    record(extras, source, &next, NativeEventKind::Satisfied, captured)?;
                     Some(next)
                 } else {
                     None
@@ -350,6 +359,7 @@ pub(super) fn prepare(
         rounds = rounds.checked_sub(1).ok_or(ContractError::Capacity)?;
         visits.charge(1)?;
         let prior = extras.events();
+        let captured = super::graph_effects::capture(extras)?;
         let next = {
             let (current, snapshot) = freeze(&original, &changed, limits, scratch, &mut visits)?;
             let trigger = current
@@ -390,7 +400,7 @@ pub(super) fn prepare(
                     peers(&current, binding, &mut peer_rows, &mut visits)?;
                     let mut next = copy(actual, scratch)?;
                     next.break_deadlock(&binding, &witness, &peer_rows, cut.position)?;
-                    record(extras, actual, &next, NativeEventKind::Deadlocked)?;
+                    record(extras, actual, &next, NativeEventKind::Deadlocked, captured)?;
                     next
                 }
                 None => {
@@ -405,10 +415,10 @@ pub(super) fn prepare(
                             &peer_rows,
                             cut.position,
                         )?;
-                        record(extras, trigger, &next, NativeEventKind::Satisfied)?;
+                        record(extras, trigger, &next, NativeEventKind::Satisfied, captured)?;
                     } else {
                         next.expire(&trigger.binding(), input.deadline, logical_time, cut)?;
-                        record(extras, trigger, &next, NativeEventKind::Expired)?;
+                        record(extras, trigger, &next, NativeEventKind::Expired, captured)?;
                         fence_expired(view, &next, limits, extras, scratch, &mut visits)?;
                     }
                     next
