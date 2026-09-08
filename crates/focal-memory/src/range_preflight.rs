@@ -3,7 +3,7 @@
 
 use super::{
     Arc, Change, Entry, PageDirectory, PreparedRange, RangeConfig, RangeStore, Root, groups,
-    layout, merge_charge, page_charge, root_charge, visit_merged,
+    layout, merge_layout_charge, page_charge, root_charge, visit_merged,
 };
 use crate::{ALLOCATOR_OVERHEAD, BudgetLane, MemoryBudget, MemoryError, checked_add, checked_mul};
 
@@ -76,6 +76,13 @@ impl<K: Ord + Clone, V> RangePreparationPlan<'_, K, V> {
     }
     pub fn output_pages(&self) -> usize {
         self.output_pages
+    }
+
+    /// Exact, strictly ordered inputs checked against this plan's immutable
+    /// base. A durability encoder may inspect them without copying values or
+    /// traversing unaffected pages. The plan cannot be mutated through this view.
+    pub fn changes(&self) -> &[Change<K, V>] {
+        &self.changes
     }
 
     /// Consume exactly the checked inputs. Retained values follow the copier
@@ -223,22 +230,26 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
                 .ok_or(MemoryError::MissingKey)?;
             match base.pages.get(group.rank) {
                 None if base.pages.is_empty() => {
-                    let produced = count.merge::<K, V>(&[], selected, self.config)?;
+                    let produced =
+                        count.merge::<K, V>(&[], selected, self.config, self.partition)?;
                     count.directory_edits = checked_add(count.directory_edits, produced)?;
                 }
                 None => return Err(MemoryError::MissingKey),
                 Some(page) => {
-                    if let Some(split) = layout::reusable_singleton(page, selected, self.config)? {
+                    if let Some(split) =
+                        layout::reusable_page(page, selected, self.config, self.partition)?
+                    {
                         let before = selected.get(..split).ok_or(MemoryError::MissingKey)?;
                         let after = selected.get(split..).ok_or(MemoryError::MissingKey)?;
-                        let left = count.merge(&[], before, self.config)?;
-                        let right = count.merge(&[], after, self.config)?;
-                        // The existing singleton remains in place. Only its
+                        let left = count.merge(&[], before, self.config, self.partition)?;
+                        let right = count.merge(&[], after, self.config, self.partition)?;
+                        // The existing isolated page remains in place. Only its
                         // inserted neighbors require directory edits.
                         count.directory_edits =
                             checked_add(count.directory_edits, checked_add(left, right)?)?;
                     } else {
-                        let produced = count.merge(&page.entries, selected, self.config)?;
+                        let produced =
+                            count.merge(&page.entries, selected, self.config, self.partition)?;
                         count.output_pages = count
                             .output_pages
                             .checked_sub(1)
@@ -305,6 +316,7 @@ impl Counts {
         old: &[Entry<K, V>],
         selected: &[Change<K, V>],
         config: RangeConfig,
+        classify: Option<fn(&K) -> u64>,
     ) -> Result<usize, MemoryError> {
         let initial = self.new_pages;
         let mut partition = layout::LeafPartition::new::<K, V>(config)?;
@@ -317,16 +329,19 @@ impl Counts {
             )?;
             Ok(())
         };
-        visit_merged(old, selected, |entry| {
-            partition.push(entry.heap_bytes(), &mut emit)
+        let mut previous = None;
+        visit_merged(old, selected, |key, entry| {
+            let label = classify.map_or(0, |classify| classify(key));
+            let boundary = previous.is_some_and(|previous| previous != label);
+            partition.push(entry.heap_bytes(), boundary, &mut emit)?;
+            previous = Some(label);
+            Ok(())
         })?;
         partition.finish(&mut emit)?;
-        self.merge_pending_bytes =
-            self.merge_pending_bytes
-                .max(merge_charge::<K, V>(checked_add(
-                    old.len(),
-                    selected.len(),
-                )?)?);
+        self.merge_pending_bytes = self.merge_pending_bytes.max(merge_layout_charge::<K, V>(
+            checked_add(old.len(), selected.len())?,
+            classify.is_some(),
+        )?);
         self.new_pages
             .checked_sub(initial)
             .ok_or(MemoryError::MissingKey)

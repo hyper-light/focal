@@ -19,7 +19,7 @@ pub(super) fn prepare(
         .owned_claim(id)?
         .registrations()
         .ok_or(ContractError::InvalidTarget)?;
-    super::response_budget::check_registration_capacity(claim, source, limits)?;
+    super::response_budget::check_registration_capacity_in(view, claim, source, limits)?;
     if source.is_sealed() {
         return Err(ContractError::InvalidTransition.into());
     }
@@ -42,9 +42,11 @@ pub(super) fn prepare(
     let mut rows = scratch.reserve::<ClaimState>(1)?;
     scratch.charge(heap(claim)?)?;
     rows.push(claim.try_copy(claim.retained_bytes()?)?);
+    let mut replacements = transactions::RegistryOverrides::new();
+    replacements.insert(claim, registry, limits.plan_nodes, scratch)?;
     Ok(transactions::Plan {
         rows,
-        registry: Some((id, registry)),
+        registry: replacements,
         created: 0,
     })
 }

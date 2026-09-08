@@ -17,8 +17,8 @@ mod tests;
 const WALK_LIMIT: u32 = usize::BITS.saturating_mul(2).saturating_add(2);
 
 #[derive(Debug)]
-struct Node<T> {
-    key: EvaluationKey,
+struct Node<T, K> {
+    key: K,
     value: T,
     weight: usize,
     maximum: usize,
@@ -29,8 +29,8 @@ struct Node<T> {
 }
 
 #[derive(Debug)]
-struct Slot<T> {
-    node: Option<Node<T>>,
+struct Slot<T, K> {
+    node: Option<Node<T, K>>,
     // Doubly linked vacancies allow growth rollback to remove only its own
     // trailing vacant slots, without scanning older live grants or vacancies.
     free_previous: Option<usize>,
@@ -38,8 +38,8 @@ struct Slot<T> {
 }
 
 #[derive(Debug)]
-pub(super) struct IndexGrowth<T> {
-    slots: Vec<Slot<T>>,
+pub(super) struct IndexGrowth<T, K = EvaluationKey> {
+    slots: Vec<Slot<T, K>>,
     allocation: Option<Allocation>,
     owner: OwnerId,
     old_len: usize,
@@ -47,9 +47,9 @@ pub(super) struct IndexGrowth<T> {
 }
 
 #[derive(Debug)]
-pub(super) struct CompletionIndex<T> {
+pub(super) struct CompletionIndex<T, K = EvaluationKey> {
     // Drop values/buffers before returning the matching accounting allowance.
-    slots: Vec<Slot<T>>,
+    slots: Vec<Slot<T, K>>,
     allocation: Option<Allocation>,
     root: Option<usize>,
     free: Option<usize>,
@@ -60,7 +60,7 @@ pub(super) struct CompletionIndex<T> {
     touches: std::cell::Cell<usize>,
 }
 
-impl<T> CompletionIndex<T> {
+impl<T, K: Copy + Ord> CompletionIndex<T, K> {
     pub(super) fn new() -> Self {
         Self {
             slots: Vec::new(),
@@ -75,7 +75,6 @@ impl<T> CompletionIndex<T> {
         }
     }
 
-    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.len
     }
@@ -106,7 +105,7 @@ impl<T> CompletionIndex<T> {
         #[cfg(test)]
         self.touches.set(self.touches.get().saturating_add(1));
     }
-    fn node(&self, index: usize) -> Option<&Node<T>> {
+    fn node(&self, index: usize) -> Option<&Node<T, K>> {
         self.touch();
         let node = self.slots.get(index).and_then(|slot| slot.node.as_ref());
         if node.is_none() {
@@ -114,7 +113,7 @@ impl<T> CompletionIndex<T> {
         }
         node
     }
-    fn node_mut(&mut self, index: usize) -> Option<&mut Node<T>> {
+    fn node_mut(&mut self, index: usize) -> Option<&mut Node<T, K>> {
         self.touch();
         let node = self
             .slots
@@ -143,7 +142,7 @@ impl<T> CompletionIndex<T> {
     }
 
     /// Returns a matching node, or the final parent of an absent key.
-    fn locate(&self, key: EvaluationKey) -> Result<(Option<usize>, Option<usize>), NativeError> {
+    fn locate(&self, key: K) -> Result<(Option<usize>, Option<usize>), NativeError> {
         self.check_health()?;
         let mut current = self.root;
         let mut parent = None;
@@ -163,7 +162,7 @@ impl<T> CompletionIndex<T> {
         Err(ContractError::InvalidCut.into())
     }
 
-    pub(super) fn get(&self, key: EvaluationKey) -> Option<&T> {
+    pub(super) fn get(&self, key: K) -> Option<&T> {
         let (index, _) = self.locate(key).ok()?;
         self.node(index?).map(|node| &node.value)
     }
@@ -174,7 +173,7 @@ impl<T> CompletionIndex<T> {
         &mut self,
         source: &MemoryBudget,
         limit: usize,
-    ) -> Result<Option<IndexGrowth<T>>, NativeError> {
+    ) -> Result<Option<IndexGrowth<T, K>>, NativeError> {
         self.check_health()?;
         if self.free.is_some() || self.slots.len() < self.slots.capacity() {
             return Ok(None);
@@ -196,13 +195,13 @@ impl<T> CompletionIndex<T> {
             Some(owner) => owner,
             None => OwnerId::new()?,
         };
-        let bytes = array::<Slot<T>>(capacity)?;
+        let bytes = array::<Slot<T, K>>(capacity)?;
         let reservation = source.reserve(BudgetKind::Index, BudgetLane::Ordinary, bytes)?;
         let mut slots = Vec::new();
         slots
             .try_reserve_exact(capacity)
             .map_err(|_| MemoryError::AllocationFailed)?;
-        within(array::<Slot<T>>(slots.capacity())?, bytes)?;
+        within(array::<Slot<T, K>>(slots.capacity())?, bytes)?;
         let old_len = self.slots.len();
         slots.append(&mut self.slots);
         let old = std::mem::replace(&mut self.slots, slots);
@@ -219,12 +218,7 @@ impl<T> CompletionIndex<T> {
 
     /// No allocation. Duplicate keys and insufficient prepared capacity refuse
     /// before modifying the tree or invoking any caller mutation.
-    pub(super) fn insert(
-        &mut self,
-        key: EvaluationKey,
-        value: T,
-        workspace: usize,
-    ) -> Result<(), NativeError> {
+    pub(super) fn insert(&mut self, key: K, value: T, workspace: usize) -> Result<(), NativeError> {
         let (found, parent) = self.locate(key)?;
         if found.is_some() {
             return Err(ContractError::ContentConflict.into());
@@ -288,7 +282,7 @@ impl<T> CompletionIndex<T> {
     /// The precomputed replacement weight repairs cached maxima up the same path.
     pub(super) fn replace_weight(
         &mut self,
-        key: EvaluationKey,
+        key: K,
         workspace: usize,
         mutate: impl FnOnce(&mut T),
     ) -> Result<(), NativeError> {
@@ -462,7 +456,7 @@ impl<T> CompletionIndex<T> {
 
     /// Removal transplants a successor's links into the removed node's position;
     /// the successor and every other surviving value keep their physical slot.
-    pub(super) fn remove(&mut self, key: EvaluationKey) -> Result<T, NativeError> {
+    pub(super) fn remove(&mut self, key: K) -> Result<T, NativeError> {
         let index = self.locate(key)?.0.ok_or(ContractError::StaleEvaluation)?;
         let node = self.node(index).ok_or(ContractError::InvalidCut)?;
         let (parent, left, right) = (node.parent, node.left, node.right);
@@ -586,8 +580,8 @@ impl<T> CompletionIndex<T> {
 
     fn check_growth(
         &self,
-        growth: &IndexGrowth<T>,
-        removed: Option<EvaluationKey>,
+        growth: &IndexGrowth<T, K>,
+        removed: Option<K>,
     ) -> Result<(), NativeError> {
         self.check_health()?;
         if self.owner != Some(growth.owner)
@@ -610,8 +604,8 @@ impl<T> CompletionIndex<T> {
 
     pub(super) fn check_remove_restore_growth(
         &self,
-        growth: &IndexGrowth<T>,
-        removed_key: EvaluationKey,
+        growth: &IndexGrowth<T, K>,
+        removed_key: K,
     ) -> Result<(), NativeError> {
         self.locate(removed_key)?
             .0
@@ -619,11 +613,17 @@ impl<T> CompletionIndex<T> {
         self.check_growth(growth, Some(removed_key))
     }
 
-    pub(super) fn check_restore_growth(&self, growth: &IndexGrowth<T>) -> Result<(), NativeError> {
+    pub(super) fn check_restore_growth(
+        &self,
+        growth: &IndexGrowth<T, K>,
+    ) -> Result<(), NativeError> {
         self.check_growth(growth, None)
     }
 
-    pub(super) fn restore_growth(&mut self, mut growth: IndexGrowth<T>) -> Result<(), NativeError> {
+    pub(super) fn restore_growth(
+        &mut self,
+        mut growth: IndexGrowth<T, K>,
+    ) -> Result<(), NativeError> {
         self.check_restore_growth(&growth)?;
         // Only the new suffix is inspected/unlinked. Committed removals within
         // the original capacity retain their actual free-list and tree links.
@@ -638,7 +638,7 @@ impl<T> CompletionIndex<T> {
         self.check_health()
     }
 
-    fn lower_bound(&self, key: EvaluationKey) -> Option<usize> {
+    fn lower_bound(&self, key: K) -> Option<usize> {
         self.check_health().ok()?;
         let mut current = self.root;
         let mut candidate = None;
@@ -685,7 +685,7 @@ impl<T> CompletionIndex<T> {
         None
     }
 
-    pub(super) fn iter_from(&self, lower: EvaluationKey) -> Cursor<'_, T> {
+    pub(super) fn iter_from(&self, lower: K) -> Cursor<'_, T, K> {
         Cursor {
             index: self,
             next: self.lower_bound(lower),
@@ -695,14 +695,14 @@ impl<T> CompletionIndex<T> {
     }
 }
 
-pub(super) struct Cursor<'a, T> {
-    index: &'a CompletionIndex<T>,
+pub(super) struct Cursor<'a, T, K = EvaluationKey> {
+    index: &'a CompletionIndex<T, K>,
     next: Option<usize>,
     remaining: usize,
-    previous: Option<EvaluationKey>,
+    previous: Option<K>,
 }
-impl<'a, T> Iterator for Cursor<'a, T> {
-    type Item = (EvaluationKey, &'a T);
+impl<'a, T, K: Copy + Ord> Iterator for Cursor<'a, T, K> {
+    type Item = (K, &'a T);
     fn next(&mut self) -> Option<Self::Item> {
         self.index.check_health().ok()?;
         let current = self.next?;
@@ -721,11 +721,11 @@ impl<'a, T> Iterator for Cursor<'a, T> {
 }
 
 #[cfg(test)]
-impl<T> CompletionIndex<T> {
+impl<T, K: Copy + Ord> CompletionIndex<T, K> {
     pub(super) fn slot_charge(capacity: usize) -> Result<usize, NativeError> {
-        array::<Slot<T>>(capacity)
+        array::<Slot<T, K>>(capacity)
     }
-    pub(super) fn slot(&self, key: EvaluationKey) -> Option<usize> {
+    pub(super) fn slot(&self, key: K) -> Option<usize> {
         self.locate(key).ok()?.0
     }
     pub(super) fn reset_visits(&self) {

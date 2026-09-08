@@ -14,6 +14,10 @@ use crate::{
     VerdictValue,
 };
 
+#[path = "artifact_descriptor_source.rs"]
+mod source;
+pub use source::{ArtifactFields, ArtifactSource, ArtifactSourcePlan};
+
 /// Immutable provenance of a participant-authored validation result artifact.
 /// The owner must match this complete value to the actual retained evaluation
 /// before accepting custody or a report; these fields confer no authority.
@@ -216,9 +220,8 @@ pub struct ArtifactDescriptor {
 #[derive(Debug)]
 pub struct ArtifactPlan<'a> {
     spec: ArtifactSpec<'a>,
-    heap: usize,
-    allocations: usize,
-    charge: usize,
+    limits: Limits,
+    shape: source::Shape,
 }
 
 fn string(value: &str) -> Result<String, ContractError> {
@@ -242,105 +245,11 @@ impl ArtifactDescriptor {
         spec: ArtifactSpec<'_>,
         limits: Limits,
     ) -> Result<ArtifactPlan<'_>, ContractError> {
-        if spec.ledger.tenant.is_zero() || spec.ledger.session.is_zero() {
-            return Err(ContractError::WrongLedger);
-        }
-        if spec.id.is_zero() || spec.producer.is_zero() {
-            return Err(ContractError::InvalidTarget);
-        }
-        if spec.schema != 1
-            || spec.schema_hash.0 == [0; 32]
-            || spec.kind.is_empty()
-            || !spec.kind.bytes().all(|byte| {
-                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_./-".contains(&byte)
-            })
-        {
-            return Err(ContractError::InvalidPolicy);
-        }
-        if spec
-            .receipt
-            .is_some_and(|receipt| receipt.receipt.is_zero() || receipt.epoch == 0)
-        {
-            return Err(ContractError::StaleReceipt);
-        }
-        if let Some(result) = spec.result {
-            result.check(spec.ledger, spec.producer)?;
-        }
-        if let Some(work) = spec.work {
-            if spec.result.is_some() {
-                return Err(ContractError::InvalidPolicy);
-            }
-            work.check(spec.receipt, spec.kind)?;
-        }
-        if spec.kind.len() > limits.kind_bytes
-            || spec.metadata.len() > limits.metadata_bytes
-            || spec.inputs.len() > limits.inputs
-            || spec.visibility.len() > limits.visibility_labels
-        {
-            return Err(ContractError::Capacity);
-        }
-        let inline = match spec.payload {
-            PayloadSpec::Inline(value) => {
-                if value.len() > limits.inline_bytes {
-                    return Err(ContractError::Capacity);
-                }
-                value.len()
-            }
-            PayloadSpec::Content(pointer) => {
-                if pointer.domain.is_zero() || pointer.root.0 == [0; 32] {
-                    return Err(ContractError::InvalidTarget);
-                }
-                // A zero length may name valid empty content. Root/length/class
-                // agreement is verified against the actual store by the owner.
-                0
-            }
-        };
-        for input in spec.inputs {
-            if input.ledger != spec.ledger {
-                return Err(ContractError::WrongLedger);
-            }
-            if input.id.is_zero() {
-                return Err(ContractError::InvalidTarget);
-            }
-        }
-        if spec
-            .inputs
-            .windows(2)
-            .any(|pair| matches!(pair, [a,b] if a >= b))
-            || spec
-                .visibility
-                .windows(2)
-                .any(|pair| matches!(pair, [a,b] if a >= b))
-        {
-            return Err(ContractError::InvalidManifest);
-        }
-        let mut heap = bytes::add(bytes::add(spec.kind.len(), spec.metadata.len())?, inline)?;
-        heap = bytes::add(heap, bytes::array::<ObjectRef>(spec.inputs.len())?)?;
-        heap = bytes::add(heap, bytes::array::<String>(spec.visibility.len())?)?;
-        let mut allocations = 0;
-        for count in [
-            bytes::allocation::<u8>(spec.kind.len()),
-            bytes::allocation::<u8>(spec.metadata.len()),
-            bytes::allocation::<u8>(inline),
-            bytes::allocation::<ObjectRef>(spec.inputs.len()),
-            bytes::allocation::<String>(spec.visibility.len()),
-        ] {
-            allocations = bytes::add(allocations, count)?;
-        }
-        for label in spec.visibility {
-            if label.len() > limits.visibility_label_bytes {
-                return Err(ContractError::Capacity);
-            }
-            heap = bytes::add(heap, label.len())?;
-            allocations = bytes::add(allocations, bytes::allocation::<u8>(label.len()))?;
-        }
-        let charge = bytes::total::<Self>(heap)?;
-        bytes::fits(charge, limits.construction_bytes)?;
+        let (_, shape) = source::inspect(&spec, limits, usize::MAX)?;
         Ok(ArtifactPlan {
             spec,
-            heap,
-            allocations,
-            charge,
+            limits,
+            shape,
         })
     }
 
@@ -573,120 +482,109 @@ impl ArtifactDescriptor {
     /// Address-sensitive native retry identity; immutable content identity above
     /// excludes this artifact's own allocated ID, as required by D-02.
     pub fn intent_fingerprint(&self) -> ContentHash {
-        let mut hash = blake3::Hasher::new_derive_key("focal/native/artifact-intent/1");
-        hash.update(&self.id.0);
-        hash.update(&self.content_hash.0);
-        ContentHash(*hash.finalize().as_bytes())
+        intent_fingerprint(self.id, self.content_hash)
     }
 }
 
 impl ArtifactPlan<'_> {
-    /// Inline descriptor plus requested buffer capacities, excluding allocator
-    /// metadata. Build refuses allocator-reported excess capacity. The effective
-    /// owner reserves this charge and the allocation count before calling build.
+    /// Inline descriptor plus requested buffers, excluding allocator metadata.
+    /// The effective owner reserves this and the allocation count before build.
     pub fn construction_charge(&self) -> usize {
-        self.charge
+        self.shape.charge
     }
     pub fn construction_heap_bytes(&self) -> usize {
-        self.heap
+        self.shape.heap
     }
     pub fn construction_heap_allocations(&self) -> usize {
-        self.allocations
+        self.shape.allocations
+    }
+    pub fn content_hash(&self) -> ContentHash {
+        self.shape.content_hash
+    }
+    pub fn intent_fingerprint(&self) -> ContentHash {
+        intent_fingerprint(self.spec.id, self.shape.content_hash)
     }
     pub fn build(self) -> Result<ArtifactDescriptor, ContractError> {
-        let spec = self.spec;
-        let mut visibility = reserve(spec.visibility.len())?;
-        for label in spec.visibility {
-            visibility.push(string(label)?);
-        }
-        let mut descriptor = ArtifactDescriptor {
-            ledger: spec.ledger,
-            id: spec.id,
-            schema: spec.schema,
-            kind: string(spec.kind)?,
-            schema_hash: spec.schema_hash,
-            metadata: copy(spec.metadata)?,
-            payload: match spec.payload {
-                PayloadSpec::Inline(value) => Payload::Inline(copy(value)?),
-                PayloadSpec::Content(pointer) => Payload::Content(pointer),
-            },
-            producer: spec.producer,
-            receipt: spec.receipt,
-            result: spec.result,
-            work: spec.work,
-            inputs: copy(spec.inputs)?,
-            visibility,
-            content_hash: ContentHash([0; 32]),
-        };
-        bytes::fits(descriptor.retained_bytes()?, self.charge)?;
-        descriptor.content_hash = content_hash(&descriptor);
-        Ok(descriptor)
+        source::build(
+            &self.spec,
+            self.spec.id,
+            self.limits,
+            self.shape,
+            self.shape.charge,
+            self.shape.build_visits,
+        )
     }
 }
 
-/// Native immutable content identity, distinct from both historical V1 hashes
-/// and any future successor durable encoding. All fields carry explicit lengths
-/// or fixed structure; set order was checked before allocation.
-fn content_hash(descriptor: &ArtifactDescriptor) -> ContentHash {
-    struct Hash(blake3::Hasher);
-    impl Hash {
-        fn field(&mut self, value: &[u8]) {
-            self.0.update(&(value.len() as u128).to_be_bytes());
-            self.0.update(value);
-        }
-        fn count(&mut self, value: usize) {
-            self.field(&(value as u128).to_be_bytes());
-        }
-        fn binding(&mut self, binding: Binding) {
-            self.field(&binding.ledger.tenant.0);
-            self.field(&binding.ledger.session.0);
-            self.field(&binding.object.0);
-            self.field(&binding.content.0);
-            self.field(&binding.revision.0.to_be_bytes());
-        }
-        fn target(&mut self, target: Target) {
-            match target {
-                Target::Artifact {
-                    response,
-                    slot,
-                    artifact,
-                } => {
-                    self.field(b"artifact");
-                    self.binding(response);
-                    self.field(&slot.to_be_bytes());
-                    self.binding(artifact);
-                }
-                Target::MissingSlot { response, slot } => {
-                    self.field(b"missing-slot");
-                    self.binding(response);
-                    self.field(&slot.to_be_bytes());
-                }
-                Target::Delivery { response } => {
-                    self.field(b"delivery");
-                    self.binding(response);
-                }
-                Target::Admission { claim } => {
-                    self.field(b"admission");
-                    self.binding(claim);
-                }
-                Target::Increment { claim, artifact } => {
-                    self.field(b"increment");
-                    self.binding(claim);
-                    self.binding(artifact);
-                }
+fn intent_fingerprint(id: ArtifactId, content: ContentHash) -> ContentHash {
+    let mut hash = blake3::Hasher::new_derive_key("focal/native/artifact-intent/1");
+    hash.update(&id.0);
+    hash.update(&content.0);
+    ContentHash(*hash.finalize().as_bytes())
+}
+
+/// One hash engine supplies both checked value-source preparation and owned
+/// artifact rehashing; the native content preimage remains unchanged.
+struct Hash(blake3::Hasher);
+impl Hash {
+    fn field(&mut self, value: &[u8]) {
+        self.0.update(&(value.len() as u128).to_be_bytes());
+        self.0.update(value);
+    }
+    fn count(&mut self, value: usize) {
+        self.field(&(value as u128).to_be_bytes());
+    }
+    fn binding(&mut self, binding: Binding) {
+        self.field(&binding.ledger.tenant.0);
+        self.field(&binding.ledger.session.0);
+        self.field(&binding.object.0);
+        self.field(&binding.content.0);
+        self.field(&binding.revision.0.to_be_bytes());
+    }
+    fn target(&mut self, target: Target) {
+        match target {
+            Target::Artifact {
+                response,
+                slot,
+                artifact,
+            } => {
+                self.field(b"artifact");
+                self.binding(response);
+                self.field(&slot.to_be_bytes());
+                self.binding(artifact);
+            }
+            Target::MissingSlot { response, slot } => {
+                self.field(b"missing-slot");
+                self.binding(response);
+                self.field(&slot.to_be_bytes());
+            }
+            Target::Delivery { response } => {
+                self.field(b"delivery");
+                self.binding(response);
+            }
+            Target::Admission { claim } => {
+                self.field(b"admission");
+                self.binding(claim);
+            }
+            Target::Increment { claim, artifact } => {
+                self.field(b"increment");
+                self.binding(claim);
+                self.binding(artifact);
             }
         }
     }
+}
+fn begin_hash(fields: ArtifactFields<'_>, input_count: usize) -> Hash {
     let mut hash = Hash(blake3::Hasher::new_derive_key(
         "focal/native/artifact-content/1",
     ));
-    hash.field(&descriptor.ledger.tenant.0);
-    hash.field(&descriptor.ledger.session.0);
-    hash.field(&descriptor.schema.to_be_bytes());
-    hash.field(descriptor.kind.as_bytes());
-    hash.field(&descriptor.schema_hash.0);
-    hash.field(&descriptor.metadata);
-    match descriptor.payload() {
+    hash.field(&fields.ledger.tenant.0);
+    hash.field(&fields.ledger.session.0);
+    hash.field(&fields.schema.to_be_bytes());
+    hash.field(fields.kind.as_bytes());
+    hash.field(&fields.schema_hash.0);
+    hash.field(fields.metadata);
+    match fields.payload {
         PayloadSpec::Inline(value) => {
             hash.field(b"inline");
             hash.field(value);
@@ -703,8 +601,8 @@ fn content_hash(descriptor: &ArtifactDescriptor) -> ContentHash {
             });
         }
     }
-    hash.field(&descriptor.producer.0);
-    match descriptor.receipt {
+    hash.field(&fields.producer.0);
+    match fields.receipt {
         None => hash.field(b"no-receipt"),
         Some(receipt) => {
             hash.field(b"receipt");
@@ -712,23 +610,30 @@ fn content_hash(descriptor: &ArtifactDescriptor) -> ContentHash {
             hash.field(&receipt.epoch.to_be_bytes());
         }
     }
-    hash.count(descriptor.inputs.len());
-    for input in &descriptor.inputs {
-        hash.field(&input.ledger.tenant.0);
-        hash.field(&input.ledger.session.0);
-        hash.field(match input.kind {
+    hash.count(input_count);
+    hash
+}
+
+impl Hash {
+    fn input(&mut self, input: ObjectRef) {
+        self.field(&input.ledger.tenant.0);
+        self.field(&input.ledger.session.0);
+        self.field(match input.kind {
             ObjectKind::Claim => b"claim",
             ObjectKind::Testament => b"testament",
             ObjectKind::Validation => b"validation",
             ObjectKind::Artifact => b"artifact",
         });
-        hash.field(&input.id.0);
+        self.field(&input.id.0);
     }
-    hash.count(descriptor.visibility.len());
-    for label in &descriptor.visibility {
-        hash.field(label.as_bytes());
-    }
-    match descriptor.result {
+}
+
+fn finish_hash(
+    mut hash: Hash,
+    result: Option<ResultProvenance>,
+    work: Option<WorkProvenance>,
+) -> ContentHash {
+    match result {
         None => hash.field(b"no-result"),
         Some(result) => {
             hash.field(b"result");
@@ -758,7 +663,7 @@ fn content_hash(descriptor: &ArtifactDescriptor) -> ContentHash {
     // Descriptors without work provenance retain their original native hashes.
     // The optional role adds a domain-separated, length-framed suffix; repeated
     // payloads in distinct cycles no longer require invented metadata to differ.
-    if let Some(work) = descriptor.work {
+    if let Some(work) = work {
         hash.field(b"focal/native/artifact-work/1");
         hash.field(&work.claim.0);
         hash.field(&work.cycle.to_be_bytes());
@@ -792,6 +697,23 @@ fn content_hash(descriptor: &ArtifactDescriptor) -> ContentHash {
     ContentHash(*hash.0.finalize().as_bytes())
 }
 
+fn content_hash(descriptor: &ArtifactDescriptor) -> ContentHash {
+    let fields = source::OwnedSource(descriptor).fields();
+    let mut hash = begin_hash(fields, descriptor.inputs.len());
+    for input in &descriptor.inputs {
+        hash.input(*input);
+    }
+    hash.count(descriptor.visibility.len());
+    for label in descriptor.visibility() {
+        hash.field(label.as_bytes());
+    }
+    finish_hash(hash, descriptor.result, descriptor.work)
+}
+
 #[cfg(test)]
 #[path = "artifact_descriptor_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "artifact_plan_identity_tests.rs"]
+mod plan_identity_tests;

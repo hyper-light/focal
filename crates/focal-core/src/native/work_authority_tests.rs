@@ -75,6 +75,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new(present: bool) -> Self {
+        Self::through_response(present, true)
+    }
+    fn through_response(present: bool, received: bool) -> Self {
         let mut core = Core::new_native(
             binding(1).ledger,
             RangeId(3901),
@@ -85,7 +88,7 @@ impl Fixture {
                     ..RangeConfig::default()
                 },
                 plan_nodes: 16,
-                plan_edges: 2048,
+                plan_edges: 64 * 1024,
                 preparation_bytes: 1024 * 1024,
                 evaluations_per_claim: 32,
                 ..NativeLimits::default()
@@ -222,13 +225,15 @@ impl Fixture {
                 expected: fixture.response().identity().binding,
             },
         );
-        fixture.send(
-            ISSUER,
-            NativeCommand::ReceiveResponse {
-                claim: fixture.claim(),
-                expected: fixture.response().identity().binding,
-            },
-        );
+        if received {
+            fixture.send(
+                ISSUER,
+                NativeCommand::ReceiveResponse {
+                    claim: fixture.claim(),
+                    expected: fixture.response().identity().binding,
+                },
+            );
+        }
         fixture
     }
     fn send(&mut self, actor: ParticipantId, command: NativeCommand) {
@@ -389,8 +394,12 @@ impl Fixture {
     }
 }
 
+pub(super) fn history_fixture(present: bool, received: bool) -> Core<NativeState> {
+    Fixture::through_response(present, received).core
+}
+
 #[test]
-fn external_work_begin_requires_prior_checked_response_entry_and_exact_designation() {
+fn external_work_begin_accepts_received_or_entered_response_with_exact_designation() {
     let mut fixture = Fixture::new(true);
     {
         let view = fixture.view();
@@ -400,18 +409,23 @@ fn external_work_begin_requires_prior_checked_response_entry_and_exact_designati
             aggregation_limits(),
         )
         .unwrap();
-        assert!(
-            super::begin(
-                &view,
-                f::context(EVALUATOR, 100),
-                fixture.claim(),
-                key,
-                view.evaluation(key).unwrap().binding(),
-                fixture.core.limits,
-                &aggregate.decision()
-            )
-            .is_err()
+        let begun = super::begin(
+            &view,
+            f::context(EVALUATOR, 100),
+            fixture.claim(),
+            key,
+            view.evaluation(key).unwrap().binding(),
+            fixture.core.limits,
+            &aggregate.decision(),
+        )
+        .unwrap();
+        assert!(begun.next.has_begun());
+        assert_eq!(begun.next.state(), validation::State::Validating);
+        assert_eq!(
+            view.evaluation(key).unwrap().state(),
+            validation::State::Ready
         );
+        assert_eq!(fixture.response().state(), ResponseState::Received);
     }
     fixture.enter();
     let view = fixture.view();
@@ -421,6 +435,22 @@ fn external_work_begin_requires_prior_checked_response_entry_and_exact_designati
         aggregation::ClaimAggregation::new(view.claim(key.claim).unwrap(), aggregation_limits())
             .unwrap();
     let before = fixture.core.state.budget.stats();
+    let stale = Binding {
+        revision: focal_model::ObjectRevision(expected.revision.0 + 1),
+        ..expected
+    };
+    assert!(matches!(
+        super::begin(
+            &view,
+            f::context(EVALUATOR, 100),
+            fixture.claim(),
+            key,
+            stale,
+            fixture.core.limits,
+            &aggregate.decision(),
+        ),
+        Err(NativeError::Contract(ContractError::StaleRevision))
+    ));
     for principal in [
         Principal::Actor(ISSUER),
         Principal::Actor(SUBJECT),
@@ -786,3 +816,8 @@ fn already_begun_sibling_can_report_after_checked_work_response_and_claim_failur
         before_cut
     );
 }
+
+#[path = "completion_work_tests.rs"]
+mod completion_work_tests;
+#[path = "work_reporting_tests.rs"]
+mod work_reporting_tests;

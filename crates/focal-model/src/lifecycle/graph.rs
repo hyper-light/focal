@@ -6,6 +6,8 @@
 use super::claim::{ClaimState, ClaimTerminalCut};
 #[path = "graph_capture.rs"]
 mod capture;
+#[path = "graph_deadline.rs"]
+mod deadline;
 #[path = "graph_memory.rs"]
 mod memory;
 use super::{Binding, ContractError};
@@ -38,19 +40,62 @@ impl Declaration {
         if obligations.len() > max_edges {
             return Err(ContractError::Capacity);
         }
-        let mut previous = None;
-        for obligation in obligations {
-            if obligation.target.is_zero() || previous.is_some_and(|old| old >= *obligation) {
-                return Err(ContractError::InvalidManifest);
-            }
-            previous = Some(*obligation);
-        }
+        Self::check_sorted_values(
+            obligations.iter().copied().map(Ok),
+            obligations.len(),
+            max_edges,
+            &mut VisitBudget::new(usize::MAX),
+        )?;
         let mut owned = reserve(obligations.len())?;
         owned.extend_from_slice(obligations);
         Ok(Self { obligations: owned })
     }
     pub fn obligations(&self) -> &[Obligation] {
         &self.obligations
+    }
+    /// Validate complete canonical values before allocating their final buffer.
+    /// Each iterator step must be bounded; encoded adapters meter parsing separately.
+    pub fn check_sorted_values(
+        mut obligations: impl Iterator<Item = Result<Obligation, ContractError>>,
+        count: usize,
+        max_edges: usize,
+        visits: &mut VisitBudget,
+    ) -> Result<(), ContractError> {
+        if count > max_edges {
+            return Err(ContractError::Capacity);
+        }
+        let mut previous = None;
+        for _ in 0..count {
+            visits.charge(1)?;
+            let obligation = obligations.next().ok_or(ContractError::InvalidManifest)??;
+            if obligation.target.is_zero() || previous.is_some_and(|old| old >= obligation) {
+                return Err(ContractError::InvalidManifest);
+            }
+            previous = Some(obligation);
+        }
+        visits.charge(1)?;
+        match obligations.next() {
+            None => Ok(()),
+            Some(Err(error)) => Err(error),
+            Some(Ok(_)) => Err(ContractError::InvalidManifest),
+        }
+    }
+    /// Consume the assembly's exact-capacity funded buffer without copying it.
+    pub fn from_owned_sorted(
+        obligations: Vec<Obligation>,
+        max_edges: usize,
+        visits: &mut VisitBudget,
+    ) -> Result<Self, ContractError> {
+        if obligations.len() > max_edges || obligations.capacity() != obligations.len() {
+            return Err(ContractError::Capacity);
+        }
+        Self::check_sorted_values(
+            obligations.iter().copied().map(Ok),
+            obligations.len(),
+            max_edges,
+            visits,
+        )?;
+        Ok(Self { obligations })
     }
 }
 
@@ -158,13 +203,49 @@ fn reserve<T>(capacity: usize) -> Result<Vec<T>, ContractError> {
         .map_err(|_| ContractError::Capacity)?;
     Ok(value)
 }
-struct Budget {
+/// A transaction-wide allowance for the model's graph traversal steps. Reusing
+/// this value across captures and queries prevents each operation from renewing
+/// the allowance. Native source discovery and witness-consumption scans must be
+/// charged separately by the owner through `charge`.
+#[derive(Debug)]
+pub struct VisitBudget {
     left: usize,
 }
-impl Budget {
+type Budget = VisitBudget;
+impl VisitBudget {
+    pub fn new(visits: usize) -> Self {
+        Self { left: visits }
+    }
+    pub fn remaining(&self) -> usize {
+        self.left
+    }
     fn visit(&mut self) -> Result<(), ContractError> {
-        self.left = self.left.checked_sub(1).ok_or(ContractError::Capacity)?;
+        self.charge(1)
+    }
+    /// Admit a known bounded amount before doing that work. A refused debit
+    /// leaves the remaining allowance unchanged; it never saturates or renews it.
+    pub fn charge(&mut self, visits: usize) -> Result<(), ContractError> {
+        self.left = self
+            .left
+            .checked_sub(visits)
+            .ok_or(ContractError::Capacity)?;
         Ok(())
+    }
+    fn with_limit<T>(
+        &mut self,
+        limit: usize,
+        action: impl FnOnce(&mut Budget) -> Result<T, ContractError>,
+    ) -> Result<T, ContractError> {
+        let admitted = self.left.min(limit);
+        let mut local = Self::new(admitted);
+        let result = action(&mut local);
+        // Keep all work already performed charged even when the operation
+        // refused a source, allocation, or later traversal step.
+        let consumed = admitted
+            .checked_sub(local.left)
+            .ok_or(ContractError::Capacity)?;
+        self.charge(consumed)?;
+        result
     }
 }
 fn id(binding: Binding) -> ClaimId {
@@ -367,6 +448,29 @@ impl Snapshot {
         target: ClaimId,
         max_bytes: usize,
     ) -> Result<DependencyFailure<'_>, ContractError> {
+        let mut visits = VisitBudget::new(self.limits.visits);
+        self.dependency_failure_with_visits(target, max_bytes, &mut visits)
+    }
+
+    /// Uses the shared transaction allowance in addition to this Snapshot's
+    /// per-operation limit. Traversal already performed remains charged on Err.
+    pub fn dependency_failure_with_visits(
+        &self,
+        target: ClaimId,
+        max_bytes: usize,
+        visits: &mut VisitBudget,
+    ) -> Result<DependencyFailure<'_>, ContractError> {
+        visits.with_limit(self.limits.visits, |budget| {
+            self.dependency_failure_budget(target, max_bytes, budget)
+        })
+    }
+
+    fn dependency_failure_budget(
+        &self,
+        target: ClaimId,
+        max_bytes: usize,
+        budget: &mut Budget,
+    ) -> Result<DependencyFailure<'_>, ContractError> {
         let charge = self.dependency_failure_charge()?;
         if charge > max_bytes {
             return Err(ContractError::Capacity);
@@ -375,9 +479,6 @@ impl Snapshot {
         if self.node(target)?.status.is_terminal() {
             return Err(ContractError::InvalidTransition);
         }
-        let mut budget = Budget {
-            left: self.limits.visits,
-        };
         let mut seen = reserve(self.nodes.len())?;
         seen.resize(self.nodes.len(), false);
         let mut stack = reserve(self.nodes.len())?;
@@ -437,114 +538,6 @@ impl Snapshot {
             target,
             origin,
             path: selected_path,
-            fingerprint,
-        })
-    }
-    fn reachable(
-        &self,
-        start: usize,
-        reverse: bool,
-        budget: &mut Budget,
-    ) -> Result<Vec<bool>, ContractError> {
-        let mut seen = reserve(self.nodes.len())?;
-        seen.resize(self.nodes.len(), false);
-        let mut queue = reserve(self.nodes.len())?;
-        *seen.get_mut(start).ok_or(ContractError::InvalidTarget)? = true;
-        queue.push(start);
-        let mut cursor = 0usize;
-        while let Some(at) = queue.get(cursor).copied() {
-            budget.visit()?;
-            cursor = cursor.checked_add(1).ok_or(ContractError::Capacity)?;
-            let edges = if reverse {
-                let from = self.incoming.partition_point(|edge| edge.target < at);
-                let to = self.incoming.partition_point(|edge| edge.target <= at);
-                self.incoming
-                    .get(from..to)
-                    .ok_or(ContractError::InvalidTarget)?
-            } else {
-                self.outgoing(at)?
-            };
-            for edge in edges {
-                budget.visit()?;
-                if self.settled(*edge)?
-                    || (self.node(edge.source)?.status.is_terminal() && !edge.runtime)
-                {
-                    continue;
-                }
-                let next = if reverse { edge.source } else { edge.target };
-                if (self.node(next)?.status.is_terminal()
-                    && edge.predicate != Predicate::Released
-                    && !reverse)
-                    || self.node(next)?.released
-                {
-                    continue;
-                }
-                let visited = seen.get_mut(next).ok_or(ContractError::InvalidTarget)?;
-                if !*visited {
-                    *visited = true;
-                    queue.push(next);
-                }
-            }
-        }
-        Ok(seen)
-    }
-    pub fn deadlock(
-        &self,
-        trigger: ClaimId,
-        deadline: Deadline,
-        fired_at: u64,
-    ) -> Result<Deadlock<'_>, ContractError> {
-        let trigger = self.index(trigger)?;
-        let node = self.node(trigger)?;
-        if node.deadline != Some(deadline) || fired_at < deadline.at {
-            return Err(ContractError::InvalidCut);
-        }
-        if node.status.is_terminal() || self.is_satisfied(trigger)? {
-            return Err(ContractError::InvalidTransition);
-        }
-        let mut budget = Budget {
-            left: self.limits.visits,
-        };
-        let forward = self.reachable(trigger, false, &mut budget)?;
-        let reverse = self.reachable(trigger, true, &mut budget)?;
-        let mut component = reserve(self.nodes.len())?;
-        for (index, (forward, reverse)) in forward.iter().zip(&reverse).enumerate() {
-            if *forward && *reverse {
-                component.push(index);
-            }
-        }
-        let self_cycle = self
-            .outgoing(trigger)?
-            .iter()
-            .any(|edge| edge.target == trigger);
-        if component.len() < 2 && !self_cycle {
-            return Err(ContractError::InvalidTransition);
-        }
-        let victim = component
-            .iter()
-            .copied()
-            .filter(|index| {
-                self.nodes
-                    .get(*index)
-                    .is_some_and(|node| !node.status.is_terminal())
-            })
-            .min_by_key(|index| {
-                self.nodes
-                    .get(*index)
-                    .map(|node| (node.created, node.binding.object))
-            })
-            .ok_or(ContractError::InvalidTransition)?;
-        let fingerprint = self.fingerprint(
-            b"focal.lifecycle.deadlock-scc.v1\0",
-            component.iter().copied(),
-        )?;
-        Ok(Deadlock {
-            graph: self,
-            victim,
-            trigger,
-            component,
-            deadline,
-            fired_at,
             fingerprint,
         })
     }
@@ -676,6 +669,9 @@ impl Deadlock<'_> {
     }
 }
 
+#[path = "graph_snapshot.rs"]
+mod snapshot;
 #[cfg(test)]
 #[path = "graph_tests.rs"]
 mod tests;
+pub use snapshot::{OriginSnapshotV1, TerminalCutSnapshotV1};

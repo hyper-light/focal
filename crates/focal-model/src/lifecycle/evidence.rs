@@ -10,10 +10,19 @@ use crate::{
     TestamentId,
 };
 
+#[path = "evidence_entry.rs"]
+mod entry;
+pub use entry::ResponseEntry;
+
 #[path = "evidence_report.rs"]
 mod report;
 pub(super) use report::ReportStamp;
-pub use report::{ClosePreparation, CloseReport, ResponseDiagnostic, ResponseLimits};
+pub use report::{
+    ClosePreparation, CloseReport, FailedWorkSnapshotV1, ResponseArtifacts, ResponseDiagnostic,
+    ResponseDiagnosticSnapshotV1, ResponseHydrationPlan, ResponseLimits, ResponseSnapshotFieldsV1,
+    ResponseSnapshotSource, ResponseSnapshotV1, ResponseTerminalSnapshotV1, WorkArtifactSnapshotV1,
+    WorkTerminalSnapshotV1,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkArtifactState {
@@ -448,6 +457,10 @@ impl WorkArtifact {
         parent.check_receipt(self.receipt)?;
         principal.require_actor(parent.issuer)?;
         parent.require_open_response()?;
+        self.enter_attached(response)
+    }
+
+    fn enter_attached(&self, response: &Response) -> Result<Self, ContractError> {
         if self.state != WorkArtifactState::Attached || response.state != ResponseState::Validating
         {
             return Err(ContractError::InvalidTransition);

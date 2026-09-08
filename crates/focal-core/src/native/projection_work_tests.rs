@@ -5,6 +5,9 @@ use focal_memory::{BudgetLane, Change, Entry};
 use focal_model::lifecycle::artifact_descriptor::{WorkProvenance, WorkRole};
 use focal_model::{ArtifactRef, Confidence, ContentDomainId, OutcomeKind, VerdictValue};
 
+#[path = "retired_cycle_tests.rs"]
+mod retired_cycle_tests;
+
 struct Rows {
     core: Core<NativeState>,
     store: ContentStore,
@@ -371,7 +374,9 @@ fn iteration_prices_both_link_walks_and_caps_empty_cycle_traversal() {
     let mut rows = Rows::new(2);
     rows.output(800, 0);
     let view = rows.view();
-    for (visits, allowed) in [(9, false), (10, true)] {
+    // Claim, retired-cycle header, open-cycle row, first link walk and the
+    // seven source/provenance lookups for the yielded work cost eleven visits.
+    for (visits, allowed) in [(10, false), (11, true)] {
         let mut limits = rows.core.limits;
         limits.plan_edges = visits;
         let mut cursor = super::super::projection_work::works(&view, ClaimId::from_u128(1), limits);
@@ -390,7 +395,9 @@ fn iteration_prices_both_link_walks_and_caps_empty_cycle_traversal() {
     empty.close(900, vec![], vec![]);
     empty.close(901, vec![], vec![]);
     let view = empty.view();
-    for (visits, allowed) in [(4, false), (5, true)] {
+    // Two headers and two response/cycle pairs; there is no current open cycle
+    // after reaching the authored response limit.
+    for (visits, allowed) in [(5, false), (6, true)] {
         let mut limits = empty.core.limits;
         limits.plan_edges = visits;
         let mut cursor = super::super::projection_work::works(&view, ClaimId::from_u128(1), limits);
@@ -478,4 +485,327 @@ fn wrong_slot_identity_and_closed_cycle_response_links_cannot_hide_work() {
         assert!(cursor.next().unwrap().is_err());
         assert!(cursor.next().is_none());
     }
+}
+
+#[test]
+fn independent_cursors_consume_one_shared_allowance_without_allocating() {
+    let mut rows = Rows::new(2);
+    rows.output(800, 0);
+    let before = rows.core.native_budget();
+    let view = rows.view();
+    let shared = super::super::projection_visits::Visits::new(22);
+    for remaining in [11, 0] {
+        let found: Vec<_> = super::super::projection_work::works_with_budget(
+            &view,
+            ClaimId::from_u128(1),
+            rows.core.limits,
+            Some(&shared),
+        )
+        .collect::<Result<_, _>>()
+        .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(shared.remaining(), remaining);
+    }
+    let mut refused = super::super::projection_work::works_with_budget(
+        &view,
+        ClaimId::from_u128(1),
+        rows.core.limits,
+        Some(&shared),
+    );
+    assert_eq!(refused.next(), Some(Err(ContractError::Capacity)));
+    assert!(refused.next().is_none());
+    assert_eq!(shared.check(), Err(ContractError::Capacity));
+    assert_eq!(shared.charge(0), Err(ContractError::Capacity));
+    assert_eq!(rows.core.native_budget(), before);
+}
+
+#[test]
+fn interleaved_partial_cursors_cannot_restore_an_exhausted_projection_allowance() {
+    let mut rows = Rows::new(2);
+    rows.output(800, 0);
+    rows.output(801, 1);
+    let view = rows.view();
+    let shared = super::super::projection_visits::Visits::new(18);
+    let mut first = super::super::projection_work::works_with_budget(
+        &view,
+        ClaimId::from_u128(1),
+        rows.core.limits,
+        Some(&shared),
+    );
+    assert!(first.next().unwrap().is_ok());
+    assert_eq!(shared.remaining(), 6);
+    let mut second = super::super::projection_work::works_with_budget(
+        &view,
+        ClaimId::from_u128(1),
+        rows.core.limits,
+        Some(&shared),
+    );
+    assert_eq!(second.next(), Some(Err(ContractError::Capacity)));
+    assert_eq!(first.next(), Some(Err(ContractError::Capacity)));
+    assert!(first.next().is_none());
+    assert!(second.next().is_none());
+}
+
+#[test]
+fn projection_lookup_exhaustion_is_capacity_and_never_runs_the_acceptance_callback() {
+    let mut rows = Rows::new(2);
+    rows.output(800, 0);
+    let before = rows.core.native_budget();
+    let view = rows.view();
+    super::super::projection::with_projection(
+        &view,
+        ClaimId::from_u128(1),
+        rows.core.limits,
+        &rows.core.state.budget,
+        |_| (),
+    )
+    .unwrap();
+    let limits = NativeLimits {
+        plan_edges: 13,
+        ..rows.core.limits
+    };
+    let called = std::cell::Cell::new(false);
+    let result = super::super::projection::with_projection(
+        &view,
+        ClaimId::from_u128(1),
+        limits,
+        &rows.core.state.budget,
+        |_| called.set(true),
+    );
+    assert!(matches!(
+        result,
+        Err(NativeError::Contract(ContractError::Capacity))
+    ));
+    assert!(!called.get());
+    assert_eq!(rows.core.native_budget(), before);
+    assert_eq!(
+        rows.core
+            .native_claim(ClaimId::from_u128(1))
+            .unwrap()
+            .status(),
+        ClaimStatus::Received
+    );
+}
+
+#[test]
+fn provisional_overlay_comparisons_share_the_same_lookup_allowance() {
+    use focal_model::lifecycle::aggregation::WholeWorkView;
+    let mut rows = Rows::new(2);
+    let work = rows.output(800, 0);
+    let view = rows.view();
+    let mut extras = crate::native::prepare::Extras::new(2, usize::MAX).unwrap();
+    extras
+        .push(crate::native::prepare::Extra {
+            key: Key::Meta,
+            row: Row::Meta(view.meta()),
+            heap: 0,
+            fact: None,
+        })
+        .unwrap();
+    let owned = OwnedWork::new(*rows.core.native_work(work.id).unwrap()).unwrap();
+    let heap = owned.heap_charge().unwrap();
+    extras
+        .push(crate::native::prepare::Extra {
+            key: Key::Work(work.id),
+            row: Row::Work(owned),
+            heap,
+            fact: None,
+        })
+        .unwrap();
+    for (limit, found) in [(2, false), (3, true)] {
+        let visits = super::super::projection_visits::Visits::new(limit);
+        let projection = super::super::projection::ProjectionRows {
+            view: &view,
+            claim: ClaimId::from_u128(1),
+            limits: rows.core.limits,
+            staged: Some(&extras),
+            sequence: view.prefix(),
+            visits: &visits,
+        };
+        assert_eq!(projection.work(work.id).is_some(), found);
+        assert_eq!(visits.check().is_ok(), found);
+    }
+}
+
+fn measured_projection(rows: &Rows, quote: NativeProjectionQuote) -> usize {
+    use focal_model::lifecycle::aggregation::{ProjectionLimits, prepare_projection};
+    let view = rows.view();
+    let claim = rows.core.native_claim(ClaimId::from_u128(1)).unwrap();
+    let registry = view
+        .owned_claim(ClaimId::from_u128(1))
+        .unwrap()
+        .registrations()
+        .unwrap();
+    let mut extras = crate::native::prepare::Extras::new(quote.overlay_rows(), usize::MAX).unwrap();
+    // An irrelevant provisional row is enough to exercise a failed overlay
+    // search on every direct lookup. It never substitutes a source fact.
+    if quote.overlay_rows() != 0 {
+        extras
+            .push(crate::native::prepare::Extra {
+                key: Key::Meta,
+                row: Row::Meta(view.meta()),
+                heap: 0,
+                fact: None,
+            })
+            .unwrap();
+    }
+    let visits = super::super::projection_visits::Visits::new(quote.lookup_visits());
+    visits.charge(2).unwrap();
+    let model = quote.model();
+    let projection_rows = super::super::projection::ProjectionRows {
+        view: &view,
+        claim: ClaimId::from_u128(1),
+        limits: NativeLimits {
+            plan_edges: quote.lookup_visits(),
+            ..rows.core.limits
+        },
+        staged: Some(&extras),
+        sequence: view.prefix(),
+        visits: &visits,
+    };
+    let shape = model.shape();
+    let plan = prepare_projection(
+        claim,
+        registry,
+        &projection_rows,
+        ProjectionLimits {
+            responses: shape.responses,
+            works: shape.works,
+            slots: shape.responses * claim.acceptance().slot_count(),
+            evaluations: shape.evaluations,
+            declarations: claim.acceptance().declarations().len(),
+            visits: model.inspection_visits().max(model.reduction_visits()),
+            bytes: model.construction_charge(),
+        },
+    )
+    .unwrap();
+    assert!(plan.construction_charge() <= model.construction_charge());
+    let projected = plan.build().unwrap();
+    visits.check().unwrap();
+    assert!(matches!(
+        projected.claim_decision().outcome(),
+        aggregation::AggregateOutcome::Pending
+    ));
+    quote.lookup_visits() - visits.remaining()
+}
+
+#[test]
+fn one_future_native_quote_covers_later_open_work_and_full_closed_response_growth() {
+    use focal_model::lifecycle::aggregation::ProjectionShape;
+    let mut rows = Rows::new(4);
+    let shape = ProjectionShape {
+        responses: 4,
+        works: 8,
+        evaluations: 4,
+    };
+    let limits = NativeLimits {
+        plan_edges: 8192,
+        ..rows.core.limits
+    };
+    let quote = NativeProjectionQuote::derive(
+        limits,
+        rows.core.native_claim(ClaimId::from_u128(1)).unwrap(),
+        shape,
+        1,
+    )
+    .unwrap();
+    let initial = measured_projection(&rows, quote);
+    let mut maximum = initial;
+    for cycle in 0..4 {
+        let first = rows.output(800 + cycle * 2, 0);
+        let second = rows.output(801 + cycle * 2, 1);
+        maximum = maximum.max(measured_projection(&rows, quote));
+        rows.close(
+            900 + cycle,
+            vec![
+                evidence::SlotBinding {
+                    slot: 0,
+                    artifact: first,
+                },
+                evidence::SlotBinding {
+                    slot: 1,
+                    artifact: second,
+                },
+            ],
+            vec![],
+        );
+        maximum = maximum.max(measured_projection(&rows, quote));
+    }
+    assert!(maximum > initial);
+    assert!(maximum <= quote.lookup_visits());
+}
+
+#[test]
+fn native_quote_refuses_lookup_overlay_and_arithmetic_overflow_before_admission() {
+    use focal_model::lifecycle::aggregation::ProjectionShape;
+    let rows = Rows::new(4);
+    let claim = rows.core.native_claim(ClaimId::from_u128(1)).unwrap();
+    let shape = ProjectionShape {
+        responses: 4,
+        works: 8,
+        evaluations: 4,
+    };
+    let limits = NativeLimits {
+        plan_edges: 8192,
+        ..rows.core.limits
+    };
+    let quote = NativeProjectionQuote::derive(limits, claim, shape, 1).unwrap();
+    let maximum = quote
+        .model()
+        .inspection_visits()
+        .max(quote.model().reduction_visits())
+        .max(quote.lookup_visits());
+    NativeProjectionQuote::derive(
+        NativeLimits {
+            plan_edges: maximum,
+            ..limits
+        },
+        claim,
+        shape,
+        1,
+    )
+    .unwrap();
+    assert!(
+        NativeProjectionQuote::derive(
+            NativeLimits {
+                plan_edges: maximum - 1,
+                ..limits
+            },
+            claim,
+            shape,
+            1
+        )
+        .is_err()
+    );
+    assert!(
+        NativeProjectionQuote::derive(limits, claim, shape, limits.range.max_batch_entries + 1)
+            .is_err()
+    );
+    assert!(
+        NativeProjectionQuote::derive(
+            NativeLimits {
+                range: RangeConfig {
+                    max_batch_entries: usize::MAX,
+                    ..limits.range
+                },
+                ..limits
+            },
+            claim,
+            shape,
+            usize::MAX
+        )
+        .is_err()
+    );
+    assert!(
+        NativeProjectionQuote::derive(
+            limits,
+            claim,
+            ProjectionShape {
+                works: usize::MAX,
+                ..shape
+            },
+            1
+        )
+        .is_err()
+    );
 }

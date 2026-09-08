@@ -39,7 +39,7 @@ pub(super) fn prepare(
     parent.require_open_response()?;
     context.principal.require_actor(parent.holder)?;
     registry.check(claim)?;
-    super::response_budget::check_registration_capacity(claim, registry, limits)?;
+    super::response_budget::check_registration_capacity_in(view, claim, registry, limits)?;
     let additional = count(claim, limits)?;
     let final_count = add(registry.rows().len(), additional)?;
     within(final_count, registry.max_rows())?;

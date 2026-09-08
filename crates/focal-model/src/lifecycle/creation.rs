@@ -41,100 +41,34 @@ pub struct Limits {
 /// command codec and from any future persisted native format. Creation revision
 /// and sequence are assigned by the publishing owner and are not request fields.
 pub fn intent_fingerprint(proposals: &[Proposal]) -> Result<ContentHash, ContractError> {
-    let mut hash = blake3::Hasher::new();
-    hash.update(b"focal/native/creation-intent/1");
-    hash_count(&mut hash, proposals.len())?;
+    let mut hash = CreationIntent::new(proposals.len())?;
     for proposal in proposals {
         let definition = &proposal.definition;
-        hash_binding(&mut hash, definition.binding, false);
-        hash.update(&definition.issuer.0);
-        hash.update(&definition.subject.0);
-        match definition.deadline {
-            Some(deadline) => {
-                hash.update(&[1]);
-                hash.update(&deadline.timer.0);
-                hash.update(&deadline.generation.to_be_bytes());
-                hash.update(&deadline.at.to_be_bytes());
-            }
-            None => {
-                hash.update(&[0]);
-            }
-        }
-        hash.update(&definition.max_responses.to_be_bytes());
-        hash_count(&mut hash, definition.graph.obligations().len())?;
-        for obligation in definition.graph.obligations() {
-            hash.update(&[match obligation.kind {
-                super::graph::Kind::DependsOn => 0,
-                super::graph::Kind::Awaits => 1,
-            }]);
-            hash.update(&obligation.target.0);
-        }
-        hash_binding(&mut hash, definition.lineage.binding(), false);
-        match definition.lineage.cause() {
-            Cause::Root(id) => {
-                hash.update(&[0]);
-                hash.update(&id.0);
-            }
-            Cause::Claim(id) => {
-                hash.update(&[1]);
-                hash.update(&id.0);
-            }
-        }
-        hash_count(&mut hash, definition.lineage.corrections().len())?;
-        for correction in definition.lineage.corrections() {
-            hash.update(&[match correction.kind {
-                CorrectionKind::Supersedes => 0,
-                CorrectionKind::Amends => 1,
-            }]);
-            // Lineage construction already restricts predecessors to Claim.
-            hash.update(&correction.predecessor.ledger.tenant.0);
-            hash.update(&correction.predecessor.ledger.session.0);
-            hash.update(&correction.predecessor.id.0);
-        }
-        hash.update(&definition.acceptance.intent_fingerprint().0);
-        hash_count(&mut hash, definition.scope_limits.scopes)?;
-        hash_count(&mut hash, definition.scope_limits.roots)?;
-        hash_count(&mut hash, definition.scope_limits.children)?;
-        match proposal.owner {
-            Some(owner) => {
-                hash.update(&[1]);
-                hash_binding(&mut hash, owner.expected, true);
-                match owner.receipt {
-                    Some(receipt) => {
-                        hash.update(&[1]);
-                        hash.update(&receipt.receipt.0);
-                        hash.update(&receipt.epoch.to_be_bytes());
-                    }
-                    None => {
-                        hash.update(&[0]);
-                    }
-                }
-            }
-            None => {
-                hash.update(&[0]);
-            }
-        }
+        hash.push(
+            &ProposalIntentFields {
+                binding: definition.binding,
+                issuer: definition.issuer,
+                subject: definition.subject,
+                deadline: definition.deadline,
+                max_responses: definition.max_responses,
+                lineage_binding: definition.lineage.binding(),
+                cause: definition.lineage.cause(),
+                acceptance: definition.acceptance.intent_fingerprint(),
+                scope_limits: definition.scope_limits,
+                owner: proposal.owner,
+            },
+            definition.graph.obligations().len(),
+            definition.graph.obligations().iter().copied().map(Ok),
+            definition.lineage.corrections().len(),
+            definition.lineage.corrections().iter().copied().map(Ok),
+        )?;
     }
-    Ok(ContentHash(*hash.finalize().as_bytes()))
+    hash.finish()
 }
 
-fn hash_binding(hash: &mut blake3::Hasher, binding: Binding, revision: bool) {
-    hash.update(&binding.ledger.tenant.0);
-    hash.update(&binding.ledger.session.0);
-    hash.update(&binding.object.0);
-    hash.update(&binding.content.0);
-    if revision {
-        hash.update(&binding.revision.0.to_be_bytes());
-    }
-}
-fn hash_count(hash: &mut blake3::Hasher, count: usize) -> Result<(), ContractError> {
-    hash.update(
-        &u64::try_from(count)
-            .map_err(|_| ContractError::Capacity)?
-            .to_be_bytes(),
-    );
-    Ok(())
-}
+#[path = "creation_intent.rs"]
+mod identity;
+pub use identity::{CreationIntent, ProposalIntentFields};
 
 #[derive(Debug)]
 pub struct CreationPlan {

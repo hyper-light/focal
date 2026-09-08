@@ -1,81 +1,12 @@
 //! Respondent-authored closure and separate response posting/receipt. The owner
 //! discovers cycle membership from its own indexes before checking the manifest.
-use super::prepare::{ALLOCATION, Extra, Extras, Scratch, add, array, heap, within};
+use super::prepare::{ALLOCATION, Extra, Extras, Scratch, add, heap, within};
 use super::*;
 use evidence::{
-    CloseReport, Parent, ResponseDiagnostic, ResponseIdentity, ResponseLimits, SlotBinding,
-    WorkArtifact,
+    CloseReport, Parent, ResponseDiagnostic, ResponseIdentity, ResponseLimits, WorkArtifact,
 };
 use focal_model::lifecycle::aggregation;
-use focal_model::{ArtifactRef, Confidence, ObjectRevision, OutcomeKind};
-
-/// Typed authored report. There is no default outcome or implicit success.
-#[derive(Debug)]
-pub struct NativeResponseInput {
-    pub summary: String,
-    pub confidence: Confidence,
-    pub outcome: OutcomeKind,
-    pub manifest: Vec<SlotBinding>,
-    pub diagnostics: Vec<ArtifactRef>,
-}
-impl NativeResponseInput {
-    pub(super) fn heap_charge(&self) -> Result<usize, NativeError> {
-        add(
-            array::<u8>(self.summary.capacity())?,
-            add(
-                array::<SlotBinding>(self.manifest.capacity())?,
-                array::<ArtifactRef>(self.diagnostics.capacity())?,
-            )?,
-        )
-    }
-    pub(super) fn check_limits(&self, limits: NativeLimits) -> Result<(), NativeError> {
-        if self.summary.len() > limits.response_summary_bytes
-            || self.manifest.len() > super::response_budget::work_limit(limits)?
-            || self.diagnostics.len() > limits.diagnostics_per_cycle
-        {
-            return Err(NativeError::Capacity("authored response"));
-        }
-        within(self.heap_charge()?, limits.preparation_bytes)
-    }
-    pub(super) fn hash_into(&self, hash: &mut blake3::Hasher) -> Result<(), NativeError> {
-        fn count(hash: &mut blake3::Hasher, n: usize) -> Result<(), NativeError> {
-            hash.update(
-                &u64::try_from(n)
-                    .map_err(|_| NativeError::Capacity("response intent"))?
-                    .to_le_bytes(),
-            );
-            Ok(())
-        }
-        count(hash, self.summary.len())?;
-        hash.update(self.summary.as_bytes());
-        hash.update(&[match self.confidence {
-            Confidence::Hint => 0,
-            Confidence::Tentative => 1,
-            Confidence::Committed => 2,
-            Confidence::Consensus => 3,
-        }]);
-        hash.update(&[match self.outcome {
-            OutcomeKind::Complete => 0,
-            OutcomeKind::Partial => 1,
-            OutcomeKind::Refused => 2,
-            OutcomeKind::Impossible => 3,
-            OutcomeKind::Interrupted => 4,
-            OutcomeKind::Failed => 5,
-        }]);
-        count(hash, self.manifest.len())?;
-        for slot in &self.manifest {
-            hash.update(&slot.slot.to_le_bytes());
-            hash.update(&slot.artifact.id.0);
-            hash.update(&slot.artifact.hash.0);
-        }
-        count(hash, self.diagnostics.len())?;
-        for diagnostic in &self.diagnostics {
-            hash.update(&diagnostic.id.0);
-            hash.update(&diagnostic.hash.0);
-        }
-        Ok(())
-    }
-}
+use focal_model::{ArtifactRef, ObjectRevision};
 
 fn cycle(view: &View<'_>, key: NativeCycleKey) -> Result<NativeCycle, NativeError> {
     match view.get(Key::Cycle(key)) {
@@ -283,7 +214,7 @@ pub(super) fn prepare(
     old.binding().check(&expected)?;
     let parent = Parent::from_claim(old)?;
     let mut rows = scratch.reserve::<ClaimState>(1)?;
-    let mut replacement_registry = None;
+    let mut replacement_registry = transactions::RegistryOverrides::new();
     match command {
         NativeCommand::CloseResponse {
             response, report, ..
@@ -294,6 +225,9 @@ pub(super) fn prepare(
                 || response.content.0 == [0; 32]
                 || view
                     .get(Key::Response(TestamentId(response.object.0)))
+                    .is_some()
+                || view
+                    .get(Key::ResultTestament(TestamentId(response.object.0)))
                     .is_some()
             {
                 return Err(ContractError::InvalidTarget.into());
@@ -473,7 +407,7 @@ pub(super) fn prepare(
                         extras,
                         scratch,
                     )?;
-                    replacement_registry = Some((parent.claim, registry));
+                    replacement_registry.insert(&changed, registry, limits.plan_nodes, scratch)?;
                 }
                 rows.push(changed);
             }

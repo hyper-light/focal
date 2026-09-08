@@ -1,11 +1,17 @@
 //! Compact owner-held evaluation membership. Full immutable policies and
 //! definitions live in their canonical rows and are never copied into this set.
 use super::acceptance::{RegisteredEvaluation, same_target};
-use crate::ContentHash;
-use crate::lifecycle::claim::ClaimState;
+use crate::lifecycle::claim::{ClaimState, ReceiptAdoption};
 use crate::lifecycle::memory as bytes;
 use crate::lifecycle::validation::{Evaluation, Target};
 use crate::lifecycle::{Binding, ContractError};
+use crate::{ContentHash, SessionSeq};
+#[path = "registration_snapshot.rs"]
+mod snapshot;
+pub use snapshot::{
+    RegistrationHydrationPlan, RegistrationMemberSnapshotV1, RegistrationSnapshotSource,
+    RegistrationSnapshotV1, RegistrationValue,
+};
 
 const ALLOCATION: usize = 4 * std::mem::size_of::<usize>();
 
@@ -17,6 +23,29 @@ pub struct RegistrationSet {
     max_rows: usize,
     sealed: bool,
     increments_sealed: bool,
+    sealed_at: Option<SessionSeq>,
+}
+
+/// Borrowed native audit authority over the complete owned membership and the
+/// claim's original local seal. There is no participant-supplied row slice or
+/// cut, and holding this proof prevents mutation of either source.
+#[derive(Debug, Clone, Copy)]
+pub struct NativeSealedTargets<'a> {
+    registry: &'a RegistrationSet,
+    claim: &'a ClaimState,
+    sequence: SessionSeq,
+}
+
+impl NativeSealedTargets<'_> {
+    pub fn rows(&self) -> &[RegisteredEvaluation] {
+        self.registry.rows()
+    }
+    pub fn claim(&self) -> &ClaimState {
+        self.claim
+    }
+    pub fn sealed_at(&self) -> SessionSeq {
+        self.sequence
+    }
 }
 
 fn buffer(capacity: usize) -> Result<usize, ContractError> {
@@ -44,6 +73,7 @@ impl RegistrationSet {
             max_rows,
             sealed: false,
             increments_sealed: false,
+            sealed_at: None,
         })
     }
     pub fn check(&self, claim: &ClaimState) -> Result<(), ContractError> {
@@ -100,6 +130,7 @@ impl RegistrationSet {
             max_rows: self.max_rows,
             sealed: self.sealed,
             increments_sealed: self.increments_sealed,
+            sealed_at: self.sealed_at,
         };
         bytes::fits(copied.retained_bytes()?, max_bytes)?;
         Ok(copied)
@@ -110,6 +141,18 @@ impl RegistrationSet {
     pub fn increment_targets_sealed(&self) -> bool {
         self.increments_sealed
     }
+    /// Reopen only the replacement receipt's Increment target set. Historical
+    /// members retain their original receipt, ordinal, and independent state.
+    /// The owner publishes this charged copy with the adopted claim and fences.
+    pub fn adopt_receipt(&mut self, adoption: &ReceiptAdoption<'_>) -> Result<(), ContractError> {
+        self.check(adoption.claim())?;
+        if self.sealed || self.sealed_at.is_some() {
+            return Err(ContractError::InvalidTransition);
+        }
+        self.claim = adoption.next_binding();
+        self.increments_sealed = false;
+        Ok(())
+    }
     pub fn seal_increment_targets(&mut self, claim: &ClaimState) -> Result<(), ContractError> {
         self.check(claim)?;
         self.increments_sealed = true;
@@ -117,9 +160,45 @@ impl RegistrationSet {
     }
     pub fn seal_targets(&mut self, claim: &ClaimState) -> Result<(), ContractError> {
         self.check(claim)?;
+        let sequence = claim.local_sealed_at();
+        if self.sealed_at.is_some() && self.sealed_at != sequence {
+            return Err(ContractError::InvalidCut);
+        }
+        if let Some(sequence) = sequence
+            && (sequence.0 == 0
+                || sequence < claim.created()
+                || (!claim.local_complete() && !claim.is_terminal()))
+        {
+            return Err(ContractError::InvalidCut);
+        }
         self.sealed = true;
         self.increments_sealed = true;
+        self.sealed_at = sequence;
         Ok(())
+    }
+    pub fn audit_targets<'a>(
+        &'a self,
+        claim: &'a ClaimState,
+    ) -> Result<NativeSealedTargets<'a>, ContractError> {
+        self.check(claim)?;
+        if !self.sealed
+            || !self.increments_sealed
+            || (!claim.local_complete() && !claim.is_terminal())
+        {
+            return Err(ContractError::InvalidTransition);
+        }
+        let sequence = self.sealed_at.ok_or(ContractError::InvalidCut)?;
+        if sequence.0 == 0
+            || sequence < claim.created()
+            || claim.local_sealed_at() != Some(sequence)
+        {
+            return Err(ContractError::InvalidCut);
+        }
+        Ok(NativeSealedTargets {
+            registry: self,
+            claim,
+            sequence,
+        })
     }
     /// Registration and its independent EvaluationState are one owner mutation.
     /// A later generation requires a separate checked replacement operation; it
@@ -214,6 +293,7 @@ impl RegistrationSet {
             max_rows: self.max_rows,
             sealed: self.sealed,
             increments_sealed: self.increments_sealed,
+            sealed_at: self.sealed_at,
         };
         bytes::fits(copied.retained_bytes()?, max_bytes)?;
         Ok(copied)

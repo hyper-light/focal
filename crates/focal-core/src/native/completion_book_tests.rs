@@ -4,6 +4,11 @@ use crate::native::report_tests as fixture;
 use focal_evidence::BuiltinNativeSchemas;
 use focal_model::ValidationMode;
 
+#[path = "completion_book_rebind_tests.rs"]
+mod rebind_tests;
+#[path = "completion_slot_tests.rs"]
+mod slot_tests;
+
 fn source() -> MemoryBudget {
     // Accounting capacity only: construction allocates small bounded buffers.
     MemoryBudget::new(usize::MAX / 16, 0).unwrap()
@@ -117,7 +122,13 @@ fn committing_begin_head_preserves_later_update_and_rollback_restores_credit() {
     let key = fixture::key(1);
     let before = core.native_evaluation(key).unwrap().binding();
     let report = book
-        .advance(key, before, before.next().unwrap(), false, false)
+        .advance(
+            key,
+            before,
+            before.next().unwrap(),
+            false,
+            CompletionUse::Regular,
+        )
         .unwrap();
     assert_eq!(book.remaining_reports(key), Some(1));
     book.commit(begin).unwrap();
@@ -145,7 +156,13 @@ fn published_terminal_head_and_discarded_replacement_preserve_issued_pages() {
         .unwrap()
         .commit();
     let report = book
-        .advance(first_key, binding, binding.next().unwrap(), true, false)
+        .advance(
+            first_key,
+            binding,
+            binding.next().unwrap(),
+            true,
+            CompletionUse::Regular,
+        )
         .unwrap();
     assert_eq!(book.totals.workspace, 0);
     let before_second_capacity = book.funded_capacity();
@@ -188,7 +205,13 @@ fn trim_waits_for_pending_report_rollback_and_never_refunds_issued_debit() {
         .unwrap()
         .commit();
     let report = book
-        .advance(key, binding, binding.next().unwrap(), true, false)
+        .advance(
+            key,
+            binding,
+            binding.next().unwrap(),
+            true,
+            CompletionUse::Regular,
+        )
         .unwrap();
     assert!(book.trim_idle().is_err());
     assert_eq!(book.funded_capacity(), backing);
@@ -342,7 +365,7 @@ fn increment_grant_funds_exact_target_family_and_journals_terminal_report_withou
             state.binding(),
             state.binding().next().unwrap(),
             true,
-            true
+            CompletionUse::AdmissionFailure
         )
         .is_err()
     );
@@ -353,7 +376,7 @@ fn increment_grant_funds_exact_target_family_and_journals_terminal_report_withou
             state.binding(),
             state.binding().next().unwrap(),
             true,
-            false,
+            CompletionUse::Regular,
         )
         .unwrap();
     assert_eq!(book.remaining_reports(key), Some(0));
@@ -368,7 +391,7 @@ fn increment_grant_funds_exact_target_family_and_journals_terminal_report_withou
             state.binding(),
             state.binding().next().unwrap(),
             true,
-            false,
+            CompletionUse::Regular,
         )
         .unwrap();
     book.commit(report).unwrap();
@@ -427,6 +450,7 @@ fn unequal_envelope_demands_survive_partial_reports_head_commits_and_tail_rollba
                 events: 11,
                 sequences: 1,
                 new_rows: 20,
+                ..CompletionSlots::default()
             },
             Some(CompletionSlots {
                 events: 3,
@@ -446,6 +470,7 @@ fn unequal_envelope_demands_survive_partial_reports_head_commits_and_tail_rollba
                 events: 6,
                 sequences: 1,
                 new_rows: 10,
+                ..CompletionSlots::default()
             },
             None,
         )
@@ -479,6 +504,7 @@ fn unequal_envelope_demands_survive_partial_reports_head_commits_and_tail_rollba
             events: 43,
             sequences: 5,
             new_rows: 74,
+            ..CompletionSlots::default()
         }
     );
     assert_eq!(full.reports, 5);
@@ -488,7 +514,7 @@ fn unequal_envelope_demands_survive_partial_reports_head_commits_and_tail_rollba
             a_binding,
             a_binding.next().unwrap(),
             false,
-            false,
+            CompletionUse::Regular,
         )
         .unwrap();
     let after_first = book.totals;
@@ -502,6 +528,7 @@ fn unequal_envelope_demands_survive_partial_reports_head_commits_and_tail_rollba
             events: 32,
             sequences: 4,
             new_rows: 54,
+            ..CompletionSlots::default()
         }
     );
     let second = book
@@ -510,7 +537,7 @@ fn unequal_envelope_demands_survive_partial_reports_head_commits_and_tail_rollba
             b_binding,
             b_binding.next().unwrap(),
             false,
-            false,
+            CompletionUse::Regular,
         )
         .unwrap();
     assert_eq!(
@@ -523,6 +550,7 @@ fn unequal_envelope_demands_survive_partial_reports_head_commits_and_tail_rollba
             events: 26,
             sequences: 3,
             new_rows: 44,
+            ..CompletionSlots::default()
         }
     );
     book.commit(a_begin).unwrap();
@@ -537,7 +565,7 @@ fn unequal_envelope_demands_survive_partial_reports_head_commits_and_tail_rollba
             a_binding,
             a_binding.next().unwrap(),
             true,
-            true,
+            CompletionUse::AdmissionFailure,
         )
         .unwrap();
     assert_eq!(book.totals.slots, b.slots());
@@ -549,7 +577,7 @@ fn unequal_envelope_demands_survive_partial_reports_head_commits_and_tail_rollba
             b_binding,
             b_binding.next().unwrap(),
             true,
-            false,
+            CompletionUse::Regular,
         )
         .unwrap();
     book.commit(done).unwrap();
@@ -575,6 +603,7 @@ fn recovered_partial_credit_uses_its_envelope_profile_instead_of_full_original_c
                 events: 9,
                 sequences: 1,
                 new_rows: 15,
+                ..CompletionSlots::default()
             },
             Some(CompletionSlots {
                 events: 2,
@@ -603,6 +632,7 @@ fn recovered_partial_credit_uses_its_envelope_profile_instead_of_full_original_c
             events: 11,
             sequences: 1,
             new_rows: 18,
+            ..CompletionSlots::default()
         }
     );
     assert_eq!(book.totals.reports, 1);
@@ -634,6 +664,7 @@ fn summed_slot_overflow_refuses_before_metadata_growth_or_funding_changes() {
                 events: usize::MAX / 2,
                 sequences: 1,
                 new_rows: 7,
+                ..CompletionSlots::default()
             },
             Some(CompletionSlots {
                 events: 1,

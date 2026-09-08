@@ -18,10 +18,14 @@ mod admission;
 mod projection;
 #[path = "registration.rs"]
 mod registration;
+#[path = "aggregation_snapshot.rs"]
+mod snapshot;
 #[cfg(test)]
 pub(crate) use acceptance::acceptance_for;
+pub(in crate::lifecycle) use acceptance::preparation::{SourceShape, check_sources};
 pub use acceptance::{
-    AcceptancePolicy, DeclaredObligation, EvaluationRegistry, ObligationTarget,
+    AcceptancePlan, AcceptancePolicy, AcceptanceSource, AcceptanceSourcePasses,
+    AcceptanceSourcePlan, DeclaredObligation, EvaluationRegistry, ObligationTarget,
     RegisteredEvaluation, SealedTargets,
 };
 pub use admission::{
@@ -29,10 +33,15 @@ pub use admission::{
     project_admission,
 };
 pub use projection::{
-    ProjectionLimits, ProjectionPlan, PublicationPosition, PublishedResponse, PublishedResult,
-    WholeWorkProjection, WholeWorkView, prepare_projection,
+    ProjectionLimits, ProjectionPlan, ProjectionQuote, ProjectionShape, PublicationPosition,
+    PublishedResponse, PublishedResult, WholeWorkProjection, WholeWorkView, prepare_projection,
+    quote_projection,
 };
-pub use registration::RegistrationSet;
+pub use registration::{
+    NativeSealedTargets, RegistrationHydrationPlan, RegistrationMemberSnapshotV1, RegistrationSet,
+    RegistrationSnapshotSource, RegistrationSnapshotV1, RegistrationValue,
+};
+pub use snapshot::{BlockingCauseSnapshotV1, TerminalCutSnapshotV1};
 
 use super::evidence::ResponseEvaluation;
 use super::validation::{AcceptedResult, Phase, Target};
@@ -400,22 +409,72 @@ fn same_content(left: Binding, right: Binding) -> Result<(), ContractError> {
     })
 }
 
-fn validate_policies(policies: &[SlotPolicy<'_>], limits: Limits) -> Result<(), ContractError> {
+// Scalar policy rules shared with repeatable, unmaterialized authored sources.
+// The traversal and its debit remain the responsibility of each checked caller.
+pub(in crate::lifecycle) fn check_policy_order(
+    previous: Option<u32>,
+    current: u32,
+) -> Result<(), ContractError> {
+    if previous.is_some_and(|old| old >= current) {
+        return Err(ContractError::InvalidPolicy);
+    }
+    Ok(())
+}
+pub(in crate::lifecycle) fn check_policy_index(left: u32, right: u32) -> Result<(), ContractError> {
+    if left == right {
+        return Err(ContractError::InvalidPolicy);
+    }
+    Ok(())
+}
+pub(in crate::lifecycle) fn check_policy_validation(
+    check: CheckPolicy,
+) -> Result<(), ContractError> {
+    if check.validation.is_zero() {
+        return Err(ContractError::InvalidPolicy);
+    }
+    Ok(())
+}
+pub(in crate::lifecycle) fn check_policy_pair(
+    left: CheckPolicy,
+    right: CheckPolicy,
+) -> Result<(), ContractError> {
+    if left.validation == right.validation {
+        return Err(ContractError::InvalidPolicy);
+    }
+    check_policy_index(left.declaration_index, right.declaration_index)
+}
+
+#[cfg(test)]
+pub(in crate::lifecycle) fn validate_policies(
+    policies: &[SlotPolicy<'_>],
+    limits: Limits,
+) -> Result<(), ContractError> {
+    validate_policy_sources(
+        policies.iter().copied(),
+        limits,
+        &mut super::graph::VisitBudget::new(usize::MAX),
+    )
+}
+
+pub(in crate::lifecycle) fn validate_policy_sources<'a>(
+    policies: impl ExactSizeIterator<Item = SlotPolicy<'a>> + Clone,
+    limits: Limits,
+    visits: &mut super::graph::VisitBudget,
+) -> Result<(), ContractError> {
     if policies.len() > limits.max_slots || limits.max_results == 0 || limits.max_updates == 0 {
         return Err(ContractError::Capacity);
     }
     let mut count = 0usize;
     let mut previous = None;
-    for (position, slot) in policies.iter().enumerate() {
-        if previous.is_some_and(|old| old >= slot.slot) {
-            return Err(ContractError::InvalidPolicy);
-        }
-        if policies
-            .iter()
-            .take(position)
-            .any(|old| old.missing_declaration_index == slot.missing_declaration_index)
-        {
-            return Err(ContractError::InvalidPolicy);
+    for (position, slot) in policies.clone().enumerate() {
+        visits.charge(1)?;
+        check_policy_order(previous, slot.slot)?;
+        for old in policies.clone().take(position) {
+            visits.charge(1)?;
+            check_policy_index(
+                old.missing_declaration_index,
+                slot.missing_declaration_index,
+            )?;
         }
         previous = Some(slot.slot);
         count = count
@@ -424,23 +483,30 @@ fn validate_policies(policies: &[SlotPolicy<'_>], limits: Limits) -> Result<(), 
         if count > limits.max_checks {
             return Err(ContractError::Capacity);
         }
-        if !slot.checks.windows(2).all(|pair| matches!(pair, [left, right] if left.declaration_index < right.declaration_index)) { return Err(ContractError::InvalidPolicy); }
+        for pair in slot.checks.windows(2) {
+            visits.charge(1)?;
+            match pair {
+                [left, right] => {
+                    check_policy_order(Some(left.declaration_index), right.declaration_index)?
+                }
+                _ => return Err(ContractError::InvalidPolicy),
+            }
+        }
     }
-    for (position, check) in policies.iter().flat_map(|slot| slot.checks).enumerate() {
-        if check.validation.is_zero()
-            || policies
-                .iter()
-                .any(|slot| slot.missing_declaration_index == check.declaration_index)
-            || policies
-                .iter()
-                .flat_map(|slot| slot.checks)
-                .take(position)
-                .any(|old| {
-                    old.validation == check.validation
-                        || old.declaration_index == check.declaration_index
-                })
-        {
-            return Err(ContractError::InvalidPolicy);
+    // Empty slots still cost traversal work when flattened. Charge the complete
+    // outer walk, including for a prefix scan that may stop earlier below.
+    visits.charge(policies.len())?;
+    for (position, check) in policies.clone().flat_map(|slot| slot.checks).enumerate() {
+        visits.charge(1)?;
+        check_policy_validation(*check)?;
+        for slot in policies.clone() {
+            visits.charge(1)?;
+            check_policy_index(slot.missing_declaration_index, check.declaration_index)?;
+        }
+        visits.charge(policies.len())?;
+        for old in policies.clone().flat_map(|slot| slot.checks).take(position) {
+            visits.charge(1)?;
+            check_policy_pair(*old, *check)?;
         }
     }
     Ok(())

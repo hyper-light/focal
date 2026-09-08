@@ -3,6 +3,14 @@ use super::*;
 use focal_memory::{Change, Entry};
 use focal_model::ObjectRevision;
 
+#[path = "history_assembly.rs"]
+mod history_assembly;
+pub(super) use history_assembly::visit_history;
+
+#[path = "original_plan.rs"]
+mod original_plan;
+pub(super) use original_plan::{OriginalPlan, SealedChanges};
+
 #[derive(Clone, Copy)]
 pub(super) struct History {
     binding: Binding,
@@ -14,7 +22,7 @@ pub(super) fn event_count(
     view: &View<'_>,
     operation: NativeOperation,
 ) -> Result<usize, NativeError> {
-    if operation == NativeOperation::EnterWholeWork {
+    if history_assembly::explicit(operation) {
         return Ok(0);
     }
     let mut count = 0;
@@ -33,6 +41,7 @@ pub(super) fn event_count(
                         && matches!(
                             operation,
                             NativeOperation::CloseResponse
+                                | NativeOperation::AdoptReceipt
                                 | NativeOperation::PostResponse
                                 | NativeOperation::ReceiveResponse
                         )) =>
@@ -45,29 +54,6 @@ pub(super) fn event_count(
     Ok(count)
 }
 
-fn event(
-    changes: &mut Vec<Change<Key, Row>>,
-    outcome: NativeOutcome,
-    ordinal: &mut u32,
-    kind: NativeEventKind,
-    owned_child: Option<Binding>,
-    before: Option<Binding>,
-    after: History,
-) -> Result<(), NativeError> {
-    record_fact(
-        changes,
-        outcome,
-        ordinal,
-        NativeFact::Claim(NativeClaimEvent {
-            kind,
-            owned_child,
-            before,
-            after: after.binding,
-            status: after.status,
-        }),
-    )
-}
-
 fn record_fact(
     changes: &mut Vec<Change<Key, Row>>,
     outcome: NativeOutcome,
@@ -75,7 +61,7 @@ fn record_fact(
     fact: NativeFact,
 ) -> Result<(), NativeError> {
     let item = NativeEvent {
-        request: outcome.request,
+        invocation: outcome.invocation,
         sequence: outcome.sequence,
         ordinal: *ordinal,
         fact,
@@ -98,9 +84,10 @@ fn record_fact(
 }
 
 #[allow(clippy::too_many_arguments)] // Internal staging context, already bounded by the owner.
+#[cfg(test)]
 pub(super) fn changes(
     plan: transactions::Plan,
-    mut extras: Extras,
+    extras: Extras,
     meta: Meta,
     outcome: NativeOutcome,
     view: &View<'_>,
@@ -108,261 +95,17 @@ pub(super) fn changes(
     allowance: usize,
     scratch: &mut Scratch,
 ) -> Result<Vec<Change<Key, Row>>, NativeError> {
-    let transactions::Plan {
-        mut rows,
-        mut registry,
-        ..
-    } = plan;
-    let journaled = extras.journal.is_some();
-    if journaled != (outcome.operation == NativeOperation::EnterWholeWork) {
-        return Err(ContractError::InvalidTransition.into());
-    }
-    if journaled {
-        check_journal(&rows, &extras, view, limits)?;
-    }
-    let event_charge = event_containers(
-        usize::try_from(outcome.events).map_err(|_| NativeError::Capacity("events"))?,
-    )?;
-    rows.sort_unstable_by_key(|row| row.binding().object);
-    let count = add(
-        add(
-            rows.len(),
-            usize::try_from(outcome.events).map_err(|_| NativeError::Capacity("events"))?,
-        )?,
-        add(2, extras.rows.len())?,
-    )?;
-    if count > limits.range.max_batch_entries {
-        return Err(NativeError::Capacity(
-            "changes including history and outcome",
-        ));
-    }
-    let mut changes = Vec::new();
-    changes
-        .try_reserve_exact(count)
-        .map_err(|_| MemoryError::AllocationFailed)?;
-    within(
-        add(
-            add(
-                array::<Change<Key, Row>>(changes.capacity())?,
-                array::<History>(rows.len())?,
-            )?,
-            add(containers(rows.len())?, event_charge)?,
-        )?,
-        allowance,
-    )?;
-    let mut history = Vec::new();
-    history
-        .try_reserve_exact(rows.len())
-        .map_err(|_| MemoryError::AllocationFailed)?;
-    within(
-        add(
-            add(
-                array::<Change<Key, Row>>(changes.capacity())?,
-                array::<History>(history.capacity())?,
-            )?,
-            add(containers(rows.len())?, event_charge)?,
-        )?,
-        allowance,
-    )?;
-    let mut ordinal = 0;
-    // A report publishes its artifact, evaluation and accepted result before the
-    // derived claim failure. Existing command history retains its original order.
-    if journaled
-        || matches!(
-            outcome.operation,
-            NativeOperation::ReportAdmission
-                | NativeOperation::CloseResponse
-                | NativeOperation::PostResponse
-                | NativeOperation::ReceiveResponse
-        )
-    {
-        append_extras(&mut changes, &mut extras, outcome, &mut ordinal)?;
-    }
-    // Match model preparation phases: creation, child registration in child-ID
-    // order, then terminal changes. Registrations never precede child creation.
-    for row in &rows {
-        let old = view.claim(ClaimId(row.binding().object.0));
-        let state = old.map_or(
-            History {
-                binding: Binding {
-                    revision: ObjectRevision(1),
-                    ..row.binding()
-                },
-                status: ClaimStatus::Generated,
-            },
-            |old| History {
-                binding: old.binding(),
-                status: old.status(),
-            },
-        );
-        if old.is_none() {
-            event(
-                &mut changes,
-                outcome,
-                &mut ordinal,
-                NativeEventKind::Created,
-                None,
-                None,
-                state,
-            )?;
-        }
-        history.push(state);
-    }
-    for row in &rows {
-        if view.claim(ClaimId(row.binding().object.0)).is_some() {
-            continue;
-        }
-        let focal_model::Cause::Claim(parent) = row.lineage().cause() else {
-            continue;
-        };
-        let index = rows
-            .binary_search_by_key(&parent.0, |row| row.binding().object.0)
-            .map_err(|_| ContractError::InvalidTarget)?;
-        let owner = rows.get(index).ok_or(ContractError::InvalidTarget)?;
-        let child = owner
-            .scopes()
-            .children()
-            .binary_search_by_key(&ClaimId(row.binding().object.0), |child| child.id())
-            .ok()
-            .and_then(|index| owner.scopes().children().get(index))
-            .ok_or(ContractError::InvalidTarget)?;
-        let state = history.get_mut(index).ok_or(ContractError::InvalidTarget)?;
-        let before = state.binding;
-        state.binding = before.next()?;
-        event(
-            &mut changes,
-            outcome,
-            &mut ordinal,
-            NativeEventKind::ChildRegistered,
-            Some(child.binding()),
-            Some(before),
-            *state,
-        )?;
-    }
-    for (row, mut state) in rows.into_iter().zip(history) {
-        if journaled {
-            state = History {
-                binding: row.binding(),
-                status: row.status(),
-            };
-        }
-        if outcome.operation == NativeOperation::SealIncrementTargets {
-            record_fact(
-                &mut changes,
-                outcome,
-                &mut ordinal,
-                NativeFact::Registrations {
-                    claim: row.binding(),
-                },
-            )?;
-        }
-        if state.binding != row.binding() {
-            let kind = if state.status == row.status()
-                && matches!(
-                    outcome.operation,
-                    NativeOperation::CloseResponse
-                        | NativeOperation::PostResponse
-                        | NativeOperation::ReceiveResponse
-                ) {
-                NativeEventKind::ResponseObserved
-            } else {
-                match row.status() {
-                    ClaimStatus::Cancelled => NativeEventKind::Cancelled,
-                    ClaimStatus::Superseded => NativeEventKind::Superseded,
-                    ClaimStatus::Posted => NativeEventKind::Posted,
-                    ClaimStatus::PostFailed => NativeEventKind::PostFailed,
-                    ClaimStatus::Received => NativeEventKind::Received,
-                    ClaimStatus::Satisfied => NativeEventKind::Satisfied,
-                    ClaimStatus::TestamentGenerated => NativeEventKind::TestamentGenerated,
-                    ClaimStatus::TestamentAcknowledged => NativeEventKind::TestamentAcknowledged,
-                    _ => return Err(ContractError::InvalidTransition.into()),
-                }
-            };
-            let before = state.binding;
-            state.binding = before.next()?;
-            state.status = row.status();
-            event(
-                &mut changes,
-                outcome,
-                &mut ordinal,
-                kind,
-                None,
-                Some(before),
-                state,
-            )?;
-        }
-        state.binding.check(&row.binding())?;
-        let id = ClaimId(row.binding().object.0);
-        let registrations = if registry.as_ref().is_some_and(|(owner, _)| *owner == id) {
-            registry.take().ok_or(ContractError::InvalidTarget)?.1
-        } else {
-            transactions::copy_registry(view, &row, limits, scratch)?
-        };
-        registrations.check(&row)?;
-        let row = OwnedClaim::new(row, registrations)?;
-        let heap_bytes = row.heap_charge()?;
-        changes.push(Change::Put(Entry::new(
-            Key::Claim(id),
-            Row::Claim(row),
-            heap_bytes,
-        )));
-    }
-    if registry.is_some() {
-        return Err(ContractError::InvalidTarget.into());
-    }
-    append_extras(&mut changes, &mut extras, outcome, &mut ordinal)?;
-    if ordinal != outcome.events {
-        return Err(ContractError::InvalidManifest.into());
-    }
-    changes.push(Change::Put(Entry::new(Key::Meta, Row::Meta(meta), 0)));
-    changes.push(Change::Put(Entry::new(
-        Key::Outcome(outcome.request),
-        Row::Outcome(outcome),
-        0,
-    )));
-    Ok(changes)
+    original_plan::OriginalPlan::check(plan, extras, meta, outcome, view, limits, scratch)?
+        .into_changes(allowance, scratch)
 }
 
-fn append_extras(
+fn append_rows(
     changes: &mut Vec<Change<Key, Row>>,
     extras: &mut Extras,
-    outcome: NativeOutcome,
-    ordinal: &mut u32,
 ) -> Result<(), NativeError> {
-    if let Some(mut journal) = extras.journal.take() {
-        for fact in journal.drain(..) {
-            record_fact(changes, outcome, ordinal, fact)?;
-        }
-    }
     for extra in extras.rows.drain(..) {
-        let needed = if extra.fact.is_some() { 2 } else { 1 };
-        if changes
-            .len()
-            .checked_add(needed)
-            .is_none_or(|count| count > changes.capacity())
-        {
-            return Err(NativeError::Capacity("extra history preparation"));
-        }
-        if let Some(fact) = extra.fact {
-            if *ordinal >= outcome.events {
-                return Err(NativeError::Capacity("extra history ordinal"));
-            }
-            let event = NativeEvent {
-                request: outcome.request,
-                sequence: outcome.sequence,
-                ordinal: *ordinal,
-                fact,
-            };
-            let stored = OwnedEvent::new(StoredEvent::pack(event)?)?;
-            let heap = stored.heap_charge()?;
-            changes.push(Change::Put(Entry::new(
-                Key::Event(outcome.sequence, *ordinal),
-                Row::Event(stored),
-                heap,
-            )));
-            *ordinal = ordinal
-                .checked_add(1)
-                .ok_or(NativeError::Capacity("event ordinal"))?;
+        if changes.len() == changes.capacity() {
+            return Err(NativeError::Capacity("extra row preparation"));
         }
         changes.push(Change::Put(Entry::new(extra.key, extra.row, extra.heap)));
     }
@@ -397,12 +140,27 @@ fn check_journal(
         }
     }
     for row in rows {
-        let old = view
-            .claim(ClaimId(row.binding().object.0))
+        let controlled = extras.control_graph.as_ref();
+        if let Some(proof) = controlled {
+            visits = visits
+                .checked_sub(proof.originals().len())
+                .ok_or(NativeError::Capacity("control claim history visits"))?;
+        }
+        let old = controlled
+            .and_then(|proof| {
+                proof
+                    .originals()
+                    .iter()
+                    .find(|source| source.binding().object == row.binding().object)
+            })
+            .or_else(|| view.claim(ClaimId(row.binding().object.0)))
             .ok_or(ContractError::InvalidTarget)?;
         let mut binding = old.binding();
         let mut status = old.status();
-        for fact in journal {
+        let suffix = journal
+            .get(controlled.map_or(0, |proof| proof.prefix().len())..)
+            .ok_or(ContractError::InvalidManifest)?;
+        for fact in suffix {
             visits = visits
                 .checked_sub(1)
                 .ok_or(NativeError::Capacity("claim history visits"))?;
@@ -418,12 +176,21 @@ fn check_journal(
             {
                 return Err(ContractError::StaleRevision.into());
             }
+            if status.is_terminal()
+                && !matches!(
+                    event.kind,
+                    NativeEventKind::Monitor(_) | NativeEventKind::OwnerReleased
+                )
+            {
+                return Err(ContractError::InvalidTransition.into());
+            }
             let valid = matches!(
                 (event.kind, event.status),
                 (
                     NativeEventKind::Validating | NativeEventKind::LocallyComplete,
                     ClaimStatus::Validating
                 ) | (NativeEventKind::Satisfied, ClaimStatus::Satisfied)
+                    | (NativeEventKind::PostFailed, ClaimStatus::PostFailed)
                     | (
                         NativeEventKind::ValidationIncomplete,
                         ClaimStatus::ValidationIncomplete
@@ -440,8 +207,40 @@ fn check_journal(
                         NativeEventKind::DependencyFailed,
                         ClaimStatus::DependencyFailed
                     )
+                    | (NativeEventKind::Expired, ClaimStatus::Expired)
+                    | (NativeEventKind::Deadlocked, ClaimStatus::Deadlocked)
             );
-            if !valid {
+            let released = event.kind == NativeEventKind::OwnerReleased
+                && event.status == status
+                && old.is_terminal()
+                && !old.scopes().released()
+                && row.scopes().released();
+            let monitor = if let NativeEventKind::Monitor(monitor) = event.kind {
+                if event.status != status {
+                    return Err(ContractError::InvalidTransition.into());
+                }
+                let depth = row
+                    .scopes()
+                    .limits()
+                    .scopes
+                    .checked_ilog2()
+                    .map(|n| n.checked_add(1).ok_or(ContractError::Capacity))
+                    .transpose()?
+                    .unwrap_or(0);
+                visits = visits
+                    .checked_sub(
+                        usize::try_from(depth)
+                            .map_err(|_| ContractError::Capacity)?
+                            .checked_add(1)
+                            .ok_or(ContractError::Capacity)?,
+                    )
+                    .ok_or(NativeError::Capacity("claim history visits"))?;
+                super::monitor_commands::check_event(row, monitor)?;
+                true
+            } else {
+                false
+            };
+            if !valid && !released && !monitor {
                 return Err(ContractError::InvalidTransition.into());
             }
             binding = event.after;
@@ -454,3 +253,7 @@ fn check_journal(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "control_graph_checks_tests.rs"]
+mod control_graph_checks_tests;

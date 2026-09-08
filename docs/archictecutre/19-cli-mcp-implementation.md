@@ -5,7 +5,14 @@ and [the complete interface plan](13-cli-and-agent-implementation-plan.md).
 It does not replace the independent lifecycle target in
 [17](17-lifecycle-state-and-authority.md) or its required storage migration in
 [18](18-lifecycle-storage-upgrade.md). The existing reducer still has one closing
-testament per claim. Exposing its operations is not completion of that migration.
+testament per claim and the live decoder/reducer remains V1. Native Rust monitor
+commands, direct root subscriptions, fixed-point settlement and trusted monitor
+timers now exist in the separate RAM owner (§6.12 of document 18). Posted Required
+Admission also reserves its complete graph failure and uses shared grant protection
+(§6.7). Native receipt acquisition/adoption also fund the respondent's bounded
+mandatory diagnostic, authored close and posting history through that owner.
+These paths have not been connected to the running CLI/MCP dispatch.
+Exposing existing operations is not completion of that migration.
 
 ## Peer operations
 
@@ -80,6 +87,66 @@ The profile uses existing persisted `Command` variants and authority fields.
 It changes ingress admission, not historical reducer semantics, WAL command
 ordinals, checkpoint object layouts, or the frozen managed decoder floor.
 The independent lifecycle migration must still follow document 18.
+
+Successor claim builders and dispatch have an earlier authored-content gate in
+[18 §6.13](18-lifecycle-storage-upgrade.md#613-successor-input-codec-dependency-plan).
+The current native creation projection has no complete work description/document,
+occurrence/schema, action, authored work scopes or contextual input references.
+CLI/MCP must preserve those fields and complete requirement instructions,
+quality-bar/rubric references, contributor provenance and policy-resolution
+revision through the checked immutable owner representation. A displayed document
+that the submitted body omits is not an authored claim, and an opaque supplied
+hash cannot stand in for that document. Runtime monitors/ownership scopes are a
+separate concern. Explicit Consultation/Challenge purposes and Focal's self-work
+restriction with its checked legitimate Handoff exception must survive the shared
+builder and admission path.
+
+Complete content ownership, recomputed nonrecursive content identity and bounded
+effective-state dedup precede codec freeze and live successor activation. Existing
+V1 content and exact retries, and current native semantic request identities,
+remain unchanged until the extended body receives an explicit successor profile.
+No builder may invent absent instructions, infer work scopes from prose, or treat
+handler references as authority to execute tools inside Focal. See also
+[17's executable boundary](17-lifecycle-state-and-authority.md#11-executable-contract-boundary).
+
+For successor activation, the shared validation builder must preserve the native
+Admission contract as well as artifact/verdict authority. A Posted Required
+`BeginAdmission` accepts responsibility only after the owner funds its complete
+indexed failure component. Its final blocking report atomically retains Accepted
+at ordinal 2, the original PostFailed cut, dependency and monitor consequences,
+and any cohort seals. The final claim revision may include a later monitor release
+from that same transaction. CLI/MCP must return the original operation outcome and
+publication coordinates on retry, without refreshing the claim or asking the
+participant to replay graph completion. A successfully recorded failing verdict
+remains a successful write of that evidence.
+
+Eligible reports after receipt or terminality remain independent audit evidence;
+they do not reopen the claim or create another graph transition. Later authored
+dependencies and monitors can be refused when they exceed a held report's graph
+promise; clients must retain the actual refusal rather than presenting an accepted
+but unfunded operation. This describes the implemented native RAM contract and
+its pending interface mapping. Existing live operations above continue to use V1
+semantics until native codec/WAL/Session activation and shared dispatch are complete.
+
+Successor receipt builders must preserve the native respondent funding boundary.
+`AcquireReceipt` and `AdoptReceipt` use Ordinary admission for the exact receipt's
+remaining diagnostic, close and post credits before returning an accepted
+candidate. The held diagnostic path pins the builtin Work error contract; the
+respondent still authors the actual artifact and the explicit response. Separate
+`CloseResponse` and `PostResponse` operations must retain their own exact request
+identities, manifests and source revisions. Several Generated responses can await
+posting, and owner reconstruction includes that complete current-receipt backlog.
+Clients must not translate acquired capacity into an automatically generated or
+posted testament, or translate a diagnostic into acceptance.
+
+Optional evidence remains subject to admission that preserves the guaranteed
+closing shape and first Work diagnostic slot. Failed funding or candidate discard
+preserves the source and restores provisional credit; adoption replaces the
+receipt grant atomically while retaining original evidence/history. These are
+implemented native RAM/finite-record semantics, not a guarantee already exposed
+by the V1 endpoints in the table. Claimant receipt/evaluation-entry funding,
+whole-claim/control closure, disk/replica quotas and native codec/WAL/Session
+activation remain required before the complete successor interface is available.
 
 ### External execution
 
@@ -207,6 +274,31 @@ Release is a stored fact, with its original sequence, and is not by itself proof
 that every root succeeded. There is no associated Focal worker or callback
 process. A caller's timeout cannot expire the monitor.
 
+The separate native RAM owner now implements authenticated `RegisterMonitor`,
+`RebindMonitor` and `CancelMonitor`, exact root subscriptions, frozen monitor/graph
+settlement and owner-delivered monitor timers. These are typed Rust transactions,
+not newly available live CLI/MCP commands. Their source and funding contract is in
+[18 §6.12](18-lifecycle-storage-upgrade.md#612-runtime-scope-integration-sequence).
+The current `monitor.register`/`monitor.get` operations above retain their V1
+meaning and existing negotiated transport profile.
+
+Successor interface activation still needs the native codec, WAL/Ready and Session
+path, followed by shared authored-operation schemas and CLI/MCP dispatch. Expose
+original predicates, registration, deadline, named rebind history and exact
+monitor disposition through those reads. Registration/rebinding/cancellation must
+resolve the actual claim revision and optional receipt for a fresh request and
+retain them unchanged on retry. Rebinding names both actual endpoint bindings and
+the required `Supersedes` relationship. Explicit terminal-owner cancellation
+retains the original owner terminal position and its separate cancellation cut;
+it must not display as successful predicate release or alter the claim's failure.
+
+Owner `ReleaseScope` remains a separate claimant operation after its monitors and
+owned children meet release preconditions. Automatic monitor settlement does not
+release the owner or its targets. A client timeout remains a read outcome and can
+never be decoded as native timer authority. Shared reads and optional-filter lists
+must preserve these distinctions when the new lifecycle profile is activated;
+old-profile release observations cannot supply missing successor provenance.
+
 Large payload workflows save exact staged bytes, hashes, offsets, upload identity
 and final artifact command before transmission. `artifact upload inspect` sends
 nothing; `artifact upload cancel` saves and retries the existing cancellation
@@ -229,6 +321,14 @@ context; `--shape-only` explicitly limits the check to document structure.
 without authenticating the author. The existing raw sender remains compatible
 with protocol families outside the offline checker's supported subset. Discovery,
 examples and completion derive from the released descriptors and command tree.
+
+The internal authored RAM owner now accepts complete grouped claim/validation
+bodies and retains their content, responsibility profile and returned identity
+mapping atomically. Its [typed read boundary](../../crates/focal-core/src/native/authored_reads.rs)
+exposes matching content and lifecycle from one effective or pinned prefix. This
+is a prerequisite for the successor CLI/MCP input compiler; the live CLI, SDK and
+MCP still select V1. The internal `CreateAuthored` command does not silently change
+existing JSON/YAML wire output or activate a new service codec.
 
 ## Remaining independent work
 

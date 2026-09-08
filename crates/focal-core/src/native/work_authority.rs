@@ -2,6 +2,7 @@
 //! custody IO. Begin borrows an already checked acceptance decision; reports do
 //! not allocate a projection or require a later parent outcome to remain open.
 use super::admission_authority::{Begun, Registered};
+use super::report_artifact::ArtifactView;
 use super::*;
 use focal_model::lifecycle::{aggregation::ClaimDecision, artifact_descriptor::ArtifactDescriptor};
 
@@ -31,7 +32,7 @@ fn registered<'a>(
     super::admission_authority::registered_any(view, claim, key)
 }
 
-fn target<'a>(
+pub(super) fn completion_target<'a>(
     view: &'a View<'_>,
     registered: &Registered<'_>,
     limits: NativeLimits,
@@ -55,10 +56,8 @@ fn target<'a>(
     let response = record.response();
     let identity = response.identity();
     let received = record.received().ok_or(ContractError::InvalidTransition)?;
-    let entered = record.entered().ok_or(ContractError::InvalidTransition)?;
     if received.sequence.0 == 0
-        || entered <= received
-        || entered.sequence > view.prefix()
+        || received.sequence > view.prefix()
         || identity.claim.0 != registered.parent.binding().object.0
         || identity.binding.ledger != registered.parent.binding().ledger
         || identity.binding.object != pinned.object
@@ -69,15 +68,17 @@ fn target<'a>(
     {
         return Err(ContractError::InvalidTarget.into());
     }
-    match response.state() {
-        ResponseState::Validating
-        | ResponseState::Validated
-        | ResponseState::ValidationIncomplete
-        | ResponseState::ValidationFailed
-        | ResponseState::ValidationErrored => {}
-        ResponseState::Generated | ResponseState::Posted | ResponseState::Received => {
-            return Err(ContractError::InvalidTransition.into());
-        }
+    match (response.state(), record.entered()) {
+        (ResponseState::Received, None) => {}
+        (
+            ResponseState::Validating
+            | ResponseState::Validated
+            | ResponseState::ValidationIncomplete
+            | ResponseState::ValidationFailed
+            | ResponseState::ValidationErrored,
+            Some(entered),
+        ) if entered > received && entered.sequence <= view.prefix() => {}
+        _ => return Err(ContractError::InvalidTransition.into()),
     }
     let cycle = NativeCycleKey {
         claim: identity.claim,
@@ -123,8 +124,11 @@ pub(super) fn begin<'a>(
     if registered.registry.is_sealed() {
         return Err(ContractError::InvalidTransition.into());
     }
-    let (response, work) = target(view, &registered, limits)?;
-    if response.state() != ResponseState::Validating {
+    let (response, work) = completion_target(view, &registered, limits)?;
+    if !matches!(
+        response.state(),
+        ResponseState::Received | ResponseState::Validating
+    ) {
         return Err(ContractError::InvalidTransition.into());
     }
     let evaluation = registered.state.bind(registered.definition)?;
@@ -154,7 +158,7 @@ pub(super) fn report_owner(
     time: u64,
     limits: NativeLimits,
 ) -> Result<validation::OwnerState, NativeError> {
-    let (response, work) = target(view, registered, limits)?;
+    let (response, work) = completion_target(view, registered, limits)?;
     Ok(registered
         .state
         .bind(registered.definition)?
@@ -169,7 +173,7 @@ pub(super) fn check_completion_target(
     envelope: &super::completion_envelope::CompletionEnvelope,
     limits: NativeLimits,
 ) -> Result<(), NativeError> {
-    let (_, work) = target(view, registered, limits)?;
+    let (_, work) = completion_target(view, registered, limits)?;
     let source = as_artifact(view.get(Key::Artifact(work.state.reference().id)))
         .ok_or(ContractError::MissingEvidence)?;
     super::increment_authority::check_completion_visibility(
@@ -190,9 +194,25 @@ pub(super) fn report<'a>(
     descriptor: &ArtifactDescriptor,
     limits: NativeLimits,
 ) -> Result<(Registered<'a>, validation::ReportAuthorization), NativeError> {
+    report_view(
+        view, context, claim, key, expected, report, descriptor, limits,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Same exact report authority over a prepared borrowed body.
+pub(super) fn report_view<'a>(
+    view: &'a View<'_>,
+    context: NativeContext,
+    claim: Binding,
+    key: EvaluationKey,
+    expected: Binding,
+    report: validation::Report,
+    descriptor: &impl ArtifactView,
+    limits: NativeLimits,
+) -> Result<(Registered<'a>, validation::ReportAuthorization), NativeError> {
     let registered = registered(view, claim, key, limits)?;
     let owner = report_owner(view, &registered, context.logical_time, limits)?;
-    let (_, work) = target(view, &registered, limits)?;
+    let (_, work) = completion_target(view, &registered, limits)?;
     let source = as_artifact(view.get(Key::Artifact(work.state.reference().id)))
         .ok_or(ContractError::MissingEvidence)?;
     // Sorted descriptor restrictions permit a bounded merge walk. Explicit
@@ -204,7 +224,7 @@ pub(super) fn report<'a>(
             remaining = remaining
                 .checked_sub(1)
                 .ok_or(NativeError::Capacity("WholeWork evidence visibility"))?;
-            match labels.next() {
+            match labels.next().transpose()? {
                 Some(label) if label < required => continue,
                 Some(label) if label == required => break,
                 _ => return Err(ContractError::InvalidPolicy.into()),
@@ -219,3 +239,8 @@ pub(super) fn report<'a>(
 #[cfg(test)]
 #[path = "work_authority_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(super) fn history_fixture(present: bool, received: bool) -> Core<NativeState> {
+    tests::history_fixture(present, received)
+}

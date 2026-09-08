@@ -71,7 +71,7 @@ fn closure<'a>(
         }
         for scope in parent.scopes().iter() {
             closure.visit()?;
-            if scope.released().is_some() {
+            if !scope.active() {
                 continue;
             }
             for root in scope.roots() {
@@ -259,7 +259,7 @@ pub(super) fn prepare(
     })?;
     Ok(transactions::Plan {
         rows,
-        registry: None,
+        registry: transactions::RegistryOverrides::new(),
         created: 0,
     })
 }

@@ -13,12 +13,24 @@ use crate::{
 
 #[path = "validation_admission.rs"]
 mod admission;
+#[path = "validation_adoption.rs"]
+mod adoption;
+#[path = "validation_claim_deadline.rs"]
+mod claim_deadline;
+#[path = "validation_deadline.rs"]
+mod deadline;
 #[path = "validation_delivery.rs"]
 mod delivery;
 #[path = "validation_increment.rs"]
 mod increment;
+#[path = "validation_seal.rs"]
+mod seal;
+#[path = "validation_snapshot.rs"]
+mod snapshot;
 #[path = "validation_work.rs"]
 mod work;
+pub use seal::SealTransition;
+pub use snapshot::{AcceptedResultSnapshotV1, EvaluationSnapshotV1};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -149,34 +161,16 @@ pub(super) use definition::DefinitionStamp;
 #[cfg(test)]
 use definition::OwnedHandlerPolicy;
 use definition::OwnedProgram;
-pub use definition::{Declaration, DeclarationPlan};
-
-fn validate_policy(
-    policy: PhasePolicy<'_>,
-    agentic: bool,
-    limits: Limits,
-) -> Result<u32, ContractError> {
-    if policy.evaluator.is_zero() || policy.handlers.is_empty() {
-        return Err(ContractError::InvalidPolicy);
-    }
-    let handlers = u32::try_from(policy.handlers.len()).map_err(|_| ContractError::Capacity)?;
-    if handlers > limits.handlers {
-        return Err(ContractError::Capacity);
-    }
-    let mut attempts = 0u32;
-    for step in policy.handlers {
-        if step.attempts == 0 || step.handler.id.is_zero() || step.handler.agentic != agentic {
-            return Err(ContractError::InvalidPolicy);
-        }
-        attempts = attempts
-            .checked_add(step.attempts)
-            .ok_or(ContractError::Capacity)?;
-        if attempts > limits.attempts {
-            return Err(ContractError::Capacity);
-        }
-    }
-    Ok(attempts)
-}
+pub(in crate::lifecycle) use definition::stamp_begin;
+pub use definition::{Declaration, DeclarationPlan, PhasePolicyView, ProgramView};
+pub use definition::{
+    DeclarationFields, DeclarationHandlers, DeclarationSource, DeclarationSourcePlan, HandlerValue,
+    PhaseFields, PolicyPhase, PolicySource, ProgramFields,
+};
+pub(in crate::lifecycle) use definition::{PolicyEvent, check_declaration_fields, visit_program};
+#[path = "validation_checked.rs"]
+mod checked;
+pub use checked::{CheckedDeclaration, CheckedDeclarationTarget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParentState {
@@ -458,8 +452,10 @@ impl ReportAuthorization {
     }
 }
 
-/// Capability emitted only by an accepted transition. Intermediate attempts are
-/// audit facts, not acceptance witnesses; `is_terminal` distinguishes them.
+/// Recorded acceptance capability, emitted by a checked transition or restored
+/// from verified history. Intermediate attempts are audit facts, not acceptance
+/// witnesses; `is_terminal` distinguishes them. Snapshot restoration alone does
+/// not establish the enclosing history's authority or artifact custody.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AcceptedResult {
     definition: DefinitionStamp,
@@ -1347,15 +1343,8 @@ impl<'a> Evaluation<'a> {
         let Cohort::Sealed { cause } = owner.cohort else {
             return Err(ContractError::InvalidTransition);
         };
-        if self.sealed.is_some() || self.state.is_terminal() {
-            return Err(ContractError::InvalidTransition);
-        }
         let mut next = *self;
-        next.stored.binding = self.binding.next()?;
-        next.stored.sealed = Some(cause);
-        if !self.begun && self.suppression.is_none() {
-            next.stored.suppression = Some(Suppression::CohortSealed(cause));
-        }
+        next.stored = seal::record(self.stored, cause)?;
         Ok(next)
     }
 

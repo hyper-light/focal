@@ -13,7 +13,9 @@
 pub mod aggregation;
 pub mod artifact_descriptor;
 pub mod audit;
+pub mod authored_creation;
 pub mod claim;
+pub mod claim_descriptor;
 pub mod creation;
 pub mod evidence;
 pub mod graph;
@@ -22,6 +24,7 @@ pub mod ownership;
 pub mod scope;
 pub mod succession;
 pub mod validation;
+pub mod validation_descriptor;
 
 #[cfg(test)]
 mod exchange_tests;

@@ -3,6 +3,7 @@ use super::*;
 #[derive(Clone, Copy)]
 enum Step {
     Timeout,
+    Allocation,
     Redirect(u64),
     Pending,
     Refuse,
@@ -30,6 +31,7 @@ impl ClientTransport for Script<'_> {
             seen.push(request.clone());
             let result = match step {
                 Step::Timeout => return Err(WireError::Timeout),
+                Step::Allocation => return Err(WireError::Allocation),
                 Step::Redirect(epoch) => Response::Error(AccessError::RouteChanged(RouteHint {
                     epoch: RouteEpoch(epoch),
                     endpoint: "127.0.0.1:7777".into(),
@@ -61,6 +63,9 @@ async fn later_route_or_domain_rejection_cannot_replace_an_unknown_write_identit
         vec![Step::Timeout, Step::Redirect(2), Step::Redirect(1)],
         vec![Step::Pending, Step::Refuse],
         vec![Step::Pending, Step::Inform],
+        // Decoding can fail after a mutation reached the server. A later
+        // refusal cannot prove that the original request was never applied.
+        vec![Step::Allocation, Step::Refuse],
     ] {
         let seen = Mutex::new(Vec::new());
         let count = steps.len();
@@ -97,6 +102,7 @@ async fn definite_admission_response_and_exact_committed_retry_remain_distinct()
         vec![Step::Refuse],
         vec![Step::Inform],
         vec![Step::Timeout, Step::Committed],
+        vec![Step::Allocation, Step::Committed],
         vec![Step::Pending, Step::Duplicate],
     ] {
         let seen = Mutex::new(Vec::new());

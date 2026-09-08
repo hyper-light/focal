@@ -103,7 +103,7 @@ fn cumulative_create_post_begin_limits_refuse_one_short_and_accept_exact_totals(
 }
 
 #[test]
-fn verified_required_failure_counts_all_four_events_and_exact_retry_needs_no_capacity() {
+fn verified_required_failure_counts_history_and_registry_seal_and_retry_needs_no_capacity() {
     let mut core = fixture::running(&[(ValidationMode::Required, false)]);
     assert_eq!(meta(&core, None).events, 6);
     let old = *core.native_evaluation(fixture::key(1)).unwrap();
@@ -116,7 +116,7 @@ fn verified_required_failure_counts_all_four_events_and_exact_retry_needs_no_cap
     let input = fixture::report_for(&core, None, 4, 1, VerdictValue::Fail, artifact);
     let evidence = fixture::verified(&mut store, &input);
     let retry = fixture::copy_report(&input);
-    core.limits.events = 9;
+    core.limits.events = 10;
     assert_refused_without_change(&core, fixture::copy_report(&input), &[], Some(&evidence));
     assert_eq!(core.native_evaluation(fixture::key(1)), Some(&old));
     assert!(core.native_artifact(ArtifactId::from_u128(500)).is_none());
@@ -125,15 +125,15 @@ fn verified_required_failure_counts_all_four_events_and_exact_retry_needs_no_cap
         ClaimStatus::Posted
     );
 
-    core.limits.events = 10;
+    core.limits.events = 11;
     let prepared = fixture::report(&core, input, &[], &evidence);
     let outcome = prepared.outcome();
-    assert_eq!(outcome.events, 4);
-    assert_eq!(meta(&core, Some(&prepared)).events, 10);
+    assert_eq!(outcome.events, 5);
+    assert_eq!(meta(&core, Some(&prepared)).events, 11);
     assert_eq!(meta(&core, None).events, 6);
     core.publish_native(prepared).unwrap();
-    assert_eq!(meta(&core, None).events, 10);
-    assert_eq!(fixture::events(&core, outcome).len(), 4);
+    assert_eq!(meta(&core, None).events, 11);
+    assert_eq!(fixture::events(&core, outcome).len(), 5);
     assert!(matches!(
         core.native_event(outcome.sequence, 3).unwrap().fact,
         NativeFact::Claim(NativeClaimEvent {
@@ -141,11 +141,17 @@ fn verified_required_failure_counts_all_four_events_and_exact_retry_needs_no_cap
             ..
         })
     ));
+    assert_eq!(
+        core.native_event(outcome.sequence, 4).unwrap().fact,
+        NativeFact::Registrations {
+            claim: core.native_claim(fixture::key(1).claim).unwrap().binding(),
+        },
+    );
     let outcomes: Vec<_> = [
-        fixture::request(fixture::ISSUER, 1),
-        fixture::request(fixture::ISSUER, 2),
-        fixture::request(fixture::EVALUATOR, 11),
-        outcome.request,
+        fixture::request(fixture::ISSUER, 1).into(),
+        fixture::request(fixture::ISSUER, 2).into(),
+        fixture::request(fixture::EVALUATOR, 11).into(),
+        outcome.invocation,
     ]
     .into_iter()
     .map(|request| core.native_outcome(request).unwrap())
@@ -170,7 +176,7 @@ fn verified_required_failure_counts_all_four_events_and_exact_retry_needs_no_cap
         matches!(existing, NativePreparation::Existing { outcome: old, committed: true } if old == outcome)
     );
     assert_eq!(budget.stats(), occupied);
-    assert_eq!(meta(&core, None).events, 10);
+    assert_eq!(meta(&core, None).events, 11);
     drop(pressure);
 }
 

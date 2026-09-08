@@ -9,8 +9,28 @@ now retain complete definitions, post claims, begin Admission evaluations and
 fence evaluations during control changes over custom RAM storage (§6.2).
 `NativeOwner` also integrates bounded Admission RAM and record-slot completion
 entitlements (§6.7), with indexed grant ownership and cohort checks (§6.8),
-without a native codec or Session entrypoint. The successor decoder, activation and
-lifecycle migration remain open. This is the storage
+without a native durable codec or Session entrypoint. The successor decoder, activation and
+lifecycle migration remain open. Native audit inspection and claimant
+result-testament generation/posting are implemented in RAM (§6.10), with
+ordinary admission and no guaranteed whole-claim closure reservation. Receipt
+adoption (§6.11), explicit terminal-owner scope release, and native monitor
+registration/rebinding/cancellation, direct root subscriptions, fixed-point
+settlement and exact monitor timers (§6.12) also use that RAM owner. Work funding
+includes repeated monitor revisions. Posted Required Admission now shares that
+indexed graph protection and reserves its complete failure consequences (§6.7).
+Receipt acquisition and adoption also fund mandatory respondent diagnostics,
+authored response closure and posting across the remaining cycles, including
+current-receipt Generated posting history on owner reconstruction (§6.7).
+Borrowed declaration/acceptance views and checked input construction plans now
+supply model prerequisites for a successor input codec (§6.13). AuthoredV1 now
+retains complete claim content, validation instructions/provenance and atomic
+creation results in partitioned RAM rows. A dormant full-body input encoder and
+bounded structural inspector exist ([21](21-native-input-format.md)). Complete
+typed construction and managed owner admission of borrowed plans now exist;
+authenticated transport integration and durable native activation remain open. The live V1
+service does not yet expose those native bodies or lifecycles.
+Remaining control/funding gates, whole-claim RAM/disk promises and live activation
+remain open. This is the storage
 prerequisite for L2–L5 in
 [the peer validation contract](16-peer-validation-contract.md), not permission to
 change existing serialized types in place.
@@ -555,6 +575,10 @@ plan. The implementation and remaining dependency order are:
    owns slot text and ordered handler policies once. `Declaration::prepare`
    validates all input without allocation and reports checked requested row/buffer
    bytes; `DeclarationPlan::build` reserves those buffers fallibly.
+   Its borrowed `program()` and `deadline()` views expose the complete authored
+   policy. `DeclarationPlan::intent_fingerprint()` reuses the checked private
+   stamp and produces the built declaration's existing native request identity
+   before any owned buffer is constructed; it does not define a wire encoding.
    `Declaration::retained_bytes` measures actual capacities. Its copy APIs also
    report requested/actual dynamic bytes and allocation counts. Core charges the
    owned definitions and retained neighbor copies; future ingress must reserve
@@ -624,8 +648,9 @@ plan. The implementation and remaining dependency order are:
    scopes. Cancellation and supersession resolve every evaluation through the
    stored registration set and publish applicable authority fences in the same
    candidate. Terminal evaluation facts remain unchanged. Admission reporting and
-   respondent evidence now use that boundary (§6.3); receipt adoption and the
-   remaining evaluation families remain open. Ordinary blocking validation failure
+   respondent evidence now use that boundary (§6.3); later sections add the other
+   evaluation families and receipt adoption (§§6.7, 6.9 and 6.11). Ordinary
+   blocking validation failure
    preserves eligible begun Admission checks. Scope release still waits for every
    owned obligation and occurs once.
 5. **Extend the transaction discipline to the remaining families.** Extend tracked
@@ -698,7 +723,7 @@ materialization creates an evaluation. Admission, Increment, pure Receipt and
 WholeWork have native owner materialization paths. Increment derives from actual
 work submission; Receipt and WholeWork derive from explicit claimant observation
 of an actual response. WholeWork Ready targets use the exact attached source or
-MissingSlot; non-Receipt WholeWork entry and reporting remain open.
+MissingSlot; §6.9 now supplies funded non-Receipt WholeWork entry and reporting.
 
 Responses may be received in a different order from their authored cycles. The
 first received response under the current entitlement advances the claim's
@@ -717,11 +742,13 @@ cohort generations and attachment bindings remain pinned to their actual source.
 | `prepare_native_in(source, context, input, pending, evidence)` | Use the owner's budget or a descendant source for both preparation and retained pages; preserve operation-derived lanes, ancestry checks and exact retries without granting a per-evaluation entitlement |
 | `NativeCommand::Create { claims, declarations }` | Require revision one, new IDs and the exact full declaration cohort for each acceptance manifest; assign creation positions and atomically retain claims, definitions and checked parent/predecessor consequences |
 | `NativeCommand::Post { expected }` | Resolve all retained definitions, perform issuer-authorized posting and atomically register Ready evaluations for every Admission declaration |
-| `NativeCommand::BeginAdmission { claim, key, expected }` | Resolve the exact retained evaluation and registration, derive readiness/authority/deadline from owner state and begin as the declared evaluator |
-| `NativeCommand::ReportAdmission { claim, key, expected, report, artifact }` | Resolve the begun attempt, exact descriptor provenance and verified local custody; atomically retain artifact, accepted result, next evaluation state, any derived PostFailed claim, events and request outcome |
+| `NativeCommand::BeginAdmission { claim, key, expected }` | Resolve exact retained authority/readiness and begin as the evaluator; NativeOwner funds a Posted Required evaluation's complete indexed failure component and protects its topology before accepting responsibility |
+| `NativeCommand::ReportAdmission { claim, key, expected, report, artifact }` | Retain actual proof/diagnostic and Accepted at ordinal 2; an exact Posted → PostFailed proof publishes complete graph/monitor/cohort consequences under the held failure allowance, while other reports preserve independent audit semantics |
 | `NativeCommand::BeginIncrement { claim, key, expected }` | Resolve the registered exact output/receipt/cycle and live evaluator authority; the managed owner funds the bounded report chain before accepting Begun |
 | `NativeCommand::ReportIncrement { claim, key, expected, report, artifact }` | Require the actual begun attempt, typed provenance, inherited target visibility and local custody; retain result/evaluation/history without changing claim or work acceptance |
 | `NativeCommand::SealIncrementTargets { claim }` | Let the claimant seal complete stored Increment membership; preserve registered checks, respondent diagnostics and the claim's attained phase |
+| `NativeCommand::GenerateResultTestament { claim, id }` | Require the original claimant, exact claim binding and complete actual sealed audit; atomically retain one Generated result bundle, its per-claim index and original result publication witnesses |
+| `NativeCommand::PostResultTestament { expected }` | Require the claimant and exact Generated bundle; advance only the bundle to Posted, preserving frozen content after later parent graph progress |
 | `NativeCommand::AcquireReceipt { expected, receipt }` | Require the actual subject, Posted claim, passing Required Admission and complete checked graph/start predicates; assign epoch one and atomically retain unique receipt allocation, Received, acquisition cut, history and outcome without testimony |
 | `NativeCommand::SubmitWork { claim, slot, artifact }` | Require the current respondent, exact receipt/cycle/output provenance, a declared vacant slot and local custody; atomically retain Generated work, cycle membership and every declared Ready Increment evaluation |
 | `NativeCommand::SubmitDiagnostic { claim, reason, artifact }` | Require exact respondent/receipt/cycle diagnostic provenance, kind `error`, schema and local custody; retain the independently inspectable diagnostic in the complete cycle index |
@@ -732,6 +759,11 @@ cohort generations and attachment bindings remain pinned to their actual source.
 | `NativeCommand::PostResponse { claim, expected }` | Let the respondent post the exact Generated response under its valid entitlement; do not imply claimant receipt |
 | `NativeCommand::ReceiveResponse { claim, expected }` | Record claimant receipt under the matching fence; for an open claim materialize every pure Receipt check and its eligible artifact-free Pass, retaining expired checks Ready; terminal/local-complete claim receipt is audit-only |
 | `NativeCommand::Cancel { expected }` | Check the root issuer and revision, traverse the complete stored owned tree through terminal descendants, and publish nonterminal claim cancellations plus evaluation authority fences; no implicit scope release |
+| `NativeCommand::ReleaseScope { expected }` | Require the issuer, exact terminal owner and every owned child already released; refuse active monitors, precharge the checked scope transition, and atomically publish OwnerReleased before indexed graph consequences while preserving original cuts and eligible begun evaluations |
+| `NativeCommand::RegisterMonitor { expected, receipt, id, roots, deadline }` | Require the claimant, exact claim/receipt and unused monitor identity; atomically record typed roots, original finite deadline, direct root subscriptions and checked consequences |
+| `NativeCommand::RebindMonitor { expected, receipt, id, predecessor, successor }` | Require exact owner/receipt/endpoints and compatible actual Supersedes lineage; retain original registration/deadline while moving only the named monitor roots and subscriptions |
+| `NativeCommand::CancelMonitor { expected, receipt, id }` | Let the claimant dispose of a terminal owner's active wait while retaining original failure and separate cancellation cuts; do not infer successful root or owner release |
+| `NativeOwner::prepare_monitor_deadline(input, logical_time)` | Trusted exact monitor timer; deduplicate its disjoint key, resolve actual allocation/scope, apply canonical SCC precedence and checked release/expiry, retaining all index changes and exact expiry fences |
 | `NativePreparation::Existing { outcome, committed }` | Return an exact successful request match; `committed: false` identifies an earlier pending candidate and must await that candidate's durability |
 | `NativePrepared::claim` / `definition` / `evaluation` / `artifact` / `result` / `receipt` / `recorded` | Read the complete prepared version, including all predecessors and independent evidence/result rows |
 | `NativePrepared::registrations` / `work` / `diagnostic` / `response` / `delivery_result` | Borrow complete registration membership, respondent evidence, response state and artifact-free Receipt results at the same prepared prefix; matching projections exist on `NativeView` and expiring `NativeRead` |
@@ -897,14 +929,13 @@ production `Clone`; evaluation state is a reference-free `Copy` value. This owne
 adds no per-object `Arc`; shared budget and immutable page/root lifetimes remain
 within the existing memory subsystem.
 
-**Next authoritative transaction work:** extend the bounded Admission/Increment
-completion contract in §6.7 to first respondent responsibility and closing. Add
-receipt adoption, non-Receipt WholeWork materialization and reporting, expired
-Ready deadline/fence publication, whole-work aggregation, graph consequences,
-audit seals and their complete request/history results to this same mechanism. Resolve real stored policy grants
-before enabling checks that require them. Preserve the implemented permission for
-authorized begun late results after ordinary required-check failure. Explicit
-cancellation must not become scope release or fabricate respondent testimony.
+**Next integration boundaries:** the later RAM increments implement respondent
+responsibility, adoption, WholeWork, deadline fencing, graph consequences and
+audit sealing under this owner. Complete whole-claim closure funding and the
+successor input/replay/activation boundary remain open (§§6.7, 6.10–6.13).
+Resolve real stored policy grants before enabling checks that require them.
+Preserve authorized begun late results after ordinary required-check failure;
+explicit cancellation must not become scope release or fabricate testimony.
 
 Native snapshots, prepared commands, import provenance, decoder identity, shared
 WAL/Ready integration and quorum activation still require §§4–7. Current native
@@ -924,8 +955,9 @@ laptop-to-Meta-scale objective.
 ### 6.3 Admission results, first receipt and respondent evidence
 
 **Result/receipt/evidence milestone.** These native RAM owner transactions share
-the range publication seam; §6.7 describes integrated Admission funding.
-End-to-end respondent and durable completion reservations remain open.
+the range publication seam; §6.7 describes integrated evaluation and mandatory
+respondent funding. Complete whole-claim and durable completion reservations
+remain open.
 
 The native owner implements Admission reporting, first receipt acquisition,
 respondent work and diagnostic submission, authored response closure, posting and
@@ -985,23 +1017,27 @@ capacity is still required before production activation.
 checks the complete authoritative Admission cohort before a Begun state can
 publish. It bounds projection work when every member has a result, resolves the
 current declarations, registrations, evaluations and retained results, and requires
-room for the eleven-write failure branch. Retries update the latest result, so
-this projection-work bound does not multiply by the number of historical attempts.
+the original eleven-write failure floor. That prerequisite alone does not price
+graph or cohort effects; the managed Required Begin envelope now derives the
+complete shape from the indexed component (§6.7). Retries update the latest result,
+so this projection-work bound does not multiply by historical attempt count.
 The native owner also refuses Begin when any reachable programmatic, agentic or
 quality phase requires policy evidence: no installed native policy-evidence registry yet
 supplies those grants. Passing the first phase cannot admit an unavailable quality
 continuation.
 
 [ConstructionBudget](../../crates/focal-core/src/native/prepare_budget.rs)
-now sizes direct staging by operation. Begin needs one evaluation container,
-one event and four changes including Meta and request outcome. A report allows
-four extra rows, four events and one changed claim: nine changes normally, eleven
-when it first makes the parent PostFailed. Actual counts are checked before the
-final change vector is allocated, and actual capacities remain bounded by the
-reserved allowance. Both operations also check their actual range plan against
-an occupancy-independent `RangeWriteEnvelope` (§6.5). These checks price the
-current mutation and enforce future work prerequisites; they do not reserve
-the remaining report chain at Begin.
+sizes direct staging by operation. Begin needs one evaluation container, one
+event and four changes including Meta and request outcome. A report starts with
+the original nine-change ordinary shape or eleven-change isolated failure floor.
+A real Admission failure expands those buffers through the complete checked
+graph plan, including every monitor/index revision and original journal fact;
+automatic cohort construction has its own admitted suffix. Actual counts are
+checked before the final change vector is allocated, and actual capacities must
+fit the reserved allowance. Both operations also check their actual range plan
+against an occupancy-independent `RangeWriteEnvelope` (§6.5). Direct Core staging
+prices the current mutation; `NativeOwner` additionally retains the future report
+chain and graph failure entitlement before accepting Begin (§6.7).
 
 The receipt owner gathers the complete bounded outgoing closure from the actual
 effective root, including pending rows: immutable dependency/await declarations,
@@ -1023,13 +1059,17 @@ no automatic scope release or testament.
 
 The adapter also stages checked `graph_release` transitions for locally complete
 neighbors whose least-fixpoint satisfaction becomes established in that snapshot.
-Those states and active native scopes are not yet reachable through implemented
-native commands. Their full owner qualification must accompany WholeWork/scope
-activation and include all affected incoming monitor subscribers and scope-release
-consequences in the atomic publication. Outgoing closure capture alone is not a
-complete global propagation implementation. Current actual-owner qualification
-covers terminal-failure Awaits, unresolved DependsOn and complete owned closure;
-the broader satisfaction/runtime-root proofs also have model tests.
+WholeWork now supplies those local outcomes (§6.9); explicit terminal-owner release
+has its own checked graph entry (§6.12). That later section now implements native
+monitor commands, direct incoming monitor subscriptions and frozen settlement.
+Outgoing closure capture alone is not a complete propagation implementation;
+remaining control paths must use the complete affected-source contract. Posted
+Required Admission now has its own full graph promise and atomic failure path
+(§6.7).
+The receipt milestone
+qualified terminal-failure Awaits, unresolved DependsOn and complete owned closure;
+later native integration and its qualification are recorded in the sections below
+and [09](09-implementation-status.md).
 
 **Funding gap at this milestone, addressed for managed Admission in §6.7:**
 low-level Core Begin retains no per-attempt reservation
@@ -1188,7 +1228,9 @@ bounds accepted work membership by the actual closing transaction shape: attachi
 It also checks staging, event and traversal limits before accepting another work
 artifact. This prevents an intrinsically unrepresentable closing batch. It does
 **not** reserve future RAM, response rows, mandatory diagnostic headroom, disk or
-replica capacity. Full respondent responsibility/closing reservations remain open.
+replica capacity. The separate receipt-bound envelope and owner loans in §6.7
+now reserve mandatory diagnostic, close and post RAM/record capacity; successful
+output payloads and durable capacity remain independently admitted.
 The same module counts the full immutable target allowance: Admission once;
 Delivery and slot checks once per authored response; Increment once per possible
 work slot per response, including slots without WholeWork checks. First receipt
@@ -1228,9 +1270,10 @@ the explicit durable representation and remaining object transactions exist.
 ### 6.4 Reserve completion capacity before responsibility
 
 **Dependency plan and earlier primitive evidence.** Section 6.7 implements the
-managed Admission RAM/discrete-record portion of this plan. The primitive and
-low-level Core APIs described here do not grant individual entitlements; respondent
-responsibility and independent durable capacity remain activation requirements. The guarantee covers the admitted bounded
+managed evaluation and mandatory respondent RAM/discrete-record portions of this
+plan. The primitive and low-level Core APIs described here do not grant individual
+entitlements; complete whole-claim responsibility and independent durable capacity
+remain activation requirements. The guarantee covers the admitted bounded
 report, including a diagnostic when participant work fails; it does not promise
 that an external participant will run or that an unreachable participant will
 respond. Focal never fabricates a respondent's testament to consume an allowance.
@@ -1292,8 +1335,9 @@ retry or fail closed, without recording successful delivery or validation.
    entire declared retry/fallback/quality chain using
    `Declaration::attempt_bound()`, not just the current attempt. Enforce separate
    slots for required diagnostics. Byte headroom alone cannot satisfy artifact,
-   result or history limits. Respondent responsibility needs an analogous envelope
-   for its admitted work cycle and mandatory closing report.
+   result or history limits. The respondent envelope now covers mandatory
+   diagnostics, authored close and posting for its remaining cycles (§6.7);
+   successful output payloads are admitted separately within that closing bound.
 
    The implemented `RangeWriteEnvelope` covers one storage write, not these
    complete domain obligations. Pin the allowed schemas and verifier limits,
@@ -1541,9 +1585,10 @@ the full remaining retry/fallback/quality chain, pinned schemas and authored
 descriptor contract, direct claim/descriptor construction, evidence verification
 and discrete record allowances. Retained writes need capacity even when old
 snapshots prevent reclamation. The owner completion book, exclusive spending loans
-and durable storage reservations remain open. WholeWork, graph consequences,
-respondent evidence and mandatory respondent-authored closing testimony each need
-complete bounded envelopes before activation. These native changes do not activate
+and durable storage reservations were separate prerequisites at this milestone.
+Sections 6.7–6.9 now integrate evaluation, graph and mandatory respondent reporting
+envelopes in the native RAM owner. Complete whole-claim responsibility and durable
+reservations remain required. These native changes do not activate
 Session/CLI/MCP lifecycles or establish global-scale performance.
 
 
@@ -1636,8 +1681,10 @@ capacity, and low-level Core preparation alone does not provide it.
    Resolve the actual effective claim, immutable declaration, complete registration
    set and evaluation generation. Check the declared actor, target, current
    revision, readiness and trusted deadline before funding. Preserve the complete
-   Admission projection visit bound and the ability to construct its four-event
-   Required failure. Increment reports have three events and no parent-failure
+   Admission projection visit bound and its four-event Required-failure prefix.
+   For a Posted Required evaluation, also reserve the complete indexed component's
+   graph/monitor consequences and cohort suffix described below. Increment reports
+   have three events and no parent-failure
    write, irrespective of Required/Observe mode. The helper rejects any reachable programmatic or quality
    phase that requires unavailable policy evidence; it cannot synthesize grants.
 
@@ -1654,8 +1701,9 @@ capacity, and low-level Core preparation alone does not provide it.
    kind, metadata, inline bytes, input references and visibility labels. Durable
    content references remain possible within the same verification bound. Price
    `Declaration::attempt_bound()` across the entire retry/fallback/quality chain,
-   with one possible additional Required parent-failure write for Admission only.
-   Include descriptor ingress allowance, actual custody verification, Core staging, persistent range
+   with one possible complete Required Admission failure transaction in addition
+   to the ordinary attempts. That one-time shape includes the parent, affected
+   component, monitor/index history and seals. Include descriptor ingress allowance, actual custody verification, Core staging, persistent range
    copies, artifacts, accepted results, events and outcomes. The future decoder
    must still acquire ingress capacity before constructing its owned input.
 
@@ -1696,8 +1744,9 @@ capacity, and low-level Core preparation alone does not provide it.
 3. **Protect discrete records and mutable parent bounds as well as bytes.**
    Each remaining report reserves one artifact/content-identity pair, accepted
    result, request outcome and sequence, plus three base event rows. A Required
-   Admission grant also reserves its possible fourth event for PostFailed.
-   Increment grants reserve the three-event report path; they cannot spend an
+   Admission grant also reserves its possible PostFailed prefix and complete
+   affected graph/monitor/cohort event and row shape. Increment grants reserve
+   the three-event report path; they cannot spend an
    Admission parent-failure allowance or turn an Increment failure into PostFailed.
    Core increments `Meta.events` by the actual `NativeOutcome.events`; a three-event Observe report
    does not consume a fourth event. Every candidate checks actual effective counts
@@ -1710,8 +1759,9 @@ capacity, and low-level Core preparation alone does not provide it.
    not a universal RAM reservation for an arbitrarily large cancellation closure.
 
    Preserve evaluation revision space for remaining attempts. While an active
-   Required grant can still fail a Posted parent, preserve that parent's next
-   revision too. Check every affected protected parent's immutable policy, full
+   Required grant can still fail a Posted parent, preserve its failure revision
+   and the component's possible monitor/graph revisions too. Check every affected
+   protected parent's immutable policy, full
    registered cohort, bounded scope/ownership growth and charged row size before
    accepting ordinary changes. Receipt progress may change the parent's phase;
    it does not revoke an otherwise eligible begun Admission report. The parent
@@ -1727,8 +1777,9 @@ capacity, and low-level Core preparation alone does not provide it.
    actual charged heaps. The book also checks each grant's saved append ordinal
    and exact key; count bounds alone cannot prove the original cohort survived.
    This protects begun Admission reporting across response/history/registration
-   growth. It does not fund respondent artifacts, diagnostics, Receipt results or
-   the closing transaction.
+   growth. The evaluation grant itself does not fund respondent work; the separate
+   receipt grant below funds its mandatory diagnostic, close and post. Claimant
+   Receipt results and optional output payloads remain separately admitted.
 
 4. **Journal provisional credit with the one candidate chain.** Each grant is
    keyed by exact evaluation identity/generation and carries its current binding,
@@ -1788,11 +1839,14 @@ must cost O(log N + cohort), with capacity/fault and head-commit/tail-rollback
 qualification. Reusing a container that allocates infallibly or adds a shared
 allocation per evaluation would not satisfy that replacement contract.
 
-Admission/Increment RAM report ownership does not fund the respondent's full work
-cycle or mandatory authored testament. Receipt acquisition still creates no
-testimony. Complete respondent evidence/close reservations, non-Receipt WholeWork
-ownership, scope/graph propagation, audit and their bounded envelopes remain
-required. Independently reserve
+Admission/Increment RAM report ownership and the respondent receipt grant are
+separate credits in one owner pool. The latter funds the mandatory diagnostic,
+authored close and post described below; receipt acquisition still creates no
+testimony. Native WholeWork and Posted Required Admission have bounded graph and
+monitor completion envelopes. Optional successful output payloads and claimant
+audit closure use separate ordinary admission. Claimant receipt, evaluation entry
+and complete whole-claim/control responsibility reservations remain required.
+Independently reserve
 payload staging/sealing, WAL growth, checkpoint coexistence and required replica
 placement before claiming durable completion capacity. Disk failure or unavailable
 quorum cannot produce a success acknowledgment. Native durable codecs, replay and
@@ -1805,6 +1859,129 @@ rollback, late siblings, control ordering, reconstruction and finite-counter
 boundaries. The relevant source is in the native completion-book, owner-completion,
 schema, envelope and event-budget tests; completed run evidence belongs in
 [09](09-implementation-status.md).
+
+**Posted Required Admission graph completion is implemented in RAM.** The
+[dedicated envelope](../../crates/focal-core/src/native/completion_admission_graph.rs)
+uses the actual indexed component before Begin or owner reconstruction accepts
+responsibility. It includes immutable incoming/outgoing dependencies, active
+monitor roots and subscribers, ownership/lineage membership, complete registration
+bounds and every affected cohort. The shared
+[graph ceiling](../../crates/focal-core/src/native/completion_graph.rs) prices source
+copies, repeated captures, up to `M + L` graph/monitor revisions, reverse-link
+writes, original journal validation, automatic seal construction, range publication
+and discrete slots. Retained capacity includes one complete failure transaction
+plus all remaining ordinary attempts; retry and quality history cannot spend that
+one-time allowance twice. The complete failure shape must fit the configured
+transaction limits before the evaluation becomes Begun.
+
+The [failure capability](../../crates/focal-core/src/native/admission_graph.rs)
+consumes an actual `Posted → PostFailed` model decision with the exact registered
+report, artifact provenance, evaluator, accepted result and original cut. Its
+history prefix is stable: Artifact ordinal 0, Evaluation Reported ordinal 1,
+Accepted ordinal 2 and PostFailed ordinal 3. Frozen graph consequences follow,
+then the independently checked cohort suffix. A monitor on the failed parent may
+release after a dependent becomes terminal, advancing that parent's final binding
+again. The retained proof preserves the original failure binding and Required cut;
+`CompletionUse::AdmissionFailure` authenticates that proof instead of assuming the
+final parent is exactly one revision newer than the source. No extra result or
+participant authorization is inferred from graph changes.
+
+All actual report, claim, dependency, monitor, index and seal rows publish in one
+candidate. Their pending credit journal supports exact retry, publication and
+suffix discard. Other reports keep their original three-fact evidence shape:
+nonblocking attempts, retryable Error and eligible begun reports after receipt or
+terminality do not create another failure cut or graph pass. They do not rescan
+later response cohorts or manufacture testimony.
+
+The [indexed growth check](../../crates/focal-core/src/native/completion_growth.rs)
+is shared with Work grants. Even an isolated Posted Required parent installs
+protected membership. New incoming dependencies, monitor endpoints and owned
+membership are checked against all directly affected held promises before the
+candidate becomes accepted. A source cannot shrink the original protected union
+to conceal an unfunded endpoint. Current incompatible growth is refused; accepting
+such growth in a future extension would require atomically backing the enlarged
+promise first. Reconstruction rebuilds the same contract from actual retained
+Core state and refuses without losing that Core when funding cannot be acquired.
+This is a RAM owner seam, not native checkpoint or restart decoding.
+
+Qualification of this increment belongs in document 09. Its actual-source tests
+must cover Required failure under exhausted ancestor RAM, preserved earlier Error
+artifacts and Accepted ordinal 2, dependency failure and monitor release, a later
+monitor revision on the reporting parent, rollback of all effects and held credit,
+protected topology growth, late report-only evidence and owner reconstruction.
+Whole-claim responsibility still needs reserved claimant receipt/evaluation entry,
+control, audit, timer and owner-release capacity, including disk and replica resources.
+Native codec/import, WAL/Ready, Session/quorum and CLI/MCP activation remain required.
+
+#### Respondent mandatory reporting
+
+**Implemented native RAM and finite-record contract; qualification is recorded
+separately in document 09.** [RespondentEnvelope](../../crates/focal-core/src/native/respondent_envelope.rs)
+quotes one actual claim/receipt/epoch, using the immutable response allowance,
+slot policy, descriptor/verifier contract and future parent/registry heaps.
+[Respondent state](../../crates/focal-core/src/native/respondent_state.rs) derives
+three independent credits from actual indexed rows: one Work-reason diagnostic
+per remaining cycle unless the current cycle already has one, one authored close
+per remaining cycle, and one post for each future close plus every existing
+Generated response of the current receipt. Reconstruction follows the complete
+response chain, exact recorded report stamps, receipt allocations and cycle rows;
+it never substitutes an attempt counter, current status or newest response for
+that retained history.
+
+`AcquireReceipt` and `AdoptReceipt` acquire this backing through Ordinary admission
+before their candidates are accepted. [Respondent bookkeeping](../../crates/focal-core/src/native/respondent_book.rs)
+uses the existing indexed `CompletionBook` and its one expandable funded pool,
+with inline credit and pinned verifier values. There is no new pool or `Arc` per
+receipt. The [owner adapter](../../crates/focal-core/src/native/respondent_owner.rs)
+selects a loan only for the authenticated current holder's exact operation.
+The reserved diagnostic path uses the pinned builtin error-report schema and
+`EvidenceFailure::Work`; other evidence is ordinary admission. No entitlement
+authorizes Focal to supply a response, outcome, confidence, summary or diagnostic
+on the respondent's behalf.
+
+Let `W` be the immutable slot count capped by the checked closable work bound and
+`D` the admitted diagnostic count. The quote covers complete manifested and failed
+work, all cycle diagnostics and the bounded authored summary. Diagnostic, close
+and post require at most 8, `2W + 7` and 6 changed keys respectively. Their separate
+storage envelopes include direct rows, complete parent/registry and response
+copies, event containers, retained neighboring range pages and directory paths.
+Every possible action retains its own range-write allowance while old snapshots
+or pending candidates remain pinned; one shared workspace covers serial input,
+verification, construction and range transients. Discrete promises include the
+diagnostic artifact/identity, response rows, outcomes, events, sequences and new
+unique rows. No successful output payload is reserved merely because its slot
+exists.
+
+Optional work and diagnostics must preserve these limits before publication,
+including the first unspent Work diagnostic slot. The owner checks actual input
+capacities, current work attachment revision margins, every remaining close/post
+claim revision, future response history and registry sizes, and the retained heap
+of existing Generated reports. The counted respondent reader checks
+`3 + 4R + 3W + 3D` against its allowance using the full authored response count `R`.
+Journal checks use complete final events, including automatic cohort suffixes;
+the conservative multi-update bound is `9E + 2N` for `E` events and `N` changed
+respondents. Individual source readers, construction and journal stages retain
+their own checked limits; this does not assert a shared transaction-wide visit
+counter.
+
+Actual publication consumes or retires the corresponding credit once. A close
+can leave older Generated reports unposted, so it cannot retire their posting
+allowance. Adoption atomically retires the old receipt credit and funds the new
+one; terminal/local-complete claims and authorized controls retire only their
+actual respondent entitlements. Work/Admission reports that terminalize graph
+peers also reserve the retained multi-respondent journal, on every Work report
+or the one Admission failure respectively. Rollback drops prepared pages before
+restoring earlier credit and refunds newly added pool/index backing; a head
+commit preserves later pending advances. Evidence and original response history
+remain retained independently of entitlement retirement.
+
+The guarantee is accounting capacity for these admitted RAM operations, not
+physical preallocation or a promise that external execution, schema custody or
+allocation succeeds. Refusal preserves the source and retryable responsibility.
+Full claimant receipt/evaluation-entry, whole-claim and control closure remain
+separate funding requirements. Payload staging, disk/WAL/checkpoint coexistence,
+replica quotas and durable native codec/import/activation remain open. Existing
+V1 bytes, replay interpretation and live CLI/MCP behavior are unchanged.
 
 ### 6.8 Indexed completion ownership and bounded cohort checks
 
@@ -1927,14 +2104,15 @@ presence here does not claim those runs have completed.
 
 This removes the grant vector's repeated O(N) shifts and the workspace high-water
 policy. It does not establish global workload throughput, independent disk/replica
-reservations, respondent completion guarantees or native durable recovery. The
+reservations or native durable recovery. The separately integrated respondent
+reporting contract is described in §6.7. The
 remaining native object transactions, codec/import, WAL/Ready and quorum activation,
 and Session/CLI/MCP dispatch gates in §§6.4 and 6.7 remain in force.
 
-### 6.9 Planned WholeWork owner projection and funding
+### 6.9 WholeWork owner projection and funding
 
-**Owner projection and explicit claimant entry are implemented; funded external
-WholeWork Begin/report remain open.**
+**Owner projection, explicit claimant entry and funded native WholeWork
+Begin/report are implemented in RAM. Durable and Session/CLI/MCP activation remain open.**
 The [bounded model projection](../../crates/focal-model/src/lifecycle/aggregation_projection.rs)
 borrows actual retained sources through the
 [native owner adapter](../../crates/focal-core/src/native/projection.rs).
@@ -1943,12 +2121,18 @@ The native `EnterWholeWork` command publishes the claimant's request, exact
 response/work entry, structural MissingSlot outcomes, zero-check consequences,
 claim acceptance and indexed immutable dependency effects atomically. An explicit
 event journal preserves all intermediate transitions while storage retains the
-final rows. An acceptance read remains observational. WholeWork-specific completion
-pricing, external evaluator Begin/report and final audit closure remain required.
-Immutable incoming graph links are now indexed at creation; active runtime scopes
-still require their own reverse index before activation. Items 1–4 below describe
-the implemented projection/entry contract; items 5–6 identify the remaining funded
-execution and scope work. Document 09 records executed qualification. Preserve V1
+final rows. Its precharged object index now checks complete work/response revision
+chains, exact missing-evaluation/result correspondence and original publication
+positions before the final write. `BeginWork` and `ReportWork` add exact designated
+evaluator authority, held completion capacity, complete result history and derived
+object consequences. An acceptance read remains observational. Final audit closure
+remains required.
+Immutable incoming graph links are indexed at creation. Native active monitors
+now have direct root reverse membership and frozen consequences (§6.12), including
+expanded Work bounds. Items 1–4 below describe the projection/entry contract;
+items 5–6 describe the held-resource contract. Posted Required Admission now
+shares the graph ceiling and protection index (§6.7). Remaining control/funding
+and durable activation gates are distinct from those implemented report paths. Document 09 records executed qualification. Preserve V1
 decoding, execution and bytes throughout this sequence.
 
 1. **Retain exact entry and internal-result positions.** Extend the native
@@ -2016,29 +2200,43 @@ decoding, execution and bytes throughout this sequence.
    and [CompletionBook](../../crates/focal-core/src/native/completion_book.rs)
    now aggregate checked envelope-derived remaining slot vectors through spend,
    retirement, reconstruction and rollback. The book no longer infers event or
-   row counts from the number of reports. Admission and Increment retain their
-   existing demand; WholeWork-specific envelopes are not yet enabled.
+   row counts from the number of reports. Increment retains its report-only
+   demand; Work reserves its complete remaining chain, and Posted Required
+   Admission reserves its full one-time graph failure shape (§6.7).
    Price every attempt's artifact/evaluation/result
    writes plus possible work, response and claim changes, events, outcomes and
    copied neighbors. One parent-failure surcharge cannot cover transitions that
-   occur on different reports. The current loan/advance `failed_parent` flag is
-   still Admission-specific; replace that interpretation with the complete target's
-   checked effect shape before enabling WholeWork. Separately admit the first-entry transaction: it
+   occur on different reports. Loan selection and spending now use typed
+   `CompletionUse::{Regular, AdmissionFailure}`. Only an actual ReportAdmission
+   Posted → PostFailed transition with its exact Required Admission cut may spend
+   the one-off surcharge. Its retained proof distinguishes the original failure
+   revision from later monitor revisions on the same parent; final-row equality
+   with `before + 1` is not required. Other report families use Regular; WholeWork must
+   price its complete effect shape on every Regular attempt. Separately admit the first-entry transaction: it
    may change every manifest artifact, create internal missing-target results and
    reduce the response and claim before any external report. Bound its full batch,
    projection work and retained bytes; do not charge it as an ordinary retry.
 
-   The explicit claimant entry transaction is now implemented. Evaluator-first
-   entry remains required: a designated peer's successful Begin must be able to
-   enter a Received response in the same funded transaction. Consume the actual
+   Explicit claimant entry and evaluator-first entry are implemented. A designated
+   peer's successful Begin can enter a Received response in the same admitted
+   transaction. The first-entry effects use ordinary admission, while its future
+   reports receive a held completion grant before publication. Consume the actual
    begun evaluation with `ClaimState::observe_evaluation` and
    `Response::plan_evaluation`; do not construct a claimant Principal on behalf of
    the evaluator. Derive any other work-entry and structural-absence effects from
-   a private capability for that checked response entry. The current
+   a private capability for that checked response entry. The
    `WorkArtifact::observe_evaluation` authorizes only the begun evaluation's exact
    artifact, and `settle_missing` authorizes an explicit claimant; neither alone
-   grants blanket actor authority over the other slots. Extend those typed owner
-   capabilities before enabling automatic evaluator-first entry. Preserve the
+   grants blanket actor authority over the other slots. The model now provides
+   `ResponseEntry`: the owner obtains it from the checked Received → Validating
+   plan after checked claim advancement and a refreshed acceptance decision.
+   It pins the exact resulting response and current claim bindings, report stamp,
+   receipt, cycle and respondent. `WorkArtifact::begin_entered` and
+   `Evaluation::settle_missing_entered` consume it without a Principal argument;
+   the latter preserves explicit fences/seals and creates no external attempt.
+   Native claimant and evaluator-first entry use these APIs for all derived effects.
+   A low-level Core call cannot bypass managed funding for BeginWork or ReportWork.
+   Preserve the
    same chronology, all-slot structural assessment and exact entry/result cuts as
    explicit claimant entry. Fund all such initial effects before recording Begin.
 
@@ -2049,14 +2247,34 @@ decoding, execution and bytes throughout this sequence.
    explicit claimant entry discovers the bounded affected closure through those
    links, outgoing declarations and exact owned/lineage membership. It publishes
    checked dependency failure and fixed-point graph release with the root's local
-   outcome. Active runtime scopes are explicitly refused until their reverse
-   membership and consequence path are integrated. Add that scope index before
-   enabling scope writers/import. Price each affected row and
-   transaction or an explicitly retained, funded continuation. Later response,
+   outcome. Native scope writers now retain direct root reverse membership and
+   publish repeated frozen monitor/graph consequences (§6.12). These Work paths
+   price their affected rows and history; remaining family paths and future native
+   import must use the same complete source and capacity checks. Larger work
+   needs an explicitly retained, funded continuation. Later response,
    registry, coverage-witness, audit-cohort, scope or graph growth must remain
    inside held grants' byte, visit, write and discrete-slot envelopes, including
    later ordinary creation and registration. Refuse incompatible growth or reserve its
    added obligation atomically; successful earlier Begin must not become unfunded.
+
+   The owner now retains a typed reverse protection index from every member of a
+   Work grant's checked component to that exact evaluation key. New claim creation
+   checks its dependency targets and lineage parent as well as its own row, so an
+   incoming link cannot enlarge a protected component unnoticed. Other native
+   facts identify their owning claim. The complete affected cohort is discovered
+   through those indexes; temporary scalar marks deduplicate checks and are reset
+   for the whole affected cohort before each candidate. No ledger-wide or grant-wide
+   scan is needed. Every check runs serially inside held completion workspace.
+
+   Work grants pin complete graph membership and immutable content, while pricing
+   each mutable member's full authored response-history and registration capacity.
+   Incompatible topology is refused before candidate acceptance; automatic added
+   funding is not implemented. Protected membership survives pending retirement
+   until publication and rolls back with Begin, including geometric index-buffer
+   growth. Already-begun checks remain funded after ordinary parent completion or
+   failure; explicit fences retire the corresponding grants through the existing
+   journal. Each active grant preserves future terminal revision capacity in its
+   work/response and affected claims.
 
 7. **Qualify in dependency order.** First test entry provenance, complete-cohort
    refusal and real artifact-free outcomes. Then test missing and zero-check slots,
@@ -2068,7 +2286,1321 @@ decoding, execution and bytes throughout this sequence.
    allocation failure, pending-tail rollback and refused growth leave original
    state and credit intact. Run the no-panic, strict Clippy and workspace gates.
    RAM qualification does not activate native codecs, WAL/Session/CLI/MCP dispatch
-   or establish respondent closing, disk or replica completion reservations.
+   or establish disk or replica completion reservations. Respondent closing uses
+   the separate receipt-bound RAM contract in §6.7.
+
+#### WholeWork funding implementation checklist
+
+The model's checked `ProjectionQuote` and native `NativeProjectionQuote` now
+implement the following shape, construction-byte and counted-visit bounds. The
+native projection shares one lookup allowance across inspection, reduction,
+nested work cursors and staged-row searches. Graph execution also consumes a
+checked preflight over its complete actual indexed closure. The native Work
+completion envelope now reserves these costs and guards later growth before
+publication; these are internal accounting bounds, not new required user settings.
+Durable and Session/CLI/MCP activation remain separate. An overflow or a bound exceeding the owner's
+allowance must refuse Begin before it creates an attempt.
+
+1. **Pin the eventual projection shape.** Let `r` be the promised maximum responses,
+   `w` maximum indexed work rows, `s` immutable declared slots, `d` declarations,
+   `e` maximum registrations and `k` total checks across the slot policies. These
+   use legal future occupancy, including failed and unclosed work, rather than
+   currently present evidence. The response promise must cover the current count
+   and cannot exceed the authored maximum. A smaller promise is valid only if
+   the owner guards later growth or atomically adds funding; the estimator itself
+   cannot establish that guarantee. Define `t = r*s`, `h = r+e`, `a = e+t`, and
+   `tri(x) = x*(x-1)/2`, with `tri(0) = 0`. The existing projection allocation
+   quote must cover `Counts { responses: r, slots: t, results: e, events: h }`.
+   Its eleven buffers include both final borrowed proofs and all simultaneous
+   temporary state; charge allocator metadata and the inline projection too.
+
+2. **Price visits separately from bytes.** A conservative bound for the current
+   source inspection's explicit visit counter is:
+
+   ```text
+   (d+s+k) + d*(d+1)
+   + r*(1+s*(w+1)+d*(e+1)) + tri(r)
+   + e*(2*d+7+w+r) + 3*tri(e) + e + d*(e+1)
+   + w*(2+r+s+d*(e+1)) + tri(w) + d
+   + r*(1+e*(d+4))
+   ```
+
+   A conservative bound for the current reduction's explicit visit counter is:
+
+   ```text
+   2*r + t + e*(d+r+3) + h
+   + h*(2*r+2*t+e*(a+1)+s+(3*d+k)*(e+1)+a*(s+1))
+   + t*a + d*(e+1) + 2*e + s + k*(e+1) + r + r*t
+   ```
+
+   Across all chronological groups, a dirty started response is reduced at most
+   `h` times total: each such reduction needs an entry or result event. A slot
+   produces at most one terminal response cause, bounding the total cause-list
+   insertion work by `t*a`. Preserve these invariants when changing the reducer.
+   These expressions cover the counted visits, not sort comparisons, descriptor
+   validation, range-tree descent or native membership lookups.
+
+   Native lookup accounting uses `c = t+e+w+1` cursor starts, including constructors
+   for partial or empty duplicate-prefix scans, and `X` maximum staged extra rows.
+   Across inspection and reduction, direct source lookups are bounded by:
+
+   ```text
+   D = d + 9*e + 3*r + tri(r) + 2*t + 2*tri(e) + 3*r*e + w + w*r
+   ```
+
+   The complete adapter lookup ceiling is:
+
+   ```text
+   2 + c*(2+2*r+8*w) + (D+c*w)*(1+X)
+   ```
+
+   The initial two lookups cover the claim and registry headers. Each cursor
+   charges membership and provenance lookups before access; its mapped work reads
+   and every direct source lookup also charge each examined overlay row. All
+   cursors share the same owner-local scalar allowance, so nesting cannot renew
+   it. Exhaustion is sticky and surfaces as Capacity before the owner interprets
+   an infallible source callback's absent value or invokes the acceptance callback.
+   Range-tree descent and uncounted model helper/sort comparisons remain separate
+   bounded costs. The quote does not reserve bytes, pin evidence or authorize Begin.
+
+3. **Price each report's complete effects.** After entry has already published
+   all structural/zero-check effects, a report adds artifact, identity,
+   evaluation and accepted-result rows. It can additionally replace the target
+   work, its response and `g` claims, including the target claim. If each other
+   claim changes once and the target may publish LocalComplete then Satisfied,
+   the per-report maxima are:
+
+   | Resource | Per-attempt bound |
+   | --- | --- |
+   | Artifacts / identities / results / outcomes / sequences | One each |
+   | Events | `g + 6` |
+   | Changed keys and input capacity | `2*g + 14` |
+   | New unique rows | `g + 10` |
+
+   These bounds assume the report stages only its target work and response; if
+   the implementation restages a larger set, quote that larger set. Retained
+   bytes cover every remaining retry/fallback/quality attempt and pinned old
+   pages; serialized verification/projection/construction needs one held peak
+   workspace. Include the new object-journal index in construction bytes.
+   First-entry all-slot transitions and internal missing results are separately
+   admitted before recording Begin. An entry consequence may close the claim
+   while the newly begun evaluation retains its authorized reporting capacity.
+
+4. **Protect the promise against later mutations.** Add typed Work completion
+   bounds pinning response/work identity and receipt, future response heap,
+   projection shape/visits, complete affected graph closure and revision margins.
+   Reserve one future terminal revision for target work and response, up to two
+   local-outcome/release revisions for the target claim, and a terminal revision
+   for each affected peer. Ordinary response observations and graph mutations
+   must preserve that headroom while a grant is active.
+
+   `CompletionBook::check_parents` visits Claim/Registrations facts.
+   Creating a dependent can instead grow IncomingHead/IncomingLink rows without
+   changing the funded claim itself. Therefore guard changes to reverse graph
+   membership and owned children, discover the affected grants, and check their
+   complete proposed closures before publication. Either refuse incompatible
+   growth or fund the added obligation atomically. Rechecking only when a report
+   arrives is too late. Runtime scope activation needs the same guarantee through
+   its own reverse membership index. The Work protection index and candidate guard
+   now supply this requirement for the currently enabled native writers.
+
+   The graph preflight now supplies exact-current node, discovery, snapshot,
+   witness, row, event and heap ceilings from the same incoming/outgoing/ownership
+   traversal and frozen snapshot used by execution. It checks one graph revision
+   for each nonterminal member and reconciles actual output costs. Its optional
+   prior ceiling rejects a proposed closure that grows even when the root Claim
+   binding is unchanged. The Work completion book now installs this comparison
+   before admitting affected native mutations. The full report envelope adds non-graph rows, target
+   local-outcome revision headroom, range construction and the common object-journal
+   index; graph preflight alone is not a complete report reservation.
+
+5. **Qualify the funded path before exposing it.** Exercise maximum legal future
+   response/work/registration growth after Begin; new incoming dependencies and
+   owned children; staggered Required/Observe outcomes; retryable Error and
+   quality phases; terminal parent with an outstanding audit report; revision
+   exhaustion; pinned snapshots; exhausted ancestor RAM; and every pending-chain
+   rollback. Record exact per-attempt credit consumption and no partial evidence,
+   history, row, or grant changes on refusal. Only then enable native Begin/Report
+   dispatch and proceed to the separately required durable and CLI/MCP activation.
+
+### 6.10 Native deadlines and remaining audit integration
+
+**Exact native evaluation/claim deadlines and claimant result-bundle
+generation/posting are implemented in RAM; guaranteed whole-claim completion
+funding remains open.** Keep timeout
+authority, business acceptance, cohort sealing and audit completion distinct.
+An expired evaluation cannot report, but refusing that report does not itself
+record a deadline fence or close the retained audit obligation. The trusted
+owner now exposes `prepare_evaluation_deadline` and `prepare_claim_deadline`; future due-timer scheduling,
+durable activation and node service dispatch must call that separate ingress.
+
+1. **Implemented exact trusted evaluation deadlines.** The owner derives the due evaluation
+   from its actual declaration, target, generation, current binding and trusted
+   owner time. A participant-supplied timestamp or Node identity is not a timer
+   capability. Keep due-deadline ingress separate from actor mutation ingress,
+   preserve request retries and reject early or stale timers before mutation.
+   Retain consumed timer generation/target independently of participant request
+   deduplication. Expired Ready checks, pure Receipt declarations and declared
+   policy requirements need this fence without external report authorization.
+   Use the model's checked deadline fence: preserve state and original accepted
+   results, append the actual authority-fence event, and invent no Fail/Error,
+   artifact or testament. Existing terminal results and earlier fences retain
+   their original coordinates. Begin and Report must observe a pending fence.
+
+   Native invocation identity is now an explicit `Request(RequestKey)`,
+   `EvaluationDeadline(NativeDeadlineKey)` or `ClaimDeadline(NativeClaimDeadlineKey)`,
+   shared by outcomes and event history.
+   The timer key pins the full evaluation target/generation and timer identity/
+   generation; its separately domain-separated intent also commits the authored
+   due time. Fired time is trusted context and does not change exact retry
+   identity. The owner resolves and caches the checked replacement once against
+   its immutable borrowed prefix before construction. A terminal/fenced no-op
+   consumes its timer by writing only Meta and the typed outcome. Actor command
+   fingerprints and frozen V1 bytes remain unchanged. No participant command
+   variant or synthetic claimant principal supplies this authority.
+
+2. **Implemented bounded funding for Ready and begun deadlines.** An unbegun
+   Ready evaluation has no report grant. Its deadline operation therefore cannot
+   assume that a completion loan exists. Its bounded checked owner transaction
+   uses Ordinary admission, as does timer consumption for a terminal evaluation.
+   For a begun
+   evaluation, select the exact held grant, stage the actual fence and retire its
+   remaining report promises through the existing journal only after successful
+   construction. Do not borrow another evaluation's credit or infer available
+   bytes from diagnostic budget snapshots. Preserve needed parent/graph effects
+   in the same funded transaction or an explicitly retained funded continuation.
+
+   Before native Begin or reconstruction accepts responsibility,
+   `CompletionEnvelope::deadline_storage` proves the exact four-put, one-event,
+   two-new-row fence fits one Regular report's range, temporary workspace and
+   discrete slots. `CompletionBook::deadline_contract` lends that exact grant
+   without reporter/schema checks; the actual range plan is checked before
+   construction. Single-grant fence retirement uses the existing inline journal
+   update with no new Ordinary allocation. Commit/discard retain the same page,
+   credit and reverse-membership lifetime rules as reports. Evaluation deadlines
+   change no parent/response/work result and produce no Accepted row or artifact;
+   subsequent claim expiry and audit publication need their own funded effects.
+3. **Implemented deadlock precedence before bounded claim expiry.** For claim deadlines,
+   evaluate the qualifying unsatisfied strongly connected component before
+   ordinary expiry as required by D-08. The canonical victim can differ from
+   the timer's trigger. Apply its checked witness against the same complete
+   snapshot and then propagate graph consequences. Account separately for
+   `Snapshot::deadlock` reachability/component buffers; dependency-failure
+   preparation does not cover them. Capacity, stale-cut or incomplete-closure
+   errors cannot authorize expiry. Expired claims fence their evaluations;
+   Deadlocked and DependencyFailed claims preserve already-begun report authority.
+
+   `prepare_claim_deadline` accepts the actual authored claim/timer identity and
+   trusted firing time; it resolves the current claim revision and full closure
+   from the effective owner prefix. The separately fingerprinted typed outcome
+   handles exact retries before clock/capacity checks. Terminal claims consume
+   the timer without rewriting their cut, evidence or graph. The model's
+   [bounded query](../../crates/focal-model/src/lifecycle/graph_deadline.rs)
+   distinguishes a checked negative answer from every error, reserves all
+   reachability/queue/component buffers before traversal, and preserves the
+   original canonical witness fingerprint and deadline provenance. A settled
+   self-edge does not qualify as a wait cycle.
+
+   The [native control transaction](../../crates/focal-core/src/native/claim_deadlines.rs)
+   applies the actual witness or expiry, complete registered expiry fences and
+   checked graph consequences in one candidate. When the victim differs from
+   the due trigger, it captures the complete resulting component again and
+   resolves any remaining SCC or ordinary expiry until the original trigger
+   is terminal. Every round must terminalize a previously live member; later
+   witnesses bind the complete staged source at that round and preserve earlier
+   terminal cuts. The same typed timer cannot be consumed with the trigger still
+   open. Exact redelivery remains a retry, not a new firing or renewal.
+   Its dedicated journal validates
+   the exact initiating cut, fence membership/order, changed rows and events;
+   it cannot inject work, testimony or evaluation results. Multi-grant retirement
+   uses the same Completion lane as the bounded control construction, including
+   the additional coexisting journal allocation. All successive SCC and graph
+   captures are cumulatively precharged and share a finite traversal allowance.
+   Active runtime-scope closures now include direct reverse monitor membership.
+   A scope release can advance a still-open trigger before its next SCC/expiry
+   round; the next witness consumes that actual staged revision. The journal
+   retains terminal-owner monitor releases as separate facts, and the common
+   index checker validates every associated subscription write (§6.12).
+
+   This is atomic bounded control admission, not a guarantee that every future
+   claim deadline fits. The current registry and graph growth bounds can admit
+   a closure larger than one control transaction. Expiry writes
+   `2 * changed_evaluations + 2 * changed_claims + 2` rows in this profile and
+   refuses the entire candidate if any construction, journal, traversal or
+   range allowance is exhausted. Before guaranteeing timer completion, reserve
+   the complete future claim obligation at responsibility admission and
+   revalidate topology/registration growth, or retain an explicitly funded
+   continuation with equivalent atomic authority fencing. Price the control
+   journal, discrete rows/events, RAM coexistence, disk and replica capacity;
+   evaluator report promises cannot silently subsidize arbitrary claim control.
+4. **Implemented automatic native seal publication and grant rebinding.**
+   `Evaluation::record_seal` advances the evaluation binding even when the
+   evaluation has already begun. It preserves that attempt and its reporting
+   authority. The completion book now supports an exact before/after
+   rebind which preserves remaining reports, descriptor/schema contracts,
+   memberships, workspace and retained capacity. Rollback must restore the old
+   binding without allocation. A seal cannot consume an attempt, retire an active
+   grant or leave its binding stale. Preserve the extra revision margin before
+   admitting the responsibility that can require the seal.
+   Report advancement and sibling rebinds share one atomic journal. The explicit
+   `Sealed` events now come from a separately checked suffix after the complete
+   original history. They do not pass through `Extras::evaluation`, whose
+   unfenced existing-row change represents Begin. Original object-journal
+   checks remain intact; no synthetic Begin is used for a seal.
+
+   Derive a checked seal update from actual before/after evaluation states and
+   the retained declaration/cohort cause. Require exactly the next binding and
+   preserve current attempt, state, phase, target, generation, receipt, last
+   result and fence; only the seal and applicable Ready suppression may change.
+   A live grant preserves report count, failure surcharge, schemas, reverse
+   memberships and workspace. Ready/terminal members never create grants.
+   Fold a report followed by a seal of that same evaluation into one update:
+   debit the report once, bind the grant to the final sealed row, and retain the
+   result's original pre-seal evaluation revision and publication ordinal.
+
+   `CompletionBook`'s multi-update journal now handles this purpose.
+   `Change::Many` removes only retired grants at commit; live rebinds remain.
+   A later pending report may already
+   have advanced a live rebound grant when the earlier seal candidate commits.
+   Commit must preserve that later credit, while suffix rollback restores exact
+   before bindings and per-entry workspace weights without allocation. Validate
+   all mixed updates before mutation, then return one journal for report advance,
+   sibling seals and any real fences. Allocate its vector from the triggering
+   transaction's funded source and include its coexistence in the envelope.
+   Integrate it after report construction and before owner candidate checks;
+   control construction uses the same checked collector. Begin and reconstruction
+   retain one additional revision for an unsealed nonterminal member. Existing
+   single-evaluation report envelopes also preflight the collector's full visit
+   bound: `maximum_report_events + 3 * declarations + slots + 3`. The immutable
+   policy fixes this cost for all future attempts. Exact source-root provenance,
+   complete registry membership, and Accepted-after-Reported event ordering are
+   checked before any credit change. The common collector bounds sorting,
+   lookup and all cohort passes; automatic writers must price their larger
+   mixed-update visit demand before adding those events.
+   Evaluator-first `BeginWork` can itself produce a local outcome while entering
+   the full cohort. Its owner branch now sends the actual checked Begin transition
+   through the collector and composes the installation with any resulting
+   own/sibling updates in one candidate journal. The new grant's original
+   funding and reverse-membership journal remain owned until commit/discard.
+   The automatic writer uses the complete preparation/envelope profile below.
+
+   Keep the composition bounded: one publication can own at most the existing
+   Begin-install journal plus one complete mixed-update journal. Reserve their
+   pending representation before accepting the publication; avoid a recursive
+   journal or an independently allocated list of journal objects. Check their
+   owner identities and adjacent book revisions. On candidate refusal, drop
+   prepared pages before rolling back the mixed updates, then roll back the
+   installation and return its newly added funding. Commit in publication order
+   without overwriting any younger pending report's live credit. Empty journals
+   must not create phantom revision steps. Qualify both own-evaluation and
+   sibling seals, immediate retirement, later pending reports and suffix discard.
+
+   The collector starts from source evaluation rows and accepts the one external
+   Begin only with its owner-created transition capability. For a Begin followed
+   by a seal of the new evaluation, it verifies the actual intermediate Begin state:
+   the source is Ready while the newly installed grant is already bound to the
+   begun revision. The capability borrows the exact original source root and
+   retains the authorized complete before/after states, request identity, intent
+   and logical time. It survives consumption of the preparation input without
+   cloning a root or budget handle. Retain the
+   original Begun history before Sealed, and prove both deltas against the same
+   immutable source. A participant-supplied binding or fabricated Begun event
+   cannot authorize the grant or bypass actor/target/receipt/deadline checks.
+   Do not weaken source-state checks to accommodate the later binding.
+   The proof requirement applies to every Begun fact, even when it contains no
+   attempt. Inactive authorization, if returned by the owner model, travels
+   through the same checked path without installing a grant. Structural
+   MissingTarget outcomes use their separate event kind; an arbitrary Begun
+   event cannot be ignored merely because its final row is still Ready.
+5. **Implemented complete cohort pricing and suffix construction.** A Work report's
+   original `g + 6` event and `2g + 14` changed-key bounds cover its object and graph
+   effects. The extended envelope also covers sealing every registered sibling. Derive the entire
+   affected cohort from owner indexes and immutable declarations, including
+   Ready, suppressed, begun and already-terminal members. Extend each possible
+   triggering envelope with only the actual bounded additional row/event,
+   registry, revision, journal and persistent range costs. Revalidate future
+   registration growth against these promises. First entry, final Required
+   results and explicit controls need separate consequence profiles; no
+   unbounded cohort scan may appear in an otherwise funded report.
+
+   The writer runs at the common preparation boundary, after the operation
+   has produced its final claim rows and before outcome counts/history/range
+   construction. Compare each actual source claim's original `local_sealed_at`
+   with its final row; only newly sealed claims create a cohort. This includes
+   Admission failure, WholeWork entry/report outcomes and affected graph peers,
+   cancellation, supersession and claim deadlines. A late result or later graph
+   release cannot reseal the cohort. `Plan` now carries a bounded collection of
+   registration overrides for all affected claims, with inline empty/single
+   cases and charged buffer growth for multiple claims. Use canonical claim
+   order so appends and final merging have linear total movement/traversal.
+   Each override must match one final claim row; duplicate and unmatched IDs
+   refuse. The collection moves the already-charged registry buffer into the
+   final claim instead of copying it again. Future multi-claim writer envelopes
+   must include the override buffer's full coexisting growth charges and both
+   per-claim policy checks at insertion and final-row validation. Do not copy a
+   registry again for each evaluation. Resolve state from the staged override
+   first, then the immutable source, so a report followed by a seal preserves
+   its real intermediate state and original Accepted coordinates.
+
+   Let `e` be the sum of the checked maximum future registration counts for all
+   potentially affected claims, and `g` their existing claim-row bound. A safe
+   initial profile adds at most `e` evaluation writes, `e` seal events and `g`
+   registration-seal events to the existing transaction; the reporting
+   evaluation can share its existing row, but its distinct seal event remains.
+   For a baseline of `h0` events and `m0` unique changed keys, and `o` sealed
+   evaluations already present in the original extra rows, use
+   `h = h0 + e + g` and `m = m0 + 2e + g - o`. With no overlap deduction,
+   the original isolated Admission profile grows from four events/eleven changed
+   keys to `e + 5` events/`2e + 12` changed keys. The current graph-backed Admission
+   profile instead derives `h0`/`m0` from its complete indexed component and monitor
+   journal before adding this suffix; the isolated formula is not its full bound. Work reports grow from `g + 6` events/
+   `2g + 14` changed keys to `e + 2g + 6` events/`2e + 3g + 14` changed keys.
+   These seals replace existing evaluation and claim rows; new-row demand adds
+   only the `e + g` history records. Work's per-report new-row allowance therefore
+   grows from `g + 10` to `e + 2g + 10`. Here `e` and `g` are conservative
+   affected-cohort bounds, not global ledger cardinalities.
+   Price the full `SealTransition` buffer (previous and next state), evaluation
+   containers, sorted lookup/history buffers and mixed completion-update journal
+   while candidate pages coexist. Registry heaps are counted once per rewritten
+   claim. Tighten the profile after proving actual overlap; do not subtract an
+   event merely because two transitions share one row.
+
+   Admission's one-time Required-failure surcharge must include its complete
+   cohort. WholeWork's regular envelope must include every potential affected
+   graph cohort. Ordinary entry and controls require their own complete shape.
+   For first WholeWork entry, let `p` be the manifest size, `q` the changed
+   missing evaluations, `r` the Required missing results and `b = 1` when an
+   evaluator's Begin triggers entry (`0` for explicit claimant entry). With
+   graph-row bound `G`, the original conservative bounds are
+   `p + 1 + q + r + b` extra rows, `G + 2p + q + r + b + 4` events and
+   `2G + 3p + 2q + 2r + 2b + 7` changed keys. Add the seal suffix to these
+   bounds; do not substitute the smaller report profile. Entry can refuse its
+   complete Ordinary admission before accepting new evaluator responsibility.
+   Extend held membership/growth checks so later target materialization cannot
+   exceed any prior promise. A protected Work component must pin the sum of
+   each member's maximum future registry count and declaration/check traversal
+   bounds, including Ready evaluation revision headroom. Protecting only its
+   identity and current heap ceiling is insufficient. Materialization on any
+   protected peer must revalidate this promise. Cancellation, superseding
+   creation and claim deadlines fund their own complete control consequence;
+   they cannot borrow an unrelated evaluation's report grant. ReportIncrement
+   and EvaluationDeadline need no new cohort surcharge while their semantics
+   produce no newly sealed claim.
+
+   The existing single-key completion visit quote (`H + 3D + S + 3`) is not a
+   multi-cohort quote. Include the second event pass, comparison/move work,
+   per-claim registry resolution, full declaration checks and seal proof lookup.
+   The collector now requires seal proofs in strict canonical order: complete
+   before binding, complete target bindings/slot, then generation. It checks this
+   borrowed slice once and uses binary search with one debit per probe; it adds
+   no index allocation or empty-slice visit overhead. The writer charges its
+   own ordering work and preserves original event order independently.
+   Do not reinstate a complete proof-list scan for every evaluation. The mixed completion-update
+   buffer remains live alongside prepared pages until commit/discard and belongs
+   in each report's retained allowance. It cannot be funded only through the
+   maximum shared workspace: several pending reports retain several buffers.
+   Admission reserves this with its one-time failure surcharge; WholeWork
+   reserves the conservative journal for every remaining report. Construction,
+   seal capabilities and page-building scratch still share the serial workspace.
+   A shared checked cohort-cost profile drives both preparation and each
+   retained completion promise. Traversal refusals identify their visit limit
+   separately from insufficient preparation bytes.
+
+   The collector includes structural MissingTarget facts before a later seal.
+   It resolves the real source state and exact response-entry publication,
+   verifies missing manifest membership and any Required Missing result, then
+   checks the intermediate state against the seal capability. The structural
+   event's MissingTarget phase is distinct from the evaluation's unchanged
+   configured execution phase. This Ordinary entry path grants no external
+   attempt and spends no held report credit.
+
+   Existing nonjournaled operations must preserve
+   their complete original history before they can append seals; a second evaluation
+   event cannot be hidden in the final row's single `fact` field. Keep seals
+   internal consequences, with no extra participant command required to make
+   an already sealed local outcome consistent.
+
+   Original history is now assembled by the shared borrowed
+   `claim_changes::visit_history` visitor. Immediate publication uses this same
+   path, preserving the exact ordering of creations, child registrations,
+   report evidence and Accepted/Delivery/Missing coordinates, and derived claim
+   facts. The visitor owns no output buffer and uses the existing precharged
+   claim-history workspace. Preserve the original `Plan` and `Extras` together
+   behind private ownership until this pass finishes. A separate checked seal
+   suffix may then supply final evaluation/registry replacements while original
+   rows move into publication. This streams the original prefix directly into
+   final events and needs no duplicate `NativeFact` capture buffer. Full original
+   and replacement payloads still coexist and must be charged. Existing explicit
+   journal semantic checks run against the original rows; implicit claim chains
+   remain checked during the single emission pass. No original payload or fact
+   may be edited after that ownership boundary. The suffix must prove its exact
+   source/intermediate state, start at the original event count and account for
+   every replacement and appended event before publication. Nonjournaled commands
+   cannot simply set `Extras.journal` or bypass the original object/claim checks.
+6. **Implemented bounded native audit inspection.**
+   [RegistrationSet](../../crates/focal-model/src/lifecycle/registration.rs)
+   retains the original local-seal position and supplies a checked borrowed
+   capability matching the actual claim and immutable policy. An unstamped
+   open-claim target seal cannot grant audit authority. The
+   [native model plan](../../crates/focal-model/src/lifecycle/audit_native.rs)
+   consumes complete evaluations in registry order and accepted history grouped
+   by that same order. One forward pass checks exact declarations, targets,
+   generations, receipts, contiguous attempts, increasing accepted revisions
+   and each member's actual latest result; counted in-place sorting then creates
+   canonical audit order. Terminal members need no invented seal revision.
+   Construction and fallible copies expose full heap/allocation accounting.
+   Complete cohorts reserve exact retained results; incomplete cohorts retain
+   the capacity for all admitted attempts. The older `AuditCohort::seal` and
+   `EvaluationRegistry` APIs remain available without reconstructing them on
+   the native path.
+
+   The [native owner reader](../../crates/focal-core/src/native/audit.rs) gathers
+   complete actual membership and all Accepted, Delivery and Missing ranges
+   through bounded per-member key seeks on one committed or pending prefix.
+   Wrong-family rows, missing retries, substituted artifact IDs/provenance and
+   absent or mismatched original event/outcome records refuse inspection.
+   Native result keys contain evaluation revisions, so attempts never substitute
+   for row addresses. A separate sorted publication index preserves every
+   original sequence/ordinal, including legitimate reports after the local
+   seal and no later than the captured prefix. Query admission covers both
+   simultaneously live source and output buffers, and actual capacity checks
+   precede their use. The callback cannot outlive its owned audit buffers or
+   release their permits early. Inspection retains no second mutable audit
+   registry and grants no future whole-claim closure reservation. The separate
+   mutation path below consumes the same checked construction under its own
+   transaction allowance.
+7. **Implemented claimant result-testament generation and posting.** The
+   [native owner](../../crates/focal-core/src/native/audit_bundle.rs) resolves
+   the actual claimant and exact claim binding before constructing the complete
+   sealed audit. Every begun member, including Observe, must have completed or
+   acquired a real fence. Unbegun suppression remains a fact without a verdict.
+   `GenerateResultTestament { claim, id }` consumes that audit into a Generated
+   bundle. It retains the source's captured prefix, original local-seal cut and
+   complete Accepted/Delivery/Missing sequence/ordinal witnesses. The model's
+   native audit hash includes every canonical member/result field and the exact
+   optional seal-cause hash; the enclosing bundle hash also commits the captured
+   prefix and separate sorted publication index. Canonical generation checks
+   revision one and consumes the buffers without another sort or allocation.
+
+   `PostResultTestament { expected }` checks the claimant and exact stored
+   Generated bundle, copies its owned buffers fallibly, then records Posted at
+   the next bundle revision. Content, source capture and original witnesses are
+   immutable. Posting does not regather the audit or depend on an unchanged
+   parent revision after graph progress. A locally complete claim may close its
+   bundle before graph release. The per-claim index admits only one bundle;
+   reciprocal checks prevent response/result-testament ID collisions. Exact
+   request retries return the original outcome before fresh admission.
+
+   Native storage uses separate `ResultTestament` and `ClaimResultTestament`
+   keys/rows, a `ResultTestament` history fact and its own metadata/outcome
+   count. Generation has five changed keys (bundle, index, event, metadata,
+   outcome); posting has four (bundle replacement, event, metadata, outcome).
+   Both have zero changed claim/response/artifact/evaluation rows and retain
+   independent Generated/Posted publication positions. The ledger counter grows
+   only on generation. Existing per-result artifacts are sufficient evidence;
+   no second aggregate artifact or synthetic result is required. These objects
+   never replace respondent testimony or enter work acceptance/attachment.
+
+   Both commands use ordinary RAM admission and preserve other evaluations'
+   held completion slots. The internal audit builder charges coexisting source
+   arrays, cohort and publication buffers to the already reserved construction
+   `Scratch`, then moves the final buffers into the owned bundle. It does not
+   escape borrowed query funding or duplicate the complete audit. Posting
+   precharges the full owned copy, including both accepted-result and publication
+   arrays. Final hashing/copying use checked linear `E + R` visit bounds, in
+   addition to the history gather and counted canonical sorts. Range preparation
+   charges the final owned heap and copied neighbors before atomic publication.
+   Borrowed and pinned read projections expose the role and original positions.
+   Native history packing changes no V1 codec, hash or command preimage.
+
+   Executed qualification is recorded in
+   [09](09-implementation-status.md#native-claimant-result-testaments--2026-09-07).
+   These commands provide no guaranteed future whole-claim closure funding.
+8. **Qualify races before broader activation.** Exercise exact and stale timer
+   generations, early deadlines, actor spoofing, Ready versus begun evaluations,
+   retry/quality phases, and ordinary terminal parents with unfinished audits.
+   Race a report against an earlier pending deadline in both publication orders;
+   exact request retries must retain their original result. Seal a begun sibling,
+   then finish it under exhausted ancestor RAM with pinned old versions. Discard
+   the sealing/fencing suffix and recover original bindings, report credit and
+   reverse protection memberships. Check that authority-only closure produces
+   no participant result and that complete audit closure does not repaint an
+   earlier work/response/claim terminal cut.
+   Also cover a deadlock victim distinct from the triggering claim, expired
+   pure Receipt/required-policy checks, omitted or duplicate attempt history,
+   begun Observe alongside suppressed Ready, bundle closure before graph release,
+   and claimant-only bundle generation/posting.
+
+After these bounded seams and adoption below, complete the remaining
+control/succession completeness and funding gates. Posted Required Admission now
+shares indexed graph promises (§6.7). Native monitor reverse membership,
+disposition, timers and explicit terminal-owner release are implemented in §6.12.
+Native
+durable import/codec, WAL/Session/quorum and CLI/MCP activation remain downstream.
+
+### 6.11 Receipt adoption and retained unfinished cycles
+
+The [native adoption transaction](../../crates/focal-core/src/native/adoption.rs)
+uses `AdoptReceipt { expected, previous, receipt, holder }`. The claimant supplies
+the intended replacement participant and a fresh receipt ID; the owner assigns
+`previous.epoch + 1` with checked arithmetic. The source claim's exact binding,
+current entitlement, original receipt allocation, creation/publication positions,
+deadline and available response allowance must all agree before mutation. A
+replacement cannot reuse a receipt allocated to another claim or an older epoch.
+Exact request retries return their original retained outcome, including after
+later responsibility transfers.
+
+1. **Resolve authority without copying source truth.**
+   `ClaimState::prepare_receipt_adoption` returns a borrowed capability carrying
+   the exact original claim, previous/replacement entitlements, next binding and
+   cause/cut. Applying it to a charged copy compares the complete source state.
+   Native adoption preserves status and immutable content. It refuses completed
+   claims and transfers that cannot leave a fresh response cycle for the new
+   holder; it never resets `max_responses` or adopts old testimony implicitly.
+2. **Resolve and fence complete actual membership.** Read the stored registration
+   set once and resolve every declaration, evaluation, original receipt and
+   target. Bound the per-member source lookups and declaration checks before
+   traversal. `EvaluationState::adopt_receipt` adds one authority fence to every
+   unfenced nonterminal member, including Ready and begun Admission/Increment/
+   Work. Keep original attempts, phases, results and target identities. Terminal
+   members and previously fenced members remain byte-for-byte unchanged.
+3. **Retain abandoned work.** Closed cycles remain reachable through response
+   lineage. A nonempty open cycle receives an inline `RetiredCycle` link and
+   `RetiredCycleHead` update. The exact key includes receipt and epoch, so the
+   replacement may reuse `response_count + 1` and a slot without colliding with
+   earlier evidence. Validate complete old index termination/aggregates and
+   actual current work/diagnostic membership before appending. Empty cycles add
+   no invented history. Bound retained cycle/work counts and require strictly
+   descending receipt epochs in the retained chain.
+4. **Preserve complete projection and future bounds.** The indexed work cursor
+   includes current, retired and closed cycles. Historical duplicate and response
+   association checks use receipt-qualified cycle/slot identity. Reset only the
+   current receipt's Increment target seal; retain the registry's original rows
+   and advance its checked claim-binding baseline. Previously entered responses
+   retain their original Required-check result gates. Charge actual retired work
+   in addition to the immutable future response/slot allowance; charge old
+   diagnostic-only cycles even when they add no work. New Work report grants
+   must cover those histories. Existing live peer grants can refuse shape growth
+   which exceeds their protected bounds.
+5. **Publish and retire atomically.** Claim, new receipt, evaluation fences,
+   registry and optional retired index share the ordinary candidate. Claim
+   `ReceiptAdopted` history records its exact before/after revision; the separate
+   receipt fact retains both holders/fences and the adoption cause. No claim
+   status, response, work, accepted result or artifact is fabricated. The common
+   completion journal retires the fenced grants before checking later shape
+   growth. Refusal or discard rolls back those retirements as well as every row.
+   With `E` changed evaluation rows, adoption writes `2E + 6` keys, or `2E + 8`
+   when retaining a nonempty open cycle. Alongside those rows, adoption now
+   replaces the respondent grant atomically and funds the replacement receipt's
+   remaining diagnostic/close/post operations through Ordinary admission (§6.7).
+   Static shape checks remain prerequisites for that complete RAM quote.
+6. **Carry these facts through durable activation.** Native command intent uses
+   its own appended tag, leaving V1 hashes/bytes untouched. The forthcoming
+   native codec/checkpoint/import must encode both receipt allocations, complete
+   fences and retired-cycle membership. Recovery must reconstruct report grants
+   only for actual unfenced begun members and preserve every original accepted
+   result/publication. CLI/MCP activation must expose an explicit claimant
+   transfer operation without requiring a worker framework or launching agents.
+
+Tests and executed qualification belong in [09](09-implementation-status.md).
+Adoption has no automatic execution, report, graph release or whole-claim funding
+guarantee. Complete claim-responsibility reservations, remaining control/succession
+completeness, native WAL/Session/quorum recovery and live interface activation remain
+required. Native monitor propagation and its bounded Work and Admission
+integration are described in §6.12.
+
+### 6.12 Runtime-scope integration sequence
+
+**Native RAM implementation now includes monitor registration, named rebinding,
+terminal-owner cancellation, direct root reverse subscriptions, repeated frozen
+settlement, exact monitor timers and shared Work/Admission graph bounds.** Explicit
+terminal-owner release was implemented and qualified in the earlier increment.
+Qualification of this new monitor increment is recorded separately in
+[09](09-implementation-status.md); the implementation description below does not
+claim an additional completed test run. The live Session decoder and reducer still
+use V1. This sequence preserves the ownership contract in
+[02 §7](02-domain-and-lifecycle.md#7-graph-satisfaction-and-parked-scopes).
+
+1. **Bounded model and native actor ingress are implemented.**
+   [`MonitorPlan`](../../crates/focal-model/src/lifecycle/scope_monitor.rs) checks
+   exact source/peer bindings and quotes replacement/read buffers before
+   allocation. `BuildLimits` bounds bytes and visits; construction rejects actual
+   capacities beyond its quote. The
+   [native commands](../../crates/focal-core/src/native/monitor_commands.rs) consume
+   those capabilities using the authenticated claimant, current claim binding
+   and exact optional receipt fence:
+
+   - `RegisterMonitor { expected, receipt, id, roots, deadline }` records nonempty
+     typed roots under a globally unused monitor ID and a finite future deadline.
+   - `RebindMonitor { expected, receipt, id, predecessor, successor }` checks both
+     actual endpoint bindings and a real compatible `Supersedes` relationship.
+     It changes the named monitor's roots while retaining its original deadline
+     and registration; immutable claim graph declarations stay unchanged.
+   - `CancelMonitor { expected, receipt, id }` requires a terminal owner. It records
+     the original owner terminal position and a separate cancellation cut without
+     rewriting that failure, testimony, root predicates or child obligations.
+
+   `Released` and `Cancelled` are mutually exclusive monitor dispositions.
+   Successful release requires settled predicates. Cancellation is the claimant's
+   explicit disposal of a terminal owner's outstanding wait. Each real change
+   emits one revision-bound monitor event in the claim history; no worker,
+   callback, report or response is created.
+
+2. **Direct subscriptions publish with their source changes.**
+   The [monitor index](../../crates/focal-core/src/native/monitor_index.rs) retains
+   one immutable global monitor allocation, including owner identity, original
+   registration and full deadline. Each distinct direct root has a bounded
+   reverse chain keyed by target and monitor. Links retain owner, registration,
+   rebind stamp and adjacent link identities; removed links remain tombstones
+   for global allocation accounting. Registration, rebind and disposition update
+   the actual scopes, reverse links, history and outcome in one candidate.
+   Neighbor edits use earlier staged index writes before committed source rows.
+
+   Discovery follows actual immutable incoming/outgoing dependencies, active
+   runtime roots, direct monitor subscribers and exact ownership/lineage links.
+   It validates both index membership and the referenced source scope under finite
+   visit and node bounds. The complete original transaction receives one
+   [index-journal check](../../crates/focal-core/src/native/monitor_index_journal.rs):
+   replay the genuine monitor deltas into a precharged overlay and require all
+   and only the corresponding index rows. Omitted, duplicate or unrelated writes
+   cannot be hidden by an event count. This direct index does **not** materialize
+   transitive blocking closures or deliver durable notifications. Those caches,
+   notifications and recovery reconciliation remain separate work.
+
+3. **Frozen monitor and graph convergence is implemented.**
+   [Native scope consequences](../../crates/focal-core/src/native/graph_monitor_effects.rs)
+   recapture the full affected component after every real monitor release or
+   claim graph transition. `Satisfied`, `Terminal` and `Released` remain distinct:
+   terminal failure does not satisfy a success predicate, and claim terminality
+   does not establish ownership release. Only a checked settled monitor loses
+   its blocking links. A terminal owner's monitor can release later while its
+   original terminal/local cuts, evidence and testimony remain unchanged.
+
+   Each round consumes an actual staged source revision and retains its event;
+   the final row cannot erase intermediate releases. Dependency failure and claim
+   graph satisfaction converge without turning an already-begun eligible check
+   into an unauthorized report. The model graph/source checks remain in force
+   at the checked scope-transition entry. Refusal discards the candidate and
+   preserves committed and earlier pending obligations.
+
+   `ReleaseScope { expected }` remains an **explicit issuer action**. The terminal
+   owner must be unreleased, its active monitors disposed, and every owned child
+   already released. Its bounded private capability publishes `OwnerReleased`
+   before derived consequences and preserves original terminal facts. Automatic
+   monitor settlement does not call it. Cancelling a monitor does not cancel or
+   release its targets or children. The earlier owner-release qualification
+   remains a distinct record in document 09.
+
+4. **Exact native monitor timers and claim-timer convergence are implemented.**
+   [`NativeMonitorDeadlineInput`](../../crates/focal-core/src/native/monitor_deadlines.rs)
+   has a disjoint `(claim, monitor, timer, generation)` retry key. Intent hashes
+   the complete deadline, including its due time. Fresh resolution checks the
+   retained global monitor allocation, actual source scope, original publication
+   coordinates and trusted owner logical time. Exact pending and committed
+   redelivery retain the original outcome before new timing or capacity checks.
+   Participant commands cannot supply timer provenance or select a deadlock victim.
+
+   [`MonitorDeadlinePlan`](../../crates/focal-model/src/lifecycle/scope_deadline.rs)
+   separates an inactive timer, a settled wait, a canonical SCC witness and a
+   checked negative-SCC expiry capability. Inactive delivery records a no-op;
+   settled waits take their real release path. An unsettled timer must process
+   the earliest effective claim/monitor deadline. Resource refusal, stale source
+   or a different earlier deadline is an error, never an absence-of-cycle proof.
+   Shared visit budgets retain preflight and SCC traversal costs on errors as
+   well as success. All allocations are admitted before construction.
+
+   `ClaimState::expire_monitor` consumes the private expiry authority even when
+   the claim has no authored deadline. Expiry atomically fences the exact
+   registered evaluations and preserves prior results; ordinary deadlock or
+   dependency failure preserves eligible begun report authority. Repeated frozen
+   SCC/fallback rounds include monitor releases and their index changes.
+   [Ordinary claim timers](../../crates/focal-core/src/native/claim_deadlines.rs)
+   still require their own authored deadline, but now consume fresh trigger
+   revisions after monitor settlement before deciding further SCC or expiry.
+   Their original trigger must become terminal before that claim timer is
+   consumed. Neither timer fabricates participant work or testimony.
+
+5. **Held graph bounds include repeated monitor revisions.**
+   [Graph preparation](../../crates/focal-core/src/native/graph_monitor_effects.rs)
+   and the shared [completion graph ceiling](../../crates/focal-core/src/native/completion_graph.rs)
+   used by Work and Posted Required Admission price at most `M + L` automatic
+   graph transitions for a captured component:
+   `M` initially active monitors may each release once, and `L` live claims may
+   each acquire one terminal graph outcome. This includes terminal owners whose
+   monitors settle later. It does not include an implicit owner-release action.
+   Bounds cover repeated source copies and captures, reverse-link neighbor edits,
+   index-journal replay, intermediate history, cohort seals, revision margins,
+   incoming publication storage and discrete event/outcome/sequence slots.
+
+   Work and Posted Required Admission grant protection retains the complete
+   original protected membership and checks proposed scope endpoints and reverse
+   consequences before accepting
+   topology changes. A later source cannot shrink that protection by presenting
+   a smaller traversal. Growth must fit held byte, visit, write and slot promises
+   or be refused before publication. These bounds provide native RAM completion
+   capacity for the admitted Work cohort and one possible Required Admission
+   failure. A claim-wide reservation for every future action remains required.
+   Explicit owner release continues to use ordinary
+   bounded admission. Separate bounded stages also need a checked aggregate
+   traversal contract wherever a transaction-wide guarantee is advertised.
+
+6. **Complete the remaining integration and durable capacity work.** Posted
+   Required Admission now uses a complete indexed failure component, atomic
+   failure/monitor/cohort publication and protected topology (§6.7). Other
+   Admission results remain report-only where receipt or terminal history has
+   already fixed the claim's disposition. Complete the remaining control/succession
+   family audit and capacity work under the same source and fixed-point contract;
+   generic graph support does not prove every owner entrypoint has a complete
+   future reservation. Materialized transitive caches need
+   explicit prefix coverage and invalidation if introduced. Durable notification
+   delivery, timer scheduling/redelivery, continuation and reconciliation need
+   replayable cursor/provenance rules; the direct in-memory index alone supplies
+   none of those delivery guarantees.
+
+   Reserve the full future claim obligation at responsibility admission before
+   promising that all deadlines, cancellations, audit closure and scope/owner
+   release can always complete. That reservation must cover future RAM, WAL and
+   artifact bytes, disk/replica headroom, bounded continuation and retirement.
+   Revalidate later topology and registration growth against it. The native codec,
+   checkpoint/import, WAL/Ready publication, Session/quorum activation and CLI/MCP
+   dispatch remain downstream gates in §§4–7. No running V1 command or record
+   acquires successor semantics merely because the Rust owner path exists.
+
+Qualification must use actual native creation, registration, receipt, response,
+validation, supersession and timer histories. Cover local WholeWork completion
+waiting on a real monitor; all three predicates; terminal-owner late release;
+claimant-only register/rebind/cancel; exact receipt/binding checks; earlier monitor
+and claim deadlines; SCC victims distinct from the trigger; intermediate trigger
+revisions; begun late reports; pending/discard races; original reverse protection
+under shrink/growth; and failures across quoted memory, visits and publication
+slots. Preserve retained snapshots, audit coordinates and original cuts through
+those transitions. Record executed results in [09](09-implementation-status.md);
+source tests and implementation descriptions alone do not establish production
+or cross-platform qualification.
+
+### 6.13 Successor input-codec dependency plan
+
+**Authored-content gate, now implemented in the RAM owner.** The
+[`ClaimDefinition`/`ClaimState`](../../crates/focal-model/src/lifecycle/claim.rs)
+represent lifecycle-relevant parties, ancestry, acceptance and runtime scope
+limits. They are lifecycle projections; the AuthoredV1 profile now retains the
+complete request separately in native claim-content and content-identity rows.
+ProjectionOnly remains an incomplete representation of the authored contract in
+[02 §§2–3](02-domain-and-lifecycle.md#2-identity-and-canonical-content), not a
+complete claim document ready to serialize. A codec cannot recover omitted
+instructions from an opaque hash or silently supply defaults for missing intent.
+
+The checked immutable content representation includes schema and `OccurrenceId`,
+a bounded inline work description, the closed Focal action, normalized authored
+work scopes, full typed contextual relations and referenced inputs, and exact
+ordered requirement specifications. Parties and cause remain verified
+content; the existing graph/lineage/acceptance fields must be derived from, or
+checked against, that same body. Preserve the single-authority relation rule in
+[02 §3.1](02-domain-and-lifecycle.md#31-claim): cached typed views cannot become
+independently writable alternatives. Retain and expose this content through the
+actual owner at a fixed prefix, with bounded borrowed preparation, fallible
+construction/copying, and atomic creation alongside its lifecycle and indices.
+
+Keep immutable authored content in separate rows of the same native range root;
+lifecycle transitions should operate on their smaller state projections. Resolve
+content and state through one checked borrowed view at the same effective prefix.
+This uses existing fallible owned containers, with no per-object Arc, secondary
+mutable authority or separately published arena. Price the new content rows,
+identity indices and creation changes before admission. Separate key namespaces
+alone do not prevent copying: range writes copy retained neighbors on touched
+pages. A strict guarantee that lifecycle updates never copy request text requires
+an actual content-page partition respected by both preflight and construction.
+Do not simulate isolation by inflating heap charges.
+
+The range implementation now supplies fixed allocation-free key classifiers
+through `new_partitioned` and `from_entries_partitioned`. Shared preflight and
+construction rules force leaf boundaries at partition changes and reuse an
+unchanged page when neighboring writes belong to other partitions. Ordinary
+unpartitioned callers retain their layout and merge charges; partitioned merge
+descriptors explicitly account for their classifier token. Native Core now
+separates Definition pages and Artifact/ArtifactIdentity pages from changing
+lifecycle rows. This protects small immutable rows as well as the existing large
+singleton case. Authored claim content/identity and creation-result rows also
+have their own explicit partitions. See the
+[range implementation](../../crates/focal-memory/src/range.rs),
+[partition cases](../../crates/focal-memory/src/range_partition_tests.rs) and
+[actual native histories](../../crates/focal-core/src/native/layout_tests.rs).
+
+Authored File/Symbol/Api/TestSurface/Component/UxSurface scopes describe the work
+and its allowed scope. They are distinct from the native runtime monitor/child
+registry and its capacity limits. Consultation and Challenge must remain explicit
+actions with their actual questions, targets and contextual evidence. Required
+receipt proves consultation delivery; it cannot supply the missing question or
+turn an answer into quality approval. Challenge proof/follow-up requirements stay
+under [16 L7](16-peer-validation-contract.md#6-dependency-ordered-implementation-and-acceptance),
+without automatic corrective work. Enforce Focal/Hecate's prohibition on
+self-targeted work with only an explicitly checked legitimate Handoff exception
+([02 §8](02-domain-and-lifecycle.md#8-affordance-policy-rank-and-visibility));
+authored posting now refuses self-work and also refuses self-Handoff until an
+authenticated transfer capability exists.
+Sylk's self-task bookkeeping and runtime handoff cleanup do not enlarge this
+exception or authorize fabricated testimony or implicit scope release.
+
+Validation uses the same body/projection distinction. The
+[`DeclarationSpec`](../../crates/focal-model/src/lifecycle/validation.rs) and
+legacy definition expose target, modes, evaluator/handler policies, schemas,
+deadline and external definition hashes. AuthoredV1 now retains the complete
+ValidationDescriptor, including checking instruction, optional quality-bar text,
+contributed-by provenance and policy revision, with that same declaration.
+This implements the authored body contract in
+[02 §3.3](02-domain-and-lifecycle.md#33-validation-requirement-and-verdict) and
+[16 §4](16-peer-validation-contract.md#4-supplying-and-invoking-validators).
+Referenced-standard and policy-resolution authority remain separate gates. A code
+or skill reference identifies participant-owned execution; it grants no new
+executor authority, and Focal does not invoke it. Provenance records origin,
+not permission to change requirements or report as another evaluator.
+
+Derive content hashes from the complete canonical immutable body under the
+assigned schema/domain, including occurrence and referenced stable IDs but
+excluding the object's own allocated ID and mutable lifecycle. Requirement↔claim
+references must remain nonrecursive as specified in [02 §2.2](02-domain-and-lifecycle.md#22-hash-domains).
+
+For native descriptors, `RequirementRef.specification` pins the separately derived
+`ValidationDescriptor::specification_hash()`: it commits the complete instruction,
+policy and provenance under a separate domain while excluding the parent claim
+ID and the validation's own ID/revision. The full `content_hash()` still includes
+the actual parent claim and supplies `declaration().binding().content`; assembly
+checks both identities and exact allocated IDs/parentage. Neither hash is an
+author-supplied substitute for the body. This distinction changes no existing
+native declaration stamp/intent, external `PhasePolicy.definition`, or V1 hash.
+
+The effective owner needs a bounded content-identity/dedup index: identical
+content including occurrence resolves to its existing identity; intentionally
+repeated work carries a new occurrence; conflicting or partially duplicate batches
+refuse without partial publication. A caller's binding hash is not this proof.
+Do not rehash V1 evidence or silently change existing native request identities
+and exact retries. Complete authored bodies and any new durable identity preimage require
+an explicitly assigned successor wire profile. The internal AuthoredV1 RAM
+profile below is separate; no durable profile is assigned here.
+
+**Implemented typed construction, creation correspondence and managed decoded admission; transport activation remains.**
+The dormant byte encoder and structural inspector now cover all 28 commands and
+three timer namespaces, with the full grammar and bounds in
+[21](21-native-input-format.md). Structural inspection establishes no content or
+request identity and selects no owner loan. Separate bounded construction plans
+now cover all 28 actor commands and three timer namespaces, including complete
+creation cohorts. The owner accepts both existing owned Rust inputs and complete
+opaque `DecodedRequest` plans. The latter preserve borrowed variable content
+through exact retry inspection and actual held/Ordinary source selection, then
+retain the input reservation through custody and candidate preparation. See
+[21 §6.3](21-native-input-format.md#63-managed-owner-admission-of-decoded-requests).
+The following borrowed model surfaces
+make a bounded decoder possible without replacing actual policies with hashes or
+constructing unreserved copies just to inspect them:
+
+| Source | Available construction/inspection boundary | Remaining decoder obligation |
+| --- | --- | --- |
+| [Authored claim descriptor](../../crates/focal-model/src/lifecycle/claim_descriptor.rs) | `ClaimSpec` and repeatable `ClaimSource` share instruction, occurrence, canonical relation/scope, requirement and nested slot checking, original hash preimages and final-buffer construction. The complete creation decoder preserves ordered pins and zero-check slots, verifies actual validation correspondence and constructs final bodies without temporary typed arrays. | Connect the complete local cohort proof to effective-state owner inspection, reference-policy visibility, retry/dedup and funding. Legitimate Handoff authority remains unresolved; durable/live activation remains separate. |
+| [Authored validation descriptor](../../crates/focal-model/src/lifecycle/validation_descriptor.rs) | `ValidationSpec` and repeatable `ValidationSource` share complete policy, instruction, quality standard, contributor and revision checks. The decoder derives original specification/full identities and complete checked acceptance metadata from actual bodies. Final allocation and every repeated source/model pass are explicitly quoted. | Preserve those identities and local cohort proofs through owner-selected funding. Resolve referenced standards and policy authority; provenance supplies no evaluator grant. No durable successor or live request dispatch is activated by these codecs. |
+| [Validation definitions](../../crates/focal-model/src/lifecycle/validation_definition.rs) | Borrowed program views and repeatable `DeclarationSource` expose every phase, fallback, handler ID/version/agentic flag, attempts and both schemas. The standalone legacy body decoder prepares the same checked stamp and intent, then constructs final arrays directly. Shared model construction verifies actual owned identity and capacity. | Preserve the supplied binding while checking it against the enclosing cohort and its real authored bodies. Fund complete parsing, model work, final arrays and bookkeeping through actual ingress; no temporary typed handler array is needed by the new adapter. |
+| [Acceptance policy](../../crates/focal-model/src/lifecycle/acceptance.rs) and [value-source plan](../../crates/focal-model/src/lifecycle/acceptance_source.rs) | Existing typed plans and the repeatable `AcceptanceSource` check complete real declaration correspondence. The value-source path consumes opaque checked metadata from actual declaration bodies and borrowed nested slots, preserves zero-check slots and Required Delivery, checks repeated-source stability, and quotes canonical selection, all full-scan callbacks and final construction. Both creation frame decoders consume it. | Keep complete local correspondence and intent tied to the immutable frame through owner retry/funding selection. Include the actual descriptor/parser work performed by every callback, custody and candidate construction in the complete ingress budget. |
+| [Artifact descriptor](../../crates/focal-model/src/lifecycle/artifact_descriptor.rs) | `ArtifactSpec` and repeatable `ArtifactSource` share bounded semantic checks, accounting and complete hashes. Raw plans borrow reference/label spans and construct final buffers. Managed admission now shares actual receipt/target/provenance, visibility, schema and held-contract checks with owned reports before reserving input capacity; final owned identity/authority is checked again. | Complete transport buffer and transaction-wide work accounting. Source parsing remains cumulative through borrowed preflight and build; final construction headroom is checked before allocation. Extend integrated qualification across every report target. See [21 §6.3](21-native-input-format.md#63-managed-owner-admission-of-decoded-requests). |
+| [Authored response input](../../crates/focal-core/src/native/response_input.rs) | Shared response/monitor plans preserve full authored content and bound final construction. Managed decoded admission now resolves exact retries and selects actual respondent receipt credits before constructing response buffers. Failure diagnostics, authored close and posting pass full ancestor-memory pressure tests. | Connect authenticated transport and complete total ingress work accounting. Evidence acceptance, cycle closure and monitor authority remain existing candidate checks. The API and pressure tests do not activate durable or live CLI/MCP dispatch. |
+
+The model now provides
+[`AuthoredCreationPlan`](../../crates/focal-model/src/lifecycle/authored_creation.rs)
+for the assembly in step 1. It derives graph, correction lineage and acceptance
+from the actual claim and validation descriptors, preserving zero-check slots
+and parent-independent requirement pins. It verifies the complete descriptor set
+without copying handler arrays. Preparation quotes the actual inspection work,
+the exact bounded build visits, and all final/temporary buffers with allocator
+bookkeeping before construction. Canonical graph/lineage buffers move directly
+into the projection; typed slot and declaration-reference arrays remain charged
+until acceptance is built. `into_definition()` ends the descriptor borrows so the
+owner can move the original bodies into immutable storage. Reference existence,
+current ownership and ordered creation cuts still require the normal owner
+`CreationPlan`. The model plan itself does not publish; the authored Core profile below consumes it before moving the original bodies into storage.
+
+**Authored-content owner/store requirements.** The native RAM implementation
+below establishes assembly, retention, dedup and matching reads. Preserve these
+requirements through its remaining durable import, authority and activation work:
+
+1. **Integrate the checked model projection.** Use `AuthoredCreationPlan` with the actual `ClaimDescriptor`
+   relations to derive/check graph obligations and cause/correction lineage, and
+   its complete `SlotPolicy` entries with each actual `ValidationDescriptor`'s
+   `Declaration` to construct/check acceptance. Match every ordered requirement
+   ID and `RequirementRef.specification` to the descriptor's actual ID and
+   `specification_hash()`. Separately check the actual declaration's full
+   `binding().content` against descriptor `content_hash()`, and exact parent
+   claim/issuer, declaration index, target and mode. Require the complete
+   declaration set, Required Receipt and zero-check slot presence rules.
+   Hashes or supplied summaries cannot substitute for the actual descriptors.
+   Keep `max_responses` and runtime `ScopeLimits` as explicit checked responsibility
+   capacity/profile values, preserved through assembly and reconstruction. They
+   are not omitted request text or values to recover through invented defaults.
+2. **Stage content identity with the whole creation batch.** Add immutable full-body
+   content rows and namespace/family/schema-bound identity indices in the same
+   native root as lifecycle state. Resolve endpoints, descriptor pins, positive
+   reads and absence against committed state plus earlier pending candidates and
+   the complete proposed batch. Recompute identity; exact duplicate content must
+   resolve consistently, while collisions, substituted bodies, conflicting IDs
+   and partially duplicate batches refuse without silent rebinding or partial
+   publication. Creation must still permit valid compound dependency/wait cycles
+   and refuse forbidden causation/correction cycles.
+3. **Fund real storage isolation and rollback.** Precharge all added counters,
+   content/identity rows, containers, indices, grouping workspace, retained-page
+   copies and journal buffers, including temporary/final coexistence. Implement
+   strict content-page isolation in both range preflight and construction before
+   promising that lifecycle writes never copy request text; key separation and
+   fake padding do not provide it. Revalidate existing completion envelopes and
+   receipt/Begin growth promises against the actual partition and new row shapes.
+   Publication and discard must preserve exact counter, page and permit ownership.
+4. **Expose one checked read and authority boundary.** Borrow content, descriptor
+   policy, lifecycle and references from the same committed/effective prefix,
+   retaining snapshot pins and bounded traversal. Check authenticated issuer,
+   actual cause/ownership, reference visibility and supported action semantics;
+   `check_postable` alone does not establish legitimate Handoff or permissions.
+   Lifecycle updates must preserve immutable content and descriptor identities.
+5. **Qualify actual owner histories before wiring the codec.** Cover substituted
+   claim/validation content, missing/extra declarations and changed slot modes;
+   Work/Consultation/Challenge and self-work/Handoff authority; identical content
+   versus a new occurrence; pending-batch races and legal versus forbidden cycles;
+   same-prefix reads, pinned old snapshots and content-page isolation; allocation,
+   counter and visit refusal with exact rollback under existing held promises.
+   Preserve frozen V1 bytes/hashes/replay and existing native exact retry identity
+   until an extended successor profile is explicitly assigned. Source descriptors
+   alone qualify neither stored content, Core assembly nor a wire entrypoint.
+
+**Implemented native RAM creation profile and result contract.**
+[`Core::new_native_authored`](../../crates/focal-core/src/native.rs) creates an
+empty `AuthoredV1` owner. The existing `new_native` constructor remains
+`ProjectionOnly`; neither constructor promotes or repairs another profile's root.
+`CreateAuthored` groups each claim descriptor with its complete validation
+specifications, explicit response/scope capacities and original owner
+precondition. Assembly borrows that group, derives its projection and moves the
+original descriptor buffers into immutable range rows. The mandatory multi-claim
+`CreationPlan` still resolves ownership, creation cuts, lineage and graph effects.
+The existing `Create` input and its tag-zero native intent remain unchanged.
+The new command has a separate internal tag/domain; neither profile is a durable
+schema allocation or a live transport entrypoint.
+
+[Authored preparation](../../crates/focal-core/src/native/authored_prepare.rs)
+stores claim content and family/schema/full-content indices with state,
+definitions, history and a creation-result row under the same candidate root.
+Definitions own either the old declaration or one complete validation descriptor;
+policy reads borrow the descriptor's actual declaration without a second handler
+array. Claim content retains the originally admitted response/scope capacities
+and owner fence separately from mutable state. Actual page partitions isolate
+these bodies and frozen results from lifecycle-only writes.
+
+The [creation result](../../crates/focal-core/src/native/creation_result.rs)
+records each input ordinal, family, schema, full content hash, requested ID and
+resolved ID in one bounded vector. A wholly consistent existing-content batch
+publishes a new outcome and frozen mapping with no new claims or definition
+facts. Exact request retries return the recorded outcome and mapping. Partial
+matches, reused conflicting IDs, duplicate same-family identities/content or
+changed responsibility profiles refuse the whole transaction. Validation content
+indices use the parent-bound hash; requirement pins use the separate specification
+hash. Focal never rewrites parent references to make a duplicate batch fit.
+Claims and validations may share the same numeric ID bytes.
+
+The [publication checker](../../crates/focal-core/src/native/authored_check.rs)
+verifies the private preparation proof, exact row/index membership, descriptor
+policies, profile and returned mapping before common history emission. The proof
+binds the actual retained body identities, original owner precondition and result
+order. Both ordinary and graph-controlled creation pass this check. Reconstruction
+inspects real bodies and descriptor variants plus both directions of identity
+membership; matching counters or an enum flag are insufficient. A missing body
+refuses reconstruction and returns the original Core unchanged.
+[Content reads](../../crates/focal-core/src/native/authored_reads.rs) borrow the
+same effective or pinned prefix as their lifecycle and result rows.
+
+Contextual object relations resolve against the effective prefix and complete
+proposed batch. Authenticated issuer and actual ownership still use the existing
+owner gates. Authored posting checks self-work explicitly; a self-Handoff label
+currently refuses too, because this owner has no authenticated transfer capability
+yet. That capability, referenced-standard/policy authority beyond the current
+checked declaration contract, durable import/codec provenance and live CLI/MCP
+activation remain separate work. No tool execution or worker launch was added.
+
+The complete next boundary includes all **28 actor commands** in
+[`NativeCommand`](../../crates/focal-core/src/native.rs), with no implicit
+fallback to a V1 command:
+
+| Family | Commands |
+| --- | --- |
+| Creation, control and responsibility | `Create`, `CreateAuthored`, `Post`, `Cancel`, `AcquireReceipt`, `AdoptReceipt`, `ReleaseScope` |
+| Monitors | `RegisterMonitor`, `RebindMonitor`, `CancelMonitor` |
+| Respondent and claimant evidence | `SubmitWork`, `SubmitDiagnostic`, `FailWorkProduction`, `RejectWork`, `ReceiveWork`, `CloseResponse`, `PostResponse`, `ReceiveResponse` |
+| Assessment entry and target membership | `SealIncrementTargets`, `EnterWholeWork` |
+| Evaluation execution | `BeginAdmission`, `ReportAdmission`, `BeginIncrement`, `ReportIncrement`, `BeginWork`, `ReportWork` |
+| Claimant audit bundle | `GenerateResultTestament`, `PostResultTestament` |
+
+Keep the three trusted timer namespaces separate: `NativeDeadlineInput` identifies
+an exact evaluation; `NativeClaimDeadlineInput` identifies a claim;
+`NativeMonitorDeadlineInput` identifies a claim and monitor. Each carries the
+complete authored `Deadline`, including `at`; invocation keys alone omit that
+field and cannot establish exact retry identity. The actual authenticated
+principal, trusted firing/logical time, assigned creation cut and receipt epoch,
+custody attestation, model transition proofs and completion loans remain owner
+values. A participant body cannot supply or select trusted timer authority.
+
+The existing native `Create` projection contains ordered proposals
+with claim binding, issuer/subject, optional deadline, maximum responses, graph
+declaration, succession lineage, acceptance policy, scope limits and optional
+exact owner binding/receipt fence, followed by the ordered declaration inputs.
+These fields must be bound to the complete authored content above before codec
+freeze. The owner assigns `created`; no description, occurrence or missing V1
+content is recoverable from the opaque native binding hash. The graph encodes every
+DependsOn/Awaits obligation; lineage encodes binding, Root/Claim cause and every
+Supersedes/Amends predecessor reference. Existing borrowed constructors in
+[`graph.rs`](../../crates/focal-model/src/lifecycle/graph.rs) and
+[`succession.rs`](../../crates/focal-model/src/lifecycle/succession.rs) now also
+provide bounded canonical value checks and consuming constructors for final
+funded vectors. The projection decoder uses these seams without temporary typed
+graph/correction arrays. Interleaved global declarations are checked through a
+bounded repeated filter; every callback and final array is included in its quote.
+
+The complete local construction boundary is implemented in
+[21 §6.2](21-native-input-format.md#62-complete-creation-frames). Effective-state
+authority/retries, owner-selected funding and durable/live activation below are
+still required.
+
+Implement the wire boundary in this dependency order:
+
+1. **Authored content is retained and qualified in RAM.** The checked claim and
+   validation ownership, derived action/scope views, nonrecursive identities and
+   effective-state dedup above are implemented. Referenced-policy authority and
+   legitimate self-Handoff remain unresolved. Qualification covers changed instruction,
+   action, scope, requirement and occurrence cases, self-work/Handoff refusal,
+   exact reconstructed content, and all additional creation/copy/page costs.
+   Codec primitives may be developed independently, but the current lifecycle
+   projection must not be frozen as the complete successor `Create` body.
+2. **Define and validate the complete borrowed body.** Use explicit schema,
+   command/variant tags, widths, lengths, option markers and UTF-8 rules. Reject
+   unknown tags, truncation, trailing bytes, overflow, duplicate identities and
+   noncanonical set encodings before retaining owned input. Preserve authored
+   order where the current native intent includes it: outer proposals and
+   declarations, monitor roots, handler fallbacks and response references.
+   Graph obligations and slot/check sets retain their canonical ordering rules;
+   normalized lineage corrections must have one canonical representation. Never
+   use unsafe byte casts to manufacture typed slices. Derive all dimensions from
+   the complete body, including nested arrays and every potential allocation.
+3. **Recompute identity before retry or funding selection.** Validate and hash all
+   represented fields using the same checked native semantic rules as the owned
+   input. Do not trust a serialized summary, digest, dimension table or supplied
+   content hash as proof of the body. Reuse the shared plan identities and
+   [`intent.rs`](../../crates/focal-core/src/native/intent.rs) logic where applicable;
+   the new format must define its own canonical bytes and explicitly assign any
+   extended authored-body identity, preserving existing V1 and native request
+   identities rather than changing their preimages in place. A valid retained
+   exact request can return its
+   original outcome before fresh-source admission; malformed or changed bodies
+   cannot exploit a known request key. Only after this complete borrowed check
+   may the owner choose an existing retry, a held evaluation/respondent loan or
+   Ordinary admission for a fresh request.
+4. **Reserve, construct and reconcile under the selected source.** Count borrowed
+   parser workspace that owns storage, typed temporary arrays, grouping/index
+   buffers, final input containers, nested capacities and allocator bookkeeping
+   while they are simultaneously live. Model quotes report their own layers;
+   they do not include all decoder buffers. In particular, `AcceptancePlan`'s
+   allocation count is separate from its byte quote, while `NativeResponsePlan`
+   includes native allocator bookkeeping. Hold the chosen loan through owned
+   input construction, custody verification and candidate preparation; refund
+   every temporary allocation on refusal. An already promised report or response
+   must not need a new Ordinary allocation merely to decode its body. Bound the
+   full parsing, hashing, model validation, sorting and reconstruction work too;
+   the new preparation plans do not establish a transaction-wide visit budget.
+5. **Qualify the unadvertised codec before durable integration.** Require exact
+   vectors and borrowed/owned identity parity for all commands and all timer
+   namespaces, malformed nested fields and limits, unchanged V1 vectors, exact
+   pending/committed retries, and construction failure under a real held loan
+   with Ordinary RAM exhausted. Verify that no refusal publishes custody,
+   results, timers or range changes. This codec can be implemented independently
+   of whole-claim closure reservations, but cannot claim those guarantees.
+6. **Advertise only the complete durable successor.** Input bytes alone do not
+   provide native recorded-mutation replay, explicit historical import,
+   checkpoint hydration and entitlement reconstruction, Session pending/committed
+   prefix handling, shared WAL/Ready publication or quorum activation. Finish
+   those gates and allocate the real successor descriptor before advertising a
+   decoder or wiring live Session/CLI/MCP dispatch. The existing V1 floor remains
+   authoritative until the ordered transition and replicated activation in §§4–5.
+
+### 6.14 Constructing durable native state without cloning or re-executing it
+
+The native input codec is not a redo record. Current request authorization,
+deadline discovery and graph reduction must not run again to decide what an
+already committed mutation meant. Native recovery needs actual recorded rows,
+checked model hydration and complete cross-row validation before publishing a
+detached root. The physical WAL can retain its existing checksums and durability
+fences while the application record and checkpoint receive distinct native
+formats and an explicitly activated decoder requirement.
+
+The implemented envelope, row families and construction boundaries are specified
+in [22 — Native recorded mutations](22-native-record-format.md).
+
+The [precharged range loader](../../crates/focal-memory/src/range_hydration.rs)
+accepts borrowed row plans and does not require `V: Clone`. Each plan carries the
+final key and complete quoted key/value heap. The engine reserves that allowance
+before invoking the trusted row builder, immediately checks the actual owned
+charge, and releases unused allowance. Source preparation and decoder workspace
+remain separately bounded. Values move into final pages; retained-neighbor copies
+use the supplied fallible copier under existing range precharges. A single
+bounded chunk is staged, partitions remain physical leaf boundaries, and every
+failure drops rows before their permits and discards the detached store. Existing
+Clone-based checkpoint loaders retain their prior behavior.
+
+The [dependency-phased range builder](../../crates/focal-memory/src/range_hydration_phased.rs)
+now extends this construction path. `RangeHydration` owns the detached range;
+each consuming `insert_phase` accepts exactly the declared number of strictly
+ordered, previously absent keys. Phases may arrive in a different order from
+their canonical keys. During construction, a scoped immutable lookup includes
+earlier phases and earlier rows in the current chunk, so a dependency does not
+change availability at a page boundary. The owner checks the total expected row
+count and maximum phase count. It stages at most
+`min(page_entries, max_batch_entries)` owned rows, without a whole-ledger row
+array or cloned high-water key. Any phase error consumes and drops the complete
+detached import. `finish` checks final cardinality, invokes the supplied complete
+validator through a read-only view, and binds the verified prefix only after
+validation succeeds. Neither callback can obtain a root handle, snapshot or pin.
+Parser work, repeated scans, dependency lookups, row-plan preparation and any
+decoder-owned indices or workspace still need their own enclosing byte/work
+accounting. The native decoded-row adapter and validator are now connected in
+[checkpoint recovery](../../crates/focal-core/src/native/record_codec/recovery.rs),
+with the phase order, custody boundary and scratch indices specified in
+[22](22-native-record-format.md#native-checkpoint-restoration). Their consolidated
+qualification is pending. Incremental mutation replay, Session provenance and
+activation remain separate requirements.
+
+The [scalar validation snapshots](../../crates/focal-model/src/lifecycle/validation_snapshot.rs)
+now preserve every retained EvaluationState and AcceptedResult field, including
+handler-local cursors, programmatic evidence, older last results, receipt and
+generation, suppression, authority fences and cohort seals. Hydration derives the
+private definition stamp from the actual retained Declaration. It checks intrinsic
+target/policy/cursor/result consistency with a bounded, allocation-free scan;
+exact work limits are checked before scanning handlers. Real early transitions
+from programmatic checking to quality assessment remain valid, and structural
+delivery/missing-target results retain their absence of participant attempts.
+These model views are not serialized native records or authenticated history.
+Monotone/minimum revisions cannot prove that all intermediate events occurred;
+complete ordered history, registry membership, original publication coordinates,
+immutable evidence and local custody remain importer obligations.
+
+The implemented construction stages and remaining integration are concrete:
+
+1. **Retain and encode the actual write set.** The
+   [native write-set owner](../../crates/focal-core/src/native/mutation.rs) now
+   captures every canonical changed key after the range's preflight and before
+   its builder consumes row values. `NativePrepared` retains these keys, its
+   content profile, range and outcome; values remain in the candidate's single
+   immutable root. All 30 row families participate, including Meta, Outcome,
+   Event, content and every index/link row. Explicit deletions remain distinct
+   from present tombstone rows. Preparation reserves exactly the actual key
+   count before allocating, checks the final candidate against the captured
+   plan, and preserves the debit through pending ownership and publication
+   refusal. Evaluator/respondent promises now retain this charge per action;
+   shared construction workspace excludes it. Capturing the maximum possible
+   failure shape during a smaller regular report would exceed that report's
+   retained promise, so exact reservation follows canonical shape validation.
+   `NativeOwner::prepared_candidate` exposes the actual ticket's borrowed
+   candidate to the [native mutation encoder](../../crates/focal-core/src/native/record_codec.rs).
+   Its `EncodingPlan` measures and writes the complete values found at exactly
+   those captured keys in that immutable candidate. It does not replay requests
+   or dump the whole root. Measurement, row sizing, lookup and hashing share a
+   checked work allowance; a length-prefixed row can be measured and written
+   without a body buffer or per-row offset array. The plan itself allocates no
+   buffer and acquires no additional reference-counted owner. Each measurement
+   and write pass consumes its quoted work; callers must budget both passes.
+   The destination must have the exact quoted size and remain funded through
+   pending WAL ownership, commit or rollback. Incorporating those encoded bytes
+   into evaluator/respondent completion promises, admission peaks and retained
+   pending charges is still required. Existing key-manifest funding does not
+   cover the encoded buffer. A whole-root record per mutation would scale with
+   occupancy and violate held report envelopes.
+2. **Hydrate model state explicitly.** Versioned model snapshot views and checked
+   constructors now cover scalar EvaluationState/AcceptedResult,
+   [claims](../../crates/focal-model/src/lifecycle/claim_snapshot.rs),
+   [registration sets](../../crates/focal-model/src/lifecycle/registration_snapshot.rs),
+   [scope registries](../../crates/focal-model/src/lifecycle/scope_snapshot.rs),
+   [work and response evidence](../../crates/focal-model/src/lifecycle/evidence_snapshot.rs)
+   and [audit/result testimony](../../crates/focal-model/src/lifecycle/audit_snapshot.rs).
+   They preserve original receipt, target, generation, cursors, histories,
+   reserved audit capacity, fences and seals. Claim history derives private
+   report stamps from actual restored responses; registrations and audits derive
+   private definition stamps from actual declarations. Original Generated bindings
+   come from recorded history, not an assumed revision one. This preserves broader
+   reachable model states while the native importer separately enforces its
+   original command profile. Construction quotes include actual owned capacities,
+   bounded source reinspection and final values. No restoration invokes current
+   Begin/report/expiry/adoption authority. A model DTO version is distinct from
+   the frozen live V1 wire/application formats.
+   The native loader must respect these dependencies: restore immutable policies
+   and declarations, evaluations and work evidence before responses; restore
+   response-dependent claim history and scopes before its registrations; then
+   restore claimant audit bundles. Canonical key order alone is not a construction
+   order. Connect these constructors to the implemented phased range builder
+   using borrowed decoded-row plans and checked heap quotes. Derive model plans
+   that need restored dependencies inside the scoped row-construction callback,
+   under its reserved row allowance. If a decoder creates a phase index, price
+   that index and its workspace separately. Avoid a second whole-ledger array of
+   owned rows merely to reorder construction.
+3. **Decode and check the complete recorded rows.** The implemented encoder uses
+   its own dormant `FCMUTATE` magic and version, explicit tags for all 30 key
+   families and four invocation namespaces (participant request, evaluation
+   deadline, claim deadline and monitor deadline), and length-delimited bodies.
+   It uses explicit fixed integer widths and encodes scalar ledger, linked-head
+   and cycle counters as checked `u64`; collection lengths use `u32`. It does not
+   serialize Rust enum layouts or use serde. Complete immutable descriptors,
+   original hashes, receipts, active/retired cycles, index links, publication
+   coordinates and creation mappings are represented. Response and result
+   testament rows retain their actual original Generated binding/revision
+   metadata; restoration must not infer it from a later lifecycle state or assume
+   revision one. The trailer hashes every preceding byte using the BLAKE3
+   derive-key domain `focal.native.record.v1`, independently of physical WAL
+   checksums. The recorded range ID identifies the original process-local
+   incarnation, which changes on restoration; recovery must prove and retain
+   its mapping to the new owner instead of comparing it directly with a newly
+   allocated `RangeId`.
+
+   The [structural inspector](../../crates/focal-core/src/native/record_codec/inspect.rs)
+   checks the envelope/version/profile, ledger and adjacent prefix frame, exact
+   row count, key order, mutation kind/body lengths, presence of Meta and the
+   byte-identical current Outcome, trailing bytes and checksum under explicit
+   byte/row/work bounds. Its row iterator borrows opaque body slices and has an
+   explicit work limit for each scan. A structural record is not decoded model
+   state: a body labeled as one family may still contain invalid fields, foreign
+   references or fabricated history. Implement the bounded per-family decoders,
+   intrinsic model hydration and full native checks before accepting any of those
+   bodies. Artifact custody fields encode only the retained content-tree address
+   and observed local revision. They do not serialize a capability or prove
+   availability on a follower or after restart; recover actual local
+   content/placement evidence separately from accepted-result provenance.
+
+   The complete native Core checkpoint encoder in [22](22-native-record-format.md#complete-root-checkpoint-envelope)
+   now shares these row bodies, with a distinct `FCNROOTS` envelope and checksum
+   domain, exact u64 total row count, genesis rules and put-only rows. It supports
+   an exactly sized output slice and bounded callback streaming, without a second
+   encoded-root buffer. Callback errors preserve their original value; partial
+   output has no successful publication or durability acknowledgment. The
+   borrowed-Core plan does not yet provide online scheduling from an accounted
+   fixed-prefix pin. Complete row decoding, native validation, checkpoint
+   persistence/retention and enclosing Session metadata remain required.
+4. **Validate the detached complete root.** Recompute every Meta count from actual
+   row families, including inactive links, result families and retired cycles.
+   Validate identities, registration membership, reference/index completeness,
+   contiguous accepted history and original event coordinates before import.
+   `NativeOwner::with_schemas` then reconstructs live evaluator/respondent credits;
+   its existing live-obligation checks alone do not validate an arbitrary snapshot.
+5. **Connect application durability and replication.** Add a Session path owning
+   NativeOwner with an exact record-hash, ticket, Raft-index and native-prefix
+   mapping. Publish only committed candidate heads and discard only a suffix whose
+   durability is resolved. Native prefix advances once per native mutation;
+   membership, cursors and other Raft entries mean it is not simply the Raft index.
+   Checkpoints retain this mapping alongside membership, placement, retirement and
+   request-stream metadata. Preserve explicit activation/import base provenance.
+6. **Activate only the complete decoder.** Keep the existing physical WAL and
+   Ready persistence contract; complete native checkpoint decoding, the enclosing
+   Session checkpoint and decoder descriptors before registering the dormant
+   mutation format. Encoding and
+   structural inspection do not activate a native WAL decoder or live dispatch.
+   Local decoder-floor promises do not establish replicated
+   activation or membership agreement. Complete those fences and durable
+   completion-capacity obligations before exposing native live CLI/MCP dispatch.
 
 ## 7. Import facts without inventing history
 

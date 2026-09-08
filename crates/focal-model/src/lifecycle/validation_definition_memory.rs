@@ -10,7 +10,7 @@ impl OwnedPhasePolicy {
     }
 
     fn copy_owned(&self) -> Result<Self, ContractError> {
-        let mut handlers = bytes::reserve(self.handlers.len())?;
+        let mut handlers = construction_buffer(self.handlers.len())?;
         for step in &self.handlers {
             handlers.push(OwnedHandlerPolicy {
                 handler: HandlerRef {
@@ -92,18 +92,7 @@ impl OwnedTarget {
     }
 
     fn copy_owned(&self) -> Result<Self, ContractError> {
-        Ok(match self {
-            Self::WholeWorkSlot { index, name } => Self::WholeWorkSlot {
-                index: *index,
-                // UTF-8 validation consumes the allocated byte Vec without a
-                // second allocation; safe Rust String supplies valid bytes.
-                name: String::from_utf8(bytes::copy(name.as_bytes())?)
-                    .map_err(|_| ContractError::InvalidManifest)?,
-            },
-            Self::Delivery => Self::Delivery,
-            Self::Admission => Self::Admission,
-            Self::Increment => Self::Increment,
-        })
+        Self::build(self.view())
     }
 }
 
@@ -173,10 +162,7 @@ impl Declaration {
     /// every admitted field, ordered handler and schema; include the retained
     /// attempt bound too. This is not a wire hash or durable schema commitment.
     pub fn intent_fingerprint(&self) -> ContentHash {
-        let mut hash = blake3::Hasher::new_derive_key("focal/native/validation-intent/1");
-        hash.update(self.stamp.as_bytes());
-        hash.update(&self.attempts.to_be_bytes());
-        ContentHash(*hash.finalize().as_bytes())
+        self.stamp.intent_fingerprint(self.attempts)
     }
 }
 

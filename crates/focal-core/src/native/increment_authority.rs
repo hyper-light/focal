@@ -1,6 +1,7 @@
 //! Increment authority comes from the exact registered work product and receipt.
 //! Neither the participant's target selection nor an artifact payload grants it.
 use super::admission_authority::{Begun, Registered};
+use super::report_artifact::ArtifactView;
 use super::*;
 use focal_model::lifecycle::artifact_descriptor::ArtifactDescriptor;
 
@@ -31,8 +32,16 @@ pub(super) fn check_completion_visibility(
     limits: focal_model::lifecycle::artifact_descriptor::Limits,
     visits: usize,
 ) -> Result<(), NativeError> {
+    check_completion_visibility_view(source, limits, visits)
+}
+
+pub(super) fn check_completion_visibility_view(
+    source: &impl ArtifactView,
+    limits: focal_model::lifecycle::artifact_descriptor::Limits,
+    visits: usize,
+) -> Result<(), NativeError> {
     use super::prepare::{add, within};
-    let count = source.visibility().len();
+    let count = source.visibility_count();
     within(count, visits)?;
     within(count, limits.visibility_labels)?;
     within("error".len(), limits.kind_bytes)?;
@@ -43,6 +52,7 @@ pub(super) fn check_completion_visibility(
         .ok_or(NativeError::Capacity("increment visibility slots"))?;
     let mut bytes = add("error".len(), slots)?;
     for label in source.visibility() {
+        let label = label?;
         within(label.len(), limits.visibility_label_bytes)?;
         bytes = add(bytes, label.len())?;
     }
@@ -158,6 +168,22 @@ pub(super) fn report<'a>(
     descriptor: &ArtifactDescriptor,
     limits: NativeLimits,
 ) -> Result<(Registered<'a>, validation::ReportAuthorization), NativeError> {
+    report_view(
+        view, context, claim, key, expected, report, descriptor, limits,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Same exact report authority over a prepared borrowed body.
+pub(super) fn report_view<'a>(
+    view: &'a View<'_>,
+    context: NativeContext,
+    claim: Binding,
+    key: EvaluationKey,
+    expected: Binding,
+    report: validation::Report,
+    descriptor: &impl ArtifactView,
+    limits: NativeLimits,
+) -> Result<(Registered<'a>, validation::ReportAuthorization), NativeError> {
     let registered = super::admission_authority::registered_any(view, claim, key)?;
     let owner = report_owner(view, &registered, context.logical_time)?;
     let source = work(view, key)?;
@@ -172,7 +198,7 @@ pub(super) fn report<'a>(
             remaining = remaining
                 .checked_sub(1)
                 .ok_or(NativeError::Capacity("increment evidence visibility"))?;
-            match labels.next() {
+            match labels.next().transpose()? {
                 Some(label) if label < required => continue,
                 Some(label) if label == required => break,
                 _ => return Err(ContractError::InvalidPolicy.into()),

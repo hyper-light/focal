@@ -1,4 +1,8 @@
 use super::*;
+
+#[path = "report_artifact_tests.rs"]
+mod artifact_view_tests;
+
 use focal_evidence::{
     BuiltinNativeSchemas, ContentStore, StoreLimits, VerifiedNativeArtifact, error_report_schema,
     test_report_schema,
@@ -71,7 +75,9 @@ fn native_limits() -> NativeLimits {
             ..RangeConfig::default()
         },
         plan_nodes: 16,
-        plan_edges: 256,
+        // Include the future response registrations and their completion seals.
+        // Tests exercising refusal replace this with the specific bound under test.
+        plan_edges: 4096,
         preparation_bytes: 1024 * 1024,
         evaluations_per_claim: 16,
         ..NativeLimits::default()
@@ -497,8 +503,8 @@ pub(super) fn events(core: &Core<NativeState>, outcome: NativeOutcome) -> Vec<Na
         .map(|ordinal| {
             let event = core.native_event(outcome.sequence, ordinal).unwrap();
             assert_eq!(
-                (event.request, event.sequence, event.ordinal),
-                (outcome.request, outcome.sequence, ordinal)
+                (event.invocation, event.sequence, event.ordinal),
+                (outcome.invocation, outcome.sequence, ordinal)
             );
             event.fact
         })
@@ -541,9 +547,17 @@ fn check_stored(
         if attempt == stored.attempt() && after == result.binding() && state == result.resulting_state())
     );
     assert_eq!(facts[2], NativeFact::Accepted { key: result_key });
+    assert_eq!((outcome.artifacts, outcome.results), (1, 1));
+    let changed_evaluations = facts
+        .iter()
+        .filter_map(|fact| match fact {
+            NativeFact::Evaluation { key, .. } => Some(*key),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
-        (outcome.artifacts, outcome.results, outcome.evaluations),
-        (1, 1, 1)
+        usize::try_from(outcome.evaluations).unwrap(),
+        changed_evaluations.len()
     );
 }
 
@@ -665,6 +679,9 @@ fn first_failure_and_original_evidence_survive_later_pending_sibling_report() {
     let token = verified(&mut custody, &input);
     let first = report(&core, input, &[], &token);
     let original = first.claim(key(1).claim).unwrap().terminal_cut().unwrap();
+    assert_eq!(first.outcome().evaluations, 2);
+    assert!(first.evaluation(key(1)).unwrap().sealed().is_some());
+    assert!(first.evaluation(key(1)).unwrap().last_result().is_none());
     let ClaimTerminalCut::Required(cut) = original else {
         panic!("expected required cause")
     };

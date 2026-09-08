@@ -71,12 +71,33 @@ impl Snapshot {
         limits: Limits,
         max_bytes: usize,
     ) -> Result<CapturePlan<'a>, ContractError> {
+        let mut visits = VisitBudget::new(limits.visits);
+        Self::prepare_capture_with_visits(claims, limits, max_bytes, &mut visits)
+    }
+
+    /// Preflight against a transaction-wide traversal allowance. The returned
+    /// plan retains the remaining per-capture limit; `build_with_visits` also
+    /// checks whatever remains in the transaction allowance at construction.
+    pub fn prepare_capture_with_visits<'a>(
+        claims: &'a [&'a ClaimState],
+        limits: Limits,
+        max_bytes: usize,
+        visits: &mut VisitBudget,
+    ) -> Result<CapturePlan<'a>, ContractError> {
+        visits.with_limit(limits.visits, |budget| {
+            Self::prepare_capture_budget(claims, limits, max_bytes, budget)
+        })
+    }
+
+    fn prepare_capture_budget<'a>(
+        claims: &'a [&'a ClaimState],
+        limits: Limits,
+        max_bytes: usize,
+        budget: &mut Budget,
+    ) -> Result<CapturePlan<'a>, ContractError> {
         if claims.is_empty() || claims.len() > limits.nodes {
             return Err(ContractError::Capacity);
         }
-        let mut budget = Budget {
-            left: limits.visits,
-        };
         let mut total_edges = 0usize;
         let mut minimum_cut = SessionSeq(0);
         let mut prior = None;
@@ -123,10 +144,13 @@ impl Snapshot {
                 if let Some(cut) = scope.release_cut() {
                     minimum_cut = minimum_cut.max(cut.position);
                 }
+                if let Some(cancellation) = scope.cancellation() {
+                    minimum_cut = minimum_cut.max(cancellation.cut.position);
+                }
                 if let Some(change) = scope.last_rebinding() {
                     minimum_cut = minimum_cut.max(change.cut.position);
                 }
-                if scope.released().is_none() {
+                if scope.active() {
                     total_edges = total_edges
                         .checked_add(scope.roots().len())
                         .ok_or(ContractError::Capacity)?;
@@ -213,16 +237,25 @@ impl CapturePlan<'_> {
     }
 
     pub fn build(self) -> Result<Snapshot, ContractError> {
+        let mut visits = VisitBudget::new(self.visits);
+        self.build_with_visits(&mut visits)
+    }
+
+    /// Completes the same checked capture under the remaining shared allowance.
+    /// Failed construction keeps preflight and completed traversal charged.
+    pub fn build_with_visits(self, visits: &mut VisitBudget) -> Result<Snapshot, ContractError> {
+        visits.with_limit(self.visits, |budget| self.build_budget(budget))
+    }
+
+    fn build_budget(self, budget: &mut Budget) -> Result<Snapshot, ContractError> {
         let Self {
             claims,
             limits,
             total_edges,
             minimum_cut,
-            visits,
             charge,
             ..
         } = self;
-        let mut budget = Budget { left: visits };
         let mut nodes = checked_reserve(claims.len())?;
         let mut edges = checked_reserve(total_edges)?;
         let mut incoming = checked_reserve(total_edges)?;
@@ -245,11 +278,7 @@ impl CapturePlan<'_> {
                     runtime: false,
                 });
             }
-            for scope in claim
-                .scopes()
-                .iter()
-                .filter(|scope| scope.released().is_none())
-            {
+            for scope in claim.scopes().iter().filter(|scope| scope.active()) {
                 for root in scope.roots() {
                     budget.visit()?;
                     let (target, predicate) = match *root {
@@ -291,7 +320,7 @@ impl CapturePlan<'_> {
                     claim
                         .scopes()
                         .iter()
-                        .filter(|scope| scope.released().is_none())
+                        .filter(|scope| scope.active())
                         .map(|scope| scope.deadline()),
                 )
                 .min_by_key(|deadline| (deadline.at, deadline.timer, deadline.generation));
@@ -348,7 +377,7 @@ impl CapturePlan<'_> {
                 if graph.is_satisfied(index)? || node.status.is_terminal() || !node.local_complete {
                     continue;
                 }
-                if graph.predicates(index, &mut budget)? {
+                if graph.predicates(index, budget)? {
                     *graph
                         .satisfied
                         .get_mut(index)

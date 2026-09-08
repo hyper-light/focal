@@ -1,4 +1,6 @@
 use super::*;
+#[path = "claim_adoption_tests.rs"]
+mod adoption_tests;
 use crate::{
     ArtifactId, ArtifactRef, ObjectId, ObjectRevision, ReceiptId, SessionId, TenantId, TimerId,
 };

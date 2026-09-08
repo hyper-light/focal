@@ -6,10 +6,13 @@ use crate::lifecycle::claim::ClaimState;
 use crate::lifecycle::evidence::{Response, WorkArtifact};
 use crate::lifecycle::validation::{Declaration, EvaluationState};
 
+#[path = "aggregation_projection_quote.rs"]
+mod quote;
 #[path = "aggregation_projection_reduce.rs"]
 mod reduce;
 #[path = "aggregation_projection_source.rs"]
 mod source;
+pub use quote::{ProjectionQuote, ProjectionShape, quote_projection};
 #[cfg(test)]
 #[path = "aggregation_projection_tests.rs"]
 mod tests;
@@ -71,6 +74,10 @@ struct Counts {
 struct Visits {
     remaining: usize,
 }
+#[cfg(test)]
+std::thread_local! {
+    static MEASURED_VISITS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
 impl Visits {
     fn new(limit: usize) -> Self {
         Self { remaining: limit }
@@ -80,6 +87,16 @@ impl Visits {
             .remaining
             .checked_sub(count)
             .ok_or(ContractError::Capacity)?;
+        #[cfg(test)]
+        MEASURED_VISITS.with(|total| {
+            if let Some(previous) = total.get() {
+                total.set(Some(
+                    previous
+                        .checked_add(count)
+                        .expect("measured visits fit usize"),
+                ));
+            }
+        });
         Ok(())
     }
 }

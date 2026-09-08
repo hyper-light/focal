@@ -1,9 +1,9 @@
 # Implementation evidence and remaining work
 
-Updated 2026-09-06. The objective is the complete P00–P20 plan: the original P00–P16 scope plus the user's manual CLI, skills, MCP, challenge and consultation extension in [13](13-cli-and-agent-implementation-plan.md). This record distinguishes executable components from integration and deployment qualification. No package is marked complete merely because its crate compiles. Imported Hecate references remain unchanged. The current execution boundary is strictly peer-to-peer: Focal records claims, testament/artifact evidence and authenticated verdicts; participants invoke their own validating tools/skills or request evaluation from another peer through ordinary claims. Focal is not an agent/worker launcher or model-job scheduler. Existing optional execution helpers do not make participant execution a daemon responsibility.
+Updated 2026-09-07. The objective is the complete P00–P20 plan: the original P00–P16 scope plus the user's manual CLI, skills, MCP, challenge and consultation extension in [13](13-cli-and-agent-implementation-plan.md). This record distinguishes executable components from integration and deployment qualification. No package is marked complete merely because its crate compiles. Imported Hecate references remain unchanged. The current execution boundary is strictly peer-to-peer: Focal records claims, testament/artifact evidence and authenticated verdicts; participants invoke their own validating tools/skills or request evaluation from another peer through ordinary claims. Focal is not an agent/worker launcher or model-job scheduler. Existing optional execution helpers do not make participant execution a daemon responsibility.
 
-A further source audit identifies a real four-family lifecycle gap. Claim
-status/history and durable validation attempts exist, but testament lifecycle is
+A source audit identifies a real four-family lifecycle gap in the active V1
+storage profile. Claim status/history and durable validation attempts exist, but testament lifecycle is
 currently only created/acknowledged, artifact lifecycle only created/custody
 revision, and validation lifecycle only created/latest epoch. Separate family
 state transitions, artifact-target binding, independent testament posting and
@@ -65,17 +65,61 @@ progress. Claimant receipt now also registers the complete WholeWork Ready cohor
 against actual attached or missing targets; the latest section below records its
 qualification. The subsequent projection reconstructs acceptance from actual
 retained sources. Explicit claimant WholeWork entry now publishes structural and
-zero-check outcomes plus indexed dependency effects. Funded external WholeWork
-Begin/report, audit/scope integration and durable activation remain on the critical
-path before the native lifecycle reaches users.
+zero-check outcomes plus indexed dependency effects. Checked response-entry
+authority now covers every exact attached artifact and structural missing slot
+without impersonating a claimant; the atomic journal checks cross-object order
+and original publication positions. The subsequent
+[funded WholeWork increment](#native-wholework-report-funding-and-graph-protection--2026-09-06)
+adds actual designated-evaluator Begin/report transactions and protects their
+future projection and graph capacity. Trusted exact evaluation deadlines now
+record authority fences and separate typed timer outcomes through the same
+funded owner. Claim deadlines now apply canonical SCC precedence and bounded
+atomic expiry/fencing. The [automatic cohort sealing increment](#automatic-native-cohort-sealing--2026-09-07)
+records complete native validation cohorts with each new local outcome and
+rebinds existing report grants in the same candidate. Earlier sections describing
+that writer as disabled record its preceding prerequisites. The subsequent
+[native audit inspection increment](#bounded-native-audit-inspection--2026-09-07)
+derives complete sealed membership and original result history from one actual
+owner prefix. The subsequent
+[claimant result-testament increment](#native-claimant-result-testaments--2026-09-07)
+adds generation and posting of that complete immutable bundle in native RAM.
+The subsequent [receipt adoption increment](#native-receipt-adoption-and-retained-open-cycles--2026-09-07)
+transfers the actual receipt entitlement, fences its complete evaluation cohort,
+and retains abandoned open cycles and their original evidence. The subsequent
+[owner-scope release increment](#native-owner-scope-release--2026-09-07)
+adds explicit release of terminal owned claims after their children have
+released; executed qualification is recorded below.
+The subsequent bounded monitor model increment adds preflighted registration,
+rebinding and disposition, plus exact monitor deadline assessment and a private
+negative-SCC expiry capability. The subsequent native monitor increment adds
+atomic register/rebind/disposition history, direct-root reverse subscriptions,
+typed monitor timers and bounded repeated consequences, with held WholeWork
+report reservations. Guaranteed whole-claim completion funding, complete
+Admission/control consequences, durable monitor reconciliation and durable
+activation remain on the critical path before the native lifecycle reaches users.
+
+The [raw admission and recovery increment](#raw-native-admission-and-recovery-construction-primitives--2026-09-07)
+connects complete native frames to the RAM owner and adds caller-owned wire reads,
+precharged range hydration and checked scalar validation restoration. The latest
+[write-set and lifecycle restoration increment](#native-write-sets-and-lifecycle-restoration--2026-09-07)
+retains actual candidate writes and restores the remaining lifecycle histories.
+The subsequent [record encoding and phased construction increment](#native-record-encoding-and-phased-recovery-construction--2026-09-07)
+encodes those retained facts and adds a dependency-aware detached loader. Native
+row decoding, complete recovery and live server/CLI/MCP activation remain unfinished.
 
 The remaining delivery milestones are substantial and are not equally sized:
 
-1. **Finish native lifecycle integration.** Funded WholeWork Begin/report transactions,
-   independently progressing artifact/response outcomes, acceptance, audits and
-   complete graph effects must publish atomically within held resource budgets.
-   Explicit claimant entry and its structural/zero-check consequences are qualified
-   in the latest section below; external WholeWork reports are still not enabled.
+1. **Finish native lifecycle integration.** Claimant and designated-evaluator entry,
+   funded WholeWork reports and their atomic artifact/response/acceptance effects
+   are implemented in the native RAM owner, including exact evaluation-deadline
+   publication, claim expiry/deadlock control, automatic cohort sealing and
+   bounded audit inspection and claimant result-testament generation/posting.
+   Receipt adoption, complete retained open-cycle discovery and explicit
+   terminal owner-scope release are implemented and qualified below. Native
+   monitor transactions, timer resolution and indexed consequences now extend
+   work reports, cancellation and supersession. Guaranteed claim-completion
+   funding, Admission failure propagation, complete runtime-scope qualification
+   and durable reconciliation remain required.
 2. **Activate the lifecycle end to end.** Complete native codecs/import, recovery,
    WAL/Session/quorum dispatch and the shared CLI/MCP path. A complete laptop
    workflow must preserve both successful and failed testimony across restart.
@@ -2801,3 +2845,2130 @@ and CLI/MCP activation are still open. The unhooked WholeWork authority helper
 and its tests are preparation for that next funded execution path; they are not
 included in the passing test count. This increment adds no Arc, unsafe code,
 thread or dependency package.
+
+
+## Checked response-entry authority and journal integrity — 2026-09-06
+
+The native explicit entry path now derives all artifact and structural missing
+consequences from one checked response-entry capability. The model supports the
+same derivation after an actual designated evaluator Begin. That evaluator-first
+native command still awaits its complete held-resource contract; this increment
+does not expose an unfunded Begin/report path.
+
+Implemented:
+
+- [ResponseEntry](../../crates/focal-model/src/lifecycle/evidence_entry.rs) is a
+  private-field, ephemeral capability created from an actual Received → Validating
+  plan, the checked current claim and a refreshed acceptance decision. It pins the
+  exact claim/response revisions, report stamp, receipt, cycle and respondent.
+  `WorkArtifact::begin_entered` and `Evaluation::settle_missing_entered` consume
+  that capability without creating a claimant Principal. Existing explicit
+  claimant APIs retain their actor checks.
+- [Native entry](../../crates/focal-core/src/native/whole_work.rs) now uses that
+  capability for every exact attached manifest artifact and the complete
+  structural missing cohort. Missing Required targets retain artifact-free
+  Incomplete results; Observe omissions record suppression. Explicit evaluation
+  fences and seals remain unchanged. Failed/unattached work is not converted to
+  an attached success artifact, and respondent-authored testimony is preserved.
+- [Object journal validation](../../crates/focal-core/src/native/object_journal.rs)
+  checks complete work/response revision chains, immutable testimony and target
+  fields, one-to-one missing-evaluation/result correspondence, and exact retained
+  event coordinates. A precharged sorted index matches journal facts to final
+  rows without a ledger scan or per-object allocation. The entry phases enforce
+  claim entry, response entry, work entry, structural assessment, work outcomes,
+  response outcome, claim acceptance and graph effects in causal order. Observe
+  missing evaluations must follow the actual response entry even though they
+  create no accepted-result row. Omitted/duplicate rows or facts, stale revisions,
+  shifted result coordinates and reordered cross-object events are refused.
+- [Typed completion use](../../crates/focal-core/src/native/completion_envelope.rs)
+  replaces a generic changed-claim boolean in range-envelope selection and book
+  spending. Only an actual ReportAdmission Posted → PostFailed transition with
+  the exact next binding and Required Admission cut consumes AdmissionFailure
+  credit. Unchanged parents and other operations select Regular. This preserves
+  Admission/Increment reservations while preventing future WholeWork claim
+  changes from being mistaken for an Admission surcharge.
+
+Executed on the final source for this increment:
+
+- **748 unfiltered library tests passed:** `focal-core` 405, `focal-model` 306,
+  `focal-evidence` 37, with offline locked Cargo and four test threads. Seven new
+  model capability tests cover designated-evaluator entry, all-slot effects,
+  Required/Observe parity, exact report/receipt/generation, stale and controlled
+  sources, fences/seals and the Increment gate. Seven new native journal tests
+  exercise actual prepared candidates and corrupt their copies; two additional
+  completion tests distinguish real Admission failure from unrelated changes.
+- Workspace all-target Clippy with `-D warnings`, the production no-panic gate,
+  `cargo fmt --all -- --check` and `git diff --check` all passed. Contract checks
+  verified **671 architecture links, 37 imported hashes and 15 frozen vocabularies**.
+  These checks do not constitute a new full-workspace behavioral, network,
+  fault-injection or cross-platform qualification run.
+
+The funding review also identified the concrete remaining activation requirements:
+future rather than present projection occupancy; separate byte, model-visit and
+native-cursor budgets; every-attempt work/response/claim/graph effect costs; first
+entry costs; and protected revision capacity. In particular, a newly created
+incoming dependency can enlarge a funded claim's future graph work without
+changing its claim row, so the current parent-event checks alone are insufficient.
+[Document 18](18-lifecycle-storage-upgrade.md#wholework-funding-implementation-checklist)
+now provides checked-arithmetic shape/visit equations, per-report row/event
+formulas, growth guards and the qualification sequence to implement next. These
+are planning bounds awaiting executable qualification, not active Work grants.
+
+No new durable codec/import, WAL/Session/quorum activation, CLI/MCP native dispatch,
+full runtime-scope propagation, platform release or distributed-scale qualification
+is claimed here. The existing unhooked `work_authority` source is still outside
+these executed tests. Full audit closure and non-entry control/succession graph
+consequences remain required. Frozen V1 wire/hash/replay behavior is preserved.
+
+## Future projection bounds and graph preflight — 2026-09-06
+
+The next WholeWork funding prerequisites are implemented and exercised against
+the actual projection and graph algorithms. They establish checked estimates and
+bounded execution; they do not yet install future Work report grants.
+
+- The model's [ProjectionQuote](../../crates/focal-model/src/lifecycle/aggregation_projection_quote.rs)
+  estimates all eleven simultaneous projection buffers plus separate inspection
+  and reduction visit ceilings from immutable policy and promised future response,
+  work and evaluation counts. Checked arithmetic rejects overflow and excess
+  dimensions before scanning policy slots. Counts cover unclosed and failed work,
+  missing targets and every registered check, including suppressed or terminal
+  members. The owner must preserve the promised shape before admitting later growth.
+- [NativeProjectionQuote](../../crates/focal-core/src/native/projection_quote.rs)
+  adds direct lookups, nested work-cursor traversal, source provenance checks and
+  each provisional overlay comparison. A single
+  [owner-local visit allowance](../../crates/focal-core/src/native/projection_visits.rs)
+  spans inspection and reduction; opening or interleaving cursors cannot replenish
+  it. Exhaustion returns Capacity before an absent lookup can be interpreted as
+  missing participant evidence or an acceptance callback can run. The adapter
+  uses scalar Cell values and borrowed lifetimes without shared heap ownership.
+- [Graph preflight](../../crates/focal-core/src/native/graph_effects.rs) captures
+  the same complete indexed dependency/ownership closure consumed by execution.
+  It quotes discovery, snapshot, witness, copied claim/registry, output row, event
+  and heap costs; checks one graph revision per nonterminal member; and verifies
+  actual output costs. An optional prior ceiling compares the entire proposed
+  closure, including new incoming links whose target Claim row did not change.
+  Source identities stay borrowed, and each allocation is charged before creation.
+
+Qualification: **767 unfiltered affected-library tests passed**: Core 416, model
+314 and evidence 37, with zero failures, ignored or filtered tests. Executed:
+`bash scripts/cargo.sh test -p focal-core -p focal-model -p focal-evidence --offline --locked --lib -- --test-threads=4`.
+The record is `/tmp/focal-work-bounds-tests.log`. Eight new model tests compare
+quotes with measured real reducer visits across future growth, missing and failed
+work, retryable Error, terminal outcomes and alternate chronological coverage;
+they also exercise allocation refusal and arithmetic boundaries. Six new native
+projection tests cover shared/exhausted/interleaved cursor budgets, overlay costs,
+callback refusal, future open/closed response growth and exact quote boundaries.
+Five graph tests cover actual output fit, pending incoming-link and registry
+growth, prefix/limit changes, exact stage-byte boundaries and active-scope refusal.
+One preexisting multi-response fixture needed a larger explicit lookup allowance
+because all nested traversal is now counted together; runtime guards remain intact.
+
+Workspace all-target Clippy with `-D warnings`, the separate production no-panic
+gate, formatting and whitespace checks passed on macOS arm64. Logs are
+`/tmp/focal-work-bounds-clippy.log` and `/tmp/focal-work-bounds-production.log`.
+Contract checks verified **675 architecture links, 37 imported hashes and 15 frozen
+vocabularies** in `/tmp/focal-work-bounds-contracts.log`. These are affected-library
+behavioral checks and workspace lint/compilation checks, not a new full-workspace
+behavioral, network, fault-injection or cross-platform qualification run.
+
+The remaining activation path is unchanged: install typed per-attempt Work grants,
+fund all report and first-entry effects, preserve work/response/claim/peer revision
+headroom, and enforce graph/response/registration growth checks before every
+relevant publication. Native Begin/report, complete audit and runtime-scope/control
+consequences, codecs/import, WAL/Session/quorum and CLI/MCP activation remain open.
+The estimates exclude range-tree descent and uncounted model helper/sort work;
+graph preflight excludes non-graph rows, range construction and the common
+object-journal index. These costs still belong in the full report envelope.
+No new Arc, unsafe code, thread or dependency package was introduced. Frozen V1
+wire/hash/replay behavior is preserved. No platform release or distributed-scale
+qualification is established by this increment.
+
+## Native WholeWork report funding and graph protection — 2026-09-06
+
+The native RAM owner now accepts funded `BeginWork` and `ReportWork` transactions
+against an exact attached artifact, response, receipt and declaration generation.
+This completes the external WholeWork report path inside `NativeOwner`. Native
+durable codecs, Session/quorum dispatch and the CLI/MCP lifecycle migration remain
+separate activation requirements.
+
+- **Actual participant authority.** A designated evaluator may begin against a
+  Received response. The first actual Begun evaluation event authorizes entry of
+  that exact response and the consequences for its complete manifest, including
+  structural missing slots and zero-check artifacts. No claimant is impersonated.
+  Subsequent checks against an entered response record their own Begin without
+  repeating entry. Low-level unfunded Work preparation refuses the bypass.
+- **One report and its real consequences.** The shared
+  [report staging path](../../crates/focal-core/src/native/reporting.rs) verifies
+  actor, exact attempt, provenance, schema and custody before accepting the real
+  proof or error artifact. Artifact, evaluation and accepted-result history keep
+  their original positions. A single bounded projection then applies the target
+  artifact, response, claim acceptance and actual indexed graph effects in one
+  candidate. A report after ordinary claim completion can finish its already-begun
+  evaluation without changing earlier terminal cuts. Retryable Error remains an
+  inspectable result with real diagnostic evidence.
+- **Future capacity before responsibility.** The
+  [Work envelope](../../crates/focal-core/src/native/completion_work.rs) covers the
+  complete remaining retry/fallback/quality chain, all authored response cycles,
+  work and registration growth, immutable response heap, graph member copies,
+  revision margins, verification, object journal and range construction. Each
+  attempt reserves possible artifact/response/claim/graph writes; it cannot spend
+  Admission-only failure credit. Retained versions remain funded when old reads
+  pin earlier pages. Begin's first entry is separately admitted through Ordinary
+  capacity; later reports spend their held Completion allowance.
+- **Indexed protection of every affected graph member.** The
+  [reverse membership index](../../crates/focal-core/src/native/completion_protection.rs)
+  records the complete actual dependency/ownership closure with each Work grant.
+  [Candidate checks](../../crates/focal-core/src/native/completion_growth.rs) find
+  affected grants from owning-claim facts and new claims' actual dependency and
+  lineage endpoints. A new incoming edge is therefore checked even when its target
+  Claim row does not change. Each affected grant is checked once using held serial
+  scratch; unrelated grants and ledger rows are not scanned. The complete affected
+  cohort's temporary marks are reset before each check, including after refusal.
+  Changed component membership is refused while that original promise is live;
+  automatic additional funding for topology changes remains future work.
+- **Rollback and independent retention.** Grant installation, reverse memberships,
+  index growth and pool funding share the pending candidate journal. Refusal and
+  suffix discard restore original credit and memberships. A pending terminal
+  report retains its membership records until publication so rollback requires
+  no replacement allocation. Committed retirement releases logical promises;
+  retained pages and evidence keep their own actual memory charges.
+- **Operation-specific causal checking.** The
+  [object journal](../../crates/focal-core/src/native/object_journal.rs) now checks
+  claimant entry, first/subsequent evaluator Begin and report profiles separately.
+  It verifies actual Begun authority before derived entry, exact report evidence
+  and original ordinals, object revision histories and staged consequences. This
+  does not replace the acceptance/graph projection with a second reducer.
+
+The implementation introduces no Arc, unsafe code, thread or dependency package.
+Explicit native command-intent tags 18 and 19 append the Work operations without
+changing the earlier tags. Frozen V1 wire, content hashes and replay are unchanged.
+No durable restart, release platform or distributed-scale qualification is implied
+by this native RAM increment.
+
+Qualification: **802 unfiltered affected-library tests passed**: Core 451, model
+314 and evidence 37, with zero failures, ignored or filtered tests. Executed:
+`bash scripts/cargo.sh test -p focal-core -p focal-model -p focal-evidence --offline --locked --lib -- --test-threads=4`.
+The record is `/tmp/focal-work-funded-tests.log`. The 35 added Core tests cover:
+
+- Actual designated-evaluator first entry, subsequent Begin, Required failure,
+  late Observe report, actor refusal and atomic entry rollback.
+- Envelope refusal before responsibility, exact slot counts, full authored
+  response/registration growth, future graph heap copies and terminal peers.
+- Retryable Error and final Pass under exhausted ancestor RAM with pinned old
+  versions; a distinct agentic quality evaluator after programmatic retry and
+  Pass; wrong-evaluator refusal before custody; retained proof provenance for
+  every phase; no premature work/response/claim success.
+- Reverse membership identity and interval isolation, partial installation
+  failure and exact refund, journal rollback after earlier grant retirement,
+  incoming dependency and owned-child growth refusal, unrelated creation,
+  and successful completion after those refused mutations.
+- Operation-specific journal entry/report order, missing or substituted
+  evidence, omitted consequences, original result coordinates and late reports
+  without terminal-object rewrites.
+- Owner reconstruction from actual retained native rows after a custody-backed
+  retryable Error, followed by a funded final Pass under exhausted parent RAM.
+  This uses the existing native reconstruction harness, not disk replay or a
+  checkpoint decoder. Original Error coordinates survive reconstruction and
+  final owner teardown releases its memory charges.
+
+Workspace all-target Clippy with `-D warnings`, the separate production no-panic
+gate, formatting and whitespace checks passed on macOS arm64. Logs are
+`/tmp/focal-work-funded-clippy.log`, `/tmp/focal-work-funded-production.log` and
+`/tmp/focal-work-funded-fmt.log`. Contract checks verified **680 architecture links,
+37 imported hashes and 15 frozen vocabularies** in
+`/tmp/focal-work-funded-contracts.log`.
+
+Remaining native work includes trusted deadline transactions, complete audit
+closure, adoption and non-entry control/succession/runtime-scope graph effects.
+Respondent responsibility and closing capacity, durable reservations and recovery,
+native codecs/import, WAL/Session/quorum and CLI/MCP activation remain required.
+The held membership policy can refuse topology growth; it does not yet acquire
+additional graph funding automatically. These behavioral checks exercise the
+affected libraries; they are not full-workspace network, fault-injection,
+cross-platform release or global deployment qualification.
+
+## Trusted native evaluation deadlines — 2026-09-06
+
+`NativeOwner::prepare_evaluation_deadline` now publishes a due evaluation's
+authority fence or records consumption of an already-terminal/fenced timer.
+It accepts a separate typed timer input and trusted owner time. It does not
+accept a participant command or impersonate a claimant, evaluator or respondent.
+
+- The model's [deadline transition](../../crates/focal-model/src/lifecycle/validation_deadline.rs)
+  checks the exact binding, authored declaration, target/generation, claim source,
+  complete timer identity, due time and publication cut. Expired Ready checks,
+  handler-free Receipt/MissingSlot targets and declared-policy checks do not need
+  external report authorization. Receipt adoption, parent terminality and
+  cohort sealing do not rewrite historical timer authority. An actual fence
+  preserves state, attempts and original accepted evidence; no verdict, artifact,
+  response or claim outcome is manufactured.
+- The [native deadline path](../../crates/focal-core/src/native/deadlines.rs)
+  resolves actual owner registration once and caches the checked replacement
+  against the borrowed immutable effective prefix. `NativeInvocation` separates
+  actor requests from evaluation deadlines throughout outcome keys and event
+  history. Timer identity includes the full evaluation key and timer generation;
+  the separate intent domain commits authored due time. Exact pending/committed
+  retries precede clock, queue and memory checks. Changing the authored due time
+  under an already-consumed key is a conflict. A no-op consumes only its typed
+  outcome and Meta update, preserving the previous event/result coordinates.
+- Begun evaluations use a dedicated checked deadline loan from their actual
+  report grant. Begin and owner reconstruction now prove the four-put,
+  one-event, two-new-row fence fits a Regular report's reserved storage, workspace
+  and discrete slots. The actual write plan must fit that envelope. Ready and
+  terminal/no-op deadlines use bounded Ordinary admission. Single-grant fence
+  retirement uses an inline journal update with no new Ordinary allocation.
+  Rollback restores exact credit and Work reverse protections; committed
+  retirement leaves existing pinned pages charged to their actual owner.
+- Actor mutation fingerprints and frozen V1 wire/hash/replay remain unchanged.
+  The new invocation fields belong to the unactivated native API. Trusted timer
+  preparation stays separate from the actor-only `NativeInput` surface. No new
+  Arc, unsafe code, thread or dependency package was introduced.
+
+Qualification: **814 unfiltered affected-library tests passed**: Core 458,
+model 319 and evidence 37, with no failures, ignored or filtered tests. Executed:
+`bash scripts/cargo.sh test -p focal-core -p focal-model -p focal-evidence --offline --locked --lib -- --test-threads=4`.
+The record is `/tmp/focal-deadline-full-tests.log`. Five model tests cover all
+five target families, Required-policy Ready checks, invalid source/timer/cut and
+revision capacity, retained retry/quality evidence, actual receipt adoption and
+unchanged terminal/fenced history. Seven
+[owner integration tests](../../crates/focal-core/src/native/deadline_owner_tests.rs)
+exercise Ready expiry, retry/quality expiry under full ancestor RAM with pins,
+pending report/deadline order, suffix discard, immutable completed evidence,
+full-queue/full-RAM exact retries, and actual Work graph-protection retirement
+and restoration. Existing actor-only identity assertions now inspect their
+explicit Request invocation; artifact custody still uses its real RequestKey.
+
+Workspace all-target Clippy with `-D warnings`, the separate production no-panic
+gate, formatting and whitespace checks passed on macOS arm64. Logs are
+`/tmp/focal-deadline-clippy.log`, `/tmp/focal-deadline-production.log` and
+`/tmp/focal-deadline-fmt.log`. Contract checks verified **683 architecture links,
+37 imported hashes and 15 frozen vocabularies** in
+`/tmp/focal-deadline-contracts.log`.
+
+These are native RAM transactions. Due-timer scheduling and durable timer
+recovery, claim expiry with canonical deadlock precedence, cohort seal rebinds,
+audit bundles, adoption and remaining scope/graph effects are still required.
+Native codecs/import, WAL/Session/quorum and CLI/MCP activation remain open.
+No disk-restart, network, release-platform or global-scale qualification is
+established by this increment.
+
+## Native claim deadlines and canonical deadlock resolution — 2026-09-07
+
+`NativeOwner::prepare_claim_deadline` now accepts a trusted, separately typed
+claim deadline. It resolves the authored timer and current claim from the
+effective owner prefix, including pending predecessors. Its invocation key is
+independent of actor and evaluation-deadline identities. Exact pending and
+committed retries retain their original accepted time, outcome and history;
+changed intent under the same key refuses. A terminal trigger consumes the
+timer without rewriting its prior claim cut or evidence.
+
+- The [model SCC query](../../crates/focal-model/src/lifecycle/graph_deadline.rs)
+  returns an explicit checked absence of a qualifying unsatisfied cycle. Wrong
+  timers, early time, bad cuts, incomplete sources, traversal exhaustion and
+  allocation refusal remain errors. All reachability, queue and component
+  buffers are charged before construction. Canonical victim selection uses
+  original creation position and then claim ID; original fingerprint ordering
+  is preserved. A settled self-edge cannot create a false wait cycle.
+- The [native transaction](../../crates/focal-core/src/native/claim_deadlines.rs)
+  resolves canonical SCC victims and their dependency/release consequences
+  against complete frozen snapshots. It then reassesses the original due claim.
+  A victim distinct from that trigger must not consume its only timer and leave
+  it open: each round terminalizes a previously live member, until the trigger
+  is terminal or a checked absence of a remaining cycle permits ordinary expiry.
+  The [D-08 clarification](02-domain-and-lifecycle.md#73-deadlock-and-cancellation)
+  records that rule for successor semantics. Every intermediate witness retains
+  its actual source bindings, deadline provenance and publication cut. All
+  rounds share finite traversal and cumulative construction bounds.
+- Ordinary expiry resolves the entire retained registration set and uses the
+  model's [actual claim-expiry fence](../../crates/focal-model/src/lifecycle/validation_claim_deadline.rs).
+  Nonterminal unfenced checks acquire only an authority fence; Ready/retry/quality
+  state and original evidence remain intact. Terminal results and earlier
+  fences remain unchanged. Deadlocked and DependencyFailed preserve eligible
+  already-begun reports. No timeout generates respondent testimony, work bytes,
+  diagnostics or an evaluation verdict.
+- The dedicated deadline journal validates initiating cuts, complete expiry
+  fence membership and ordering, final rows and permitted graph events. Control
+  construction and the additional coexisting multi-grant retirement journal
+  use Completion-lane admission. Commit/discard preserve exact report credit,
+  pinned history and reverse-protection lifetimes. A refusal after an earlier
+  prepared round leaves no claim change, consumed timer or partial retirement.
+- The new API is native RAM state only. Actor mutation fingerprints and frozen
+  V1 wire/hash/replay are unchanged. The increment adds no Arc, unsafe code,
+  thread or dependency package.
+
+Qualification: **839 unfiltered affected-library tests passed**: Core 471,
+model 331 and evidence 37, with no failures, ignored or filtered tests. Executed:
+`bash scripts/cargo.sh test -p focal-core -p focal-model -p focal-evidence --offline --locked --lib -- --test-threads=4`.
+The record is `/tmp/focal-claim-deadline-full-tests.log`.
+
+Ten [owner deadline tests](../../crates/focal-core/src/native/claim_deadline_owner_tests.rs)
+cover actual Ready/begun/terminal cohorts, preserved response and result evidence,
+canonical victims distinct from the trigger, overlapping cycles requiring
+several victims, late reports after business failure, timer conflicts and exact
+retries, both pending report/expiry orders, and suffix discard. Multi-grant expiry
+succeeds with Ordinary capacity full and old states pinned. A construction
+allowance one byte below the complete quote refuses after private deadlock
+progress, leaving published rows, clock, timer outcome, credits and memory
+unchanged. Three [journal tests](../../crates/focal-core/src/native/claim_deadline_journal_tests.rs)
+reject omitted registry members even when both row and event are removed,
+reordered/duplicate/false fence events, extra rows and altered timer/cut identity.
+
+The twelve added model tests cover actual claim-expiry authority and preserved
+retry/quality evidence, exact canonical SCC identity and source errors, all SCC
+allocation boundaries, and [shared traversal accounting](../../crates/focal-model/src/lifecycle/graph_visit_tests.rs).
+Capture, build and successive SCC/dependency queries spend one allowance;
+partial failures retain already-spent visits. A refused bulk debit preserves
+unused visits without saturating or renewing the budget. Compatibility wrappers
+retain their original witness fingerprints.
+
+Workspace all-target Clippy with `-D warnings`, the separate production no-panic
+gate, formatting and whitespace checks passed on macOS arm64. Logs are
+`/tmp/focal-claim-deadline-clippy.log`, `/tmp/focal-claim-deadline-production.log`
+and `/tmp/focal-claim-deadline-fmt.log`. Contract checks verified **692 architecture
+links, 37 imported hashes and 15 frozen vocabularies** in
+`/tmp/focal-claim-deadline-contracts.log`.
+
+This control path does not reserve guaranteed future completion for every
+admitted claim. Registered evaluation and graph cohorts can grow beyond one
+deadline transaction; oversized work refuses atomically. Before guaranteeing
+timer liveness, admission and future growth must fund the complete claim
+obligation or an explicit continuation, including control journals, discrete
+rows/events, RAM coexistence, durable storage and replicas. Active runtime-scope
+closures also await their owner integration. Due-timer scheduling/recovery,
+cohort seal rebinds and audit bundles, adoption and other scope/graph effects,
+native codecs/import, WAL/Session/quorum and CLI/MCP activation remain required.
+No disk-restart, network, release-platform or global-scale qualification is
+established by this increment.
+
+
+## Checked evaluation seals and mixed completion journals — 2026-09-07
+
+The [checked model seal](../../crates/focal-model/src/lifecycle/validation_seal.rs)
+now derives cohort recording from the actual claim and its original local seal
+position. It verifies the immutable definition, claim identity and expected
+revision, preserves begun retry/quality attempts, proof, diagnostics and existing
+fences, and records suppression for an unbegun Ready member. Terminal and
+already-sealed members remain unchanged. Its cause is stable across later claim
+revisions and graph release; an empty cause is rejected. This process-local
+identity does not alter frozen V1 hashes or define a successor wire format.
+
+`SealTransition` retains exact private before/after states and checks the complete
+allowed delta. A binding alone cannot substitute another attempt or evidence
+chain. Future preparation must precharge the full token buffer; the capability
+performs no allocation. A seal records cohort membership and does not consume a
+report, revoke an otherwise eligible begun attempt or generate a verdict.
+
+The [completion journal](../../crates/focal-core/src/native/completion_updates.rs)
+now collects actual candidate report, seal and fence events against the same
+immutable effective source used for preparation. Existing owner reports and
+controls use this checked path. It validates every event group before changing
+credit, checks exact range-root ancestry and actual registry membership even for
+members without live grants, binds actual Accepted coordinates after their
+Reported event inside the declared publication, and folds multiple transitions of one
+evaluation into one credit update. A report followed by a seal spends exactly
+one report and binds to the final sealed revision. A seal alone preserves credit,
+schemas, workspace and reverse protections. An older pending retirement keeps
+its original zero-credit binding when a later audit-only seal is recorded.
+
+Single updates stay inline. Multiple updates reserve their complete buffer from
+the actual triggering allocation source and lane. Commit removes only retired
+grants; a live sealed grant remains even if a later pending report has already
+advanced it. Tail-first rollback restores exact bindings, counts and index
+weights. Begin and reconstruction also retain one extra revision for an unsealed
+member. Existing report envelopes preflight the complete immutable-policy and
+event traversal bound at Begin and reconstruction. Reconstruction now also
+rechecks the existing Admission projection bound for a still-Posted parent;
+lower owner limits cannot accept a recovered grant whose later report will not
+fit. Sorting, registry lookup,
+state-chain and credit passes share a finite visit allowance; an exhausted
+allowance refuses before grant mutation. Source inspection copies only borrowed
+references, with no root clone, per-evaluation Arc or new dependency.
+
+Report and begun-deadline journal funding now resolves the same held owner pool
+by borrowing it internally after actual loan authorization. External controls
+retain their original borrowed source and lane. This removes the temporary
+shared-budget handle clones from each report and deadline path; it does not
+substitute a grant or change the reserved funding contract.
+
+Qualification: **943 unfiltered affected-library tests passed**: Core 478,
+model 338, evidence 37 and memory 90. Executed:
+`bash scripts/cargo.sh test -p focal-core -p focal-model -p focal-evidence -p focal-memory --lib --offline --locked -- --test-threads=4`.
+The record is `/tmp/focal-seal-full-tests.log`.
+
+Seven new model tests exercise checked source identity, immutable policy and
+state deltas, Ready suppression, retry/quality preservation and stable seal
+causes. Five [journal tests](../../crates/focal-core/src/native/completion_book_rebind_tests.rs)
+cover mixed retirement/live rebinds with younger pending reports, one debit for
+Report followed by Seal, missing/duplicate tokens, absent source membership,
+insufficient actual funding, and shared traversal refusal without changed
+credits or memory. Two owner tests cover Begin/reconstruction refusal below
+complete report-work bounds, intact Core return, and real Required failure
+after sufficient admission, including exhausted parent RAM. Three
+[range tests](../../crates/focal-memory/src/range_successor_tests.rs) reject
+sibling branches and unrelated owners with matching IDs/prefixes and check
+valid sequential candidates without allocation under full memory pressure.
+
+Workspace all-target Clippy with `-D warnings`, the separate production no-panic
+gate, formatting and whitespace checks passed on macOS arm64. Logs are
+`/tmp/focal-seal-clippy.log`, `/tmp/focal-seal-production.log` and
+`/tmp/focal-seal-format.log`. Contract checks verified **697 architecture links,
+37 imported hashes and 15 frozen vocabularies** in `/tmp/focal-seal-contracts.log`.
+These checks do not qualify automatic owner cohort publication.
+
+Automatic cohort sealing is still disabled. Existing production calls pass an
+empty seal-capability list; no participant command can force an unpriced cohort
+write. Enabling the writer requires complete affected registration overrides,
+seal/history profiles and future report/control envelopes, including token and
+mixed-journal coexistence. Evaluator-first BeginWork additionally needs one
+commit/rollback unit combining grant installation and all resulting seal updates.
+These concrete steps are recorded in [18 §6.10](18-lifecycle-storage-upgrade.md#610-native-deadlines-and-remaining-audit-integration).
+
+This increment does not create retained native AuditCohort rows or claimant result
+bundles. Their complete original Accepted/Delivery/Missing history, late audit
+updates, native codecs/import, WAL/Session/quorum and CLI/MCP activation remain
+required. Qualification here cannot establish disk recovery, release-platform
+support or distributed-scale behavior.
+
+## Multiple claim registry overrides — 2026-09-07
+
+Native transaction plans now carry [owned registry overrides](../../crates/focal-core/src/native/registry_overrides.rs)
+for several affected claims. Empty and single-claim plans retain their inline
+representation; multiple claims use a bounded, precharged buffer. Canonical
+appends avoid searching earlier claims and geometric growth gives linear total
+movement over that append sequence. An out-of-order insert uses binary lookup
+and at most one bounded shift. Allocation and actual-capacity checks precede
+every ownership transfer; refusal preserves the earlier collection and the
+caller’s scratch accounting.
+
+The common final-row builder checks sorted, unique claim identities and complete
+override ownership before constructing storage changes. It merges final claims
+with the sorted overrides, consumes each replacement once, and moves each
+already-owned registration buffer into its final claim row. Existing receipt,
+received-testament and Increment-target writers use this path. Other writers
+retain empty overrides and copy their actual source registry as before.
+
+This removes the single-claim structural restriction needed by the future
+automatic cohort writer. It does not emit cohort seals. Future affected-graph
+envelopes still need the full override-buffer growth charge and both policy
+checks for each replacement, alongside evaluation/seal history, token buffers,
+mixed journals and durable storage. No extra participant command, user-facing
+configuration, dependency or shared ownership wrapper was added.
+
+Qualification of the integrated multi-claim path and borrowed journal funding:
+**950 unfiltered affected-library tests passed**: Core 485, model 338, evidence
+37 and memory 90. Executed the same four-library test command as the preceding
+checkpoint; the record is `/tmp/focal-registry-full-tests.log`.
+
+The subsequently added two-claim publication test passed with all eight
+[registry tests](../../crates/focal-core/src/native/registry_overrides_tests.rs)
+using `bash scripts/cargo.sh test -p focal-core --lib native::transactions::registry_overrides --offline --locked`.
+That focused run has 8 passed and 478 filtered tests, recorded in
+`/tmp/focal-registry-integration-tests.log`; it adds one distinct test to the
+950-test run. It combines two actual authorized Increment-target seal plans,
+merges both registries through the production final-row builder and range
+copier, and publishes after the actual pending receipt predecessor. Both
+registries and their events appear together; the earlier source and pinned
+snapshot remain unchanged. The other tests cover inline ownership, canonical
+spill and out-of-order insertion, duplicate/foreign/unconsumed owners, insufficient
+scratch, unexpectedly oversized allocator capacity, and preserved received
+testament/Delivery target, receipt, cycle, seal flags and owned-buffer identity.
+
+Workspace all-target Clippy with `-D warnings`, the separate production no-panic
+gate, formatting and whitespace checks passed on macOS arm64. Logs are
+`/tmp/focal-registry-clippy.log`, `/tmp/focal-registry-production.log` and
+`/tmp/focal-registry-fmt.log`. Contract checks verified **699 architecture links,
+37 imported hashes and 15 frozen vocabularies** in
+`/tmp/focal-registry-contracts.log`. These results cover the borrowed journal
+funding refactor too. Automatic cohort publication, audit bundle authoring,
+native durable/CLI/MCP activation and distributed qualification remain open.
+
+## Begin composition, original history and indexed seals — 2026-09-07
+
+Every managed native Begin now keeps a private checked transition borrowing its
+complete source evaluation state and retaining its authorized next state,
+exact request/intent/time, and immutable publication source. It outlives
+consumption of the preparation command without cloning a root or shared budget
+handle. The
+completion collector verifies this proof, the real Begun event and its original
+position before accepting an intermediate begun revision followed by a seal.
+An ordinary Begin with no later credit change creates no additional book
+journal or phantom revision. Every Begun fact requires its matching proof,
+including one without an attempt; an invented handler-free Begin cannot hide
+behind an unchanged Ready row. Structural MissingTarget facts retain their
+separate event kind and do not require external Begin authority.
+
+The [candidate journal](../../crates/focal-core/src/native/completion_composition.rs)
+holds at most two journals inline: the Begin installation and the complete
+mixed update. The owner reserves its exact pending representation and checks
+owner identities, adjacent revisions and original totals before transferring
+either journal. Refusal drops candidate pages, rolls back mixed updates, then
+returns the Begin's new funding and restores its prior index. Ordered commit
+preserves a live grant even when a younger pending report has advanced it.
+This path is now used by active BeginAdmission, BeginIncrement and BeginWork.
+
+The shared [history visitor](../../crates/focal-core/src/native/history_assembly.rs)
+also drives current publication. It emits the complete original fact sequence,
+including creation/child-registration revisions, original evidence-result
+ordinals and derived claim facts. It reuses the existing precharged history
+workspace; it neither grows a hidden capture buffer nor changes current
+construction profiles. An immutable
+[original plan](../../crates/focal-core/src/native/original_plan.rs) now owns the
+claim plan, extra rows and source/outcome context until that single emission
+pass finishes. Explicit object-journal checks run before encapsulation; implicit
+claim chains remain checked during emission. Original payloads cannot be edited
+through this boundary and move only after the original event count is verified.
+A future writer can append a separately checked seal suffix while retaining
+this original prefix, without allocating a duplicate history buffer.
+
+The [completion collector](../../crates/focal-core/src/native/completion_updates.rs)
+now borrows a checked canonical index over the caller's existing seal-proof
+slice. One linear validation rejects unchanged, duplicate or misordered proofs;
+each lookup then uses binary search with a debit for every probe. Keys retain
+the complete before binding, every target binding and slot, and generation.
+The index allocates nothing and adds no visits to empty-proof report/deadline
+paths. Proof ordering does not reorder the candidate's original events.
+
+Qualification: **all 502 Core library tests passed**, with no failures, ignored
+or filtered tests, using
+`bash scripts/cargo.sh test -p focal-core --lib --offline --locked -- --test-threads=4`.
+The final record is `/tmp/focal-seal-index-tests.log`. The preceding 499-test
+set passed before and after the original-plan ownership refactor, recorded in
+`/tmp/focal-begin-final-tests.log` and `/tmp/focal-original-plan-tests.log`.
+This increment changes native Core
+ownership/history code; the unchanged model, memory and evidence library
+qualification remains recorded in the preceding four-library runs.
+
+Four [composition tests](../../crates/focal-core/src/native/completion_composition_tests.rs)
+cover mixed live rebind/retirement, exact funding/index restoration, a composed
+head committed after a younger report, empty updates and invalid journal
+ownership/order. Four [Begin-proof tests](../../crates/focal-core/src/native/prepare_begin_tests.rs)
+use real Fresh authorization and candidate construction to check proof lifetime,
+request/time identity and exact pending source roots. Omitted proofs,
+missing/duplicate/foreign-key/misordered Begun facts and altered final states
+refuse without losing the installed grant or its report credit. The fourth
+test rejects a fake attempt-free Begun fact against the real source root and
+an unchanged Ready row. Five
+[history tests](../../crates/focal-core/src/native/history_assembly_tests.rs)
+compare the visitor with actual publication for nested creation revisions,
+Admission Accepted, claimant-received Delivery, and explicit WholeWork
+Missing/entry positions; malformed rows and exhausted sinks/workspaces refuse.
+Three [seal-lookup tests](../../crates/focal-core/src/native/completion_seal_lookup_tests.rs)
+check every target variant's binding and slot identity, foreign generation and
+binding refusal, and fifteen actual native Ready-member seal proofs searched
+within four probes each after one complete order check. One fewer visit than
+needed refuses. The mixed-journal fixture preserves reversed original seal
+event order while supplying canonical proofs; reversed or duplicate proof
+slices refuse without changing report credit, funding or book revision.
+
+Workspace all-target Clippy with `-D warnings`, the separate production no-panic
+gate, formatting and whitespace checks passed on macOS arm64. Logs are
+`/tmp/focal-seal-index-clippy.log`, `/tmp/focal-seal-index-production.log` and
+`/tmp/focal-seal-index-fmt.log`. Contract checks verified **707 architecture
+links, 37 imported hashes and 15 frozen vocabularies**, recorded in
+`/tmp/focal-seal-index-contracts.log`. These final checks cover the complete
+Begin, original-plan and indexed-lookup changes; no new shared ownership was added.
+
+Automatic cohort construction is still disabled. Remaining activation work includes full
+affected-cohort demand and growth guards, checked seal-suffix assembly,
+actual seal/registry writes and capability buffers.
+Audit bundle authoring, complete claim/control completion promises, native
+codecs/WAL/Session/quorum, CLI/MCP dispatch and distributed qualification remain
+required; these ownership/history changes do not complete the storage rollout.
+
+## Automatic native cohort sealing — 2026-09-07
+
+The native RAM preparation path now records a complete validation cohort when
+an actual claim first acquires its local seal. The
+[automatic writer](../../crates/focal-core/src/native/cohort_seals.rs) compares
+each final claim with the exact immutable effective source, including pending
+predecessors. An unchanged original seal produces no second cohort. Newly
+sealed claims include Required Admission failure, WholeWork entry/report and
+graph consequences, cancellation, supersession and claim expiry/deadlock.
+No additional participant command is required.
+
+For each selected claim, the writer resolves its complete actual registration
+set and immutable declarations. It uses staged evaluation rows before source
+rows, so a report, authority fence or structural MissingTarget transition can
+be followed by a seal without losing the intermediate state. The checked
+model transition preserves target, generation, receipt, attempt, accepted
+evidence and any prior authority fence. Begun chains keep their independent
+report obligations; unbegun members remain Ready with a cohort suppression,
+and terminal or already-sealed evaluation rows remain unchanged. The registry
+is sealed once even when no evaluation needs a new revision.
+
+The immutable [original plan](../../crates/focal-core/src/native/original_plan.rs)
+retains the complete operation and its original history until one checked
+emission pass finishes. A separately owned suffix supplies evaluation seals
+and registry replacements. Original Accepted, Delivery and Missing sequence
+and ordinal coordinates remain intact; seal events start after the complete
+original prefix. This streams history directly into final storage changes
+without an additional full-history capture buffer. Explicit journal validation
+still checks the original transaction, and final merging consumes every
+replacement exactly once.
+
+The [prepared owner value](../../crates/focal-core/src/native/prepare.rs)
+keeps checked seal capabilities alongside its candidate under the original
+construction allocation. After range construction, that allocation shrinks to
+the token buffer's actual retained capacity and survives until the completion
+collector has checked every source, event and final state. Candidate pages
+retain their own storage charges. The book combines report advancement,
+same-attempt rebindings, retirement and any new Begin grant in the candidate's
+commit/rollback journal. Refusal returns all provisional ownership and credit;
+a seal cannot fabricate a report or consume an outstanding attempt.
+
+The shared [cohort cost profile](../../crates/focal-core/src/native/cohort_budget.rs)
+prices full future registration bounds, seal tokens and lookup records,
+coexisting evaluation containers, registry copies, suffix history, range writes
+and mixed-journal traversal. Required Admission holds its complete cohort as
+a one-time failure surcharge; each remaining Work report holds the bounded
+cohorts of its protected graph component. Later registration, policy and
+retained-heap growth are checked against those original promises. Begin and
+owner reconstruction validate complete actual sources and reserve seal
+revision headroom; candidate evaluation facts preserve that headroom for
+unbegun rows. Ordinary entry and controls still admit their own complete
+consequence before publication. These are RAM report guarantees, not a promise
+that every future claim/control operation or disk write is already funded.
+
+The [completion collector](../../crates/focal-core/src/native/completion_updates.rs)
+now verifies the actual MissingTarget-to-seal chain, including exact response
+entry, absent manifest slot and Required internal result. Its structural
+MissingTarget event phase is checked independently from the retained
+evaluation's configured phase. This handler-free entry creates no external
+attempt and spends no report credit.
+
+Qualification also exposed a retained-journal accounting issue: a multi-update
+book journal survives with its pending candidate until commit or discard, so
+several pending reports can retain several journals. The correction to the
+[Admission envelope](../../crates/focal-core/src/native/completion_envelope.rs)
+and [Work envelope](../../crates/focal-core/src/native/completion_work.rs)
+reserves that journal with Admission's one-time failure allowance and
+with every remaining Work report. A maximum shared workspace alone cannot
+cover those overlapping lifetimes. Construction and temporary seal proofs
+continue to use their separately accounted preparation workspace. Visit-limit
+refusals now distinguish cohort writer, source and completion-journal work
+from a preparation-byte refusal.
+
+Qualification: **980 unfiltered affected-library tests passed**: Core 515,
+model 338, evidence 37 and memory 90. Executed
+`bash scripts/cargo.sh test -p focal-core -p focal-model -p focal-evidence -p focal-memory --lib --offline --locked -- --test-threads=4`.
+The complete record is `/tmp/focal-automatic-seal-final-tests.log`. The first
+integration run failed; this qualification covers the corrected source and
+fixtures, not that intermediate build.
+
+The tests exercise real Required-failure and WholeWork publication, a Begin
+followed by its own seal, late reports, complete registry closure, pending
+rollback and exhausted ancestor capacity. Structural missing-target tests
+reject omitted, reordered and impersonated history while retaining original
+terminal Delivery evidence. Cancellation and deadline tests now verify the
+distinct fence and seal revisions and preserve prior result coordinates.
+The pending-journal regression keeps two real sealing reports pending together
+with ancestor RAM exhausted; their separate retained charges survive head
+commit and return exactly on tail discard. Exact envelope assertions separate
+those retained journals from reusable construction workspace. Original-history
+fixtures replay the same authorized operation against its actual source and
+compare the complete original prefix before testing malformed journals.
+
+Workspace all-target Clippy with `-D warnings`, the separate production no-panic
+gate, formatting and whitespace checks passed on macOS arm64. Logs are
+`/tmp/focal-automatic-seal-clippy.log`, `/tmp/focal-automatic-seal-production.log`
+and `/tmp/focal-automatic-seal-format.log`. No additional Arc wrapper, thread,
+unsafe code or dependency package was introduced. Architecture checks verify **715 links, 37 imported
+source hashes and 15 frozen vocabularies** in
+`/tmp/focal-automatic-seal-contracts.log`.
+
+Native audit cohort rows and claimant result bundles still need complete
+Accepted/Delivery/Missing history, bounded construction and late audit updates.
+Guaranteed whole-claim completion funding and complete adoption, control and
+runtime-scope integration remain open. Native codecs/import, WAL/Session/quorum
+recovery and CLI/MCP activation are also unfinished; this increment does not
+qualify a native disk restart. Client/server binary distribution, cross-platform
+release execution and the distributed deployment/failure journeys remain
+separate delivery work. The next lifecycle steps are recorded in
+[18 §6.10](18-lifecycle-storage-upgrade.md#610-native-deadlines-and-remaining-audit-integration).
+
+## Bounded native audit inspection — 2026-09-07
+
+The native owner now derives an audit from one committed or effective pending
+prefix through a funded borrowed callback. The
+[audit reader](../../crates/focal-core/src/native/audit.rs) resolves the actual
+claim, its complete sealed registration set, immutable definitions and current
+evaluation states. It retains no second mutable evaluation registry. Incomplete
+cohorts remain inspectable while previously begun participants finish; a read
+does not freeze or post a claimant bundle.
+
+[RegistrationSet](../../crates/focal-model/src/lifecycle/registration.rs) now
+retains the original local-seal position. Its private borrowed audit capability
+requires that stamp to match the actual claim's original seal and immutable
+policy. An earlier open-claim target seal has no audit authority without this
+stamp. Terminal evaluations that completed before the seal retain their exact
+original rows; unbegun suppressed members retain no invented verdict.
+
+The [native history scan](../../crates/focal-core/src/native/audit_history.rs)
+seeks each registered evaluation's complete Accepted, Delivery and Missing key
+ranges. It refuses the wrong result family and validates every result against
+its original event and request/timer outcome. External evidence also matches
+the actual artifact's ID, descriptor hash and exact result provenance. Original
+accepted revisions and publication positions must increase within each member;
+attempt ordinals cannot substitute for revision-based storage keys. Late
+reports may occur after the original seal, but every retained position must
+belong to the captured prefix.
+
+The [model bridge](../../crates/focal-model/src/lifecycle/audit_native.rs) checks
+evaluations in complete registry order and consumes grouped history with one
+forward cursor. Exact private declaration stamps, targets, generations and
+receipts remain bound to each member. Contiguous attempts and the exact retained
+latest result reject omitted or substituted retries. Counted in-place sorts
+produce canonical audit ordering; a separate native index preserves original
+publication positions. There is no repeated whole-history scan per member.
+
+Byte and visit admission precedes owned construction. Source arrays, audit
+buffers and the publication index remain charged through the callback, including
+failure or unwind. Requested capacities are reconciled against actual
+allocations before use. Completed cohorts reserve exactly their retained
+results; incomplete cohorts reserve all remaining admitted result capacity.
+[Fallible copies](../../crates/focal-model/src/lifecycle/audit_memory.rs) preserve
+that capacity and independent owned buffers. Existing legacy audit construction
+and result-testament APIs remain available with their original semantics; their
+late-record path now also refuses removal or revision regression of prior
+accepted evidence.
+
+Qualification: **992 unfiltered affected-library tests passed**: Core 519,
+model 343, memory 93 and evidence 37, with no failures or ignored tests.
+The initial Core/model/memory run is recorded in
+`/tmp/focal-native-audit-tests.log`. After the exact artifact-ID guard and its
+corruption case were added, Core and evidence passed in
+`/tmp/focal-native-audit-final-tests.log`; the count does not double-count
+the repeated Core suite.
+
+The five [model bridge tests](../../crates/focal-model/src/lifecycle/audit_native_tests.rs)
+cover exact membership and original seal identity, malformed history, byte/visit
+boundaries, both allocation-failure stages, independent owned copies and late
+completion without new allocation. Four
+[native owner tests](../../crates/focal-core/src/native/audit_tests.rs) cover
+pending and committed retry/quality history, late Observe results, suppressed
+Ready members, artifact-free Delivery/Missing positions, discard, query pressure
+and corrupted history/publication/artifact identity. The separate production
+no-panic gate passed in `/tmp/focal-native-audit-production.log`.
+Final workspace all-target Clippy with `-D warnings` passed in
+`/tmp/focal-native-audit-final-clippy.log`; formatting and whitespace checks
+also passed. Architecture checks verified **727 links, 37 imported source
+hashes and 15 frozen vocabularies** in `/tmp/focal-native-audit-contracts.log`.
+This increment adds no Arc wrapper, unsafe code, thread or dependency package.
+
+At this inspection checkpoint, native claimant-authorized result-testament
+generation and posting remained unimplemented. This prerequisite does not guarantee funded
+whole-claim closure, finish adoption/control/runtime-scope consequences, or
+activate native codecs, disk recovery, WAL/Session/quorum or CLI/MCP dispatch.
+Release distribution and the distributed deployment journeys remain separate
+qualification work.
+
+## Native claimant result testaments — 2026-09-07
+
+The [native bundle owner](../../crates/focal-core/src/native/audit_bundle.rs)
+implements `GenerateResultTestament { claim, id }` and
+`PostResultTestament { expected }`. Generation authenticates the original
+claimant against the actual claim and checks its current binding. The complete
+source audit must have its original local seal and every member must be
+terminal, explicitly fenced, or sealed and suppressed without having begun.
+Begun Observe checks therefore still prevent premature bundle closure.
+The guard accepts local completion independently of terminal claim status.
+Qualification of generation while a live runtime scope still blocks graph
+release requires the remaining native scope-register/release ingress. Current
+native receipt acquisition settles declared start dependencies, and owned child
+membership alone does not add a release wait; no synthetic scope state is used
+to claim that end-to-end case passes.
+
+Generation consumes the actual audit and publication index from one committed
+or effective pending prefix. The bundle retains that captured prefix, the
+original claim seal, every accepted result's original sequence/ordinal, and
+exact suppression, seal-cause and fence facts. Its native content hash commits
+the complete canonical model audit and the separate publication witnesses.
+The model retains the optional seal-cause hash itself, not merely a sealed flag.
+Canonical validation and hashing use bounded linear passes; capacities and
+arrival order are not audit content. The native owner assigns bundle revision
+one and records its Generated position independently of the source capture.
+
+Posting requires the claimant and exact stored Generated bundle binding. It
+advances that object's revision and state to Posted while preserving its
+content, frozen cohort and original positions. It does not reconstruct the
+audit or require the parent to remain at its earlier revision after graph
+progress. Exact retries return the retained request outcome. A per-claim index
+permits only one bundle, including across pending candidates, and both bundle
+generation and response closure reject a testament ID already used by the
+other role.
+
+The bundle has a separate native row, per-claim index, history fact and counter.
+Generation uses five changed keys: the bundle, index, Generated event, metadata
+and outcome. Posting uses four: the replacement bundle, Posted event, metadata
+and outcome. Both leave claim, response, artifact and evaluation rows unchanged.
+The ledger counter increases only on generation; the outcome counts the touched
+bundle row. Existing evaluator-authored per-result artifacts remain the bundle's
+evidence. No second aggregate artifact, result, receipt or response testimony is
+manufactured, and bundle membership does not attach evidence to work slots.
+
+Both operations use ordinary RAM admission. The
+[consuming audit builder](../../crates/focal-core/src/native/audit.rs) charges
+all coexisting source/output buffers to the transaction's preheld `Scratch`
+allowance, then moves the cohort and publication index into the owned row.
+It does not borrow and prematurely release query permits or copy the complete
+audit again. Posting precharges the complete fallible owned copy. With `E`
+members and `R` results, final canonical hashing and copying have checked
+linear bounds in `E + R`; posting counts both its result and publication arrays.
+Native stored-history packing and borrowed/pinned read projections cover the
+distinct role. Existing V1 bytes, codecs and command identities remain unchanged.
+
+Qualification: **1,005 unfiltered affected-library tests passed**: Core 528,
+model 347, memory 93 and evidence 37, with no failures or ignored tests. Final
+Core results are in `/tmp/focal-native-bundle-core-final.log`; the final model
+run, including exact seal causes, is in `/tmp/focal-native-bundle-model-final.log`.
+Memory/evidence results are in `/tmp/focal-native-bundle-model-tests.log`;
+repeated suites are not counted twice.
+
+Nine native bundle tests cover claimant authority, exact bindings and retries,
+pending uniqueness and reciprocal role collisions, complete late Observe
+retry/quality history, deadline fences and structural results without invented
+artifacts, rollback and memory pressure, and independently retained read leases.
+Actual transactions refuse four/three-key limits and succeed at five/four keys
+for generation/posting. A retained Core reconstructs a new RAM owner which can
+post and retry the frozen bundle. Another actual owner history completes a
+second claim and generates its independent audit before posting the first;
+the first bundle's original capture and result positions remain unchanged.
+That test establishes independent ledger progress, not the pending runtime-scope
+activation case above. Four model fingerprint tests cover the fixed native
+encoding, complete field sensitivity, canonical late-arrival order and immutable
+content through posting.
+
+Workspace all-target Clippy with `-D warnings`, the separate production no-panic
+gate, formatting and whitespace checks passed. Logs are
+`/tmp/focal-native-bundle-final-clippy.log`,
+`/tmp/focal-native-bundle-production.log` and
+`/tmp/focal-native-bundle-format.log`. Architecture checks verified **733 links,
+37 imported source hashes and 15 frozen vocabularies** in
+`/tmp/focal-native-bundle-contracts.log`. No Arc wrapper, unsafe code, thread or
+dependency package was introduced by this increment.
+
+These operations do not reserve guaranteed future whole-claim closure. At this
+bundle checkpoint, complete adoption/control/runtime-scope consequences, native durable codecs/import,
+WAL/Session/quorum recovery, CLI/MCP activation, release distribution and the
+distributed deployment journeys remained open. This is an implemented native RAM
+transaction boundary, not a qualified native disk-restart or live protocol path.
+
+## Native receipt adoption and retained open cycles — 2026-09-07
+
+The [native adoption transaction](../../crates/focal-core/src/native/adoption.rs)
+implements `AdoptReceipt { expected, previous, receipt, holder }`. Only the
+claim's original issuer may replace its actual current receipt entitlement.
+The owner checks the exact claim binding and previous fence against retained
+receipt allocation, assigns exactly the next epoch, and requires a fresh
+nonzero receipt ID across the ledger and pending prefix. The replacement holder
+must be an addressable nonzero participant. Adoption refuses an expired authored
+deadline, local or terminal completion, or an exhausted response-cycle allowance;
+it cannot create extra authored response capacity.
+
+The checked [model capability](../../crates/focal-model/src/lifecycle/claim_adoption.rs)
+borrows the exact original claim. Applying it advances the claim revision once
+and replaces the entitlement while preserving immutable content, the attained
+claim status, response history and local outcome facts. Publication records the
+same-status claim revision, exact previous and replacement entitlements, original
+cause and every changed evaluation fence in one candidate. The transfer records
+one new receipt allocation without inventing a testament, diagnostic, work
+artifact, acceptance result or graph outcome. A receipt change alone does not change dependency or
+local-completion truth.
+
+The owner visits the full actual registration set and validates every retained
+definition, target, original receipt and evaluation state. Every eligible
+unfenced evaluation receives the adoption fence, including Ready and begun
+Admission members that have no receipt field. Existing terminal results and
+earlier fences remain unchanged. Accepted results, original attempts, artifact
+evidence and publication positions remain available for the later sealed audit;
+the transfer does not reuse old results as new-holder evidence.
+
+The same checked completion journal retires active report capacity and graph
+protections for the fenced grants before the proposed prefix passes ordinary
+growth and slot checks. A stale old-holder response or evaluator report cannot
+acquire authority from the replacement receipt. Reports already accepted before
+adoption retain their original outcomes, and exact request retries still resolve
+before fresh authority or resource admission. Discarding or refusing a pending
+adoption restores the prior receipt, grant bindings, remaining report credits and
+funding; committed adoption retires responsibility without discarding retained
+or pinned result pages.
+
+An adoption can leave real work or diagnostics in an unclosed cycle. The
+[retired-cycle index](../../crates/focal-core/src/native/retired_cycles.rs)
+retains that exact cycle and its original holder through a per-claim head and
+immutable links. Empty open cycles add no retired entry. Closed cycles remain
+reachable through the original response chain. The replacement holder uses the
+next cycle derived from response history; receipt ID and epoch distinguish an
+abandoned cycle from a new cycle with the same numeric position or slot name.
+Old work, diagnostics, responses and their slot indexes are preserved, and old
+responses are not automatically adopted or attached as replacement evidence.
+The claimant can still explicitly acknowledge an old unattached artifact after
+adoption. That advances only its independent artifact lifecycle, retaining its
+original receipt and provenance; it supplies no replacement-holder work.
+
+The [complete work cursor](../../crates/focal-core/src/native/projection_work.rs)
+traverses the current open cycle, retained abandoned cycles and the complete
+closed response lineage without a ledger scan or allocated membership list.
+Exact link termination, descending receipt epochs, original receipt allocation,
+work provenance and aggregate counts reject broken or duplicated membership.
+Diagnostic-only retired cycles consume traversal capacity even when they yield
+no work. The model retains all evaluation registrations for audit, reopens only
+the replacement entitlement's Increment target seal, and checks current readiness
+and historical entry facts against their respective receipt identities.
+
+[Registration bounds](../../crates/focal-core/src/native/response_budget.rs)
+add retired work's Increment targets to the immutable authored-response baseline.
+The [projection quote](../../crates/focal-core/src/native/projection_quote.rs)
+includes both retained work and the extra cycle, receipt and link lookups.
+New WholeWork completion contracts price that complete shape; held contracts
+continue to protect their original limits. Adoption refuses atomically if
+retained membership, future registration capacity, visits, batch rows, memory or
+an affected held grant's bound cannot accommodate it. It does not expand a
+previously funded promise without admission or silently omit old evidence.
+
+Qualification: **1,031 unfiltered affected-library tests passed**: Core 544,
+model 357, memory 93 and evidence 37, with zero failed or ignored tests. Final
+Core results are in `/tmp/focal-native-adoption-core-qualified.log`; model,
+memory and evidence results are in `/tmp/focal-native-adoption-libraries.log`.
+Repeated Core runs are not counted twice.
+
+The 16 new native tests cover actual authority and receipt-ID conflicts,
+same-status claim and receipt history, pending/committed retries, no automatic
+testimony, replacement success/failure testimony, preserved old-artifact
+observation, Admission and Work fences, report/adoption ordering, pressure refusal
+and rollback restoring held report capacity. Increment coverage retains a real
+Error result, resets the old target seal, discards a staged adoption and fresh
+work together, then validates replacement work under the new receipt and reaches
+satisfaction with the old history still present in the audit. Retired-cycle tests
+exercise repeated slot reuse, diagnostic-only cycles, bounded traversal and
+corrupt chain termination. Two deliberately corrupted-source tests reject a
+broken closed-cycle link and a substituted MissingSlot target when the real
+response contains that slot; healthy copied owner history first proves the
+transfer is otherwise admissible. These are explicit corruption fixtures, not
+claims that participant ingress permits those states.
+
+Ten model tests cover the complete borrowed adoption capability, source changes,
+exact-next-epoch and overflow boundaries, all relevant validation phases,
+terminal/fenced preservation, registry reopening, and receipt-qualified
+historical entry and work membership. Existing exact cursor-budget tests now
+account for the additional retired-index lookup without relaxing their failure
+boundaries.
+
+Workspace all-target Clippy with `-D warnings` and the separate production
+no-panic gate passed, recorded in `/tmp/focal-native-adoption-clippy-final.log`
+and `/tmp/focal-native-adoption-production.log`. Formatting and whitespace checks
+passed; the format check is in `/tmp/focal-native-adoption-format.log`.
+Architecture checks verified **750 links, 37 imported source hashes and 15 frozen
+vocabularies**, recorded in `/tmp/focal-native-adoption-contracts-final.log`.
+This increment adds no Arc wrapper, unsafe code, thread or dependency.
+
+This remains a native RAM owner transaction. Whole-claim completion funding,
+remaining control/succession/runtime-scope integration, native durable codecs and
+import, WAL/Session/quorum recovery and CLI/MCP activation remain open. Adoption
+does not launch a participant, worker, tool or model job, and this implementation
+does not establish a native disk-restart or deployment guarantee.
+Document 18 §6.12 records the next scope integration sequence, including the
+precharge, monitor-release, reverse-subscription, deadline and funded graph
+consequence prerequisites which must accompany active native monitor admission.
+
+## Native owner-scope release — 2026-09-07
+
+The [native release transaction](../../crates/focal-core/src/native/scope_release.rs)
+implements `ReleaseScope { expected }`. It authenticates the original issuer,
+checks the exact current claim binding and requires a terminal, unreleased owner.
+The complete retained owned-child set must already be released. Neither a caller
+summary nor cancellation alone supplies that proof. The transaction does not
+cancel children, release another owner's scope, detach work, or create testimony
+or evaluator evidence. Fresh release of an already-released owner refuses;
+exact request retries return their original outcome.
+
+The initiating `OwnerReleased` claim event records a single revision advance
+without changing status. The claim retains its original terminal cut, local
+seal, receipt, immutable content and response history; its separate scope release
+cut records the actual publication sequence and request intent. Release adds no
+evaluation fence and does not retire eligible late report grants. Already-begun
+checks continue under their existing receipt, evaluator, deadline and control
+guards, with their original evidence and acceptance history intact.
+
+The [bounded model release plan](../../crates/focal-model/src/lifecycle/scope_release.rs)
+checks actual owner and peer bindings before allocation. Its construction quote
+includes the replacement scope registry, nested roots, owned children, complete
+read-binding buffer and allocator overhead. The native owner charges that quote
+before building, verifies actual capacities, and separately charges graph/peer
+buffers and the claim copy. Canonically ordered children and peers use a bounded
+merge instead of repeated child-by-peer searches. The native bounded path refuses
+unreleased active monitors; their terminal-owner disposition remains a separate
+integration requirement.
+
+The private [released-root capability](../../crates/focal-core/src/native/graph_owner_release.rs)
+consumes a real checked model `OwnerReleased` transition against the exact
+borrowed source view. It exposes the resulting claim only immutably before the
+initial event is recorded. Graph propagation consumes that capability through a
+separate entry; ordinary report preparation retains its unchanged-scope guard.
+Complete outgoing/incoming and owned-child discovery uses retained native indexes,
+including original terminal peers. Only genuinely proved dependency failure or
+graph satisfaction may add subsequent claim transitions. Those rows, original
+release event, any checked cohort suffix and request outcome publish atomically.
+
+This command uses ordinary RAM admission and existing completion protection
+checks. Byte, visit, revision, event, batch and outcome limits can refuse the
+entire candidate. Refusal or pending discard preserves the prior release state,
+claim history and held report capacity; no intermediate release becomes visible.
+Traversal allowances currently bound individual preparation and history-checking
+stages; they are not a single transaction-wide visit allowance. Shared traversal
+accounting remains part of complete scope integration.
+It does not establish guaranteed future scope or whole-claim completion funding.
+
+Qualification on macOS arm64, 2026-09-07: the final unfiltered affected-library
+run passes **915 tests** (554 core and 361 model), with no failures, ignored or
+filtered tests. Four model tests cover exact byte/visit bounds, allocation
+failures, complete peer bindings and monitor/child disposition. Ten core tests
+cover the checked graph entry, real cancelled ownership trees, pending child-first
+release, issuer/revision guards, exact retries, memory refusal and suffix discard,
+unchanged satisfied testimony, and already-begun late reports under pressure.
+The journal regression uses real external dependent claims and rejects eleven
+corruptions, including duplicate facts hiding an unused final row.
+
+Strict workspace all-target Clippy, the separate production no-panic gate,
+formatting and diff checks pass. Architecture contracts resolve **762 links**,
+preserve all **37 imported source hashes** and validate **15 frozen vocabularies**.
+No Arc, unsafe code, thread or dependency was added by this increment. These
+checks qualify the exercised native RAM paths; this was not a full workspace
+test run or a native durable-restart/deployment qualification.
+
+Active monitor registration and named rebinding, reverse monitor subscriptions,
+monitor deadlines and complete funded multi-revision settlement remain required
+by [18 §6.12](18-lifecycle-storage-upgrade.md#612-runtime-scope-integration-sequence).
+Native durable codecs/import, WAL/Session/quorum recovery and CLI/MCP activation
+remain open. This owner release records a peer's explicit lifecycle action; it
+does not launch a worker, tool or participant continuation.
+
+## Bounded monitor construction, disposition and deadline assessment — 2026-09-07
+
+The [monitor construction plans](../../crates/focal-model/src/lifecycle/scope_monitor.rs)
+authorize registration and named successor rebinding against the exact owner,
+receipt and complete graph peers. Successful release requires each exact root
+predicate to settle. The borrowed plan allocates nothing during preflight and
+quotes the complete compact scope registry, nested roots, children, binding-read
+buffer and allocator metadata. It accounts for construction traversals before
+building, checks every allocated capacity and reports actual final charge.
+Source graph/peers, caller ClaimState copies and future native subscriptions are
+separate construction obligations. The existing legacy methods remain available;
+the new bounded entry points provide the native construction seam.
+
+Explicit terminal-owner monitor cancellation closes a previously unresolved
+teardown case. A `Satisfied(B)` wait cannot successfully release after B fails.
+The original claimant may instead cancel that monitor, subject to current owner
+binding/receipt and terminal-state checks. A single disposition enum records
+either successful release or cancellation, with the original terminal position
+and distinct cancellation cut. Roots, deadline, registration and rebinding history
+remain intact. The graph excludes cancelled waits and advances its minimum cut;
+the owner-release model accepts disposed monitors but still requires every owned
+child to have released. No target, child, claim outcome, response or validation
+result is fabricated by cancellation. The [glossary](../../CONTEXT.md) and
+[domain contract](02-domain-and-lifecycle.md#72-monitor-implementation-contract)
+record this distinction.
+
+The [monitor deadline plan](../../crates/focal-model/src/lifecycle/scope_deadline.rs)
+checks monitor identity, full deadline, due logical time and complete source cut
+before allocation. It quotes SCC workspace and carries one traversal allowance
+through preflight/query. Inactive and settled waits return without SCC allocation.
+An unsettled wait must use the captured earliest effective deadline: the query
+either returns a canonical deadlock witness or constructs private negative-SCC
+expiry authority. The exact owner/peer check on `expire_monitor` permits a real
+earlier monitor deadline without modifying the claim's authored deadline.
+Deadline mismatch, stale peers, construction failure and exhausted traversal
+remain errors, never authority for an expiry fallback.
+
+Qualification on macOS arm64, 2026-09-07: the final unfiltered affected-library
+run passes **928 tests** (554 core and 374 model), with zero failed, ignored or
+filtered tests. Thirteen new model tests cover allocation-free quoting and exact
+limits, each construction allocation's refusal, capacity reconciliation, actor/
+receipt/revision and complete-peer guards, actual named successor rebinding,
+distinct root predicates, impossible-wait cancellation, preservation of owned
+children and original cuts, earlier monitor expiry, canonical SCC precedence,
+settled/inactive timers and refusal without negative-cycle evidence. One initial
+cycle fixture supplied graph sources out of canonical order; the corrected
+fixture uses the ordered source graph and real checked registration transitions.
+
+Strict workspace all-target Clippy, the separate production no-panic gate,
+formatting and diff checks pass. Architecture contracts resolve **772 links**,
+preserve all **37 imported source hashes** and validate **15 frozen vocabularies**.
+No Arc, unsafe code, thread or dependency was added. This is a model increment,
+not native monitor ingress or disk-restart qualification; the full workspace test
+suite was not rerun for this increment.
+The native graph and receipt readers recognize disposed monitors while retaining
+their guards against active monitor admission. Reverse subscription storage,
+atomic native register/rebind/disposition history, typed durable timer retries,
+complete iterative consequences and held completion bounds remain on the
+critical path in [18 §6.12](18-lifecycle-storage-upgrade.md#612-runtime-scope-integration-sequence).
+
+## Native monitor publication and report reservations — 2026-09-07
+
+The [native monitor commands](../../crates/focal-core/src/native/monitor_commands.rs)
+implement claimant registration, explicit named-successor rebinding and terminal
+owner cancellation. Each checks the exact current owner binding and receipt.
+Registration retains a globally unique monitor allocation; rebinding retains its
+original registration and finite deadline. Each actual scope transition records
+one claim revision and a typed monitor event at the same publication cut.
+Cancellation retains the owner's original failure and does not masquerade as
+successful predicate settlement or release its owned children.
+
+The [reverse index](../../crates/focal-core/src/native/monitor_index.rs) stores
+direct-root subscriptions with checked owner, registration and rebind provenance.
+Removed links become bounded retained tombstones; IDs cannot be recycled. Both
+directions are checked against actual scopes before graph discovery. Journal
+validation independently reconstructs all and only the proposed index changes,
+including registration followed by immediate release and several owners sharing
+one subscription chain. This is direct-root indexing with connected graph
+discovery; the planned materialized transitive closure/cache remains separate.
+
+The [consequence engine](../../crates/focal-core/src/native/graph_monitor_effects.rs)
+recaptures a frozen graph after each real transition, up to one release per
+active monitor and one terminal transition per live claim. Terminal owners can
+still release their monitors without changing their original outcome, receipt or
+testimony. Work entry/reporting, owner release, cancellation, supersession and
+deadline resolution use these consequences. Explicit owner-scope release remains
+an independently authorized claimant action. The
+[control proof](../../crates/focal-core/src/native/control_graph.rs) retains the
+real original creation/control plan and exact history prefix before appending
+graph effects; it does not reconstruct imaginary intermediate claim states.
+
+[Monitor timer ingress](../../crates/focal-core/src/native/monitor_ingress.rs)
+uses a disjoint claim/monitor/timer/generation key and hashes the complete
+deadline into retry identity. Resolution validates the retained monitor
+allocation even for inactive timers. SCC resolution, release and fresh-trigger
+reassessment finish before timer consumption. Only a typed negative-SCC witness
+permits expiry; earlier effective deadlines, stale sources and resource refusal
+remain errors. An actual monitor can expire a claim with no claim-level deadline,
+and its real evaluation cohort is fenced without manufacturing evidence.
+
+[Held Work report contracts](../../crates/focal-core/src/native/completion_work.rs)
+now reserve monitor revisions/events, index edits, cumulative graph captures and
+row copies, journal replay, cohort consequences and source rechecks. Ordinary
+bounded stages retain their existing admission limits; accepting a Work attempt
+additionally requires the complete future report bound. Protected component
+membership survives a monitor's release by retaining the original member IDs.
+The topology fingerprint permits disposition changes while pinning monitor
+identity, roots, registration, rebind and deadline. New monitor endpoints also
+visit affected grants, so a change cannot evade a held report's growth checks
+through an otherwise unchanged target row.
+
+Qualification on macOS arm64, 2026-09-07: the final unfiltered affected-library
+run passes **953 tests** (576 core and 377 model), with zero failed, ignored or
+filtered tests. Twenty-five added regressions cover exact subscription replay,
+multiple releases and intermediate revisions, earlier monitor deadlines and SCC
+precedence, deadline-less claim expiry, actor/receipt/revision refusal, real named
+supersession, terminal-owner cancellation, retained original cuts and rejection
+of forged control history. A held Work report settles two real monitors with
+the ancestor RAM budget exhausted; discarding that candidate restores its waits
+and the original report promise, and the report succeeds again under pressure.
+Frozen V1 codec/hash tests remain in the passing library run. The complete
+workspace test suite and disk-restart/distributed monitor tests were not run for
+this native increment.
+
+Strict workspace all-target Clippy and the separate production no-panic gate
+pass. Formatting, diff and architecture checks pass: **784 links**, all **37
+imported source hashes** and **15 frozen vocabularies**. No Arc, unsafe code,
+thread or dependency was added for native monitors.
+
+The live service, codecs and CLI/MCP still select V1. Remaining work includes
+Admission failure propagation and its held report bounds, complete predicate and
+control interleaving qualification, guaranteed whole-claim RAM and disk capacity,
+materialized monitor closures, durable wake/reconciliation, native codecs,
+WAL/Session/quorum recovery and interface activation. These RAM transactions do
+not establish disk restart or distributed monitor recovery.
+
+## Native Admission failure propagation and held reports — 2026-09-07
+
+The Admission graph work left open in the preceding increment is now implemented
+in the native RAM owner. A Required Admission result that closes a Posted claim
+retains its actual evidence artifact, evaluation transition and accepted result
+at original ordinals 0, 1 and 2. The original `PostFailed` event follows at ordinal
+3. The [report proof](../../crates/focal-core/src/native/admission_graph.rs)
+preserves that exact failure binding and Required cut while the same transaction
+publishes dependent failures, monitor releases and automatic evaluation seals.
+Later monitor revisions can advance the reporting claim without replacing its
+original failure or changing the accepted result's coordinates. Receipt or a
+terminal parent closes Admission; eligible begun reports afterward remain
+independent audit evidence. No graph consequence fabricates respondent testimony
+or an explicit owner-scope release.
+
+The [Admission completion envelope](../../crates/focal-core/src/native/completion_admission_graph.rs)
+reserves the complete possible failure before a Required attempt on a Posted
+claim is accepted. It includes graph and monitor revisions, reverse-index edits,
+original and seal history, final row heaps, temporary copies, journal validation
+and completion accounting. One possible failure has a separate allowance from
+the remaining ordinary reports. Reconstruction of already begun evaluations
+derives the same remaining responsibility and returns the original Core intact
+if funding is refused. Observe checks and already closed Admission parents keep
+their ordinary report contracts.
+
+[Shared graph protection](../../crates/focal-core/src/native/completion_graph.rs)
+now covers both Admission and Work grants. Even an isolated Posted parent retains
+its original component membership, so a later incoming dependency or monitor
+cannot add unfunded consequences through an unchanged target row. Complete
+original membership survives monitor release. Pending publication and discard
+journal grant accounting and protection membership together; committing a retired
+grant refunds its retained member buffer.
+
+The completion collector now classifies a failure from the actual original
+event and source parent. Inferring it from a final revision rejected a valid
+failure followed by a monitor release. Counting every Admission journal longer
+than three events as a new failure also rejected valid late reports with cohort
+seals. Both owner dispatch and collection use the checked source transition,
+original event identity and original terminal cut. Missing original failure
+history is refused, and the additional indexed lookup is priced before Begin.
+
+Qualification on macOS arm64, 2026-09-07: the final unfiltered affected-library
+run passes **963 tests** (586 core and 377 model), with zero failed, ignored or
+filtered tests. Ten new regressions cover failure journal corruption, preserved
+evidence and accepted ordinals, retained component growth, reconstruction and
+complete report funding. The pressure case retains an earlier Error artifact,
+then publishes a failing result, a dependent failure and two monitor releases
+with the ancestor RAM budget exhausted. One release advances the reporting
+claim itself after its initial failure. Discard restores the original claims,
+monitors, evaluation states, report credit and result visibility; the same report
+then succeeds again under pressure. A late Observe report preserves those
+terminal cuts and adds only its three original report facts. Existing frozen V1
+codec/hash tests remain in the passing library run.
+
+Strict workspace all-target Clippy and the separate production no-panic gate
+pass. Formatting, diff and architecture checks pass: **795 links**, all **37
+imported source hashes** and **15 frozen vocabularies**. No Arc, unsafe code,
+thread or dependency was added for this increment.
+
+The live service, codecs and CLI/MCP still select V1. Remaining work includes
+whole-claim RAM and disk capacity guarantees, complete control/predicate
+interleaving qualification, materialized monitor closures, durable wake and
+reconciliation, native codecs, WAL/Session/quorum recovery and interface
+activation. This increment does not qualify disk restart or distributed recovery;
+the complete workspace test suite was not rerun.
+
+## Native respondent reporting capacity — 2026-09-07
+
+The native owner now reserves mandatory respondent reporting capacity before
+accepting an acquired or adopted receipt. The
+[respondent envelope](../../crates/focal-core/src/native/respondent_envelope.rs)
+funds one bounded Work-failure diagnostic, one authored response close and one
+post per remaining response cycle. Optional successful output payloads retain
+ordinary admission. Receipt does not generate a testament: the authenticated
+holder supplies the outcome, summary, confidence and actual evidence after its
+work succeeds or fails.
+
+The [state reader](../../crates/focal-core/src/native/respondent_state.rs)
+reconstructs independent diagnostic, close and post counts from actual receipts,
+cycle membership, complete response lineage and exact claim-history stamps.
+Several Generated responses can await posting independently. Closing a later
+cycle preserves the earlier reports' posting capacity. The first actual Work
+diagnostic fulfills its cycle's diagnostic allowance; other diagnostic reasons
+and extra diagnostics use ordinary admission and cannot consume the last
+unspent mandatory diagnostic slot.
+
+[Respondent bookkeeping](../../crates/focal-core/src/native/respondent_book.rs)
+uses the existing completion pool and a uniquely owned index. Receipt admission
+funds future retained range writes and a shared maximum construction/verification
+workspace through Ordinary capacity. Full finite-record accounting includes
+response rows, artifacts, outcomes, events and sequence/candidate margins.
+Optional writes must preserve the admitted source, parent/registry, authored
+buffer, response history and revision bounds. No per-receipt Arc or separate
+memory pool was introduced.
+
+The [owner adapter](../../crates/focal-core/src/native/respondent_owner.rs)
+selects the authenticated operation's loan before custody verification or owned
+construction. Its guaranteed diagnostic path pins the builtin error-report
+schema; other trusted schemas use ordinary verification. Closing and posting
+stored testimony do not consult a new diagnostic verifier. Reconstruction
+validates exhausted receipts without acquiring an unnecessary schema contract.
+Unavailable funding returns the original Core intact; this is checked transfer
+of an already-owned native RAM state, not disk checkpoint decoding.
+
+Candidate journals compose evaluator updates, respondent retirement and new
+receipt installation in fixed inline ownership slots. Refusal drops prepared
+pages before reversing their credit; tail discard restores the old receipt's
+funding, and head commit preserves later pending operations. Adoption must fund
+the replacement receipt before it takes effect. Graph-triggering Work reports
+and the one possible Admission failure additionally price retirement journals
+for affected respondents. Independent evidence and original response history
+remain retained after their reporting allowances retire.
+
+Qualification on macOS arm64, 2026-09-07: the final unfiltered affected-library
+run passes **985 tests** (608 core and 377 model), with zero failed, ignored or
+filtered tests. Twenty-two new regressions cover independent credits and Generated
+backlogs, actual-source reconstruction, bounded descriptors and authored buffers,
+finite-record accounting, adoption, composed journal rollback, and schema selection.
+The managed pressure test records diagnostics and authored Failed/Partial
+testaments through all four admitted cycles, refilling the ancestor RAM budget
+before each diagnostic, close and post. It retains an earlier snapshot, exercises
+discard/retry at each action, and retires the final allowance without erasing
+evidence. Separate cases preserve the old holder's reporting ability after
+refused receipt/adoption, reject a diagnostic that would strand mandatory failure
+reporting, and reconstruct outstanding close/post responsibility. A corrupted
+response-cycle association is now rejected during owner reconstruction, returning
+the original Core, terminal Receipt results, evidence and budget intact.
+
+Strict workspace all-target Clippy and the separate production no-panic gate
+pass. Formatting, diff and architecture checks pass: **806 links**, all **37
+imported source hashes** and **15 frozen vocabularies**. No Arc, unsafe code,
+thread or dependency was added for this increment. Frozen V1 codec/hash tests
+remain in the passing library run; the full workspace test suite was not rerun.
+
+The live service, codecs and CLI/MCP still select V1. This milestone establishes
+native RAM/discrete-record reporting capacity, not disk restart or distributed
+durability. Remaining work includes claimant receipt/evaluation-entry and complete
+whole-claim/control guarantees, disk and replica quotas, native codecs/import,
+WAL/Session/quorum recovery and interface activation, durable reconciliation and
+distributed deployment qualification. External execution and physical allocation,
+storage or quorum failures remain explicit failures, never invented testimony or
+successful durability acknowledgments.
+
+## Bounded native input preparation — 2026-09-07
+
+The allocation-free input inspection prerequisites now expose the complete
+fields currently represented by native declarations, acceptance policies,
+artifact descriptors and respondent reports. These are Rust model APIs; no byte
+decoder or owner wire ingress was activated.
+
+[AcceptancePlan](../../crates/focal-model/src/lifecycle/acceptance_prepare.rs)
+checks full slot/declaration correspondence, mandatory Delivery, duplicate
+identities and missing-slot index collisions before allocating. It quotes final
+buffers and allocator counts separately, preserves declaration order independence,
+and builds under an explicit byte allowance. The canonical fingerprint shares
+the existing owned-policy encoding. Canonical selection currently has bounded
+quadratic work in the declaration count; a future decoder must budget the actual
+scans and sort as well as buffers.
+
+[Declaration views](../../crates/focal-model/src/lifecycle/validation_definition.rs)
+expose complete deadlines, target policy, phase definitions and ordered borrowed
+handler fallbacks. Prepared declarations expose the same identity as their built
+form. [Artifact plans](../../crates/focal-model/src/lifecycle/artifact_descriptor.rs)
+derive content and native request identity from the checked borrowed descriptor.
+[Response input plans](../../crates/focal-core/src/native/response_input.rs)
+quote and construct the respondent's actual summary, confidence, outcome,
+manifest and diagnostics. They do not fabricate evidence or close a work cycle.
+
+At this prerequisite checkpoint, the unfiltered core/model run passed **1,000
+tests** (612 core and 388 model), with zero failures, ignored or filtered tests.
+Fifteen new tests cover full borrowed views, unchanged identities, correspondence,
+all reported outcome/confidence values, dimensions and fallible construction.
+Strict workspace all-target Clippy and the separate production no-panic gate
+passed. The contract check passed **815 links**, all **37 imported source hashes**
+and **15 frozen vocabularies**. These counts precede the authored-content work
+below; they are not a full-workspace or distributed qualification.
+
+The codec audit also identified a prerequisite semantic gap: native claim rows
+and validation declarations omit the authored request and checking instructions.
+Opaque bindings cannot recover those fields. [18 §6.13](18-lifecycle-storage-upgrade.md#613-successor-input-codec-dependency-plan)
+now requires complete authored content and checked projections before format
+freeze, alongside all 27 actor commands and three trusted timer namespaces.
+The live service, CLI and MCP continue to use V1.
+
+## Authored claim and validation descriptor foundations — 2026-09-07
+
+Standalone native descriptors now retain the request and checking instructions
+that the existing lifecycle projections omit. They are internal checked Rust
+types, with no new persisted schema allocation or live dispatch.
+
+The [claim descriptor](../../crates/focal-model/src/lifecycle/claim_descriptor.rs)
+owns bounded instruction text, occurrence, canonical party/action/cause and
+contextual relations, normalized authored work scopes, ordered requirement pins,
+deadline and complete output-slot rules. Zero-check slots and separate required
+presence rules remain part of the body. Party/action views derive from the
+immutable relations. Self-directed drafts remain representable; a separate local
+posting check rejects them except for Handoff, whose legitimacy still needs
+owner verification. Unsupported relation profiles are refused, not discarded.
+
+The [validation descriptor](../../crates/focal-model/src/lifecycle/validation_descriptor.rs)
+owns the actual instruction, optional quality standard, contributor provenance
+and policy revision with the exact target, evaluator, ordered fallback, attempt,
+schema and deadline policy. Programmatic and agentic behavior follows the
+declared program; text does not choose an execution phase. Pure Delivery refuses
+a quality rubric. Contributors and referenced policy documents do not confer
+evaluator authority, and Focal runs no tools or workers.
+
+Both descriptors compute content identity from the complete checked body,
+excluding their own allocated ID. Address-sensitive request identity remains
+separate. Validation additionally computes an independent requirement
+specification hash that excludes the allocated parent claim. A claim's
+`RequirementRef.specification` pins that specification; the validation's full
+content separately binds it to its actual parent. Existing native stamps, their
+retry preimages and frozen V1 identities are unchanged. Pinned external evaluator
+standards retain their original identities.
+
+Borrowed preparation allocates nothing and quotes final dynamic bytes plus a
+separate allocator count. Construction and compact copying use fallible exact
+buffers with immediate capacity reconciliation; refusal leaves the input and
+existing descriptor intact. Existing declaration construction/copying now uses
+the same checked allocation mechanism, including target text and both handler
+arrays. No per-object shared ownership was introduced.
+
+Qualification on macOS arm64, 2026-09-07: the unfiltered affected-library run
+passes **1,018 tests** (612 core and 406 model), with zero failed, ignored or
+filtered tests. Eighteen new regressions cover independently encoded content
+vectors, complete supported claim relations/scopes/slot policies and validation
+program/target shapes, occurrence and requirement-specification identity,
+authored-field mutations, malformed inputs and all partial construction/copy
+allocation failures followed by exact retry. They preserve actual external
+standard identities and keep Delivery distinct from evidence evaluation.
+
+Strict workspace all-target Clippy and the separate production no-panic gate
+pass. Formatting, diff and architecture checks pass: **839 links**, all **37
+imported source hashes** and **15 frozen vocabularies**. No Arc, unsafe code,
+thread or dependency was added for this increment. Frozen V1 codec/hash checks
+remain in the passing library run; the full workspace test suite was not rerun.
+
+These descriptors are not yet retained by Core. The next assembly/store work in
+[18 §6.13](18-lifecycle-storage-upgrade.md#613-successor-input-codec-dependency-plan)
+must derive or verify the actual graph, lineage and acceptance projection;
+resolve exact declaration specifications and reference authority; install
+immutable content and dedup indices atomically; and expose matching content/state
+through one effective prefix. Independent immutable rows also need real page
+isolation before claiming lifecycle updates never copy request text. Codec,
+WAL/checkpoint/Session/quorum integration and CLI/MCP activation remain pending.
+
+## Authored native creation and immutable page isolation — 2026-09-07
+
+The native RAM owner now has a separate complete-content profile. It retains the
+actual request and validation instructions together with their derived lifecycle
+state; it does not reconstruct omitted text from projection hashes. The live
+service, SDK, CLI and MCP still select V1.
+
+[AuthoredCreationPlan](../../crates/focal-model/src/lifecycle/authored_creation.rs)
+assembles graph, correction lineage and acceptance from exact claim and validation
+descriptors. It verifies complete parent/issuer/specification/slot correspondence,
+including Required Delivery and zero-check slots. Descriptor order need not match
+requirement order. Its bounded construction quote includes final and temporary
+buffers and allocator bookkeeping; canonical graph/lineage buffers move into the
+projection without another copy. Actual counted inspection and build traversals
+share one allowance. The consuming projection releases borrows before storage
+moves the original bodies.
+
+[CreateAuthored](../../crates/focal-core/src/native/authored.rs) groups each claim
+with its actual validation bodies, response/scope capacity profile and original
+owner precondition. The normal multi-claim CreationPlan still supplies owner,
+lineage, graph and ordered-cut checks, including supersession and existing control
+consequences. Complete contextual relation endpoints resolve against committed
+state, earlier pending candidates and the proposed batch. Claims and validations
+may reuse the same numeric ID bytes because addresses are scoped by object family.
+
+`Core::new_native_authored` starts an empty AuthoredV1 RAM root; `new_native`
+remains ProjectionOnly. Each refuses the other's creation input. The original
+Create command's native tag/intent stays unchanged; the new command has its own
+internal identity. This distinction assigns no durable schema, imports no missing
+content and activates no transport.
+
+[Owned content](../../crates/focal-core/src/native/owned.rs) retains each original
+claim descriptor and responsibility profile in one fallible container. Definition
+rows retain either the old declaration or one complete validation descriptor;
+existing policy readers borrow the descriptor's actual declaration. Moving inputs
+preserves instruction and handler allocations. The
+[range partition layout](../../crates/focal-memory/src/range.rs) now has an optional
+immutable classifier shared by preflight, construction and import. Native content,
+definition, artifact and frozen creation-result namespaces occupy actual separate
+pages. Unchanged small pages can be reused across lifecycle-only writes, as well
+as already oversized rows; this uses no fake padding or new per-object Arc.
+Unpartitioned range layout and merge charges remain unchanged.
+
+[Preparation](../../crates/focal-core/src/native/authored_prepare.rs) installs
+body, family/schema/full-content identity, definition, lifecycle, history and
+ordered creation-result rows under one root. Entirely existing content produces
+an outcome and frozen requested/resolved-ID mapping without new object facts.
+Partial duplicates, conflicting IDs, changed responsibility profiles and duplicate
+same-family content refuse atomically. Validation dedup uses the parent-bound
+content hash; requirement pins use the separate specification hash. No parent or
+requirement reference is silently rewritten.
+
+The [publication audit](../../crates/focal-core/src/native/authored_check.rs)
+checks exact row/index membership and the private retained-content proof before
+common history emission. That proof binds full descriptor identities, the original
+owner fence and every returned ordinal/requested/resolved ID. Publication auditing
+has a separately preflighted, dimension-derived visit allowance; it does not reset
+its budget for each lookup. Reconstruction checks actual bodies, descriptor
+variants, profile/cause shape, bidirectional indices and retained heap charges,
+returning the original Core on refusal. This is checked transfer of an existing
+RAM root, not checkpoint decoding.
+
+[Borrowed reads](../../crates/focal-core/src/native/authored_reads.rs) expose body,
+policy, state and frozen result from the same effective or retained prefix.
+Authored claim reads reject an existing state with a missing body. Posting checks
+self-work from the actual descriptor. Self-Handoff currently refuses too: the
+native owner does not yet have an authenticated transfer capability, and a label
+alone cannot grant one. Participants continue to run their own tools and author
+success/failure testimony explicitly; no receipt fabricates a testament.
+
+Qualification on macOS arm64, 2026-09-07: the unfiltered affected-crate run passes
+**1,175 tests** (638 core, 413 model and 124 memory), with zero failed, ignored or
+filtered tests. Thirty-eight new regressions cover model assembly, real page
+partition/import reuse, atomic authored retention and policy correspondence,
+family-scoped IDs, complete/pending references, retry/dedup/profile refusals,
+original-owner/result proof integrity, pinned reads and lifecycle allocation
+addresses, malformed reconstruction, and fallible copying with exact retry.
+
+Strict workspace all-target Clippy and the separate production no-panic gate
+pass. Formatting, diff and architecture checks pass: **856 links**, all **37
+imported source hashes** and **15 frozen vocabularies**. No per-object Arc,
+unsafe code, thread or dependency was added. Existing range page/root sharing
+remains in the memory engine. Frozen V1 codec/hash checks remain in the passing
+libraries; the full workspace test suite was not rerun.
+
+The remaining plan includes legitimate transfer/reference-policy authority,
+complete claimant/whole-claim resource guarantees, successor input and recorded
+mutation codecs, bounded checkpoint import, WAL/Session/quorum recovery and
+CLI/MCP activation. Disk/replica quotas, durable reconciliation and global
+placement/deployment qualification also remain. This milestone makes no claim of
+native restart durability, live successor-interface activation or global scale.
+
+## Complete native input framing and fixed-field decoding — 2026-09-07
+
+The dormant [native input codec](../../crates/focal-core/src/native/input_codec.rs)
+now represents all **28 actor commands** and the three separate evaluation,
+claim and monitor timer namespaces. The complete grammar, field widths, tags,
+resource rules and remaining activation gates are specified in
+[21](21-native-input-format.md). No V1 format, intent preimage, replay dispatch or
+live service/SDK/CLI/MCP selection changes.
+
+Encoding covers complete authored claim and validation descriptors, legacy
+projection/declaration cohorts, artifact bodies and provenance, response summary,
+confidence, all six reported outcomes, manifests, diagnostics, monitor roots and
+all deadline fields. The existing semantic fingerprints remain separate from
+these bytes. Derived descriptor hashes/stamps are not serialized as substitutes
+for bodies; external definition, handler, schema and requirement pins remain
+explicit. Legacy acceptance summaries are omitted only after bounded verification
+against the actual global declaration cohort. Assigned creation cuts and trusted
+logical/firing times remain owner values.
+
+`EncodingPlan` measures an immutable borrowed source before writing the same
+source into an exact-size caller buffer. Checked cursor/sink primitives use
+fixed-width little endian fields, explicit length prefixes and safe slice access.
+They share deterministic byte/work accounting without allocating. A wrong-sized
+destination refuses before modification. The complete structural inspector uses
+one visit allowance and cumulative item/text/blob budgets across nested arrays
+and fields, checking all closed tags, schema versions, UTF-8, truncation and
+trailing bytes. Its borrowed header and dimension quote grant no authentication,
+semantic identity, custody, retry decision or completion loan.
+
+[Fixed-field decoding](../../crates/focal-core/src/native/input_codec/fixed.rs)
+constructs typed inputs for **18 commands and all three timers** without heap
+allocation. Its separate bounded pass preserves all bindings, IDs, revisions,
+receipt fences, evaluation-target shapes and authored deadline values. The
+structural quote supplies its exact second-pass visit allowance; callers must
+account for both traversals. The normal owner retains all semantic and authority
+checks. The ten dynamic commands return `None` after complete structural inspection
+and remain pending semantic/funded construction. No empty body or alternative
+decoder is substituted. The typed frame stays inline on the stack; a narrow
+large-enum lint allowance avoids allocating before admission.
+
+Qualification on macOS arm64, 2026-09-07: the unfiltered Core library suite passes
+**664 tests**, with zero failed, ignored or filtered tests. The **26 new tests**
+cover primitive byte/work refusal, complete independent descriptor/response/timer
+vectors, all actor tags and timer target shapes, every actor-frame truncation,
+malformed nested fields, shared quota exhaustion, output sentinel preservation,
+creation-profile/acceptance correspondence, and fixed decoding's existing
+byte/intent parity. A decoded missing-claim request is refused by the real owner
+without range, budget, outcome or pending-candidate changes; structurally valid
+invalid timer values still fail the existing semantic identity check.
+
+Strict workspace all-target Clippy and the separate production no-panic gate
+pass. Formatting, diff and architecture checks pass: **874 links**, all **37
+imported source hashes** and **15 frozen vocabularies**. No per-object Arc,
+unsafe code, thread or dependency was added. The full workspace test suite was
+not rerun; frozen V1 codec/hash checks remain in the passing Core library suite.
+
+The next boundary is allocation-free semantic inspection of the ten dynamic
+commands, shared descriptor/intent validation and actual owner-funded typed
+construction, including promised reports and responses with Ordinary RAM
+exhausted. Recorded-mutation codecs, checked checkpoint hydration/import,
+WAL/Ready and Session/quorum integration, then live CLI/MCP activation remain
+required. This input milestone supplies no native restart guarantee or global
+deployment qualification.
+
+## Borrowed dynamic input construction — 2026-09-07
+
+Eight more dormant native commands now construct typed inputs from bounded
+borrowed bytes: CloseResponse, RegisterMonitor, SubmitWork, SubmitDiagnostic,
+RejectWork, and Admission/Increment/WholeWork reports. Together with the fixed
+decoder, this covers **26 of 28 actor commands** and all three timer namespaces.
+Create and CreateAuthored remain. Live V1 service/SDK/CLI/MCP dispatch is unchanged;
+these construction plans do not select an owner loan or activate persistence.
+
+The [artifact value-source model](../../crates/focal-model/src/lifecycle/artifact_descriptor_source.rs)
+shares semantic validation, canonical ordering, content/native-intent hashing,
+construction accounting and fallible construction with the existing descriptor
+API. Generic sources expose copied ObjectRefs and borrowed labels through bounded
+repeatable iterators. Preparation requires exact declared cardinality and checks
+full provenance/content; construction checks the actual produced descriptor,
+including its allocated ID, against the captured identity. Changed sources,
+including changes during iteration, cannot substitute a different body. Actual
+capacities and allocation counts are reconciled before retaining output, with no
+typed scratch array needed by the byte adapter.
+
+[Response and monitor sources](../../crates/focal-core/src/native/response_source.rs)
+likewise read copied manifest/diagnostic/root values without temporary vectors.
+They preserve every confidence/outcome value and authored ordering. Plans price
+final buffers and all preparation/hash/build work, require exact termination,
+and hash the actual final owned body before returning. A failed response hash
+leaves the caller's hasher unchanged. Existing immutable-slice response APIs
+retain their signatures and native preimage through shared helpers.
+
+The [response/monitor decoder](../../crates/focal-core/src/native/input_codec/response.rs)
+borrows fixed-width encoded collections and captures the complete existing
+request identity. The [artifact decoder](../../crates/focal-core/src/native/input_codec/artifact.rs)
+borrows scalar fields, content pointers/inline bytes, and encoded reference/label
+spans. One source parsing counter spans model preparation and construction. It
+also verifies that the known second pass fits before returning the plan; build
+cannot replenish that allowance. Model checking and native wrapper/hashing costs
+have distinct explicit limits. The final artifact quote includes its singleton
+container and all allocator bookkeeping, and final command identity is checked
+after construction. [21 §6](21-native-input-format.md#6-borrowed-dynamic-construction)
+records each component and the remaining ingress obligations.
+
+The [shared artifact-command preimage](../../crates/focal-core/src/native/artifact_intent.rs)
+and monitor/request helpers keep owned and borrowed command identities aligned.
+Independent legacy preimage checks cover ReportAdmission, SubmitWork and RejectWork;
+byte/intent roundtrips cover all six artifact-bearing command tags. These helpers
+do not replace actual evaluator, receipt, custody or state-dependent admission
+checks, and no participant execution was added.
+
+Qualification on macOS arm64, 2026-09-07: the unfiltered affected-library run passes
+**1,135 tests** (679 Core, 419 model, 37 evidence), with zero failed, ignored or
+filtered tests. The **21 new tests** cover generic-source substitutions and exact
+termination, partial allocation failure/retry, complete encoded bodies and all
+artifact provenance roles, response outcomes and monitor predicates, separate
+and shared byte/work limits, invalid raw fields that pass framing but fail model
+checks, and unchanged native identities. Frozen V1 checks remain in the passing
+libraries; the full workspace test suite was not rerun.
+
+Strict workspace all-target Clippy and the production no-panic gate pass.
+Formatting, diff and architecture checks pass: **885 links**, all **37 imported
+source hashes** and **15 frozen vocabularies**. No Arc, unsafe code, thread or
+dependency was added. Decoded scalar command fields stay on the stack with a
+narrow large-enum lint allowance, avoiding allocation before admission.
+
+Remaining native ingress work includes complete claim/validation creation
+decoding, borrowed state-dependent admission, exact retry/held-source selection,
+and keeping the selected capacity through construction, custody and candidate
+preparation. Promised responses/reports still need end-to-end decoding tests with
+Ordinary admission exhausted. Native recorded-mutation codecs, checkpoint
+hydration, WAL/Ready, Session/quorum recovery and live CLI/MCP activation remain
+required, followed by the outstanding deployment and scale qualification.
+
+## Borrowed creation descriptor construction — 2026-09-07
+
+The dormant native codec now constructs complete standalone claim, legacy
+declaration and authored validation bodies through
+[borrowed body plans](../../crates/focal-core/src/native/input_codec/creation_content.rs).
+This completes their local descriptor prerequisites; whole Create/CreateAuthored
+frame assembly, borrowed acceptance/cohort correspondence and owner admission
+remain pending. Complete actor-command construction coverage therefore remains
+**26 of 28**, plus all three timer namespaces. Live V1 service/SDK/CLI/MCP
+dispatch and native persistence selection remain unchanged.
+
+The model's new
+[claim sources](../../crates/focal-model/src/lifecycle/claim_source.rs),
+[declaration sources](../../crates/focal-model/src/lifecycle/validation_definition_source.rs)
+and [authored validation sources](../../crates/focal-model/src/lifecycle/validation_descriptor_source.rs)
+share semantic checking, original hash preimages and owned construction with the
+existing slice APIs. Claim values retain canonical relations and work scopes,
+ordered requirement pins, nested output checks and zero-check slots. Validation
+values retain every program/phase/fallback field, description, quality standard,
+contributor and policy revision. Each declared stream must yield exactly its
+count and then end. Construction verifies actual owned content and capacities
+against the prepared identity, including changes made by a generic source while
+copying. Original native declaration stamps and claim/full/specification hashes
+are preserved; external policy/schema pins remain separate authored references.
+
+The byte adapters keep complete scalar fields and encoded collection spans
+borrowed. A shared parsing counter covers repeated nested source callbacks,
+separately from model checking and hash work. The borrowing plan cannot replenish
+that counter. Preparation also checks that the known build passes fit before
+returning a plan. Claim construction reads every outer collection and nested
+check stream once; legacy declaration construction reads each handler stream
+once. Authored validation construction explicitly charges three handler passes
+and two contributor passes before final owned checking. Final-buffer capacities,
+allocator bookkeeping and complete conservative model work are checked before
+allocation; actual source consumption is reconciled after construction. No typed
+scratch policy/reference arrays are allocated by these adapters. See
+[21 §6.1](21-native-input-format.md#61-borrowed-creation-descriptor-bodies).
+
+Qualification on macOS arm64, 2026-09-07: the unfiltered affected-library run
+passes **1,155 tests** (685 Core, 433 model and 37 evidence), with zero failed,
+ignored or filtered tests. The **20 new tests** cover complete nested byte bodies,
+all validator programs and target families, exact byte/work/stream bounds,
+truncation and trailing bytes, actual caller/semantic refusals, allocation
+failure/retry, original identity preimages and source substitution during
+construction. Frozen V1 checks remain in the passing libraries; the full
+workspace test suite was not rerun. Strict workspace all-target Clippy and the
+production no-panic gate pass. Formatting, diff and architecture checks pass:
+**894 links**, all **37 imported source hashes** and **15 frozen vocabularies**.
+No Arc, unsafe code, thread or dependency was added.
+
+These are local content proofs, not authenticated request or memory-admission
+capabilities. Remaining work includes full borrowed creation-cohort assembly,
+Required Delivery and actual descriptor correspondence before owner-selected
+funding, exact pending/committed retries, and reserved-source construction/custody
+under Ordinary exhaustion. Native mutation/checkpoint codecs, restart recovery,
+WAL/Ready, Session/quorum, live CLI/MCP activation and deployment/scale
+qualification remain required. No receipt creates a testament, and these policy
+decoders invoke no tool, skill, script or agent.
+
+## Complete native creation frames and checked acceptance sources — 2026-09-07
+
+The dormant native codec now constructs typed inputs for **all 28 actor commands**
+and all three timer namespaces. The complete
+[authored creation decoder](../../crates/focal-core/src/native/input_codec/authored_creation.rs)
+and [projection creation decoder](../../crates/focal-core/src/native/input_codec/legacy_creation.rs)
+check local creation correspondence and derive the existing native request
+identity before allocating final owned inputs. Live server/SDK/CLI/MCP dispatch
+still uses V1; input construction does not activate native durability.
+
+The model's repeatable
+[acceptance source plan](../../crates/focal-model/src/lifecycle/acceptance_source.rs)
+requires actual opaque
+[checked declaration metadata](../../crates/focal-model/src/lifecycle/validation_checked.rs),
+produced only from real model declarations or successful source preparation.
+Authored validation metadata performs an extra bounded pass over the same body,
+deriving the original declaration stamp with its actual content binding while
+rechecking full/specification identities. No supplied summary or digest can stand
+in for missing policies. Acceptance checks Required Delivery, exact parent,
+issuer and ledger, duplicate IDs/indices, missing-index conflicts and complete
+slot/check correspondence. Zero-check slots retain their presence obligations.
+Repeated passes verify complete source cardinality and identity; final
+construction checks actual owned policy output. Existing typed acceptance API traversal
+semantics and acceptance hash preimages are preserved.
+
+Authored frame preparation checks complete requirement/specification matches,
+per-claim descriptor cardinality and family-scoped IDs across groups, preserving
+authored ordering and runtime scope/response/owner fields. Projection preparation
+checks canonical graph/lineage streams and actual interleaved global declarations.
+New bounded model value checks and consuming constructors move final
+graph/correction vectors without temporary typed arrays. Both decoders use shared
+original intent writers and verify the actual constructed native input. The owner
+still assigns creation cuts and verifies effective-state authority and references.
+
+Five cumulative work domains separate parsing, encoded-source callbacks,
+descriptor checks, acceptance checks and structural/native work. Nested callbacks
+cannot renew their enclosing allowance. Quotes include replayed preparation and
+every final allocation; acceptance exposes actual full-scan counts so its repeated
+raw callbacks are priced before construction. Frame-only body inspection does not
+require unused future build headroom, while actual body builds check the complete
+remaining source budget before allocation. Final authored capacity checks price
+both scans over every scope and slot. Graph/lineage validators charge terminal
+iterator probes even for empty streams. Review found and fixed those two variable
+work-accounting gaps before final qualification. No Arc, unsafe code, thread or
+dependency was added. Details and remaining ingress obligations are in
+[21 §6.2](21-native-input-format.md#62-complete-creation-frames).
+
+Qualification on macOS arm64, 2026-09-07: the unfiltered affected-library run
+passes **1,175 tests** (697 Core, 441 model and 37 evidence), with zero failed,
+ignored or filtered tests. The **20 new tests** cover complete mixed creation
+frames, interleaved declarations, actual nested policies and specification pins,
+byte/native-intent parity, exact five-domain limits, source substitution, final
+allocation refusal/retry, callback terminal budgets and variable final inspection
+work. A decoded authored request enters the real RAM owner and publishes its
+claim content with zero response testaments. Frozen V1 checks remain in the
+passing libraries; the full workspace test suite was not rerun. Strict workspace
+all-target Clippy and the production no-panic gate pass. Architecture checks
+verify **904 links**, all **37 imported source hashes** and **15 frozen
+vocabularies**. Formatting and diff checks pass; all six legacy decoder tests
+also pass after the final lint cleanup.
+
+The remaining boundary is authenticated, effective-prefix owner inspection and
+exact pending/committed retry selection, followed by preserving the selected
+Ordinary or held capacity through construction, custody and candidate preparation.
+Promised reports/responses still need complete ingress qualification with Ordinary
+RAM exhausted. Native mutation/checkpoint codecs, recovery and entitlement
+reconstruction, WAL/Ready, Session/quorum, live CLI/MCP activation, and deployment
+and scale qualification remain required. Participants continue to author their
+own evidence and success/failure testimony; no decoder invokes execution or
+creates testimony from claim receipt.
+
+## Managed admission of borrowed native requests — 2026-09-07
+
+The [decoded-request wrapper](../../crates/focal-core/src/native/input_codec/admission.rs)
+and [owner ingress](../../crates/focal-core/src/native/owner_ingress.rs) now connect
+complete native input plans to the exclusive RAM owner. Fixed actor commands and
+all dynamic plan families preserve their actual intent and profile; actor plan
+conversion rejects timer namespaces. The owner verifies its ledger/profile and
+the supplied authenticated principal, then shares exact committed/pending request
+lookup with owned-input preparation. Original outcomes and pending tickets return
+before fresh queue, clock, work, memory or current-state report admission.
+
+Borrowed Admission, Increment and WholeWork report checks share actual evaluation,
+attempt, evaluator, parent, target, provenance and inherited-visibility rules with
+the existing owned path. A sealed artifact view accepts actual descriptors or
+opaque model source plans, bounds replayed streams by captured dimensions and
+retains the original source counter. The completion book checks the real held
+parent/registration/schema contract before lending memory. Respondent selection
+uses the actual receipt/holder/cycle and recorded response, with early close-ID
+collision checks. The mandatory first Work diagnostic and authored close/post
+operations select their existing credits; unrelated work retains Ordinary
+admission.
+
+The selected input reservation precedes final buffer construction and stays live
+through custody and candidate preparation. Existing envelopes already include
+that simultaneous input, verification and Core construction demand. A second
+source-budget check refuses before allocation if borrowed preflight has consumed
+the final build pass. Full owned authority and identity checks still precede
+custody/publication. Rejections and discarded candidates release input capacity
+and preserve the existing journal/retry contract. No Arc, unsafe code, thread or
+dependency was added. See [21 §6.3](21-native-input-format.md#63-managed-owner-admission-of-decoded-requests).
+
+Qualification on macOS arm64, 2026-09-07: the unfiltered affected-library run
+passes **1,186 tests** (708 Core, 441 model and 37 evidence), with zero failed,
+ignored or filtered tests. The **11 new tests** cover borrowed/owned report
+authority parity and refusals, managed creation/fixed command chaining,
+principal/profile/ledger/timer boundaries, complete Admission reporting and the
+respondent error-artifact → authored Failed testament → explicit posting sequence
+under full ancestor-memory exhaustion. Missing custody, stale receipts, malformed
+identity, insufficient construction/source work, pending/committed retries and
+discard/retry preserve source capacity and responsibility credits. Receipt still
+creates no testimony. Strict workspace all-target Clippy and the production
+no-panic gate pass; frozen V1 tests remain in the passing affected libraries.
+The full workspace test suite was not rerun. Formatting and diff checks pass;
+architecture checks verify **909 links**, all **37 imported source hashes** and
+**15 frozen vocabularies**. Independent read-only review found no remaining
+authority, funding-lifetime or retry blocker in these new seams.
+
+The live server/SDK/CLI/MCP remain V1. Remaining work includes authenticated raw
+transport with bounded receive buffers and complete ingress work accounting,
+reference-policy/Handoff authority, broader integrated target/profile coverage,
+native mutation/checkpoint codecs, recovery and entitlement reconstruction,
+WAL/Ready and Session/quorum activation, binary/deployment qualification and
+multi-region scale/failure testing. The managed plan API supplies no durable
+acknowledgment or automatic agent execution.
+
+## Raw native admission and recovery construction primitives — 2026-09-07
+
+The [complete frame dispatcher](../../crates/focal-core/src/native/input_codec/ingress.rs)
+now feeds all 28 actor commands into the managed native owner. One internal limit
+set derives semantic bounds from existing node limits and tracks five cumulative
+input-work domains through initial inspection, preparation and final construction.
+The owner verifies the actual ledger/profile and authenticated actor header before
+scanning the variable body. An opaque remaining-work marker prevents construction
+from resetting any domain; exact pending/committed retries require the complete
+actual intent but no unused final build headroom. A test exposed an artifact
+inspection requirement for unused future source capacity; the internal frame path
+now defers that requirement until fresh admission, preserving the standalone
+artifact plan's stronger construction promise. Borrowed authority checks still
+share the raw source counter and cannot consume the final build pass.
+
+The [wire reader](../../crates/focal-wire/src/frame.rs) can now inspect a fixed
+header and read one exact payload into caller-owned storage without allocating.
+Typed compatibility reads/writes also reserve their frame buffers fallibly, and
+the client preserves uncertain outcomes when a response allocation fails. Frozen
+V1 framing is unchanged. These helpers do not negotiate native transport or fund
+asynchronous receive buffers. The remaining receive/retry pools, credential/tenant
+selection, queue/Quinn accounting and enclosing work contract are explicit in
+[21 §§6.4–6.5](21-native-input-format.md#64-complete-frame-dispatch-and-cumulative-input-work).
+
+Recovery construction now includes a
+[partitioned range loader](../../crates/focal-memory/src/range_hydration.rs)
+for non-Clone values built from borrowed row plans. It reserves each complete row
+allowance before construction, reconciles actual owned capacity, bounds staging
+to one chunk and discards the entire detached root on failure. Existing page/root
+sharing is retained; no per-object Arc was introduced. The
+[scalar validation snapshots](../../crates/focal-model/src/lifecycle/validation_snapshot.rs)
+restore every evaluation/accepted-result field against the actual declaration
+without allocation or replaying current participant authority. Intrinsic checks
+preserve real fallback/quality cursors, historical results, seals/fences and
+structural outcomes. They do not authenticate a checkpoint or establish complete
+cross-row history. The recorded-write-set, remaining model hydration, native row
+codec, detached-root checks and Session/WAL integration sequence is specified in
+[18 §6.14](18-lifecycle-storage-upgrade.md#614-constructing-durable-native-state-without-cloning-or-re-executing-it).
+
+The live server, SDK, CLI and MCP still select V1. No native restart, quorum
+activation, binary publication or scale/deployment qualification is claimed by
+this increment. Respondents still author their own success or failure testimony;
+raw creation, claim receipt and recovery do not fabricate a testament.
+
+Qualification on macOS arm64, 2026-09-07: the unfiltered affected-library runs
+pass **1,492 tests** (714 Core, 448 model, 37 evidence, 103 memory, 137 client and
+53 wire), with zero failed, ignored or filtered tests in the successful runs.
+The wire suite initially encountered sandbox denials for local sockets; the full
+53-test rerun with permission to bind loopback/Unix test servers passes. The
+**24 new tests** cover all-command raw byte/intent parity, cumulative work bounds,
+header rejection before body scans, held reporting and exact retries without
+build headroom, authored raw creation without testimony, fragmented/truncated
+frames, precharged non-Clone restoration and scalar lifecycle/history corruption.
+Two existing client uncertainty tests additionally exercise allocation failure.
+Strict workspace all-target Clippy, the production no-panic gate, formatting and
+diff checks pass. Architecture checks verify **919 links**, all **37 imported
+source hashes** and **15 frozen vocabularies**. Independent ingress review found
+no concrete budget, authority-ordering, source-lifetime or exact-retry defect.
+The full workspace test suite and other operating systems were not rerun.
+
+## Native write sets and lifecycle restoration — 2026-09-07
+
+Each real native candidate now retains its
+[exact write set](../../crates/focal-core/src/native/mutation.rs), captured from
+the storage plan's canonical inputs. This includes all 30 row families and
+distinguishes deleted keys from present tombstones. Metadata, request outcomes,
+events, identities and indices are preserved alongside domain rows. Values stay
+in the candidate's one immutable root; capture neither clones those values nor
+scans unrelated ledger rows. `NativeOwner::prepared_candidate` borrows the exact
+unpublished ticket for the future durable writer. Publication refusal retains
+the write set and its funding; commit and rollback release it at their actual
+ownership boundary.
+
+Evaluator and respondent completion envelopes now price a separate retained key
+vector for each promised action. Construction workspace excludes it. Review
+identified a peak gap in reserving the maximum failure shape during a smaller
+regular report: capture now reserves the exact canonical count after storage
+envelope validation, before allocating. The owned allocation moves into the
+write set without an additional accounting-handle clone. This remains subject to
+the same Ordinary or held source selected for the candidate.
+
+Model restoration now covers claim state/history, scope registries and children,
+registration membership, work/diagnostic/failure evidence, responses, audit
+cohorts and claimant result testaments, alongside the prior scalar evaluation
+and accepted-result restorers. Actual restored response bodies supply claim
+history's private report stamps; actual declarations supply registration/audit
+definition stamps. Original generation bindings come from retained history.
+Broader reachable model states, including noncanonical starting revisions, zero
+content where originally allowed and unstamped legacy seals, remain preserved;
+the native importer enforces its original command profile separately.
+
+Borrowed plans bound inspection and final construction, reconcile actual owned
+capacities and reject changed sources. Response/work terminal causes must name
+the correct response and required role; required claim response cuts must resolve
+to the actual retained received response. Restored histories preserve errors,
+retry exhaustion, programmatic-to-quality evidence, receipt adoption, independent
+delivery, scope cancellation/release and original terminal cuts. Review also
+corrected omitted summary-comparison work and preserved original generation
+semantics before qualification. No production panic, per-object Arc, execution
+worker or change to frozen V1 bytes is introduced by these APIs.
+
+The remaining durable integration is in
+[18 §6.14](18-lifecycle-storage-upgrade.md#614-constructing-durable-native-state-without-cloning-or-re-executing-it):
+complete native row/record codecs and encoded-buffer funding, bounded phased
+construction in an unpublished range, authenticated history and complete-root
+validation, local custody restoration, entitlement reconstruction, Session/WAL
+and quorum activation. Canonical key order is not model hydration dependency
+order. The live server, SDK, CLI and MCP remain V1; this increment does not yet
+provide native restart recovery or a native durable acknowledgment.
+
+Qualification on macOS arm64, 2026-09-07: the unfiltered affected-library run
+passes **1,333 tests** (719 Core, 474 model, 103 memory and 37 evidence), with
+zero failed, ignored or filtered tests. The **31 new tests** cover exact write-set
+ownership and funding through publication refusal, commit and rollback, plus
+restoration of actual lifecycle histories, failures, retries and terminal causes.
+They exercise bounded construction, allocation failure and changed-source
+rejection. Strict workspace all-target Clippy, the production no-panic gate,
+formatting and diff checks pass. Architecture checks verify **927 links**, all
+**37 imported source hashes** and **15 frozen vocabularies**. The full workspace
+test suite and other operating systems were not rerun. These checks qualify the
+new component APIs; end-to-end native restart and activation remain unverified.
+
+## Native record encoding and phased recovery construction — 2026-09-07
+
+The [native mutation encoder](../../crates/focal-core/src/native/record_codec.rs)
+now records complete values from the actual candidate's retained write set. It
+includes all 30 row families: immutable descriptors, lifecycle state, responses
+and failed-work evidence, receipts/cycles, independent evaluations and accepted
+history, audit bundles, original events, counters, indices, identity mappings and
+outcomes. Participant and all three timer namespaces stay disjoint. Explicit
+stable tags, little-endian fields and checked widths avoid Rust enum/host-layout
+coupling. Scalar ledger/head/cycle counters use u64 rather than collection sizes.
+No frozen V1 bytes or existing content-hash preimages change.
+
+Measurement and writing borrow the same immutable candidate. Exact byte/work
+quotes include row sizing, bounded key lookups, snapshot/digest hashing and
+collection iteration. The writer uses the caller's precharged destination and
+allocates no buffer, row copy, offset array or additional shared owner. Review
+added explicit iteration costs to shared descriptor writers; their byte streams
+remain unchanged. The destination's pending WAL funding and its inclusion in
+future completion promises remain integration work.
+
+The outer inspector checks format/profile, sequence/ledger correspondence,
+strict key ordering, row bounds, put/delete distinctions, mandatory metadata,
+exact outcome correspondence, complete consumption and a domain-separated
+BLAKE3 digest. Its iterator returns bounded borrowed bodies. These bodies remain
+untrusted: a changed body with a recomputed digest can pass structural inspection
+and still fail model/native validation. No API publishes an inspected record.
+The original process-local range incarnation likewise requires a proven recovery
+mapping, not equality with a new owner's identity.
+
+The [complete-root checkpoint encoder](../../crates/focal-core/src/native/record_codec/checkpoint.rs)
+uses the same body writers while streaming every retained row, including unchanged
+content and original history. A separate `FCNROOTS` envelope, checksum domain and
+u64 full-row count distinguish it from mutations. Genesis is an empty prefix-zero
+root; nonzero roots require Meta and a retained outcome. Checkpoint rows cannot be
+deletions. Encoding and structural scans acquire no snapshot, shared root handle,
+whole-ledger staging array or row index. Session metadata, persistence funding and
+complete native checkpoint decoding/validation remain separate requirements.
+The callback writer additionally streams the same bytes through caller-funded
+bounded buffering, avoiding a second encoded-root allocation. Original output
+errors return by value without boxing or cloning. A failed stream leaves no
+successful checkpoint result; callers discard its prefix and establish their own
+flush/publication fences. Online scheduling from an accounted fixed-prefix pin
+remains separate from the current borrowed-Core encoding plan.
+
+Response and claimant result-testament owners retain their actual Generated
+revision as one additional scalar. Delivery/posting/copying preserve it; recovery
+must compare it with the original event. Work errors, production diagnostics,
+failed artifacts and pure missing/delivery results remain separate retained facts.
+Artifact bytes carry the immutable descriptor plus local tree address/revision;
+the process-local custody token is never serialized or accepted as follower proof.
+
+The [phased memory builder](../../crates/focal-memory/src/range_hydration_phased.rs)
+constructs non-Clone rows in dependency order while keeping one unpublished owner.
+Each phase has exact cardinality and strictly ordered, previously absent keys;
+phases may differ from canonical key order. Scoped lookups include earlier phases
+and earlier staged rows. Each complete final-row allowance is acquired before
+building, actual capacity is checked before the next row, and only one bounded
+chunk is staged. Any failure discards every phase and returns its funding. Final
+cardinality and complete validation precede prefix binding and owner exposure.
+Source/decoder workspace and callback visits still require enclosing accounting.
+
+The [record-format contract](22-native-record-format.md) and [18 §6.14](18-lifecycle-storage-upgrade.md#614-constructing-durable-native-state-without-cloning-or-re-executing-it)
+retain the next obligations: row-body decoders and native phased adapters,
+complete cross-row/history validation, local custody and entitlement recovery,
+checkpoint/mutation application, encoded-buffer funding, Session/WAL/Raft mapping
+and replicated activation. The live server, SDK, CLI and MCP remain V1; these
+components do not yet demonstrate native restart recovery or a native durable
+acknowledgment.
+
+Qualification of the encoding/phased-construction increment above, before the
+subsequent decoder implementation: **1,367 affected-library tests passed**
+(746 Core, 474 model, 110 memory and 37 evidence), with **34 new tests** and no
+failed, ignored or filtered tests. Strict workspace all-target Clippy passed;
+formatting completed. The last architecture pass checked **946 links**, all
+**37 imported source hashes**, and **15 frozen vocabularies**. These results
+apply to that earlier source increment, not the recovery work below.
+
+## Native checkpoint restoration — implementation awaiting qualification
+
+The source now connects [complete row dispatch](../../crates/focal-core/src/native/record_codec/read_dispatch.rs)
+to [native checkpoint recovery](../../crates/focal-core/src/native/record_codec/recovery.rs).
+All 30 row families have explicit readers and checked construction paths.
+Dependency-aware quotation precedes the engine's final allocation; mutable
+descriptor plans remain scoped and are re-prepared from the same borrowed bytes
+under cumulative work bounds. Eight internal phases restore immutable bodies,
+actual evidence, independent evaluations/results, respondent testimony, complete
+claims and frozen claimant audits without exposing an intermediate owner.
+
+The implementation resolves the policy/response/claim dependency cycle with a
+temporary funded acceptance policy derived from the original claim body and
+actual declarations. A bounded paged index retains borrowed claim spans and
+original artifact publication coordinates. Root validation uses a funded
+sequence bitmap and scalar history index to check coverage without a full
+event scan per object. Scratch indices drop before owner publication. Artifact
+custody recovery reads and verifies existing local trees and schemas; it never
+recreates missing content from inline descriptor bytes.
+
+Regression cases are being added for explicit failed testimony with error
+artifacts, each delivery stage, independent validations, cold evidence-store
+reopen, authored content and reused identities, checksum-valid corrupted state,
+missing local evidence, work limits, memory refusal and full refund. **No tests,
+formatting, lint or contract checks have been run for this decoder increment.**
+The user requested completion of the functionality before consolidated
+validation, replacing repeated broad checks after individual edits.
+
+This remains Core checkpoint restoration source, awaiting qualification. It
+does not supply incremental native mutation replay, completion entitlement
+reconstruction, Session checkpoint provenance, WAL/Raft prefix mapping, decoder
+activation, or live native CLI/MCP dispatch. The final-state checkpoint also
+cannot independently reconstruct every historical graph/root set; observable
+witnesses are checked, and the enclosing service must establish the trusted
+checkpoint/log chain. [22](22-native-record-format.md#native-checkpoint-restoration)
+records the construction order, accounting requirements and remaining integration.

@@ -60,7 +60,7 @@ impl Registry {
                 roots: bytes::copy(&scope.roots)?,
                 deadline: scope.deadline,
                 registered: scope.registered,
-                released: scope.released,
+                disposition: scope.disposition,
                 last_rebinding: scope.last_rebinding,
             });
         }
@@ -101,7 +101,7 @@ impl Registry {
                 at: 999,
             },
             registered: SessionSeq(4),
-            released: Some(cut),
+            disposition: Some(MonitorDisposition::Released(cut)),
             last_rebinding: Some(Rebinding {
                 predecessor: ClaimId::from_u128(91),
                 successor: ClaimId::from_u128(92),

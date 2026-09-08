@@ -105,13 +105,39 @@ impl<'a> Evaluation<'a> {
         acceptance: &ClaimDecision<'_>,
     ) -> Result<Transition<'a>, ContractError> {
         principal.require_actor(claim.issuer())?;
+        self.settle_missing_checked(expected, claim, response, Some(acceptance))
+    }
+
+    /// Structural absence follows the same checked response entry as attached
+    /// work. No participant acts as the claimant on this derived path, and no
+    /// external attempt, proof artifact, or report is invented.
+    pub fn settle_missing_entered(
+        &self,
+        expected: &Binding,
+        claim: &ClaimState,
+        response: &Response,
+        entry: &crate::lifecycle::evidence::ResponseEntry,
+    ) -> Result<Transition<'a>, ContractError> {
+        entry.check(claim, response)?;
+        self.settle_missing_checked(expected, claim, response, None)
+    }
+
+    fn settle_missing_checked(
+        &self,
+        expected: &Binding,
+        claim: &ClaimState,
+        response: &Response,
+        acceptance: Option<&ClaimDecision<'_>>,
+    ) -> Result<Transition<'a>, ContractError> {
         self.binding.check(expected)?;
         if !matches!(self.target, Target::MissingSlot { .. }) {
             return Err(ContractError::InvalidTarget);
         }
         self.work_target(claim, response, None)?;
         open_claim(claim)?;
-        ResponseReadiness::from_received(response, self.target, claim, acceptance)?;
+        if let Some(acceptance) = acceptance {
+            ResponseReadiness::from_received(response, self.target, claim, acceptance)?;
+        }
         if self.state != State::Ready || self.begun || self.last_result.is_some() {
             return Err(ContractError::InvalidTransition);
         }

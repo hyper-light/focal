@@ -2,6 +2,7 @@
 //! it is not repeated in each before/after/child binding on every event. Reads
 //! expand it into the public exact-binding view without allocating.
 use super::*;
+use focal_model::lifecycle::audit::ResultTestamentState;
 use focal_model::{ObjectId, ObjectRevision};
 
 #[derive(Debug, Clone, Copy)]
@@ -30,7 +31,7 @@ impl Revision {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct StoredEvent {
-    request: RequestKey,
+    invocation: NativeInvocation,
     sequence: SessionSeq,
     ordinal: u32,
     fact: Fact,
@@ -63,10 +64,22 @@ enum Fact {
         after: Revision,
         state: ResponseState,
     },
+    ResultTestament {
+        claim: ClaimId,
+        before: Option<Revision>,
+        after: Revision,
+        state: ResultTestamentState,
+    },
     Receipt {
         claim: Revision,
         fence: ReceiptFence,
         holder: ParticipantId,
+    },
+    ReceiptAdopted {
+        claim: Revision,
+        previous: ReceiptEntitlement,
+        replacement: ReceiptEntitlement,
+        cause: ContentHash,
     },
     Artifact {
         binding: Revision,
@@ -147,6 +160,22 @@ impl StoredEvent {
                     state,
                 }
             }
+            NativeFact::ResultTestament {
+                claim,
+                before,
+                after,
+                state,
+            } => {
+                if before.is_some_and(|value| value.ledger != after.ledger) {
+                    return Err(ContractError::WrongLedger);
+                }
+                Fact::ResultTestament {
+                    claim,
+                    before: before.map(Revision::pack),
+                    after: Revision::pack(after),
+                    state,
+                }
+            }
             NativeFact::Receipt {
                 claim,
                 fence,
@@ -155,6 +184,17 @@ impl StoredEvent {
                 claim: Revision::pack(claim),
                 fence,
                 holder,
+            },
+            NativeFact::ReceiptAdopted {
+                claim,
+                previous,
+                replacement,
+                cause,
+            } => Fact::ReceiptAdopted {
+                claim: Revision::pack(claim),
+                previous,
+                replacement,
+                cause,
             },
             NativeFact::Artifact { binding } => Fact::Artifact {
                 binding: Revision::pack(binding),
@@ -215,7 +255,7 @@ impl StoredEvent {
             }
         };
         Ok(Self {
-            request: event.request,
+            invocation: event.invocation,
             sequence: event.sequence,
             ordinal: event.ordinal,
             fact,
@@ -223,7 +263,7 @@ impl StoredEvent {
     }
     pub(super) fn expand(self, ledger: LedgerId) -> NativeEvent {
         NativeEvent {
-            request: self.request,
+            invocation: self.invocation,
             sequence: self.sequence,
             ordinal: self.ordinal,
             fact: match self.fact {
@@ -263,6 +303,17 @@ impl StoredEvent {
                     after: after.expand(ledger),
                     state,
                 },
+                Fact::ResultTestament {
+                    claim,
+                    before,
+                    after,
+                    state,
+                } => NativeFact::ResultTestament {
+                    claim,
+                    before: before.map(|value| value.expand(ledger)),
+                    after: after.expand(ledger),
+                    state,
+                },
                 Fact::Receipt {
                     claim,
                     fence,
@@ -271,6 +322,17 @@ impl StoredEvent {
                     claim: claim.expand(ledger),
                     fence,
                     holder,
+                },
+                Fact::ReceiptAdopted {
+                    claim,
+                    previous,
+                    replacement,
+                    cause,
+                } => NativeFact::ReceiptAdopted {
+                    claim: claim.expand(ledger),
+                    previous,
+                    replacement,
+                    cause,
                 },
                 Fact::Artifact { binding } => NativeFact::Artifact {
                     binding: binding.expand(ledger),
@@ -331,7 +393,7 @@ mod tests {
 
     fn event(fact: NativeFact) -> NativeEvent {
         NativeEvent {
-            request: request(ISSUER, 91),
+            invocation: request(ISSUER, 91).into(),
             sequence: SessionSeq(77),
             ordinal: 3,
             fact,
@@ -366,6 +428,17 @@ mod tests {
                     state: *state,
                 });
             }
+            for state in [
+                ResultTestamentState::Generated,
+                ResultTestamentState::Posted,
+            ] {
+                roundtrip(NativeFact::ResultTestament {
+                    claim,
+                    before: previous,
+                    after,
+                    state,
+                });
+            }
         }
         for reason in [
             EvidenceFailure::Work,
@@ -382,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_work_and_response_history_reject_cross_ledger_revision_pairs() {
+    fn compact_independent_history_rejects_cross_ledger_revision_pairs() {
         let claim = ClaimId::from_u128(42);
         let before = binding(92);
         for ledger in [
@@ -411,6 +484,12 @@ mod tests {
                     before: Some(before),
                     after,
                     state: ResponseState::Posted,
+                },
+                NativeFact::ResultTestament {
+                    claim,
+                    before: Some(before),
+                    after,
+                    state: ResultTestamentState::Posted,
                 },
             ] {
                 assert!(matches!(

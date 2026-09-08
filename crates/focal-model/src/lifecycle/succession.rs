@@ -96,6 +96,82 @@ impl Lineage {
     pub fn corrections(&self) -> &[Correction] {
         &self.corrections
     }
+    /// Validate complete canonical lineage values without allocating. This checks
+    /// local structure only; predecessor existence and ownership remain owner checks.
+    pub fn check_sorted_values(
+        binding: Binding,
+        cause: &Cause,
+        mut corrections: impl Iterator<Item = Result<Correction, ContractError>>,
+        count: usize,
+        max_relations: usize,
+        visits: &mut super::graph::VisitBudget,
+    ) -> Result<(), ContractError> {
+        visits.charge(1)?;
+        if binding.ledger.tenant.is_zero()
+            || binding.ledger.session.is_zero()
+            || binding.object.is_zero()
+        {
+            return Err(ContractError::InvalidTarget);
+        }
+        match cause {
+            Cause::Root(root) if root.is_zero() => return Err(ContractError::InvalidTarget),
+            Cause::Claim(claim) if claim.is_zero() || claim.0 == binding.object.0 => {
+                return Err(ContractError::InvalidTarget);
+            }
+            _ => {}
+        }
+        if count > max_relations {
+            return Err(ContractError::Capacity);
+        }
+        let mut previous = None;
+        for _ in 0..count {
+            visits.charge(1)?;
+            let correction = corrections.next().ok_or(ContractError::InvalidManifest)??;
+            if correction.predecessor.ledger != binding.ledger {
+                return Err(ContractError::WrongLedger);
+            }
+            if correction.predecessor.kind != ObjectKind::Claim
+                || correction.predecessor.id.is_zero()
+                || correction.predecessor.id == binding.object
+                || previous.is_some_and(|old| old >= correction)
+            {
+                return Err(ContractError::InvalidTarget);
+            }
+            previous = Some(correction);
+        }
+        visits.charge(1)?;
+        match corrections.next() {
+            None => Ok(()),
+            Some(Err(error)) => Err(error),
+            Some(Ok(_)) => Err(ContractError::InvalidManifest),
+        }
+    }
+    /// Consume the assembly's funded canonical buffer without another copy.
+    /// Endpoint existence and lineage traversal remain owner responsibilities.
+    pub fn from_owned_sorted(
+        binding: Binding,
+        cause: Cause,
+        corrections: Vec<Correction>,
+        max_relations: usize,
+        visits: &mut super::graph::VisitBudget,
+    ) -> Result<Self, ContractError> {
+        if corrections.capacity() != corrections.len() {
+            return Err(ContractError::Capacity);
+        }
+        Self::check_sorted_values(
+            binding,
+            &cause,
+            corrections.iter().copied().map(Ok),
+            corrections.len(),
+            max_relations,
+            visits,
+        )?;
+        Ok(Self {
+            binding,
+            cause,
+            corrections,
+        })
+    }
     fn target(&self, edge: usize) -> Option<ClaimId> {
         let offset = match self.cause {
             Cause::Claim(claim) if edge == 0 => return Some(claim),

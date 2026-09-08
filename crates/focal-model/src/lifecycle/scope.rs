@@ -4,14 +4,31 @@
 //! edges, since a new edge can create a cycle. Durable suffix subscriptions and
 //! transition histories belong to the publishing owner.
 use super::claim::{ClaimCut, ClaimState, ClaimTerminalCut};
+#[path = "scope_deadline.rs"]
+mod deadline;
 #[path = "scope_memory.rs"]
 mod memory;
+#[path = "scope_monitor.rs"]
+mod monitor;
+#[path = "scope_release.rs"]
+mod release;
+#[path = "scope_snapshot.rs"]
+pub(in crate::lifecycle) mod snapshot;
 use super::graph::Snapshot;
 use super::succession::CorrectionKind;
 use super::{Binding, ContractError, Principal};
 use crate::{
     Cause, ClaimId, ClaimStatus, Deadline, MonitorId, ObjectRef, ReceiptFence, SessionSeq,
     WaitPredicate,
+};
+pub use deadline::{
+    MonitorDeadlineDecision, MonitorDeadlinePlan, MonitorDeadlineRequest, MonitorExpiry,
+};
+pub use monitor::{BuildLimits, MonitorPlan, RebindRequest};
+pub use release::ReleaseOwnerPlan;
+pub use snapshot::{
+    OwnedChildSnapshotV1, RegistryHydrationPlan, RegistrySnapshotSource, RegistrySnapshotV1,
+    RegistrySnapshotView, ScopeSnapshotSource, ScopeSnapshotV1,
 };
 
 /// Bounds apply to retained rows, including released scopes, and the total
@@ -31,6 +48,20 @@ pub struct Rebinding {
     pub cut: ClaimCut,
 }
 
+/// Cancellation disposes of a terminal owner's wait without claiming its
+/// predicates settled. The original terminal fact remains on the owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MonitorCancellation {
+    pub terminal: SessionSeq,
+    pub cut: ClaimCut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonitorDisposition {
+    Released(ClaimCut),
+    Cancelled(MonitorCancellation),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(test, derive(Clone))]
 pub struct Scope {
@@ -38,7 +69,7 @@ pub struct Scope {
     roots: Vec<WaitPredicate>,
     deadline: Deadline,
     registered: SessionSeq,
-    released: Option<ClaimCut>,
+    disposition: Option<MonitorDisposition>,
     last_rebinding: Option<Rebinding>,
 }
 impl Scope {
@@ -55,10 +86,25 @@ impl Scope {
         self.registered
     }
     pub fn released(&self) -> Option<SessionSeq> {
-        self.released.map(|cut| cut.position)
+        self.release_cut().map(|cut| cut.position)
     }
     pub fn release_cut(&self) -> Option<ClaimCut> {
-        self.released
+        match self.disposition {
+            Some(MonitorDisposition::Released(cut)) => Some(cut),
+            _ => None,
+        }
+    }
+    pub fn cancellation(&self) -> Option<MonitorCancellation> {
+        match self.disposition {
+            Some(MonitorDisposition::Cancelled(cancellation)) => Some(cancellation),
+            _ => None,
+        }
+    }
+    pub fn disposition(&self) -> Option<MonitorDisposition> {
+        self.disposition
+    }
+    pub fn active(&self) -> bool {
+        self.disposition.is_none()
     }
     pub fn last_rebinding(&self) -> Option<Rebinding> {
         self.last_rebinding
@@ -115,11 +161,29 @@ pub struct Registration<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
-    Registered { id: MonitorId, cut: ClaimCut },
-    Rebound { id: MonitorId, change: Rebinding },
-    MonitorReleased { id: MonitorId, cut: ClaimCut },
-    ChildRegistered { child: Binding, cut: ClaimCut },
-    OwnerReleased { cut: ClaimCut },
+    Registered {
+        id: MonitorId,
+        cut: ClaimCut,
+    },
+    Rebound {
+        id: MonitorId,
+        change: Rebinding,
+    },
+    MonitorReleased {
+        id: MonitorId,
+        cut: ClaimCut,
+    },
+    MonitorCancelled {
+        id: MonitorId,
+        cancellation: MonitorCancellation,
+    },
+    ChildRegistered {
+        child: Binding,
+        cut: ClaimCut,
+    },
+    OwnerReleased {
+        cut: ClaimCut,
+    },
 }
 
 /// Construction is private. All fallible work and allocation happens before
@@ -136,6 +200,11 @@ const ALLOCATION: usize = 4 * std::mem::size_of::<usize>();
 impl Transition {
     pub fn event(&self) -> Event {
         self.event
+    }
+    /// Actual replacement/read-buffer charge, including allocator metadata.
+    /// The source registry and graph remain separately retained by the owner.
+    pub fn construction_charge(&self) -> Result<usize, ContractError> {
+        self.allocation_charge()
     }
     /// Actual provisional replacement plus its complete read buffer, while the
     /// original registry is still retained. Native preparation checks this peak
@@ -244,6 +313,12 @@ impl Registry {
     pub fn iter(&self) -> impl Iterator<Item = &Scope> {
         self.scopes.iter()
     }
+    pub fn monitor(&self, id: MonitorId) -> Option<&Scope> {
+        self.scopes
+            .binary_search_by_key(&id, |scope| scope.id)
+            .ok()
+            .and_then(|position| self.scopes.get(position))
+    }
     pub fn children(&self) -> &[OwnedChild] {
         &self.children
     }
@@ -307,7 +382,7 @@ impl Registry {
                 roots,
                 deadline: row.deadline,
                 registered: row.registered,
-                released: row.released,
+                disposition: row.disposition,
                 last_rebinding: row.last_rebinding,
             });
         }
@@ -388,7 +463,7 @@ impl Registry {
             roots,
             deadline: request.deadline,
             registered: authority.cut.position,
-            released: None,
+            disposition: None,
             last_rebinding: None,
         });
         replacement.scopes.sort_unstable_by_key(|row| row.id);
@@ -443,7 +518,7 @@ impl Registry {
             .scopes
             .get(index)
             .ok_or(ContractError::InvalidTarget)?;
-        if row.released.is_some() || !row.roots.iter().any(|root| target(*root) == before) {
+        if !row.active() || !row.roots.iter().any(|root| target(*root) == before) {
             return Err(ContractError::InvalidTransition);
         }
         if successor.created() > authority.cut.position {
@@ -498,7 +573,7 @@ impl Registry {
             .scopes
             .get(index)
             .ok_or(ContractError::InvalidTarget)?;
-        if row.released.is_some() {
+        if !row.active() {
             return Err(ContractError::InvalidTransition);
         }
         for root in &row.roots {
@@ -512,7 +587,7 @@ impl Registry {
             .scopes
             .get_mut(index)
             .ok_or(ContractError::InvalidTarget)?
-            .released = Some(cut);
+            .disposition = Some(MonitorDisposition::Released(cut));
         Self::plan(
             owner,
             graph,
@@ -528,41 +603,7 @@ impl Registry {
         peers: &[&ClaimState],
         cut: ClaimCut,
     ) -> Result<Transition, ContractError> {
-        Self::check_cut(owner, cut)?;
-        graph.check_owner(owner, peers)?;
-        let registry = owner.scopes();
-        if !owner.status().is_terminal() || registry.released() {
-            return Err(ContractError::InvalidTransition);
-        }
-        let terminal = match owner.terminal_cut().ok_or(ContractError::InvalidCut)? {
-            ClaimTerminalCut::Explicit(value) => value.position,
-            ClaimTerminalCut::Required(value) => value.sequence(),
-            ClaimTerminalCut::Graph(value) => value.sequence(),
-        };
-        if cut.position < terminal {
-            return Err(ContractError::InvalidCut);
-        }
-        for child in &registry.children {
-            let actual = peers
-                .iter()
-                .find(|peer| peer.binding().object == child.binding.object)
-                .ok_or(ContractError::InvalidManifest)?;
-            same_content(actual.binding(), child.binding)?;
-            if !actual.scopes().released() {
-                return Err(ContractError::InvalidTransition);
-            }
-            if actual
-                .scopes()
-                .release_cut()
-                .is_some_and(|value| value.position > cut.position)
-            {
-                return Err(ContractError::InvalidCut);
-            }
-        }
-        let mut replacement =
-            registry.copy_with_capacity(registry.scopes.len(), registry.children.len())?;
-        replacement.released = Some(cut);
-        Self::plan(owner, graph, replacement, cut, Event::OwnerReleased { cut })
+        release::prepare(owner, graph, peers, cut, usize::MAX, usize::MAX, false)?.build()
     }
 
     /// Only atomic child generation can mint this token. The child is returned

@@ -1,5 +1,11 @@
 use super::super::{aggregation, claim, graph, succession};
 use super::*;
+#[path = "scope_deadline_tests.rs"]
+mod deadline_tests;
+#[path = "scope_monitor_tests.rs"]
+mod monitor_tests;
+#[path = "scope_release_tests.rs"]
+mod release_tests;
 use crate::{
     ContentHash, ObjectId, ObjectRevision, ParticipantId, ReceiptId, RootCommandId, TimerId,
 };

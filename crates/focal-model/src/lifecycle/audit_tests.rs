@@ -13,6 +13,11 @@ use crate::{
     ValidatorId, VerdictValue,
 };
 
+#[path = "audit_fingerprint_tests.rs"]
+mod fingerprint_tests;
+#[path = "audit_native_tests.rs"]
+mod native_tests;
+
 fn binding(id: u128) -> Binding {
     Binding {
         ledger: LedgerId {

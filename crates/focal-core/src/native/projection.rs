@@ -14,18 +14,20 @@ pub(super) struct ProjectionRows<'a, 'b> {
     pub(super) limits: NativeLimits,
     pub(super) staged: Option<&'a prepare::Extras>,
     pub(super) sequence: SessionSeq,
+    pub(super) visits: &'a super::projection_visits::Visits,
 }
 impl ProjectionRows<'_, '_> {
     fn get(&self, key: Key) -> Option<&Row> {
-        self.staged
-            .and_then(|extras| {
-                extras
-                    .rows
-                    .iter()
-                    .find(|row| row.key == key)
-                    .map(|row| &row.row)
-            })
-            .or_else(|| self.view.get(key))
+        self.visits.charge(1).ok()?;
+        if let Some(extras) = self.staged {
+            for row in &extras.rows {
+                self.visits.charge(1).ok()?;
+                if row.key == key {
+                    return Some(&row.row);
+                }
+            }
+        }
+        self.view.get(key)
     }
 }
 impl WholeWorkView for ProjectionRows<'_, '_> {
@@ -92,11 +94,13 @@ impl WholeWorkView for ProjectionRows<'_, '_> {
         &self,
         claim: ClaimId,
     ) -> impl Iterator<Item = Result<&evidence::WorkArtifact, ContractError>> {
-        super::projection_work::works(self.view, claim, self.limits).map(|old| {
-            let old = old?;
-            self.work(old.reference().id)
-                .ok_or(ContractError::MissingEvidence)
-        })
+        super::projection_work::works_with_budget(self.view, claim, self.limits, Some(self.visits))
+            .map(|old| {
+                let old = old?;
+                let work = self.work(old.reference().id);
+                self.visits.check()?;
+                work.ok_or(ContractError::MissingEvidence)
+            })
     }
 }
 
@@ -107,6 +111,8 @@ pub(super) fn with_projection<T>(
     source: &MemoryBudget,
     project: impl FnOnce(&WholeWorkProjection<'_>) -> T,
 ) -> Result<T, NativeError> {
+    let visits = super::projection_visits::Visits::new(limits.plan_edges);
+    visits.charge(2)?;
     let claim = view.claim(id).ok_or(ContractError::InvalidTarget)?;
     let registrations = view
         .owned_claim(id)?
@@ -118,6 +124,7 @@ pub(super) fn with_projection<T>(
         limits,
         staged: None,
         sequence: view.prefix(),
+        visits: &visits,
     };
     let plan = aggregation::prepare_projection(
         claim,
@@ -132,7 +139,9 @@ pub(super) fn with_projection<T>(
             visits: limits.plan_edges,
             bytes: limits.preparation_bytes,
         },
-    )?;
+    );
+    visits.check()?;
+    let plan = plan?;
     // The reservation precedes every projection allocation and outlives the
     // temporary proof buffers, including participant callback failure/unwind.
     let reservation = source.reserve(
@@ -140,7 +149,9 @@ pub(super) fn with_projection<T>(
         BudgetLane::Ordinary,
         plan.construction_charge(),
     )?;
-    let projection = plan.build()?;
+    let projection = plan.build();
+    visits.check()?;
+    let projection = projection?;
     let result = project(&projection);
     drop(projection);
     drop(reservation);
@@ -161,6 +172,8 @@ pub(super) fn with_staged<T>(
     scratch: &mut prepare::Scratch,
     project: impl FnOnce(&WholeWorkProjection<'_>, &mut prepare::Scratch) -> Result<T, NativeError>,
 ) -> Result<T, NativeError> {
+    let visits = super::projection_visits::Visits::new(limits.plan_edges);
+    visits.charge(1)?;
     let id = ClaimId(claim.binding().object.0);
     let old = view.claim(id).ok_or(ContractError::InvalidTarget)?;
     if sequence.0
@@ -184,6 +197,7 @@ pub(super) fn with_staged<T>(
         limits,
         staged: Some(staged),
         sequence,
+        visits: &visits,
     };
     let plan = aggregation::prepare_projection(
         claim,
@@ -198,8 +212,12 @@ pub(super) fn with_staged<T>(
             visits: limits.plan_edges,
             bytes: scratch.remaining()?,
         },
-    )?;
+    );
+    visits.check()?;
+    let plan = plan?;
     scratch.charge(plan.construction_charge())?;
-    let projection = plan.build()?;
+    let projection = plan.build();
+    visits.check()?;
+    let projection = projection?;
     project(&projection, scratch)
 }

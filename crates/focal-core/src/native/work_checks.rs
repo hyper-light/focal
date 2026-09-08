@@ -27,7 +27,7 @@ pub(super) fn prepare(
     scratch: &mut Scratch,
 ) -> Result<(), NativeError> {
     context.principal.require_actor(claim.issuer())?;
-    super::response_budget::check_registration_capacity(claim, registry, limits)?;
+    super::response_budget::check_registration_capacity_in(view, claim, registry, limits)?;
     let additional = count(claim, limits)?;
     let final_count = add(registry.rows().len(), additional)?;
     within(final_count, registry.max_rows())?;

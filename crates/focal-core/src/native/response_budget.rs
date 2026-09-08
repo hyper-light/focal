@@ -50,6 +50,63 @@ pub(super) fn check_registration_capacity(
     within(registry.rows().len(), required)
 }
 
+/// Closed response cycles already occupy the immutable baseline. Retired open
+/// cycles add independent old-receipt Increment targets, including slots later
+/// reused by the replacement holder; none of those registrations is discarded.
+pub(super) fn required_with_retired(
+    claim: &ClaimState,
+    limits: NativeLimits,
+    retired_work: usize,
+) -> Result<usize, NativeError> {
+    within(retired_work, limits.plan_edges)?;
+    let increments = super::increments::count(claim, limits)?;
+    add(
+        required_registrations(claim, limits)?,
+        retired_work
+            .checked_mul(increments)
+            .ok_or(NativeError::Capacity("retired increment registrations"))?,
+    )
+}
+
+pub(super) fn check_registration_capacity_in(
+    view: &super::View<'_>,
+    claim: &ClaimState,
+    registry: &RegistrationSet,
+    limits: NativeLimits,
+) -> Result<(), NativeError> {
+    registry.check(claim)?;
+    let retired =
+        super::retired_cycles::head(view, super::ClaimId(claim.binding().object.0), limits)?;
+    let required = required_with_retired(claim, limits, retired.work_count)?;
+    within(required, registry.max_rows())?;
+    within(required, limits.evaluations_per_claim)?;
+    within(registry.rows().len(), required)
+}
+
+/// View-free conservative retained-registry bound for a completion contract.
+/// Old-receipt Increment rows include every abandoned output registration. Some
+/// may also belong to closed responses already covered by the baseline; keeping
+/// that overlap is safe and avoids dropping any original audit membership.
+pub(super) fn retained_registration_bound(
+    claim: &ClaimState,
+    registry: &RegistrationSet,
+    limits: NativeLimits,
+) -> Result<usize, NativeError> {
+    within(registry.rows().len(), limits.plan_edges)?;
+    let current = claim.receipt().map(|receipt| receipt.fence);
+    let mut previous = 0usize;
+    for row in registry.rows() {
+        if matches!(
+            row.target(),
+            focal_model::lifecycle::validation::Target::Increment { .. }
+        ) && row.receipt() != current
+        {
+            previous = add(previous, 1)?;
+        }
+    }
+    add(required_registrations(claim, limits)?, previous)
+}
+
 pub(super) fn delivery_count(
     claim: &ClaimState,
     limits: NativeLimits,

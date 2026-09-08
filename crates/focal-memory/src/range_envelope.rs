@@ -10,6 +10,9 @@
 //! use more pages than this partition. Empty deletion groups need one directory
 //! removal, already covered by their affected-leaf term. Unchanged oversized
 //! singletons are shared; replaced/deleted oversized entries are never copied.
+//! A partitioned old leaf is homogeneous, so every retained subsequence also
+//! satisfies its key boundary. Each incoming key can add at most two boundaries;
+//! the same `3m` bound covers arbitrary classifier values without extra padding.
 //!
 //! Each published base page owns at least `page_charge(1, 0)` bytes under the
 //! store's budget. Its immutable limit therefore bounds the page count and
@@ -19,8 +22,8 @@
 //! this bound does not promise that a future reservation will succeed.
 
 use super::{
-    Change, Entry, PageDirectory, RangePreparationPlan, RangeStore, merge_charge, page_charge,
-    root_charge,
+    Change, Entry, PageDirectory, RangePreparationPlan, RangeStore, merge_layout_charge,
+    page_charge, root_charge,
 };
 use crate::{ALLOCATOR_OVERHEAD, MemoryError, OwnerId, checked_add, checked_mul};
 
@@ -208,7 +211,10 @@ impl<K, V> RangeStore<K, V> {
         let merge_pending_bytes = if changed_keys == 0 {
             0
         } else {
-            merge_charge::<K, V>(checked_add(old_rows, changed_keys)?)?
+            merge_layout_charge::<K, V>(
+                checked_add(old_rows, changed_keys)?,
+                self.partition.is_some(),
+            )?
         };
         let additional_retained_bytes = checked_add(directory_bytes, new_pages_bytes)?;
         let additional_peak_bytes = checked_add(

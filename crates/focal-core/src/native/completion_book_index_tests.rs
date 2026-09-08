@@ -58,8 +58,14 @@ fn install(
 fn advance(book: &mut CompletionBook, index: u32, terminal: bool) -> Journal {
     let key = fixture::key(index);
     let before = book.grant(key).unwrap().credit.binding;
-    book.advance(key, before, before.next().unwrap(), terminal, false)
-        .unwrap()
+    book.advance(
+        key,
+        before,
+        before.next().unwrap(),
+        terminal,
+        CompletionUse::Regular,
+    )
+    .unwrap()
 }
 
 fn children(core: &Core<NativeState>, count: u128) -> NativeInput {
@@ -206,7 +212,11 @@ fn wrong_pinned_registration_ordinal_refuses_report_and_changed_parent_without_s
         &BuiltinNativeSchemas,
     )
     .unwrap();
-    book.check_parents(&changed).unwrap();
+    let changed_view = View {
+        state: &core.state,
+        tail: Some(&changed),
+    };
+    book.check_parents(&changed_view, &changed).unwrap();
     book.entries
         .replace_weight(key, weight, |grant| grant.registration_index = other)
         .unwrap();
@@ -225,7 +235,7 @@ fn wrong_pinned_registration_ordinal_refuses_report_and_changed_parent_without_s
         Err(NativeError::Contract(ContractError::InvalidTarget))
     ));
     assert!(matches!(
-        book.check_parents(&changed),
+        book.check_parents(&changed_view, &changed),
         Err(NativeError::Contract(ContractError::InvalidTarget))
     ));
     assert_eq!(book.remaining_reports(key), Some(2));
@@ -244,7 +254,7 @@ fn wrong_pinned_registration_ordinal_refuses_report_and_changed_parent_without_s
         &BuiltinNativeSchemas,
     )
     .unwrap();
-    book.check_parents(&changed).unwrap();
+    book.check_parents(&changed_view, &changed).unwrap();
     drop(book);
     assert_eq!(source.stats().used, 0);
 }
@@ -312,10 +322,24 @@ fn child_registration_batch_checks_the_final_parent_cohort_once() {
     );
     let budget = source.stats();
     book.entries.reset_visits();
-    book.check_parents(&one).unwrap();
+    book.check_parents(
+        &View {
+            state: &core.state,
+            tail: Some(&one),
+        },
+        &one,
+    )
+    .unwrap();
     let one_visits = book.entries.visits();
     book.entries.reset_visits();
-    book.check_parents(&many).unwrap();
+    book.check_parents(
+        &View {
+            state: &core.state,
+            tail: Some(&many),
+        },
+        &many,
+    )
+    .unwrap();
     let many_visits = book.entries.visits();
     book.entries.reset_visits();
     let after = EvaluationKey {

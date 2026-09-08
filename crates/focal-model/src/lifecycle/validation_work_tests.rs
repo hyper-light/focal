@@ -3,6 +3,9 @@ use super::*;
 use crate::lifecycle::{aggregation as a, claim, evidence as e, graph};
 use crate::{Confidence, EvidenceAttestation, OutcomeKind, ReceiptId, SessionSeq};
 
+#[path = "evidence_entry_tests.rs"]
+mod entry_tests;
+
 fn limits() -> a::Limits {
     a::Limits {
         max_slots: 2,

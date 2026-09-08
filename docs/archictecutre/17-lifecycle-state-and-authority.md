@@ -6,10 +6,29 @@ The [lifecycle module](../../crates/focal-model/src/lifecycle/mod.rs) implements
 the role, state, target, aggregation and audit rules described in §11 below;
 L1's remaining owner-integration obligations keep that gate open. The first
 `Core<NativeState>` owner retains claims, complete validation definitions,
-independent Admission/Increment/Receipt evaluations, evidence, responses and request
+independent Admission/Increment/Receipt/WholeWork evaluations, evidence, responses and request
 outcomes in custom RAM storage. Posting, evaluator entry and result publication are
 checked owner transactions; cancellation and supersession atomically fence
-registered evaluations. These rules are
+registered evaluations. Trusted exact evaluation deadlines now publish their
+authority fences and separate typed timer outcomes through that same owner.
+Claim deadlines first resolve canonical deadlock precedence against the complete
+bounded component; ordinary expiry fences the complete registered evaluation set.
+Both paths preserve existing results and independent evidence lifecycles.
+Automatic local-outcome sealing and bounded inspection of actual sealed audit
+membership/history are also implemented in RAM; native claimant result-bundle
+generation and posting, receipt adoption and bounded terminal-owner scope release
+are implemented there as well. Native monitor registration, named rebinding,
+terminal-owner monitor cancellation, direct root subscriptions and exact monitor
+timers now have RAM owner paths. Repeated frozen snapshots settle eligible
+monitors and claim graph consequences; held Work bounds include their repeated
+revisions. Posted Required Admission also reserves its full indexed graph
+component and publishes failure, monitor and cohort consequences atomically.
+Receipt acquisition and adoption now also reserve native RAM and record capacity
+for the respondent's bounded diagnostic, authored response close and posting
+obligations across the remaining cycles; reconstruction includes Generated
+responses still awaiting posting.
+Remaining control/funding gates, whole-claim completion capacity and durable/interface
+activation keep the migration open. These rules are
 not installed in the running ledger. [18](18-lifecycle-storage-upgrade.md) remains
 the prerequisite for storing or applying successor semantics. Existing records
 retain their original interpretation.
@@ -353,7 +372,13 @@ wire numbers.
 | ValidatingQualityBar | Evaluation cannot complete after its permitted attempts | Errored or ErroredNotRequired; not a quality Fail |
 | Terminal evaluation | Another result or new begin | Exact retry returns prior outcome; conflicting replacement rejected |
 
-Missing-slot settlement is a structural claimant operation. It checks the exact
+Missing-slot settlement is a structural consequence of checked response entry.
+A claimant request or an actual designated evaluator's Begin authorizes that
+entry. The owner derives a `ResponseEntry` capability from the checked response
+plan and refreshed claim decision; it grants no participant authority to begin
+or report another evaluator's checks. All exact attached artifacts, including
+zero-check slots, and all structural missing targets consume that same capability.
+It checks the exact
 live claim, received report, frozen manifest, declared slot, receipt, generation
 and Required Increment gate. It invokes no handler, so a handler deadline or
 handler policy grant cannot delay that assessment or let an Observe omission
@@ -362,6 +387,13 @@ Observe absence records suppression. An already explicitly fenced or sealed
 evaluation retains its original state without a new result. Required slot
 presence still has its independent consequence at response entry. Generic
 external Begin and Report retain their deadline, policy and authority checks.
+The capability pins the current claim and resulting response bindings, report
+stamp, receipt, cycle and respondent. It cannot be reused after another claim or
+response revision, against a substituted report, or after control/adoption.
+Native explicit claimant entry and funded evaluator-first `BeginWork` both use
+this path. The evaluator's actual Begun fact precedes the first response-entry
+consequences; the owner does not construct a claimant Principal for it. The
+resource and durable-activation boundaries remain tracked in document 18.
 
 An Observe evaluation that establishes Incomplete retains that outcome as
 nonblocking, including its explicit mode. The blocking test is mode plus outcome,
@@ -612,10 +644,30 @@ these fixtures.
 The successor [Rust contract](../../crates/focal-model/src/lifecycle/mod.rs)
 is independent of `semantics_v1` and the existing stored vocabulary. It deliberately
 has no Serde implementation, numeric discriminants, command registration or
-activation path. It prepares checked values and transitions. The first native
-Core owner publishes creation, posting, Admission entry and control fences in
-RAM; durable publication and the remaining family transitions still require
-L2–L5. It is not a second live ledger.
+activation path. It prepares checked values and transitions. The native Core
+owner publishes the transactions described below in RAM; durable publication and
+the remaining family transitions still require L2–L5. It is not a second live ledger.
+
+The original projection-only native profile omits authored request and checking
+instructions. The separate
+[AuthoredV1 RAM profile](../../crates/focal-core/src/native/authored.rs) now retains
+complete claim descriptions, schema/occurrence, explicit actions, normalized work
+scopes, contextual relations and output requirements, together with the actual
+validation instructions, rubric, provenance and policy revision. Runtime monitor
+scopes and child-release registries remain separate from authored work scopes.
+
+Authored creation derives the lifecycle's parties, graph, lineage and acceptance
+from those exact descriptors, resolves contextual endpoints, and atomically
+retains family-scoped content indices and ordered result mappings. It uses a new
+internal command identity; existing `Create` and V1 identities remain unchanged.
+Self-work drafts remain representable but cannot post. Self-Handoff also refuses
+until a supported authenticated transfer capability exists; an action label alone
+does not establish authority.
+
+These are native RAM owner operations. Complete durable import/codec provenance,
+referenced-standard/policy authority and live interface activation remain required
+under [18 §6.13](18-lifecycle-storage-upgrade.md#613-successor-input-codec-dependency-plan).
+The profile does not authorize invoking participant tools or launching workers.
 
 | Executable part | Enforced behavior |
 |---|---|
@@ -625,13 +677,14 @@ L2–L5. It is not a second live ledger.
 | [Owned validation definitions](../../crates/focal-model/src/lifecycle/validation_definition.rs) | Checked allocation plan, independently owned slot and handler policies, reference-free retained evaluation state, exact semantic policy checks across rebinding, acceptance, results and sealed audit membership |
 | [Aggregation](../../crates/focal-model/src/lifecycle/aggregation.rs) | Exact same-artifact required-check witnesses, explicit pure Receipt, slot presence declaration order, distinct optional-slot/optional-check effects, incremental coverage across responses, coverage before failure, canonical first cuts and late evidence without repainting |
 | [Acceptance manifest and registry](../../crates/focal-model/src/lifecycle/acceptance.rs) | Complete immutable declaration summaries and semantic stamps, exact target/content/generation/receipt registration, separate increment and audit seals, Required Admission and Increment gates, complete pure Receipt proof set |
-| [Compact owner registration](../../crates/focal-model/src/lifecycle/registration.rs) | Claim/policy-bound exact evaluation membership, bounded fallible growth and copying, preserved seals; full definitions remain separately owned rather than copied into the registry |
+| [Compact owner registration](../../crates/focal-model/src/lifecycle/registration.rs) | Claim/policy-bound exact evaluation membership, bounded fallible growth and copying, original local-seal stamp and checked borrowed native audit capability; full definitions remain separately owned rather than copied into the registry |
 | [Graph](../../crates/focal-model/src/lifecycle/graph.rs) | Complete effective snapshot closure, least fixed point, immutable DependsOn versus Awaits, canonical originating dependency cause, deadline-triggered SCC victim, private revision-bound start/release/failure witnesses |
-| [Scope](../../crates/focal-model/src/lifecycle/scope.rs) | Bounded owner-held monitor roots, exact named successor rebind, once-only settlement, atomic child creation/registration, complete owned-child release requirements |
+| [Scope](../../crates/focal-model/src/lifecycle/scope.rs) | Bounded owner-held monitor roots, exact named successor rebind, mutually exclusive successful release and terminal-owner cancellation, atomic child registration and explicit owned-child release; borrowed plans price bytes and visits, and owner release refuses unresolved active monitors |
 | [Succession](../../crates/focal-model/src/lifecycle/succession.rs) | Compatible actual successor, explicit Supersedes relation, bounded acyclic cause/correction closure, chronology checked on every referring edge, effective read fences, unchanged terminal predecessor |
 | [Mandatory creation](../../crates/focal-model/src/lifecycle/creation.rs) | All proposed components checked against actual effective owner lookup; no missing ancestors, duplicate IDs or cycles; same-batch ancestry; atomic child registration and compatible predecessor replacement; public unchecked constructors are test-only |
 | [Owned cancellation](../../crates/focal-model/src/lifecycle/ownership.rs) | Root-issuer authority, complete bounded stored child traversal through terminal descendants, exact child identity/content/cause/creation checks, private derived tokens and unchanged terminal cuts/seals; no implicit scope release |
 | [Audit](../../crates/focal-model/src/lifecycle/audit.rs) | Actual evaluator result artifacts, exact local sealing prefix, complete bounded attempt history, reserved late-result capacity, begun Observe accounting, suppressed Ready/fence provenance, claimant bundle Generated → Posted without recursive acceptance |
+| [Native audit bridge](../../crates/focal-model/src/lifecycle/audit_native.rs) | Complete registry-ordered membership and grouped accepted history, exact latest-result and revision checks, allocation/visit preflight and counted canonical sorting; complete cohorts retain exact result capacity and fallible copies preserve unfinished capacity |
 
 The [two-Actor exchange fixture](../../crates/focal-model/src/lifecycle/exchange_tests.rs)
 passes checked capabilities between all four families. It exercises generated but
@@ -673,10 +726,34 @@ changes. Terminal evaluations retain their original facts; cancellation does not
 release scopes or manufacture respondent testimony.
 
 The owner also implements actual Admission reports with typed attempt provenance,
-schema-checked local custody and atomic artifact/result publication. Eligible
-begun siblings can report after an ordinary Required failure without changing the
-original claim cut. First receipt acquisition consumes checked Admission and graph
-start decisions; it creates responsibility, never a testament.
+schema-checked local custody and atomic artifact/result publication. Before
+accepting a Posted claim's Required `BeginAdmission`, the
+[Admission completion envelope](../../crates/focal-core/src/native/completion_admission_graph.rs)
+reserves the full indexed component's possible failure, graph/monitor revisions,
+index writes and cohort seals as well as the remaining ordinary report attempts.
+Even an isolated parent has protected membership: a later incoming dependency or
+monitor cannot enlarge that promise unnoticed. Admission and WholeWork use the same
+[held graph ceiling](../../crates/focal-core/src/native/completion_graph.rs) and
+[indexed growth guard](../../crates/focal-core/src/native/completion_growth.rs).
+Incompatible topology is refused before its candidate is published.
+
+An actual `Posted → PostFailed` result keeps Artifact at ordinal 0, Evaluation
+Reported at 1 and Accepted at 2; the original failure follows at ordinal 3.
+A private [Admission failure proof](../../crates/focal-core/src/native/admission_graph.rs)
+pins that report and intermediate failure binding while dependency and monitor
+consequences advance other rows, or the failed parent's own revision, in the same
+candidate. Its original Required cut and accepted coordinates remain unchanged.
+The complete original journal precedes any automatic cohort seals, and all rows,
+history and the request outcome publish together through the held report capacity.
+Discard restores the earlier graph, monitors, evaluations and provisional credit.
+
+Other Admission reports retain independent evidence semantics. Eligible begun
+siblings can report after receipt or ordinary terminal failure without rescanning
+later response cohorts, generating graph consequences or changing the original
+claim cut. An Error with remaining attempts remains retry history. First receipt
+acquisition consumes checked Admission and graph start decisions; it creates
+responsibility, never a testament. These native RAM paths still require the
+storage and interface activation described in document 18.
 
 [Respondent evidence transactions](../../crates/focal-core/src/native/work_artifacts.rs)
 retain work outputs and diagnostics with immutable claim, receipt, cycle and role
@@ -699,6 +776,35 @@ an already-posted response can progress after claim terminalization without
 changing the claim's state, history or original cut; receipt and identity guards
 still apply. Reported success or failure is not an acceptance verdict.
 
+The [respondent completion envelope](../../crates/focal-core/src/native/respondent_envelope.rs)
+and [owner loans](../../crates/focal-core/src/native/respondent_owner.rs) now reserve
+these mandatory reporting costs before `AcquireReceipt` or `AdoptReceipt` becomes
+an accepted candidate. New responsibility uses Ordinary admission into the same
+owner pool as evaluation grants. Each remaining authored cycle has capacity for
+one Work-reason diagnostic under the pinned builtin error schema, an explicit
+`CloseResponse` and a separate `PostResponse`. The quote also covers actual
+Generated responses of the current receipt still awaiting posting. These credits
+are independent: closing another cycle does not erase an earlier unposted report.
+
+The respondent still supplies every diagnostic, summary, confidence, outcome and
+manifest. Receipt acquisition creates no response, and reserved capacity does not
+create testimony or turn failure evidence into acceptance. Optional work and
+additional diagnostics use ordinary admission and must leave the bounded close
+and first mandatory diagnostic representable. Exact receipt/actor checks,
+immutable schema and custody requirements, input capacities, complete cycle
+membership and future parent/registry heaps remain enforced. Pending publication
+and rollback journal the actual reporting credit; adoption replaces that credit
+atomically while retaining original evidence and response history. Cancellation
+or terminal/local completion can retire respondent entitlement without revoking
+otherwise eligible already-begun evaluator reports.
+
+This is a RAM and finite-record guarantee for the admitted respondent operations,
+subject to allocator and custody failures retaining retryable responsibility.
+Claimant receipt, evaluation entry, whole-claim/control closure and independent
+payload/WAL/checkpoint/replica capacity still need their complete funding paths.
+Native codec, replay/import and Session/CLI/MCP activation remain open; see
+[18 §6.7](18-lifecycle-storage-upgrade.md#67-integrated-nativeowner-ram-completion-contract).
+
 For an open claim, `ReceiveResponse` also materializes the complete declared pure
 Receipt cohort from the actual received report and records eligible Pass results
 without artifacts, external attempts or an impersonated evaluator. Generation is
@@ -710,7 +816,13 @@ complete [WholeWork cohort](../../crates/focal-core/src/native/work_checks.rs),
 including Required and Observe checks, against actual attached output bindings
 or MissingSlot targets. Both cohorts use one precharged registration copy. Work
 checks remain Ready even after their deadlines; no attempt, verdict or parent
-acceptance is invented. Native WholeWork Begin/report and aggregation remain open.
+acceptance is invented. A designated evaluator explicitly invokes native
+`BeginWork`; it can enter a Received response or begin a check on an already
+Validating response. The sole owner reserves the remaining retry/fallback/quality
+reports before accepting responsibility. `ReportWork` retains the evaluator's
+actual proof or diagnostic and applies the exact artifact, response and claim
+decisions. An ordinary terminal parent does not erase another already-begun
+check's reporting authority or let its later result rewrite the original cut.
 
 [Native Increment ownership](../../crates/focal-core/src/native/increments.rs)
 now materializes every declared Increment check, including Observe, atomically
@@ -735,7 +847,7 @@ evaluation and result reads expose the actual effective or pinned prefix without
 copying complete collections. New registration still uses bounded scans per check;
 this is not a claim of constant-time cohort insertion or global-scale qualification.
 
-The Admission/Increment completion envelope prices complete response history and
+The Admission/Increment/Work completion envelopes price complete response history and
 bounded append-only evaluation registration growth, preserving each held grant's original
 registration ordinal. Before first responsibility, the owner requires the full
 authored target count to fit its registry limits and the combined pure Receipt
@@ -753,16 +865,226 @@ boundary; qualification results are recorded separately in
 [09](09-implementation-status.md). No native codec, restart/import or Session
 activation is supplied by this in-process path.
 
-The remaining owner obligations keep L1 open: non-Receipt WholeWork
-entry/reporting; deadline/fence publication for expired Ready checks;
-receipt adoption; aggregation, graph consequences and audit transactions against
-the complete registry. Adoption must derive receipt/definition/generation fences
-from actual rows. These additional paths must preserve authorized begun late reports after ordinary required-check failure.
-Broader standing and grant policy must likewise resolve actual stored facts;
-ingress must never accept participant permission flags. Start and graph release
-in the model consume checked proof tokens rather than caller-selected booleans.
-Native codecs, WAL/Ready integration, Session activation and CLI/MCP dispatch remain
-open; these RAM transactions do not complete the L1–L8 storage rollout.
+Exact evaluation deadlines now fence expired Ready or begun checks, including
+handler-free Receipt and MissingSlot targets, without manufacturing a verdict.
+Their owner-only ingress resolves the current registered evaluation; actor
+requests cannot select timer authority. An exact consumed timer retry returns
+its original outcome before clock/capacity checks. Begun evaluations spend held
+capacity and retire their grants atomically; Ready and already-terminal timer
+consumption uses ordinary admission. A pending fence blocks later reports and
+rolls back with its original credit and history.
+
+Claim deadlines have a distinct trusted input and retry identity. The owner
+checks the original due claim and the complete unsatisfied SCC before selecting
+the canonical victim by creation position and then claim ID. The victim may be
+another claim. A verified absence of such a cycle permits ordinary expiry;
+invalid sources, exhausted traversal/storage bounds and incomplete components
+remain errors. After each victim's consequences, reassess the original trigger
+until it is terminal; a consumed timer cannot strand it open after another
+claim broke the first cycle. Each round must terminalize a previously live
+member and preserves the witnesses and cuts already established.
+Deadlocked/DependencyFailed retain already-begun report authority.
+Expired fences every registered nonterminal, unfenced evaluation while preserving
+its actual state, attempts and evidence. Claim changes, fences, graph consequences,
+grant retirement and timer consumption publish or roll back together.
+
+This control path uses bounded Completion-lane admission. It does not borrow an
+arbitrary evaluation's held report grant. An expiry cohort can exceed the current
+transaction bounds; the owner refuses the whole candidate. Admission does not
+yet reserve guaranteed completion capacity for every future claim deadline.
+That obligation requires a checked admission bound or a funded continuation,
+including the control journal, graph closure, RAM, disk and replica costs.
+
+The model now derives evaluation cohort seals from an actual locally sealed
+claim and its original seal position. It preserves begun attempts and evidence;
+an unbegun member acquires suppression without a result. The owner uses a common
+checked report/fence journal that can also rebind sealed siblings atomically,
+including a report followed by a seal of the same evaluation. Begin/recovery
+reserve the extra revision and complete future report/cohort bookkeeping work.
+Automatic cohort publication now runs at the native RAM preparation boundary.
+It preserves the complete original history, appends exact evaluation seals and
+registration-seal events, and installs final rows and grant bindings atomically.
+Only a newly recorded local seal triggers this suffix; late reports retain its
+original cut and cannot reseal it. Audit bundles remain separate
+claimant-authored objects; no seal supplies respondent testimony.
+
+Every managed Begin now retains its actual authorized source and complete intermediate
+evaluation state. Its grant installation and any resulting mixed journal occupy
+one bounded candidate; updates roll back before the installation, and commit
+preserves newer pending reports. Every Begun event requires that proof, even
+when no attempt is present. The common history visitor preserves original
+evidence-result positions before seal events are appended. A private
+original plan owns its source/outcome context and unchanged payloads until the
+single original-history emission finishes; it adds no history-copy buffer.
+Seal proofs use a once-checked canonical slice and bounded binary lookup with
+complete target bindings and generation, without a separate index allocation. Neither
+mechanism admits an extra external attempt or generates participant evidence.
+
+Structural missing-slot settlement keeps its own history before any seal.
+The collector checks the actual Received response, immutable manifest absence,
+and its recorded entry position before applying the missing-target transition.
+It then validates the seal against that intermediate revision. This path
+creates no evaluator attempt or report credit; a Required structural result
+must retain its original Missing publication and an Observe suppression must
+remain without a fabricated result.
+
+The [native audit reader](../../crates/focal-core/src/native/audit.rs) now resolves
+the complete sealed registry, declarations and evaluation states from one actual
+committed or pending prefix. Direct result-key seeks gather all Accepted,
+Delivery and Missing history and verify each original event/outcome position;
+external results retain exact artifact identity and provenance. The model's
+borrowed native seal capability binds the registry to the original claim seal.
+A linear grouped-history check rejects omitted retries before counted canonical
+sorting. Source and output buffers share explicit query admission and remain
+charged through the inspection callback. Begun late reports remain visible at
+their later original positions; terminal and suppressed members do not acquire
+fabricated results. This derives a read view and does not retain another mutable
+audit index.
+
+The [native result-testament owner](../../crates/focal-core/src/native/audit_bundle.rs)
+also implements claimant-only `GenerateResultTestament` and
+`PostResultTestament`. Generation requires the complete actual sealed audit to
+be closed, including begun Observe checks. It consumes that audit into one
+immutable Generated bundle, retaining the captured source prefix, original
+local seal and every Accepted/Delivery/Missing publication position. The content
+hash includes complete canonical audit facts, including exact optional seal
+causes, and the separate publication witnesses. Existing evaluator result
+artifacts supply the evidence; generation creates no additional aggregate
+artifact or participant verdict.
+
+A separate native per-claim index permits one bundle. Response and result
+testament IDs cannot collide, in either creation order. Exact request retries
+preserve the original outcome. Posting checks the claimant and stored bundle
+binding, advances only its own revision/state to Posted, and preserves all
+frozen content and positions. It remains valid after later graph progress
+changes the parent revision. Generation may occur while a locally complete
+claim still waits for that graph release. Neither operation changes claim,
+response, artifact or evaluation state, response membership or acceptance.
+
+Construction uses ordinary precharged RAM. The internal audit builder moves
+its source-derived buffers into the bundle under the transaction's `Scratch`
+allowance; posting precharges a fallible owned copy. Checked linear passes
+bound canonical hashing and copying by the retained member/result counts.
+Separate native row/index/fact/counter storage and read projections preserve
+Generated and Posted positions without changing any V1 format. Final
+qualification for this increment is recorded separately in [09](09-implementation-status.md#native-claimant-result-testaments--2026-09-07).
+
+The native [adoption transaction](../../crates/focal-core/src/native/adoption.rs)
+now replaces responsibility through a checked token borrowed from the complete
+source claim. `AdoptReceipt { expected, previous, receipt, holder }` requires the
+claimant, exact current claim binding and receipt, a globally unused receipt ID,
+and exactly the next receipt epoch. It refuses terminal/local-complete claims,
+past deadlines and exhausted response allowances. The new holder must retain
+room for a fresh explicitly authored response. Adoption preserves immutable
+content, status, response count, all earlier testimony and evidence; it creates
+no result, artifact or respondent testament.
+
+The owner resolves every registered evaluation and its original target before
+publishing an adoption fence. Every live unfenced member, including receipt-free
+Admission, receives the exact adoption cause; terminal results and earlier fences
+remain unchanged. The same candidate retires held report promises. Discard or
+admission failure restores old authority and funding. The registry retains all
+historical membership while reopening the replacement receipt's Increment target
+set. Its checked binding baseline advances with the claim, so the old adoption
+token cannot reset a later registry.
+
+Abandoned nonempty open cycles remain indexed by claim, receipt, epoch and cycle.
+The replacement can reuse the numerical next-cycle ordinal and slot under its
+new receipt. Work projection includes those retained cycles; duplicate and
+closed-response membership checks compare the exact receipt as well as cycle.
+Required Increment entry gates preserve historical terminal result positions and
+apply the new target-seal flag only to the current receipt. Future registration
+and report-projection bounds include retained work and diagnostic-only cycle
+traversal. Capacity refusal cannot delete history to make a transfer fit.
+This operation uses ordinary bounded admission; guaranteed future whole-claim
+closure and durable activation remain separate obligations. Executed adoption
+qualification is recorded in [09](09-implementation-status.md).
+
+The [native owner-release transaction](../../crates/focal-core/src/native/scope_release.rs)
+implements `ReleaseScope { expected }` for a terminal, unreleased claim. It checks
+the original issuer and exact current binding, gathers the complete indexed graph
+and proves every owned child already released. The
+[model preflight](../../crates/focal-model/src/lifecycle/scope_release.rs) borrows
+those sources and quotes the replacement registry and complete read buffer before
+allocation. Construction reconciles actual capacities under held permits. Active
+individual monitors are refused, even when a root predicate is already settled.
+
+A private [released-root capability](../../crates/focal-core/src/native/graph_owner_release.rs)
+applies the real scope transition to an exact checked claim copy before deriving
+indexed graph consequences. The original journal records `OwnerReleased` first,
+then each actual dependency-failure or satisfaction revision; automatic cohort
+seals follow that journal. The release preserves status, original terminal/local
+cuts, receipt and testimony. It does not fence an eligible begun evaluation or
+invent a result, cancellation or response. Pending children may release before
+their parent; refusal or suffix discard preserves the earlier effective state.
+
+This operation uses ordinary bounded admission. Owner release remains a separate
+issuer action after every owned child and active monitor satisfies its release
+preconditions. Monitor settlement does not implicitly release its owner. The
+previous owner-release qualification remains recorded in
+[09](09-implementation-status.md#native-owner-scope-release--2026-09-07);
+implementation of the additional monitor paths below does not extend that
+qualification record by implication.
+
+The [native monitor commands](../../crates/focal-core/src/native/monitor_commands.rs)
+now apply bounded model registration, named rebinding and terminal-owner
+cancellation against the issuer's exact claim binding and receipt. A monitor has
+one mutually exclusive disposition: released because its predicates settled, or
+cancelled with the original owner terminal position and a separate cancellation
+cut. Both retain original registration and deadline provenance. Cancellation
+preserves claim failure, testimony and child obligations; it cannot stand in for
+successful predicate release.
+
+[Direct root subscriptions](../../crates/focal-core/src/native/monitor_index.rs)
+retain global monitor identity and bounded reverse membership from each actual
+root to its monitor. Registration, rebind, release and cancellation publish their
+source-checked membership changes with the corresponding claim revisions and
+history. Retained link tombstones preserve allocation accounting. This is a
+direct root index; transitive closure is discovered against the actual bounded
+source when needed. Materialized transitive caches, durable notification delivery
+and recovery reconciliation remain separate work.
+
+The [scope consequence reducer](../../crates/focal-core/src/native/graph_monitor_effects.rs)
+recaptures the complete affected graph after each real transition. It distinguishes
+`Satisfied`, `Terminal` and `Released` predicates, releases only settled monitors,
+and propagates claim satisfaction or dependency failure to a bounded fixed point.
+It retains every intermediate claim revision and original terminal cut. A
+terminal owner's monitor can settle later without repainting that owner's result.
+No owner release, participant report or respondent testament is synthesized.
+Held native Work and Posted Required Admission contracts price up to `M + L`
+such graph events, where `M` is the active monitor count and `L` is the number
+of live claims in the protected component. They include source copies, repeated
+captures, index writes, history, revision margins and discrete slots. Incompatible
+growth is refused before it can strand an existing report grant. These bounded
+RAM promises cover the admitted Work cohort and one possible Admission failure.
+Complete claim-responsibility and durable-storage reservations remain required.
+
+[Native monitor timers](../../crates/focal-core/src/native/monitor_deadlines.rs)
+use a disjoint `(claim, monitor, timer, generation)` invocation key and include
+the complete deadline in intent. They resolve the retained global monitor
+allocation and actual scope, and reuse the original outcome on an exact retry.
+The [model deadline plan](../../crates/focal-model/src/lifecycle/scope_deadline.rs)
+checks due logical time and complete source bindings under shared traversal
+budgets. An inactive timer records no new lifecycle fact; a settled wait uses a
+real monitor release. An unsettled wait first selects the canonical SCC victim;
+only a checked absence of a cycle authorizes monitor expiry and exact evaluation
+fences. That authority also works when the claim has no authored deadline.
+An earlier effective deadline, malformed source or resource refusal cannot be
+used as negative-cycle evidence. Ordinary claim timers likewise recapture after
+monitor revisions before resolving their original trigger. Neither timer is an
+agent request or a participant-supplied wall clock.
+
+The remaining owner obligations keep L1 open: finish control/succession coverage
+and funding, whole-claim completion capacity, and durable notification/reconciliation.
+Work entry/reporting and Posted Required Admission already use bounded atomic
+aggregation and indexed graph consequences; other paths must
+preserve the same source checks, capacity promises and authorized begun late
+reports after ordinary business failure. Standing and grant policy must resolve
+actual stored facts rather than participant permission flags. Due-timer scheduling
+and recovery, native codecs, WAL/Ready integration, Session/quorum activation and
+CLI/MCP dispatch remain open. The live ledger still uses V1 semantics. The full
+remaining sequence and qualification boundary are in
+[18 §6.12](18-lifecycle-storage-upgrade.md#612-runtime-scope-integration-sequence).
 
 Acceptance and graph declarations freeze with claim generation. The live owner
 must retain the full histories, all simultaneous causes and exact acceptance witnesses, bind

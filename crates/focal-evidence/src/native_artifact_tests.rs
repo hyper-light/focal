@@ -1,4 +1,6 @@
 use super::*;
+#[path = "native_artifact_recovery_tests.rs"]
+mod recovery;
 use focal_model::lifecycle::artifact_descriptor::{ArtifactSpec, Limits as ArtifactLimits};
 use focal_model::{
     ArtifactId, LedgerId, ParticipantId, RequestEpoch, RequestId, SessionId, TenantId,

@@ -178,7 +178,10 @@ fn change_allowance_covers_simultaneous_vectors_and_owned_containers() {
         assert!(actual <= budget.changes_bytes, "{operation:?}");
         assert_eq!(
             budget.pending_bytes().unwrap(),
-            budget.scratch_bytes + budget.changes_bytes + budget.extras_bytes
+            budget.scratch_bytes
+                + budget.changes_bytes
+                + budget.extras_bytes
+                + crate::native::mutation::bytes(budget.max_changes).unwrap()
         );
     }
 }
@@ -207,7 +210,10 @@ fn creation_prices_derived_index_rows_while_other_operations_keep_their_allowanc
                 + event_containers(batch).unwrap();
             assert_eq!(
                 budget.pending_bytes().unwrap(),
-                scratch + original_changes + original_extras
+                scratch
+                    + original_changes
+                    + original_extras
+                    + crate::native::mutation::bytes(batch).unwrap()
             );
             assert_eq!(budget.max_changes, batch);
             assert_eq!(budget.max_claim_rows, nodes);

@@ -1,4 +1,4 @@
-//! One checked byte/count partition rule shared by quoting and construction.
+//! One checked key/byte/count partition rule shared by quoting and construction.
 //! Layout limits are immutable for an owner's lifetime; no value is copied here.
 
 use super::{Change, Entry, Page, RangeConfig, page_charge};
@@ -60,6 +60,7 @@ impl LeafPartition {
     pub fn push(
         &mut self,
         heap: usize,
+        boundary: bool,
         emit: &mut impl FnMut(LeafSpan) -> Result<(), MemoryError>,
     ) -> Result<(), MemoryError> {
         let bytes = checked_add(self.entry_bytes, heap)?;
@@ -70,7 +71,8 @@ impl LeafPartition {
             });
         }
         if self.span.len != 0
-            && (self.span.len == self.config.page_entries
+            && (boundary
+                || self.span.len == self.config.page_entries
                 || bytes > self.config.page_bytes.saturating_sub(self.bytes))
         {
             self.finish(emit)?;
@@ -101,21 +103,47 @@ impl LeafPartition {
     }
 }
 
-/// Return the boundary between smaller and larger incoming keys when this
-/// oversized singleton is unchanged. Only counts escape, so the builder can
-/// consume the input iterator afterward. Replacement/deletion uses normal merge.
-pub(super) fn reusable_singleton<K: Ord, V>(
+/// Reuse an unchanged isolated leaf when all changes sit outside its key span.
+/// Oversized singletons retain the original byte-isolation rule. Partitioned
+/// ordinary pages can remain shared when each adjacent incoming key starts a
+/// different partition. Only counts escape; owned changes can then be consumed.
+pub(super) fn reusable_page<K: Ord, V>(
     page: &Page<K, V>,
     changes: &[Change<K, V>],
     config: RangeConfig,
+    partition: Option<fn(&K) -> u64>,
 ) -> Result<Option<usize>, MemoryError> {
-    let [entry] = page.entries.as_slice() else {
+    if let [entry] = page.entries.as_slice()
+        && page_charge::<K, V>(1, entry.heap_bytes)? > config.page_bytes
+    {
+        return Ok(changes
+            .binary_search_by(|change| change.key().cmp(&entry.key))
+            .err());
+    }
+    let Some(classify) = partition else {
         return Ok(None);
     };
-    if page_charge::<K, V>(1, entry.heap_bytes)? <= config.page_bytes {
+    let first = page.entries.first().ok_or(MemoryError::MissingKey)?;
+    let last = page.entries.last().ok_or(MemoryError::MissingKey)?;
+    let split = changes.partition_point(|change| change.key() < &first.key);
+    // A replacement, deletion or insertion within the retained page still
+    // needs its normal ordered merge, even if the classifier is nonmonotonic.
+    if changes
+        .get(split)
+        .is_some_and(|change| change.key() <= &last.key)
+    {
         return Ok(None);
     }
-    Ok(changes
-        .binary_search_by(|change| change.key().cmp(&entry.key))
-        .err())
+    let label = classify(&first.key);
+    if split
+        .checked_sub(1)
+        .and_then(|index| changes.get(index))
+        .is_some_and(|change| classify(change.key()) == label)
+        || changes
+            .get(split)
+            .is_some_and(|change| classify(change.key()) == label)
+    {
+        return Ok(None);
+    }
+    Ok(Some(split))
 }

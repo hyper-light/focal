@@ -1,5 +1,8 @@
 use super::super::report_tests::{EVALUATOR, QUALITY, artifact_spec};
 use super::*;
+
+#[path = "adoption_increment_tests.rs"]
+mod adoption_tests;
 use focal_memory::{BudgetKind, BudgetLane};
 use focal_model::lifecycle::artifact_descriptor::ResultProvenance;
 use focal_model::{
@@ -712,7 +715,7 @@ fn pending_work_begin_and_report_discard_restore_full_registry_and_reserved_cred
     assert!(
         f.owner
             .effective()
-            .recorded(report_outcome.request)
+            .recorded(report_outcome.invocation)
             .is_none()
     );
     assert_eq!(f.owner.discard_from(work).unwrap(), 1);
@@ -725,7 +728,12 @@ fn pending_work_begin_and_report_discard_restore_full_registry_and_reserved_cred
             .work(ArtifactId::from_u128(801))
             .is_none()
     );
-    assert!(f.owner.effective().recorded(work_outcome.request).is_none());
+    assert!(
+        f.owner
+            .effective()
+            .recorded(work_outcome.invocation)
+            .is_none()
+    );
     assert_eq!(
         f.owner
             .effective()

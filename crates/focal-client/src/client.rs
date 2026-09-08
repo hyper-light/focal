@@ -477,7 +477,13 @@ impl<T: ClientTransport> Client<T> {
                     }
                     return Err(ClientError::Unauthenticated);
                 }
-                Ok(Err(WireError::Io(_) | WireError::Connection | WireError::Timeout)) | Err(_) => {
+                Ok(Err(
+                    WireError::Io(_)
+                    | WireError::Allocation
+                    | WireError::Connection
+                    | WireError::Timeout,
+                ))
+                | Err(_) => {
                     uncertain = true;
                     *write_uncertain = request.operation.is_mutation();
                 }

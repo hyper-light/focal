@@ -6,12 +6,25 @@ mod admission_authority;
 #[cfg(test)]
 mod admission_authority_tests;
 mod admission_budget;
+mod admission_graph;
 mod admission_view;
+mod adoption;
+mod artifact_intent;
+mod audit;
+mod audit_bundle;
+mod authored;
+mod authored_reads;
 mod claim_changes;
+mod claim_deadlines;
+mod cohort_budget;
+mod cohort_seals;
 mod completion_book;
 mod completion_envelope;
 mod completion_index;
 mod completion_schemas;
+mod control_graph;
+mod creation_result;
+mod deadlines;
 mod delivery;
 mod delivery_owned;
 #[cfg(test)]
@@ -24,30 +37,47 @@ mod incoming_graph;
 mod increment_authority;
 mod increment_seal;
 mod increments;
+pub mod input_codec;
 mod intent;
 #[cfg(test)]
 mod layout_tests;
 mod missing_owned;
 mod missing_results;
+mod monitor_commands;
+mod monitor_deadlines;
+mod monitor_index;
+mod mutation;
+mod object_journal;
 mod owned;
 mod owner;
 mod prepare;
 mod prepare_budget;
 mod projection;
+mod projection_quote;
+mod projection_visits;
 mod projection_work;
 mod receipt;
 #[cfg(test)]
 mod receipt_tests;
+pub mod record_codec;
+mod report_artifact;
 #[cfg(test)]
 mod report_tests;
 mod reporting;
+mod respondent_envelope;
+mod respondent_state;
 mod response_budget;
+mod response_input;
 mod response_owned;
 mod response_reads;
 #[cfg(test)]
 mod response_tests;
 mod responses;
 mod result_owned;
+mod retired_cycles;
+mod scope_release;
+#[cfg(test)]
+mod scope_release_tests;
 #[cfg(test)]
 mod tests;
 mod transactions;
@@ -55,11 +85,19 @@ mod transactions;
 mod validation_tests;
 mod whole_work;
 mod work_artifacts;
+mod work_authority;
 mod work_checks;
 mod work_failures;
 mod work_owned;
+mod work_reporting;
 
 use crate::{Core, CoreState, state_kind};
+pub use audit::{NativeAudit, NativeAuditPublication};
+pub use audit_bundle::NativeResultTestament;
+use audit_bundle::OwnedResultTestament;
+pub use authored::{NativeAuthoredProposal, NativeContentProfile};
+use creation_result::OwnedCreationResult;
+pub use creation_result::{NativeCreatedFamily, NativeCreatedObject, NativeCreationResult};
 pub use delivery_owned::NativeDeliveryResult;
 use delivery_owned::OwnedDeliveryResult;
 use focal_memory::{
@@ -72,25 +110,30 @@ use focal_model::lifecycle::evidence::{
 use focal_model::lifecycle::{
     Binding, ContractError, Principal,
     aggregation::RegistrationSet,
-    claim::ClaimState,
+    claim::{ClaimState, ReceiptEntitlement},
     creation::{EffectiveClaims, Proposal},
-    validation,
+    scope, validation,
 };
 use focal_model::{
-    ArtifactId, ClaimId, ClaimStatus, ContentHash, LedgerId, ParticipantId, ReceiptFence,
-    ReceiptId, RequestKey, SessionSeq, TestamentId, ValidationId,
+    ArtifactId, ClaimId, ClaimStatus, ContentHash, Deadline, LedgerId, MonitorId, ParticipantId,
+    ReceiptFence, ReceiptId, RequestKey, SessionSeq, TestamentId, TimerId, ValidationId,
+    WaitPredicate,
 };
 use history::StoredEvent;
 pub use missing_owned::NativeMissingResult;
 use missing_owned::OwnedMissingResult;
-use owned::{OwnedClaim, OwnedDeclaration, OwnedEvaluation, OwnedEvent};
+use owned::{OwnedClaim, OwnedClaimContent, OwnedDeclaration, OwnedEvaluation, OwnedEvent};
 pub use owner::{
     NativeCandidate, NativeOwner, NativeOwnerError, NativeOwnerInitError, NativeStaging, NativeView,
+};
+pub use projection_quote::NativeProjectionQuote;
+pub use response_input::{
+    NativeMonitorSource, NativeMonitorSourcePlan, NativeResponseInput, NativeResponsePlan,
+    NativeResponseSource, NativeResponseSourcePlan, NativeResponseSpec, NativeSourceQuote,
 };
 pub use response_owned::NativeResponseRecord;
 use response_owned::OwnedResponse;
 use response_reads::{as_diagnostic, as_response, as_work};
-pub use responses::NativeResponseInput;
 pub use result_owned::{NativeAccepted, NativeArtifact, NativeArtifactInput};
 use result_owned::{OwnedAccepted, OwnedArtifact};
 pub use work_owned::{NativeDiagnostic, NativeWork};
@@ -115,6 +158,8 @@ pub struct NativeLimits {
     pub results: usize,
     pub receipts: usize,
     pub responses: usize,
+    pub monitors: usize,
+    pub monitor_links: usize,
     pub work_artifacts_per_cycle: usize,
     pub diagnostics_per_cycle: usize,
     pub response_summary_bytes: usize,
@@ -137,6 +182,8 @@ impl Default for NativeLimits {
             results: 8_000_000,
             receipts: 8_000_000,
             responses: 4_000_000,
+            monitors: 4_000_000,
+            monitor_links: 16_000_000,
             work_artifacts_per_cycle: 256,
             diagnostics_per_cycle: 64,
             response_summary_bytes: 64 * 1024,
@@ -146,6 +193,7 @@ impl Default for NativeLimits {
 
 pub struct NativeState {
     ledger: LedgerId,
+    profile: NativeContentProfile,
     rows: RangeStore<Key, Row>,
     budget: MemoryBudget,
 }
@@ -153,6 +201,7 @@ impl std::fmt::Debug for NativeState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NativeState")
             .field("ledger", &self.ledger)
+            .field("profile", &self.profile)
             .field("range", &self.rows.id())
             .field("prefix", &self.rows.prefix())
             .field("entries", &self.rows.len())
@@ -169,6 +218,102 @@ pub struct NativeInput {
     pub request: RequestKey,
     pub command: NativeCommand,
 }
+/// Trusted timer delivery. The owner resolves the current evaluation revision;
+/// this is deliberately separate from participant-authored commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeDeadlineInput {
+    pub evaluation: EvaluationKey,
+    pub deadline: Deadline,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NativeDeadlineKey {
+    pub evaluation: EvaluationKey,
+    pub timer: TimerId,
+    pub generation: u64,
+}
+impl NativeDeadlineInput {
+    pub fn key(self) -> NativeDeadlineKey {
+        NativeDeadlineKey {
+            evaluation: self.evaluation,
+            timer: self.deadline.timer,
+            generation: self.deadline.generation,
+        }
+    }
+}
+/// Trusted delivery of the claim's own authored deadline. The effective owner
+/// resolves its current revision and checks deadlock precedence before expiry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeClaimDeadlineInput {
+    pub claim: ClaimId,
+    pub deadline: Deadline,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NativeClaimDeadlineKey {
+    pub claim: ClaimId,
+    pub timer: TimerId,
+    pub generation: u64,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeMonitorDeadlineInput {
+    pub claim: ClaimId,
+    pub monitor: MonitorId,
+    pub deadline: Deadline,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NativeMonitorDeadlineKey {
+    pub claim: ClaimId,
+    pub monitor: MonitorId,
+    pub timer: TimerId,
+    pub generation: u64,
+}
+impl NativeMonitorDeadlineInput {
+    pub fn key(self) -> NativeMonitorDeadlineKey {
+        NativeMonitorDeadlineKey {
+            claim: self.claim,
+            monitor: self.monitor,
+            timer: self.deadline.timer,
+            generation: self.deadline.generation,
+        }
+    }
+}
+impl NativeClaimDeadlineInput {
+    pub fn key(self) -> NativeClaimDeadlineKey {
+        NativeClaimDeadlineKey {
+            claim: self.claim,
+            timer: self.deadline.timer,
+            generation: self.deadline.generation,
+        }
+    }
+}
+/// Disjoint exact-invocation namespaces. A timer can never impersonate an
+/// actor request or consume its retry identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NativeInvocation {
+    Request(RequestKey),
+    EvaluationDeadline(NativeDeadlineKey),
+    ClaimDeadline(NativeClaimDeadlineKey),
+    MonitorDeadline(NativeMonitorDeadlineKey),
+}
+impl From<RequestKey> for NativeInvocation {
+    fn from(request: RequestKey) -> Self {
+        Self::Request(request)
+    }
+}
+impl From<NativeDeadlineKey> for NativeInvocation {
+    fn from(deadline: NativeDeadlineKey) -> Self {
+        Self::EvaluationDeadline(deadline)
+    }
+}
+impl From<NativeClaimDeadlineKey> for NativeInvocation {
+    fn from(deadline: NativeClaimDeadlineKey) -> Self {
+        Self::ClaimDeadline(deadline)
+    }
+}
+impl From<NativeMonitorDeadlineKey> for NativeInvocation {
+    fn from(deadline: NativeMonitorDeadlineKey) -> Self {
+        Self::MonitorDeadline(deadline)
+    }
+}
 /// Supplied by the trusted publishing owner, never decoded from participant
 /// intent. Logical time advances monotonically at the effective ledger prefix.
 #[derive(Debug, Clone, Copy)]
@@ -178,6 +323,37 @@ pub struct NativeContext {
 }
 #[derive(Debug)]
 pub enum NativeCommand {
+    RegisterMonitor {
+        expected: Binding,
+        receipt: Option<ReceiptFence>,
+        id: MonitorId,
+        roots: Vec<WaitPredicate>,
+        deadline: Deadline,
+    },
+    RebindMonitor {
+        expected: Binding,
+        receipt: Option<ReceiptFence>,
+        id: MonitorId,
+        predecessor: Binding,
+        successor: Binding,
+    },
+    CancelMonitor {
+        expected: Binding,
+        receipt: Option<ReceiptFence>,
+        id: MonitorId,
+    },
+    /// Release a terminal claim's owned scope after its children are released.
+    /// This does not terminalize children or invent evaluation results.
+    ReleaseScope {
+        expected: Binding,
+    },
+    GenerateResultTestament {
+        claim: Binding,
+        id: TestamentId,
+    },
+    PostResultTestament {
+        expected: Binding,
+    },
     /// Explicit claimant request to assess the exact received response.
     /// External check execution remains the evaluator's responsibility.
     EnterWholeWork {
@@ -233,11 +409,24 @@ pub enum NativeCommand {
         expected: Binding,
         receipt: ReceiptId,
     },
+    /// The claimant replaces current responsibility. The owner assigns the next
+    /// receipt epoch and fences old evaluations without manufacturing testimony.
+    AdoptReceipt {
+        expected: Binding,
+        previous: ReceiptFence,
+        receipt: ReceiptId,
+        holder: ParticipantId,
+    },
     /// Core assigns every creation position. Definitions must begin at revision
     /// one; their immutable content and acceptance identities remain pinned.
     Create {
         claims: Vec<Proposal>,
         declarations: Vec<validation::Declaration>,
+    },
+    /// Complete authored bodies, grouped by their actual parent. The owner
+    /// derives lifecycle projections and assigns the creation cut.
+    CreateAuthored {
+        claims: Vec<NativeAuthoredProposal>,
     },
     /// Root-issuer control of the actual stored owned closure, including children
     /// created in an earlier unpublished candidate in the supplied chain.
@@ -271,9 +460,30 @@ pub enum NativeCommand {
         report: validation::Report,
         artifact: NativeArtifactInput,
     },
+    /// The designated evaluator begins one exact received-work check. The first
+    /// begin enters its response using the actual evaluator capability.
+    BeginWork {
+        claim: Binding,
+        key: EvaluationKey,
+        expected: Binding,
+    },
+    ReportWork {
+        claim: Binding,
+        key: EvaluationKey,
+        expected: Binding,
+        report: validation::Report,
+        artifact: NativeArtifactInput,
+    },
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeOperation {
+    RegisterMonitor,
+    RebindMonitor,
+    CancelMonitor,
+    MonitorDeadline,
+    ReleaseScope,
+    GenerateResultTestament,
+    PostResultTestament,
     EnterWholeWork,
     SealIncrementTargets,
     BeginIncrement,
@@ -287,16 +497,21 @@ pub enum NativeOperation {
     PostResponse,
     ReceiveResponse,
     AcquireReceipt,
+    AdoptReceipt,
     Create,
     Cancel,
     Post,
     BeginAdmission,
     ReportAdmission,
+    BeginWork,
+    ReportWork,
+    EvaluationDeadline,
+    ClaimDeadline,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeOutcome {
     pub ledger: LedgerId,
-    pub request: RequestKey,
+    pub invocation: NativeInvocation,
     pub sequence: SessionSeq,
     pub logical_time: u64,
     pub operation: NativeOperation,
@@ -310,10 +525,13 @@ pub struct NativeOutcome {
     pub results: u32,
     pub receipts: u32,
     pub responses: u32,
+    pub result_testaments: u32,
     pub events: u32,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeEventKind {
+    Monitor(NativeMonitorEvent),
+    OwnerReleased,
     Validating,
     LocallyComplete,
     ValidationIncomplete,
@@ -327,20 +545,88 @@ pub enum NativeEventKind {
     Posted,
     PostFailed,
     Received,
+    ReceiptAdopted,
     Satisfied,
     TestamentGenerated,
     TestamentAcknowledged,
     ResponseObserved,
+    Expired,
+    Deadlocked,
+}
+/// Ledger-local monitor facts carry their exact model cuts without duplicating
+/// owner bindings. Each is one ordinary claim revision in the same journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeMonitorEvent {
+    Registered {
+        id: MonitorId,
+        cut: focal_model::lifecycle::claim::ClaimCut,
+    },
+    Rebound {
+        id: MonitorId,
+        change: scope::Rebinding,
+    },
+    Released {
+        id: MonitorId,
+        cut: focal_model::lifecycle::claim::ClaimCut,
+    },
+    Cancelled {
+        id: MonitorId,
+        cancellation: scope::MonitorCancellation,
+    },
+}
+impl NativeMonitorEvent {
+    pub fn from_scope(event: scope::Event) -> Result<Self, ContractError> {
+        match event {
+            scope::Event::Registered { id, cut } => Ok(Self::Registered { id, cut }),
+            scope::Event::Rebound { id, change } => Ok(Self::Rebound { id, change }),
+            scope::Event::MonitorReleased { id, cut } => Ok(Self::Released { id, cut }),
+            scope::Event::MonitorCancelled { id, cancellation } => {
+                Ok(Self::Cancelled { id, cancellation })
+            }
+            _ => Err(ContractError::InvalidTransition),
+        }
+    }
+    pub fn into_scope(self) -> scope::Event {
+        match self {
+            Self::Registered { id, cut } => scope::Event::Registered { id, cut },
+            Self::Rebound { id, change } => scope::Event::Rebound { id, change },
+            Self::Released { id, cut } => scope::Event::MonitorReleased { id, cut },
+            Self::Cancelled { id, cancellation } => {
+                scope::Event::MonitorCancelled { id, cancellation }
+            }
+        }
+    }
+    pub fn id(self) -> MonitorId {
+        match self {
+            Self::Registered { id, .. }
+            | Self::Rebound { id, .. }
+            | Self::Released { id, .. }
+            | Self::Cancelled { id, .. } => id,
+        }
+    }
+    pub fn cut(self) -> focal_model::lifecycle::claim::ClaimCut {
+        match self {
+            Self::Registered { cut, .. } | Self::Released { cut, .. } => cut,
+            Self::Rebound { change, .. } => change.cut,
+            Self::Cancelled { cancellation, .. } => cancellation.cut,
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeEvent {
-    pub request: RequestKey,
+    pub invocation: NativeInvocation,
     pub sequence: SessionSeq,
     pub ordinal: u32,
     pub fact: NativeFact,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeFact {
+    ResultTestament {
+        claim: ClaimId,
+        before: Option<Binding>,
+        after: Binding,
+        state: focal_model::lifecycle::audit::ResultTestamentState,
+    },
     Missing {
         key: NativeResultKey,
     },
@@ -371,6 +657,12 @@ pub enum NativeFact {
         claim: Binding,
         fence: ReceiptFence,
         holder: ParticipantId,
+    },
+    ReceiptAdopted {
+        claim: Binding,
+        previous: ReceiptEntitlement,
+        replacement: ReceiptEntitlement,
+        cause: ContentHash,
     },
     Artifact {
         binding: Binding,
@@ -403,6 +695,7 @@ pub enum NativeEvaluationEventKind {
     Begun,
     Reported,
     AuthorityFenced,
+    Sealed,
 }
 impl NativeEvent {
     pub fn claim_event(self) -> Option<NativeClaimEvent> {
@@ -487,7 +780,7 @@ impl EvaluationTarget {
     }
 }
 
-/// Immutable allocation of a first execution receipt. This row survives later
+/// Immutable allocation of an execution receipt. This row survives later
 /// receipt control so an old identity can never be recycled for another claim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeReceipt {
@@ -526,6 +819,18 @@ pub(super) struct NativeCycle {
     pub response: Option<TestamentId>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RetiredCycleHead {
+    pub head: Option<NativeCycleKey>,
+    pub count: usize,
+    pub work_count: usize,
+}
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RetiredCycle {
+    pub holder: ParticipantId,
+    pub next: Option<NativeCycleKey>,
+}
+
 /// Address of an immutable accepted attempt, separate from its mutable evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NativeResultKey {
@@ -550,6 +855,9 @@ impl NativeResultKey {
 enum Key {
     IncomingHead(ClaimId),
     IncomingLink(ClaimId, ClaimId),
+    Monitor(focal_model::MonitorId),
+    MonitorHead(ClaimId),
+    MonitorLink(ClaimId, focal_model::MonitorId),
     MissingResult(NativeResultKey),
     Meta,
     Claim(ClaimId),
@@ -561,13 +869,35 @@ enum Key {
     DeliveryResult(NativeResultKey),
     Receipt(ReceiptId),
     Cycle(NativeCycleKey),
+    RetiredCycleHead(ClaimId),
+    RetiredCycle(NativeCycleKey),
     Work(ArtifactId),
     WorkSlot(NativeCycleKey, u32),
     Diagnostic(ArtifactId),
     Response(TestamentId),
-    Outcome(RequestKey),
+    ResultTestament(TestamentId),
+    ClaimResultTestament(ClaimId),
+    Outcome(NativeInvocation),
     Event(SessionSeq, u32),
+    ClaimContent(ClaimId),
+    ClaimIdentity(u16, ContentHash),
+    DefinitionIdentity(u16, ContentHash),
+    CreationResult(NativeInvocation),
     End,
+}
+
+/// Separate immutable definition/descriptor pages from frequently rewritten
+/// lifecycle rows. This is an owner-local storage layout, not a wire partition
+/// or placement choice. Creating another immutable object may rewrite its own
+/// namespace; a lifecycle-only mutation must share those retained pages.
+fn page_partition(key: &Key) -> u64 {
+    match key {
+        Key::Definition(_) | Key::DefinitionIdentity(..) => 1,
+        Key::Artifact(_) | Key::ArtifactIdentity(_) => 2,
+        Key::ClaimContent(_) | Key::ClaimIdentity(..) => 3,
+        Key::CreationResult(_) => 4,
+        _ => 0,
+    }
 }
 #[derive(Debug, Default, Clone, Copy)]
 struct Meta {
@@ -580,12 +910,19 @@ struct Meta {
     results: usize,
     receipts: usize,
     responses: usize,
+    result_testaments: usize,
+    monitors: usize,
+    monitor_links: usize,
+    creation_results: usize,
     logical_time: u64,
 }
 #[derive(Debug)]
 enum Row {
     IncomingHead(incoming_graph::IncomingHead),
     IncomingLink(incoming_graph::IncomingLink),
+    Monitor(monitor_index::MonitorAllocation),
+    MonitorHead(monitor_index::MonitorHead),
+    MonitorLink(Option<monitor_index::MonitorLink>),
     MissingResult(OwnedMissingResult),
     Meta(Meta),
     Claim(OwnedClaim),
@@ -597,12 +934,20 @@ enum Row {
     DeliveryResult(OwnedDeliveryResult),
     Receipt(NativeReceipt),
     Cycle(NativeCycle),
+    RetiredCycleHead(RetiredCycleHead),
+    RetiredCycle(RetiredCycle),
     Work(OwnedWork),
     WorkSlot(ArtifactId),
     Diagnostic(OwnedDiagnostic),
     Response(OwnedResponse),
+    ResultTestament(OwnedResultTestament),
+    ClaimResultTestament(TestamentId),
     Outcome(NativeOutcome),
     Event(OwnedEvent),
+    ClaimContent(OwnedClaimContent),
+    ClaimIdentity(ClaimId),
+    DefinitionIdentity(ValidationId),
+    CreationResult(OwnedCreationResult),
 }
 
 /// All allocated candidate rows, outcomes and events have one immutable root.
@@ -610,6 +955,7 @@ enum Row {
 pub struct NativePrepared {
     range: PreparedRange<Key, Row>,
     outcome: NativeOutcome,
+    writes: mutation::WriteSet,
 }
 impl std::fmt::Debug for NativePrepared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -620,6 +966,16 @@ impl std::fmt::Debug for NativePrepared {
     }
 }
 impl NativePrepared {
+    /// Number of actual storage writes, including metadata, indices and history.
+    pub fn mutation_count(&self) -> usize {
+        self.writes.len()
+    }
+    pub fn mutation_heap_bytes(&self) -> usize {
+        self.writes.heap_bytes()
+    }
+    pub fn content_profile(&self) -> NativeContentProfile {
+        self.writes.profile()
+    }
     pub fn outcome(&self) -> NativeOutcome {
         self.outcome
     }
@@ -635,8 +991,8 @@ impl NativePrepared {
     pub fn result(&self, key: NativeResultKey) -> Option<&NativeAccepted> {
         as_result(self.range.get(&Key::Accepted(key)))
     }
-    pub fn recorded(&self, key: RequestKey) -> Option<NativeOutcome> {
-        as_outcome(self.range.get(&Key::Outcome(key)))
+    pub fn recorded(&self, key: impl Into<NativeInvocation>) -> Option<NativeOutcome> {
+        as_outcome(self.range.get(&Key::Outcome(key.into())))
     }
     pub fn definition(&self, id: ValidationId) -> Option<&validation::Declaration> {
         as_definition(self.range.get(&Key::Definition(id)))
@@ -709,10 +1065,10 @@ impl NativeRead {
     }
     pub fn recorded(
         &self,
-        request: RequestKey,
+        request: impl Into<NativeInvocation>,
         now: u64,
     ) -> Result<Option<NativeOutcome>, MemoryError> {
-        let key = Key::Outcome(request);
+        let key = Key::Outcome(request.into());
         self.lease
             .project_next(&key, false, &Key::End, now, |entry| {
                 (entry.key == key)
@@ -757,57 +1113,96 @@ impl NativeRead {
     }
 }
 
+/// Shared local and recovered owner configuration checks.
+fn checked_native_limits(ledger: LedgerId, mut limits: NativeLimits) -> Result<NativeLimits, NativeError> {
+    if ledger.tenant.is_zero() || ledger.session.is_zero() {
+        return Err(ContractError::WrongLedger.into());
+    }
+    if limits.pending == 0
+        || limits.plan_nodes == 0
+        || limits.plan_edges == 0
+        || limits.preparation_bytes == 0
+        || limits.claims == 0
+        || limits.outcomes == 0
+        || limits.events == 0
+        || limits.definitions == 0
+        || limits.evaluations == 0
+        || limits.evaluations_per_claim == 0
+        || limits.artifacts == 0
+        || limits.results == 0
+        || limits.receipts == 0
+        || limits.responses == 0
+        || limits.work_artifacts_per_cycle == 0
+        || limits.diagnostics_per_cycle == 0
+        || limits.response_summary_bytes == 0
+        || limits.range.max_batch_entries < 4
+    {
+        return Err(MemoryError::InvalidConfiguration("native limits must be nonzero").into());
+    }
+    // Native mutations already bound nested row heaps through Scratch;
+    // moved claim/event singleton containers have their separate precharge.
+    // Preserve tighter node-derived limits and isolate larger admitted rows
+    // so an unrelated small write cannot copy their payloads as neighbors.
+    let entry_ceiling = prepare::add(
+        prepare::add(
+            limits.preparation_bytes,
+            prepare::add(
+                OwnedClaim::container_charge(),
+                OwnedEvent::container_charge(),
+            )?,
+        )?,
+        size_of::<focal_memory::Entry<Key, Row>>(),
+    )?;
+    limits.range.page_bytes = limits.range.page_bytes.min(64 * 1024);
+    limits.range.max_entry_bytes = limits.range.max_entry_bytes.min(entry_ceiling);
+    Ok(limits)
+}
+
 impl Core<NativeState> {
     pub fn new_native(
         ledger: LedgerId,
         range: RangeId,
-        mut limits: NativeLimits,
+        limits: NativeLimits,
         budget: MemoryBudget,
     ) -> Result<Self, NativeError> {
-        if ledger.tenant.is_zero() || ledger.session.is_zero() {
-            return Err(ContractError::WrongLedger.into());
-        }
-        if limits.pending == 0
-            || limits.plan_nodes == 0
-            || limits.plan_edges == 0
-            || limits.preparation_bytes == 0
-            || limits.claims == 0
-            || limits.outcomes == 0
-            || limits.events == 0
-            || limits.definitions == 0
-            || limits.evaluations == 0
-            || limits.evaluations_per_claim == 0
-            || limits.artifacts == 0
-            || limits.results == 0
-            || limits.receipts == 0
-            || limits.responses == 0
-            || limits.work_artifacts_per_cycle == 0
-            || limits.diagnostics_per_cycle == 0
-            || limits.response_summary_bytes == 0
-            || limits.range.max_batch_entries < 4
-        {
-            return Err(MemoryError::InvalidConfiguration("native limits must be nonzero").into());
-        }
-        // Native mutations already bound nested row heaps through Scratch;
-        // moved claim/event singleton containers have their separate precharge.
-        // Preserve tighter node-derived limits and isolate larger admitted rows
-        // so an unrelated small write cannot copy their payloads as neighbors.
-        let entry_ceiling = prepare::add(
-            prepare::add(
-                limits.preparation_bytes,
-                prepare::add(
-                    OwnedClaim::container_charge(),
-                    OwnedEvent::container_charge(),
-                )?,
-            )?,
-            size_of::<focal_memory::Entry<Key, Row>>(),
-        )?;
-        limits.range.page_bytes = limits.range.page_bytes.min(64 * 1024);
-        limits.range.max_entry_bytes = limits.range.max_entry_bytes.min(entry_ceiling);
-        let rows = RangeStore::new(range, 0, limits.range, budget.clone())?;
+        Self::new_native_profile(
+            ledger,
+            range,
+            limits,
+            budget,
+            NativeContentProfile::ProjectionOnly,
+        )
+    }
+    /// Start an empty native owner that requires complete authored content.
+    /// This never promotes a projection-only root or activates a durable codec.
+    pub fn new_native_authored(
+        ledger: LedgerId,
+        range: RangeId,
+        limits: NativeLimits,
+        budget: MemoryBudget,
+    ) -> Result<Self, NativeError> {
+        Self::new_native_profile(
+            ledger,
+            range,
+            limits,
+            budget,
+            NativeContentProfile::AuthoredV1,
+        )
+    }
+    fn new_native_profile(
+        ledger: LedgerId,
+        range: RangeId,
+        mut limits: NativeLimits,
+        budget: MemoryBudget,
+        profile: NativeContentProfile,
+    ) -> Result<Self, NativeError> {
+        limits = checked_native_limits(ledger, limits)?;
+        let rows =
+            RangeStore::new_partitioned(range, 0, limits.range, budget.clone(), page_partition)?;
         Ok(Self {
             state: NativeState {
                 ledger,
+                profile,
                 rows,
                 budget,
             },
@@ -820,8 +1215,8 @@ impl Core<NativeState> {
     pub fn native_claim(&self, id: ClaimId) -> Option<&ClaimState> {
         as_claim(self.state.rows.get(&Key::Claim(id)))
     }
-    pub fn native_outcome(&self, request: RequestKey) -> Option<NativeOutcome> {
-        as_outcome(self.state.rows.get(&Key::Outcome(request)))
+    pub fn native_outcome(&self, request: impl Into<NativeInvocation>) -> Option<NativeOutcome> {
+        as_outcome(self.state.rows.get(&Key::Outcome(request.into())))
     }
     pub fn native_definition(&self, id: ValidationId) -> Option<&validation::Declaration> {
         as_definition(self.state.rows.get(&Key::Definition(id)))
@@ -866,13 +1261,21 @@ impl Core<NativeState> {
         &mut self,
         prepared: NativePrepared,
     ) -> Result<NativeOutcome, NativePublishError> {
-        let NativePrepared { range, outcome } = prepared;
+        let NativePrepared {
+            range,
+            outcome,
+            writes,
+        } = prepared;
         self.state
             .rows
             .publish_recoverable(range)
             .map_err(|(error, range)| NativePublishError {
                 error,
-                prepared: NativePrepared { range, outcome },
+                prepared: NativePrepared {
+                    range,
+                    outcome,
+                    writes,
+                },
             })?;
         Ok(outcome)
     }

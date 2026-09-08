@@ -69,7 +69,7 @@ struct Fixture {
     core: Core<NativeState>,
     claim: ClaimState,
     response: Response,
-    acceptance: aggregation::ClaimAggregation,
+    authority: evidence::ResponseEntry,
     entry: PublicationPosition,
 }
 
@@ -194,18 +194,18 @@ impl Fixture {
         )
         .unwrap();
         let mut response = source.try_copy(source.retained_bytes().unwrap()).unwrap();
-        response
-            .apply(
-                response
-                    .plan_begin(
-                        &response.identity().binding,
-                        &claim,
-                        Principal::Actor(ISSUER),
-                        &acceptance.decision(),
-                    )
-                    .unwrap(),
+        let transition = response
+            .plan_begin(
+                &response.identity().binding,
+                &claim,
+                Principal::Actor(ISSUER),
+                &acceptance.decision(),
             )
             .unwrap();
+        let authority = response
+            .entry_capability(&transition, &claim, &acceptance.decision())
+            .unwrap();
+        response.apply(transition).unwrap();
         let entry = PublicationPosition {
             sequence: SessionSeq(core.native_sequence().0 + 1),
             ordinal: 3,
@@ -214,7 +214,7 @@ impl Fixture {
             core,
             claim,
             response,
-            acceptance,
+            authority,
             entry,
         }
     }
@@ -257,7 +257,7 @@ impl Fixture {
     #[allow(clippy::too_many_arguments)] // Exercise individual owner-frame refusals independently.
     fn run(
         &self,
-        context: NativeContext,
+        claim: &ClaimState,
         registry: &RegistrationSet,
         entry: PublicationPosition,
         limits: NativeLimits,
@@ -266,11 +266,10 @@ impl Fixture {
         scratch: &mut Scratch,
     ) -> Result<usize, NativeError> {
         prepare(
-            context,
             &self.view(),
-            &self.claim,
+            claim,
             &self.response,
-            &self.acceptance.decision(),
+            &self.authority,
             entry,
             registry,
             limits,
@@ -313,7 +312,7 @@ fn full_missing_cohort_uses_actual_journal_positions_without_worker_or_artifact(
     assert_eq!(
         fixture
             .run(
-                fixture::context(ISSUER, 100),
+                &fixture.claim,
                 fixture.registry(),
                 fixture.entry,
                 fixture.core.limits,
@@ -376,7 +375,7 @@ fn full_missing_cohort_uses_actual_journal_positions_without_worker_or_artifact(
 }
 
 #[test]
-fn invalid_actor_cut_and_omitted_registry_refuse_before_staging_a_result() {
+fn stale_entry_authority_cut_and_omitted_registry_refuse_before_staging_a_result() {
     let fixture = Fixture::new();
     let empty = RegistrationSet::new(&fixture.claim, 16, size_of::<RegistrationSet>()).unwrap();
     for bad in 0..4 {
@@ -390,11 +389,15 @@ fn invalid_actor_cut_and_omitted_registry_refuse_before_staging_a_result() {
         if bad == 2 {
             entry.ordinal += 1;
         }
-        let context = fixture::context(if bad == 0 { SUBJECT } else { ISSUER }, 100);
+        let claim = if bad == 0 {
+            fixture.core.native_claim(ClaimId::from_u128(1)).unwrap()
+        } else {
+            &fixture.claim
+        };
         assert!(
             fixture
                 .run(
-                    context,
+                    claim,
                     if bad == 3 { &empty } else { fixture.registry() },
                     entry,
                     fixture.core.limits,
@@ -431,7 +434,7 @@ fn incomplete_candidate_capacity_refusal_leaves_all_retained_sources_unchanged()
         assert!(
             fixture
                 .run(
-                    fixture::context(ISSUER, 100),
+                    &fixture.claim,
                     fixture.registry(),
                     fixture.entry,
                     limits,

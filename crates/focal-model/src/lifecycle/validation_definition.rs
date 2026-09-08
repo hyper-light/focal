@@ -3,14 +3,43 @@
 //! it is not a content identity, persisted hash, or successor wire allocation.
 use super::*;
 
+#[cfg(test)]
+#[path = "validation_definition_allocation_tests.rs"]
+mod allocation_tests;
 #[path = "validation_definition_memory.rs"]
 mod memory;
+#[path = "validation_definition_source.rs"]
+mod source;
+#[cfg(test)]
+#[path = "validation_definition_view_tests.rs"]
+mod view_tests;
+pub use source::{
+    DeclarationFields, DeclarationHandlers, DeclarationSource, DeclarationSourcePlan, HandlerValue,
+    PhaseFields, PolicyPhase, PolicySource, ProgramFields,
+};
+pub(in crate::lifecycle) use source::{PolicyEvent, check_declaration_fields, visit_program};
+
+fn construction_buffer<T>(count: usize) -> Result<Vec<T>, ContractError> {
+    let values = crate::lifecycle::memory::reserve::<T>(count)?;
+    // Reconcile the provisional allocation before constructing its elements or
+    // allocating the next buffer. The checked plan quotes exact capacities.
+    if values.capacity() != count {
+        return Err(ContractError::Capacity);
+    }
+    Ok(values)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::lifecycle) struct DefinitionStamp([u8; 32]);
 impl DefinitionStamp {
     pub(in crate::lifecycle) fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+    fn intent_fingerprint(self, attempts: u32) -> ContentHash {
+        let mut hash = blake3::Hasher::new_derive_key("focal/native/validation-intent/1");
+        hash.update(self.as_bytes());
+        hash.update(&attempts.to_be_bytes());
+        ContentHash(*hash.finalize().as_bytes())
     }
     #[cfg(test)]
     pub(in crate::lifecycle) fn fixture() -> Self {
@@ -32,31 +61,49 @@ pub(super) struct OwnedPhasePolicy {
     pub(super) handlers: Vec<OwnedHandlerPolicy>,
     pub(super) required_policy: Option<ContentHash>,
 }
-impl OwnedPhasePolicy {
-    fn build(policy: PhasePolicy<'_>) -> Result<Self, ContractError> {
-        let mut handlers = Vec::new();
-        handlers
-            .try_reserve_exact(policy.handlers.len())
-            .map_err(|_| ContractError::Capacity)?;
-        for step in policy.handlers {
-            handlers.push(OwnedHandlerPolicy {
-                handler: HandlerRef {
-                    id: step.handler.id,
-                    version: step.handler.version,
-                    agentic: step.handler.agentic,
-                },
-                attempts: step.attempts,
-                proof_schema: step.proof_schema,
-                diagnostic_schema: step.diagnostic_schema,
-            });
-        }
-        Ok(Self {
-            evaluator: policy.evaluator,
-            definition: policy.definition,
-            handlers,
-            required_policy: policy.required_policy,
+
+/// Allocation-free view of a retained phase and its ordered fallback handlers.
+#[derive(Debug, Clone, Copy)]
+pub struct PhasePolicyView<'a> {
+    policy: &'a OwnedPhasePolicy,
+}
+impl<'a> PhasePolicyView<'a> {
+    pub fn evaluator(self) -> ParticipantId {
+        self.policy.evaluator
+    }
+    pub fn definition(self) -> ContentHash {
+        self.policy.definition
+    }
+    pub fn required_policy(self) -> Option<ContentHash> {
+        self.policy.required_policy
+    }
+    /// Each value borrows the original immutable handler reference. No handler
+    /// array or owned definition is copied to expose the authored policy.
+    pub fn handlers(
+        self,
+    ) -> impl ExactSizeIterator<Item = HandlerPolicy<'a>> + DoubleEndedIterator + 'a {
+        self.policy.handlers.iter().map(|step| HandlerPolicy {
+            handler: &step.handler,
+            attempts: step.attempts,
+            proof_schema: step.proof_schema,
+            diagnostic_schema: step.diagnostic_schema,
         })
     }
+}
+
+/// Complete borrowed program policy, including optional quality and fallbacks.
+#[derive(Debug, Clone, Copy)]
+pub enum ProgramView<'a> {
+    Delivery,
+    Programmatic {
+        check: PhasePolicyView<'a>,
+        quality: Option<PhasePolicyView<'a>>,
+    },
+    Agentic {
+        check: PhasePolicyView<'a>,
+    },
+}
+impl OwnedPhasePolicy {
     fn retained_bytes(&self) -> Result<usize, ContractError> {
         self.handlers
             .capacity()
@@ -76,18 +123,6 @@ pub(super) enum OwnedProgram {
     },
 }
 impl OwnedProgram {
-    fn build(program: Program<'_>) -> Result<Self, ContractError> {
-        Ok(match program {
-            Program::Delivery => Self::Delivery,
-            Program::Programmatic { check, quality } => Self::Programmatic {
-                check: OwnedPhasePolicy::build(check)?,
-                quality: quality.map(OwnedPhasePolicy::build).transpose()?,
-            },
-            Program::Agentic { check } => Self::Agentic {
-                check: OwnedPhasePolicy::build(check)?,
-            },
-        })
-    }
     fn retained_bytes(&self) -> Result<usize, ContractError> {
         match self {
             Self::Delivery => Ok(0),
@@ -114,11 +149,11 @@ impl OwnedTarget {
     fn build(target: TargetDeclaration<'_>) -> Result<Self, ContractError> {
         Ok(match target {
             TargetDeclaration::WholeWorkSlot { index, name } => {
-                let mut owned = String::new();
-                owned
-                    .try_reserve_exact(name.len())
-                    .map_err(|_| ContractError::Capacity)?;
-                owned.push_str(name);
+                let mut bytes = construction_buffer(name.len())?;
+                bytes.extend_from_slice(name.as_bytes());
+                // Consumes the checked byte buffer without a second allocation;
+                // the borrowed str already supplies valid UTF-8.
+                let owned = String::from_utf8(bytes).map_err(|_| ContractError::InvalidManifest)?;
                 Self::WholeWorkSlot { index, name: owned }
             }
             TargetDeclaration::Delivery => Self::Delivery,
@@ -172,36 +207,30 @@ pub struct Declaration {
 #[derive(Debug)]
 pub struct DeclarationPlan<'a> {
     spec: DeclarationSpec<'a>,
-    attempts: u32,
-    charge: usize,
+    principal: Principal,
+    limits: Limits,
+    shape: source::Shape,
 }
 impl DeclarationPlan<'_> {
-    /// Native row plus requested exact buffer capacities. Allocator metadata is
-    /// excluded; `retained_bytes` reports actual buffer capacities after building.
+    /// Native row plus exact requested buffer capacities, excluding allocator metadata.
     pub fn construction_charge(&self) -> usize {
-        self.charge
+        self.shape.charge
+    }
+    pub fn intent_fingerprint(&self) -> ContentHash {
+        self.shape.stamp.intent_fingerprint(self.shape.attempts)
     }
     pub fn build(self) -> Result<Declaration, ContractError> {
-        let spec = self.spec;
-        let stamp = definition_stamp(spec)?;
-        Ok(Declaration {
-            spec: OwnedSpec {
-                binding: spec.binding,
-                claim: spec.claim,
-                issuer: spec.issuer,
-                declaration_index: spec.declaration_index,
-                kind: spec.kind,
-                phase: spec.phase,
-                mode: spec.mode,
-                target: OwnedTarget::build(spec.target)?,
-                program: OwnedProgram::build(spec.program)?,
-                deadline: spec.deadline,
-            },
-            attempts: self.attempts,
-            stamp,
-        })
+        source::build(
+            &self.spec,
+            self.principal,
+            self.limits,
+            self.shape,
+            self.shape.charge,
+            self.shape.build_visits,
+        )
     }
 }
+
 impl Declaration {
     pub fn new(
         principal: Principal,
@@ -215,88 +244,15 @@ impl Declaration {
         spec: DeclarationSpec<'a>,
         limits: Limits,
     ) -> Result<DeclarationPlan<'a>, ContractError> {
-        principal.require_actor(spec.issuer)?;
-        if spec.claim.is_zero()
-            || spec.issuer.is_zero()
-            || spec.binding.object.is_zero()
-            || spec.binding.ledger.tenant.is_zero()
-            || spec.binding.ledger.session.is_zero()
-            || spec.deadline.timer.is_zero()
-            || spec.deadline.generation == 0
-        {
-            return Err(ContractError::InvalidPolicy);
-        }
-        let target_phase = match spec.target {
-            TargetDeclaration::WholeWorkSlot { name, .. } => {
-                if name.is_empty() || name.len() > limits.slot_bytes {
-                    return Err(ContractError::InvalidTarget);
-                }
-                ValidationPhase::WholeWork
-            }
-            TargetDeclaration::Delivery => ValidationPhase::WholeWork,
-            TargetDeclaration::Admission => ValidationPhase::Admission,
-            TargetDeclaration::Increment => ValidationPhase::Increment,
-        };
-        if spec.phase != target_phase {
-            return Err(ContractError::InvalidTarget);
-        }
-        let attempts = match spec.program {
-            Program::Delivery => {
-                if spec.kind != ValidationKind::Receipt
-                    || spec.mode != ValidationMode::Required
-                    || spec.target != TargetDeclaration::Delivery
-                {
-                    return Err(ContractError::InvalidPolicy);
-                }
-                0
-            }
-            Program::Programmatic { check, quality } => {
-                if spec.kind == ValidationKind::Receipt
-                    || spec.target == TargetDeclaration::Delivery
-                {
-                    return Err(ContractError::InvalidPolicy);
-                }
-                let first = validate_policy(check, false, limits)?;
-                let second = quality
-                    .map(|policy| validate_policy(policy, true, limits))
-                    .transpose()?
-                    .unwrap_or(0);
-                first.checked_add(second).ok_or(ContractError::Capacity)?
-            }
-            Program::Agentic { check } => {
-                if spec.kind == ValidationKind::Receipt
-                    || spec.target == TargetDeclaration::Delivery
-                {
-                    return Err(ContractError::InvalidPolicy);
-                }
-                validate_policy(check, true, limits)?
-            }
-        };
-        if attempts > limits.attempts {
-            return Err(ContractError::Capacity);
-        }
-        let slots = match spec.target {
-            TargetDeclaration::WholeWorkSlot { name, .. } => name.len(),
-            _ => 0,
-        };
-        let handlers = match spec.program {
-            Program::Delivery => 0,
-            Program::Programmatic { check, quality } => add(
-                check.handlers.len(),
-                quality.map(|p| p.handlers.len()).unwrap_or(0),
-            )?,
-            Program::Agentic { check } => check.handlers.len(),
-        };
-        let buffers = handlers
-            .checked_mul(std::mem::size_of::<OwnedHandlerPolicy>())
-            .ok_or(ContractError::Capacity)?;
-        let charge = add(add(std::mem::size_of::<Self>(), slots)?, buffers)?;
+        let (_, shape) = source::inspect(principal, &spec, limits, usize::MAX)?;
         Ok(DeclarationPlan {
             spec,
-            attempts,
-            charge,
+            principal,
+            limits,
+            shape,
         })
     }
+
     pub fn retained_bytes(&self) -> Result<usize, ContractError> {
         add(
             add(
@@ -332,6 +288,23 @@ impl Declaration {
     }
     pub fn target(&self) -> TargetDeclaration<'_> {
         self.spec.target.view()
+    }
+    /// Original authored deadline; reading it does not authorize a timer firing.
+    pub fn deadline(&self) -> Deadline {
+        self.spec.deadline
+    }
+    /// Complete immutable program view, borrowing every retained handler.
+    pub fn program(&self) -> ProgramView<'_> {
+        match &self.spec.program {
+            OwnedProgram::Delivery => ProgramView::Delivery,
+            OwnedProgram::Programmatic { check, quality } => ProgramView::Programmatic {
+                check: PhasePolicyView { policy: check },
+                quality: quality.as_ref().map(|policy| PhasePolicyView { policy }),
+            },
+            OwnedProgram::Agentic { check } => ProgramView::Agentic {
+                check: PhasePolicyView { policy: check },
+            },
+        }
     }
     pub fn attempt_bound(&self) -> u32 {
         self.attempts
@@ -383,62 +356,37 @@ fn add(left: usize, right: usize) -> Result<usize, ContractError> {
     left.checked_add(right).ok_or(ContractError::Capacity)
 }
 
-/// Every chunk carries its length; explicit variant names and ordered handler
-/// counts disambiguate shape. This native cache key is never serialized or
-/// advertised. A future canonical content format must define its own identity.
-fn definition_stamp(spec: DeclarationSpec<'_>) -> Result<DefinitionStamp, ContractError> {
-    struct Stamp(blake3::Hasher);
-    impl Stamp {
-        fn field(&mut self, bytes: &[u8]) -> Result<(), ContractError> {
-            let len = u64::try_from(bytes.len()).map_err(|_| ContractError::Capacity)?;
-            self.0.update(&len.to_be_bytes());
-            self.0.update(bytes);
-            Ok(())
-        }
-        fn policy(&mut self, policy: PhasePolicy<'_>) -> Result<(), ContractError> {
-            self.field(&policy.evaluator.0)?;
-            self.field(&policy.definition.0)?;
-            match policy.required_policy {
-                None => self.field(b"no-policy")?,
-                Some(hash) => {
-                    self.field(b"policy")?;
-                    self.field(&hash.0)?;
-                }
-            }
-            self.field(
-                &u64::try_from(policy.handlers.len())
-                    .map_err(|_| ContractError::Capacity)?
-                    .to_be_bytes(),
-            )?;
-            for step in policy.handlers {
-                self.field(&step.handler.id.0)?;
-                self.field(&step.handler.version.0)?;
-                self.field(&[u8::from(step.handler.agentic)])?;
-                self.field(&step.attempts.to_be_bytes())?;
-                self.field(&step.proof_schema.0)?;
-                self.field(&step.diagnostic_schema.0)?;
-            }
-            Ok(())
-        }
+pub(in crate::lifecycle) struct Stamp(blake3::Hasher);
+impl Stamp {
+    fn field(&mut self, bytes: &[u8]) -> Result<(), ContractError> {
+        let len = u64::try_from(bytes.len()).map_err(|_| ContractError::Capacity)?;
+        self.0.update(&len.to_be_bytes());
+        self.0.update(bytes);
+        Ok(())
     }
+}
+
+pub(in crate::lifecycle) fn stamp_begin(
+    fields: DeclarationFields<'_>,
+) -> Result<Stamp, ContractError> {
     let mut stamp = Stamp(blake3::Hasher::new_derive_key(
         "focal native validation definition binding",
     ));
-    stamp.field(&spec.binding.ledger.tenant.0)?;
-    stamp.field(&spec.binding.ledger.session.0)?;
-    stamp.field(&spec.binding.object.0)?;
-    stamp.field(&spec.binding.content.0)?;
-    stamp.field(&spec.binding.revision.0.to_be_bytes())?;
-    stamp.field(&spec.claim.0)?;
-    stamp.field(&spec.issuer.0)?;
-    stamp.field(&spec.declaration_index.to_be_bytes())?;
-    stamp.field(&spec.kind.code().to_be_bytes())?;
-    stamp.field(&spec.phase.code().to_be_bytes())?;
-    stamp.field(&spec.mode.code().to_be_bytes())?;
-    stamp.field(&spec.deadline.timer.0)?;
-    stamp.field(&spec.deadline.generation.to_be_bytes())?;
-    stamp.field(&spec.deadline.at.to_be_bytes())?;
-    match spec.target {
+    stamp.field(&fields.binding.ledger.tenant.0)?;
+    stamp.field(&fields.binding.ledger.session.0)?;
+    stamp.field(&fields.binding.object.0)?;
+    stamp.field(&fields.binding.content.0)?;
+    stamp.field(&fields.binding.revision.0.to_be_bytes())?;
+    stamp.field(&fields.claim.0)?;
+    stamp.field(&fields.issuer.0)?;
+    stamp.field(&fields.declaration_index.to_be_bytes())?;
+    stamp.field(&fields.kind.code().to_be_bytes())?;
+    stamp.field(&fields.phase.code().to_be_bytes())?;
+    stamp.field(&fields.mode.code().to_be_bytes())?;
+    stamp.field(&fields.deadline.timer.0)?;
+    stamp.field(&fields.deadline.generation.to_be_bytes())?;
+    stamp.field(&fields.deadline.at.to_be_bytes())?;
+    match fields.target {
         TargetDeclaration::WholeWorkSlot { index, name } => {
             stamp.field(b"whole-work-slot")?;
             stamp.field(&index.to_be_bytes())?;
@@ -448,23 +396,48 @@ fn definition_stamp(spec: DeclarationSpec<'_>) -> Result<DefinitionStamp, Contra
         TargetDeclaration::Admission => stamp.field(b"admission")?,
         TargetDeclaration::Increment => stamp.field(b"increment")?,
     }
-    match spec.program {
-        Program::Delivery => stamp.field(b"delivery")?,
-        Program::Programmatic { check, quality } => {
-            stamp.field(b"programmatic")?;
-            stamp.policy(check)?;
-            match quality {
-                None => stamp.field(b"no-quality")?,
-                Some(policy) => {
-                    stamp.field(b"quality")?;
-                    stamp.policy(policy)?;
+    Ok(stamp)
+}
+
+impl Stamp {
+    pub(in crate::lifecycle) fn event(&mut self, event: PolicyEvent) -> Result<(), ContractError> {
+        match event {
+            PolicyEvent::Program(program) => self.field(match program {
+                ProgramFields::Delivery => b"delivery",
+                ProgramFields::Programmatic { .. } => b"programmatic",
+                ProgramFields::Agentic { .. } => b"agentic",
+            }),
+            PolicyEvent::Quality(present) => {
+                self.field(if present { b"quality" } else { b"no-quality" })
+            }
+            PolicyEvent::Phase(fields) => {
+                self.field(&fields.evaluator.0)?;
+                self.field(&fields.definition.0)?;
+                match fields.required_policy {
+                    None => self.field(b"no-policy")?,
+                    Some(hash) => {
+                        self.field(b"policy")?;
+                        self.field(&hash.0)?;
+                    }
                 }
+                self.field(
+                    &u64::try_from(fields.handlers)
+                        .map_err(|_| ContractError::Capacity)?
+                        .to_be_bytes(),
+                )
+            }
+            PolicyEvent::Handler(_, value) => {
+                self.field(&value.id.0)?;
+                self.field(&value.version.0)?;
+                self.field(&[u8::from(value.agentic)])?;
+                self.field(&value.attempts.to_be_bytes())?;
+                self.field(&value.proof_schema.0)?;
+                self.field(&value.diagnostic_schema.0)
             }
         }
-        Program::Agentic { check } => {
-            stamp.field(b"agentic")?;
-            stamp.policy(check)?;
-        }
     }
-    Ok(DefinitionStamp(*stamp.0.finalize().as_bytes()))
+
+    pub(in crate::lifecycle) fn finish(self) -> DefinitionStamp {
+        DefinitionStamp(*self.0.finalize().as_bytes())
+    }
 }

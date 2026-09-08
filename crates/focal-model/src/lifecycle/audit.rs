@@ -7,6 +7,20 @@ use super::validation::{
 use super::{Binding, ContractError, Principal};
 use crate::{ArtifactRef, ClaimId, ParticipantId, SessionSeq, ValidationId};
 
+#[path = "audit_fingerprint.rs"]
+mod fingerprint;
+#[path = "audit_memory.rs"]
+mod memory;
+#[path = "audit_native.rs"]
+mod native;
+#[path = "audit_snapshot.rs"]
+mod snapshot;
+pub use native::NativeAuditPlan;
+pub use snapshot::{
+    AuditCohortHydrationPlan, AuditCohortSnapshotV1, AuditMemberSnapshotV1,
+    ResultArtifactSnapshotV1, ResultTestamentHydrationPlan, ResultTestamentSnapshotV1,
+};
+
 /// A real evaluator result artifact is already generated in the accepted result
 /// transaction. This role has no receipt, attachment or validation transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,7 +131,7 @@ pub struct AuditMember {
     suppression: Option<Suppression>,
     fence: Option<AuthorityFence>,
     last_result: Option<AcceptedResult>,
-    sealed: bool,
+    sealed: Option<crate::ContentHash>,
 }
 impl AuditMember {
     fn from_evaluation(evaluation: &Evaluation<'_>) -> Self {
@@ -141,7 +155,7 @@ impl AuditMember {
             suppression: evaluation.suppression(),
             fence: evaluation.fence(),
             last_result: evaluation.last_result(),
-            sealed: evaluation.sealed().is_some(),
+            sealed: evaluation.sealed(),
         }
     }
     pub fn key(&self) -> EvaluationKey {
@@ -156,10 +170,13 @@ impl AuditMember {
     pub fn fence(&self) -> Option<AuthorityFence> {
         self.fence
     }
+    pub fn seal_cause(&self) -> Option<crate::ContentHash> {
+        self.sealed
+    }
     pub fn complete(&self) -> bool {
         self.state.is_terminal()
             || self.fence.is_some()
-            || (!self.begun && self.sealed && self.suppression.is_some())
+            || (!self.begun && self.sealed.is_some() && self.suppression.is_some())
     }
 }
 
@@ -217,24 +234,7 @@ impl AuditCohort {
                         && row.generation() == evaluation.generation()
                 })
                 .ok_or(ContractError::StaleEvaluation)?;
-            if registered.definition_stamp() != evaluation.definition_stamp()
-                || registered.binding().content != evaluation.binding().content
-                || registered.binding().revision > evaluation.binding().revision
-                || registered.receipt() != evaluation.receipt()
-                || registered.declaration_index() != evaluation.declaration_index()
-                || registered.mode() != evaluation.mode()
-            {
-                return Err(ContractError::StaleEvaluation);
-            }
-            if evaluation.ledger() != claim.binding().ledger {
-                return Err(ContractError::WrongLedger);
-            }
-            if evaluation.claim().0 != claim.binding().object.0 {
-                return Err(ContractError::WrongObject);
-            }
-            if !evaluation.state().is_terminal() && evaluation.sealed().is_none() {
-                return Err(ContractError::InvalidTransition);
-            }
+            Self::check_registered(claim, registered, evaluation)?;
             let bound = usize::try_from(evaluation.attempt_bound().max(1))
                 .map_err(|_| ContractError::Capacity)?;
             capacity = capacity.checked_add(bound).ok_or(ContractError::Capacity)?;
@@ -306,6 +306,35 @@ impl AuditCohort {
         })
     }
 
+    fn check_registered(
+        claim: &ClaimState,
+        registered: &super::aggregation::RegisteredEvaluation,
+        evaluation: &Evaluation<'_>,
+    ) -> Result<(), ContractError> {
+        if registered.definition_stamp() != evaluation.definition_stamp()
+            || registered.binding().object != evaluation.binding().object
+            || registered.binding().content != evaluation.binding().content
+            || registered.binding().revision > evaluation.binding().revision
+            || registered.target() != evaluation.target()
+            || registered.generation() != evaluation.generation()
+            || registered.receipt() != evaluation.receipt()
+            || registered.declaration_index() != evaluation.declaration_index()
+            || registered.mode() != evaluation.mode()
+        {
+            return Err(ContractError::StaleEvaluation);
+        }
+        if evaluation.ledger() != claim.binding().ledger {
+            return Err(ContractError::WrongLedger);
+        }
+        if evaluation.claim().0 != claim.binding().object.0 {
+            return Err(ContractError::WrongObject);
+        }
+        if !evaluation.state().is_terminal() && evaluation.sealed().is_none() {
+            return Err(ContractError::InvalidTransition);
+        }
+        Ok(())
+    }
+
     fn check_result(
         claim: Binding,
         member: &AuditMember,
@@ -353,14 +382,18 @@ impl AuditCohort {
             || previous.key != next.key
             || previous.binding.content != next.binding.content
             || previous.receipt != next.receipt
+            || previous.sealed != next.sealed
         {
             return Err(ContractError::InvalidTarget);
         }
         if next.binding.revision <= previous.binding.revision {
             return Err(ContractError::StaleRevision);
         }
-        if previous.complete() || !previous.begun || !next.begun || !next.sealed {
+        if previous.complete() || !previous.begun || !next.begun || next.sealed.is_none() {
             return Err(ContractError::InvalidTransition);
+        }
+        if previous.last_result.is_some() && next.last_result.is_none() {
+            return Err(ContractError::InvalidManifest);
         }
         let new_result = if next.last_result != previous.last_result {
             next.last_result
@@ -369,6 +402,12 @@ impl AuditCohort {
         };
         if let Some(result) = new_result {
             Self::check_result(self.claim, &next, result)?;
+            if previous
+                .last_result
+                .is_some_and(|old| result.binding().revision <= old.binding().revision)
+            {
+                return Err(ContractError::InvalidManifest);
+            }
             let expected_attempt = match previous.last_result {
                 Some(previous) => previous
                     .attempt()
@@ -385,15 +424,48 @@ impl AuditCohort {
         } else if next.fence.is_none() {
             return Err(ContractError::InvalidTransition);
         }
+        let result_position = new_result
+            .map(|result| {
+                match self
+                    .results
+                    .binary_search_by_key(&result_order(result), |row| result_order(*row))
+                {
+                    Ok(_) => Err(ContractError::InvalidManifest),
+                    Err(position) => Ok(position),
+                }
+            })
+            .transpose()?;
+        if new_result.is_some() && self.results.len() == self.results.capacity() {
+            return Err(ContractError::Capacity);
+        }
         // Completion storage was reserved at sealing. No allocation follows.
+        // Keep canonical order even when late reports from different members
+        // arrive in the opposite order, so a later fingerprint remains linear.
+        if let (Some(result), Some(position)) = (new_result, result_position) {
+            let mut at = self.results.len();
+            self.results.push(result);
+            while at > position {
+                let prior = at.checked_sub(1).ok_or(ContractError::Capacity)?;
+                let value = *self
+                    .results
+                    .get(prior)
+                    .ok_or(ContractError::InvalidManifest)?;
+                *self
+                    .results
+                    .get_mut(at)
+                    .ok_or(ContractError::InvalidManifest)? = value;
+                at = prior;
+            }
+            *self
+                .results
+                .get_mut(position)
+                .ok_or(ContractError::InvalidManifest)? = result;
+        }
         let row = self
             .members
             .get_mut(index)
             .ok_or(ContractError::InvalidTarget)?;
         *row = next;
-        if let Some(result) = new_result {
-            self.results.push(result);
-        }
         Ok(())
     }
 
@@ -405,6 +477,18 @@ impl AuditCohort {
     }
     pub fn result_count(&self) -> usize {
         self.results.len()
+    }
+    pub fn claim_binding(&self) -> Binding {
+        self.claim
+    }
+    pub fn issuer(&self) -> ParticipantId {
+        self.issuer
+    }
+    pub fn results(&self) -> &[AcceptedResult] {
+        &self.results
+    }
+    pub fn result_capacity(&self) -> usize {
+        self.result_capacity
     }
     pub fn sealed_at(&self) -> SessionSeq {
         self.sequence
@@ -427,6 +511,31 @@ pub struct ResultTestament {
 }
 
 impl ResultTestament {
+    /// Native publication already gathered and checked canonical complete
+    /// history. The enclosing owner derives content identity, including its
+    /// original publication witnesses; no second sort or allocation occurs.
+    pub fn generate_canonical(
+        binding: Binding,
+        principal: Principal,
+        cohort: AuditCohort,
+    ) -> Result<Self, ContractError> {
+        principal.require_actor(cohort.issuer)?;
+        if binding.ledger != cohort.claim.ledger {
+            return Err(ContractError::WrongLedger);
+        }
+        if binding.object.is_zero() || binding.content == crate::ContentHash([0; 32]) {
+            return Err(ContractError::InvalidTarget);
+        }
+        if binding.revision != crate::ObjectRevision(1) {
+            return Err(ContractError::StaleRevision);
+        }
+        cohort.check_complete_order()?;
+        Ok(Self {
+            binding,
+            cohort,
+            state: ResultTestamentState::Generated,
+        })
+    }
     pub fn generate(
         binding: Binding,
         principal: Principal,
@@ -470,6 +579,15 @@ impl ResultTestament {
     }
     pub fn claim(&self) -> ClaimId {
         ClaimId(self.cohort.claim.object.0)
+    }
+    pub fn issuer(&self) -> ParticipantId {
+        self.cohort.issuer
+    }
+    pub fn sealed_at(&self) -> SessionSeq {
+        self.cohort.sequence
+    }
+    pub fn cohort(&self) -> &AuditCohort {
+        &self.cohort
     }
     pub fn members(&self) -> &[AuditMember] {
         &self.cohort.members

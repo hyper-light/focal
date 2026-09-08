@@ -4,6 +4,10 @@ use super::super::report_tests::{
     running, verified,
 };
 use super::*;
+#[path = "claim_deadline_owner_tests.rs"]
+mod claim_deadline_owner_tests;
+#[path = "deadline_owner_tests.rs"]
+mod deadline_owner_tests;
 use focal_evidence::{BuiltinSchemaError, StoreLimits, error_report_schema, test_report_schema};
 use focal_model::lifecycle::{aggregation, artifact_descriptor::ResultProvenance};
 use focal_model::{
@@ -13,6 +17,129 @@ use focal_model::{
 use std::cell::Cell;
 
 const DOMAIN: ContentDomainId = ContentDomainId::from_u128(1900);
+
+fn completion_visit_bound(core: &Core<NativeState>) -> usize {
+    let Row::Claim(row) = core.state.rows.get(&Key::Claim(key(1).claim)).unwrap() else {
+        panic!("claim row");
+    };
+    let claim = row.claim().unwrap();
+    let registry = row.registrations().unwrap();
+    let projection = aggregation::admission_completion_visits(claim, registry).unwrap();
+    if core.native_definition(key(1).validation).unwrap().mode() == ValidationMode::Observe {
+        return projection;
+    }
+    let cohort =
+        crate::native::completion_envelope::cohort_bound(core.limits, claim, registry).unwrap();
+    projection
+        .max(cohort.writer_visits(1, 4).unwrap())
+        .max(cohort.journal_visits(4, 1).unwrap())
+}
+
+#[test]
+fn begin_reserves_completion_visits_before_accepting_an_attempt() {
+    for sufficient in [false, true] {
+        let mut core = posted(&[(ValidationMode::Required, false)]);
+        let minimum = completion_visit_bound(&core);
+        assert!(
+            minimum > 13,
+            "future cohort work exceeds a single report journal"
+        );
+        core.limits.plan_edges = minimum - usize::from(!sufficient);
+        let parent = core.state.budget.clone();
+        let mut owner = NativeOwner::new(core).unwrap();
+        let before = parent.stats();
+        let prefix = owner.effective().sequence();
+        let claim = owner.effective().claim(key(1).claim).unwrap().binding();
+        let evaluation = owner.effective().evaluation(key(1)).unwrap().binding();
+        let result = owner.prepare(
+            context(EVALUATOR, 30),
+            begin(30001, claim, 1, evaluation),
+            None,
+        );
+        if !sufficient {
+            assert!(matches!(
+                result,
+                Err(NativeOwnerError::Native(NativeError::Capacity(
+                    "cohort seal writer visits"
+                )))
+            ));
+            assert_eq!(owner.effective().sequence(), prefix);
+            assert_eq!(
+                owner.effective().evaluation(key(1)).unwrap().binding(),
+                evaluation
+            );
+            assert_eq!(owner.book.len(), 0);
+            assert_eq!(parent.stats(), before);
+            continue;
+        }
+        let NativeStaging::Prepared { candidate, .. } = result.unwrap() else {
+            panic!("fresh Begin");
+        };
+        owner.publish_after_durable(candidate).unwrap();
+        let input = report_input(&owner, 1, 30002, VerdictValue::Fail);
+        let pressure = exhaust(&parent);
+        let mut store = Store::new();
+        let candidate = report_stage(&mut owner, &mut store, input);
+        owner.publish_after_durable(candidate).unwrap();
+        assert_eq!(
+            owner.committed().claim(key(1).claim).unwrap().status(),
+            ClaimStatus::PostFailed
+        );
+        assert_eq!(owner.book.remaining_reports(key(1)), None);
+        drop(pressure);
+    }
+}
+
+#[test]
+fn reconstruction_refuses_insufficient_completion_visits_without_losing_the_core() {
+    for mode in [ValidationMode::Required, ValidationMode::Observe] {
+        let mut core = running(&[(mode, false)]);
+        let journal_bound = if mode == ValidationMode::Required {
+            13
+        } else {
+            12
+        };
+        core.limits.plan_edges = journal_bound - 1;
+        let parent = core.state.budget.clone();
+        let before = parent.stats();
+        let prefix = core.native_sequence();
+        let failure = NativeOwner::new(core).unwrap_err();
+        assert!(
+            matches!(
+                failure.error,
+                NativeOwnerError::Native(NativeError::Capacity(_))
+            ),
+            "insufficient completion visits must refuse without consuming the core: {:?}",
+            failure.error,
+        );
+        assert_eq!(failure.core.native_sequence(), prefix);
+        assert_eq!(parent.stats(), before);
+        let mut core = failure.core;
+        core.limits.plan_edges = journal_bound;
+        // A single report journal does not cover future projection or a
+        // Required failure's graph checks and complete seal cohort. Refusal may
+        // occur at any earlier checked visit bound; its ordering is not an API.
+        let failure = NativeOwner::new(core).unwrap_err();
+        assert!(
+            matches!(
+                failure.error,
+                NativeOwnerError::Native(NativeError::Capacity(_))
+            ),
+            "a report-only visit budget must refuse: {:?}",
+            failure.error,
+        );
+        assert_eq!(failure.core.native_sequence(), prefix);
+        assert_eq!(parent.stats(), before);
+        let mut core = failure.core;
+        core.limits.plan_edges = completion_visit_bound(&core);
+        let mut owner = NativeOwner::new(core).unwrap();
+        let input = report_input(&owner, 1, 30003, VerdictValue::Fail);
+        let mut store = Store::new();
+        let candidate = report_stage(&mut owner, &mut store, input);
+        owner.publish_after_durable(candidate).unwrap();
+        assert_eq!(owner.book.remaining_reports(key(1)), None);
+    }
+}
 
 struct Store {
     _directory: tempfile::TempDir,

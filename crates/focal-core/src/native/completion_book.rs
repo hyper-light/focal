@@ -12,13 +12,30 @@
 //! workspace maxima. Inserts, updates and removals touch logarithmic paths;
 //! charged buffer growth is geometric and journaled for exact rollback.
 
-use super::completion_envelope::{CompletionEnvelope, CompletionSlots, ParentFacts};
+use super::completion_envelope::{CompletionEnvelope, CompletionSlots, CompletionUse, ParentFacts};
 use super::completion_index::{CompletionIndex, IndexGrowth};
 use super::completion_schemas::SchemaSet;
 use super::prepare::{add, array, within};
 use super::*;
 use focal_evidence::{NativeSchemaVerifier, NativeVerificationBudget};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, ElasticFundedPool, MemoryBudget, OwnerId};
+
+#[path = "completion_protection.rs"]
+mod protections;
+pub(super) use protections::GraphMembers;
+#[path = "completion_growth.rs"]
+mod growth;
+#[path = "completion_updates.rs"]
+mod updates;
+pub(super) use updates::{JournalFunding, ReportAdvance, compare_seals};
+#[path = "completion_composition.rs"]
+mod composition;
+pub(super) use composition::CandidateJournal;
+#[path = "respondent_book.rs"]
+mod respondents;
+use super::respondent_state::RespondentKey;
+use respondents::{RespondentGrant, RespondentUpdate};
+pub(super) use respondents::{respondent_journal_bytes, respondent_journal_visits};
 
 #[cfg(test)]
 #[path = "completion_book_tests.rs"]
@@ -41,6 +58,10 @@ struct Grant {
     credit: Credit,
     envelope: CompletionEnvelope,
     schemas: SchemaSet,
+    members: Option<GraphMembers>,
+    // Cleared for the complete affected cohort before every candidate check.
+    // This deduplicates temporary verification, never caches an authorization.
+    growth_checked: std::cell::Cell<bool>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +71,7 @@ struct Totals {
     reports: usize,
     slots: CompletionSlots,
     live: usize,
+    graphs: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -57,6 +79,20 @@ struct Update {
     key: EvaluationKey,
     before: Credit,
     after: Credit,
+    // Used while sorting/folding candidate events; immutable journal logic
+    // depends only on the resulting exact before/after credit.
+    ordinal: u32,
+    registration_index: Option<usize>,
+}
+
+/// Exact owned update-buffer charge used by the complete cohort promise.
+/// Zero and one collected event use the collector's existing inline path.
+pub(super) fn journal_bytes(records: usize) -> Result<usize, NativeError> {
+    if records <= 1 {
+        Ok(0)
+    } else {
+        array::<Update>(records)
+    }
 }
 
 #[derive(Debug)]
@@ -67,10 +103,22 @@ enum Change {
         credit: Credit,
         growth: Option<IndexGrowth<Grant>>,
         added_funding: usize,
+        protections: Option<protections::Journal>,
     },
     One(Update),
     Many {
         updates: Vec<Update>,
+        _allocation: Allocation,
+    },
+    RespondentInstall {
+        key: RespondentKey,
+        credit: super::respondent_state::RespondentCredit,
+        growth: Option<IndexGrowth<RespondentGrant, RespondentKey>>,
+        added_funding: usize,
+    },
+    RespondentOne(RespondentUpdate),
+    RespondentMany {
+        updates: Vec<RespondentUpdate>,
         _allocation: Allocation,
     },
 }
@@ -115,9 +163,26 @@ impl ReportLoan<'_> {
     }
 }
 
+/// The owner has independently checked a due timer against the actual retained
+/// evaluation. This loan requires no external reporter, schema or evidence.
+pub(super) struct DeadlineLoan<'a> {
+    source: &'a MemoryBudget,
+    storage: focal_memory::RangeWriteEnvelope,
+}
+impl DeadlineLoan<'_> {
+    pub(super) fn source(&self) -> &MemoryBudget {
+        self.source
+    }
+    pub(super) fn storage(&self) -> focal_memory::RangeWriteEnvelope {
+        self.storage
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct CompletionBook {
     entries: CompletionIndex<Grant>,
+    respondents: CompletionIndex<RespondentGrant, RespondentKey>,
+    protections: protections::Protections,
     pool: ElasticFundedPool,
     parent: MemoryBudget,
     limits: NativeLimits,
@@ -142,9 +207,12 @@ fn demand(envelope: CompletionEnvelope, credit: Credit) -> Result<Totals, Native
     }
     let reports = usize::try_from(credit.remaining_reports)
         .map_err(|_| NativeError::Capacity("completion report count"))?;
-    let regular = envelope.per_report_retained_bytes(false)?;
+    let regular = envelope.per_report_retained_bytes(CompletionUse::Regular)?;
     let failure = if credit.failure_available {
-        sub(envelope.per_report_retained_bytes(true)?, regular)?
+        sub(
+            envelope.per_report_retained_bytes(CompletionUse::AdmissionFailure)?,
+            regular,
+        )?
     } else {
         0
     };
@@ -154,6 +222,7 @@ fn demand(envelope: CompletionEnvelope, credit: Credit) -> Result<Totals, Native
         reports,
         slots: envelope.remaining_slots(credit.remaining_reports, credit.failure_available)?,
         live: 1,
+        graphs: usize::from(envelope.has_graph()),
     })
 }
 
@@ -165,6 +234,7 @@ impl Totals {
             reports: add(sub(self.reports, old.reports)?, new.reports)?,
             slots: self.slots.checked_sub(old.slots)?.checked_add(new.slots)?,
             live: add(sub(self.live, old.live)?, new.live)?,
+            graphs: add(sub(self.graphs, old.graphs)?, new.graphs)?,
         })
     }
 }
@@ -176,6 +246,8 @@ impl CompletionBook {
         let pool = source.elastic_funded_child(BudgetLane::Ordinary, ceiling, 0)?;
         Ok(Self {
             entries: CompletionIndex::new(),
+            respondents: CompletionIndex::new(),
+            protections: protections::Protections::new(),
             pool,
             parent: source.clone(),
             limits,
@@ -190,7 +262,9 @@ impl CompletionBook {
         self.pool.budget()
     }
     pub(super) fn check_health(&self) -> Result<(), NativeError> {
-        self.entries.check_health()
+        self.entries.check_health()?;
+        self.respondents.check_health()?;
+        self.protections.check_health()
     }
     #[cfg(test)]
     pub(super) fn len(&self) -> usize {
@@ -207,12 +281,17 @@ impl CompletionBook {
         self.pool.funded_capacity()
     }
 
+    fn maximum_workspace(&self) -> usize {
+        self.entries.maximum().max(self.respondents.maximum())
+    }
+
     fn grant(&self, key: EvaluationKey) -> Result<&Grant, NativeError> {
         self.entries
             .get(key)
             .ok_or(ContractError::StaleEvaluation.into())
     }
 
+    #[cfg(test)]
     pub(super) fn install_begin(
         &mut self,
         key: EvaluationKey,
@@ -228,12 +307,34 @@ impl CompletionBook {
             envelope,
             schemas,
             registration_index,
+            None,
+        )
+    }
+
+    pub(super) fn install_begin_with_members(
+        &mut self,
+        key: EvaluationKey,
+        binding: Binding,
+        envelope: CompletionEnvelope,
+        schemas: SchemaSet,
+        registration_index: usize,
+        members: Option<GraphMembers>,
+    ) -> Result<Journal, NativeError> {
+        self.install(
+            key,
+            binding,
+            envelope.reports(),
+            envelope,
+            schemas,
+            registration_index,
+            members,
         )
     }
 
     /// Reconstruction is driven by the owner's complete actual registered-row
     /// scan. It includes begun unfenced Admission and Increment chains after receipt or parent
     /// failure. The owner derives remaining attempts from the exact definition.
+    #[cfg(test)]
     pub(super) fn install_recovered(
         &mut self,
         key: EvaluationKey,
@@ -242,6 +343,28 @@ impl CompletionBook {
         envelope: CompletionEnvelope,
         schemas: SchemaSet,
         registration_index: usize,
+    ) -> Result<(), NativeError> {
+        self.install_recovered_with_members(
+            key,
+            binding,
+            remaining_reports,
+            envelope,
+            schemas,
+            registration_index,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Exact owner reconstruction contract.
+    pub(super) fn install_recovered_with_members(
+        &mut self,
+        key: EvaluationKey,
+        binding: Binding,
+        remaining_reports: u32,
+        envelope: CompletionEnvelope,
+        schemas: SchemaSet,
+        registration_index: usize,
+        members: Option<GraphMembers>,
     ) -> Result<(), NativeError> {
         if self.journals != 0 {
             return Err(ContractError::InvalidTransition.into());
@@ -253,10 +376,12 @@ impl CompletionBook {
             envelope,
             schemas,
             registration_index,
+            members,
         )?;
         self.commit(journal)
     }
 
+    #[allow(clippy::too_many_arguments)] // One grant and its checked protected membership.
     fn install(
         &mut self,
         key: EvaluationKey,
@@ -265,8 +390,10 @@ impl CompletionBook {
         envelope: CompletionEnvelope,
         schemas: SchemaSet,
         registration_index: usize,
+        members: Option<GraphMembers>,
     ) -> Result<Journal, NativeError> {
         if !envelope.supports_target(key.target)
+            || envelope.has_graph() != members.is_some()
             || key.validation.0 != binding.object.0
             || remaining_reports == 0
             || remaining_reports > envelope.reports()
@@ -277,7 +404,9 @@ impl CompletionBook {
         let credit = Credit {
             binding,
             remaining_reports,
-            failure_available: envelope.report_storage(true).is_ok(),
+            failure_available: envelope
+                .report_storage(CompletionUse::AdmissionFailure)
+                .is_ok(),
         };
         let full = demand(
             envelope,
@@ -297,6 +426,11 @@ impl CompletionBook {
         let needed = add(totals.retained, totals.workspace)?;
         let journals = add(self.journals, 1)?;
         let revision = self.next_revision()?;
+        let protection_limit = if members.is_some() {
+            mul(self.limits.evaluations, self.limits.plan_nodes)?
+        } else {
+            0
+        };
         let growth = self.entries.grow(&self.parent, self.limits.evaluations)?;
         let new_funding = needed.saturating_sub(self.pool.available());
         if let Err(error) = self.pool.grow(new_funding) {
@@ -305,6 +439,23 @@ impl CompletionBook {
             }
             return Err(error.into());
         }
+        let protections = if let Some(members) = &members {
+            match self
+                .protections
+                .install(&self.parent, key, members, protection_limit)
+            {
+                Ok(journal) => Some(journal),
+                Err(error) => {
+                    self.pool.trim_unused(new_funding)?;
+                    if let Some(growth) = growth {
+                        self.entries.restore_growth(growth)?;
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         // Growth and funding precede tree mutation; insert allocates nothing.
         if let Err(error) = self.entries.insert(
             key,
@@ -313,9 +464,14 @@ impl CompletionBook {
                 credit,
                 envelope,
                 schemas,
+                members,
+                growth_checked: std::cell::Cell::new(false),
             },
             envelope.workspace_bytes(),
         ) {
+            if let Some(protections) = protections {
+                self.protections.rollback(protections)?;
+            }
             self.pool.trim_unused(new_funding)?;
             if let Some(growth) = growth {
                 self.entries.restore_growth(growth)?;
@@ -335,6 +491,7 @@ impl CompletionBook {
                 credit,
                 growth,
                 added_funding: new_funding,
+                protections,
             },
             before,
         })
@@ -351,6 +508,50 @@ impl CompletionBook {
         schema: ContentHash,
         verifier: &impl NativeSchemaVerifier,
     ) -> Result<ReportLoan<'a>, NativeError> {
+        self.report_contract_with(
+            key,
+            binding,
+            parent,
+            registry,
+            schema,
+            verifier,
+            |envelope| envelope.check_descriptor(input),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Same exact held contract, before artifact allocation.
+    pub(super) fn report_contract_view<'a>(
+        &'a self,
+        key: EvaluationKey,
+        binding: Binding,
+        parent: &ClaimState,
+        registry: &RegistrationSet,
+        descriptor: &impl super::report_artifact::ArtifactView,
+        schema: ContentHash,
+        verifier: &impl NativeSchemaVerifier,
+    ) -> Result<ReportLoan<'a>, NativeError> {
+        self.report_contract_with(
+            key,
+            binding,
+            parent,
+            registry,
+            schema,
+            verifier,
+            |envelope| envelope.check_descriptor_view(descriptor),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // One allocation-free descriptor checker within the held frame.
+    fn report_contract_with<'a>(
+        &'a self,
+        key: EvaluationKey,
+        binding: Binding,
+        parent: &ClaimState,
+        registry: &RegistrationSet,
+        schema: ContentHash,
+        verifier: &impl NativeSchemaVerifier,
+        check_descriptor: impl FnOnce(&CompletionEnvelope) -> Result<(), NativeError>,
+    ) -> Result<ReportLoan<'a>, NativeError> {
         self.check_health()?;
         let grant = self.grant(key)?;
         grant.credit.binding.check(&binding)?;
@@ -366,7 +567,7 @@ impl CompletionBook {
         {
             return Err(ContractError::InvalidTarget.into());
         }
-        grant.envelope.check_descriptor(input)?;
+        check_descriptor(&grant.envelope)?;
         let verification = grant.schemas.budget_for(schema, verifier)?;
         Ok(ReportLoan {
             source: self.source(),
@@ -375,13 +576,31 @@ impl CompletionBook {
         })
     }
 
+    pub(super) fn deadline_contract(
+        &self,
+        key: EvaluationKey,
+        binding: Binding,
+    ) -> Result<DeadlineLoan<'_>, NativeError> {
+        self.check_health()?;
+        let grant = self.grant(key)?;
+        grant.credit.binding.check(&binding)?;
+        if grant.credit.remaining_reports == 0 {
+            return Err(ContractError::InvalidTransition.into());
+        }
+        Ok(DeadlineLoan {
+            source: self.source(),
+            storage: grant.envelope.deadline_storage(self.limits)?,
+        })
+    }
+
+    #[cfg(test)]
     pub(super) fn advance(
         &mut self,
         key: EvaluationKey,
         before: Binding,
         after: Binding,
         terminal: bool,
-        failed_parent: bool,
+        usage: CompletionUse,
     ) -> Result<Journal, NativeError> {
         let grant = self.grant(key)?;
         grant.credit.binding.check(&before)?;
@@ -392,7 +611,7 @@ impl CompletionBook {
         .check(&before)?;
         if after.revision <= before.revision
             || grant.credit.remaining_reports == 0
-            || (failed_parent && !grant.credit.failure_available)
+            || (usage == CompletionUse::AdmissionFailure && !grant.credit.failure_available)
         {
             return Err(ContractError::InvalidTransition.into());
         }
@@ -407,13 +626,26 @@ impl CompletionBook {
         let next = Credit {
             binding: after,
             remaining_reports: if terminal { 0 } else { remaining },
-            failure_available: grant.credit.failure_available && !failed_parent,
+            failure_available: grant.credit.failure_available
+                && usage != CompletionUse::AdmissionFailure,
         };
         let update = Update {
             key,
             before: grant.credit,
             after: next,
+            ordinal: 0,
+            registration_index: Some(grant.registration_index),
         };
+        self.apply_single_update(update)
+    }
+
+    fn apply_single_update(&mut self, update: Update) -> Result<Journal, NativeError> {
+        let key = update.key;
+        let grant = self.grant(key)?;
+        if grant.credit != update.before {
+            return Err(ContractError::StaleEvaluation.into());
+        }
+        let next = update.after;
         let totals = self.totals.replace(
             demand(grant.envelope, grant.credit)?,
             demand(grant.envelope, next)?,
@@ -429,7 +661,7 @@ impl CompletionBook {
         self.entries
             .replace_weight(key, workspace, |grant| grant.credit = next)?;
         self.totals = totals;
-        self.totals.workspace = self.entries.maximum();
+        self.totals.workspace = self.maximum_workspace();
         self.check_health()?;
         self.journals = journals;
         let before_revision = self.revision;
@@ -443,7 +675,10 @@ impl CompletionBook {
         })
     }
 
-    fn event(prepared: &NativePrepared, ordinal: u32) -> Result<NativeEvent, NativeError> {
+    pub(super) fn event(
+        prepared: &NativePrepared,
+        ordinal: u32,
+    ) -> Result<NativeEvent, NativeError> {
         match prepared
             .range
             .get(&Key::Event(prepared.outcome.sequence, ordinal))
@@ -456,131 +691,68 @@ impl CompletionBook {
         }
     }
 
-    fn retirement(
-        &self,
+    /// The original Admission failure precedes graph revisions and cohort
+    /// seals. Resolve that publication instead of inferring it from a final row.
+    pub(super) fn admission_failure_event(
         prepared: &NativePrepared,
-        ordinal: u32,
-    ) -> Result<Option<Update>, NativeError> {
-        let NativeFact::Evaluation {
-            kind: NativeEvaluationEventKind::AuthorityFenced,
-            key,
-            before,
-            after,
-            state,
-            fence,
-            ..
-        } = Self::event(prepared, ordinal)?.fact
-        else {
+    ) -> Result<Option<NativeClaimEvent>, NativeError> {
+        if prepared.outcome.operation != NativeOperation::ReportAdmission
+            || prepared.outcome.events <= 3
+        {
             return Ok(None);
+        }
+        let publication = Self::event(prepared, 3)?;
+        let NativeFact::Claim(event) = publication.fact else {
+            return Err(ContractError::InvalidCut.into());
         };
-        let actual = prepared
-            .evaluation(key)
+        let parent = prepared
+            .claim(ClaimId(event.after.object.0))
             .ok_or(ContractError::InvalidTarget)?;
-        if actual.binding() != after
-            || actual.state() != state
-            || actual.fence() != fence
-            || !(actual.state().is_terminal() || actual.fence().is_some())
+        if publication.sequence != prepared.outcome.sequence
+            || publication.ordinal != 3
+            || publication.invocation != prepared.outcome.invocation
+            || event.kind != NativeEventKind::PostFailed
+            || !matches!(parent.terminal_cut(),
+                Some(focal_model::lifecycle::claim::ClaimTerminalCut::Required(cut))
+                if cut.sequence() == prepared.outcome.sequence)
         {
             return Err(ContractError::InvalidCut.into());
         }
-        let Some(grant) = self.entries.get(key) else {
-            if actual.has_begun() {
-                return Err(ContractError::StaleEvaluation.into());
-            }
-            return Ok(None);
-        };
-        if Some(grant.credit.binding) != before || grant.credit.remaining_reports == 0 {
-            return Err(ContractError::StaleEvaluation.into());
-        }
-        Ok(Some(Update {
-            key,
-            before: grant.credit,
-            after: Credit {
-                binding: after,
-                remaining_reports: 0,
-                failure_available: false,
-            },
-        }))
-    }
-
-    /// Inspect only evaluation-fence events emitted by this actual candidate.
-    /// Parent failure alone never retires an already-begun sibling's grant.
-    pub(super) fn retire_prepared(
-        &mut self,
-        prepared: &NativePrepared,
-    ) -> Result<Journal, NativeError> {
-        let mut count = 0;
-        for ordinal in 0..prepared.outcome.events {
-            count = add(
-                count,
-                usize::from(self.retirement(prepared, ordinal)?.is_some()),
-            )?;
-        }
-        if count == 0 {
-            return Ok(Journal::empty());
-        }
-        let bytes = array::<Update>(count)?;
-        let reservation = self
-            .parent
-            .reserve(BudgetKind::Pending, BudgetLane::Ordinary, bytes)?;
-        let mut updates = Vec::new();
-        updates
-            .try_reserve_exact(count)
-            .map_err(|_| MemoryError::AllocationFailed)?;
-        within(array::<Update>(updates.capacity())?, bytes)?;
-        let mut totals = self.totals;
-        for ordinal in 0..prepared.outcome.events {
-            if let Some(update) = self.retirement(prepared, ordinal)? {
-                let grant = self.grant(update.key)?;
-                totals =
-                    totals.replace(demand(grant.envelope, update.before)?, Totals::default())?;
-                if updates.len() == updates.capacity() {
-                    return Err(NativeError::Capacity("retirement journal"));
-                }
-                updates.push(update);
-            }
-        }
-        updates.sort_unstable_by_key(|update| update.key);
-        if updates.windows(2).any(|pair| {
-            pair.first()
-                .zip(pair.last())
-                .is_some_and(|(left, right)| left.key == right.key)
-        }) {
-            return Err(ContractError::InvalidCut.into());
-        }
-        let journals = add(self.journals, 1)?;
-        let revision = self.next_revision()?;
-        let before = self.totals;
-        for update in &updates {
-            self.entries
-                .replace_weight(update.key, 0, |grant| grant.credit = update.after)?;
-        }
-        self.totals = totals;
-        self.totals.workspace = self.entries.maximum();
-        self.check_health()?;
-        self.journals = journals;
-        let before_revision = self.revision;
-        self.revision = revision;
-        Ok(Journal {
-            owner: Some(self.owner),
-            before_revision,
-            after_revision: revision,
-            change: Change::Many {
-                updates,
-                _allocation: reservation.commit(),
-            },
-            before,
-        })
+        Ok(Some(event))
     }
 
     /// Protect every active grant on each parent actually changed by this
     /// candidate; registered definitions supply the complete lookup keys.
-    pub(super) fn check_parents(&self, prepared: &NativePrepared) -> Result<(), NativeError> {
+    pub(super) fn check_parents(
+        &self,
+        view: &View<'_>,
+        prepared: &NativePrepared,
+    ) -> Result<(), NativeError> {
         self.check_health()?;
+        if view.tail.is_none_or(|tail| !std::ptr::eq(tail, prepared)) {
+            return Err(MemoryError::WrongRange.into());
+        }
+        let mut previous = None;
         for ordinal in 0..prepared.outcome.events {
             let after = match Self::event(prepared, ordinal)?.fact {
                 NativeFact::Claim(event) => event.after,
                 NativeFact::Registrations { claim } => claim,
+                NativeFact::Evaluation { key, .. } => {
+                    let state = prepared
+                        .evaluation(key)
+                        .ok_or(ContractError::InvalidTarget)?;
+                    // Complete source cohorts were checked before accepting a
+                    // responsibility. Every later evaluation mutation has a
+                    // fact, so preserving Ready headroom needs only its final
+                    // row, including authority-only deadline fences.
+                    if !state.has_begun()
+                        && !state.state().is_terminal()
+                        && state.sealed().is_none()
+                    {
+                        state.binding().next()?;
+                    }
+                    continue;
+                }
                 _ => continue,
             };
             let id = ClaimId(after.object.0);
@@ -594,6 +766,10 @@ impl CompletionBook {
             if after != parent.binding() {
                 continue;
             }
+            if previous == Some(id) {
+                continue;
+            }
+            previous = Some(id);
             // Seek this parent's own grant interval. Iterating only supplied
             // registration rows would silently miss a dropped whole cohort.
             let first = EvaluationKey {
@@ -642,8 +818,30 @@ impl CompletionBook {
     ) -> Result<(), NativeError> {
         self.check_health()?;
         let slots = self.totals.slots;
+        within(add(meta.claims, slots.claims)?, self.limits.claims)?;
+        within(
+            add(meta.definitions, slots.definitions)?,
+            self.limits.definitions,
+        )?;
+        within(
+            add(meta.evaluations, slots.evaluations)?,
+            self.limits.evaluations,
+        )?;
         within(add(meta.artifacts, slots.artifacts)?, self.limits.artifacts)?;
         within(add(meta.results, slots.results)?, self.limits.results)?;
+        within(add(meta.responses, slots.responses)?, self.limits.responses)?;
+        within(add(meta.receipts, slots.receipts)?, self.limits.receipts)?;
+        // Exactly one claimant result testament may be generated per claim.
+        // Its native admission path shares the configured claim-count ceiling.
+        within(
+            add(meta.result_testaments, slots.result_testaments)?,
+            self.limits.claims,
+        )?;
+        within(add(meta.monitors, slots.monitors)?, self.limits.monitors)?;
+        within(
+            add(meta.monitor_links, slots.monitor_links)?,
+            self.limits.monitor_links,
+        )?;
         within(add(meta.events, slots.events)?, self.limits.events)?;
         let control = usize::from(self.totals.live != 0);
         within(
@@ -673,8 +871,12 @@ impl CompletionBook {
             .and_then(|value| value.checked_add(u64::from(self.totals.live != 0)))
             .ok_or(NativeError::Capacity("completion candidate margin"))?;
         self.revision
-            .checked_add(reports)
-            .and_then(|value| value.checked_add(u64::from(self.totals.live != 0)))
+            .checked_add(
+                reports
+                    .checked_mul(2)
+                    .ok_or(NativeError::Capacity("completion journal margin"))?,
+            )
+            .and_then(|value| value.checked_add(if self.totals.live != 0 { 4 } else { 0 }))
             .ok_or(NativeError::Capacity("completion journal margin"))?;
         Ok(())
     }
@@ -715,16 +917,40 @@ impl CompletionBook {
                     self.check_update(*update)?;
                 }
             }
+            Change::RespondentInstall {
+                key,
+                credit,
+                growth,
+                ..
+            } => {
+                self.check_respondent_install(*key, *credit, growth.as_ref())?;
+            }
+            Change::RespondentOne(update) => self.check_respondent_update(*update)?,
+            Change::RespondentMany { updates, .. } => {
+                for update in updates {
+                    self.check_respondent_update(*update)?;
+                }
+            }
             Change::None => {}
         }
-        if let Change::Begin { added_funding, .. } = &journal.change {
+        if let Change::Begin { added_funding, .. }
+        | Change::RespondentInstall { added_funding, .. } = &journal.change
+        {
             // Only this Begin's new parent contribution is returned. The owner
             // has dropped its prepared pages and every later spender first;
             // pre-Begin promises and rollback backing remain fully funded.
             self.pool.trim_unused(*added_funding)?;
         }
         match journal.change {
-            Change::Begin { key, growth, .. } => {
+            Change::Begin {
+                key,
+                growth,
+                protections,
+                ..
+            } => {
+                if let Some(protections) = protections {
+                    self.protections.rollback(protections)?;
+                }
                 drop(self.entries.remove(key)?);
                 if let Some(growth) = growth {
                     self.entries.restore_growth(growth)?;
@@ -737,6 +963,22 @@ impl CompletionBook {
             } => {
                 for update in updates {
                     self.restore_credit(update)?;
+                }
+                drop(_allocation);
+            }
+            Change::RespondentInstall { key, growth, .. } => {
+                self.respondents.remove(key)?;
+                if let Some(growth) = growth {
+                    self.respondents.restore_growth(growth)?;
+                }
+            }
+            Change::RespondentOne(update) => self.restore_respondent(update)?,
+            Change::RespondentMany {
+                updates,
+                _allocation,
+            } => {
+                for update in updates {
+                    self.restore_respondent(update)?;
                 }
                 drop(_allocation);
             }
@@ -761,6 +1003,18 @@ impl CompletionBook {
             .replace_weight(update.key, workspace, |grant| grant.credit = update.before)
     }
 
+    fn remove_grant(&mut self, key: EvaluationKey) -> Result<(), NativeError> {
+        let grant = self
+            .entries
+            .get(key)
+            .ok_or(ContractError::StaleEvaluation)?;
+        if let Some(members) = &grant.members {
+            self.protections.remove(key, members)?;
+        }
+        drop(self.entries.remove(key)?);
+        Ok(())
+    }
+
     pub(super) fn commit(&mut self, journal: Journal) -> Result<(), NativeError> {
         if matches!(journal.change, Change::None) {
             return Ok(());
@@ -773,18 +1027,42 @@ impl CompletionBook {
             }
             Change::Many { updates, .. } => {
                 for update in updates {
-                    self.check_update(*update)?;
+                    if update.after.remaining_reports == 0 {
+                        self.check_update(*update)?;
+                    }
+                }
+            }
+            Change::RespondentOne(update) if update.after.actions()? == 0 => {
+                self.check_respondent_update(*update)?;
+            }
+            Change::RespondentMany { updates, .. } => {
+                for update in updates {
+                    if update.after.actions()? == 0 {
+                        self.check_respondent_update(*update)?;
+                    }
                 }
             }
             _ => {}
         }
         match &journal.change {
             Change::One(update) if update.after.remaining_reports == 0 => {
-                drop(self.entries.remove(update.key)?);
+                self.remove_grant(update.key)?;
             }
             Change::Many { updates, .. } => {
                 for update in updates {
-                    drop(self.entries.remove(update.key)?);
+                    if update.after.remaining_reports == 0 {
+                        self.remove_grant(update.key)?;
+                    }
+                }
+            }
+            Change::RespondentOne(update) if update.after.actions()? == 0 => {
+                self.respondents.remove(update.key)?;
+            }
+            Change::RespondentMany { updates, .. } => {
+                for update in updates {
+                    if update.after.actions()? == 0 {
+                        self.respondents.remove(update.key)?;
+                    }
                 }
             }
             _ => {}

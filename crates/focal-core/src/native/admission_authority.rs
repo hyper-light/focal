@@ -2,6 +2,7 @@
 //! These capabilities describe the exact effective prefix; they own no row,
 //! reservation, execution task or fabricated evidence fact.
 
+use super::report_artifact::ArtifactView;
 use super::*;
 use focal_model::VerdictValue;
 use focal_model::lifecycle::artifact_descriptor::{ArtifactDescriptor, ResultProvenance};
@@ -111,6 +112,22 @@ pub(super) fn report<'a>(
     descriptor: &ArtifactDescriptor,
     limits: NativeLimits,
 ) -> Result<(Registered<'a>, validation::ReportAuthorization), NativeError> {
+    report_view(
+        view, context, claim, key, expected, report, descriptor, limits,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // Same exact owner frame, with a checked borrowed artifact body.
+pub(super) fn report_view<'a>(
+    view: &'a View<'_>,
+    context: NativeContext,
+    claim: Binding,
+    key: EvaluationKey,
+    expected: Binding,
+    report: validation::Report,
+    descriptor: &impl ArtifactView,
+    limits: NativeLimits,
+) -> Result<(Registered<'a>, validation::ReportAuthorization), NativeError> {
     let registered = registered(view, claim, key)?;
     let evaluation = registered.state.bind(registered.definition)?;
     let owner = evaluation.admission_report_owner(registered.parent, context.logical_time)?;
@@ -126,7 +143,7 @@ pub(super) fn authorize_report<'a>(
     registered: Registered<'a>,
     expected: Binding,
     report: validation::Report,
-    descriptor: &ArtifactDescriptor,
+    descriptor: &impl ArtifactView,
     owner: validation::OwnerState,
     limits: NativeLimits,
 ) -> Result<(Registered<'a>, validation::ReportAuthorization), NativeError> {
@@ -141,28 +158,29 @@ pub(super) fn authorize_report<'a>(
         .require_actor(evaluation.current_attempt()?.evaluator)?;
     let authorization =
         evaluation.authorize_report(context.principal, &expected, &owner, report)?;
-    if descriptor.ledger() != view.ledger() {
+    let fields = descriptor.fields();
+    if fields.ledger != view.ledger() {
         return Err(ContractError::WrongLedger.into());
     }
-    if descriptor.producer() != authorization.attempt().evaluator {
+    if fields.producer != authorization.attempt().evaluator {
         return Err(ContractError::WrongActor.into());
     }
-    if descriptor.receipt() != registered.state.receipt() {
+    if fields.receipt != registered.state.receipt() {
         return Err(ContractError::StaleReceipt.into());
     }
     if matches!(report.value, VerdictValue::Incomplete | VerdictValue::Error)
-        && descriptor.kind() != "error"
+        && fields.kind != "error"
     {
         return Err(ContractError::MissingEvidence.into());
     }
-    if descriptor.id() != report.evidence.id {
+    if fields.id != report.evidence.id {
         return Err(ContractError::WrongObject.into());
     }
     if descriptor.content_hash() != report.evidence.hash {
         return Err(ContractError::ContentConflict.into());
     }
-    if descriptor.schema_hash() != authorization.schema()
-        || descriptor.result_provenance()
+    if fields.schema_hash != authorization.schema()
+        || fields.result
             != Some(ResultProvenance {
                 claim: key.claim,
                 validation: key.validation,
@@ -174,8 +192,8 @@ pub(super) fn authorize_report<'a>(
     {
         return Err(ContractError::MissingEvidence.into());
     }
-    super::reporting::check_inputs(descriptor, view, limits)?;
-    if view.get(Key::Artifact(descriptor.id())).is_some()
+    super::reporting::check_inputs_view(descriptor, view, limits)?;
+    if view.get(Key::Artifact(fields.id)).is_some()
         || view
             .get(Key::ArtifactIdentity(descriptor.content_hash()))
             .is_some()

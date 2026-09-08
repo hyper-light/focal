@@ -749,7 +749,12 @@ fn entry_gates(
         if !claim.response_history(source.response)?.received() {
             continue;
         }
-        if source.entered.is_some() && requires_increment && !registry.increment_targets_sealed() {
+        if source.entered.is_some()
+            && requires_increment
+            && claim.receipt().map(|receipt| receipt.fence)
+                == Some(source.response.identity().receipt)
+            && !registry.increment_targets_sealed()
+        {
             return Err(ContractError::InvalidTransition);
         }
         for registered in registry.rows().iter().copied() {
@@ -811,7 +816,9 @@ fn inspect_works(
             visits.take(1)?;
             let earlier = earlier?;
             if earlier.binding().object == work.binding().object
-                || (earlier.cycle() == work.cycle() && earlier.slot() == work.slot())
+                || (earlier.receipt() == work.receipt()
+                    && earlier.cycle() == work.cycle()
+                    && earlier.slot() == work.slot())
             {
                 return Err(ContractError::InvalidManifest);
             }
@@ -823,7 +830,9 @@ fn inspect_works(
                 .checked_sub(1)
                 .ok_or(ContractError::InvalidManifest)?;
             let response = response(claim, view, id, visits)?.source.response;
-            if response.identity().cycle == work.cycle() {
+            if response.identity().receipt == work.receipt()
+                && response.identity().cycle == work.cycle()
+            {
                 visits.take(response.manifest().len())?;
                 visits.take(response.failed_work().len())?;
                 let present = response

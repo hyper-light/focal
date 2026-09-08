@@ -7,12 +7,18 @@ use focal_memory::MemoryError;
 use focal_model::lifecycle::{
     aggregation::RegistrationSet,
     claim::ClaimState,
+    claim_descriptor::ClaimDescriptor,
+    creation::Owner,
+    scope::ScopeLimits,
     validation::{Declaration, EvaluationState},
+    validation_descriptor::ValidationDescriptor,
 };
 
 const ALLOCATION: usize = 4 * size_of::<usize>();
 const CLAIM_CONTAINER: usize = size_of::<ClaimRow>() + ALLOCATION;
 const DECLARATION_CONTAINER: usize = size_of::<Declaration>() + ALLOCATION;
+const AUTHORED_DECLARATION_CONTAINER: usize = size_of::<ValidationDescriptor>() + ALLOCATION;
+const CLAIM_CONTENT_CONTAINER: usize = size_of::<ClaimContentRow>() + ALLOCATION;
 const EVALUATION_CONTAINER: usize = size_of::<EvaluationState>() + ALLOCATION;
 const EVENT_CONTAINER: usize = size_of::<StoredEvent>() + ALLOCATION;
 
@@ -24,7 +30,25 @@ struct ClaimRow {
 #[derive(Debug)]
 pub(super) struct OwnedClaim(Vec<ClaimRow>);
 #[derive(Debug)]
-pub(super) struct OwnedDeclaration(Vec<Declaration>);
+pub(super) struct OwnedDeclaration(DeclarationStorage);
+#[derive(Debug)]
+enum DeclarationStorage {
+    Legacy(Vec<Declaration>),
+    Authored(Vec<ValidationDescriptor>),
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ClaimContentProfile {
+    pub(super) max_responses: u32,
+    pub(super) scope_limits: ScopeLimits,
+    pub(super) owner: Option<Owner>,
+}
+#[derive(Debug)]
+struct ClaimContentRow {
+    descriptor: ClaimDescriptor,
+    profile: ClaimContentProfile,
+}
+#[derive(Debug)]
+pub(super) struct OwnedClaimContent(Vec<ClaimContentRow>);
 #[derive(Debug)]
 pub(super) struct OwnedEvaluation(Vec<EvaluationState>);
 #[derive(Debug)]
@@ -57,7 +81,11 @@ fn within(actual: usize, allowance: usize) -> Result<(), MemoryError> {
 fn singleton<T>(value: T, allowance: usize) -> Result<Vec<T>, MemoryError> {
     within(container_heap::<T>(1)?, allowance)?;
     let mut rows = Vec::new();
-    rows.try_reserve_exact(1)
+    #[cfg(test)]
+    let requested = tests::allocation_capacity(1)?;
+    #[cfg(not(test))]
+    let requested = 1;
+    rows.try_reserve_exact(requested)
         .map_err(|_| MemoryError::AllocationFailed)?;
     within(container_heap::<T>(rows.capacity())?, allowance)?;
     rows.push(value);
@@ -103,6 +131,28 @@ fn declaration_heap(declaration: &Declaration) -> Result<usize, MemoryError> {
             .retained_heap_bytes()
             .map_err(|_| MemoryError::AllocationFailed)?,
         declaration
+            .heap_allocations()
+            .map_err(|_| MemoryError::AllocationFailed)?,
+    )
+}
+
+fn authored_declaration_heap(descriptor: &ValidationDescriptor) -> Result<usize, MemoryError> {
+    nested_heap(
+        descriptor
+            .retained_heap_bytes()
+            .map_err(|_| MemoryError::AllocationFailed)?,
+        descriptor
+            .heap_allocations()
+            .map_err(|_| MemoryError::AllocationFailed)?,
+    )
+}
+
+fn claim_content_heap(descriptor: &ClaimDescriptor) -> Result<usize, MemoryError> {
+    nested_heap(
+        descriptor
+            .retained_heap_bytes()
+            .map_err(|_| MemoryError::AllocationFailed)?,
+        descriptor
             .heap_allocations()
             .map_err(|_| MemoryError::AllocationFailed)?,
     )
@@ -187,28 +237,137 @@ impl OwnedDeclaration {
     }
     pub(super) fn new(declaration: Declaration) -> Result<Self, MemoryError> {
         add(Self::container_charge(), declaration_heap(&declaration)?)?;
-        Ok(Self(singleton(declaration, Self::container_charge())?))
+        Ok(Self(DeclarationStorage::Legacy(singleton(
+            declaration,
+            Self::container_charge(),
+        )?)))
+    }
+    pub(super) const fn authored_container_charge() -> usize {
+        AUTHORED_DECLARATION_CONTAINER
+    }
+    /// Move the complete descriptor, including its declaration's existing
+    /// handler buffers, into one fallible container without another copy.
+    pub(super) fn new_authored(descriptor: ValidationDescriptor) -> Result<Self, MemoryError> {
+        add(
+            Self::authored_container_charge(),
+            authored_declaration_heap(&descriptor)?,
+        )?;
+        Ok(Self(DeclarationStorage::Authored(singleton(
+            descriptor,
+            Self::authored_container_charge(),
+        )?)))
     }
     pub(super) fn get(&self) -> Option<&Declaration> {
-        get(&self.0)
+        match &self.0 {
+            DeclarationStorage::Legacy(rows) => get(rows),
+            DeclarationStorage::Authored(rows) => get(rows).map(ValidationDescriptor::declaration),
+        }
+    }
+    pub(super) fn descriptor(&self) -> Option<&ValidationDescriptor> {
+        match &self.0 {
+            DeclarationStorage::Legacy(_) => None,
+            DeclarationStorage::Authored(rows) => get(rows),
+        }
     }
     pub(super) fn heap_charge(&self) -> Result<usize, MemoryError> {
-        let declaration = self.get().ok_or(MemoryError::MissingKey)?;
+        match &self.0 {
+            DeclarationStorage::Legacy(rows) => add(
+                container_heap::<Declaration>(rows.capacity())?,
+                declaration_heap(get(rows).ok_or(MemoryError::MissingKey)?)?,
+            ),
+            DeclarationStorage::Authored(rows) => add(
+                container_heap::<ValidationDescriptor>(rows.capacity())?,
+                authored_declaration_heap(get(rows).ok_or(MemoryError::MissingKey)?)?,
+            ),
+        }
+    }
+    pub(super) fn copy(&self) -> Result<Self, MemoryError> {
+        let old = self.heap_charge()?;
+        let copied = match &self.0 {
+            DeclarationStorage::Legacy(rows) => {
+                let declaration = get(rows).ok_or(MemoryError::MissingKey)?;
+                let charge = declaration
+                    .retained_bytes()
+                    .map_err(|_| MemoryError::AllocationFailed)?;
+                Self::new(
+                    declaration
+                        .try_copy(charge)
+                        .map_err(|_| MemoryError::AllocationFailed)?,
+                )?
+            }
+            DeclarationStorage::Authored(rows) => {
+                let descriptor = get(rows).ok_or(MemoryError::MissingKey)?;
+                let charge = descriptor
+                    .copy_charge()
+                    .map_err(|_| MemoryError::AllocationFailed)?;
+                Self::new_authored(
+                    descriptor
+                        .try_copy(charge)
+                        .map_err(|_| MemoryError::AllocationFailed)?,
+                )?
+            }
+        };
+        within(copied.heap_charge()?, old)?;
+        Ok(copied)
+    }
+}
+
+impl OwnedClaimContent {
+    pub(super) const fn container_charge() -> usize {
+        CLAIM_CONTENT_CONTAINER
+    }
+    pub(super) fn new(
+        descriptor: ClaimDescriptor,
+        max_responses: u32,
+        scope_limits: ScopeLimits,
+        owner: Option<Owner>,
+    ) -> Result<Self, MemoryError> {
+        add(Self::container_charge(), claim_content_heap(&descriptor)?)?;
+        Ok(Self(singleton(
+            ClaimContentRow {
+                descriptor,
+                profile: ClaimContentProfile {
+                    max_responses,
+                    scope_limits,
+                    owner,
+                },
+            },
+            Self::container_charge(),
+        )?))
+    }
+    pub(super) fn get(&self) -> Option<&ClaimDescriptor> {
+        get(&self.0).map(|row| &row.descriptor)
+    }
+    pub(super) fn descriptor(&self) -> Option<&ClaimDescriptor> {
+        self.get()
+    }
+    pub(super) fn profile(&self) -> Option<ClaimContentProfile> {
+        get(&self.0).map(|row| row.profile)
+    }
+    pub(super) fn heap_charge(&self) -> Result<usize, MemoryError> {
+        let descriptor = self.get().ok_or(MemoryError::MissingKey)?;
         add(
-            container_heap::<Declaration>(self.0.capacity())?,
-            declaration_heap(declaration)?,
+            container_heap::<ClaimContentRow>(self.0.capacity())?,
+            claim_content_heap(descriptor)?,
         )
     }
     pub(super) fn copy(&self) -> Result<Self, MemoryError> {
         let old = self.heap_charge()?;
-        let declaration = self.get().ok_or(MemoryError::MissingKey)?;
-        let charge = declaration
-            .retained_bytes()
+        let row = get(&self.0).ok_or(MemoryError::MissingKey)?;
+        let charge = row
+            .descriptor
+            .copy_charge()
             .map_err(|_| MemoryError::AllocationFailed)?;
+        let descriptor = row
+            .descriptor
+            .try_copy(charge)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        let profile = row.profile;
         let copied = Self::new(
-            declaration
-                .try_copy(charge)
-                .map_err(|_| MemoryError::AllocationFailed)?,
+            descriptor,
+            profile.max_responses,
+            profile.scope_limits,
+            profile.owner,
         )?;
         within(copied.heap_charge()?, old)?;
         Ok(copied)

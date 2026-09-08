@@ -1,5 +1,14 @@
 use super::*;
+
+#[path = "adoption_tests.rs"]
+mod adoption_tests;
 use focal_model::VerdictValue;
+#[path = "object_journal_tests.rs"]
+mod object_journal_tests;
+#[path = "work_completion_hybrid_tests.rs"]
+mod work_completion_hybrid_tests;
+#[path = "work_completion_tests.rs"]
+mod work_completion_tests;
 
 const CLAIM: ClaimId = ClaimId::from_u128(1);
 const RESPONSE: TestamentId = TestamentId::from_u128(900);
@@ -169,12 +178,32 @@ fn missing_required_presence_becomes_incomplete_without_fabricating_work_or_eval
 // This fixture commits the full declaration and slot policy before taking the
 // receipt. It never installs an evaluation or accepted result through a test seam.
 fn checked_slot_fixture() -> Fixture {
+    checked_slot_fixture_with_mode(ValidationMode::Required)
+}
+
+fn checked_slot_fixture_with_mode(mode: ValidationMode) -> Fixture {
+    checked_slot_fixture_with_visits(mode, 2048)
+}
+
+fn checked_slot_fixture_with_visits(mode: ValidationMode, visits: usize) -> Fixture {
+    checked_slot_fixture_with_definition(
+        mode,
+        visits,
+        work_check_tests::declaration(1, 0, mode, 1000),
+    )
+}
+
+fn checked_slot_fixture_with_definition(
+    mode: ValidationMode,
+    visits: usize,
+    declaration: validation::Declaration,
+) -> Fixture {
     let core = Core::new_native(
         binding(1).ledger,
         RangeId(5781),
         NativeLimits {
             plan_nodes: 16,
-            plan_edges: 2048,
+            plan_edges: visits,
             preparation_bytes: 1024 * 1024,
             evaluations_per_claim: 32,
             range: RangeConfig {
@@ -213,16 +242,11 @@ fn checked_slot_fixture() -> Fixture {
     else {
         panic!("create")
     };
-    declarations.push(work_check_tests::declaration(
-        1,
-        0,
-        ValidationMode::Required,
-        1000,
-    ));
+    declarations.push(declaration);
     let check = [aggregation::CheckPolicy {
         declaration_index: 1,
         validation: ValidationId::from_u128(301),
-        mode: ValidationMode::Required,
+        mode,
     }];
     let policies = [
         aggregation::SlotPolicy {

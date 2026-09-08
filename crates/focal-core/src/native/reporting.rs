@@ -1,6 +1,6 @@
-//! Report one already-begun Admission/Increment attempt with immutable evidence.
+//! Report one already-begun attempt with immutable evidence.
 //! All derived rows remain detached until the common owner publication.
-use super::prepare::{Extra, Extras, Scratch, heap};
+use super::prepare::{Extra, Extras, Scratch};
 use super::*;
 use focal_model::lifecycle::{
     aggregation, artifact_descriptor::ArtifactDescriptor, audit, claim::ClaimCut,
@@ -16,12 +16,21 @@ pub(super) fn check_inputs(
     view: &View<'_>,
     limits: NativeLimits,
 ) -> Result<(), NativeError> {
-    if descriptor.inputs().len() > limits.plan_edges {
+    check_inputs_view(descriptor, view, limits)
+}
+
+pub(super) fn check_inputs_view(
+    descriptor: &impl super::report_artifact::ArtifactView,
+    view: &View<'_>,
+    limits: NativeLimits,
+) -> Result<(), NativeError> {
+    if descriptor.input_count() > limits.plan_edges {
         return Err(NativeError::Capacity("artifact input visits"));
     }
     let mut visits = limits.plan_edges;
     for input in descriptor.inputs() {
         visit(&mut visits)?;
+        let input = input?;
         if input.ledger != view.ledger() {
             return Err(ContractError::WrongLedger.into());
         }
@@ -40,7 +49,7 @@ pub(super) fn check_inputs(
                         visit(&mut visits)?;
                         loop {
                             visit(&mut visits)?;
-                            match labels.next() {
+                            match labels.next().transpose()? {
                                 Some(label) if label < required => continue,
                                 Some(label) if label == required => break,
                                 _ => return Err(ContractError::InvalidPolicy.into()),
@@ -86,7 +95,9 @@ pub(super) fn prepare(
     scratch: &mut Scratch,
 ) -> Result<transactions::Plan, NativeError> {
     let descriptor = artifact.get().ok_or(ContractError::MissingEvidence)?;
-    let authorize = if matches!(key.target, EvaluationTarget::Increment { .. }) {
+    let authorize = if matches!(key.target, EvaluationTarget::Work { .. }) {
+        super::work_authority::report
+    } else if matches!(key.target, EvaluationTarget::Increment { .. }) {
         super::increment_authority::report
     } else {
         super::admission_authority::report
@@ -99,7 +110,9 @@ pub(super) fn prepare(
     let old = registered.state;
     let registry = registered.registry;
     let evaluation = old.bind(definition)?;
-    let owner = if matches!(key.target, EvaluationTarget::Increment { .. }) {
+    let owner = if matches!(key.target, EvaluationTarget::Work { .. }) {
+        super::work_authority::report_owner(view, &registered, context.logical_time, limits)?
+    } else if matches!(key.target, EvaluationTarget::Increment { .. }) {
         super::increment_authority::report_owner(view, &registered, context.logical_time)?
     } else {
         evaluation.admission_report_owner(parent, context.logical_time)?
@@ -139,7 +152,7 @@ pub(super) fn prepare(
         cut.position,
         ACCEPTED_ORDINAL,
     )?;
-    let mut rows = Vec::new();
+    let mut failure = None;
     // Admission determines whether a Posted claim can be received. Once receipt
     // or a terminal cut has committed, a begun report remains independent audit
     // evidence. Do not scan later response/Increment cohorts: that would make an
@@ -165,11 +178,22 @@ pub(super) fn prepare(
             decision.outcome(),
             aggregation::AdmissionOutcome::Blocked(_)
         ) {
-            rows = scratch.reserve::<ClaimState>(1)?;
-            scratch.charge(heap(parent)?)?;
-            let mut changed = parent.try_copy(parent.retained_bytes()?)?;
-            changed.apply_admission(&claim, &decision)?;
-            rows.push(changed);
+            failure = Some(super::admission_graph::Failure::apply(
+                parent,
+                claim,
+                &decision,
+                super::admission_graph::ReportFrame {
+                    key,
+                    previous: *old,
+                    next,
+                    accepted,
+                    facts,
+                    request,
+                    logical_time: context.logical_time,
+                },
+                cut,
+                scratch,
+            )?);
         }
     }
     transactions::increment(&mut meta.artifacts, 1, limits.artifacts, "artifacts")?;
@@ -227,9 +251,13 @@ pub(super) fn prepare(
         heap: accepted_heap,
         fact: Some(NativeFact::Accepted { key: result_key }),
     })?;
+    let rows = match failure {
+        Some(failure) => failure.prepare(view, cut, limits, extras, scratch)?,
+        None => Vec::new(),
+    };
     Ok(transactions::Plan {
         rows,
-        registry: None,
+        registry: transactions::RegistryOverrides::new(),
         created: 0,
     })
 }

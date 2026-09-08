@@ -23,7 +23,13 @@ struct Works<'a, 'b> {
     claim: Option<&'b ClaimState>,
     limits: NativeLimits,
     visits: usize,
+    shared: Option<&'a super::projection_visits::Visits>,
     open: Option<(NativeCycleKey, ParticipantId)>,
+    retired: Option<NativeCycleKey>,
+    remaining_retired: usize,
+    remaining_retired_work: usize,
+    retired_epoch: u64,
+    retired_cycle: u32,
     next_response: Option<TestamentId>,
     remaining_responses: u32,
     latest: Option<ResponseLink>,
@@ -32,17 +38,33 @@ struct Works<'a, 'b> {
     done: bool,
 }
 
+#[cfg(test)]
 pub(super) fn works<'a, 'b>(
     view: &'a View<'b>,
     claim: ClaimId,
     limits: NativeLimits,
+) -> impl Iterator<Item = Result<&'b WorkArtifact, ContractError>> + 'a {
+    works_with_budget(view, claim, limits, None)
+}
+
+pub(super) fn works_with_budget<'a, 'b>(
+    view: &'a View<'b>,
+    claim: ClaimId,
+    limits: NativeLimits,
+    shared: Option<&'a super::projection_visits::Visits>,
 ) -> impl Iterator<Item = Result<&'b WorkArtifact, ContractError>> + 'a {
     let mut cursor = Works {
         view,
         claim: None,
         limits,
         visits: limits.plan_edges,
+        shared,
         open: None,
+        retired: None,
+        remaining_retired: 0,
+        remaining_retired_work: 0,
+        retired_epoch: 0,
+        retired_cycle: 0,
         next_response: None,
         remaining_responses: 0,
         latest: None,
@@ -74,6 +96,16 @@ impl<'a, 'b> Works<'a, 'b> {
         self.remaining_responses = count;
         self.latest = claim.latest_response();
         self.next_response = self.latest.map(|row| row.testament);
+        self.charge(1)?;
+        let retired = super::retired_cycles::head(self.view, id, self.limits)?;
+        self.retired = retired.head;
+        self.remaining_retired = retired.count;
+        self.remaining_retired_work = retired.work_count;
+        self.retired_cycle = if count == claim.max_responses() {
+            count
+        } else {
+            count.checked_add(1).ok_or(ContractError::Capacity)?
+        };
         match claim.receipt() {
             Some(receipt) => {
                 if receipt.fence.receipt.is_zero()
@@ -82,6 +114,7 @@ impl<'a, 'b> Works<'a, 'b> {
                 {
                     return Err(ContractError::StaleReceipt);
                 }
+                self.retired_epoch = receipt.fence.epoch;
                 // At the authored maximum there is no open cycle to visit. In
                 // particular, a maximal u32 response count must not be incremented.
                 if count < claim.max_responses() {
@@ -96,17 +129,21 @@ impl<'a, 'b> Works<'a, 'b> {
                     ));
                 }
             }
-            None if count == 0 => {}
+            None if count == 0 && retired.count == 0 => {}
             None => return Err(ContractError::StaleReceipt),
         }
         Ok(())
     }
 
     fn charge(&mut self, count: usize) -> Result<(), ContractError> {
-        self.visits = self
+        let remaining = self
             .visits
             .checked_sub(count)
             .ok_or(ContractError::Capacity)?;
+        if let Some(shared) = self.shared {
+            shared.charge(count)?;
+        }
+        self.visits = remaining;
         Ok(())
     }
 
@@ -167,6 +204,39 @@ impl<'a, 'b> Works<'a, 'b> {
     fn next_cycle(&mut self) -> Result<Option<Cycle<'b>>, ContractError> {
         if let Some((key, holder)) = self.open.take() {
             return self.load_cycle(key, holder, None);
+        }
+        if self.remaining_retired != 0 {
+            self.charge(3)?;
+            let key = self.retired.ok_or(ContractError::InvalidManifest)?;
+            let claim = self.claim.ok_or(ContractError::WrongObject)?;
+            let (link, cycle) = super::retired_cycles::link(
+                self.view,
+                claim,
+                key,
+                self.retired_epoch,
+                self.retired_cycle,
+                self.limits,
+            )?;
+            self.remaining_retired = self
+                .remaining_retired
+                .checked_sub(1)
+                .ok_or(ContractError::InvalidManifest)?;
+            self.remaining_retired_work = self
+                .remaining_retired_work
+                .checked_sub(cycle.work_count)
+                .ok_or(ContractError::InvalidManifest)?;
+            self.retired = link.next;
+            self.retired_epoch = key.epoch;
+            self.retired_cycle = key.cycle;
+            if self.retired.is_some() != (self.remaining_retired != 0)
+                || (self.remaining_retired == 0 && self.remaining_retired_work != 0)
+            {
+                return Err(ContractError::InvalidManifest);
+            }
+            return self.load_cycle(key, link.holder, None);
+        }
+        if self.retired.is_some() || self.remaining_retired_work != 0 {
+            return Err(ContractError::InvalidManifest);
         }
         if self.remaining_responses == 0 {
             if self.next_response.is_some() {

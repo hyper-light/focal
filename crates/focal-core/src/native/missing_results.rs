@@ -5,7 +5,8 @@ use super::missing_owned::{NativeMissingResult, OwnedMissingResult};
 use super::prepare::{Extra, Extras, Scratch, add, within};
 use super::*;
 use focal_model::ValidationMode;
-use focal_model::lifecycle::aggregation::{ClaimDecision, ObligationTarget, PublicationPosition};
+use focal_model::lifecycle::aggregation::{ObligationTarget, PublicationPosition};
+use focal_model::lifecycle::evidence::ResponseEntry;
 
 fn visit(remaining: &mut usize) -> Result<(), NativeError> {
     *remaining = remaining
@@ -20,11 +21,10 @@ fn visit(remaining: &mut usize) -> Result<(), NativeError> {
 /// Returns the number of changed evaluations, including Observe suppressions.
 #[allow(clippy::too_many_arguments)] // One exact borrowed owner transaction, no authored permission flags.
 pub(super) fn prepare(
-    context: NativeContext,
     view: &View<'_>,
     claim: &ClaimState,
     response: &Response,
-    acceptance: &ClaimDecision<'_>,
+    authority: &ResponseEntry,
     entry: PublicationPosition,
     registry: &RegistrationSet,
     limits: NativeLimits,
@@ -32,8 +32,7 @@ pub(super) fn prepare(
     extras: &mut Extras,
     scratch: &mut Scratch,
 ) -> Result<usize, NativeError> {
-    context.principal.require_actor(claim.issuer())?;
-    claim.binding().check(&acceptance.binding())?;
+    authority.check(claim, response)?;
     registry.check(claim)?;
     within(registry.rows().len(), limits.evaluations_per_claim)?;
     if response.state() != ResponseState::Validating
@@ -96,13 +95,8 @@ pub(super) fn prepare(
         let previous = *view.evaluation(key)?;
         registered.check_state(previous, definition)?;
         let evaluation = previous.bind(definition)?;
-        let transition = evaluation.settle_missing(
-            context.principal,
-            &previous.binding(),
-            claim,
-            response,
-            acceptance,
-        )?;
+        let transition =
+            evaluation.settle_missing_entered(&previous.binding(), claim, response, authority)?;
         let next = transition.next.into_state();
         if next == previous {
             if transition.result.is_some() {

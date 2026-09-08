@@ -2,11 +2,20 @@
 //! The claim owner retains this registry with its effective mutation state. All
 //! materialization goes through `materialize`; sealing closes the increment target
 //! set, not the independently progressing evaluation lifecycles.
-use super::{CheckPolicy, Limits, SlotPolicy, reserved, same_content, validate_policies};
+#[cfg(test)]
+use super::validate_policies;
+use super::{CheckPolicy, Limits, SlotPolicy, reserved, same_content};
 #[path = "acceptance_intent.rs"]
 mod intent;
 #[path = "acceptance_memory.rs"]
 mod memory;
+#[path = "acceptance_prepare.rs"]
+pub(in crate::lifecycle) mod preparation;
+pub use preparation::{
+    AcceptancePlan, AcceptanceSource, AcceptanceSourcePasses, AcceptanceSourcePlan,
+};
+#[path = "acceptance_registration_snapshot.rs"]
+mod registration_snapshot;
 #[path = "acceptance_support.rs"]
 mod support;
 use crate::lifecycle::validation::{
@@ -77,6 +86,18 @@ impl AcceptancePolicy {
     pub fn slot_count(&self) -> usize {
         self.slots.len()
     }
+    /// Every authored slot in canonical slot order, including slots with no
+    /// validation declarations. Check slices borrow the immutable policy.
+    pub fn slots(
+        &self,
+    ) -> impl ExactSizeIterator<Item = SlotPolicy<'_>> + DoubleEndedIterator + '_ {
+        self.slots.iter().map(|slot| SlotPolicy {
+            slot: slot.slot,
+            missing_declaration_index: slot.missing_declaration_index,
+            mode: slot.mode,
+            checks: &slot.checks,
+        })
+    }
 
     pub fn new(
         claim: Binding,
@@ -85,34 +106,11 @@ impl AcceptancePolicy {
         declarations: &[Declaration],
         limits: Limits,
     ) -> Result<Self, ContractError> {
-        validate_policies(slots, limits)?;
-        if claim.object.is_zero() || issuer.is_zero() || declarations.len() > limits.max_checks {
-            return Err(ContractError::InvalidPolicy);
-        }
-        let mut records = reserved(declarations.len())?;
-        for declaration in declarations {
-            if declaration.claim() != ClaimId(claim.object.0)
-                || declaration.binding().ledger != claim.ledger
-                || declaration.issuer() != issuer
-            {
-                return Err(ContractError::InvalidPolicy);
-            }
-            let target = match declaration.target() {
-                TargetDeclaration::WholeWorkSlot { index, .. } => ObligationTarget::Slot(index),
-                TargetDeclaration::Delivery => ObligationTarget::Delivery,
-                TargetDeclaration::Admission => ObligationTarget::Admission,
-                TargetDeclaration::Increment => ObligationTarget::Increment,
-            };
-            records.push(DeclaredObligation {
-                definition: declaration.definition_stamp(),
-                binding: declaration.binding(),
-                index: declaration.declaration_index(),
-                mode: declaration.mode(),
-                target,
-            });
-        }
-        Self::from_records(claim, issuer, slots, records, limits)
+        let plan = Self::prepare(claim, issuer, slots, declarations, limits)?;
+        let charge = plan.construction_charge();
+        plan.build(charge)
     }
+    #[cfg(test)]
     fn from_records(
         claim: Binding,
         issuer: ParticipantId,

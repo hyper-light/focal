@@ -1,16 +1,25 @@
-//! One Admission or Increment generation's future RAM and record demand. The owner separately
+//! One evaluation generation's future RAM and record demand. The owner separately
 //! retains the exact definition/schema contract, funds the envelope and journals
 //! its exclusive loans. No reservation or authority is granted by this value.
 
+use super::cohort_budget::CohortBudget;
 use super::prepare::{ALLOCATION, add, array, containers, event_containers, heap, within};
 use super::prepare_budget::ConstructionBudget;
 use super::*;
 use focal_memory::{RangeWriteEnvelope, RangeWriteLimits};
-use focal_model::lifecycle::artifact_descriptor::{
-    ArtifactDescriptor, Limits as ArtifactLimits, PayloadSpec,
-};
+#[cfg(test)]
+use focal_model::lifecycle::artifact_descriptor::PayloadSpec;
+use focal_model::lifecycle::artifact_descriptor::{ArtifactDescriptor, Limits as ArtifactLimits};
 use focal_model::lifecycle::scope::{OwnedChild, Scope, ScopeLimits};
 use focal_model::{ObjectRef, ValidationMode, WaitPredicate};
+
+#[path = "completion_admission_graph.rs"]
+mod admission_graph;
+#[path = "completion_graph.rs"]
+mod graph;
+#[path = "completion_work.rs"]
+mod work;
+use graph::CompletionGraph;
 
 #[cfg(test)]
 #[path = "completion_envelope_tests.rs"]
@@ -25,11 +34,149 @@ pub(super) struct EvidenceBounds {
     pub(super) retained_bytes: usize,
 }
 
+/// The one additional allowance belongs only to a checked Admission failure.
+/// Other changed parent rows do not consume that target-specific credit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CompletionUse {
+    Regular,
+    AdmissionFailure,
+}
+
+/// Capture the actual report parent before its borrowed preparation frame is
+/// consumed. No participant can select the completion-use classification.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ReportParent {
+    binding: Binding,
+    status: ClaimStatus,
+}
+
+impl ReportParent {
+    pub(super) fn capture(parent: &ClaimState) -> Self {
+        Self {
+            binding: parent.binding(),
+            status: parent.status(),
+        }
+    }
+
+    pub(super) fn claim_id(self) -> ClaimId {
+        ClaimId(self.binding.object.0)
+    }
+
+    /// A late report can contain cohort seals without failing its parent again.
+    /// Only a real Posted-to-PostFailed change needs the original failure fact.
+    pub(super) fn completion_use_recorded(
+        self,
+        prepared: &NativePrepared,
+    ) -> Result<CompletionUse, NativeError> {
+        let operation = prepared.outcome.operation;
+        let changed = prepared.claim(self.claim_id());
+        if operation != NativeOperation::ReportAdmission
+            || self.status != ClaimStatus::Posted
+            || changed.is_none_or(|row| row.status() != ClaimStatus::PostFailed)
+        {
+            return self.completion_use(operation, changed);
+        }
+        let event = super::completion_book::CompletionBook::admission_failure_event(prepared)?
+            .ok_or(ContractError::InvalidCut)?;
+        self.completion_use_prepared(operation, changed, Some(event))
+    }
+
+    /// Classify a prepared report using its actual original PostFailed fact.
+    /// Later monitor releases may advance the same terminal row while its
+    /// original Required cut and immutable identity remain unchanged.
+    pub(super) fn completion_use_prepared(
+        self,
+        operation: NativeOperation,
+        changed: Option<&ClaimState>,
+        post_failed: Option<NativeClaimEvent>,
+    ) -> Result<CompletionUse, NativeError> {
+        let Some(event) = post_failed else {
+            let usage = self.completion_use(operation, changed)?;
+            return if usage == CompletionUse::AdmissionFailure {
+                Err(ContractError::InvalidCut.into())
+            } else {
+                Ok(usage)
+            };
+        };
+        let changed = changed.ok_or(ContractError::InvalidTransition)?;
+        let failed = self.binding.next()?;
+        if operation != NativeOperation::ReportAdmission
+            || self.status != ClaimStatus::Posted
+            || changed.status() != ClaimStatus::PostFailed
+            || event.kind != NativeEventKind::PostFailed
+            || event.before != Some(self.binding)
+            || event.after != failed
+            || event.status != ClaimStatus::PostFailed
+            || event.owned_child.is_some()
+            || changed.binding().revision < failed.revision
+        {
+            return Err(ContractError::InvalidTransition.into());
+        }
+        failed.check(&Binding {
+            revision: failed.revision,
+            ..changed.binding()
+        })?;
+        let Some(focal_model::lifecycle::claim::ClaimTerminalCut::Required(cut)) =
+            changed.terminal_cut()
+        else {
+            return Err(ContractError::InvalidCut.into());
+        };
+        if cut.sequence().0 == 0
+            || changed.local_sealed_at() != Some(cut.sequence())
+            || cut.cause().key().target
+                != focal_model::lifecycle::aggregation::CauseTarget::Admission
+        {
+            return Err(ContractError::InvalidCut.into());
+        }
+        Ok(CompletionUse::AdmissionFailure)
+    }
+
+    pub(super) fn completion_use(
+        self,
+        operation: NativeOperation,
+        changed: Option<&ClaimState>,
+    ) -> Result<CompletionUse, NativeError> {
+        if operation != NativeOperation::ReportAdmission {
+            return Ok(CompletionUse::Regular);
+        }
+        let Some(changed) = changed else {
+            return Ok(CompletionUse::Regular);
+        };
+        if changed.binding() == self.binding && changed.status() == self.status {
+            return Ok(CompletionUse::Regular);
+        }
+        self.binding.next()?.check(&changed.binding())?;
+        if self.status != ClaimStatus::Posted || changed.status() != ClaimStatus::PostFailed {
+            return Err(ContractError::InvalidTransition.into());
+        }
+        let Some(focal_model::lifecycle::claim::ClaimTerminalCut::Required(cut)) =
+            changed.terminal_cut()
+        else {
+            return Err(ContractError::InvalidTransition.into());
+        };
+        if cut.sequence().0 == 0
+            || cut.cause().key().target
+                != focal_model::lifecycle::aggregation::CauseTarget::Admission
+        {
+            return Err(ContractError::InvalidCut.into());
+        }
+        Ok(CompletionUse::AdmissionFailure)
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct CompletionSlots {
+    pub(super) claims: usize,
+    pub(super) definitions: usize,
+    pub(super) evaluations: usize,
     pub(super) artifacts: usize,
     pub(super) identities: usize,
     pub(super) results: usize,
+    pub(super) responses: usize,
+    pub(super) receipts: usize,
+    pub(super) result_testaments: usize,
+    pub(super) monitors: usize,
+    pub(super) monitor_links: usize,
     pub(super) outcomes: usize,
     pub(super) events: usize,
     pub(super) sequences: u64,
@@ -41,9 +188,17 @@ pub(super) struct CompletionSlots {
 impl CompletionSlots {
     pub(super) fn checked_add(self, other: Self) -> Result<Self, NativeError> {
         Ok(Self {
+            claims: add(self.claims, other.claims)?,
+            definitions: add(self.definitions, other.definitions)?,
+            evaluations: add(self.evaluations, other.evaluations)?,
             artifacts: add(self.artifacts, other.artifacts)?,
             identities: add(self.identities, other.identities)?,
             results: add(self.results, other.results)?,
+            responses: add(self.responses, other.responses)?,
+            receipts: add(self.receipts, other.receipts)?,
+            result_testaments: add(self.result_testaments, other.result_testaments)?,
+            monitors: add(self.monitors, other.monitors)?,
+            monitor_links: add(self.monitor_links, other.monitor_links)?,
             outcomes: add(self.outcomes, other.outcomes)?,
             events: add(self.events, other.events)?,
             sequences: self
@@ -60,9 +215,17 @@ impl CompletionSlots {
                 .ok_or(NativeError::Capacity("completion slot subtraction"))
         };
         Ok(Self {
+            claims: subtract(self.claims, other.claims)?,
+            definitions: subtract(self.definitions, other.definitions)?,
+            evaluations: subtract(self.evaluations, other.evaluations)?,
             artifacts: subtract(self.artifacts, other.artifacts)?,
             identities: subtract(self.identities, other.identities)?,
             results: subtract(self.results, other.results)?,
+            responses: subtract(self.responses, other.responses)?,
+            receipts: subtract(self.receipts, other.receipts)?,
+            result_testaments: subtract(self.result_testaments, other.result_testaments)?,
+            monitors: subtract(self.monitors, other.monitors)?,
+            monitor_links: subtract(self.monitor_links, other.monitor_links)?,
             outcomes: subtract(self.outcomes, other.outcomes)?,
             events: subtract(self.events, other.events)?,
             sequences: self
@@ -73,13 +236,21 @@ impl CompletionSlots {
         })
     }
 
-    fn checked_scale(self, reports: u32) -> Result<Self, NativeError> {
+    pub(super) fn checked_scale(self, reports: u32) -> Result<Self, NativeError> {
         let count =
             usize::try_from(reports).map_err(|_| NativeError::Capacity("completion slot count"))?;
         Ok(Self {
+            claims: multiply(self.claims, count)?,
+            definitions: multiply(self.definitions, count)?,
+            evaluations: multiply(self.evaluations, count)?,
             artifacts: multiply(self.artifacts, count)?,
             identities: multiply(self.identities, count)?,
             results: multiply(self.results, count)?,
+            responses: multiply(self.responses, count)?,
+            receipts: multiply(self.receipts, count)?,
+            result_testaments: multiply(self.result_testaments, count)?,
+            monitors: multiply(self.monitors, count)?,
+            monitor_links: multiply(self.monitor_links, count)?,
             outcomes: multiply(self.outcomes, count)?,
             events: multiply(self.events, count)?,
             sequences: self
@@ -135,17 +306,25 @@ pub(super) struct CompletionEnvelope {
     reports: u32,
     ordinary_report: RangeWriteEnvelope,
     failed_report: Option<RangeWriteEnvelope>,
+    // Mixed completion journals survive construction until their pending
+    // candidate commits or rolls back, just like the candidate's range rows.
+    ordinary_journal_bytes: usize,
+    failed_journal_bytes: usize,
     retained: usize,
     workspace: usize,
     required: usize,
     slot_demand: SlotDemand,
     slots: CompletionSlots,
+    cohort: CohortBudget,
+    work: Option<work::WorkCompletion>,
+    graph: Option<CompletionGraph>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompletionTarget {
     Admission,
     Increment,
+    Work,
 }
 
 impl CompletionTarget {
@@ -153,6 +332,7 @@ impl CompletionTarget {
         match declaration.target() {
             validation::TargetDeclaration::Admission => Ok(Self::Admission),
             validation::TargetDeclaration::Increment => Ok(Self::Increment),
+            validation::TargetDeclaration::WholeWorkSlot { .. } => Ok(Self::Work),
             _ => Err(ContractError::InvalidTarget.into()),
         }
     }
@@ -162,6 +342,7 @@ impl CompletionTarget {
             (self, target),
             (Self::Admission, validation::Target::Admission { .. })
                 | (Self::Increment, validation::Target::Increment { .. })
+                | (Self::Work, validation::Target::Artifact { .. })
         )
     }
 }
@@ -219,17 +400,18 @@ fn charged_heap(bytes: usize, allocations: usize) -> Result<usize, NativeError> 
 /// One Admission target per declaration; one Delivery or WholeWork slot target
 /// per response; one Increment target per possible work slot and response. The
 /// current native owner permits at most one work artifact per slot/cycle. Future
-/// target replacement or adoption generations require a revised bound before
-/// those commands can be enabled. This count is independent of present occupancy.
-/// The registry's immutable owner limit also bounds legal future registration.
-fn registry_bound(
+/// target replacement requires a revised bound; retained prior-receipt
+/// Increment registrations add conservative adoption-generation headroom. The
+/// registry's immutable owner limit also bounds legal future registration.
+pub(super) fn registry_bound(
     limits: NativeLimits,
     claim: &ClaimState,
     registrations: &RegistrationSet,
 ) -> Result<(usize, usize), NativeError> {
     use focal_model::lifecycle::aggregation::RegisteredEvaluation;
-    let maximum = super::response_budget::required_registrations(claim, limits)?
-        .min(registrations.max_rows());
+    let maximum =
+        super::response_budget::retained_registration_bound(claim, registrations, limits)?
+            .min(registrations.max_rows());
     within(registrations.rows().len(), maximum)?;
     let future = charged_heap(
         multiply(maximum, size_of::<RegisteredEvaluation>())?,
@@ -241,11 +423,62 @@ fn registry_bound(
     ))
 }
 
+pub(super) fn cohort_bound(
+    limits: NativeLimits,
+    claim: &ClaimState,
+    registry: &RegistrationSet,
+) -> Result<CohortBudget, NativeError> {
+    let (rows, heap) = registry_bound(limits, claim, registry)?;
+    CohortBudget::empty().add_claim(claim, registry, rows, heap)
+}
+
+/// A funded report has one live evaluation group in the completion journal.
+/// Its immutable parent policy is fingerprinted once, its exact declaration is
+/// resolved once, and all actual candidate events are visited. Reject Begin or
+/// reconstruction if even that guaranteed final bookkeeping cannot fit. Future
+/// multi-member seal writers must replace this bound with their complete cohort.
+fn check_journal_visits(
+    limits: NativeLimits,
+    claim: &ClaimState,
+    events: usize,
+) -> Result<(), NativeError> {
+    let visits = add(
+        add(
+            events,
+            multiply(3, claim.acceptance().declarations().len())?,
+        )?,
+        add(claim.acceptance().slot_count(), 3)?,
+    )?;
+    if visits > limits.plan_edges {
+        return Err(NativeError::Capacity("completion journal visits"));
+    }
+    Ok(())
+}
+
+fn check_cohort_visits(
+    limits: NativeLimits,
+    cohort: CohortBudget,
+    claims: usize,
+    extras: usize,
+    original_events: usize,
+) -> Result<(), NativeError> {
+    if cohort.claims() == 0 {
+        return Ok(());
+    }
+    if cohort.writer_visits(claims, extras)? > limits.plan_edges {
+        return Err(NativeError::Capacity("cohort seal writer visits"));
+    }
+    if cohort.journal_visits(original_events, 1)? > limits.plan_edges {
+        return Err(NativeError::Capacity("cohort completion journal visits"));
+    }
+    Ok(())
+}
+
 /// Prices full authored response-history and bounded future registration
 /// capacity, retaining existing spare capacities as floors. Both must fit the
 /// entry ceiling in full; only additional scope growth may be clipped to the
 /// remaining space. Later parent checks enforce this fixed envelope.
-fn parent_bound(
+pub(super) fn parent_bound(
     limits: NativeLimits,
     claim: &ClaimState,
     registrations: &RegistrationSet,
@@ -304,7 +537,7 @@ fn parent_bound(
     Ok((parent, registry))
 }
 
-fn entry_heap(limits: NativeLimits) -> Result<usize, NativeError> {
+pub(super) fn entry_heap(limits: NativeLimits) -> Result<usize, NativeError> {
     limits
         .range
         .max_entry_bytes
@@ -336,7 +569,10 @@ fn descriptor_charge(dynamic: usize) -> Result<usize, NativeError> {
     charged_heap(dynamic, add(5, labels)?)
 }
 
-fn pinned_descriptor_charge(dynamic: usize, limits: ArtifactLimits) -> Result<usize, NativeError> {
+pub(super) fn pinned_descriptor_charge(
+    dynamic: usize,
+    limits: ArtifactLimits,
+) -> Result<usize, NativeError> {
     let mut allocations = 0;
     for possible in [
         limits.kind_bytes,
@@ -364,10 +600,22 @@ pub(super) fn descriptor_limits(
     claim: &ClaimState,
     registrations: &RegistrationSet,
 ) -> Result<ArtifactLimits, NativeError> {
+    descriptor_limits_with_cohort(limits, claim, registrations, CohortBudget::empty())
+}
+
+fn descriptor_limits_with_cohort(
+    limits: NativeLimits,
+    claim: &ClaimState,
+    registrations: &RegistrationSet,
+    cohort: CohortBudget,
+) -> Result<ArtifactLimits, NativeError> {
     let (parent, registry) = parent_bound(limits, claim, registrations)?;
     let fixed = add(
-        NativeArtifactInput::container_charge(),
-        add(result_containers()?, failure_scratch(parent, registry)?)?,
+        cohort.construction_bytes()?,
+        add(
+            NativeArtifactInput::container_charge(),
+            add(result_containers()?, failure_scratch(parent, registry)?)?,
+        )?,
     )?;
     let available = limits
         .preparation_bytes
@@ -452,6 +700,11 @@ impl CompletionEnvelope {
         evidence: EvidenceBounds,
     ) -> Result<Self, NativeError> {
         let target = CompletionTarget::of(declaration)?;
+        // WholeWork needs the actual response, complete graph and future
+        // projection. Its dedicated constructor cannot be bypassed here.
+        if target == CompletionTarget::Work {
+            return Err(ContractError::InvalidTarget.into());
+        }
         if declaration.attempt_bound() == 0 {
             return Err(ContractError::InvalidTransition.into());
         }
@@ -467,14 +720,51 @@ impl CompletionEnvelope {
         let operation = match target {
             CompletionTarget::Admission => NativeOperation::ReportAdmission,
             CompletionTarget::Increment => NativeOperation::ReportIncrement,
+            CompletionTarget::Work => return Err(ContractError::InvalidTarget.into()),
         };
-        let construction = ConstructionBudget::for_operation(operation, limits)?;
+        let failure_possible =
+            target == CompletionTarget::Admission && declaration.mode() == ValidationMode::Required;
+        let cohort = if failure_possible {
+            cohort_bound(limits, claim, registrations)?
+        } else {
+            CohortBudget::empty()
+        };
+        let maximum_events = if target == CompletionTarget::Admission
+            && declaration.mode() == ValidationMode::Required
+        {
+            4
+        } else {
+            3
+        };
+        check_journal_visits(limits, claim, maximum_events)?;
+        check_cohort_visits(limits, cohort, 1, 4, maximum_events)?;
+        if target == CompletionTarget::Admission && claim.status() == ClaimStatus::Posted {
+            // Begin already checks the current projection through authority.
+            // Reconstruction must retain that same future-work promise even
+            // when this owner was created with smaller traversal limits.
+            if focal_model::lifecycle::aggregation::admission_completion_visits(
+                claim,
+                registrations,
+            )? > limits.plan_edges
+            {
+                return Err(NativeError::Capacity(
+                    "admission completion projection visits",
+                ));
+            }
+        }
+        let construction =
+            ConstructionBudget::for_operation(operation, limits)?.with_cohort(cohort, limits)?;
         match target {
-            CompletionTarget::Admission => construction.check_counts(1, 4, 4)?,
+            CompletionTarget::Admission => construction.check_counts(
+                1,
+                add(4, cohort.evaluations())?,
+                add(4, cohort.events())?,
+            )?,
             CompletionTarget::Increment => construction.check_counts(0, 4, 3)?,
+            CompletionTarget::Work => return Err(ContractError::InvalidTarget.into()),
         }
         let (parent_heap, registry_heap) = parent_bound(limits, claim, registrations)?;
-        let maximum = descriptor_limits(limits, claim, registrations)?;
+        let maximum = descriptor_limits_with_cohort(limits, claim, registrations, cohort)?;
         descriptor.construction_bytes = descriptor
             .construction_bytes
             .min(maximum.construction_bytes);
@@ -500,11 +790,15 @@ impl CompletionEnvelope {
         // Increment outcomes constrain later acceptance. They do not replace
         // the work or claim row, even when the check is Required and fails.
         let scratch = add(
-            add(input_heap, result_containers()?)?,
-            match target {
-                CompletionTarget::Admission => failure_scratch(parent_heap, registry_heap)?,
-                CompletionTarget::Increment => 0,
-            },
+            cohort.construction_bytes()?,
+            add(
+                add(input_heap, result_containers()?)?,
+                match target {
+                    CompletionTarget::Admission => failure_scratch(parent_heap, registry_heap)?,
+                    CompletionTarget::Increment => 0,
+                    CompletionTarget::Work => return Err(ContractError::InvalidTarget.into()),
+                },
+            )?,
         )?;
         within(scratch, construction.scratch_bytes)?;
         let regular_heap = add(
@@ -517,27 +811,31 @@ impl CompletionEnvelope {
             incoming_heap: regular_heap,
             input_capacity: 9,
         })?;
-        let failed_report = if target == CompletionTarget::Admission
-            && declaration.mode() == ValidationMode::Required
-        {
+        let failed_report = if failure_possible {
+            let changes = add(11, cohort.changed_keys())?;
             Some(rows.future_write_envelope(RangeWriteLimits {
-                changed_keys: 11,
+                changed_keys: changes,
                 deleted_keys: 0,
                 incoming_heap: add(
-                    regular_heap,
+                    add(regular_heap, cohort.incoming_heap()?)?,
                     add(
                         add(containers(1)?, add(parent_heap, registry_heap)?)?,
                         event_containers(1)?,
                     )?,
                 )?,
-                input_capacity: 11,
+                input_capacity: changes,
             })?)
         } else {
             None
         };
         let reports = declaration.attempt_bound();
         let count = usize::try_from(reports).map_err(|_| NativeError::Capacity("report count"))?;
-        let regular_retained = ordinary_report.additional_retained_bytes();
+        let failed_journal_bytes = if cohort.claims() == 0 {
+            0
+        } else {
+            super::completion_book::journal_bytes(add(1, cohort.evaluations())?)?
+        };
+        let regular_retained = crate::native::mutation::retained(ordinary_report)?;
         let retained = if let Some(failed) = failed_report {
             add(
                 multiply(
@@ -546,7 +844,10 @@ impl CompletionEnvelope {
                         .ok_or(NativeError::Capacity("report count"))?,
                     regular_retained,
                 )?,
-                failed.additional_retained_bytes(),
+                add(
+                    crate::native::mutation::retained(failed)?,
+                    failed_journal_bytes,
+                )?,
             )?
         } else {
             multiply(count, regular_retained)?
@@ -567,8 +868,9 @@ impl CompletionEnvelope {
                 input_heap,
                 add(evidence.workspace_bytes, evidence.retained_bytes)?,
             )?,
-            add(construction.pending_bytes()?, range_workspace)?,
+            add(construction.temporary_bytes()?, range_workspace)?,
         )?;
+        let failure_events = add(1, cohort.events())?;
         let slot_demand = SlotDemand {
             per_report: CompletionSlots {
                 artifacts: 1,
@@ -578,10 +880,11 @@ impl CompletionEnvelope {
                 events: 3,
                 sequences: 1,
                 new_rows: 7,
+                ..CompletionSlots::default()
             },
             failure: failed_report.map(|_| CompletionSlots {
-                events: 1,
-                new_rows: 1,
+                events: failure_events,
+                new_rows: failure_events,
                 ..CompletionSlots::default()
             }),
         };
@@ -602,11 +905,16 @@ impl CompletionEnvelope {
             reports,
             ordinary_report,
             failed_report,
+            ordinary_journal_bytes: 0,
+            failed_journal_bytes,
             retained,
             workspace,
             required: add(retained, workspace)?,
             slot_demand,
             slots,
+            cohort,
+            work: None,
+            graph: None,
         };
         result.check_parent(claim, registrations)?;
         Ok(result)
@@ -614,6 +922,9 @@ impl CompletionEnvelope {
 
     pub(super) fn descriptor_limits(self) -> ArtifactLimits {
         self.descriptor
+    }
+    pub(super) fn cohort(self) -> CohortBudget {
+        self.cohort
     }
     pub(super) fn supports_target(self, target: EvaluationTarget) -> bool {
         matches!(
@@ -623,6 +934,7 @@ impl CompletionEnvelope {
                     CompletionTarget::Increment,
                     EvaluationTarget::Increment { .. }
                 )
+                | (CompletionTarget::Work, EvaluationTarget::Work { .. })
         )
     }
     pub(super) fn reports(self) -> u32 {
@@ -671,42 +983,96 @@ impl CompletionEnvelope {
     }
     pub(super) fn report_storage(
         self,
-        failed_parent: bool,
+        usage: CompletionUse,
     ) -> Result<RangeWriteEnvelope, NativeError> {
-        if failed_parent {
-            self.failed_report
-                .ok_or(ContractError::InvalidTransition.into())
-        } else {
-            Ok(self.ordinary_report)
+        match usage {
+            CompletionUse::AdmissionFailure => self
+                .failed_report
+                .ok_or(ContractError::InvalidTransition.into()),
+            CompletionUse::Regular => Ok(self.ordinary_report),
         }
     }
     pub(super) fn per_report_retained_bytes(
         self,
-        failed_parent: bool,
+        usage: CompletionUse,
     ) -> Result<usize, NativeError> {
-        Ok(self
-            .report_storage(failed_parent)?
-            .additional_retained_bytes())
+        add(
+            crate::native::mutation::retained(self.report_storage(usage)?)?,
+            match usage {
+                CompletionUse::Regular => self.ordinary_journal_bytes,
+                CompletionUse::AdmissionFailure => self.failed_journal_bytes,
+            },
+        )
+    }
+
+    /// A due deadline substitutes a smaller authority-only write for the
+    /// unfinished report chain. Prove this at Begin/reconstruction, before the
+    /// owner promises completion, and repeat it when lending the held source.
+    pub(super) fn deadline_storage(
+        self,
+        limits: NativeLimits,
+    ) -> Result<RangeWriteEnvelope, NativeError> {
+        let construction =
+            ConstructionBudget::for_operation(NativeOperation::EvaluationDeadline, limits)?;
+        within(4, construction.max_changes)?;
+        within(1, construction.max_events)?;
+        within(1, construction.extras_count)?;
+        within(
+            OwnedEvaluation::container_charge(),
+            construction.scratch_bytes,
+        )?;
+        let storage = self.report_storage(CompletionUse::Regular)?;
+        let dimensions = storage.limits();
+        within(construction.max_changes, dimensions.changed_keys)?;
+        within(construction.max_changes, dimensions.input_capacity)?;
+        within(
+            add(
+                construction.scratch_bytes,
+                event_containers(construction.max_events)?,
+            )?,
+            dimensions.incoming_heap,
+        )?;
+        let transient = storage
+            .additional_peak_bytes()
+            .checked_sub(storage.additional_retained_bytes())
+            .ok_or(NativeError::Capacity("deadline range temporary charge"))?;
+        within(
+            add(construction.temporary_bytes()?, transient)?,
+            self.workspace_bytes(),
+        )?;
+        self.remaining_slots(1, false)?
+            .checked_sub(CompletionSlots {
+                artifacts: 0,
+                identities: 0,
+                results: 0,
+                outcomes: 1,
+                events: 1,
+                sequences: 1,
+                new_rows: 2,
+                ..CompletionSlots::default()
+            })?;
+        Ok(storage)
     }
 
     /// Apply before custody or construction. Schemas/provenance and semantic
     /// input visibility remain checked by the exact owner/definition contract.
     pub(super) fn check_descriptor(&self, input: &NativeArtifactInput) -> Result<(), NativeError> {
         let descriptor = input.get().ok_or(ContractError::MissingEvidence)?;
-        let limits = self.descriptor_limits();
-        if descriptor.kind().len() > limits.kind_bytes
-            || descriptor.metadata().len() > limits.metadata_bytes
-            || descriptor.inputs().len() > limits.inputs
-            || descriptor.visibility().len() > limits.visibility_labels
-            || descriptor
-                .visibility()
-                .any(|label| label.len() > limits.visibility_label_bytes)
-            || matches!(descriptor.payload(), PayloadSpec::Inline(bytes) if bytes.len() > limits.inline_bytes)
-        {
-            return Err(NativeError::Capacity("pinned report descriptor dimensions"));
-        }
-        within(descriptor.retained_bytes()?, limits.construction_bytes)?;
-        within(input.heap_charge()?, self.input_heap)
+        // NativeArtifactInput's private fallible constructor retains exactly
+        // one descriptor; ArtifactView prices that same singleton capacity.
+        self.check_descriptor_view(descriptor)
+    }
+
+    pub(super) fn check_descriptor_view(
+        &self,
+        descriptor: &impl super::report_artifact::ArtifactView,
+    ) -> Result<(), NativeError> {
+        super::report_artifact::check_limits(
+            descriptor,
+            self.descriptor_limits(),
+            self.input_heap,
+            "pinned report descriptor dimensions",
+        )
     }
 
     /// The owner must also apply this before publishing mutations that grow a

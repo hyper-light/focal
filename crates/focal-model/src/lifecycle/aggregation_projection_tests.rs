@@ -8,6 +8,11 @@ use crate::{
 };
 use v::tests::{EVALUATOR, ISSUER, binding, programmatic, report_parts};
 
+#[path = "aggregation_adoption_tests.rs"]
+mod adoption_tests;
+#[path = "aggregation_projection_quote_tests.rs"]
+mod quote_tests;
+
 struct ResponseRow {
     response: Response,
     received: Option<PublicationPosition>,
@@ -255,8 +260,19 @@ impl Fixture {
         outcome: OutcomeKind,
         diagnostics: &[evidence::ResponseDiagnostic],
     ) -> usize {
+        self.receive_report_with_work(id, outputs, sequence, outcome, diagnostics, &[])
+    }
+    fn receive_report_with_work(
+        &mut self,
+        id: u128,
+        outputs: &[(u32, u128)],
+        sequence: u64,
+        outcome: OutcomeKind,
+        diagnostics: &[evidence::ResponseDiagnostic],
+        failed: &[WorkArtifact],
+    ) -> usize {
         let parent = evidence::Parent::from_claim(&self.claim).unwrap();
-        let current: Vec<_> = outputs
+        let mut current: Vec<_> = outputs
             .iter()
             .map(|(slot, id)| {
                 WorkArtifact::generate(
@@ -282,6 +298,7 @@ impl Fixture {
                 artifact: work.reference(),
             })
             .collect();
+        current.extend_from_slice(failed);
         let plan = Response::close(
             evidence::ResponseIdentity {
                 binding: binding(id),
@@ -310,6 +327,7 @@ impl Fixture {
         .unwrap();
         let mut response = plan.response;
         self.works.extend(plan.attachments);
+        self.works.extend_from_slice(failed);
         self.claim
             .observe_response(
                 &self.claim.binding(),

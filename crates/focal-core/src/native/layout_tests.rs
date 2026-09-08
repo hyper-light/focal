@@ -161,13 +161,13 @@ fn real_pending_claim_admission_and_custody_report_publish_with_small_byte_bound
             None
         );
         for outcome in outcomes {
-            assert_eq!(core.native_outcome(outcome.request), Some(outcome));
+            assert_eq!(core.native_outcome(outcome.invocation), Some(outcome));
             for ordinal in 0..outcome.events {
                 assert_eq!(
                     core.native_event(outcome.sequence, ordinal)
                         .unwrap()
-                        .request,
-                    outcome.request
+                        .invocation,
+                    outcome.invocation
                 );
             }
         }
@@ -216,6 +216,141 @@ fn large_native_claim_remains_at_the_same_owned_address_when_an_adjacent_claim_i
         Some(pointer)
     );
     assert!(core.native_claim(ClaimId::from_u128(2)).is_some());
+    check_entries(&core);
+}
+
+#[test]
+fn small_immutable_definitions_keep_their_owned_addresses_through_pending_lifecycle_writes() {
+    let mut core = new_core(limits(64 * 1024));
+    publish(
+        &mut core,
+        10,
+        creation(1, 1, &[(ValidationMode::Required, false)], None),
+    );
+    let id = key(1).validation;
+    let entry = core.state.rows.get_entry(&Key::Definition(id)).unwrap();
+    assert!(entry_bytes(entry) < core.limits.range.page_bytes / 4);
+    let original = std::ptr::from_ref(core.native_definition(id).unwrap());
+    let original_intent = core.native_definition(id).unwrap().intent_fingerprint();
+    let pinned = core.pin_native(0, 1000).unwrap();
+    let before = core.state.budget.stats();
+    let posted = prepared(core.prepare_native(context(ISSUER, 20), post(2, binding(1)), &[]));
+    assert_eq!(std::ptr::from_ref(posted.definition(id).unwrap()), original);
+    let claim = posted.claim(key(1).claim).unwrap().binding();
+    let evaluation = posted.evaluation(key(1)).unwrap().binding();
+    let begun = prepared(core.prepare_native(
+        context(EVALUATOR, 30),
+        begin(3, claim, 1, evaluation),
+        &[&posted],
+    ));
+    assert_eq!(std::ptr::from_ref(begun.definition(id).unwrap()), original);
+    assert_eq!(
+        begun.definition(id).unwrap().intent_fingerprint(),
+        original_intent
+    );
+    assert_eq!(
+        pinned.with_definition(id, 1, std::ptr::from_ref).unwrap(),
+        Some(original)
+    );
+    drop(begun);
+    drop(posted);
+    assert_eq!(core.state.budget.stats(), before);
+    assert_eq!(core.native_sequence(), SessionSeq(1));
+    assert!(core.native_outcome(request(ISSUER, 2)).is_none());
+    let posted = prepared(core.prepare_native(context(ISSUER, 20), post(2, binding(1)), &[]));
+    core.publish_native(posted).unwrap();
+    assert_eq!(
+        std::ptr::from_ref(core.native_definition(id).unwrap()),
+        original
+    );
+    assert_eq!(
+        pinned
+            .with_claim(key(1).claim, 1, |row| row.status())
+            .unwrap(),
+        Some(ClaimStatus::Generated)
+    );
+    check_entries(&core);
+}
+
+#[test]
+fn small_immutable_artifact_descriptor_survives_control_writes_without_copying() {
+    let mut core = new_core(limits(64 * 1024));
+    publish(
+        &mut core,
+        10,
+        creation(1, 1, &[(ValidationMode::Required, false)], None),
+    );
+    publish(&mut core, 20, post(2, binding(1)));
+    let claim = core.native_claim(key(1).claim).unwrap().binding();
+    let evaluation = core.native_evaluation(key(1)).unwrap().binding();
+    publish(&mut core, 30, begin(3, claim, 1, evaluation));
+    let input = report_for(
+        &core,
+        None,
+        4,
+        1,
+        VerdictValue::Pass,
+        descriptor(artifact_spec(950, EVALUATOR, VerdictValue::Pass)),
+    );
+    let artifact = match &input.command {
+        NativeCommand::ReportAdmission { report, .. } => report.evidence,
+        _ => panic!("expected Admission report"),
+    };
+    let mut custody = Custody::new();
+    let token = verified(&mut custody, &input);
+    let reported =
+        prepared(core.prepare_native_evidenced(context(EVALUATOR, 40), input, &[], Some(&token)));
+    core.publish_native(reported).unwrap();
+    let entry = core
+        .state
+        .rows
+        .get_entry(&Key::Artifact(artifact.id))
+        .unwrap();
+    assert!(entry_bytes(entry) < core.limits.range.page_bytes / 4);
+    let original = std::ptr::from_ref(core.native_artifact(artifact.id).unwrap());
+    let definition = std::ptr::from_ref(core.native_definition(key(1).validation).unwrap());
+    let pinned = core.pin_native(0, 1000).unwrap();
+    let expected = core.native_claim(key(1).claim).unwrap().binding();
+    let before = core.state.budget.stats();
+    let cancel = || NativeInput {
+        request: request(ISSUER, 5),
+        command: NativeCommand::Cancel { expected },
+    };
+    let cancelled = prepared(core.prepare_native(context(ISSUER, 50), cancel(), &[]));
+    assert_eq!(
+        std::ptr::from_ref(cancelled.artifact(artifact.id).unwrap()),
+        original
+    );
+    assert_eq!(
+        std::ptr::from_ref(cancelled.definition(key(1).validation).unwrap()),
+        definition
+    );
+    assert_eq!(
+        cancelled.claim(key(1).claim).unwrap().status(),
+        ClaimStatus::Cancelled
+    );
+    drop(cancelled);
+    assert_eq!(core.state.budget.stats(), before);
+    assert_eq!(core.native_claim(key(1).claim).unwrap().binding(), expected);
+    let cancelled = prepared(core.prepare_native(context(ISSUER, 50), cancel(), &[]));
+    core.publish_native(cancelled).unwrap();
+    assert_eq!(
+        std::ptr::from_ref(core.native_artifact(artifact.id).unwrap()),
+        original
+    );
+    assert_eq!(
+        pinned
+            .with_claim(key(1).claim, 1, |row| row.binding())
+            .unwrap(),
+        Some(expected)
+    );
+    assert_eq!(
+        core.native_artifact(artifact.id)
+            .unwrap()
+            .descriptor()
+            .content_hash(),
+        artifact.hash
+    );
     check_entries(&core);
 }
 

@@ -12,6 +12,10 @@ mod increment_tests;
 mod projection_owner_tests;
 #[path = "projection_work_tests.rs"]
 mod projection_work_tests;
+#[path = "respondent_owner_tests.rs"]
+mod respondent_owner_tests;
+#[path = "respondent_state_tests.rs"]
+mod respondent_state_tests;
 #[path = "response_position_tests.rs"]
 mod response_position_tests;
 #[path = "whole_work_entry_tests.rs"]
@@ -38,7 +42,9 @@ impl Fixture {
     fn new() -> Self {
         Self::with_limits(NativeLimits {
             plan_nodes: 16,
-            plan_edges: 256,
+            // Multiple responses share one allowance for all projection
+            // lookups, including nested work cursors and staged-row searches.
+            plan_edges: 1024,
             preparation_bytes: 1024 * 1024,
             evaluations_per_claim: 16,
             range: RangeConfig {
@@ -273,6 +279,39 @@ fn slot_policy(slot: u32) -> aggregation::SlotPolicy<'static> {
         mode: ValidationMode::Required,
         checks: &[],
     }
+}
+
+pub(super) fn registry_override_fixture() -> (ClaimState, RegistrationSet) {
+    let mut fixture = Fixture::new();
+    let first = fixture.work(801, 0);
+    let second = fixture.work(802, 1);
+    fixture.commit(
+        SUBJECT,
+        fixture.close(900, OutcomeKind::Complete, vec![first, second], vec![]),
+    );
+    fixture.commit(
+        SUBJECT,
+        NativeCommand::PostResponse {
+            claim: fixture.claim(),
+            expected: fixture.response(900),
+        },
+    );
+    fixture.commit(
+        ISSUER,
+        NativeCommand::ReceiveResponse {
+            claim: fixture.claim(),
+            expected: fixture.response(900),
+        },
+    );
+    let view = fixture.owner.effective();
+    let claim = view.claim(ClaimId::from_u128(1)).unwrap();
+    let registry = view.registrations(ClaimId::from_u128(1)).unwrap();
+    (
+        claim.try_copy(claim.retained_bytes().unwrap()).unwrap(),
+        registry
+            .try_copy(registry.retained_bytes().unwrap())
+            .unwrap(),
+    )
 }
 
 #[test]
@@ -802,14 +841,20 @@ fn claimant_can_observe_unattached_work_and_posted_response_after_claim_cancella
 fn output_bound_preserves_room_for_diagnostics_and_atomic_closure() {
     // Ten rows fit one attachment's close and the pure Receipt publication. A
     // second independently admitted output would make the cycle uncloseable.
+    // Bound the promised report payload and diagnostic set independently of
+    // the ten-row publication limit being exercised here.
     let mut f = Fixture::with_limits(NativeLimits {
         range: RangeConfig {
             max_batch_entries: 10,
+            page_bytes: 4096,
+            max_entry_bytes: 64 * 1024,
             ..RangeConfig::default()
         },
         plan_nodes: 4,
         plan_edges: 64,
         preparation_bytes: 1024 * 1024,
+        diagnostics_per_cycle: 1,
+        response_summary_bytes: 256,
         ..NativeLimits::default()
     });
     let a = f.work(801, 0);

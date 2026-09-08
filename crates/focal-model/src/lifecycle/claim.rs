@@ -4,10 +4,15 @@
 //! immutable standing policy and aggregation witnesses require owner validation
 //! before publication; these methods do not invent those witnesses.
 use super::evidence::{Diagnostic, Parent, ReportStamp, ResponseDiagnostic};
+#[path = "claim_adoption.rs"]
+mod adoption;
+pub use adoption::ReceiptAdoption;
 #[path = "claim_memory.rs"]
 mod memory;
 #[path = "claim_posting.rs"]
 mod posting;
+#[path = "claim_snapshot.rs"]
+mod snapshot;
 use super::{Binding, ContractError, Principal};
 use super::{aggregation, graph, scope, succession, validation};
 #[cfg(test)]
@@ -15,6 +20,10 @@ use crate::ClaimId;
 use crate::{
     ClaimStatus, ContentHash, Deadline, EvidenceAttestation, ParticipantId, ReceiptFence,
     SessionSeq, TestamentId,
+};
+pub use snapshot::{
+    ClaimHydrationPlan, ClaimResponseSnapshotV1, ClaimResponseSource, ClaimResponseValue,
+    ClaimSnapshotV1, ClaimTerminalSnapshotV1,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -507,17 +516,7 @@ impl ClaimState {
                 previous,
                 replacement,
             } => {
-                self.working()?;
-                principal.require_actor(self.issuer)?;
-                self.receipt_matches(previous)?;
-                if replacement.holder.is_zero()
-                    || replacement.fence.receipt.is_zero()
-                    || replacement.fence.receipt == previous.receipt
-                    || replacement.fence.epoch <= previous.epoch
-                {
-                    return Err(ContractError::StaleReceipt);
-                }
-                let binding = self.binding.next()?;
+                let binding = self.adoption_binding(principal, previous, replacement)?;
                 self.binding = binding;
                 self.receipt = Some(replacement);
                 Ok(())
@@ -922,6 +921,17 @@ impl ClaimState {
         })
     }
 
+    /// Check this exact immutable report against the recorded cycle and return
+    /// its posting and receipt observations. This grants no current authority;
+    /// old-receipt history remains inspectable after adoption.
+    pub fn recorded_response(
+        &self,
+        response: &super::evidence::Response,
+    ) -> Result<(bool, bool), ContractError> {
+        let history = self.response_history(response)?;
+        Ok((history.posted, history.received))
+    }
+
     /// Apply only a decision produced by the checked aggregate. The token pins
     /// exact acceptance/terminal evidence; the owner publishes both records in
     /// the same commit. This does not satisfy graph predicates on its own.
@@ -1037,6 +1047,19 @@ impl ClaimState {
             return Err(ContractError::InvalidCut);
         }
         self.terminalize(ClaimStatus::Expired, cut)
+    }
+
+    /// Expire only from an exact due monitor and a checked absence of a wait
+    /// SCC. Its deadline may precede the claim's own immutable deadline.
+    pub fn expire_monitor(
+        &mut self,
+        expected: &Binding,
+        expiry: &scope::MonitorExpiry<'_>,
+        peers: &[&ClaimState],
+    ) -> Result<(), ContractError> {
+        self.open(expected)?;
+        expiry.check(self, peers)?;
+        self.terminalize(ClaimStatus::Expired, expiry.cut())
     }
 
     pub(super) fn record_response(

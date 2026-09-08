@@ -45,7 +45,7 @@ One session's mutation history has one authoritative order under the consistency
 | `DeltaId` | `(LedgerId, SessionSeq, ordinal)` | Distinguishes multiple ordered deltas from one mutation |
 | `Handle<T>` | Arena slot + generation + owner-local provenance | Internal only; never serialized as an object identity |
 
-All identifier newtypes are distinct Rust types. An `ArtifactId` cannot be used as a `ClaimId` because their underlying bytes have the same length. Wire references include object kind and `LedgerId`; the complete proof address is `(LedgerId, ObjectId)`. Routed references resolve stable IDs to current owners; relocations never rewrite graph content. IDs are allocated outside the pure reducer and included in the accepted logged command; replay never mints replacements. Uniqueness and namespace binding are checked at admission. No family ID is derived from a content hash.
+All identifier newtypes are distinct Rust types. Matching bytes do not make an `ArtifactId` a `ClaimId`. Cross-family references carry the complete address `(LedgerId, ObjectKind, ObjectId)`; typed claim/validation/artifact operations already fix the family. IDs are not assumed globally unique across object maps, as required by [mixed-family queries](11-cli-spec-research.md#52-list-semantics-to-implement-consistently). Routed references resolve stable IDs to current owners; relocations never rewrite graph content. IDs are allocated outside the pure reducer and included in the accepted logged command; replay never mints replacements. Uniqueness within each object family and namespace binding are checked at admission. No family ID is derived from a content hash.
 
 ### 2.2 Hash domains
 
@@ -381,9 +381,38 @@ A node dependency whose predicate is settled becomes a released token; do not re
 
 The monitor releases exactly once at a prefix satisfying its root predicates. A release is a typed committed fact, never a bare channel close. Cross-node wake hints can be lost; the durable inbox cursor plus a bounded reconciliation trigger discovers the release. A hint cannot be the only reason a parked agent wakes.
 
+A terminal claim can retain an impossible wait: for example, a `Satisfied(B)`
+monitor after B has failed. Its claimant may explicitly **cancel the monitor**.
+Cancellation records the owner's original terminal position and a separate
+authenticated cancellation cut; it retains the original predicates and does not
+claim they settled. Release and cancellation are mutually exclusive monitor
+dispositions. A cancelled monitor contributes no active wait edge or deadline.
+It neither cancels its targets nor discharges owned child work. Owner release
+still requires a terminal owner, disposed monitors and released child scopes.
+The native RAM owner now records registration, named rebinding, release and
+cancellation with exact per-revision history and retained reverse subscriptions.
+Typed monitor timers resolve SCC precedence and checked expiry, including a
+monitor on a claim without its own deadline. The implemented index subscribes to
+direct roots and discovers their connected graph through existing indices;
+materialized transitive closures, durable wake delivery and reconciliation remain
+required. Native codec/recovery and CLI/MCP activation are separate gates in
+[18 §6.12](18-lifecycle-storage-upgrade.md#612-runtime-scope-integration-sequence).
+
 ### 7.3 Deadlock and cancellation
 
 **Focal decision D-08:** initial deadlock breaking is deadline-triggered. On a logged deadline event, evaluate the affected unsatisfied SCC and choose its lowest original claim sequence as victim, tie-broken by ClaimId. Emit `deadlocked` with SCC witness and deadline provenance; downstream failure/release propagation occurs deterministically. Hecate's undeveloped eager-break suggestion is deferred until a separate tested policy specifies its trigger.
+
+A deadline can select a victim other than its triggering claim. After propagating
+that victim's consequences, reassess the original trigger against the complete
+resulting component. If it is terminal, retain that result. Otherwise, break the
+next qualifying SCC or apply ordinary expiry only after a checked absence of a
+cycle. Each round must terminalize a previously live member; all rounds share
+finite traversal, construction and publication bounds. Consume the timer together
+with this complete resolution, or retain an explicitly funded continuation.
+Consuming the timer while silently leaving its original due claim open is not a
+valid completion. Exact redelivery returns the original timer outcome and never
+acts as an implicit renewal. This clarification applies to native successor
+semantics; it does not reinterpret frozen V1 history.
 
 A claim expiry outside a qualifying wait SCC yields `expired`. Timers carry generation IDs; stale timer firings after renewal, supersession or terminalization are no-ops. Replay consumes logged timer events and never reads wall time.
 
@@ -408,12 +437,17 @@ definitions and independent evaluation rows now share that authoritative range.
 Cancellation and supersession resolve actual evaluation registrations and record
 authority fences atomically, including earlier pending evaluations. Fencing
 preserves lifecycle state and terminal results without fabricating a verdict or
-respondent testimony. Adoption fences and result/evidence admission remain open. Ordinary
-required-check failure must continue to permit eligible begun late reports.
+respondent testimony. Native receipt adoption and evidence-backed reports also
+preserve independent evaluation history. A Required Admission failure retains
+the actual accepted result before publishing `post_failed`, dependent failures,
+monitor releases and cohort seals in one candidate. Its held report contract
+reserves those consequences before accepting the evaluator's attempt. Eligible
+begun late reports remain independent audit evidence after the parent closes.
 The current native owner has no Session, CLI/MCP or durable codec entrypoint;
 the running V1 ledger retains its frozen execution behavior. Runtime-monitor
-registration/rebind/release and the remaining four-family consequences are
-model contracts awaiting that owner integration. A `Satisfied` runtime predicate
+registration, rebinding, disposition, timers and graph convergence are implemented
+in that RAM owner. Whole-claim capacity guarantees, durable activation and
+distributed recovery remain on the implementation path. A `Satisfied` runtime predicate
 can block a monitor without acquiring immutable `DependsOn` failure propagation.
 
 All closure counts, edge visits and retained tokens are budgeted per scope/session/owner. A large fleet does not justify an unbounded single-session closure. Budget exhaustion yields typed admission/backpressure and observable accounting; it never silently truncates the dependency graph or claims successful release.

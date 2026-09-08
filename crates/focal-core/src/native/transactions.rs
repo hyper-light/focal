@@ -8,9 +8,13 @@ use focal_model::lifecycle::{
     creation, ownership,
 };
 
+#[path = "registry_overrides.rs"]
+mod registry_overrides;
+pub(super) use registry_overrides::RegistryOverrides;
+
 pub(super) struct Plan {
     pub rows: Vec<ClaimState>,
-    pub registry: Option<(ClaimId, RegistrationSet)>,
+    pub registry: RegistryOverrides,
     pub created: usize,
 }
 
@@ -66,7 +70,7 @@ pub(super) fn copy_registry(
 
 /// No caller supplies the evaluation list. The authoritative compact membership
 /// on this exact effective claim names every independent evaluation row.
-fn fence_evaluations(
+pub(super) fn fence_evaluations(
     claim: &ClaimState,
     view: &View<'_>,
     extras: &mut Extras,
@@ -129,6 +133,53 @@ pub(super) fn prepare(
     scratch: &mut Scratch,
 ) -> Result<Plan, NativeError> {
     match command {
+        NativeCommand::CreateAuthored { claims } => super::authored::prepare(
+            claims, request, context, cut, view, limits, meta, extras, scratch,
+        ),
+        NativeCommand::RegisterMonitor { .. }
+        | NativeCommand::RebindMonitor { .. }
+        | NativeCommand::CancelMonitor { .. } => super::monitor_commands::prepare(
+            command, context, cut, view, limits, meta, extras, scratch,
+        ),
+        NativeCommand::ReleaseScope { expected } => {
+            super::scope_release::prepare(expected, context, cut, view, limits, extras, scratch)
+        }
+        NativeCommand::AdoptReceipt {
+            expected,
+            previous,
+            receipt,
+            holder,
+        } => super::adoption::prepare(
+            expected, previous, receipt, holder, context, cut, view, limits, meta, extras, scratch,
+        ),
+        NativeCommand::GenerateResultTestament { .. }
+        | NativeCommand::PostResultTestament { .. } => super::audit_bundle::prepare(
+            command,
+            context,
+            cut.position,
+            view,
+            limits,
+            meta,
+            extras,
+            scratch,
+        ),
+        NativeCommand::BeginWork {
+            claim,
+            key,
+            expected,
+        } => super::whole_work::begin(
+            view, context, claim, key, expected, cut, limits, meta, extras, scratch,
+        ),
+        NativeCommand::ReportWork {
+            claim,
+            key,
+            expected,
+            report,
+            artifact,
+        } => super::work_reporting::prepare(
+            claim, key, expected, report, artifact, request, evidence, context, cut, view, limits,
+            meta, extras, scratch,
+        ),
         NativeCommand::EnterWholeWork { claim, expected } => super::whole_work::enter(
             view, context, claim, expected, cut, limits, meta, extras, scratch,
         ),
@@ -269,9 +320,18 @@ pub(super) fn prepare(
             }
             let rows = plan.into_rows();
             super::incoming_graph::stage_created(&rows, view, extras, scratch, limits)?;
+            let rows = super::control_graph::prepare(
+                rows,
+                view,
+                NativeOperation::Create,
+                cut,
+                limits,
+                extras,
+                scratch,
+            )?;
             Ok(Plan {
                 rows,
-                registry: None,
+                registry: RegistryOverrides::new(),
                 created,
             })
         }
@@ -308,9 +368,18 @@ pub(super) fn prepare(
                 row.apply_cancellation(token)?;
                 rows.push(row);
             }
+            let rows = super::control_graph::prepare(
+                rows,
+                view,
+                NativeOperation::Cancel,
+                cut,
+                limits,
+                extras,
+                scratch,
+            )?;
             Ok(Plan {
                 rows,
-                registry: None,
+                registry: RegistryOverrides::new(),
                 created: 0,
             })
         }
@@ -318,6 +387,7 @@ pub(super) fn prepare(
             let id = ClaimId(expected.object.0);
             let old = view.claim(id).ok_or(ContractError::InvalidTarget)?;
             old.binding().check(&expected)?;
+            super::authored::check_postable(view, old)?;
             check_retained_definitions(old, view)?;
             let mut rows = scratch.reserve::<ClaimState>(1)?;
             scratch.charge(heap(old)?)?;
@@ -364,10 +434,21 @@ pub(super) fn prepare(
                 increment(&mut meta.evaluations, 1, limits.evaluations, "evaluations")?;
                 extras.evaluation(id, declaration, None, state, scratch)?;
             }
+            let mut replacements = RegistryOverrides::new();
+            replacements.insert(&claim, registry, limits.plan_nodes, scratch)?;
             rows.push(claim);
+            let rows = super::control_graph::prepare(
+                rows,
+                view,
+                NativeOperation::Post,
+                cut,
+                limits,
+                extras,
+                scratch,
+            )?;
             Ok(Plan {
                 rows,
-                registry: Some((id, registry)),
+                registry: replacements,
                 created: 0,
             })
         }
@@ -395,7 +476,7 @@ pub(super) fn prepare(
             )?;
             Ok(Plan {
                 rows: Vec::new(),
-                registry: None,
+                registry: RegistryOverrides::new(),
                 created: 0,
             })
         }

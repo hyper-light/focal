@@ -56,7 +56,8 @@ fn limits() -> NativeLimits {
             ..RangeConfig::default()
         },
         plan_nodes: 16,
-        plan_edges: 64,
+        // Control transactions also close their complete validation cohort.
+        plan_edges: 4096,
         preparation_bytes: 512 * 1024,
         evaluations_per_claim: 8,
         ..NativeLimits::default()
@@ -303,11 +304,90 @@ fn facts(core: &Core<NativeState>, outcome: NativeOutcome) -> Vec<NativeFact> {
     (0..outcome.events)
         .map(|ordinal| {
             let event = core.native_event(outcome.sequence, ordinal).unwrap();
-            assert_eq!(event.request, outcome.request);
+            assert_eq!(event.invocation, outcome.invocation);
             assert_eq!(event.ordinal, ordinal);
             event.fact
         })
         .collect()
+}
+fn assert_fence_then_seal(
+    candidate: &NativePrepared,
+    key: EvaluationKey,
+    previous: validation::EvaluationState,
+    reason: validation::FenceReason,
+) {
+    let next = candidate.evaluation(key).unwrap();
+    let definition = candidate.definition(key.validation).unwrap();
+    let outcome = candidate.outcome();
+    let fenced_binding = previous.binding().next().unwrap();
+    assert_eq!(next.binding(), fenced_binding.next().unwrap());
+    assert_eq!(next.state(), previous.state());
+    assert_eq!(next.target(), previous.target());
+    assert_eq!(next.generation(), previous.generation());
+    assert_eq!(next.receipt(), previous.receipt());
+    assert_eq!(next.phase(), previous.phase());
+    assert_eq!(next.has_begun(), previous.has_begun());
+    assert_eq!(next.last_result(), previous.last_result());
+    assert_eq!(
+        next.fence(),
+        Some(validation::AuthorityFence {
+            reason,
+            cause: outcome.intent,
+        })
+    );
+    assert!(previous.sealed().is_none());
+    assert!(
+        next.sealed()
+            .is_some_and(|cause| cause != ContentHash([0; 32]))
+    );
+    let attempt = previous.has_begun().then(|| {
+        previous
+            .bind(definition)
+            .unwrap()
+            .current_attempt()
+            .unwrap()
+    });
+    assert_eq!(
+        next.has_begun()
+            .then(|| next.bind(definition).unwrap().current_attempt().unwrap()),
+        attempt
+    );
+    let events: Vec<_> = (0..outcome.events)
+        .map(|ordinal| {
+            let Some(Row::Event(event)) =
+                candidate.range.get(&Key::Event(outcome.sequence, ordinal))
+            else {
+                panic!("retained event");
+            };
+            event.get().unwrap().expand(outcome.ledger).fact
+        })
+        .filter(|fact| matches!(fact, NativeFact::Evaluation { key: actual, .. } if *actual == key))
+        .collect();
+    assert_eq!(
+        events,
+        vec![
+            NativeFact::Evaluation {
+                kind: NativeEvaluationEventKind::AuthorityFenced,
+                key,
+                before: Some(previous.binding()),
+                after: fenced_binding,
+                state: previous.state(),
+                phase: previous.phase(),
+                attempt,
+                fence: next.fence(),
+            },
+            NativeFact::Evaluation {
+                kind: NativeEvaluationEventKind::Sealed,
+                key,
+                before: Some(fenced_binding),
+                after: next.binding(),
+                state: next.state(),
+                phase: next.phase(),
+                attempt,
+                fence: next.fence(),
+            },
+        ]
+    );
 }
 fn contract(result: Result<NativePreparation, NativeError>, expected: ContractError) {
     assert!(
@@ -600,7 +680,7 @@ fn cancellation_fences_pending_begun_evaluation_and_preserves_unrelated_claim() 
         begin(3, claim, binding(102)),
         &[&creation, &posting],
     );
-    let before = beginning.evaluation(evaluation_key(1)).unwrap().binding();
+    let before = *beginning.evaluation(evaluation_key(1)).unwrap();
     let cancellation = prepare(
         &core,
         ISSUER,
@@ -610,7 +690,12 @@ fn cancellation_fences_pending_begun_evaluation_and_preserves_unrelated_claim() 
     );
     let value = cancellation.evaluation(evaluation_key(1)).unwrap();
     assert_eq!(value.state(), validation::State::Validating);
-    assert_eq!(value.binding(), before.next().unwrap());
+    assert_fence_then_seal(
+        &cancellation,
+        evaluation_key(1),
+        before,
+        validation::FenceReason::Cancellation,
+    );
     assert_eq!(
         value.fence().unwrap().reason,
         validation::FenceReason::Cancellation
@@ -701,7 +786,7 @@ fn pending_supersession_fences_actual_predecessor_but_amends_does_not() {
         let mut core = core();
         let claim = posted(&mut core, 1, false, false);
         let beginning = prepare(&core, EVALUATOR, 30, begin(3, claim, binding(102)), &[]);
-        let before = beginning.evaluation(evaluation_key(1)).unwrap().binding();
+        let before = *beginning.evaluation(evaluation_key(1)).unwrap();
         let correction = prepare(
             &core,
             ISSUER,
@@ -715,14 +800,17 @@ fn pending_supersession_fences_actual_predecessor_but_amends_does_not() {
             value.fence().map(|fence| fence.reason),
             supersedes.then_some(validation::FenceReason::Supersession)
         );
-        assert_eq!(
-            value.binding(),
-            if supersedes {
-                before.next().unwrap()
-            } else {
-                before
-            }
-        );
+        if supersedes {
+            assert_fence_then_seal(
+                &correction,
+                evaluation_key(1),
+                before,
+                validation::FenceReason::Supersession,
+            );
+        } else {
+            assert_eq!(*value, before);
+            assert!(value.sealed().is_none());
+        }
         assert_eq!(value.state(), validation::State::Validating);
         assert!(value.last_result().is_none());
         assert_eq!(
@@ -991,7 +1079,12 @@ fn child_registration_preserves_posted_parent_begun_registry_for_pending_cancell
         &[&child],
     );
     let fenced = cancellation.evaluation(evaluation_key(1)).unwrap();
-    assert_eq!(fenced.binding(), before.binding().next().unwrap());
+    assert_fence_then_seal(
+        &cancellation,
+        evaluation_key(1),
+        before,
+        validation::FenceReason::Cancellation,
+    );
     assert_eq!(fenced.state(), validation::State::Validating);
     assert_eq!(
         fenced.fence().unwrap().reason,
@@ -1076,7 +1169,12 @@ fn all_required_and_observe_admission_members_survive_pending_begins_and_are_fen
     for key in [evaluation_key(1), observe] {
         let prior = second.evaluation(key).unwrap();
         let next = cancellation.evaluation(key).unwrap();
-        assert_eq!(next.binding(), prior.binding().next().unwrap());
+        assert_fence_then_seal(
+            &cancellation,
+            key,
+            *prior,
+            validation::FenceReason::Cancellation,
+        );
         assert_eq!(next.state(), prior.state());
         assert_eq!(
             next.fence().unwrap().reason,

@@ -101,6 +101,22 @@ fn submission<'a>(
     artifact: &'a NativeArtifactInput,
     limits: NativeLimits,
 ) -> Result<&'a ArtifactDescriptor, NativeError> {
+    let descriptor = artifact.get().ok_or(ContractError::MissingEvidence)?;
+    submission_view(view, context, expected, role, descriptor, limits)?;
+    Ok(descriptor)
+}
+
+/// Resolve the exact receipt, cycle, artifact identity and referenced sources
+/// before the owner constructs a typed input or performs custody IO. A prepared
+/// body is checked again by the owned writer after fallible construction.
+pub(super) fn submission_view(
+    view: &View<'_>,
+    context: NativeContext,
+    expected: Binding,
+    role: WorkRole,
+    descriptor: &impl super::report_artifact::ArtifactView,
+    limits: NativeLimits,
+) -> Result<(), NativeError> {
     let parent = parent(view, expected)?;
     context.principal.require_actor(parent.holder)?;
     let cycle = cycle(view, &parent, limits)?;
@@ -110,18 +126,18 @@ fn submission<'a>(
     if cycle.work_count > work_limit {
         return Err(NativeError::Capacity("response close work bound"));
     }
-    let descriptor = artifact.get().ok_or(ContractError::MissingEvidence)?;
-    if descriptor.ledger() != parent.ledger {
+    let fields = descriptor.fields();
+    if fields.ledger != parent.ledger {
         return Err(ContractError::WrongLedger.into());
     }
-    if descriptor.producer() != parent.holder {
+    if fields.producer != parent.holder {
         return Err(ContractError::WrongActor.into());
     }
-    if descriptor.receipt() != Some(parent.receipt) {
+    if fields.receipt != Some(parent.receipt) {
         return Err(ContractError::StaleReceipt.into());
     }
-    if descriptor.result_provenance().is_some()
-        || descriptor.work_provenance()
+    if fields.result.is_some()
+        || fields.work
             != Some(WorkProvenance {
                 claim: parent.claim,
                 cycle: parent.next_cycle,
@@ -145,7 +161,9 @@ fn submission<'a>(
                     .owned_claim(parent.claim)?
                     .registrations()
                     .ok_or(ContractError::InvalidTarget)?;
-                super::response_budget::check_registration_capacity(claim, registry, limits)?;
+                super::response_budget::check_registration_capacity_in(
+                    view, claim, registry, limits,
+                )?;
                 if registry.is_sealed() || registry.increment_targets_sealed() {
                     return Err(ContractError::InvalidTransition.into());
                 }
@@ -158,7 +176,7 @@ fn submission<'a>(
                 }) {
                     let report_limits =
                         super::completion_envelope::descriptor_limits(limits, claim, registry)?;
-                    super::increment_authority::check_completion_visibility(
+                    super::increment_authority::check_completion_visibility_view(
                         descriptor,
                         report_limits,
                         limits.plan_edges,
@@ -182,31 +200,49 @@ fn submission<'a>(
                 return Err(ContractError::InvalidManifest.into());
             }
         }
-        WorkRole::Diagnostic { .. } => {
-            if descriptor.kind() != "error" {
+        WorkRole::Diagnostic { reason } => {
+            if fields.kind != "error" {
                 return Err(ContractError::MissingEvidence.into());
             }
-            if cycle.diagnostic_count >= limits.diagnostics_per_cycle.min(limits.plan_edges) {
+            let maximum = limits.diagnostics_per_cycle.min(limits.plan_edges);
+            if cycle.diagnostic_count >= maximum {
                 return Err(NativeError::Capacity("diagnostics per response cycle"));
+            }
+            if reason != EvidenceFailure::Work {
+                let claim = view
+                    .claim(parent.claim)
+                    .ok_or(ContractError::InvalidTarget)?;
+                let (_, credit) = super::respondent_state::read(view, claim, limits)?
+                    .ok_or(ContractError::InvalidTransition)?;
+                // Extra diagnostics may not occupy the last slot still needed
+                // for the respondent's own whole-cycle failure report.
+                if credit.diagnostics == credit.closes
+                    && cycle
+                        .diagnostic_count
+                        .checked_add(1)
+                        .is_none_or(|next| next >= maximum)
+                {
+                    return Err(NativeError::Capacity("reserved respondent diagnostic slot"));
+                }
             }
         }
         WorkRole::ReceiptRejection { .. } => return Err(ContractError::InvalidPolicy.into()),
     }
-    if view.get(Key::Artifact(descriptor.id())).is_some()
+    if view.get(Key::Artifact(fields.id)).is_some()
         || view
             .get(Key::ArtifactIdentity(descriptor.content_hash()))
             .is_some()
-        || view.get(Key::Work(descriptor.id())).is_some()
-        || view.get(Key::Diagnostic(descriptor.id())).is_some()
+        || view.get(Key::Work(fields.id)).is_some()
+        || view.get(Key::Diagnostic(fields.id)).is_some()
     {
         return Err(ContractError::ContentConflict.into());
     }
-    super::reporting::check_inputs(descriptor, view, limits)?;
+    super::reporting::check_inputs_view(descriptor, view, limits)?;
     // An existing completion promise may reserve part of this allowance. The
     // publishing owner additionally checks its book before accepting the candidate.
     let mut artifacts = view.meta().artifacts;
     transactions::increment(&mut artifacts, 1, limits.artifacts, "artifacts")?;
-    Ok(descriptor)
+    Ok(())
 }
 
 pub(super) fn observation<'a>(
@@ -329,7 +365,7 @@ pub(super) fn authorize<'a>(
 pub(super) fn empty_plan() -> transactions::Plan {
     transactions::Plan {
         rows: Vec::new(),
-        registry: None,
+        registry: transactions::RegistryOverrides::new(),
         created: 0,
     }
 }
@@ -514,7 +550,8 @@ pub(super) fn prepare(
                 plan.rows = scratch.reserve::<ClaimState>(1)?;
                 scratch.charge(super::prepare::heap(claim)?)?;
                 plan.rows.push(claim.try_copy(claim.retained_bytes()?)?);
-                plan.registry = Some((parent.claim, registry));
+                plan.registry
+                    .insert(claim, registry, limits.plan_nodes, scratch)?;
             }
         }
         WorkRole::Diagnostic { reason } => {
@@ -564,10 +601,7 @@ pub(super) fn prepare(
         key: Key::Cycle(key),
         row: Row::Cycle(cycle),
         heap: 0,
-        fact: plan
-            .registry
-            .as_ref()
-            .map(|_| NativeFact::Registrations { claim }),
+        fact: (!plan.registry.is_empty()).then_some(NativeFact::Registrations { claim }),
     })?;
     Ok(plan)
 }

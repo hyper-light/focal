@@ -68,6 +68,93 @@ fn extras(scratch: &mut Scratch) -> Extras {
 }
 
 #[test]
+fn future_heap_ceiling_prices_peer_history_and_registry_copies_without_repricing_topology() {
+    let mut core = core();
+    create(&mut core, 1, &[]);
+    create(&mut core, 2, &[(Kind::DependsOn, 1)]);
+    let view = View {
+        state: &core.state,
+        tail: None,
+    };
+    let root = view.claim(ClaimId::from_u128(1)).unwrap();
+    let plan = preflight(
+        &view,
+        root,
+        core.limits,
+        None,
+        &mut Scratch {
+            used: 0,
+            max: core.limits.preparation_bytes,
+        },
+    )
+    .unwrap();
+    let original = plan.budget();
+    let expanded = plan
+        .with_future_heaps(|claim| {
+            Ok((
+                heap(claim)? + 100,
+                transactions::registry_heap(registry(&view, claim)?)? + 200,
+            ))
+        })
+        .unwrap();
+    assert_eq!(expanded.charges().nodes, original.charges().nodes);
+    assert_eq!(expanded.charges().changed_rows, 2);
+    assert_eq!(
+        expanded.charges().preparation_bytes,
+        original.charges().preparation_bytes + 600
+    );
+    assert_eq!(
+        expanded.charges().incoming_heap_bytes,
+        original.charges().incoming_heap_bytes + 600
+    );
+    assert_eq!(expanded.graph_bytes, original.graph_bytes + 100);
+    assert_eq!(expanded.membership, original.membership);
+    expanded.check_candidate(&plan).unwrap();
+    assert!(
+        plan.with_future_heaps(|claim| Ok((heap(claim)?.saturating_sub(1), 0)))
+            .is_err()
+    );
+}
+
+#[test]
+fn terminal_peer_keeps_its_source_identity_without_a_future_copy_obligation() {
+    let mut core = core();
+    create(&mut core, 1, &[]);
+    create(&mut core, 2, &[(Kind::DependsOn, 1)]);
+    core.publish_native(cancel(&core, 2)).unwrap();
+    let view = View {
+        state: &core.state,
+        tail: None,
+    };
+    let root = view.claim(ClaimId::from_u128(1)).unwrap();
+    let plan = preflight(
+        &view,
+        root,
+        core.limits,
+        None,
+        &mut Scratch {
+            used: 0,
+            max: core.limits.preparation_bytes,
+        },
+    )
+    .unwrap();
+    let mut copied = Vec::new();
+    let expanded = plan
+        .with_future_heaps(|claim| {
+            copied.push(ClaimId(claim.binding().object.0));
+            Ok((
+                heap(claim)?,
+                transactions::registry_heap(registry(&view, claim)?)?,
+            ))
+        })
+        .unwrap();
+    assert_eq!(copied, vec![ClaimId::from_u128(1)]);
+    assert_eq!(plan.members().len(), 2);
+    assert_eq!(expanded.charges().changed_rows, 1);
+    expanded.check_candidate(&plan).unwrap();
+}
+
+#[test]
 fn reverse_transitive_dependencies_fail_from_original_root_without_repainting_terminals_or_awaits()
 {
     let mut core = core();
@@ -125,6 +212,10 @@ fn reverse_transitive_dependencies_fail_from_original_root_without_repainting_te
         assert_eq!(terminal.origin().binding(), root_binding);
         assert_eq!(terminal.origin().created(), root_created);
         assert_eq!(terminal.sequence(), cut(&view).position);
+        let original = view.claim(ClaimId(row.binding().object.0)).unwrap();
+        assert!(heap(row).unwrap() <= heap(original).unwrap());
+        assert_eq!(row.response_count(), original.response_count());
+        assert_eq!(row.scopes(), original.scopes());
     }
     let events = extras.journal.as_ref().unwrap();
     assert_eq!(events.len(), 2);
@@ -294,4 +385,319 @@ fn already_terminal_connected_rows_keep_their_exact_original_cuts() {
     assert_eq!(rows.len(), 1);
     assert!(extras.journal.unwrap().is_empty());
     assert_eq!(core.native_claim(ClaimId::from_u128(2)).unwrap(), &old);
+}
+
+fn scratch(core: &Core<NativeState>) -> Scratch {
+    Scratch {
+        used: 0,
+        max: core.limits.preparation_bytes,
+    }
+}
+
+#[test]
+fn preflight_pins_complete_sources_and_bounds_the_actual_consequence_rows() {
+    let mut core = core();
+    let input = f::creation(1, 1, &[(focal_model::ValidationMode::Observe, false)], None);
+    f::publish(&mut core, 1, input);
+    f::publish(&mut core, 2, f::post(20, binding(1)));
+    create(&mut core, 2, &[(Kind::DependsOn, 1)]);
+    create(&mut core, 3, &[(Kind::Awaits, 1)]);
+    create(&mut core, 4, &[]);
+    let view = View {
+        state: &core.state,
+        tail: None,
+    };
+    let root = view.claim(ClaimId::from_u128(1)).unwrap();
+    let mut staged = scratch(&core);
+    let plan = preflight(&view, root, core.limits, None, &mut staged).unwrap();
+    assert_eq!(
+        plan.members()
+            .iter()
+            .map(|row| ClaimId(row.binding().object.0))
+            .collect::<Vec<_>>(),
+        vec![
+            ClaimId::from_u128(1),
+            ClaimId::from_u128(2),
+            ClaimId::from_u128(3)
+        ]
+    );
+    assert!(std::ptr::eq(plan.members()[0], root));
+    assert_eq!(registry(&view, plan.members()[0]).unwrap().rows().len(), 1);
+    let budget = plan.budget();
+    let quote = budget.charges();
+    assert_eq!(
+        (quote.nodes, quote.changed_rows, quote.graph_events),
+        (3, 3, 3)
+    );
+    assert!(quote.registry_heap_bytes > 0);
+    assert!(
+        quote.preparation_bytes >= staged.used + quote.claim_heap_bytes + quote.registry_heap_bytes
+    );
+    drop(plan);
+    let candidate = cancel(&core, 1);
+    let root = changed_root(&candidate, 1);
+    let mut staged = scratch(&core);
+    preflight(&view, &root, core.limits, Some(budget), &mut staged).unwrap();
+    let mut staged = scratch(&core);
+    let mut events = extras(&mut staged);
+    let rows = prepare(
+        &view,
+        root,
+        cut(&view),
+        core.limits,
+        &mut events,
+        &mut staged,
+    )
+    .unwrap();
+    budget.check_output(&view, &rows, events.events()).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(events.events(), 1);
+    assert_eq!(
+        core.native_claim(ClaimId::from_u128(2)).unwrap().status(),
+        ClaimStatus::Generated
+    );
+}
+
+#[test]
+fn proposed_reverse_link_growth_is_detected_even_when_target_row_is_unchanged() {
+    let mut core = core();
+    create(&mut core, 1, &[]);
+    let original = core.native_claim(ClaimId::from_u128(1)).unwrap().binding();
+    let budget = {
+        let view = View {
+            state: &core.state,
+            tail: None,
+        };
+        preflight(
+            &view,
+            view.claim(ClaimId::from_u128(1)).unwrap(),
+            core.limits,
+            None,
+            &mut scratch(&core),
+        )
+        .unwrap()
+        .budget()
+    };
+    let mut input = f::creation(2, 2, &[], None);
+    let NativeCommand::Create { claims, .. } = &mut input.command else {
+        panic!("create")
+    };
+    claims[0].definition.graph = graph::Declaration::new(
+        &[Obligation {
+            kind: Kind::DependsOn,
+            target: ClaimId::from_u128(1),
+        }],
+        1,
+    )
+    .unwrap();
+    let candidate = f::prepared(core.prepare_native(f::context(ISSUER, 2), input, &[]));
+    let view = View {
+        state: &core.state,
+        tail: Some(&candidate),
+    };
+    let root = view.claim(ClaimId::from_u128(1)).unwrap();
+    assert_eq!(root.binding(), original);
+    let before = core.native_budget();
+    assert!(matches!(
+        preflight(&view, root, core.limits, Some(budget), &mut scratch(&core)),
+        Err(NativeError::Contract(ContractError::InvalidPolicy))
+    ));
+    let replacement = preflight(&view, root, core.limits, None, &mut scratch(&core)).unwrap();
+    assert_eq!(replacement.members().len(), 2);
+    assert_eq!(
+        replacement.members()[1].binding(),
+        candidate.claim(ClaimId::from_u128(2)).unwrap().binding()
+    );
+    assert_eq!(core.native_budget(), before);
+    assert!(core.native_claim(ClaimId::from_u128(2)).is_none());
+}
+
+#[test]
+fn registry_growth_and_prefix_rewind_cannot_reuse_a_cheaper_graph_quote() {
+    let mut core = core();
+    f::publish(
+        &mut core,
+        1,
+        f::creation(1, 1, &[(focal_model::ValidationMode::Observe, false)], None),
+    );
+    let view = View {
+        state: &core.state,
+        tail: None,
+    };
+    let root = view.claim(ClaimId::from_u128(1)).unwrap();
+    let original = preflight(&view, root, core.limits, None, &mut scratch(&core))
+        .unwrap()
+        .budget();
+    assert_eq!(original.charges().registry_heap_bytes, 0);
+    let candidate =
+        f::prepared(core.prepare_native(f::context(ISSUER, 2), f::post(2, root.binding()), &[]));
+    let pending = View {
+        state: &core.state,
+        tail: Some(&candidate),
+    };
+    let changed = pending.claim(ClaimId::from_u128(1)).unwrap();
+    assert!(matches!(
+        preflight(
+            &pending,
+            changed,
+            core.limits,
+            Some(original),
+            &mut scratch(&core)
+        ),
+        Err(NativeError::Capacity(_))
+    ));
+    let next = preflight(&pending, changed, core.limits, None, &mut scratch(&core))
+        .unwrap()
+        .budget();
+    assert!(next.charges().registry_heap_bytes > 0);
+    assert_eq!(next.charges().nodes, original.charges().nodes);
+    assert!(matches!(
+        preflight(&view, root, core.limits, Some(next), &mut scratch(&core)),
+        Err(NativeError::Contract(ContractError::StaleRevision))
+    ));
+    assert_eq!(
+        core.native_claim(ClaimId::from_u128(1)).unwrap().status(),
+        ClaimStatus::Generated
+    );
+}
+
+#[test]
+fn graph_quote_checks_remaining_stage_bytes_before_copying_or_mutating_sources() {
+    let mut core = core();
+    create(&mut core, 1, &[]);
+    create(&mut core, 2, &[(Kind::DependsOn, 1)]);
+    let view = View {
+        state: &core.state,
+        tail: None,
+    };
+    let root = view.claim(ClaimId::from_u128(1)).unwrap();
+    let budget = preflight(&view, root, core.limits, None, &mut scratch(&core))
+        .unwrap()
+        .budget();
+    let remaining = budget.charges().preparation_bytes - heap(root).unwrap();
+    let before = core.native_budget();
+    preflight(
+        &view,
+        root,
+        core.limits,
+        None,
+        &mut Scratch {
+            used: 0,
+            max: remaining,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        preflight(
+            &view,
+            root,
+            core.limits,
+            None,
+            &mut Scratch {
+                used: 0,
+                max: remaining - 1
+            }
+        ),
+        Err(NativeError::Capacity(_))
+    ));
+    assert_eq!(core.native_budget(), before);
+    assert_eq!(root.status(), ClaimStatus::Generated);
+    let mut wrong = core.limits;
+    wrong.plan_edges -= 1;
+    assert!(matches!(
+        preflight(&view, root, wrong, Some(budget), &mut scratch(&core)),
+        Err(NativeError::Contract(ContractError::InvalidPolicy))
+    ));
+}
+
+#[test]
+fn retained_active_scope_without_its_actual_subscription_refuses_graph_preflight() {
+    use focal_model::lifecycle::scope;
+    use focal_model::{Deadline, MonitorId, TimerId, WaitPredicate};
+    let mut core = core();
+    create(&mut core, 1, &[]);
+    create(&mut core, 2, &[]);
+    let view = View {
+        state: &core.state,
+        tail: None,
+    };
+    let original = view.claim(ClaimId::from_u128(1)).unwrap();
+    let target = view.claim(ClaimId::from_u128(2)).unwrap();
+    let mut changed = original
+        .try_copy(original.retained_bytes().unwrap())
+        .unwrap();
+    let graph = graph::Snapshot::capture(
+        &[original, target],
+        graph::Limits {
+            nodes: 2,
+            edges: 2,
+            visits: 100,
+        },
+    )
+    .unwrap();
+    let transition = scope::Registry::prepare_register(
+        &changed,
+        scope::Authority {
+            principal: Principal::Actor(ISSUER),
+            expected: changed.binding(),
+            receipt: None,
+            cut: cut(&view),
+            now: 0,
+        },
+        scope::Registration {
+            id: MonitorId::from_u128(1),
+            roots: &[WaitPredicate::Satisfied(ClaimId::from_u128(2))],
+            deadline: Deadline {
+                timer: TimerId::from_u128(1),
+                generation: 1,
+                at: 100,
+            },
+        },
+        &graph,
+    )
+    .unwrap();
+    changed
+        .apply_scope(&changed.binding(), transition, &[target])
+        .unwrap();
+    let registered = view
+        .owned_claim(ClaimId::from_u128(1))
+        .unwrap()
+        .registrations()
+        .unwrap();
+    let registered = registered
+        .try_copy(registered.retained_bytes().unwrap())
+        .unwrap();
+    let owned = OwnedClaim::new(changed, registered).unwrap();
+    let heap = owned.heap_charge().unwrap();
+    // Corrupt native storage by importing a real model scope while omitting its
+    // required allocation and subscription rows. Discovery must fail closed.
+    let replacement = core
+        .state
+        .rows
+        .prepare_batch_with(
+            core.state.rows.prefix() + 1,
+            vec![Change::Put(Entry::new(
+                Key::Claim(ClaimId::from_u128(1)),
+                Row::Claim(owned),
+                heap,
+            ))],
+            BudgetLane::Completion,
+            |_| panic!("single-row replacement"),
+        )
+        .unwrap();
+    core.state.rows.publish(replacement).unwrap();
+    let view = View {
+        state: &core.state,
+        tail: None,
+    };
+    assert!(matches!(
+        preflight(
+            &view,
+            view.claim(ClaimId::from_u128(1)).unwrap(),
+            core.limits,
+            None,
+            &mut scratch(&core)
+        ),
+        Err(NativeError::Contract(ContractError::InvalidManifest))
+    ));
 }

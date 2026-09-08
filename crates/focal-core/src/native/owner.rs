@@ -1,8 +1,12 @@
 //! Exclusive ownership of the speculative native chain. Tickets identify a
 //! candidate but cannot retain its pages, fork it, or transfer its resources.
 
-use super::completion_book::{CompletionBook, Journal};
-use super::completion_envelope::{CompletionEnvelope, EvidenceBounds, descriptor_limits};
+use super::completion_book::{
+    CandidateJournal, CompletionBook, GraphMembers, JournalFunding, ReportAdvance,
+};
+use super::completion_envelope::{
+    CompletionEnvelope, EvidenceBounds, ReportParent, descriptor_limits,
+};
 use super::completion_schemas::SchemaSet;
 use super::*;
 use focal_evidence::{
@@ -13,11 +17,21 @@ use focal_model::ContentDomainId;
 use focal_model::lifecycle::aggregation;
 use std::collections::VecDeque;
 
-fn check_revision_capacity(binding: Binding, reports: u32) -> Result<(), NativeError> {
+#[path = "owner_ingress.rs"]
+mod ingress;
+#[path = "respondent_owner.rs"]
+mod respondent;
+
+fn check_revision_capacity(
+    binding: Binding,
+    reports: u32,
+    unsealed: bool,
+) -> Result<(), NativeError> {
     binding
         .revision
         .0
         .checked_add(u64::from(reports))
+        .and_then(|after_reports| after_reports.checked_add(u64::from(unsealed)))
         .ok_or(NativeError::Capacity("completion revision margin"))?;
     Ok(())
 }
@@ -27,7 +41,7 @@ fn completion_contract(
     limits: NativeLimits,
     registered: &super::admission_authority::Registered<'_>,
     schemas: &impl NativeSchemaVerifier,
-) -> Result<(CompletionEnvelope, SchemaSet), NativeError> {
+) -> Result<(CompletionEnvelope, SchemaSet, Option<GraphMembers>), NativeError> {
     let state = view.state;
     // Required failure may advance the parent once. Ordinary mutations must
     // preserve this last revision while an active grant still needs it.
@@ -36,6 +50,7 @@ fn completion_contract(
         && registered.parent.status() == focal_model::ClaimStatus::Posted
     {
         registered.parent.binding().next()?;
+        super::cohort_budget::check_source(view, registered.parent, registered.registry, limits)?;
     }
     let pins = SchemaSet::new(
         registered.definition,
@@ -51,22 +66,41 @@ fn completion_contract(
             .ok_or(NativeError::Capacity("completion verification workspace"))?,
         retained_bytes: pins.custody_bytes(),
     };
-    let envelope = CompletionEnvelope::derive(
-        &state.rows,
-        limits,
-        registered.parent,
-        registered.registry,
-        registered.definition,
-        descriptor,
-        evidence,
-    )?;
+    let (envelope, members) = if matches!(
+        registered.state.target(),
+        validation::Target::Artifact { .. }
+    ) {
+        let (envelope, members) =
+            CompletionEnvelope::derive_work(view, limits, registered, descriptor, evidence)?;
+        super::work_authority::check_completion_target(view, registered, &envelope, limits)?;
+        (envelope, Some(members))
+    } else if matches!(
+        registered.state.target(),
+        validation::Target::Admission { .. }
+    ) {
+        CompletionEnvelope::derive_admission(view, limits, registered, descriptor, evidence)?
+    } else {
+        (
+            CompletionEnvelope::derive(
+                &state.rows,
+                limits,
+                registered.parent,
+                registered.registry,
+                registered.definition,
+                descriptor,
+                evidence,
+            )?,
+            None,
+        )
+    };
     if matches!(
         registered.state.target(),
         validation::Target::Increment { .. }
     ) {
         super::increment_authority::check_completion_target(view, registered, &envelope, limits)?;
     }
-    Ok((envelope, pins))
+    envelope.deadline_storage(limits)?;
+    Ok((envelope, pins, members))
 }
 
 fn build_funded(
@@ -75,22 +109,91 @@ fn build_funded(
     evidence: Option<&VerifiedNativeArtifact>,
     custody: Option<(&mut ContentStore, ContentDomainId)>,
     schemas: &impl NativeSchemaVerifier,
-) -> Result<(NativePrepared, Journal), NativeError> {
+) -> Result<(NativePrepared, CandidateJournal), NativeError> {
     let source = fresh.source();
+    let publication_source = fresh.publication_source();
+    let lane = fresh.lane();
+    if let Some((key, spend)) = respondent::select(&fresh, book, schemas)? {
+        return respondent::build(fresh, book, evidence, custody, schemas, key, spend);
+    }
+    if let Some(deadline) = fresh.authorize_deadline()? {
+        let funding = if deadline.begun {
+            JournalFunding::HeldCompletion
+        } else {
+            JournalFunding::External { source, lane }
+        };
+        let built = if deadline.begun {
+            let loan = book.deadline_contract(deadline.key, deadline.binding)?;
+            fresh.build_recorded(loan.source(), None, None, Some(loan.storage()))?
+        } else {
+            fresh.build_recorded(source, None, None, None)?
+        };
+        let journal = book.apply_prepared(
+            &publication_source,
+            built.prepared(),
+            None,
+            None,
+            built.seals(),
+            funding,
+        )?;
+        return Ok((built.into_prepared(), CandidateJournal::single(journal)));
+    }
     match fresh.authorize_admission()? {
         Some(prepare::Admission::Begin {
             key,
             registered,
             binding,
+            transition,
             active: true,
         }) => {
-            check_revision_capacity(binding, registered.definition.attempt_bound())?;
-            let (envelope, pins) =
+            check_revision_capacity(
+                binding,
+                registered.definition.attempt_bound(),
+                registered.state.sealed().is_none(),
+            )?;
+            let (envelope, pins, members) =
                 completion_contract(fresh.view(), fresh.limits(), &registered, schemas)?;
-            let journal =
-                book.install_begin(key, binding, envelope, pins, registered.registration_index)?;
-            match fresh.build(source, evidence) {
-                Ok(prepared) => Ok((prepared, journal)),
+            let journal = book.install_begin_with_members(
+                key,
+                binding,
+                envelope,
+                pins,
+                registered.registration_index,
+                members,
+            )?;
+            let built = if envelope.is_work() {
+                fresh.build_recorded(source, evidence, Some(&envelope), None)
+            } else {
+                fresh.build_recorded(source, evidence, None, None)
+            };
+            match built {
+                Ok(built) => {
+                    let update = match book.apply_prepared(
+                        &publication_source,
+                        built.prepared(),
+                        None,
+                        Some(&transition),
+                        built.seals(),
+                        JournalFunding::External { source, lane },
+                    ) {
+                        Ok(update) => update,
+                        Err(error) => {
+                            drop(built);
+                            book.rollback(journal)?;
+                            return Err(error);
+                        }
+                    };
+                    if let Err(error) = book.check_begin_composition(&journal, &update) {
+                        drop(built);
+                        book.rollback(update)?;
+                        book.rollback(journal)?;
+                        return Err(error);
+                    }
+                    Ok((
+                        built.into_prepared(),
+                        CandidateJournal::begin(journal, update),
+                    ))
+                }
                 Err(error) => {
                     book.rollback(journal)?;
                     Err(error)
@@ -104,6 +207,7 @@ fn build_funded(
             artifact,
         }) => {
             let before = registered.state.binding();
+            let parent = ReportParent::capture(registered.parent);
             let loan = book.report_contract(
                 key,
                 before,
@@ -115,7 +219,7 @@ fn build_funded(
             )?;
             let verified = if let Some((store, domain)) = custody {
                 Some(store.verify_native_artifact_with_budget(
-                    fresh.input().request,
+                    fresh.input()?.request,
                     artifact.get().ok_or(ContractError::MissingEvidence)?,
                     domain,
                     loan.source(),
@@ -125,30 +229,50 @@ fn build_funded(
             } else {
                 None
             };
-            let prepared = fresh.build_with_completion(
+            let built = fresh.build_recorded(
                 loan.source(),
                 verified.as_ref().or(evidence),
                 Some(loan.envelope()),
+                None,
             )?;
             drop(verified);
-            let after = prepared
-                .evaluation(key)
-                .ok_or(ContractError::StaleEvaluation)?;
-            let journal = book.advance(
-                key,
-                before,
-                after.binding(),
-                after.state().is_terminal() || after.fence().is_some(),
-                prepared.outcome.changed != 0,
+            let prepared = built.prepared();
+            let journal = book.apply_prepared(
+                &publication_source,
+                prepared,
+                Some(ReportAdvance {
+                    key,
+                    before,
+                    usage: parent.completion_use_recorded(prepared)?,
+                }),
+                None,
+                built.seals(),
+                JournalFunding::HeldCompletion,
             )?;
-            Ok((prepared, journal))
+            Ok((built.into_prepared(), CandidateJournal::single(journal)))
         }
-        Some(prepare::Admission::Begin { .. }) | None => {
+        Some(prepare::Admission::Begin {
+            transition,
+            active: false,
+            ..
+        }) => {
+            let built = fresh.build_recorded(source, evidence, None, None)?;
+            let journal = book.apply_prepared(
+                &publication_source,
+                built.prepared(),
+                None,
+                Some(&transition),
+                built.seals(),
+                JournalFunding::External { source, lane },
+            )?;
+            Ok((built.into_prepared(), CandidateJournal::single(journal)))
+        }
+        None => {
             let descriptor = fresh.authorize_work()?;
             let verified = if let (Some(descriptor), Some((store, domain))) = (descriptor, custody)
             {
                 Some(store.verify_native_artifact(
-                    fresh.input().request,
+                    fresh.input()?.request,
                     descriptor,
                     domain,
                     source,
@@ -157,10 +281,17 @@ fn build_funded(
             } else {
                 None
             };
-            let prepared = fresh.build(source, verified.as_ref().or(evidence))?;
+            let built = fresh.build_recorded(source, verified.as_ref().or(evidence), None, None)?;
             drop(verified);
-            let journal = book.retire_prepared(&prepared)?;
-            Ok((prepared, journal))
+            let journal = book.apply_prepared(
+                &publication_source,
+                built.prepared(),
+                None,
+                None,
+                built.seals(),
+                JournalFunding::External { source, lane },
+            )?;
+            Ok((built.into_prepared(), CandidateJournal::single(journal)))
         }
     }
 }
@@ -181,6 +312,14 @@ pub struct NativeCandidate {
     serial: u64,
 }
 
+#[allow(clippy::large_enum_variant)] // Keep bounded input on stack before memory admission.
+enum OwnerInput {
+    Request(NativeContext, NativeInput),
+    Deadline(NativeDeadlineInput, u64),
+    ClaimDeadline(NativeClaimDeadlineInput, u64),
+    MonitorDeadline(NativeMonitorDeadlineInput, u64),
+}
+
 /// Preparation does not acknowledge durability. A pending retry retains the
 /// original ticket; a committed retry needs no candidate or additional charge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,12 +338,22 @@ pub enum NativeStaging {
 pub enum NativeOwnerError {
     #[error(transparent)]
     Native(#[from] NativeError),
+    #[error("native input: {0}")]
+    Input(#[from] super::input_codec::CodecError),
     #[error("candidate belongs to another native owner incarnation")]
     WrongOwner,
     #[error("native candidate is no longer pending")]
     UnknownCandidate,
     #[error("native candidates must publish in preparation order")]
     OutOfOrder,
+}
+impl From<super::input_codec::DecodeError> for NativeOwnerError {
+    fn from(error: super::input_codec::DecodeError) -> Self {
+        match error {
+            super::input_codec::DecodeError::Codec(error) => Self::Input(error),
+            super::input_codec::DecodeError::Native(error) => Self::Native(error),
+        }
+    }
 }
 impl From<MemoryError> for NativeOwnerError {
     fn from(error: MemoryError) -> Self {
@@ -230,7 +379,7 @@ impl std::error::Error for NativeOwnerInitError {}
 struct Pending {
     candidate: NativeCandidate,
     prepared: NativePrepared,
-    journal: Journal,
+    journal: CandidateJournal,
 }
 
 /// Owns the Core and every unpublished candidate in exactly one ordered chain.
@@ -285,6 +434,7 @@ impl NativeOwner {
         schemas: &impl NativeSchemaVerifier,
     ) -> Result<Self, NativeOwnerInitError> {
         let resources = (|| {
+            super::authored::check_storage(&core)?;
             let (incarnation, pending, allocation) = Self::allocate_queue(&core)?;
             let mut book = CompletionBook::new(&core.state.budget, core.limits)?;
             let view = View {
@@ -309,17 +459,33 @@ impl NativeOwner {
                     .checked_sub(attempt.index)
                     .filter(|remaining| *remaining != 0)
                     .ok_or(NativeError::Capacity("remaining completion reports"))?;
-                check_revision_capacity(state.binding(), remaining)?;
-                let (envelope, pins) =
+                check_revision_capacity(state.binding(), remaining, state.sealed().is_none())?;
+                let (envelope, pins, members) =
                     completion_contract(&view, core.limits, &registered, schemas)?;
-                book.install_recovered(
+                book.install_recovered_with_members(
                     key,
                     state.binding(),
                     remaining,
                     envelope,
                     pins,
                     registered.registration_index,
+                    members,
                 )?;
+            }
+            for entry in core.state.rows.entries() {
+                let Key::Claim(id) = entry.key else {
+                    continue;
+                };
+                let claim = view.claim(id).ok_or(ContractError::InvalidTarget)?;
+                let Some((_, credit)) = super::respondent_state::read(&view, claim, core.limits)?
+                else {
+                    continue;
+                };
+                if credit.actions()? != 0 {
+                    let (envelope, verification) =
+                        respondent::contract(&view, claim, core.limits, schemas)?;
+                    book.install_recovered_respondent(&view, claim, &envelope, verification)?;
+                }
             }
             book.check_slots(view.meta(), view.prefix(), core.state.rows.len())?;
             Ok::<_, NativeError>((incarnation, pending, allocation, book))
@@ -376,7 +542,60 @@ impl NativeOwner {
         input: NativeInput,
         evidence: Option<&VerifiedNativeArtifact>,
     ) -> Result<NativeStaging, NativeOwnerError> {
-        self.prepare_using(context, input, evidence, None, &BuiltinNativeSchemas)
+        self.prepare_using(
+            OwnerInput::Request(context, input),
+            evidence,
+            None,
+            &BuiltinNativeSchemas,
+        )
+    }
+
+    /// Trusted timer ingress, separate from participant commands. The input
+    /// identifies an authored timer; time comes from the publishing owner and
+    /// cannot be decoded from an agent's request. The committed typed timer
+    /// outcome also deduplicates firings after the evaluation has advanced.
+    pub fn prepare_evaluation_deadline(
+        &mut self,
+        input: NativeDeadlineInput,
+        logical_time: u64,
+    ) -> Result<NativeStaging, NativeOwnerError> {
+        self.prepare_using(
+            OwnerInput::Deadline(input, logical_time),
+            None,
+            None,
+            &BuiltinNativeSchemas,
+        )
+    }
+
+    /// Trusted claim deadline ingress. The owner discovers the complete
+    /// affected graph and applies canonical deadlock precedence before expiry.
+    /// Participants cannot supply its clock, victim, peers or failure status.
+    pub fn prepare_claim_deadline(
+        &mut self,
+        input: NativeClaimDeadlineInput,
+        logical_time: u64,
+    ) -> Result<NativeStaging, NativeOwnerError> {
+        self.prepare_using(
+            OwnerInput::ClaimDeadline(input, logical_time),
+            None,
+            None,
+            &BuiltinNativeSchemas,
+        )
+    }
+
+    /// Deliver the exact named monitor timer using owner-observed logical time.
+    /// This cannot be requested by inventing a participant principal.
+    pub fn prepare_monitor_deadline(
+        &mut self,
+        input: NativeMonitorDeadlineInput,
+        logical_time: u64,
+    ) -> Result<NativeStaging, NativeOwnerError> {
+        self.prepare_using(
+            OwnerInput::MonitorDeadline(input, logical_time),
+            None,
+            None,
+            &BuiltinNativeSchemas,
+        )
     }
 
     /// Check participant authority and the exact pending attempt before touching
@@ -391,7 +610,12 @@ impl NativeOwner {
         inline_domain: ContentDomainId,
         schemas: &impl NativeSchemaVerifier,
     ) -> Result<NativeStaging, NativeOwnerError> {
-        self.prepare_using(context, input, None, Some((store, inline_domain)), schemas)
+        self.prepare_using(
+            OwnerInput::Request(context, input),
+            None,
+            Some((store, inline_domain)),
+            schemas,
+        )
     }
 
     /// A trusted embedding may provide custody it has already verified. The
@@ -403,22 +627,32 @@ impl NativeOwner {
         evidence: Option<&VerifiedNativeArtifact>,
         schemas: &impl NativeSchemaVerifier,
     ) -> Result<NativeStaging, NativeOwnerError> {
-        self.prepare_using(context, input, evidence, None, schemas)
+        self.prepare_using(OwnerInput::Request(context, input), evidence, None, schemas)
     }
 
     fn prepare_using(
         &mut self,
-        context: NativeContext,
-        input: NativeInput,
+        input: OwnerInput,
         evidence: Option<&VerifiedNativeArtifact>,
         custody: Option<(&mut ContentStore, ContentDomainId)>,
         schemas: &impl NativeSchemaVerifier,
     ) -> Result<NativeStaging, NativeOwnerError> {
-        let preparation = self.core.check_native_chain(
-            context,
-            input,
-            self.pending.iter().map(|row| &row.prepared),
-        )?;
+        let pending = self.pending.iter().map(|row| &row.prepared);
+        let preparation = match input {
+            OwnerInput::Request(context, input) => {
+                self.core.check_native_chain(context, input, pending)?
+            }
+            OwnerInput::Deadline(input, logical_time) => {
+                self.core
+                    .check_deadline_chain(input, logical_time, pending)?
+            }
+            OwnerInput::ClaimDeadline(input, logical_time) => self
+                .core
+                .check_claim_deadline_chain(input, logical_time, pending)?,
+            OwnerInput::MonitorDeadline(input, logical_time) => self
+                .core
+                .check_monitor_deadline_chain(input, logical_time, pending)?,
+        };
         match preparation {
             prepare::Checked::Existing { outcome, committed } => {
                 let candidate = if committed {
@@ -455,6 +689,18 @@ impl NativeOwner {
                 }
                 let (prepared, journal) =
                     build_funded(fresh, &mut self.book, evidence, custody, schemas)?;
+                let source = View {
+                    state: &self.core.state,
+                    tail: self.pending.back().map(|row| &row.prepared),
+                };
+                let (prepared, journal) = respondent::attach(
+                    &source,
+                    prepared,
+                    journal,
+                    &mut self.book,
+                    self.core.limits,
+                    schemas,
+                )?;
                 let view = View {
                     state: &self.core.state,
                     tail: Some(&prepared),
@@ -463,10 +709,11 @@ impl NativeOwner {
                     .book
                     .check_slots(view.meta(), view.prefix(), prepared.range.len())
                     .and_then(|()| self.book.check_serial(serial))
-                    .and_then(|()| self.book.check_parents(&prepared));
+                    .and_then(|()| self.book.check_parents(&view, &prepared))
+                    .and_then(|()| self.book.check_graph_growth(&view, &prepared));
                 if let Err(error) = checked {
                     drop(prepared);
-                    if let Err(rollback) = self.book.rollback(journal) {
+                    if let Err(rollback) = self.book.rollback_candidate(journal) {
                         self.faulted = true;
                         return Err(rollback.into());
                     }
@@ -507,7 +754,7 @@ impl NativeOwner {
             .ok_or(NativeOwnerError::UnknownCandidate)?;
         match self.core.publish_native(head.prepared) {
             Ok(outcome) => {
-                if let Err(error) = self.book.commit(head.journal) {
+                if let Err(error) = self.book.commit_candidate(head.journal) {
                     self.faulted = true;
                     return Err(error.into());
                 }
@@ -546,7 +793,7 @@ impl NativeOwner {
         while self.pending.len() > position {
             if let Some(row) = self.pending.pop_back() {
                 drop(row.prepared);
-                if let Err(error) = self.book.rollback(row.journal) {
+                if let Err(error) = self.book.rollback_candidate(row.journal) {
                     self.faulted = true;
                     return Err(error.into());
                 }
@@ -567,7 +814,7 @@ impl NativeOwner {
         let count = self.pending.len();
         while let Some(row) = self.pending.pop_back() {
             drop(row.prepared);
-            if self.book.rollback(row.journal).is_err() {
+            if self.book.rollback_candidate(row.journal).is_err() {
                 self.faulted = true;
             }
         }
@@ -607,18 +854,33 @@ impl NativeOwner {
         &self,
         candidate: NativeCandidate,
     ) -> Result<NativeView<'_>, NativeOwnerError> {
-        let row = self
-            .pending
-            .get(self.position(candidate)?)
-            .ok_or(NativeOwnerError::UnknownCandidate)?;
+        let prepared = self.prepared_candidate(candidate)?;
         Ok(NativeView(View {
             state: &self.core.state,
-            tail: Some(&row.prepared),
+            tail: Some(prepared),
         }))
+    }
+
+    /// Borrow the exact unpublished mutation owned by this ticket. A future
+    /// durable writer must encode this candidate and await its actual barrier;
+    /// inspecting it does not publish or acknowledge any operation.
+    pub fn prepared_candidate(
+        &self,
+        candidate: NativeCandidate,
+    ) -> Result<&NativePrepared, NativeOwnerError> {
+        self.pending
+            .get(self.position(candidate)?)
+            .map(|row| &row.prepared)
+            .ok_or(NativeOwnerError::UnknownCandidate)
     }
 
     pub fn budget_stats(&self) -> BudgetStats {
         self.core.native_budget()
+    }
+
+    #[cfg(test)]
+    pub(super) fn budget_for_test(&self) -> &MemoryBudget {
+        &self.core.state.budget
     }
 
     /// Inspect acceptance from the actual effective prefix, including this
@@ -642,6 +904,35 @@ impl NativeOwner {
         self.core.native_stats()
     }
 
+    /// Inspect the complete audit at this owner's effective prefix. This read
+    /// does not freeze or post a claimant result testament.
+    pub fn with_effective_audit<T>(
+        &self,
+        claim: ClaimId,
+        project: impl FnOnce(&NativeAudit) -> T,
+    ) -> Result<T, NativeOwnerError> {
+        Ok(super::audit::with_audit(
+            &self.effective().0,
+            claim,
+            self.core.limits,
+            project,
+        )?)
+    }
+
+    /// Inspect committed audit history while preserving pending isolation.
+    pub fn with_committed_audit<T>(
+        &self,
+        claim: ClaimId,
+        project: impl FnOnce(&NativeAudit) -> T,
+    ) -> Result<T, NativeOwnerError> {
+        Ok(super::audit::with_audit(
+            &self.committed().0,
+            claim,
+            self.core.limits,
+            project,
+        )?)
+    }
+
     /// Pins committed state only. Speculative pages cannot escape as read leases.
     pub fn pin(&mut self, now: u64, ttl: u64) -> Result<NativeRead, MemoryError> {
         self.core.pin_native(now, ttl)
@@ -659,8 +950,15 @@ impl NativeOwner {
 /// Borrowed observations from one fixed committed or candidate prefix. The
 /// borrow prevents publication/discard while rows are in use and carries no
 /// independent allocation, root clone, or authority to prepare another branch.
-pub struct NativeView<'a>(View<'a>);
+pub struct NativeView<'a>(pub(super) View<'a>);
 impl<'a> NativeView<'a> {
+    /// Borrow the exact source for isolated native transaction verification.
+    /// Tests cannot mutate it or acquire an independently owned range root.
+    #[cfg(test)]
+    pub(super) fn source_view(&self) -> &View<'a> {
+        &self.0
+    }
+
     pub fn ledger(&self) -> LedgerId {
         self.0.ledger()
     }
@@ -679,8 +977,8 @@ impl<'a> NativeView<'a> {
             _ => None,
         }
     }
-    pub fn recorded(&self, request: RequestKey) -> Option<NativeOutcome> {
-        as_outcome(self.0.get(Key::Outcome(request)))
+    pub fn recorded(&self, invocation: impl Into<NativeInvocation>) -> Option<NativeOutcome> {
+        as_outcome(self.0.get(Key::Outcome(invocation.into())))
     }
     pub fn definition(&self, id: ValidationId) -> Option<&'a validation::Declaration> {
         as_definition(self.0.get(Key::Definition(id)))
@@ -708,6 +1006,14 @@ impl<'a> NativeView<'a> {
     }
     pub fn response_record(&self, id: TestamentId) -> Option<&'a NativeResponseRecord> {
         super::response_reads::as_response_record(self.0.get(Key::Response(id)))
+    }
+    pub fn result_testament(&self, id: TestamentId) -> Option<&'a NativeResultTestament> {
+        super::audit_bundle::as_result_testament(self.0.get(Key::ResultTestament(id)))
+    }
+    pub fn claim_result_testament(&self, claim: ClaimId) -> Option<&'a NativeResultTestament> {
+        let id = super::audit_bundle::index(self.0.get(Key::ClaimResultTestament(claim)))?;
+        self.result_testament(id)
+            .filter(|row| row.testament().claim() == claim)
     }
     pub fn delivery_result(&self, key: NativeResultKey) -> Option<&'a NativeDeliveryResult> {
         super::response_reads::as_delivery(self.0.get(Key::DeliveryResult(key)))

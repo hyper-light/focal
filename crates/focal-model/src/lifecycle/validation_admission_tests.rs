@@ -1,8 +1,13 @@
 use super::super::tests as fixtures;
 use super::*;
+
+#[path = "validation_seal_tests.rs"]
+mod seal_tests;
 use crate::lifecycle::{aggregation, claim, graph, scope, succession};
 use crate::{ObjectRevision, ReceiptId, RootCommandId, SessionSeq};
 use fixtures::{EVALUATOR, ISSUER, binding, programmatic};
+#[path = "validation_claim_deadline_tests.rs"]
+mod claim_deadline_tests;
 
 const SUBJECT: ParticipantId = ParticipantId::from_u128(9);
 

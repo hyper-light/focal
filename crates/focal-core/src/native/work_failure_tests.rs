@@ -684,7 +684,7 @@ fn pending_diagnostic_failure_and_close_share_one_discardable_effective_chain() 
     assert_eq!(f.claim(), parent);
     assert_eq!(f.owner.budget_stats(), budget);
     for outcome in [first_outcome, failed_outcome, closed_outcome] {
-        assert!(f.owner.effective().recorded(outcome.request).is_none());
+        assert!(f.owner.effective().recorded(outcome.invocation).is_none());
         assert!(f.owner.effective().event(outcome.sequence, 0).is_none());
     }
     assert!(f.owner.effective().artifact(diagnostic.id).is_none());
@@ -793,7 +793,7 @@ fn pending_rejection_close_discard_restores_original_work_and_removes_both_diagn
         );
     }
     for outcome in [rejection, respondent, close] {
-        assert!(f.owner.effective().recorded(outcome.request).is_none());
+        assert!(f.owner.effective().recorded(outcome.invocation).is_none());
     }
     assert!(
         f.owner

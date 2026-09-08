@@ -2,7 +2,7 @@
 
 Status: architecture baseline with implementation in progress, 2026-09-05. This directory uses the path requested for this project: `docs/archictecutre`.
 
-Focal is a Rust protocol and claims-ledger platform. Its target is one architecture that works on a single laptop and across multiple regions at Meta scale: custom RAM-resident working state, disk-backed durable logs, sharded state and execution, and independent session ordering. The latter scale is an objective to qualify through measurement, not a demonstrated property of either reference repository.
+Focal is an inter-agent, single-node or massively distributed communication protocol and event-driven ledger that facilitates robust, predictable, efficient, and scalable coordination and communication between swarms of agents. It is implemented in Rust. Its target is one architecture that works on a single laptop and across multiple regions at Meta scale: custom RAM-resident working state, disk-backed durable logs, sharded ledger execution, and independent session ordering. The latter scale is an objective to qualify through measurement, not a demonstrated property of either reference repository.
 
 The user confirmed that RAM is primary and disk provides durability, analogous to Kafka's durable log. This does not require Kafka, Kafka's storage engine, or Kafka's consistency semantics. Focal owns its memory store and log storage adapter.
 
@@ -43,6 +43,8 @@ states or mutations are already implemented.
 | [18 — Lifecycle storage upgrade and decoder transition](18-lifecycle-storage-upgrade.md) | Existing format/reducer audit, explicit successor decoder floor and activation, immutable historical replay and migration qualification |
 | [19 — CLI and MCP implementation contracts](19-cli-mcp-implementation.md) | Peer operation admission, durable retry, external validation, named authenticated contexts, and explicit remaining lifecycle and deployment work |
 | [20 — Native binary distribution](20-binary-distribution.md) | One prebuilt server/client/MCP executable, native release matrix and integrity gates, Windows implementation and installation qualification |
+| [21 — Native input format](21-native-input-format.md) | Complete dormant command/timer byte grammar, allocation-free structural inspection, aggregate limits and the remaining semantic/durable activation gates |
+| [22 — Native recorded mutations](22-native-record-format.md) | Complete mutation encoding, structural integrity, dependency-phased restoration and remaining row decoding, recovery and WAL activation |
 | [Hecate source snapshot](reference/README.md) | Imported architecture and supporting specs, original provenance and hashes |
 
 ## Authority and current status
@@ -53,9 +55,9 @@ Hecate is a design repository. Sylk is a Go implementation reference. Focal star
 
 The implementation plan is executable without inventing a distributed consistency model. Deployment-specific workload sizes, capacity budgets, geographic placement, and recovery objectives remain measured inputs. Each has a named qualification step rather than an invented universal number.
 
-## First executable slice
+## Implementation stages
 
-Complete P00–P04 in the [implementation plan](05-implementation-plan.md) for a durable laptop ledger: establish the Rust workspace and model; implement the deterministic serial ledger; persist its log; restart and recover. P05 adds the complete generated → posted → received → testament → validation → satisfied demonstration with immutable evidence. Preserve the final command and read interfaces so replication and partitioning extend this slice.
+P00–P05 in the [implementation plan](05-implementation-plan.md) define the original durable laptop baseline. The current V1 service persists and recovers its ledger and exposes CLI/MCP operations. The native RAM owner implements the corrected independent lifecycles and full authored bodies; its durable recovery, complete wire decoding and live activation remain the next boundary described in [18](18-lifecycle-storage-upgrade.md) and [21](21-native-input-format.md).
 
 The production objective requires all distributed, multi-region, memory-bound, security, operational, and stepped-complexity gates through P16. The user's added CLI, skills, MCP, challenge and consultation scope extends the active implementation goal through P20 in [13](13-cli-and-agent-implementation-plan.md). All list filters are optional, and flags/JSON/YAML must compile to the same typed requests. A working laptop demo or command parser is an intermediate milestone.
 
@@ -63,4 +65,4 @@ The [network startup guide](../network-startup.md) documents the implemented fou
 
 The [manual CLI guide](../manual-cli.md) documents the implemented local submit/get/list commands, validation results, artifact downloads and durable operation recovery. The CLI uses shared typed Rust builders and the service's authenticated mutation/read boundary.
 
-The [MCP guide and agent skills](../mcp.md) document `focal mcp serve`, its released operation catalog and exact retry contract. Remote contexts, autonomous challenge/consult policy and full deployment journeys remain required.
+The [MCP guide and agent skills](../mcp.md) document `focal mcp serve`, its implemented operation catalog, named local/authenticated remote contexts and exact retry contract. Native lifecycle activation, complete peer challenge/consult workflows and full deployment journeys remain required. Participants retain responsibility for executing tools and authoring any follow-up claims.

@@ -4,6 +4,14 @@ use super::*;
 use crate::lifecycle::memory as bytes;
 use crate::{Confidence, OutcomeKind};
 
+#[path = "evidence_snapshot.rs"]
+mod snapshot;
+pub use snapshot::{
+    FailedWorkSnapshotV1, ResponseArtifacts, ResponseDiagnosticSnapshotV1, ResponseHydrationPlan,
+    ResponseSnapshotFieldsV1, ResponseSnapshotSource, ResponseSnapshotV1,
+    ResponseTerminalSnapshotV1, WorkArtifactSnapshotV1, WorkTerminalSnapshotV1,
+};
+
 /// Limits are supplied by the effective owner, never by an untrusted request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResponseLimits {
@@ -191,6 +199,10 @@ pub(super) struct ReportedWork {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::lifecycle) struct ReportStamp([u8; 32]);
 impl ReportStamp {
+    pub(in crate::lifecycle) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
     #[cfg(test)]
     pub(in crate::lifecycle) fn fixture() -> Self {
         Self([0; 32])
@@ -582,6 +594,47 @@ fn report_stamp(
     failed_count: usize,
     report: CloseReport<'_>,
 ) -> Result<ReportStamp, ContractError> {
+    report_stamp_body(
+        identity,
+        respondent,
+        ReportBody {
+            summary: report.summary,
+            confidence: report.confidence,
+            outcome: report.outcome,
+            manifest_count: manifest.len(),
+            manifest: manifest.iter().copied().map(Ok),
+            failed_count,
+            failed: current
+                .iter()
+                .filter_map(|artifact| FailedWork::from_artifact(artifact).transpose()),
+            diagnostic_count: report.diagnostics.len(),
+            diagnostics: report.diagnostics.iter().copied().map(Ok),
+        },
+    )
+}
+
+struct ReportBody<'a, M, F, D> {
+    summary: &'a str,
+    confidence: Confidence,
+    outcome: OutcomeKind,
+    manifest_count: usize,
+    manifest: M,
+    failed_count: usize,
+    failed: F,
+    diagnostic_count: usize,
+    diagnostics: D,
+}
+
+fn report_stamp_body(
+    identity: ResponseIdentity,
+    respondent: ParticipantId,
+    mut body: ReportBody<
+        '_,
+        impl Iterator<Item = Result<SlotBinding, ContractError>>,
+        impl Iterator<Item = Result<FailedWork, ContractError>>,
+        impl Iterator<Item = Result<ResponseDiagnostic, ContractError>>,
+    >,
+) -> Result<ReportStamp, ContractError> {
     struct Stamp(blake3::Hasher);
     impl Stamp {
         fn field(&mut self, bytes: &[u8]) -> Result<(), ContractError> {
@@ -618,14 +671,14 @@ fn report_stamp(
         }
     }
     stamp.field(&respondent.0)?;
-    stamp.field(report.summary.as_bytes())?;
-    stamp.field(match report.confidence {
+    stamp.field(body.summary.as_bytes())?;
+    stamp.field(match body.confidence {
         Confidence::Hint => b"hint",
         Confidence::Tentative => b"tentative",
         Confidence::Committed => b"committed",
         Confidence::Consensus => b"consensus",
     })?;
-    stamp.field(match report.outcome {
+    stamp.field(match body.outcome {
         OutcomeKind::Complete => b"complete",
         OutcomeKind::Partial => b"partial",
         OutcomeKind::Refused => b"refused",
@@ -633,40 +686,53 @@ fn report_stamp(
         OutcomeKind::Interrupted => b"interrupted",
         OutcomeKind::Failed => b"failed",
     })?;
-    stamp.count(manifest.len())?;
-    for entry in manifest {
+    stamp.count(body.manifest_count)?;
+    for _ in 0..body.manifest_count {
+        let entry = body
+            .manifest
+            .next()
+            .ok_or(ContractError::InvalidManifest)??;
         stamp.field(&entry.slot.to_be_bytes())?;
         stamp.field(&entry.artifact.id.0)?;
         stamp.field(&entry.artifact.hash.0)?;
     }
+    if body.manifest.next().is_some() {
+        return Err(ContractError::InvalidManifest);
+    }
     // This is an in-memory guard, not a durable hash. Include the exact failed
     // row revision and diagnostic even though failed rows are never attached.
-    stamp.count(failed_count)?;
-    for artifact in current {
-        if let Some(failed) = FailedWork::from_artifact(artifact)? {
-            stamp.field(&failed.binding.ledger.tenant.0)?;
-            stamp.field(&failed.binding.ledger.session.0)?;
-            stamp.field(&failed.binding.object.0)?;
-            stamp.field(&failed.binding.content.0)?;
-            stamp.field(&failed.binding.revision.0.to_be_bytes())?;
-            stamp.field(&failed.slot.to_be_bytes())?;
-            stamp.field(match failed.state {
-                WorkArtifactState::GenerationFailed => b"generation-failed",
-                WorkArtifactState::ReceiptFailed => b"receipt-failed",
-                _ => return Err(ContractError::InvalidTransition),
-            })?;
-            stamp.field(&failed.diagnostic.artifact.id.0)?;
-            stamp.field(&failed.diagnostic.artifact.hash.0)?;
-            stamp.field(match failed.diagnostic.reason {
-                EvidenceFailure::Work => b"work",
-                EvidenceFailure::Production => b"production",
-                EvidenceFailure::Structure => b"structure",
-                EvidenceFailure::Metadata => b"metadata",
-            })?;
-        }
+    stamp.count(body.failed_count)?;
+    for _ in 0..body.failed_count {
+        let failed = body.failed.next().ok_or(ContractError::InvalidManifest)??;
+        stamp.field(&failed.binding.ledger.tenant.0)?;
+        stamp.field(&failed.binding.ledger.session.0)?;
+        stamp.field(&failed.binding.object.0)?;
+        stamp.field(&failed.binding.content.0)?;
+        stamp.field(&failed.binding.revision.0.to_be_bytes())?;
+        stamp.field(&failed.slot.to_be_bytes())?;
+        stamp.field(match failed.state {
+            WorkArtifactState::GenerationFailed => b"generation-failed",
+            WorkArtifactState::ReceiptFailed => b"receipt-failed",
+            _ => return Err(ContractError::InvalidTransition),
+        })?;
+        stamp.field(&failed.diagnostic.artifact.id.0)?;
+        stamp.field(&failed.diagnostic.artifact.hash.0)?;
+        stamp.field(match failed.diagnostic.reason {
+            EvidenceFailure::Work => b"work",
+            EvidenceFailure::Production => b"production",
+            EvidenceFailure::Structure => b"structure",
+            EvidenceFailure::Metadata => b"metadata",
+        })?;
     }
-    stamp.count(report.diagnostics.len())?;
-    for entry in report.diagnostics {
+    if body.failed.next().is_some() {
+        return Err(ContractError::InvalidManifest);
+    }
+    stamp.count(body.diagnostic_count)?;
+    for _ in 0..body.diagnostic_count {
+        let entry = body
+            .diagnostics
+            .next()
+            .ok_or(ContractError::InvalidManifest)??;
         // Ledger/claim/receipt/cycle/producer are checked equal to the already
         // encoded response entitlement before this stamp is constructed.
         stamp.field(&entry.artifact().id.0)?;
@@ -677,6 +743,9 @@ fn report_stamp(
             EvidenceFailure::Structure => b"structure",
             EvidenceFailure::Metadata => b"metadata",
         })?;
+    }
+    if body.diagnostics.next().is_some() {
+        return Err(ContractError::InvalidManifest);
     }
     Ok(ReportStamp(*stamp.0.finalize().as_bytes()))
 }

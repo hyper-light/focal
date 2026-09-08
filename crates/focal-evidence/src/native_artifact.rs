@@ -192,6 +192,55 @@ fn reference(pointer: ContentPointer) -> ContentRef {
 }
 
 impl ContentStore {
+    /// Restore custody only from an already present, fully verified local tree.
+    /// Unlike submission, this path never seals inline bytes or creates missing
+    /// evidence. The enclosing ledger importer authenticates the original request
+    /// and publication history before trusting the reconstructed capability.
+    pub fn recover_native_artifact(
+        &self,
+        request: RequestKey,
+        descriptor: &ArtifactDescriptor,
+        expected: ContentPointer,
+        local_revision: u64,
+        budget: &MemoryBudget,
+        schemas: &impl NativeSchemaVerifier,
+    ) -> Result<VerifiedNativeArtifact, NativeEvidenceError> {
+        self.check_native_verification_request(request, descriptor, expected.domain)?;
+        if local_revision != 1 || expected.root.0 == [0; 32] {
+            return Err(ContractError::MissingEvidence.into());
+        }
+        let verification = NativeVerificationBudget::for_schema(descriptor.schema_hash(), schemas)?;
+        let maximum = verification.maximum_bytes();
+        if usize::try_from(expected.length).map_err(|_| ContentError::Capacity)? > maximum {
+            return Err(ContentError::Capacity.into());
+        }
+        match descriptor.payload() {
+            PayloadSpec::Inline(bytes) => {
+                if expected.class != ContentClass::Evidence
+                    || u64::try_from(bytes.len()).map_err(|_| ContentError::Capacity)? != expected.length {
+                    return Err(ContractError::MissingEvidence.into());
+                }
+            }
+            PayloadSpec::Content(pointer) if pointer != expected => return Err(ContractError::MissingEvidence.into()),
+            PayloadSpec::Content(_) => {}
+        }
+        let mut allocation = budget.reserve(BudgetKind::Payload, BudgetLane::Completion, verification.peak_bytes())?.commit();
+        {
+            let bytes = self.read_bytes(&reference(expected), maximum)?;
+            if bytes.capacity() > maximum { return Err(ContentError::Capacity.into()); }
+            if let PayloadSpec::Inline(inline) = descriptor.payload()
+                && inline != bytes.as_slice() {
+                return Err(ContractError::MissingEvidence.into());
+            }
+            schemas.verify(descriptor.schema_hash(), &bytes)?;
+        }
+        // The complete read/schema buffers have dropped before their permit is
+        // reduced to the retained token. No raw encoded token can reach here.
+        let custody = NativeLocalCustody { request, descriptor: descriptor.intent_fingerprint(), payload: expected };
+        allocation.shrink_to(verification.retained_bytes())?;
+        Ok(VerifiedNativeArtifact { custody, allocation })
+    }
+
     /// Verify and retain actual local evidence before entering native Core.
     /// Inline payloads are sealed into the existing content-tree format too:
     /// an in-memory command alone cannot prove durable custody. Request/actor
