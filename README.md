@@ -3,7 +3,7 @@
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="docs/assets/brand/focal-prism-dark.svg">
       <source media="(prefers-color-scheme: light)" srcset="docs/assets/brand/focal-prism-light.svg">
-      <img src="docs/assets/brand/focal-prism-light.svg" alt="Focal logo: an oblique triangular prism joining three incoming rays into one outgoing ray" width="276" height="90">
+      <img src="docs/assets/brand/focal-prism-light.svg" alt="Focal logo: a triangular prism with three straight incoming rays and one outgoing ray" width="194" height="90">
     </picture>
   </a>
 </p>

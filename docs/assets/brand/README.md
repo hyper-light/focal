@@ -1,45 +1,46 @@
 # Focal logo
 
-Revised 2026-09-09 with the built-in image generation tool. Following Ada's correction, the
-optical body is an oblique triangular prism with a flat base and a visible side face.
-Three incoming rays join into one continuous outgoing ray. The broad planes and open cuts
-retain the monochrome family style of vorpal and slates.
+Redrawn directly as SVG on 2026-09-09 after Ada supplied prism references. The logo uses the
+simple end-on triangular profile shown in the
+[Newton artwork](https://deltavcreations.com/portfolio/prism-light-spectrum-artwork-newton/).
+Three incoming rays meet at the right face and continue as one outgoing ray, following Ada's
+requested focus direction. The interior is transparent and every segment is straight.
 
-- `focal-prism-transparent.png` is the original generated artwork with its alpha channel.
-- `focal-prism-light.svg` and `focal-prism-dark.svg` embed that PNG unchanged. Their filters
-  use the sibling brands' theme colors (`#1f2328` and `#f0f6fc`). The viewBox frames the
-  visible bounds with a small margin. These are presentation wrappers around raster
-  artwork, not traced vectors.
-- The README renders the mark at 276 × 90 pixels. Its width follows the wider prism and ray
-  composition while retaining the family's 90-pixel display height.
-- `focal-prism-preview.png` shows both theme SVGs enlarged and at README size. It was rendered
-  with the installed `rsvg-convert` on 2026-09-09 and visually checked. ImageMagick inspection
-  confirmed an RGBA source with transparent and opaque pixels.
+## Files and construction
 
-The root README uses relative paths and a `<picture>` element to select the matching theme.
-Clicking the logo opens the preview. No external image host or font is required.
+- `focal-prism.svg` is the editable monochrome vector master.
+- `focal-prism-light.svg` and `focal-prism-dark.svg` contain the same geometry in the sibling
+  brands' theme colors, `#1f2328` and `#f0f6fc`. They contain vector paths directly.
+- `focal-prism-transparent.png` is a 1164 × 540 transparent export from the vector master,
+  rendered with the installed `rsvg-convert`.
+- `focal-prism-preview.png` shows both theme SVGs enlarged and at their 194 × 90 README size.
+  Both views were visually checked on 2026-09-09.
+
+The triangle vertices are (300, 36), (168, 264), and (432, 264). Each ray enters at its
+intersection with the left side. The shared exit is the intersection of the right side
+with y = 158. The SVG contains straight line segments only. Its viewBox preserves the
+drawing's proportions as it scales.
+
+The root README selects a theme with a `<picture>` element and links to the preview.
+The artwork has no external images, fonts, or scripts.
+
+## Supplied references
+
+- [Delta V Créations — Newton](https://deltavcreations.com/portfolio/prism-light-spectrum-artwork-newton/):
+  the full artwork and detail image were visually inspected; its open triangular profile
+  informed this redraw.
+- [StockCake — Colorful Prism Art](https://stockcake.com/i/colorful-prism-art_532801_410392):
+  page text was accessible; the image fetch was blocked.
+- [Shutterstock prism icon](https://www.shutterstock.com/image-vector/prism-icon-art-illustrations-premium-line-2700688405):
+  the image page could not be retrieved.
+- [Etsy prism art prints](https://www.etsy.com/market/prism_art_print):
+  the supplied collection could not be retrieved directly.
+
+No reference artwork is embedded in these assets.
 
 ## Previous concepts
 
-The hexagonal relay (`9f690b0`) was rejected for resemblance to familiar AI branding.
-The tuning fork (`689842a`) was rejected as an unsuitable, insufficiently futuristic metaphor.
-The first optical mark (`38d990a`) looked like a diamond and ended in a dot; Ada requested a
-prism with an outgoing ray. Two edit attempts for this revision produced flattened RGB
-checkerboards and were discarded. The final generation supplies actual alpha transparency.
-Previous installed artwork remains in git history.
-
-## Final generation prompt
-
-```text
-Generate a finished logo as a PNG with a genuinely transparent alpha background.
-
-The logo depicts an oblique TRIANGULAR GLASS PRISM converting three incoming light bands into one continuous outgoing light band. Pure solid black shapes, clean transparent gaps, precise antialiased edges.
-
-The prism is an extruded optical wedge seen from three-quarter perspective. Show a large simple triangular end face on the left and a long quadrilateral side face receding to the right. The prism has a broad flat base and one top ridge. Its silhouette is squat and architectural, with no downward point and no gemstone shape. Only two broad faces, with a strong transparent seam defining the depth.
-
-Three thick parallel black light bands approach from the left. Their paths continue as clean cutouts through the front face, bend together across the side face, and merge into ONE long straight black output band extending well beyond the right side. The output has a flat end. There is NO DOT or other symbol at the exit. The three input bands and one output band should be equally bold and clearly visible.
-
-Design this as an elegant futuristic emblem for Focal, in the same family as a monochrome blade or sharply cut stacked slates: a memorable physical silhouette with engineered negative space. Sparse, balanced, strong at 90 pixels high. Wide overall proportions; center the mark on the canvas with generous clear margins.
-
-Background: actual alpha transparency outside every black shape and within every cutout. Flat pure black artwork. No backdrop of any kind, no texture, no lighting, no shadow, no gray shading, no rainbow, no spectrum, no glow, no words, no labels, no arrows, no node, no circle, no star, no jewel facets, no diamond, no additional decorative objects. One logo only.
-```
+Earlier generated concepts remain in git history: the relay (`9f690b0`), tuning fork
+(`689842a`), diamond with a terminal dot (`38d990a`), and tapered wedge with curved paths
+(`53948e6`). This redraw replaces the generated geometry with the simple profile from
+Ada's reference.
