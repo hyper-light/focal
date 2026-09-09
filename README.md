@@ -11,14 +11,17 @@
 <h1 align="center">focal</h1>
 <p align="center"><em>A ledger for agents that have to trust each other's work.</em></p>
 
-Focal records what one agent asked another to do, who took responsibility, what came back,
-and which checks actually passed. A **claim** is a request with its acceptance requirements
-written down. The agent that accepts it takes a **receipt**, does the work with its own
-tools, and answers with a **testament** and the **artifacts** that back it up. Whoever was
-named as evaluator checks that exact evidence and records a **validation**. Focal derives
-whether the claim is satisfied from those records and never from anyone's say-so. It
-launches nothing; agents run whatever they like, in any language, and Focal keeps the
-history.
+When you hand work to a swarm of agents, you need to know what each one was asked, who took
+it on, what came back, and whether it was actually checked. Focal is the ledger that answers
+those questions. Your agents can:
+
+- Ask each other for work with the acceptance criteria written down up front
+- Take responsibility for a task, so you know who is on it
+- Report what they did, success or failure, with the evidence attached
+- Check each other's evidence and record what passed
+
+Focal decides a task is done from those records, never from an agent saying so. It runs none
+of your tools; agents use whatever they like, in any language, and Focal keeps the history.
 
 It is one binary: the service, the command line and the MCP server.
 
@@ -114,10 +117,10 @@ EVIDENCE SETS	0
 VALIDATION RUNS	0
 ```
 
-Generating a claim and posting it are separate commits; only a posted claim can be worked
-on. The example is a claim on yourself (`target: self`) with one required check, that the
-testament is received, so it shows the mechanics without pretending to check quality. IDs
-are 32 hex characters, hashes 64. Every read prints the `SEQUENCE` it was served at.
+You generate a claim, then post it; only a posted claim can be picked up. The example is a
+claim on yourself with one required check, that the report is received, so you can see the
+mechanics without setting up a real evaluator. IDs are 32 hex characters, hashes 64. Every
+read prints the `SEQUENCE` it was served at, so you always know how current it is.
 
 Stop the service with Ctrl-C and run `focal start` again: the same ledger comes back.
 
@@ -157,7 +160,7 @@ validation. Failed work is reported the same way, with an error artifact instead
 report; a testament that says "failed" is still a testament. Every step with its flags is
 in the [manual](docs/manual-cli.md#deliver-artifacts-and-a-testament).
 
-## How two agents coordinate
+## What two agents see
 
 ```mermaid
 sequenceDiagram
@@ -173,11 +176,11 @@ sequenceDiagram
     Note over A,B: Focal derives acceptance from the required results
 ```
 
-Every arrow is a write to the ledger that both sides can read back. B always writes the
-testament, whether the work succeeded or failed; Focal never writes one for it. A validator
-definition names who evaluates, what kind of check, and which handler and version; that is
-a reference the evaluator maps to its own tool, not something Focal executes. A passing
-required check is what makes a claim satisfied, together with any claims it depends on.
+Every arrow is a record both agents can read back, and you can too. B always writes its own
+report, whether the work succeeded or failed; Focal never writes one for it, so an agent that
+went quiet shows up as exactly that. When you write a claim you say who checks it and with
+what; the checker runs that tool itself and records the result. A claim is satisfied when its
+required checks pass and the claims it depends on are done, and not before.
 
 | Object | What it records |
 |---|---|
@@ -275,20 +278,20 @@ fields and duplicate keys are rejected. Exit codes and every flag: **[docs/manua
 
 ## How it works
 
-- **One log per ledger.** Every mutation is appended to a write-ahead log and acknowledged
-  only once it is on disk (or on a quorum of disks when replicated). A deterministic
-  reducer applies the committed prefix into memory and publishes it atomically, so a read
-  sees a complete prefix, never half a mutation.
-- **Replay runs nothing.** Validators, clocks and tools never run during recovery; their
-  results were logged as inputs. Restart recovers the same ledger at the same sequence.
-- **Evidence has its own custody.** Artifact bytes are stored content-addressed and
-  verified against their hash before the ledger may refer to them. Adding a replica does
-  not copy evidence, and Focal tracks the two separately.
-- **Retries are exact.** A client journals each mutation under a durable ID before sending
-  it. A timeout is an unknown outcome, so the same ID is resent or its receipt queried;
-  a new command never resolves an old one.
-- **Everything is bounded.** Pages, scans, queues and request windows have budgets, and
-  the service reports pressure instead of growing without limit.
+- **Why you can trust a read.** Every change is written to a log on disk before it is
+  acknowledged, then applied into memory and published all at once. What you read is a
+  complete, committed state, never half of a change.
+- **Why a restart changes nothing.** Recovery replays the log and runs no tools, clocks or
+  validators; their results were recorded as inputs the first time. You get the same ledger
+  back at the same sequence.
+- **Why evidence cannot be swapped.** Artifact bytes are stored by their hash and checked
+  against it before the ledger may point at them. A report says which bytes were checked, and
+  those are the bytes you will find.
+- **Why a lost reply is safe.** An agent records what it is about to do, under its own ID,
+  before it sends it. If the reply is lost it resends the same ID and gets the original
+  outcome; it cannot accidentally do the work twice.
+- **Why it stays up under load.** Pages, scans, queues and request windows all have limits,
+  and the service tells you when it is under pressure instead of falling over later.
 
 The design is in [docs/archictecutre/](docs/archictecutre/README.md) (the directory name
 is deliberate), starting with the [target architecture](docs/archictecutre/00-target-architecture.md).
@@ -307,10 +310,10 @@ focal --data-dir ~/focal-node join --invite-file worker-2.invite --advertise 192
 focal --data-dir ~/focal-node start
 ```
 
-Joining adds the node as a learner of the cluster's metadata. It does not yet copy the
-ledger or raise its durability; promoting voters and placing application replicas are
-explicit `cluster membership` and `cluster replicas` commands, and the automatic placement
-that will do this for you is the next batch of work. Two nodes on one laptop, hosts on
+Joining lets the new node take part in the cluster; it does not yet copy your ledger onto
+it or make your data survive the loss of the first machine. Today you do that yourself with
+`cluster membership` and `cluster replicas`; the automatic placement that will do it for you
+is the next batch of work. Two nodes on one laptop, hosts on
 different machines, and the administration commands are in
 [docs/network-startup.md](docs/network-startup.md) and [docs/cluster-admin.md](docs/cluster-admin.md).
 
