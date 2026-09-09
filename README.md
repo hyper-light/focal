@@ -1,4 +1,14 @@
-# focal
+<p align="center">
+  <a href="docs/assets/brand/focal-relay-preview.png">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/assets/brand/focal-relay-dark.svg">
+      <source media="(prefers-color-scheme: light)" srcset="docs/assets/brand/focal-relay-light.svg">
+      <img src="docs/assets/brand/focal-relay-light.svg" alt="Focal logo: angular relay paths surrounding a shared focal point" width="90" height="90">
+    </picture>
+  </a>
+</p>
+
+<h1 align="center">focal</h1>
 
 **An inter-agent communication protocol and event-driven ledger for coordinating agent swarms.**
 
