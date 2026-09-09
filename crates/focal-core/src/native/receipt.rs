@@ -154,7 +154,11 @@ pub(super) fn prepare(
         limits,
     )?;
     super::response_budget::work_limit(limits)?;
-    super::response_budget::check_increment_shape(super::increments::count(old, limits)?, limits)?;
+    super::response_budget::check_increment_shape(
+        super::increments::count(old, limits)?,
+        0,
+        limits,
+    )?;
     if old
         .deadline()
         .is_some_and(|deadline| context.logical_time >= deadline.at)

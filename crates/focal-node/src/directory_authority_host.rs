@@ -194,6 +194,7 @@ impl<V: AuthorityVerifier> Owner<V> {
                 ))
                 | Err(ControlError::Memory(
                     focal_memory::MemoryError::Capacity { .. }
+                    | focal_memory::MemoryError::DiskCapacity { .. }
                     | focal_memory::MemoryError::AllocationFailed,
                 )) => {}
                 Err(error) => return Err(error.into()),

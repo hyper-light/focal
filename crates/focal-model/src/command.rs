@@ -291,7 +291,16 @@ pub enum DeltaFact {
     Scope(MonitorId),
     Epoch(RequestEpoch),
     LocalCompletion,
+    /// One committed native event (schema `NATIVE_DELTA_SCHEMA`): the exact
+    /// fact a native record published, addressed inside the record by native
+    /// sequence and ordinal. The delta's `action` is the nearest legacy
+    /// lifecycle action for coarse consumers; the record is the authority.
+    /// Never encodable by the frozen V1 durable codec.
+    Native(Box<crate::native_event::NativeEventRecord>),
 }
+/// Delta schema of facts derived from the native engine's committed events.
+/// Schema 1 deltas are the frozen legacy facts above.
+pub const NATIVE_DELTA_SCHEMA: u16 = 2;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EffectIntent {
     DispatchClaim {

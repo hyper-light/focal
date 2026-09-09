@@ -462,6 +462,22 @@ record!(SnapshotEnvelopeV5 {
     requests: RequestStreamsCheckpoint,
 });
 
+record!(SnapshotEnvelopeV6 {
+    state: SnapshotEnvelopeV4,
+    requests: RequestStreamsCheckpoint,
+    activation: Vec<u8>,
+    native: Vec<u8>,
+});
+
+// `FOCALSS7`: SS6 plus the request-stream registry's generation watermark.
+record!(SnapshotEnvelopeV7 {
+    state: SnapshotEnvelopeV4,
+    requests: RequestStreamsCheckpoint,
+    activation: Vec<u8>,
+    native: Vec<u8>,
+    slot_generation: u64,
+});
+
 record!(StreamSlotData {
     principal: ParticipantId,
     state: RequestStreamState,
@@ -597,8 +613,20 @@ struct SnapshotV5Ref<'a> {
     state: SnapshotV4Ref<'a>,
     requests: RequestCheckpointRef<'a>,
 }
+#[derive(Serialize)]
+struct SnapshotV7Ref<'a> {
+    state: SnapshotV4Ref<'a>,
+    requests: RequestCheckpointRef<'a>,
+    activation: CoreBytes<'a>,
+    native: CoreBytes<'a>,
+    slot_generation: u64,
+}
 
-pub(super) fn snapshot(session: &Session, core: &[u8]) -> Result<Vec<u8>, LedgerError> {
+pub(super) fn snapshot(
+    session: &Session,
+    core: &[u8],
+    native: Option<&[u8]>,
+) -> Result<Vec<u8>, LedgerError> {
     let state = SnapshotV3Ref {
         state: SnapshotV2Ref {
             schema: 2,
@@ -613,6 +641,31 @@ pub(super) fn snapshot(session: &Session, core: &[u8]) -> Result<Vec<u8>, Ledger
         membership: Frozen(&session.membership_state),
     };
     const LIMIT: usize = 8 * 1024 * 1024;
+    if let Some(native) = native {
+        // A native ledger always writes the complete envelope: every ancillary
+        // section, its activation record and the enclosing native checkpoint.
+        let activation = session
+            .activation_record
+            .as_deref()
+            .ok_or(LedgerError::Corrupt)?;
+        return encode_view(
+            SNAPSHOT_V7_MAGIC,
+            &SnapshotV7Ref {
+                state: SnapshotV4Ref {
+                    state,
+                    placement: Frozen(&session.placement_state),
+                },
+                requests: RequestCheckpointRef {
+                    activated: session.request_streams.activated,
+                    slots: StreamRows(&session.request_streams),
+                },
+                activation: CoreBytes(activation),
+                native: CoreBytes(native),
+                slot_generation: session.request_streams.next_generation(),
+            },
+            LIMIT.saturating_mul(2),
+        );
+    }
     if session.request_streams.activated {
         encode_view(
             SNAPSHOT_V5_MAGIC,

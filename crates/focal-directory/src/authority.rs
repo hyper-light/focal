@@ -468,9 +468,7 @@ pub(crate) fn validate_node_identity(
     }
     let receipt = registry
         .enrollments()
-        .find(|receipt| {
-            ContentHash(server_fingerprint(&receipt.certificate)) == grant.enrollment.identity
-        })
+        .find(|receipt| ContentHash(receipt.public_key) == grant.enrollment.identity)
         .ok_or(DirectoryError::UnverifiedAuthority)?;
     let identity = registry
         .authorize_certificate(&receipt.certificate, now)

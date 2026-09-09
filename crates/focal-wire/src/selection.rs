@@ -57,6 +57,8 @@ impl SelectionPredicates {
                         reference.ledger != ledger || reference.id.is_zero()
                     }
                     RelationTarget::Action(_) => false,
+                    // A zero hash means any committed hash of the artifact.
+                    RelationTarget::Evidence(evidence) => evidence.id.is_zero(),
                 })
             || matches!((self.created_after,self.created_through),(Some(after),Some(through)) if after>=through)
         {

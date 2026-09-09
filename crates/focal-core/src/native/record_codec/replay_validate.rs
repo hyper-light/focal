@@ -147,18 +147,38 @@ pub(super) fn validate<O: Overlay>(read: &ReplayRead<'_, '_, O>) -> Result<(), N
     let mut new_evaluations = 0usize;
     read.charge(add(read.overlay.changes().len(), 1)?)?;
     for (key, row) in read.overlay.changes() {
-        let row = row.ok_or_else(invalid)?;
+        let Some(row) = row else {
+            super::replay_validate_index::check_delete(key, read)?;
+            continue;
+        };
+        if matches!(row, Row::Index) {
+            super::replay_validate_index::check_put(key, read)?;
+            continue;
+        }
         references::check(key, row, read)?;
         links::check(key, row, read, &mut linked)?;
         match (key, row) {
+            (Key::Claim(id), Row::Claim(value)) => {
+                super::replay_validate_index::claim_complete(id, value, read)?
+            }
+            (Key::Artifact(id), Row::Artifact(value)) => {
+                super::replay_validate_index::artifact_complete(id, value, read)?
+            }
+            (Key::Definition(id), Row::Definition(value)) => {
+                super::replay_validate_index::definition_complete(id, value, read)?
+            }
+            (Key::Accepted(key), Row::Accepted(value)) => {
+                super::replay_validate_index::accepted_complete(key, value, read)?
+            }
             (Key::Work(id), Row::Work(value)) => {
                 objects::work(id, value.get().ok_or_else(invalid)?, read)?
             }
             (Key::Response(id), Row::Response(value)) => {
-                objects::response(id, value.record().ok_or_else(invalid)?, read)?
+                objects::response(id, value.record().ok_or_else(invalid)?, read)?;
             }
             (Key::Evaluation(key), Row::Evaluation(value)) => {
                 objects::evaluation(key, value.get().ok_or_else(invalid)?, read)?;
+                super::replay_validate_index::evaluation_complete(key, value, read)?;
                 if read.before(Key::Evaluation(key))?.is_none() {
                     new_evaluations = add(new_evaluations, 1)?;
                 }
@@ -170,6 +190,7 @@ pub(super) fn validate<O: Overlay>(read: &ReplayRead<'_, '_, O>) -> Result<(), N
         }
     }
     linked.finish()?;
+    super::replay_validate_index::consumption_complete(read)?;
     affected_claims(read, new_evaluations)
 }
 
@@ -207,7 +228,11 @@ fn each_affected<O: Overlay>(
 ) -> Result<(), NativeError> {
     read.charge(mul(add(read.overlay.changes().len(), 1)?, 256)?)?;
     for (key, row) in read.overlay.changes() {
-        let row = row.ok_or_else(invalid)?;
+        let Some(row) = row else {
+            // A deleted index row names no owner; its primary row is in
+            // the same record and is visited on its own.
+            continue;
+        };
         if let Some(id) = owner(key, row)? {
             accept(id)?;
         }

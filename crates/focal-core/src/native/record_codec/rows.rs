@@ -59,7 +59,7 @@ pub(super) fn value(s: &mut impl Sink, row: &Row, ledger: LedgerId) -> Result<()
         Row::Meta(v) => {
             // Cumulative ledger counters are u64, never host-size integers or
             // u32 collection lengths. The decoder must checked-convert them.
-            s.visit(14)?;
+            s.visit(15)?;
             for value in [
                 v.claims,
                 v.outcomes,
@@ -74,6 +74,7 @@ pub(super) fn value(s: &mut impl Sink, row: &Row, ledger: LedgerId) -> Result<()
                 v.monitors,
                 v.monitor_links,
                 v.creation_results,
+                v.legacy,
             ] {
                 write_u64(s, u64::try_from(value).map_err(|_| Error::Capacity)?)?;
             }
@@ -124,5 +125,17 @@ pub(super) fn value(s: &mut impl Sink, row: &Row, ledger: LedgerId) -> Result<()
         Row::ClaimIdentity(id) => raw(s, &id.0),
         Row::DefinitionIdentity(id) => raw(s, &id.0),
         Row::CreationResult(v) => evidence::creation(s, v),
+        Row::LegacyTestament(v)
+        | Row::LegacyEvidenceSet(v)
+        | Row::LegacyRun(v)
+        | Row::LegacyDefinition(v) => legacy(s, v),
+        Row::Index => write_u8(s, 1),
     }
+}
+/// Frozen legacy bytes, count-prefixed; the decoder bounds the count by the
+/// configured legacy row limit before taking the slice.
+fn legacy(s: &mut impl Sink, v: &OwnedLegacy) -> Result<(), Error> {
+    s.visit(1)?;
+    bytes::write_count(s, v.bytes().len())?;
+    raw(s, v.bytes())
 }

@@ -85,13 +85,15 @@ fn count(value: u32) -> Result<usize, NativeError> {
 fn action(
     view: &View<'_>,
     changes: usize,
+    deleted: usize,
     incoming_heap: usize,
     slots: CompletionSlots,
 ) -> Result<Action, NativeError> {
     Ok(Action {
         storage: view.state.rows.future_write_envelope(RangeWriteLimits {
             changed_keys: changes,
-            deleted_keys: 0,
+            deleted_keys: deleted,
+            deleted_heap: 0,
             incoming_heap,
             input_capacity: changes,
         })?,
@@ -158,7 +160,7 @@ impl RespondentEnvelope {
         view: &View<'_>,
         claim: &ClaimState,
         limits: NativeLimits,
-        descriptor: ArtifactLimits,
+        mut descriptor: ArtifactLimits,
         evidence: EvidenceBounds,
     ) -> Result<Self, NativeError> {
         let (key, maximum) = super::respondent_state::read(view, claim, limits)?
@@ -198,9 +200,27 @@ impl RespondentEnvelope {
             ConstructionBudget::for_operation(NativeOperation::CloseResponse, limits)?;
         let post_construction =
             ConstructionBudget::for_operation(NativeOperation::PostResponse, limits)?;
-        diagnostic_construction.check_counts(0, 4, 2)?;
-        close_construction.check_counts(1, add(work_limit, 2)?, add(work_limit, 2)?)?;
-        post_construction.check_counts(1, 1, 2)?;
+        // Index rows (doc 22 §7): a diagnostic artifact's producer, kind,
+        // schema and inputs; a close's and a post's claim status move. A
+        // diagnostic's eight primary rows and three fixed index rows leave the
+        // batch's remainder to the inputs its descriptor may cite.
+        let inputs = crate::native::index_rows::cap_inputs(
+            super::completion_envelope::input_bound(descriptor),
+            8 + 3,
+            limits.range.max_batch_entries,
+        );
+        descriptor.inputs = inputs;
+        let diagnostic_index = crate::native::index_rows::artifact_rows(inputs)?;
+        let close_index = crate::native::index_rows::STATUS_ROWS;
+        let post_index = crate::native::index_rows::STATUS_ROWS;
+        diagnostic_construction.check_counts(0, 4, 2, diagnostic_index)?;
+        close_construction.check_counts(
+            1,
+            add(work_limit, 2)?,
+            add(work_limit, 2)?,
+            close_index,
+        )?;
+        post_construction.check_counts(1, 1, 2, post_index)?;
         let dynamic = descriptor
             .construction_bytes
             .checked_sub(size_of::<ArtifactDescriptor>())
@@ -283,7 +303,8 @@ impl RespondentEnvelope {
         }
         let diagnostic = action(
             view,
-            8,
+            add(8, diagnostic_index)?,
+            0,
             add(
                 add(
                     descriptor_heap,
@@ -307,7 +328,8 @@ impl RespondentEnvelope {
         let close_events = add(work_limit, 2)?;
         let close = action(
             view,
-            add(multiply(2, work_limit)?, 7)?,
+            add(add(multiply(2, work_limit)?, 7)?, close_index)?,
+            1,
             add(
                 add(claim_row, response_row)?,
                 add(work_rows, event_containers(close_events)?)?,
@@ -323,7 +345,8 @@ impl RespondentEnvelope {
         )?;
         let post = action(
             view,
-            6,
+            add(6, post_index)?,
+            1,
             add(add(claim_row, response_row)?, event_containers(2)?)?,
             CompletionSlots {
                 outcomes: 1,
@@ -407,8 +430,13 @@ impl RespondentEnvelope {
             retained_bytes = add(
                 retained_bytes,
                 multiply(
-                    add(crate::native::mutation::retained(action.storage)?,
-                        self.record_buffers.map(|limits| record_codec::future_record_bytes(action.storage, limits)).transpose()?.unwrap_or(0))?,
+                    add(
+                        crate::native::mutation::retained(action.storage)?,
+                        self.record_buffers
+                            .map(|limits| record_codec::future_record_bytes(action.storage, limits))
+                            .transpose()?
+                            .unwrap_or(0),
+                    )?,
                     self::count(count)?,
                 )?,
             )?;
@@ -429,8 +457,13 @@ impl RespondentEnvelope {
         self.workspace
     }
 
-    pub(super) fn with_record_buffers(mut self, limits: record_codec::EncodingLimits) -> Result<Self, NativeError> {
-        if self.record_buffers.is_some() { return Err(ContractError::InvalidTransition.into()); }
+    pub(super) fn with_record_buffers(
+        mut self,
+        limits: record_codec::EncodingLimits,
+    ) -> Result<Self, NativeError> {
+        if self.record_buffers.is_some() {
+            return Err(ContractError::InvalidTransition.into());
+        }
         for action in [self.diagnostic, self.close, self.post] {
             record_codec::future_record_bytes(action.storage, limits)?;
         }

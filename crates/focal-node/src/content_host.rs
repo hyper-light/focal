@@ -24,6 +24,8 @@ pub struct ContentHost {
     budget: MemoryBudget,
     timeout: Duration,
     max_frame_bytes: u32,
+    chunk_bytes: usize,
+    max_manifest_bytes: usize,
 }
 pub struct ContentOwner(JoinHandle<Result<(), AccessError>>);
 impl ContentOwner {
@@ -40,8 +42,18 @@ enum Command {
     Chunk(CustodyScope, ContentRef, usize),
     Read(CustodyScope, ContentRef, usize),
     Seal(CustodyScope, Box<VerifiedRequest>),
+    /// Seal an inline legacy payload with the canonical import chunking.
+    SealImport(focal_model::ContentDomainId, Vec<u8>, usize),
     Verify(Box<CustodyVerification>),
+    VerifyNative(Box<NativeVerification>),
     Stop,
+}
+/// One native artifact to seal and verify under the exclusive content writer.
+pub(crate) struct NativeVerification {
+    pub scope: CustodyScope,
+    pub request: RequestKey,
+    pub descriptor: focal_model::lifecycle::artifact_descriptor::ArtifactDescriptor,
+    pub domain: focal_model::ContentDomainId,
 }
 enum Output {
     Response(Box<Accounted<ResponseEnvelope>>),
@@ -50,6 +62,7 @@ enum Output {
     LocalSeal(ContentRef),
     Done,
     Verification(CustodyVerificationProgress),
+    NativeEvidence(Box<focal_evidence::VerifiedNativeArtifact>),
 }
 struct Work {
     command: Command,
@@ -111,6 +124,8 @@ impl ContentHost {
             )
             .map_err(|_| AccessError::Capacity)?
             .commit();
+        let (chunk_bytes, max_manifest_bytes) =
+            (store.upload_chunk_bytes(), store.max_manifest_bytes());
         let owner = CustodyStore::new(store, config, budget.clone())?;
         let (sender, receiver) = mpsc::sync_channel::<Work>(queue_items);
         let timeout = limits.request_timeout;
@@ -164,6 +179,8 @@ impl ContentHost {
                 budget,
                 timeout,
                 max_frame_bytes,
+                chunk_bytes,
+                max_manifest_bytes,
             },
             ContentOwner(thread),
         ))
@@ -236,6 +253,27 @@ impl ContentHost {
             .await?
         {
             Output::Done => Ok(()),
+            _ => Err(AccessError::Unavailable),
+        }
+    }
+    /// Seal and verify one native artifact's inline payload under the installed
+    /// custody policy, returning the evidence the replicated owner requires.
+    pub(crate) async fn verify_native(
+        &self,
+        verification: NativeVerification,
+    ) -> Result<focal_evidence::VerifiedNativeArtifact, AccessError> {
+        let bytes = verification
+            .descriptor
+            .retained_bytes()
+            .map_err(|_| AccessError::Capacity)?
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(self.chunk_bytes.saturating_mul(4)))
+            .ok_or(AccessError::Capacity)?;
+        match self
+            .call(Command::VerifyNative(Box::new(verification)), bytes, false)
+            .await?
+        {
+            Output::NativeEvidence(evidence) => Ok(*evidence),
             _ => Err(AccessError::Unavailable),
         }
     }
@@ -335,6 +373,28 @@ impl ContentHost {
             _ => Err(AccessError::Unavailable),
         }
     }
+    /// The store's chunk size and manifest bound: the parameters an import
+    /// proposal records so every replica seals legacy payloads identically.
+    pub fn import_chunking(&self) -> (usize, usize) {
+        (self.chunk_bytes, self.max_manifest_bytes)
+    }
+    /// Seal one inline legacy payload before an import is proposed or applied
+    /// (23 §5.2). Idempotent: an already sealed payload installs nothing new.
+    pub async fn seal_import_inline(
+        &self,
+        domain: focal_model::ContentDomainId,
+        bytes: Vec<u8>,
+        chunk_bytes: usize,
+    ) -> Result<focal_model::ContentRef, AccessError> {
+        let size = bytes.len();
+        match self
+            .call(Command::SealImport(domain, bytes, chunk_bytes), size, true)
+            .await?
+        {
+            Output::LocalSeal(value) => Ok(value),
+            _ => Err(AccessError::Unavailable),
+        }
+    }
     pub async fn stop(&self) -> Result<(), AccessError> {
         match self.call(Command::Stop, 0, true).await? {
             Output::Done => Ok(()),
@@ -364,6 +424,17 @@ impl RequestHandler for ContentHost {
         })
     }
 }
+fn native_evidence_error(error: focal_evidence::NativeEvidenceError) -> AccessError {
+    use focal_evidence::NativeEvidenceError;
+    match error {
+        NativeEvidenceError::Content(error) => crate::custody::content_error(error),
+        NativeEvidenceError::Memory(_) => AccessError::Capacity,
+        NativeEvidenceError::Contract(_)
+        | NativeEvidenceError::Schema(_)
+        | NativeEvidenceError::WrongRequest => AccessError::InvalidRequest,
+        NativeEvidenceError::VerificationBudgetChanged => AccessError::Unavailable,
+    }
+}
 fn execute(
     owner: &mut CustodyStore,
     command: Command,
@@ -382,6 +453,25 @@ fn execute(
         Command::Check(scope) => {
             owner.check_policy(scope)?;
             Ok(Output::Done)
+        }
+        Command::VerifyNative(verification) => {
+            owner.check_policy(verification.scope)?;
+            if verification.domain
+                != focal_model::ContentDomainId(verification.scope.ledger.tenant.0)
+            {
+                return Err(AccessError::Unauthorized);
+            }
+            let evidence = owner
+                .content_mut()
+                .verify_native_artifact(
+                    verification.request,
+                    &verification.descriptor,
+                    verification.domain,
+                    budget,
+                    &focal_evidence::BuiltinNativeSchemas,
+                )
+                .map_err(native_evidence_error)?;
+            Ok(Output::NativeEvidence(Box::new(evidence)))
         }
         Command::Export(scope, content) => {
             owner.export_manifest(scope, content).map(Output::Manifest)
@@ -424,6 +514,22 @@ fn execute(
             owner
                 .content_mut()
                 .seal(id)
+                .map(Output::LocalSeal)
+                .map_err(content_error)
+        }
+        Command::SealImport(domain, bytes, chunk_bytes) => {
+            let amount = bytes
+                .len()
+                .checked_mul(2)
+                .and_then(|n| n.checked_add(owner.content().max_manifest_bytes()))
+                .and_then(|n| n.checked_add(4096))
+                .ok_or(AccessError::Capacity)?;
+            let _scan = budget
+                .reserve(BudgetKind::Payload, BudgetLane::Completion, amount)
+                .map_err(|_| AccessError::Capacity)?;
+            owner
+                .content_mut()
+                .seal_import_inline(domain, &bytes, chunk_bytes)
                 .map(Output::LocalSeal)
                 .map_err(content_error)
         }

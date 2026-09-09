@@ -10,6 +10,7 @@ enum Step {
     Inform,
     Committed,
     Duplicate,
+    Capacity,
 }
 struct Script<'a> {
     seen: &'a Mutex<Vec<RequestEnvelope>>,
@@ -50,6 +51,7 @@ impl ClientTransport for Script<'_> {
                 Step::Duplicate => Response::Submitted(MutationReply::Domain(
                     DomainOutcome::Duplicate(Box::new(receipt(request))),
                 )),
+                Step::Capacity => Response::Error(AccessError::Capacity),
             };
             Ok(request.reply(result))
         })
@@ -140,4 +142,80 @@ async fn definite_admission_response_and_exact_committed_retry_remain_distinct()
         }
         assert_eq!(seen.lock().unwrap().len(), count);
     }
+}
+
+#[tokio::test]
+async fn capacity_refusals_are_resent_with_backoff_and_reported_as_refusals_not_unknown_outcomes() {
+    let quick = RetryPolicy {
+        max_attempts: 4,
+        max_elapsed: Duration::from_secs(5),
+        base_backoff: Duration::from_millis(1),
+        max_backoff: Duration::from_millis(2),
+    };
+    // A full ingress that drains: the same request is sent again unchanged
+    // and the committed reply is returned.
+    let seen = Mutex::new(Vec::new());
+    let client = Client::new(
+        Script {
+            seen: &seen,
+            steps: vec![Step::Capacity, Step::Capacity, Step::Committed],
+        },
+        quick.clone(),
+        WireLimits::default(),
+        1,
+    )
+    .unwrap();
+    let original = request();
+    let reply = client.request(original.clone()).await.unwrap();
+    assert!(matches!(
+        reply.result,
+        Response::Submitted(MutationReply::Committed(_))
+    ));
+    {
+        let sent = seen.lock().unwrap();
+        assert_eq!(sent.len(), 3);
+        assert!(
+            sent.iter()
+                .all(|request| request.request_id == original.request_id)
+        );
+    }
+    // A refusal on every attempt is the refusal, never an unknown outcome:
+    // nothing was admitted, so nothing is left to reconcile.
+    let seen = Mutex::new(Vec::new());
+    let client = Client::new(
+        Script {
+            seen: &seen,
+            steps: vec![Step::Capacity; 4],
+        },
+        quick.clone(),
+        WireLimits::default(),
+        1,
+    )
+    .unwrap();
+    assert!(matches!(
+        client.request(request()).await,
+        Err(ClientError::Access(AccessError::Capacity))
+    ));
+    assert_eq!(seen.lock().unwrap().len(), 4);
+    // Once a send was uncertain, later refusals cannot prove non-execution.
+    let seen = Mutex::new(Vec::new());
+    let client = Client::new(
+        Script {
+            seen: &seen,
+            steps: vec![
+                Step::Timeout,
+                Step::Capacity,
+                Step::Capacity,
+                Step::Capacity,
+            ],
+        },
+        quick,
+        WireLimits::default(),
+        1,
+    )
+    .unwrap();
+    assert!(matches!(
+        client.request(request()).await,
+        Err(ClientError::OutcomeUnknown { .. })
+    ));
 }

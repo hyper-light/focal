@@ -138,8 +138,19 @@ fn malformed_ordinals_schemas_and_zero_identities_refuse() {
         ]),
         ContractError::InvalidManifest,
     );
-    for family in [NativeCreatedFamily::Claim, NativeCreatedFamily::Validation] {
-        for schema in [0, 2, u16::MAX] {
+    // Claims exist in descriptor schemas 1 and 2; definitions only in 1.
+    assert!(
+        candidate(vec![NativeCreatedObject {
+            schema: 2,
+            ..entry(0, NativeCreatedFamily::Claim)
+        }])
+        .is_ok()
+    );
+    for (family, schemas) in [
+        (NativeCreatedFamily::Claim, [0, 3, u16::MAX]),
+        (NativeCreatedFamily::Validation, [0, 2, u16::MAX]),
+    ] {
+        for schema in schemas {
             assert_contract(
                 candidate(vec![NativeCreatedObject {
                     schema,

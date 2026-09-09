@@ -30,6 +30,9 @@ impl AuthorityVerifier for AttemptedBypass {
     fn verify_replica_ready(&self, _: &ReplicaReady) -> Result<(), DirectoryError> {
         panic!("installed authority must never invoke caller verifier")
     }
+    fn verify_custody(&self, _: &CustodyProof) -> Result<(), DirectoryError> {
+        panic!("installed authority must never invoke caller verifier")
+    }
     fn verify_delegation(&self, _: &DelegationFence) -> Result<(), DirectoryError> {
         panic!("installed authority must never invoke caller verifier")
     }
@@ -614,9 +617,7 @@ fn quorum_activation_installed_topology_revocation_and_checkpoint_replay_are_aut
             region: RegionId([1; 16]),
             zone: ZoneId([2; 16]),
             endpoint: "127.0.0.1:7443".into(),
-            identity: ContentHash(focal_enrollment::server_fingerprint(
-                &founder.receipt().certificate,
-            )),
+            identity: ContentHash(founder.receipt().public_key),
             authority_epoch: 1,
             attestation: ContentHash([0; 32]),
             eligible: true,

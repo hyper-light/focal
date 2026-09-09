@@ -7,6 +7,12 @@
     clippy::disallowed_macros
 )]
 use focal_client::{Client, EmbeddedTransport, RetryPolicy, pending::OperationContext, watch::*};
+use focal_core::native::{NativeCommand, NativeInput, input_codec};
+use focal_ledger::NativeContentProfile;
+use focal_model::lifecycle::{
+    Binding, Principal, aggregation, claim::ClaimDefinition, creation::Proposal, graph, scope,
+    succession::Lineage, validation,
+};
 use focal_model::*;
 use focal_node::{
     config::Settings,
@@ -25,6 +31,7 @@ struct Fixture {
     host: LocalHost,
     owner: HostOwner,
     context: OperationContext,
+    worker: ParticipantId,
 }
 impl Fixture {
     fn start(root: &std::path::Path) -> Self {
@@ -36,6 +43,7 @@ impl Fixture {
             ledger: node.identity.ledger,
             principal: node.identity.issuer,
         };
+        let worker = node.identity.worker;
         let limits = WireLimits::default();
         let (host, owner) = LocalHost::spawn(node, limits.clone()).unwrap();
         let peer = AuthenticatedPeer::local(PeerGrant {
@@ -56,6 +64,7 @@ impl Fixture {
             host,
             owner,
             context,
+            worker,
         }
     }
     fn stop(self) {
@@ -359,5 +368,353 @@ fn large_seed_rows_use_server_byte_budget_and_all_continuations_finish() {
     assert_eq!(count, 11);
     assert!(pages >= 3);
     drop(watch);
+    fixture.stop();
+}
+
+// Native claim frames, shaped as in the node's own native host tests.
+fn native_binding(ledger: LedgerId, id: u128) -> Binding {
+    Binding {
+        ledger,
+        object: ObjectId::from_u128(id),
+        content: ContentHash([7; 32]),
+        revision: ObjectRevision(1),
+    }
+}
+
+fn definition(issuer: ParticipantId, binding: Binding) -> validation::Declaration {
+    let claim_id = u128::from_be_bytes(binding.object.0);
+    validation::Declaration::new(
+        Principal::Actor(issuer),
+        validation::DeclarationSpec {
+            binding: Binding {
+                object: ObjectId::from_u128(claim_id.checked_add(10_000).unwrap()),
+                ..binding
+            },
+            claim: ClaimId(binding.object.0),
+            issuer,
+            declaration_index: 900,
+            kind: ValidationKind::Receipt,
+            phase: ValidationPhase::WholeWork,
+            mode: ValidationMode::Required,
+            target: validation::TargetDeclaration::Delivery,
+            program: validation::Program::Delivery,
+            deadline: Deadline {
+                timer: TimerId::from_u128(1),
+                generation: 1,
+                at: 100,
+            },
+        },
+        validation::Limits {
+            handlers: 4,
+            attempts: 8,
+            slot_bytes: 64,
+        },
+    )
+    .unwrap()
+}
+
+fn proposal(ledger: LedgerId, issuer: ParticipantId, subject: ParticipantId, id: u128) -> Proposal {
+    let binding = native_binding(ledger, id);
+    Proposal {
+        definition: ClaimDefinition {
+            binding,
+            issuer,
+            subject,
+            deadline: None,
+            max_responses: 4,
+            created: SessionSeq(999),
+            graph: graph::Declaration::empty(),
+            lineage: Lineage::root(binding, RootCommandId::from_u128(1)).unwrap(),
+            acceptance: aggregation::AcceptancePolicy::new(
+                binding,
+                issuer,
+                &[],
+                &[definition(issuer, binding)],
+                aggregation::Limits {
+                    max_slots: 8,
+                    max_checks: 16,
+                    max_results: 32,
+                    max_updates: 8,
+                },
+            )
+            .unwrap(),
+            scope_limits: scope::ScopeLimits {
+                scopes: 8,
+                roots: 32,
+                children: 16,
+            },
+        },
+        owner: None,
+    }
+}
+
+fn create(
+    ledger: LedgerId,
+    issuer: ParticipantId,
+    worker: ParticipantId,
+    request: u128,
+    id: u128,
+) -> NativeInput {
+    let proposals = vec![proposal(ledger, issuer, worker, id)];
+    let declarations = proposals
+        .iter()
+        .map(|p| definition(issuer, p.definition.binding))
+        .collect();
+    NativeInput {
+        request: RequestKey {
+            principal: issuer,
+            epoch: RequestEpoch(1),
+            id: RequestId::from_u128(request),
+        },
+        command: NativeCommand::Create {
+            claims: proposals,
+            declarations,
+        },
+    }
+}
+
+fn frame(ledger: LedgerId, input: &NativeInput) -> Vec<u8> {
+    let plan = input_codec::EncodingPlan::prepare(
+        input_codec::InputFrame::Request {
+            ledger,
+            profile: NativeContentProfile::ProjectionOnly,
+            input,
+        },
+        input_codec::EncodingLimits {
+            bytes: 1 << 20,
+            visits: 1 << 28,
+        },
+    )
+    .unwrap();
+    let mut bytes = vec![0; plan.quote().bytes];
+    plan.write_into(&mut bytes).unwrap();
+    bytes
+}
+/// One committed native creation through the in-process client.
+fn commit_native(
+    runtime: &tokio::runtime::Runtime,
+    fixture: &Fixture,
+    request: u128,
+    claim: u128,
+) -> NativeReceipt {
+    let ledger = fixture.context.ledger;
+    let input = create(
+        ledger,
+        fixture.context.principal,
+        fixture.worker,
+        request,
+        claim,
+    );
+    let envelope = RequestEnvelope {
+        protocol: NATIVE_PROTOCOL_VERSION,
+        ledger,
+        route_epoch: RouteEpoch(1),
+        request_epoch: RequestEpoch(1),
+        request_id: RequestId::from_u128(request),
+        operation: Operation::Native {
+            frame: frame(ledger, &input),
+        },
+    };
+    match runtime
+        .block_on(fixture.client.request(envelope))
+        .unwrap()
+        .result
+    {
+        Response::Native(NativeMutationReply::Committed(receipt)) => receipt,
+        other => panic!("native creation: {other:?}"),
+    }
+}
+#[test]
+fn native_watches_seed_through_native_reads_and_stream_schema_two_deltas_in_process() {
+    let root = tempfile::tempdir().unwrap();
+    let local = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(local.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut settings = Settings::default();
+    settings.node.data_dir = Some(root.path().into());
+    focal_node::native_activation::activate_local(&settings, NativeContentProfile::ProjectionOnly)
+        .unwrap();
+    let fixture = Fixture::start(root.path());
+    let first = commit_native(&runtime, &fixture, 1, 100);
+    assert_eq!(first.sequence, SessionSeq(1));
+    let store = WatchStore::open(local.path(), fixture.context).unwrap();
+
+    // A seeded claim watch: the claim is read with its evaluations at a
+    // prefix no older than the snapshot, then the seed completes and the
+    // tail polls.
+    let mut seeded = store
+        .create(
+            "seeded",
+            WatchOptions {
+                engine: WatchEngine::Native,
+                claims: vec![ClaimId::from_u128(100)],
+                seed: true,
+                max_items: 8,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let page = delivery(&runtime, &fixture.client, &mut seeded);
+    let WatchPage::NativeSeed {
+        token,
+        objects,
+        next,
+    } = &page.page
+    else {
+        panic!("native seed page: {page:?}");
+    };
+    assert_eq!(*next, NativeSeedNext::Complete);
+    assert!(token.sequence >= SessionSeq(1));
+    assert!(
+        objects.iter().any(|object| matches!(object, NativeObject::Claim(claim) if claim.binding.object == ObjectId::from_u128(100))),
+        "{objects:?}"
+    );
+    assert!(seeded.status().seeding);
+    seeded.acknowledge(page.id).unwrap();
+    let tail = delivery(&runtime, &fixture.client, &mut seeded);
+    let WatchPage::Events { page: events } = &tail.page else {
+        panic!("tail page: {tail:?}");
+    };
+    assert!(
+        events
+            .events
+            .iter()
+            .all(|event| !matches!(event, StreamEvent::Delta { .. })),
+        "the seed's own facts are not replayed: {events:?}"
+    );
+    assert!(!seeded.status().seeding);
+    seeded.acknowledge(tail.id).unwrap();
+
+    // A second record: the seeded watch receives only its claim's facts and
+    // an unseeded watch of everything replays both records from the origin.
+    let second = commit_native(&runtime, &fixture, 2, 101);
+    assert_eq!(second.sequence, SessionSeq(2));
+    let mut everything = store
+        .create(
+            "everything",
+            WatchOptions {
+                engine: WatchEngine::Native,
+                seed: false,
+                max_items: 64,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let history = delivery(&runtime, &fixture.client, &mut everything);
+    let WatchPage::Events { page: events } = &history.page else {
+        panic!("history page: {history:?}");
+    };
+    let deltas: Vec<&Delta> = events
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::Delta { delta, .. } => Some(delta),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        deltas
+            .iter()
+            .all(|delta| delta.schema == NATIVE_DELTA_SCHEMA),
+        "{deltas:?}"
+    );
+    assert!(
+        deltas
+            .iter()
+            .all(|delta| delta.actor == fixture.context.principal)
+    );
+    let creations: Vec<ClaimId> = deltas
+        .iter()
+        .filter(|delta| {
+            matches!(
+                &delta.fact,
+                DeltaFact::Native(record) if matches!(
+                    record.fact,
+                    NativeFactRecord::Claim(NativeClaimEventRecord { kind: NativeEventKindRecord::Created, .. })
+                )
+            )
+        })
+        .filter_map(|delta| delta.claim)
+        .collect();
+    assert_eq!(
+        creations,
+        [ClaimId::from_u128(100), ClaimId::from_u128(101)],
+        "{deltas:?}"
+    );
+    assert!(
+        deltas
+            .iter()
+            .any(|delta| delta.id.sequence == SessionSeq(1))
+    );
+    assert!(
+        deltas
+            .iter()
+            .any(|delta| delta.id.sequence == SessionSeq(2))
+    );
+    for delta in &deltas {
+        let DeltaFact::Native(record) = &delta.fact else {
+            panic!("{delta:?}");
+        };
+        assert_eq!(record.sequence, delta.id.sequence);
+        assert_eq!(record.ordinal, delta.id.ordinal);
+    }
+    everything.acknowledge(history.id).unwrap();
+    let after = delivery(&runtime, &fixture.client, &mut seeded);
+    let WatchPage::Events { page: events } = &after.page else {
+        panic!("{after:?}");
+    };
+    assert!(
+        events
+            .events
+            .iter()
+            .all(|event| !matches!(event, StreamEvent::Delta { .. })),
+        "the claim filter keeps another claim's creation out: {events:?}"
+    );
+    seeded.acknowledge(after.id).unwrap();
+
+    // A watch of a family seeds through its list and restarts intact.
+    let mut definitions = store
+        .create(
+            "definitions",
+            WatchOptions {
+                engine: WatchEngine::Native,
+                family: Some(ObjectKind::Validation),
+                max_items: 8,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let listed = delivery(&runtime, &fixture.client, &mut definitions);
+    let WatchPage::NativeSeed { objects, next, .. } = &listed.page else {
+        panic!("{listed:?}");
+    };
+    assert_eq!(*next, NativeSeedNext::Complete);
+    assert_eq!(objects.len(), 2, "{objects:?}");
+    assert!(
+        objects
+            .iter()
+            .all(|object| matches!(object, NativeObject::Definition(_)))
+    );
+    drop(definitions);
+    drop(seeded);
+    drop(everything);
+    drop(store);
+    let context = fixture.context;
+    fixture.stop();
+    let fixture = Fixture::start(root.path());
+    let store = WatchStore::open(local.path(), context).unwrap();
+    let mut definitions = store.resume("definitions").unwrap();
+    assert_eq!(definitions.delivery(), Some(&listed));
+    definitions.acknowledge(listed.id).unwrap();
+    let tail = delivery(&runtime, &fixture.client, &mut definitions);
+    assert!(matches!(tail.page, WatchPage::Events { .. }), "{tail:?}");
+    let mut everything = store.resume("everything").unwrap();
+    let again = delivery(&runtime, &fixture.client, &mut everything);
+    assert!(matches!(again.page, WatchPage::Events { .. }));
+    drop(definitions);
+    drop(everything);
     fixture.stop();
 }

@@ -19,14 +19,14 @@ fn network_service_requires_runtime_before_starting_physical_owners() {
     assert!(!directory.path().join("IDENTITY").exists());
 }
 
-struct Running {
-    handles: NetworkHandles,
-    status: NetworkServiceStatus,
+pub(crate) struct Running {
+    pub(crate) handles: NetworkHandles,
+    pub(crate) status: NetworkServiceStatus,
     stop: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<Result<(), ServiceError>>,
 }
 impl Running {
-    async fn start(settings: &TestSettings) -> Self {
+    pub(crate) async fn start(settings: &TestSettings) -> Self {
         Self::from_service(settings.open().await.unwrap()).await
     }
     async fn from_service(service: NetworkService) -> Self {
@@ -61,7 +61,15 @@ impl Running {
             task,
         }
     }
-    async fn stop(mut self) {
+    /// Stop and report how the service ended, without unwrapping.
+    pub(crate) async fn outcome(mut self) -> Result<(), ServiceError> {
+        let _ = self.stop.take().unwrap().send(());
+        tokio::time::timeout(Duration::from_secs(10), &mut self.task)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+    pub(crate) async fn stop(mut self) {
         let _ = self.stop.take().unwrap().send(());
         tokio::time::timeout(Duration::from_secs(10), &mut self.task)
             .await
@@ -77,7 +85,7 @@ impl Drop for Running {
         }
     }
 }
-struct TestSettings {
+pub(crate) struct TestSettings {
     value: Settings,
     // Keep the physical reservation throughout startup, client creation, and
     // restart. Quinn receives a duplicate handle to this same bound socket,
@@ -95,7 +103,7 @@ impl TestSettings {
         NetworkService::open_with_socket(&self.value, Some(self.socket.try_clone().unwrap())).await
     }
 }
-fn settings(root: &Path) -> TestSettings {
+pub(crate) fn settings(root: &Path) -> TestSettings {
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     let address = socket.local_addr().unwrap();
     let mut settings = Settings::default();
@@ -663,7 +671,10 @@ async fn joined_service_receives_committed_root_learner_and_restarts_without_led
     let plan =
         crate::directory_bootstrap::FirstDirectoryPlan::derive(identity.cluster, identity.node)
             .unwrap();
-    assert_eq!(authority.groups.len(), 1);
+    // The first directory group is committed before the founder serves; the
+    // placement agent registers the founder's own session group after it.
+    assert!(!authority.groups.is_empty());
+    assert!(authority.groups.len() <= 2);
     let directory_grant = authority
         .groups
         .get(&plan.group())
@@ -681,6 +692,22 @@ async fn joined_service_receives_committed_root_learner_and_restarts_without_led
         peer.handles.directory.host().is_none(),
         "joining does not assign the founder directory"
     );
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let observed = founder.handles.control.observe_root().await.unwrap();
+            if observed.authority().is_some_and(|authority| {
+                authority.groups.values().any(|grant| {
+                    grant.scope == focal_directory::GroupScope::Session(identity.ledger)
+                        && grant.voters == std::collections::BTreeMap::from([(identity.node, 1)])
+                })
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the placement agent never registered the founder's session group");
     assert!(!peer_dir.path().join("POLICY").exists());
     peer.stop().await;
     founder.stop().await;

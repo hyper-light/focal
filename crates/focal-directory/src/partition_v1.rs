@@ -1,0 +1,251 @@
+//! The schema 1 partition checkpoint, kept so that control checkpoints written
+//! before assignment progress existed still restore. A restored plan derives
+//! its progress from the readiness it had recorded; nothing is invented beyond
+//! what the schema 1 rules already implied.
+use crate::*;
+use focal_model::{LedgerId, RouteEpoch};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeLoadV1 {
+    pub node: u64,
+    pub generation: u64,
+    pub report: u64,
+    pub available_memory: u64,
+    pub active_weight: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeRecordV1 {
+    pub enrollment: NodeEnrollment,
+    pub load: Option<NodeLoadV1>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlacementPhaseV1 {
+    Planned,
+    Preparing,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingPlacementV1 {
+    pub operation: OperationId,
+    pub next_route: RouteEpoch,
+    pub next_membership: u64,
+    pub next_placement: u64,
+    pub desired: PlacementSpec,
+    pub phase: PlacementPhaseV1,
+    pub ready: BTreeMap<u64, ReplicaReady>,
+    pub barrier: Option<SessionFence>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDescriptorV1 {
+    pub ledger: LedgerId,
+    pub log_group: LogGroupId,
+    pub revision: u64,
+    pub route_epoch: RouteEpoch,
+    pub membership_epoch: u64,
+    pub placement_epoch: u64,
+    pub active: PlacementSpec,
+    pub authority: SessionFence,
+    pub pending: Option<PendingPlacementV1>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionCheckpointV1 {
+    pub schema: u16,
+    pub cluster: ClusterId,
+    pub delegation: Delegation,
+    pub revision: u64,
+    pub sealed: Option<PartitionSeal>,
+    pub nodes: BTreeMap<u64, NodeRecordV1>,
+    pub sessions: BTreeMap<LedgerId, SessionDescriptorV1>,
+}
+
+impl From<NodeLoadV1> for NodeLoad {
+    fn from(value: NodeLoadV1) -> Self {
+        Self {
+            node: value.node,
+            generation: value.generation,
+            report: value.report,
+            available_memory: value.available_memory,
+            active_weight: value.active_weight,
+            disk_available: 0,
+        }
+    }
+}
+impl TryFrom<PendingPlacementV1> for PendingPlacement {
+    type Error = DirectoryError;
+    fn try_from(value: PendingPlacementV1) -> Result<Self, DirectoryError> {
+        let mut progress = BTreeMap::new();
+        if value.phase == PlacementPhaseV1::Preparing {
+            for (node, generation) in value
+                .desired
+                .placement
+                .nodes()
+                .into_iter()
+                .filter_map(|node| Some((node, value.desired.placement.generation(node)?)))
+            {
+                let roles = roles_of(&value.desired.placement, node);
+                let mut entry = AssignmentProgress::assigned(node, generation, roles);
+                if let Some(ready) = value.ready.get(&node) {
+                    entry.phase = AssignmentPhase::CustodyVerified;
+                    entry.through = ready.through;
+                    entry.custody_epoch = value.next_placement;
+                    // Schema 1 accepted the cutover fence before readiness. The
+                    // fence proves the log committed the next membership epoch,
+                    // which is what a promoted voter reports; a voter that never
+                    // reported readiness cannot be represented under that fence.
+                    if value.barrier.is_some() && entry.roles.contains(&AssignmentRole::Voter) {
+                        entry.phase = AssignmentPhase::Promoted;
+                    }
+                } else if value.barrier.is_some() && entry.roles.contains(&AssignmentRole::Voter) {
+                    return Err(DirectoryError::Phase);
+                }
+                progress.insert(node, entry);
+            }
+        }
+        let mut plan = Self {
+            operation: value.operation,
+            next_route: value.next_route,
+            next_membership: value.next_membership,
+            next_placement: value.next_placement,
+            desired: value.desired,
+            phase: match value.phase {
+                PlacementPhaseV1::Planned => PlacementPhase::Planned,
+                PlacementPhaseV1::Preparing => PlacementPhase::Preparing,
+            },
+            ready: value.ready,
+            barrier: value.barrier,
+            observations: BTreeMap::new(),
+            progress,
+        };
+        plan.phase = partition_progress::derive_phase(&plan);
+        Ok(plan)
+    }
+}
+impl TryFrom<SessionDescriptorV1> for SessionDescriptor {
+    type Error = DirectoryError;
+    fn try_from(value: SessionDescriptorV1) -> Result<Self, DirectoryError> {
+        Ok(Self {
+            ledger: value.ledger,
+            log_group: value.log_group,
+            revision: value.revision,
+            route_epoch: value.route_epoch,
+            membership_epoch: value.membership_epoch,
+            placement_epoch: value.placement_epoch,
+            active: value.active,
+            authority: value.authority,
+            pending: value.pending.map(PendingPlacement::try_from).transpose()?,
+            retiring: BTreeMap::new(),
+            refusals: Vec::new(),
+        })
+    }
+}
+/// The schema 2 node record: no liveness verdict yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeRecordV2 {
+    pub enrollment: NodeEnrollment,
+    pub load: Option<NodeLoad>,
+}
+/// The schema 2 partition checkpoint: assignment progress, but no liveness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionCheckpointV2 {
+    pub schema: u16,
+    pub cluster: ClusterId,
+    pub delegation: Delegation,
+    pub revision: u64,
+    pub sealed: Option<PartitionSeal>,
+    pub nodes: BTreeMap<u64, NodeRecordV2>,
+    pub sessions: BTreeMap<LedgerId, SessionDescriptor>,
+}
+impl TryFrom<PartitionCheckpointV1> for PartitionCheckpointV2 {
+    type Error = DirectoryError;
+    fn try_from(value: PartitionCheckpointV1) -> Result<Self, DirectoryError> {
+        Ok(Self {
+            schema: 2,
+            cluster: value.cluster,
+            delegation: value.delegation,
+            revision: value.revision,
+            sealed: value.sealed,
+            nodes: value
+                .nodes
+                .into_iter()
+                .map(|(id, node)| {
+                    (
+                        id,
+                        NodeRecordV2 {
+                            enrollment: node.enrollment,
+                            load: node.load.map(NodeLoad::from),
+                        },
+                    )
+                })
+                .collect(),
+            sessions: value
+                .sessions
+                .into_iter()
+                .map(|(ledger, session)| Ok((ledger, SessionDescriptor::try_from(session)?)))
+                .collect::<Result<_, DirectoryError>>()?,
+        })
+    }
+}
+/// A schema 2 checkpoint knows no liveness verdict: every node restores as
+/// alive until the detector commits one.
+impl From<PartitionCheckpointV2> for PartitionCheckpoint {
+    fn from(value: PartitionCheckpointV2) -> Self {
+        Self {
+            schema: PARTITION_CHECKPOINT_SCHEMA,
+            cluster: value.cluster,
+            delegation: value.delegation,
+            revision: value.revision,
+            sealed: value.sealed,
+            nodes: value
+                .nodes
+                .into_iter()
+                .map(|(id, node)| {
+                    (
+                        id,
+                        NodeRecord {
+                            enrollment: node.enrollment,
+                            load: node.load,
+                            liveness: None,
+                        },
+                    )
+                })
+                .collect(),
+            sessions: value.sessions,
+        }
+    }
+}
+impl TryFrom<PartitionCheckpointV1> for PartitionCheckpoint {
+    type Error = DirectoryError;
+    fn try_from(value: PartitionCheckpointV1) -> Result<Self, DirectoryError> {
+        Ok(PartitionCheckpointV2::try_from(value)?.into())
+    }
+}
+impl PartitionCheckpoint {
+    /// Decode a checkpoint at any schema. Schema 1 and 2 convert as above; the
+    /// result still passes every current validation before it is installed.
+    pub fn decode_any(bytes: &[u8]) -> Result<Self, DirectoryError> {
+        let (schema, _) = postcard::take_from_bytes::<u16>(bytes)
+            .map_err(|_| DirectoryError::Invalid("partition checkpoint schema"))?;
+        let (checkpoint, rest) = match schema {
+            1 => {
+                let (value, rest) = postcard::take_from_bytes::<PartitionCheckpointV1>(bytes)
+                    .map_err(|_| DirectoryError::Invalid("partition checkpoint v1"))?;
+                (Self::try_from(value)?, rest)
+            }
+            2 => {
+                let (value, rest) = postcard::take_from_bytes::<PartitionCheckpointV2>(bytes)
+                    .map_err(|_| DirectoryError::Invalid("partition checkpoint v2"))?;
+                (Self::from(value), rest)
+            }
+            3 => postcard::take_from_bytes::<Self>(bytes)
+                .map_err(|_| DirectoryError::Invalid("partition checkpoint v3"))?,
+            _ => return Err(DirectoryError::Invalid("partition checkpoint schema")),
+        };
+        if !rest.is_empty() {
+            return Err(DirectoryError::Invalid(
+                "partition checkpoint trailing bytes",
+            ));
+        }
+        Ok(checkpoint)
+    }
+}

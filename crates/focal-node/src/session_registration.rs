@@ -22,9 +22,9 @@ use focal_directory::{
     PlacementPolicy, PlacementSpec, RegionId, RootCheckpoint, SessionFenceKind,
 };
 use focal_enrollment::{EnrollmentLimits, EnrollmentRegistry, EnrollmentRole, server_fingerprint};
-use focal_ledger::{CommittedPlacement, Session, SessionPlacementRequest};
+use focal_ledger::{CommittedPlacement, MembershipView, Session, SessionPlacementRequest};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
-use focal_model::{ContentHash, LedgerId, RouteEpoch};
+use focal_model::{ContentHash, LedgerId, RouteEpoch, SessionSeq};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -50,6 +50,48 @@ pub enum SessionRegistrationError {
 }
 type Result<T> = std::result::Result<T, SessionRegistrationError>;
 
+/// The facts a registration reads from a session, whether it still owns the
+/// `Session` or the fleet hosts it. Read on the owner thread so every field
+/// describes one applied prefix; nothing here is accepted from a peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostedSessionFacts {
+    pub cluster: [u8; 16],
+    pub ledger: LedgerId,
+    pub node: u64,
+    pub group: LogGroupId,
+    pub genesis: ContentHash,
+    pub memory_limit: u64,
+    pub membership: MembershipView,
+    /// The latest placement record, which may be a pending cutover.
+    pub placement: Option<focal_directory::SessionFence>,
+    /// The activated placement and its members.
+    pub active: Option<(focal_directory::SessionFence, PlacementSpec)>,
+    pub sequence: SessionSeq,
+    pub authoritative: bool,
+}
+impl HostedSessionFacts {
+    pub fn from_session(session: &Session) -> Result<Self> {
+        let status = session.status();
+        Ok(Self {
+            cluster: session.cluster_id(),
+            ledger: session.ledger(),
+            node: status.node_id,
+            group: LogGroupId(session.group_id()),
+            genesis: session.placement_genesis()?,
+            memory_limit: u64::try_from(session.memory_stats().limit)
+                .map_err(|_| SessionRegistrationError::Capacity)?,
+            membership: session.membership()?,
+            placement: session.placement(),
+            active: session
+                .active_fence()
+                .cloned()
+                .zip(session.active_placement().cloned()),
+            sequence: session.sequence(),
+            authoritative: session.is_authoritative(),
+        })
+    }
+}
+
 /// Captured before transferring the actual Session into its fleet owner. There
 /// is no decoder or constructor accepting claimed Raft coordinates. Application
 /// identities and raw deployment constraints survive the local-to-network step.
@@ -74,6 +116,17 @@ impl FirstSessionPlan {
         required_memory: u64,
         budget: &MemoryBudget,
     ) -> Result<Self> {
+        let facts = HostedSessionFacts::from_session(session)?;
+        Self::capture_facts(&facts, network, settings, required_memory, budget)
+    }
+    /// `capture` over facts exported by a hosted replica.
+    pub fn capture_facts(
+        facts: &HostedSessionFacts,
+        network: &NetworkGenesis,
+        settings: &Settings,
+        required_memory: u64,
+        budget: &MemoryBudget,
+    ) -> Result<Self> {
         let bytes = serialized_size(&(&settings.durability, &settings.placement))?;
         if bytes > MAX_POLICY_BYTES {
             return Err(SessionRegistrationError::Capacity);
@@ -93,31 +146,28 @@ impl FirstSessionPlan {
             .validate(&network.founder)
             .map_err(|_| SessionRegistrationError::Unauthorized)?;
         let founder = &network.founder;
-        let status = session.status();
-        let membership = session.membership()?;
-        if session.cluster_id() != founder.cluster
-            || session.ledger() != founder.ledger
-            || status.node_id != founder.node
+        let membership = &facts.membership;
+        if facts.cluster != founder.cluster
+            || facts.ledger != founder.ledger
+            || facts.node != founder.node
             || membership.configuration.voters != [founder.node]
             || !membership.configuration.learners.is_empty()
             || !membership.configuration.voters_outgoing.is_empty()
             || !membership.configuration.learners_next.is_empty()
             || membership.configuration.auto_leave
-            || required_memory
-                < u64::try_from(session.memory_stats().limit)
-                    .map_err(|_| SessionRegistrationError::Capacity)?
+            || required_memory < facts.memory_limit
         {
             return Err(SessionRegistrationError::Unauthorized);
         }
-        let group = LogGroupId(session.group_id());
-        let genesis = session.placement_genesis()?;
+        let group = facts.group;
+        let genesis = facts.genesis;
         let operation = OperationId(stable_id(
             "focal.session.first-registration-operation.v1",
             founder,
             group,
             genesis,
         )?);
-        if session.placement().is_some_and(|fence| {
+        if facts.placement.as_ref().is_some_and(|fence| {
             fence.kind != SessionFenceKind::Created || fence.operation != operation
         }) {
             return Err(SessionRegistrationError::Conflict);
@@ -215,6 +265,7 @@ impl FirstSessionPlan {
                 NodeRecord {
                     enrollment: node.enrollment.clone(),
                     load: None,
+                    liveness: None,
                 },
             )]),
             1,
@@ -553,8 +604,7 @@ impl AuthorityContext {
             .find(|receipt| {
                 receipt.identity.node_id == Some(founder.node)
                     && receipt.identity.principal == founder.issuer.0
-                    && ContentHash(server_fingerprint(&receipt.certificate))
-                        == node.enrollment.identity
+                    && ContentHash(receipt.public_key) == node.enrollment.identity
             })
             .ok_or(SessionRegistrationError::Unauthorized)?;
         let identity = self
@@ -569,6 +619,24 @@ impl AuthorityContext {
         }
         Ok(node)
     }
+}
+/// Evidence naming the installed authority and enrollment revisions of a
+/// partition owner, for commands that carry no proofs of their own or append
+/// them afterwards. The enrollment bytes are decoded under `budget`.
+pub(crate) fn control_evidence(
+    installed: &ControlAuthoritySnapshot,
+    cluster: [u8; 16],
+    now: i64,
+    budget: &MemoryBudget,
+) -> Result<ControlEvidence> {
+    if installed.enrollment.len() > MAX_AUTHORITY_BYTES {
+        return Err(SessionRegistrationError::Capacity);
+    }
+    let _allocation = reserve(budget, installed.enrollment.len())?;
+    let enrollment =
+        EnrollmentRegistry::restore(&installed.enrollment, cluster, EnrollmentLimits::default())
+            .map_err(|_| SessionRegistrationError::Unauthorized)?;
+    Ok(evidence(installed, &enrollment, now))
 }
 fn evidence(
     installed: &ControlAuthoritySnapshot,

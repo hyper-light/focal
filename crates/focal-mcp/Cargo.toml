@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 focal-memory = { version = "0.1.0", path = "../focal-memory" }
 focal-client = { version = "0.1.0", path = "../focal-client" }
+focal-native-client = { version = "0.1.0", path = "../focal-native-client" }
 focal-model = { version = "0.1.0", path = "../focal-model" }
 focal-wire = { version = "0.1.0", path = "../focal-wire" }
 serde.workspace = true

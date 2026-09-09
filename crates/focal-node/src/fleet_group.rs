@@ -3,8 +3,8 @@
 //! independent; a stopped session does not stop unrelated healthy sessions.
 use super::*;
 use focal_directory::{
-    FairScheduler, ScheduleOutcome, SchedulerConfig, TenantQuota, WorkClass, WorkId, WorkKey,
-    WorkMetadata,
+    DirectoryError, FairScheduler, QueueUsage, ScheduleOutcome, SchedulerConfig, TenantQuota,
+    WorkClass, WorkId, WorkKey, WorkMetadata,
 };
 use std::collections::BTreeMap;
 #[path = "fleet_management.rs"]
@@ -19,6 +19,7 @@ pub struct FleetReplica {
     pub session: Session,
     pub config: ReplicaConfig,
 }
+#[derive(Clone)]
 pub struct FleetTenant {
     pub tenant: TenantId,
     pub weight: u32,
@@ -68,9 +69,12 @@ pub(super) fn lane(work: &Work) -> BudgetLane {
 fn class(work: &Work) -> WorkClass {
     match work {
         Work::Diagnostics(..)
+        | Work::Registration(..)
         | Work::Stop(_)
         | Work::Transfer(..)
         | Work::ManagedSupport(..)
+        | Work::ActivateNative(..)
+        | Work::ImportPayloads(..)
         | Work::Membership(..)
         | Work::Placement(..)
         | Work::Evidence(..) => WorkClass::Control,

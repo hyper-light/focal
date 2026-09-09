@@ -42,6 +42,8 @@ pub enum ClusterAdminError {
     Access(#[from] AccessError),
     #[error(transparent)]
     Control(#[from] ControlFailure),
+    #[error("credential renewal: {0}")]
+    Renewal(#[from] crate::credential_renewal::RenewalError),
     #[error("admin journal is missing, corrupt, or belongs to another physical node")]
     Corrupt,
     #[error(
@@ -180,6 +182,30 @@ impl ClusterAdmin {
                 })
             }
             _ => Err(ClusterAdminError::Invalid),
+        }
+    }
+    /// Renew this node's own credential now, through its running controller.
+    pub async fn renew_credential(&self) -> Result<AdminResult> {
+        use crate::credential_renewal::CredentialReply;
+        let bytes = self.exchange_bytes(AdminCommand::RenewCredential).await?;
+        let (reply, tail): (CredentialReply, _) =
+            postcard::take_from_bytes(&bytes).map_err(|_| ClusterAdminError::Invalid)?;
+        if !tail.is_empty() {
+            return Err(ClusterAdminError::Invalid);
+        }
+        match reply {
+            CredentialReply::Renewed(summary) if summary.node == self.identity.node => {
+                Ok(AdminResult::CredentialRenewed {
+                    node: summary.node,
+                    principal: hex(&summary.principal),
+                    issued_at: summary.issued_at,
+                    expires_at: summary.expires_at,
+                    certificate_fingerprint: hex(&summary.certificate_fingerprint),
+                    renewals: summary.renewals,
+                })
+            }
+            CredentialReply::Renewed(_) => Err(ClusterAdminError::Invalid),
+            CredentialReply::Failed(error) => Err(error.into()),
         }
     }
     pub fn open(settings: &Settings) -> Result<Self> {

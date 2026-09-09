@@ -8,12 +8,28 @@ use super::claim::{ClaimCut, ClaimDefinition, ClaimState};
 use super::memory as bytes;
 use super::succession::{CorrectionKind, Lineage};
 use super::{Binding, ContractError, Principal, scope};
-use crate::{Cause, ClaimId, ContentHash, LedgerId, ObjectId, ReceiptFence, SessionSeq};
+use crate::{
+    Cause, ClaimId, ContentHash, Escalation, LedgerId, ObjectId, ParticipantId, ReceiptFence,
+    SessionSeq,
+};
 
 pub trait EffectiveClaims {
     fn ledger(&self) -> LedgerId;
     fn prefix(&self) -> SessionSeq;
     fn claim(&self, id: ClaimId) -> Option<&ClaimState>;
+    /// Who besides the issuer may cite `parent` as a cause: the authored
+    /// follow-up policy of a schema-2 descriptor, or the frozen schema-1 rule
+    /// (the current receipt holder) when the parent carries none.
+    fn cause_escalation(&self, parent: ClaimId) -> Escalation {
+        let _ = parent;
+        Escalation::Holder
+    }
+    /// Whether `actor` is a designated evaluator of one of `parent`'s
+    /// declared validations; consulted only under `Escalation::Evaluator`.
+    fn is_designated_evaluator(&self, parent: ClaimId, actor: ParticipantId) -> bool {
+        let _ = (parent, actor);
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -430,10 +446,29 @@ impl CreationPlan {
                 if parent.receipt().map(|value| value.fence) != owner.receipt {
                     return Err(ContractError::StaleReceipt);
                 }
+                // Only the parent's issuer, its current receipt holder (unless
+                // the parent's authored policy reserves follow-ups to the
+                // issuer) or, when that policy escalates to evaluators, one
+                // of its designated evaluators may cite it as a cause; without
+                // any receipt there is no holder, so any other actor is simply
+                // the wrong one.
                 if principal != Principal::Actor(parent.issuer()) {
-                    principal.require_actor(
-                        parent.receipt().ok_or(ContractError::StaleReceipt)?.holder,
-                    )?;
+                    let parent_id = ClaimId(owner.expected.object.0);
+                    let escalation = effective.cause_escalation(parent_id);
+                    let admitted = match principal {
+                        Principal::Actor(actor) => {
+                            (escalation != Escalation::None
+                                && parent
+                                    .receipt()
+                                    .is_some_and(|receipt| receipt.holder == actor))
+                                || (escalation == Escalation::Evaluator
+                                    && effective.is_designated_evaluator(parent_id, actor))
+                        }
+                        Principal::Node(_) => false,
+                    };
+                    if !admitted {
+                        return Err(ContractError::WrongActor);
+                    }
                 }
             }
         }

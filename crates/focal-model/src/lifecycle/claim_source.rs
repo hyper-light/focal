@@ -1,5 +1,6 @@
 //! Repeatable authored claim values. Only the final owned descriptor allocates.
 use super::*;
+use crate::PeerPolicy;
 use crate::lifecycle::{aggregation, graph::VisitBudget};
 
 #[path = "claim_source_adapters.rs"]
@@ -23,6 +24,8 @@ pub struct ClaimFields<'a> {
     pub occurrence: OccurrenceId,
     pub description: &'a str,
     pub deadline: Option<Deadline>,
+    /// Schema 2 only: the immutable follow-up policy.
+    pub policy: Option<PeerPolicy>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

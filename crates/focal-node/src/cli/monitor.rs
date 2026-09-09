@@ -10,6 +10,123 @@ pub(crate) enum MonitorCommand {
     Register(Box<RegisterArgs>),
     /// Observe the exact committed monitor after a fresh quorum read.
     Get(GetArgs),
+    /// Native engine: rebind one root of your monitor from a predecessor claim to its successor.
+    Rebind(RebindArgs),
+    /// Native engine: cancel one of your claim's monitors.
+    Cancel(CancelArgs),
+}
+#[derive(Args)]
+pub(crate) struct RebindArgs {
+    #[command(flatten)]
+    input: DocumentInput,
+    /// The monitor.
+    #[arg(required_unless_present_any = ["json", "yaml", "file"])]
+    id: Option<String>,
+    /// The claim the monitor is registered on.
+    #[arg(long)]
+    owner: Option<String>,
+    #[arg(long)]
+    predecessor: Option<String>,
+    #[arg(long)]
+    successor: Option<String>,
+    #[command(flatten)]
+    mutation: MutationOptions,
+}
+#[derive(Args)]
+pub(crate) struct CancelArgs {
+    #[command(flatten)]
+    input: DocumentInput,
+    /// The monitor.
+    #[arg(required_unless_present_any = ["json", "yaml", "file"])]
+    id: Option<String>,
+    /// The claim the monitor is registered on.
+    #[arg(long)]
+    owner: Option<String>,
+    #[command(flatten)]
+    mutation: MutationOptions,
+}
+
+/// Native engine: the same flags as `register`, compiled into the native
+/// monitor document (`--owner` is the claim; `--at` is logical time).
+pub(super) fn native_register(
+    args: RegisterArgs,
+) -> Result<(NativeMonitorDocument, MutationOptions)> {
+    let fields = args.id.is_some()
+        || args.owner.is_some()
+        || !args.roots.is_empty()
+        || args.timer.is_some()
+        || args.generation.is_some()
+        || args.at.is_some();
+    if let Some(document) = args.input.load(fields)? {
+        return Ok((document, args.mutation));
+    }
+    if args.roots.len() > focal_wire::MAX_MONITOR_ROOTS {
+        return Err(InputError::Capacity.into());
+    }
+    let mut roots = Vec::new();
+    roots
+        .try_reserve_exact(args.roots.len())
+        .map_err(|_| InputError::Capacity)?;
+    for root in args.roots {
+        let (predicate, claim) = root.split_once(':').ok_or_else(|| {
+            CliError::Input("wait root must be satisfied:ID, terminal:ID or released:ID".into())
+        })?;
+        if !matches!(predicate, "satisfied" | "terminal" | "released") {
+            return Err(CliError::Input("unknown wait predicate".into()));
+        }
+        roots.push(NativeWaitRootDocument {
+            predicate: predicate.into(),
+            claim: claim.into(),
+        });
+    }
+    Ok((
+        NativeMonitorDocument {
+            claim: required(args.owner, "owner")?,
+            id: args.id,
+            roots,
+            deadline: NativeDeadlineDocument {
+                at: required(args.at, "at")?,
+                timer: args.timer,
+                generation: args.generation.unwrap_or(1),
+            },
+        },
+        args.mutation,
+    ))
+}
+pub(super) fn native_rebind(
+    args: RebindArgs,
+) -> Result<(NativeMonitorRebindDocument, MutationOptions)> {
+    let fields = args.id.is_some()
+        || args.owner.is_some()
+        || args.predecessor.is_some()
+        || args.successor.is_some();
+    if let Some(document) = args.input.load(fields)? {
+        return Ok((document, args.mutation));
+    }
+    Ok((
+        NativeMonitorRebindDocument {
+            claim: required(args.owner, "owner")?,
+            monitor: required(args.id, "monitor")?,
+            predecessor: required(args.predecessor, "predecessor")?,
+            successor: required(args.successor, "successor")?,
+        },
+        args.mutation,
+    ))
+}
+pub(super) fn native_cancel(
+    args: CancelArgs,
+) -> Result<(NativeMonitorTargetDocument, MutationOptions)> {
+    let fields = args.id.is_some() || args.owner.is_some();
+    if let Some(document) = args.input.load(fields)? {
+        return Ok((document, args.mutation));
+    }
+    Ok((
+        NativeMonitorTargetDocument {
+            claim: required(args.owner, "owner")?,
+            monitor: required(args.id, "monitor")?,
+        },
+        args.mutation,
+    ))
 }
 #[derive(Args)]
 pub(crate) struct RegisterArgs {

@@ -5,9 +5,13 @@
 //! dormant bytes are not yet a registered WAL decoder or an activation promise.
 //! Structural inspection does not prove model validity, complete history, local
 //! evidence custody or permission to publish a recovered root.
-pub mod checkpoint;
 mod buffer;
+pub mod checkpoint;
 pub use buffer::FundedRecord;
+#[cfg(test)]
+pub(in crate::native) use buffer::{
+    HEAP_EXPANSION, future_quote as future_record_quote, header_fixed_bytes, row_fixed_bytes,
+};
 pub(in crate::native) use buffer::{PendingRecord, future as future_record_bytes};
 mod events;
 mod evidence;
@@ -32,13 +36,17 @@ mod read_validate_aggregate;
 mod read_validate_attempts;
 mod read_validate_audit;
 mod read_validate_evidence;
+mod read_validate_index;
 pub mod recovery;
 pub mod replay;
 mod replay_index;
 mod replay_projection;
 mod replay_validate;
+mod replay_validate_index;
 mod rows;
 
+#[cfg(test)]
+mod bound_tests;
 #[cfg(test)]
 mod tests;
 
@@ -64,7 +72,7 @@ pub use inspect::{
 pub const MAGIC: [u8; 8] = *b"FCMUTATE";
 // Version 2 records the actual graph snapshot boundary on consequence events.
 // These dormant native bytes are separate from the frozen live V1 formats.
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 4;
 const HASH_DOMAIN: &str = "focal.native.record.v2";
 
 #[derive(Debug, Clone, Copy)]

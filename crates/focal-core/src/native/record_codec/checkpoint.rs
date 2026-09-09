@@ -13,7 +13,7 @@ use bytes::Cursor;
 mod tests;
 
 pub const MAGIC: [u8; 8] = *b"FCNROOTS";
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 4;
 pub(super) const HASH_DOMAIN: &str = "focal.native.checkpoint.v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,10 +306,73 @@ fn iteration_work() -> Result<usize, CodecError> {
 
 fn frame(sink: &mut impl Sink, core: &Core<NativeState>) -> Result<ContentHash, CodecError> {
     let state = &core.state;
-    let count = state.rows.len();
-    let prefix = state.rows.prefix();
-    if state.ledger.tenant.is_zero()
-        || state.ledger.session.is_zero()
+    frame_entries(
+        sink,
+        RootFrame {
+            ledger: state.ledger,
+            profile: state.profile,
+            range: state.rows.id(),
+            prefix: state.rows.prefix(),
+            count: state.rows.len(),
+        },
+        state.rows.entries().map(|entry| (entry.key, &entry.value)),
+    )
+}
+
+/// Fixed root frame fields shared by a retained Core and an import image.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::native) struct RootFrame {
+    pub(in crate::native) ledger: LedgerId,
+    pub(in crate::native) profile: NativeContentProfile,
+    pub(in crate::native) range: RangeId,
+    pub(in crate::native) prefix: u64,
+    pub(in crate::native) count: usize,
+}
+
+/// Encode sorted rows as one complete root image. Import translation writes
+/// its rows through this exact frame so the image restores like a checkpoint
+/// and hashes identically on every replica (23 §5.1).
+pub(in crate::native) fn encode_rows(
+    frame: RootFrame,
+    rows: &[(Key, Row)],
+    limits: EncodingLimits,
+) -> Result<(Vec<u8>, ContentHash), CodecError> {
+    if rows.len() > limits.rows || frame.count != rows.len() {
+        return Err(CodecError::Capacity);
+    }
+    let mut counting = CountingSink::new(limits.bytes, limits.visits);
+    let expected = frame_entries(
+        &mut counting,
+        frame,
+        rows.iter().map(|(key, row)| (*key, row)),
+    )?;
+    let (bytes, visits) = (counting.len(), counting.visits_used());
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(bytes)
+        .map_err(|_| CodecError::Capacity)?;
+    if output.capacity() != bytes {
+        return Err(CodecError::Capacity);
+    }
+    output.resize(bytes, 0);
+    let mut sink = SliceSink::new(&mut output, visits);
+    let hash = frame_entries(&mut sink, frame, rows.iter().map(|(key, row)| (*key, row)))?;
+    if sink.len() != bytes || hash != expected {
+        return Err(CodecError::InvalidTag("import image"));
+    }
+    sink.finish()?;
+    Ok((output, hash))
+}
+
+fn frame_entries<'a>(
+    sink: &mut impl Sink,
+    frame: RootFrame,
+    mut entries: impl Iterator<Item = (Key, &'a Row)>,
+) -> Result<ContentHash, CodecError> {
+    let count = frame.count;
+    let prefix = frame.prefix;
+    if frame.ledger.tenant.is_zero()
+        || frame.ledger.session.is_zero()
         || (prefix == 0) != (count == 0)
     {
         return Err(CodecError::InvalidTag("checkpoint frame"));
@@ -324,35 +387,33 @@ fn frame(sink: &mut impl Sink, core: &Core<NativeState>) -> Result<ContentHash, 
     write_u16(&mut hashed, VERSION)?;
     write_u8(
         &mut hashed,
-        match state.profile {
+        match frame.profile {
             NativeContentProfile::ProjectionOnly => 0,
             NativeContentProfile::AuthoredV1 => 1,
         },
     )?;
-    types::ledger(&mut hashed, state.ledger)?;
-    write_raw(&mut hashed, &state.rows.id().0.to_le_bytes())?;
+    types::ledger(&mut hashed, frame.ledger)?;
+    write_raw(&mut hashed, &frame.range.0.to_le_bytes())?;
     write_u64(&mut hashed, prefix)?;
     write_u64(&mut hashed, count_u64)?;
     let iteration = iteration_work()?;
     hashed.visit(iteration)?;
-    let mut entries = state.rows.entries();
     let mut previous = None;
     let mut meta = false;
     let mut outcome = false;
     for _ in 0..count {
         hashed.visit(iteration)?;
-        let entry = entries
+        let (key, value) = entries
             .next()
             .ok_or(CodecError::InvalidTag("checkpoint row count"))?;
-        let key = entry.key;
         if previous.is_some_and(|last| last >= key) {
             return Err(CodecError::InvalidTag("checkpoint key order"));
         }
-        rows::family(key, &entry.value)?;
+        rows::family(key, value)?;
         previous = Some(key);
         meta |= key == Key::Meta;
         outcome |= matches!(key, Key::Outcome(_));
-        put_row(&mut hashed, key, &entry.value, state.ledger)?;
+        put_row(&mut hashed, key, value, frame.ledger)?;
     }
     hashed.visit(iteration)?;
     if entries.next().is_some() {

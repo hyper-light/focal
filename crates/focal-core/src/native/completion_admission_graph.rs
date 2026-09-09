@@ -63,11 +63,6 @@ impl CompletionEnvelope {
             crate::native::completion_book::respondent_journal_visits(events, claims)?,
             limits.plan_edges,
         )?;
-        let changes = add(
-            add(add(claims, original_extras)?, add(original_events, 2)?)?,
-            cohort.changed_keys(),
-        )?;
-        within(changes, limits.range.max_batch_entries)?;
         within(events, limits.plan_edges)?;
         graph.check_journal(original_events, limits)?;
         if crate::native::admission_graph::checker_visits_bound(
@@ -96,7 +91,33 @@ impl CompletionEnvelope {
         ]
         .into_iter()
         .try_fold(0, add)?;
-        let descriptor = work::capped_descriptor(limits, fixed, descriptor)?;
+        let mut descriptor = work::capped_descriptor(limits, fixed, descriptor)?;
+        // The failed report's artifact and verdict rows and a status move for
+        // every changed graph claim and sealed cohort claim (doc 22 §7); the
+        // promised artifact cites no more inputs than leave room for them.
+        let moved = add(claims, cohort.claims())?;
+        // The reported evaluation, every changed evaluation and every monitor
+        // release retires its due timer (doc 22 §7).
+        let timers = add(
+            1,
+            crate::native::index_rows::timer_rows(
+                0,
+                add(original_extras, cohort.evaluations())?,
+                original_events,
+            )?,
+        )?;
+        let fixed_rows = add(
+            add(add(claims, original_extras)?, add(original_events, 2)?)?,
+            add(
+                cohort.changed_keys(),
+                add(add(4, add(moved, moved)?)?, timers)?,
+            )?,
+        )?;
+        descriptor.inputs = crate::native::index_rows::cap_inputs(
+            super::completion_envelope::input_bound(descriptor),
+            fixed_rows,
+            limits.range.max_batch_entries,
+        );
         let mut result = Self::derive(
             &view.state.rows,
             limits,
@@ -132,9 +153,23 @@ impl CompletionEnvelope {
         ] {
             within(bytes, entry)?;
         }
+        let changes = add(
+            add(add(claims, original_extras)?, add(original_events, 2)?)?,
+            add(
+                cohort.changed_keys(),
+                add(
+                    crate::native::index_rows::report_rows(
+                        super::completion_envelope::input_bound(descriptor),
+                    )?,
+                    add(add(moved, moved)?, timers)?,
+                )?,
+            )?,
+        )?;
+        within(changes, limits.range.max_batch_entries)?;
         let failed = view.state.rows.future_write_envelope(RangeWriteLimits {
             changed_keys: changes,
-            deleted_keys: 0,
+            deleted_keys: add(moved, timers)?,
+            deleted_heap: 0,
             incoming_heap,
             input_capacity: changes,
         })?;
@@ -147,7 +182,18 @@ impl CompletionEnvelope {
             respondent_journal,
         )?;
         let construction = result.report_construction(limits)?;
-        construction.check_counts(claims, add(original_extras, cohort.evaluations())?, events)?;
+        construction.check_counts(
+            claims,
+            add(original_extras, cohort.evaluations())?,
+            events,
+            add(
+                crate::native::index_rows::report_rows(super::completion_envelope::input_bound(
+                    descriptor,
+                ))?,
+                add(add(moved, moved)?, timers)?,
+            )?
+            .min(limits.range.max_batch_entries),
+        )?;
         let count = usize::try_from(result.reports).map_err(|_| ContractError::Capacity)?;
         result.retained = add(
             multiply(

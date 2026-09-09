@@ -93,17 +93,23 @@ fn full_chain_prices_all_retained_versions_and_only_one_parent_failure() {
                     outcomes: reports as usize,
                     sequences: u64::from(reports),
                     events: 3 * reports as usize + failure + cohort.events(),
-                    new_rows: 7 * reports as usize + failure + cohort.events(),
+                    // Seven primary rows and twenty index rows per report.
+                    new_rows: 27 * reports as usize + failure + cohort.events(),
                     ..CompletionSlots::default()
                 }
             );
+            // Nine primary writes, the report's twenty index rows and the
+            // due timers of the reported and every sealed cohort evaluation.
+            let report_index = crate::native::index_rows::report_rows(16).unwrap();
+            let regular_timers =
+                crate::native::index_rows::timer_rows(0, 1 + cohort.evaluations(), 0).unwrap();
             assert_eq!(
                 envelope
                     .report_storage(CompletionUse::Regular)
                     .unwrap()
                     .limits()
                     .changed_keys,
-                9
+                9 + report_index + regular_timers
             );
             let regular = envelope
                 .per_report_retained_bytes(CompletionUse::Regular)
@@ -114,17 +120,27 @@ fn full_chain_prices_all_retained_versions_and_only_one_parent_failure() {
                     .report_storage(CompletionUse::Regular)
                     .unwrap()
                     .additional_retained_bytes()
-                    + crate::native::mutation::bytes(9).unwrap(),
+                    + crate::native::mutation::bytes(9 + report_index + regular_timers).unwrap(),
                 "a report keeps its write set and an inline credit update"
             );
             let expected = if failure != 0 {
+                // Eleven primary rows, the cohort's rows, the report's index
+                // rows, a status move for the parent and every sealed cohort
+                // claim, and the due timers of every moved claim and every
+                // affected evaluation.
+                let failed = 11
+                    + cohort.changed_keys()
+                    + report_index
+                    + crate::native::index_rows::STATUS_ROWS * (1 + cohort.claims())
+                    + crate::native::index_rows::timer_rows(0, 1 + cohort.evaluations(), 0)
+                        .unwrap();
                 assert_eq!(
                     envelope
                         .report_storage(CompletionUse::AdmissionFailure)
                         .unwrap()
                         .limits()
                         .changed_keys,
-                    11 + cohort.changed_keys()
+                    failed
                 );
                 assert_eq!(
                     envelope
@@ -134,7 +150,7 @@ fn full_chain_prices_all_retained_versions_and_only_one_parent_failure() {
                         .report_storage(CompletionUse::AdmissionFailure)
                         .unwrap()
                         .additional_retained_bytes()
-                        + crate::native::mutation::bytes(11 + cohort.changed_keys()).unwrap()
+                        + crate::native::mutation::bytes(failed).unwrap()
                         + crate::native::completion_book::journal_bytes(1 + cohort.evaluations())
                             .unwrap(),
                     "a pending failure retains the full collected update buffer"
@@ -1365,7 +1381,9 @@ fn required_increment_prices_nine_writes_per_attempt_without_a_claim_failure_all
     let (claim, _, _) = parts(&core);
     let declaration = core.native_definition(key(4).validation).unwrap();
     let mut limits = core.limits;
-    limits.range.max_batch_entries = 9;
+    // Nine primary writes, the report's twenty index rows and its evaluation's
+    // due timer (doc 22 §7).
+    limits.range.max_batch_entries = 30;
     let before = core.state.budget.stats();
     let quote = CompletionEnvelope::derive(
         &core.state.rows,
@@ -1386,16 +1404,18 @@ fn required_increment_prices_nine_writes_per_attempt_without_a_claim_failure_all
             .report_storage(CompletionUse::AdmissionFailure)
             .is_err()
     );
+    // Nine primary writes, the report's twenty index rows and the reported
+    // evaluation's due timer (doc 22 §7).
     assert_eq!(
         quote
             .report_storage(CompletionUse::Regular)
             .unwrap()
             .limits()
             .changed_keys,
-        9
+        9 + 20 + 1
     );
     assert_eq!(quote.slots().events, reports * 3);
-    assert_eq!(quote.slots().new_rows, reports * 7);
+    assert_eq!(quote.slots().new_rows, reports * 27);
     assert_eq!(
         quote.total_retained_bytes(),
         reports
@@ -1468,7 +1488,7 @@ fn remaining_slots_keep_admission_surcharge_until_used_and_zero_it_after_termina
             outcomes: 1,
             events: 4 + quote.cohort().events(),
             sequences: 1,
-            new_rows: 8 + quote.cohort().events(),
+            new_rows: 28 + quote.cohort().events(),
             ..CompletionSlots::default()
         }
     );
@@ -1481,7 +1501,8 @@ fn remaining_slots_keep_admission_surcharge_until_used_and_zero_it_after_termina
             outcomes: 1,
             events: 3,
             sequences: 1,
-            new_rows: 7,
+            // Seven primary rows and the report's twenty index rows.
+            new_rows: 27,
             ..CompletionSlots::default()
         }
     );

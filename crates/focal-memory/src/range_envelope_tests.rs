@@ -15,9 +15,12 @@ fn config() -> RangeConfig {
 }
 
 fn limits(changed_keys: usize, deleted_keys: usize, incoming_heap: usize) -> RangeWriteLimits {
+    // Every deleted entry is priced at the largest entry this layout retains.
+    let largest = config().max_entry_bytes - size_of::<Entry<u64, Vec<u8>>>();
     RangeWriteLimits {
         changed_keys,
         deleted_keys,
+        deleted_heap: deleted_keys * largest,
         incoming_heap,
         input_capacity: changed_keys,
     }

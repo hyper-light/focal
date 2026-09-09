@@ -26,6 +26,13 @@ impl EnrollmentCommand {
             _ => None,
         }
     }
+    /// Identifies a renewal, which only the enrollment host may commit.
+    pub fn renewed_invitation(&self) -> Option<InvitationId> {
+        match self.change {
+            Change::Renew { invitation, .. } => Some(invitation),
+            _ => None,
+        }
+    }
 }
 impl EnrollmentRegistry {
     pub fn invitation_status(&self, id: InvitationId) -> Option<InvitationStatus> {

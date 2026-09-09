@@ -3,7 +3,7 @@ use crate::{
     DeltaFilter, Position, PositionOffset, ResyncReason, StreamError, add, mul,
 };
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
-use focal_model::{Delta, DeltaFact, LedgerId, SessionSeq};
+use focal_model::{Delta, DeltaFact, LedgerId, NATIVE_DELTA_SCHEMA, SessionSeq};
 use serde::{Deserialize, Serialize};
 use std::{collections::VecDeque, sync::Arc};
 
@@ -604,7 +604,10 @@ fn validate_delta(
 ) -> Result<(), StreamError> {
     let position = Position::after_delta(delta.id);
     position.validate(previous.ledger, published)?;
-    if delta.schema != 1 {
+    // Schema 1 carries the frozen legacy facts; schema 2 carries exactly one
+    // committed native event. Any other pairing is a source defect.
+    let native = matches!(delta.fact, DeltaFact::Native(_));
+    if delta.schema != if native { NATIVE_DELTA_SCHEMA } else { 1 } {
         return Err(StreamError::SourceViolation("unknown delta schema"));
     }
     if position <= previous {

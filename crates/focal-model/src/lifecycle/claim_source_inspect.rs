@@ -1,4 +1,6 @@
 use super::*;
+/// Largest authored follow-up budget of one claim.
+pub const MAX_FOLLOW_UPS: u16 = 1024;
 
 pub(in crate::lifecycle::claim_descriptor) fn inspect<'a>(
     source: &impl ClaimSource<'a>,
@@ -23,7 +25,16 @@ pub(super) fn inspect_with<'a>(
     if fields.id.is_zero() || fields.occurrence.is_zero() {
         return Err(ContractError::InvalidTarget);
     }
-    if fields.schema != 1 {
+    // Schema 1 carries no follow-up policy; schema 2 may carry one and only
+    // then may relations name exact evidence.
+    match (fields.schema, fields.policy) {
+        (1, None) | (2, _) => {}
+        _ => return Err(ContractError::InvalidPolicy),
+    }
+    if fields
+        .policy
+        .is_some_and(|policy| policy.max_follow_ups > MAX_FOLLOW_UPS)
+    {
         return Err(ContractError::InvalidPolicy);
     }
     if fields.description.len() > limits.description_bytes {
@@ -66,6 +77,14 @@ pub(super) fn inspect_with<'a>(
             return Err(ContractError::InvalidManifest);
         }
         roles.relation(fields.ledger, fields.id, &value)?;
+        // Exact evidence targets and corrective `invalidates` relations exist
+        // only from descriptor schema 2.
+        if fields.schema < 2
+            && (matches!(value.target, RelationTarget::Evidence(_))
+                || value.kind == RelationKind::Invalidates)
+        {
+            return Err(ContractError::InvalidPolicy);
+        }
         hash.relation(&value);
         previous = Some(value);
     }

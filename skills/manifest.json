@@ -1,29 +1,34 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "adapter": {
     "name": "focal-mcp",
     "version": "0.1.0",
     "recovery_contract_version": 2,
     "transfer_contract_version": 1,
     "watch_contract_version": 1,
-    "administration_contract_version": 1
+    "administration_contract_version": 1,
+    "native_contract_version": 2
   },
   "resources": [
     {
       "path": "references/workflow-contract.md",
-      "blake3": "8b0c89d08578ba6546a16101fe596a0a4ba1816d639fec519b17f40384e5a435"
+      "blake3": "e4a7cf349f3aa876e8a57a300dc41d7adc8327846d5e59a6f7277f218af30461"
     },
     {
       "path": "references/admin-workflow.md",
       "blake3": "5a57272861e188911edf45bb8127d521fb01708c93a7e5852709d631dc69bdd8"
+    },
+    {
+      "path": "references/peer-workflows.md",
+      "blake3": "dd44a8d90b6f7c7e1ee1600feb7e97a11cb63bb922ee8e10985b41cef545e737"
     }
   ],
   "skills": [
     {
       "name": "focal-claims",
-      "version": 8,
+      "version": 10,
       "path": "focal-claims/SKILL.md",
-      "blake3": "39565f2be27e619b010a4379d793c56fe5e5498a51476eeb8cafcaaca35a435c",
+      "blake3": "ceef116a30d9d22f1f6f9d26ac5321bfd5e33ab710f355bda9612b198f10616c",
       "references": [
         "references/workflow-contract.md"
       ],
@@ -150,13 +155,83 @@
           "version": 1
         }
       ],
-      "required_admin_tools": []
+      "required_admin_tools": [],
+      "required_native_operations": [
+        {
+          "name": "claim.cancel",
+          "version": 2
+        },
+        {
+          "name": "claim.get",
+          "version": 2
+        },
+        {
+          "name": "claim.list",
+          "version": 2
+        },
+        {
+          "name": "claim.post",
+          "version": 2
+        },
+        {
+          "name": "claim.release_scope",
+          "version": 2
+        },
+        {
+          "name": "claim.submit",
+          "version": 2
+        },
+        {
+          "name": "event.list",
+          "version": 2
+        },
+        {
+          "name": "ledger.standing",
+          "version": 2
+        },
+        {
+          "name": "monitor.cancel",
+          "version": 2
+        },
+        {
+          "name": "monitor.list",
+          "version": 2
+        },
+        {
+          "name": "monitor.rebind",
+          "version": 2
+        },
+        {
+          "name": "monitor.register",
+          "version": 2
+        },
+        {
+          "name": "receipt.acquire",
+          "version": 2
+        },
+        {
+          "name": "receipt.adopt",
+          "version": 2
+        },
+        {
+          "name": "receipt.list",
+          "version": 2
+        },
+        {
+          "name": "validation.get",
+          "version": 2
+        },
+        {
+          "name": "validation.list",
+          "version": 2
+        }
+      ]
     },
     {
       "name": "focal-evidence",
-      "version": 7,
+      "version": 8,
       "path": "focal-evidence/SKILL.md",
-      "blake3": "9803a35794afa1bfe8a683ac552456c82dd5e9b07120c83d385f1e187b643873",
+      "blake3": "c563f964cf1e602341cfa1bbd7c02626fb73920c18e6c44021111209422c35cc",
       "references": [
         "references/workflow-contract.md"
       ],
@@ -308,13 +383,75 @@
           "version": 1
         }
       ],
-      "required_admin_tools": []
+      "required_admin_tools": [],
+      "required_native_operations": [
+        {
+          "name": "artifact.diagnostic",
+          "version": 2
+        },
+        {
+          "name": "artifact.fail",
+          "version": 2
+        },
+        {
+          "name": "artifact.get",
+          "version": 2
+        },
+        {
+          "name": "artifact.list",
+          "version": 2
+        },
+        {
+          "name": "artifact.receive",
+          "version": 2
+        },
+        {
+          "name": "artifact.reject",
+          "version": 2
+        },
+        {
+          "name": "artifact.submit",
+          "version": 2
+        },
+        {
+          "name": "claim.get",
+          "version": 2
+        },
+        {
+          "name": "receipt.acquire",
+          "version": 2
+        },
+        {
+          "name": "testament.get",
+          "version": 2
+        },
+        {
+          "name": "testament.list",
+          "version": 2
+        },
+        {
+          "name": "testament.post",
+          "version": 2
+        },
+        {
+          "name": "testament.receive",
+          "version": 2
+        },
+        {
+          "name": "testament.submit",
+          "version": 2
+        },
+        {
+          "name": "validation.context",
+          "version": 2
+        }
+      ]
     },
     {
       "name": "focal-validation",
-      "version": 3,
+      "version": 4,
       "path": "focal-validation/SKILL.md",
-      "blake3": "75748af3608662e09fafee6b957a55c1ae9647b3936188f4b62fe44348c61be1",
+      "blake3": "687fe803704dcf897184bbd86490734a4179576a25a351b892c96eac07987363",
       "references": [
         "references/workflow-contract.md"
       ],
@@ -409,13 +546,75 @@
         }
       ],
       "required_watch_tools": [],
-      "required_admin_tools": []
+      "required_admin_tools": [],
+      "required_native_operations": [
+        {
+          "name": "artifact.get",
+          "version": 2
+        },
+        {
+          "name": "artifact.list",
+          "version": 2
+        },
+        {
+          "name": "audit.generate",
+          "version": 2
+        },
+        {
+          "name": "audit.post",
+          "version": 2
+        },
+        {
+          "name": "claim.get",
+          "version": 2
+        },
+        {
+          "name": "evaluation.list",
+          "version": 2
+        },
+        {
+          "name": "testament.get",
+          "version": 2
+        },
+        {
+          "name": "testament.receive",
+          "version": 2
+        },
+        {
+          "name": "validation.begin",
+          "version": 2
+        },
+        {
+          "name": "validation.context",
+          "version": 2
+        },
+        {
+          "name": "validation.enter_whole_work",
+          "version": 2
+        },
+        {
+          "name": "validation.get",
+          "version": 2
+        },
+        {
+          "name": "validation.list",
+          "version": 2
+        },
+        {
+          "name": "validation.report",
+          "version": 2
+        },
+        {
+          "name": "validation.seal_increments",
+          "version": 2
+        }
+      ]
     },
     {
       "name": "focal-cluster",
-      "version": 1,
+      "version": 3,
       "path": "focal-cluster/SKILL.md",
-      "blake3": "9667396fdb559ac14922cd96108f6c27405ee8f0ba24126afb1c06962c41f535",
+      "blake3": "caaded0f6de7ba5794bfa33587b726d43f4538f03354b409cb3198f69d1d0668",
       "references": [
         "references/admin-workflow.md"
       ],
@@ -430,6 +629,10 @@
         },
         {
           "name": "cluster.credentials.get",
+          "version": 1
+        },
+        {
+          "name": "cluster.credentials.renew",
           "version": 1
         },
         {
@@ -551,6 +754,97 @@
         {
           "name": "cluster.status",
           "version": 1
+        }
+      ],
+      "required_native_operations": []
+    },
+    {
+      "name": "focal-peers",
+      "version": 1,
+      "path": "focal-peers/SKILL.md",
+      "blake3": "f4f315128cda921e828aa456672c38903eeddee936ed60f4a56709512ccb3e66",
+      "references": [
+        "references/workflow-contract.md",
+        "references/peer-workflows.md"
+      ],
+      "required_operations": [],
+      "required_recovery_tools": [
+        {
+          "name": "request.inspect",
+          "version": 2
+        },
+        {
+          "name": "request.retry",
+          "version": 2
+        },
+        {
+          "name": "request.reserve",
+          "version": 2
+        },
+        {
+          "name": "request.pending",
+          "version": 2
+        },
+        {
+          "name": "request.acknowledge",
+          "version": 2
+        },
+        {
+          "name": "request.seal",
+          "version": 2
+        }
+      ],
+      "required_transfer_tools": [],
+      "required_watch_tools": [],
+      "required_admin_tools": [],
+      "required_native_operations": [
+        {
+          "name": "artifact.get",
+          "version": 2
+        },
+        {
+          "name": "claim.challenge",
+          "version": 2
+        },
+        {
+          "name": "claim.consult",
+          "version": 2
+        },
+        {
+          "name": "claim.correct",
+          "version": 2
+        },
+        {
+          "name": "claim.follow_up",
+          "version": 2
+        },
+        {
+          "name": "claim.get",
+          "version": 2
+        },
+        {
+          "name": "claim.lineage",
+          "version": 2
+        },
+        {
+          "name": "claim.list",
+          "version": 2
+        },
+        {
+          "name": "claim.post",
+          "version": 2
+        },
+        {
+          "name": "claim.wait",
+          "version": 2
+        },
+        {
+          "name": "monitor.register",
+          "version": 2
+        },
+        {
+          "name": "validation.context",
+          "version": 2
         }
       ]
     }

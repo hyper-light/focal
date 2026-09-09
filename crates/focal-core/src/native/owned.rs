@@ -421,3 +421,35 @@ impl OwnedEvent {
 #[cfg(test)]
 #[path = "owned_tests.rs"]
 mod tests;
+
+/// Frozen legacy bytes an import retains verbatim (23 §5.2). They are never
+/// decoded into a native lifecycle row; readers decode them with the frozen
+/// legacy codec on demand.
+#[derive(Debug)]
+pub(super) struct OwnedLegacy(Vec<u8>);
+impl OwnedLegacy {
+    pub(super) fn charge(len: usize) -> Result<usize, MemoryError> {
+        len.checked_add(ALLOCATION)
+            .ok_or(MemoryError::AllocationFailed)
+    }
+    pub(super) fn new(bytes: &[u8]) -> Result<Self, MemoryError> {
+        let mut owned = Vec::new();
+        owned
+            .try_reserve_exact(bytes.len())
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        if owned.capacity() != bytes.len() {
+            return Err(MemoryError::AllocationFailed);
+        }
+        owned.extend_from_slice(bytes);
+        Ok(Self(owned))
+    }
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+    pub(super) fn heap_charge(&self) -> Result<usize, MemoryError> {
+        Self::charge(self.0.len())
+    }
+    pub(super) fn copy(&self) -> Result<Self, MemoryError> {
+        Self::new(&self.0)
+    }
+}

@@ -36,8 +36,16 @@ impl DurableNode {
         allocation: Allocation,
     ) -> Result<(), ConsensusError> {
         let mut input = FundedCheckpointInput { data, allocation };
-        let overhead = if input.data.capacity() == 0 { 0 } else { const { 4 * size_of::<usize>() } };
-        let required = input.data.capacity().checked_add(overhead).ok_or(ConsensusError::Capacity)?;
+        let overhead = if input.data.capacity() == 0 {
+            0
+        } else {
+            const { 4 * size_of::<usize>() }
+        };
+        let required = input
+            .data
+            .capacity()
+            .checked_add(overhead)
+            .ok_or(ConsensusError::Capacity)?;
         if input.allocation.bytes() < required {
             return Err(ConsensusError::Capacity);
         }

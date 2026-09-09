@@ -152,8 +152,16 @@ pub fn capability(operation: &Operation) -> Capability {
         | Operation::EnrollmentControl { .. }
         | Operation::Custody(_)
         | Operation::PeerControl { .. }
+        | Operation::PlacementControl { .. }
+        | Operation::SessionSign { .. }
+        | Operation::Probe { .. }
         | Operation::NodeContact { .. } => Capability::Replication,
         Operation::Control { .. } => Capability::Runtime,
+        // Native frames carry the authenticated principal; timers never arrive
+        // here, and the owner proves every role from its committed prefix.
+        Operation::Native { .. } | Operation::NativeRead(_) | Operation::NativeList(_) => {
+            Capability::Actor
+        }
         Operation::Submit { command, .. }
         | Operation::Managed {
             operation: ManagedOperation::Submit { command, .. },
@@ -291,9 +299,15 @@ pub fn verify_request(
             | Operation::ManagedSupport { .. }
     );
     let participant = is_peer_request(&request);
-    if !participant
-        && ((managed && request.protocol != MANAGED_PROTOCOL_VERSION)
-            || (!managed && request.protocol != PROTOCOL_VERSION))
+    let native = request.protocol == crate::NATIVE_PROTOCOL_VERSION;
+    if native {
+        if !crate::native_profile_operation(&request.operation) {
+            return Err(AccessError::UnsupportedProtocol);
+        }
+    } else if crate::is_native_operation(&request.operation)
+        || (!participant
+            && ((managed && request.protocol != MANAGED_PROTOCOL_VERSION)
+                || (!managed && request.protocol != PROTOCOL_VERSION)))
     {
         return Err(AccessError::UnsupportedProtocol);
     }
@@ -375,6 +389,9 @@ pub fn check_request_shape(
         request.operation,
         Operation::Control { .. }
             | Operation::PeerControl { .. }
+            | Operation::PlacementControl { .. }
+            | Operation::SessionSign { .. }
+            | Operation::Probe { .. }
             | Operation::NodeContact { .. }
             | Operation::EnrollmentControl { .. }
             | Operation::Raft { .. }
@@ -610,6 +627,45 @@ fn request_shape(
             }
             if request.len() > MAX_PEER_CONTROL_REQUEST_BYTES {
                 return Err(AccessError::Capacity);
+            }
+            1
+        }
+        Operation::PlacementControl { group, request } => {
+            if *group == [0; 16] || request.is_empty() {
+                return Err(AccessError::InvalidRequest);
+            }
+            if request.len() > MAX_PLACEMENT_CONTROL_REQUEST_BYTES {
+                return Err(AccessError::Capacity);
+            }
+            // A node's own facts are signed with its certificate; a trusted
+            // local Node grant has none and cannot speak for a remote identity.
+            if peer.is_some_and(|peer| peer.certificate_fingerprint().is_none()) {
+                return Err(AccessError::Unauthorized);
+            }
+            1
+        }
+        Operation::SessionSign { group, request } => {
+            if *group == [0; 16] || request.is_empty() {
+                return Err(AccessError::InvalidRequest);
+            }
+            if request.len() > MAX_SESSION_SIGN_REQUEST_BYTES {
+                return Err(AccessError::Capacity);
+            }
+            if peer.is_some_and(|peer| peer.certificate_fingerprint().is_none()) {
+                return Err(AccessError::Unauthorized);
+            }
+            1
+        }
+        Operation::Probe { request } => {
+            if request.is_empty() {
+                return Err(AccessError::InvalidRequest);
+            }
+            if request.len() > MAX_PROBE_BYTES {
+                return Err(AccessError::Capacity);
+            }
+            // A probe speaks for a remote node identity: certificate-bound.
+            if peer.is_some_and(|peer| peer.certificate_fingerprint().is_none()) {
+                return Err(AccessError::Unauthorized);
             }
             1
         }

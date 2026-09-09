@@ -50,6 +50,22 @@ pub(super) fn immutable(key: Key) -> bool {
             | Key::ClaimIdentity(..)
             | Key::DefinitionIdentity(..)
             | Key::CreationResult(_)
+            | Key::LegacyTestament(_)
+            | Key::LegacyEvidenceSet(_)
+            | Key::LegacyRun(..)
+            | Key::LegacyDefinition(_)
+            | Key::ByIssuer(..)
+            | Key::BySubject(..)
+            | Key::ByAction(..)
+            | Key::ByScope(..)
+            | Key::ByRelation(..)
+            | Key::ByProducer(..)
+            | Key::ByArtifactKind(..)
+            | Key::BySchema(..)
+            | Key::ArtifactInput(..)
+            | Key::ByEvaluator(..)
+            | Key::ByVerdict(..)
+            | Key::ByCreated(..)
     )
 }
 
@@ -77,9 +93,14 @@ pub(super) fn validate<O: Overlay>(read: &ReplayRead<'_, '_, O>) -> Result<(), N
         last = Some(key);
         // All native row families retain allocation/history identities. Live
         // removal of an active monitor writes a tombstone, not a key deletion.
-        // The format can represent deletes, but no current native command has
-        // authority to erase any retained row or a derived membership head.
-        let value = value.ok_or_else(invalid)?;
+        // The only key deletion any native command has authority over is the
+        // status index row a claim transition leaves behind (doc 22 §7); no
+        // retained row or derived membership head is ever erased.
+        let Some(value) = value else {
+            require(matches!(key, Key::ByStatus(..) | Key::DueTimer(..)))?;
+            require(matches!(read.before(key)?, Some(Row::Index)))?;
+            continue;
+        };
         mutation::check_family(key, value)?;
         let old = read.before(key)?;
         if let Some(old) = old {

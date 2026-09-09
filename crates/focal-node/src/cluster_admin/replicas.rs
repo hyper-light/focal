@@ -60,6 +60,26 @@ impl ClusterAdmin {
             _ => Err(ClusterAdminError::Invalid),
         }
     }
+    /// Propose native activation on the ledger's authority. The record commits
+    /// under the current configuration; diagnostics show when it applied.
+    pub async fn replica_activate_native(&self, session: SessionId) -> Result<AdminResult> {
+        let (group, _) = self.replica_configuration(session, None).await?;
+        match self
+            .replica_exchange(ReplicaAdminCommand::ActivateNative { session, group })
+            .await?
+        {
+            ReplicaAdminReply::NativeActivationProposed {
+                session: actual,
+                group: actual_group,
+            } if actual == session && actual_group == group => {
+                Ok(AdminResult::ReplicaNativeActivationProposed {
+                    session: session.to_string(),
+                    group: hex(&group),
+                })
+            }
+            _ => Err(ClusterAdminError::Invalid),
+        }
+    }
     pub async fn replica_list(&self, after: Option<SessionId>, limit: u16) -> Result<AdminResult> {
         let ReplicaAdminReply::Inventory {
             management_sequence,

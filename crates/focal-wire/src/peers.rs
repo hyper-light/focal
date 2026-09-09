@@ -208,6 +208,22 @@ impl PeerConnectionPool {
         state.routes = routes;
         Ok(())
     }
+    /// Present a renewed credential on every connection opened from now on.
+    /// Cached connections under the previous certificate are retired, so the
+    /// next send to each peer opens a connection the peer authorizes anew.
+    pub fn replace_identity(&self, tls: quinn::ClientConfig) -> Result<(), PeerSendError> {
+        self.connector
+            .replace_tls(tls)
+            .map_err(|_| PeerSendError::Configuration)?;
+        let mut state = self.state.lock().map_err(|_| PeerSendError::Closed)?;
+        if state.closed {
+            return Err(PeerSendError::Closed);
+        }
+        for (_, entry) in std::mem::take(&mut state.cached) {
+            entry.slot.retire();
+        }
+        Ok(())
+    }
     /// There is no internal packet queue. Global/per-peer permits reject excess
     /// work immediately; the FleetHost owns its separate bounded egress queue.
     /// Ok means ingress accepted this packet, never a quorum/durability signal.
@@ -264,6 +280,40 @@ impl PeerConnectionPool {
         }
         match self.exchange(target, request).await? {
             Response::Control { response } => Ok(response),
+            _ => Err(PeerSendError::InvalidRequest),
+        }
+    }
+    /// Placement protocol to a partition owner or a session-fact signature
+    /// from a peer; both reply with opaque control bytes the caller decodes.
+    pub async fn send_placement(
+        &self,
+        target: u64,
+        request: &RequestEnvelope,
+    ) -> Result<Vec<u8>, PeerSendError> {
+        if !matches!(
+            request.operation,
+            Operation::PlacementControl { .. } | Operation::SessionSign { .. }
+        ) {
+            return Err(PeerSendError::InvalidRequest);
+        }
+        match self.exchange(target, request).await? {
+            Response::Control { response } => Ok(response),
+            Response::Error(error) => Err(PeerSendError::Rejected(error)),
+            _ => Err(PeerSendError::InvalidRequest),
+        }
+    }
+    /// A liveness probe; the reply is the peer's opaque probe reply.
+    pub async fn send_probe(
+        &self,
+        target: u64,
+        request: &RequestEnvelope,
+    ) -> Result<Vec<u8>, PeerSendError> {
+        if !matches!(request.operation, Operation::Probe { .. }) {
+            return Err(PeerSendError::InvalidRequest);
+        }
+        match self.exchange(target, request).await? {
+            Response::Probe(reply) => Ok(reply),
+            Response::Error(error) => Err(PeerSendError::Rejected(error)),
             _ => Err(PeerSendError::InvalidRequest),
         }
     }
@@ -329,6 +379,17 @@ impl PeerConnectionPool {
                     && !request.is_empty()
                     && request.len() <= MAX_PEER_CONTROL_REQUEST_BYTES
             }
+            Operation::PlacementControl { group, request } => {
+                *group != [0; 16]
+                    && !request.is_empty()
+                    && request.len() <= MAX_PLACEMENT_CONTROL_REQUEST_BYTES
+            }
+            Operation::SessionSign { group, request } => {
+                *group != [0; 16]
+                    && !request.is_empty()
+                    && request.len() <= MAX_SESSION_SIGN_REQUEST_BYTES
+            }
+            Operation::Probe { request } => !request.is_empty() && request.len() <= MAX_PROBE_BYTES,
             Operation::NodeContact { group, .. } => *group != [0; 16],
             Operation::EnrollmentControl {
                 group,
@@ -384,7 +445,8 @@ impl PeerConnectionPool {
                         value @ (Response::PeerAccepted
                         | Response::Custody(_)
                         | Response::Control { .. }
-                        | Response::ManagedSupport(_)) => {
+                        | Response::ManagedSupport(_)
+                        | Response::Probe(_)) => {
                             if slot.retired.load(Ordering::Acquire) {
                                 return Err(PeerSendError::RouteChanged);
                             }

@@ -35,6 +35,8 @@ pub enum ServeError {
     Owner,
     #[error("MCP transport shutdown deadline exceeded; saved operations remain recoverable")]
     Shutdown,
+    #[error("MCP engine probe failed before any tool was served: {0}")]
+    Probe(String),
 }
 
 struct Job {
@@ -60,11 +62,21 @@ enum Event {
 /// return means the host must exit, releasing any OS I/O still blocked at the
 /// bounded shutdown deadline. It is not a reusable embedded thread pool.
 pub fn serve<T: ClientTransport + 'static, R: Read + Send + 'static, W: Write + Send + 'static>(
-    backend: Backend<T>,
+    mut backend: Backend<T>,
     reader: R,
     writer: W,
 ) -> Result<(), ServeError> {
-    let budget = MemoryBudget::new(128 * MIB, 80 * MIB)?;
+    // 80 MiB of ordinary headroom: the catalogue's construction admission
+    // (half a mebibyte per tool) and its measured resident tree (about 7.5
+    // MiB for the 47-tool native catalogue) are held together before the
+    // admission is released, beside the frame decoder and the journals.
+    let budget = MemoryBudget::new(160 * MIB, 80 * MIB)?;
+    // The worker's runtime is created here so the engine probe, which may bind
+    // a remote endpoint to it, and every later call share one runtime.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    backend.detect(&runtime).map_err(ServeError::Probe)?;
     let limits = Limits {
         max_frame_bytes: 278_528,
         max_response_bytes: 16 * MIB,
@@ -73,29 +85,38 @@ pub fn serve<T: ClientTransport + 'static, R: Read + Send + 'static, W: Write + 
     };
     // Reserve before constructing serde schema trees. Protocol takes its own
     // measured resident charge before this temporary admission is released.
-    let tool_count = focal_client::operations::descriptors()
-        .len()
-        .checked_add(6)
-        .and_then(|n| {
-            n.checked_add(if backend.has_admin() {
-                crate::catalog_admin::TOOL_COUNT
-            } else {
-                0
-            })
-        })
-        .and_then(|n| {
-            n.checked_add(if backend.has_uploads() {
-                crate::catalog_transfer::TOOL_COUNT
-            } else {
-                0
-            })
-        })
-        .and_then(|n| {
-            n.checked_add(if backend.has_watches() {
+    let application = match backend.native_standing() {
+        Some(standing) => {
+            crate::catalog_native::tool_count(standing)?.checked_add(if backend.has_watches() {
                 crate::catalog_watch::TOOL_COUNT
             } else {
                 0
             })
+        }
+        None => focal_client::operations::descriptors()
+            .len()
+            .checked_add(6)
+            .and_then(|n| {
+                n.checked_add(if backend.has_uploads() {
+                    crate::catalog_transfer::TOOL_COUNT
+                } else {
+                    0
+                })
+            })
+            .and_then(|n| {
+                n.checked_add(if backend.has_watches() {
+                    crate::catalog_watch::TOOL_COUNT
+                } else {
+                    0
+                })
+            }),
+    }
+    .ok_or(ProtocolError::Capacity)?;
+    let tool_count = application
+        .checked_add(if backend.has_admin() {
+            crate::catalog_admin::TOOL_COUNT
+        } else {
+            0
         })
         .ok_or(ProtocolError::Capacity)?;
     // Covers each retained pruned input/output tree and one temporary shared
@@ -111,11 +132,14 @@ pub fn serve<T: ClientTransport + 'static, R: Read + Send + 'static, W: Write + 
             construction_bytes,
         )?
         .commit();
-    let mut tools = crate::catalog::catalog()?;
+    let mut tools = match backend.native_standing() {
+        Some(standing) => crate::catalog_native::catalog(standing)?,
+        None => crate::catalog::catalog()?,
+    };
     if backend.has_admin() {
         crate::catalog_admin::append(&mut tools)?;
     }
-    if backend.has_uploads() {
+    if !backend.has_native() && backend.has_uploads() {
         crate::catalog_transfer::append(&mut tools)?;
     }
     if backend.has_watches() {
@@ -141,7 +165,7 @@ pub fn serve<T: ClientTransport + 'static, R: Read + Send + 'static, W: Write + 
     let (jobs, work) = mpsc::sync_channel(1);
     let (frames, output) = mpsc::sync_channel(2);
     let worker = owner("focal-mcp-ledger", &budget, events.clone(), move |events| {
-        worker(backend, work, events)
+        worker(backend, runtime, work, events)
     })?;
     let writer = owner("focal-mcp-output", &budget, events.clone(), move |events| {
         write_output(writer, output, events)
@@ -336,12 +360,10 @@ fn owner(
 }
 fn worker<T: ClientTransport>(
     mut backend: Backend<T>,
+    runtime: tokio::runtime::Runtime,
     jobs: Receiver<Job>,
     events: &SyncSender<Event>,
 ) -> Result<(), ServeError> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
     while let Ok(mut job) = jobs.recv() {
         let result = backend.execute(&runtime, &mut job.call, &mut job.cancel);
         events

@@ -243,7 +243,11 @@ fn list_flags_share_registry_predicates_and_preserve_cli_page_defaults() {
             ListCommand::Claims(args)
             | ListCommand::Testaments(args)
             | ListCommand::Artifacts(args)
-            | ListCommand::Validations(args) => args,
+            | ListCommand::Validations(args)
+            | ListCommand::Evaluations(args)
+            | ListCommand::Receipts(args)
+            | ListCommand::Monitors(args)
+            | ListCommand::Events(args) => args,
         };
         let mut document = authored::filters(args.filters);
         document.limit = args.limit;
@@ -376,4 +380,533 @@ fn atomic_claim_batch_flags_json_yaml_share_one_intent_and_reject_mixed_input() 
         ]))
         .is_err()
     );
+}
+
+mod native_adapters {
+    use super::*;
+    use focal_client::operations::{
+        NativeAuthoredOperation, NativeExposure, NativePayloadDocument, native_coverage_table,
+    };
+
+    fn native_document(args: &[&str]) -> NativeAuthoredOperation {
+        match command(args) {
+            Commands::Submit {
+                command: SubmitCommand::Claim(args),
+            } => NativeAuthoredOperation::ClaimSubmit(native_documents::claim(args).unwrap().0),
+            Commands::Submit {
+                command: SubmitCommand::Testament(args),
+            } => NativeAuthoredOperation::TestamentSubmit(
+                native_documents::testament(args).unwrap().0,
+            ),
+            Commands::Submit {
+                command: SubmitCommand::Artifact(args),
+            } => NativeAuthoredOperation::ArtifactSubmit(native_documents::work(args).unwrap().0),
+            Commands::Artifact {
+                command: ArtifactCommand::Submit(args),
+            } => NativeAuthoredOperation::ArtifactSubmit(native_documents::work(*args).unwrap().0),
+            Commands::Testament {
+                command: TestamentCommand::Submit(args),
+            } => NativeAuthoredOperation::TestamentSubmit(
+                native_documents::testament(*args).unwrap().0,
+            ),
+            Commands::Artifact {
+                command: ArtifactCommand::Diagnostic(args),
+            } => NativeAuthoredOperation::ArtifactDiagnostic(
+                native_documents::diagnostic(*args).unwrap().0,
+            ),
+            Commands::Testament {
+                command: TestamentCommand::Post(args),
+            } => NativeAuthoredOperation::TestamentPost(
+                native_documents::response_target(args).unwrap().0,
+            ),
+            Commands::Validation {
+                command: ValidationCommand::Begin(args),
+            } => NativeAuthoredOperation::ValidationBegin(native_documents::begin(args).unwrap().0),
+            Commands::Validation {
+                command: ValidationCommand::Report(args),
+            } => NativeAuthoredOperation::ValidationReport(
+                native_documents::report(*args).unwrap().0,
+            ),
+            Commands::Receipt {
+                command: ReceiptCommand::Acquire(args),
+            } => {
+                NativeAuthoredOperation::ReceiptAcquire(native_documents::receipt(args).unwrap().0)
+            }
+            Commands::Claim {
+                command: ClaimCommand::Cancel(args),
+            } => NativeAuthoredOperation::ClaimCancel(native_documents::cancel(args).unwrap().0),
+            Commands::Claim {
+                command: ClaimCommand::ReleaseScope(args),
+            } => NativeAuthoredOperation::ClaimReleaseScope(
+                native_documents::claim_target(args).unwrap().0,
+            ),
+            Commands::Receipt {
+                command: ReceiptCommand::Adopt(args),
+            } => NativeAuthoredOperation::ReceiptAdopt(native_documents::adopt(args).unwrap().0),
+            Commands::Artifact {
+                command: ArtifactCommand::Fail(args),
+            } => NativeAuthoredOperation::ArtifactFail(native_documents::fail(args).unwrap().0),
+            Commands::Artifact {
+                command: ArtifactCommand::Receive(args),
+            } => NativeAuthoredOperation::ArtifactReceive(
+                native_documents::artifact_target(args).unwrap().0,
+            ),
+            Commands::Artifact {
+                command: ArtifactCommand::Reject(args),
+            } => {
+                NativeAuthoredOperation::ArtifactReject(native_documents::reject(*args).unwrap().0)
+            }
+            Commands::Validation {
+                command: ValidationCommand::SealIncrements(args),
+            } => NativeAuthoredOperation::ValidationSealIncrements(
+                native_documents::seal_increments(args).unwrap().0,
+            ),
+            Commands::Validation {
+                command: ValidationCommand::EnterWholeWork(args),
+            } => NativeAuthoredOperation::ValidationEnterWholeWork(
+                native_documents::response_target(args).unwrap().0,
+            ),
+            Commands::Audit {
+                command: AuditCommand::Generate(args),
+            } => NativeAuthoredOperation::AuditGenerate(native_documents::audit(args).unwrap().0),
+            Commands::Audit {
+                command: AuditCommand::Post(args),
+            } => {
+                NativeAuthoredOperation::AuditPost(native_documents::audit_target(args).unwrap().0)
+            }
+            Commands::Monitor {
+                command: super::super::monitor::MonitorCommand::Register(args),
+            } => NativeAuthoredOperation::MonitorRegister(
+                super::super::monitor::native_register(*args).unwrap().0,
+            ),
+            Commands::Monitor {
+                command: super::super::monitor::MonitorCommand::Rebind(args),
+            } => NativeAuthoredOperation::MonitorRebind(
+                super::super::monitor::native_rebind(args).unwrap().0,
+            ),
+            Commands::Monitor {
+                command: super::super::monitor::MonitorCommand::Cancel(args),
+            } => NativeAuthoredOperation::MonitorCancel(
+                super::super::monitor::native_cancel(args).unwrap().0,
+            ),
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn the_remaining_native_verbs_adapt_flags_and_documents_identically() {
+        let check = |flags: &[&str], name: &str| {
+            let operation = native_document(flags);
+            assert_eq!(operation.name(), name, "{flags:?}");
+            let json = serde_json::to_string(&operation).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let body = json
+                .as_object()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .to_string();
+            let root: Vec<&str> = flags[..2].to_vec();
+            let mut through_json = root.clone();
+            through_json.extend(["--json", &body]);
+            let parsed = native_document(&through_json);
+            assert_eq!(
+                parsed.canonical_intent().unwrap(),
+                operation.canonical_intent().unwrap(),
+                "{flags:?}"
+            );
+            operation
+        };
+        check(&["claim", "release-scope", ID], "claim.release_scope");
+        let adopt = check(
+            &["receipt", "adopt", ID, "--holder", "self"],
+            "receipt.adopt",
+        );
+        let NativeAuthoredOperation::ReceiptAdopt(document) = adopt else {
+            panic!()
+        };
+        assert_eq!(
+            (document.claim.as_str(), document.holder.as_str()),
+            (ID, "self")
+        );
+        let fail = check(
+            &[
+                "artifact",
+                "fail",
+                "--claim",
+                ID,
+                "--slot",
+                "2",
+                "--diagnostic",
+                &format!("{OTHER}:{HASH}"),
+            ],
+            "artifact.fail",
+        );
+        let NativeAuthoredOperation::ArtifactFail(document) = fail else {
+            panic!()
+        };
+        assert_eq!(document.slot, 2);
+        assert_eq!(document.diagnostic, OTHER);
+        assert_eq!(document.hash.as_deref(), Some(HASH));
+        let NativeAuthoredOperation::ArtifactFail(unpinned) = native_document(&[
+            "artifact",
+            "fail",
+            "--claim",
+            ID,
+            "--slot",
+            "0",
+            "--diagnostic",
+            OTHER,
+        ]) else {
+            panic!()
+        };
+        assert_eq!(unpinned.hash, None);
+        check(
+            &["artifact", "receive", OTHER, "--claim", ID],
+            "artifact.receive",
+        );
+        let reject = check(
+            &[
+                "artifact",
+                "reject",
+                OTHER,
+                "--claim",
+                ID,
+                "--reason",
+                "metadata",
+                "--text",
+                "{}",
+                "--visibility",
+                "team",
+            ],
+            "artifact.reject",
+        );
+        let NativeAuthoredOperation::ArtifactReject(document) = reject else {
+            panic!()
+        };
+        assert_eq!(document.reason, "metadata");
+        assert_eq!(document.visibility, ["team"]);
+        check(
+            &["validation", "seal-increments", "--claim", ID],
+            "validation.seal_increments",
+        );
+        check(
+            &["validation", "enter-whole-work", OTHER, "--claim", ID],
+            "validation.enter_whole_work",
+        );
+        let begin = check(
+            &[
+                "validation",
+                "begin",
+                "--claim",
+                ID,
+                "--validation",
+                OTHER,
+                "--phase",
+                "increment",
+                "--target",
+                OTHER,
+            ],
+            "validation.begin",
+        );
+        let NativeAuthoredOperation::ValidationBegin(document) = begin else {
+            panic!()
+        };
+        assert_eq!(document.phase, "increment");
+        assert_eq!(document.target.as_deref(), Some(OTHER));
+        let NativeAuthoredOperation::ValidationReport(report) = native_document(&[
+            "validation",
+            "report",
+            "--claim",
+            ID,
+            "--validation",
+            OTHER,
+            "--phase",
+            "admission",
+            "--verdict",
+            "fail",
+            "--text",
+            "{}",
+        ]) else {
+            panic!()
+        };
+        assert_eq!(report.phase, "admission");
+        check(&["audit", "generate", "--claim", ID], "audit.generate");
+        check(&["audit", "post", OTHER], "audit.post");
+        let monitor = check(
+            &[
+                "monitor",
+                "register",
+                "--owner",
+                ID,
+                "--root",
+                &format!("satisfied:{OTHER}"),
+                "--root",
+                &format!("released:{ID}"),
+                "--at",
+                "4102444800000",
+            ],
+            "monitor.register",
+        );
+        let NativeAuthoredOperation::MonitorRegister(document) = monitor else {
+            panic!()
+        };
+        assert_eq!(document.roots.len(), 2);
+        assert_eq!(document.roots[1].predicate, "released");
+        assert_eq!(document.deadline.generation, 1);
+        assert_eq!(document.deadline.timer, None);
+        check(
+            &[
+                "monitor",
+                "rebind",
+                OTHER,
+                "--owner",
+                ID,
+                "--predecessor",
+                OTHER,
+                "--successor",
+                ID,
+            ],
+            "monitor.rebind",
+        );
+        check(
+            &["monitor", "cancel", OTHER, "--owner", ID],
+            "monitor.cancel",
+        );
+        // Unknown predicates and missing deadlines are refused before compilation.
+        let Commands::Monitor {
+            command: super::super::monitor::MonitorCommand::Register(args),
+        } = command(&[
+            "monitor",
+            "register",
+            "--owner",
+            ID,
+            "--root",
+            &format!("done:{OTHER}"),
+            "--at",
+            "5",
+        ])
+        else {
+            panic!()
+        };
+        assert!(super::super::monitor::native_register(*args).is_err());
+        let Commands::Monitor {
+            command: super::super::monitor::MonitorCommand::Register(args),
+        } = command(&[
+            "monitor",
+            "register",
+            "--owner",
+            ID,
+            "--root",
+            &format!("satisfied:{OTHER}"),
+        ])
+        else {
+            panic!()
+        };
+        assert!(super::super::monitor::native_register(*args).is_err());
+    }
+    const ID: &str = "00000000000000000000000000000010";
+    const OTHER: &str = "00000000000000000000000000000011";
+    const HASH: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    #[test]
+    fn native_flags_and_documents_compile_to_the_same_authored_operations() {
+        let validation = r#"{"kind":"receipt","description":"Deliver.","deadline":{"at":10}}"#;
+        let flags = native_document(&[
+            "submit",
+            "claim",
+            "--description",
+            "Do the work.",
+            "--target",
+            ID,
+            "--scope",
+            "file:src/lib.rs",
+            "--relation",
+            &format!("reviews:{OTHER}"),
+            "--validation-json",
+            validation,
+            "--slot-json",
+            r#"{"slot":0}"#,
+            "--parent",
+            OTHER,
+            "--max-responses",
+            "2",
+        ]);
+        let NativeAuthoredOperation::ClaimSubmit(document) = &flags else {
+            panic!()
+        };
+        assert_eq!(document.relations[0].target, format!("claim:{OTHER}"));
+        assert_eq!(document.parent.as_deref(), Some(OTHER));
+        assert_eq!(document.max_responses, 2);
+        assert_eq!(document.slots.len(), 1);
+        // The same document through --json yields identical canonical intent.
+        let json = serde_json::to_string(document).unwrap();
+        let parsed = native_document(&["submit", "claim", "--json", &json]);
+        assert_eq!(
+            parsed.canonical_intent().unwrap(),
+            flags.canonical_intent().unwrap()
+        );
+        // Field flags and a document never merge.
+        let Commands::Submit {
+            command: SubmitCommand::Claim(args),
+        } = command(&["submit", "claim", "--json", &json, "--description", "x"])
+        else {
+            panic!()
+        };
+        assert!(native_documents::claim(args).is_err());
+
+        let testament = native_document(&[
+            "submit",
+            "testament",
+            "--claim",
+            ID,
+            "--summary",
+            "Done.",
+            "--confidence",
+            "committed",
+            "--outcome",
+            "complete",
+            "--slot",
+            &format!("0={OTHER}:{HASH}"),
+            "--diagnostic",
+            &format!("{OTHER}:{HASH}"),
+        ]);
+        let NativeAuthoredOperation::TestamentSubmit(document) = testament else {
+            panic!()
+        };
+        assert_eq!(document.manifest[0].slot, 0);
+        assert_eq!(document.diagnostics[0].id, OTHER);
+        // V1-only fences are refused, not silently dropped.
+        let Commands::Submit {
+            command: SubmitCommand::Testament(args),
+        } = command(&[
+            "submit",
+            "testament",
+            "--claim",
+            ID,
+            "--summary",
+            "Done.",
+            "--confidence",
+            "committed",
+            "--outcome",
+            "complete",
+            "--receipt",
+            OTHER,
+            "--receipt-epoch",
+            "1",
+        ])
+        else {
+            panic!()
+        };
+        assert!(native_documents::testament(args).is_err());
+
+        let work = native_document(&[
+            "artifact",
+            "submit",
+            "--claim",
+            ID,
+            "--slot",
+            "1",
+            "--text",
+            "{}",
+            "--visibility",
+            "team",
+        ]);
+        let NativeAuthoredOperation::ArtifactSubmit(document) = work else {
+            panic!()
+        };
+        assert_eq!(document.slot, 1);
+        assert!(matches!(
+            document.payload,
+            NativePayloadDocument::Text { .. }
+        ));
+        let diagnostic = native_document(&[
+            "artifact",
+            "diagnostic",
+            "--claim",
+            ID,
+            "--reason",
+            "work",
+            "--text",
+            "{}",
+        ]);
+        assert!(matches!(
+            diagnostic,
+            NativeAuthoredOperation::ArtifactDiagnostic(_)
+        ));
+        let post = native_document(&["testament", "post", OTHER, "--claim", ID]);
+        let NativeAuthoredOperation::TestamentPost(document) = post else {
+            panic!()
+        };
+        assert_eq!(
+            (document.claim.as_str(), document.testament.as_str()),
+            (ID, OTHER)
+        );
+        let begin = native_document(&[
+            "validation",
+            "begin",
+            "--claim",
+            ID,
+            "--validation",
+            OTHER,
+            "--slot",
+            "0",
+        ]);
+        let NativeAuthoredOperation::ValidationBegin(document) = begin else {
+            panic!()
+        };
+        assert_eq!(document.slot, Some(0));
+        let report = native_document(&[
+            "validation",
+            "report",
+            "--claim",
+            ID,
+            "--validation",
+            OTHER,
+            "--verdict",
+            "pass",
+            "--text",
+            "{}",
+        ]);
+        assert!(matches!(
+            report,
+            NativeAuthoredOperation::ValidationReport(_)
+        ));
+        let acquire = native_document(&["receipt", "acquire", ID]);
+        assert!(matches!(
+            acquire,
+            NativeAuthoredOperation::ReceiptAcquire(_)
+        ));
+        let cancel = native_document(&["claim", "cancel", ID]);
+        assert!(matches!(cancel, NativeAuthoredOperation::ClaimCancel(_)));
+        let Commands::Claim {
+            command: ClaimCommand::Cancel(args),
+        } = command(&["claim", "cancel", ID, "--reason", "no"])
+        else {
+            panic!()
+        };
+        assert!(native_documents::cancel(args).is_err());
+    }
+
+    #[test]
+    fn every_exposed_coverage_row_names_a_command_in_the_clap_tree() {
+        let tree = super::super::command_tree::command();
+        for row in native_coverage_table() {
+            if row.exposure != NativeExposure::AuthoredTool {
+                assert!(row.cli.is_empty());
+                continue;
+            }
+            let mut path = row.cli.split(' ');
+            assert_eq!(path.next(), Some("focal"));
+            let mut node = &tree;
+            for segment in path {
+                node = node
+                    .get_subcommands()
+                    .find(|sub| sub.get_name() == segment)
+                    .unwrap_or_else(|| panic!("{}: no subcommand {segment}", row.cli));
+            }
+            assert!(node.get_subcommands().next().is_none(), "{}", row.cli);
+        }
+    }
 }

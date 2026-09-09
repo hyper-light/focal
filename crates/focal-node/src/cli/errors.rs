@@ -33,6 +33,20 @@ pub(crate) fn classification(error: &(dyn Error + 'static)) -> Failure {
                 exit_code: 5,
             },
             CliError::Unconfirmed => Failure::outcome_unknown(),
+            CliError::NativeRefused(refusal) => failure::native(refusal),
+            CliError::NativeStore(error) => failure::native_store(error),
+            CliError::NativeCompile(error) => match error {
+                focal_native_client::CompileError::Input(error) => failure::input(error),
+                focal_native_client::CompileError::Contract(_) => {
+                    Failure::error("invalid_input", 2)
+                }
+                focal_native_client::CompileError::Capacity(_) => Failure::error("capacity", 6),
+                focal_native_client::CompileError::Codec(_) => Failure::error("native_frame", 1),
+                focal_native_client::CompileError::Missing(_) => Failure::error("not_found", 4),
+                focal_native_client::CompileError::Unsupported(_) => {
+                    Failure::error("operation_conflict", 5)
+                }
+            },
             CliError::Other(error) => classification(error.as_ref()),
             CliError::Io(error) => io(error),
         };

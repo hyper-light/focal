@@ -143,6 +143,7 @@ struct Answer<T> {
 enum Action {
     Invite(RequestId, InviteIntent, oneshot::Sender<Answer<Invitation>>),
     Redeem(JoinRequest, oneshot::Sender<Answer<EnrollmentReceipt>>),
+    Renew(RenewRequest, oneshot::Sender<Answer<EnrollmentReceipt>>),
     Revoke(InvitationId, oneshot::Sender<Answer<()>>),
     Authorize(Vec<u8>, oneshot::Sender<Answer<PeerGrant>>),
     Stop(oneshot::Sender<()>),
@@ -308,6 +309,20 @@ impl QuorumEnrollmentHost {
             .map_err(|_| QuorumEnrollmentError::Stopped)?
             .result
     }
+    /// Renew a credential its holder proves it holds; the same key receives a
+    /// fresh certificate and lifetime.
+    pub async fn renew(
+        &self,
+        request: RenewRequest,
+    ) -> Result<EnrollmentReceipt, QuorumEnrollmentError> {
+        let bytes = request.encode()?.len();
+        let (send, receive) = oneshot::channel();
+        self.enqueue(Action::Renew(request, send), bytes)?;
+        receive
+            .await
+            .map_err(|_| QuorumEnrollmentError::Stopped)?
+            .result
+    }
     pub async fn revoke(&self, invitation: InvitationId) -> Result<(), QuorumEnrollmentError> {
         let (send, receive) = oneshot::channel();
         self.enqueue(Action::Revoke(invitation, send), 16)?;
@@ -337,23 +352,25 @@ impl QuorumEnrollmentHost {
         receive.await.map_err(|_| QuorumEnrollmentError::Stopped)
     }
 }
+fn join_response(result: Result<EnrollmentReceipt, QuorumEnrollmentError>) -> JoinResponse {
+    match result {
+        Ok(receipt) => JoinResponse::Enrolled(receipt),
+        Err(QuorumEnrollmentError::Enrollment(error)) => {
+            JoinResponse::Rejected(JoinFailure::from(&error))
+        }
+        Err(QuorumEnrollmentError::Control(ControlFailure::Capacity)) => {
+            JoinResponse::Rejected(JoinFailure::Capacity)
+        }
+        Err(QuorumEnrollmentError::Identity) => JoinResponse::Rejected(JoinFailure::WrongCluster),
+        Err(_) => JoinResponse::Rejected(JoinFailure::OutcomeUnknown),
+    }
+}
 impl JoinHandler for QuorumEnrollmentHost {
     fn handle(&self, request: JoinRequest) -> JoinFuture<'_> {
-        Box::pin(async move {
-            match self.redeem(request).await {
-                Ok(receipt) => JoinResponse::Enrolled(receipt),
-                Err(QuorumEnrollmentError::Enrollment(error)) => {
-                    JoinResponse::Rejected(JoinFailure::from(&error))
-                }
-                Err(QuorumEnrollmentError::Control(ControlFailure::Capacity)) => {
-                    JoinResponse::Rejected(JoinFailure::Capacity)
-                }
-                Err(QuorumEnrollmentError::Identity) => {
-                    JoinResponse::Rejected(JoinFailure::WrongCluster)
-                }
-                Err(_) => JoinResponse::Rejected(JoinFailure::OutcomeUnknown),
-            }
-        })
+        Box::pin(async move { join_response(self.redeem(request).await) })
+    }
+    fn renew(&self, request: RenewRequest) -> JoinFuture<'_> {
+        Box::pin(async move { join_response(self.renew(request).await) })
     }
 }
 impl QuorumEnrollmentDriver {
@@ -379,6 +396,13 @@ impl QuorumEnrollmentDriver {
                 }
                 Action::Redeem(request, send) => {
                     let result = self.redeem(control, &request).await;
+                    let _ = send.send(Answer {
+                        result,
+                        _charge: work._charge,
+                    });
+                }
+                Action::Renew(request, send) => {
+                    let result = self.renew(control, &request).await;
                     let _ = send.send(Answer {
                         result,
                         _charge: work._charge,
@@ -598,6 +622,24 @@ impl QuorumEnrollmentDriver {
         self.commit(control, command).await?;
         let (registry, _charge) = self.registry(control).await?;
         Ok(registry.release(request, now()?)?)
+    }
+    async fn renew(
+        &mut self,
+        control: &impl EnrollmentControl,
+        request: &RenewRequest,
+    ) -> Result<EnrollmentReceipt, QuorumEnrollmentError> {
+        self.reconcile(control).await?;
+        let (registry, charge) = self.registry(control).await?;
+        let grace = crate::credential_renewal::grace_seconds(registry.limits().credential_lifetime);
+        let command = match registry.prepare_renew(&self.authority, request, now()?, grace)? {
+            RenewPreparation::Existing(receipt) => return Ok(receipt),
+            RenewPreparation::Commit(command) => command,
+        };
+        drop(registry);
+        drop(charge);
+        self.commit(control, command).await?;
+        let (registry, _charge) = self.registry(control).await?;
+        Ok(registry.release_renewal(request, now()?)?)
     }
     async fn revoke(
         &mut self,

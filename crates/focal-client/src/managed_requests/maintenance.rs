@@ -12,7 +12,7 @@ impl ManagedRequests {
         }
         if let Phase::Initialize(initial) = &state.phase {
             ManagedOperationStore::finish_initialization(
-                &self.parent.join(&self.name),
+                &self.child_path(&state),
                 self.context,
                 self.limits,
                 &initial.input,
@@ -65,10 +65,19 @@ impl ManagedRequests {
             Phase::Ready => {
                 let store = self.ready(&state)?;
                 let pruned = self.prune(&store, &mut state)?;
+                let status = store.status()?;
+                if status.closed {
+                    // The closed generation is fully resolved and retired:
+                    // rotate to the next generation on the same slot. The
+                    // record now names the next phase, so the fresh load
+                    // below continues with its registration.
+                    self.begin_rotation(&directory, &mut state, status.stream)?;
+                    drop(directory);
+                    return self.maintenance(ids);
+                }
                 let control = if let Some(control) = store.pending_control()? {
                     Some(control)
                 } else {
-                    let status = store.status()?;
                     let mut next = status.retired_through;
                     let mut count = 0u32;
                     for mark in &state.delivered {
@@ -81,10 +90,14 @@ impl ManagedRequests {
                         next = expected;
                         count = count.checked_add(1).ok_or(ManagedRequestsError::Corrupt)?;
                     }
-                    if count == 0 {
-                        None
-                    } else {
+                    if count > 0 {
                         Some(store.prepare_acknowledgment(fresh(ids)?, count)?)
+                    } else if store.stop_if_drained(state.rotation)? {
+                        // Every ordinal of a full generation is retired:
+                        // stop issuance durably and close it exactly.
+                        Some(store.prepare_close(fresh(ids)?)?)
+                    } else {
+                        None
                     }
                 };
                 let Some(control) = control else {
@@ -189,6 +202,8 @@ impl ManagedRequests {
                     RequestStreamState::Vacant { generation, .. } => generation,
                     RequestStreamState::Active { stream, .. } => stream.generation,
                 };
+                // An owned registration whose reply was lost is recognized
+                // by its nonce at exactly the generation it was assigned.
                 let ours = matches!(observed,RequestStreamState::Active{stream,owner:actual,window:bound,..} if expected_generation.checked_add(1)==Some(stream.generation) && owner==actual && window==bound);
                 if generation > expected_generation && !ours {
                     state.phase = Phase::Scan { slot };

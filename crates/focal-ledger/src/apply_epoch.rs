@@ -416,7 +416,9 @@ fn apply_capacity(error: &LedgerError) -> bool {
         error,
         LedgerError::Capacity
             | LedgerError::Epoch(EpochError::Capacity(_))
-            | LedgerError::Memory(MemoryError::Capacity { .. })
-            | LedgerError::Graph(GraphError::Memory(MemoryError::Capacity { .. }))
+            | LedgerError::Memory(MemoryError::Capacity { .. } | MemoryError::DiskCapacity { .. })
+            | LedgerError::Graph(GraphError::Memory(
+                MemoryError::Capacity { .. } | MemoryError::DiskCapacity { .. }
+            ))
     )
 }

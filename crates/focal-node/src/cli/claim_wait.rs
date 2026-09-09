@@ -16,29 +16,46 @@ pub(crate) enum Until {
     Satisfied,
     Terminal,
     Released,
+    /// Native engine: the issuer has received a closing testament.
+    Testament,
 }
-impl From<Until> for ClaimWaitUntil {
-    fn from(value: Until) -> Self {
-        match value {
-            Until::Satisfied => Self::Satisfied,
-            Until::Terminal => Self::Terminal,
-            Until::Released => Self::Released,
+impl Until {
+    /// The V1 observer's predicates; `testament` exists on the native engine.
+    fn legacy(self) -> Result<ClaimWaitUntil> {
+        Ok(match self {
+            Until::Satisfied => ClaimWaitUntil::Satisfied,
+            Until::Terminal => ClaimWaitUntil::Terminal,
+            Until::Released => ClaimWaitUntil::Released,
+            Until::Testament => {
+                return Err(CliError::Input(
+                    "--until testament observes a native ledger; V1 ledgers offer satisfied, terminal or released".into(),
+                ));
+            }
+        })
+    }
+    pub(super) fn native(self) -> focal_client::operations::NativeWaitUntil {
+        use focal_client::operations::NativeWaitUntil;
+        match self {
+            Until::Satisfied => NativeWaitUntil::Satisfied,
+            Until::Terminal => NativeWaitUntil::Terminal,
+            Until::Released => NativeWaitUntil::Released,
+            Until::Testament => NativeWaitUntil::Testament,
         }
     }
 }
 #[derive(Args)]
 pub(crate) struct WaitArgs {
     #[command(flatten)]
-    input: DocumentInput,
+    pub(super) input: DocumentInput,
     #[arg(required_unless_present_any = ["json", "yaml", "file"])]
-    claim: Option<String>,
+    pub(super) claim: Option<String>,
     #[arg(long, value_enum, required_unless_present_any = ["json", "yaml", "file"])]
-    until: Option<Until>,
+    pub(super) until: Option<Until>,
     /// Observer deadline in milliseconds, 1..30000; use watch for longer waits.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=30000))]
-    timeout_ms: Option<u32>,
+    pub(super) timeout_ms: Option<u32>,
     #[command(flatten)]
-    output: super::args::OutputOptions,
+    pub(super) output: super::args::OutputOptions,
 }
 pub(super) fn run(
     runtime: &tokio::runtime::Runtime,
@@ -55,7 +72,7 @@ pub(super) fn run(
             until: args
                 .until
                 .ok_or_else(|| CliError::Input("--until is required".into()))?
-                .into(),
+                .legacy()?,
             timeout_ms: args.timeout_ms.unwrap_or(30_000),
         },
     };

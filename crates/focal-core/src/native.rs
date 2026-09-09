@@ -29,14 +29,20 @@ mod delivery;
 mod delivery_owned;
 #[cfg(test)]
 mod event_budget_tests;
+pub mod event_record;
+#[cfg(any(test, feature = "test-support"))]
+pub mod fixtures;
 #[cfg(test)]
 mod funding_tests;
 mod graph_effects;
 mod history;
+mod import;
 mod incoming_graph;
 mod increment_authority;
 mod increment_seal;
 mod increments;
+mod index_rows;
+mod index_scan;
 pub mod input_codec;
 mod intent;
 #[cfg(test)]
@@ -50,6 +56,8 @@ mod mutation;
 mod object_journal;
 mod owned;
 mod owner;
+#[cfg(test)]
+mod owner_record_buffer_tests;
 mod prepare;
 mod prepare_budget;
 mod projection;
@@ -100,6 +108,7 @@ use creation_result::OwnedCreationResult;
 pub use creation_result::{NativeCreatedFamily, NativeCreatedObject, NativeCreationResult};
 pub use delivery_owned::NativeDeliveryResult;
 use delivery_owned::OwnedDeliveryResult;
+pub use event_record::delta as native_delta;
 use focal_memory::{
     BudgetStats, MemoryBudget, MemoryError, PreparedRange, RangeConfig, RangeId, RangeStats,
     RangeStore, SnapshotLease,
@@ -116,15 +125,21 @@ use focal_model::lifecycle::{
 };
 use focal_model::{
     ArtifactId, ClaimId, ClaimStatus, ContentHash, Deadline, LedgerId, MonitorId, ParticipantId,
-    ReceiptFence, ReceiptId, RequestKey, SessionSeq, TestamentId, TimerId, ValidationId,
-    WaitPredicate,
+    ReceiptFence, ReceiptId, RequestEpoch, RequestId, RequestKey, SessionSeq, TestamentId, TimerId,
+    ValidationId, WaitPredicate,
 };
 use history::StoredEvent;
+pub use import::{ImportError, ImportRequest, Imported, InlinePayload, import, inline_payloads};
+pub use index_rows::{artifact_kind_hash, scope_key_hash};
+pub use index_scan::{NativeIndexHit, NativeIndexScan};
 pub use missing_owned::NativeMissingResult;
 use missing_owned::OwnedMissingResult;
-use owned::{OwnedClaim, OwnedClaimContent, OwnedDeclaration, OwnedEvaluation, OwnedEvent};
+use owned::{
+    OwnedClaim, OwnedClaimContent, OwnedDeclaration, OwnedEvaluation, OwnedEvent, OwnedLegacy,
+};
 pub use owner::{
-    NativeCandidate, NativeOwner, NativeOwnerError, NativeOwnerInitError, NativeOwnerIntoCoreError, NativeStaging, NativeView,
+    NativeCandidate, NativeOwner, NativeOwnerError, NativeOwnerInitError, NativeOwnerIntoCoreError,
+    NativeStaging, NativeView,
 };
 pub use projection_quote::NativeProjectionQuote;
 pub use response_input::{
@@ -163,6 +178,12 @@ pub struct NativeLimits {
     pub work_artifacts_per_cycle: usize,
     pub diagnostics_per_cycle: usize,
     pub response_summary_bytes: usize,
+    /// Inputs one artifact may cite, and so the `ArtifactInput` index rows its
+    /// admission writes (22 §7); never above the model's fixed ceiling.
+    pub artifact_inputs: usize,
+    /// Frozen legacy rows an imported ledger may retain (23 §5.2).
+    pub legacy_rows: usize,
+    pub legacy_row_bytes: usize,
 }
 impl Default for NativeLimits {
     fn default() -> Self {
@@ -187,6 +208,9 @@ impl Default for NativeLimits {
             work_artifacts_per_cycle: 256,
             diagnostics_per_cycle: 64,
             response_summary_bytes: 64 * 1024,
+            artifact_inputs: 16,
+            legacy_rows: 4_000_000,
+            legacy_row_bytes: 1024 * 1024,
         }
     }
 }
@@ -293,6 +317,29 @@ pub enum NativeInvocation {
     EvaluationDeadline(NativeDeadlineKey),
     ClaimDeadline(NativeClaimDeadlineKey),
     MonitorDeadline(NativeMonitorDeadlineKey),
+    /// The one-time translation of a sealed legacy prefix (23 §5). Never a
+    /// participant request and never a timer; it owns native sequence one.
+    Import,
+}
+/// Custody request identity of an imported artifact (23 §5.2): derived from
+/// the ledger and artifact under a private domain, principal = producer, epoch
+/// one. It is never minted by a participant and never consumes a retry slot.
+pub fn import_request(
+    ledger: LedgerId,
+    artifact: ArtifactId,
+    producer: ParticipantId,
+) -> RequestKey {
+    let mut hash = blake3::Hasher::new_derive_key("focal.native.import.request.v1");
+    hash.update(&ledger.tenant.0);
+    hash.update(&ledger.session.0);
+    hash.update(&artifact.0);
+    let mut id = [0u8; 16];
+    hash.finalize_xof().fill(&mut id);
+    RequestKey {
+        principal: producer,
+        epoch: RequestEpoch(1),
+        id: RequestId(id),
+    }
 }
 impl From<RequestKey> for NativeInvocation {
     fn from(request: RequestKey) -> Self {
@@ -507,6 +554,15 @@ pub enum NativeOperation {
     ReportWork,
     EvaluationDeadline,
     ClaimDeadline,
+    Import,
+}
+/// Address of one frozen legacy row retained by import.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeLegacyKey {
+    Testament(TestamentId),
+    EvidenceSet(focal_model::EvidenceSetId),
+    Run { validation: ValidationId, run: u32 },
+    Definition(ValidationId),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeOutcome {
@@ -552,6 +608,9 @@ pub enum NativeEventKind {
     ResponseObserved,
     Expired,
     Deadlocked,
+    /// A legacy status fact carried by import; the value is the legacy
+    /// sequence at which the legacy engine recorded it (23 §5.2).
+    Imported(SessionSeq),
 }
 /// Ledger-local monitor facts carry their exact model cuts without duplicating
 /// owner bindings. Each is one ordinary claim revision in the same journal.
@@ -779,7 +838,8 @@ impl EvaluationKey {
     }
 }
 impl EvaluationTarget {
-    fn of(target: validation::Target) -> Self {
+    /// The lookup identity of a pinned evaluation target.
+    pub fn of(target: validation::Target) -> Self {
         use validation::Target;
         match target {
             Target::Admission { .. } => EvaluationTarget::Admission,
@@ -909,7 +969,66 @@ enum Key {
     ClaimIdentity(u16, ContentHash),
     DefinitionIdentity(u16, ContentHash),
     CreationResult(NativeInvocation),
+    LegacyTestament(TestamentId),
+    LegacyEvidenceSet(focal_model::EvidenceSetId),
+    LegacyRun(ValidationId, u32),
+    LegacyDefinition(ValidationId),
+    /// Secondary index families (doc 22 §7). Unit rows derived from exactly
+    /// one primary row; replay and recovery check them against it.
+    ByIssuer(ParticipantId, ClaimId),
+    BySubject(ParticipantId, ClaimId),
+    ByStatus(u16, ClaimId),
+    ByAction(u16, ClaimId),
+    ByScope(u16, ContentHash, ClaimId),
+    ByRelation(u16, ClaimId, ClaimId),
+    ByProducer(ParticipantId, ArtifactId),
+    ByArtifactKind(ContentHash, ArtifactId),
+    BySchema(ContentHash, ArtifactId),
+    ArtifactInput(focal_model::ObjectId, ArtifactId),
+    ByEvaluator(ParticipantId, ValidationId),
+    ByVerdict(u16, NativeResultKey),
+    ByCreated(u16, SessionSeq, focal_model::ObjectId),
+    /// A trusted timer that is due at the logical time and has not been
+    /// consumed: the claim's deadline, an evaluation's declaration deadline
+    /// or a monitor's deadline (22 §7).
+    DueTimer(u64, TimerTarget),
     End,
+}
+
+/// The primary row a due timer belongs to. Its deadline identity (timer and
+/// generation) is read from that row when the timer is delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TimerTarget {
+    Claim(ClaimId),
+    Evaluation(EvaluationKey),
+    Monitor(ClaimId, MonitorId),
+}
+impl TimerTarget {
+    /// The invocation delivering this timer with `deadline`.
+    pub fn invocation(self, deadline: Deadline) -> NativeInvocation {
+        match self {
+            Self::Claim(claim) => NativeInvocation::ClaimDeadline(NativeClaimDeadlineKey {
+                claim,
+                timer: deadline.timer,
+                generation: deadline.generation,
+            }),
+            Self::Evaluation(evaluation) => {
+                NativeInvocation::EvaluationDeadline(NativeDeadlineKey {
+                    evaluation,
+                    timer: deadline.timer,
+                    generation: deadline.generation,
+                })
+            }
+            Self::Monitor(claim, monitor) => {
+                NativeInvocation::MonitorDeadline(NativeMonitorDeadlineKey {
+                    claim,
+                    monitor,
+                    timer: deadline.timer,
+                    generation: deadline.generation,
+                })
+            }
+        }
+    }
 }
 
 /// Separate immutable definition/descriptor pages from frequently rewritten
@@ -922,6 +1041,24 @@ fn page_partition(key: &Key) -> u64 {
         Key::Artifact(_) | Key::ArtifactIdentity(_) => 2,
         Key::ClaimContent(_) | Key::ClaimIdentity(..) => 3,
         Key::CreationResult(_) => 4,
+        Key::LegacyTestament(_)
+        | Key::LegacyEvidenceSet(_)
+        | Key::LegacyRun(..)
+        | Key::LegacyDefinition(_) => 5,
+        Key::ByIssuer(..)
+        | Key::BySubject(..)
+        | Key::ByStatus(..)
+        | Key::ByAction(..)
+        | Key::ByScope(..)
+        | Key::ByRelation(..)
+        | Key::ByProducer(..)
+        | Key::ByArtifactKind(..)
+        | Key::BySchema(..)
+        | Key::ArtifactInput(..)
+        | Key::ByEvaluator(..)
+        | Key::ByVerdict(..)
+        | Key::ByCreated(..)
+        | Key::DueTimer(..) => 6,
         _ => 0,
     }
 }
@@ -940,6 +1077,7 @@ struct Meta {
     monitors: usize,
     monitor_links: usize,
     creation_results: usize,
+    legacy: usize,
     logical_time: u64,
 }
 #[derive(Debug)]
@@ -974,6 +1112,12 @@ enum Row {
     ClaimIdentity(ClaimId),
     DefinitionIdentity(ValidationId),
     CreationResult(OwnedCreationResult),
+    LegacyTestament(OwnedLegacy),
+    LegacyEvidenceSet(OwnedLegacy),
+    LegacyRun(OwnedLegacy),
+    LegacyDefinition(OwnedLegacy),
+    /// The unit value of every secondary index row.
+    Index,
 }
 
 /// All allocated candidate rows, outcomes and events have one immutable root.
@@ -1163,6 +1307,7 @@ fn checked_native_limits(
         || limits.responses == 0
         || limits.work_artifacts_per_cycle == 0
         || limits.diagnostics_per_cycle == 0
+        || limits.artifact_inputs == 0
         || limits.response_summary_bytes == 0
         || limits.range.max_batch_entries < 4
     {
@@ -1240,6 +1385,31 @@ impl Core<NativeState> {
     }
     pub fn native_sequence(&self) -> SessionSeq {
         SessionSeq(self.state.rows.prefix())
+    }
+    /// The trusted clock of the last committed record; zero before any record.
+    pub fn native_logical_time(&self) -> u64 {
+        match self.state.rows.get(&Key::Meta) {
+            Some(Row::Meta(meta)) => meta.logical_time,
+            _ => 0,
+        }
+    }
+    /// Frozen V1 bytes retained by import (23 §5.2), never reinterpreted here.
+    pub fn native_legacy_bytes(&self, key: NativeLegacyKey) -> Option<&[u8]> {
+        let key = match key {
+            NativeLegacyKey::Testament(id) => Key::LegacyTestament(id),
+            NativeLegacyKey::EvidenceSet(id) => Key::LegacyEvidenceSet(id),
+            NativeLegacyKey::Run { validation, run } => Key::LegacyRun(validation, run),
+            NativeLegacyKey::Definition(id) => Key::LegacyDefinition(id),
+        };
+        match self.state.rows.get(&key) {
+            Some(
+                Row::LegacyTestament(row)
+                | Row::LegacyEvidenceSet(row)
+                | Row::LegacyRun(row)
+                | Row::LegacyDefinition(row),
+            ) => Some(row.bytes()),
+            _ => None,
+        }
     }
     pub fn native_claim(&self, id: ClaimId) -> Option<&ClaimState> {
         as_claim(self.state.rows.get(&Key::Claim(id)))
@@ -1375,6 +1545,56 @@ impl<'a> View<'a> {
     fn evaluation(&self, key: EvaluationKey) -> Result<&validation::EvaluationState, NativeError> {
         as_evaluation(self.get(Key::Evaluation(key))).ok_or(ContractError::InvalidTarget.into())
     }
+    /// Ordered rows of the effective prefix at or after `start`. The caller
+    /// bounds what it consumes; nothing is allocated per row.
+    fn entries_from(
+        &self,
+        start: Key,
+    ) -> impl Iterator<Item = &'a focal_memory::Entry<Key, Row>> + use<'a> {
+        let (committed, tail) = match self.tail {
+            Some(tail) => (None, Some(tail.range.entries_from(&start, false))),
+            None => (Some(self.state.rows.entries_from(&start, false)), None),
+        };
+        committed
+            .into_iter()
+            .flatten()
+            .chain(tail.into_iter().flatten())
+    }
+    /// Committed claims whose authored `kind` relation targets `target`
+    /// (the relation index of 22 §7), in identity order.
+    fn relation_sources(
+        &self,
+        kind: focal_model::RelationKind,
+        target: ClaimId,
+    ) -> impl Iterator<Item = ClaimId> + use<'a> {
+        let code = kind.code();
+        self.entries_from(Key::ByRelation(code, target, ClaimId([0; 16])))
+            .take_while(move |entry| matches!(entry.key, Key::ByRelation(k, t, _) if k == code && t == target))
+            .filter(|entry| matches!(entry.value, Row::Index))
+            .filter_map(|entry| match entry.key {
+                Key::ByRelation(_, _, source) => Some(source),
+                _ => None,
+            })
+    }
+    /// Every evaluation of `claim` in key order with its state.
+    fn evaluations_of(
+        &self,
+        claim: ClaimId,
+    ) -> impl Iterator<Item = (EvaluationKey, &'a validation::EvaluationState)> + use<'a> {
+        self.entries_from(Key::Evaluation(EvaluationKey {
+            claim,
+            validation: ValidationId([0; 16]),
+            target: EvaluationTarget::Admission,
+            generation: 0,
+        }))
+        .take_while(move |entry| matches!(entry.key, Key::Evaluation(key) if key.claim == claim))
+        .filter_map(|entry| match (&entry.key, &entry.value) {
+            (Key::Evaluation(key), Row::Evaluation(state)) => {
+                state.get().map(|state| (*key, state))
+            }
+            _ => None,
+        })
+    }
 }
 impl EffectiveClaims for View<'_> {
     fn ledger(&self) -> LedgerId {
@@ -1388,6 +1608,19 @@ impl EffectiveClaims for View<'_> {
     }
     fn claim(&self, id: ClaimId) -> Option<&ClaimState> {
         as_claim(self.get(Key::Claim(id)))
+    }
+    fn cause_escalation(&self, parent: ClaimId) -> focal_model::Escalation {
+        authored_reads::content(self.get(Key::ClaimContent(parent)))
+            .and_then(|content| content.policy())
+            .map_or(focal_model::Escalation::Holder, |policy| policy.escalation)
+    }
+    fn is_designated_evaluator(&self, parent: ClaimId, actor: ParticipantId) -> bool {
+        authored_reads::content(self.get(Key::ClaimContent(parent))).is_some_and(|content| {
+            content.requirements().iter().any(|pin| {
+                as_definition(self.get(Key::Definition(pin.id)))
+                    .is_some_and(|definition| definition.designates(actor))
+            })
+        })
     }
 }
 

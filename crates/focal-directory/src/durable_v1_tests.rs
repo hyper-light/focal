@@ -9,6 +9,15 @@ macro_rules! fixture {
     };
 }
 
+/// Rows whose live type gained fields after the writer was frozen: only the
+/// V1 path reads the fixture, and it must write the identical bytes back.
+fn frozen_parity<T: V1 + PartialEq + Debug>(bytes: &[u8]) -> T {
+    let (Value(frozen), tail) = postcard::take_from_bytes::<Value<T>>(bytes).unwrap();
+    assert!(tail.is_empty());
+    assert_eq!(postcard::to_allocvec(&Ref(&frozen)).unwrap(), bytes);
+    frozen
+}
+
 fn parity<T: V1 + DeserializeOwned + PartialEq + Debug>(bytes: &[u8]) -> T {
     let original: T = postcard::from_bytes(bytes).unwrap();
     let (Value(frozen), tail) = postcard::take_from_bytes::<Value<T>>(bytes).unwrap();
@@ -30,8 +39,12 @@ fn all_native_types_preserve_original_writer_bytes_and_owned_values() {
     parity::<Vec<NamespaceKey>>(fixture!("namespace-keys.rows"));
     parity::<Vec<NamespaceRange>>(fixture!("namespace-ranges.rows"));
     parity::<Vec<NodeEnrollment>>(fixture!("node-enrollments.rows"));
-    parity::<Vec<NodeLoad>>(fixture!("node-loads.rows"));
-    parity::<Vec<NodeRecord>>(fixture!("node-records.rows"));
+    for load in frozen_parity::<Vec<NodeLoad>>(fixture!("node-loads.rows")) {
+        assert_eq!(load.disk_available, 0);
+    }
+    for record in frozen_parity::<Vec<NodeRecord>>(fixture!("node-records.rows")) {
+        assert!(record.load.is_none_or(|load| load.disk_available == 0));
+    }
     parity::<Vec<FailureClass>>(fixture!("failure-classes.rows"));
     parity::<Vec<DurabilityIntent>>(fixture!("durability-intents.rows"));
     parity::<Vec<PlacementPolicy>>(fixture!("placement-policies.rows"));
@@ -45,7 +58,7 @@ fn all_native_types_preserve_original_writer_bytes_and_owned_values() {
 
 #[test]
 fn distinct_field_sentinels_pin_order_even_between_same_typed_fields() {
-    let load = parity::<NodeLoad>(fixture!("distinct-node-load.bin"));
+    let load = frozen_parity::<NodeLoad>(fixture!("distinct-node-load.bin"));
     assert_eq!(
         (
             load.node,

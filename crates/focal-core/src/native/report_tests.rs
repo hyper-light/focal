@@ -88,7 +88,7 @@ pub(super) fn core() -> Core<NativeState> {
         ledger(),
         RangeId(81),
         native_limits(),
-        MemoryBudget::new(64 * 1024 * 1024, 8 * 1024 * 1024).unwrap(),
+        MemoryBudget::new(80 * 1024 * 1024, 8 * 1024 * 1024).unwrap(),
     )
     .unwrap()
 }

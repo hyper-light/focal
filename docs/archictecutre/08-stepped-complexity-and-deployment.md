@@ -75,6 +75,7 @@ must show the missing independent capacity and keep the existing guarantee uncha
 | `node.listen` | Local bind address; default is local-only transport; explicit override for NAT/multi-interface environments |
 | `node.advertise` | Endpoint peers can reach and authenticate; commonly the only networking field the operator sets |
 | `node.seeds` | Optional bootstrap override for managed recovery/infrastructure; normal join persists a bounded peer set automatically |
+| `node.max_tenants` | Tenants this node hosts sessions for at most, its own included (default 8, at most 1024); a placement that needs one more is refused by this node as a capacity refusal ([24](24-placement-execution-and-fleet-control.md) §10) |
 | `topology.zone`, `topology.region` | Infrastructure facts, validated against the configured source of topology authority |
 | `durability.survive` | Failure-domain class `node`, `zone`, or `region` |
 | `durability.max_failures` | Number of simultaneous independent failures in that class to tolerate |

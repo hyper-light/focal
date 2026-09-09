@@ -35,6 +35,29 @@ macro_rules! v1_struct {
     };
 }
 
+/// A frozen row whose live type gained fields after the V1 writer was frozen.
+/// The V1 representation carries only the original fields; restored values
+/// take the stated defaults for the later ones.
+macro_rules! v1_struct_later {
+    ($name:ident { $($field:ident: $ty:ty),+ $(,)? } later { $($later:ident: $default:expr),+ $(,)? }) => {
+        impl V1 for $name {
+            #[inline]
+            fn serialize_v1<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                #[derive(Serialize)]
+                struct Record<'a> { $($field: Ref<'a, $ty>),+ }
+                let Self { $($field,)+ $($later: _,)+ } = self;
+                Record { $($field: Ref($field)),+ }.serialize(serializer)
+            }
+            fn deserialize_v1<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                #[derive(Deserialize)]
+                struct Record { $($field: Value<$ty>),+ }
+                let Record { $($field),+ } = Record::deserialize(deserializer)?;
+                Ok(Self { $($field: $field.0,)+ $($later: $default,)+ })
+            }
+        }
+    };
+}
+
 macro_rules! v1_unit_enum {
     ($name:ident { $($variant:ident),+ $(,)? }) => {
         impl V1 for $name {
@@ -87,14 +110,18 @@ v1_struct!(NodeEnrollment {
     attestation: ContentHash,
     eligible: bool,
 });
-v1_struct!(NodeLoad {
+v1_struct_later!(NodeLoad {
     node: u64,
     generation: u64,
     report: u64,
     available_memory: u64,
     active_weight: u64
+} later {
+    disk_available: 0
 });
-v1_struct!(NodeRecord { enrollment: NodeEnrollment, load: Option<NodeLoad> });
+v1_struct_later!(NodeRecord { enrollment: NodeEnrollment, load: Option<NodeLoad> } later {
+    liveness: None
+});
 
 v1_unit_enum!(SessionFenceKind {
     Created,

@@ -178,6 +178,7 @@ impl BootstrapAuthority {
     }
 }
 
+#[derive(Clone)]
 pub struct CredentialMaterial {
     certificate_chain: Vec<Vec<u8>>,
     private_key: Zeroizing<Vec<u8>>,
@@ -267,6 +268,29 @@ impl JoinKey {
         verify_issued(&receipt, ca_certificate)?;
         Ok((receipt, *blake3::hash(&bundle.csr).as_bytes()))
     }
+    /// Open existing joining material for reading beside other readers; the
+    /// enrollment cannot be completed through this handle.
+    pub fn open_shared(
+        path: impl AsRef<Path>,
+        cluster: ClusterId,
+    ) -> Result<Self, EnrollmentError> {
+        if cluster == [0; 16] {
+            return Err(EnrollmentError::Invalid);
+        }
+        let directory = PrivateDirectory::open_shared(path.as_ref())?;
+        let bundle: JoinKeyBundle = decode(
+            &directory
+                .read("join-key.bin")?
+                .ok_or(EnrollmentError::Corrupt)?,
+        )?;
+        if bundle.schema != 1 || bundle.cluster != cluster {
+            return Err(EnrollmentError::Corrupt);
+        }
+        Ok(Self {
+            bundle,
+            _directory: directory,
+        })
+    }
     pub fn open_or_create(
         path: impl AsRef<Path>,
         cluster: ClusterId,
@@ -350,6 +374,42 @@ impl JoinKey {
             .map(|bytes| decode(&bytes))
             .transpose()
     }
+    /// Install a renewed receipt of this key over the one held: the same
+    /// request and CSR under a fresh certificate that expires later. A held
+    /// receipt that is already as new is kept; an older one is refused.
+    pub fn renew(
+        &self,
+        receipt: &EnrollmentReceipt,
+        ca_certificate: &[u8],
+        now: i64,
+    ) -> Result<CredentialMaterial, EnrollmentError> {
+        if receipt.identity.cluster != self.bundle.cluster {
+            return Err(EnrollmentError::WrongCluster);
+        }
+        if receipt.request != self.bundle.request
+            || receipt.csr_hash != hash("focal.enrollment.csr.v1", self.csr())
+            || receipt.public_key != csr_key_hash(self.csr())?
+            || receipt.expires_at <= now
+        {
+            return Err(EnrollmentError::Unauthorized);
+        }
+        verify_issued(receipt, ca_certificate)?;
+        let held = self.enrollment()?.ok_or(EnrollmentError::NotCommitted)?;
+        if held.identity != receipt.identity || held.public_key != receipt.public_key {
+            return Err(EnrollmentError::Conflict);
+        }
+        if held.expires_at > receipt.expires_at {
+            return Err(EnrollmentError::Conflict);
+        }
+        if held != *receipt {
+            self._directory
+                .replace("enrollment.bin", &encode(receipt)?)?;
+        }
+        Ok(CredentialMaterial {
+            certificate_chain: vec![receipt.certificate.clone(), ca_certificate.to_vec()],
+            private_key: Zeroizing::new(self.bundle.key.0.clone()),
+        })
+    }
 }
 
 fn params(
@@ -388,6 +448,22 @@ pub(crate) fn csr_key_hash(csr: &[u8]) -> Result<Fingerprint, EnrollmentError> {
     Ok(hash(
         "focal.enrollment.public-key.v1",
         &verified_csr(csr)?.public_key.subject_public_key_info(),
+    ))
+}
+/// The identity of the key a certificate carries, in the same domain as
+/// `EnrollmentReceipt::public_key`; stable across certificate renewal.
+pub fn certificate_key_hash(certificate: &[u8]) -> Result<Fingerprint, EnrollmentError> {
+    if certificate.len() > 4096 {
+        return Err(EnrollmentError::Capacity);
+    }
+    let (rest, certificate) =
+        X509Certificate::from_der(certificate).map_err(|_| EnrollmentError::Corrupt)?;
+    if !rest.is_empty() {
+        return Err(EnrollmentError::Corrupt);
+    }
+    Ok(hash(
+        "focal.enrollment.public-key.v1",
+        certificate.public_key().raw,
     ))
 }
 pub(crate) fn verify_issued(receipt: &EnrollmentReceipt, ca: &[u8]) -> Result<(), EnrollmentError> {

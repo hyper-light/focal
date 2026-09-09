@@ -83,6 +83,9 @@ pub struct NodeEnrollment {
     /// Zero is unknown. A known zone requires a known enclosing region.
     pub zone: ZoneId,
     pub endpoint: String,
+    /// The enrolled key's identity (`EnrollmentReceipt::public_key`), stable
+    /// across certificate renewal; statements are verified by the certificate
+    /// the registry authorizes and bound to this key.
     pub identity: ContentHash,
     pub authority_epoch: u64,
     pub attestation: ContentHash,
@@ -96,12 +99,38 @@ pub struct NodeLoad {
     pub report: u64,
     pub available_memory: u64,
     pub active_weight: u64,
+    /// Bytes the node's data directory can still take before its disk
+    /// watermark refuses admission. A report of zero never receives new
+    /// assignments; the V1 row codec restores it as zero.
+    pub disk_available: u64,
 }
 
+/// What the fleet's failure detector last committed about a node through the
+/// partition owner ([24](../../../docs/archictecutre/24-placement-execution-and-fleet-control.md) §12).
+/// Liveness never touches enrollment: a dead node keeps its identity,
+/// generation and grants, and a revived one needs no re-enrollment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeLiveness {
+    pub alive: bool,
+    /// The node's own incarnation the verdict was reached at; a later
+    /// incarnation always wins, an older one is stale.
+    pub incarnation: u64,
+    /// The node whose detector reached the verdict.
+    pub witness: u64,
+    pub decided_at: i64,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeRecord {
     pub enrollment: NodeEnrollment,
     pub load: Option<NodeLoad>,
+    /// Absent until the detector committed a verdict; a node with no
+    /// verdict counts as alive.
+    pub liveness: Option<NodeLiveness>,
+}
+impl NodeRecord {
+    pub fn is_alive(&self) -> bool {
+        self.liveness.is_none_or(|liveness| liveness.alive)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +168,7 @@ pub trait AuthorityVerifier {
     fn verify_session_fence(&self, fence: &SessionFence) -> Result<(), DirectoryError>;
     fn verify_replica_ready(&self, ready: &ReplicaReady) -> Result<(), DirectoryError>;
     fn verify_delegation(&self, fence: &DelegationFence) -> Result<(), DirectoryError>;
+    fn verify_custody(&self, proof: &CustodyProof) -> Result<(), DirectoryError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +181,23 @@ pub struct ReplicaReady {
     pub through: SessionSeq,
     /// Verified durable artifact/checkpoint custody through this prefix.
     pub custody: ContentHash,
+    pub attestation: ContentHash,
+}
+
+/// A copy holder's statement that it durably holds the content set of one
+/// session through `verified_through` at one placement epoch. Like
+/// `ReplicaReady`, the attestation field is zero in the signed body and only
+/// the holder itself signs; a transfer request or an install intent is never
+/// custody.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustodyProof {
+    pub ledger: LedgerId,
+    pub node: u64,
+    pub node_generation: u64,
+    pub custody_epoch: u64,
+    pub verified_through: SessionSeq,
+    /// Digest of the exact content set the holder verified.
+    pub content: ContentHash,
     pub attestation: ContentHash,
 }
 

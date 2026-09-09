@@ -114,7 +114,7 @@ An unused invitation expires **one hour after its first preparation**. Repeating
 
 If `join` fails or its reply is lost, retry the exact command with the same directory, invitation, and endpoints. The saved private key, CSR, and request identity are reused. A previously committed enrollment can be recovered using that identity even after the invitation's initial redemption window closes, while the issued credential remains valid. Preserve the pending directory; substituting another invitation or endpoint is rejected. Do not delete unknown-outcome join state to manufacture a new attempt.
 
-After successful enrollment, keep the node directory intact. Startup uses its saved credentials and fails closed if initialized identity, policy, or join state is missing. Root and installed application membership removal are available through [cluster administration](cluster-admin.md). Membership removal does not drain application placement or complete evidence migration. Same-identity credential renewal and the complete operational recovery journeys remain work in progress.
+After successful enrollment, keep the node directory intact. Startup uses its saved credentials and fails closed if initialized identity, policy, or join state is missing. Root and installed application membership removal are available through [cluster administration](cluster-admin.md). Membership removal does not drain application placement or complete evidence migration. A joined node renews its own credential ten days ahead of expiry, or on `cluster credentials renew` (the same key under a fresh certificate; see [cluster administration](cluster-admin.md)); the complete operational recovery journeys remain work in progress.
 
 ## Current deployment boundary
 

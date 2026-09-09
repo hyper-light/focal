@@ -103,6 +103,7 @@ fn claim_body_preserves_relations_pins_slots_and_optional_deadline_without_deriv
                 requirements: &requirements,
                 slots: &slots,
                 deadline,
+                policy: None,
             },
             Limits {
                 description_bytes: 128,

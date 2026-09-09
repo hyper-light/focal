@@ -22,6 +22,24 @@ impl Hash {
         hash.code(fields.schema);
         hash.field(&fields.occurrence.0);
         hash.field(fields.description.as_bytes());
+        // Schema-1 hashes are frozen: the policy section exists only from
+        // schema 2, where its absence is hashed explicitly.
+        if fields.schema >= 2 {
+            match fields.policy {
+                Some(policy) => {
+                    hash.code(1);
+                    hash.field(&[u8::from(policy.corrective_allowed)]);
+                    hash.field(&policy.max_follow_ups.to_be_bytes());
+                    hash.field(&[u8::from(policy.single_issuer)]);
+                    hash.code(match policy.escalation {
+                        crate::Escalation::None => 0,
+                        crate::Escalation::Holder => 1,
+                        crate::Escalation::Evaluator => 2,
+                    });
+                }
+                None => hash.code(0),
+            }
+        }
         hash
     }
     pub(super) fn relation(&mut self, relation: &Relation) {
@@ -77,6 +95,11 @@ impl Hash {
             RelationTarget::Root(value) => {
                 self.code(4);
                 self.field(&value.0);
+            }
+            RelationTarget::Evidence(value) => {
+                self.code(5);
+                self.field(&value.id.0);
+                self.field(&value.hash.0);
             }
         }
     }

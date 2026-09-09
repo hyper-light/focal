@@ -186,6 +186,10 @@ impl Counts {
             Row::RetiredCycle(_) => increment(&mut self.retired_cycles),
             Row::Work(_) => increment(&mut self.works),
             Row::Diagnostic(_) => increment(&mut self.diagnostics),
+            Row::LegacyTestament(_)
+            | Row::LegacyEvidenceSet(_)
+            | Row::LegacyRun(_)
+            | Row::LegacyDefinition(_) => increment(&mut self.meta.legacy),
             _ => Ok(()),
         }
     }
@@ -232,6 +236,7 @@ impl Counts {
                 expected.creation_results,
                 read.limits.outcomes,
             ),
+            (self.meta.legacy, expected.legacy, read.limits.legacy_rows),
         ];
         read.charge(sum(pairs.len(), 1)?)?;
         for (actual, expected, limit) in pairs {
@@ -408,6 +413,13 @@ pub(super) fn validate(
                 | Key::CreationResult(_),
                 _,
             ) => objects::authored(key, row, &read)?,
+            (
+                Key::LegacyTestament(_)
+                | Key::LegacyEvidenceSet(_)
+                | Key::LegacyRun(..)
+                | Key::LegacyDefinition(_),
+                _,
+            ) => objects::legacy(key, row, &read)?,
             (Key::ResultTestament(id), Row::ResultTestament(value)) => {
                 super::read_validate_audit::audit(&read, id, value.get().ok_or_else(invalid)?)?
             }
@@ -446,6 +458,23 @@ pub(super) fn validate(
                 links::row(key, row, &read, &history)?;
             }
             (Key::Meta, Row::Meta(_)) => (),
+            (
+                Key::ByIssuer(..)
+                | Key::BySubject(..)
+                | Key::ByStatus(..)
+                | Key::ByAction(..)
+                | Key::ByScope(..)
+                | Key::ByRelation(..)
+                | Key::ByProducer(..)
+                | Key::ByArtifactKind(..)
+                | Key::BySchema(..)
+                | Key::ArtifactInput(..)
+                | Key::ByEvaluator(..)
+                | Key::ByVerdict(..)
+                | Key::ByCreated(..)
+                | Key::DueTimer(..),
+                Row::Index,
+            ) => super::read_validate_index::check_row(key, row, &read)?,
             _ => return Err(invalid()),
         }
     }

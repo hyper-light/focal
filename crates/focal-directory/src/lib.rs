@@ -20,6 +20,9 @@ mod cache;
 mod control;
 mod durable_v1;
 mod partition;
+mod partition_progress;
+mod partition_session;
+mod partition_v1;
 mod placement;
 mod scheduler;
 mod types;
@@ -29,6 +32,8 @@ pub use authority_proof::*;
 pub use cache::*;
 pub use control::*;
 pub use partition::*;
+pub use partition_progress::*;
+pub use partition_v1::*;
 pub use placement::*;
 pub use scheduler::*;
 pub use types::*;
@@ -47,6 +52,8 @@ pub enum DirectoryError {
     StalePreparation,
     StaleEpoch,
     StaleNode,
+    /// A member the fleet's detector declared dead at its current generation.
+    DeadNode,
     WrongOperation,
     Phase,
     NotReady,
@@ -57,7 +64,10 @@ pub enum DirectoryError {
     NoPlacement,
     ClockRegression,
     Expired,
-    WatchGap { expected: u64, actual: u64 },
+    WatchGap {
+        expected: u64,
+        actual: u64,
+    },
     InFlight,
     Memory(focal_memory::MemoryError),
 }

@@ -121,13 +121,9 @@ impl EmbeddedNode {
         )?;
         let config = NodeConfig::single(identity.node, identity.cluster, identity.ledger.session.0);
         let consensus = DurableNode::open_on_wal(config, wal.clone())?;
-        let mut session = Session::from_node(identity.ledger, consensus, SessionLimits::default())?;
-        session.campaign()?;
-        // One voter can establish the committed current-term read barrier locally.
-        for _ in 0..4 {
-            let _ = session.poll()?;
-        }
-        let content = ContentStore::open(
+        // The content writer exists before the session so a native ledger can
+        // read its evidence during recovery.
+        let content = ContentStore::open_with_disk(
             root.join("content"),
             StoreLimits {
                 max_content_bytes: 64 * 1024 * 1024,
@@ -136,7 +132,19 @@ impl EmbeddedNode {
                 chunk_bytes: 1024 * 1024,
                 max_manifest_bytes: 1024 * 1024,
             },
+            wal.disk_budget(),
         )?;
+        let mut session = Session::from_node_hosted(
+            identity.ledger,
+            consensus,
+            SessionLimits::default(),
+            crate::network_service::native_hosting(root, &identity)?,
+        )?;
+        session.campaign()?;
+        // One voter can establish the committed current-term read barrier locally.
+        for _ in 0..4 {
+            let _ = session.poll()?;
+        }
         Ok(Self {
             identity,
             session,

@@ -1,5 +1,5 @@
 use super::*;
-use focal_client::watch::{WatchAction, WatchOptions};
+use focal_client::watch::{WatchAction, WatchEngine, WatchOptions};
 use serde::Deserialize;
 use std::{
     panic::AssertUnwindSafe,
@@ -79,6 +79,11 @@ impl<T: ClientTransport> Backend<T> {
                 store.create(
                     &input.name,
                     WatchOptions {
+                        engine: if self.has_native() {
+                            WatchEngine::Native
+                        } else {
+                            WatchEngine::Legacy
+                        },
                         claims,
                         family,
                         seed: input.seed,

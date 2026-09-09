@@ -24,6 +24,7 @@ struct Adapter {
     transfer_contract_version: u16,
     watch_contract_version: u16,
     administration_contract_version: u16,
+    native_contract_version: u16,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -44,6 +45,7 @@ struct Skill {
     required_transfer_tools: Vec<Required>,
     required_watch_tools: Vec<Required>,
     required_admin_tools: Vec<Required>,
+    required_native_operations: Vec<Required>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -80,14 +82,15 @@ fn resource(path: &str, digest: &str) -> String {
 fn packaged_skills_pin_real_application_versions_and_complete_relative_resources() {
     let manifest: Manifest =
         serde_json::from_slice(&fs::read(root().join("manifest.json")).unwrap()).unwrap();
-    assert_eq!(manifest.schema_version, 2);
+    assert_eq!(manifest.schema_version, 3);
     assert_eq!(manifest.adapter.name, "focal-mcp");
     assert_eq!(manifest.adapter.version, env!("CARGO_PKG_VERSION"));
     assert_eq!(manifest.adapter.recovery_contract_version, 2);
     assert_eq!(manifest.adapter.transfer_contract_version, 1);
     assert_eq!(manifest.adapter.watch_contract_version, 1);
     assert_eq!(manifest.adapter.administration_contract_version, 1);
-    assert_eq!(manifest.skills.len(), 4);
+    assert_eq!(manifest.adapter.native_contract_version, 2);
+    assert_eq!(manifest.skills.len(), 5);
     let mut resources = BTreeSet::new();
     let mut reference_content = String::new();
     for item in &manifest.resources {
@@ -95,16 +98,19 @@ fn packaged_skills_pin_real_application_versions_and_complete_relative_resources
         reference_content.push_str(&resource(&item.path, &item.blake3));
     }
     let mut all_operations = BTreeSet::new();
+    let mut all_native = BTreeSet::new();
     let mut names = BTreeSet::new();
     for skill in manifest.skills {
         assert!(names.insert(skill.name.clone()));
         assert_eq!(
             skill.version,
             match skill.name.as_str() {
-                "focal-claims" => 8,
-                "focal-evidence" => 7,
-                "focal-validation" => 3,
-                _ => 1,
+                "focal-claims" => 10,
+                "focal-peers" => 1,
+                "focal-evidence" => 8,
+                "focal-validation" => 4,
+                "focal-cluster" => 3,
+                _ => 2,
             }
         );
         assert_eq!(skill.path, format!("{}/SKILL.md", skill.name));
@@ -151,6 +157,42 @@ fn packaged_skills_pin_real_application_versions_and_complete_relative_resources
                 )
             );
             all_operations.insert(operation.name);
+        }
+        // The native catalogue (version 2) shares names with V1; a skill that
+        // requires a native operation must use it in its native branch.
+        let mut native = BTreeSet::new();
+        for operation in skill.required_native_operations {
+            assert!(native.insert(operation.name.clone()));
+            let Some(descriptor) = operations::find_native(&operation.name) else {
+                panic!(
+                    "skill requires an unimplemented native operation: {}",
+                    operation.name
+                );
+            };
+            assert_eq!(descriptor.version, operation.version, "{}", operation.name);
+            assert_eq!(operation.version, manifest.adapter.native_contract_version);
+            assert!(
+                content.contains(&format!("`{}`", operation.name)),
+                "unused native skill requirement: {}",
+                operation.name
+            );
+            let schema = descriptor.input_schema().unwrap();
+            assert_eq!(
+                schema.get("$id").and_then(serde_json::Value::as_str),
+                Some(
+                    format!(
+                        "urn:focal:operation:{}:input:{}",
+                        descriptor.name, descriptor.version
+                    )
+                    .as_str()
+                )
+            );
+            all_native.insert(operation.name);
+        }
+        assert_eq!(native.is_empty(), skill.name == "focal-cluster");
+        if !native.is_empty() {
+            assert!(content.contains("`ledger.standing`") || content.contains("#native-engine"));
+            assert!(reference_content.contains("## Native engine"));
         }
         for watch in skill.required_watch_tools {
             assert_eq!(watch.version, manifest.adapter.watch_contract_version);
@@ -202,7 +244,8 @@ fn packaged_skills_pin_real_application_versions_and_complete_relative_resources
             "focal-claims".to_owned(),
             "focal-evidence".to_owned(),
             "focal-validation".to_owned(),
-            "focal-cluster".to_owned()
+            "focal-cluster".to_owned(),
+            "focal-peers".to_owned()
         ])
     );
     assert_eq!(
@@ -212,4 +255,30 @@ fn packaged_skills_pin_real_application_versions_and_complete_relative_resources
             .map(|descriptor| descriptor.name.to_owned())
             .collect()
     );
+    assert_eq!(
+        all_native,
+        operations::native_descriptors()
+            .iter()
+            .map(|descriptor| descriptor.name.to_owned())
+            .collect::<BTreeSet<_>>()
+    );
+}
+
+/// Print the digest of every packaged skill and reference so `manifest.json`
+/// can be re-pinned after an edit:
+/// `cargo test -p focal-client --test skill_contract -- --ignored --nocapture print_skill_digests`.
+#[test]
+#[ignore]
+fn print_skill_digests() {
+    let manifest: Manifest =
+        serde_json::from_slice(&fs::read(root().join("manifest.json")).unwrap()).unwrap();
+    let paths = manifest
+        .resources
+        .iter()
+        .map(|resource| resource.path.clone())
+        .chain(manifest.skills.iter().map(|skill| skill.path.clone()));
+    for path in paths {
+        let bytes = fs::read(root().join(&path)).unwrap();
+        println!("{} {}", path, blake3::hash(&bytes).to_hex());
+    }
 }

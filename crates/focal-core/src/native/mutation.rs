@@ -160,6 +160,27 @@ pub(super) fn check_family(key: Key, row: &Row) -> Result<(), NativeError> {
             | (Key::ClaimIdentity(..), Row::ClaimIdentity(_))
             | (Key::DefinitionIdentity(..), Row::DefinitionIdentity(_))
             | (Key::CreationResult(_), Row::CreationResult(_))
+            | (Key::LegacyTestament(_), Row::LegacyTestament(_))
+            | (Key::LegacyEvidenceSet(_), Row::LegacyEvidenceSet(_))
+            | (Key::LegacyRun(..), Row::LegacyRun(_))
+            | (Key::LegacyDefinition(_), Row::LegacyDefinition(_))
+            | (
+                Key::ByIssuer(..)
+                    | Key::BySubject(..)
+                    | Key::ByStatus(..)
+                    | Key::ByAction(..)
+                    | Key::ByScope(..)
+                    | Key::ByRelation(..)
+                    | Key::ByProducer(..)
+                    | Key::ByArtifactKind(..)
+                    | Key::BySchema(..)
+                    | Key::ArtifactInput(..)
+                    | Key::ByEvaluator(..)
+                    | Key::ByVerdict(..)
+                    | Key::ByCreated(..)
+                    | Key::DueTimer(..),
+                Row::Index
+            )
     );
     if valid {
         Ok(())

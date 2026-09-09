@@ -12,8 +12,8 @@ use super::aggregation::{CheckPolicy, SlotPolicy};
 use super::{Binding, ContractError, memory as bytes};
 use crate::{
     ActionType, Cause, ClaimId, ContentHash, Deadline, LedgerId, ObjectId, ObjectKind,
-    ObjectRevision, OccurrenceId, ParticipantId, Relation, RelationKind, RelationTarget,
-    RequirementRef, ScopeKind, ValidationMode,
+    ObjectRevision, OccurrenceId, ParticipantId, PeerPolicy, Relation, RelationKind,
+    RelationTarget, RequirementRef, ScopeKind, ValidationMode,
 };
 
 #[path = "claim_descriptor_hash.rs"]
@@ -43,6 +43,8 @@ pub struct ClaimSpec<'a> {
     pub requirements: &'a [RequirementRef],
     pub slots: &'a [SlotPolicy<'a>],
     pub deadline: Option<Deadline>,
+    /// Schema 2 only: the immutable follow-up policy.
+    pub policy: Option<PeerPolicy>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -112,6 +114,7 @@ pub struct ClaimDescriptor {
     requirements: Vec<RequirementRef>,
     slots: Vec<AuthoredSlot>,
     deadline: Option<Deadline>,
+    policy: Option<PeerPolicy>,
     roles: Roles,
     content_hash: ContentHash,
 }
@@ -168,6 +171,16 @@ impl RoleBuilder {
                     return Err(ContractError::InvalidTarget);
                 }
             }
+            // Exact evidence: the artifact a challenge disputes or a
+            // correction cites, at its committed descriptor hash.
+            (
+                RelationKind::Reviews | RelationKind::DerivedFrom,
+                RelationTarget::Evidence(value),
+            ) => {
+                if value.id.is_zero() || value.hash.0 == [0; 32] {
+                    return Err(ContractError::InvalidTarget);
+                }
+            }
             (
                 RelationKind::DependsOn
                 | RelationKind::Awaits
@@ -177,7 +190,8 @@ impl RoleBuilder {
                 | RelationKind::Refines
                 | RelationKind::ConflictsWith
                 | RelationKind::DerivedFrom
-                | RelationKind::Reviews,
+                | RelationKind::Reviews
+                | RelationKind::Invalidates,
                 RelationTarget::Object(value),
             ) => {
                 if value.ledger != ledger {
@@ -189,7 +203,10 @@ impl RoleBuilder {
                 if value.id.0 == id.0
                     && matches!(
                         relation.kind,
-                        RelationKind::CausedBy | RelationKind::Supersedes | RelationKind::Amends
+                        RelationKind::CausedBy
+                            | RelationKind::Supersedes
+                            | RelationKind::Amends
+                            | RelationKind::Invalidates
                     )
                 {
                     return Err(ContractError::InvalidTarget);
@@ -239,6 +256,7 @@ fn copy_relation(relation: &Relation) -> Relation {
             RelationTarget::Object(value) => RelationTarget::Object(*value),
             RelationTarget::Action(value) => RelationTarget::Action(*value),
             RelationTarget::Root(value) => RelationTarget::Root(*value),
+            RelationTarget::Evidence(value) => RelationTarget::Evidence(*value),
         },
     }
 }
@@ -267,6 +285,10 @@ impl ClaimDescriptor {
     }
     pub fn occurrence(&self) -> OccurrenceId {
         self.occurrence
+    }
+    /// The follow-up policy of a schema-2 claim.
+    pub fn policy(&self) -> Option<PeerPolicy> {
+        self.policy
     }
     pub fn description(&self) -> &str {
         &self.description
@@ -449,6 +471,7 @@ impl ClaimDescriptor {
             requirements,
             slots,
             deadline: self.deadline,
+            policy: self.policy,
             roles: self.roles.copy(),
             content_hash: self.content_hash,
         };

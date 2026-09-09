@@ -19,10 +19,13 @@ use focal_client::managed_store::{ManagedOperationId, ManagedStoreError};
 use focal_client::operation_store::{OperationIntent, OperationStore, StoreError};
 #[path = "managed_backend.rs"]
 mod managed;
+#[path = "native_backend.rs"]
+mod native;
 #[path = "transfer_backend.rs"]
 mod transfer;
 #[path = "watch_backend.rs"]
 mod watch;
+pub use native::{JournalError, NativeJournal};
 
 pub struct Backend<T: ClientTransport> {
     client: Client<T>,
@@ -33,6 +36,8 @@ pub struct Backend<T: ClientTransport> {
     admin: Option<Box<dyn crate::AdminBackend>>,
     uploads: Option<focal_client::artifact_transfer::UploadStore>,
     watches: Option<focal_client::watch::WatchStore>,
+    native_journal: Option<Box<dyn NativeJournal>>,
+    native: Option<native::Native>,
 }
 impl<T: ClientTransport> Backend<T> {
     pub fn new(
@@ -57,7 +62,12 @@ impl<T: ClientTransport> Backend<T> {
             admin: None,
             uploads: None,
             watches: None,
+            native_journal: None,
+            native: None,
         })
+    }
+    pub(crate) fn has_native(&self) -> bool {
+        self.native.is_some()
     }
     /// Enable the managed namespace without changing legacy operation bindings.
     pub fn with_admin(mut self, admin: Box<dyn crate::AdminBackend>) -> Self {
@@ -103,29 +113,37 @@ impl<T: ClientTransport> Backend<T> {
     ) -> ApplicationResult {
         let mut operation_id = None;
         let result = self.execute_inner(runtime, call, cancel, &mut operation_id);
+        // Native results share the application result shape at version 2.
+        let schema_version = if self.has_native() { 2 } else { 1 };
         match result {
             Ok((condition, result)) => ApplicationResult {
-                schema_version: 1,
+                schema_version,
                 operation_id,
                 condition: condition.into(),
                 result,
             },
             Err(BackendError::Domain(reply)) => ApplicationResult {
-                schema_version: 1,
+                schema_version,
                 operation_id,
                 condition: "DomainOutcome".into(),
                 result: OperationOutput::Mutation { reply: *reply },
             },
             Err(BackendError::ManagedDomain(outcome)) => ApplicationResult {
-                schema_version: 1,
+                schema_version,
                 operation_id,
                 condition: "DomainOutcome".into(),
                 result: OperationOutput::Mutation {
                     reply: MutationReply::Domain(*outcome),
                 },
             },
+            Err(BackendError::NativeRefused(refusal)) => ApplicationResult {
+                schema_version,
+                operation_id,
+                condition: focal_client::failure::native(&refusal).condition.into(),
+                result: OperationOutput::NativeRefused { refusal: *refusal },
+            },
             Err(error) => ApplicationResult {
-                schema_version: 1,
+                schema_version,
                 operation_id,
                 condition: error.condition().into(),
                 result: OperationOutput::Error {
@@ -148,19 +166,37 @@ impl<T: ClientTransport> Backend<T> {
         if cancelled(cancel) {
             return Err(BackendError::Cancelled);
         }
-        if call.tool.starts_with("cluster.") {
-            let action = crate::admin::parse(&call.tool, std::mem::take(&mut call.arguments))?;
-            let backend = self.admin.as_mut().ok_or(BackendError::Configuration)?;
-            return match backend.execute(runtime, action, cancel) {
-                Ok(result) => Ok(("Administration", OperationOutput::Administration { result })),
-                Err(error) => Err(BackendError::Admin(error)),
-            };
+        // One registry names every surface; the adapter serves a surface only
+        // with the standing it advertised, so a tool that was not listed is
+        // refused here as well as at the protocol layer.
+        match focal_client::operations::surface_of(&call.tool) {
+            Some(focal_client::operations::Surface::Administration) => {
+                let action = crate::admin::parse(&call.tool, std::mem::take(&mut call.arguments))?;
+                let backend = self.admin.as_mut().ok_or(BackendError::Configuration)?;
+                return match backend.execute(runtime, action, cancel) {
+                    Ok(result) => {
+                        Ok(("Administration", OperationOutput::Administration { result }))
+                    }
+                    Err(error) => Err(BackendError::Admin(error)),
+                };
+            }
+            // Durable watches speak both engines: the journal saves the engine
+            // it was created for and streams schema-2 deltas on a native ledger.
+            Some(focal_client::operations::Surface::Watch) => {
+                return self.watch(runtime, call, cancel);
+            }
+            Some(focal_client::operations::Surface::Transfer) => {
+                if self.has_native() {
+                    return Err(BackendError::Configuration);
+                }
+                return self.transfer(runtime, call, cancel);
+            }
+            Some(focal_client::operations::Surface::Application) | None => {}
         }
-        if call.tool.starts_with("upload.") || call.tool == "artifact.download" {
-            return self.transfer(runtime, call, cancel);
-        }
-        if call.tool.starts_with("watch.") {
-            return self.watch(runtime, call, cancel);
+        if self.has_native() {
+            // The native catalogue replaces the V1 application and transfer
+            // tools; the owner refuses their wire profile anyway.
+            return self.native_call(runtime, call, cancel, operation_id);
         }
         if matches!(
             call.tool.as_str(),
@@ -477,6 +513,25 @@ fn validation_context_error(
         ValidationContextError::Capacity => BackendError::Input(InputError::Capacity),
     }
 }
+fn native_drive(error: &focal_native_client::DriveError) -> focal_client::failure::Failure {
+    use focal_client::failure::{self, Failure};
+    use focal_native_client::{CompileError, DriveError};
+    match error {
+        DriveError::Compile(error) => match error {
+            CompileError::Input(error) => failure::input(error),
+            CompileError::Contract(_) => Failure::error("invalid_input", 2),
+            CompileError::Capacity(_) => Failure::error("capacity", 6),
+            CompileError::Codec(_) => Failure::error("native_frame", 1),
+            CompileError::Missing(_) => Failure::error("not_found", 4),
+            CompileError::Unsupported(_) => Failure::error("operation_conflict", 5),
+        },
+        DriveError::Store(error) => failure::native_store(error),
+        DriveError::Client(error) => failure::client(error),
+        DriveError::Input(error) => failure::input(error),
+        DriveError::ProjectionOnly => Failure::error("invalid_input", 2),
+        DriveError::Cancelled => Failure::cancelled(),
+    }
+}
 fn take_id(arguments: &mut serde_json::Map<String, Value>) -> Result<String, BackendError> {
     let Some(Value::String(id)) = arguments.remove("operation_id") else {
         return Err(InputError::Invalid("operation_id is required").into());
@@ -721,6 +776,16 @@ enum BackendError {
     Domain(Box<MutationReply>),
     #[error("domain outcome; exact managed request remains saved: {0:?}")]
     ManagedDomain(Box<DomainOutcome>),
+    #[error(transparent)]
+    NativeStore(#[from] focal_client::native_store::NativeStoreError),
+    #[error(transparent)]
+    NativeDrive(#[from] focal_native_client::DriveError),
+    #[error("native journal unavailable: {0}")]
+    NativeJournal(JournalError),
+    #[error("the native owner refused the frame: {}", .0.detail)]
+    NativeRefused(Box<NativeRefusal>),
+    #[error("the native owner holds the frame as a pending candidate; retry the exact operation")]
+    NativePending(NativeTicket),
 }
 impl BackendError {
     fn condition(&self) -> &'static str {
@@ -758,6 +823,11 @@ impl BackendError {
             Self::Configuration => Failure::error("configuration", 2),
             Self::Admin(error) => return (error.condition, error.code),
             Self::Domain(_) | Self::ManagedDomain(_) => return ("DomainOutcome", "domain"),
+            Self::NativeStore(error) => failure::native_store(error),
+            Self::NativeDrive(error) => native_drive(error),
+            Self::NativeJournal(_) => Failure::error("native_store", 1),
+            Self::NativeRefused(refusal) => failure::native(refusal),
+            Self::NativePending(_) => Failure::outcome_unknown(),
         };
         (value.condition, value.code)
     }

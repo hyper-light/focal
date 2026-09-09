@@ -125,6 +125,7 @@ impl Session {
             return Ok(());
         }
         self.managed_membership_guard(request.change)?;
+        self.native_membership_guard(request.change)?;
         if self.pending_managed.is_some()
             || self.pending_placement.is_some()
             || self.placement_state.paused()

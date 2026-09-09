@@ -28,6 +28,9 @@ pub struct LocalHost {
     ended: watch::Receiver<()>,
     budget: MemoryBudget,
     limits: WireLimits,
+    /// The hosted ledger runs native history; an embedded node activates
+    /// offline, so this is fixed for the life of the host.
+    native: bool,
 }
 pub struct HostOwner {
     thread: JoinHandle<()>,
@@ -44,6 +47,7 @@ impl LocalHost {
         let budget =
             MemoryBudget::new(64 * 1024 * 1024, 8 * 1024 * 1024).map_err(LedgerError::from)?;
         let host_limits = limits.clone();
+        let native = node.session.activation().is_native();
         let (sender, receiver) = mpsc::sync_channel(32);
         let (liveness, ended) = watch::channel(());
         let mut views = crate::reads::ReadViews::new();
@@ -97,6 +101,7 @@ impl LocalHost {
                 ended,
                 budget,
                 limits: host_limits,
+                native,
             },
             HostOwner { thread },
         ))
@@ -152,6 +157,9 @@ impl RequestHandler for LocalHost {
     fn supports_participant_requests(&self) -> bool {
         true
     }
+    fn supports_native_requests(&self) -> bool {
+        self.native
+    }
     fn handle(
         &self,
         request: VerifiedRequest,
@@ -190,6 +198,10 @@ impl RequestHandler for LocalHost {
                     }
                 }
                 Operation::Monitor { .. } => crate::monitor_reads::RESPONSE_BYTES,
+                Operation::NativeRead(_) | Operation::NativeList(_) => {
+                    self.limits.max_frame_bytes as usize
+                }
+                Operation::Native { .. } => 4096,
                 Operation::Summary => {
                     match crate::ledger_summary::response_bytes(self.limits.max_frame_bytes) {
                         Some(bytes) => bytes,
@@ -274,6 +286,7 @@ impl RequestHandler for LocalHost {
                     ..
                 }
                 | Operation::Monitor { .. } => BudgetLane::Completion,
+                Operation::Native { frame } => crate::native_ingress::lane(frame),
                 _ => BudgetLane::Ordinary,
             };
             let Ok(charge) = self.budget.reserve(BudgetKind::Pending, lane, bytes) else {
@@ -387,6 +400,9 @@ fn maintain(node: &mut EmbeddedNode, views: &mut crate::reads::ReadViews) -> Res
     .map_err(|_| NodeError::Domain("system clock overflow".into()))?;
     node.session
         .maintain_cursor_clock_local(now.max(node.session.cursor_clock()))?;
+    // Trusted timers of the native engine fire from this clock; a refusal
+    // of one timer is that timer's outcome, not a maintenance failure.
+    crate::native_timers::sweep(&mut node.session)?;
     Ok(())
 }
 fn dispatch(
@@ -474,6 +490,27 @@ fn dispatch(
                 crate::managed_requests::local(node, views, streams, verified, limits)
             }
             Operation::ManagedSupport { .. } => Err(AccessError::UnsupportedOperation),
+            Operation::Native { frame } => {
+                crate::native_ingress::admit_local(node, peer, request, frame)
+            }
+            Operation::NativeRead(read) => crate::native_reads::local(
+                &mut node.session,
+                peer,
+                read,
+                request.request_id,
+                request.route_epoch,
+                limits,
+            )
+            .map(Response::NativeRead),
+            Operation::NativeList(list) => crate::native_lists::local(
+                &mut node.session,
+                views,
+                peer,
+                list,
+                request.route_epoch,
+                limits,
+            )
+            .map(Response::NativeListed),
             Operation::Monitor { id } => crate::monitor_reads::local(
                 &mut node.session,
                 principal,
@@ -607,6 +644,9 @@ fn dispatch(
             | Operation::PeerControl { .. }
             | Operation::NodeContact { .. }
             | Operation::EnrollmentControl { .. }
+            | Operation::PlacementControl { .. }
+            | Operation::SessionSign { .. }
+            | Operation::Probe { .. }
             | Operation::Custody(_) => Err(AccessError::UnsupportedOperation),
         }
     };
@@ -787,6 +827,7 @@ mod tests {
             ended,
             budget: MemoryBudget::new(64 * 1024 * 1024, 8 * 1024 * 1024).unwrap(),
             limits: WireLimits::default(),
+            native: false,
         };
         let (send, _receive) = oneshot::channel();
         host.sender.try_send(Work::Stop(send)).unwrap();

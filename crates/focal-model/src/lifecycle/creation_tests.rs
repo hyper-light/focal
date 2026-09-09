@@ -12,6 +12,9 @@ const RESPONDENT: ParticipantId = ParticipantId::from_u128(2);
 struct View {
     rows: Vec<ClaimState>,
     prefix: SessionSeq,
+    /// The authored follow-up policy every parent presents in this fixture.
+    escalation: crate::Escalation,
+    evaluators: Vec<ParticipantId>,
 }
 impl EffectiveClaims for View {
     fn ledger(&self) -> LedgerId {
@@ -23,12 +26,20 @@ impl EffectiveClaims for View {
     fn claim(&self, id: ClaimId) -> Option<&ClaimState> {
         self.rows.iter().find(|row| row.binding().object.0 == id.0)
     }
+    fn cause_escalation(&self, _: ClaimId) -> crate::Escalation {
+        self.escalation
+    }
+    fn is_designated_evaluator(&self, _: ClaimId, actor: ParticipantId) -> bool {
+        self.evaluators.contains(&actor)
+    }
 }
 impl View {
     fn empty() -> Self {
         Self {
             rows: Vec::new(),
             prefix: SessionSeq(0),
+            escalation: crate::Escalation::Holder,
+            evaluators: Vec::new(),
         }
     }
     fn install(&mut self, plan: CreationPlan) {
@@ -179,6 +190,8 @@ fn duplicate_existing_and_pending_ids_are_refused() {
     let pending_view = View {
         rows: pending.into_rows(),
         prefix: SessionSeq(2),
+        escalation: crate::Escalation::Holder,
+        evaluators: Vec::new(),
     };
     assert!(matches!(
         prepare(&pending_view, vec![proposal(2, 3)]),
@@ -207,6 +220,8 @@ fn missing_transitive_endpoint_is_not_treated_as_a_root() {
     let view = View {
         rows: vec![ClaimState::generate(Principal::Actor(ISSUER), old.definition).unwrap()],
         prefix: SessionSeq(1),
+        escalation: crate::Escalation::Holder,
+        evaluators: Vec::new(),
     };
     assert!(matches!(
         prepare(
@@ -292,6 +307,8 @@ fn historical_edge_chronology_is_checked_at_its_actual_referrer() {
     let view = View {
         rows: vec![one, two],
         prefix: SessionSeq(2),
+        escalation: crate::Escalation::Holder,
+        evaluators: Vec::new(),
     };
     assert!(matches!(
         prepare(
@@ -313,6 +330,8 @@ fn unregistered_historical_cause_is_refused() {
     let view = View {
         rows: vec![parent, orphan],
         prefix: SessionSeq(2),
+        escalation: crate::Escalation::Holder,
+        evaluators: Vec::new(),
     };
     assert!(matches!(
         prepare(
@@ -666,4 +685,53 @@ fn actual_scope_transition_capacity_is_checked_before_registry_install() {
     assert_eq!(view.get(1), &original);
     assert!(view.get(1).scopes().children().is_empty());
     assert!(view.claim(ClaimId::from_u128(2)).is_none());
+}
+
+#[test]
+fn authored_escalation_decides_who_besides_the_issuer_may_cite_a_parent() {
+    const EVALUATOR: ParticipantId = ParticipantId::from_u128(3);
+    let mut view = with_root();
+    let fence = receive(&mut view.rows[0]);
+    let expected = view.get(1).binding();
+    let attempt = |view: &View, actor: ParticipantId| {
+        CreationPlan::prepare(
+            Principal::Actor(actor),
+            vec![child(2, 2, expected, Some(fence), actor)],
+            view,
+            cut(2),
+            limits(),
+        )
+        .map(|plan| plan.rows()[1].issuer())
+    };
+    // Follow-ups reserved to the issuer: the current holder is refused.
+    view.escalation = crate::Escalation::None;
+    assert!(matches!(
+        attempt(&view, RESPONDENT),
+        Err(ContractError::WrongActor)
+    ));
+    assert_eq!(attempt(&view, ISSUER).unwrap(), ISSUER);
+    // Escalation to evaluators admits a designated evaluator and nobody else.
+    view.escalation = crate::Escalation::Evaluator;
+    assert!(matches!(
+        attempt(&view, EVALUATOR),
+        Err(ContractError::WrongActor)
+    ));
+    view.evaluators.push(EVALUATOR);
+    assert_eq!(attempt(&view, EVALUATOR).unwrap(), EVALUATOR);
+    assert_eq!(attempt(&view, RESPONDENT).unwrap(), RESPONDENT);
+    assert!(matches!(
+        attempt(&view, ParticipantId::from_u128(9)),
+        Err(ContractError::WrongActor)
+    ));
+    // A node principal never authors a child, whatever the policy says.
+    assert!(matches!(
+        CreationPlan::prepare(
+            Principal::Node(EVALUATOR),
+            vec![child(2, 2, expected, Some(fence), EVALUATOR)],
+            &view,
+            cut(2),
+            limits(),
+        ),
+        Err(ContractError::WrongActor)
+    ));
 }

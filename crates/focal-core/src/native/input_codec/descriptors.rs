@@ -126,6 +126,31 @@ fn relation_target(sink: &mut impl Sink, value: &RelationTarget) -> Result<(), E
             write_u8(sink, 3)?;
             raw(sink, &id.0)
         }
+        RelationTarget::Evidence(value) => {
+            write_u8(sink, 4)?;
+            raw(sink, &value.id.0)?;
+            raw(sink, &value.hash.0)
+        }
+    }
+}
+/// Schema 2 appends the optional follow-up policy after the deadline.
+fn policy(sink: &mut impl Sink, value: Option<focal_model::PeerPolicy>) -> Result<(), Error> {
+    match value {
+        None => write_u8(sink, 0),
+        Some(policy) => {
+            write_u8(sink, 1)?;
+            write_u8(sink, u8::from(policy.corrective_allowed))?;
+            write_u16(sink, policy.max_follow_ups)?;
+            write_u8(sink, u8::from(policy.single_issuer))?;
+            write_u8(
+                sink,
+                match policy.escalation {
+                    focal_model::Escalation::None => 0,
+                    focal_model::Escalation::Holder => 1,
+                    focal_model::Escalation::Evaluator => 2,
+                },
+            )
+        }
     }
 }
 
@@ -192,7 +217,11 @@ pub(in crate::native) fn claim(sink: &mut impl Sink, value: &ClaimDescriptor) ->
         raw(sink, &requirement.specification.0)?;
     }
     slots(sink, value.slots())?;
-    optional_deadline(sink, value.deadline())
+    optional_deadline(sink, value.deadline())?;
+    if value.schema() >= 2 {
+        policy(sink, value.policy())?;
+    }
+    Ok(())
 }
 
 fn kind(sink: &mut impl Sink, value: ValidationKind) -> Result<(), Error> {

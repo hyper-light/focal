@@ -71,6 +71,8 @@ fn immutable<O: Overlay>(
 
 fn expected_status(kind: NativeEventKind, prior: Option<ClaimStatus>, next: ClaimStatus) -> bool {
     match kind {
+        // Imported facts are never published by a mutation record.
+        NativeEventKind::Imported(_) => false,
         NativeEventKind::Created => prior.is_none() && next == ClaimStatus::Generated,
         NativeEventKind::Posted => {
             prior == Some(ClaimStatus::Generated) && next == ClaimStatus::Posted

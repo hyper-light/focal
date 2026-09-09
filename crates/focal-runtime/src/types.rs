@@ -57,7 +57,9 @@ impl RuntimeError {
             | Self::Ledger(LedgerError::Graph(GraphError::Memory(error))) => {
                 matches!(
                     error,
-                    MemoryError::Capacity { .. } | MemoryError::AllocationFailed
+                    MemoryError::Capacity { .. }
+                        | MemoryError::DiskCapacity { .. }
+                        | MemoryError::AllocationFailed
                 )
             }
             Self::Ledger(

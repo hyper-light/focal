@@ -37,7 +37,7 @@ fn branch_kind(branch: &Value) -> Option<&str> {
         .as_str()
 }
 
-pub(super) fn prune_definitions(schema: &mut Value) -> Result<(), ProtocolError> {
+pub(crate) fn prune_definitions(schema: &mut Value) -> Result<(), ProtocolError> {
     let root = schema.as_object_mut().ok_or(ProtocolError::Limits)?;
     let Some(definitions) = root.remove("$defs") else {
         return Ok(());
@@ -197,7 +197,9 @@ mod tests {
     #[test]
     fn full_optional_catalogue_leaves_room_for_a_real_first_job() {
         const MIB: usize = 1024 * 1024;
-        let budget = MemoryBudget::new(128 * MIB, 80 * MIB).unwrap();
+        // The adapter's production allowance: 160 MiB with an 80 MiB
+        // completion reserve, sized for the whole optional catalogue.
+        let budget = MemoryBudget::new(160 * MIB, 80 * MIB).unwrap();
         let count = focal_client::operations::descriptors().len()
             + 6
             + crate::catalog_admin::TOOL_COUNT

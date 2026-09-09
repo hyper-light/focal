@@ -19,6 +19,16 @@ impl PrivateJournal {
             failed: false,
         })
     }
+    /// Open an existing journal for reading beside other readers; every write
+    /// is refused as `Locked`.
+    pub fn open_shared(path: impl AsRef<Path>) -> Result<Self, EnrollmentError> {
+        let directory = PrivateDirectory::open_shared(path.as_ref())?;
+        let _ = directory.read("journal.bin")?;
+        Ok(Self {
+            directory,
+            failed: false,
+        })
+    }
     pub fn read(&self) -> Result<Option<Zeroizing<Vec<u8>>>, EnrollmentError> {
         if self.failed {
             return Err(EnrollmentError::Corrupt);
@@ -54,7 +64,9 @@ impl PrivateJournal {
         }
         let name = format!("invite-{}", crate::hex(&request));
         let result = self.directory.install_new(&name, &invitation);
-        if result.is_err() {
+        // A refused write on a shared handle changed nothing; only a failed
+        // write leaves the record in doubt.
+        if result.is_err() && !matches!(result, Err(EnrollmentError::Locked)) {
             self.failed = true;
         }
         result
@@ -67,7 +79,7 @@ impl PrivateJournal {
             return Err(EnrollmentError::Capacity);
         }
         let result = self.directory.replace("journal.bin", bytes);
-        if result.is_err() {
+        if result.is_err() && !matches!(result, Err(EnrollmentError::Locked)) {
             self.failed = true;
         }
         result
@@ -135,5 +147,58 @@ mod tests {
         let journal = PrivateJournal::open(&path).unwrap();
         assert_eq!(journal.read().unwrap().unwrap().as_slice(), b"new");
         assert!(path.join("journal.bin.initialized").exists());
+    }
+
+    #[test]
+    fn shared_readers_coexist_and_exclude_writers_without_writing() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("journal");
+        assert!(matches!(
+            PrivateJournal::open_shared(&path),
+            Err(EnrollmentError::Invalid)
+        ));
+        let mut journal = PrivateJournal::open(&path).unwrap();
+        journal.replace(b"saved").unwrap();
+        drop(journal);
+        let mut first = PrivateJournal::open_shared(&path).unwrap();
+        let second = PrivateJournal::open_shared(&path).unwrap();
+        assert_eq!(first.read().unwrap().unwrap().as_slice(), b"saved");
+        assert_eq!(second.read().unwrap().unwrap().as_slice(), b"saved");
+        // A shared owner never writes, and a writer waits for every reader.
+        assert!(matches!(
+            first.replace(b"changed"),
+            Err(EnrollmentError::Locked)
+        ));
+        assert!(matches!(
+            first.remember_invitation([1; 32], [2; 16]),
+            Err(EnrollmentError::Locked)
+        ));
+        assert!(matches!(
+            PrivateJournal::open(&path),
+            Err(EnrollmentError::Locked)
+        ));
+        drop(first);
+        assert!(matches!(
+            PrivateJournal::open(&path),
+            Err(EnrollmentError::Locked)
+        ));
+        drop(second);
+        let mut writer = PrivateJournal::open(&path).unwrap();
+        writer.replace(b"changed").unwrap();
+        // A reader is refused while a writer holds the directory.
+        assert!(matches!(
+            PrivateJournal::open_shared(&path),
+            Err(EnrollmentError::Locked)
+        ));
+        drop(writer);
+        assert_eq!(
+            PrivateJournal::open_shared(&path)
+                .unwrap()
+                .read()
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"changed"
+        );
     }
 }

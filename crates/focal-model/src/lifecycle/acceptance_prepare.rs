@@ -5,7 +5,7 @@ use crate::lifecycle::validation::{CheckedDeclaration, CheckedDeclarationTarget}
 #[path = "acceptance_source.rs"]
 mod source;
 use crate::lifecycle::{graph::VisitBudget, memory as bytes};
-pub use source::{AcceptanceSource, AcceptanceSourcePasses, AcceptanceSourcePlan};
+pub use source::{AcceptanceSource, AcceptanceSourcePasses, AcceptanceSourcePlan, PolicyShape};
 
 #[derive(Debug, Clone, Copy)]
 enum Declarations<'a> {

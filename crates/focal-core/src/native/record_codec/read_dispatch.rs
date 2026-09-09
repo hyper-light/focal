@@ -12,7 +12,7 @@ use read_evidence as evidence;
 use read_source::Meter;
 
 #[path = "read_dispatch_objects.rs"]
-mod objects;
+pub(super) mod objects;
 #[cfg(test)]
 #[path = "read_dispatch_tests.rs"]
 mod tests;
@@ -219,12 +219,13 @@ fn with_policy<O: Objects, C: evidence::Custody, T>(
     let input = raw_claim(claim, body, access, context.parsing)?;
     let source = input.acceptance_source(access, context.source);
     let plan = context.model.model(|visits| {
-        let plan = aggregation::AcceptancePolicy::prepare_source(
+        let plan = aggregation::AcceptancePolicy::prepare_source_with(
             input.acceptance,
             input.acceptance_issuer,
             &source,
             context.limits.acceptance,
             visits,
+            read_claim::policy_shape(input.fields.origin),
         )?;
         let used = plan.inspection_visits();
         Ok((plan, used))
@@ -370,8 +371,9 @@ fn process<O: Objects, C: evidence::Custody>(
             {
                 return Err(invalid());
             }
+            let request = origin.request.resolve(ledger, id, fields.producer);
             let (plan, value_quote) = inspect(context, |model, source| {
-                let plan = input.prepare(origin.request, context.limits.artifact, model, source)?;
+                let plan = input.prepare(request, context.limits.artifact, model, source)?;
                 let quote = plan.quote();
                 Ok((plan, quote))
             })?;
@@ -530,13 +532,51 @@ fn process<O: Objects, C: evidence::Custody>(
         | Key::ClaimResultTestament(_)
         | Key::Outcome(_)
         | Key::ClaimIdentity(..)
-        | Key::DefinitionIdentity(..) => {
+        | Key::DefinitionIdentity(..)
+        | Key::ByIssuer(..)
+        | Key::BySubject(..)
+        | Key::ByStatus(..)
+        | Key::ByAction(..)
+        | Key::ByScope(..)
+        | Key::ByRelation(..)
+        | Key::ByProducer(..)
+        | Key::ByArtifactKind(..)
+        | Key::BySchema(..)
+        | Key::ArtifactInput(..)
+        | Key::ByEvaluator(..)
+        | Key::ByVerdict(..)
+        | Key::ByCreated(..)
+        | Key::DueTimer(..) => {
             let row = parse(body, context.parsing, |c| {
                 read_rows::read_fixed(encoded.key, c, ledger)
             })?
             .ok_or_else(invalid)?;
             let quote = quoted(0, 0, build)?;
             Ok((quote, build.map(|_| row)))
+        }
+        Key::LegacyTestament(_)
+        | Key::LegacyEvidenceSet(_)
+        | Key::LegacyRun(..)
+        | Key::LegacyDefinition(_) => {
+            let bytes = parse(body, context.parsing, |c| {
+                let len = c
+                    .count(context.limits.native.legacy_row_bytes)
+                    .map_err(evidence::codec)?;
+                c.take(len).map_err(evidence::codec)
+            })?;
+            let quote = quoted(OwnedLegacy::charge(bytes.len())?, 0, build)?;
+            let row = if build.is_some() {
+                let owned = OwnedLegacy::new(bytes)?;
+                Some(match encoded.key {
+                    Key::LegacyTestament(_) => Row::LegacyTestament(owned),
+                    Key::LegacyEvidenceSet(_) => Row::LegacyEvidenceSet(owned),
+                    Key::LegacyDefinition(_) => Row::LegacyDefinition(owned),
+                    _ => Row::LegacyRun(owned),
+                })
+            } else {
+                None
+            };
+            Ok((quote, row))
         }
         Key::End => Err(invalid()),
     }

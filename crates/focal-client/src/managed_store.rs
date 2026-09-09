@@ -117,7 +117,18 @@ struct State {
     last_control: Option<RequestStreamControlReceipt>,
 }
 impl State {
+    /// The stream this store owns: the generation the registration cited
+    /// plus one, which is exactly what the registry assigns; after the
+    /// registration commits the receipt's identity is authoritative.
     fn stream(&self) -> Result<RequestStreamIdentity, ManagedStoreError> {
+        if let Some(RequestStreamControlReceipt {
+            outcome:
+                RequestStreamControlOutcome::Registered(RequestStreamState::Active { stream, .. }),
+            ..
+        }) = &self.registered
+        {
+            return Ok(*stream);
+        }
         let RequestStreamCommand::Register {
             slot,
             expected_generation,
@@ -392,6 +403,30 @@ impl ManagedOperationStore {
     pub fn registration(&self) -> Result<RequestStreamControlInput, ManagedStoreError> {
         let (_, state) = self.load()?;
         Ok(state.registration)
+    }
+    /// Stop issuance durably when this generation has issued at least
+    /// `threshold` ordinals and every one of them is retired: the single
+    /// check-and-stop under the store lock is what makes a rotation safe
+    /// against a concurrent process reserving in between. Returns whether
+    /// issuance stopped now; a store that is stopped, mid-control or not yet
+    /// drained is left as it is.
+    pub fn stop_if_drained(&self, threshold: u64) -> Result<bool, ManagedStoreError> {
+        let (directory, mut state) = self.load()?;
+        if state.registered.is_none() {
+            return Err(ManagedStoreError::NotRegistered);
+        }
+        if state.stopped
+            || state.closed
+            || state.control.is_some()
+            || state.frontier < threshold.max(1)
+            || state.retired != state.frontier
+            || !state.entries.is_empty()
+        {
+            return Ok(false);
+        }
+        state.stopped = true;
+        self.save(&directory, &state)?;
+        Ok(true)
     }
     pub fn record_registration(
         &self,

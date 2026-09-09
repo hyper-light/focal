@@ -7,6 +7,7 @@ use crate::{
     operation_store::StoreError, *,
 };
 use focal_model::*;
+use focal_wire::{NativeListCursor, NativeObject};
 pub use journal::{WatchAction, WatchJournal, WatchRequest};
 use serde::{Deserialize, Serialize};
 pub use store::WatchStore;
@@ -14,7 +15,13 @@ pub use store::WatchStore;
 pub const MAX_WATCHES: usize = 16;
 pub const MAX_WATCH_PAGE_BYTES: usize = 64 * 1024;
 pub(crate) const RECORD_BYTES: usize = 256 * 1024;
-pub(crate) const MAGIC: &[u8; 8] = b"FCLWAT01";
+/// Journal record format: version 2 adds the engine to the saved options and
+/// the client-driven native seed phases; records of earlier development
+/// builds are refused rather than reinterpreted.
+pub(crate) const MAGIC: &[u8; 8] = b"FCLWAT02";
+/// Items per client-driven native seed list page, below the frame credit so
+/// each page fits the retained 64 KiB delivery bound with typical documents.
+pub(crate) const NATIVE_SEED_ITEMS: u32 = 32;
 #[derive(Debug, thiserror::Error)]
 pub enum WatchError {
     #[error(transparent)]
@@ -44,9 +51,20 @@ pub enum WatchError {
     #[error("watch had an ambiguous write; reopen before continuing")]
     Failed,
 }
+/// The engine a watch speaks to. A native ledger streams schema-2 deltas under
+/// the native wire profile and seeds through native reads; the choice is
+/// fixed when the watch is created and saved with its options.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WatchEngine {
+    #[default]
+    Legacy,
+    Native,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WatchOptions {
+    #[serde(default)]
+    pub engine: WatchEngine,
     #[serde(default)]
     pub claims: Vec<ClaimId>,
     #[serde(default)]
@@ -70,6 +88,7 @@ fn bytes() -> u32 {
 impl Default for WatchOptions {
     fn default() -> Self {
         Self {
+            engine: WatchEngine::Legacy,
             claims: vec![],
             family: None,
             seed: true,
@@ -110,8 +129,30 @@ impl WatchOptions {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WatchPage {
-    Seed { page: ReadPage },
-    Events { page: Box<StreamReply> },
+    Seed {
+        page: ReadPage,
+    },
+    Events {
+        page: Box<StreamReply>,
+    },
+    /// One page of a client-driven native seed: the objects read
+    /// linearizably after the source pinned the snapshot (`token` is the
+    /// native prefix of that read), and the step that follows once this page
+    /// is consumed. Facts committed between the snapshot and the read also
+    /// arrive as deltas: the seed is at-least-once.
+    NativeSeed {
+        token: ReadToken,
+        objects: Vec<NativeObject>,
+        next: NativeSeedNext,
+    },
+}
+/// The next step of a native seed: the claim at `index` of the watch's claim
+/// filter, the next page of the family list, or the seed's completion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeSeedNext {
+    Claim { index: u32 },
+    List { cursor: Option<NativeListCursor> },
+    Complete,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchDelivery {

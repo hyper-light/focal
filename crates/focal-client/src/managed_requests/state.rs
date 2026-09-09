@@ -4,10 +4,26 @@ pub(super) struct State {
     schema: u16,
     context: OperationContext,
     limits: ManagedStoreLimits,
+    /// Ordinals one generation issues before the coordinator closes it and
+    /// registers the next generation on the same slot (15 §"Close").
+    pub rotation: u64,
+    /// The active child store directory; `None` names the coordinator's own
+    /// name, the first generation's store.
+    pub child: Option<String>,
+    /// A retired child store whose removal has not completed yet.
+    pub cleanup: Option<String>,
+    /// Closed generations this owner retired, newest last: a bounded local
+    /// fence beside the server's, so an old reference is retired here too.
+    pub retired: Vec<Retired>,
     pub phase: Phase,
     pub pending: Option<Box<RequestEnvelope>>,
     pub delivered: Vec<Delivered>,
     pub accepted: Option<(ContentHash, ContentHash)>,
+}
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(super) struct Retired {
+    pub slot: u32,
+    pub generation: u64,
 }
 #[derive(Serialize, Deserialize)]
 pub(super) enum Phase {
@@ -40,11 +56,15 @@ impl State {
             && self.delivered.is_empty()
             && self.accepted.is_none()
     }
-    pub fn new(context: OperationContext, limits: ManagedStoreLimits) -> Self {
+    pub fn new(context: OperationContext, limits: ManagedStoreLimits, rotation: u64) -> Self {
         Self {
-            schema: 1,
+            schema: 2,
             context,
             limits,
+            rotation,
+            child: None,
+            cleanup: None,
+            retired: Vec::new(),
             phase: Phase::Scan { slot: 0 },
             pending: None,
             delivered: Vec::new(),
@@ -55,12 +75,41 @@ impl State {
         &self,
         context: OperationContext,
         limits: ManagedStoreLimits,
+        rotation: u64,
+        name: &str,
     ) -> Result<(), ManagedRequestsError> {
-        if self.schema != 1 || self.context != context {
+        if self.schema != 2 || self.context != context {
             return Err(ManagedRequestsError::Context);
         }
-        if self.limits != limits {
+        if self.limits != limits || self.rotation != rotation || rotation == 0 {
             return Err(StoreError::LimitsMismatch.into());
+        }
+        let child_valid = |child: &str| {
+            child
+                .strip_prefix(name)
+                .and_then(|rest| rest.strip_prefix(".g"))
+                .is_some_and(|generation| {
+                    !generation.is_empty()
+                        && generation.len() <= 20
+                        && generation.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        };
+        if self
+            .child
+            .as_deref()
+            .is_some_and(|child| !child_valid(child))
+            || self
+                .cleanup
+                .as_deref()
+                .is_some_and(|old| old != name && !child_valid(old))
+            || (self.cleanup.is_some() && self.cleanup == self.child)
+            || self.retired.len() > RETIRED_FENCES
+            || self
+                .retired
+                .windows(2)
+                .any(|pair| matches!(pair, [a, b] if a.generation >= b.generation))
+        {
+            return Err(ManagedRequestsError::Corrupt);
         }
         if self.delivered.len() > limits.window as usize {
             return Err(ManagedRequestsError::Corrupt);

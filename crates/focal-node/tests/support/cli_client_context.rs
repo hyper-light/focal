@@ -53,6 +53,19 @@ impl PeerMcp {
         assert_eq!(result["isError"], false, "{result}");
         result["structuredContent"].clone()
     }
+    /// A call the adapter must refuse outright: the raw JSON-RPC error.
+    pub(super) fn refused(&mut self, name: &str, args: Value) -> Value {
+        let id = self.next;
+        self.next += 1;
+        let input = json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":args,"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}});
+        serde_json::to_writer(&mut self.input, &input).unwrap();
+        self.input.write_all(b"\n").unwrap();
+        self.input.flush().unwrap();
+        let result = self.output.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(result["id"], id, "{result}");
+        assert!(result["error"].is_object(), "not refused: {result}");
+        result["error"].clone()
+    }
 }
 
 #[test]
@@ -184,6 +197,10 @@ fn enrolled_named_context_reads_over_quic_and_mcp_survives_server_and_client_res
         focal_model::ClaimStatus::Satisfied
     );
     let mut mcp = PeerMcp::open(client.path());
+    // An enrolled participant's adapter never lists the operator surface, and
+    // a hidden tool invoked directly is refused, not served.
+    let refused = mcp.refused("cluster.status", json!({}));
+    assert_eq!(refused["message"], "Unknown tool", "{refused}");
     assert_eq!(mcp.call("claim.list", json!({}))["result"]["kind"], "list");
     drop(mcp);
     drop(server);

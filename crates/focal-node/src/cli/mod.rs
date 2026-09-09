@@ -13,6 +13,8 @@ mod lifecycle;
 mod managed;
 mod mcp;
 mod monitor;
+mod native;
+mod native_documents;
 mod output;
 mod reads;
 mod reconcile;
@@ -77,8 +79,26 @@ pub(super) enum CliError {
     Domain(DomainOutcome),
     #[error("mutation has no verified durable receipt; retry the saved operation")]
     Unconfirmed,
+    #[error("the native owner refused the frame: {}", .0.detail)]
+    NativeRefused(NativeRefusal),
+    #[error(transparent)]
+    NativeCompile(#[from] focal_native_client::CompileError),
+    #[error(transparent)]
+    NativeStore(#[from] focal_client::native_store::NativeStoreError),
     #[error(transparent)]
     Other(Box<dyn std::error::Error + Send + Sync>),
+}
+impl From<focal_native_client::DriveError> for CliError {
+    fn from(error: focal_native_client::DriveError) -> Self {
+        use focal_native_client::DriveError;
+        match error {
+            DriveError::Compile(error) => Self::NativeCompile(error),
+            DriveError::Store(error) => Self::NativeStore(error),
+            DriveError::Client(error) => Self::Client(error),
+            DriveError::Input(error) => Self::Document(error),
+            DriveError::ProjectionOnly | DriveError::Cancelled => Self::Input(error.to_string()),
+        }
+    }
 }
 pub(super) struct Context {
     client: Client<context::Transport>,
@@ -184,6 +204,9 @@ pub(super) fn run(
     selection: Option<&str>,
 ) -> Result<()> {
     let context = Context::open(settings, selection)?;
+    if let Some(standing) = native::detect(runtime, &context)? {
+        return native::run(runtime, &context, command, &standing);
+    }
     let command = match command {
         Commands::Claim {
             command: ClaimCommand::Wait(args),
@@ -191,7 +214,14 @@ pub(super) fn run(
         Commands::Monitor {
             command: monitor::MonitorCommand::Get(args),
         } => return monitor::get(runtime, &context, args),
-        Commands::Watch { command } => return watch::run(runtime, &context, command),
+        Commands::Watch { command } => {
+            return watch::run(
+                runtime,
+                &context,
+                command,
+                focal_client::watch::WatchEngine::Legacy,
+            );
+        }
         Commands::Ledger { command } => return graph::run(runtime, &context, command),
         Commands::Validator { command } => return validators::run(runtime, &context, command),
         Commands::Artifact {
@@ -336,6 +366,9 @@ pub(super) fn status(
     selection: Option<&str>,
 ) -> Result<()> {
     let context = Context::open(settings, selection)?;
+    if native::detect(runtime, &context)?.is_some() {
+        return native::status(runtime, &context, OutputFormat::Json);
+    }
     let request = context.envelope(Operation::Read(ReadRequest {
         consistency: ReadConsistency::Linearizable,
         query: ReadQuery::Objects(Vec::new()),
@@ -416,12 +449,14 @@ pub(super) fn request(
                 operation_id: Some(id),
                 output,
             }),
-        ) => managed::retry(
-            runtime,
-            &Context::open(settings, selection)?,
-            &id,
-            output.format,
-        ),
+        ) => {
+            let context = Context::open(settings, selection)?;
+            if let Some(native) = id.strip_prefix("n1:") {
+                let id = format!("n1:{native}").parse()?;
+                return native::retry(runtime, &context, id, output.format);
+            }
+            managed::retry(runtime, &context, &id, output.format)
+        }
         (
             None,
             Some(RequestCommand::Inspect {
@@ -430,13 +465,13 @@ pub(super) fn request(
                 remote,
                 output,
             }),
-        ) => managed::inspect(
-            runtime,
-            &Context::open(settings, selection)?,
-            &id,
-            remote,
-            output.format,
-        ),
+        ) => {
+            let context = Context::open(settings, selection)?;
+            if id.starts_with("n1:") {
+                return native::inspect(runtime, &context, id.parse()?, remote, output.format);
+            }
+            managed::inspect(runtime, &context, &id, remote, output.format)
+        }
         (None, Some(RequestCommand::Reserve { output })) => {
             managed::reserve(runtime, &Context::open(settings, selection)?, output.format)
         }

@@ -16,6 +16,8 @@ use focal_model::{ObjectId, RelationTarget};
 mod checks;
 #[path = "authored_prepare.rs"]
 mod creation_work;
+#[path = "authored_peer.rs"]
+mod peer;
 pub(super) use checks::{check_plan, check_storage};
 pub(super) use checks::{
     declaration_pair as check_recorded_declaration, pair as check_recorded_claim,

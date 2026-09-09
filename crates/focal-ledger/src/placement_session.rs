@@ -221,6 +221,21 @@ impl Session {
             .as_ref()
             .map(|record| record.fence.to_route)
     }
+    /// The fence of the active record, as opposed to a later cutover record
+    /// whose activation is still pending.
+    pub fn active_fence(&self) -> Option<&SessionFence> {
+        self.placement_state
+            .active
+            .as_ref()
+            .map(|record| &record.fence)
+    }
+    /// The placement the active record committed, with its members.
+    pub fn active_placement(&self) -> Option<&PlacementSpec> {
+        self.placement_state
+            .active
+            .as_ref()
+            .map(|record| &record.record.request.placement)
+    }
     pub fn placement_receipt(
         &self,
         request: &SessionPlacementRequest,
@@ -362,10 +377,13 @@ impl Session {
                             != request.placement.placement.voters,
                     ))
                     .ok_or(LedgerError::Capacity)?;
+                // A cutover may follow several committed configuration changes;
+                // its epoch is the group's actual epoch, never below the change
+                // this placement itself implies.
                 if self.placement_state.paused()
                     || request.operation == active.fence.operation
                     || request.from_route != active.fence.to_route
-                    || request.membership_epoch != membership
+                    || request.membership_epoch < membership
                     || active.fence.placement_epoch.checked_add(1) != Some(request.placement_epoch)
                 {
                     return Err(LedgerError::PlacementConflict);
@@ -546,7 +564,7 @@ impl Session {
                         || cutover.fence.from_route != active.fence.to_route
                         || active.fence.placement_epoch.checked_add(1)
                             != Some(cutover.fence.placement_epoch)
-                        || cutover.fence.membership_epoch != expected_membership
+                        || cutover.fence.membership_epoch < expected_membership
                         || cutover.fence.sequence < active.fence.sequence
                         || cutover.fence.term < active.fence.term
                     {

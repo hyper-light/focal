@@ -5069,3 +5069,2229 @@ Native Session/WAL replay, checkpoint provenance, encoded-buffer funding,
 quorum-prefix mapping and live CLI/MCP activation remain required before the
 two-participant restart acceptance gate. Passing these component tests does not
 qualify live native service recovery, regional deployment or throughput.
+
+## Durable native Session, cluster harness and record-bound proof — 2026-09-08
+
+This batch finishes the interrupted composition and delivers the R0–R2 packages
+of [REMAINING](../REMAINING.md). The workspace compiles again: the allocator
+overhead constant is public in `focal-memory`, the completion book carries its
+record-buffer profile, and the ledger registers its native checkpoint module.
+The single native decoder identity is the enclosing checkpoint descriptor hash,
+which now names the input frames as well; `NativeSession` confirms exactly that
+hash as the group's durable floor.
+
+[NativeSession](../../crates/focal-ledger/src/native_session.rs) is the durable
+native Session over the consensus replica. Its contract is recorded in
+[22 §6](22-native-record-format.md#6-durable-session-contract): a committed
+`FCNGENES1` genesis before any native mutation; `NativeCommit` carrying Raft
+index and term next to the native sequence; membership merged by Raft index;
+suffix disposition only on a matched head, a conflicting committed prefix, an
+installed snapshot or an applied newer-term barrier; 16-byte read correlations;
+an explicit retryable/authority/request/fail-closed error classification;
+snapshot installation that rebuilds a complete replacement root under a derived
+incarnation before replacing the domain; and startup that returns its recovered
+events to the caller. Admission through typed input, borrowed `FCNINPUT1` frames
+and trusted timers shares one path; timer namespaces are refused from frames.
+
+Two defects surfaced by the three-node harness were fixed at their source. A
+refused consensus staging reservation taken before any Raft state is touched no
+longer marks the replica failed; it is retryable
+([persistence.rs](../../crates/focal-consensus/src/persistence.rs)). Restored
+replicas no longer draw a random producer range; the incarnation derives from
+the attested genesis, node and install event, and the ledger crate lost its
+`getrandom` dependency. `DurableNode` gained leader transfer, snapshot feedback
+and free-space passthroughs, plus a `test-support` election pacing hook.
+
+The R1 lifetime work is proven rather than argued. The future record bound in
+[buffer.rs](../../crates/focal-core/src/native/record_codec/buffer.rs) is one
+quote function; [bound_tests](../../crates/focal-core/src/native/record_codec/bound_tests.rs)
+drives complete two-party workflows at authored maxima (largest metadata,
+inputs, visibility labels and summaries, monitors, deadlines, adoption, child and
+dependent claims, audit testaments, authored descriptors) and checks every changed
+key of all thirty row families against its fixed allowance plus four bytes per
+charged heap byte, every frame against the quote, and every completion promise
+against the report it later funds. Record buffers and their permits are shown to
+live exactly as long as their candidate, read leases keep only their own charge
+once the owner is gone, extraction refuses without allocation while candidates
+are pending, and consensus staging is released after a checkpoint finishes.
+Admission promises are explicit in [18 §6.7](18-lifecycle-storage-upgrade.md#67-integrated-nativeowner-ram-completion-contract):
+RAM for construction, the encoded record and retained pages, never disk, quorum
+or fan-out; a free-space watermark on the WAL filesystem refuses fresh candidates
+before any in-memory acknowledgement while exact retries are still answered.
+
+Evidence on one disk-backed node: create, post, receipt, work and diagnostic
+artifacts, authored success and failed testimony, posting, receipt of testimony,
+whole-work entry, evaluator reports with derived acceptance, checkpoint, restart,
+exact retry across restart and a new term; frames and typed inputs share one
+identity; queue-slot, delivery-under-memory-pressure, refused-open and disk
+watermark bounds each refuse without losing state. Evidence on three disk-backed
+voters exchanging Raft messages in-process: follower replay equality of native
+prefixes, producer ranges and claim state; leader loss with an unresolved
+candidate discarded only by the newer-term barrier or a conflicting committed
+prefix and its request key reusable afterwards; a commit before the reply
+surviving the leader crash with the exact retry finding it; a lagging follower
+installing the enclosing checkpoint, replaying the tail and taking authority by
+planned handover; concurrent correlated read barriers; a follower without
+evidence custody retaining the record until the content is imported through the
+transfer API and applying it once; a follower under memory pressure keeping its
+delivery until memory returns; corrupted record bytes in transit stopping only
+the receiving replica.
+
+Qualification on macOS arm64 (Darwin 25.4.0, Rust 1.94.1), 2026-09-08, on this
+tree: `bash scripts/cargo.sh test --workspace --offline` passed **2,330 tests
+across 85 test binaries** with no failures (822 Core library tests grew
+to 828, 77 ledger to 91, 40 consensus to 43); strict
+workspace all-target Clippy, the production no-panic gate, formatting and
+`--locked` checks pass; architecture checks verify **981 links**, all
+**37 imported source hashes** and **15 frozen vocabularies**. One node library
+test with a 300 ms timeout flaked once under the full parallel run and passed
+alone and on rerun; it is timing, not state. Linux, Windows and released
+binaries were not exercised.
+
+Still open before the first product gate: activating this Session inside the
+running service next to the ancillary protocols with V1 import (R3), and native
+operations through the service, CLI and MCP (R4).
+## One Session with two engines: native activation, hosting and barriers — 2026-09-08
+
+This batch delivers the R3 packages except populated-history import. The
+durable native engine of the previous batch is now a component
+([native_session_engine.rs](../../crates/focal-ledger/src/native_session_engine.rs))
+that the standalone native session and the unified
+[Session](../../crates/focal-ledger/src/session.rs) share: every consensus
+interaction takes the replica explicitly, native replay and recovery read
+evidence through a lock-free [ContentReader](../../crates/focal-evidence/src/store.rs)
+over the node's content directory, and the exclusive writer keeps installation
+and inline sealing. The Session keeps every ancillary protocol and adds a
+committed `FOCALAC1` activation record, the `FOCALSS6` envelope carrying every
+legacy section plus the native section, native routing in one Raft-ordered
+apply loop with deliveries retained across retryable native refusals, readiness
+promotion of the native owner, legacy refusals after activation, and a native
+admission/read API. [23](23-native-activation-and-import.md) records the field
+matrix and the protocol.
+
+Activation is gated by durable promises: the managed baseline floor, the
+recorded transition to the native decoder, and a support exchange that now
+advertises the native descriptor so the leader proposes only when every voter
+in both configuration sets has promised. Replicas fence native history at
+ingress until their own transition is durable; a replica without hosting
+refuses permanently and a downgraded binary cannot open a native ledger.
+Membership additions and promotions require the native promise after
+activation. Nodes host the engine at construction over `<data>/content`
+([network_service.rs](../../crates/focal-node/src/network_service.rs),
+[embedded.rs](../../crates/focal-node/src/embedded.rs)); the support driver
+makes hosted replicas promise; `cluster replicas activate-native --session`
+proposes activation through the replica admin protocol; replica diagnostics
+report native hosting, readiness and activation.
+
+Evidence in [session_native_tests.rs](../../crates/focal-ledger/src/session_native_tests.rs):
+an empty ledger activates through the unified Session, runs the two-party
+workflow natively, refuses legacy commands with a typed outcome, writes the SS6
+checkpoint, restarts to the same prefix and answers an exact retry; a voter
+without hosting blocks activation with a typed refusal and a downgraded replica
+is refused at open while a rehosted one catches up; a lagging replica installs
+the SS6 checkpoint with native state and takes authority by planned handover.
+The standalone native suites, the record-bound proof and the V1 fixture corpus
+keep passing unchanged.
+
+Timing guards in the fleet evidence tests were widened to the 30-second export
+bound so a loaded host cannot turn a causal check into a timeout; the ordering
+assertions are unchanged.
+
+Qualification on macOS arm64 (Darwin 25.4.0, Rust 1.94.1), 2026-09-08, on this
+tree: `bash scripts/cargo.sh test --workspace --offline --no-fail-fast` passed
+**2333 tests across 86 test binaries** (0 failed);
+strict workspace all-target Clippy, the production no-panic gate, formatting
+and `--locked` checks pass; architecture checks verify **991 links**, all
+**37 imported source hashes** and **15 frozen vocabularies**. Linux, Windows
+and released binaries were not exercised.
+
+Still open in R3: import of populated legacy history (the `Imported` activation
+kind is refused at apply until then), crash cuts at each durable boundary of
+the transition, and resumed watches across it. R4 follows with native
+operations through the service, CLI and MCP.
+
+## Populated legacy history imports into native prefix one — 2026-09-08
+
+This batch delivers the import path R3 left open. A legacy ledger with history
+activates through the same `FOCALAC1` record (now schema 2, kind `Imported`):
+the record carries the sealed legacy prefix, the trusted logical time, the
+canonical inline chunking and the translation root; every replica translates
+its own legacy core with the recorded-fact constructors recovery uses
+([import.rs](../../crates/focal-core/src/native/import.rs)), writes one
+`FCNROOTS2` image under a canonical incarnation, restores it through the
+checkpoint recovery path and compares the root; a divergent replica fails
+closed and nothing is transferred or rerun. The representation is frozen in
+[23 §5](23-native-activation-and-import.md): claims keep their recorded status
+history as `Imported` events with an explicit legacy origin and an empty
+acceptance policy; testaments, evidence sets, validations and runs are retained
+verbatim as frozen legacy rows (families 30–33); artifacts are re-verified from
+local content under a derived import request key; receipts, monitors and graph
+indices are native rows. Legacy claims refuse every native completion
+operation; cancellation, expiry, supersession, scope and graph effects apply.
+The enclosing checkpoint (`FCNSESS1` version 2) records the prefix that holds
+no native record so the first record after an import binds to sequence one.
+
+Hosts seal inline legacy payloads through the exclusive content writer
+(`ContentHost::seal_import_inline`, canonical chunk size from the record). The
+leader's admin path seals before proposing; a replica whose host has not sealed
+retains the import delivery (`CustodyPending`, retryable) and reports
+`native_import_pending`; the support driver seals and the next poll applies.
+The replica worker no longer stops on a retained delivery, a not-yet-possible
+shutdown checkpoint (genesis in flight) is skipped rather than reported as a
+failure, and diagnostics gained `native_import_pending` and
+`native_authoritative`.
+
+Evidence: [import_tests.rs](../../crates/focal-core/src/native/import_tests.rs)
+imports a populated legacy history (a satisfied claim with an inline artifact,
+closed testament and run; a posted dependent with released and active monitors;
+a cancelled, released claim; a superseded claim; a content-backed standalone
+artifact), restores it, re-encodes the same rows, reproduces the root on a
+second replica under another range, and refuses empty prefixes, missing
+content, the synthetic broad corpus and a starved budget with typed outcomes;
+[session_native_tests.rs](../../crates/focal-ledger/src/session_native_tests.rs)
+imports on three replicas (followers seal through the host path), keeps legacy
+exact-retry receipts resolving from the frozen prefix, refuses legacy commands,
+continues native work to sequence two on every replica, checkpoints and
+restarts with the imported prefix;
+[fleet_import_tests.rs](../../crates/focal-node/src/fleet_import_tests.rs)
+drives the node path: the worker hands payloads to the content host, an
+unsealed proposal is refused with `CustodyPending`, and after sealing the
+ledger becomes native and authoritative with no import pending. The V1 fixture
+corpora keep their bytes and hashes.
+
+The transition itself is qualified under crash cuts and across the ancillary
+protocols in the same suite: the authority crashes right after proposing (the
+record commits once or is superseded and proposed again, never applied twice),
+a follower crashes with the record appended but unapplied and applies it after
+restart, the authority crashes after applying activation and before genesis
+commits (its shutdown checkpoint is skipped, the restarted authority commits
+genesis and opens native admission), a replica whose host seals late retains
+the import across its own restart and applies the same record once; a
+protected watch registered before activation replays its legacy deltas from
+its position without a resync, its cursor and receipts survive the transition,
+a managed request committed before activation keeps resolving exactly, a late
+legacy managed command is refused with a typed outcome, and all of it survives
+the `FOCALSS6` checkpoint and a restart. Opening a session with a retained
+import delivery is not an open failure; the host services it.
+
+Two test-harness races surfaced under machine load while this batch was
+qualified and are fixed with it. The network CLI tests chose loopback ports
+from the operating system's ephemeral range and released them before the child
+process bound them, so another process could take the port in between and the
+node failed with "address already in use"; the helper now probes ports outside
+that range, keeps a per-process registry so concurrently running tests never
+share one, and probes both protocols
+([cli_network.rs](../../crates/focal-node/tests/cli_network.rs)). The control
+host budget test exhausted the memory budget from a single statistics snapshot
+while the host's own tick could move bytes; it now reserves until a single byte
+is refused ([control_host.rs](../../crates/focal-node/tests/control_host.rs)).
+Three complete workspace runs of these sources before the qualifying run
+reported one, three and one failures: the budget race above, one MCP stdio
+watch test that received `resync_required` after a server restart under load
+and passed alone twice
+(`watch_stdio_retains_seed_and_events_until_explicit_consumption_across_restart`),
+and the network cluster test failing at a node start with "address already in
+use" (twice before the port change and once after it, each time passing alone
+and in repeated runs of its own binary). The port change removes one collision
+source but is not proven to be the whole cause; the helper now records the
+holder of every socket in the test range when a start fails, so the next
+occurrence names it. Both flaky tests are otherwise unchanged and remain under
+observation.
+
+Qualification on macOS arm64 (Darwin 25.4.0, Rust 1.94.1), 2026-09-08 15:23
+CDT, on this tree: `bash scripts/cargo.sh test --workspace --offline --no-fail-fast` passed
+**2,340 tests across 85 test binaries** (0 failed);
+strict workspace all-target Clippy, the production no-panic gate, formatting
+and `--locked` checks pass; architecture checks verify **1,003 links**, all
+**37 imported source hashes** and **15 frozen vocabularies**. Linux, Windows
+and released binaries were not exercised.
+
+R3 closes with this batch. R4 follows with native operations through the
+service, CLI and MCP; the first product gate (a two-party workflow through CLI
+and MCP with restart) is its close condition.
+
+## Native wire profile and node ingress — 2026-09-08
+
+This batch opens R4 by carrying native operations across the wire and through
+the node. Protocol version 4 ([native.rs](../../crates/focal-wire/src/native.rs))
+registers `Native { frame }` (tag 25), `NativeRead` (26) and `NativeList` (27)
+with their replies; a handler advertises it only when it admits managed,
+participant and native requests, and the profile admits a closed operation set
+(native operations, managed request streams, reconcile, summary, stream and
+content transfer). Admissibility inspects only a frame's fixed header (magic,
+format version, content profile, actor namespace, ledger, principal and request
+identity bound to the authenticated envelope); node peers hold no native
+capability. Mutation replies are the committed native receipt, a pending ticket
+or a closed refusal (invalid input, unauthorized, not found, stale binding,
+conflict, capacity, or a contract code mirroring the lifecycle contract errors).
+Read documents mirror every committed native row family explicitly, from claims
+with obligations, lineage, acceptance slots, scopes and authored content down to
+events and frozen legacy bytes; the registered encodings of the three
+operations are pinned by hash in the wire tests. The node projects committed
+rows into those documents
+([native_documents.rs](../../crates/focal-node/src/native_documents.rs)),
+admits frames on the embedded owner with custody through its exclusive content
+writer ([native_ingress.rs](../../crates/focal-node/src/native_ingress.rs)),
+serves reads under every consistency mode with the native read barrier for
+linearizable reads ([native_reads.rs](../../crates/focal-node/src/native_reads.rs)),
+and on the replicated path proposes non-artifact frames, resolves pending
+outcomes and linearizable reads from the session's committed events, and
+refuses artifact-bearing frames until the content host proves custody for
+them. Bounded lists, the validation context read, claim history expansion and
+node-scheduled native timers are refused as unsupported until the index
+families of the next batch exist; nothing is partially served.
+
+Activation gained the pieces a laptop needs: `cluster replicas activate-native`
+on a node without a network listener runs offline against the exclusive data
+directory ([native_activation.rs](../../crates/focal-node/src/native_activation.rs)),
+commits the record under the node's own authority, checkpoints and returns;
+genesis activation (fleet admin or offline) now uses the authored content
+profile so claims are authored natively, while a populated prefix is still
+imported projection-only. The first node test exposed that a restored replica
+reported the activation record's Raft index as a bound derived from the sealed
+legacy prefix rather than the exact position; `FCNSESS1` version 3 retains the
+index, the hosted engine records it when the record applies, the standalone
+engine records its genesis entry, and restore refuses an index outside the
+sealed prefix and the applied position ([22](22-native-record-format.md)).
+
+Decisions recorded in [07](07-decisions-and-traceability.md): F16 (frames on
+the wire), F17 (the planned input-codec extraction was surveyed and deferred
+because the codec is coupled to admission helpers; `focal-client` and
+`focal-mcp` use `focal-core` only in tests, so native documents stay in the
+client while the document-to-frame compiler and native journal go into a
+host-side crate), F18 (retained activation index; authored genesis profile).
+
+Both servers negotiate the profile only when their handler admits native
+requests, both clients offer it, the embedded transport gates it, and reply
+validation checks native receipts, tickets, pages and cursors against the
+request identity and bounds.
+
+Evidence: [native_tests.rs](../../crates/focal-wire/src/native_tests.rs) covers
+header inspection, admissibility against the authenticated envelope, tags,
+capability and mutation class, profile gating, negotiation, request validation,
+reply validation, frozen encodings and a local-socket round trip that reaches
+a native-capable handler and is rejected at negotiation by one that is not;
+[native_host_tests.rs](../../crates/focal-node/src/native_host_tests.rs) runs a
+V1 embedded node that refuses the profile, activates it offline (idempotently),
+admits a projection frame through the local host, returns the same receipt for
+the identical frame, refuses a different intent under the same key as a
+conflict, refuses a foreign principal and the legacy profile, commits a second
+frame, reads the claim with its evaluations, an outcome, a missing claim and a
+definition in one page, scans events, reports standing, refuses a stale exact
+token and the unsupported list, then restarts with the prefix and activation
+intact. The R3 activation, import, checkpoint and cluster suites pass on the
+version 3 envelope.
+
+Qualification on macOS arm64 (Darwin 25.4.0, Rust 1.94.1), 2026-09-08 16:27
+CDT, on this tree: `bash scripts/cargo.sh test --workspace --offline --no-fail-fast`
+passed **2,350 tests across 85 test binaries** (0 failed);
+strict workspace all-target Clippy, the production no-panic gate, formatting
+and `--locked` checks pass; architecture checks verify **1,019 links**, all
+**37 imported source hashes** and **15 frozen vocabularies**. Linux, Windows
+and released binaries were not exercised.
+
+R4 continues with the coverage table, the client document and frame layer, and
+the first product gate through the CLI.
+
+## Native client documents, compiler and journal — 2026-09-08
+
+This batch delivers the client side of R4: the authored surface through which
+every host submits native operations as byte-identical frames. `focal-client`
+gains the native documents and their descriptors at version 2 of the verbs
+humans already use ([native_documents.rs](../../crates/focal-client/src/operations/native_documents.rs),
+[native_catalog.rs](../../crates/focal-client/src/operations/native_catalog.rs)),
+hand-written input schemas ([native_schema.rs](../../crates/focal-client/src/operations/native_schema.rs)),
+the R4.0 coverage table as an exhaustive match over the owner's operations with
+codec frame tags, actors, CLI paths, reads and exposure
+([native_inventory.rs](../../crates/focal-client/src/operations/native_inventory.rs)),
+the `n1:` operation journal that claims the request identity under the
+canonical document, persists the exact frame with its fingerprint and minted
+identities, and records only receipts bound to that frame
+([native_store.rs](../../crates/focal-client/src/native_store.rs)), the
+`submit_native`, `native_read` and `native_list` client calls with pending
+tickets treated as uncertain writes, and the native refusal exit classes.
+Descriptors now carry their wire profile and retry identity (F21). The new
+`focal-native-client` crate compiles documents plus the bindings read from one
+fixed prefix into `NativeInput`, encodes the frame and recomputes the owner's
+intent fingerprint with the owner's own decoder
+([compile.rs](../../crates/focal-native-client/src/compile.rs),
+[resolve.rs](../../crates/focal-native-client/src/resolve.rs),
+[frame.rs](../../crates/focal-native-client/src/frame.rs)). The wire evaluation
+document gained the current attempt so a report can be compiled from a read.
+
+Writing the compiler against the real owner surfaced four contract rules the
+documents now respect explicitly and doc [21](21-native-input-format.md)
+records: authored relations target committed claims of the same ledger (the
+owner refuses a relation to an absent claim), a slot's missing-slot obligation
+is a virtual declaration index no declaration uses, a closing testament cites
+every diagnostic of its cycle in ascending artifact order, and beginning or
+reporting work is admitted only through the managed owner's completion
+contract, never through a direct core call. Decisions F20 and F21 are recorded
+in [07](07-decisions-and-traceability.md).
+
+Evidence: the compiler suite ([tests.rs](../../crates/focal-native-client/src/tests.rs))
+runs the complete two-party workflow from documents through `NativeOwner`
+frame ingress with real content custody — create, post, acquire the receipt,
+submit work and a diagnostic, close the cycle citing both, post, receive,
+begin and report the whole-work evaluation — and checks after every step that
+identical documents and identities encode identical bytes, that the frame
+header carries the request identity, and that the committed receipt's intent
+equals the client's fingerprint; the claim ends `Satisfied`. It also pins the
+creation refusals (missing delivery declaration, derived or non-claim
+relations, check outside the declarations, empty handler list, phase and
+target mismatch, self-work, duplicate scopes, missing parent), diagnostic
+citation rules and content binding for failed testimony, and the mapping from
+wire objects to bindings including current-evaluation selection across
+generations and slots. `focal-client` tests cover the catalog (sorted,
+version 2, every serialized field has a schema property, unknown fields
+refused, V1 rows untouched), the coverage table (every frame tag 0–27 owned by
+exactly one operation, exposed rows resolve to descriptors, the exact
+`WireOnly` set), the journal (claim once, exact retry, receipt binding by
+invocation and intent, intent and context conflicts, malformed expansions,
+interrupted initialization at each durable step resuming without a second
+identity, capacity and limit mismatch) and the client (a pending ticket is
+resent as the identical frame until it commits, a ticket that never commits
+is an unknown outcome with the request retained, refusals are final, reads
+return pages, a handler without the engine refuses the profile before any
+frame is seen).
+
+Qualification on macOS arm64 (Darwin 25.4.0, Rust 1.94.1), 2026-09-08 18:03
+CDT, on this tree: `bash scripts/cargo.sh test --workspace --offline --no-fail-fast`
+passed **2,367 tests across 87 test binaries** (0 failed);
+strict workspace all-target Clippy, the production no-panic gate, formatting
+and `--locked` checks pass; architecture checks verify **1,041 links**, all
+**37 imported source hashes** and **15 frozen vocabularies**. Linux, Windows
+and released binaries were not exercised; no CLI or MCP host yet drives the
+native path, which is the next batch.
+
+
+## Native CLI verbs and the first product gate — 2026-09-08
+
+This batch reaches the first product gate on the native engine through the
+real binary (REMAINING §9 A1). The manual CLI probes the engine once per
+invocation with a standing read under the native profile and, on a native
+ledger, adapts every verb's flags or document into the native document,
+reads the objects the compiler names, compiles and encodes the exact frame,
+claims its `n1:` identity in the client journal and drives the frame to a
+committed receipt, a closed refusal or a recovery command
+([native.rs](../../crates/focal-node/src/cli/native.rs),
+[native_documents.rs](../../crates/focal-node/src/cli/native_documents.rs)).
+New verbs and flags: `artifact submit --slot`, `artifact diagnostic --reason`,
+`testament submit --slot SLOT=ID:HASH --diagnostic ID:HASH`, `testament post`,
+`validation begin --validation --slot`, `validation report --verdict`, and
+`--parent`, `--max-responses`, `--slot-json` on `submit claim`; `request
+retry|inspect --operation-id n1:…`, `request pending` rows for native
+operations, `schema coverage`, `schema get NAME --native`, and an
+engine-aware `status`. The client journal records reported refusals and a
+delivery marker so a reply lost after the commit stays listed until the
+recovery command reprints it. Results share the application result shape
+at schema version 2 (`native`, `native_read`, `native_list`).
+
+Driving the binary exposed three faults on the replicated host that the
+embedded host never showed, each fixed at its cause and pinned by a test:
+the replica's reply accounting had no native arm, so any native read page
+larger than the fixed slack was replaced by an unknown outcome
+([fleet.rs](../../crates/focal-node/src/fleet.rs)); artifact-bearing frames
+were refused on the replicated path, so the data service now has the
+exclusive content writer seal and verify the frame's inline payload under
+the current custody placement and submits the frame with that evidence,
+which the owner binds to the exact frame
+([evidence_service.rs](../../crates/focal-node/src/evidence_service.rs),
+[content_host.rs](../../crates/focal-node/src/content_host.rs), the codec's
+`DecodedRequest::into_artifact`); and the standard native session limits
+carried the default owner shapes, whose future record buffer exceeds the
+4 MiB encoding envelope, so every completion-class admission on a node was
+refused as capacity (decision F22 in [07](07-decisions-and-traceability.md);
+`NativeSessionLimits::standard` now carries bounded shapes and
+[native_session_workflow_tests.rs](../../crates/focal-ledger/src/native_session_workflow_tests.rs)
+runs the complete cycle under exactly those limits).
+
+Evidence: [cli_native_a1.rs](../../crates/focal-node/tests/cli_native_a1.rs)
+runs the real binary: offline activation of a fresh data directory, a
+network listener, `status` reporting the authored native standing, a second
+participant enrolled over QUIC, the issuer's claim (delivery check plus a
+programmatic slot check), post, the respondent's receipt, work artifact,
+closing testament citing the artifact by identity and hash, post, the
+issuer's receipt of the testament, begin and report of the evaluation,
+`get claim` showing the derived `Satisfied` status and `get validation`
+showing the validated evaluation, an exact retry printing the same receipt,
+SIGKILL and restart with identical reads and the same retried receipt, a
+post of the satisfied claim refused with the conflict exit class, and a
+reply lost on a closed stdout recovered through `request pending` and the
+printed recovery command. [fleet_native_tests.rs](../../crates/focal-node/src/fleet_native_tests.rs)
+drives the replicated host in process (activation, standing, creation,
+linearizable object reads, post and a second principal's receipt), and the
+CLI unit tests check that flags and documents compile to identical native
+intents, that V1-only fences are refused, and that every exposed coverage
+row resolves to a leaf of the clap tree.
+
+The first workspace run of this batch failed seven CLI binary tests: the
+engine probe ran before local validation and journaling, so an unreachable
+transport surfaced as a transport error where the V1 path reports an input
+error or journals first, and a shared host serving a V1 ledger next to
+native ones answers the probe with an operation refusal rather than the
+protocol refusal an embedded V1 host gives. The probe now treats both
+refusals as the V1 engine, and an unreachable transport as V1 only for a
+context that has never journaled a native operation; a context that has
+stays native and refuses to mint a V1 identity for a native ledger. The
+seven tests and the native gate pass on the recorded tree.
+
+Qualification on macOS arm64 (Darwin 25.4.0, Rust 1.94.1), 2026-09-08 18:53
+CDT, on this tree: `bash scripts/cargo.sh test --workspace --offline --no-fail-fast`
+passed **2,372 tests across 88 test binaries** (0 failed);
+strict workspace all-target Clippy, the production no-panic gate, formatting
+and `--locked` checks pass; architecture checks verify **1,059 links**, all
+**37 imported source hashes** and **15 frozen vocabularies**. Linux, Windows
+and released binaries were not exercised. Known limits carried into the next
+batch: multi-node custody of native inline payloads is not yet replicated to
+followers, native claim creation on a projection-only (imported) ledger is
+refused because imported prefixes carry no authored profile, and the MCP
+server does not yet expose the native catalog (R4.4).
+
+## Native MCP tools and the first product gate through the adapter — 2026-09-08
+
+This batch closes the MCP half of the first product gate (REMAINING §9 A1).
+The adapter decides its catalogue once per connection: `serve` now creates
+the worker runtime before anything else, runs the engine probe on it (a
+remote transport binds its endpoint to the first runtime that drives it),
+and on a native ledger opens the adapter's own `n1:` journal
+(`client/mcp-native`) and serves the native catalogue
+([catalog_native.rs](../../crates/focal-mcp/src/catalog_native.rs),
+[native_backend.rs](../../crates/focal-mcp/src/native_backend.rs)): the
+native descriptors the standing permits, five exact reads (`claim.get`,
+`testament.get`, `artifact.get`, `validation.get`, `ledger.standing`, added
+to the native descriptor table at version 2), and `request.inspect`,
+`request.retry`, `request.pending` and `request.acknowledge` over `n1:`
+references, with output schemas under `urn:focal:mcp:NAME:output:2`. Native
+mutations take an optional `n1:` reference, journal the exact frame before
+the send, return `native` receipts, typed `native_refused` refusals or an
+unknown outcome, and stay listed by `request.pending` until acknowledged;
+`request.inspect` with `remote: true` and the CLI's `request inspect
+--operation-id n1:… --remote` read the owner's committed outcome by request
+key so each adapter observes the other's operations (decision F23 in
+[07](07-decisions-and-traceability.md)).
+
+The CLI's native path moved into one shared driver
+([driver.rs](../../crates/focal-native-client/src/driver.rs)): resolve the
+compiler's requirements with the host's blocking read, compile, encode,
+fingerprint, claim the identity in the journal and plan the exact reads, so
+flags, documents and MCP tools compile byte-identical frames through one
+function. The client gained the engine probe (`Client::native_standing`,
+which treats a protocol refusal from an embedded V1 host and an operation
+refusal from a shared host serving a V1 ledger alike) and the
+`native_refused` output kind; native refusals count as error results the way
+V1 domain refusals do.
+
+Evidence: [mcp_native_a1.rs](../../crates/focal-node/tests/mcp_native_a1.rs)
+runs the real binary with two `mcp serve` processes, the issuer on the local
+socket and the respondent on an enrolled QUIC client context: the native
+catalogue is discovered by both, the complete cycle (claim, post, receipt,
+work artifact, testament, post, receive, begin, report) runs through native
+tools to the derived `Satisfied` status and the validated evaluation, the
+node is killed and restarted with both adapters still connected, reads and
+journaled receipts are unchanged, the owner's outcome is observed through
+the adapter and the CLI, a stale post is a typed refusal that leaves the
+pending list, acknowledgment retires results idempotently, an adapter killed
+after a commit is replaced by a fresh one that lists and replays the exact
+frame, the same reference with the same input resumes, and different input
+under the same reference is refused as a conflict. In-crate stdio tests
+([native_stdio_tests.rs](../../crates/focal-mcp/src/native_stdio_tests.rs))
+drive the probe, catalogue, journaling, pending tickets, refusals, reads and
+restart with a controlled transport, and pin that a V1 answer or an
+unreachable owner keeps the V1 catalogue unless a native journal exists.
+Catalogue tests pin the exact native tool set, the version 2 identities and
+the projection-only filter.
+
+Qualification on macOS arm64 (Darwin 25.4.0, Rust 1.94.1), 2026-09-08 19:20
+CDT, on this tree: `bash scripts/cargo.sh test --workspace --offline --no-fail-fast`
+passed **2,377 tests across 89 test binaries** (0 failed);
+strict workspace all-target Clippy, the production no-panic gate, formatting
+and `--locked` checks pass; architecture checks verify **1,072 links**, all
+**37 imported source hashes** and **15 frozen vocabularies**. Linux, Windows,
+released binaries and external MCP clients were not exercised. Known limits
+carried forward: the chunked upload, download, watch, list, wait, monitor,
+summary and validation-context tools are withheld on native ledgers until
+the native index families and content transfer (R4.5); the packaged skills
+still describe the V1 tools (R4.10); follower custody of native inline
+payloads is not replicated; projection-only imported ledgers cannot author
+claims.
+
+## Native index families and bounded lists — 2026-09-08
+
+This batch gives the native engine its secondary indexes and the bounded
+lists they serve (R4.5 Batch D; [22 §7](22-native-record-format.md), decision
+F24 in [07](07-decisions-and-traceability.md)). Thirteen index families
+(record tags 34–46) are unit rows of the same range, derived from exactly one
+primary row each by one shared function
+([index_rows.rs](../../crates/focal-core/src/native/index_rows.rs)): the
+leader derives them from the exact rows a plan writes
+([original_plan.rs](../../crates/focal-core/src/native/original_plan.rs)),
+replay validation rederives every put and delete and requires the record to
+carry exactly those changes
+([replay_validate_index.rs](../../crates/focal-core/src/native/record_codec/replay_validate_index.rs)),
+checkpoint validation rederives every retained row and requires every
+primary row to be covered
+([read_validate_index.rs](../../crates/focal-core/src/native/record_codec/read_validate_index.rs)),
+and the import image writes the same rows for translated claims and
+artifacts. `FCMUTATE` and `FCNROOTS` advance to version 3 (the decoder
+identity follows). Only the status family is ever deleted; the count
+validator admits exactly that deletion. Scans are bounded iterators over one
+key range ([index_scan.rs](../../crates/focal-core/src/native/index_scan.rs)).
+
+Funding is exact rather than assumed: every construction ceiling carries
+its possible index rows (`max_index_rows`), completion and respondent
+promises quote them in their write envelopes, record buffers and slot
+demands, and a promised artifact's inputs are bounded by the new
+`NativeLimits::artifact_inputs` (16) and narrowed by a small batch
+(`cap_inputs`) rather than refusing every report. Two accounting defects
+this exposed are fixed at their source: the range write envelope priced
+every deletion as the largest entry the range admits (a status move cost
+megabytes), so `RangeWriteLimits` gains `deleted_heap` and the plan check
+verifies the actual deleted heap
+([range_envelope.rs](../../crates/focal-memory/src/range_envelope.rs)); and
+range reconstruction charged each neighbour copy at the maximum entry size,
+so restore and replay now charge the copied row's own footprint
+([recovery.rs](../../crates/focal-core/src/native/record_codec/recovery.rs)).
+The standard session record envelope grows to 6 MiB so a preparation-sized
+body at the codec's fourfold expansion plus every fixed row still fits; the
+respondent's diagnostic was a few kilobytes over the old 4 MiB.
+
+Lists are stateless on the node
+([native_lists.rs](../../crates/focal-node/src/native_lists.rs), host and
+fleet dispatch): the filter selects one indexed predicate, the rest filter
+residually within `max_visits`, the continuation names the last visited row
+(an empty page may continue; only an absent cursor ends the list), and a
+cursor carries a keyed BLAKE3 digest over the ledger, principal, route epoch
+and exact filter under a per-incarnation key, so tampering, reuse under
+another filter or principal, and a node restart are refused. The client
+gains eight version 2 list descriptors and documents (`claim.list`,
+`artifact.list`, `validation.list`, `evaluation.list`, `testament.list`,
+`receipt.list`, `monitor.list`, `event.list`; 24 native descriptors in
+all), the shared driver translates them into wire filters
+([driver.rs](../../crates/focal-native-client/src/driver.rs)), `focal list`
+serves all eight families on a native ledger with the shared flags plus
+`--validation`, `--verdict`, `--holder` and `--after` (refusing flags a
+family does not index, and refused on V1), and the MCP adapter offers the
+eight tools with `native_list` results. Evidence:
+[cli_native_lists.rs](../../crates/focal-node/tests/cli_native_lists.rs)
+drives the real binary through every family and filter, paging, the
+residual-filtered empty page, `--all`, a tampered cursor, a cursor reused
+under another filter and family, V1-only flags, the MCP list tools and a
+restart that retires the previous cursors; core, memory, ledger, client and
+MCP suites were retuned to the exact new row shapes.
+
+Qualification on macOS arm64 (Darwin 25.4.0, Rust 1.94.1), 2026-09-08 21:13
+CDT, on this tree: `bash scripts/cargo.sh test --workspace --offline --no-fail-fast`
+ran **2,378 tests across 90 test binaries**; 2,377 passed and one failed in
+the parallel run: `fleet::evidence_tests::checkpoint_waits_for_exact_writer_fence_while_another_writer_commits_and_reopens`
+(its 300 ms fence timeout under a full parallel workspace run), which passed
+three consecutive times in isolation (`--lib` filter) immediately after. The
+preceding run of the same tree at 21:07 CDT (before a formatting-only change
+to `cli_native_lists.rs`) passed that test and instead timed out
+`fleet_tests::reconciliation_tests::receipt_reads_require_live_quorum_preserve_privacy_and_recover_after_leader_restart`
+once, which likewise passed three times alone; both are timing-sensitive
+fleet tests, not regressions of this batch. Strict workspace all-target
+Clippy, the production no-panic gate, formatting and `--locked` checks pass;
+architecture checks verify **1,103 links**, all **37 imported source hashes**
+and **15 frozen vocabularies**. Linux, Windows, released binaries and
+external MCP clients were not exercised. Known limits carried forward: the
+sixteen wire-only native verbs, timers, the validation context read, deltas
+and watches, chunked transfer and the packaged skills remain open on the
+native engine (R4.5 Batches E–G, R4.10); follower custody of native inline
+payloads is not replicated; projection-only imported ledgers cannot author
+claims.
+
+## The remaining native verbs through CLI and MCP — 2026-09-08
+
+This batch closes the authored gap of the R4.0 coverage table (R4.5 Batch
+E): the sixteen operations that were `WireOnly` are authored tools, and the
+table's test now asserts that set is empty
+([native_inventory.rs](../../crates/focal-client/src/operations/native_inventory.rs),
+[native_tests.rs](../../crates/focal-client/src/operations/native_tests.rs)).
+Twelve descriptors are new (`claim.release_scope`, `receipt.adopt`,
+`artifact.fail`, `artifact.receive`, `artifact.reject`,
+`validation.seal_increments`, `validation.enter_whole_work`,
+`audit.generate`, `audit.post`, `monitor.register`, `monitor.rebind`,
+`monitor.cancel`; 36 native descriptors in all) with strict documents and
+schemas ([native_documents.rs](../../crates/focal-client/src/operations/native_documents.rs),
+[native_catalog.rs](../../crates/focal-client/src/operations/native_catalog.rs),
+[native_schema.rs](../../crates/focal-client/src/operations/native_schema.rs));
+the four admission and increment evaluation kinds share the existing
+`validation.begin` and `validation.report` descriptors, whose documents gain
+`phase` (`whole_work` by default, `admission`, `increment`) and `target`
+(the increment's work artifact), so one verb selects the current evaluation
+of any phase and the compiler emits the matching owner command.
+
+The shared compiler binds every verb to exactly the committed objects it
+names ([resolve.rs](../../crates/focal-native-client/src/resolve.rs),
+[compile.rs](../../crates/focal-native-client/src/compile.rs)): a rejection
+reads the work artifact's binding, receipt and cycle and the descriptor
+whose visibility the diagnostic inherits, then authors the
+`ReceiptRejection` diagnostic under the issuer with the builtin error
+schema; a failed slot reads the holder's committed production diagnostic
+(refusing any other reason, and a pinned hash that differs); adoption fences
+the claim's current receipt and mints the next one; monitors carry the
+claim's current fence and parse their wait predicates and deadline;
+rebinding names both claims; audits mint the result testament identity and
+post it by its committed binding. Nothing is derived from wall-clock time and
+every minted identity is journaled with the frame as before. The CLI gains
+`claim release-scope`, `receipt adopt`, `artifact fail|receive|reject`,
+`validation seal-increments|enter-whole-work`, the `audit generate|post`
+root (the one addition to the root list of
+[13](13-cli-and-agent-implementation-plan.md)), `monitor rebind|cancel`,
+native `monitor register` on the existing flags, and `--phase`/`--target` on
+`validation begin|report`; each adapts flags and documents identically
+([native_documents.rs](../../crates/focal-node/src/cli/native_documents.rs),
+[monitor.rs](../../crates/focal-node/src/cli/monitor.rs)) and is refused by
+name on the V1 engine. The MCP adapter serves the twelve tools from the
+descriptors with no adapter change beyond the listing test.
+
+Evidence: [cli_native_a3.rs](../../crates/focal-node/tests/cli_native_a3.rs)
+drives the real binary with two enrolled participants through an admission
+check selected by phase (and refused under the default phase), an increment
+check of the submitted artifact, work receipt, sealing (with an exact retry),
+the testament cycle, explicit whole-work entry, the slot check, scope release
+(refused a second time), audit generation and posting; a second claim
+through a rejected work product (a `work` reason refused as invalid input,
+the diagnostic inheriting `team` visibility), a production diagnostic and
+the failed slot (a work diagnostic refused), adoption by the issuer (epoch
+two, two receipts listed, the respondent's late testimony refused); a third
+claim's monitor registered over a satisfied root, rebound after a committed
+supersession (an unrelated successor refused), cancelled only once the owner
+is cancelled; then a kill and restart with identical claim and monitor reads
+and an exact retry of the audit posting. Unit coverage: the twelve verbs'
+read requirements, missing-object refusals, adoption and monitor compilation
+and their input refusals, plus release, audit generation and posting through
+the owner ([tests.rs](../../crates/focal-native-client/src/tests.rs)); flag
+and document parity for every new verb
+([cli/tests.rs](../../crates/focal-node/src/cli/tests.rs)); the MCP A1 test
+asserts the twelve tools are listed.
+
+Qualification on macOS arm64 (Darwin 25.4.0, Rust 1.94.1), 2026-09-08 21:48–21:53
+CDT, on this tree: `bash scripts/cargo.sh test --workspace --offline --no-fail-fast`
+ran **2,381 tests across 91 test binaries with 0 failures**; strict workspace
+all-target Clippy (`-D warnings`), the production no-panic gate, `cargo fmt
+--all --check` and `cargo check --workspace --all-targets --locked --offline`
+pass; `scripts/check-contracts.py` verifies **1,118 links**, all **37 imported
+source hashes** and **15 frozen vocabularies**. The preceding run of this
+batch (21:40 CDT, before the last two edits) failed two tests under the
+full parallel load: the fleet fence test recorded as flaky in the previous
+two batches expired its fixture's 500 ms `request_timeout` on the other
+ledger's commit, so the fixture bound is now 2 s and the stop-deadline test
+scales with it ([fleet_evidence_tests.rs](../../crates/focal-node/src/fleet_evidence_tests.rs);
+the product default is 5 s), and the V1 MCP stdio test's 5 s process-exit
+bound after EOF was exceeded once (its adapter shutdown bound is 3 s); both
+passed alone and in this recorded run, and the stdio bound is left as a
+known load sensitivity rather than widened. Linux, Windows, released binaries
+and external MCP clients were not exercised. Known limits carried forward:
+the trusted timers (claim, evaluation and monitor deadlines), the validation
+context read, deltas and watches, chunked transfer and the packaged skills
+remain open on the native engine (R4.5 Batches F–G, R4.10); follower custody
+of native inline payloads is not replicated; projection-only imported
+ledgers cannot author claims; `list testaments` scans the response chain
+and the result testament is read by `get testament`.
+
+## Trusted timers: the due-timer index and the node's sweep — 2026-09-08
+
+This batch makes the three trusted timers fire (R4.5 Batch F, first part;
+decision F25 in [07](07-decisions-and-traceability.md)). The native store
+gains a fourteenth index family, `DueTimer` (record tag 47;
+[22 §7](22-native-record-format.md)): one unit row per undelivered claim,
+monitor and evaluation deadline, keyed by logical time then target, derived
+by the same shared function as every other index row
+([index_rows.rs](../../crates/focal-core/src/native/index_rows.rs)). A row
+exists exactly while the timer has not been delivered and its target is
+still live: a claim's deadline until its timer's outcome row exists (terminal
+transitions leave it, so ordinary transitions never pay for claim timers and
+the timer fires once on the terminal claim); a monitor's deadline while the
+scope is active and undelivered; an evaluation's declaration deadline while
+the evaluation is neither terminal nor fenced and undelivered. Consumption
+is the retained outcome row of the timer's invocation, so the leader, replay
+validation
+([replay_validate_index.rs](../../crates/focal-core/src/native/record_codec/replay_validate_index.rs),
+which now also requires the consumption delete of a delivered timer whose
+target row did not change) and checkpoint validation
+([read_validate_index.rs](../../crates/focal-core/src/native/record_codec/read_validate_index.rs),
+which now covers every registered evaluation) all derive the same rows;
+cohort seals derive the sealed evaluations' rows from the sealed states.
+`FCMUTATE` and `FCNROOTS` advance to version 4.
+
+Funding is per operation rather than a blanket ceiling: creation pays one
+timer per claim, registrations one per new evaluation, a monitor
+registration one, a report its own evaluation's plus every sealed cohort
+evaluation's and every graph consequence's (added where the cohort and graph
+are known), the three timers their own consumption; every other operation
+is bounded by its extras and events
+([prepare_budget.rs](../../crates/focal-core/src/native/prepare_budget.rs)
+`max_timer_rows`, `timer_bound`). Completion, work and admission-graph
+promises quote the same allowance in their fixed rows, write envelopes and
+count checks, and the begin/report write envelope admits timer deletions
+beside status moves, so a promise is never smaller than the construction it
+must fund. The scan gains `Due { through }`
+([index_scan.rs](../../crates/focal-core/src/native/index_scan.rs)).
+
+The node sweeps the due rows each tick
+([native_timers.rs](../../crates/focal-node/src/native_timers.rs)): the
+embedded host from its one-second maintenance, the fleet's replica owner from
+its tick on the leader only. A sweep reads at most sixty-four due rows at the
+committed prefix, reads each timer's identity (timer and generation) from
+its primary row, and delivers through `Session::deliver_native_timer` with
+the node's logical clock (never behind the last committed record); a
+redelivered timer is an exact retry that resolves to its recorded outcome, a
+deferrable refusal (capacity, readiness, consensus) ends the sweep, a
+contract refusal is counted, and a restart needs no memory because the next
+sweep rescans the index.
+
+Evidence: [due_timer_tests.rs](../../crates/focal-core/src/native/due_timer_tests.rs)
+(rows at creation and registration, the not-yet-due refusal, delivery
+retiring the row, the exact redelivery finding the outcome, a live claim's
+expiry, a monitor's registration and delivery); the replay, recovery,
+import, envelope, budget and response-shape suites retuned to the new row
+counts; and [cli_native_a3.rs](../../crates/focal-node/tests/cli_native_a3.rs)
+now posts a claim with a deadline a few seconds ahead and a monitor with its
+own deadline through the real binary, observes the claim expire from the
+node's clock, the monitor's timer consumed on the terminal owner without a
+fabricated release, a later post refused as stale, the terminal status
+surviving a cancellation attempt, and the expiry surviving a kill and
+restart.
+
+Qualification on macOS arm64 (Darwin 25.4.0, Rust 1.94.1), 2026-09-08 22:47–22:53
+CDT, on this tree: `bash scripts/cargo.sh test --workspace --offline --no-fail-fast`
+ran **2,383 tests across 91 test binaries with 0 failures**; strict workspace
+all-target Clippy (`-D warnings`), the production no-panic gate, `cargo fmt
+--all --check` and `cargo check --workspace --all-targets --locked --offline`
+pass; `scripts/check-contracts.py` verifies **1,136 links**, all **37 imported
+source hashes** and **15 frozen vocabularies**. One node library test
+(`fleet::async_tests::shared_owner_queues_covering_flush_and_serves_another_group_while_disk_waits`)
+failed once in an earlier partial run of this batch under parallel load and
+passed twice alone and in this recorded run; it is timing-sensitive like the
+fleet fence test of the previous batch. Linux, Windows, released binaries
+and external MCP clients were not exercised. Known limits carried forward:
+the validation context read, deltas and watches, chunked transfer and the
+packaged skills remain open on the native engine (R4.5 Batch F second part,
+Batch G, R4.10); follower custody of native inline payloads is not
+replicated; projection-only imported ledgers cannot author claims; a claim
+whose timer is delivered on a terminal claim records only its outcome, so a
+terminal claim's timer row lives until its deadline passes.
+
+## The evaluator's validation context read — 2026-09-08
+
+This batch serves the composed read an evaluator needs before it runs
+anything (R4.5 Batch F, second part; [19 §4](19-cli-mcp-implementation.md)).
+`NativeReadQuery::ValidationContext` is answered from one committed prefix
+([native_reads.rs](../../crates/focal-node/src/native_reads.rs)
+`validation_context`): the claim, the definition, the registration selected
+among the declaration's registrations (by family — admission, increment or
+whole work — and optionally the exact target or generation, else the highest
+generation of that family), that registration's evaluation, its target with
+the manifest it covers (every slot of the response for a delivery or slot
+check, the one artifact of an increment) and each artifact's verified
+custody, the accepted results after an optional revision cursor bounded by
+the request, and the delivery result of the same response. The registration
+reports why it is not eligible (missing, terminal, fenced, custody), and the
+delivery result has its own wire shape (`NativeDeliveryOutcome`) because the
+owner records the issuer's acknowledgment without any handler attempt; the
+query gains `kind` so a family with no registration reports `Missing`
+instead of silently selecting another. Nothing is fabricated: absent rows
+are absent, and no validator runs.
+
+The client gains the `validation.context` descriptor and document
+(`validation`, `phase`, `slot`, `target`, `generation`, `results_after`,
+`limit`; 37 native descriptors), the driver selects the evaluation exactly as
+`validation.begin` does over the definition's evaluations page and reads the
+context at a prefix no older than that page
+([driver.rs](../../crates/focal-native-client/src/driver.rs)), the CLI's
+`get validation ID --context` takes `--phase`, `--slot`, `--target`,
+`--generation`, `--limit` and `--cursor REVISION` on the native engine, and
+the MCP adapter serves the tool from the descriptor. Evidence:
+[cli_native_a3.rs](../../crates/focal-node/tests/cli_native_a3.rs) reads the
+context of the satisfied claim's slot check (registration sealed and no
+longer eligible, evaluation validated, manifest slot zero with the submitted
+artifact in verified custody, the accepted result and the delivery result),
+the admission check by phase (no manifest, one result) and an increment
+context the definition never had (`Missing`, no evaluation); the MCP A1 test
+lists the tool; the client's descriptor suite checks the document against
+its schema.
+
+Qualification on macOS arm64 (Darwin 25.4.0, Rust 1.94.1), 2026-09-08 23:28–23:34
+CDT, on this tree: `bash scripts/cargo.sh test --workspace --offline --no-fail-fast`
+ran **2,383 tests across 92 test binaries with 0 failures**; strict workspace
+all-target Clippy (`-D warnings`), the production no-panic gate, `cargo fmt
+--all --check` and `cargo check --workspace --all-targets --locked --offline`
+pass; `scripts/check-contracts.py` verifies **1,141 links**, all **37 imported
+source hashes** and **15 frozen vocabularies**. Linux, Windows, released
+binaries and external MCP clients were not exercised. Known limits carried
+forward: deltas and watches, chunked transfer and the packaged skills remain
+open on the native engine (R4.5 Batch F second part, Batch G, R4.10);
+follower custody of native inline payloads is not replicated; projection-only
+imported ledgers cannot author claims; a claim whose timer is delivered on a
+terminal claim records only its outcome, so a terminal claim's timer row
+lives until its deadline passes.
+
+## Deltas and watches on the native engine — 2026-09-08
+
+This batch closes the last R4.5 Batch F item: durable watches observe a
+native ledger through the same cursor protocol, and the deltas they receive
+are derived from the committed native records themselves
+([07 F26](07-decisions-and-traceability.md),
+[23 §6](23-native-activation-and-import.md)). The event vocabulary the native
+wire profile already carried (twenty-two record types from
+`NativeEvaluationTarget` to `NativeEventRecord`) moved unchanged into
+[`focal_model::native_event`](../../crates/focal-model/src/native_event.rs)
+and is re-exported by the wire crate, so the ledger builds deltas without a
+wire dependency and the frozen native reply bytes are untouched. `DeltaFact`
+gains its twelfth variant, `Native(Box<NativeEventRecord>)`, under delta
+schema 2 (`NATIVE_DELTA_SCHEMA`); the frozen durable V1 codec refuses it
+([outputs.rs](../../crates/focal-model/src/durable_v1/outputs.rs)), so no
+legacy delta tail can ever hold one. The projection of a committed
+`NativeEvent` into its record, its nearest legacy lifecycle action (evaluation
+facts through their state, work and response facts through theirs, imported
+status facts exactly as the legacy engine mapped them), its actor (the
+request principal, or the zero participant for trusted timers and the
+import) and the claim it concerns (a registered artifact belongs to none)
+lives once in the core
+([event_record.rs](../../crates/focal-core/src/native/event_record.rs)); the
+node's read documents delegate to the same functions, so the `events` read
+and the delta stream carry one shape.
+
+The Session keeps one continuous stream sequence line
+([native_deltas.rs](../../crates/focal-ledger/src/native_deltas.rs)): the
+sealed legacy prefix `0..=N` followed by the native records, native record
+`s` of a genesis ledger being stream sequence `s` and record `s > 1` of an
+imported ledger `N + s - 1` (native sequence one is the import image and
+emits nothing). `stream_published` is the end of that line, `stream_bounds`,
+replay validation and the registry's position checks use it, while cursor
+envelopes and receipts keep naming the sealed domain sequence, so the leader's
+candidate and every follower's apply still agree. A replay walks the retained
+legacy tail and then the committed `Key::Event` rows, building each schema-2
+delta on demand under the same item, byte and sequence limits (a first delta
+that cannot fit is a capacity refusal, never a skip); a delta position past
+the prefix is valid exactly when that event exists. Nothing new is persisted:
+events are retained with the prefix, so native history never expires before
+the retention floor, and checkpoints and restarts derive the same deltas.
+
+The node ([streams.rs](../../crates/focal-node/src/streams.rs)) admits stream
+requests on a native ledger only under the native wire profile (the proof the
+consumer decodes schema 2; older profiles are refused before any cursor is
+registered, and the managed request identity accepts that profile for the
+managed operations it admits), takes the native read barrier as the stream
+prefix, pins a seeded watch's snapshot at that prefix without a server-side
+scan (the native engine keeps no historical read snapshot), reports the
+published end of the stream line in the reply token and returns no tail while
+a cursor is seeding. Cursor receipts, legacy and managed, name the published
+end of the line when their entry applies (`apply_cursor_entry`,
+`PreparedStream::set_cursor_sequence`), computed identically on every replica,
+so the frozen receipt validators still bound every position a record names;
+the checkpoint restore validates restored cursors and receipts against the
+same line, rebuilding the native engine first. The stream subscription admits
+schema-2 deltas exactly when they carry a native fact
+([subscription.rs](../../crates/focal-stream/src/subscription.rs)). The client
+journal ([watch.rs](../../crates/focal-client/src/watch.rs),
+[journal.rs](../../crates/focal-client/src/watch/journal.rs), record
+`FCLWAT02`, schema 2) saves the engine with the watch's options and, on the
+native engine, reads its own seed through linearizable native reads after the
+snapshot is pinned: a claim filter reads each claim with its responses and
+evaluations, an unfiltered watch lists the family (claims for `claims`,
+`testaments` and `all`, artifacts, definitions) in bounded pages, delivering
+`NativeSeed` pages (objects, prefix token, next step) before completing the
+seed and following the tail; family selection classifies native facts and
+objects. `focal watch` routes to the same commands on a native ledger and
+prints native changes compactly in tables; the MCP adapter offers the four
+`watch.*` tools next to the version-2 catalogue and creates native watches.
+
+Evidence: [event_record_tests.rs](../../crates/focal-core/src/native/event_record_tests.rs)
+(record, action, actor and claim of claim, timer, import, artifact, work,
+evaluation, result and monitor facts);
+[session_native_tests.rs](../../crates/focal-ledger/src/session_native_tests.rs)
+(a genesis ledger streams its records as schema-2 deltas on its native
+sequence, resumption after an exact delta, refusal of a delta position naming
+no event and of a position ahead, one-item replays walking the same deltas,
+a native position acknowledged by the registry, identical deltas after
+checkpoint and restart; the imported ledger continues past its sealed prefix
+at `N + s - 1` with the legacy tail replayed first);
+[native_host_tests.rs](../../crates/focal-node/src/native_host_tests.rs)
+(legacy profile refused at the door, native profile admitted);
+[watch_client.rs](../../crates/focal-node/tests/watch_client.rs) (the client
+journal over an in-process native node: the seeded claim watch reads the
+claim with its evaluations and completes, the seed's facts are not replayed,
+another claim's creation stays out of the claim filter, an unseeded watch
+replays both records as schema-2 deltas with actor and claim, a family watch
+seeds through the definitions list, and every watch resumes after the host
+restarts);
+[cli_native_watch.rs](../../crates/focal-node/tests/cli_native_watch.rs)
+(seeded claim watch with its evaluations, the cancellation arriving as a
+schema-2 delta, an unseeded replay of the whole history in order, family
+seeds through lists, a second participant's watch, table output, and
+resumption after the node is killed and restarted); the MCP A1 test opens,
+acknowledges and polls a native watch through the adapter.
+
+Limits: objects committed between the pinned snapshot and the seed's read
+prefix arrive both in the seed and as deltas (at-least-once, deduplicated by
+binding); an unfiltered testament watch seeds the claims, responses being
+reached through their claims; raw legacy `Operation::Stream` cursors need an
+admitted V1 request epoch and are therefore invalid on a native ledger (watches
+use managed cursors); watch journals of earlier development builds are
+refused; native event retention and the retention floor's reclamation of
+events belong to R8.
+
+Qualification on macOS arm64 (Darwin 25.4.0, Rust 1.94.1), 2026-09-09 00:24–00:31
+CDT, on this tree: `bash scripts/cargo.sh test --workspace --offline --no-fail-fast`
+ran **2,388 tests across 93 test binaries with 0 failures**; strict workspace
+all-target Clippy (`-D warnings`), the production no-panic gate, `cargo fmt
+--all --check` and `cargo check --workspace --all-targets --locked --offline`
+pass; `scripts/check-contracts.py` verifies **1,166 links**, all **37 imported
+source hashes** and **15 frozen vocabularies**. Linux, Windows, released
+binaries and external MCP clients were not exercised. Known limits carried
+forward: chunked transfer and the packaged skills remain open on the native
+engine (Batch G, R4.10); follower custody of native inline payloads is not
+replicated; projection-only imported ledgers cannot author claims; a claim
+whose timer is delivered on a terminal claim records only its outcome, so a
+terminal claim's timer row lives until its deadline passes; native events
+are retained with the prefix until R8 defines their retention floor; an
+unfiltered testament watch seeds the claims rather than the responses.
+
+## Child causes and follower custody of native payloads — 2026-09-09
+
+This batch closes two of the limits the R4 native batches carried forward
+(Batch G, first part). An artifact-bearing native frame's inline payload was
+sealed and verified by the leader's data service but never replicated: a
+follower held the record and not the bytes. `attest_native`
+([evidence_service.rs](../../crates/focal-node/src/evidence_service.rs)) now
+replicates the sealed payload to every other required copy of the current
+placement through the same custody transfer a sealed upload uses, before the
+frame is admitted, and an unreachable required copy refuses the frame; the
+verified artifact's payload pointer is the content reference the transfer
+moves. Evidence:
+[evidence_service_tests.rs](../../crates/focal-node/src/evidence_service_tests.rs)
+(`native_inline_payloads_are_sealed_locally_and_replicated_to_every_required_copy`:
+the payload is readable as durable content under the placement after
+attestation, and a second required copy that cannot be reached refuses the
+frame). Node tests may now use the core's native fixtures
+(`focal-core` `test-support` as a dev-dependency).
+
+P17.12, the narrow child-cause authority, was already enforced by the model
+and the owner (parent existence at the effective prefix, exact binding and
+current receipt, actor equal to the parent's issuer or its current receipt
+holder, live and unreleased parent, same ledger, owner-derived cause and
+lineage, child registration as one parent revision, cancellation of pending
+children with the parent) and reached by the shared claim document's
+`parent`; what it lacked was qualification through the real surfaces and its
+record. It is now exercised by
+[cli_native_children.rs](../../crates/focal-node/tests/cli_native_children.rs)
+(the issuer and the receipt holder each register a child through the binary,
+the parent's registry names both at their committed bindings, a third
+participant is refused as unauthorized, a forged parent is refused before
+sending, cancelling the parent cancels its pending children and refuses a
+late child, and the lineage survives a kill and restart),
+[native_host_tests.rs](../../crates/focal-node/src/native_host_tests.rs)
+(a frame naming a foreign-ledger parent, a stale parent binding and a
+subject without a receipt are each refused with their typed code), and the
+MCP A1 test (the issuer's follow-up through `claim.submit` with `parent`, the
+respondent without a receipt refused with a typed outcome). Documents 13, 19
+and the manual record the rule; designated-evaluator follow-ups arrive with
+R5.
+
+Qualification on macOS arm64 (Darwin 25.4.0, Rust 1.94.1), 2026-09-09 00:55–01:02
+CDT, on this tree: `bash scripts/cargo.sh test --workspace --offline --no-fail-fast`
+ran **2,391 tests across 94 test binaries with 0 failures**; strict workspace
+all-target Clippy (`-D warnings`), the production no-panic gate, `cargo fmt
+--all --check` and `cargo check --workspace --all-targets --locked --offline`
+pass; `scripts/check-contracts.py` verifies **1,172 links**, all **37 imported
+source hashes** and **15 frozen vocabularies**. Linux, Windows, released
+binaries and external MCP clients were not exercised. Known limits carried
+forward: automatic managed-stream rotation and registry recycling under
+principal churn (P17.11, next batch), chunked transfer and the packaged skills
+on the native engine (R4.10); multi-node native activation through the node's
+support driver is exercised only at the ledger level until the R6 fleet
+harness; projection-only imported ledgers cannot author claims; a terminal
+claim's timer row lives until its deadline passes; native events are retained
+with the prefix until R8; an unfiltered testament watch seeds the claims.
+
+## Bounded generations: automatic rotation and registry recycling — 2026-09-09
+
+This batch closes the P17.11 limits the managed-stream work carried since
+2026-09-06 (Batch G, second part; decision F27 in
+[07](07-decisions-and-traceability.md)). A principal's request stream is now
+finite on both sides without any time-based deletion.
+
+On the client, a generation issues at most its rotation bound of ordinals
+(`DEFAULT_ROTATION` = 65,536). When the issuance frontier reaches the bound
+and every ordinal through it is retired, `ManagedOperationStore::stop_if_drained`
+stops issuance durably (a reservation refused during the drain is `Stopped`),
+the coordinator issues the exact `Close`, and on the `Closed` reply
+`begin_rotation` records the retired `(slot, generation)` fence (the last
+sixteen are kept locally; the server keeps every slot's last generation),
+names the next child store (`<name>.g<generation+1>`), removes the old store
+and observes the slot again before registering above the generation it
+presents. The coordinator record is `FCLMCO02` (schema 2: rotation bound,
+active child, pending cleanup, retired fences; the bound is part of the record,
+so a different bound cannot open it). A crash between the fence and the
+removal finishes the removal at the next open; a lost close or read reply
+re-issues the same request. References into a retired generation report
+`Retired` from every adapter and never execute again. The CLI and the MCP
+adapter open their stores through `cli/managed.rs::rotation()`, which reads
+`FOCAL_MANAGED_ROTATION` for campaigns.
+Evidence: [managed_requests/tests.rs](../../crates/focal-client/src/managed_requests/tests.rs)
+(`a_drained_generation_at_its_rotation_bound_closes_and_the_next_registers_in_a_fresh_store`:
+acknowledgment below the bound does not close, the exact close survives a
+fresh process, the rotated store is removed, the slot is observed again and
+the registration cites the presented generation, old references are retired
+and the new generation issues from ordinal one;
+`a_rotation_interrupted_between_its_fence_and_the_store_removal_finishes_on_the_next_open`;
+`only_pre_network_initialization_can_repair_a_partial_external_marker` on the
+schema-2 marker) and the binary campaign in
+[cli_managed.rs](../../crates/focal-node/tests/cli_managed.rs)
+(`a_bounded_generation_rotates_automatically_and_retires_its_references_across_processes`:
+seven submits under `FOCAL_MANAGED_ROTATION=3` across seven processes rotate
+twice with ordinals `1,2,3,1,2,3,1` and strictly increasing generations, the
+ledger sequence advances exactly once per submit, the rotated store exists
+under its generation name and the original is gone, a different bound is
+refused, every retired reference inspects as `Retired`, nothing is pending,
+a retry of a retired reference after a server restart is refused with exit
+code 5 and commits nothing, and the next submit continues at ordinal two).
+
+On the server, the registry (`request_streams.rs`) recycles pairs under a
+persisted **slot-generation watermark**: `next_generation` is the highest
+generation ever assigned, advanced by every registration and validated at
+publication (`assigned > watermark`). At capacity a registration with no pair
+of its own evicts the vacant pair with the smallest committed stamp
+(`PreparedStream::evict`, validated against the same stamp and vacancy at
+publication so every replica removes the same victim); occupied pairs are
+never evicted and a registry of occupied pairs refuses `Capacity`. A vacant
+pair presents `max(last generation, watermark)`; a registration cites that
+presented generation and is assigned exactly one above it, which keeps the
+frozen wire and client validators (`expected + 1 == assigned`) exact while
+guaranteeing that a re-created or reassigned pair never reissues a generation
+another principal's delayed traffic still names. Occupancy reads answer only
+for the authenticated principal's own pairs, so no read exposes another
+principal's owner nonce or receipts. The watermark is carried by the
+`FOCALSS7` checkpoint envelope (`SnapshotEnvelopeV7`: SS6 plus
+`slot_generation`); SS6 checkpoints are still decoded and derive the
+watermark from their retained pairs, and a persisted watermark below the
+retained pairs is refused as corrupt. Evidence:
+[managed_tests.rs](../../crates/focal-ledger/src/managed_tests.rs)
+(`registry_at_capacity_evicts_the_longest_closed_pair_and_never_reuses_a_generation`:
+a two-pair registry, a stale registration citing zero conflicts, the
+longest-closed pair is evicted by a third principal, the evicted principal's
+seal is `NotRegistered` and its receipt reads `Unknown`, the survivor's slot
+read is unchanged, a fourth principal is refused at capacity, the evicted
+principal returns above every generation ever issued, and the watermark
+survives checkpoint and restart), plus the unchanged managed suite whose
+registrations now cite the presented generation.
+
+Documents 13, 15, 07, 19, 22, 23, the manual and the MCP guide record the
+contract; document 15 keeps the throughput (managed batching) and
+mixed-version network gates open.
+
+Qualification on macOS arm64 (Darwin 25.4.0, Rust 1.94.1), 2026-09-09 01:41–01:47
+CDT, on this tree: `bash scripts/cargo.sh test --workspace --offline --no-fail-fast`
+ran **2,395 tests across 94 test binaries with 1 failure**:
+[cli_network.rs](../../crates/focal-node/tests/cli_network.rs)
+`cluster::actual_cli_promotes_caught_up_learner_transfers_and_removes_with_exact_restart_receipt`,
+whose founder process found the UDP port it chose from the shared
+24,000–32,000 test range already bound by another test binary's node under
+the parallel run (the panic lists the holder); the binary passes alone (six
+tests, twice, 01:47 CDT). The preceding full run on the same tree (01:33–01:40
+CDT, while another cargo build ran on the machine) instead failed three other
+timing-sensitive tests that each pass alone:
+`borrowed_proposal_tests::funded_checkpoint_transfers_source_lifetime_without_losing_durable_prefix`
+(budget statistics compared while a writer thread released 582 bytes), the
+`cli_network.rs` founder join, and the `fleet_quic.rs` trusted-membership
+scenario (no quorum leader within its deadline with 97 lost messages). None
+of the four touches this batch's files. Strict workspace all-target Clippy
+(`-D warnings`), the production no-panic gate, `cargo fmt --all --check` and
+`cargo check --workspace --all-targets --locked --offline` pass;
+`scripts/check-contracts.py` verifies **1,183 links**, all **37 imported
+source hashes** and **15 frozen vocabularies**. Linux, Windows, released
+binaries and external MCP clients were not exercised. Known limits carried
+forward: managed batching throughput and the mixed-version network campaign
+(P17.11 order 9), chunked transfer and the packaged skills on the native
+engine (R4.10); multi-node native activation through the node's support
+driver is exercised only at the ledger level until the R6 fleet harness;
+projection-only imported ledgers cannot author claims; a terminal claim's
+timer row lives until its deadline passes; native events are retained with
+the prefix until R8; an unfiltered testament watch seeds the claims.
+
+## Failed work and evaluator errors as evidence (A2) — 2026-09-09
+
+The second product gate (REMAINING §9 A2) now holds through the real binary
+and the MCP adapter for its failure branches. Two participants run two claims
+on a native ledger. On the first, the respondent's work fails: a failed
+testament without its diagnostic is refused before anything is sent (typed
+input failure); the respondent records the actual diagnostic with `artifact
+diagnostic --reason work` and authors `testament submit --outcome failed
+--diagnostic ID:HASH`; the reply is lost on a closed stdout (CLI) or the
+adapter dies before the result is consumed (MCP), the journaled frame is
+found committed and replayed, and exactly one testament exists. The claimant
+receives it, reads the testament's `diagnostics` (producer, reason `Work`,
+exact artifact reference) and the diagnostic bytes through `get artifact`;
+the evaluator's context read names the missing slot as the exact target with
+the delivery check passed and the registration ineligible; `validation
+begin` and `validation report` on the missing slot are refused; `validation
+enter-whole-work` assesses it, ending the required check and the claim
+`ValidationIncomplete` from a missing-target result with no attempt and no
+evidence, never Satisfied. On the second claim the work succeeds and the
+evaluator cannot run its handler: `validation report --verdict error` retains
+an error report whose provenance names the claim, validation, exact artifact
+target and attempt zero, the evaluation stays open on attempt one of a
+declared bound of two, the claim stays Validating and the work is untouched;
+the retry passes on attempt one, the claim is Satisfied and the error report
+remains beside the passing one. Both histories, the diagnostic bytes, the
+report artifacts and every journaled receipt read identically after a kill
+and restart, and the human CLI observes the adapter's error report through
+the owner. Evidence:
+[cli_native_a2.rs](../../crates/focal-node/tests/cli_native_a2.rs) and
+[mcp_native_a2.rs](../../crates/focal-node/tests/mcp_native_a2.rs). A2's
+challenge/consult bullet (an authorized evidence-backed corrective claim, an
+ordinary follow-up consult) is R5 work; the manual and the MCP guide record
+the failure contract.
+
+Qualification on macOS arm64 (Darwin 25.4.0, Rust 1.94.1), 2026-09-09 02:05–02:11
+CDT, on this tree: `bash scripts/cargo.sh test --workspace --offline --no-fail-fast`
+ran **2,397 tests across 96 test binaries with 1 failure**:
+`fleet_tests::reconciliation_tests::receipt_reads_require_live_quorum_preserve_privacy_and_recover_after_leader_restart`
+in the `focal-node` library, whose in-process three-node fleet answered a
+receipt read `Unavailable` (no live quorum within its window) under the
+parallel run while another cargo build ran on the machine; it passes alone
+(rerun at 02:11 CDT, and after the previous batch's run). Strict workspace
+all-target Clippy (`-D warnings`), the production no-panic gate, `cargo fmt
+--all --check` and `cargo check --workspace --all-targets --locked --offline`
+pass; `scripts/check-contracts.py` verifies **1,185 links**, all **37 imported
+source hashes** and **15 frozen vocabularies**. Linux, Windows, released
+binaries and external MCP clients were not exercised. Known limits carried
+forward: the A4 gate; A2's corrective/consult bullet (R5); managed batching
+throughput and the mixed-version network campaign (P17.11 order 9); chunked
+transfer, artifact payload download and the packaged skills on the native
+engine (R4.10); multi-node native activation through the node's support
+driver is exercised only at the ledger level until the R6 fleet harness;
+projection-only imported ledgers cannot author claims; a terminal claim's
+timer row lives until its deadline passes; native events are retained with
+the prefix until R8; an unfiltered testament watch seeds the claims.
+
+## Concurrency, lost replies and admission pressure (A4) — 2026-09-09
+
+The fourth product gate (REMAINING §9 A4) holds through the real binary and
+the MCP adapter on one node. The campaign exposed and fixed five defects in
+the client layer before it could pass, each recorded here with its fix.
+
+- **Concurrent processes on one data directory.** Six CLI processes of two
+  participants submitting at once failed three ways: the enrolled context's
+  credential directory and the context catalogue were opened under exclusive
+  locks for the whole process, so a second process was refused ("already
+  locked"); two processes racing to create the native request journal on
+  first use produced `Exists` and `Corrupt`; and the journal's per-operation
+  lock failed immediately on contention. Readers now take shared locks
+  (`PrivateDirectory::open_shared`, `PrivateJournal::open_shared`,
+  `JoinKey::open_shared`, `PendingClientJoin::resume_shared`,
+  `Store::open_read`); writers stay exclusive and a reader meeting a writer
+  fails closed; a refused write on a shared handle no longer poisons it.
+  Journal creation is serialized by `<name>.lock` beside the marker
+  (`cli/native.rs::store_in`), an interrupted creation without its marker is
+  redone, and the native layout's directory lock waits up to five seconds
+  (`FileLock::acquire_within`). Evidence: the concurrency sections of
+  [cli_native_a4.rs](../../crates/focal-node/tests/cli_native_a4.rs) and
+  [mcp_native_a4.rs](../../crates/focal-node/tests/mcp_native_a4.rs), and
+  `journal::tests::shared_readers_coexist_and_exclude_writers_without_writing`.
+- **Capacity refusals.** A refusal without effect was reported as an unknown
+  outcome once it exhausted the attempt budget. The client now resends a
+  request refused for capacity up to three times with backoff and, when every
+  attempt was such a refusal, reports the refusal itself
+  (`retry_uncertainty_tests.rs`,
+  `capacity_refusals_are_resent_with_backoff_and_reported_as_refusals_not_unknown_outcomes`).
+- **Lost replies at the durable boundaries.** `crates/focal-node/src/fault.rs`
+  (feature `test-support`, `FOCAL_FAULT=<site>:<n>`, see [06 §3](06-verification-and-operations.md))
+  aborts the node before the proposal or after the commit and before the
+  reply. Before the proposal: the client reports an unknown outcome, the
+  restarted node holds nothing, the reference is `Pending`, the exact retry
+  commits once and a second retry returns the same receipt. After the commit:
+  the restarted node re-commits its durable tail in its new term, the exact
+  retry is answered by the owner's committed outcome for the same identity,
+  the remote inspection shows the same intent, and no second claim exists.
+- **Dead peers over QUIC.** An enrolled client's in-flight request waited
+  the whole request timeout on a connection to a node that had died. The QUIC
+  transport now bounds silence at ten seconds with keep-alive pings every
+  two and a half (`focal-wire/src/transport.rs`), so the next attempt
+  reconnects instead of waiting on a dead connection; connecting to an
+  endpoint that is still down remains bounded by the request timeout.
+- **Admission pressure.** `FOCAL_DISK_HEADROOM_BYTES` (read once at hosting,
+  `network_service.rs::native_limits`) sets the engine's free-space watermark.
+  Raised above the volume's free space, every fresh native candidate is
+  refused `capacity` with the ledger sequence unchanged, while the exact retry
+  of a committed operation is answered with its unchanged receipt and the
+  remote inspection shows its intent; the refused reference stays `Pending`
+  and commits exactly once when the pressure lifts. Read pins, partial apply
+  under memory pressure and completion-budget pressure remain qualified at the
+  ledger and owner level (`delivery_under_session_memory_pressure_is_retained_and_completes_exactly_once`,
+  `a_follower_under_memory_pressure_keeps_its_delivery_and_finishes_when_memory_returns`,
+  the R1 record-buffer and lease tests).
+
+A cancelled MCP tool call (`notifications/cancelled`) drops only the
+adapter's wait; the journal decides afterwards and the exact retry settles
+the reference once. The manual, the MCP guide and document 06 record the
+contract.
+
+Qualification on macOS arm64 (Darwin 25.4.0, Rust 1.94.1), 2026-09-09 03:07–03:15
+CDT, on this tree: `bash scripts/cargo.sh test --workspace --offline --no-fail-fast`
+ran **2,401 tests across 98 test binaries with 0 failures**; strict workspace
+all-target Clippy (`-D warnings`), the production no-panic gate, `cargo fmt
+--all --check` and `cargo check --workspace --all-targets --locked --offline`
+pass; `scripts/check-contracts.py` verifies **1,188 links**, all **37 imported
+source hashes** and **15 frozen vocabularies**. Two earlier full runs of the
+same batch (02:49–02:57 and 02:58–03:06 CDT) each failed one `cli_network.rs`
+scenario whose founder found the UDP port it chose from the shared
+24,000–32,000 test range already bound by another test binary's node, and
+the first also a `cli_native_a2.rs` enrollment whose stderr the test did not
+yet print (both pass alone; the gate tests now print the enrollment's
+output). Linux, Windows, released binaries and external MCP clients were not
+exercised. Known limits carried forward: A2's corrective/consult bullet (R5);
+managed batching throughput and the mixed-version network campaign (P17.11
+order 9); the packaged skills on the native engine (R4.10), the shared
+operator/watch/transfer descriptors and the external MCP client
+qualification (R4.9); chunked transfer and artifact payload download on the
+native engine; multi-node native activation through the node's support
+driver is exercised only at the ledger level until the R6 fleet harness;
+projection-only imported ledgers cannot author claims; a terminal claim's
+timer row lives until its deadline passes; native events are retained with
+the prefix until R8; an unfiltered testament watch seeds the claims.
+
+## Skills on the native engine — 2026-09-09
+
+The four packaged skills (`skills/focal-claims`, `focal-evidence`,
+`focal-validation`, `focal-cluster`) now carry an "On a native ledger" branch
+and the shared contract a "Native engine" section
+([workflow-contract.md](../../skills/references/workflow-contract.md)):
+`ledger.standing` selects the branch; native identity is minted per call and
+resumed through `operation_id` (no reservation or seal), recovery is the
+four `request.*` tools, refusals are typed and a `capacity` refusal leaves
+the reference pending; version-2 documents (slots, phases, handlers with
+attempts, deadlines, `parent`), inline payloads, code-valued vocabularies,
+bounded lists and schema-2 watches are described once and referenced from
+each skill. The claims branch covers authoring/posting/cancelling, receipts
+and adoption, lists and events, monitors and scope release; the evidence
+branch the slot-bound work, diagnostics, failed slots, testaments with
+diagnostics, posting/receiving and issuer acceptance/rejection; the
+validation branch the context read, begin/report with zero-based attempts
+and the error-retry rule, the missing-slot assessment at whole-work entry,
+increment sealing and audits; the cluster skill the engine reporting and the
+offline activation command. `skills/manifest.json` is schema 3: the adapter
+pins `native_contract_version` 2 and every skill lists its
+`required_native_operations`, whose union must equal the native catalogue
+(37 descriptors). Both contract tests enforce it
+([skill_contract.rs](../../crates/focal-client/tests/skill_contract.rs):
+descriptor existence, version 2, `$id` `…:input:2`, use in the skill text,
+the native section in the shared contract, and the union;
+[skill_contract_tests.rs](../../crates/focal-mcp/src/skill_contract_tests.rs):
+every required native operation is an advertised native tool whose
+`operation_id` is an optional `n1:` resume argument), and an ignored helper
+(`print_skill_digests`) prints the digests to re-pin after an edit. The MCP
+guide and documents 13 and 19 record the packaging rule. The challenge,
+consult and continuation procedures (`skills/focal-peers`) follow their typed
+operations in R5.
+
+Qualification on macOS arm64 (Darwin 25.4.0, Rust 1.94.1), 2026-09-09 03:21–03:29
+CDT, on this tree: `bash scripts/cargo.sh test --workspace --offline --no-fail-fast`
+ran **2,401 tests across 98 test binaries with 0 failures**; strict workspace
+all-target Clippy (`-D warnings`), the production no-panic gate, `cargo fmt
+--all --check` and `cargo check --workspace --all-targets --locked --offline`
+pass; `scripts/check-contracts.py` verifies **1,192 links**, all **37 imported
+source hashes** and **15 frozen vocabularies**. Linux, Windows, released
+binaries and external MCP clients were not exercised. Known limits carried
+forward: the peer skill and A2's corrective/consult bullet (R5); the shared
+operator/watch/transfer descriptors and the external MCP client qualification
+(R4.9); managed batching throughput and the mixed-version network campaign
+(P17.11 order 9); chunked transfer and artifact payload download on the
+native engine; multi-node native activation through the node's support
+driver is exercised only at the ledger level until the R6 fleet harness;
+projection-only imported ledgers cannot author claims; a terminal claim's
+timer row lives until its deadline passes; native events are retained with
+the prefix until R8; an unfiltered testament watch seeds the claims.
+
+## One registry for every adapter surface — 2026-09-09
+
+The watch, transfer and administration tools of the MCP adapter are now
+shared `OperationDescriptor`s in the client crate beside the two application
+catalogues (R4.9): `Surface::{Application, Watch, Transfer, Administration}`,
+`Capability::{Actor, Node, FounderNode}`, a `RetryIdentity` naming the `a1:`
+and `r1:` administration references, exact-argument resumption for watches
+and uploads, or a fresh intent per call, the reviewed input schema as a
+literal, and the CLI path that performs the same operation
+(`catalog_watch.rs`, `catalog_transfer.rs`, `catalog_admin.rs`;
+`find_surface`, `surface_of`). The adapter's catalogues are derived from
+them with byte-equivalent tool schemas (the existing catalogue, schema and
+administration tests pass unchanged), `tools/list` remains one pass filtered
+by the standing the adapter can prove, and `execute_inner` dispatches by
+surface so a tool the adapter did not advertise is refused by the dispatcher
+as well as by the protocol layer (a transfer tool on a native ledger, an
+administration tool without local node ownership). Evidence:
+[command_tree_tests.rs](../../crates/focal-node/src/cli/command_tree_tests.rs)
+(`every_surface_descriptor_cli_path_resolves_in_the_command_tree`: each named
+path resolves to a leaf of the clap tree; the surface lookup is exact) and
+the unchanged catalogue tests of the adapter. Documents 19 and the MCP guide
+record the registry rule; the R9 operator surfaces extend it.
+
+External MCP client qualification is packaged as scripts under
+[crates/focal-mcp/tests/external](../../crates/focal-mcp/tests/external/README.md)
+(the MCP Inspector CLI, Claude Code's `claude mcp add`, and the Python SDK
+client), driven by [mcp_external.rs](../../crates/focal-node/tests/mcp_external.rs)
+only when `FOCAL_EXTERNAL_MCP=1`; without the variable the test records the
+skip. They were **not executed** in this offline session: the versions run
+and their results are to be recorded here when they are.
+
+Qualification on macOS arm64 (Darwin 25.4.0, Rust 1.94.1), 2026-09-09 03:39–03:47
+CDT, on this tree: `bash scripts/cargo.sh test --workspace --offline --no-fail-fast`
+ran **2,403 tests across 99 test binaries with 1 failure**:
+`network_service::tests::joined_service_receives_committed_root_learner_and_restarts_without_ledger_policy`
+in the `focal-node` library, whose in-process peer's invitation redemption
+answered `Invalid` under the parallel run; it passes alone (twice, 03:48
+CDT). This is the fourth network scenario today to fail only under the full
+parallel run: every test binary draws the node ports it advertises from the
+same 24,000–32,000 range, so binaries can race for a port between probing
+and binding. Serializing that allocation across binaries is a test-harness
+robustness item carried forward, not a defect of the batch. Strict workspace
+all-target Clippy (`-D warnings`), the production no-panic gate, `cargo fmt
+--all --check` and `cargo check --workspace --all-targets --locked --offline`
+pass; `scripts/check-contracts.py` verifies **1,198 links**, all **37 imported
+source hashes** and **15 frozen vocabularies**. Linux, Windows, released
+binaries and external MCP clients were not exercised; the external client
+scripts above have not run. Known limits carried forward: the peer skill and
+A2's corrective/consult bullet (R5); the parallel-run port allocation of the
+node tests; managed batching throughput and the mixed-version network
+campaign (P17.11 order 9); chunked transfer and artifact payload download on
+the native engine; multi-node native activation through the node's support
+driver is exercised only at the ledger level until the R6 fleet harness;
+projection-only imported ledgers cannot author claims; a terminal claim's
+timer row lives until its deadline passes; native events are retained with
+the prefix until R8; an unfiltered testament watch seeds the claims.
+
+## Exact evidence and peer policy (R5.1) — 2026-09-09
+
+A claim can now cite one exact committed artifact and carry its own
+follow-up rules (decision F28, [07](07-decisions-and-traceability.md)),
+the representation the challenge, consult and corrective workflows of R5 are
+built on. Claim descriptor schema 2 appends an optional `PeerPolicy`
+(`corrective_allowed`, `max_follow_ups` bounded by `MAX_FOLLOW_UPS` = 1,024,
+`single_issuer`, `escalation` none/holder/evaluator) after the deadline and
+admits `RelationTarget::Evidence(ArtifactRef)` as the target of `reviews` and
+`derived_from` relations only; schema 1 refuses both (`InvalidPolicy`), any
+other relation kind naming evidence is `InvalidTarget`, and the descriptor
+hash covers the policy's presence and fields from schema 2 on so schema-1
+identities, bytes and hashes are unchanged
+([21 §5](21-native-input-format.md), [22 §7](22-native-record-format.md)).
+The input codec writes the target as tag 4 (artifact identity and descriptor
+hash) and the policy as a presence byte plus fields, the frame inspector
+bounds both without decoding, the canonical record codec carries the target
+as tag 5, the V1 durable codec refuses the new target, and a creation result
+records claims of schema 1 or 2 and definitions of schema 1 only. The owner
+admits an evidence relation only when that artifact is committed on the same
+ledger at exactly that descriptor hash (a pending artifact of the same batch
+cannot be cited), replay validation requires the same, and `ByRelation`
+indexes the relation by the artifact's identity so the reviews and
+derivations of one artifact are listable (`--relation reviews=artifact:ID`,
+optionally `@HASH`). The host-side compiler selects schema 2 exactly when a
+document carries `policy` or an evidence relation; documents, the reviewed
+JSON schema, the CLI's `--relation reviews:artifact:ID@HASH` form and the MCP
+`claim.submit` tool share that one rule, and `get claim` returns the policy.
+
+Evidence: [claim_descriptor_tests.rs](../../crates/focal-model/src/lifecycle/claim_descriptor_tests.rs)
+(schema-2 construction and hashing; a schema-1 policy or evidence target and
+an unsupported schema refused), [objects_tests.rs](../../crates/focal-model/src/durable_v1/objects_tests.rs)
+(the V1 codec refuses an evidence target), [creation_content_tests.rs](../../crates/focal-core/src/native/input_codec/creation_content_tests.rs)
+(input round trip of the target and policy; a schema flip changes the
+identity), [frame_tests.rs](../../crates/focal-core/src/native/input_codec/frame_tests.rs)
+(schema 3 refused by the inspector), [creation_result_tests.rs](../../crates/focal-core/src/native/creation_result_tests.rs)
+(claim schema 2 recorded, definition schema 2 refused) and
+[focal-native-client tests.rs](../../crates/focal-native-client/src/tests.rs)
+(`a_challenge_cites_exact_committed_evidence_and_carries_its_policy_through_the_owner`:
+the challenge compiles to schema 2, commits through the owner with its
+policy and exact target readable, an ordinary claim keeps schema 1, the wrong
+hash and an unknown artifact are refused `InvalidTarget` by the owner, and a
+`depends_on` on evidence or an evidence target without its hash is refused by
+the compiler before any identity is spent). The CLI `claim challenge|consult|
+correct|follow-up|lineage` verbs, the owner's corrective and follow-up rules
+(cause authority for a designated evaluator, single-issuer and follow-up
+bounds, verdict citation) and the peer skill are R5.2–R5.5.
+
+Qualification on macOS arm64 (Darwin 25.4.0, Rust 1.94.1), 2026-09-09: `bash
+scripts/cargo.sh test --workspace --offline --no-fail-fast` at 04:15–04:23 CDT
+ran **2,407 tests across 99 test binaries with 0 failures**. Three edits
+followed that run and were re-tested in their crates on the final tree: a
+Clippy-required rewrite of the replay evidence check in
+`authored_check.rs` to the equivalent `is_none_or` form (`focal-core` library,
+834 tests, 04:24 CDT), the `--relation` help text (`focal-node` library, 163
+tests, 04:24 CDT) and a scoped borrow in the native-client test (6 tests,
+04:26 CDT); the node's binary-level suites were not rerun for the equivalent
+rewrite. On that final tree strict workspace all-target Clippy
+(`-D warnings`), the production no-panic gate, `cargo fmt --all --check` and
+`cargo check --workspace --all-targets --locked --offline` pass (04:26 CDT);
+`scripts/check-contracts.py` verifies **1,210 links**, all **37 imported
+source hashes** and **15 frozen vocabularies**. Linux, Windows, released
+binaries and external MCP clients were not exercised. Known limits carried
+forward are those of the registry batch above, with the peer verbs, owner
+rules, skill and fault journeys of R5 still open.
+
+## Corrections and follow-ups under the authored policy (R5.2) — 2026-09-09
+
+The owner now enforces the peer rules that the schema-2 policy declares
+(decision F29, [07](07-decisions-and-traceability.md); rules in
+[21 §5](21-native-input-format.md)). A challenge whose verdict failed and a
+consultation that was answered are terminal, and a terminal or released
+claim cannot own a child, so a follow-up never reopens the claim it follows:
+a correction (action `correction`) `invalidates` exactly one committed
+challenge and `reviews` exactly one exact artifact, the report of that
+challenge's terminal Fail, Incomplete or Error verdict at its current
+registration generation; a follow-up consultation `refines` the consultation
+it continues. `authored_peer.rs` applies the rules at admission and, from
+the recorded contents, at replay: the invalidated claim must be a challenge
+whose policy has `corrective_allowed` (`InvalidTarget`, `InvalidPolicy`),
+the cited artifact must be that challenge's terminal negative verdict
+(`MissingEvidence` for any other artifact, `InvalidTransition` for a passing
+or still-retryable verdict, `StaleEvaluation` when the challenge has been
+re-registered since), the author must be the challenge's issuer, its
+current holder unless `escalation` is `none`, or under `escalation:
+evaluator` the evaluator who reported that verdict (`WrongActor`), and under
+`single_issuer` a second correction, committed or in the same batch, is
+`ConflictingCause`; a follow-up consultation of a claim with a policy is
+authorized by the same escalation and bounded by `max_follow_ups` across
+the committed prefix and the batch (`InvalidPolicy`), while a claim without
+a policy bounds nobody. Both counts come from the relation index through
+`View::relation_sources`, exposed as `NativeView::related_claims`; each
+claim's citation walk and scans are bounded by `plan_edges` of their own
+rather than the exact creation allowance. The same escalation now governs
+`caused_by` children of a live parent through two default methods on the
+model's `EffectiveClaims` (`cause_escalation`, `is_designated_evaluator`):
+`none` reserves them to the issuer, `holder` keeps the schema-1 rule, and
+`evaluator` also admits a designated evaluator of the parent's declarations
+(`Declaration::designates`). Descriptor schema 2 admits the `invalidates`
+relation (never to the descriptor itself); the compiler refuses an
+`invalidates` on anything but a correction and requires a correction to
+carry exactly one `invalidates` and one reviewed verdict artifact before any
+identity is spent; the reviewed JSON schema lists the kind.
+
+Evidence: [creation_tests.rs](../../crates/focal-model/src/lifecycle/creation_tests.rs)
+(`authored_escalation_decides_who_besides_the_issuer_may_cite_a_parent`:
+`none` refuses the holder, `evaluator` admits only a designated evaluator, a
+node principal is always refused), [claim_descriptor_tests.rs](../../crates/focal-model/src/lifecycle/claim_descriptor_tests.rs)
+(`invalidates` accepted at schema 2, refused at schema 1 and when
+reflexive) and [focal-native-client tests.rs](../../crates/focal-native-client/src/tests.rs)
+(`a_correction_rests_on_the_challenge_s_failed_verdict_under_its_authored_policy`:
+a full two-party challenge to a Fail verdict, then a stranger refused
+`WrongActor`, the work artifact instead of the report `MissingEvidence`, a
+plain claim `InvalidTarget`, a challenge without a policy `InvalidPolicy`, a
+passed challenge `InvalidTransition`, the wrong document shapes refused by
+the compiler, the reporting evaluator's correction committed at schema 2
+with its relations readable and the challenge untouched, and the issuer's
+and holder's later corrections `ConflictingCause`;
+`consult_follow_ups_refine_their_parent_within_its_authored_policy`: the
+subject refused under `escalation: none`, one follow-up admitted, the second
+refused `InvalidPolicy`, and a consultation without a policy taking
+follow-ups from anyone). The peer verbs, documents, `claim wait` on the
+native engine, the peer skill and the CLI/MCP fault journeys are R5.3–R5.5.
+
+Qualification on macOS arm64 (Darwin 25.4.0, Rust 1.94.1), 2026-09-09
+04:53–05:01 CDT, on this tree: `bash scripts/cargo.sh test --workspace
+--offline --no-fail-fast` ran **2,410 tests across 99 test binaries with 0
+failures**; strict workspace all-target Clippy (`-D warnings`), the
+production no-panic gate, `cargo fmt --all --check` and `cargo check
+--workspace --all-targets --locked --offline` pass; `scripts/check-contracts.py`
+verifies **1,218 links**, all **37 imported source hashes** and **15 frozen
+vocabularies**. Linux, Windows, released binaries and external MCP clients
+were not exercised. Known limits carried forward are those of the R5.1
+section, with the peer verbs, skill and fault journeys of R5 still open.
+
+## Peer verbs, lineage, the testament wait and the peer skill (R5.3–R5.5) — 2026-09-09
+
+The peer workflows now have their typed surface on both adapters. Four
+native descriptors are **authored shapes of `claim.submit`**
+(`claim.challenge`, `claim.consult`, `claim.correct`, `claim.follow_up`):
+typed documents that `focal-native-client/src/peer.rs` lowers to one
+complete claim document before the shared claim compiler runs, so they
+produce the same `FCNINPUT` frame, `n1:` identity and receipt as a
+hand-written claim with the same content; the coverage table claims them
+through `claim.submit`'s frame tags (`native_catalog::authored_shape`) and a
+projection-only ledger withholds them with it. A challenge names the
+disputed artifact as `ID` or `ID@HASH` (an omitted hash is read from the
+ledger before the frame is compiled) and must carry its policy; a correction
+names the challenge and the report artifact of its verdict (`verdict`,
+again `ID` or `ID@HASH`), defaults its target to the challenge's subject and
+lowers to `invalidates` + `reviews`; a follow-up names the consultation it
+`refines` and defaults its target to that consultation's subject. A
+correction's and a follow-up's **occurrence identity derives from the facts
+they rest on** (ledger, author, challenge or refined claim, verdict at its
+hash, description) and, with it, the claim's, every validation's and every
+timer's identity, so the same facts produce byte-identical descriptors and
+the owner resolves a repeated delivery to the one committed claim: a lost
+reply, a retried tool call or a second CLI invocation never mints a second
+correction. Two composed reads join them: `claim.lineage` (one
+`native_read` page: the claim with its content, its `caused_by` ancestors
+nearest first up to 16, then up to 64 committed corrections, refinements and
+children with their content, every read at or after the first read's token)
+and `claim.wait` on the native engine (`observe.rs`: the V1 observer's
+bounds and monotonic checks over exact native claim reads, plus the
+`testament` predicate met once the issuer has received a closing
+testament; result kind `native_wait`). The wire claim content now carries
+the authored `policy`, so `get claim` returns it. The CLI adds `claim
+challenge|consult|correct|follow-up|lineage` and serves `claim wait` on
+native ledgers (with `--until testament`); the MCP adapter derives the six
+tools from the descriptors, dispatches the composed reads through one
+`focal_native_client::read` entry point with a cancellable pause, and its
+ordinary memory headroom grew to 80 MiB for the 47-tool catalogue. The
+`focal-peers` skill (manifest schema 3, five skills) sequences the verbs
+with `references/peer-workflows.md`; the union of the skills' native
+requirements still equals the native catalogue (43 descriptors).
+
+Evidence: [focal-native-client tests.rs](../../crates/focal-native-client/src/tests.rs)
+(`peer_verbs_are_authored_shapes_of_claim_submit_with_derived_identities`:
+a challenge disputing an exact artifact with its hash read from the ledger;
+a correction by the reporting evaluator whose second delivery under a fresh
+request resolves to the same claim with identical derived identities and
+whose variant is `ConflictingCause`; a consultation, its follow-up addressed
+to the consultation's subject, the same follow-up as one claim, and the
+subject refused; `the_wait_observer_and_the_lineage_read_compose_bounded_exact_reads`:
+pending then met with one pause, `Unmet` at once on a terminal claim, a
+backwards observation refused, and a lineage page ordered claim, ancestor,
+correction, child at the first token), [native_tests.rs](../../crates/focal-client/src/operations/native_tests.rs)
+(43 descriptors, the four authored shapes claimed through `claim.submit`,
+every new document field in its schema), the MCP catalogue tests (the peer
+shapes withheld on projection-only ledgers, `claim.wait` as `native_wait`)
+and the two journeys through the real binary:
+[cli_peer_workflows.rs](../../crates/focal-node/tests/cli_peer_workflows.rs)
+and [mcp_peer_workflows.rs](../../crates/focal-node/tests/mcp_peer_workflows.rs)
+(three participants on one native node: a consultation answered, observed
+with `--until testament` Pending before and Met after receipt, followed up
+once with the same command twice being one claim, a second follow-up refused
+by the policy and the subject refused; a challenge disputing the exact
+answer, failed by its evaluator, `--until satisfied` Unmet; a correction
+citing the work instead of the verdict refused `missing_evidence`, the
+reporting evaluator's correction committed, repeated as the same claim and
+retried by reference, the holder's and issuer's corrections
+`conflicting_cause`, the challenge's revision and status untouched; lineage
+pages naming the correction and the follow-up; a kill-and-restart after
+which every read and refusal is the same; and on MCP the follow-up
+cancelled and observed terminal and the correction's outcome read by
+identity with `request.inspect`). Not exercised in this batch: the
+replicated journeys (they wait for the R6 fleet harness), deadline expiry
+under a controlled clock, receipt adoption during a challenge, and evaluator
+error-retry exhaustion on a challenge (its mechanics are qualified by A2).
+
+Qualification on macOS arm64 (Darwin 25.4.0, Rust 1.94.1), 2026-09-09: `bash
+scripts/cargo.sh test --workspace --offline --no-fail-fast` at 05:50–05:58 CDT
+ran **2,414 tests across 101 test binaries with 0 failures**. One edit
+followed that run: Clippy's `clone_on_copy` lint required dropping four
+`.clone()` calls on a `Copy` document field in `peer.rs`; on the final tree
+the native-client suite (10 tests) and both peer journeys were rerun
+(05:58–05:59 CDT) and strict workspace all-target Clippy (`-D warnings`), the
+production no-panic gate, `cargo fmt --all --check` and `cargo check
+--workspace --all-targets --locked --offline` pass (05:59 CDT);
+`scripts/check-contracts.py` verifies **1,226 links**, all **37 imported
+source hashes** and **15 frozen vocabularies**. Linux, Windows, released
+binaries and external MCP clients were not exercised. Known limits carried
+forward: the replicated peer journeys and the remaining fault cases named
+above (R6 harness), plus those of the R5.1 section.
+
+## Placement progress in the directory (R6.1) — 2026-09-09
+
+The partition directory now records what a placement change has achieved,
+not only that one is pending. Design: [24](24-placement-execution-and-fleet-control.md);
+decision F31 in [07](07-decisions-and-traceability.md).
+
+**Model** (`crates/focal-directory/src/partition_progress.rs`,
+`partition_session.rs`, `partition.rs`, `types.rs`, `placement.rs`,
+`authority_proof.rs`):
+
+- `AssignmentProgress { node, node_generation, roles, phase, attempt,
+  through, custody_epoch, refusal }` per node of a pending placement, created
+  at `BeginPreparation`; `AssignmentPhase` ladder `Assigned → Installed →
+  CaughtUp → CustodyVerified → Promoted` (`Active | Draining | Retired` for
+  retiring copies, `Failed` off the ladder); `AssignmentRole` derived from the
+  desired placement and refused when a report disagrees.
+- `SessionChange::{Progress, Refuse, Drain, Retire}` appended;
+  `SessionChange::Plan` carries `observations` (load-report epochs that must be
+  at most the committed report of a node in the placement).
+- `PlacementPhase::{Planned, Preparing, Catchup, Custody, Promoting, Cutover,
+  Failed}`; every phase after `Planned` is derived from committed rows and the
+  checkpoint validator refuses a stored phase that differs.
+- Rules: progress is monotone within an attempt and an exact repeat is a
+  no-op; a new attempt may restart the ladder; `CustodyVerified` and `Promoted`
+  require the node's own signed `ReplicaReady` (`NotReady` otherwise) and
+  readiness itself raises a row to `CustodyVerified`; `Promoted` only for
+  voters; the cutover fence is accepted only when every desired voter is
+  `Promoted` and no copy is `Failed`; after the fence a refusal can no longer
+  fail an assignment; `Activate` additionally requires every copy at its
+  required phase with `custody_epoch == next_placement`, and moves the copies
+  the new placement drops into `SessionDescriptor.retiring` (`Active`, drained
+  by `Drain`, removed by `Retire`, both keyed by the activation's operation).
+- `Refusal { operation, code: RefusalCode, node, attempt, at }` with a bounded
+  per-session ring (`PartitionConfig::max_refusals`, default 16); a named
+  refusal fails that attempt exactly once; an unnamed refusal never names the
+  live plan or the active authority; `RefusalCode::retryable()`.
+- `effective_guarantee(&SessionDescriptor, &nodes) -> GuaranteeReport {
+  desired, achieved, blocked_by, phase }`: `achieved` is the largest number of
+  promised failure domains the active placement survives with the live node
+  registry (missing, re-enrolled and ineligible members count as lost; an
+  unevaluable domain yields `None`); `blocked_by` names outstanding
+  assignments, refusals, the awaited cutover or activation, and draining
+  copies; bounded to 256 blockers under `try_reserve_exact`.
+- `NodeLoad.disk_available`; `propose_placement(nodes, policy, max_members,
+  min_disk_available)` skips nodes below the headroom and prefers roomier ones;
+  `PartitionConfig::min_disk_available` (64 MiB). The frozen V1 row codec
+  (`durable_v1.rs`, new `v1_struct_later!`) writes the original five fields and
+  restores the sixth as zero; the fixture parity test reads those rows through
+  the frozen path only.
+- `AuthorityFact::Custody(CustodyProof)` and `AuthorityVerifier::verify_custody`
+  (self-signed, attestation zeroed in the body, epoch non-zero), implemented by
+  the installed verifier and every stub verifier in the tree.
+- Memory: every new row is charged in `partition_charge` and per change in
+  `partition_session::change_charge` (progress rows with their role sets,
+  observations, the refusal ring, retiring rows at activation).
+
+**Formats.** `PartitionCheckpoint.schema = 2`; the digest domain is
+`focal:directory-partition-checkpoint:v2`. `partition_v1.rs` keeps
+`PartitionCheckpointV1` (with `NodeLoadV1`, `PendingPlacementV1`,
+`SessionDescriptorV1`) and a fallible conversion: rows derive from recorded
+readiness, voters become `Promoted` under a recorded cutover fence, and a fence
+over a voter without readiness refuses (`Phase`) instead of inventing custody;
+`PartitionCheckpoint::decode_any` accepts either schema and refuses trailing
+bytes. `focal-control` writes checkpoint schema 4 (the schema 3 layout with the
+current bootstrap; the structs are generic over the state type) and reads
+schemas 1–3 through `LegacyControlBootstrap`; the command envelope is schema 2
+and schema 1 entries still decode except for load reports and plans, which
+predate these fields. A partition group bootstrapped at schema 1 has a
+different genesis identity from the same delegation at schema 2 (asserted in
+`state::legacy_tests`); root groups are unchanged. None of these formats has
+shipped.
+
+**Tests.** `crates/focal-directory/tests/placement_progress.rs` (5): the
+full ladder with every refusal of stale, forged or premature progress, cutover
+gated on promotion, activation gated on readiness at the barrier, shrinking a
+placement and draining/retiring the copies left behind, restore equality;
+refusals failing one attempt, restarting under a new attempt, the bounded
+ring, plan-level refusals and abort; the measured guarantee under stale,
+missing, ineligible and unevaluable members; schema 1 decode, conversion,
+continuation through activation, and the refused orphaned fence; the planner's
+disk headroom filter and ordering. `control_state.rs` reordered its two
+lifecycle tests for the promotion-before-cutover rule. `focal-control`
+`state::legacy_tests` pins the root bootstrap bytes and the partition
+conversion. Not exercised: replica-level restore of a schema 1–3 control
+snapshot (no writer for those schemas remains; the conversion is tested at the
+directory and bootstrap level).
+
+**Deviations from the plan text, recorded.** `PlacementPhase` has no
+`Draining` value: draining is a property of retiring copies, which live in
+`SessionDescriptor.retiring` after activation frees the pending slot;
+refusals are kept per session rather than per pending plan so that a refused
+plan that never became pending has a record.
+
+**Evidence** (macOS arm64, this tree, 06:36–06:44 CDT):
+`bash scripts/cargo.sh test --workspace --offline --no-fail-fast` — **2,420
+tests across 102 test binaries, 0 failures**; `bash scripts/cargo.sh clippy
+--workspace --all-targets --offline -- -D warnings` clean; `bash
+scripts/check-production.sh` clean; `cargo fmt --all --check` clean; `cargo
+check --workspace --all-targets --locked --offline` clean; `python3
+scripts/check-contracts.py` — 1,236 links, 37 hashes, 15 vocabularies.
+
+**Remaining for R6** (24 §7): agent and journal, `PlacementControl` and the
+proof collector, the controller, admission and load, credential renewal and
+revocation, split/merge with the route cache, and the operator API.
+
+## The placement agent registers the founder's session (R6.2) — 2026-09-09
+
+Every `NetworkService` now runs a `PlacementAgent` beside the root controller
+(`crates/focal-node/src/placement_agent.rs`; design in
+[24](24-placement-execution-and-fleet-control.md) §7). It acts where the
+partition owner is hosted locally and this node leads it, which is the
+founder's first partition; nodes without a local partition owner idle until
+the peer placement RPC exists.
+
+**What it does.** One bounded pass every 250 ms, at most one command per pass:
+
+- **Exact-retry journals** (`placement_journal.rs`): `IntentJournal` under
+  `cluster/placement-root` and `cluster/placement-partition` with
+  `PLACEMENT-ROOT.initialized` / `PLACEMENT-PARTITION.initialized` markers,
+  one stable client identity per node (`PlacementAgent::client`), the pending
+  `ControlRequest` journaled before proposal through the owner's
+  `save_local_intent`, resubmitted with the identical identity until a receipt
+  or a pre-admission refusal (`CompareFailed`, `Rejected`, `Unauthorized`,
+  `Invalid`, `WrongOwner`) resolves it; not-leader, not-ready, capacity,
+  unavailable and unknown outcomes keep it pending.
+- **Founder registration** over the hosted replica: `ReplicaHost::registration_facts`
+  (new `fleet_registration.rs`, read on the owner thread) feeds
+  `FirstSessionPlan::capture_facts` (the former `capture` now builds
+  `HostedSessionFacts` from a `Session` and delegates), then in order the root
+  `BootstrapGroup` grant, the session-log `Created` witness
+  (`propose_placement` answers the exact request with the committed record),
+  the partition `Enroll`, the root-signed session fact
+  (`prepare_session_proof`) and `CreateSession`. Once the directory holds the
+  session the plan is never captured again, so a session whose log moved past
+  its creation fence is not a conflict.
+- **Load reports**: `NodeLoad { available_memory }` from the node's whole
+  allowance, `active_weight` from installed replicas, `disk_available` from
+  the data directory's filesystem, report epoch above the committed one and
+  the clock; due when no row exists, the generation changed, or 30 s passed.
+- **Signed readiness**: for a pending plan naming this node in preparation,
+  once the hosted replica's own placement fence is the plan's cutover record,
+  `checkpoint_evidence` → `ContentHost::verify_prefix` →
+  `ReplicaReady { through, custody }` → root `prepare_replica_ready`
+  (new `placement_proof::prepare_replica_ready_proof`: this node at its
+  enrolled generation in the session's installed group, enrollment current for
+  the window) → `SessionProofPermit::attestation` completes the fact → signed
+  with the node credential → `SessionChange::Ready` under `VerifiedPartition`
+  evidence carrying the proof (`session_registration::control_evidence`).
+  Reported once per verified prefix, again only past a recorded barrier, at
+  most once per two seconds per plan.
+- **Failure policy**: a failed tick never ends the node; retryable failures
+  wait one tick, others back off five seconds, the last error is retained for
+  diagnostics; a runtime without a timer driver is the only fatal condition.
+
+`ControlHost` gains `Work::PrepareReplicaReady` / `prepare_replica_ready`;
+the fleet owner gains `Work::Registration` (control lane). The service moves
+the node credential into the agent after the listener and connector copied
+what they need and drives the agent in `run_tasks`.
+
+**Tests.** `crates/focal-node/src/placement_agent_tests.rs` (2, real
+`NetworkService` over QUIC and the Unix socket): the founder's session appears
+in the partition with its `Created` fence, single-voter placement and a load
+row with positive disk headroom; both journals exist; a restart re-reads them
+and adds exactly one fresh load report and nothing else within the interval;
+a Plan and BeginPreparation submitted as the controller produce no readiness
+while the log is still at the old route, the session-log cutover record then
+yields one signed `ReplicaReady` at route 2 with a non-zero custody digest and
+attestation that the partition's installed verifier accepted, progress
+`CustodyVerified` at `custody_epoch` 2 and plan phase `Promoting`, and a
+restart adds only a load report. `network_service_tests` now waits for the
+founder's session group grant on the root instead of asserting one group.
+
+**Evidence** (macOS arm64, this tree, 07:15–07:23 CDT):
+`bash scripts/cargo.sh test --workspace --offline --no-fail-fast` — **2,422
+tests across 102 test binaries, 0 failures**; strict all-target Clippy,
+`scripts/check-production.sh`, `cargo fmt --all --check` and the `--locked`
+check clean; `python3 scripts/check-contracts.py` — 1,239 links, 37 hashes,
+15 vocabularies. An earlier run of the same batch (07:04–07:12) failed three
+tests because the agent ended the service on a registration conflict and a
+service test pinned one root group; both are fixed above and the final tree
+was rerun in full.
+
+**Limits recorded.** The agent acts only where the partition owner is local
+and led by this node; a session whose membership changed before its first
+registration cannot be registered by `FirstSessionPlan`; readiness for copies
+on other nodes, learner promotion and the cutover/activation fences await the
+collector and controller batches (24 §8).
+
+## A joined host installs its assignment and signs under a quorum (R6.3) — 2026-09-09
+
+The placement agent now acts on every node, and a founder's session expands
+onto a joined host end to end. Design: [24](24-placement-execution-and-fleet-control.md)
+§8; wire tags in [03](03-rust-workspace-and-interfaces.md) §9.
+
+**Wire** (`crates/focal-wire`): `Operation::PlacementControl { group,
+request }` (tag 28, mutation, 256 KiB) and `Operation::SessionSign { group,
+request }` (tag 29, read, 64 KiB); both `Capability::Replication`,
+certificate-bound (a trusted local Node grant is refused), unavailable to
+participant ingress, answered in `Response::Control`;
+`PeerConnectionPool::send_placement`; the client inventory rows
+`peer.placement_control` and `peer.session_sign`. Test
+`placement_control_and_session_sign_are_node_only_certificate_bound_and_bounded`.
+
+**Node** (`crates/focal-node`):
+
+- `placement_control.rs`: `decode_placement_control` admits reads through the
+  discovery selectors and a submit only when it is a `VerifiedPartition`
+  command about the sender itself (`Enroll`, `ReportLoad`, `Ready`,
+  `Progress` at `Assigned` or `Installed`); the control host binds the
+  sender's certificate to the enrollment it has installed
+  (`ControlReplica::installed_enrollment`, the installed authority's copy for
+  a partition) before decoding. `SessionFact::{Placement, Membership}`,
+  `SessionSignRequest`/`SessionSignReply`; `prepare_session_fact` witnesses a
+  placement record on any replica (new `ReplicaHost::placement_witness`) or
+  checks a membership against the replica's applied configuration and its
+  change receipt, then the root owner prepares the permit. `PlacementHandle`
+  (`NetworkHandles::placement`) carries `sign`, `collect` and `status` jobs
+  to the agent, which owns the node credential; the managed service answers
+  `SessionSign` through it.
+- `placement_collect.rs`: `Collected` merges signatures over one identical
+  statement, drops a differing statement, and completes at
+  `voters / 2 + 1`; `remote_signature` asks one voter and yields nothing for
+  an unreachable or refusing one.
+- `placement_proof.rs`: `prepare_membership_proof` (root owner; the signer
+  must be a current voter, `next` a legal successor whose members are
+  enrolled for the window; the unsigned share must fail only on quorum) and
+  `MembershipRecord`; `ControlHost::prepare_membership_proof`.
+- `placement_agent.rs`: partition access is local where the owner is hosted
+  and led here, otherwise `PeerControl` reads and `PlacementControl` submits
+  at the founder node; the partition journal binds the identity its owner
+  sees (derived local principal locally, enrolled principal on the wire);
+  `enroll_self` from the root grant; `install_assignment` opens a
+  `DurableNode` on the shared WAL under the founder's bootstrap membership,
+  hosts the native engine, installs into the fleet at the log's committed
+  route and records the copy in `cluster/placement-installs`
+  (`PLACEMENT-INSTALLS.initialized`), reopened at every start;
+  `install_custody`/`sync_custody` keep each hosted ledger's custody scope at
+  the placement the directory activated; `collect` signs locally and asks the
+  other voters; `AgentStatus` for diagnostics.
+- `network_service.rs`: the founder's serving scope (`ReplicaConfig::{route_epoch,
+  policy_revision}`) and custody policy follow the session's *active* placement
+  fence (`Session::active_fence`, `active_placement`), never a pending cutover;
+  node peer grants include the first directory's namespace tenant.
+- `focal-directory`: `verify_membership` keeps the membership epoch for a
+  learner-only change and advances it by one for a voter change, so the epoch
+  a fence carries equals the grant's epoch; `verify_membership` is public.
+- `network_join.rs`: `PendingJoin::redeem` resamples the clock after the
+  exchange before checking `issued_at`, closing a second-boundary race that
+  refused fresh receipts as future-dated under load.
+
+**Tests.** `placement_agent_tests::a_joined_host_installs_its_assignment_and_the_expanded_placement_activates_under_a_signed_quorum`
+(two real `NetworkService`s over QUIC): the joined host enrolls itself and
+reports load over the wire; the test as controller plans two voters and
+begins preparation; both agents report `Installed` and the joined host
+serves a replica; the learner is added, its group change installed on the
+root under the founder's signature, it catches up and is promoted, the
+promotion installed as epoch 2; the session log commits the cutover record;
+both copies verify custody and sign readiness (the joined host's proof
+verified against the partition's installed authority); promotion is
+recorded, the cutover fence is signed by both voters through
+`PlacementHandle::collect` (one local signature, one over `SessionSign`) and
+installed, the activated record is signed and installed; the directory holds
+the two-voter placement at route 2 with `effective_guarantee` reporting the
+desired tolerance and no blockers; the joined host restarts and reopens its
+copy from its install journal. The two R6.2 tests still pass;
+`authority_tests` adds a learner without advancing the epoch.
+
+**Evidence** (macOS arm64, this tree, 08:16–08:24 CDT):
+`bash scripts/cargo.sh test --workspace --offline --no-fail-fast` — **2,424
+tests across 102 test binaries, 0 failures**; strict all-target Clippy,
+`scripts/check-production.sh`, `cargo fmt --all --check` and the `--locked`
+check clean; `python3 scripts/check-contracts.py` — 1,243 links, 37 hashes,
+15 vocabularies. An earlier run of the same batch (08:06–08:15) failed the
+learner-epoch assertion and the join redemption race named above; both are
+fixed and the final tree was rerun in full.
+
+**Limits recorded.** The test acts as the controller; the controller batch
+automates every step it performed. A cutover fence must carry exactly one
+epoch above the active one, which two or more promotions before one cutover
+cannot satisfy; the controller batch redefines the fence's membership epoch
+as the grant's actual epoch at signing (a lower bound in the directory and
+the ledger). After a placement change a host serves the new route epoch and
+participant clients must be told it (route discovery is R7). Remote partition
+submits target the node the first partition was delegated to.
+
+## The controller drives a plan to activation and heals a lost host (R6.4) — 2026-09-09
+
+The placement controller of [24](24-placement-execution-and-fleet-control.md) §9
+is implemented in `crates/focal-node/src/placement_controller.rs` as the last
+step of the placement agent's tick, on the node that leads both the partition
+owner and the session's log. It reconstructs every step from the committed
+partition checkpoint, the session's applied membership and its placement
+fences, so a restarted or re-elected controller resumes where the committed
+state stands, and every command goes through the agent's exact-retry journals.
+
+- **Grant follows log.** A configuration the session log committed but the
+  root grant does not name is installed first (`ChangeGroup` with a
+  membership proof collected from the current grant's voters); the epoch
+  advances only for a voter change.
+- **Driving a plan.** `BeginPreparation` from `Planned`; `AddLearner` once a
+  desired voter reports `Installed` and `Promote` once it reports `CaughtUp`
+  (deterministic change ids, so a lost reply finds the retained receipt);
+  the cutover record once the log's voters are the desired voters; `Promoted`
+  for each voter the grant names whose custody is verified; the voter-majority
+  proof of the cutover fence recorded as the barrier; the activated record and
+  its proof once every copy has signed readiness at or beyond the barrier.
+- **After activation.** Retiring copies are drained, removed from the log and
+  retired; when the active placement no longer verifies against the live
+  registry the controller re-plans under the active policy, or records one
+  `NoPlacement` refusal.
+- **Epoch rule.** A cutover fence carries the group's actual membership epoch,
+  which several learner and promotion changes raise above the one the
+  placement implies: the directory's transition check, the session log's live
+  cutover rule and its checkpoint validator now all require the fence's epoch
+  to be at least the implied one (the validator previously demanded exactly
+  one above the active fence, which refused a copy's own checkpoint at reopen
+  as `Corrupt`); activation sets the session's epoch to the fence's.
+- Copies report `CaughtUp` from their own replica diagnostics; the agent's
+  `Behind` and `Collect` errors are retryable; `CollectRequest` names one
+  statement to be signed by a majority; the healer uses the partition's
+  configured bounds.
+
+**Tests.** `placement_agent_tests::the_controller_completes_a_plan_on_one_host_with_signed_readiness_and_fences`
+(a one-host plan driven from `Planned` to `Activated` by the controller alone)
+and `the_controller_expands_a_laptop_session_to_three_hosts_that_survive_one_loss`
+(three real `NetworkService`s over QUIC: two hosts join and enroll with load;
+the operator plans one tolerated node loss; the controller adds and promotes
+both learners with signed group changes, commits the cutover, records the
+promotions, collects the cutover and activation proofs and activates; the
+directory holds the three-voter placement at route 2, the root grant names
+three voters at membership epoch 3, `effective_guarantee` reports the desired
+tolerance with no blockers, every host serves one installed copy; one host
+stops and the founder still answers a quorum read and stays leader; the host
+returns, reopens its copy from its own checkpoint and rejoins as a voter).
+The ledger's placement lifecycle test now also runs with a cutover epoch above
+the implied one, with and without a checkpoint, and refuses one below it.
+
+**Evidence** (macOS arm64, this tree, 09:07–09:16 CDT):
+`bash scripts/cargo.sh test --workspace --offline --no-fail-fast` — **2,424 tests across 102 test binaries, 0 failures**;
+strict all-target Clippy, `scripts/check-production.sh`,
+`cargo fmt --all --check` and the `--locked` check clean;
+`python3 scripts/check-contracts.py` — 1,246 links, 37 hashes, 15 vocabularies.
+
+**Limits recorded.** The controller does not transfer leadership to the
+planner's preferred leader; the root grant's expiry is the earliest member
+expiry; retirement is not yet gated on retention pins (R8); a session whose
+membership changed before its first registration cannot register; remote
+partition submits target the founder node; participant route discovery after
+a placement change is R7.
+
+## Tenant admission and the disk envelope (R6.5) — 2026-09-09
+
+Instruction 5 of R6 ([24](24-placement-execution-and-fleet-control.md) §10;
+decision F32): a session's admission is connected to the node's memory
+budget, its volume and its custody staging, and a noisy tenant is throttled
+by its own quota.
+
+- **`focal_memory::DiskBudget`** (`crates/focal-memory/src/disk.rs`): one
+  shared envelope per volume with no IO of its own. Owners sample the volume
+  at the cadence it decides and report free bytes; every durable write is
+  promised its bytes (`reserve(kind, lane, bytes)`) and refused with the new
+  `MemoryError::DiskCapacity { requested, available }` before any
+  acknowledgement; the headroom is never spent and the completion reserve
+  only by completion-lane work; a reservation committed after its fence
+  lowers the estimate until the next sample, one dropped returns its promise.
+  `DiskCapacity` joins `Capacity`/`AllocationFailed` in every retryable
+  classification (control RPC, ledger apply, node hosts, runtime).
+- **WAL** (`focal-log`): `SharedWal::open_with_budgets` takes the envelope;
+  every append and checkpoint-rewrite batch is promised in `batch()` and
+  committed by the writer after `fsync` and the fence install (Raft snapshots
+  are WAL records, so checkpoints are covered); `available_bytes` reports
+  the envelope's unpromised free bytes, zero while the volume cannot be
+  sampled; `disk_budget()` shares the envelope.
+- **Content store** (`focal-evidence`): `ContentStore::open_with_disk`;
+  staging bytes promised at `begin` and returned at `finish`, the sealed
+  object promised at `seal` and committed once its manifest is installed,
+  imported chunks and manifests and custody records promised on the
+  completion lane and committed once installed; recovered uploads promise
+  their remainder. `StoreLimits::domain_staging_bytes()` bounds one
+  domain's staged bytes to half the staging allowance (never below one
+  maximal upload), rebuilt from recovered uploads at open.
+- **Node**: one envelope per node under the standard physical watermark
+  (`network_service::disk_budget`), shared by the WAL and the content
+  store; the load report's `disk_available` is the envelope's unpromised
+  free bytes. `FOCAL_DISK_HEADROOM_BYTES` remains the native admission gate
+  for fresh work only: raised above the volume's free space it still lets
+  the node recover and commit its control plane (the A4 campaigns depend on
+  that), which an envelope bound to it would refuse. `crates/focal-node/src/admission.rs`: `AdmissionPolicy`
+  (`node.max_tenants`, default 8, at most 1024, validated by the
+  configuration; 512 MiB allowance with a 128 MiB completion reserve per
+  tenant) and `TenantAdmission` (the founder's tenant admitted at start;
+  `admit(tenant, required_memory)` refuses `Tenants` at the bound and
+  `Memory` when the node budget cannot fund the plan's requirement, answers
+  an admitted tenant identically). `FleetManager::{is_admitted,
+  admit_tenant, tenant_usage}` register a tenant on the running worker
+  (scheduler quota, budgets, per-session slots) and report queue usage; the
+  agent admits a tenant before its first copy and otherwise records
+  `Refuse { NodeCapacity, node }` against its own assignment;
+  `AgentStatus.admission` is an `AdmissionReport` (bound, node memory, the
+  volume's free, promised and headroom bytes, and per tenant weight,
+  allowance, use, sessions and queued items and bytes).
+
+**Tests.** `focal-memory` `disk_tests` (unknown space, lanes and the
+reserve, commit versus drop, sampling cadence and a failed probe, four
+threads sharing one envelope); `focal-log` `a_batch_is_promised_its_volume_bytes_before_queueing_and_charged_after_its_fence`
+(a watermark above the volume refuses an append before any record is
+written and keeps nothing promised; the sample is charged by an append and
+a checkpoint rewrite); `focal-evidence` `uploads_are_promised_volume_bytes_before_any_part_exists`
+and `one_domain_cannot_fill_the_whole_staging_allowance`; `focal-node`
+`admission::tests` (policy bounds, admission under the node budget until
+the bound and identical re-admission, the report), `fleet::admission_tests::a_tenant_admitted_at_runtime_installs_its_sessions_under_its_own_quota`
+(a second tenant's session is refused before admission with its candidate
+returned, a foreign budget is not a tenant, admission is idempotent, the
+session then installs and both tenants report usage), the founder agent test
+asserting the admission report, and `config::tests::the_tenant_bound_is_optional_and_bounded`.
+
+**Evidence** (macOS arm64, this tree, 10:18–10:26 CDT):
+`bash scripts/cargo.sh test --workspace --offline --no-fail-fast` — **2,437 tests across 102 test binaries, 0 failures**;
+strict all-target Clippy, `scripts/check-production.sh`,
+`cargo fmt --all --check` and the `--locked` check clean;
+`python3 scripts/check-contracts.py` — 1,257 links, 37 hashes, 15 vocabularies.
+
+Two earlier runs of this batch (09:41–09:49 and 09:52–10:16) failed the A4
+campaigns, because the envelope first took its headroom from the admission
+knob and refused the node's own recovery writes, and then the client join
+test, whose receipt check compared against the clock sampled before the
+exchange (the race the node join path had already closed; `client_join.rs`
+now resamples the clock too); the final tree was rerun in full.
+
+**Limits recorded.** No path creates a session of a second tenant yet, so
+the agent's refusal is exercised at the admission table and the fleet, not
+through a foreign assignment (the operator batch adds session creation). The
+per-tenant allowance is fixed, not derived from the plan's policy. Custody
+capacity is bounded per domain at staging only. A promise and the sample
+that already counts the bytes it protects can overlap between a commit and
+the next sample, which is conservative, never optimistic.
+
+## A node renews its own credential and every proof follows its key (R6.6) — 2026-09-09
+
+Instruction 6 of R6 ([24](24-placement-execution-and-fleet-control.md) §11;
+decision F33).
+
+- **Identity by key.** `NodeEnrollment.identity` is the enrolled key's
+  identity (`EnrollmentReceipt::public_key`); `focal_enrollment::certificate_key_hash`
+  derives it from a certificate. The directory verifier, node grants, the
+  control checkpoint's liveness check, the placement proof permits, the
+  directory bootstrap, session registration and the root learner admission
+  all compare keys now; the transport, contacts and the peer registry keep
+  the certificate fingerprint.
+- **Registry** (`focal-enrollment`, schema 2): `Change::Renew { invitation,
+  receipt, retire_previous_at }`, a bounded `retired` table swept at every
+  apply, `prepare_renew`/`release_renewal`/`authenticate_renewal`
+  (`RenewRequest` signed by the holder's credential through the node
+  statement path; `RenewPreparation::{Existing, Commit}`; a same-second
+  renewal is refused), `authorize_certificate` through retirement,
+  `retired(now)`, restore validation of the retired table,
+  `EnrollmentCommand::renewed_invitation`, `JoinKey::renew`,
+  `ServerTrust::{client_config, verify_quic}`, enrollment transport frame
+  kind 3 (`JoinHandler::renew`, refused by join-only handlers;
+  `EnrollmentClient::renew`), `CredentialMaterial: Clone`.
+- **Node**: `credential_renewal.rs` (`CredentialHandle::{renew, current}`,
+  `CredentialSummary`, `RenewalError`, `CredentialSwap`, the ten-day window,
+  one-minute retry and the sponsor's grace knob); the network controller
+  renews (automatic, on request, or when the committed registry is ahead of
+  the receipt it holds), installs and swaps the listener identity
+  (`ListenerIdentity`), the peer pool identity
+  (`PeerConnectionPool::replace_identity`, `QuicConnector::replace_tls`) and
+  the placement agent's credential (`AgentJob::Credentials`), re-announces
+  its contact under the committed generation, and starts on a retired
+  receipt; the founder's enrollment host serves renewals (`Action::Renew`,
+  `RegisteredEnrollment::renew` waits for its own grant); contacts and
+  grants keep retired certificates through their grace;
+  `AdminCommand::RenewCredential`, `ClusterAdmin::renew_credential`,
+  `AdminResult::CredentialRenewed`, CLI `cluster credentials renew`, MCP
+  `cluster.credentials.renew` (33 administration tools; the cluster skill is
+  version 3).
+- **Contact retries.** A contact announcement retried after a lost reply is
+  never byte-identical to the request the root retained (the root stamps its
+  own decision time into the command), so the root answers `RetryConflict`;
+  the controller used to end on it. It now reads a conflicting or
+  compare-failed reply as an earlier attempt having committed and lets the
+  next observation settle it. The renewal test exposed this under the full
+  binary's load; the first announcement carried the same latent fault.
+
+**Tests.** `focal-enrollment`: `a_renewal_keeps_the_key_and_identity_retires_the_old_certificate_after_grace_and_is_idempotent`,
+`renewals_need_the_holder_s_own_key_and_a_live_unrevoked_enrollment`,
+`a_node_renews_over_the_enrollment_transport_and_a_join_only_handler_refuses`;
+`focal-node`: `credential_renewal::tests::a_joined_host_renews_its_credential_presents_it_everywhere_and_converges_after_a_crash`
+(two real services over QUIC: the founder refuses to renew its own identity;
+the joined host renews on request, holds a later expiry and a new fingerprint
+under the same principal, the root's contact table carries the fingerprint it
+now presents, its agent keeps its state; the host stops with the previous
+receipt written back, starts on it and converges on the committed renewal by
+itself; a later renewal commits again); the identity-by-key fixtures in the
+directory, control, bootstrap, placement-proof and registration tests.
+
+**Evidence** (macOS arm64, this tree, 11:30–11:38 CDT):
+`bash scripts/cargo.sh test --workspace --offline --no-fail-fast` — **2,441 tests across 102 test binaries, 0 failures**;
+strict all-target Clippy, `scripts/check-production.sh`,
+`cargo fmt --all --check` and the `--locked` check clean;
+`python3 scripts/check-contracts.py` — 1,261 links, 37 hashes, 15 vocabularies.
+
+Two earlier runs of the batch on the same code: 11:00–11:08 failed the
+renewal test itself under load, which exposed the contact-retry fault above,
+and the known port-range race of `cli_network.rs`; 11:19–11:28 failed only
+`fleet::async_tests::shared_owner_queues_covering_flush_and_serves_another_group_while_disk_waits`,
+a timing assertion on a paused WAL writer that passes alone and in its whole
+binary. The final run is clean.
+
+**Limits recorded.** The founder's identity is not renewed; CA rotation and
+client credential renewal are not implemented; key rotation is planned; the
+stale-certificate refusal after grace is qualified in the registry, not
+across two services (the grace is sixty seconds); the contact
+re-announcement assumes every committed contact command advanced the node's
+generation.
+
+## Liveness: SWIM with Lifeguard, late extension and coordinates (R6.7) — 2026-09-09
+
+Instruction 7 of R6 ([24](24-placement-execution-and-fleet-control.md) §12;
+decision F34). The reference behaviours were taken from hyperscale's SWIM
+package (local health multiplier, suspicion manager and state, gossip
+buffer, Vivaldi coordinate engine, AD-26 extensions).
+
+- **Directory** (`focal-directory`): `NodeLiveness { alive, incarnation,
+  witness, decided_at }` on `NodeRecord` (`is_alive()`), partition checkpoint
+  schema 3 (schemas 1 and 2 restore with no liveness known; `PartitionCheckpointV2`),
+  `PartitionOperation::Liveness` applied only at the current enrollment
+  generation with a non-decreasing incarnation and time (the same verdict, an
+  older incarnation or an earlier time is `StaleNode`; a first "alive" is a
+  `Duplicate`), `DirectoryError::DeadNode`, the planner skips dead nodes,
+  `verify_placement` refuses a dead member, `BlockReason::DeadNode` in the
+  guarantee. Tests `crates/focal-directory/tests/liveness.rs`.
+- **Wire** (`focal-wire`): `Operation::Probe { request }` (tag 30, ≤ 8 KiB,
+  Replication capability, certificate-bound), `Response::Probe`, accepted by
+  the peer pool's `send_probe`; inventory row `peer.probe`.
+- **Algorithms** (`focal-node/src/liveness/`): `health::LocalHealth` (score
+  0..8, multiplier 1–3×), `suspicion::{Suspicion, ExtensionTracker}`
+  (`max − (max − min)·ln(C+1)/ln(K+1)`, confirmations deduplicated, the
+  originator never counts, logarithmic grants capped at five with witness,
+  interval and overload rules), `gossip::GossipBuffer` (newest verdict per
+  node, λ·log(n+1) rebroadcasts, least-broadcast first, 64 updates, 8 per
+  probe), `coordinates::NetworkCoordinate` (Vivaldi, eight dimensions plus
+  height, adjustment, error and gravity; `rtt_ucb_ms = rtt̂ + k_σ·σ` with
+  conservative defaults below three samples).
+- **Driver** (`liveness/driver.rs`): `LivenessHandle::channel(budget, config,
+  node, namespace)` charges the whole state up front (640 B per member for
+  1,024 members plus 96 KiB) and returns the handle the data service and the
+  agent use and the driver the service runs; one tick per second probes the
+  next member of a shuffled round with timeout `clamp(300 ms, 3·rtt_ucb,
+  2 s)·lhm`, a timeout fans out up to three indirect probes through
+  confirmed members, a member is confirmed by its first acknowledgement and
+  suspected only when confirmed, outside a grace window and not already
+  suspected, an expired suspicion is a death gossiped from this node, an
+  acknowledgement or a higher incarnation revives; gossip about this node at
+  its incarnation bumps the incarnation, raises the health score and, when
+  the score is at or above two, queues an extension request to the accuser;
+  late ticks raise the score; the view (`LivenessView`: members with status,
+  incarnation, confirmation, suspicion originator, confirmations, grants and
+  the timeout in force; health; coordinate; 32 events; counters) is published
+  after every step. `ProbeRequest`/`ProbeReply` (`liveness/wire.rs`, schema
+  1) are validated on decode (schema, sender, generation, finite coordinate,
+  health bound, at most eight updates, nonzero ids); the data service answers
+  `Probe` only for `PeerRole::Node` and refuses a probe whose sender is not
+  the authenticated node.
+- **Service and agent**: `NetworkHandles.liveness`; the driver runs beside
+  the controller and the agent in `NetworkService::run`; the agent reports
+  facts each tick (`LocalFacts { generation, members, witness = completed
+  ticks, overloaded }`, overloaded when memory use reaches 95 % of the node
+  budget or the volume's free bytes fall under the headroom) and, when it
+  leads the partition, commits one settled verdict per tick (§12 rules).
+
+**Tests.** `focal-node`:
+`liveness_tests::a_stopped_host_is_committed_dead_by_the_partition_leader_and_revived_on_restart`
+(founder plus two joined hosts over real QUIC confirm each other and learn
+coordinates; no verdict exists for healthy hosts; a stopped host is probed,
+suspected and declared dead in the founder's view and the partition commits
+`alive = false` once; the other host stays alive; the stopped host restarts
+with a fresh incarnation and the partition commits `alive = true` at the
+higher incarnation without re-enrollment; the third host converges on the
+same membership),
+`liveness_tests::probes_bind_their_sender_refute_self_suspicion_and_ration_extensions`
+(a probe for another node is refused; a direct probe is acknowledged with the
+founder's generation and incarnation; an extension is granted once with the
+configured minimum, rate-limited within one period, refused while the
+requester reports overload, and counted in the view; a gossiped suspicion of
+the founder at its incarnation is refuted by the next incarnation, the
+refutation rides the answer, stale gossip changes nothing),
+`liveness_tests::the_driver_refuses_an_unusable_configuration_and_charges_its_state`,
+and the four algorithm tests in `liveness/algorithm_tests.rs`. The peer pool
+accepting `Response::Probe` was the fault the fleet test exposed (every
+acknowledgement had been classified as lost). The first whole-workspace run
+(12:16–12:24 CDT) aborted `focal-node`'s library binary with a stack
+overflow in `network_service::tests::missing_runtime_drivers_fail_before_ingress_and_release_started_owners`:
+the service's task set (`run_tasks`, 176 KiB of pinned driver state, 380 KiB
+for the whole `run_until` future) is driven by `block_on` on a two-mebibyte
+test thread, and the debug build's copies while constructing the nested
+futures crossed that bound once the liveness driver joined the select.
+`run_until` now pins the task set on the heap once for the service's life
+(one allocation at start, no per-request or per-tick allocation), so the
+caller's stack carries only its own frame; the measurement was taken with a
+temporary size trace and removed.
+
+EVIDENCE_PLACEHOLDER
+
+**Limits recorded.** See [24](24-placement-execution-and-fleet-control.md) §12:
+node-local constants, flat membership, the founder never judged, the
+extension path qualified by crafted probes rather than a loaded host.

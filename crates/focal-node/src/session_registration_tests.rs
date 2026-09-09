@@ -122,7 +122,7 @@ async fn setup(path: &std::path::Path) -> (FoundingNetwork, Settings, Session, F
                         region: RegionId::UNKNOWN,
                         zone: ZoneId([0; 16]),
                         endpoint: "127.0.0.1:7443".into(),
-                        identity: ContentHash(server_fingerprint(&network.receipt.certificate)),
+                        identity: ContentHash(network.receipt.public_key),
                         authority_epoch: 1,
                         attestation: ContentHash::default(),
                         eligible: true,

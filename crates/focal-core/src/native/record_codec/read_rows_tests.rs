@@ -138,6 +138,7 @@ fn values() -> Vec<(Key, Row)> {
                 monitors: 11,
                 monitor_links: 12,
                 creation_results: 13,
+                legacy: 14,
                 logical_time: u64::MAX,
             }),
         ),

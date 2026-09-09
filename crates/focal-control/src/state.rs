@@ -35,6 +35,41 @@ pub enum ControlBootstrap {
         directory: PartitionCheckpoint,
     },
 }
+/// The bootstrap shape written by control checkpoint schemas 1–3, whose
+/// partition directory predates assignment progress.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one bounded legacy checkpoint decoded per restore"
+)]
+pub(crate) enum LegacyControlBootstrap {
+    Root {
+        directory: RootCheckpoint,
+        enrollment: Vec<u8>,
+    },
+    Partition {
+        directory: focal_directory::PartitionCheckpointV1,
+    },
+}
+impl TryFrom<LegacyControlBootstrap> for ControlBootstrap {
+    type Error = ControlError;
+    fn try_from(value: LegacyControlBootstrap) -> Result<Self, ControlError> {
+        Ok(match value {
+            LegacyControlBootstrap::Root {
+                directory,
+                enrollment,
+            } => Self::Root {
+                directory,
+                enrollment,
+            },
+            LegacyControlBootstrap::Partition { directory } => Self::Partition {
+                directory: directory
+                    .try_into()
+                    .map_err(|_| ControlError::Corrupt("legacy placement barrier"))?,
+            },
+        })
+    }
+}
 impl ControlBootstrap {
     pub fn root(
         directory: &RootDirectory,
@@ -298,9 +333,8 @@ impl Machine {
                             receipt.identity.role == focal_enrollment::EnrollmentRole::Node
                                 && receipt.identity.node_id == Some(*node)
                                 && receipt.identity.principal == grant.principal
-                                && focal_model::ContentHash(focal_enrollment::server_fingerprint(
-                                    &receipt.certificate,
-                                )) == grant.enrollment.identity
+                                && focal_model::ContentHash(receipt.public_key)
+                                    == grant.enrollment.identity
                                 && receipt.issued_at <= authority.decided_at
                                 && receipt.expires_at > authority.decided_at
                                 && matches!(
@@ -687,5 +721,81 @@ impl Machine {
             .checked_add(enrollment)
             .and_then(|n| n.checked_add(8192))
             .ok_or(ControlError::Capacity)
+    }
+}
+
+#[cfg(test)]
+mod legacy_tests {
+    use super::*;
+    use focal_directory::{
+        Delegation, LogGroupId, NamespaceRange, PartitionCheckpointV1, PartitionConfig,
+        PartitionId, RegionId, RootConfig,
+    };
+    use focal_memory::MemoryBudget;
+    use std::collections::BTreeMap;
+
+    const CLUSTER: [u8; 16] = [7; 16];
+
+    #[test]
+    fn legacy_root_bootstraps_keep_their_bytes_and_partitions_convert_to_schema_two() {
+        let budget = MemoryBudget::new(8 * 1024 * 1024, 1024 * 1024).unwrap();
+        let root =
+            RootDirectory::new(ClusterId(CLUSTER), RootConfig::default(), budget.clone()).unwrap();
+        let current = ControlBootstrap::Root {
+            directory: root.checkpoint().clone(),
+            enrollment: vec![4, 5],
+        };
+        let legacy = LegacyControlBootstrap::Root {
+            directory: root.checkpoint().clone(),
+            enrollment: vec![4, 5],
+        };
+        assert_eq!(
+            postcard::to_stdvec(&legacy).unwrap(),
+            postcard::to_stdvec(&current).unwrap()
+        );
+        assert_eq!(ControlBootstrap::try_from(legacy).unwrap(), current);
+
+        let delegation = Delegation {
+            namespace: NamespaceRange::all(),
+            partition: PartitionId::from_u128(3),
+            region: RegionId::from_u128(1),
+            log_group: LogGroupId::from_u128(9),
+            epoch: 1,
+            activation: None,
+        };
+        let legacy = LegacyControlBootstrap::Partition {
+            directory: PartitionCheckpointV1 {
+                schema: 1,
+                cluster: ClusterId(CLUSTER),
+                delegation: delegation.clone(),
+                revision: 0,
+                sealed: None,
+                nodes: BTreeMap::new(),
+                sessions: BTreeMap::new(),
+            },
+        };
+        let legacy_bytes = postcard::to_stdvec(&legacy).unwrap();
+        let converted = ControlBootstrap::try_from(legacy).unwrap();
+        let ControlBootstrap::Partition { directory } = &converted else {
+            panic!("partition bootstrap");
+        };
+        assert_eq!(
+            directory.schema,
+            focal_directory::PARTITION_CHECKPOINT_SCHEMA
+        );
+        DirectoryPartition::restore(directory.clone(), PartitionConfig::default(), budget).unwrap();
+        // The genesis identity hashes the bootstrap bytes, so a partition group
+        // bootstrapped at schema 1 is not the group bootstrapped at schema 2.
+        assert_ne!(legacy_bytes, postcard::to_stdvec(&converted).unwrap());
+        let fresh = ControlBootstrap::partition(
+            &DirectoryPartition::new(
+                ClusterId(CLUSTER),
+                delegation,
+                PartitionConfig::default(),
+                MemoryBudget::new(8 * 1024 * 1024, 1024 * 1024).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(fresh, converted);
     }
 }

@@ -29,12 +29,15 @@ use crate::{ALLOCATOR_OVERHEAD, MemoryError, OwnerId, checked_add, checked_mul};
 
 /// Maximum shape of one future write. `incoming_heap` bounds the summed heap
 /// charges of Put entries, including their owned key/value allocator overhead.
-/// Delete key accounting is separately bounded from the largest possible old
-/// entry. `input_capacity` bounds actual Vec capacity, including unused slots.
+/// `deleted_heap` bounds the summed retained heap charges of the entries the
+/// deleted keys name, so a caller that only ever deletes heap-free unit rows
+/// is not priced as if it deleted the largest possible entry. `input_capacity`
+/// bounds actual Vec capacity, including unused slots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RangeWriteLimits {
     pub changed_keys: usize,
     pub deleted_keys: usize,
+    pub deleted_heap: usize,
     pub incoming_heap: usize,
     pub input_capacity: usize,
 }
@@ -100,14 +103,20 @@ impl RangeWriteEnvelope {
         fits(plan.changes.len(), self.limits.changed_keys)?;
         fits(plan.changes.capacity(), self.limits.input_capacity)?;
         let mut deleted = 0;
+        let mut deleted_heap = 0;
         let mut incoming_heap = 0;
         for change in &plan.changes {
             match change {
                 Change::Put(entry) => incoming_heap = checked_add(incoming_heap, entry.heap_bytes)?,
-                Change::Delete(_) => deleted = checked_add(deleted, 1)?,
+                Change::Delete(key) => {
+                    deleted = checked_add(deleted, 1)?;
+                    let existing = plan.base.get(key).ok_or(MemoryError::MissingKey)?;
+                    deleted_heap = checked_add(deleted_heap, existing.heap_bytes)?;
+                }
             }
         }
         fits(deleted, self.limits.deleted_keys)?;
+        fits(deleted_heap, self.limits.deleted_heap)?;
         fits(incoming_heap, self.limits.incoming_heap)?;
         let actual = plan.charges();
         // Checking each component prevents a cheaper, unrelated component from
@@ -137,6 +146,7 @@ impl<K, V> RangeStore<K, V> {
         let RangeWriteLimits {
             changed_keys,
             deleted_keys,
+            deleted_heap,
             incoming_heap,
             input_capacity,
         } = limits;
@@ -148,6 +158,11 @@ impl<K, V> RangeStore<K, V> {
         if changed_keys == 0 && incoming_heap != 0 {
             return Err(MemoryError::InvalidConfiguration(
                 "an empty future write cannot carry incoming heap",
+            ));
+        }
+        if deleted_keys == 0 && deleted_heap != 0 {
+            return Err(MemoryError::InvalidConfiguration(
+                "a future write without deletions cannot release deleted heap",
             ));
         }
         fits(changed_keys, self.config.max_batch_entries)?;
@@ -175,12 +190,6 @@ impl<K, V> RangeStore<K, V> {
                 MemoryError::InvalidConfiguration("a range entry must have a nonzero charge"),
             )?)
             .max(usize::from(max_base_pages != 0));
-        let old_entry_heap = self
-            .config
-            .max_entry_bytes
-            .min(owner_limit.saturating_sub(page_header))
-            .saturating_sub(entry_inline);
-
         let input_buffer = if input_capacity == 0 {
             0
         } else {
@@ -189,10 +198,10 @@ impl<K, V> RangeStore<K, V> {
                 checked_mul(input_capacity, size_of::<Change<K, V>>())?,
             )?
         };
-        let input_pending_bytes = checked_add(
-            input_buffer,
-            checked_add(incoming_heap, checked_mul(deleted_keys, old_entry_heap)?)?,
-        )?;
+        // A deletion clones its key into the input; the plan bounds that clone
+        // by the deleted entry's retained heap, which the caller bounds here.
+        let input_pending_bytes =
+            checked_add(input_buffer, checked_add(incoming_heap, deleted_heap)?)?;
         let max_new_pages = checked_mul(3, changed_keys)?;
         let new_pages_bytes = checked_add(
             checked_mul(max_new_pages, page_header)?,

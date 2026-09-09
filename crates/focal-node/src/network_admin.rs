@@ -42,14 +42,20 @@ pub fn admin_wire_limits() -> WireLimits {
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub enum AdminCommand {
-    Invite { name: String },
+    Invite {
+        name: String,
+    },
     Read(AdminRead),
     Membership(Box<ControlRequest>),
     Transfer(ControlTransfer),
     Revocation(Box<ControlRequest>),
-    InviteClient { name: String },
+    InviteClient {
+        name: String,
+    },
     Replica(Box<ReplicaAdminCommand>),
     Operator(OperatorRead),
+    /// Renew this node's own credential now.
+    RenewCredential,
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum AdminRead {
@@ -140,6 +146,7 @@ impl AdminCommand {
         match self {
             Self::Operator(read) => read.validate(),
             Self::Replica(command) => command.validate(),
+            Self::RenewCredential => Ok(()),
             Self::Invite { name } | Self::InviteClient { name } => validate_name(name),
             Self::Read(AdminRead::Invitations { limit, .. }) if *limit == 0 || *limit > 64 => {
                 Err(AccessError::InvalidRequest)
@@ -278,6 +285,8 @@ pub struct LocalNetworkAdmin {
     enrollment: Option<QuorumEnrollmentHost>,
     control: Option<crate::control_host::ControlHost>,
     fleet: Option<crate::fleet::FleetManager>,
+    content: Option<crate::content_host::ContentHost>,
+    credentials: Option<crate::credential_renewal::CredentialHandle>,
     budget: MemoryBudget,
 }
 impl LocalNetworkAdmin {
@@ -307,6 +316,8 @@ impl LocalNetworkAdmin {
             enrollment: Some(enrollment),
             control: None,
             fleet: None,
+            content: None,
+            credentials: None,
             budget,
         })
     }
@@ -338,8 +349,37 @@ impl LocalNetworkAdmin {
             enrollment,
             control: None,
             fleet: None,
+            content: None,
+            credentials: None,
             budget,
         })
+    }
+    pub fn with_credentials(
+        mut self,
+        credentials: crate::credential_renewal::CredentialHandle,
+    ) -> Self {
+        self.credentials = Some(credentials);
+        self
+    }
+    async fn renew_credential(&self) -> Result<Vec<u8>, AccessError> {
+        use crate::credential_renewal::CredentialReply;
+        let handle = self.credentials.as_ref().ok_or(AccessError::Unavailable)?;
+        let reply = match handle.renew().await {
+            Ok(summary) => CredentialReply::Renewed(summary),
+            Err(error) => CredentialReply::Failed(error),
+        };
+        let len =
+            postcard::experimental::serialized_size(&reply).map_err(|_| AccessError::Capacity)?;
+        if len > MAX_COMMAND {
+            return Err(AccessError::Capacity);
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(len)
+            .map_err(|_| AccessError::Capacity)?;
+        bytes.resize(len, 0);
+        postcard::to_slice(&reply, &mut bytes).map_err(|_| AccessError::InvalidRequest)?;
+        Ok(bytes)
     }
     pub fn with_control(
         mut self,
@@ -383,6 +423,9 @@ impl LocalNetworkAdmin {
         }
         if let AdminCommand::Replica(command) = command {
             return self.replica_command(*command).await;
+        }
+        if let AdminCommand::RenewCredential = command {
+            return self.renew_credential().await;
         }
         if !matches!(
             command,
@@ -505,7 +548,8 @@ impl LocalNetworkAdmin {
             AdminCommand::Invite { .. }
             | AdminCommand::InviteClient { .. }
             | AdminCommand::Operator(_)
-            | AdminCommand::Replica(_) => {
+            | AdminCommand::Replica(_)
+            | AdminCommand::RenewCredential => {
                 return Err(AccessError::Unauthorized);
             }
         };

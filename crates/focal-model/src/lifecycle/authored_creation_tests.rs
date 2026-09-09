@@ -228,6 +228,7 @@ fn claim(
                 generation: 1,
                 at: 200,
             }),
+            policy: None,
         },
         claim_descriptor::Limits {
             description_bytes: 1024,

@@ -32,6 +32,16 @@ pub struct ReceiptEntitlement {
     pub fence: ReceiptFence,
 }
 
+/// Where a claim's lifecycle authority lives. A legacy claim was translated by
+/// import (23 §5): its recorded history is frozen, its acceptance policy is
+/// empty, and only cancellation, revocation, expiry, supersession, scope and
+/// graph effects apply to it. Every native completion operation is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimOrigin {
+    Native,
+    Legacy,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaimCut {
     pub position: SessionSeq,
@@ -214,6 +224,7 @@ pub struct ClaimState {
     local_complete: bool,
     local_sealed_at: Option<SessionSeq>,
     terminal_cut: Option<ClaimTerminalCut>,
+    origin: ClaimOrigin,
 }
 
 impl ClaimState {
@@ -284,6 +295,7 @@ impl ClaimState {
             local_complete: false,
             local_sealed_at: None,
             terminal_cut: None,
+            origin: ClaimOrigin::Native,
         })
     }
     #[cfg(test)]
@@ -379,6 +391,16 @@ impl ClaimState {
     }
     pub fn terminal_cut(&self) -> Option<ClaimTerminalCut> {
         self.terminal_cut
+    }
+    pub fn origin(&self) -> ClaimOrigin {
+        self.origin
+    }
+    /// Native completion operations are refused on a frozen legacy claim.
+    fn native_only(&self) -> Result<(), ContractError> {
+        if self.origin == ClaimOrigin::Legacy {
+            return Err(ContractError::InvalidTransition);
+        }
+        Ok(())
     }
     pub fn latest_response(&self) -> Option<ResponseLink> {
         self.responses.last().map(|row| row.link)
@@ -488,6 +510,7 @@ impl ClaimState {
                 self.terminalize(status, cut)
             }
             ClaimIntent::Post { standing } => {
+                self.native_only()?;
                 principal.require_actor(self.issuer)?;
                 self.binding.check(&standing.binding)?;
                 standing.standing.require_pass()?;
@@ -501,6 +524,7 @@ impl ClaimState {
                 Ok(())
             }
             ClaimIntent::Progress { receipt } => {
+                self.native_only()?;
                 self.working()?;
                 let entitlement = self.receipt_matches(receipt)?;
                 principal.require_actor(entitlement.holder)?;
@@ -516,6 +540,7 @@ impl ClaimState {
                 previous,
                 replacement,
             } => {
+                self.native_only()?;
                 let binding = self.adoption_binding(principal, previous, replacement)?;
                 self.binding = binding;
                 self.receipt = Some(replacement);
@@ -528,6 +553,7 @@ impl ClaimState {
         &self,
         decision: &aggregation::ClaimDecision<'_>,
     ) -> Result<(), ContractError> {
+        self.native_only()?;
         self.binding.check(&decision.binding())?;
         if decision.acceptance() != &self.acceptance {
             return Err(ContractError::InvalidPolicy);
@@ -552,6 +578,7 @@ impl ClaimState {
         principal: Principal,
         decision: &aggregation::ClaimDecision<'_>,
     ) -> Result<(), ContractError> {
+        self.native_only()?;
         self.open(expected)?;
         self.working()?;
         principal.require_actor(self.issuer)?;
@@ -575,6 +602,7 @@ impl ClaimState {
         start: &graph::Start<'_>,
         peers: &[&ClaimState],
     ) -> Result<(), ContractError> {
+        self.native_only()?;
         self.open(expected)?;
         principal.require_actor(self.subject)?;
         self.binding.check(&admission.binding())?;
@@ -606,6 +634,7 @@ impl ClaimState {
         expected: &Binding,
         decision: &aggregation::AdmissionDecision<'_>,
     ) -> Result<(), ContractError> {
+        self.native_only()?;
         self.open(expected)?;
         self.binding.check(&decision.binding())?;
         if decision.acceptance() != &self.acceptance {
@@ -675,6 +704,7 @@ impl ClaimState {
         custody: &EvidenceAttestation,
         cut: ClaimCut,
     ) -> Result<(), ContractError> {
+        self.native_only()?;
         self.open(expected)?;
         if diagnostic.artifact.id.is_zero()
             || custody.custody_revision == 0
@@ -706,6 +736,7 @@ impl ClaimState {
         diagnostic: ResponseDiagnostic,
         cut: ClaimCut,
     ) -> Result<ClosingIncident, ContractError> {
+        self.native_only()?;
         self.open(expected)?;
         self.working()?;
         let parent = Parent::from_claim(self)?;
@@ -730,6 +761,7 @@ impl ClaimState {
         &mut self,
         incident: &ClosingIncident,
     ) -> Result<(), ContractError> {
+        self.native_only()?;
         self.open(&incident.expected)?;
         self.working()?;
         incident
@@ -808,6 +840,7 @@ impl ClaimState {
         evaluation: &validation::Evaluation<'_>,
         decision: &aggregation::ClaimDecision<'_>,
     ) -> Result<(), ContractError> {
+        self.native_only()?;
         self.open(expected)?;
         if evaluation.ledger() != self.binding.ledger {
             return Err(ContractError::WrongLedger);
@@ -868,6 +901,7 @@ impl ClaimState {
         receipt: ReceiptFence,
         stamp: ReportStamp,
     ) -> Result<(), ContractError> {
+        self.native_only()?;
         self.received_response(response, receipt)?;
         let row = self
             .responses
@@ -940,6 +974,7 @@ impl ClaimState {
         expected: &Binding,
         decision: &aggregation::ClaimDecision<'_>,
     ) -> Result<(), ContractError> {
+        self.native_only()?;
         self.open(expected)?;
         self.working()?;
         self.binding.check(&decision.binding())?;
@@ -1070,6 +1105,7 @@ impl ClaimState {
         stamp: ReportStamp,
         event: ResponseEvent,
     ) -> Result<(), ContractError> {
+        self.native_only()?;
         self.open(expected)?;
         self.working()?;
         let entitlement = self.receipt_matches(link.receipt)?;
@@ -1163,6 +1199,7 @@ impl ClaimState {
         expected: &Binding,
         fact: DerivedClaimFact,
     ) -> Result<(), ContractError> {
+        self.native_only()?;
         self.open(expected)?;
         match fact {
             DerivedClaimFact::EvaluatorBegan { receipt } => {

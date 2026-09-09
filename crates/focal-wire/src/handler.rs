@@ -59,6 +59,12 @@ pub trait RequestHandler: Send + Sync + 'static {
     fn supports_participant_requests(&self) -> bool {
         false
     }
+    /// The handler admits borrowed native frames, native reads and lists on the
+    /// native profile. Advertising it without an active native engine is a
+    /// handler bug; activation itself stays a committed owner decision.
+    fn supports_native_requests(&self) -> bool {
+        false
+    }
     fn handle(&self, request: VerifiedRequest) -> HandlerFuture<'_>;
     fn handle_accounted(&self, request: VerifiedRequest) -> OwnedHandlerFuture<'_> {
         Box::pin(async move { OwnedResponse::new(self.handle(request).await) })
@@ -82,6 +88,9 @@ impl RequestHandler for std::sync::Arc<dyn RequestHandler> {
     }
     fn supports_managed_requests(&self) -> bool {
         self.as_ref().supports_managed_requests()
+    }
+    fn supports_native_requests(&self) -> bool {
+        self.as_ref().supports_native_requests()
     }
     fn handle(&self, request: VerifiedRequest) -> HandlerFuture<'_> {
         self.as_ref().handle(request)
@@ -121,8 +130,12 @@ pub async fn dispatch_accounted(
         Ok(value) => value,
         Err(error) => return OwnedResponse::new(request.reply(Response::Error(error))),
     };
-    if request.protocol == PEER_PROTOCOL_VERSION
-        && (!handler.supports_managed_requests() || !handler.supports_participant_requests())
+    if (request.protocol == PEER_PROTOCOL_VERSION
+        && (!handler.supports_managed_requests() || !handler.supports_participant_requests()))
+        || (request.protocol == crate::NATIVE_PROTOCOL_VERSION
+            && (!handler.supports_managed_requests()
+                || !handler.supports_participant_requests()
+                || !handler.supports_native_requests()))
     {
         return OwnedResponse::new(
             request.reply(Response::Error(AccessError::UnsupportedProtocol)),
@@ -251,6 +264,8 @@ pub fn validate_response(
                 request.operation,
                 Operation::Control { .. }
                     | Operation::PeerControl { .. }
+                    | Operation::PlacementControl { .. }
+                    | Operation::SessionSign { .. }
                     | Operation::NodeContact { .. }
                     | Operation::EnrollmentControl { .. }
             ) || response.is_empty()
@@ -377,6 +392,76 @@ pub fn validate_response(
                 ReadObject::Artifact { .. } => list.filter.kind != ObjectKind::Artifact,
                 ReadObject::ValidationResults { .. } => true,
             }) {
+                return Err(WireError::InvalidFrame);
+            }
+        }
+        Response::Native(reply) => {
+            if !matches!(request.operation, Operation::Native { .. }) {
+                return Err(WireError::InvalidFrame);
+            }
+            let key_valid = |key: &RequestKey| {
+                key.epoch == request.request_epoch
+                    && key.id == request.request_id
+                    && principal.is_none_or(|p| key.principal == p)
+            };
+            match reply {
+                NativeMutationReply::Committed(receipt) => {
+                    let NativeInvocationRef::Request(key) = &receipt.invocation else {
+                        return Err(WireError::InvalidFrame);
+                    };
+                    if !key_valid(key) || receipt.sequence.0 == 0 {
+                        return Err(WireError::InvalidFrame);
+                    }
+                }
+                NativeMutationReply::Pending(ticket) => {
+                    if !key_valid(&ticket.key) {
+                        return Err(WireError::InvalidFrame);
+                    }
+                }
+                NativeMutationReply::Refused(refusal) => {
+                    if refusal.detail.len() > 4096 {
+                        return Err(WireError::InvalidFrame);
+                    }
+                }
+            }
+        }
+        Response::NativeRead(page) => {
+            let Operation::NativeRead(read) = &request.operation else {
+                return Err(WireError::InvalidFrame);
+            };
+            let expected = match &read.query {
+                NativeReadQuery::Objects(references) => Some(references.len()),
+                NativeReadQuery::Outcome(_)
+                | NativeReadQuery::Receipt(_)
+                | NativeReadQuery::Monitor { .. }
+                | NativeReadQuery::Standing => Some(1),
+                _ => None,
+            };
+            if page.token.ledger != request.ledger
+                || page.token.route_epoch != response.route_epoch
+                || page.token.sequence != page.native_sequence
+                || page.objects.len() > read.max_items.min(limits.max_items) as usize
+                || expected.is_some_and(|count| page.objects.len() != count)
+                || (page.visited as usize) < page.objects.len()
+            {
+                return Err(WireError::InvalidFrame);
+            }
+        }
+        Response::NativeListed(page) => {
+            let Operation::NativeList(list) = &request.operation else {
+                return Err(WireError::InvalidFrame);
+            };
+            if page.token.ledger != request.ledger
+                || page.token.route_epoch != response.route_epoch
+                || page.token.sequence != page.native_sequence
+                || page.objects.len() > list.max_items.min(limits.max_items) as usize
+                || page.visited > list.max_visits
+                || (page.visited as usize) < page.objects.len()
+                || page.next.as_ref().is_some_and(|cursor| {
+                    cursor.0.is_empty() || cursor.0.len() > MAX_NATIVE_LIST_CURSOR_BYTES
+                })
+                || (page.next.is_some() && page.visited == 0)
+            {
                 return Err(WireError::InvalidFrame);
             }
         }

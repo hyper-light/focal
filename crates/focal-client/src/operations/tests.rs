@@ -154,6 +154,9 @@ fn cursor_reconciliation_output_preserves_the_distinct_committed_result_family()
 pub(super) fn id(value: u128) -> String {
     format!("{value:032x}")
 }
+pub(super) fn id_hash(value: u8) -> String {
+    hash(value)
+}
 fn hash(value: u8) -> String {
     format!("{value:02x}").repeat(32)
 }
@@ -581,7 +584,7 @@ fn typed_outputs_match_published_envelope_and_preserve_domain_conditions() {
 
 // Small test-only checker for the finite structural schema subset we emit.
 // Production does not evaluate arbitrary schemas or fetch remote references.
-fn assert_shape(root: &Value, schema: &Value, value: &Value) {
+pub(super) fn assert_shape(root: &Value, schema: &Value, value: &Value) {
     if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
         assert_shape(
             root,

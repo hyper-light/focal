@@ -121,6 +121,30 @@ enum Work {
         >,
         _input: Allocation,
     },
+    PrepareReplicaReady {
+        ready: Box<focal_directory::ReplicaReady>,
+        group: focal_directory::LogGroupId,
+        window: crate::placement_proof::ProofWindow,
+        response: oneshot::Sender<
+            Result<
+                crate::placement_proof::SessionProofPermit,
+                crate::placement_proof::PlacementProofError,
+            >,
+        >,
+        _input: Allocation,
+    },
+    PrepareMembershipProof {
+        next: Box<focal_directory::GroupAuthorityGrant>,
+        record: crate::placement_proof::MembershipRecord,
+        window: crate::placement_proof::ProofWindow,
+        response: oneshot::Sender<
+            Result<
+                crate::placement_proof::SessionProofPermit,
+                crate::placement_proof::PlacementProofError,
+            >,
+        >,
+        _input: Allocation,
+    },
     PrepareDirectory {
         plan: crate::directory_bootstrap::FirstDirectoryPlan,
         response: DirectoryReply,
@@ -257,6 +281,74 @@ impl ControlHost {
                 // The witness already owns its full structural export charge.
                 // Boxing keeps unrelated bounded queue entries small.
                 witness: Box::new(witness),
+                window,
+                response,
+                _input: input,
+            })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => PlacementProofError::Capacity,
+                mpsc::TrySendError::Disconnected(_) => PlacementProofError::Unavailable,
+            })?;
+        receive
+            .await
+            .map_err(|_| PlacementProofError::Unavailable)?
+    }
+    /// Validate this node's own readiness fact against the installed session
+    /// authority and return a permit the node's credential signs. Local only.
+    pub async fn prepare_replica_ready(
+        &self,
+        ready: focal_directory::ReplicaReady,
+        group: focal_directory::LogGroupId,
+        window: crate::placement_proof::ProofWindow,
+    ) -> Result<
+        crate::placement_proof::SessionProofPermit,
+        crate::placement_proof::PlacementProofError,
+    > {
+        use crate::placement_proof::PlacementProofError;
+        let input = self
+            .budget
+            .reserve(BudgetKind::Control, BudgetLane::Completion, 512)
+            .map_err(|_| PlacementProofError::Capacity)?
+            .commit();
+        let (response, receive) = oneshot::channel();
+        self.sender
+            .try_send(Work::PrepareReplicaReady {
+                ready: Box::new(ready),
+                group,
+                window,
+                response,
+                _input: input,
+            })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => PlacementProofError::Capacity,
+                mpsc::TrySendError::Disconnected(_) => PlacementProofError::Unavailable,
+            })?;
+        receive
+            .await
+            .map_err(|_| PlacementProofError::Unavailable)?
+    }
+    /// Validate a session group's next membership against the installed
+    /// authority and return a permit this node's credential signs. Local only.
+    pub async fn prepare_membership_proof(
+        &self,
+        next: focal_directory::GroupAuthorityGrant,
+        record: crate::placement_proof::MembershipRecord,
+        window: crate::placement_proof::ProofWindow,
+    ) -> Result<
+        crate::placement_proof::SessionProofPermit,
+        crate::placement_proof::PlacementProofError,
+    > {
+        use crate::placement_proof::PlacementProofError;
+        let input = self
+            .budget
+            .reserve(BudgetKind::Control, BudgetLane::Completion, 512)
+            .map_err(|_| PlacementProofError::Capacity)?
+            .commit();
+        let (response, receive) = oneshot::channel();
+        self.sender
+            .try_send(Work::PrepareMembershipProof {
+                next: Box::new(next),
+                record,
                 window,
                 response,
                 _input: input,
@@ -653,6 +745,52 @@ impl<V: AuthorityVerifier> Owner<V> {
                     });
                 let _ = response.send(result);
             }
+            Work::PrepareReplicaReady {
+                ready,
+                group,
+                window,
+                response,
+                _input,
+            } => {
+                self.drain()?;
+                let result = crate::network_bootstrap::unix_time()
+                    .map_err(|_| crate::placement_proof::PlacementProofError::Unavailable)
+                    .and_then(|now| {
+                        crate::placement_proof::prepare_replica_ready_proof(
+                            &self.replica,
+                            &ready,
+                            group,
+                            window,
+                            now,
+                            &self.budget,
+                        )
+                    });
+                let _ = response.send(result);
+            }
+            Work::PrepareMembershipProof {
+                next,
+                record,
+                window,
+                response,
+                _input,
+            } => {
+                self.drain()?;
+                let node = self.replica.status().node_id;
+                let result = crate::network_bootstrap::unix_time()
+                    .map_err(|_| crate::placement_proof::PlacementProofError::Unavailable)
+                    .and_then(|now| {
+                        crate::placement_proof::prepare_membership_proof(
+                            &self.replica,
+                            node,
+                            &next,
+                            &record,
+                            window,
+                            now,
+                            &self.budget,
+                        )
+                    });
+                let _ = response.send(result);
+            }
             Work::ObserveRoot(response, input) => {
                 self.drain()?;
                 let result = self.observe_root(input);
@@ -818,6 +956,21 @@ impl<V: AuthorityVerifier> Owner<V> {
                 return Err(ControlFailure::Invalid);
             }
             let contact = matches!(request.operation, Operation::NodeContact { .. });
+            let placement = matches!(request.operation, Operation::PlacementControl { .. });
+            if placement {
+                // A node's own placement facts: bind the certificate-backed
+                // identity to the enrollment this owner has installed.
+                self.drain().map_err(ControlFailure::from)?;
+                match (
+                    verified.peer().role(),
+                    verified.peer().certificate_fingerprint(),
+                ) {
+                    (PeerRole::Node { node_id }, Some(fingerprint)) => {
+                        self.authorize_placement_peer(node_id, principal.0, fingerprint)?;
+                    }
+                    _ => return Err(ControlFailure::Unauthorized),
+                }
+            }
             let (group, bytes, read_only): (&[u8; 16], &[u8], bool) = match &request.operation {
                 Operation::EnrollmentControl { group, request, .. }
                     if matches!(verified.peer().role(), PeerRole::Node { .. }) =>
@@ -838,6 +991,11 @@ impl<V: AuthorityVerifier> Owner<V> {
                     if matches!(verified.peer().role(), PeerRole::Node { .. }) =>
                 {
                     (group, request, true)
+                }
+                Operation::PlacementControl { group, request }
+                    if matches!(verified.peer().role(), PeerRole::Node { .. }) =>
+                {
+                    (group, request, false)
                 }
                 _ => return Err(ControlFailure::Unauthorized),
             };
@@ -869,6 +1027,8 @@ impl<V: AuthorityVerifier> Owner<V> {
                     ControlRpc::decode_read_only(bytes, MAX_PEER_CONTROL_REQUEST_BYTES)
                         .map_err(|_| ControlFailure::Unauthorized)?,
                 )
+            } else if placement {
+                crate::placement_control::decode_placement_control(&verified, bytes)?
             } else {
                 ControlRpc::decode(bytes, self.replica.limits().max_command_bytes)
                     .map_err(ControlFailure::from)?
@@ -1213,6 +1373,21 @@ impl<V: AuthorityVerifier> Owner<V> {
             })?;
         self.publish_progress(false);
         Ok(())
+    }
+    fn authorize_placement_peer(
+        &self,
+        node: u64,
+        principal: [u8; 16],
+        fingerprint: [u8; 32],
+    ) -> Result<(), ControlFailure> {
+        let enrollment = self
+            .replica
+            .installed_enrollment()
+            .ok_or(ControlFailure::Unauthorized)?;
+        let now = crate::network_bootstrap::unix_time().map_err(|_| ControlFailure::Unavailable)?;
+        authorize_node_contact(enrollment, node, principal, fingerprint, now)
+            .map(|_| ())
+            .map_err(|_| ControlFailure::Unauthorized)
     }
     fn authorize_root_peer(&self, peer: RootPeer) -> Result<(), ControlFailure> {
         let enrollment = self

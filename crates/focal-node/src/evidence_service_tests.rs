@@ -654,3 +654,125 @@ fn managed_artifact_custody_transfer_namespace_binds_the_full_stream_key() {
     assert_ne!(custody_request_id(&other).unwrap(), transfer);
     assert!(artifact(&original.request().operation).is_some());
 }
+
+/// One artifact-bearing native frame: a work output for slot zero under a
+/// current receipt, with its payload inline, encoded exactly as a client would.
+fn native_work_frame(request: u128, payload: &[u8]) -> VerifiedRequest {
+    use focal_core::native::{fixtures as fx, input_codec};
+    let principal = ParticipantId::from_u128(9);
+    let parent = focal_model::lifecycle::evidence::Parent {
+        ledger: ledger(),
+        claim: ClaimId::from_u128(31),
+        issuer: ParticipantId::from_u128(8),
+        holder: principal,
+        receipt: ReceiptFence {
+            receipt: ReceiptId::from_u128(41),
+            epoch: 1,
+        },
+        status: ClaimStatus::Received,
+        local_complete: false,
+        latest_response: None,
+        next_cycle: 1,
+    };
+    let (artifact, _) = fx::work_artifact(ledger(), 51, &parent, 0, payload).unwrap();
+    let input = fx::submit_work(
+        RequestKey {
+            principal,
+            epoch: RequestEpoch(1),
+            id: RequestId::from_u128(request),
+        },
+        fx::binding(ledger(), 31),
+        0,
+        artifact,
+    );
+    let plan = input_codec::EncodingPlan::prepare(
+        input_codec::InputFrame::Request {
+            ledger: ledger(),
+            profile: focal_ledger::NativeContentProfile::AuthoredV1,
+            input: &input,
+        },
+        input_codec::EncodingLimits {
+            bytes: 1 << 20,
+            visits: 1 << 28,
+        },
+    )
+    .unwrap();
+    let mut frame = vec![0; plan.quote().bytes];
+    plan.write_into(&mut frame).unwrap();
+    verify_request(
+        AuthenticatedPeer::local(PeerGrant {
+            principal,
+            tenants: BTreeSet::from([ledger().tenant]),
+            role: PeerRole::Actor,
+        })
+        .unwrap(),
+        RequestEnvelope {
+            protocol: NATIVE_PROTOCOL_VERSION,
+            ledger: ledger(),
+            route_epoch: RouteEpoch(1),
+            request_epoch: RequestEpoch(1),
+            request_id: RequestId::from_u128(request),
+            operation: Operation::Native { frame },
+        },
+        &WireLimits::default(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn native_inline_payloads_are_sealed_locally_and_replicated_to_every_required_copy() {
+    let fixture = Fixture::new();
+    let (coordinator, driver) =
+        EvidenceCoordinator::channel(fixture.host.clone(), 1, vec![], fixture.budget.clone(), 1)
+            .unwrap();
+    let pool = pool();
+    let exercise = async {
+        // This node is the only required copy: the payload is sealed under
+        // the placement and readable as durable content afterwards.
+        let local = placement(1, &[1]);
+        coordinator
+            .replace_placement(None, local.clone())
+            .await
+            .unwrap();
+        let evidenced = coordinator
+            .attest_native(native_work_frame(21, &report()))
+            .await
+            .unwrap();
+        let payload = evidenced.evidence.custody().payload();
+        let reference = ContentRef {
+            domain: payload.domain,
+            root: payload.root,
+            length: payload.length,
+            class: payload.class,
+        };
+        assert_eq!(payload.length, report().len() as u64);
+        assert_eq!(
+            fixture
+                .host
+                .read_bytes(local.scope(), reference.clone(), 4096)
+                .await
+                .unwrap()
+                .value(),
+            &report()
+        );
+        drop(evidenced);
+        // A second required copy that cannot be reached refuses the frame
+        // before admission: custody is never claimed on one node's word.
+        let wider = placement(2, &[1, 2]);
+        coordinator
+            .replace_placement(Some(local.scope()), wider.clone())
+            .await
+            .unwrap();
+        assert!(
+            coordinator
+                .attest_native(native_work_frame(22, &report()))
+                .await
+                .is_err()
+        );
+        drop(coordinator);
+    };
+    let (result, ()) = tokio::join!(driver.run(&pool), exercise);
+    result.unwrap();
+    pool.close();
+    fixture.close().await;
+}

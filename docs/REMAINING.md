@@ -1,0 +1,526 @@
+# Remaining implementation work
+
+Recorded: 2026-09-08. Scope: the complete Focal implementation requested by the user, including P00–P20, native independent lifecycles, the human CLI, MCP and skills, peer challenge/consult workflows, binary distribution, and operation from one laptop to a global fleet.
+
+This is an implementation handoff. It describes the unfinished work, the reasons it is necessary, where to implement it, the invariants to preserve, and the evidence required to close it. It is not a claim that a working component, an existing command name, or a passing library test delivers the complete product.
+
+## 1. Actual state of the project
+
+**The full requested system is not close to completion.** There is substantial implemented infrastructure and a substantial native lifecycle engine, but the corrected native lifecycle engine has not been delivered through the running service, CLI, and MCP. Distributed placement, movement, sustained retention, deployment automation, platform qualification, and scale qualification remain significant work. No reliable percentage or completion date has been established.
+
+**The interrupted integration batch in the checkout has been completed (2026-09-08).** `NativeSession` is now a durable, Raft-backed native Session with committed genesis, a single decoder identity, evidence-based suffix disposition, snapshot installation and correlated reads; its one-node, workflow and three-node cluster suites pass, the record-buffer bound is proven per row family, and R0–R2 are closed with the dated evidence in [09 — Implementation status](archictecutre/09-implementation-status.md). Preserve this work; do not reset the working tree or mistake older recorded checks for checks of the current tree.
+
+**The R3 batch (2026-09-08) delivers one `Session` with two engines.** The unified Session hosts the durable native engine as a component, commits the `FOCALAC1` activation record only after every voter has promised the native decoder, writes the `FOCALSS6` envelope (every legacy section plus the native section), retains deliveries across retryable native refusals, fences mixed-version writers at ingress, and exposes hosting, readiness and activation through replica diagnostics and `cluster replicas activate-native`. Its evidence is in `crates/focal-ledger/src/session_native_tests.rs` and the dated entry "One Session with two engines" in [09](archictecutre/09-implementation-status.md); the design is [23](archictecutre/23-native-activation-and-import.md). The import batch (2026-09-08) closes R3: a populated legacy ledger is translated deterministically on every replica into native prefix one (frozen representation in 23 §5), inline legacy payloads are sealed by the node's content writer before proposal and by followers' hosts before apply, the transition is qualified under crash cuts at each durable boundary, and watches, cursors and managed receipts survive it (evidence in `crates/focal-ledger/src/session_native_tests.rs`, `crates/focal-core/src/native/import_tests.rs`, `crates/focal-node/src/fleet_import_tests.rs`; dated entry "Populated legacy history imports into native prefix one" in [09](archictecutre/09-implementation-status.md)).
+
+| Area | What exists | What remains before it fulfills the request |
+|---|---|---|
+| Architecture and source research | Hecate imports, Sylk analysis, Focal decisions, detailed P00–P20 plans | Keep contracts synchronized with actual delivery; resolve remaining implementation decisions explicitly |
+| Existing V1 service | Durable local service, authenticated networking, replication components, evidence custody, managed requests | Preserve its compatibility while introducing the corrected native model |
+| Human CLI and MCP | Shared typed operation builders, many submit/get/list operations, validation context, artifact transfers, watches, contexts, discovery; the native A1 cycle through CLI and MCP with `n1:` journals; bounded native lists over the index families through `focal list` and the eight `*.list` tools; every participant-authored native operation (36 native descriptors: admission and increment phases, seals, whole-work entry, work receipt/rejection/failure, adoption, scope release, audits, monitors) through CLI verbs and MCP tools, exercised by the A3 binary test; the three trusted timers scheduled by the due-timer index and delivered by the node's sweep; the evaluator's validation context read (`get validation --context`, `validation.context`); durable watches on the native engine (`focal watch`, the four `watch.*` tools) with client-driven native seeds and schema-2 deltas derived from committed native events on one continuous stream line | Finish peer workflows and deployment operations; qualify real clients |
+| Native lifecycle engine | Independent object state, authored bodies, evidence, receipt cycles, evaluations, graph effects, timers, admission and completion accounting | Running durable Session composition, protocol exposure, migration, and end-to-end qualification |
+| Native persistence | Mutation encoding, Core checkpoint restoration, incremental replay, durable Raft-backed native Session, unified Session hosting with `FOCALSS6` checkpoints, committed activation and deterministic import of populated legacy history; thirteen secondary index families recorded, replayed, checkpointed and imported as ordinary rows (`FCMUTATE3`, `FCNROOTS3`) | Online chunked checkpoints and archive retention (R7/R8) |
+| Distribution | Consensus, membership, directory, placement, range and resource-control foundations | Complete automatic placement, application replication, safe movement, archive/retention, multi-region operation |
+| Binary distribution | One-binary packaging design and release tooling for six Unix targets | Executed platform/release qualification, native Windows support, verified installation without a source toolchain |
+| Scale and operations | Budgets, algorithms, focused fault tests, proposed qualification matrices | Measured capacity, sustained fault campaigns, complete operator journeys, regional disaster recovery |
+
+### Last recorded qualification, and its limits
+
+The credential batch recorded, on macOS arm64 and this tree (2026-09-09 11:30–11:38 CDT), a complete no-fail-fast workspace test run of **2,441 tests across 102 test binaries, 0 failures**, strict all-target Clippy, the production no-panic gate, formatting and `--locked` checks, and architecture checks over 1,261 links, 37 hashes, 15 vocabularies (doc [09](archictecutre/09-implementation-status.md), "A node renews its own credential and every proof follows its key (R6.6)").
+
+Those results qualify component and durable-Session behaviour on one platform. The A1 product gate holds through the real binary's CLI (`cli_native_a1.rs`) and MCP adapter (`mcp_native_a1.rs`); the A2 gate's failure branches hold through both (`cli_native_a2.rs`, `mcp_native_a2.rs`: a failed testament citing the actual work diagnostic, the claimant reading its bytes, the missing slot assessed at whole-work entry without a manufactured verdict, an evaluator error retained beside the passing retry, across a lost reply and a kill and restart; its challenge/consult bullet is R5); and every remaining participant verb runs through the binary in `cli_native_a3.rs` (admission and increment phases, seals, whole-work entry, work receipt, rejection and failure, adoption, scope release, audits, monitors, with a kill and restart). The A4 gate holds through both surfaces on one node (`cli_native_a4.rs`, `mcp_native_a4.rs`: concurrent processes and adapters on their own journals, a cancelled tool call, replies lost before and after commitment by crash cuts at the node's durable boundaries, node restarts, exact reconciliation, and admission refused for missing disk headroom while exact retries of committed work still answer; read pins, partial apply and completion-budget pressure remain qualified at the ledger and owner level). Those results are not evidence of Linux, Windows, a released binary, an external MCP client, or multi-region operation. Temporary logs under the session scratchpad are not an immutable source revision.
+
+The previous execution spent too much time on internal machinery before completing the central user workflow. Test counts and component progress obscured the lack of delivery through the product interfaces. The next agent must use observable acceptance gates, preserve the complete scope, and finish connected implementation batches before consolidated verification.
+
+## 2. Requirements that must not be redesigned away
+
+1. **Product definition.** Focal is an inter-agent, single-node or massively distributed communication protocol and event-driven ledger that facilitates robust, predictable, efficient, and scalable coordination and communication between swarms of agents. Rust is its implementation language, not the explanation of what the product does.
+2. **One architecture across deployment sizes.** Custom RAM-resident working state is primary. Disk-backed logs provide durability. Larger installations add replication, placement, and sharding without replacing the domain model, storage engine, content identities, or client API. Kafka is an analogy for durable logging, not a required dependency.
+3. **Stepped complexity.** Moving from laptop to hosts, Kubernetes, multiple zones, multiple regions, and global deployment introduces only the irreducible new choices for that step. Users do not choose Raft terms, shard counts, range split keys, WAL segments, or materializer topology to perform normal setup.
+4. **No production panics.** Tests are exempt. Production parsing, arithmetic, indexing, allocation, task joins, I/O, shutdown, and recovery must return explicit errors or use established bounded invariants. Do not replace an error path with `unwrap`, `expect`, `panic!`, `todo!`, `unimplemented!`, or an unchecked assumption. Preserve the repository's unsafe-code prohibition.
+5. **Avoid `Arc` wherever possible.** Prefer owned state, borrowing, explicit transfer, and one authoritative owner. Do not add per-claim, per-row, per-artifact, or per-request `Arc` objects to make ownership easier. Retained sharing at an existing root/page or concurrent budget boundary needs an actual concurrent-lifetime reason and accounting; it is not permission to spread shared ownership through the model.
+6. **Independent lifecycles.** Claims, testaments, artifacts, and validations have separate state and authority. Their relationships derive acceptance; they do not move through a single shared lifecycle or require all events to arrive in one convenient order.
+7. **Respondents author testimony.** Receiving a claim never generates a testament. A respondent attempts the requested work and explicitly supplies its testament when that attempt is closed, whether the work succeeded or failed. Failed or errored work must be represented with diagnostic artifacts that the claimant can inspect and validate. An unreachable respondent is not license for Focal to fabricate its testimony.
+8. **Participant-owned execution.** The issuing participant or an explicitly designated evaluator invokes its own tools, skills, scripts, programs, or agents. Those can use any language or framework. Focal records and checks authorized facts; it does not launch workers, load arbitrary scripts for execution, schedule agent jobs, or select an agent framework.
+9. **Peer-to-peer validation and follow-up.** A validation declaration identifies requirements, evidence, authorized evaluator, and the relevant tool/skill/handler identity where applicable. That reference is data, not an instruction for the daemon to execute it. A peer evaluation request is an ordinary directed claim. Challenge corrections and consult follow-ups are authorized participant decisions with evidence and lineage, not automatically generated punishment.
+10. **A complete human interface.** Flags, JSON, and YAML compile to the same typed request. List filters are optional. Humans need useful defaults, understandable tables and errors, shell completion, exact retry behavior, and clear ambiguous-selection handling. MCP must expose the same semantics rather than a second domain implementation.
+11. **Prebuilt distribution.** Users must be able to install and run server and client binaries without Rust, Cargo, protobuf tooling, Python, or a source checkout. One `focal` executable can provide server, CLI, and stdio MCP roles. Building from source is optional contributor documentation.
+12. **Frozen history.** Existing V1 bytes, identifiers, hashes, replay semantics, and retry identities must remain readable with their original meaning. A successor format requires an explicit activation and migration contract. Never silently decode old facts into new meanings.
+
+## 3. Source of truth and reading order
+
+The user's explicit corrections take precedence over imported Hecate or Sylk passages and over earlier Focal wording. Imported reference documents are immutable research evidence. Hecate's `ACCEPTED` labels do not certify Focal implementation. Some older status paragraphs and unchecked plan rows predate completed native component work; read the dated implementation entries and actual code before deciding to rebuild a component.
+
+| Read | Purpose |
+|---|---|
+| [Architecture index](archictecutre/README.md), [00](archictecutre/00-target-architecture.md), [08](archictecutre/08-stepped-complexity-and-deployment.md) | Product scope, authority, consistency, and deployment progression |
+| [16](archictecutre/16-peer-validation-contract.md), [17](archictecutre/17-lifecycle-state-and-authority.md) | Corrected peer execution boundary and exact independent lifecycle/authority contracts |
+| [18](archictecutre/18-lifecycle-storage-upgrade.md), [21](archictecutre/21-native-input-format.md), [22](archictecutre/22-native-record-format.md) | Format compatibility, native input/record contracts, activation and recovery |
+| [09](archictecutre/09-implementation-status.md) | Dated implementation and qualification evidence; distinguish components from service delivery |
+| [05](archictecutre/05-implementation-plan.md), [13](archictecutre/13-cli-and-agent-implementation-plan.md) | Complete P00–P20 acceptance scope |
+| [11](archictecutre/11-cli-spec-research.md), [12](archictecutre/12-agent-tools-and-workflows.md), [19](archictecutre/19-cli-mcp-implementation.md) | Human operations, peer workflows, and shared interface contracts |
+| [14](archictecutre/14-mcp-protocol-research.md), [15](archictecutre/15-managed-request-streams.md) | MCP compatibility and durable operation-stream ownership |
+| [04](archictecutre/04-storage-and-distribution.md), [06](archictecutre/06-verification-and-operations.md), [10](archictecutre/10-ownership-and-failure-policy.md), [20](archictecutre/20-binary-distribution.md) | Distributed storage, qualification, ownership, and binary releases |
+| [Source snapshot](archictecutre/reference/README.md), [source audit](archictecutre/01-source-audit.md), [traceability](archictecutre/07-decisions-and-traceability.md) | Original Hecate evidence, Sylk comparisons, and conflict resolutions |
+
+The directory is intentionally spelled `docs/archictecutre` in the current repository. Do not rename it as part of this work without updating all references.
+
+## 4. Delivery order and meaning of completion
+
+The work packages below are a dependency-ordered handoff over the existing plan, not replacement scope. A package is complete only when its implementation, integration, failure behavior, and relevant acceptance evidence are complete.
+
+| Package | Result | Dependencies |
+|---|---|---|
+| R0 | Finish the interrupted module/API composition | None; preserve existing changes |
+| R1 | Bound candidate, encoded-record, persistence, and output memory through their real lifetimes | R0 composition; develop alongside R2 |
+| R2 | Native lifecycle state survives actual consensus commits, checkpoints, restart, and authority changes | R0, R1 |
+| R3 | Native service activation preserves ancillary protocols and frozen V1 history | R2 |
+| R4 | Complete native operations through the running service, human CLI, and MCP | R2; R3 for upgrading populated deployments |
+| R5 | Complete peer challenge, consult, corrective, and continuation workflows | R4 |
+| R6 | Execute secure membership, application placement, and fleet resource policy | R2–R4 foundations |
+| R7 | Integrate parallel apply, sharding, and safe range movement | R6 and native persistence |
+| R8 | Sustain evidence custody, archival, retention, and complete restore | R2, R6; integrate with R7 |
+| R9 | Deliver all stepped deployment and operating journeys | R6–R8 |
+| R10 | Deliver and qualify prebuilt binaries on supported platforms, including Windows | Platform work can proceed in parallel; final release needs integrated product |
+| R11 | Qualify correctness, boundedness, performance, faults, and product documentation | Throughout coherent batches; final closure after R0–R10 |
+
+**The first product gate is a real two-party workflow through both CLI and MCP:** the claimant submits and posts a claim; the respondent receives it, does work outside Focal, supplies actual success or failure artifacts and its own testament; the claimant/evaluator checks the exact evidence; the ledger derives acceptance; restart preserves the same history and operation outcomes. Core-only tests cannot close this gate. Passing this gate does not close the distributed/global objective.
+
+## 5. R0 — Finish the interrupted integration without losing existing work
+
+### Observed unfinished source
+
+The following observations are from the checkout at the time of this handoff, not from a successful build of these changes:
+
+| Source | Current condition | Required action |
+|---|---|---|
+| [Ledger module root](../crates/focal-ledger/src/lib.rs) | Registers `native_session`; does not register the existing `native_checkpoint` module | Register the actual checkpoint implementation and reconcile visibility |
+| [Native Session](../crates/focal-ledger/src/native_session.rs) | References absent `native_session_checkpoint.rs` and `native_session_tests.rs` | Implement the missing checkpoint integration and meaningful integration tests; do not add empty modules to declare completion |
+| [Native Session apply](../crates/focal-ledger/src/native_session_apply.rs) | Contains unqualified committed-delivery, authority, replay, and retry logic | Complete the invariants in R2 and exercise the real durable path |
+| [Native checkpoint](../crates/focal-ledger/src/native_checkpoint.rs), [fields](../crates/focal-ledger/src/native_checkpoint_fields.rs), [reader](../crates/focal-ledger/src/native_checkpoint_read.rs), [tests](../crates/focal-ledger/src/native_checkpoint_tests.rs) | New enclosing codec and tests exist but are not integrated or qualified | Wire the codec into Session checkpoint/startup; verify identity and allocation ownership |
+| [Native owner](../crates/focal-core/src/native/owner.rs), [record buffer](../crates/focal-core/src/native/record_codec/buffer.rs), completion/respondent accounting modules | New record-buffer reservation, cached encoding, and owner-extraction APIs exist as unfinished changes | Complete R1; preserve previous owner and refusal guarantees |
+| [Consensus](../crates/focal-consensus/src/lib.rs), [checkpoint](../crates/focal-consensus/src/checkpoint.rs), [borrowed proposal tests](../crates/focal-consensus/src/borrowed_proposal_tests.rs) | Borrowed proposal and funded checkpoint APIs are source-present but unqualified | Reconcile with Session, verify real reservation and buffer lifetimes |
+| [Ledger manifest](../crates/focal-ledger/Cargo.toml), `Cargo.lock` | New Evidence dependency is part of the interrupted integration | Retain and reconcile with the final dependency graph |
+
+### Implementation instructions
+
+1. Read the changed files before editing. There is a large working-tree diff containing qualified component work and newer unqualified integration. Do not use a reset, blanket checkout, or generated rewrite to obtain a clean tree.
+2. Implement the missing Session checkpoint adapter and tests as part of a complete R0–R2 batch. The planned `native_session_workflow_tests.rs` does not exist yet; create it only with actual disk-backed workflow coverage.
+3. Reconcile imports, error conversions, visibility, record-buffer APIs, and constructor ownership. In particular, the pending-queue budget reservation must be committed or otherwise safely transferred before moving the budget it borrows.
+4. Reconcile decoder identity. Session currently hashes its own `DECODER` descriptor; the checkpoint codec exposes a separately derived `format_hash()`. Establish a single intentional capability identity and use it consistently for durable floor, genesis, envelope validation, and startup. Do not merely make two values compare equal by ignoring the binding.
+5. Implement borrowed native-frame admission and all three existing trusted timer entrypoints using the owner APIs. Participant-authored context must not gain trusted runtime authority. Preserve the configured content domain.
+6. Once the connected implementation is finished, run one consolidated compile/test/lint pass. A source file existing or a module compiling is only the R0 composition gate, not delivery of R2 or R4.
+
+**Close R0 when:** the complete module graph and API composition build without stubs; missing integration is implemented; the relevant checks qualify the actual final batch; the implementation record names the exact scope checked and remaining failures.
+
+## 6. R1 — Finish lifetime-correct memory and completion funding
+
+### Why this is required
+
+Admission must not accept a bounded obligation and later lose the ability to publish its required result because another request consumed the reporting capacity. Candidate pages, encoded mutation bytes, consensus copies, WAL staging, transport output, retained committed delivery, and checkpoints can coexist. Charging one of them does not fund the others. Selecting a completion budget lane is not a proof that the complete durable path is reserved.
+
+The qualified owner already has substantial completion/respondent grant and persistent-page machinery. Extend that machinery; do not replace it with whole-Core clones, per-object shared ownership, or a second unaccounted queue.
+
+### Implementation instructions
+
+1. Complete `NativeOwner::with_record_buffers`, `encode_candidate`, `committed_core`, and checked `into_committed_core`. An unresolved or faulted owner must be returned intact on refused extraction. Extraction must never discard pending candidates implicitly.
+2. Keep the exact encoded record and its allocation permit together. `FundedRecord` and `PendingRecord` are the current approach. Measure the canonical encoding before allocation, reserve the measured charge, encode once, and retain the same bytes/hash across a retry. Encoding or proposal refusal must not consume the candidate identity.
+3. Prove the future-record reservation bound across every native row family and maximal legal shape. The new `future_record_bytes` implementation currently uses fixed overhead and a four-times incoming-heap expansion estimate plus a work bound. Its comment is not proof. Compare the bound against the actual encoder's headers, keys, values, nested descriptors, events, changed/deleted rows, and traversal work. Use checked arithmetic and supported-platform widths. Replace any under-bound with a derivation tied to the encoder.
+4. Preserve exact funding when moving prepared input into the range owner. The previous batch already added `RangePreparationPlan::build_in_funded_with`; avoid taking a second admission reservation for the same live input or releasing its permit before retained bytes disappear.
+5. Trace simultaneous live allocations through `DurableNode::propose_borrowed_in`. It must check authority and size before allocating, reserve the actual consensus staging requirement, then copy fallibly. The owner keeps its original funded bytes. Proposal admission is not commitment.
+6. Trace `begin_checkpoint_funded` through actual checkpoint copying and persistence. The original input permit must remain live until the original buffer is no longer live; separately account for consensus-owned staging. Include allocator overhead, exact capacity, snapshot data, WAL records, and output buffers. Refusal must not leak or undercharge either ownership path.
+7. Review the removal of the custom owner `Drop` implementation. Pending buffers and retained pages must be destroyed before the backing completion funds become unavailable. Verify external read pins and owner extraction cannot leave live storage backed by released credits.
+8. Define which future resources are promised by accepting a completion obligation. The current record-buffer reservation does not reserve future network fan-out, quorum availability, WAL disk space, or checkpoint coexistence. Reserve bounded memory/disk allowances where required, or expose an honest retained-pending/backpressure contract. Do not turn an unavailable quorum into a false local durability guarantee.
+9. Bound pending candidate slots, retained `NodeEvents`, native commit summaries, read-result correlation data, schema/custody inspection, and startup reconstruction. A delivery retained for retry must retain its memory charge as well as its cursor.
+
+**Close R1 when:** pressure tests cover refusal before admission, refusal after a candidate is retained, exact retries, encoding failures, transport pressure, checkpoint overlap, publication, discard, owner extraction, and shutdown. They must assert the original bytes/identity survive where required, all live memory remains charged, and charges return exactly once after destruction. Existing no-panic and ownership gates must pass without adding unnecessary `Arc` usage.
+
+## 7. R2 — Complete native durable Session, recovery, and authority
+
+### Existing foundation to reuse
+
+The native Core supports all 30 recorded row families and eight dependency-ordered restoration phases. Incremental replay validates changed and deleted rows against the unchanged committed base; preserves original graph capture coordinates; checks immutable authoring, receipts, response cycles, attempts, reports, seals, history, graph effects, and acceptance projections; and verifies local artifact custody through the actual content store and schema verifier. Restored-owner tests exercise completion and respondent reporting under pressure.
+
+This is the replay engine, not yet the running Session. Do not reimplement it by replaying participant commands, decoding the complete ledger into an auxiliary map on each entry, or inventing local evidence from metadata.
+
+### 7.1 Commit and retry semantics
+
+Implement the Session around the existing separation between candidate preparation and publication:
+
+1. Check authenticated caller context and exact committed/pending request identity before unrelated transport work. **The current `propose` calls `flush_proposals` before owner retry lookup.** That ordering can prevent an exact retry from discovering its outcome under unrelated proposal pressure and must be fixed.
+2. Prepare and retain the candidate, its grant ownership, and its stable encoded-record identity. After this point, temporary encoding or proposal pressure must preserve the candidate and return a meaningful `Pending` result. **The current `submit_staged` propagates a flush failure instead of completing this contract.** Polling must retry submission without creating a second candidate.
+3. Treat `propose_borrowed_in` success as submission only. Use `NodeEvents.committed` to obtain the actual committed index, term, and bytes. A WAL append or local leader state is not quorum commitment.
+4. Publish a pending native head only when the committed record matches the expected ledger, content profile, original writer range, base/prefix, and exact record hash. A different committed entry must take the replay/conflict path and resolve the speculative suffix under explicit rules.
+5. Separate native mutation sequence from Raft position. Each native mutation, including a zero-domain-event result, advances the native prefix once. Membership and internal Raft entries advance Raft progress without fabricating a native mutation.
+6. Preserve commit output if a subsequent proposal flush fails. The caller must still be able to observe and reconcile already committed operations. Fatal errors stop further admission without asserting that an in-flight operation definitely did not commit.
+
+### 7.2 Replay, partial application, and leadership changes
+
+1. Followers own a passive `Core<NativeState>` and use recorded-mutation replay. A new authoritative leader reconstructs `NativeOwner::with_record_buffers` once at a proven current-term readiness boundary, not after every entry.
+2. Retain the original committed `NodeEvents`, its allocation, and the partially applied cursor when application is temporarily refused. Resume from the unapplied entry; do not lose already drained consensus output or apply an entry twice.
+3. Audit `poll`, `try_poll`, `campaign`, `tick`, authenticated `step`, proposal admission, and read operations together. No entrypoint may bypass a retained delivery in a way that exposes authority or state beyond the applied prefix.
+4. Classify failures precisely. A capacity refusal, temporarily unavailable recoverable custody, or reconstructable owner shortage may require retry. Corrupt records, conflicting immutable facts, and invalid schema evidence require fail-closed handling. The current broad retry/fatal classifications need review; do not silently retry corruption forever or permanently stop on every recoverable resource condition.
+5. A role change alone does not prove that a pending candidate was rejected. Discard an unresolved suffix only after a matching committed head, a conflicting committed native prefix, an installed authoritative snapshot, or a fully applied newer-term barrier proves its disposition. Audit every call to the current discard/demotion helpers against that evidence.
+6. Tie producer identity to authority. Records from the same recording term must preserve their original producer range. A new recording term/range requires the committed authority boundary. Do not read a range from an untrusted record and then pass that same value as the supposedly independent expected range.
+7. Bind native genesis to the actual physical cluster/group and ledger/profile before accepting native domain bytes. A supported decoder hash alone does not bind the ledger to the physical group.
+8. Preserve client association for ReadIndex results. The current native read summary contains Raft/native coordinates but omits request context. Return a bounded opaque correlation identity or the retained context so concurrent callers can identify their own barrier. A caller-constructed scalar boundary must not become a linearizability capability.
+
+### 7.3 Session checkpoint and restart
+
+The source-present enclosing checkpoint format is `FCNSESS1`, version 1, with hash domain `focal.native.session.checkpoint.v1`. It encloses native Core roots and records cluster/group, ledger/profile, applied Raft index/term, membership/configuration index, producer range/term, genesis and decoder-floor binding. Its current ancillary profile explicitly disables managed streams, cursors, deltas, and placement. That is a limited native-genesis component, not the final service format.
+
+Implement the missing Session checkpoint adapter as follows:
+
+1. Select a coherent committed Core and matching applied Raft/configuration coordinates. A pending speculative root must not enter the checkpoint.
+2. Prepare the enclosing encoding with `native_checkpoint::EncodingPlan`, using the actual membership configuration and actual durable decoder floor. Check cumulative work/byte limits for both enclosing metadata and nested Core.
+3. Encode under a retained output allocation, then move the bytes and permit together into `DurableNode::begin_checkpoint_funded`. Do not release the input permit while the input buffer is still live.
+4. On snapshot application/startup, validate the physical cluster/group, ledger/profile, native genesis, decoder floor, outer/nested hashes, exact `AppliedSnapshot` index/term, and membership configuration before replacing authoritative state.
+5. Restore Core into the new local range incarnation while preserving the original nested checkpoint range and last recording range/term as historical provenance. Restore configuration index and both prefixes independently.
+6. Verify referenced local content/schema custody through the actual store. Missing or mismatched bytes must refuse publication; a content hash alone is not possession.
+7. Build replacement state before atomically replacing the previous domain. On a retryable refusal, keep the previous authoritative state and retained delivery intact. Reject legacy/import profiles explicitly until R3 implements them.
+8. Review startup draining. `from_node` currently polls during construction; any recovered messages, committed summaries, read states, or pending work must be intentionally retained or delivered, not dropped as an unused poll result.
+
+The existing consensus checkpoint path has an **8 MiB complete-buffer limit**. Keep that limit explicit for this component. Larger, online, bounded checkpoints and transfer require additional work under R7/R8; do not claim arbitrary ledger recovery based on a small-root codec test.
+
+**Close R2 when:** a real disk-backed one-node Session performs native create/post, respondent evidence and testimony, evaluation, checkpoint, subsequent mutations, process restart, checkpoint-plus-tail replay, and new-term submission. A three-node harness must cover committed-head matching, passive follower replay, leader loss with unresolved candidates, conflicting replacements, producer-range changes, concurrent ReadIndex, partial delivery retry, corruption, and custody refusal. Assert identities, prefixes, grants, histories, and output delivery, not merely final row counts.
+
+## 8. R3 — Activate native storage without discarding service metadata or V1 history
+
+### Why this remains separate work
+
+The existing live Session persists more than domain rows. Managed request streams, request receipts and retirement floors, cursor state, deltas, membership, placement, and authority metadata affect exact retry, subscriptions, and routing. A fresh native-only genesis cannot substitute for importing a populated deployment or for preserving these services.
+
+The current live V1 formats and execution semantics remain frozen. Native mutation and Core-root formats are dormant version 2 (`FCMUTATE` and `FCNROOTS`); version 2 explicitly adds the graph-capture provenance missing from the earlier dormant native format. This is not permission to change live V1 records. The native input format is a separate contract in document 21.
+
+### Implementation instructions
+
+1. Inventory every field in the existing [Session](../crates/focal-ledger/src/session.rs), durable V1 envelope, managed-session, membership, placement, cursor, and request-stream modules. Build a field-by-field migration/checkpoint matrix: persisted source, new representation, authority, default legality, and recovery validation. No populated field may disappear behind `NativeOnlyV1`.
+2. Define a versioned complete Session envelope for native operation plus supported ancillary protocols. Explicitly distinguish an empty new deployment from an imported historical deployment. Missing legacy metadata is an error unless an audited migration rule proves absence was meaningful.
+3. Implement replicated capability/decoder activation as specified in document 18. A local compiled decoder declaration is a capability; it is not proof that every required replica can interpret newly committed bytes. Bind activation to committed membership/capability evidence and a durable minimum decoder floor.
+4. Fence mixed-version writers and reject unsupported startups before they mutate data. Define downgrade behavior after activation. Preserve old readers/replay for their old history rather than rewriting content identities.
+5. Use explicit migration/import records or a separately versioned audited checkpoint transition. Preserve old request outcomes, operation IDs, receipt generations, content hashes, historical states, and tombstones. Do not rerun old commands under the new reducer to manufacture a new history.
+6. Carry request-stream owners, reserved ordinals, consumed-result acknowledgments, retirement floors, unresolved requests, watch cursors, delta boundaries, placement assignments, and membership through checkpoint, restart, and migration.
+7. Wire native Session selection into node registration/hosting only after the activation and startup checks can explain which format is active. Expose the active format and effective guarantee through diagnostics. Avoid an ordinary user-facing maze of storage modes.
+
+**Close R3 when:** fresh native startup, populated V1 restart, explicit V1-to-native transition, mixed-version refusal, interrupted activation, checkpoint/tail recovery, unresolved client requests, and resumed watches all have integration evidence. Old frozen fixtures must retain their bytes/hashes and original replay results. A restart must not accidentally allocate new request identities or reset retention/authority floors.
+
+## 9. R4 — Deliver the complete native service, human CLI, MCP, and skills
+
+### Current interface foundation
+
+The existing V1 interface already has shared Rust operation builders, strict flags/JSON/YAML input, managed request journals, optional-filter pages, artifact transfers, validation context, named local and authenticated remote contexts, watches, traversal, summary, schema/example discovery, and shell completion. Use that implementation. The remaining work is complete native behavior and missing operations, not a second parser or a separate MCP reducer.
+
+Primary entrypoints are [shared operations](../crates/focal-client/src/operations/mod.rs), the operation inventory/catalog/schema/input modules, the node CLI modules, [node hosting](../crates/focal-node/src/host.rs), managed service and session registration, and [MCP](../crates/focal-mcp/src/lib.rs). The current new `NativeSession` is not dispatched through node/client/MCP yet.
+
+### 9.1 Finish the typed operation contract first
+
+1. Produce an explicit native operation coverage table from the commands, input decoder, owner APIs, lifecycle authority tables, and existing shared registry. For each operation record its domain command, authenticated actor, native wire body, CLI verb, MCP tool, result schema, retry identity, and relevant reads/events. Mark internal trusted timers as internal, not public actor privileges.
+2. Preserve the full authored content when converting input: description, schemas, occurrences, action, scopes, relations/lineage, acceptance requirements, validation declarations, and stable handler/tool/skill identity. Do not flatten these into a string, omit them from JSON/YAML, or accept fields that the wire builder silently drops.
+3. Route all transports through the same admission and authorization boundary. Do not derive the actor from a user-editable request field or permit a client to set trusted runtime/cause authority.
+4. Expose committed, pending, rejected, and unknown outcomes distinctly. A lost reply is not a failed command. Retain the expanded exact request and its identity for reconciliation before allowing a semantic resubmission.
+5. Extend the coherent validation-context read to include exact claim/requirement versions, artifact manifests, custody/schema evidence, receipt and registration generation, validation phase, authorized evaluator, attempt, and previous relevant results at one prefix.
+
+### 9.2 Required human command coverage
+
+The following describes required behavior. Where a verb already exists, extend its shared implementation. Final new spellings should follow the existing command tree and document 11; the examples below are not assertions that unfinished commands currently run.
+
+| Family | Required operations and semantics |
+|---|---|
+| Claim | `focal submit claim --target …` with complete authored flags; `--json` and `--yaml` alternatives; explicit post; receipt acquisition/adoption/renewal where authorized; progress/disposition; cancel/supersede; get, list, wait/watch, history and dependency inspection |
+| Testament | Explicit respondent submission after attempted work, with outcome, summary and exact manifest; response-cycle close/post and claimant delivery acknowledgment as distinct facts; claimant-authored result/audit testimony where defined; get/list/history; no automatic testament on receipt |
+| Artifact | Register/upload independently, attach/reference exact immutable evidence, retrieve metadata or download bytes with `focal get artifact <artifact_id>`, resumable transfer, list by optional testament/claim and other supported filters; diagnostic evidence is a first-class artifact |
+| Validation | Discover declarations and external invocation context; begin eligible Admission/Increment/WholeWork checks as specified; submit fenced programmatic or agentic reports; retry evaluator execution when allowed; inspect exact attempt/results/history; derive completion without a caller forcing acceptance |
+| Relationships and work | Inspect dependencies, lineage, scopes, monitors, standing, waits and release/adoption state; expose legal participant actions without exposing daemon authority |
+| Context and recovery | Discover/select local or enrolled remote context; inspect/resume unresolved operations; reconcile exact request outcomes; inspect authenticated identity and effective permissions |
+| Cluster and deployment | Start, invite, join, inspect membership/guarantees, plan/apply policy, drain, credential renewal/revocation, backup/restore, upgrade and diagnostic operations as completed in R6–R10 |
+
+Required common examples include `focal get claim --source …`, `focal list claims`, `focal list testaments`, `focal list artifacts --testament …`, `focal get validation <validation_id>`, and `focal list validations --claim …`. Every list relationship filter is optional. Singular retrieval by a non-unique selector must return a useful ambiguity result rather than arbitrarily selecting a row.
+
+### 9.3 Queries, filters, pagination, output, and errors
+
+1. Finish native indexed query adapters for all four families. Support applicable ID, source, target, claim, testament, status, phase, action, scope, relation, kind, producer, schema, evaluator, verdict, and created/changed-prefix filters according to the typed catalog. Do not invent invalid combinations for a family; reject them clearly.
+2. Use existing indexes for common selectors and a bounded residual scan for the remainder. A list command must not download the whole ledger for client-side filtering or allocate a complete result before pagination.
+3. Bind continuation cursors to principal/tenant, query/filter, route, and a fixed committed prefix. Preserve consistent results while writes continue. Distinguish an empty filtered page with further scan work from end-of-results. Expose expiry, retention gaps, and resynchronization explicitly.
+4. Bound retained cursors, read pins, pending request journals, and watch buffers per client/tenant. ACK, disconnect, expiry, checkpoint, movement, and restart must preserve or release ownership according to the protocol.
+5. Keep human table output concise and useful; provide JSON/YAML schemas for machine use. Preserve complete diagnostics without dumping opaque implementation structures into normal user flows. Help must show the next legal action and examples.
+6. Keep stable categories for invalid input, unauthenticated, unauthorized, not found, ambiguous, conflict, busy/capacity, resync required, unmet deployment guarantee, and unknown outcome. Domain `Inform`/`Yield` are not generic server crashes. A successfully recorded validation whose verdict is Fail is still a successful submission operation; exit behavior must not make scripts retry the report as if transport failed.
+7. Qualify interactive completion, stdin/file input where supported, quoting, Unicode, large bounded documents, pipelines, broken pipes, interrupted output, cancellation, and exact replay of a journaled request. An output failure must not lose the identity of an already submitted operation. JSON and YAML are transport conveniences, not a special validator execution language.
+
+### 9.4 Finish managed request streams and trusted causes
+
+P17.11 and document 15 remain authoritative. Safe concurrent allocation/ownership of client streams, durable ordinal reservation, consumed-result acknowledgment, bounded retention and recovery of pending/unknown outcomes were already implemented; bounded close with automatic rotation, registry recycling under a persisted slot-generation watermark (`FOCALSS7`) and privacy-safe occupancy are implemented on 2026-09-09 (doc [09](archictecutre/09-implementation-status.md), "Bounded generations: automatic rotation and registry recycling"; decision F27). A process restart or second CLI process must not reuse an ordinal for different content, and a retired receipt must not be mistaken for proof that an unknown operation never committed: both hold across rotation (`cli_managed.rs`). What remains for P17.11 is the managed batching measurement (R11) and the mixed-version network qualification (R6/R9).
+
+P17.12's narrow authenticated child-cause authority is implemented on the native engine (2026-09-09; doc [09](archictecutre/09-implementation-status.md), "Child causes and follower custody of native payloads"): a participant may cite a committed claim as the cause of a new claim only as that claim's issuer or its current receipt holder, only while the parent is live, at its exact binding and receipt, on the same ledger; the owner derives the cause and lineage, and CLI, MCP and the embedded client share one document and one frame. Exact evidence targets and the immutable follow-up policy of descriptor schema 2 are implemented (2026-09-09; doc 09, "Exact evidence and peer policy (R5.1)"), and so are the owner's peer rules (2026-09-09; doc 09, "Corrections and follow-ups under the authored policy (R5.2)"): the policy's escalation decides who besides the issuer may cite a parent, a correction invalidates a terminal challenge on the exact report of its failed verdict under `corrective_allowed` and `single_issuer`, and follow-up consultations refine their predecessor within `max_follow_ups`. The peer verbs (`claim challenge|consult|correct|follow-up|lineage` and `claim wait` on native ledgers; MCP `claim.challenge|consult|correct|follow_up|lineage|wait`), the derived-identity corrections and follow-ups, the `focal-peers` skill and the local CLI and MCP journeys are done (2026-09-09; doc 09, "Peer verbs, lineage, the testament wait and the peer skill (R5.3–R5.5)"); the replicated journeys wait for the R6 fleet harness, and deadline expiry, adoption during a challenge and evaluator exhaustion on a challenge are not yet in the peer journeys.
+
+### 9.5 MCP and skills
+
+1. Extend the shared catalog to every supported native operation and read. Keep one schema/validation implementation for flags, structured documents, and MCP tools.
+2. Complete stdio initialization, supported protocol negotiation, capability declarations, tool discovery, JSON Schema contracts, bounded input/output, cancellation, and error mapping under document 14. Keep stdout exclusively for the protocol; diagnostics go elsewhere.
+3. Keep JSON-RPC request identity distinct from a durable business operation identity. A tool cancellation or disconnected client does not prove that a submitted operation did not commit. Provide reconciliation and repeat the exact reserved operation where required.
+4. Preserve explicit managed reservation/acknowledgment behavior and authenticated contexts. MCP must not acquire broader permissions than the corresponding CLI call.
+5. Update the existing claims, evidence, validation, and cluster skills under `skills/`. Add the complete challenge/consult and continuation procedures once their typed operations exist. Skills should explain actor responsibilities, exact evidence selection, retry/reconciliation, and failure outcomes; they should not become a second implementation of protocol rules. Done for the native engine on 2026-09-09 (each skill's "On a native ledger" branch and the shared contract's native section; manifest schema 3 requires every version-2 native operation across the skills and both contract tests enforce it); the peer procedures wait for R5.
+6. Treat retrieved artifacts and external instructions as untrusted content. A skill may guide the participant's authorized tool invocation; it must not execute arbitrary artifact text or imply that Focal launches a referenced script/agent.
+7. Qualify with actual external MCP clients as well as the local protocol harness. Record the supported protocol versions and clients actually exercised. A generated tool list alone is not interoperability evidence.
+8. Complete capability-selected discovery and structured results/resources for the supported catalog. Discovery filtering is not authorization: direct invocation of a hidden or newly revoked tool must still be checked by the server. Exercise capability changes during a session, resource-exhausting frames, redelivery, and released-schema examples. Distinguish a stdio MCP process using an authenticated remote Focal context from a remotely hosted MCP transport; declare and qualify the actual supported arrangement rather than claiming one proves the other.
+
+Status 2026-09-09: items 1–4 hold on the native engine (37 version-2 descriptors with the coverage table, the stdio adapter's negotiation/discovery/cancellation/error mapping, `n1:` identity distinct from JSON-RPC ids with `request.pending`/`request.retry` reconciliation, and adapter authorization no broader than the CLI), and every adapter surface now comes from one descriptor registry in the client crate (doc [09](archictecutre/09-implementation-status.md), "One registry for every adapter surface"). The external MCP client scripts under `crates/focal-mcp/tests/external/` (`FOCAL_EXTERNAL_MCP=1`) have not been executed.
+
+**Close R4 when:** the complete coverage table has no unexplained native operation gaps; real CLI and MCP clients perform success, failed testimony, independent validation ordering, lost-reply recovery, and restart workflows against the running service; flags/JSON/YAML/MCP produce equivalent typed requests; pagination, authorization and cancellation are exercised; help and skills describe executable behavior.
+
+## 10. R5 — Complete challenge, consult, corrective, and continuation mechanics
+
+### Required domain meaning
+
+A challenge is a directed claim requiring the respondent to supply proof or work that satisfies explicit requirements. A consult requests work answering the claimant's query. Both use the normal claim, artifact, testament, and validation machinery. Their difference is intent, policy and follow-up, not a separate agent-job engine.
+
+The respondent closes its attempted work with its own testament and evidence even when the attempt fails. The claimant or designated evaluator inspects that evidence and records an authorized verdict. A corrective claim may follow a challenge when an authorized participant decides the evidence warrants it. A consult normally permits follow-up consultation; punitive/corrective escalation requires an explicit applicable policy. Timeout alone does not prove a failed business claim and does not authorize a fabricated corrective result.
+
+### Implementation instructions
+
+1. Persist challenge/consult intent, parent/cause lineage, scopes, proof/query requirements, accepted evidence schemas, and follow-up policy as immutable authored content. An exact-artifact challenge needs a typed immutable artifact/manifest target, not a digest buried in prose. Reuse native authored descriptors and existing relation types where their semantics fit; version any genuinely new wire vocabulary.
+2. Make response operations select the correct receipt generation and response cycle. A late response after adoption, supersession, cancellation, or scope release must be handled by the specified standing/history rules, not silently attached to the newest cycle.
+3. Ensure failed and errored attempts retain actual error artifacts. Missing required proof, wrong schema, wrong digest, partial work, evaluator Error, and an actual negative verdict are distinct facts. Preserve their inspectable causes and validation eligibility.
+4. Specify validators through typed declarations: what requirement is checked, on which exact evidence, by which authorized evaluator, under which handler/tool/skill identity and version, with which accepted report schema. Participant code may implement a deterministic check or invoke an agent. Focal validates the report's identity and consistency; it never executes the reference.
+5. Enforce phase gating. A programmatic pass enables quality evaluation only when that path is declared. Agentic-only checks enter the applicable path directly. Pin reports to the required policy/version, target manifest, receipt/registration generation, phase, evaluator, and attempt. Retries after evaluator Error must not rewrite a previous result or impersonate another evaluator.
+6. Implement evidence-backed corrective issuance as an authorized participant operation with a stable issuance identity. Bind it to the challenged claim, relevant failed verdict, exact evidence, and policy. Duplicate delivery or lost replies must produce one logical follow-up. Reject stale, unauthorized, or contradictory causes.
+7. Implement consult follow-up with query lineage, nesting, remaining work, and applicable scopes. Keep follow-up selection explicit. Do not encode automatic correction as the default consequence of a consult not producing a satisfactory answer.
+8. Complete timeout, cancellation, waiver, renewal, adoption, escalation and standing checks with receipt/generation fences. Trusted timer events record their authorized facts; they do not pretend an offline agent supplied a report.
+9. Finish participant continuation/wait behavior. Persist or expose stable wake/effect identity, dependency conditions, and adoption boundaries. Handle late/out-of-order reports, duplicate wakes, terminal races and recovery without creating a second callback authority. Focal may notify; participant execution remains outside the daemon.
+10. External actions may lack exactly-once execution. Use participant-side idempotency keys and durable reconciliation where supported. Never claim that a ledger retry automatically makes an arbitrary tool invocation exactly once, and never blindly rerun an external action solely because its report reply was lost.
+11. Add complete human and MCP paths for initiating, responding, inspecting, waiting, validating, and issuing authorized follow-ups. Reuse ordinary operations rather than introducing a second hidden workflow protocol.
+
+**Close R5 when:** two real participants complete challenge and consult journeys locally and on a replicated deployment. Cover valid proof, missing proof, wrong schema/digest, failed work with diagnostics, evaluator Error/retry, declared fallback/exhaustion, unavailable external tools, quality failure, inconclusive results, nested consults, forged or cross-ledger parentage, stale generations/verdicts, terminal parents, simultaneous corrective issuers, deadline expiry, adoption, cancellation, lost replies, and restart. Assert exactly one authorized logical follow-up and no fabricated respondent testimony or daemon-launched execution.
+
+## 11. R6 — Execute secure membership, application placement, and fleet control
+
+### Current gap
+
+Root metadata enrollment and replication, authenticated transports, consensus membership primitives, directory/placement models, and resource-control components exist. Joining a node as a root learner does not establish application-ledger replication, evidence custody, safe voter promotion, or the requested failure tolerance. Placement solvers and signed structures are not an executing deployment controller.
+
+Primary code is in `focal-consensus`, `focal-directory`, and the node's directory bootstrap, control host, directory authority, fleet placement, placement proof, cluster administration, network administration, client join, and joined-context modules. In particular, examine `focal-directory/src/{placement,partition,authority,scheduler,cache}.rs`, `focal-control/src/{replica,membership,authority}.rs`, and `focal-node/src/{fleet_placement,network_controller,network_directory,placement_proof}.rs`. Reuse those boundaries and the existing authenticated context machinery.
+
+The directory's existing transfer fences and placement proposals do not run transfer reconciliation or namespace split/merge. These require implementation, not merely another qualification pass over the proposal code.
+
+**Progress (2026-09-09).** The directory model for instruction 4 is implemented and gated (doc [09](archictecutre/09-implementation-status.md), "Placement progress in the directory (R6.1)"; design in [24](archictecutre/24-placement-execution-and-fleet-control.md); decision F31): one monotone `AssignmentProgress` row per copy of a pending placement, plan phases derived from committed rows and signed readiness, a cutover fence accepted only once every voter is promoted, activation that leaves the abandoned copies in a `retiring` map to be drained and retired, bounded refusals, `effective_guarantee` measuring what the live nodes provide, `NodeLoad.disk_available`, the `Custody` authority fact, partition checkpoint schema 2 with a typed schema 1 conversion, and control checkpoint schema 4. The placement agent and its exact-retry journals are implemented and gated (2026-09-09; doc [09](archictecutre/09-implementation-status.md), "The placement agent registers the founder's session (R6.2)"; [24](archictecutre/24-placement-execution-and-fleet-control.md) §7): every service registers the founder's session in the partition directory through the root group grant, the session-log witness, the signed session fact and the partition commands, reports memory, replica and disk load, and answers assignments naming the node with readiness it verifies and signs itself once the session log has cut over. The node-to-node placement protocol is implemented and gated (2026-09-09; doc [09](archictecutre/09-implementation-status.md), "A joined host installs its assignment and signs under a quorum (R6.3)"; [24](archictecutre/24-placement-execution-and-fleet-control.md) §8): `PlacementControl` carries an enrolled node's own enrollment, load, progress and readiness to the partition owner, `SessionSign` returns one node's signature over a placement record or a membership it witnessed from its own replica, the agent installs assigned copies and reopens them at every start, and a two-host expansion of the founder's session (join, install, learner, promotion with signed group changes, both readiness signatures, quorum-signed cutover and activation, restart) is executed over real QUIC. The placement controller is implemented and gated (2026-09-09; doc [09](archictecutre/09-implementation-status.md), "The controller drives a plan to activation and heals a lost host (R6.4)"; [24](archictecutre/24-placement-execution-and-fleet-control.md) §9): on the node leading the partition owner and the session log it installs committed configurations on the root grant, adds and promotes learners, commits and records the cutover and activation under voter-majority proofs, drains and retires abandoned copies and re-plans under the active policy when the live registry no longer carries the placement; a laptop session expands to three hosts unattended, tolerates one host loss and takes the host back when it returns. Admission is implemented and gated (2026-09-09; doc [09](archictecutre/09-implementation-status.md), "Tenant admission and the disk envelope (R6.5)"; [24](archictecutre/24-placement-execution-and-fleet-control.md) §10; decision F32): one disk envelope per volume promises every durable write (WAL batches, checkpoint rewrites, upload staging, sealed objects, imports, custody records) its bytes before any acknowledgement under a headroom watermark and a completion reserve, one content domain cannot fill the staging allowance, and a tenant is admitted to a node when a committed placement first assigns it a session, under `node.max_tenants` and the node budget, with a capacity refusal recorded against the node's own assignment otherwise; the agent reports the node's tenants, queues and envelopes. Credential renewal is implemented and gated (2026-09-09; doc [09](archictecutre/09-implementation-status.md), "A node renews its own credential and every proof follows its key (R6.6)"; [24](archictecutre/24-placement-execution-and-fleet-control.md) §11; decision F33): a node's directory identity is its enrolled key, a joined node renews its credential ahead of expiry or on `cluster credentials renew` under the same key, presents the renewed certificate on its listener, its peer pool and its placement agent at once, the replaced certificate retires after the sponsor's grace, and a node that crashed before installing a committed renewal converges on it. Liveness is implemented and gated (2026-09-09; doc [09](archictecutre/09-implementation-status.md), "Liveness: SWIM with Lifeguard, late extension and coordinates (R6.7)"; [24](archictecutre/24-placement-execution-and-fleet-control.md) §12; decision F34): every node runs a SWIM failure detector with Lifeguard's local health multiplier, confirmation-shortened suspicions and incarnation refutation, under-load deadline extensions granted logarithmically against a progress witness, and Vivaldi network coordinates that bound each peer's probe timeout; the partition leader's agent commits settled verdicts as `NodeRecord.liveness` (partition checkpoint schema 3), which the planner, placement verification and the guarantee read, and a restarted host revives at a higher incarnation without re-enrollment. The split/merge and operator batches remain (24 §13).
+
+### Implementation instructions
+
+1. Finish the invitation-to-serving journey: authenticate sponsor and new identity, consume the invitation durably once, persist bootstrap/trust state, catch up the required checkpoint/log, establish evidence custody, then promote through the fenced membership protocol. Snapshot possession alone must not grant voting or application-write authority.
+2. Distinguish root membership from each application group's placement and membership. Reconcile desired durability with available independent nodes, zones, regions and storage. Report the effective guarantee until the new configuration is actually committed and ready.
+3. Complete the producers and collectors for the existing quorum/delegation evidence. Verify signatures, scope, generation, membership, revocation and freshness against authoritative state; do not accept a caller-assembled proof merely because its fields are well formed.
+4. Implement the directory scheduling/reconciliation loop that turns committed placement intent into bounded, idempotent actions. Track assignment identity, epochs, progress, refusals, custody, completion and restart recovery. A repeated reconciliation must not create competing owners. Complete directory namespace split/merge and bounded delegated routing so the control plane itself can scale without a single unbounded metadata owner.
+5. Connect tenant/session resource admission to actual node budgets, disk/custody capacity, and placement eligibility. Bound queued work and control messages. Backpressure must remain visible and fair under a noisy tenant rather than consuming the completion reserve of unrelated sessions.
+6. Complete authority refresh, expiry, credential renewal/rotation, revocation, reconnect and stale-node rejection. A joined node role must not become tenant administration or arbitrary participant impersonation.
+7. Ensure committed assignments and in-progress membership transitions recover after controller/leader restart. Joint membership, learner catch-up, demotion and failed promotion must leave one coherent authority history.
+8. Expose the result through the shared operator API and CLI/MCP with understandable plan/status/reason output. Users request tolerated failures and provide topology facts; Focal derives placement and voter changes.
+
+**Close R6 when:** a laptop deployment expands to several authenticated hosts without losing history, request receipts or content identity; application data and artifacts become replicated; failure of the promised number of nodes preserves the stated guarantee; interrupted joins/promotions/controller restarts converge; insufficient capacity reports an unmet guarantee without silently weakening it.
+
+## 12. R7 — Integrate deterministic parallel apply, sharding, and safe movement
+
+### Why this remains substantial
+
+The project has range, persistent-page, preflight, directory and deterministic-apply foundations. The native lifecycle must use them through actual Session and fleet execution. A range data structure does not by itself provide multi-node sharding, safe range transfer, or improved throughput. Native dependency, scope and validation effects can touch multiple objects and must retain their atomicity and deterministic meaning.
+
+Primary code includes `focal-ranges/src/{coordinator,replica,map,pins}.rs`, `focal-memory` range/preflight modules, native transaction/graph effects, ledger Session, and directory/placement execution. The range crate explicitly remains experimental groundwork disconnected from node writes, recovery, placement and transport; its cleanup tests do not demonstrate the complete split/move lifecycle. The worker pool here executes ledger computation, not participant agent jobs.
+
+### Implementation instructions
+
+1. Integrate deterministic parallel apply with a bounded persistent worker pool. Declare and validate read/write access sets against native operations, including graph effects and derived aggregates. Implement tracked footprints, deterministic conflict graphs, multiversion reads, validation barriers, full speculative-suffix discard and serial recomputation where needed, followed by contiguous publication. Conflicting operations need deterministic ordering or a correct bounded serial fallback. Do not create one thread/task per row or share all mutable state behind `Arc<Mutex<…>>`.
+2. Complete the active publication path over persistent range/page directories. Remove residual whole-tree publication copying or allocation from paths that are supposed to use bounded touched-page copying. Preserve borrowed read views and account for pinned old roots.
+3. Implement automatic split/merge/placement decisions from measured load, range size, locality, and resource policy. Keep internal range IDs and epochs observable for diagnosis without making users choose shard counts.
+4. Define and execute cross-range commands/effects under the architecture's session-ordering contract. Admission, recorded write sets, graph dependencies, scope release and exact retry must not be partially visible because their rows reside on different apply partitions.
+5. Implement a durable movement state machine: prepare target, copy a bounded checkpoint/content inventory, stream an ordered tail, establish a cutover barrier, prove target readiness/custody, commit routing/ownership change, reject stale writes, and retire the old copy only after safe retention conditions.
+6. Persist movement identity, source/target epochs, transfer progress, barrier and routing state. Source failure, target failure, controller restart and duplicate transfer messages must resume or abort under one authoritative decision.
+7. Preserve request-stream identities, cursor positions, watch deltas and read consistency across movement. Translate or explicitly invalidate old route-bound cursors with a resumable resync contract; do not silently skip or duplicate history.
+8. Bound simultaneous source roots, target roots, transfer chunks, WAL tails, retained pins and retries. Replace the current small complete-buffer checkpoint ceiling where necessary with a versioned chunk/manifest protocol whose partial data cannot become authoritative.
+
+**Close R7 when:** native workflows run while ranges split/move and parallel apply is active; deterministic replay matches serial semantics; faults at every movement barrier recover to one owner; stale clients cannot write to the old owner; subscriptions/retries remain coherent; measured throughput and memory behavior demonstrate actual benefit and bounded overhead.
+
+## 13. R8 — Complete evidence custody, archival, retention, and restore
+
+### Current gap
+
+Local evidence verification, uploads/downloads, schema checks and recovery primitives exist. They must be integrated with live placement, replication, archive ownership, and bounded retention. An immutable digest is not proof that bytes survive the promised failures. Truncating a WAL or deleting an artifact because its immediate operation completed can invalidate later validation, historical inspection, retries, or disaster recovery.
+
+### Implementation instructions
+
+1. Bind artifact registration and validation eligibility to actual verified custody in the configured content domain. Preserve digest, size, schema, producer, manifest and authority. Verify upload completion before claiming the artifact is usable; retain failed upload state only within a bounded resumable contract.
+2. Connect custody obligations to placement and membership. Before promotion, movement cutover, eviction or retirement, establish the required independent durable copies. Track proof of custody and its applicable epoch instead of equating a transfer request with successful durable receipt.
+3. Finish schema/validator registry authority and versioning. A referenced validator or schema must retain its historical identity across upgrades. External validation reports may attach new audit artifacts; bound their upload, retention and authorization just like respondent evidence.
+4. Implement archive catalog, durable archive receipt/manifest, and checkpoint/log retirement boundaries. Retirement must depend on sufficient recoverable checkpoint plus ordered tail, required replicas/archives, and the oldest retained read/watch/request/validation obligation.
+5. Define and implement retention floors for managed operation receipts, cursors/deltas, history, artifacts, tombstones and deduplication. Floor advancement must be authoritative and monotonic. A reclaimed request receipt cannot be treated as proof of non-execution. Retire domain objects only when terminal-and-released conditions and all outstanding obligations allow it; terminal status by itself is insufficient. Preserve exact archived identities and historical outcomes so cold retrieval and retry do not require executing historical validators again.
+6. Add bounded garbage collection and reconciliation. Handle orphaned partial uploads, interrupted transfers, stale custody declarations, unreachable content, expired pins and abandoned movement copies without deleting content still reachable from a retained testament, report, checkpoint or archive. Include active uploads, snapshots, completion grants, unfinished retirement, and restore operations in the protection set; exercise archive outages and cold proof retrieval after eviction/restart.
+7. Implement coherent online checkpoints and backups at a declared prefix. A backup includes domain state, content inventory/bytes or verifiable custody references, ancillary metadata, authority/format information and enough tail to recover that prefix. A collection of independently copied files is not automatically a coherent backup.
+8. Implement restore verification before serving. Check hashes, ordering, versions, content availability, membership/identity assumptions and decoder floors. If the source cannot be fenced, create an explicit recovery incarnation rather than claiming uninterrupted authority for two offline copies.
+9. Make retention policy, actual oldest retained prefix, storage pressure, repair progress and recoverability visible to operators. Refuse new work honestly when resources are exhausted rather than acknowledging memory-only writes or deleting required history.
+
+**Close R8 when:** a sustained workload with bounded memory/disk exercises append, checkpoint, archive, transfer, retirement and GC; retained evidence and operation outcomes remain readable; corrupt/missing archives or artifacts are detected before unsafe activation; backup and restore reproduce an explicitly stated prefix and content inventory under crashes and interrupted uploads.
+
+## 14. R9 — Deliver stepped deployment and complete operations
+
+The progression in [08](archictecutre/08-stepped-complexity-and-deployment.md) is a product acceptance condition. Stages are documentation milestones over one implementation, not runtime modes that change semantics. Bare-metal deployments can span zones and regions without Kubernetes. Adding Kubernetes must not be represented as adding database durability by itself.
+
+| Stage | Minimal new operator input/concept | Required implemented result and demonstration |
+|---|---|---|
+| Laptop | A durable workspace; optional data directory | Prebuilt `focal start`, local identity/discovery and protected access, disk durability, useful explain/status, two-party workflow and restart with no network/configuration requirement |
+| VMs/bare metal | Reachable endpoints, secure invitations, desired node-failure tolerance | Authenticated join, derived application placement/voter count, custody readiness, stronger guarantee only after committed readiness; no manual shard or mesh configuration |
+| Kubernetes | Namespace, usable persistent storage and deployment access | Generated/packaged manifests, stable identity/storage association, resource requests and disruption handling; restart/rescheduling preserves authority and history |
+| Multiple AZs | Verified zone facts and tolerated zone failures | Placement and artifact copies span independent zones; plan identifies insufficient capacity; actual zone loss meets the selected guarantee |
+| Multiple regions | Geography, residency, eligible home regions and region-failure/latency choices | Real regional routing, custody placement, failover and recovery; explain the actual remote-commit tradeoff and degraded state |
+| Global fleet | Tenant/workload policies and resource allocations where they differ | Partitioned directory/control operation, bounded routing, hot-range placement and isolation; global operation without a global total order or promises of unlimited throughput for one hot session |
+
+### Implementation instructions
+
+1. Finish a single typed versioned configuration schema with clear ownership. Node-local facts can use startup overrides; committed durability/residency intent changes through plan/apply. Unknown keys fail with their full path. Omitted update fields retain committed values rather than resetting to creation defaults.
+2. Implement `deployment plan`, `apply`, and `explain` against the real control-plane actions from R6–R8. A plan binds to a known state/version and describes required capacity, transfers, authority changes and effective guarantees. Apply is idempotent, resumable and rejects stale/invalid plans without hiding partially completed work.
+3. Complete authenticated node drain, remove/replace, credential renewal/rotation/revocation, repair, backup/restore and rolling-upgrade operations through shared operator APIs. Long operations expose durable progress and resume identities.
+4. Implement the geographic placement executor, not only a solver. Enforce residency over WAL replicas, artifacts, checkpoints, archives and derived persistent copies. Disallowed data must not be copied temporarily to an otherwise convenient region.
+5. Distinguish desired protection from currently achieved protection. Track planned, preparing and active guarantee transitions against trusted topology and the enumerated failure sets. Network partitions, lost zones, stale custody and insufficient replicas must be visible. Do not acknowledge stronger durability before the selected commit/custody conditions hold or silently substitute asynchronous replication for a synchronous guarantee. Include independent metadata, credential and object-store failures, plus fenced regional rejoin, in the recovery design.
+6. Complete operational metrics and bounded diagnostics: admission/refusal reasons, completion-reserve pressure, WAL/checkpoint lag, commit/apply latency, custody health, retention floors, cursor gaps, movement, credential state, and effective placement. Avoid unbounded high-cardinality per-object labels.
+7. Ship service supervision and Kubernetes packaging with persistent storage, identity, shutdown, health/readiness, upgrades and disruption behavior appropriate to the platform. Supply usable containers/manifests and optional packaging conveniences without requiring a Kubernetes operator/CRD to introduce new ledger concepts. A readiness probe must not claim write authority solely because the process is listening.
+8. Write and execute runbooks for disk exhaustion, corrupt/missing content, stalled replication, node/zone/region loss, stale clones, failed movement, expired credentials and interrupted upgrade/restore. Record recovery limits and which guarantees were tested.
+9. Measure the configuration and concepts introduced at each step. If normal setup requires a user to reason about internal consensus/range machinery, fix the product flow rather than merely documenting the complexity.
+
+**Close R9 when:** all six journeys run using the released interface and retain prior domain semantics/history. Each adds only the required new inputs, demonstrates the claimed failures, and produces an inspectable effective guarantee. A generated YAML file or a plan printed without executing placement is not completion.
+
+## 15. R10 — Finish prebuilt binary distribution and native Windows support
+
+### Existing release work
+
+The repository has a release workflow, platform catalog, packaging/inspection scripts and smoke tooling. The current catalog covers macOS arm64/x64 and Linux glibc/musl arm64/x64. This handoff does not establish that a complete qualified release is published or that every platform lane has executed successfully.
+
+Use [20 — Binary distribution](archictecutre/20-binary-distribution.md), [.github release workflow](../.github/workflows/release.yml), and [release scripts](../scripts/release/README.md). Do not replace the user's binary requirement with installation-from-source instructions.
+
+### Implementation instructions
+
+1. Deliver one prebuilt `focal` binary per supported target with server, CLI and MCP roles. Publish accurate supported OS/architecture/libc baselines, archive names, version output and checksums. Verify the catalog, build matrix, archive inspector and documentation agree atomically.
+2. Execute native server/client/MCP smoke tests on the promised targets. Cross-compilation alone is insufficient for filesystem durability, local transport, process behavior or installation claims. Clearly record any lane not executed.
+3. Finish Windows as a real platform port. Implement protected filesystem creation and access using appropriate SID/DACL ownership, reparse-point/hard-link defenses, exclusive locks, rename/replace semantics, and durable flush behavior. Choose safe maintained APIs compatible with the project's unsafe-code policy; do not scatter platform stubs through business logic.
+4. Implement authenticated same-user local Windows communication, such as named pipes with correct access control, using the existing typed protocol boundary. Do not silently replace protected local transport with unauthenticated TCP.
+5. Implement Windows data/discovery paths, Unicode and long-path handling, process cancellation/shutdown, lock cleanup, atomic operation-journal updates, WAL/checkpoint recovery and evidence transfer. Validate MSVC x64 and arm64 targets under the declared support contract; do not add nominal catalog entries without runnable artifacts.
+6. Qualify the existing Unix platforms to their declared minimum baselines, including musl artifacts' runtime assumptions. Check dynamic dependencies and required native libraries; packaging must not accidentally require development tools on the user's machine.
+7. Provide clean-machine installation/download instructions and executable examples. A user must be able to start the server, use the client, configure MCP, submit/read evidence and restart using only the distributed artifact and ordinary OS facilities.
+8. Finish release integrity/provenance, dependency notices/licenses, checksum verification and applicable signing/notarization. Checksums establish artifact integrity relative to the published manifest; they are not equivalent to a signing identity. Record the actual release controls used.
+9. Qualify upgrades from a previously released supported artifact, including data format floor behavior, rollback refusal after incompatible activation, operation journals, identity and content preservation. Keep source-build instructions in contributor documentation.
+
+**Close R10 when:** the supported target catalog corresponds to actual inspected artifacts; native platform tests and clean-machine install/upgrade journeys pass; server and client require no source toolchain; Windows is implemented and tested rather than documented as future support; the README links to the actual distribution and states the tested support boundary.
+
+## 16. R11 — Qualify correctness, performance, scale, and documentation
+
+### Correctness and failure qualification
+
+1. Extend black-box history checking across the real service transports and multiple clients. Check committed ordering, exact retry, authorized lifecycle transitions, derived acceptance, and linearizable reads where promised. Component state assertions alone cannot detect every lost response, double publication, or routing error.
+2. Execute a crash-cut matrix around proposal, WAL append/flush, committed delivery, partial apply, checkpoint installation, activation, cursor/request-floor updates, movement, archive receipt and retirement. Verify a committed operation cannot disappear and an uncommitted operation is not falsely advertised as durable.
+3. Exercise malformed/truncated/oversized wire documents, recursive structures, cumulative allocation/work limits, invalid identity/signatures, stale generations, schema/digest mismatches, corrupted WAL/checkpoints and recovery input. Reject before unbounded allocation or publication.
+4. Exercise long-running mixed faults: slow disks, exhausted memory/disk, disconnected peers, leader churn, duplicate/out-of-order messages, expired credentials, missing custody, tenant overload, moving ranges and retained readers. Verify fairness and bounded retained state.
+5. Run strict production no-panic/unsafe/ownership checks on the final batch and inspect new sharing manually. Lint success alone does not prove panic-freedom in every dependency or correctness of resource accounting; document the tested dependency boundary and handled errors.
+
+### Performance and scale qualification
+
+1. Define reproducible workload shapes before making performance claims: active sessions, claims and evidence per session, object sizes, dependency fan-out, validation modes, request rates, read/write ratios, retention and geographic placement. Record hardware, disks, network, build profile and configuration.
+2. Measure end-to-end latency distributions, throughput, CPU, allocation/copy cost, resident memory, durable disk growth, checkpoint/recovery time, custody bandwidth, and control-plane convergence. Include saturated and degraded conditions, not only an empty in-memory reducer benchmark.
+3. Distinguish one-session ordering limits from fleet scaling across sessions/ranges. Measure hot-range handling and noisy-tenant isolation. Do not imply that adding global nodes increases the throughput of an inherently serialized hot session without evidence.
+4. Demonstrate sustained bounds: memory and disk stabilize under the declared retention/admission policy; completion traffic progresses under ordinary admission pressure; movement and snapshots do not exceed budget; restart time is measured at realistic retained sizes.
+5. Qualify each failure objective with actual placement and custody. Specify measured RPO/RTO and latency/cost tradeoffs rather than inventing universal numbers. Multi-region deployment is not automatically region-loss durability.
+6. The phrase “Meta scale” is a target requiring a concrete workload/capacity envelope and evidence. Record what was measured, what was simulated, and what remains an extrapolation. Do not close the global objective on a small multi-node test.
+
+### Product documentation
+
+1. Rewrite status claims against delivered interfaces after each coherent milestone. The README must explain what Focal does, why participants use it, how it works, binary installation, a complete runnable example, and the actual support/qualification boundary.
+2. Use a clear two-party sequence for the primary workflow: claimant issues/posts; respondent receives and attempts work externally; respondent supplies artifacts and explicit success/failure testament; claimant/evaluator checks exact evidence; ledger records reports and derives status. Show failed testimony as a normal evidence-bearing branch. Do not use a vertical state chain that implies receipt generates testimony.
+3. Explain independent lifecycles separately from the two-party communication flow. A relationship between objects does not require synchronous movement through every object's state. Keep exact transition/authority tables in document 17 and practical examples in the manual.
+4. Update CLI help, schemas, examples, MCP guide, skills, deployment docs, release docs and the implementation record from the same completed operation surface. Label planned commands as planned until executable; remove stale claims that completed native components are absent without claiming their missing integration is complete.
+5. Preserve imported references and their hashes. Record deliberate source conflict resolutions in Focal-owned documents instead of editing the Hecate snapshot.
+
+**Close R11 when:** the acceptance evidence covers the delivered scope on the actual final source/artifacts; observed limits and unresolved risks are explicit; all P00–P20 gates have evidence; public documentation accurately describes what users can install and run. Test totals, source line count and another reset are not completion metrics.
+
+## 17. Mandatory end-to-end acceptance scenarios
+
+These scenarios specify the first usable product milestone and the later integration evidence. Implement them through the running service and real CLI/MCP adapters where indicated. Reuse component tests for internal invariants, but do not substitute direct owner calls for the requested user experience.
+
+### A1 — Successful two-party request
+
+- Start from a prebuilt/local development binary with a durable data directory and two authenticated participant identities.
+- The claimant submits authored acceptance requirements and posts the claim to the respondent. Reading/receiving the claim must not create a testament.
+- The respondent acquires the proper receipt, performs the work outside Focal, registers/uploads actual artifacts, and explicitly supplies and posts its closing testament with the exact manifest.
+- The claimant acknowledges delivery and the designated evaluator obtains a coherent context, runs its external check, and submits a report bound to the correct evidence/phase/attempt.
+- The ledger derives acceptance only after declared requirements and dependencies hold. Both participants inspect who did what and which bytes passed.
+- Restart and retrieve the same identities, history, manifests, outcomes and derived state. Execute once through human CLI operations and once through MCP operations.
+
+### A2 — Failed respondent work remains inspectable evidence
+
+- Repeat A1 with work that fails or errors. Upload the actual diagnostic artifact and author a failed/errored testament rather than omitting testimony or replacing it with server-generated success.
+- Verify claimant/evaluator access to the diagnostic bytes and exact report target. Successful recording of failed work must not mark the original requirements satisfied.
+- Distinguish work failure from an evaluator failing to execute. Preserve both histories across restart and lost replies.
+- For a challenge, exercise an authorized evidence-backed corrective claim; for a consult, exercise an ordinary follow-up consult. Ensure neither appears merely because time elapsed.
+
+### A3 — Independent lifecycle ordering and repeated evaluation
+
+- Register evidence independently; exercise multiple response cycles and legal delivery/evaluation orders from document 17.
+- Test Admission, Increment and WholeWork paths, agentic-only declarations, declared programmatic-to-quality gating, evaluator Error followed by retry, late reports after sealing, and alternative response eligibility.
+- Check receipt adoption, stale-generation refusal, claimant audit/result testimony, cancellation, scope release, dependency changes, deadlock resolution and trusted deadlines.
+- Assert no automatic shared-state transition hides an error artifact, retroactively changes an old verdict, reopens a sealed target incorrectly, or accepts evidence from the wrong manifest.
+
+### A4 — Lost replies, concurrency, and resource pressure
+
+- Use concurrent CLI/MCP clients and durable request streams. Lose replies before/after commitment; cancel a transport request; restart client and server; reconcile the exact operation.
+- Exhaust unrelated proposal capacity while retrying a committed or retained-pending operation. Its outcome/ticket must remain discoverable and its bytes unchanged.
+- Hold read pins, partially apply committed output, overlap checkpointing, and pressure completion budgets. Verify bounded memory, retained progress, correct refund/drop behavior and no duplicate logical effects.
+
+### A5 — Replication and authority change
+
+- Run at least three actual durable consensus nodes. Kill the leader before commit, after commit but before reply, and while committed output is only partly applied.
+- Exercise matching pending-head publication, follower replay, conflicting speculative replacement, new-term producer range, snapshot catch-up and concurrent correlated ReadIndex.
+- Verify only proven authority serves the promised reads/writes and no role-change shortcut loses an unresolved operation.
+
+### A6 — Migration and complete recovery
+
+- Start with populated V1 history including pending managed requests, receipts, cursors, deltas and placement/membership state.
+- Exercise explicit activation/migration and crashes at its durable boundaries; reject unsupported decoders and invalid imported metadata.
+- Restore a coherent native checkpoint plus tail and required artifacts. Verify old identities/hashes, request outcomes, cursor behavior, authority floors and current derived state.
+
+### A7 — Movement, retention and geographic operation
+
+- Run the same business workflows during range movement, node drain, archive/retirement, restore, and zone/region disruption.
+- Verify the effective guarantee and residency of every durable copy, stable operation identity, cursor continuity/resync, complete evidence custody and one authoritative owner.
+- Run the six deployment journeys and record the exact new configuration/concepts and measured outcomes at each step.
+
+## 18. Complete P00–P20 traceability
+
+This table prevents the immediate native/CLI milestone from silently replacing the original full objective. Existing partial implementation remains valuable; each row describes the remaining integration or qualification obligation, not an instruction to rebuild the entire package.
+
+| Original package | Remaining obligation | Handoff packages |
+|---|---|---|
+| P00 — Workspace/contracts/harness | Qualify the final native workspace, CI/platform lanes, frozen registries and release/dependency records | R0, R10, R11 |
+| P01 — Typed domain/identity | Complete bounded malformed-input handling, service identity/authority integration, full disposition and authored wire parity | R3, R4, R11 |
+| P02 — State machine/admission | Integrate independent native lifecycles durably; preserve migration semantics and exhaustive authority/transition accounting | R1–R4 |
+| P03 — Memory graph/indexes/views | Integrate persistent publication paths, bounded reads/pins and actual production memory/recovery behavior | R1, R4, R7, R11 |
+| P04 — WAL/recovery | Finish native Session, full crash-cut qualification, online checkpoint and sustained pressure behavior | R1–R3, R8, R11 |
+| P05 — Evidence/testaments/validators | Integrate verified custody, declarations/registry, external peer reports, placement and retention; no daemon execution | R4, R5, R8 |
+| P06 — Graph/parked work/lifecycle | Complete service exposure of standing, child causes, waits, continuation/adoption and trusted timer effects | R2, R4, R5 |
+| P07 — Protocol/client/subscriptions | Complete native authenticated operations, bounded queries/cursors, stream recovery and transport conformance | R3, R4, R11 |
+| P08 — Replication/membership | Finish application group placement/promotion and committed capability transitions; qualify authority changes | R2, R3, R6 |
+| P09 — Directory/tenancy/fleet | Execute evidence-backed scheduling, authority refresh, committed assignment recovery and resource admission | R6, R9 |
+| P10 — Parallel apply | Integrate persistent workers, access auditing, deterministic fallback and measured native execution | R7, R11 |
+| P11 — Ranges/movement | Execute cross-range effects, transfer barriers, cutover/recovery, routing and cursor continuity | R7 |
+| P12 — Archive/bounded operation | Complete archive catalog, retirement/dedup floors, GC, coherent backup/restore and sustained bounds | R8, R11 |
+| P13 — Geography/global placement | Execute regional placement/custody/residency/failover and qualify real partitions/disaster recovery | R6–R9, R11 |
+| P14 — Correctness/capacity | Black-box histories, full fault matrix, sustained realistic workloads and measured capacity envelope | R11 |
+| P15 — Operations/release | Complete plan/apply/drain/credentials/backup/restore/upgrade, metrics, packaging, binaries and runbooks | R9–R11 |
+| P16 — Stepped complexity | Execute all six minimal-concept deployment journeys over the same history and API | R9, R11 |
+| P17 — Shared typed operations | Native operation/query coverage, complete stream lifecycle, exact retry and narrow child-cause authority | R3, R4 |
+| P18 — Human CLI | Complete intuitive native workflows, all optional-filter lists, result/recovery behavior and operator commands | R4, R5, R9, R10 |
+| P19 — MCP/skills | Complete shared tools/capabilities, durable identity, external interoperability and executable workflow skills | R4, R5, R11 |
+| P20 — Challenge/consult | Proof-bearing response, authorized corrective/follow-up policy, continuation and two-party fault qualification | R5, R11 |
+
+## 19. Instructions for the next implementation agent
+
+1. Begin with R0–R2 as one connected implementation batch. Read the current unfinished files and this handoff, retain the already implemented Core/replay machinery, and finish the actual durable composition. Do not spend another batch merely restating the architecture or adding empty interfaces.
+2. Keep the critical path visible: native durable Session → service/shared operation integration → real CLI/MCP two-party workflows. In parallel, bounded independent work can address Windows/platform adapters or control-plane execution without changing the same core files.
+3. Assign explicit file ownership when delegating. Shared owner/Session/codec interfaces must have one coordinating implementation owner. Reconcile APIs before merging dependent edits; an agent reporting its source files written is not proof the combined tree works.
+4. Complete a coherent functionality set, then run the relevant consolidated verification. Do not rerun the whole suite after every small edit. Repeat or broaden checks when a concrete failure, new modification, or unresolved concern requires it. Documentation-only edits do not justify Cargo suites.
+5. Record the exact source/artifact state, commands, platform, results and limits for each completed gate. Separate evidence of source implementation, passing component checks, actual service integration, and released/platform-tested behavior. Never use the last good result to qualify newer edits.
+6. If an implementation decision remains open, record its alternatives, chosen invariant, compatibility effect and acceptance test. Known decisions still needing concrete resolution include the single Session decoder identity, complete ancillary migration envelope, large online checkpoint transfer, end-to-end completion resource promises, Windows safe platform APIs, and measurable global workload/SLO inputs.
+7. Keep the user's full objective active until P00–P20 and the required platform/deployment gates are actually delivered. A successful laptop demonstration is an important milestone, not permission to declare the distributed system complete.
+
+The next meaningful progress report should name a completed observable gate, the evidence for it, and the remaining gates. It should not substitute more test counts, new abstractions, or an unsupported completion estimate for delivered functionality.

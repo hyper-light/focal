@@ -12,17 +12,33 @@ use zeroize::Zeroizing;
 pub(crate) struct PrivateDirectory {
     path: PathBuf,
     _lock: File,
+    /// A shared owner reads beside other readers and never writes; a writer
+    /// holds the directory exclusively.
+    shared: bool,
 }
 impl PrivateDirectory {
     pub(crate) fn open(path: &Path) -> Result<Self, EnrollmentError> {
+        Self::open_with(path, false)
+    }
+    /// Open an existing directory for reading beside other readers. Concurrent
+    /// processes of one participant (a human CLI beside its MCP adapter, or
+    /// several CLI invocations) read the same credentials; any writer still
+    /// excludes them all and is excluded by them.
+    pub(crate) fn open_shared(path: &Path) -> Result<Self, EnrollmentError> {
+        Self::open_with(path, true)
+    }
+    fn open_with(path: &Path, shared: bool) -> Result<Self, EnrollmentError> {
         #[cfg(not(unix))]
         {
-            let _ = path;
+            let _ = (path, shared);
             Err(EnrollmentError::Permissions)
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+            if shared && !path.exists() {
+                return Err(EnrollmentError::Invalid);
+            }
             if !path.exists() {
                 // Require an existing deployment-owned parent; do not create a
                 // chain of private directories with ambiguous owner permissions.
@@ -46,18 +62,26 @@ impl PrivateDirectory {
                 .mode(0o600)
                 .open(&lock_path)?;
             check_file(&lock_path, metadata.uid())?;
-            lock.try_lock_exclusive().map_err(|error| {
+            let acquired = if shared {
+                FileExt::try_lock_shared(&lock)
+            } else {
+                FileExt::try_lock_exclusive(&lock)
+            };
+            acquired.map_err(|error| {
                 if error.kind() == std::io::ErrorKind::WouldBlock {
                     EnrollmentError::Locked
                 } else {
                     error.into()
                 }
             })?;
-            lock.sync_all()?;
-            File::open(path)?.sync_all()?;
+            if !shared {
+                lock.sync_all()?;
+                File::open(path)?.sync_all()?;
+            }
             Ok(Self {
                 path: path.to_path_buf(),
                 _lock: lock,
+                shared,
             })
         }
     }
@@ -108,6 +132,9 @@ impl PrivateDirectory {
         )))
     }
     pub(crate) fn install_new(&self, name: &str, payload: &[u8]) -> Result<(), EnrollmentError> {
+        if self.shared {
+            return Err(EnrollmentError::Locked);
+        }
         let path = self.path.join(name);
         if path.exists() {
             return Err(EnrollmentError::Conflict);
@@ -115,6 +142,9 @@ impl PrivateDirectory {
         self.install(name, payload)
     }
     pub(crate) fn replace(&self, name: &str, payload: &[u8]) -> Result<(), EnrollmentError> {
+        if self.shared {
+            return Err(EnrollmentError::Locked);
+        }
         // Validate existing state and its initialization marker before replacing
         // it; missing/corrupt private retry state is never silently reset.
         let _ = self.read(name)?;

@@ -51,11 +51,40 @@ fn success(root: &Path, args: &[&str]) -> (Value, Output) {
     (serde_json::from_slice(&output.stdout).unwrap(), output)
 }
 fn address() -> String {
-    UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .to_string()
+    // A port above the ephemeral range is never handed to another process's
+    // unbound socket between this probe and the node's own bind, which may be
+    // seconds later on a loaded machine; the per-process registry keeps the
+    // tests of this binary apart, and both protocols are probed so a colliding
+    // TCP listener is skipped as well.
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicU32, Ordering},
+    };
+    static TAKEN: Mutex<std::collections::BTreeSet<u16>> =
+        Mutex::new(std::collections::BTreeSet::new());
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    const FIRST: u32 = 24_000;
+    const COUNT: u32 = 8_000;
+    let seed = std::process::id().wrapping_mul(2_654_435_761)
+        ^ std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.subsec_nanos())
+            .unwrap_or(0);
+    let _ = NEXT.compare_exchange(0, seed.max(1), Ordering::Relaxed, Ordering::Relaxed);
+    for _ in 0..COUNT {
+        let port = (FIRST + NEXT.fetch_add(1, Ordering::Relaxed) % COUNT) as u16;
+        let mut taken = TAKEN.lock().unwrap();
+        if taken.contains(&port) {
+            continue;
+        }
+        let free = UdpSocket::bind(("127.0.0.1", port)).is_ok()
+            && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok();
+        if free {
+            taken.insert(port);
+            return format!("127.0.0.1:{port}");
+        }
+    }
+    panic!("no free loopback port for the network tests")
 }
 fn start(root: &Path, address: Option<&str>) -> (Server, Value) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
@@ -89,10 +118,32 @@ fn start(root: &Path, address: Option<&str>) -> (Server, Value) {
             }
         }
     });
-    let server = Server(child);
+    let mut server = Server(child);
     let status = receive
         .recv_timeout(Duration::from_secs(25))
-        .expect("network process did not report startup");
+        .unwrap_or_else(|error| {
+            let exit = server.0.try_wait();
+            let holders = Command::new("lsof")
+                .args(["-nP", "-iUDP", "-iTCP"])
+                .output()
+                .map(|output| {
+                    String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .filter(|line| {
+                            line.rsplit(':')
+                                .next()
+                                .and_then(|port| port.split(' ').next()?.parse::<u32>().ok())
+                                .is_some_and(|port| (24_000..32_000).contains(&port))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            panic!(
+                "network process did not report startup ({error}; data dir {}, advertise {address:?}, exit {exit:?}); sockets in the test range:\n{holders}",
+                root.display()
+            )
+        });
     assert!(
         matches!(status["condition"].as_str(), Some("Ready" | "CatchingUp")),
         "{status}"

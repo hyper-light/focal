@@ -16,8 +16,14 @@
 mod reconciliation;
 mod request_streams;
 pub use request_streams::{ManagedError, RequestStreamLimits, RequestStreamReadView};
-mod session;
+pub mod native_checkpoint;
 pub mod native_session;
+pub use native_session::{
+    FailureClass, NativeCommit, NativeReadBoundary, NativeSessionError, NativeSessionLimits,
+    NativeSubmission, NativeTimerInput, ReadCorrelation,
+};
+mod session;
+pub use focal_core::native::NativeContentProfile;
 pub use focal_core::{Core, State};
 pub use focal_model::*;
 pub use reconciliation::ReconciliationView;

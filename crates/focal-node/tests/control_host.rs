@@ -42,6 +42,9 @@ impl AuthorityVerifier for RejectUnverifiedEvidence {
     fn verify_replica_ready(&self, _: &ReplicaReady) -> Result<(), DirectoryError> {
         Err(DirectoryError::UnverifiedAuthority)
     }
+    fn verify_custody(&self, _: &CustodyProof) -> Result<(), DirectoryError> {
+        Err(DirectoryError::UnverifiedAuthority)
+    }
     fn verify_delegation(&self, _: &DelegationFence) -> Result<(), DirectoryError> {
         Err(DirectoryError::UnverifiedAuthority)
     }
@@ -62,6 +65,27 @@ fn peer(role: PeerRole) -> AuthenticatedPeer {
 }
 fn budget() -> MemoryBudget {
     MemoryBudget::new(256 * 1024 * 1024, 64 * 1024 * 1024).unwrap()
+}
+/// Holds the entire remaining allowance. The host's own tick may take or
+/// release bytes between a statistics read and a reservation, so exhaustion is
+/// reached by reserving until even one byte is refused rather than by trusting
+/// a single snapshot.
+fn exhaust(memory: &MemoryBudget) -> Vec<focal_memory::Allocation> {
+    let mut held = Vec::new();
+    for _ in 0..64 {
+        let stats = memory.stats();
+        let remaining = stats.limit.saturating_sub(stats.used).max(1);
+        match memory.reserve(
+            focal_memory::BudgetKind::Control,
+            focal_memory::BudgetLane::Completion,
+            remaining,
+        ) {
+            Ok(reservation) => held.push(reservation.commit()),
+            Err(_) if remaining == 1 => return held,
+            Err(_) => {}
+        }
+    }
+    panic!("the control budget never reached exhaustion")
 }
 fn now() -> i64 {
     SystemTime::now()
@@ -834,14 +858,7 @@ async fn follower_root_observation_exports_one_durable_prefix_and_retains_delive
         Err(ControlFailure::NotLeader { .. })
     ));
     let before = memory.stats();
-    let exhausted = memory
-        .reserve(
-            focal_memory::BudgetKind::Control,
-            focal_memory::BudgetLane::Completion,
-            before.limit - before.used,
-        )
-        .unwrap()
-        .commit();
+    let exhausted = exhaust(&memory);
     assert!(matches!(
         host.observe_root().await,
         Err(ControlFailure::Capacity)

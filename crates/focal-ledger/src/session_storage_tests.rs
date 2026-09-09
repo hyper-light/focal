@@ -310,7 +310,7 @@ fn original_ss1_through_ss5_restore_replay_tail_and_reject_suffixes_without_publ
             .unwrap();
         let expected_core = fixture(&format!("live-ss{}.core", version.max(3)));
         assert_eq!(session.core.encode_checkpoint().unwrap(), expected_core);
-        let before = durable_session_v1::snapshot(&session, &expected_core).unwrap();
+        let before = durable_session_v1::snapshot(&session, &expected_core, None).unwrap();
         let malformed = fixture(&format!("reader-ss{version}-trailing.bin"));
         assert!(matches!(
             session.restore_snapshot(&malformed, index, term, &configuration),
@@ -318,7 +318,7 @@ fn original_ss1_through_ss5_restore_replay_tail_and_reject_suffixes_without_publ
         ));
         assert_eq!(session.core.encode_checkpoint().unwrap(), expected_core);
         assert_eq!(
-            durable_session_v1::snapshot(&session, &expected_core).unwrap(),
+            durable_session_v1::snapshot(&session, &expected_core, None).unwrap(),
             before
         );
         session.audit_graph().unwrap();
@@ -449,11 +449,20 @@ fn exact_metadata_readers_reject_committed_suffix_before_application_publication
                     ManagedSubmission::Pending(_)
                 ));
             } else {
+                // The second slot presents the registry watermark (one).
+                let RequestStreamState::Vacant { generation, .. } = session
+                    .request_streams
+                    .state(ParticipantId::from_u128(1), 1)
+                    .unwrap()
+                else {
+                    panic!("slot 1 is not vacant")
+                };
+                assert_eq!(generation, 1);
                 let request = stream_control(
                     903,
                     RequestStreamCommand::Register {
                         slot: 1,
-                        expected_generation: 0,
+                        expected_generation: generation,
                         owner: RequestId::from_u128(904),
                         window: 4,
                     },
@@ -468,7 +477,7 @@ fn exact_metadata_readers_reject_committed_suffix_before_application_publication
         assert_eq!(events.committed.len(), 1);
         assert!(events.committed[0].data.starts_with(family));
         let core = session.core.encode_checkpoint().unwrap();
-        let before = durable_session_v1::snapshot(&session, &core).unwrap();
+        let before = durable_session_v1::snapshot(&session, &core, None).unwrap();
         events.committed[0].data.extend_from_slice(&[0xff, 0x80, 0]);
         assert!(matches!(
             session.apply_events(events),
@@ -476,7 +485,7 @@ fn exact_metadata_readers_reject_committed_suffix_before_application_publication
         ));
         assert_eq!(session.core.encode_checkpoint().unwrap(), core);
         assert_eq!(
-            durable_session_v1::snapshot(&session, &core).unwrap(),
+            durable_session_v1::snapshot(&session, &core, None).unwrap(),
             before
         );
         session.audit_graph().unwrap();
@@ -504,14 +513,14 @@ fn original_managed_cursor_size_fences_proposal_and_actual_committed_replay() {
         commit_managed(&mut session, &domain);
         let cursor: ManagedCursorInput = fixed("live-managed-cursor-input.bin");
         let core = session.core.encode_checkpoint().unwrap();
-        let before = durable_session_v1::snapshot(&session, &core).unwrap();
+        let before = durable_session_v1::snapshot(&session, &core, None).unwrap();
         session.limits.core.max_command_bytes = bytes.len() - 1;
         assert!(matches!(
             session.propose_managed_cursor(&cursor, false),
             Err(LedgerError::Capacity)
         ));
         assert_eq!(
-            durable_session_v1::snapshot(&session, &core).unwrap(),
+            durable_session_v1::snapshot(&session, &core, None).unwrap(),
             before
         );
         session.limits.core.max_command_bytes = bytes.len();
@@ -530,7 +539,7 @@ fn original_managed_cursor_size_fences_proposal_and_actual_committed_replay() {
         if replay_limit < bytes.len() {
             assert!(matches!(result, Err(LedgerError::Capacity)));
             assert_eq!(
-                durable_session_v1::snapshot(&session, &core).unwrap(),
+                durable_session_v1::snapshot(&session, &core, None).unwrap(),
                 before
             );
         } else {
@@ -587,13 +596,13 @@ fn original_delta_byte_budget_and_retention_cut_survive_snapshot_restore() {
         elect(&mut session);
         durable_managed_support(&mut session);
         let before_core = session.core.encode_checkpoint().unwrap();
-        let before = durable_session_v1::snapshot(&session, &before_core).unwrap();
+        let before = durable_session_v1::snapshot(&session, &before_core, None).unwrap();
         let result = session.restore_snapshot(&bytes, index, term, &configuration);
         if limit < total {
             assert!(matches!(result, Err(LedgerError::Capacity)));
             assert_eq!(session.core.encode_checkpoint().unwrap(), before_core);
             assert_eq!(
-                durable_session_v1::snapshot(&session, &before_core).unwrap(),
+                durable_session_v1::snapshot(&session, &before_core, None).unwrap(),
                 before
             );
         } else {

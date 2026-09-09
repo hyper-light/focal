@@ -188,7 +188,7 @@ pub(super) fn prepare(
         limits,
     )?;
     response_budget::work_limit(limits)?;
-    response_budget::check_increment_shape(increments::count(old, limits)?, limits)?;
+    response_budget::check_increment_shape(increments::count(old, limits)?, 0, limits)?;
     let stored = view
         .owned_claim(id)?
         .registrations()

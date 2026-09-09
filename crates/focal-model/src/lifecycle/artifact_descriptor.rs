@@ -182,6 +182,11 @@ pub struct ArtifactSpec<'a> {
     pub visibility: &'a [&'a str],
 }
 
+/// The most inputs one artifact may name (doc 21 §3, the authored schema's
+/// bound). Storage indexes every input, so this is also the bound on the
+/// index rows one artifact adds.
+pub const MAX_INPUTS: usize = 64;
+
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
     pub kind_bytes: usize,
@@ -191,6 +196,10 @@ pub struct Limits {
     pub visibility_labels: usize,
     pub visibility_label_bytes: usize,
     pub construction_bytes: usize,
+}
+
+impl Limits {
+    pub const MAX_INPUTS: usize = MAX_INPUTS;
 }
 
 #[derive(Debug, PartialEq, Eq)]

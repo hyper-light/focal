@@ -183,7 +183,9 @@ impl CompletionBook {
         let envelope = if let Some(limits) = self.record_buffers {
             recorded = envelope.with_record_buffers(limits)?;
             &recorded
-        } else { envelope };
+        } else {
+            envelope
+        };
         self.check_health()?;
         let Some((key, credit)) = respondent_state::read(view, claim, self.limits)? else {
             return Ok(Journal::empty());

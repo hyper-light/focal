@@ -21,6 +21,9 @@ pub const fn peer_command(command: &Command) -> bool {
 
 pub const fn participant_protocol(operation: &Operation) -> u16 {
     match operation {
+        Operation::Native { .. } | Operation::NativeRead(_) | Operation::NativeList(_) => {
+            crate::NATIVE_PROTOCOL_VERSION
+        }
         Operation::Submit { command, .. }
         | Operation::Managed {
             operation: ManagedOperation::Submit { command, .. },

@@ -190,14 +190,9 @@ impl CompletionEnvelope {
         graph.check_journal(original_events, limits)?;
         check_journal_visits(limits, parent, original_events)?;
         check_cohort_visits(limits, cohort, g, original_extras, original_events)?;
-        let changes = add(
-            add(add(g, original_events)?, add(original_extras, 2)?)?,
-            cohort.changed_keys(),
-        )?;
         let construction = ConstructionBudget::for_operation(NativeOperation::ReportWork, limits)?
             .with_cohort(cohort, limits)?;
-        construction.check_counts(g, add(original_extras, cohort.evaluations())?, events)?;
-        within(changes, limits.range.max_batch_entries)?;
+        let batch = limits.range.max_batch_entries;
         let response_heap = add(
             OwnedResponse::container_charge(),
             crate::native::response_owned::response_heap(response)?,
@@ -216,7 +211,45 @@ impl CompletionEnvelope {
         ]
         .into_iter()
         .try_fold(0, add)?;
-        let descriptor = capped_descriptor(limits, fixed, descriptor)?;
+        let mut descriptor = capped_descriptor(limits, fixed, descriptor)?;
+        // The report's artifact and verdict rows, and one status move per
+        // changed claim (doc 22 §7); the promised artifact cites no more
+        // inputs than leave room for those rows in one batch.
+        let moved = add(g, cohort.claims())?;
+        // The reported evaluation, every changed evaluation and every monitor
+        // release retires its due timer (doc 22 §7).
+        let timers = add(
+            1,
+            crate::native::index_rows::timer_rows(
+                0,
+                add(original_extras, cohort.evaluations())?,
+                original_events,
+            )?,
+        )?;
+        let fixed_rows = add(
+            add(add(g, original_events)?, add(original_extras, 2)?)?,
+            add(
+                cohort.changed_keys(),
+                add(add(4, add(moved, moved)?)?, timers)?,
+            )?,
+        )?;
+        descriptor.inputs = crate::native::index_rows::cap_inputs(
+            super::completion_envelope::input_bound(descriptor),
+            fixed_rows,
+            batch,
+        );
+        construction.check_counts(
+            g,
+            add(original_extras, cohort.evaluations())?,
+            events,
+            add(
+                crate::native::index_rows::report_rows(super::completion_envelope::input_bound(
+                    descriptor,
+                ))?,
+                add(add(moved, moved)?, timers)?,
+            )?
+            .min(batch),
+        )?;
         let dynamic = descriptor
             .construction_bytes
             .checked_sub(size_of::<ArtifactDescriptor>())
@@ -249,9 +282,23 @@ impl CompletionEnvelope {
         ] {
             within(bytes, entry)?;
         }
+        let changes = add(
+            add(add(g, original_events)?, add(original_extras, 2)?)?,
+            add(
+                cohort.changed_keys(),
+                add(
+                    crate::native::index_rows::report_rows(
+                        super::completion_envelope::input_bound(descriptor),
+                    )?,
+                    add(add(moved, moved)?, timers)?,
+                )?,
+            )?,
+        )?;
+        within(changes, batch)?;
         let ordinary_report = view.state.rows.future_write_envelope(RangeWriteLimits {
             changed_keys: changes,
-            deleted_keys: 0,
+            deleted_keys: add(moved, timers)?,
+            deleted_heap: 0,
             incoming_heap,
             input_capacity: changes,
         })?;
@@ -299,7 +346,12 @@ impl CompletionEnvelope {
                 outcomes: 1,
                 events,
                 sequences: 1,
-                new_rows: add(add(graph_charges.graph_events, 10)?, cohort.events())?,
+                new_rows: add(
+                    add(add(graph_charges.graph_events, 10)?, cohort.events())?,
+                    crate::native::index_rows::report_rows(
+                        super::completion_envelope::input_bound(descriptor),
+                    )?,
+                )?,
                 ..CompletionSlots::default()
             },
             failure: None,

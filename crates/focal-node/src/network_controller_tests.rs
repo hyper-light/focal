@@ -1,18 +1,22 @@
 use super::*;
 use crate::{config::Settings, network_bootstrap::FoundingNetwork};
 
-async fn founder(root: &std::path::Path) -> (NetworkState, EnrollmentReceipt) {
+async fn founder(root: &std::path::Path) -> (NetworkState, EnrollmentReceipt, CredentialMaterial) {
     let mut settings = Settings::default();
     settings.node.data_dir = Some(root.to_owned());
     settings.node.advertise = Some("127.0.0.1:45678".into());
     let network = FoundingNetwork::open(&settings).await.unwrap();
-    (network.state.clone(), network.receipt.clone())
+    (
+        network.state.clone(),
+        network.receipt.clone(),
+        network.credentials.clone(),
+    )
 }
 
 #[tokio::test]
 async fn admission_reopens_exact_request_and_rejects_lost_or_inconsistent_journal() {
     let directory = tempfile::tempdir().unwrap();
-    let (state, _) = founder(directory.path()).await;
+    let (state, _, _) = founder(directory.path()).await;
     let mut admission = RootAdmission::open(&state, directory.path()).unwrap();
     let pending = ControlRequest {
         id: ControlRequestId {
@@ -56,12 +60,13 @@ async fn admission_reopens_exact_request_and_rejects_lost_or_inconsistent_journa
 #[tokio::test]
 async fn controller_admission_precedes_private_journal_and_releases_on_drop() {
     let directory = tempfile::tempdir().unwrap();
-    let (state, receipt) = founder(directory.path()).await;
+    let (state, receipt, credentials) = founder(directory.path()).await;
     let small = MemoryBudget::new(1024 * 1024, 512 * 1024).unwrap();
     assert!(matches!(
         NetworkController::new(
             state.clone(),
             receipt.clone(),
+            credentials.clone(),
             directory.path().to_owned(),
             small.clone()
         ),
@@ -70,9 +75,14 @@ async fn controller_admission_precedes_private_journal_and_releases_on_drop() {
     assert_eq!(small.stats().used, 0);
     assert!(!directory.path().join("ROOT-ADMISSION.initialized").exists());
     let budget = MemoryBudget::new(128 * 1024 * 1024, 64 * 1024 * 1024).unwrap();
-    let controller =
-        NetworkController::new(state, receipt, directory.path().to_owned(), budget.clone())
-            .unwrap();
+    let controller = NetworkController::new(
+        state,
+        receipt,
+        credentials,
+        directory.path().to_owned(),
+        budget.clone(),
+    )
+    .unwrap();
     assert_eq!(budget.stats().used, 64 * 1024 * 1024);
     drop(controller);
     assert_eq!(budget.stats().used, 0);
@@ -81,7 +91,7 @@ async fn controller_admission_precedes_private_journal_and_releases_on_drop() {
 #[tokio::test]
 async fn grant_projection_removes_revoked_credentials_and_rejects_clock_before_floor() {
     let directory = tempfile::tempdir().unwrap();
-    let (state, receipt) = founder(directory.path()).await;
+    let (state, receipt, _credentials) = founder(directory.path()).await;
     let now = unix_time().unwrap();
     let mut enrollment = genesis_enrollment(&state).unwrap();
     let registry = PeerRegistry::new(4).unwrap();
@@ -118,7 +128,7 @@ async fn grant_projection_removes_revoked_credentials_and_rejects_clock_before_f
 #[tokio::test]
 async fn delayed_enrollment_authorization_cannot_restore_a_revoked_projection() {
     let directory = tempfile::tempdir().unwrap();
-    let (state, receipt) = founder(directory.path()).await;
+    let (state, receipt, _credentials) = founder(directory.path()).await;
     let registry = PeerRegistry::new(4).unwrap();
     let authorized = node_grant(state.node, receipt.identity.principal, &state);
     let fingerprint = registry
@@ -292,6 +302,7 @@ fn missing_timer_or_stopped_controller_clears_existing_ingress_grants() {
     let controller = NetworkController::new(
         network.state.clone(),
         network.receipt.clone(),
+        network.credentials.clone(),
         directory.path().to_owned(),
         controller_budget.clone(),
     )
@@ -305,7 +316,7 @@ fn missing_timer_or_stopped_controller_clears_existing_ingress_grants() {
     )
     .unwrap();
     assert!(matches!(
-        no_time.block_on(controller.run(&pool, &host, &registry)),
+        no_time.block_on(controller.run(&pool, &host, &registry, CredentialSwap::detached())),
         Err(ControllerError::Runtime)
     ));
     assert!(matches!(
@@ -330,12 +341,13 @@ fn missing_timer_or_stopped_controller_clears_existing_ingress_grants() {
     let controller = NetworkController::new(
         network.state,
         network.receipt,
+        network.credentials,
         directory.path().to_owned(),
         controller_budget.clone(),
     )
     .unwrap();
     assert!(matches!(
-        runtime.block_on(controller.run(&pool, &host, &registry)),
+        runtime.block_on(controller.run(&pool, &host, &registry, CredentialSwap::detached())),
         Err(ControllerError::Stopped)
     ));
     assert!(matches!(
@@ -393,11 +405,12 @@ async fn cancelling_controller_run_withdraws_live_and_unpolled_peer_projections(
     let controller = NetworkController::new(
         network.state.clone(),
         network.receipt.clone(),
+        network.credentials.clone(),
         directory.path().to_owned(),
         controller_budget.clone(),
     )
     .unwrap();
-    let mut running = Box::pin(controller.run(&pool, &host, &registry));
+    let mut running = Box::pin(controller.run(&pool, &host, &registry, CredentialSwap::detached()));
     tokio::select! {
         result = running.as_mut() => panic!("controller terminated before cancellation: {result:?}"),
         _ = async {
@@ -448,11 +461,12 @@ async fn cancelling_controller_run_withdraws_live_and_unpolled_peer_projections(
     let controller = NetworkController::new(
         network.state,
         network.receipt,
+        network.credentials,
         directory.path().to_owned(),
         controller_budget.clone(),
     )
     .unwrap();
-    let unpolled = controller.run(&pool, &host, &registry);
+    let unpolled = controller.run(&pool, &host, &registry, CredentialSwap::detached());
     assert!(registry.authenticate(fingerprint).is_ok());
     drop(unpolled);
     assert!(matches!(
@@ -477,6 +491,7 @@ async fn contact_announcement_reaches_alternate_after_blackholed_preferred_leade
     let mut controller = NetworkController::new(
         network.state.clone(),
         network.receipt.clone(),
+        network.credentials.clone(),
         directory.path().to_owned(),
         MemoryBudget::new(128 * 1024 * 1024, 64 * 1024 * 1024).unwrap(),
     )
@@ -594,7 +609,7 @@ async fn contact_announcement_reaches_alternate_after_blackholed_preferred_leade
     });
     tokio::pin!(serving);
     tokio::select! {
-        result = tokio::time::timeout(Duration::from_secs(5),controller.announce_remote(&pool,&request,99)) => {
+        result = tokio::time::timeout(Duration::from_secs(5),controller.announce_remote(&pool,&request,99,1)) => {
             result.expect("blackholed preferred leader starved the reachable alternate").unwrap();
         }
         result = &mut serving => panic!("test server ended before delivery: {result:?}"),
@@ -603,7 +618,7 @@ async fn contact_announcement_reaches_alternate_after_blackholed_preferred_leade
         .try_recv()
         .expect("reachable alternate was never invoked");
     assert_eq!(postcard::to_stdvec(&received).unwrap(), original);
-    assert!(check_contact_reply(ControlReply::Committed(receipt), &network.receipt).unwrap());
+    assert!(check_contact_reply(ControlReply::Committed(receipt), &network.receipt, 1).unwrap());
     assert_eq!(controller.contact_cursor, 100);
     assert!(matches!(
         delivered.try_recv(),

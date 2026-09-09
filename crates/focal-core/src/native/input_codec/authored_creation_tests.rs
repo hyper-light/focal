@@ -228,6 +228,7 @@ fn proposal(id: u128, change: Change) -> NativeAuthoredProposal {
             requirements: &requirements,
             slots: &slots,
             deadline: Some(deadline()),
+            policy: None,
         },
         limits().claim,
     )
@@ -582,6 +583,7 @@ fn final_native_capacity_inspection_prices_each_additional_scope_and_slot() {
             requirements: expanded.content.requirements(),
             slots: &slots,
             deadline: expanded.content.deadline(),
+            policy: None,
         },
         limits().claim,
     )

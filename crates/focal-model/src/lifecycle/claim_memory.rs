@@ -137,6 +137,7 @@ impl ClaimState {
         bytes::fits(responses.capacity(), capacity)?;
         responses.extend_from_slice(&self.responses);
         let copied = Self {
+            origin: self.origin,
             binding: self.binding,
             issuer: self.issuer,
             subject: self.subject,

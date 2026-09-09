@@ -48,7 +48,20 @@ pub(super) fn list(
         ListCommand::Testaments(args) => (ObjectKind::Testament, args),
         ListCommand::Artifacts(args) => (ObjectKind::Artifact, args),
         ListCommand::Validations(args) => (ObjectKind::Validation, args),
+        ListCommand::Evaluations(_)
+        | ListCommand::Receipts(_)
+        | ListCommand::Monitors(_)
+        | ListCommand::Events(_) => {
+            return Err(CliError::Input(
+                "this list family exists only on the native engine".into(),
+            ));
+        }
     };
+    if let Some(flag) = args.filters.native_only() {
+        return Err(CliError::Input(format!(
+            "{flag} is served only by the native engine"
+        )));
+    }
     let mut document = authored::filters(args.filters);
     document.cursor = args.cursor;
     document.limit = args.limit;
@@ -149,6 +162,11 @@ pub(super) fn get(
 ) -> Result<()> {
     let (token, object, format) = match command {
         GetCommand::Claim(args) => {
+            if let Some(flag) = args.filters.native_only() {
+                return Err(CliError::Input(format!(
+                    "{flag} is served only by the native engine"
+                )));
+            }
             let mut selector = authored::filters(args.filters);
             selector.limit = 2;
             let selection = selector.build_operation(ObjectKind::Claim, &context.build)?;

@@ -40,6 +40,8 @@ fn roots(certificates: Vec<Vec<u8>>) -> Result<rustls::RootCertStore, WireError>
 }
 // Quinn/rustls retain shared configurations across their internal connection
 // tasks; these Arc types are required by those libraries' public APIs.
+/// Longest silence before a QUIC connection is considered dead.
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 fn transport(limits: &WireLimits) -> Result<Arc<quinn::TransportConfig>, WireError> {
     limits.validate()?;
     let streams = limits
@@ -59,12 +61,13 @@ fn transport(limits: &WireLimits) -> Result<Arc<quinn::TransportConfig>, WireErr
     transport.stream_receive_window(frame.into());
     transport.receive_window(quinn::VarInt::from_u64(window).map_err(|_| WireError::Limit)?);
     transport.send_window(window);
-    transport.max_idle_timeout(Some(
-        limits
-            .request_timeout
-            .try_into()
-            .map_err(|_| WireError::Limit)?,
-    ));
+    // A peer that died or restarted is noticed within the idle bound rather
+    // than the full request timeout: keep-alive pings hold a healthy
+    // connection open across long requests, and a silent one is closed so
+    // the next attempt reconnects instead of waiting on a dead connection.
+    let idle = limits.request_timeout.min(IDLE_TIMEOUT);
+    transport.max_idle_timeout(Some(idle.try_into().map_err(|_| WireError::Limit)?));
+    transport.keep_alive_interval(Some(idle.checked_div(4).ok_or(WireError::Limit)?));
     Ok(Arc::new(transport))
 }
 
@@ -235,10 +238,11 @@ async fn serve_authenticated_connection_inner<H: RequestHandler + Clone>(
             .map_err(|_| WireError::Connection)?;
         let hello: Hello = read_frame(&mut recv, FrameKind::Hello, 4096).await?;
         require_end(&mut recv).await?;
-        let negotiated = match limits.negotiate_profiles(
+        let negotiated = match limits.negotiate_native(
             &hello,
             handler.supports_managed_requests(),
             handler.supports_participant_requests(),
+            handler.supports_native_requests(),
         ) {
             Ok(value) => value,
             Err(error) => {
@@ -356,10 +360,12 @@ async fn send_owned_response(
     Ok(())
 }
 
-#[derive(Clone)]
 pub struct QuicConnector {
     endpoint: Endpoint,
     limits: WireLimits,
+    /// The identity presented on every connection opened from now on; a
+    /// renewal replaces it without rebinding the endpoint.
+    tls: std::sync::RwLock<quinn::ClientConfig>,
 }
 impl QuicConnector {
     pub fn limits(&self) -> &WireLimits {
@@ -371,9 +377,18 @@ impl QuicConnector {
         limits: WireLimits,
     ) -> Result<Self, WireError> {
         limits.validate()?;
-        let mut endpoint = transport_setup(|| Ok(Endpoint::client(address)?))?;
-        endpoint.set_default_client_config(tls);
-        Ok(Self { endpoint, limits })
+        let endpoint = transport_setup(|| Ok(Endpoint::client(address)?))?;
+        Ok(Self {
+            endpoint,
+            limits,
+            tls: std::sync::RwLock::new(tls),
+        })
+    }
+    /// Present another client identity on every connection opened from now
+    /// on; connections already open keep the identity they were opened with.
+    pub fn replace_tls(&self, tls: quinn::ClientConfig) -> Result<(), WireError> {
+        *self.tls.write().map_err(|_| WireError::Connection)? = tls;
+        Ok(())
     }
     pub async fn connect(
         &self,
@@ -387,9 +402,10 @@ impl QuicConnector {
         address: SocketAddr,
         server_name: &str,
     ) -> Result<QuicRemote, WireError> {
+        let tls = self.tls.read().map_err(|_| WireError::Connection)?.clone();
         let connecting = self
             .endpoint
-            .connect(address, server_name)
+            .connect_with(tls, address, server_name)
             .map_err(|_| WireError::Connection)?;
         let connection = tokio::time::timeout(self.limits.request_timeout, connecting)
             .await
@@ -402,6 +418,7 @@ impl QuicConnector {
                 .map_err(|_| WireError::Connection)?;
             let hello = Hello {
                 versions: vec![
+                    crate::NATIVE_PROTOCOL_VERSION,
                     PEER_PROTOCOL_VERSION,
                     MANAGED_PROTOCOL_VERSION,
                     PROTOCOL_VERSION,
@@ -423,7 +440,10 @@ impl QuicConnector {
             .map_err(|_| WireError::Timeout)??;
         if !matches!(
             negotiated.protocol,
-            PROTOCOL_VERSION | MANAGED_PROTOCOL_VERSION | PEER_PROTOCOL_VERSION
+            PROTOCOL_VERSION
+                | MANAGED_PROTOCOL_VERSION
+                | PEER_PROTOCOL_VERSION
+                | crate::NATIVE_PROTOCOL_VERSION
         ) || negotiated.max_frame_bytes > self.limits.max_frame_bytes
             || negotiated.max_items > self.limits.max_items
         {

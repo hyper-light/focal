@@ -119,8 +119,12 @@ pub fn authorize_node_contact(
     certificate_fingerprint: [u8; 32],
     now: i64,
 ) -> Result<focal_enrollment::AssignedIdentity, ControlError> {
+    // A contact announced under a certificate a renewal since replaced stays
+    // authorized through the grace the sponsor decided; the node announces
+    // its renewed certificate meanwhile.
     let receipt = enrollment
         .enrollments()
+        .chain(enrollment.retired(now).map(|(receipt, _)| receipt))
         .find(|receipt| {
             receipt.identity.node_id == Some(node)
                 && receipt.identity.principal == principal
@@ -454,6 +458,12 @@ mod tests {
         fn verify_delegation(
             &self,
             _: &focal_directory::DelegationFence,
+        ) -> Result<(), focal_directory::DirectoryError> {
+            Err(focal_directory::DirectoryError::UnverifiedAuthority)
+        }
+        fn verify_custody(
+            &self,
+            _: &focal_directory::CustodyProof,
         ) -> Result<(), focal_directory::DirectoryError> {
             Err(focal_directory::DirectoryError::UnverifiedAuthority)
         }

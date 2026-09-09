@@ -12,6 +12,9 @@ pub struct CursorInput {
 /// Original durable outcome, retained even after this consumer advances again.
 /// Cursor revision orders metadata; domain_sequence names the domain prefix at
 /// which this Raft entry applied. Cursor commands do not consume SessionSeq.
+/// `domain_sequence` is the published end of the ledger's stream line when
+/// the entry applied (the domain sequence on a legacy ledger, 23 §6), so it
+/// bounds every position the receipt's record names.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CursorReceipt {
     pub ledger: LedgerId,
@@ -98,7 +101,7 @@ impl Session {
         ReplayBounds {
             ledger: self.ledger,
             floor: self.delta_floor.max(self.cursors.checkpoint().floor),
-            published: self.sequence(),
+            published: self.stream_published(),
         }
     }
 
@@ -336,11 +339,14 @@ impl Session {
         let _scratch =
             self.budget
                 .reserve(BudgetKind::Pending, BudgetLane::Completion, meta_bytes)?;
+        // Positions are validated against the stream line, not the legacy
+        // domain sequence; the receipt keeps naming the domain sequence.
+        let published = self.stream_published();
         let prepared = if committed {
             self.cursors
-                .prepare_committed(&input.command, self.sequence())?
+                .prepare_committed(&input.command, published)?
         } else {
-            self.cursors.prepare(&input.command, self.sequence())?
+            self.cursors.prepare(&input.command, published)?
         };
         // A lease clock advance can release projection pins, never protected pins.
         let receipt = CursorReceipt {
@@ -440,13 +446,19 @@ impl Session {
             };
             self.build_cursor_candidate(&envelope, digest, true)?
         };
+        // The receipt names the published end of the stream line at apply,
+        // computed identically on every replica (23 §6); the candidate's
+        // proposal-time value bounded the positions it validated.
+        let published = self.stream_published();
         candidate.receipt.raft_index = raft_index;
-        candidate
+        candidate.receipt.domain_sequence = published;
+        let stored = candidate
             .metadata
             .receipts
             .get_mut(&candidate.receipt.key)
-            .ok_or(LedgerError::Corrupt)?
-            .raft_index = raft_index;
+            .ok_or(LedgerError::Corrupt)?;
+        stored.raft_index = raft_index;
+        stored.domain_sequence = published;
         self.cursors.publish(candidate.prepared)?;
         self.cursor_meta = candidate.metadata;
         self.cursor_charge = candidate.metadata_charge;
@@ -517,11 +529,19 @@ impl Session {
         Ok(())
     }
     fn validate_replay_position(&self, position: Position) -> Result<(), StreamError> {
-        position.validate(self.ledger, self.sequence())?;
+        position.validate(self.ledger, self.stream_published())?;
         if position.retention_prefix() < self.stream_bounds().floor {
             return Err(StreamError::ResyncRequired(ResyncReason::HistoryExpired));
         }
         if let PositionOffset::Delta(ordinal) = position.offset {
+            if position.sequence > self.legacy_prefix() {
+                if !self.native_delta_exists(position, ordinal) {
+                    return Err(StreamError::Invalid(
+                        "delta cursor does not name a retained delta",
+                    ));
+                }
+                return Ok(());
+            }
             let index = self.deltas.partition_point(|d| {
                 (d.delta.id.sequence, d.delta.id.ordinal) < (position.sequence, ordinal)
             });
@@ -561,43 +581,7 @@ impl DeltaSource for Session {
         limit: ReplayLimit,
         visit: &mut dyn FnMut(&Delta) -> Result<(), StreamError>,
     ) -> Result<Position, StreamError> {
-        if self.failed {
-            return Err(StreamError::SourceUnavailable);
-        }
-        self.validate_replay_position(after)?;
-        if limit.max_items == 0 || limit.max_bytes == 0 || limit.max_sequences == 0 {
-            return Err(StreamError::Invalid("zero replay budget"));
-        }
-        let through = SessionSeq(
-            after
-                .sequence
-                .0
-                .saturating_add(limit.max_sequences)
-                .min(self.sequence().0),
-        );
-        let mut returned = after;
-        let mut bytes = 0usize;
-        let start = self
-            .deltas
-            .partition_point(|d| Position::after_delta(d.delta.id) <= after);
-        for (items, delta) in self.deltas.range(start..).enumerate() {
-            let position = Position::after_delta(delta.delta.id);
-            if delta.delta.id.sequence > through {
-                break;
-            }
-            if items >= limit.max_items || bytes.saturating_add(delta.bytes) > limit.max_bytes {
-                if items == 0 {
-                    return Err(StreamError::Capacity);
-                }
-                return Ok(returned);
-            }
-            visit(&delta.delta)?;
-            bytes = bytes
-                .checked_add(delta.bytes)
-                .ok_or(StreamError::Capacity)?;
-            returned = position;
-        }
-        Ok(Position::resolved(self.ledger, through))
+        self.replay_deltas(after, limit, visit)
     }
 }
 
@@ -629,6 +613,8 @@ impl Session {
             || self.pending_membership.is_some()
             || self.pending_placement.is_some()
             || self.pending_evidence.is_some()
+            || self.pending_activation.is_some()
+            || self.retained.is_some()
         {
             return Err(LedgerError::Capacity);
         }
@@ -649,7 +635,16 @@ impl Session {
         let cursor_state_charge = reference_charge(self.cursors.checkpoint())?;
         let placement_state_charge = reference_charge(&self.placement_state)?;
         let request_stream_charge = self.request_streams.checkpoint_charge()?;
+        // The native section is encoded under its own permit; the envelope
+        // copies it once more into the final bytes.
+        let native = match self.native.as_deref() {
+            Some(engine) => Some(engine.encode_checkpoint(&self.consensus)?),
+            None => None,
+        };
+        let native_bytes = native.as_ref().map_or(0, |(bytes, _)| bytes.len());
         let amount = reference_charge(self.core.snapshot())?
+            .checked_add(native_bytes)
+            .ok_or(LedgerError::Capacity)?
             .checked_add(reference_charge(&self.cursor_meta)?)
             .and_then(|n| n.checked_add(cursor_state_charge))
             .and_then(|n| n.checked_add(placement_state_charge))
@@ -665,9 +660,14 @@ impl Session {
             .reserve(BudgetKind::Recovery, BudgetLane::Completion, amount)?
             .commit();
         let core = self.core.encode_checkpoint()?;
-        let bytes = durable_session_v1::snapshot(self, &core)?;
+        let bytes = durable_session_v1::snapshot(
+            self,
+            &core,
+            native.as_ref().map(|(bytes, _)| bytes.as_slice()),
+        )?;
         // Only the final Session bytes remain before optional retained copying.
         drop(core);
+        drop(native);
         let retained = if retain_bytes {
             let allocation = self
                 .budget
@@ -703,7 +703,38 @@ impl Session {
         let mut placement = PlacementState::default();
         let mut requests = RequestStreamsCheckpoint::default();
         let mut legacy_core = None;
-        let envelope = if let Some(data) = data.strip_prefix(SNAPSHOT_V5_MAGIC) {
+        let mut native_section: Option<(Vec<u8>, Vec<u8>)> = None;
+        // The registry watermark travels only in SS7; an SS6 checkpoint
+        // never evicted a pair, so its largest retained generation is exact.
+        let mut slot_generation = None;
+        let envelope = if let Some(data) = data.strip_prefix(SNAPSHOT_V7_MAGIC) {
+            if !self.consensus.decoder_floor_ready(native_format_hash()) {
+                return Err(LedgerError::Corrupt);
+            }
+            let (envelope, remaining): (SnapshotEnvelopeV7, _) = durable_session_v1::take(data)?;
+            if !remaining.is_empty() || envelope.state.state.state.schema != 2 {
+                return Err(LedgerError::Corrupt);
+            }
+            membership = envelope.state.state.membership;
+            placement = envelope.state.placement;
+            requests = envelope.requests;
+            native_section = Some((envelope.activation, envelope.native));
+            slot_generation = Some(envelope.slot_generation);
+            envelope.state.state.state
+        } else if let Some(data) = data.strip_prefix(SNAPSHOT_V6_MAGIC) {
+            if !self.consensus.decoder_floor_ready(native_format_hash()) {
+                return Err(LedgerError::Corrupt);
+            }
+            let (envelope, remaining): (SnapshotEnvelopeV6, _) = durable_session_v1::take(data)?;
+            if !remaining.is_empty() || envelope.state.state.state.schema != 2 {
+                return Err(LedgerError::Corrupt);
+            }
+            membership = envelope.state.state.membership;
+            placement = envelope.state.placement;
+            requests = envelope.requests;
+            native_section = Some((envelope.activation, envelope.native));
+            envelope.state.state.state
+        } else if let Some(data) = data.strip_prefix(SNAPSHOT_V5_MAGIC) {
             if !self.consensus.decoder_floor_ready(managed_format_hash()) {
                 return Err(LedgerError::Corrupt);
             }
@@ -773,8 +804,8 @@ impl Session {
             return Err(LedgerError::Corrupt);
         };
         if self.placement_state.latest().is_some() && placement.latest().is_none() {
-            return Err(LedgerError::Corrupt);
-        }
+                return Err(LedgerError::Corrupt);
+            }
         if envelope.ledger != self.ledger
             || envelope.raft_index != index
             || envelope.cursors.ledger != self.ledger
@@ -843,12 +874,34 @@ impl Session {
                 return Err(LedgerError::Corrupt);
             }
         }
+        // The native engine is rebuilt completely before any legacy state is
+        // replaced; a native ledger can never regress to a legacy-only
+        // snapshot. Cursor positions are validated against the published end
+        // of the stream line it defines (23 §6), never against the sealed
+        // legacy prefix alone.
+        let native = match &native_section {
+            Some((activation, native)) => Some(self.native_from_checkpoint(
+                activation,
+                native,
+                index,
+                term,
+                configuration,
+            )?),
+            None if self.activation.is_native() => return Err(LedgerError::Corrupt),
+            None => None,
+        };
+        let published = match &native {
+            Some((engine, activation, _)) => {
+                stream_line(*activation, recovered.sequence(), engine.sequence()?)?
+            }
+            None => recovered.sequence(),
+        };
         for (key, receipt) in &envelope.cursor_meta.receipts {
             if *key != receipt.key
                 || key.principal.is_zero()
                 || key.id.is_zero()
                 || receipt.ledger != self.ledger
-                || receipt.domain_sequence > recovered.sequence()
+                || receipt.domain_sequence > published
                 || receipt.raft_index > index
                 || receipt.raft_index == 0
                 || receipt.revision == 0
@@ -866,7 +919,7 @@ impl Session {
             if let Some(record) = &receipt.record
                 && (record.token.key.ledger != self.ledger
                     || record.token.position.ledger != self.ledger
-                    || record.token.position.sequence > receipt.domain_sequence
+                    || record.token.position.sequence > published
                     || envelope.cursor_meta.owners.get(&record.token.key.consumer)
                         != Some(&key.principal))
             {
@@ -875,11 +928,11 @@ impl Session {
         }
         let cursors = CursorRegistry::restore(
             envelope.cursors,
-            recovered.sequence(),
+            published,
             self.limits.cursors,
             self.budget.clone(),
         )?;
-        if cursors.retention_limit(recovered.sequence()) < envelope.delta_floor {
+        if cursors.retention_limit(published) < envelope.delta_floor {
             return Err(LedgerError::Corrupt);
         }
         if envelope.deltas.len() > self.limits.delta_items {
@@ -971,8 +1024,11 @@ impl Session {
         self.pending_cursor = None;
         self.pending_managed = None;
         self.managed_support = ManagedSupportCache::default();
+        // Managed receipts are bounded by the stream line too: cursor
+        // receipts name its published end at apply, domain receipts the
+        // legacy prefix within it.
         self.request_streams
-            .restore(requests, recovered.sequence(), index, &self.budget)?;
+            .restore(requests, published, index, &self.budget, slot_generation)?;
         self.pending_maintenance = None;
         self.pending_membership = None;
         self.pending_placement = None;
@@ -995,6 +1051,13 @@ impl Session {
         self.delta_bytes = bytes;
         self.delta_floor = envelope.delta_floor;
         self.applied_raft = index;
+        self.retained = None;
+        self.pending_activation = None;
+        if let Some((engine, activation, record)) = native {
+            self.native = Some(engine);
+            self.activation = activation;
+            self.activation_record = Some(record);
+        }
         Ok(())
     }
 }

@@ -282,6 +282,17 @@ impl<O: Objects> read_audit::AuditObjects for Access<'_, O> {
     }
 }
 
+/// Work one neighbor copy of `row` costs during range reconstruction: the
+/// copier clones every retained collection element once, so the charge is
+/// proportional to the row's accounted heap footprint plus a fixed per-row
+/// traversal, never the range's maximum entry size. Unit rows such as index
+/// entries cost only the fixed part.
+pub(in crate::native::record_codec) fn copy_work(row: &Row) -> Result<usize, NativeError> {
+    heap(row)?
+        .checked_mul(8)
+        .and_then(|work| work.checked_add(4096))
+        .ok_or(NativeError::Capacity("recovery neighbor copy work"))
+}
 pub(super) fn heap(row: &Row) -> Result<usize, NativeError> {
     Ok(match row {
         Row::Claim(value) => value.heap_charge()?,
@@ -298,6 +309,10 @@ pub(super) fn heap(row: &Row) -> Result<usize, NativeError> {
         Row::Event(value) => value.heap_charge()?,
         Row::ClaimContent(value) => value.heap_charge()?,
         Row::CreationResult(value) => value.heap_charge()?,
+        Row::LegacyTestament(value)
+        | Row::LegacyEvidenceSet(value)
+        | Row::LegacyRun(value)
+        | Row::LegacyDefinition(value) => value.heap_charge()?,
         Row::IncomingHead(_)
         | Row::IncomingLink(_)
         | Row::Monitor(_)
@@ -313,7 +328,8 @@ pub(super) fn heap(row: &Row) -> Result<usize, NativeError> {
         | Row::ClaimResultTestament(_)
         | Row::Outcome(_)
         | Row::ClaimIdentity(_)
-        | Row::DefinitionIdentity(_) => 0,
+        | Row::DefinitionIdentity(_)
+        | Row::Index => 0,
     })
 }
 fn binding(value: Binding, ledger: LedgerId, id: [u8; 16]) -> Result<(), NativeError> {

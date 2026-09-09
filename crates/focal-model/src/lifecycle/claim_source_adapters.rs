@@ -80,6 +80,7 @@ impl<'a> ClaimSource<'a> for ClaimSpec<'a> {
             occurrence: self.occurrence,
             description: self.description,
             deadline: self.deadline,
+            policy: self.policy,
         }
     }
     fn relation_count(&self) -> usize {
@@ -150,6 +151,7 @@ impl<'a> ClaimSource<'a> for OwnedSource<'a> {
             occurrence: self.0.occurrence,
             description: &self.0.description,
             deadline: self.0.deadline,
+            policy: self.0.policy,
         }
     }
     fn relation_count(&self) -> usize {

@@ -19,7 +19,8 @@ fn limits() -> NativeLimits {
         diagnostics_per_cycle: 3,
         response_summary_bytes: 256,
         range: RangeConfig {
-            max_batch_entries: 32,
+            // Copying a fixture's rows, index rows included, in one batch.
+            max_batch_entries: 64,
             page_entries: 4,
             page_bytes: 4096,
             max_entry_bytes: 64 * 1024,

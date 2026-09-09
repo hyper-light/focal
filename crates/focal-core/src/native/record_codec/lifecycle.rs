@@ -32,6 +32,7 @@ pub(super) fn claim(sink: &mut impl Sink, row: &OwnedClaim) -> Result<(), Error>
     raw(sink, &snapshot.issuer.0)?;
     raw(sink, &snapshot.subject.0)?;
     write_u64(sink, snapshot.created.0)?;
+    fields::claim_origin(sink, snapshot.origin)?;
     fields::claim_status(sink, snapshot.status)?;
     fields::optional(sink, snapshot.receipt, fields::entitlement)?;
     write_u32(sink, snapshot.max_responses)?;

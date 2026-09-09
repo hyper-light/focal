@@ -22,21 +22,45 @@ fn ownership_error(context: &Context, error: ManagedRequestsError) -> CliError {
     }
     other(error)
 }
+/// Ordinals one managed generation issues before the client closes it and
+/// registers the next one (15 §"Close"). `FOCAL_MANAGED_ROTATION` overrides
+/// the default for qualification; the bound is saved with each owner record
+/// and must match on every open, so it is not a per-invocation tuning knob.
+pub(super) fn rotation() -> Result<u64> {
+    match std::env::var("FOCAL_MANAGED_ROTATION") {
+        Ok(value) => value
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|bound| *bound > 0)
+            .ok_or_else(|| {
+                CliError::Input(
+                    "FOCAL_MANAGED_ROTATION must be a positive number of ordinals".into(),
+                )
+            }),
+        Err(std::env::VarError::NotPresent) => Ok(focal_client::managed_requests::DEFAULT_ROTATION),
+        Err(std::env::VarError::NotUnicode(_)) => Err(CliError::Input(
+            "FOCAL_MANAGED_ROTATION must be a positive number of ordinals".into(),
+        )),
+    }
+}
 fn open(context: &Context) -> Result<ManagedRequests> {
-    ManagedRequests::open(
+    ManagedRequests::open_with(
         &context.root,
         "CLI.requests",
         context.operation,
         ManagedStoreLimits::default(),
+        rotation()?,
     )
     .map_err(|error| ownership_error(context, error))
 }
 fn existing(context: &Context, name: &str) -> Result<Option<ManagedRequests>> {
-    match ManagedRequests::open_existing(
+    match ManagedRequests::open_existing_with(
         &context.root,
         name,
         context.operation,
         ManagedStoreLimits::default(),
+        rotation()?,
     ) {
         Ok(value) => Ok(Some(value)),
         Err(ManagedRequestsError::Missing) => Ok(None),
@@ -552,6 +576,13 @@ pub(super) fn pending(context: &Context, format: OutputFormat) -> Result<()> {
                 });
             }
         }
+    }
+    for (operation_id, condition) in super::native::outstanding(context)? {
+        rows.push(PendingRow {
+            client: "CLI native",
+            operation_id: Some(operation_id),
+            condition,
+        });
     }
     let mut out = std::io::stdout().lock();
     if matches!(format, OutputFormat::Json | OutputFormat::Yaml) {

@@ -10,6 +10,9 @@ pub struct RetryPolicy {
     pub base_backoff: Duration,
     pub max_backoff: Duration,
 }
+/// Backed-off resends of one request after capacity refusals before the
+/// refusal is reported; each resend is bounded by the retry policy's clock.
+const CAPACITY_RESENDS: u32 = 3;
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
@@ -176,6 +179,78 @@ impl<T: ClientTransport> Client<T> {
         }
         match self.request(request).await?.result {
             Response::Submitted(reply) => Ok(reply),
+            _ => Err(ClientError::InvalidResponse),
+        }
+    }
+    /// Submit a journaled native frame (wire profile 4). A `Pending` ticket is
+    /// resent as the identical frame under the retry policy; if it never
+    /// commits within the policy the outcome is reported unknown, never lost.
+    pub async fn submit_native(
+        &self,
+        request: RequestEnvelope,
+    ) -> Result<NativeMutationReply, ClientError> {
+        if !matches!(request.operation, Operation::Native { .. }) {
+            return Err(ClientError::Configuration);
+        }
+        match self.request(request).await?.result {
+            Response::Native(reply) => Ok(reply),
+            _ => Err(ClientError::InvalidResponse),
+        }
+    }
+    /// The engine probe: the principal's standing under the native profile.
+    /// `None` is a V1 engine, whether an embedded host refuses the profile at
+    /// negotiation or a shared host refuses the operation for a V1 ledger it
+    /// serves next to native ones. Any other error is reported unchanged.
+    pub async fn native_standing(
+        &self,
+        request: RequestEnvelope,
+    ) -> Result<Option<NativeStanding>, ClientError> {
+        if !matches!(
+            request.operation,
+            Operation::NativeRead(NativeReadRequest {
+                query: NativeReadQuery::Standing,
+                ..
+            })
+        ) {
+            return Err(ClientError::Configuration);
+        }
+        match self.native_read(request).await {
+            Ok(page) => page
+                .objects
+                .into_iter()
+                .find_map(|object| match object {
+                    NativeObject::Standing(standing) => Some(standing),
+                    _ => None,
+                })
+                .map(Some)
+                .ok_or(ClientError::InvalidResponse),
+            Err(ClientError::Access(
+                AccessError::UnsupportedProtocol | AccessError::UnsupportedOperation,
+            )) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+    pub async fn native_read(
+        &self,
+        request: RequestEnvelope,
+    ) -> Result<NativeReadPage, ClientError> {
+        if !matches!(request.operation, Operation::NativeRead(_)) {
+            return Err(ClientError::Configuration);
+        }
+        match self.request(request).await?.result {
+            Response::NativeRead(page) => Ok(page),
+            _ => Err(ClientError::InvalidResponse),
+        }
+    }
+    pub async fn native_list(
+        &self,
+        request: RequestEnvelope,
+    ) -> Result<NativeListPage, ClientError> {
+        if !matches!(request.operation, Operation::NativeList(_)) {
+            return Err(ClientError::Configuration);
+        }
+        match self.request(request).await?.result {
+            Response::NativeListed(page) => Ok(page),
             _ => Err(ClientError::InvalidResponse),
         }
     }
@@ -408,6 +483,9 @@ impl<T: ClientTransport> Client<T> {
         }
         let start = tokio::time::Instant::now();
         let mut uncertain = false;
+        // A capacity refusal has no effect (nothing was admitted), so a
+        // bounded number of backed-off resends rides out a full ingress.
+        let mut capacity_refusals = 0u32;
         for attempt in 0..self.policy.max_attempts {
             let remaining = self.policy.max_elapsed.saturating_sub(start.elapsed());
             if remaining.is_zero() {
@@ -442,7 +520,8 @@ impl<T: ClientTransport> Client<T> {
                             route = Some(hint.clone());
                         }
                         Response::Error(AccessError::OutcomeUnknown)
-                        | Response::Submitted(MutationReply::Pending(_)) => {
+                        | Response::Submitted(MutationReply::Pending(_))
+                        | Response::Native(NativeMutationReply::Pending(_)) => {
                             uncertain = true;
                             *write_uncertain = request.operation.is_mutation();
                         }
@@ -450,6 +529,11 @@ impl<T: ClientTransport> Client<T> {
                             DomainOutcome::Refuse { .. } | DomainOutcome::Inform { .. },
                         )) if uncertain && request.operation.is_mutation() => break,
                         Response::Error(AccessError::Unavailable) => {}
+                        Response::Error(AccessError::Capacity)
+                            if capacity_refusals < CAPACITY_RESENDS =>
+                        {
+                            capacity_refusals = capacity_refusals.saturating_add(1);
+                        }
                         Response::Error(error) => {
                             if uncertain && request.operation.is_mutation() {
                                 break;
@@ -497,6 +581,11 @@ impl<T: ClientTransport> Client<T> {
                     .min(self.policy.max_elapsed.saturating_sub(start.elapsed()));
                 tokio::time::sleep(backoff).await;
             }
+        }
+        if !uncertain && capacity_refusals > 0 {
+            // Every attempt was a definite refusal without effect: report
+            // the refusal itself, never an unknown outcome.
+            return Err(ClientError::Access(AccessError::Capacity));
         }
         if request.operation.is_mutation() {
             *write_uncertain = true;

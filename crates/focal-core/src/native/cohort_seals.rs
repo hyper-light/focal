@@ -37,6 +37,37 @@ impl Visits {
     }
 }
 
+impl CohortSeals {
+    /// The sealed state of `key` if this suffix seals it. The updates are
+    /// sorted by key; the search is bounded by their count.
+    pub(super) fn sealed(&self, key: EvaluationKey) -> Option<validation::EvaluationState> {
+        let index = self
+            .updates
+            .binary_search_by_key(&key, |update| update.key)
+            .ok()?;
+        let update = self.updates.get(index)?;
+        Some(self.tokens.get(update.token_index)?.next())
+    }
+    /// Every sealed evaluation this suffix writes that the original plan did
+    /// not stage itself.
+    pub(super) fn for_each_new_sealed(
+        &self,
+        f: &mut dyn FnMut(EvaluationKey, validation::EvaluationState) -> Result<(), NativeError>,
+    ) -> Result<(), NativeError> {
+        for update in &self.updates {
+            if update.original_extra.is_some() {
+                continue;
+            }
+            let token = self
+                .tokens
+                .get(update.token_index)
+                .ok_or(ContractError::InvalidManifest)?;
+            f(update.key, token.next())?;
+        }
+        Ok(())
+    }
+}
+
 fn levels(count: usize) -> Result<usize, NativeError> {
     usize::try_from(
         usize::BITS

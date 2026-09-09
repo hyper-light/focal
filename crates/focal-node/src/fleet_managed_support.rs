@@ -90,7 +90,19 @@ impl Owner {
             if let Some((node, fact)) = received {
                 self.session.record_managed_support(node, fact)?;
             }
-            self.session.managed_support()
+            // A hosted replica promises the native successor as soon as its
+            // baseline floor is durable; the promise is what it advertises.
+            if self.session.native_hosted() {
+                match self.session.begin_native_support() {
+                    Ok(())
+                    | Err(LedgerError::NativeUnsupported)
+                    | Err(LedgerError::Consensus(
+                        focal_consensus::ConsensusError::PersistencePending,
+                    )) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            self.session.native_support()
         })()
         .map(|fact| {
             let candidate = self
@@ -125,7 +137,8 @@ impl Owner {
                         .chain(&fact.voters_outgoing)
                         .copied()
                         .filter(|node| {
-                            !self.session.managed_protocol_active()
+                            (!self.session.managed_protocol_active()
+                                || self.session.native_hosted())
                                 && self.session.needs_managed_support(*node)
                                 && !targets.contains(&Some(*node))
                         })

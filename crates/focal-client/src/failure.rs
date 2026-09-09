@@ -1,9 +1,11 @@
 //! Adapter-neutral failure categories. These describe a response, never proof
 //! that an earlier mutation did not commit or permission to allocate a new ID.
 use crate::{
-    AccessError, ClientError, artifact_transfer::TransferError, input::InputError,
+    AccessError, ClientError, NativeErrorCode, NativeMutationReply, NativeRefusal,
+    NativeRefusalKind, artifact_transfer::TransferError, input::InputError,
     managed_requests::ManagedRequestsError, managed_store::ManagedStoreError,
-    operation_store::StoreError, pending::PendingError, watch::WatchError,
+    native_store::NativeStoreError, operation_store::StoreError, pending::PendingError,
+    watch::WatchError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +58,66 @@ pub fn access(error: &AccessError) -> Failure {
         AccessError::ManagedClosed { .. } => Failure::error("managed_closed", 5),
         AccessError::ManagedConflict => Failure::error("managed_conflict", 5),
         AccessError::ManagedNotRegistered => Failure::error("managed_not_registered", 5),
+    }
+}
+/// Closed native refusal categories map to the same exit classes as V1:
+/// invalid input 2, unauthorized 3, not found 4, conflict/stale 5, capacity 6.
+pub fn native(refusal: &NativeRefusal) -> Failure {
+    match &refusal.kind {
+        NativeRefusalKind::InvalidInput => Failure::error("invalid_input", 2),
+        NativeRefusalKind::Unauthorized => Failure::error("unauthorized", 3),
+        NativeRefusalKind::NotFound => Failure::error("not_found", 4),
+        NativeRefusalKind::Stale { .. } => Failure {
+            condition: "Stale",
+            code: "stale_binding",
+            exit_code: 5,
+        },
+        NativeRefusalKind::Conflict => Failure::error("operation_conflict", 5),
+        NativeRefusalKind::Capacity => Failure::error("capacity", 6),
+        NativeRefusalKind::Refused(code) => match code {
+            NativeErrorCode::WrongActor => Failure::error("unauthorized", 3),
+            NativeErrorCode::WrongLedger => Failure::error("wrong_ledger", 2),
+            NativeErrorCode::WrongObject => Failure::error("wrong_object", 2),
+            NativeErrorCode::ContentConflict => Failure::error("content_conflict", 5),
+            NativeErrorCode::StaleRevision => Failure::error("stale_revision", 5),
+            NativeErrorCode::StaleReceipt => Failure::error("stale_receipt", 5),
+            NativeErrorCode::StaleEvaluation => Failure::error("stale_evaluation", 5),
+            NativeErrorCode::InvalidTransition => Failure::error("invalid_transition", 5),
+            NativeErrorCode::InvalidTarget => Failure::error("invalid_target", 2),
+            NativeErrorCode::InvalidManifest => Failure::error("invalid_manifest", 2),
+            NativeErrorCode::MissingEvidence => Failure::error("missing_evidence", 2),
+            NativeErrorCode::InvalidPolicy => Failure::error("invalid_policy", 2),
+            NativeErrorCode::Capacity => Failure::error("capacity", 6),
+            NativeErrorCode::ConflictingCause => Failure::error("conflicting_cause", 5),
+            NativeErrorCode::InvalidCut => Failure::error("invalid_cut", 5),
+            NativeErrorCode::Legacy => Failure::error("legacy_engine", 2),
+            NativeErrorCode::Unsupported => Failure::error("unsupported_operation", 2),
+        },
+    }
+}
+/// A native reply that is not a committed receipt: pending outcomes stay
+/// unknown; refusals classify by category.
+pub fn native_reply(reply: &NativeMutationReply) -> Option<Failure> {
+    match reply {
+        NativeMutationReply::Committed(_) => None,
+        NativeMutationReply::Pending(_) => Some(Failure::outcome_unknown()),
+        NativeMutationReply::Refused(refusal) => Some(native(refusal)),
+    }
+}
+pub fn native_store(error: &NativeStoreError) -> Failure {
+    match error {
+        NativeStoreError::Store(error) => store(error),
+        NativeStoreError::InvalidId
+        | NativeStoreError::InvalidRequest
+        | NativeStoreError::Expansion(_) => Failure::error("invalid_input", 2),
+        NativeStoreError::Corrupt => Failure::error("native_store", 1),
+        NativeStoreError::Capacity => Failure::error("capacity", 6),
+        NativeStoreError::ContextMismatch
+        | NativeStoreError::IntentConflict
+        | NativeStoreError::ReceiptMismatch => Failure::error("operation_conflict", 5),
+        NativeStoreError::MissingOperation => Failure::error("not_found", 4),
+        NativeStoreError::Incomplete => Failure::error("operation_conflict", 5),
+        NativeStoreError::NotCommitted => Failure::outcome_unknown(),
     }
 }
 pub fn client(error: &ClientError) -> Failure {
@@ -172,7 +234,8 @@ pub fn classify(error: &(dyn std::error::Error + 'static)) -> Option<Failure> {
     known! {
         ClientError => client, AccessError => access, InputError => input,
         PendingError => pending, StoreError => store, ManagedStoreError => managed_store,
-        ManagedRequestsError => managed, TransferError => transfer, WatchError => watch
+        ManagedRequestsError => managed, TransferError => transfer, WatchError => watch,
+        NativeStoreError => native_store
     }
     None
 }

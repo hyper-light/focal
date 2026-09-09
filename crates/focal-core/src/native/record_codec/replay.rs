@@ -2,7 +2,7 @@
 //! Only changed rows and retained neighbors of touched pages are constructed.
 //! The enclosing log establishes provenance; this module never executes commands.
 use super::*;
-use focal_evidence::{ContentStore, NativeSchemaVerifier};
+use focal_evidence::{NativeCustodyReader, NativeSchemaVerifier};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, Change, Entry};
 use read_source::Meter;
 
@@ -197,14 +197,14 @@ impl read_dispatch::Objects for Objects<'_, '_> {
     }
 }
 
-struct Decoder<'a, S> {
+struct Decoder<'a, S, R> {
     core: &'a Core<NativeState>,
     header: RecordHeader,
     limits: read_dispatch::Limits,
     meters: &'a recovery::Meters,
-    custody: recovery::Custody<'a, S>,
+    custody: recovery::Custody<'a, S, R>,
 }
-impl<S: NativeSchemaVerifier> Decoder<'_, S> {
+impl<S: NativeSchemaVerifier, R: NativeCustodyReader> Decoder<'_, S, R> {
     fn phase(
         &self,
         entries: &mut Entries<'_>,
@@ -311,12 +311,12 @@ impl<S: NativeSchemaVerifier> Decoder<'_, S> {
 /// descriptor construction and one cumulative recovery work allowance. Success
 /// does not authenticate a log, acknowledge disk/Raft durability, reconstruct
 /// owner completion credits, or activate a network decoder.
-pub fn prepare<S: NativeSchemaVerifier>(
+pub fn prepare<S: NativeSchemaVerifier, R: NativeCustodyReader>(
     core: &Core<NativeState>,
     record: &StructuralRecord<'_>,
     original: RangeId,
     mut limits: recovery::Limits,
-    store: &ContentStore,
+    store: &R,
     schemas: &S,
 ) -> Result<NativePrepared, NativeError> {
     let header = record.header();
@@ -461,13 +461,15 @@ pub fn prepare<S: NativeSchemaVerifier>(
     let input = entries.allocation.split_off(input_bytes)?;
     let range = plan
         .build_in_funded_with(&core.state.budget, input, |row| {
-            let work = core
-                .limits
-                .range
-                .max_entry_bytes
-                .checked_mul(8)
-                .and_then(|n| n.checked_add(4096))
-                .ok_or(MemoryError::CounterExhausted("replay neighbor copy work"))?;
+            let work = match read_dispatch::objects::copy_work(row) {
+                Ok(work) => work,
+                Err(error) => {
+                    failure.set(Some(error));
+                    return Err(MemoryError::InvalidConfiguration(
+                        "native replay copy work exhausted",
+                    ));
+                }
+            };
             if let Err(error) = meters.model.charge(work) {
                 failure.set(Some(read_evidence::codec(error)));
                 return Err(MemoryError::InvalidConfiguration(

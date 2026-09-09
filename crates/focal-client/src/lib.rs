@@ -19,6 +19,7 @@ mod file_lock;
 pub mod input;
 pub mod managed_requests;
 pub mod managed_store;
+pub mod native_store;
 pub mod operation_store;
 pub mod operations;
 mod participant;
@@ -41,7 +42,16 @@ pub use focal_wire::{
 pub use focal_wire::{
     ManagedOperation, ManagedReply, RequestStreamControlReply, RequestStreamReadReply,
 };
+pub use focal_wire::{
+    NATIVE_PROTOCOL_VERSION, NativeErrorCode, NativeListPage, NativeListRequest,
+    NativeMutationReply, NativeObject, NativeObjectRef, NativeReadPage, NativeReadQuery,
+    NativeReadRequest, NativeReceipt, NativeRefusal, NativeRefusalKind, NativeStanding,
+    NativeTicket,
+};
 pub use transport::*;
+#[cfg(test)]
+#[path = "native_client_tests.rs"]
+mod native_client_tests;
 #[cfg(test)]
 mod tests;
 

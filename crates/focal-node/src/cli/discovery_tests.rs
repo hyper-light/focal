@@ -47,13 +47,13 @@ fn discovery_schema_is_exact_registry_projection_and_builtins_stay_compatible() 
             (Direction::Output, descriptor.output_schema().unwrap()),
         ] {
             let mut bytes = Vec::new();
-            get(descriptor.name, Some(direction), &mut bytes).unwrap();
+            get(descriptor.name, Some(direction), false, &mut bytes).unwrap();
             let actual: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(actual, expected);
         }
     }
     let mut bytes = Vec::new();
-    get("test-report", None, &mut bytes).unwrap();
+    get("test-report", None, false, &mut bytes).unwrap();
     let schema: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(
         schema["hash"],
@@ -63,7 +63,15 @@ fn discovery_schema_is_exact_registry_projection_and_builtins_stay_compatible() 
         schema["example"],
         serde_json::json!({"passed":1,"failed":0,"skipped":0})
     );
-    assert!(get("test-report", Some(Direction::Output), &mut Vec::new()).is_err());
+    assert!(
+        get(
+            "test-report",
+            Some(Direction::Output),
+            false,
+            &mut Vec::new()
+        )
+        .is_err()
+    );
 }
 
 struct Broken;
@@ -105,7 +113,7 @@ fn completion_uses_actual_tree_and_output_errors_remain_fallible() {
 #[test]
 fn error_schema_discovery_exposes_exact_pinned_contract_and_valid_example() {
     let mut bytes = Vec::new();
-    get("error-report", None, &mut bytes).unwrap();
+    get("error-report", None, false, &mut bytes).unwrap();
     let schema: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(schema["name"], "focal.error_report.v1");
     assert_eq!(
@@ -122,7 +130,15 @@ fn error_schema_discovery_exposes_exact_pinned_contract_and_valid_example() {
         &serde_json::to_vec(&schema["example"]).unwrap(),
     )
     .unwrap();
-    assert!(get("error-report", Some(Direction::Input), &mut Vec::new()).is_err());
+    assert!(
+        get(
+            "error-report",
+            Some(Direction::Input),
+            false,
+            &mut Vec::new()
+        )
+        .is_err()
+    );
     let mut bytes = Vec::new();
     list(OutputFormat::Json, &mut bytes).unwrap();
     let catalog: serde_json::Value = serde_json::from_slice(&bytes).unwrap();

@@ -332,16 +332,22 @@ impl Scan<'_> {
     fn claim(&mut self) -> Result<(), Error> {
         self.ledger()?;
         self.id()?;
-        self.closed16(1, 1, "claim schema")?;
+        let schema = self.closed16(1, 2, "claim schema")?;
         self.id()?;
         self.text()?;
         for _ in 0..self.count()? {
             self.closed16(1, 15, "relation kind")?;
-            match self.closed8(3, "relation target")? {
+            match self.closed8(4, "relation target")? {
                 0 | 3 => self.id()?,
                 1 => self.object_ref()?,
                 2 => {
                     self.closed16(1, 10, "claim action")?;
+                }
+                4 => {
+                    // Exact evidence: artifact id and committed descriptor
+                    // hash (doc 21 §5, target tag 4).
+                    self.id()?;
+                    self.hash()?;
                 }
                 _ => return Err(Error::InvalidTag("relation target")),
             }
@@ -355,7 +361,23 @@ impl Scan<'_> {
             self.hash()?;
         }
         self.slots()?;
-        self.optional_deadline()
+        self.optional_deadline()?;
+        if schema >= 2 {
+            self.peer_policy()?;
+        }
+        Ok(())
+    }
+    /// Schema 2 appends the optional follow-up policy after the deadline:
+    /// presence flag, corrective flag, follow-up bound, single-issuer flag and
+    /// escalation tag, mirroring `claim_source::policy`.
+    fn peer_policy(&mut self) -> Result<(), Error> {
+        if self.option()? {
+            self.closed8(1, "policy flag")?;
+            self.cursor.u16()?;
+            self.closed8(1, "policy flag")?;
+            self.closed8(2, "policy escalation")?;
+        }
+        Ok(())
     }
     fn phase_policy(&mut self) -> Result<(), Error> {
         self.id()?;

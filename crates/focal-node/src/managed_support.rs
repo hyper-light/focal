@@ -1,6 +1,7 @@
 //! Borrowed node driver: capability facts come from installed Session owners,
 //! travel over authenticated peer routes, and return to that same incarnation.
 use crate::fleet::FleetManager;
+use focal_ledger::LedgerError;
 use focal_memory::{BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::{RequestEpoch, RequestId};
 use focal_wire::{MANAGED_PROTOCOL_VERSION, Operation, PeerConnectionPool, RequestEnvelope};
@@ -11,6 +12,7 @@ pub(crate) async fn drive(
     manager: &FleetManager,
     pool: &PeerConnectionPool,
     budget: &MemoryBudget,
+    content: &crate::content_host::ContentHost,
 ) {
     let mut after = None;
     let mut serial = 0u128;
@@ -21,6 +23,11 @@ pub(crate) async fn drive(
             continue;
         };
         after = Some(ledger);
+        if let Some(pending) = host.progress().import_pending {
+            // The replica retained an import delivery until its inline legacy
+            // payloads are sealed locally; seal them with the recorded chunking.
+            let _ = service_import(&host, content, pending).await;
+        }
         let Ok(charge) = budget.reserve(BudgetKind::Control, BudgetLane::Completion, 512 * 1024)
         else {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -71,4 +78,24 @@ pub(crate) async fn drive(
         // laptops. No busy polling, unbounded queue, or new owner is introduced.
         tokio::task::yield_now().await;
     }
+}
+
+/// Seal every inline legacy payload of a replica's pending import through the
+/// exclusive content writer; the replica applies the import at its next poll.
+async fn service_import(
+    host: &crate::fleet::ReplicaHost,
+    content: &crate::content_host::ContentHost,
+    pending: focal_ledger::PendingImport,
+) -> Result<(), LedgerError> {
+    let Some(import) = host.import_payloads().await? else {
+        return Ok(());
+    };
+    let chunk_bytes = usize::try_from(pending.chunk_bytes).map_err(|_| LedgerError::Capacity)?;
+    for bytes in import.payloads {
+        content
+            .seal_import_inline(import.domain, bytes, chunk_bytes)
+            .await
+            .map_err(|_| LedgerError::Capacity)?;
+    }
+    Ok(())
 }

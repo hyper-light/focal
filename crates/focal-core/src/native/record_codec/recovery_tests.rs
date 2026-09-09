@@ -1,5 +1,6 @@
 use super::*;
 use crate::native::report_tests as f;
+use focal_evidence::ContentStore;
 use focal_evidence::{BuiltinNativeSchemas, StoreLimits};
 use focal_memory::BudgetKind;
 use focal_model::ValidationMode;

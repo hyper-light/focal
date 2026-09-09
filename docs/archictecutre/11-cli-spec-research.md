@@ -208,7 +208,7 @@ Do not collapse a `ContentRef` into a bare hash: domain, content class, length a
 | `cluster status` | Requested/effective/observed protection, root and directory readiness, bounded node counts | P: separate from application prefix status |
 | `cluster nodes list/get` | Bounded committed contacts, credential state, membership role, catch-up state, known/unknown topology | P; do not present contact registration as voter admission |
 | `cluster invitations list/get/revoke` | Metadata-only inspection, exact ID and expiry; never display secret; revoke committed admission authority | P: CLI absent; enrollment primitives are not a finished admin API |
-| `cluster credentials renew` | Durable key/CSR identity and rotation proof; interrupted renewal reconciles | P |
+| `cluster credentials renew` | Durable key/CSR identity; the same key under a fresh certificate, interrupted renewal reconciles on the committed one (2026-09-09); key rotation with a proof of the previous key remains planned | C |
 | `cluster nodes drain/remove` | Plan and commit handoff/removal; maintain placement guarantees; distinguish initiation from completion | P: internal membership primitives exist, operator workflow incomplete |
 | `cluster membership show` | Explicit group-scoped configuration and applied fence | W/P: `ControlRead::Membership/Configuration`, not an existing command |
 | `cluster membership add-learner/promote/remove/leave-joint` | Restricted repair/admin surface, expected configuration and stable operation ID; report committed configuration | W/I: internal control/session APIs exist; do not require users to operate raw Raft for normal growth |

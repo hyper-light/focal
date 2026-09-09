@@ -39,6 +39,7 @@ struct Fixture {
     budget: MemoryBudget,
     observations: async_mpsc::Receiver<LedgerId>,
 }
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 fn fixture(path: &std::path::Path) -> Fixture {
     let budget = MemoryBudget::new(768 * 1024 * 1024, 256 * 1024 * 1024).unwrap();
     let tenant = budget.child(384 * 1024 * 1024, 128 * 1024 * 1024).unwrap();
@@ -108,7 +109,10 @@ fn fixture(path: &std::path::Path) -> Fixture {
         }
         let mut config = ReplicaConfig::new(RootCommandId::from_u128(147));
         config.tick = Duration::from_secs(1);
-        config.request_timeout = Duration::from_millis(500);
+        // Bounds the stop deadline below and every fleet request of these
+        // tests; a full parallel workspace run schedules a commit well past
+        // half a second, so the bound is generous while stop stays quick.
+        config.request_timeout = REQUEST_TIMEOUT;
         config.checkpoint_observer = Some(CheckpointObserver(observe.clone()));
         replicas.push(FleetReplica { session, config });
         wals.push(wal);
@@ -136,7 +140,7 @@ fn fixture(path: &std::path::Path) -> Fixture {
 }
 async fn read(fixture: &Fixture, index: u128) {
     let response = tokio::time::timeout(
-        Duration::from_millis(300),
+        Duration::from_secs(5),
         dispatch(
             &fixture.hosts[&ledger(index)],
             peer(),
@@ -162,7 +166,7 @@ async fn pending_export(
     let host = fixture.hosts[&ledger(1)].clone();
     while fixture.observations.try_recv().is_ok() {}
     let export = tokio::spawn(async move { host.checkpoint_evidence(ttl).await });
-    tokio::time::timeout(Duration::from_millis(250), async {
+    tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             // This signal follows successful snapshot preparation and its
             // first pending disk poll. Ordinary Raft/read progress cannot
@@ -200,9 +204,9 @@ async fn checkpoint_waits_for_exact_writer_fence_while_another_writer_commits_an
     read(&fixture, 1).await;
     read(&fixture, 2).await;
     let pause = fixture.wals[0].pause_for_test().unwrap();
-    let export = pending_export(&mut fixture, Duration::from_secs(5)).await;
+    let export = pending_export(&mut fixture, Duration::from_secs(30)).await;
     let committed = tokio::time::timeout(
-        Duration::from_millis(300),
+        Duration::from_secs(5),
         dispatch(
             &fixture.hosts[&ledger(2)],
             peer(),
@@ -281,7 +285,7 @@ async fn expired_cancelled_and_timed_out_exports_release_interest_without_releas
     read(&fixture, 1).await;
 
     let pause = fixture.wals[0].pause_for_test().unwrap();
-    let export = pending_export(&mut fixture, Duration::from_secs(5)).await;
+    let export = pending_export(&mut fixture, Duration::from_secs(30)).await;
     export.abort();
     assert!(matches!(export.await, Err(error) if error.is_cancelled()));
     read(&fixture, 2).await;
@@ -289,7 +293,7 @@ async fn expired_cancelled_and_timed_out_exports_release_interest_without_releas
     read(&fixture, 1).await;
 
     let pause = fixture.wals[0].pause_for_test().unwrap();
-    let export = pending_export(&mut fixture, Duration::from_secs(5)).await;
+    let export = pending_export(&mut fixture, Duration::from_secs(30)).await;
     assert!(matches!(
         export.await.unwrap(),
         Err(LedgerError::OutcomeUnknown)
@@ -307,11 +311,13 @@ async fn checkpoint_stop_deadline_leaves_other_sessions_available_until_writer_r
     read(&fixture, 1).await;
     read(&fixture, 2).await;
     let pause = fixture.wals[0].pause_for_test().unwrap();
-    let export = pending_export(&mut fixture, Duration::from_secs(5)).await;
-    let stopped =
-        tokio::time::timeout(Duration::from_millis(800), fixture.hosts[&ledger(1)].stop())
-            .await
-            .unwrap();
+    let export = pending_export(&mut fixture, Duration::from_secs(30)).await;
+    let stopped = tokio::time::timeout(
+        REQUEST_TIMEOUT.saturating_add(Duration::from_millis(800)),
+        fixture.hosts[&ledger(1)].stop(),
+    )
+    .await
+    .unwrap();
     assert!(matches!(stopped, Err(LedgerError::OutcomeUnknown)));
     assert!(matches!(
         export.await.unwrap(),

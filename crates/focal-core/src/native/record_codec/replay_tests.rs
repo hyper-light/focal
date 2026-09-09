@@ -2,6 +2,7 @@ use super::super::{recovery::tests as checkpoint, tests::encode as encode_mutati
 use super::*;
 use crate::native::report_tests as f;
 use focal_evidence::BuiltinNativeSchemas;
+use focal_evidence::ContentStore;
 use focal_model::{ClaimStatus, OutcomeKind, ParticipantId, ValidationMode};
 
 #[path = "replay_authored_tests.rs"]

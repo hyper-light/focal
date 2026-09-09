@@ -185,6 +185,34 @@ impl DecodedRequest<'_, '_> {
         }
         Ok(())
     }
+    /// The artifact an artifact-bearing frame carries, with the request that
+    /// authored it, for custody verification outside the owner (a replicated
+    /// host verifies on its content thread and hands the owner the evidence).
+    /// Other frames yield `None`. Construction is bounded by the decode quote.
+    pub fn into_artifact(
+        self,
+    ) -> Result<
+        Option<(
+            RequestKey,
+            focal_model::lifecycle::artifact_descriptor::ArtifactDescriptor,
+        )>,
+        DecodeError,
+    > {
+        if !matches!(self.plan, Plan::Artifact(_)) {
+            return Ok(None);
+        }
+        let input = self.build()?;
+        let artifact = match input.command {
+            NativeCommand::ReportAdmission { artifact, .. }
+            | NativeCommand::SubmitWork { artifact, .. }
+            | NativeCommand::SubmitDiagnostic { artifact, .. }
+            | NativeCommand::RejectWork { artifact, .. }
+            | NativeCommand::ReportIncrement { artifact, .. }
+            | NativeCommand::ReportWork { artifact, .. } => artifact,
+            _ => return Ok(None),
+        };
+        Ok(Some((input.request, artifact.into_descriptor()?)))
+    }
     pub(in crate::native) fn build(self) -> Result<NativeInput, DecodeError> {
         self.check_build(self.construction_bytes(), self.construction_visits()?)?;
         match self.plan {

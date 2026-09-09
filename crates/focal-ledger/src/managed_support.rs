@@ -11,7 +11,10 @@ struct ManagedSupportCache {
     configuration_index: Option<u64>,
     demanded: bool,
     nodes: Vec<u64>,
+    /// Peers whose durable floor already names the native successor decoder.
+    native_nodes: Vec<u64>,
     _charge: Option<Allocation>,
+    _native_charge: Option<Allocation>,
 }
 impl Session {
     /// The compiled immutable managed decoder descriptor; inspecting it never
@@ -75,7 +78,63 @@ impl Session {
         node != self.status().node_id
             && (self.managed_support.configuration_index
                 != Some(self.membership_state.configuration_index)
-                || !self.managed_support.nodes.contains(&node))
+                || !self.managed_support.nodes.contains(&node)
+                || (self.hosting.is_some() && !self.managed_support.native_nodes.contains(&node)))
+    }
+    /// The descriptor this replica advertises: the native successor once its
+    /// own transition is durable, otherwise the managed baseline. A hosted
+    /// replica promises the successor as soon as it can, so an activation may
+    /// later find every voter's promise already recorded.
+    pub fn native_support(&self) -> Result<ManagedFormatSupport, LedgerError> {
+        let mut fact = self.managed_support()?;
+        if self.consensus.decoder_floor_ready(native_format_hash()) {
+            fact.format_hash = ContentHash(native_format_hash());
+        }
+        Ok(fact)
+    }
+    /// Every current voter, in both sets of a joint configuration, has a
+    /// recorded durable promise of the native successor decoder.
+    fn require_native_support(&self) -> Result<(), LedgerError> {
+        if !self.consensus.decoder_floor_ready(native_format_hash()) {
+            return Err(ConsensusError::PersistencePending.into());
+        }
+        if self.pending_membership.is_some() {
+            return Err(ManagedError::Unsupported.into());
+        }
+        let current = self.membership()?;
+        if current.configuration.voters.is_empty() {
+            return Err(ManagedError::Unsupported.into());
+        }
+        let local = self.status().node_id;
+        for node in current
+            .configuration
+            .voters
+            .iter()
+            .chain(&current.configuration.voters_outgoing)
+        {
+            if *node != local
+                && (self.managed_support.configuration_index != Some(current.configuration_index)
+                    || !self.managed_support.native_nodes.contains(node))
+            {
+                return Err(ManagedError::Unsupported.into());
+            }
+        }
+        Ok(())
+    }
+    /// After activation, a new learner or promoted voter must already promise
+    /// the native successor; the managed baseline alone is not enough.
+    fn native_membership_guard(&self, change: MembershipChange) -> Result<(), LedgerError> {
+        if !self.activation.is_native() {
+            return Ok(());
+        }
+        if let MembershipChange::AddLearner { node } | MembershipChange::Promote { node } = change
+            && (self.managed_support.configuration_index
+                != Some(self.membership_state.configuration_index)
+                || !self.managed_support.native_nodes.contains(&node))
+        {
+            return Err(ManagedError::Unsupported.into());
+        }
+        Ok(())
     }
     pub fn managed_support(&self) -> Result<ManagedFormatSupport, LedgerError> {
         if !self.consensus.decoder_floor_ready(managed_format_hash()) {
@@ -138,19 +197,38 @@ impl Session {
             && fact.voters_outgoing.is_empty()
             && fact.learners_next.is_empty()
             && !fact.auto_leave;
+        let native = fact.format_hash == ContentHash(native_format_hash());
         if authenticated_peer_node == 0
             || authenticated_peer_node != fact.node
             || fact.cluster != expected.cluster
             || fact.ledger != expected.ledger
             || fact.group != expected.group
             || !(exact_configuration || prospective)
-            || fact.format_hash != expected.format_hash
+            || !(fact.format_hash == expected.format_hash || native)
         {
             return Err(ManagedError::Unsupported.into());
         }
         if self.managed_support.configuration_index != Some(expected.configuration_index) {
             self.managed_support = ManagedSupportCache::default();
             self.managed_support.configuration_index = Some(expected.configuration_index);
+        }
+        if native && !self.managed_support.native_nodes.contains(&authenticated_peer_node) {
+            // A successor promise implies the managed baseline it was written over.
+            if self.managed_support.native_nodes.len() >= 1025 {
+                return Err(ManagedError::Capacity.into());
+            }
+            if self.managed_support.native_nodes.capacity() < 1025 {
+                let charge = self
+                    .budget
+                    .reserve(BudgetKind::Control, BudgetLane::Completion, 1025 * 8 + 128)?
+                    .commit();
+                self.managed_support
+                    .native_nodes
+                    .try_reserve_exact(1025usize.saturating_sub(self.managed_support.native_nodes.len()))
+                    .map_err(|_| ManagedError::Capacity)?;
+                self.managed_support._native_charge = Some(charge);
+            }
+            self.managed_support.native_nodes.push(authenticated_peer_node);
         }
         if self
             .managed_support

@@ -12,7 +12,7 @@ mod memory;
 #[path = "acceptance_prepare.rs"]
 pub(in crate::lifecycle) mod preparation;
 pub use preparation::{
-    AcceptancePlan, AcceptanceSource, AcceptanceSourcePasses, AcceptanceSourcePlan,
+    AcceptancePlan, AcceptanceSource, AcceptanceSourcePasses, AcceptanceSourcePlan, PolicyShape,
 };
 #[path = "acceptance_registration_snapshot.rs"]
 mod registration_snapshot;

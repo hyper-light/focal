@@ -12,10 +12,16 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+## Crash cuts for qualification (`FOCAL_FAULT=<site>:<n>`); release binaries
+## are built without it and contain no hook.
+test-support = []
+
 [dependencies]
 focal-client = { version = "0.1.0", path = "../focal-client" }
 focal-mcp = { version = "0.1.0", path = "../focal-mcp" }
 focal-consensus = { version = "0.1.0", path = "../focal-consensus" }
+focal-core = { version = "0.1.0", path = "../focal-core" }
 focal-control = { version = "0.1.0", path = "../focal-control" }
 focal-directory = { version = "0.1.0", path = "../focal-directory" }
 focal-enrollment = { version = "0.1.0", path = "../focal-enrollment" }
@@ -25,6 +31,7 @@ focal-memory = { version = "0.1.0", path = "../focal-memory" }
 focal-ledger = { version = "0.1.0", path = "../focal-ledger" }
 focal-log = { version = "0.1.0", path = "../focal-log" }
 focal-model = { version = "0.1.0", path = "../focal-model" }
+focal-native-client = { version = "0.1.0", path = "../focal-native-client" }
 focal-runtime = { version = "0.1.0", path = "../focal-runtime" }
 focal-wire = { version = "0.1.0", path = "../focal-wire" }
 focal-stream = { version = "0.1.0", path = "../focal-stream" }
@@ -47,6 +54,8 @@ quinn = { version = "=0.11.11", default-features = false, features = ["runtime-t
 zeroize = "1.8"
 
 [dev-dependencies]
+focal-node = { version = "0.1.0", path = ".", features = ["test-support"] }
+focal-core = { version = "0.1.0", path = "../focal-core", features = ["test-support"] }
 focal-log = { version = "0.1.0", path = "../focal-log", features = ["test-support"] }
 tempfile.workspace = true
 rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring", "x509-parser"] }

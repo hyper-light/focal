@@ -517,7 +517,7 @@ fn parse_id(value: &str) -> Result<[u8; 16], StoreError> {
 fn component(id: [u8; 16]) -> String {
     format!("{:032x}", u128::from_be_bytes(id))
 }
-fn validate_context(context: OperationContext) -> Result<(), StoreError> {
+pub(crate) fn validate_context(context: OperationContext) -> Result<(), StoreError> {
     if context.cluster == [0; 16]
         || context.principal.is_zero()
         || context.ledger.tenant.is_zero()

@@ -54,6 +54,14 @@ pub struct AdminReplicaDiagnostics {
     pub compiled_managed_decoder: String,
     pub required_decoder: Option<String>,
     pub managed_active: bool,
+    pub compiled_native_decoder: String,
+    pub native_hosted: bool,
+    pub native_ready: bool,
+    pub native_active: bool,
+    pub native_import_pending: bool,
+    /// Native admission is open here: activation applied, genesis committed
+    /// and this replica is the authority with its native owner rebuilt.
+    pub native_authoritative: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,6 +154,10 @@ pub enum AdminResult {
         group: String,
         target: u64,
     },
+    ReplicaNativeActivationProposed {
+        session: String,
+        group: String,
+    },
     Replicas {
         node: u64,
         management_sequence: u64,
@@ -213,5 +225,14 @@ pub enum AdminResult {
     InvitationWritten {
         name: String,
         output: String,
+    },
+    /// This node's own credential was renewed under the same key.
+    CredentialRenewed {
+        node: u64,
+        principal: String,
+        issued_at: i64,
+        expires_at: i64,
+        certificate_fingerprint: String,
+        renewals: u64,
     },
 }

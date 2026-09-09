@@ -136,10 +136,11 @@ async fn serve_unix<H: RequestHandler>(
     handler: H,
 ) -> Result<(), WireError> {
     let hello: Hello = read_frame(&mut stream, FrameKind::Hello, 4096).await?;
-    let negotiated = match limits.negotiate_profiles(
+    let negotiated = match limits.negotiate_native(
         &hello,
         handler.supports_managed_requests(),
         handler.supports_participant_requests(),
+        handler.supports_native_requests(),
     ) {
         Ok(value) => value,
         Err(error) => {
@@ -229,7 +230,10 @@ impl UnixRemote {
         };
         if !matches!(
             negotiated.protocol,
-            PROTOCOL_VERSION | MANAGED_PROTOCOL_VERSION | PEER_PROTOCOL_VERSION
+            PROTOCOL_VERSION
+                | MANAGED_PROTOCOL_VERSION
+                | PEER_PROTOCOL_VERSION
+                | crate::NATIVE_PROTOCOL_VERSION
         ) || !negotiated.accepts_protocol(request.protocol)
             || negotiated.max_frame_bytes > self.limits.max_frame_bytes
             || negotiated.max_items > self.limits.max_items

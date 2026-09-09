@@ -98,6 +98,102 @@ enum Change {
     Revoke {
         invitation: InvitationId,
     },
+    /// The same key under a fresh certificate and lifetime; the previous
+    /// certificate keeps authorizing until `retire_previous_at`.
+    Renew {
+        invitation: InvitationId,
+        receipt: EnrollmentReceipt,
+        retire_previous_at: i64,
+    },
+}
+/// A certificate a renewal replaced: still authorized for the grace the
+/// authority decided, so connections and statements in flight complete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RetiredCredential {
+    invitation: InvitationId,
+    receipt: EnrollmentReceipt,
+    retire_at: i64,
+}
+/// A holder's request to renew its own credential: the same key and CSR, the
+/// expiry it currently holds (so a retried request finds the committed
+/// renewal instead of issuing again), signed by the credential it holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenewRequest {
+    schema: u16,
+    cluster: ClusterId,
+    invitation: InvitationId,
+    request: JoinId,
+    csr: Vec<u8>,
+    holds_until: i64,
+    proof: SignedNodeStatement,
+}
+impl RenewRequest {
+    pub fn invitation_id(&self) -> InvitationId {
+        self.invitation
+    }
+    pub fn request_id(&self) -> JoinId {
+        self.request
+    }
+    pub fn holds_until(&self) -> i64 {
+        self.holds_until
+    }
+    pub fn cluster(&self) -> ClusterId {
+        self.cluster
+    }
+    pub fn encode(&self) -> Result<Vec<u8>, EnrollmentError> {
+        encode(self)
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self, EnrollmentError> {
+        decode(bytes)
+    }
+    fn statement(&self) -> Result<Vec<u8>, EnrollmentError> {
+        encode(&(
+            b"focal.enrollment.renew.v1",
+            self.schema,
+            self.cluster,
+            self.invitation,
+            self.request,
+            hash("focal.enrollment.csr.v1", &self.csr),
+            self.holds_until,
+        ))
+    }
+}
+impl CredentialMaterial {
+    /// Ask for a renewal of the credential this material holds.
+    pub fn renewal_request(
+        &self,
+        key: &JoinKey,
+        receipt: &EnrollmentReceipt,
+    ) -> Result<RenewRequest, EnrollmentError> {
+        if receipt.request != key.request_id()
+            || receipt.csr_hash != hash("focal.enrollment.csr.v1", key.csr())
+            || receipt.identity.cluster != key.cluster()
+        {
+            return Err(EnrollmentError::Unauthorized);
+        }
+        let mut request = RenewRequest {
+            schema: 1,
+            cluster: key.cluster(),
+            invitation: receipt.invitation,
+            request: receipt.request,
+            csr: key.csr().to_vec(),
+            holds_until: receipt.expires_at,
+            proof: SignedNodeStatement {
+                cluster: key.cluster(),
+                certificate: Vec::new(),
+                statement_hash: [0; 32],
+                signature: Vec::new(),
+            },
+        };
+        request.proof = self.sign_node_statement(key.cluster(), &request.statement()?)?;
+        Ok(request)
+    }
+}
+pub enum RenewPreparation {
+    /// The registry already holds a receipt newer than the one the holder
+    /// presented: the renewal committed before, or twice is refused.
+    Existing(EnrollmentReceipt),
+    Commit(EnrollmentCommand),
 }
 /// Safe for the metadata log: no invitation secret or private key is present.
 /// Serialize this command, commit through the metadata authority, then apply.
@@ -285,7 +381,12 @@ pub struct EnrollmentRegistry {
     records: BTreeMap<InvitationId, InviteMetadata>,
     certificates: BTreeMap<Fingerprint, InvitationId>,
     enrolled_keys: BTreeMap<Fingerprint, InvitationId>,
+    /// Certificates a renewal replaced, by fingerprint, until they retire.
+    retired: BTreeMap<Fingerprint, RetiredCredential>,
 }
+/// The registry's persisted layout; a checkpoint written at another schema
+/// is not this registry.
+const REGISTRY_SCHEMA: u16 = 2;
 impl EnrollmentRegistry {
     pub fn new(
         cluster: ClusterId,
@@ -303,7 +404,7 @@ impl EnrollmentRegistry {
             .map_err(|_| EnrollmentError::Invalid)?;
         Ok(Self {
             owner: Some(random()?),
-            schema: 1,
+            schema: REGISTRY_SCHEMA,
             cluster,
             ca_certificate,
             limits,
@@ -315,6 +416,7 @@ impl EnrollmentRegistry {
             records: BTreeMap::new(),
             certificates: BTreeMap::new(),
             enrolled_keys: BTreeMap::new(),
+            retired: BTreeMap::new(),
         })
     }
     // Only the private new-genesis draft constructor can select the existing
@@ -450,6 +552,15 @@ impl EnrollmentRegistry {
         self.records
             .values()
             .filter_map(|record| record.receipt.as_ref())
+    }
+    /// Certificates a renewal replaced that still authorize at `now`, with the
+    /// receipt they were issued under and the moment they retire.
+    pub fn retired(&self, now: i64) -> impl Iterator<Item = (&EnrollmentReceipt, i64)> {
+        self.retired.values().filter_map(move |retired| {
+            let record = self.records.get(&retired.invitation)?;
+            (!record.revoked && now < retired.retire_at)
+                .then_some((&retired.receipt, retired.retire_at))
+        })
     }
     pub fn invitation_revoked(&self, id: InvitationId) -> Result<bool, EnrollmentError> {
         self.records
@@ -603,6 +714,133 @@ impl EnrollmentRegistry {
             },
         }))
     }
+    /// Renew the credential a holder presents: the same key and CSR receive a
+    /// fresh certificate and lifetime, and the certificate it holds retires
+    /// after `grace_seconds`. A holder presenting an expiry the registry has
+    /// already moved past is answered with the committed renewal.
+    pub fn prepare_renew(
+        &self,
+        authority: &BootstrapAuthority,
+        request: &RenewRequest,
+        now: i64,
+        grace_seconds: u64,
+    ) -> Result<RenewPreparation, EnrollmentError> {
+        self.check_time(now)?;
+        self.check_authority(authority)?;
+        let record = self.authenticate_renewal(request, now)?;
+        let current = record
+            .receipt
+            .as_ref()
+            .ok_or(EnrollmentError::NotCommitted)?;
+        if current.expires_at > request.holds_until {
+            return Ok(RenewPreparation::Existing(current.clone()));
+        }
+        let lifetime =
+            i64::try_from(self.limits.credential_lifetime).map_err(|_| EnrollmentError::Invalid)?;
+        let expires_at = now.checked_add(lifetime).ok_or(EnrollmentError::Invalid)?;
+        // A renewal must extend the credential; one decided within the
+        // second the current certificate was issued would not.
+        if expires_at <= current.expires_at {
+            return Err(EnrollmentError::Conflict);
+        }
+        let retire_previous_at = now
+            .checked_add(i64::try_from(grace_seconds).map_err(|_| EnrollmentError::Invalid)?)
+            .ok_or(EnrollmentError::Invalid)?
+            .min(current.expires_at)
+            .max(now);
+        let receipt = EnrollmentReceipt {
+            invitation: current.invitation,
+            request: current.request,
+            identity: current.identity.clone(),
+            public_key: current.public_key,
+            csr_hash: current.csr_hash,
+            issued_at: now,
+            expires_at,
+            revision: self
+                .revision
+                .checked_add(1)
+                .ok_or(EnrollmentError::Capacity)?,
+            certificate: authority.issue(
+                &request.csr,
+                &current.identity,
+                now,
+                self.limits.credential_lifetime,
+            )?,
+        };
+        let retired = RetiredCredential {
+            invitation: current.invitation,
+            receipt: current.clone(),
+            retire_at: retire_previous_at,
+        };
+        self.reserve(retired_charge(&retired)?)?;
+        Ok(RenewPreparation::Commit(EnrollmentCommand {
+            revision: self.revision,
+            decided_at: now,
+            change: Change::Renew {
+                invitation: current.invitation,
+                receipt,
+                retire_previous_at,
+            },
+        }))
+    }
+    /// The committed renewal a holder's request produced, once applied.
+    pub fn release_renewal(
+        &self,
+        request: &RenewRequest,
+        now: i64,
+    ) -> Result<EnrollmentReceipt, EnrollmentError> {
+        let record = self.authenticate_renewal(request, now)?;
+        let current = record
+            .receipt
+            .as_ref()
+            .ok_or(EnrollmentError::NotCommitted)?;
+        if current.expires_at > request.holds_until {
+            Ok(current.clone())
+        } else {
+            Err(EnrollmentError::NotCommitted)
+        }
+    }
+    fn authenticate_renewal(
+        &self,
+        request: &RenewRequest,
+        now: i64,
+    ) -> Result<&InviteMetadata, EnrollmentError> {
+        self.check_time(now)?;
+        if request.cluster != self.cluster {
+            return Err(EnrollmentError::WrongCluster);
+        }
+        if request.schema != 1 || request.request == [0; 16] {
+            return Err(EnrollmentError::Unauthorized);
+        }
+        let record = self
+            .records
+            .get(&request.invitation)
+            .ok_or(EnrollmentError::Unauthorized)?;
+        if record.revoked {
+            return Err(EnrollmentError::Revoked);
+        }
+        let receipt = record
+            .receipt
+            .as_ref()
+            .ok_or(EnrollmentError::Unauthorized)?;
+        if receipt.request != request.request
+            || receipt.csr_hash != hash("focal.enrollment.csr.v1", &request.csr)
+            || receipt.public_key != csr_key_hash(&request.csr)?
+            || receipt.identity.role != EnrollmentRole::Node
+        {
+            return Err(EnrollmentError::Unauthorized);
+        }
+        // The proof is signed by a certificate of this very enrollment: the
+        // current one, or the one a renewal just retired while it still
+        // authorizes, never a certificate of another key.
+        let signer = self.verify_node_statement(&request.proof, &request.statement()?, now)?;
+        if signer != receipt.identity
+            || certificate_key_hash(&request.proof.certificate)? != receipt.public_key
+        {
+            return Err(EnrollmentError::Unauthorized);
+        }
+        Ok(record)
+    }
     pub fn prepare_revoke(
         &self,
         invitation: InvitationId,
@@ -734,7 +972,79 @@ impl EnrollmentRegistry {
                     .ok_or(EnrollmentError::Unauthorized)?
                     .revoked = true
             }
+            Change::Renew {
+                invitation,
+                receipt,
+                retire_previous_at,
+            } => {
+                let record = self
+                    .records
+                    .get(invitation)
+                    .ok_or(EnrollmentError::Unauthorized)?;
+                if record.revoked {
+                    return Err(EnrollmentError::Revoked);
+                }
+                let current = record
+                    .receipt
+                    .as_ref()
+                    .ok_or(EnrollmentError::Unauthorized)?;
+                let fingerprint = server_fingerprint(&receipt.certificate);
+                if receipt.invitation != *invitation
+                    || receipt.request != current.request
+                    || receipt.identity != current.identity
+                    || receipt.public_key != current.public_key
+                    || receipt.csr_hash != current.csr_hash
+                    || receipt.revision != next_revision
+                    || receipt.issued_at != command.decided_at
+                    || receipt.expires_at.checked_sub(receipt.issued_at)
+                        != Some(self.limits.credential_lifetime as i64)
+                    || *retire_previous_at < command.decided_at
+                    || *retire_previous_at > current.expires_at
+                    || self.certificates.contains_key(&fingerprint)
+                    || self.retired.contains_key(&fingerprint)
+                {
+                    return Err(EnrollmentError::Invalid);
+                }
+                verify_issued(receipt, &self.ca_certificate)?;
+                let previous = server_fingerprint(&current.certificate);
+                let retired = RetiredCredential {
+                    invitation: *invitation,
+                    receipt: current.clone(),
+                    retire_at: *retire_previous_at,
+                };
+                let mut updated = record.clone();
+                updated.receipt = Some(receipt.clone());
+                let charge = retired_charge(&retired)?
+                    .checked_add(record_charge(&updated)?)
+                    .and_then(|bytes| bytes.checked_sub(record_charge(record).ok()?))
+                    .ok_or(EnrollmentError::Corrupt)?;
+                self.reserve(charge)?;
+                self.records
+                    .get_mut(invitation)
+                    .ok_or(EnrollmentError::Corrupt)?
+                    .receipt = Some(receipt.clone());
+                self.certificates.remove(&previous);
+                self.certificates.insert(fingerprint, *invitation);
+                self.retired.insert(previous, retired);
+                self.charged_bytes = self
+                    .charged_bytes
+                    .checked_add(charge)
+                    .ok_or(EnrollmentError::Capacity)?;
+            }
         }
+        // Retired certificates past their grace leave the table, so the
+        // registry never grows with the renewals of long-lived nodes.
+        let mut reclaimed = 0usize;
+        let decided_at = command.decided_at;
+        self.retired.retain(|_, retired| {
+            if retired.retire_at <= decided_at {
+                reclaimed = reclaimed.saturating_add(retired_charge(retired).unwrap_or(0));
+                false
+            } else {
+                true
+            }
+        });
+        self.charged_bytes = self.charged_bytes.saturating_sub(reclaimed);
         self.revision = next_revision;
         self.applied_index = committed_index;
         self.time_floor = command.decided_at;
@@ -762,9 +1072,23 @@ impl EnrollmentRegistry {
         if certificate.len() > 4096 {
             return Err(EnrollmentError::Capacity);
         }
+        let fingerprint = server_fingerprint(certificate);
+        if let Some(retired) = self.retired.get(&fingerprint) {
+            let record = self
+                .records
+                .get(&retired.invitation)
+                .ok_or(EnrollmentError::Corrupt)?;
+            if record.revoked {
+                return Err(EnrollmentError::Revoked);
+            }
+            if now < retired.receipt.issued_at || now >= retired.retire_at {
+                return Err(EnrollmentError::Expired);
+            }
+            return Ok(retired.receipt.identity.clone());
+        }
         let id = self
             .certificates
-            .get(&server_fingerprint(certificate))
+            .get(&fingerprint)
             .ok_or(EnrollmentError::Unauthorized)?;
         let record = self.records.get(id).ok_or(EnrollmentError::Corrupt)?;
         if record.revoked {
@@ -802,7 +1126,7 @@ impl EnrollmentRegistry {
         }
         let (mut registry, rest): (Self, &[u8]) = postcard::take_from_bytes(bytes)?;
         if !rest.is_empty()
-            || registry.schema != 1
+            || registry.schema != REGISTRY_SCHEMA
             || registry.limits != limits
             || registry.records.len() > limits.max_invitations
             || registry.certificates.len() > limits.max_enrollments
@@ -869,6 +1193,31 @@ impl EnrollmentRegistry {
         }
         if certificates != registry.certificates || enrolled_keys != registry.enrolled_keys {
             return Err(EnrollmentError::Corrupt);
+        }
+        if registry.retired.len() > limits.max_enrollments {
+            return Err(EnrollmentError::Corrupt);
+        }
+        for (fingerprint, retired) in &registry.retired {
+            charged_bytes = charged_bytes
+                .checked_add(retired_charge(retired)?)
+                .ok_or(EnrollmentError::Capacity)?;
+            let current = registry
+                .records
+                .get(&retired.invitation)
+                .and_then(|record| record.receipt.as_ref())
+                .ok_or(EnrollmentError::Corrupt)?;
+            if *fingerprint != server_fingerprint(&retired.receipt.certificate)
+                || certificates.contains_key(fingerprint)
+                || retired.receipt.invitation != retired.invitation
+                || retired.receipt.identity != current.identity
+                || retired.receipt.public_key != current.public_key
+                || retired.receipt.request != current.request
+                || retired.retire_at > retired.receipt.expires_at
+                || retired.receipt.revision >= current.revision
+            {
+                return Err(EnrollmentError::Corrupt);
+            }
+            verify_issued(&retired.receipt, &registry.ca_certificate)?;
         }
         if charged_bytes != registry.charged_bytes || charged_bytes > limits.max_checkpoint_bytes {
             return Err(EnrollmentError::Corrupt);
@@ -960,6 +1309,12 @@ fn record_charge(record: &InviteMetadata) -> Result<usize, EnrollmentError> {
         .len()
         .checked_add(128)
         .and_then(|value| value.checked_add(if record.receipt.is_some() { 256 } else { 0 }))
+        .ok_or(EnrollmentError::Capacity)
+}
+fn retired_charge(retired: &RetiredCredential) -> Result<usize, EnrollmentError> {
+    encode(retired)?
+        .len()
+        .checked_add(128)
         .ok_or(EnrollmentError::Capacity)
 }
 fn token_hash(secret: &[u8]) -> Fingerprint {

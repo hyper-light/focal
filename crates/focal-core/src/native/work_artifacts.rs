@@ -155,7 +155,7 @@ pub(super) fn submission_view(
                 return Err(ContractError::InvalidTarget.into());
             }
             let count = super::increments::count(claim, limits)?;
-            super::response_budget::check_increment_shape(count, limits)?;
+            super::response_budget::check_increment_shape(count, descriptor.input_count(), limits)?;
             if count != 0 {
                 let registry = view
                     .owned_claim(parent.claim)?

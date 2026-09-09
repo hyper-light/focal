@@ -74,12 +74,23 @@ pub struct PendingClientJoin {
 }
 impl PendingClientJoin {
     pub fn open(path: impl AsRef<Path>, bundle: ClientInvitation) -> Result<Self, JoinError> {
-        Self::build(path.as_ref(), Some(bundle))
+        Self::build(path.as_ref(), Some(bundle), false)
     }
     pub fn resume(path: impl AsRef<Path>) -> Result<Self, JoinError> {
-        Self::build(path.as_ref(), None)
+        Self::build(path.as_ref(), None, false)
     }
-    fn build(path: &Path, expected: Option<ClientInvitation>) -> Result<Self, JoinError> {
+    /// Resume a completed enrollment for reading beside other processes of
+    /// the same participant. An enrollment that still needs a write is
+    /// reported pending; it is completed by `context enroll`, which owns the
+    /// directory exclusively.
+    pub fn resume_shared(path: impl AsRef<Path>) -> Result<Self, JoinError> {
+        Self::build(path.as_ref(), None, true)
+    }
+    fn build(
+        path: &Path,
+        expected: Option<ClientInvitation>,
+        shared: bool,
+    ) -> Result<Self, JoinError> {
         use std::os::unix::fs::MetadataExt;
         let parent = path.parent().ok_or(JoinError::Invalid)?;
         let metadata = fs::symlink_metadata(parent)?;
@@ -105,7 +116,14 @@ impl PendingClientJoin {
         if expected.is_none() && !initialized && !path.join("journal.bin").is_file() {
             return Err(JoinError::Pending);
         }
-        let mut journal = PrivateJournal::open(path)?;
+        if shared && !initialized {
+            return Err(JoinError::Pending);
+        }
+        let mut journal = if shared {
+            PrivateJournal::open_shared(path)?
+        } else {
+            PrivateJournal::open(path)?
+        };
         let expected = expected.map(|bundle| bundle.encode()).transpose()?;
         let mut state = match journal.read()? {
             Some(bytes) => {
@@ -136,12 +154,22 @@ impl PendingClientJoin {
         };
         let bundle = ClientInvitation::decode(&state.bundle.0)?;
         let pin = blake3::hash(&state.bundle.0);
-        write_private_new(&marker, pin.as_bytes())?;
+        if shared {
+            if state.key.is_none() {
+                return Err(JoinError::Pending);
+            }
+        } else {
+            write_private_new(&marker, pin.as_bytes())?;
+        }
         let keypath = path.join("client-key");
         if state.key.is_some() && !keypath.join("join-key.bin").is_file() {
             return Err(JoinError::Invalid);
         }
-        let key = JoinKey::open_or_create(&keypath, bundle.invitation().cluster())?;
+        let key = if shared {
+            JoinKey::open_shared(&keypath, bundle.invitation().cluster())?
+        } else {
+            JoinKey::open_or_create(&keypath, bundle.invitation().cluster())?
+        };
         let keypin = KeyPin {
             request: key.request_id(),
             csr: *blake3::hash(key.csr()).as_bytes(),
@@ -201,6 +229,9 @@ impl PendingClientJoin {
         .catch_unwind()
         .await
         .map_err(|_| JoinError::Runtime)??;
+        // The receipt is issued at the sponsor's clock after the exchange; a
+        // caller's earlier sample must not read a fresh receipt as future-dated.
+        let now = now.max(crate::network_bootstrap::unix_time().map_err(|_| JoinError::Runtime)?);
         drop(self.verify(&receipt, now)?);
         Ok(receipt)
     }

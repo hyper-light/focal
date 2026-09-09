@@ -245,6 +245,7 @@ fn partition_byte_count_and_oversized_splits_have_exact_preflight_leaf_charges()
         let bound = RangeWriteLimits {
             changed_keys: rows.len(),
             deleted_keys: 0,
+            deleted_heap: 0,
             incoming_heap: rows
                 .iter()
                 .map(|row| match row {
@@ -293,6 +294,7 @@ fn funded_partitioned_update_rolls_back_under_pressure_and_preserves_the_content
         .future_write_envelope(RangeWriteLimits {
             changed_keys: 3,
             deleted_keys: 0,
+            deleted_heap: 0,
             incoming_heap: 3 * (8 + ALLOCATOR_OVERHEAD),
             input_capacity: 3,
         })

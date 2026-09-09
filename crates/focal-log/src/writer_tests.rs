@@ -583,3 +583,66 @@ async fn blocking_ticket_wait_is_runtime_independent_and_receipt_is_consumed_onc
     ));
     assert_eq!(records(&lease), vec![record(1, 1)]);
 }
+
+#[test]
+fn a_batch_is_promised_its_volume_bytes_before_queueing_and_charged_after_its_fence() {
+    use focal_memory::{DiskBudget, DiskBudgetConfig};
+    let dir = tempfile::tempdir().unwrap();
+    // A watermark above any real volume refuses every fresh batch before a
+    // byte is written, and keeps nothing promised on refusal.
+    let guarded = DiskBudget::new(DiskBudgetConfig {
+        headroom: u64::MAX / 2,
+        completion_reserve: 0,
+        sample_interval: 4,
+    })
+    .unwrap();
+    let shared = SharedWal::open_with_budgets(
+        dir.path(),
+        options(),
+        WalWriterLimits::default(),
+        memory(),
+        guarded.clone(),
+    )
+    .unwrap();
+    let mut lease = shared.lease(LogicalLogId([1; 16])).unwrap();
+    assert!(matches!(
+        lease.append(&[record(1, 1)]),
+        Err(LogError::Capacity)
+    ));
+    assert_eq!(guarded.stats().outstanding, 0);
+    // The unpromised free bytes are reported as sampled; the watermark that
+    // refused the batch is the envelope's, which admission compares against.
+    assert!(shared.available_bytes().unwrap() > 0);
+    assert_eq!(guarded.available(BudgetLane::Completion), 0);
+    assert_eq!(shared.stats().unwrap().appended_records, 0);
+    drop(lease);
+    drop(shared);
+    // Without a watermark the sample still charges every durable batch, so
+    // a run of admissions between samples cannot promise the same bytes twice.
+    let open = DiskBudget::new(DiskBudgetConfig {
+        headroom: 0,
+        completion_reserve: 0,
+        sample_interval: u32::MAX,
+    })
+    .unwrap();
+    let shared = SharedWal::open_with_budgets(
+        dir.path(),
+        options(),
+        WalWriterLimits::default(),
+        memory(),
+        open.clone(),
+    )
+    .unwrap();
+    let mut lease = shared.lease(LogicalLogId([1; 16])).unwrap();
+    let before = shared.available_bytes().unwrap();
+    assert!(before > 0);
+    lease.append(&[record(1, 1), record(1, 2)]).unwrap();
+    let stats = open.stats();
+    assert_eq!(stats.outstanding, 0);
+    assert!(stats.free.unwrap() < before);
+    assert_eq!(shared.available_bytes().unwrap(), stats.free.unwrap());
+    // The checkpoint rewrite is promised the same way.
+    lease.rewrite_checkpoint(&[record(1, 1)]).unwrap();
+    assert_eq!(open.stats().outstanding, 0);
+    assert!(open.stats().free.unwrap() < stats.free.unwrap());
+}

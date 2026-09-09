@@ -51,6 +51,31 @@ impl EvidencePlacement {
             copies: plan.content_copies.iter().copied().collect(),
         })
     }
+    /// A placement the directory has committed and the agent installs on this
+    /// node; the members are the committed voters and content copies.
+    pub fn committed(
+        scope: CustodyScope,
+        voters: BTreeSet<u64>,
+        copies: BTreeSet<u64>,
+    ) -> Result<Self, AccessError> {
+        if scope.ledger.tenant.is_zero()
+            || scope.ledger.session.is_zero()
+            || scope.route_epoch.0 == 0
+            || scope.policy_revision == 0
+            || voters.is_empty()
+            || copies.is_empty()
+        {
+            return Err(AccessError::InvalidRequest);
+        }
+        if voters.len() > 1024 || copies.len() > 1024 {
+            return Err(AccessError::Capacity);
+        }
+        Ok(Self {
+            scope,
+            voters,
+            copies,
+        })
+    }
     pub fn scope(&self) -> CustodyScope {
         self.scope
     }
@@ -87,6 +112,12 @@ pub struct EvidenceWitness {
 pub struct EvidencedRequest {
     request: VerifiedRequest,
     witness: EvidenceWitness,
+}
+/// An artifact-bearing native frame whose inline payload the exclusive content
+/// writer sealed and verified under the current placement.
+pub struct NativeEvidencedRequest {
+    pub(crate) request: VerifiedRequest,
+    pub(crate) evidence: focal_evidence::VerifiedNativeArtifact,
 }
 impl EvidenceWitness {
     pub(crate) fn validate(
@@ -129,6 +160,7 @@ impl EvidenceWitness {
 enum JobKind {
     Seal(oneshot::Sender<Result<ContentRef, AccessError>>),
     Attest(oneshot::Sender<Result<EvidencedRequest, AccessError>>),
+    AttestNative(oneshot::Sender<Result<NativeEvidencedRequest, AccessError>>),
 }
 struct Job {
     request: VerifiedRequest,
@@ -155,6 +187,11 @@ enum Completed {
         scope: Option<CustodyScope>,
         result: Box<Result<EvidencedRequest, AccessError>>,
         reply: oneshot::Sender<Result<EvidencedRequest, AccessError>>,
+    },
+    AttestNative {
+        scope: Option<CustodyScope>,
+        result: Box<Result<NativeEvidencedRequest, AccessError>>,
+        reply: oneshot::Sender<Result<NativeEvidencedRequest, AccessError>>,
     },
 }
 impl Completed {
@@ -183,6 +220,20 @@ impl Completed {
                 let _ = reply.send(result);
             }
             Self::Attest {
+                scope,
+                result,
+                reply,
+            } => {
+                let result = (*result).and_then(|value| {
+                    if current(scope) {
+                        Ok(value)
+                    } else {
+                        Err(AccessError::Unavailable)
+                    }
+                });
+                let _ = reply.send(result);
+            }
+            Self::AttestNative {
                 scope,
                 result,
                 reply,
@@ -322,6 +373,17 @@ impl EvidenceCoordinator {
     pub async fn attest(&self, request: VerifiedRequest) -> Result<EvidencedRequest, AccessError> {
         let (send, receive) = oneshot::channel();
         self.admit(request, JobKind::Attest(send))?;
+        receive.await.map_err(|_| AccessError::OutcomeUnknown)?
+    }
+    /// Seal and verify the inline payload of an artifact-bearing native frame
+    /// under the current placement; the owner still binds the evidence to the
+    /// exact frame before admission.
+    pub async fn attest_native(
+        &self,
+        request: VerifiedRequest,
+    ) -> Result<NativeEvidencedRequest, AccessError> {
+        let (send, receive) = oneshot::channel();
+        self.admit(request, JobKind::AttestNative(send))?;
         receive.await.map_err(|_| AccessError::OutcomeUnknown)?
     }
     /// Install a verified committed placement through the existing owner. The
@@ -510,7 +572,67 @@ async fn process(
                 reply: response,
             }
         }
+        JobKind::AttestNative(response) => {
+            let result = match &placement {
+                Ok(row) => attest_native(content, pool, node, &row.placement, job.request).await,
+                Err(error) => Err(error.clone()),
+            };
+            drop(job._allocation);
+            Completed::AttestNative {
+                scope,
+                result: Box::new(result),
+                reply: response,
+            }
+        }
     }
+}
+/// Seal and verify an artifact-bearing native frame's inline payload, then
+/// replicate the sealed bytes to every other required copy of the current
+/// placement, exactly as a sealed upload is. A missing required copy refuses
+/// the frame before admission; a follower that later leads or serves reads
+/// therefore holds the payload under its own custody.
+async fn attest_native(
+    content: &ContentHost,
+    pool: &PeerConnectionPool,
+    node: u64,
+    placement: &EvidencePlacement,
+    request: VerifiedRequest,
+) -> Result<NativeEvidencedRequest, AccessError> {
+    let Operation::Native { frame } = &request.request().operation else {
+        return Err(AccessError::InvalidRequest);
+    };
+    if request.request().ledger != placement.scope.ledger {
+        return Err(AccessError::Unauthorized);
+    }
+    let domain = focal_model::ContentDomainId(placement.scope.ledger.tenant.0);
+    let limits = focal_ledger::NativeSessionLimits::standard(domain);
+    let (key, descriptor) = crate::native_ingress::artifact_of_frame(&limits, frame)?
+        .ok_or(AccessError::InvalidRequest)?;
+    if key.principal != request.peer().principal()
+        || key.id != request.request().request_id
+        || key.epoch != request.request().request_epoch
+        || descriptor.ledger() != placement.scope.ledger
+    {
+        return Err(AccessError::Unauthorized);
+    }
+    let evidence = content
+        .verify_native(crate::content_host::NativeVerification {
+            scope: placement.scope,
+            request: key,
+            descriptor,
+            domain,
+        })
+        .await?;
+    let payload = evidence.custody().payload();
+    let reference = ContentRef {
+        domain: payload.domain,
+        root: payload.root,
+        length: payload.length,
+        class: payload.class,
+    };
+    replicate(content, pool, node, placement, key.id, &reference).await?;
+    content.check_policy(placement.scope).await?;
+    Ok(NativeEvidencedRequest { request, evidence })
 }
 async fn seal(
     content: &ContentHost,
@@ -946,6 +1068,9 @@ impl RequestHandler for FleetService {
     fn supports_participant_requests(&self) -> bool {
         true
     }
+    fn supports_native_requests(&self) -> bool {
+        true
+    }
     fn handle(
         &self,
         request: VerifiedRequest,
@@ -971,6 +1096,21 @@ impl RequestHandler for FleetService {
                 Operation::Custody(_) | Operation::Upload(_) | Operation::Download { .. }
             ) {
                 self.content.handle_accounted(request).await
+            } else if let Operation::Native { frame } = &request.request().operation
+                && inspect_native_frame(frame)
+                    .is_ok_and(|header| crate::native_ingress::artifact_bearing(header.command))
+            {
+                match self.evidence.attest_native(request).await {
+                    Ok(evidence) => {
+                        self.replica
+                            .submit_with_native_evidence(evidence.request, evidence.evidence)
+                            .await
+                    }
+                    Err(error) => {
+                        response.result = Response::Error(error);
+                        OwnedResponse::new(response)
+                    }
+                }
             } else if artifact(&request.request().operation).is_some() {
                 let probe = match self.replica.probe_receipt(request).await {
                     Ok(probe) => probe,

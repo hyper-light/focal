@@ -191,12 +191,18 @@ fn reference(pointer: ContentPointer) -> ContentRef {
     }
 }
 
-impl ContentStore {
+/// Read-side custody used by native replay and recovery: the local content a
+/// committed record names must exist and verify before a row is constructed.
+/// Both the exclusive writer and a lock-free reader over the same directory
+/// provide it; neither reading path seals inline bytes or creates a witness.
+pub trait NativeCustodyReader {
+    fn read_content(&self, reference: &ContentRef, budget: usize) -> Result<Vec<u8>, ContentError>;
+
     /// Restore custody only from an already present, fully verified local tree.
     /// Unlike submission, this path never seals inline bytes or creates missing
     /// evidence. The enclosing ledger importer authenticates the original request
     /// and publication history before trusting the reconstructed capability.
-    pub fn recover_native_artifact(
+    fn recover_native_artifact(
         &self,
         request: RequestKey,
         descriptor: &ArtifactDescriptor,
@@ -205,7 +211,7 @@ impl ContentStore {
         budget: &MemoryBudget,
         schemas: &impl NativeSchemaVerifier,
     ) -> Result<VerifiedNativeArtifact, NativeEvidenceError> {
-        self.check_native_verification_request(request, descriptor, expected.domain)?;
+        check_verification_request(request, descriptor, expected.domain)?;
         if local_revision != 1 || expected.root.0 == [0; 32] {
             return Err(ContractError::MissingEvidence.into());
         }
@@ -236,7 +242,7 @@ impl ContentStore {
             )?
             .commit();
         {
-            let bytes = self.read_bytes(&reference(expected), maximum)?;
+            let bytes = self.read_content(&reference(expected), maximum)?;
             if bytes.capacity() > maximum {
                 return Err(ContentError::Capacity.into());
             }
@@ -247,8 +253,6 @@ impl ContentStore {
             }
             schemas.verify(descriptor.schema_hash(), &bytes)?;
         }
-        // The complete read/schema buffers have dropped before their permit is
-        // reduced to the retained token. No raw encoded token can reach here.
         let custody = NativeLocalCustody {
             request,
             descriptor: descriptor.intent_fingerprint(),
@@ -260,7 +264,34 @@ impl ContentStore {
             allocation,
         })
     }
+}
+impl NativeCustodyReader for ContentStore {
+    fn read_content(&self, reference: &ContentRef, budget: usize) -> Result<Vec<u8>, ContentError> {
+        self.read_bytes(reference, budget)
+    }
+}
+impl NativeCustodyReader for ContentReader {
+    fn read_content(&self, reference: &ContentRef, budget: usize) -> Result<Vec<u8>, ContentError> {
+        self.read_bytes(reference, budget)
+    }
+}
+fn check_verification_request(
+    request: RequestKey,
+    descriptor: &ArtifactDescriptor,
+    inline_domain: ContentDomainId,
+) -> Result<(), NativeEvidenceError> {
+    if request.principal != descriptor.producer()
+        || request.principal.is_zero()
+        || request.id.is_zero()
+        || request.epoch.0 == 0
+        || inline_domain.is_zero()
+    {
+        return Err(NativeEvidenceError::WrongRequest);
+    }
+    Ok(())
+}
 
+impl ContentStore {
     /// Verify and retain actual local evidence before entering native Core.
     /// Inline payloads are sealed into the existing content-tree format too:
     /// an in-memory command alone cannot prove durable custody. Request/actor
@@ -317,15 +348,7 @@ impl ContentStore {
         inline_domain: ContentDomainId,
     ) -> Result<(), NativeEvidenceError> {
         self.check()?;
-        if request.principal != descriptor.producer()
-            || request.principal.is_zero()
-            || request.id.is_zero()
-            || request.epoch.0 == 0
-            || inline_domain.is_zero()
-        {
-            return Err(NativeEvidenceError::WrongRequest);
-        }
-        Ok(())
+        check_verification_request(request, descriptor, inline_domain)
     }
 
     fn verify_native_artifact_quoted(
@@ -390,30 +413,122 @@ impl ContentStore {
         self.mark_failure(&result);
         result
     }
+    /// Seal inline bytes with an explicit chunk size so every replica of an
+    /// import derives the same reference from the same legacy bytes (23 §5.2).
+    /// The chunk size travels with the activation record, not the node config.
+    pub fn seal_import_inline(
+        &mut self,
+        domain: ContentDomainId,
+        bytes: &[u8],
+        chunk_bytes: usize,
+    ) -> Result<ContentRef, ContentError> {
+        self.check()?;
+        let result = self.seal_inline_with(domain, bytes, chunk_bytes);
+        self.mark_failure(&result);
+        result
+    }
     fn seal_native_inline_inner(
         &self,
         domain: ContentDomainId,
         bytes: &[u8],
     ) -> Result<ContentRef, ContentError> {
+        self.seal_inline_with(domain, bytes, self.limits.chunk_bytes)
+    }
+    fn seal_inline_with(
+        &self,
+        domain: ContentDomainId,
+        bytes: &[u8],
+        chunk_bytes: usize,
+    ) -> Result<ContentRef, ContentError> {
         let length = u64::try_from(bytes.len()).map_err(|_| ContentError::Capacity)?;
         if length > self.limits.max_content_bytes || bytes.len() > MAX_TRANSFER_MANIFEST_BYTES {
             return Err(ContentError::Capacity);
         }
+        let (manifest, encoded, root) = inline_manifest(
+            domain,
+            bytes,
+            chunk_bytes,
+            self.limits.max_manifest_bytes,
+            STORE_WORKSPACE,
+        )?;
+        // All deterministic limits and buffer allocations precede disk writes;
+        // the committed record's payload is completion work on the volume.
+        let objects = disk_reserve(
+            &self.disk,
+            &self.root,
+            DiskKind::Content,
+            focal_memory::BudgetLane::Completion,
+            length
+                .checked_add(u64::try_from(encoded.len()).map_err(|_| ContentError::Capacity)?)
+                .ok_or(ContentError::Capacity)?,
+        )?;
+        let directory = self.root.join("objects").join(hex(&domain.0));
+        durable_directory(&directory)?;
+        for (block, chunk) in bytes.chunks(chunk_bytes).zip(&manifest.chunks) {
+            install_verified_chunk(
+                &directory.join(format!("{}.chunk", chunk.hash)),
+                block,
+                chunk.hash,
+            )?;
+        }
+        atomic_install(&directory.join(format!("{root}.manifest")), &encoded)?;
+        objects.commit();
+        Ok(ContentRef {
+            domain,
+            root,
+            length,
+            class: ContentClass::Evidence,
+        })
+    }
+}
+
+/// The reference sealing `bytes` inline would produce, without touching disk.
+/// Import translation names imported inline payloads by this reference on
+/// every replica; sealing with the same chunk size installs exactly it.
+pub fn inline_reference(
+    domain: ContentDomainId,
+    bytes: &[u8],
+    chunk_bytes: usize,
+    max_manifest_bytes: usize,
+) -> Result<ContentRef, ContentError> {
+    let length = u64::try_from(bytes.len()).map_err(|_| ContentError::Capacity)?;
+    if bytes.len() > MAX_TRANSFER_MANIFEST_BYTES {
+        return Err(ContentError::Capacity);
+    }
+    let (_, _, root) = inline_manifest(
+        domain,
+        bytes,
+        chunk_bytes,
+        max_manifest_bytes,
+        STORE_WORKSPACE,
+    )?;
+    Ok(ContentRef {
+        domain,
+        root,
+        length,
+        class: ContentClass::Evidence,
+    })
+}
+
+fn inline_manifest(
+    domain: ContentDomainId,
+    bytes: &[u8],
+    chunk_bytes: usize,
+    max_manifest_bytes: usize,
+    workspace: usize,
+) -> Result<(Manifest, Vec<u8>, ContentHash), ContentError> {
+    {
+        let length = u64::try_from(bytes.len()).map_err(|_| ContentError::Capacity)?;
+        if chunk_bytes == 0 {
+            return Err(ContentError::Capacity);
+        }
         let count = bytes
             .len()
-            .checked_add(
-                self.limits
-                    .chunk_bytes
-                    .checked_sub(1)
-                    .ok_or(ContentError::Capacity)?,
-            )
+            .checked_add(chunk_bytes.checked_sub(1).ok_or(ContentError::Capacity)?)
             .ok_or(ContentError::Capacity)?
-            .checked_div(self.limits.chunk_bytes)
+            .checked_div(chunk_bytes)
             .ok_or(ContentError::Capacity)?;
-        if count
-            .checked_mul(40)
-            .is_none_or(|n| n > self.limits.max_manifest_bytes)
-        {
+        if count.checked_mul(40).is_none_or(|n| n > max_manifest_bytes) {
             return Err(ContentError::Capacity);
         }
         let mut chunks = Vec::new();
@@ -423,11 +538,11 @@ impl ContentStore {
         if chunks
             .capacity()
             .checked_mul(std::mem::size_of::<Chunk>())
-            .is_none_or(|n| n > STORE_WORKSPACE)
+            .is_none_or(|n| n > workspace)
         {
             return Err(ContentError::Capacity);
         }
-        for block in bytes.chunks(self.limits.chunk_bytes) {
+        for block in bytes.chunks(chunk_bytes) {
             let hash = ContentHash(*blake3::hash(block).as_bytes());
             chunks.push(Chunk {
                 hash,
@@ -444,14 +559,14 @@ impl ContentStore {
         };
         let encoded_size = postcard::experimental::serialized_size(&manifest)?;
         let size = add(MANIFEST_MAGIC.len(), encoded_size)?;
-        if size > self.limits.max_manifest_bytes {
+        if size > max_manifest_bytes {
             return Err(ContentError::Capacity);
         }
         let mut encoded = Vec::new();
         encoded
             .try_reserve_exact(size)
             .map_err(|_| ContentError::Capacity)?;
-        if encoded.capacity() > self.limits.max_manifest_bytes {
+        if encoded.capacity() > max_manifest_bytes {
             return Err(ContentError::Capacity);
         }
         encoded.resize(size, 0);
@@ -469,23 +584,7 @@ impl ContentStore {
             return Err(ContentError::Corrupt);
         }
         let root = ContentHash(*blake3::hash(&encoded).as_bytes());
-        // All deterministic limits and buffer allocations precede disk writes.
-        let directory = self.root.join("objects").join(hex(&domain.0));
-        durable_directory(&directory)?;
-        for (block, chunk) in bytes.chunks(self.limits.chunk_bytes).zip(&manifest.chunks) {
-            install_verified_chunk(
-                &directory.join(format!("{}.chunk", chunk.hash)),
-                block,
-                chunk.hash,
-            )?;
-        }
-        atomic_install(&directory.join(format!("{root}.manifest")), &encoded)?;
-        Ok(ContentRef {
-            domain,
-            root,
-            length,
-            class: ContentClass::Evidence,
-        })
+        Ok((manifest, encoded, root))
     }
 }
 

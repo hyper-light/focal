@@ -27,6 +27,8 @@ pub(in crate::native) struct SealedChanges {
     pub(in crate::native) outcome: NativeOutcome,
     pub(in crate::native) meta: Meta,
     pub(in crate::native) seals: Vec<SealTransition>,
+    /// Secondary index changes among `changes`.
+    pub(in crate::native) index: usize,
 }
 
 impl SealedPlan<'_> {
@@ -197,6 +199,18 @@ impl<'source> OriginalPlan<'source> {
         let mut outcome = original_outcome;
         let mut meta = self.meta;
         let limits = self.limits;
+        // Secondary index rows are derived from the exact primary rows this
+        // plan writes, before any ownership moves; replay rederives them.
+        let index = crate::native::index_rows::derive_plan(
+            rows,
+            extras,
+            view,
+            outcome.invocation,
+            suffix.as_ref(),
+            limits,
+        )?;
+        let index_bytes =
+            array::<crate::native::index_rows::IndexChange>(index.changes.capacity())?;
         let additional_evaluations = suffix
             .as_ref()
             .map_or(0, CohortSeals::additional_evaluations);
@@ -226,7 +240,10 @@ impl<'source> OriginalPlan<'source> {
                 rows.len(),
                 usize::try_from(outcome.events).map_err(|_| NativeError::Capacity("events"))?,
             )?,
-            add(add(2, extras.rows.len())?, additional_evaluations)?,
+            add(
+                add(add(2, extras.rows.len())?, additional_evaluations)?,
+                index.changes.len(),
+            )?,
         )?;
         if count > limits.range.max_batch_entries {
             return Err(NativeError::Capacity(
@@ -243,7 +260,7 @@ impl<'source> OriginalPlan<'source> {
                     array::<Change<Key, Row>>(changes.capacity())?,
                     array::<History>(rows.len())?,
                 )?,
-                add(containers(rows.len())?, event_charge)?,
+                add(add(containers(rows.len())?, event_charge)?, index_bytes)?,
             )?,
             allowance,
         )?;
@@ -257,7 +274,7 @@ impl<'source> OriginalPlan<'source> {
                     array::<Change<Key, Row>>(changes.capacity())?,
                     array::<History>(history.capacity())?,
                 )?,
-                add(containers(rows.len())?, event_charge)?,
+                add(add(containers(rows.len())?, event_charge)?, index_bytes)?,
             )?,
             allowance,
         )?;
@@ -323,6 +340,13 @@ impl<'source> OriginalPlan<'source> {
         if ordinal != outcome.events {
             return Err(ContractError::InvalidManifest.into());
         }
+        let index_count = index.changes.len();
+        for change in index.changes {
+            if changes.len() == changes.capacity() {
+                return Err(NativeError::Capacity("index rows"));
+            }
+            changes.push(change.into_change());
+        }
         if changes.len().checked_add(2) != Some(count) || count > changes.capacity() {
             return Err(ContractError::InvalidManifest.into());
         }
@@ -337,6 +361,7 @@ impl<'source> OriginalPlan<'source> {
             outcome,
             meta,
             seals,
+            index: index_count,
         })
     }
 }

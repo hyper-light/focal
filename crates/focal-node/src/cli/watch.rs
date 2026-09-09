@@ -1,8 +1,9 @@
 use super::*;
 use clap::{Args, Subcommand};
 use focal_client::watch::{
-    WatchAction, WatchDelivery, WatchJournal, WatchOptions, WatchPage, WatchStore,
+    WatchAction, WatchDelivery, WatchEngine, WatchJournal, WatchOptions, WatchPage, WatchStore,
 };
+use focal_wire::NativeObject;
 use std::{io, time::Duration};
 use tokio::io::AsyncWriteExt;
 #[derive(Subcommand)]
@@ -53,10 +54,13 @@ struct Follow {
     #[command(flatten)]
     output: OutputOptions,
 }
+/// `engine` is the ledger's engine as probed for this invocation; a saved
+/// watch keeps the engine it was created for.
 pub(super) fn run(
     runtime: &tokio::runtime::Runtime,
     context: &Context,
     command: WatchCommand,
+    engine: WatchEngine,
 ) -> Result<()> {
     let store = WatchStore::open(&context.root, context.operation).map_err(other)?;
     let (mut journal, follow) = match command {
@@ -118,6 +122,7 @@ pub(super) fn run(
             claims.sort_unstable();
             claims.dedup();
             let options = WatchOptions {
+                engine,
                 claims,
                 family,
                 seed: !args.no_seed,
@@ -181,6 +186,64 @@ fn follow_pages(
                 }
             }
         }
+    }
+}
+/// One table row of a native seed object: its family and identity.
+fn native_seed_row(object: &NativeObject) -> (&'static str, String) {
+    let id = |object: ObjectId| object.to_string();
+    match object {
+        NativeObject::Claim(claim) => ("Claim", id(claim.binding.object)),
+        NativeObject::Definition(definition) => ("Validation", id(definition.binding.object)),
+        NativeObject::Evaluation(evaluation) => ("Evaluation", id(evaluation.binding.object)),
+        NativeObject::Result(result) => ("Result", id(result.binding.object)),
+        NativeObject::Artifact(artifact) => ("Artifact", id(artifact.binding.object)),
+        NativeObject::Work(work) => ("Work", id(work.binding.object)),
+        NativeObject::Diagnostic(work) => ("Diagnostic", id(work.binding.object)),
+        NativeObject::Response(response) => ("Testament", id(response.binding.object)),
+        NativeObject::ResultTestament(testament) => {
+            ("ResultTestament", id(testament.binding.object))
+        }
+        NativeObject::Receipt(receipt) => ("Receipt", id(ObjectId(receipt.fence.receipt.0))),
+        NativeObject::Monitor(monitor) => ("Monitor", id(ObjectId(monitor.id.0))),
+        NativeObject::Outcome(outcome) => ("Outcome", format!("{:?}", outcome.invocation)),
+        NativeObject::CreationResult(result) => {
+            ("CreationResult", format!("{:?}", result.invocation))
+        }
+        NativeObject::Event(event) => ("Event", format!("{}.{}", event.sequence.0, event.ordinal)),
+        NativeObject::Context(context) => ("Context", id(context.claim.binding.object)),
+        NativeObject::Standing(standing) => ("Standing", standing.native_sequence.0.to_string()),
+        NativeObject::Legacy(row) => ("Legacy", format!("{:?}", row.key)),
+        NativeObject::Missing(reference) => ("Missing", format!("{reference:?}")),
+    }
+}
+/// The compact table label of one native fact: its kind and the object it
+/// binds; JSON and YAML carry the complete record.
+fn native_fact_row(fact: &NativeFactRecord) -> String {
+    use NativeFactRecord as F;
+    let id = |binding: &NativeBinding| ObjectId(binding.object.0).to_string();
+    match fact {
+        F::ResultTestament { after, state, .. } => {
+            format!("ResultTestament\t{}\t{state:?}", id(after))
+        }
+        F::Missing { key } => format!("Missing\t{:?}", key.evaluation.target),
+        F::Registrations { claim } => format!("Registrations\t{}", id(claim)),
+        F::Delivery { key } => format!("Delivery\t{:?}", key.evaluation.target),
+        F::Work { after, state, .. } => format!("Work\t{}\t{state:?}", id(after)),
+        F::Diagnostic {
+            binding, reason, ..
+        } => format!("Diagnostic\t{}\t{reason:?}", id(binding)),
+        F::Response { after, state, .. } => format!("Response\t{}\t{state:?}", id(after)),
+        F::Receipt { holder, .. } => format!("Receipt\t{}", ObjectId(holder.0)),
+        F::ReceiptAdopted { replacement, .. } => {
+            format!("ReceiptAdopted\t{}", ObjectId(replacement.holder.0))
+        }
+        F::Artifact { binding } => format!("Artifact\t{}", id(binding)),
+        F::Accepted { key } => format!("Accepted\t{:?}", key.evaluation.target),
+        F::Claim(event) => format!("Claim\t{:?}\t{:?}", event.kind, event.status),
+        F::Definition { binding, index, .. } => format!("Definition\t{}\t{index}", id(binding)),
+        F::Evaluation {
+            kind, key, state, ..
+        } => format!("Evaluation\t{kind:?}\t{:?}\t{state:?}", key.target),
     }
 }
 fn other(error: impl std::error::Error + Send + Sync + 'static) -> CliError {
@@ -276,12 +339,31 @@ fn encode_delivery(delivery: &WatchDelivery, format: OutputFormat) -> Result<Vec
             }
             writeln!(out, "PREFIX\t{}", page.token.sequence.0)?;
         }
+        WatchPage::NativeSeed { token, objects, .. } => {
+            for object in objects {
+                let (kind, id) = native_seed_row(object);
+                writeln!(out, "SEED\t{kind}\t{id}")?;
+            }
+            writeln!(out, "PREFIX\t{}", token.sequence.0)?;
+        }
         WatchPage::Events { page } => {
             for event in &page.events {
                 match event {
-                    StreamEvent::Delta { delta, .. } => {
-                        writeln!(out, "CHANGE\t{}\t{:?}", delta.id.sequence.0, delta.fact)?
-                    }
+                    StreamEvent::Delta { delta, .. } => match &delta.fact {
+                        DeltaFact::Native(record) => writeln!(
+                            out,
+                            "CHANGE\t{}\t{:?}\t{}\tnative:{}.{}\t{}",
+                            delta.id.sequence.0,
+                            delta.action,
+                            delta
+                                .claim
+                                .map_or_else(|| "-".into(), |claim| ObjectId(claim.0).to_string()),
+                            record.sequence.0,
+                            record.ordinal,
+                            native_fact_row(&record.fact)
+                        )?,
+                        fact => writeln!(out, "CHANGE\t{}\t{:?}", delta.id.sequence.0, fact)?,
+                    },
                     StreamEvent::Resolved { cursor } => {
                         writeln!(out, "RESOLVED\t{}", cursor.position.sequence.0)?
                     }

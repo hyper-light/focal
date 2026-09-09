@@ -107,6 +107,18 @@ fn references(
     for claim in claims {
         for relation in claim.content.relations() {
             visits.charge(1)?;
+            if let RelationTarget::Evidence(evidence) = relation.target {
+                // Exact evidence must already be committed at that hash on
+                // this ledger; a pending artifact cannot be cited.
+                let artifact = as_artifact(view.get(Key::Artifact(evidence.id)))
+                    .ok_or(ContractError::InvalidTarget)?;
+                if artifact.descriptor().ledger() != view.ledger()
+                    || artifact.descriptor().content_hash() != evidence.hash
+                {
+                    return Err(ContractError::InvalidTarget.into());
+                }
+                continue;
+            }
             let RelationTarget::Object(target) = relation.target else {
                 continue;
             };
@@ -237,6 +249,7 @@ pub(in crate::native) fn prepare(
     let result = NativeCreationResult::from_owned(mapping, total, result_visits, result_charge)?;
     if found == 0 {
         references(&claims, view, &mut visits)?;
+        super::peer::check_batch(context.principal, &claims, view, limits)?;
     }
     let created = if found == 0 { claims.len() } else { 0 };
     let definitions = if found == 0 {

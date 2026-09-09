@@ -839,13 +839,15 @@ fn claimant_can_observe_unattached_work_and_posted_response_after_claim_cancella
 
 #[test]
 fn output_bound_preserves_room_for_diagnostics_and_atomic_closure() {
-    // Ten rows fit one attachment's close and the pure Receipt publication. A
-    // second independently admitted output would make the cycle uncloseable.
-    // Bound the promised report payload and diagnostic set independently of
-    // the ten-row publication limit being exercised here.
+    // Twelve rows fit one attachment's close (its nine primary rows and the
+    // claim's two status index rows) and the pure Receipt publication (ten
+    // primary rows and the same status move). A second independently
+    // admitted output would make the cycle uncloseable. Bound the promised
+    // report payload and diagnostic set independently of the twelve-row
+    // publication limit being exercised here.
     let mut f = Fixture::with_limits(NativeLimits {
         range: RangeConfig {
-            max_batch_entries: 10,
+            max_batch_entries: 12,
             page_bytes: 4096,
             max_entry_bytes: 64 * 1024,
             ..RangeConfig::default()

@@ -188,6 +188,13 @@ impl V1 for DeltaFact {
             Self::Scope(value0) => DeltaFactRefV1::Scope(Ref(value0)),
             Self::Epoch(value0) => DeltaFactRefV1::Epoch(Ref(value0)),
             Self::LocalCompletion => DeltaFactRefV1::LocalCompletion,
+            // Native facts are derived from committed native events on demand
+            // and never enter the frozen legacy delta tail.
+            Self::Native(_) => {
+                return Err(serde::ser::Error::custom(
+                    "native delta facts have no durable V1 encoding",
+                ));
+            }
         }
         .serialize(serializer)
     }

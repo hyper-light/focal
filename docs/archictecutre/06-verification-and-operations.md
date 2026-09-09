@@ -73,6 +73,18 @@ Inject failures before and after each durable or visible transition, including b
 | Geography | Whole region isolated; root metadata unavailable; old region returns | Surviving quorum + durable content under active contract |
 | Operator | Wrong store, wrong cluster invite, unsafe placement, incompatible schema | Refuse before alteration; explain corrective action |
 
+Crash cuts on the native mutation path are injected into the real binary
+through `crates/focal-node/src/fault.rs`: built with the `focal-node`
+`test-support` feature (which the crate's own tests enable through a
+dev-dependency on itself), `FOCAL_FAULT=<site>:<n>` aborts the process at
+the `n`-th arrival at `before-propose` (frame received and admitted, nothing
+proposed) or `after-commit-before-reply` (owner committed and published, no
+reply written). Release binaries are built without the feature and contain
+no hook. The A4 gate (`cli_native_a4.rs`, `mcp_native_a4.rs`) uses both
+cuts: the first leaves a journaled frame that commits exactly once on retry;
+the second leaves a durable commit the restarted node re-commits in its new
+term and the exact retry finds by identity without a second effect.
+
 A simulation of `fsync` is not proof that a storage device honors it. Real qualification documents OS, filesystem, mount options, device/cache behavior and failure assumptions. Laptop guarantees require intact storage that honors acknowledged flushes; independent disk loss requires another durable copy.
 
 ## 4. Capacity model and derived budgets

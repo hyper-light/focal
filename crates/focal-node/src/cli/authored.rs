@@ -11,6 +11,13 @@ pub(super) fn mutation(command: Commands) -> Result<(AuthoredOperation, Mutation
         Commands::Monitor {
             command: super::monitor::MonitorCommand::Get(_),
         } => return Err(CliError::Input("read passed to mutation builder".into())),
+        Commands::Monitor {
+            command: super::monitor::MonitorCommand::Rebind(_),
+        } => return Err(native_only("monitor rebind")),
+        Commands::Monitor {
+            command: super::monitor::MonitorCommand::Cancel(_),
+        } => return Err(native_only("monitor cancel")),
+        Commands::Audit { .. } => return Err(native_only("audit")),
         Commands::Submit { command } => match command {
             SubmitCommand::Claim(args) => {
                 let (document, options) = documents::claim(args)?;
@@ -37,6 +44,12 @@ pub(super) fn mutation(command: Commands) -> Result<(AuthoredOperation, Mutation
             ClaimCommand::Post(args) => lifecycle::claim_post(args)?,
             ClaimCommand::Progress(args) => lifecycle::claim_progress(args)?,
             ClaimCommand::Cancel(args) => lifecycle::claim_cancel(args)?,
+            ClaimCommand::ReleaseScope(_) => return Err(native_only("claim release-scope")),
+            ClaimCommand::Challenge(_) => return Err(native_only("claim challenge")),
+            ClaimCommand::Consult(_) => return Err(native_only("claim consult")),
+            ClaimCommand::Correct(_) => return Err(native_only("claim correct")),
+            ClaimCommand::FollowUp(_) => return Err(native_only("claim follow-up")),
+            ClaimCommand::Lineage(_) => return Err(native_only("claim lineage")),
             ClaimCommand::Supersede(args) => {
                 let (successor, options) = documents::claim(args.successor)?;
                 (
@@ -51,14 +64,37 @@ pub(super) fn mutation(command: Commands) -> Result<(AuthoredOperation, Mutation
         Commands::Receipt {
             command: ReceiptCommand::Acquire(args),
         } => lifecycle::receipt(args)?,
+        Commands::Receipt {
+            command: ReceiptCommand::Adopt(_),
+        } => return Err(native_only("receipt adopt")),
         Commands::Evidence {
             command: EvidenceCommand::Begin(args),
         } => lifecycle::evidence(args)?,
         Commands::Testament {
             command: TestamentCommand::Receive(args),
         } => lifecycle::receive(args)?,
+        Commands::Testament {
+            command: TestamentCommand::Submit(args),
+        } => {
+            let (document, options) = documents::testament(*args)?;
+            (AuthoredOperation::TestamentSubmit(document), options)
+        }
+        Commands::Testament {
+            command: TestamentCommand::Post(_),
+        } => return Err(native_only("testament post")),
         Commands::Validation { command } => match command {
-            ValidationCommand::Begin(args) => lifecycle::validation_claim(args, false)?,
+            ValidationCommand::Begin(args) => {
+                if args.phase.is_some() || args.target.is_some() {
+                    return Err(native_only("validation begin --phase/--target"));
+                }
+                lifecycle::validation_claim(args, false)?
+            }
+            ValidationCommand::SealIncrements(_) => {
+                return Err(native_only("validation seal-increments"));
+            }
+            ValidationCommand::EnterWholeWork(_) => {
+                return Err(native_only("validation enter-whole-work"));
+            }
             ValidationCommand::BeginIncrement(args) => {
                 let fields = args.claim.is_some()
                     || args.validation.is_some()
@@ -79,10 +115,29 @@ pub(super) fn mutation(command: Commands) -> Result<(AuthoredOperation, Mutation
                 )
             }
             ValidationCommand::Complete(args) => lifecycle::validation_claim(args, true)?,
+            ValidationCommand::Report(_) => return Err(native_only("validation report")),
         },
         Commands::Artifact {
             command: ArtifactCommand::Register(args),
         } => lifecycle::register(*args)?,
+        Commands::Artifact {
+            command: ArtifactCommand::Submit(args),
+        } => {
+            let (document, options) = documents::artifact(*args)?;
+            (AuthoredOperation::ArtifactSubmit(document), options)
+        }
+        Commands::Artifact {
+            command: ArtifactCommand::Diagnostic(_),
+        } => return Err(native_only("artifact diagnostic")),
+        Commands::Artifact {
+            command: ArtifactCommand::Fail(_),
+        } => return Err(native_only("artifact fail")),
+        Commands::Artifact {
+            command: ArtifactCommand::Receive(_),
+        } => return Err(native_only("artifact receive")),
+        Commands::Artifact {
+            command: ArtifactCommand::Reject(_),
+        } => return Err(native_only("artifact reject")),
         Commands::Artifact {
             command: ArtifactCommand::Upload { .. },
         }
@@ -94,6 +149,11 @@ pub(super) fn mutation(command: Commands) -> Result<(AuthoredOperation, Mutation
             return Err(CliError::Input("read passed to mutation builder".into()));
         }
     })
+}
+fn native_only(verb: &str) -> CliError {
+    CliError::Input(format!(
+        "{verb} exists on the native engine only; this ledger runs the V1 engine"
+    ))
 }
 pub(super) fn filters(args: Filters) -> ListDocument {
     ListDocument {

@@ -3,22 +3,37 @@
 //! persist the complete planned mutation before transmission. Unknown outcomes
 //! must reuse that saved command rather than invoking the builder again.
 mod catalog;
+mod catalog_admin;
+mod catalog_transfer;
+mod catalog_watch;
 mod claim_get;
 mod documents;
 mod inventory;
 mod lifecycle;
 mod monitors;
+mod native_catalog;
+mod native_documents;
+mod native_inventory;
+mod native_schema;
+mod native_wait;
 mod schema;
 mod selection;
 mod traversal;
 mod validators;
 mod wait;
 pub use catalog::*;
+pub use catalog_admin::*;
+pub use catalog_transfer::*;
+pub use catalog_watch::*;
 pub use claim_get::*;
 pub use documents::*;
 pub use inventory::*;
 pub use lifecycle::*;
 pub use monitors::*;
+pub use native_catalog::*;
+pub use native_documents::*;
+pub use native_inventory::*;
+pub use native_wait::*;
 pub use traversal::*;
 pub use validators::*;
 pub use wait::*;
@@ -448,7 +463,7 @@ fn authored_ids(canonical: &[u8]) -> Result<Vec<[u8; 16]>, InputError> {
     ids.dedup();
     Ok(ids)
 }
-struct LimitedJson(Vec<u8>);
+pub(super) struct LimitedJson(pub(super) Vec<u8>);
 impl std::io::Write for LimitedJson {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         let required = self
@@ -504,6 +519,8 @@ fn allocated(value: Option<String>, ids: &mut impl IdGenerator) -> Result<[u8; 1
     }
 }
 
+#[cfg(test)]
+mod native_tests;
 #[cfg(test)]
 mod tests;
 

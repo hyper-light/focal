@@ -18,8 +18,17 @@ use std::path::{Path, PathBuf};
 
 const BYTES: usize = 256 * 1024;
 const RESERVED_BYTES: u64 = 2 * (BYTES as u64 + 44) + 4096;
-const MAGIC: &[u8; 8] = b"FCLMCO01";
+/// Coordinator record format: version 2 adds the rotation bound, the active
+/// child store, the pending cleanup and the retired-generation fences.
+const MAGIC: &[u8; 8] = b"FCLMCO02";
 const SCAN: u32 = 64;
+/// Ordinals one generation issues before it is closed and the slot is
+/// registered again: bounded generations keep every local and remote
+/// per-generation structure finite without any time-based deletion.
+pub const DEFAULT_ROTATION: u64 = 65_536;
+/// Closed generations remembered locally as fences; older ones fall off, the
+/// server keeps every slot's last generation regardless.
+const RETIRED_FENCES: usize = 16;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ManagedRequestsError {
@@ -51,6 +60,7 @@ pub struct ManagedRequests {
     name: String,
     context: OperationContext,
     limits: ManagedStoreLimits,
+    rotation: u64,
 }
 impl ManagedRequests {
     pub fn open(
@@ -59,7 +69,14 @@ impl ManagedRequests {
         context: OperationContext,
         limits: ManagedStoreLimits,
     ) -> Result<Self, ManagedRequestsError> {
-        Self::open_inner(parent.as_ref(), name, context, limits, true)
+        Self::open_inner(
+            parent.as_ref(),
+            name,
+            context,
+            limits,
+            DEFAULT_ROTATION,
+            true,
+        )
     }
     pub fn open_existing(
         parent: impl AsRef<Path>,
@@ -67,13 +84,41 @@ impl ManagedRequests {
         context: OperationContext,
         limits: ManagedStoreLimits,
     ) -> Result<Self, ManagedRequestsError> {
-        Self::open_inner(parent.as_ref(), name, context, limits, false)
+        Self::open_inner(
+            parent.as_ref(),
+            name,
+            context,
+            limits,
+            DEFAULT_ROTATION,
+            false,
+        )
+    }
+    /// Open with an explicit rotation bound (ordinals per generation). The
+    /// bound is saved with the owner record and must match on every open.
+    pub fn open_with(
+        parent: impl AsRef<Path>,
+        name: &str,
+        context: OperationContext,
+        limits: ManagedStoreLimits,
+        rotation: u64,
+    ) -> Result<Self, ManagedRequestsError> {
+        Self::open_inner(parent.as_ref(), name, context, limits, rotation, true)
+    }
+    pub fn open_existing_with(
+        parent: impl AsRef<Path>,
+        name: &str,
+        context: OperationContext,
+        limits: ManagedStoreLimits,
+        rotation: u64,
+    ) -> Result<Self, ManagedRequestsError> {
+        Self::open_inner(parent.as_ref(), name, context, limits, rotation, false)
     }
     fn open_inner(
         parent: &Path,
         name: &str,
         context: OperationContext,
         limits: ManagedStoreLimits,
+        rotation: u64,
         create: bool,
     ) -> Result<Self, ManagedRequestsError> {
         if !valid_name(name)
@@ -81,6 +126,7 @@ impl ManagedRequests {
             || context.principal.is_zero()
             || context.ledger.tenant.is_zero()
             || context.ledger.session.is_zero()
+            || rotation == 0
         {
             return Err(ManagedRequestsError::Context);
         }
@@ -97,6 +143,7 @@ impl ManagedRequests {
             name: name.into(),
             context,
             limits,
+            rotation,
         };
         let (directory, initialized) =
             Directory::coordinator(parent, name, create).map_err(|e| {
@@ -114,15 +161,18 @@ impl ManagedRequests {
             if !create {
                 return Err(ManagedRequestsError::Missing);
             }
-            this.save(&directory, &State::new(context, limits), false)?;
+            this.save(&directory, &State::new(context, limits, rotation), false)?;
         }
-        let state = this.read(&directory)?;
+        let mut state = this.read(&directory)?;
         if !initialized {
             if !state.initial() || directory.exists(name)? {
                 return Err(ManagedRequestsError::Corrupt);
             }
             directory.finish_coordinator()?;
         }
+        // A rotation interrupted between its fence and the removal of the
+        // retired store finishes at open, before the handle is handed out.
+        this.finish_cleanup(&directory, &mut state)?;
         Ok(this)
     }
     pub fn context(&self) -> OperationContext {
@@ -134,10 +184,69 @@ impl ManagedRequests {
             return Err(ManagedRequestsError::NotReady);
         }
         Ok(ManagedOperationStore::open(
-            self.parent.join(&self.name),
+            self.child_path(&state),
             self.context,
             self.limits,
         )?)
+    }
+    /// The active generation's child store directory.
+    fn child_path(&self, state: &State) -> PathBuf {
+        self.parent
+            .join(state.child.as_deref().unwrap_or(&self.name))
+    }
+    /// Retire the closed generation and prepare the next one on the same
+    /// slot: the fence is recorded and the old store removed before any
+    /// registration can be sent. A crash between the two steps resumes the
+    /// removal on the next open.
+    fn begin_rotation(
+        &self,
+        directory: &Directory,
+        state: &mut State,
+        stream: RequestStreamIdentity,
+    ) -> Result<(), ManagedRequestsError> {
+        if !state.delivered.is_empty() || state.pending.is_some() || state.cleanup.is_some() {
+            return Err(ManagedRequestsError::Corrupt);
+        }
+        let old = state.child.clone().unwrap_or_else(|| self.name.clone());
+        let next = format!(
+            "{}.g{}",
+            self.name,
+            stream
+                .generation
+                .checked_add(1)
+                .ok_or(ManagedRequestsError::Corrupt)?
+        );
+        if state.retired.len() >= RETIRED_FENCES {
+            state.retired.remove(0);
+        }
+        state
+            .retired
+            .try_reserve_exact(1)
+            .map_err(|_| ManagedStoreError::Capacity)?;
+        state.retired.push(Retired {
+            slot: stream.slot,
+            generation: stream.generation,
+        });
+        state.cleanup = Some(old);
+        state.child = Some(next);
+        // The slot is observed again rather than assumed: the registry may
+        // have evicted the vacant pair and another principal may hold the
+        // slot by now, in which case the scan moves on.
+        state.phase = Phase::Scan { slot: stream.slot };
+        state.accepted = None;
+        self.save(directory, state, true)?;
+        self.finish_cleanup(directory, state)
+    }
+    fn finish_cleanup(
+        &self,
+        directory: &Directory,
+        state: &mut State,
+    ) -> Result<(), ManagedRequestsError> {
+        if let Some(old) = state.cleanup.take() {
+            directory.remove_child(&old)?;
+            self.save(directory, state, true)?;
+        }
+        Ok(())
     }
     /// Mark only an exact receipt already durably retained by the child store.
     /// Merely reading a receipt never marks it delivered.
@@ -184,7 +293,7 @@ impl ManagedRequests {
             return Err(ManagedRequestsError::NotReady);
         }
         Ok(ManagedOperationStore::open(
-            self.parent.join(&self.name),
+            self.child_path(state),
             self.context,
             self.limits,
         )?)
@@ -224,7 +333,10 @@ impl ManagedRequests {
         if !initialized {
             return Err(ManagedRequestsError::Corrupt);
         }
-        let state = self.read(&directory)?;
+        let mut state = self.read(&directory)?;
+        // A rotation interrupted between its fence and the removal of the
+        // retired store finishes here, before any further action.
+        self.finish_cleanup(&directory, &mut state)?;
         Ok((directory, state))
     }
     fn read(&self, directory: &Directory) -> Result<State, ManagedRequestsError> {
@@ -234,7 +346,7 @@ impl ManagedRequests {
         if !rest.is_empty() || encode(&state)? != bytes {
             return Err(ManagedRequestsError::Corrupt);
         }
-        state.validate(self.context, self.limits)?;
+        state.validate(self.context, self.limits, self.rotation, &self.name)?;
         if matches!(state.phase, Phase::Ready) {
             self.ready(&state)?;
         }
@@ -246,7 +358,7 @@ impl ManagedRequests {
         state: &State,
         replace: bool,
     ) -> Result<(), ManagedRequestsError> {
-        state.validate(self.context, self.limits)?;
+        state.validate(self.context, self.limits, self.rotation, &self.name)?;
         directory.write(&self.record(), MAGIC, &encode(state)?, replace)?;
         Ok(())
     }

@@ -471,7 +471,7 @@ impl Index {
             return Err(invalid());
         }
         Ok(read_index::Origin {
-            request,
+            request: read_index::ArtifactRequest::Request(request),
             binding,
             position: PublicationPosition {
                 sequence: event.sequence,

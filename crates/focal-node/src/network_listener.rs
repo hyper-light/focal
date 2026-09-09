@@ -73,6 +73,68 @@ impl ResolvesServerCert for ProtocolCertificate {
         }
     }
 }
+/// The TLS server configuration one advertised endpoint presents: the node's
+/// data identity, the founder's enrollment identity when it signs, and the
+/// cluster CA for client certificates.
+fn server_config(
+    node: &CredentialMaterial,
+    enrollment: Option<&CredentialMaterial>,
+    ca: &[u8],
+    limits: &WireLimits,
+) -> Result<quinn::ServerConfig, WireError> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(ca))
+        .map_err(|_| WireError::Authentication)?;
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        provider.clone(),
+    )
+    .allow_unauthenticated()
+    .build()
+    .map_err(|_| WireError::Authentication)?;
+    let identity = TlsIdentity::from_pkcs8(
+        node.certificate_chain().to_vec(),
+        node.private_key_der().to_vec(),
+    );
+    let mut tls = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|_| WireError::Authentication)?
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(identity.certificate_chain, identity.private_key)
+        .map_err(|_| WireError::Authentication)?;
+    let enrollment_resolver = enrollment
+        .map(CredentialMaterial::server_config)
+        .transpose()
+        .map_err(|_| WireError::Authentication)?
+        .map(|config| config.cert_resolver);
+    tls.cert_resolver = Arc::new(ProtocolCertificate {
+        data: tls.cert_resolver,
+        enrollment: enrollment_resolver,
+    });
+    tls.alpn_protocols = vec![ALPN.to_vec()];
+    if enrollment.is_some() {
+        tls.alpn_protocols.push(ENROLLMENT_ALPN.to_vec());
+    }
+    focal_wire::server_transport(tls, limits)
+}
+/// The endpoint's identity, swappable while it serves: a renewed node
+/// credential is presented to the next handshake without rebinding.
+#[derive(Clone)]
+pub struct ListenerIdentity {
+    endpoint: quinn::Endpoint,
+    ca: Vec<u8>,
+    enrollment: Option<CredentialMaterial>,
+    limits: WireLimits,
+}
+impl ListenerIdentity {
+    pub fn replace(&self, node: &CredentialMaterial) -> Result<(), WireError> {
+        let config = server_config(node, self.enrollment.as_ref(), &self.ca, &self.limits)?;
+        self.endpoint.set_server_config(Some(config));
+        Ok(())
+    }
+}
 pub struct NetworkListener {
     endpoint: Option<quinn::Endpoint>,
     released: Option<tokio::sync::oneshot::Receiver<()>>,
@@ -81,8 +143,19 @@ pub struct NetworkListener {
     join_limits: TransportLimits,
     enrollment_slots: tokio::sync::Semaphore,
     budget: MemoryBudget,
+    ca: Vec<u8>,
+    enrollment: Option<CredentialMaterial>,
 }
 impl NetworkListener {
+    /// A handle that swaps the identity this endpoint presents.
+    pub fn identity(&self) -> Result<ListenerIdentity, WireError> {
+        Ok(ListenerIdentity {
+            endpoint: self.endpoint.clone().ok_or(WireError::Connection)?,
+            ca: self.ca.clone(),
+            enrollment: self.enrollment.clone(),
+            limits: self.limits.clone(),
+        })
+    }
     pub fn bind(
         address: SocketAddr,
         node: &CredentialMaterial,
@@ -114,42 +187,7 @@ impl NetworkListener {
     ) -> Result<Self, WireError> {
         tokio::runtime::Handle::try_current().map_err(|_| WireError::Connection)?;
         limits.validate()?;
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let mut roots = rustls::RootCertStore::empty();
-        roots
-            .add(CertificateDer::from(ca))
-            .map_err(|_| WireError::Authentication)?;
-        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
-            Arc::new(roots),
-            provider.clone(),
-        )
-        .allow_unauthenticated()
-        .build()
-        .map_err(|_| WireError::Authentication)?;
-        let identity = TlsIdentity::from_pkcs8(
-            node.certificate_chain().to_vec(),
-            node.private_key_der().to_vec(),
-        );
-        let mut tls = rustls::ServerConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(|_| WireError::Authentication)?
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(identity.certificate_chain, identity.private_key)
-            .map_err(|_| WireError::Authentication)?;
-        let enrollment_resolver = enrollment
-            .map(CredentialMaterial::server_config)
-            .transpose()
-            .map_err(|_| WireError::Authentication)?
-            .map(|config| config.cert_resolver);
-        tls.cert_resolver = Arc::new(ProtocolCertificate {
-            data: tls.cert_resolver,
-            enrollment: enrollment_resolver,
-        });
-        tls.alpn_protocols = vec![ALPN.to_vec()];
-        if enrollment.is_some() {
-            tls.alpn_protocols.push(ENROLLMENT_ALPN.to_vec());
-        }
-        let config = focal_wire::server_transport(tls, &limits)?;
+        let config = server_config(node, enrollment, ca, &limits)?;
         let join_limits = TransportLimits::default();
         let allocation = budget
             .reserve(BudgetKind::Control, BudgetLane::Completion, 4096)
@@ -182,6 +220,8 @@ impl NetworkListener {
             enrollment_slots: tokio::sync::Semaphore::new(join_limits.max_connections),
             join_limits,
             budget,
+            ca: ca.to_vec(),
+            enrollment: enrollment.cloned(),
         })
     }
     pub fn local_addr(&self) -> Result<SocketAddr, WireError> {

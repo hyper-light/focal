@@ -160,6 +160,7 @@ fn claim_value() -> claim::ClaimDescriptor {
             requirements: &requirements,
             slots: &slots,
             deadline: Some(deadline()),
+            policy: None,
         },
         claim_limits(),
     )
@@ -523,8 +524,21 @@ fn truncated_trailing_and_semantically_invalid_bodies_refuse() {
     let mut trailing = claim.clone();
     trailing.push(0);
     assert!(ClaimBodyInput::inspect(&trailing, inspection()).is_err());
+    // A schema-2 header on a schema-1 body is truncated: schema 2 carries a
+    // policy section after the deadline. With the section present and
+    // absent-marked, the body is a valid schema-2 claim without a policy;
+    // an unknown schema is refused at preparation.
     let mut schema = claim;
     schema[48..50].copy_from_slice(&2u16.to_le_bytes());
+    assert!(ClaimBodyInput::inspect(&schema, inspection()).is_err());
+    schema.push(0);
+    let mut input = ClaimBodyInput::inspect(&schema, inspection()).unwrap();
+    assert!(
+        input
+            .prepare(claim_limits(), usize::MAX, usize::MAX)
+            .is_ok()
+    );
+    schema[48..50].copy_from_slice(&3u16.to_le_bytes());
     let mut input = ClaimBodyInput::inspect(&schema, inspection()).unwrap();
     assert!(
         input
@@ -552,5 +566,112 @@ fn truncated_trailing_and_semantically_invalid_bodies_refuse() {
                 usize::MAX
             )
             .is_err()
+    );
+}
+
+#[test]
+fn schema_two_bodies_round_trip_the_policy_and_exact_evidence_after_the_deadline() {
+    use focal_model::{ArtifactId, ArtifactRef, Escalation, PeerPolicy};
+    let ledger = LedgerId {
+        tenant: TenantId([11; 16]),
+        session: SessionId([12; 16]),
+    };
+    let evidence = ArtifactRef {
+        id: ArtifactId([40; 16]),
+        hash: ContentHash([41; 32]),
+    };
+    let mut relations = vec![
+        Relation {
+            kind: RelationKind::Issuer,
+            target: RelationTarget::Participant(ParticipantId([1; 16])),
+        },
+        Relation {
+            kind: RelationKind::Subject,
+            target: RelationTarget::Participant(ParticipantId([2; 16])),
+        },
+        Relation {
+            kind: RelationKind::ClaimAction,
+            target: RelationTarget::Action(ActionType::Challenge),
+        },
+        Relation {
+            kind: RelationKind::CausedBy,
+            target: RelationTarget::Root(RootCommandId([3; 16])),
+        },
+        Relation {
+            kind: RelationKind::Reviews,
+            target: RelationTarget::Evidence(evidence),
+        },
+    ];
+    relations.sort();
+    let policy = PeerPolicy {
+        corrective_allowed: true,
+        max_follow_ups: 2,
+        single_issuer: true,
+        escalation: Escalation::Holder,
+    };
+    for policy in [None, Some(policy)] {
+        let plan = claim::ClaimDescriptor::prepare(
+            claim::ClaimSpec {
+                ledger,
+                id: ClaimId([20; 16]),
+                schema: 2,
+                occurrence: OccurrenceId([21; 16]),
+                description: "Prove the report was produced by the suite.",
+                relations: &relations,
+                scopes: &[],
+                requirements: &[],
+                slots: &[],
+                deadline: None,
+                policy,
+            },
+            claim_limits(),
+        )
+        .unwrap();
+        let charge = plan.construction_charge();
+        let expected = plan.build(charge).unwrap();
+        let bytes = claim_bytes(&expected);
+        // The policy section is the trailer: presence byte, then the fields.
+        match policy {
+            None => assert_eq!(bytes.last(), Some(&0)),
+            Some(_) => assert_eq!(&bytes[bytes.len() - 6..], &[1, 1, 2, 0, 1, 1]),
+        }
+        let mut input = ClaimBodyInput::inspect(&bytes, inspection()).unwrap();
+        let plan = input
+            .prepare(claim_limits(), usize::MAX, usize::MAX)
+            .unwrap();
+        assert_eq!(plan.fields().policy, policy);
+        let quote = plan.quote();
+        let built = plan.build(quote.bytes, quote.model_build_visits).unwrap();
+        assert_eq!(built, expected);
+        assert_eq!(built.policy(), policy);
+        assert!(built.relations().iter().any(|relation| {
+            relation.kind == RelationKind::Reviews
+                && relation.target == RelationTarget::Evidence(evidence)
+        }));
+        // Without the trailer the schema-2 body is truncated; the same body
+        // declared as schema 1 refuses the evidence target.
+        let truncated = &bytes[..bytes.len() - if policy.is_some() { 6 } else { 1 }];
+        assert!(ClaimBodyInput::inspect(truncated, inspection()).is_err());
+    }
+    let mut legacy = relations.clone();
+    legacy.retain(|relation| !matches!(relation.target, RelationTarget::Evidence(_)));
+    assert!(
+        claim::ClaimDescriptor::prepare(
+            claim::ClaimSpec {
+                ledger,
+                id: ClaimId([20; 16]),
+                schema: 1,
+                occurrence: OccurrenceId([21; 16]),
+                description: "Prove the report was produced by the suite.",
+                relations: &relations,
+                scopes: &[],
+                requirements: &[],
+                slots: &[],
+                deadline: None,
+                policy: None,
+            },
+            claim_limits(),
+        )
+        .is_err()
     );
 }

@@ -37,6 +37,17 @@ impl ReadViews {
             traversal_nonce: 0,
         }
     }
+    /// The per-process key that authenticates list continuations. Minted on
+    /// first use; a restart mints another, so cursors never outlive the node
+    /// incarnation that issued them.
+    pub(crate) fn list_key(&mut self) -> Result<&[u8; 32], AccessError> {
+        if self.list_key.is_none() {
+            let mut key = zeroize::Zeroizing::new([0; 32]);
+            getrandom::fill(key.as_mut()).map_err(|_| AccessError::Unavailable)?;
+            self.list_key = Some(key);
+        }
+        self.list_key.as_deref().ok_or(AccessError::Unavailable)
+    }
     pub fn advance(&mut self, session: &mut Session) -> Result<u64, AccessError> {
         let now = u64::try_from(self.started.elapsed().as_millis())
             .map_err(|_| AccessError::Unavailable)?;
@@ -266,6 +277,7 @@ fn graph_error(error: GraphError) -> AccessError {
     match error {
         GraphError::Memory(
             MemoryError::Capacity { .. }
+            | MemoryError::DiskCapacity { .. }
             | MemoryError::AllocationFailed
             | MemoryError::ItemTooLarge { .. },
         ) => AccessError::Capacity,

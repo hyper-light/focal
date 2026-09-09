@@ -24,6 +24,15 @@ pub(crate) enum SchemaCommand {
         /// Applies to operation schemas, not built-in payload contracts.
         #[arg(long, value_enum)]
         direction: Option<Direction>,
+        /// Select the native engine's descriptor (version 2) for a shared name.
+        #[arg(long)]
+        native: bool,
+    },
+    /// The native operation coverage table: every owner operation with its
+    /// frame tags, actor, descriptor, CLI path and exposure.
+    Coverage {
+        #[arg(long, value_enum, default_value = "table")]
+        format: OutputFormat,
     },
     /// Validate an authored document locally; no request or journal is created.
     Validate {
@@ -50,11 +59,18 @@ pub(crate) enum Direction {
 pub(crate) fn operation_names() -> PossibleValuesParser {
     PossibleValuesParser::new(operations::descriptors().iter().map(|value| value.name))
 }
+fn native_only_names() -> impl Iterator<Item = &'static str> {
+    operations::native_descriptors()
+        .iter()
+        .map(|value| value.name)
+        .filter(|name| operations::find(name).is_none())
+}
 fn schema_names() -> PossibleValuesParser {
     PossibleValuesParser::new(
         ["test-report", "error-report", "domain-registry"]
             .into_iter()
-            .chain(operations::descriptors().iter().map(|value| value.name)),
+            .chain(operations::descriptors().iter().map(|value| value.name))
+            .chain(native_only_names()),
     )
 }
 
@@ -74,7 +90,12 @@ pub(crate) fn schema(command: SchemaCommand) -> Result<()> {
             ));
         }
         SchemaCommand::List { format } => list(format, &mut output)?,
-        SchemaCommand::Get { name, direction } => get(&name, direction, &mut output)?,
+        SchemaCommand::Coverage { format } => coverage(format, &mut output)?,
+        SchemaCommand::Get {
+            name,
+            direction,
+            native,
+        } => get(&name, direction, native, &mut output)?,
         SchemaCommand::Example { operation } => {
             json(&mut output, &example(&operation)?)?;
         }
@@ -132,8 +153,98 @@ impl Write for DeferredError<'_> {
     }
 }
 
-fn get(name: &str, direction: Option<Direction>, output: &mut dyn Write) -> Result<()> {
-    if let Some(descriptor) = operations::find(name) {
+fn coverage(format: OutputFormat, output: &mut dyn Write) -> Result<()> {
+    use focal_client::operations::{NativeActor, NativeExposure, native_coverage_table};
+    #[derive(Serialize)]
+    struct Row {
+        operation: &'static str,
+        frame_tags: &'static [u8],
+        actor: &'static str,
+        descriptor: Option<&'static str>,
+        cli: &'static str,
+        exposure: &'static str,
+        result: &'static str,
+        reads: &'static str,
+    }
+    let rows: Vec<Row> = native_coverage_table()
+        .into_iter()
+        .map(|row| Row {
+            operation: row.operation.name(),
+            frame_tags: row.tags,
+            actor: match row.actor {
+                NativeActor::Issuer => "issuer",
+                NativeActor::Subject => "subject",
+                NativeActor::Evaluator => "evaluator",
+                NativeActor::Owner => "owner",
+                NativeActor::Internal => "internal",
+            },
+            descriptor: row.name,
+            cli: row.cli,
+            exposure: match row.exposure {
+                NativeExposure::AuthoredTool => "authored_tool",
+                NativeExposure::InternalTimer => "internal_timer",
+                NativeExposure::WireOnly => "wire_only",
+                NativeExposure::Activation => "activation",
+            },
+            result: row.result,
+            reads: row.reads,
+        })
+        .collect();
+    match format {
+        OutputFormat::Json | OutputFormat::Yaml => {
+            #[derive(Serialize)]
+            struct Table {
+                schema_version: u16,
+                retry: &'static str,
+                operations: Vec<Row>,
+            }
+            super::output::structured_to(
+                output,
+                &Table {
+                    schema_version: 1,
+                    retry: focal_client::operations::NATIVE_RETRY,
+                    operations: rows,
+                },
+                format,
+            )
+        }
+        OutputFormat::Table => {
+            writeln!(
+                output,
+                "OPERATION                 TAGS     ACTOR      EXPOSURE       DESCRIPTOR           CLI"
+            )?;
+            for row in rows {
+                writeln!(
+                    output,
+                    "{:<25} {:<8} {:<10} {:<14} {:<20} {}",
+                    row.operation,
+                    row.frame_tags
+                        .iter()
+                        .map(|tag| tag.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    row.actor,
+                    row.exposure,
+                    row.descriptor.unwrap_or("-"),
+                    if row.cli.is_empty() { "-" } else { row.cli },
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+fn get(
+    name: &str,
+    direction: Option<Direction>,
+    native: bool,
+    output: &mut dyn Write,
+) -> Result<()> {
+    let descriptor = if native || operations::find(name).is_none() {
+        operations::find_native(name)
+    } else {
+        operations::find(name)
+    };
+    if let Some(descriptor) = descriptor {
         let value = match direction.unwrap_or(Direction::Input) {
             Direction::Input => descriptor.input_schema()?,
             Direction::Output => descriptor.output_schema()?,

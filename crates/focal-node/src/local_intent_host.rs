@@ -121,6 +121,7 @@ impl ControlHost {
                 .map(|reservation| reservation.commit())
                 .map_err(|error| match error {
                     focal_memory::MemoryError::Capacity { .. }
+                    | focal_memory::MemoryError::DiskCapacity { .. }
                     | focal_memory::MemoryError::AllocationFailed => LocalIntentError::Capacity,
                     _ => LocalIntentError::Unavailable,
                 })

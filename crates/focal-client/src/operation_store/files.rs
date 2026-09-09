@@ -11,13 +11,16 @@ use std::{
 mod lock_tests;
 
 const MARKER: &str = "INITIALIZED";
+/// Longest wait for another process's critical section on the native journal.
+const NATIVE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const INITIALIZED: &[u8; 8] = b"FCLOPS01";
 const OVERHEAD: usize = 44;
 const MANAGED_INITIALIZED: &[u8; 8] = b"FCLMST01";
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Layout {
     Legacy,
     Managed,
+    Native,
     Coordinator,
     Watch,
 }
@@ -26,7 +29,8 @@ impl Layout {
         match self {
             Self::Legacy => INITIALIZED,
             Self::Managed => MANAGED_INITIALIZED,
-            Self::Coordinator => b"FCLMCO01",
+            Self::Native => b"FCLNST01",
+            Self::Coordinator => b"FCLMCO02",
             Self::Watch => b"FCLWAT01",
         }
     }
@@ -186,6 +190,9 @@ impl Directory {
     pub(crate) fn create_managed(path: &Path) -> Result<Self, StoreError> {
         Self::create_layout(path, Layout::Managed)
     }
+    pub(crate) fn create_native(path: &Path) -> Result<Self, StoreError> {
+        Self::create_layout(path, Layout::Native)
+    }
     fn create_layout(path: &Path, layout: Layout) -> Result<Self, StoreError> {
         #[cfg(not(unix))]
         {
@@ -214,6 +221,9 @@ impl Directory {
     }
     pub(crate) fn open_managed(path: &Path) -> Result<Self, StoreError> {
         Self::open_layout(path, Layout::Managed)
+    }
+    pub(crate) fn open_native(path: &Path) -> Result<Self, StoreError> {
+        Self::open_layout(path, Layout::Native)
     }
     fn open_layout(path: &Path, layout: Layout) -> Result<Self, StoreError> {
         let directory = Self::lock(path, false, layout)?;
@@ -254,7 +264,15 @@ impl Directory {
                 .open(&lock_path)
                 .map_err(missing_is_corrupt)?;
             check_open_file(&lock_path, &lock, directory.uid())?;
-            let lock = FileLock::acquire(lock).map_err(|error| {
+            // The native journal is shared by every process of one adapter;
+            // its critical sections are short and never span a network wait,
+            // so a contending process waits briefly instead of failing.
+            let acquired = if layout == Layout::Native {
+                FileLock::acquire_within(lock, NATIVE_LOCK_WAIT)
+            } else {
+                FileLock::acquire(lock)
+            };
+            let lock = acquired.map_err(|error| {
                 if error.kind() == std::io::ErrorKind::WouldBlock {
                     StoreError::Locked
                 } else {
@@ -304,6 +322,26 @@ impl Directory {
             File::open(&self.path)?.sync_all()?;
             self.check_child(component)
         }
+    }
+    /// Remove a retired child store that this owner's durable record already
+    /// fences; a missing child is fine, anything but an owner-private
+    /// directory is refused before deletion.
+    pub(crate) fn remove_child(&self, component: &str) -> Result<(), StoreError> {
+        if component.is_empty()
+            || component == "."
+            || component == ".."
+            || component.contains('/')
+            || component.contains('\\')
+        {
+            return Err(StoreError::Permissions);
+        }
+        if !self.exists(component)? {
+            return Ok(());
+        }
+        self.check_child(component)?;
+        fs::remove_dir_all(self.path.join(component))?;
+        File::open(&self.path)?.sync_all()?;
+        Ok(())
     }
     pub(crate) fn check_child(&self, component: &str) -> Result<(), StoreError> {
         #[cfg(not(unix))]

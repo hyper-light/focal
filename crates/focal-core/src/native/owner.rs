@@ -137,7 +137,11 @@ fn build_funded(
             built.seals(),
             funding,
         )?;
-        return Ok((built.into_prepared(), CandidateJournal::single(journal), deadline.begun));
+        return Ok((
+            built.into_prepared(),
+            CandidateJournal::single(journal),
+            deadline.begun,
+        ));
     }
     match fresh.authorize_admission()? {
         Some(prepare::Admission::Begin {
@@ -251,7 +255,11 @@ fn build_funded(
                 built.seals(),
                 JournalFunding::HeldCompletion,
             )?;
-            Ok((built.into_prepared(), CandidateJournal::single(journal), true))
+            Ok((
+                built.into_prepared(),
+                CandidateJournal::single(journal),
+                true,
+            ))
         }
         Some(prepare::Admission::Begin {
             transition,
@@ -267,7 +275,11 @@ fn build_funded(
                 built.seals(),
                 JournalFunding::External { source, lane },
             )?;
-            Ok((built.into_prepared(), CandidateJournal::single(journal), false))
+            Ok((
+                built.into_prepared(),
+                CandidateJournal::single(journal),
+                false,
+            ))
         }
         None => {
             let descriptor = fresh.authorize_work()?;
@@ -293,7 +305,11 @@ fn build_funded(
                 built.seals(),
                 JournalFunding::External { source, lane },
             )?;
-            Ok((built.into_prepared(), CandidateJournal::single(journal), false))
+            Ok((
+                built.into_prepared(),
+                CandidateJournal::single(journal),
+                false,
+            ))
         }
     }
 }
@@ -388,7 +404,9 @@ pub struct NativeOwnerIntoCoreError {
     pub owner: NativeOwner,
 }
 impl std::fmt::Display for NativeOwnerIntoCoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.error.fmt(f) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
 }
 impl std::error::Error for NativeOwnerIntoCoreError {}
 
@@ -458,6 +476,7 @@ impl NativeOwner {
     /// finite future record buffers before this owner accepts new traffic.
     /// Transport, consensus staging, WAL admission and disk capacity remain the
     /// enclosing service's separate obligations; refusal there retains tickets.
+    #[allow(clippy::result_large_err)] // Preserve the original Core without allocation on refusal.
     pub fn with_record_buffers(
         core: Core<NativeState>,
         schemas: &impl NativeSchemaVerifier,
@@ -466,6 +485,7 @@ impl NativeOwner {
         Self::with_record_profile(core, schemas, Some(encoding))
     }
 
+    #[allow(clippy::result_large_err)] // Preserve the original Core without allocation on refusal.
     fn with_record_profile(
         core: Core<NativeState>,
         schemas: &impl NativeSchemaVerifier,
@@ -475,7 +495,9 @@ impl NativeOwner {
             super::authored::check_storage(&core)?;
             let (incarnation, pending, allocation) = Self::allocate_queue(&core)?;
             let mut book = CompletionBook::new(&core.state.budget, core.limits)?;
-            if let Some(limits) = record_buffers { book = book.with_record_buffers(limits); }
+            if let Some(limits) = record_buffers {
+                book = book.with_record_buffers(limits);
+            }
             let view = View {
                 state: &core.state,
                 tail: None,
@@ -760,9 +782,21 @@ impl NativeOwner {
                     }
                     return Err(error.into());
                 }
-                let record_source = if held_record { self.book.source() } else { &self.core.state.budget };
-                let record = match record_codec::PendingRecord::reserve(&prepared, record_source,
-                    if held_record { BudgetLane::Completion } else { lane }, self.record_buffers) {
+                let record_source = if held_record {
+                    self.book.source()
+                } else {
+                    &self.core.state.budget
+                };
+                let record = match record_codec::PendingRecord::reserve(
+                    &prepared,
+                    record_source,
+                    if held_record {
+                        BudgetLane::Completion
+                    } else {
+                        lane
+                    },
+                    self.record_buffers,
+                ) {
                     Ok(record) => record,
                     Err(error) => {
                         drop(prepared);
@@ -902,16 +936,31 @@ impl NativeOwner {
 
     /// Borrow the actual committed root for streaming checkpoint encoding.
     /// Pending rows remain isolated; this borrow prevents concurrent mutation.
-    pub fn committed_core(&self) -> &Core<NativeState> { &self.core }
+    pub fn committed_core(&self) -> &Core<NativeState> {
+        &self.core
+    }
 
     /// Transfer a fully reconciled committed Core without allocating or copying
     /// rows. A pending or faulted owner is returned unchanged for reconciliation.
+    #[allow(clippy::result_large_err)] // Return the identical owner without allocation on refusal.
     pub fn into_committed_core(self) -> Result<Core<NativeState>, NativeOwnerIntoCoreError> {
-        let error = if !self.pending.is_empty() { Some(NativeOwnerError::PendingCandidates) }
-            else if self.faulted { Some(NativeError::Capacity("completion owner requires reconstruction").into()) }
-            else { None };
-        if let Some(error) = error { return Err(NativeOwnerIntoCoreError { error, owner: self }); }
-        let Self { pending, core, book, _queue_allocation, .. } = self;
+        let error = if !self.pending.is_empty() {
+            Some(NativeOwnerError::PendingCandidates)
+        } else if self.faulted {
+            Some(NativeError::Capacity("completion owner requires reconstruction").into())
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            return Err(NativeOwnerIntoCoreError { error, owner: self });
+        }
+        let Self {
+            pending,
+            core,
+            book,
+            _queue_allocation,
+            ..
+        } = self;
         drop(pending);
         drop(book);
         drop(_queue_allocation);
@@ -922,11 +971,16 @@ impl NativeOwner {
     /// cached bytes remain owned by this ticket through retries; this does not
     /// publish or acknowledge durability. A low work/byte cap or allocation
     /// failure leaves the candidate and its permit available for retry.
-    pub fn encode_candidate(&mut self, candidate: NativeCandidate, limits: record_codec::EncodingLimits)
-        -> Result<&record_codec::FundedRecord, NativeOwnerError>
-    {
+    pub fn encode_candidate(
+        &mut self,
+        candidate: NativeCandidate,
+        limits: record_codec::EncodingLimits,
+    ) -> Result<&record_codec::FundedRecord, NativeOwnerError> {
         let position = self.position(candidate)?;
-        let pending = self.pending.get_mut(position).ok_or(NativeOwnerError::UnknownCandidate)?;
+        let pending = self
+            .pending
+            .get_mut(position)
+            .ok_or(NativeOwnerError::UnknownCandidate)?;
         pending.record.encode(&pending.prepared, limits)
     }
 
@@ -967,6 +1021,10 @@ impl NativeOwner {
         self.core.native_budget()
     }
 
+    #[cfg(test)]
+    pub(super) fn book_for_test(&self) -> &CompletionBook {
+        &self.book
+    }
     #[cfg(test)]
     pub(super) fn budget_for_test(&self) -> &MemoryBudget {
         &self.core.state.budget
@@ -1085,6 +1143,16 @@ impl<'a> NativeView<'a> {
     }
     pub fn artifact(&self, id: ArtifactId) -> Option<&'a NativeArtifact> {
         as_artifact(self.0.get(Key::Artifact(id)))
+    }
+    /// Committed claims whose authored `kind` relation targets `target`, in
+    /// identity order (the relation index of 22 §7): the corrections that
+    /// invalidate a challenge, the follow-ups that refine a consultation.
+    pub fn related_claims(
+        &self,
+        kind: focal_model::RelationKind,
+        target: ClaimId,
+    ) -> impl Iterator<Item = ClaimId> + use<'a> {
+        self.0.relation_sources(kind, target)
     }
     pub fn work(&self, id: ArtifactId) -> Option<&'a NativeWork> {
         as_work(self.0.get(Key::Work(id)))

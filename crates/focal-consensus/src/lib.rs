@@ -458,7 +458,9 @@ impl DurableNode {
         }
         self.guarded_in(data.len(), 0, lane, |replica| {
             let mut owned = Vec::new();
-            owned.try_reserve_exact(data.len()).map_err(|_| ConsensusError::Capacity)?;
+            owned
+                .try_reserve_exact(data.len())
+                .map_err(|_| ConsensusError::Capacity)?;
             if owned.capacity() > data.len() {
                 return Err(ConsensusError::Capacity);
             }
@@ -516,6 +518,21 @@ impl DurableNode {
     }
     pub fn transfer_leader(&mut self, node: u64) -> Result<(), ConsensusError> {
         self.guarded(|replica| replica.transfer_leader_inner(node))
+    }
+    /// Deterministic election pacing for harnesses: the follower with the
+    /// shortest timeout campaigns first once every lease has expired.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_randomized_election_timeout(&mut self, ticks: usize) -> Result<(), ConsensusError> {
+        self.check()?;
+        let floor = self.config.election_tick;
+        let ceiling = floor.checked_mul(2).ok_or(ConsensusError::Capacity)?;
+        if ticks < floor || ticks >= ceiling {
+            return Err(ConsensusError::Configuration(
+                "randomized election timeout must lie in [election_tick, 2 * election_tick)",
+            ));
+        }
+        self.raw.raft.set_randomized_election_timeout(ticks);
+        Ok(())
     }
     pub fn report_unreachable(&mut self, node: u64) -> Result<(), ConsensusError> {
         self.guarded(|replica| replica.report_unreachable_inner(node))
@@ -782,6 +799,10 @@ impl DurableNode {
     /// record on every open. This is independent of the current configuration.
     pub fn bootstrap_membership(&self) -> (&[u64], &[u64]) {
         (&self.config.voters, &self.config.learners)
+    }
+    /// Free bytes on the filesystem holding this replica's WAL, sampled now.
+    pub fn disk_available_bytes(&self) -> Result<u64, ConsensusError> {
+        Ok(self.wal.available_bytes()?)
     }
     pub fn status(&self) -> NodeStatus {
         let conf = &self.raw.store().conf_state;
@@ -1147,9 +1168,9 @@ fn decode_proto<T: PbMessage + Default>(bytes: &[u8]) -> Result<T, ConsensusErro
 }
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod borrowed_proposal_tests;
+#[cfg(test)]
+mod tests;
 
 #[cfg(test)]
 mod persistence_tests;

@@ -217,6 +217,15 @@ pub(super) fn cancellation(c: &mut Cursor<'_>) -> Result<scope::MonitorCancellat
         cut: claim_cut(c)?,
     })
 }
+pub(super) fn claim_origin(
+    c: &mut Cursor<'_>,
+) -> Result<focal_model::lifecycle::claim::ClaimOrigin, Error> {
+    Ok(match c.u8()? {
+        0 => focal_model::lifecycle::claim::ClaimOrigin::Native,
+        1 => focal_model::lifecycle::claim::ClaimOrigin::Legacy,
+        _ => return Err(Error::InvalidTag("claim origin")),
+    })
+}
 pub(super) fn claim_status(c: &mut Cursor<'_>) -> Result<ClaimStatus, Error> {
     Ok(match c.u16()? {
         1 => ClaimStatus::Generated,

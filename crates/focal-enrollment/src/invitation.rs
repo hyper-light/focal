@@ -41,6 +41,45 @@ impl ServerTrust {
     pub(crate) fn fingerprint(&self) -> Result<Fingerprint, EnrollmentError> {
         Ok(hash("focal.enrollment.server-trust.v1", &encode(self)?))
     }
+    /// Ordinary TLS 1.3 chain/name verification against the pinned CA, for
+    /// an enrollment connection made by a node that already holds a
+    /// credential; the exact leaf pin is checked on the connection.
+    pub fn client_config(&self) -> Result<rustls::ClientConfig, EnrollmentError> {
+        self.validate()?;
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|_| EnrollmentError::Crypto)?
+            .with_root_certificates(self.roots()?)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![ENROLLMENT_ALPN.to_vec()];
+        config.enable_early_data = false;
+        Ok(config)
+    }
+    /// Verify an established enrollment connection carries the pinned leaf.
+    pub fn verify_quic(
+        &self,
+        connection: &quinn::Connection,
+        now: i64,
+    ) -> Result<(), EnrollmentError> {
+        if connection.close_reason().is_some() {
+            return Err(EnrollmentError::Unauthorized);
+        }
+        let handshake = connection
+            .handshake_data()
+            .ok_or(EnrollmentError::Unauthorized)?
+            .downcast::<quinn::crypto::rustls::HandshakeData>()
+            .map_err(|_| EnrollmentError::Unauthorized)?;
+        if handshake.protocol.as_deref() != Some(ENROLLMENT_ALPN) {
+            return Err(EnrollmentError::Unauthorized);
+        }
+        let peer = connection
+            .peer_identity()
+            .ok_or(EnrollmentError::Unauthorized)?
+            .downcast::<Vec<CertificateDer<'static>>>()
+            .map_err(|_| EnrollmentError::Unauthorized)?;
+        self.verify_chain(&peer, now)
+    }
     fn roots(&self) -> Result<rustls::RootCertStore, EnrollmentError> {
         let mut roots = rustls::RootCertStore::empty();
         roots

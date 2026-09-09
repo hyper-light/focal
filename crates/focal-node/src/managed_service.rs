@@ -18,6 +18,11 @@ pub struct ManagedService {
     fleet: FleetManager,
     content: ContentHost,
     evidence: EvidenceCoordinator,
+    signing: Option<(
+        crate::control_host::ControlHost,
+        crate::placement_control::PlacementHandle,
+    )>,
+    liveness: Option<crate::liveness::LivenessHandle>,
 }
 impl ManagedService {
     pub fn new(fleet: FleetManager, content: ContentHost, evidence: EvidenceCoordinator) -> Self {
@@ -25,6 +30,96 @@ impl ManagedService {
             fleet,
             content,
             evidence,
+            signing: None,
+            liveness: None,
+        }
+    }
+    /// Answer liveness probes from enrolled peers out of the driver's state.
+    pub fn with_liveness(mut self, liveness: crate::liveness::LivenessHandle) -> Self {
+        self.liveness = Some(liveness);
+        self
+    }
+    async fn probe(&self, request: &VerifiedRequest) -> Response {
+        let Some(liveness) = &self.liveness else {
+            return Response::Error(AccessError::UnsupportedOperation);
+        };
+        // The probe speaks for the enrolled node identity the certificate
+        // authorized; a runtime or client peer has none.
+        let PeerRole::Node { node_id } = request.peer().role() else {
+            return Response::Error(AccessError::Unauthorized);
+        };
+        let Operation::Probe { request: body } = &request.request().operation else {
+            return Response::Error(AccessError::InvalidRequest);
+        };
+        match liveness.answer(node_id, body).await {
+            Ok(reply) => Response::Probe(reply),
+            Err(crate::liveness::ProbeError::Invalid) => {
+                Response::Error(AccessError::InvalidRequest)
+            }
+            Err(crate::liveness::ProbeError::Capacity) => Response::Error(AccessError::Capacity),
+            Err(crate::liveness::ProbeError::Unavailable) => {
+                Response::Error(AccessError::Unavailable)
+            }
+        }
+    }
+    /// Let enrolled peers ask this node to sign session facts it witnesses.
+    pub fn with_signing(
+        mut self,
+        control: crate::control_host::ControlHost,
+        signer: crate::placement_control::PlacementHandle,
+    ) -> Self {
+        self.signing = Some((control, signer));
+        self
+    }
+    async fn sign(&self, request: &VerifiedRequest) -> Response {
+        let Some((control, signer)) = &self.signing else {
+            return Response::Error(AccessError::UnsupportedOperation);
+        };
+        let Operation::SessionSign {
+            group,
+            request: body,
+        } = &request.request().operation
+        else {
+            return Response::Error(AccessError::InvalidRequest);
+        };
+        let ledger = request.request().ledger;
+        if *group != ledger.session.0 {
+            return Response::Error(AccessError::InvalidRequest);
+        }
+        let Ok(decoded) =
+            postcard::from_bytes::<crate::placement_control::SessionSignRequest>(body)
+        else {
+            return Response::Error(AccessError::InvalidRequest);
+        };
+        if decoded.schema != 1 {
+            return Response::Error(AccessError::InvalidRequest);
+        }
+        let reply = match crate::placement_control::sign_session_fact(
+            &self.fleet,
+            control,
+            signer,
+            ledger,
+            decoded.fact,
+            decoded.window,
+        )
+        .await
+        {
+            Ok(proof) => {
+                crate::placement_control::SessionSignReply::Signed(Box::new(proof.proof().clone()))
+            }
+            Err(error) => crate::placement_control::SessionSignReply::Refused(match error {
+                crate::placement_proof::PlacementProofError::Capacity => {
+                    focal_control::ControlFailure::Capacity
+                }
+                crate::placement_proof::PlacementProofError::Unavailable => {
+                    focal_control::ControlFailure::Unavailable
+                }
+                _ => focal_control::ControlFailure::Unauthorized,
+            }),
+        };
+        match postcard::to_stdvec(&reply) {
+            Ok(response) if !response.is_empty() => Response::Control { response },
+            _ => Response::Error(AccessError::Capacity),
         }
     }
 }
@@ -33,6 +128,9 @@ impl RequestHandler for ManagedService {
         true
     }
     fn supports_participant_requests(&self) -> bool {
+        true
+    }
+    fn supports_native_requests(&self) -> bool {
         true
     }
     fn handle(&self, request: VerifiedRequest) -> HandlerFuture<'_> {
@@ -54,6 +152,14 @@ impl RequestHandler for ManagedService {
             // custody authority; an application routing table does not grant it.
             if matches!(request.request().operation, Operation::Custody(_)) {
                 return self.content.handle_accounted(request).await;
+            }
+            if matches!(request.request().operation, Operation::SessionSign { .. }) {
+                let result = self.sign(&request).await;
+                return OwnedResponse::new(request.request().reply(result));
+            }
+            if matches!(request.request().operation, Operation::Probe { .. }) {
+                let result = self.probe(&request).await;
+                return OwnedResponse::new(request.request().reply(result));
             }
             let replica = match self.fleet.current_host(request.request().ledger) {
                 Ok(replica) => replica,

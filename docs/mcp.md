@@ -46,7 +46,7 @@ printf '%s\n' \
 {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{},"io.modelcontextprotocol/clientInfo":{"name":"focal-example","version":"1"}}}}
 ```
 
-Use the discovered input/output schemas rather than generating fields from a tool's name. Application descriptors currently use version 1, encoded in their input schema `$id`. The [manifest](../skills/manifest.json) pins required names and versions and the instruction content digests. Saved transfer state is also available through `focal artifact upload inspect UPLOAD_ID --origin mcp`; `artifact upload cancel` with the same origin retries the same durable cancellation used by `upload.cancel`. The six recovery tools use recovery contract version 2. Packaged skills pin their own instruction version, application operations use version 1, and the five transfer tools use transfer contract version 1.
+Use the discovered input/output schemas rather than generating fields from a tool's name. Application descriptors use version 1 on a V1 ledger and version 2 on a native ledger (see [native engine tools](#native-engine-tools)), encoded in their input schema `$id`. The [manifest](../skills/manifest.json) pins required names and versions and the instruction content digests. Saved transfer state is also available through `focal artifact upload inspect UPLOAD_ID --origin mcp`; `artifact upload cancel` with the same origin retries the same durable cancellation used by `upload.cancel`. The six recovery tools use recovery contract version 2. Packaged skills pin their own instruction version, application operations use version 1, and the five transfer tools use transfer contract version 1.
 
 Nested results retain the frozen model encoding (byte-array IDs/hashes and numeric vocabularies). Convert identifiers to hexadecimal for authored fields. The implemented `focal schema get domain-registry` command prints the vocabulary mapping; its schema lookup is a local CLI operation, not an advertised MCP tool.
 
@@ -180,6 +180,10 @@ outcome requires a durable error artifact in the exact response manifest. The
 requester then receives that account, and its designated evaluator checks the
 actual work and diagnostic evidence before supplying a separate verdict.
 
+On the native engine a non-`complete` `testament.submit` must cite at least one of the respondent's own committed `artifact.diagnostic` results in `diagnostics` and is refused with `invalid_input` without one; the requester reads the diagnostic bytes with `artifact.get`. A check whose slot the frozen manifest lacks is refused by `validation.begin` and `validation.report` (`not_found`), and `validation.enter_whole_work` assesses it as `ValidationIncomplete` without any manufactured verdict. An evaluator that cannot run its handler reports `verdict: "error"`; the error report stays as evidence and, while the handler's declared `attempts` remain, the evaluation stays open on the next attempt (`attempt_index` counts from zero) for a further `validation.report`.
+
+The adapter runs beside the human CLI on the same data directory: both read the context catalogue and enrolled credentials under shared locks and journal on their own native stores, so neither excludes the other. Cancelling a tool call (`notifications/cancelled`) drops only the adapter's wait: the operation keeps its durable reference, `request.pending` lists it, and `request.retry` returns the committed result or resends the exact frame, never a second business mutation. A capacity refusal from the node admitted nothing; the adapter resends with backoff and then reports `capacity`, and the reference stays `Pending` until a later `request.retry` succeeds (see the CLI guide for `FOCAL_DISK_HEADROOM_BYTES`).
+
 A committed testament close means `TestamentGenerated`. The issuer separately uses `testament.receive`, then `validation.begin` for whole-work runs or `validation.begin_increment` for a saved increment requirement and actual attached target. `validation.context`/`validation.get` expose the recorded run fences. The designated evaluator executes its tool, skill or code externally, registers actual proof with `artifact.register`, and supplies exact artifact ID/hash pairs to `validation.submit`. Finally the issuer may call `validation.complete`; Core checks stored results and graph constraints. These are real protocol-3 operations with owner authorization, not caller assertions of success. Each mutation has its own durable operation ID.
 
 Independent artifact and testament lifecycle history, owner-checked child claims and automated corrective/follow-up helpers remain incomplete, as detailed in the [peer validation contract](archictecutre/16-peer-validation-contract.md). The implemented peer surface exposes the existing single-response reducer. Focal neither launches agents nor executes supplied tools. Participants author ordinary corrective/follow-up claims and retain their actual committed outcomes.
@@ -202,7 +206,141 @@ For retrieval, call `artifact.download` with artifact `id`, optional `max_bytes`
 
 Both protocol profiles are covered by a real 300 KiB progressive upload, MCP restart, exact/conflicting retry, artifact attachment and complete paged download. The CLI regression stages offline, deletes the original source, restarts the service and completes the exact pending attachment from owned bytes. These tests qualify the installed test-report schema bound, not arbitrary external schemas.
 
+## Native engine tools
+
+On a ledger activated on the native engine (`focal cluster replicas
+activate-native`, [cluster-admin.md](cluster-admin.md)) the adapter serves a
+different catalogue. At startup it probes the engine once with a standing read
+under the native wire profile, on the same runtime every later call uses; a V1
+answer keeps the catalogue above, a native answer replaces the application,
+managed, transfer and watch tools with the native descriptors and four
+recovery tools. Discover the catalogue instead of assuming either; a native
+ledger lists `ledger.standing` and never lists `request.reserve` or
+`ledger.traverse`.
+
+| Purpose | Native tools |
+| --- | --- |
+| Claim lifecycle | `claim.submit`, `claim.post`, `claim.cancel` (version 2 documents) |
+| Peer workflows | `claim.challenge`, `claim.consult`, `claim.correct`, `claim.follow_up` (authored shapes of `claim.submit`: same frame, identity and receipt), `claim.lineage` (one composed page: the claim, its cause ancestors, its corrections, refinements and children), `claim.wait` (`testament`, `satisfied`, `terminal` or `released`; result kind `native_wait`) |
+| Respondent cycle | `receipt.acquire`, `artifact.submit`, `artifact.diagnostic`, `artifact.fail`, `testament.submit`, `testament.post` |
+| Issuer and evaluator | `testament.receive`, `artifact.receive`, `artifact.reject`, `validation.begin`, `validation.report` (admission, increment or whole-work evaluations by `phase`), `validation.seal_increments`, `validation.enter_whole_work`, `receipt.adopt`, `claim.release_scope`, `audit.generate`, `audit.post` |
+| Durable waits | `monitor.register`, `monitor.rebind`, `monitor.cancel` |
+| Exact fixed-prefix reads | `claim.get`, `testament.get`, `artifact.get`, `validation.get`, `validation.context` (the evaluator's composed view: claim, definition, selected registration and evaluation, manifest with custody, results after a revision cursor, delivery result), `ledger.standing` |
+| Bounded lists | `claim.list`, `artifact.list`, `validation.list`, `evaluation.list`, `testament.list`, `receipt.list`, `monitor.list`, `event.list` |
+| Journal recovery | `request.inspect`, `request.retry`, `request.pending`, `request.acknowledge` |
+
+A native `claim.submit` may name `parent`, the committed claim the new claim
+is caused by: the adapter reads the parent's current binding and receipt and
+pins them in the frame, and the owner admits the child only from the parent's
+issuer or its current receipt holder while the parent is live, registering the
+child on the parent; a forged, foreign, stale or terminal parent and any other
+actor are refused with typed outcomes. Cancelling the parent cancels its
+pending children.
+
+A native `claim.submit` may also cite exact evidence and declare a follow-up
+policy: a `reviews` or `derived_from` relation may target `artifact:ID@HASH`
+(the artifact at its committed descriptor hash; an unknown artifact, another
+hash, a pending artifact or any other relation kind is refused), and
+`policy` (`corrective_allowed`, `max_follow_ups`, `single_issuer`,
+`escalation`) is authored immutably with the claim and returned by
+`claim.get`. Either selects descriptor schema 2; other claims keep schema 1.
+A correction is a `claim.submit` with `action: correction`, one
+`invalidates` relation naming the challenge and one `reviews` relation
+naming the report artifact of its failed verdict at its hash; a follow-up
+consultation is a `claim.submit` with `action: consultation` and a `refines`
+relation naming the consultation it continues. The owner admits both only
+under the followed claim's policy (who may file, whether corrections are
+allowed, one issuer, how many follow-ups) and, for a correction, only on
+the terminal Fail, Incomplete or Error verdict at the current generation;
+refusals come back as `native_refused` results whose
+`refusal.kind.Refused` names the owner's code: `WrongActor`, `InvalidPolicy`,
+`InvalidTarget`, `MissingEvidence`, `InvalidTransition`, `StaleEvaluation`
+or `ConflictingCause`. The typed tools package these shapes: `claim.challenge`
+(`artifact` as `ID` or `ID@HASH`, a mandatory `policy`), `claim.consult`,
+`claim.correct` (`challenge`, `verdict` as `ID` or `ID@HASH`, `target`
+defaulting to the challenge's subject, an occurrence identity derived from
+the challenge, the verdict and the author so a repeated delivery resolves to
+one correction) and `claim.follow_up` (`refines`, `target` defaulting to the
+refined consultation's subject, an identity derived from the refined claim
+and the query). A projection-only ledger withholds them with `claim.submit`.
+`claim.lineage` reads one claim's lineage as a `native_read` page and
+`claim.wait` observes a claim as `native_wait`; the `focal-peers` skill
+sequences them.
+
+Native tools take no reservation. Every mutation compiles its document with
+the same compiler the CLI uses, reads the objects it binds to once at a fixed
+prefix, journals the exact `FCNINPUT` frame under an `n1:` reference in the
+adapter's own journal (`DATA_DIR/client/mcp-native`) and only then sends it.
+`operation_id` is optional on a native mutation: omit it and the returned
+`operation_id` is the minted reference; supply the same `n1:` reference with
+the same input to resume an exact retry, and a reference already bound to
+different input is refused with `operation_conflict` before any identity is
+minted. Results use `schema_version` 2: a committed frame returns
+`condition = "Committed"` with `result.kind = "native"` (the owner's receipt
+and the identities the frame minted), a closed refusal returns `isError`
+with `result.kind = "native_refused"` and its category (invalid input,
+unauthorized, not found, stale, conflict, capacity or the owner's code), and a
+frame the owner still holds as a pending candidate returns `OutcomeUnknown`.
+Reads return `result.kind = "native_read"` pages whose nested documents keep
+the frozen encodings (byte-array identities, numeric statuses). Lists return
+`condition = "Listed"` with `result.kind = "native_list"`: `page.objects`,
+`page.visited` (rows examined, matching or not) and `page.next`, an opaque
+cursor to pass back as the hexadecimal `cursor` argument with the same
+filter. One indexed predicate is scanned (a relation or scope, then a
+participant, then the action or status, then `created_after` for claims; an
+artifact's `input`, then `producer`, `schema`, `kind`; a `verdict` for
+evaluations) and the rest filter within `max_visits` (default 1,024), so a
+page may be empty and still carry `next`; only an absent `next` ends the
+list. Participants accept `self`. A cursor reused under another filter, by
+another principal, tampered with, or issued before a node restart is
+refused.
+
+```json
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"claim.submit","arguments":{"target":"ALICE_PRINCIPAL_HEX","description":"Run the suite and deliver the report.","validations":[{"kind":"receipt","description":"Record delivery.","deadline":{"at":4102444800000}},{"kind":"test","description":"The suite passes.","target":{"type":"slot","index":0,"name":"report"},"evaluator":"self","handlers":[{"id":"HANDLER_HEX","version":"VERSION_HEX"}],"deadline":{"at":4102444800000}}],"slots":[{"slot":0,"checks":[{"declaration":1}]}]}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"request.acknowledge","arguments":{"operation_id":"RETURNED_N1_REFERENCE"}}}
+```
+
+A committed result stays listed by `request.pending` until it is explicitly
+acknowledged, exactly as managed results do, so a reply lost between the
+adapter and the agent is found again after either restarts. `request.inspect`
+returns the journaled receipt, the recorded refusal, or `Pending`;
+`request.retry` resends the exact frame until the owner commits it and returns
+the bound receipt without a send once it has. `request.inspect` with
+`remote: true` reads the owner's committed outcome for the request key
+instead of the journal; the human CLI's `focal request inspect --operation-id
+n1:… --remote` performs the same read, so either adapter can observe an
+operation the other journaled under the same context. Refusals are recorded
+as reported and leave the pending list; the frame stays inspectable. There
+is no `request.seal` on a native ledger: the owner resolves the request key
+before admission, so an exact retry can never execute twice.
+
+The respondent's evidence is carried inline in the frame (`payload` as
+`{"type":"text"}` or `{"type":"inline"}`, at most 256 KiB), verified by the
+node's content custody before the owner records it; the chunked upload tools
+and `artifact.download` are not offered until the native content transfer
+arrives. Every owner operation a participant can author is a tool: the
+evaluation tools select the admission or increment evaluation with `phase`
+(`whole_work` by default) and `target` (the increment's work artifact);
+`artifact.fail` cites the holder's committed production diagnostic by id
+(optionally pinning its hash); `artifact.reject` records a `structure` or
+`metadata` failure with the issuer's diagnostic; `receipt.adopt` names the
+new holder and fences the committed receipt; `audit.generate` and
+`audit.post` produce the closed claim's result testament (read it with
+`testament.get`); `monitor.register` takes `roots` of
+`{predicate: satisfied|terminal|released, claim}` and a logical-time
+`deadline`, `monitor.rebind` a committed superseding successor, and
+`monitor.cancel` works once the owning claim is terminal. Discover each
+document with `schema.get` (version 2). Every `deadline` is logical
+milliseconds since the Unix epoch; the node's clock fires claim, evaluation
+and monitor deadlines once a second without a tool call, and the reads show
+the outcome. `claim.wait`, watches and `ledger.summary` wait for the native
+deltas; the CLI manual's
+[native engine verbs](manual-cli.md#native-engine-verbs) section shows the
+same cycle, the remaining verbs and lists through flags.
+
 ## Operator-only administration
+
+Every tool the adapter lists comes from one registry in the client crate: the application descriptors of the active engine, the four recovery tools, and the shared watch, transfer and administration descriptors (`focal_client::operations::{watch_descriptors, transfer_descriptors, admin_descriptors}`), each naming its capability, surface and the CLI path that performs the same operation. `tools/list` is one pass over that registry filtered by what the adapter can prove (engine, uploads, watches, local node ownership); a tool the adapter did not list is refused when called directly, both at the protocol layer and by the dispatcher.
 
 A local network operator may additionally discover `cluster.*` tools. They include root and application configuration reads, learner admission/promotion/removal and joint completion, leadership-transfer initiation, invitation/credential inspection and revocation, node and client invitations, passive diagnostics, and exact administrative request inspection/retry/reconciliation. Use their discovered schemas, [administration guide](cluster-admin.md) and [cluster skill](../skills/focal-cluster/SKILL.md). This catalogue is conditional and is required only by the cluster skill. Actor or physical Node identity alone grants no administrative authority.
 
@@ -214,7 +352,7 @@ The human CLI automatically owns `DATA_DIR/CLI.requests`, allocates IDs for ordi
 
 For MCP, preserve `MCP.requests`, `MCP.requests.managed-owner` and `MCP.requests.managed-lock` together with the node identity. The external initialized marker prevents a lost child store from silently reusing stream authority. Recovery resumes saved registration, initialization and completion controls; missing or corrupt initialized state fails closed. Deleting these files is not a recovery procedure. Requests, normalized intent, generated IDs, exact receipts and delivery marks use checksums, exclusive locks, atomic publication and file/directory fsync before they authorize the next step.
 
-A default managed stream retains at most 32 outstanding outcomes/reservations, within a 256 MiB conservative disk budget. The client library accepts configured windows up to 256 when its disk allowance and server policy permit; this is not a CLI or MCP window flag. Intent is limited to 256 KiB, and serialized requests and receipts to one MiB each. Only committed contiguous acknowledgment permits body reclamation. The bounded allocator scans slots 0–63 in order and selects the first observed vacancy: typical first use needs one slot read and one registration, then the business call. Sparse external slot allocation, exhausted server rows or generation exhaustion returns a typed failure. There is no automatic close, stream rotation or generic discovery across arbitrary principals and slots.
+A default managed stream retains at most 32 outstanding outcomes/reservations, within a 256 MiB conservative disk budget. The client library accepts configured windows up to 256 when its disk allowance and server policy permit; this is not a CLI or MCP window flag. Intent is limited to 256 KiB, and serialized requests and receipts to one MiB each. Only committed contiguous acknowledgment permits body reclamation. The bounded allocator scans slots 0–63 in order and selects the first observed vacancy: typical first use needs one slot read and one registration, then the business call. Sparse external slot allocation, exhausted server rows or generation exhaustion returns a typed failure. A generation issues at most 65,536 IDs; when every one is acknowledged the adapter closes it, removes its store and registers the next generation on the same slot automatically (`FOCAL_MANAGED_ROTATION=N` lowers the bound; it is saved with the coordinator on first use). IDs of a closed generation report `Retired`. There is no generic discovery across arbitrary principals and slots.
 
 Legacy 32-character IDs continue under `DATA_DIR/MCP.operations`. External `MCP.operations.lock` and `MCP.operations.initialized` retain their existing initialization and loss protections. Its default bounds remain 256 permanent IDs and 512 MiB of conservative reservations; completed IDs stay counted and are not migrated or evicted automatically. Epoch one remains shared without advancing another operation's deduplication floor.
 
@@ -229,7 +367,7 @@ target/debug/focal --data-dir /tmp/focal-mcp-example request inspect \
 
 The analogous `request retry PATH` resumes it. Path-based journals keep their existing format; MCP recovery tools accept IDs rather than arbitrary paths. The foreground adapter admits one active tool call and bounds transport input, output, queues and shutdown, reporting pressure rather than an unbounded backlog.
 
-Keep all four skill directories, `skills/references` and `skills/manifest.json` together when packaging; their relative links are intentional. Register each `SKILL.md` with the agent host and the executable command with its MCP client. Use [focal-validation](../skills/focal-validation/SKILL.md) for pinned external execution and verdict submission. This repository does not install skills into an external agent automatically, publish `skill://` resources, or claim a generated skill runtime. Contract tests pin live descriptors, recovery and administration contracts, and file digests. Protocol fixtures and the repository's Rust stdio harness provide qualification; an external SDK/client interoperability run is not claimed here.
+Keep all four skill directories, `skills/references` and `skills/manifest.json` together when packaging; their relative links are intentional. Register each `SKILL.md` with the agent host and the executable command with its MCP client. Use [focal-validation](../skills/focal-validation/SKILL.md) for pinned external execution and verdict submission. Each skill carries an "On a native ledger" branch and the shared contract a [native engine](../skills/references/workflow-contract.md#native-engine) section; the manifest (schema 3) pins the version-1 operations, the version-2 native operations (`required_native_operations`, together covering every native descriptor), the recovery, transfer, watch and administration contracts, and every file digest (`cargo test -p focal-client --test skill_contract -- --ignored --nocapture print_skill_digests` prints the digests to re-pin after an edit). This repository does not install skills into an external agent automatically, publish `skill://` resources, or claim a generated skill runtime. Contract tests pin live descriptors, recovery and administration contracts, and file digests. Protocol fixtures and the repository's Rust stdio harness provide qualification; an external SDK/client interoperability run is not claimed here.
 
 
 ## Consume a durable watch
@@ -243,6 +381,8 @@ When a watch store is configured, discover `watch.open`, `watch.next`, `watch.ac
 Replace the placeholder with the actual claim ID; omit `claims` for the entire ledger. `watch.open` is an exact-options retry and returns one retained delivery. `watch.next` repeats that delivery until consumed. After the sink has durably accepted the complete page, call `watch.acknowledge` with the name and the returned `delivery.id` encoded as 64 hexadecimal digits. Its `Consumed` result confirms the durable local consumed frontier. The next `watch.next` commits source cursor acknowledgment and retires the exact managed receipt before advancing. Repeating the last acknowledgment is harmless. `watch.inspect` with a name reads saved status/data; omitting the name lists at most 16 saved names. Inspection is not consumption.
 
 MCP cancellation or response loss preserves the pending action/page. A partial seed resumes at the exact saved token and last visited object key; filtered empty pages progress. Consume every seed page before completing the seed. A source lease lost during a seed produces an explicit expiry instead of silently changing the prefix. Choose a new watch name to reseed deliberately. A saved delivery can still be consumed after source restart. Each page is bounded at 64 KiB and at most 256 source items/visits; an oversized individual object is a typed capacity limit. Seed objects and original tail deltas are distinct facts, with resolved/resync markers retained; watch ACK is neither testament receipt nor validation.
+
+On a native ledger the four tools are offered next to the version-2 catalogue and behave the same: `watch.open` records the native engine in the watch's options, the seed is read through native reads (a `claims` filter reads each claim with its responses and evaluations; otherwise the family is listed) and delivered as `NativeSeed` pages, and tail deltas carry `schema` 2 with a `Native` fact holding the exact committed event record, the nearest legacy `action`, the `actor` and the `claim`. Objects read for the seed may also arrive as deltas when they were committed between the pinned snapshot and the read; deduplicate by object binding.
 
 The [CLI watch instructions](manual-cli.md#watch-delivered-ledger-changes) describe shared storage, bounds and recovery. These four adapter tools use their own private per-watch allocator and do not require business operation IDs. No background agent or subscription daemon is created. Tool output schemas are per-tool subsets of the stable `ApplicationResult` envelope, with IDs `urn:focal:mcp:TOOL:output:1`; this narrows discovery schemas without changing `schema_version` or runtime result encoding.
 
@@ -261,7 +401,9 @@ family predicates are:
 
 For list relations, use an explicit target such as `participant:self`,
 `claim:ID`, `root:ID`, or `action:work`; object targets can also name a testament,
-artifact, or validation. `caused_by` accepts `claim:ID` or `root:ID`. Each supplied
+artifact, or validation, and on a native ledger `artifact:ID` or
+`artifact:ID@HASH` lists the reviews and derivations of that exact evidence.
+`caused_by` accepts `claim:ID` or `root:ID`. Each supplied
 scope/relation/input must match, and each collection is limited to 16 (the cause
 alias also consumes one relation). Every field is optional; family-inapplicable
 fields are rejected. Discover the exact enum spellings in each tool schema.

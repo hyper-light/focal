@@ -51,6 +51,7 @@ Each new `Arc` needs a concrete lifetime/concurrency reason near its definition 
 | Boundary | Why state is shared |
 |---|---|
 | Memory snapshot roots, COW pages, immutable content, lease clocks and lease accounting | Detached readers retain an old view while the owner publishes a new view; shared content and charges live until the last reader releases them. Concurrent snapshot tests exercise this. |
+| Disk envelope counters | The WAL writer thread, the content store and the checkpoint path promise bytes of one volume before they write and charge or return them after their own fences, on different threads with independent lifetimes; the estimate and the promised total are atomic counters behind one shared handle, exactly as the memory budget's are. Its tests cover concurrent owners sharing one envelope, commit versus drop, lanes and sampling ([24](24-placement-execution-and-fleet-control.md) §10). |
 | Memory budget counters | Owned permits may be released by workers and response tasks after the admitting owner has moved on or stopped. Immutable parent links enforce session, tenant and node limits together; each permit follows those links without allocating a separate parent-permit chain. |
 | Scheduler dispatch lease | A detached worker owns dispatch while the scheduler weakly observes liveness for completion accounting and active-ID deduplication. |
 | Stream control permit | The subscription and its one outstanding control delivery share the reserved capacity; a second control delivery is refused until the first is released. |

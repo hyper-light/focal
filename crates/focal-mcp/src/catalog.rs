@@ -3,7 +3,7 @@ use crate::{ProtocolError, Tool};
 use focal_client::operations;
 use serde_json::{Map, Value};
 #[path = "catalog_schema.rs"]
-mod schema;
+pub(crate) mod schema;
 
 pub(crate) fn catalog() -> Result<Vec<Tool>, ProtocolError> {
     let mut tools = Vec::new();
@@ -143,8 +143,27 @@ fn managed_id_schema() -> Value {
         ]},"description":"A previously reserved managed ID; supplying a missing or retired ID never creates fresh work."})
 }
 
-/// Preserve the common result envelope while retaining only this adapter's
-/// possible result families. Frozen nested DTOs and their limits are unchanged.
+/// Preserve the common result envelope while retaining only the tool's
+/// possible result families. Frozen nested DTOs and their limits are
+/// unchanged; the identity names the tool and the output version so a V1 and
+/// a native tool of the same name never share a schema identity.
+pub(crate) fn specialized(
+    name: &str,
+    kinds: &[&str],
+    version: u16,
+) -> Result<Value, ProtocolError> {
+    let mut output = operations::descriptors()
+        .first()
+        .ok_or(ProtocolError::Limits)?
+        .output_schema()
+        .map_err(|_| ProtocolError::Limits)?;
+    schema::specialize_output(&mut output, kinds)?;
+    output.as_object_mut().ok_or(ProtocolError::Limits)?.insert(
+        "$id".into(),
+        Value::String(format!("urn:focal:mcp:{name}:output:{version}")),
+    );
+    Ok(output)
+}
 pub(crate) fn output_schema(name: &str) -> Result<Value, ProtocolError> {
     let kinds: &[&str] = if name.starts_with("cluster.") {
         &["administration", "error"]
@@ -184,16 +203,5 @@ pub(crate) fn output_schema(name: &str) -> Result<Value, ProtocolError> {
             },
         }
     };
-    let mut output = operations::descriptors()
-        .first()
-        .ok_or(ProtocolError::Limits)?
-        .output_schema()
-        .map_err(|_| ProtocolError::Limits)?;
-    schema::specialize_output(&mut output, kinds)?;
-    // A per-tool schema has a distinct identity from the shared full union.
-    output.as_object_mut().ok_or(ProtocolError::Limits)?.insert(
-        "$id".into(),
-        Value::String(format!("urn:focal:mcp:{name}:output:1")),
-    );
-    Ok(output)
+    specialized(name, kinds, 1)
 }

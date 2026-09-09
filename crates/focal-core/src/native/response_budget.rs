@@ -136,25 +136,48 @@ pub(super) fn check_receipt_shape(
             .ok_or(NativeError::Capacity("delivery cohort"))?,
         work,
     )?;
+    // Each Ready work check registers its due timer; a delivery evaluation
+    // registers and settles in the same publication, and released monitors
+    // are graph consequences funded with the graph.
     ConstructionBudget::for_operation(NativeOperation::ReceiveResponse, limits)?.check_counts(
         1,
         add(entries, 1)?,
         add(entries, 2)?,
+        add(
+            crate::native::index_rows::STATUS_ROWS,
+            crate::native::index_rows::timer_rows(0, work, 0)?,
+        )?,
     )
 }
 
 /// An output and I Ready checks publish with complete registration membership.
-/// With checks: artifact/identity/work/slot/cycle + I checks + parent + I+3 facts.
-pub(super) fn check_increment_shape(count: usize, limits: NativeLimits) -> Result<(), NativeError> {
+/// With checks: artifact/identity/work/slot/cycle + I checks + parent + I+3 facts,
+/// then the artifact's index rows for its `inputs` inputs and, with checks,
+/// the parent's status move (doc 22 §7). A future submission is checked with
+/// the smallest artifact: one citing more inputs is refused at its own
+/// admission, never promised in advance.
+pub(super) fn check_increment_shape(
+    count: usize,
+    inputs: usize,
+    limits: NativeLimits,
+) -> Result<(), NativeError> {
+    if inputs > crate::native::index_rows::input_bound(limits) {
+        return Err(NativeError::Capacity("artifact inputs"));
+    }
     let (claims, events) = if count == 0 {
         (0, 2)
     } else {
         (1, add(count, 3)?)
     };
+    // Each registered increment evaluation gains its due timer.
     ConstructionBudget::for_operation(NativeOperation::SubmitWork, limits)?.check_counts(
         claims,
         add(count, 5)?,
         events,
+        add(
+            crate::native::index_rows::artifact_rows(inputs)?,
+            add(add(claims, claims)?, count)?,
+        )?,
     )
 }
 
@@ -167,7 +190,14 @@ pub(super) fn work_limit(limits: NativeLimits) -> Result<usize, NativeError> {
     if budget.max_claim_rows == 0 {
         return Err(refusal());
     }
-    let changes = budget.max_changes.checked_sub(7).ok_or_else(refusal)? / 2;
+    // Closing writes seven fixed rows and the claim's two status index rows
+    // beside the two rows each closed attachment adds (doc 22 §7).
+    let changes = budget
+        .max_changes
+        .checked_sub(7)
+        .and_then(|changes| changes.checked_sub(crate::native::index_rows::STATUS_ROWS))
+        .ok_or_else(refusal)?
+        / 2;
     let extras = budget.extras_count.checked_sub(2).ok_or_else(refusal)?;
     let events = budget.max_events.checked_sub(2).ok_or_else(refusal)?;
     Ok(limits
@@ -191,21 +221,30 @@ mod tests {
     #[test]
     fn exact_close_row_bound_covers_empty_odd_and_even_batches() {
         for (batch, expected) in [
-            (7, 0),
-            (8, 0),
-            (9, 1),
-            (10, 1),
-            (127, 60),
-            (128, 60),
-            (129, 61),
+            (9, 0),
+            (10, 0),
+            (11, 1),
+            (12, 1),
+            (129, 60),
+            (130, 60),
+            (131, 61),
         ] {
             let limits = limits(batch);
             let actual = work_limit(limits).unwrap();
             assert_eq!(actual, expected);
             let budget =
                 ConstructionBudget::for_operation(NativeOperation::CloseResponse, limits).unwrap();
-            assert!(budget.check_counts(1, actual + 2, actual + 2).is_ok());
-            assert!(budget.check_counts(1, actual + 3, actual + 3).is_err());
+            let status = crate::native::index_rows::STATUS_ROWS;
+            assert!(
+                budget
+                    .check_counts(1, actual + 2, actual + 2, status)
+                    .is_ok()
+            );
+            assert!(
+                budget
+                    .check_counts(1, actual + 3, actual + 3, status)
+                    .is_err()
+            );
         }
     }
 
@@ -225,14 +264,14 @@ mod tests {
 
     #[test]
     fn impossible_closure_shape_and_overflow_refuse_before_any_cycle_admission() {
-        for batch in 0..7 {
+        for batch in 0..9 {
             assert!(work_limit(limits(batch)).is_err());
         }
-        let mut configured = limits(7);
+        let mut configured = limits(9);
         configured.plan_nodes = 0;
         assert!(work_limit(configured).is_err());
         assert!(work_limit(limits(usize::MAX)).is_err());
-        let mut configured = limits(7);
+        let mut configured = limits(9);
         configured.preparation_bytes = usize::MAX;
         assert!(work_limit(configured).is_err());
     }
@@ -259,25 +298,37 @@ mod tests {
 
     #[test]
     fn increment_cohort_must_fit_with_work_and_membership_in_one_submission() {
-        for count in 0..16 {
-            let batch = if count == 0 { 9 } else { 2 * count + 11 };
-            assert!(check_increment_shape(count, limits(batch)).is_ok());
-            assert!(check_increment_shape(count, limits(batch - 1)).is_err());
+        // The artifact's index rows (producer, kind, schema and one per
+        // input) join every shape; a Ready cohort also moves the parent's
+        // status key and registers one due timer per check (doc 22 §7).
+        for inputs in [0, 1, 16] {
+            let artifact_index = crate::native::index_rows::artifact_rows(inputs).unwrap();
+            for count in 0..16 {
+                let batch = if count == 0 {
+                    9 + artifact_index
+                } else {
+                    3 * count + 11 + artifact_index + crate::native::index_rows::STATUS_ROWS
+                };
+                assert!(check_increment_shape(count, inputs, limits(batch)).is_ok());
+                assert!(check_increment_shape(count, inputs, limits(batch - 1)).is_err());
+            }
         }
-        assert!(check_increment_shape(usize::MAX, limits(128)).is_err());
+        assert!(check_increment_shape(usize::MAX, 0, limits(128)).is_err());
+        assert!(check_increment_shape(0, 17, limits(128)).is_err());
         let mut no_parent = limits(32);
         no_parent.plan_nodes = 0;
-        assert!(check_increment_shape(1, no_parent).is_err());
-        assert!(check_increment_shape(0, no_parent).is_ok());
+        assert!(check_increment_shape(1, 0, no_parent).is_err());
+        assert!(check_increment_shape(0, 0, no_parent).is_ok());
     }
 
     #[test]
     fn receipt_prices_both_complete_cohorts_at_the_exact_batch_boundary() {
         for delivery in 0..8 {
             for work in 0..8 {
-                // One changed claim/response, their facts, Meta and outcome;
-                // Delivery adds four rows and each Ready work check adds two.
-                let batch = 4 * delivery + 2 * work + 6;
+                // One changed claim/response, their facts, Meta and outcome,
+                // then the claim's two status index rows; Delivery adds four
+                // rows and each Ready work check adds two plus its due timer.
+                let batch = 4 * delivery + 3 * work + 6 + crate::native::index_rows::STATUS_ROWS;
                 assert!(check_receipt_shape(delivery, work, limits(batch)).is_ok());
                 assert!(check_receipt_shape(delivery, work, limits(batch - 1)).is_err());
             }

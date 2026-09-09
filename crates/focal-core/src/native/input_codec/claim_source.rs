@@ -55,6 +55,10 @@ fn relation(cursor: &mut SourceCursor<'_, '_>) -> Result<Relation, CodecError> {
                 id: ObjectId(cursor.fixed()?),
             })
         }
+        4 => RelationTarget::Evidence(focal_model::ArtifactRef {
+            id: focal_model::ArtifactId(cursor.fixed()?),
+            hash: focal_model::ContentHash(cursor.fixed()?),
+        }),
         2 => RelationTarget::Action(match cursor.u16()? {
             1 => ActionType::Work,
             2 => ActionType::Consultation,
@@ -202,6 +206,40 @@ impl<'a> ClaimView<'a> {
             1 => Some(fixed::deadline(cursor)?),
             _ => return Err(CodecError::InvalidTag("option")),
         };
+        // Schema 2 appends the optional follow-up policy; schema 1 has none.
+        let policy = if schema >= 2 {
+            match cursor.u8()? {
+                0 => None,
+                1 => {
+                    let corrective_allowed = match cursor.u8()? {
+                        0 => false,
+                        1 => true,
+                        _ => return Err(CodecError::InvalidTag("policy flag")),
+                    };
+                    let max_follow_ups = cursor.u16()?;
+                    let single_issuer = match cursor.u8()? {
+                        0 => false,
+                        1 => true,
+                        _ => return Err(CodecError::InvalidTag("policy flag")),
+                    };
+                    let escalation = match cursor.u8()? {
+                        0 => focal_model::Escalation::None,
+                        1 => focal_model::Escalation::Holder,
+                        2 => focal_model::Escalation::Evaluator,
+                        _ => return Err(CodecError::InvalidTag("policy escalation")),
+                    };
+                    Some(focal_model::PeerPolicy {
+                        corrective_allowed,
+                        max_follow_ups,
+                        single_issuer,
+                        escalation,
+                    })
+                }
+                _ => return Err(CodecError::InvalidTag("option")),
+            }
+        } else {
+            None
+        };
         let parsed = max_source_visits
             .checked_sub(meter.remaining())
             .ok_or(CodecError::Capacity)?;
@@ -223,6 +261,7 @@ impl<'a> ClaimView<'a> {
                 occurrence,
                 description,
                 deadline,
+                policy,
             },
             relations,
             scopes,

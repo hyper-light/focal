@@ -17,6 +17,23 @@ impl FileLock {
         // errors release the lock as well as normal owner completion.
         Ok(Self { file })
     }
+    /// Acquire, waiting up to `wait` for another owner's short critical
+    /// section to end; a lock still held afterwards is `WouldBlock`.
+    pub(crate) fn acquire_within(file: File, wait: std::time::Duration) -> io::Result<Self> {
+        let deadline = std::time::Instant::now().checked_add(wait);
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(Self { file }),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if deadline.is_none_or(|deadline| std::time::Instant::now() >= deadline) {
+                        return Err(error);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
     pub(crate) fn file(&self) -> &File {
         &self.file
     }

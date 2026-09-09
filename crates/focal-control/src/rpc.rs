@@ -159,6 +159,7 @@ impl From<ControlError> for ControlFailure {
             | ControlError::Directory(focal_directory::DirectoryError::Capacity)
             | ControlError::Directory(focal_directory::DirectoryError::Memory(
                 focal_memory::MemoryError::Capacity { .. }
+                | focal_memory::MemoryError::DiskCapacity { .. }
                 | focal_memory::MemoryError::AllocationFailed,
             ))
             | ControlError::Consensus(focal_consensus::ConsensusError::Capacity) => Self::Capacity,

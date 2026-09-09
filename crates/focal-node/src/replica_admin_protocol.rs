@@ -23,6 +23,9 @@ pub enum ReplicaAdminCommand {
         group: [u8; 16],
         request: SessionMembershipRequest,
     },
+    /// Propose the committed activation of native history over an empty
+    /// legacy prefix; every voter must already promise the successor decoder.
+    ActivateNative { session: SessionId, group: [u8; 16] },
 }
 impl ReplicaAdminCommand {
     pub(super) fn validate(&self) -> Result<(), AccessError> {
@@ -47,6 +50,9 @@ impl ReplicaAdminCommand {
                 request,
             } if !session.is_zero() && *group != [0; 16] => {
                 request.validate().map_err(|_| AccessError::InvalidRequest)
+            }
+            Self::ActivateNative { session, group } if !session.is_zero() && *group != [0; 16] => {
+                Ok(())
             }
             _ => Err(AccessError::InvalidRequest),
         }
@@ -79,6 +85,10 @@ pub enum ReplicaAdminReply {
         group: [u8; 16],
         view: Box<MembershipView>,
     },
+    NativeActivationProposed {
+        session: SessionId,
+        group: [u8; 16],
+    },
     Rejected(ControlFailure),
 }
 impl LocalNetworkAdmin {
@@ -88,6 +98,12 @@ impl LocalNetworkAdmin {
         }
         self.fleet = Some(fleet);
         Ok(self)
+    }
+    /// The exclusive content writer, needed to seal inline legacy payloads
+    /// before a populated ledger's import is proposed.
+    pub fn with_content(mut self, content: crate::content_host::ContentHost) -> Self {
+        self.content = Some(content);
+        self
     }
     pub(super) async fn replica_command(
         &self,
@@ -209,6 +225,42 @@ impl LocalNetworkAdmin {
                     group,
                     view: Box::new(reply.view().clone()),
                 })
+            }
+            ReplicaAdminCommand::ActivateNative { session, group } => {
+                let (actual, host) = fleet
+                    .replica_target(LedgerId {
+                        tenant: self.identity.ledger.tenant,
+                        session,
+                    })
+                    .map_err(|_| ControlFailure::Unavailable)?;
+                if group != actual {
+                    return Err(ControlFailure::WrongOwner);
+                }
+                let chunking = self
+                    .content
+                    .as_ref()
+                    .map(|content| content.import_chunking())
+                    .unwrap_or((0, 0));
+                // A populated prefix is imported: its inline legacy payloads are
+                // sealed by the exclusive writer before the proposal records
+                // the root every replica must reproduce (23 §5).
+                if let Some(import) = host.import_payloads().await.map_err(failure)? {
+                    let content = self.content.as_ref().ok_or(ControlFailure::Unavailable)?;
+                    for bytes in import.payloads {
+                        content
+                            .seal_import_inline(import.domain, bytes, chunking.0)
+                            .await
+                            .map_err(|_| ControlFailure::Unavailable)?;
+                    }
+                }
+                host.activate_native(crate::fleet::ActivateNativeCall {
+                    profile: focal_ledger::NativeContentProfile::AuthoredV1,
+                    chunk_bytes: chunking.0,
+                    max_manifest_bytes: chunking.1,
+                })
+                .await
+                .map_err(failure)?;
+                Ok(ReplicaAdminReply::NativeActivationProposed { session, group })
             }
         }
     }

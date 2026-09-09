@@ -32,10 +32,10 @@ fn begin_charge_is_independent_of_unrelated_global_capacity() {
     assert_eq!(large.extras_count, 1);
     assert_eq!(large.max_events, 1);
     assert_eq!(large.scratch_bytes, OwnedEvaluation::container_charge());
-    large.check_counts(0, 1, 1).unwrap();
-    assert!(large.check_counts(1, 1, 1).is_err());
-    assert!(large.check_counts(0, 2, 1).is_err());
-    assert!(large.check_counts(0, 1, 2).is_err());
+    large.check_counts(0, 1, 1, 0).unwrap();
+    assert!(large.check_counts(1, 1, 1, 0).is_err());
+    assert!(large.check_counts(0, 2, 1, 0).is_err());
+    assert!(large.check_counts(0, 1, 2, 0).is_err());
 }
 
 #[test]
@@ -73,11 +73,18 @@ fn report_accepts_the_actual_nine_row_shape_below_its_eleven_row_ceiling() {
         .unwrap();
         // Four extra rows: artifact, content identity, evaluation and accepted
         // result. Three of them emit history. Meta and outcome add two rows.
-        assert_eq!(budget.check_counts(0, 4, 3).is_ok(), batch >= 9);
+        assert_eq!(budget.check_counts(0, 4, 3, 0).is_ok(), batch >= 9);
         // First blocking result additionally changes the claim and emits its
         // terminal transition. The smaller owner still accepts the first shape.
-        assert_eq!(budget.check_counts(1, 4, 4).is_ok(), batch >= 11);
-        assert_eq!(budget.max_changes, batch.min(11));
+        assert_eq!(budget.check_counts(1, 4, 4, 0).is_ok(), batch >= 11);
+        // The ceiling also funds the report's index rows: the artifact's
+        // three fixed rows and sixteen input rows, its verdict, and the
+        // claim's status move (doc 22 §7).
+        let index = crate::native::index_rows::report_rows(16).unwrap()
+            + crate::native::index_rows::STATUS_ROWS;
+        assert_eq!(index, 22);
+        assert_eq!(budget.max_index_rows, batch.min(index));
+        assert_eq!(budget.max_changes, batch.min(11 + index));
         assert_eq!(budget.scratch_bytes, 4096);
     }
 }
@@ -90,10 +97,12 @@ fn report_shape_limits_reject_each_independently_oversized_component() {
     for claims in 0..=2 {
         for extras in 0..=5 {
             for events in 0..=5 {
-                let expected =
-                    claims <= 1 && extras <= 4 && events <= 4 && claims + extras + events + 2 <= 11;
+                let expected = claims <= 1
+                    && extras <= 4
+                    && events <= 4
+                    && claims + extras + events + 2 <= budget.max_changes;
                 assert_eq!(
-                    budget.check_counts(claims, extras, events).is_ok(),
+                    budget.check_counts(claims, extras, events, 0).is_ok(),
                     expected,
                     "claims={claims}, extras={extras}, events={events}"
                 );
@@ -105,14 +114,16 @@ fn report_shape_limits_reject_each_independently_oversized_component() {
     let no_claim_rows =
         ConstructionBudget::for_operation(NativeOperation::ReportAdmission, limits(11, 0, 4096))
             .unwrap();
-    no_claim_rows.check_counts(0, 4, 3).unwrap();
-    assert!(no_claim_rows.check_counts(1, 4, 4).is_err());
+    no_claim_rows.check_counts(0, 4, 3, 0).unwrap();
+    assert!(no_claim_rows.check_counts(1, 4, 4, 0).is_err());
 }
 
 #[test]
 fn report_retains_existing_scratch_contract_but_not_global_array_sizes() {
+    // Thirty-four changes: the eleven-change report shape, its twenty-two
+    // possible index rows and the reported evaluation's due timer.
     let small =
-        ConstructionBudget::for_operation(NativeOperation::ReportAdmission, limits(11, 1, 8192))
+        ConstructionBudget::for_operation(NativeOperation::ReportAdmission, limits(34, 1, 8192))
             .unwrap();
     let large = ConstructionBudget::for_operation(
         NativeOperation::ReportAdmission,
@@ -124,7 +135,7 @@ fn report_retains_existing_scratch_contract_but_not_global_array_sizes() {
         large.pending_bytes().unwrap()
     );
     let wider =
-        ConstructionBudget::for_operation(NativeOperation::ReportAdmission, limits(11, 1, 16384))
+        ConstructionBudget::for_operation(NativeOperation::ReportAdmission, limits(34, 1, 16384))
             .unwrap();
     assert_eq!(
         wider.pending_bytes().unwrap() - small.pending_bytes().unwrap(),
@@ -164,7 +175,7 @@ fn change_allowance_covers_simultaneous_vectors_and_owned_containers() {
         (NativeOperation::ReportAdmission, 1, 4, 4),
     ] {
         let budget = ConstructionBudget::for_operation(operation, limits(11, 1, 4096)).unwrap();
-        budget.check_counts(claims, extras, events).unwrap();
+        budget.check_counts(claims, extras, events, 0).unwrap();
         let mut changes = Vec::<Change<Key, Row>>::new();
         changes
             .try_reserve_exact(claims + extras + events + 2)
@@ -204,10 +215,23 @@ fn creation_prices_derived_index_rows_while_other_operations_keep_their_allowanc
                 batch / 2
             };
             let original_extras = 2 * array::<Extra>(extras).unwrap();
+            // Creation may fill the batch with index rows; every other
+            // operation moves at most each changed claim between status keys
+            // and changes the due timers it can (doc 22 §7): a cancellation
+            // retires one per extra row and event, a post registers one per
+            // admission evaluation among its extras, and a receipt settles
+            // none.
+            let index_rows = match operation {
+                NativeOperation::Create => batch,
+                NativeOperation::Cancel => (2 * nodes + batch / 2 + batch / 2).min(batch),
+                NativeOperation::Post => (2 * nodes + batch / 2).min(batch),
+                _ => (2 * nodes).min(batch),
+            };
             let original_changes = array::<Change<Key, Row>>(batch).unwrap()
                 + array::<claim_changes::History>(nodes).unwrap()
                 + containers(nodes).unwrap()
-                + event_containers(batch).unwrap();
+                + event_containers(batch).unwrap()
+                + array::<crate::native::index_rows::IndexChange>(index_rows).unwrap();
             assert_eq!(
                 budget.pending_bytes().unwrap(),
                 scratch
@@ -215,18 +239,22 @@ fn creation_prices_derived_index_rows_while_other_operations_keep_their_allowanc
                     + original_extras
                     + crate::native::mutation::bytes(batch).unwrap()
             );
+            assert_eq!(budget.max_index_rows, index_rows);
             assert_eq!(budget.max_changes, batch);
             assert_eq!(budget.max_claim_rows, nodes);
             assert_eq!(budget.max_events, batch);
             assert_eq!(budget.extras_count, extras);
         }
     }
-    // One new claim with six outgoing targets adds six links, six heads and
-    // one definition. Index rows have no separate event: all eighteen rows fit.
+    // One new claim with three outgoing targets adds three links, three heads
+    // and one definition, then its own six index rows (issuer, subject,
+    // status, creation, action and the definition's evaluator). Index rows
+    // have no separate event: all eighteen rows fit, one more does not.
     let creation =
         ConstructionBudget::for_operation(NativeOperation::Create, limits(18, 7, 65536)).unwrap();
-    creation.check_counts(1, 13, 2).unwrap();
-    assert!(creation.check_counts(1, 14, 2).is_err());
+    creation.check_counts(1, 7, 2, 6).unwrap();
+    assert!(creation.check_counts(1, 8, 2, 6).is_err());
+    assert!(creation.check_counts(1, 7, 2, 7).is_err());
 }
 
 #[test]
@@ -251,6 +279,6 @@ fn construction_quotes_reject_overflow_without_building_buffers() {
         ConstructionBudget::for_operation(NativeOperation::ReportAdmission, limits(11, 1, 4096))
             .unwrap();
     for (claims, extras, events) in [(usize::MAX, 0, 0), (0, usize::MAX, 0), (0, 0, usize::MAX)] {
-        assert!(budget.check_counts(claims, extras, events).is_err());
+        assert!(budget.check_counts(claims, extras, events, 0).is_err());
     }
 }

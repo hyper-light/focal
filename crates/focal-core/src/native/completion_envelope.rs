@@ -596,6 +596,13 @@ pub(super) fn pinned_descriptor_charge(
 /// Select internal dimension caps from the complete report allowance. All byte
 /// fields share one aggregate construction cap; their maxima need not coexist.
 /// Large durable payloads may use a content pointer, independently of inline cap.
+/// The most inputs one result artifact admitted under `descriptor` can
+/// carry, and so the most `ArtifactInput` index rows its report writes: the
+/// configured input limit, never above the model's fixed ceiling.
+pub(super) fn input_bound(descriptor: ArtifactLimits) -> usize {
+    descriptor.inputs.min(ArtifactLimits::MAX_INPUTS)
+}
+
 pub(super) fn descriptor_limits(
     limits: NativeLimits,
     claim: &ClaimState,
@@ -677,10 +684,12 @@ fn descriptor_limits_with_cohort(
         kind_bytes: low,
         metadata_bytes: low,
         inline_bytes: low,
-        inputs: limits.plan_edges.min(
-            low.checked_div(size_of::<ObjectRef>())
-                .ok_or(NativeError::Capacity("descriptor input size"))?,
-        ),
+        inputs: super::index_rows::input_bound(limits)
+            .min(limits.plan_edges)
+            .min(
+                low.checked_div(size_of::<ObjectRef>())
+                    .ok_or(NativeError::Capacity("descriptor input size"))?,
+            ),
         visibility_labels: low
             .checked_div(size_of::<String>())
             .ok_or(NativeError::Capacity("descriptor label size"))?,
@@ -755,13 +764,41 @@ impl CompletionEnvelope {
         }
         let construction =
             ConstructionBudget::for_operation(operation, limits)?.with_cohort(cohort, limits)?;
+        let batch = limits.range.max_batch_entries;
+        // The promised result artifact cites no more inputs than leave room in
+        // one batch for the report's other rows: nine primary rows, the
+        // artifact's three fixed index rows and its verdict, or for a failed
+        // report eleven rows, the cohort's rows and every status move (22 §7).
+        // The reported evaluation and every sealed cohort evaluation may
+        // retire its due timer.
+        let timers = crate::native::index_rows::timer_rows(0, add(1, cohort.evaluations())?, 0)?;
+        let fixed_rows = if failure_possible {
+            let moved = add(1, cohort.claims())?;
+            add(
+                add(add(11, cohort.changed_keys())?, add(4, add(moved, moved)?)?)?,
+                timers,
+            )?
+        } else {
+            add(9 + 4, timers)?
+        };
+        descriptor.inputs =
+            crate::native::index_rows::cap_inputs(input_bound(descriptor), fixed_rows, batch);
+        let promised_index = |moved: usize| {
+            add(
+                crate::native::index_rows::report_rows(input_bound(descriptor))?,
+                add(add(moved, moved)?, timers)?,
+            )
+        };
         match target {
             CompletionTarget::Admission => construction.check_counts(
                 1,
                 add(4, cohort.evaluations())?,
                 add(4, cohort.events())?,
+                promised_index(add(1, cohort.claims())?)?,
             )?,
-            CompletionTarget::Increment => construction.check_counts(0, 4, 3)?,
+            CompletionTarget::Increment => {
+                construction.check_counts(0, 4, 3, promised_index(0)?)?
+            }
             CompletionTarget::Work => return Err(ContractError::InvalidTarget.into()),
         }
         let (parent_heap, registry_heap) = parent_bound(limits, claim, registrations)?;
@@ -806,17 +843,28 @@ impl CompletionEnvelope {
             add(descriptor_heap, result_containers()?)?,
             event_containers(3)?,
         )?;
+        // A report indexes its result artifact and verdict; a failed report
+        // also moves the parent and every sealed cohort claim between status
+        // keys (doc 22 §7).
+        let report_index = crate::native::index_rows::report_rows(input_bound(descriptor))?;
+        let ordinary_keys = add(add(9, report_index)?, timers)?;
         let ordinary_report = rows.future_write_envelope(RangeWriteLimits {
-            changed_keys: 9,
-            deleted_keys: 0,
+            changed_keys: ordinary_keys,
+            deleted_keys: timers,
+            deleted_heap: 0,
             incoming_heap: regular_heap,
-            input_capacity: 9,
+            input_capacity: ordinary_keys,
         })?;
         let failed_report = if failure_possible {
-            let changes = add(11, cohort.changed_keys())?;
+            let moved = add(1, cohort.claims())?;
+            let changes = add(
+                add(11, cohort.changed_keys())?,
+                add(report_index, add(add(moved, moved)?, timers)?)?,
+            )?;
             Some(rows.future_write_envelope(RangeWriteLimits {
                 changed_keys: changes,
-                deleted_keys: 0,
+                deleted_keys: add(moved, timers)?,
+                deleted_heap: 0,
                 incoming_heap: add(
                     add(regular_heap, cohort.incoming_heap()?)?,
                     add(
@@ -872,6 +920,9 @@ impl CompletionEnvelope {
             add(construction.temporary_bytes()?, range_workspace)?,
         )?;
         let failure_events = add(1, cohort.events())?;
+        // A report's new rows: artifact, identity, accepted result, outcome,
+        // three events, and the artifact's and verdict's index rows (22 §7).
+        // A failed report moves status keys without adding rows.
         let slot_demand = SlotDemand {
             per_report: CompletionSlots {
                 artifacts: 1,
@@ -880,7 +931,7 @@ impl CompletionEnvelope {
                 outcomes: 1,
                 events: 3,
                 sequences: 1,
-                new_rows: 7,
+                new_rows: add(7, report_index)?,
                 ..CompletionSlots::default()
             },
             failure: failed_report.map(|_| CompletionSlots {
@@ -999,7 +1050,11 @@ impl CompletionEnvelope {
         usage: CompletionUse,
     ) -> Result<usize, NativeError> {
         let storage = self.report_storage(usage)?;
-        let records = self.record_buffers.map(|limits| record_codec::future_record_bytes(storage, limits)).transpose()?.unwrap_or(0);
+        let records = self
+            .record_buffers
+            .map(|limits| record_codec::future_record_bytes(storage, limits))
+            .transpose()?
+            .unwrap_or(0);
         add(
             add(crate::native::mutation::retained(storage)?, records)?,
             match usage {
@@ -1009,13 +1064,29 @@ impl CompletionEnvelope {
         )
     }
 
-    pub(super) fn with_record_buffers(mut self, limits: record_codec::EncodingLimits) -> Result<Self, NativeError> {
-        if self.record_buffers.is_some() { return Err(ContractError::InvalidTransition.into()); }
+    pub(super) fn with_record_buffers(
+        mut self,
+        limits: record_codec::EncodingLimits,
+    ) -> Result<Self, NativeError> {
+        if self.record_buffers.is_some() {
+            return Err(ContractError::InvalidTransition.into());
+        }
         let regular = record_codec::future_record_bytes(self.ordinary_report, limits)?;
         let records = if let Some(failed) = self.failed_report {
-            add(multiply(usize::try_from(self.reports.checked_sub(1).ok_or(ContractError::Capacity)?).map_err(|_| ContractError::Capacity)?, regular)?,
-                record_codec::future_record_bytes(failed, limits)?)?
-        } else { multiply(usize::try_from(self.reports).map_err(|_| ContractError::Capacity)?, regular)? };
+            add(
+                multiply(
+                    usize::try_from(self.reports.checked_sub(1).ok_or(ContractError::Capacity)?)
+                        .map_err(|_| ContractError::Capacity)?,
+                    regular,
+                )?,
+                record_codec::future_record_bytes(failed, limits)?,
+            )?
+        } else {
+            multiply(
+                usize::try_from(self.reports).map_err(|_| ContractError::Capacity)?,
+                regular,
+            )?
+        };
         self.retained = add(self.retained, records)?;
         self.required = add(self.required, records)?;
         self.record_buffers = Some(limits);

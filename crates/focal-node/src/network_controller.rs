@@ -2,6 +2,10 @@
 //! learners. Reachability never supplies geography, custody, or voting rights.
 use crate::{
     control_host::{ControlHost, RootObservation},
+    credential_renewal::{
+        CredentialRequest, CredentialSummary, CredentialSwap, RENEWAL_RETRY_SECONDS,
+        RENEWAL_WINDOW_SECONDS, RenewalError,
+    },
     embedded::atomic_file,
     network_bootstrap::unix_time,
     network_state::NetworkState,
@@ -12,8 +16,9 @@ use focal_directory::{
     AuthorityCommand, AuthorityOperation, NodeEnrollment, NodeTopologyGrant, RegionId, ZoneId,
 };
 use focal_enrollment::{
-    EnrollmentLimits, EnrollmentReceipt, EnrollmentRegistry, EnrollmentRole, JoinFailure,
-    JoinFuture, JoinHandler, JoinRequest, JoinResponse, PrivateJournal,
+    CredentialMaterial, EnrollmentClient, EnrollmentLimits, EnrollmentReceipt, EnrollmentRegistry,
+    EnrollmentRole, JoinFailure, JoinFuture, JoinHandler, JoinRequest, JoinResponse,
+    JoinTransportError, PrivateJournal, RenewRequest, TransportLimits,
 };
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::{ParticipantId, RequestEpoch, RequestId, RouteEpoch};
@@ -72,6 +77,31 @@ impl JoinHandler for RegisteredEnrollment {
             let JoinResponse::Enrolled(receipt) = response else {
                 return response;
             };
+            let grant = match self
+                .host
+                .authorize_certificate(receipt.certificate.clone())
+                .await
+            {
+                Ok(grant) => grant,
+                Err(_) => return JoinResponse::Rejected(JoinFailure::OutcomeUnknown),
+            };
+            if wait_registered_grant(&self.registry, &receipt, &grant, Duration::from_secs(5))
+                .await
+                .is_err()
+            {
+                return JoinResponse::Rejected(JoinFailure::OutcomeUnknown);
+            }
+            JoinResponse::Enrolled(receipt)
+        })
+    }
+    fn renew(&self, request: RenewRequest) -> JoinFuture<'_> {
+        Box::pin(async move {
+            let response = JoinHandler::renew(&self.host, request).await;
+            let JoinResponse::Enrolled(receipt) = response else {
+                return response;
+            };
+            // The renewed certificate is answered only once this founder's
+            // own ingress grants it, so the holder's next connection lands.
             let grant = match self
                 .host
                 .authorize_certificate(receipt.certificate.clone())
@@ -177,7 +207,11 @@ pub fn seed_peer_registry(
         .enrollments()
         .find(|known| known.identity.node_id == Some(state.node))
     {
-        if known != receipt {
+        // The node may still hold the receipt a renewal replaced (a crash
+        // before the renewed receipt was installed): the same identity and
+        // key, authorized through the sponsor's grace; the controller then
+        // converges on the committed renewal.
+        if known.identity != receipt.identity || known.public_key != receipt.public_key {
             return Err(ControllerError::Identity);
         }
         enrollment.authorize_certificate(&receipt.certificate, now)?;
@@ -201,9 +235,18 @@ fn genesis_enrollment(state: &NetworkState) -> Result<EnrollmentRegistry, Contro
     Ok(registry)
 }
 fn node_grant(node: u64, principal: [u8; 16], state: &NetworkState) -> PeerGrant {
+    // Enrolled nodes reach the root namespace and the first directory
+    // partition's namespace: discovery reads and their own placement facts.
+    let mut tenants = BTreeSet::from([state.genesis.root_namespace.tenant]);
+    if let Ok(plan) = crate::directory_bootstrap::FirstDirectoryPlan::derive(
+        state.genesis.founder.cluster,
+        state.genesis.founder.node,
+    ) {
+        tenants.insert(plan.namespace().tenant);
+    }
     PeerGrant {
         principal: ParticipantId(principal),
-        tenants: BTreeSet::from([state.genesis.root_namespace.tenant]),
+        tenants,
         role: PeerRole::Node { node_id: node },
     }
 }
@@ -213,7 +256,13 @@ fn active_grants(
     now: i64,
 ) -> Result<BTreeMap<[u8; 32], PeerGrant>, ControllerError> {
     let mut grants = BTreeMap::new();
-    for receipt in enrollment.enrollments() {
+    // A certificate a renewal replaced keeps its grant through the grace the
+    // sponsor decided, under the identity it was issued for.
+    let retired: Vec<&EnrollmentReceipt> = enrollment
+        .retired(now)
+        .map(|(receipt, _)| receipt)
+        .collect();
+    for receipt in enrollment.enrollments().chain(retired) {
         let identity = match enrollment.authorize_certificate(&receipt.certificate, now) {
             Ok(identity) => identity,
             Err(
@@ -525,9 +574,7 @@ fn next_root_command(
             && enrollment.enrollments().any(|receipt| {
                 receipt.identity.node_id == Some(*node)
                     && receipt.identity.principal == grant.principal
-                    && focal_model::ContentHash(focal_enrollment::server_fingerprint(
-                        &receipt.certificate,
-                    )) == grant.enrollment.identity
+                    && focal_model::ContentHash(receipt.public_key) == grant.enrollment.identity
             });
         if live {
             return Ok(Some(ControlCommand::Membership(ControlMembershipCommand {
@@ -573,9 +620,7 @@ fn next_root_command(
                         region: RegionId([0; 16]),
                         zone: ZoneId([0; 16]),
                         endpoint: contact.advertise.to_string(),
-                        identity: focal_model::ContentHash(focal_enrollment::server_fingerprint(
-                            &receipt.certificate,
-                        )),
+                        identity: focal_model::ContentHash(receipt.public_key),
                         authority_epoch: 1,
                         attestation: focal_model::ContentHash([0; 32]),
                         eligible: true,
@@ -610,10 +655,18 @@ impl Drop for PeerProjectionGuard<'_> {
 pub struct NetworkController {
     state: NetworkState,
     receipt: EnrollmentReceipt,
+    credentials: CredentialMaterial,
+    root: PathBuf,
     admission: Option<RootAdmission>,
     routes: BTreeMap<u64, PeerEndpoint>,
     route_revision: u64,
     contact_cursor: u64,
+    renewals: u64,
+    last_renewal_attempt: i64,
+    last_renewal_error: Option<RenewalError>,
+    /// The committed registry holds a newer receipt of this node than the one
+    /// it presents: a renewal committed that this node has not installed.
+    registry_ahead: bool,
     budget: MemoryBudget,
     _allocation: Allocation,
 }
@@ -621,6 +674,7 @@ impl NetworkController {
     pub fn new(
         state: NetworkState,
         receipt: EnrollmentReceipt,
+        credentials: CredentialMaterial,
         root: PathBuf,
         budget: MemoryBudget,
     ) -> Result<Self, ControllerError> {
@@ -642,10 +696,16 @@ impl NetworkController {
         Ok(Self {
             state,
             receipt,
+            credentials,
+            root,
             admission,
             routes: BTreeMap::new(),
             route_revision: 0,
             contact_cursor: 0,
+            renewals: 0,
+            last_renewal_attempt: 0,
+            last_renewal_error: None,
+            registry_ahead: false,
             budget,
             _allocation: allocation,
         })
@@ -655,6 +715,7 @@ impl NetworkController {
         pool: &'a PeerConnectionPool,
         host: &'a ControlHost,
         registry: &'a PeerRegistry,
+        swap: CredentialSwap,
     ) -> impl std::future::Future<Output = Result<(), ControllerError>> + 'a {
         // Construct before the async body: cancellation before its first poll
         // must also withdraw the startup projection.
@@ -666,7 +727,7 @@ impl NetworkController {
             if tokio::runtime::Handle::try_current().is_err() {
                 Err(ControllerError::Runtime)
             } else {
-                std::panic::AssertUnwindSafe(self.run_inner(pool, host, registry))
+                std::panic::AssertUnwindSafe(self.run_inner(pool, host, registry, swap))
                     .catch_unwind()
                     .await
                     .unwrap_or(Err(ControllerError::Runtime))
@@ -678,6 +739,7 @@ impl NetworkController {
         pool: &PeerConnectionPool,
         host: &ControlHost,
         registry: &PeerRegistry,
+        mut swap: CredentialSwap,
     ) -> Result<(), ControllerError> {
         let mut observed: Option<RootObservation> = None;
         let mut eligible = BTreeSet::new();
@@ -734,8 +796,147 @@ impl NetworkController {
                         .await?;
                 }
             }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            self.maintain_credential(pool, &swap, now).await;
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_millis(250)) => {}
+                request = swap.requests.recv() => {
+                    if let Some(request) = request {
+                        let now = unix_time()?;
+                        self.serve_credential(request, pool, &swap, now).await;
+                    }
+                }
+            }
         }
+    }
+    fn summary(&self) -> CredentialSummary {
+        CredentialSummary {
+            node: self.state.node,
+            principal: self.receipt.identity.principal,
+            issued_at: self.receipt.issued_at,
+            expires_at: self.receipt.expires_at,
+            certificate_fingerprint: certificate_fingerprint(&self.receipt.certificate),
+            renewals: self.renewals,
+        }
+    }
+    async fn serve_credential(
+        &mut self,
+        request: CredentialRequest,
+        pool: &PeerConnectionPool,
+        swap: &CredentialSwap,
+        now: i64,
+    ) {
+        match request {
+            CredentialRequest::Renew(reply) => {
+                let result = self.renew(pool, swap, now).await;
+                self.last_renewal_attempt = now;
+                self.last_renewal_error = result.as_ref().err().cloned();
+                let _ = reply.send(result.map(|()| self.summary()));
+            }
+            CredentialRequest::Current(reply) => {
+                let _ = reply.send(self.summary());
+            }
+        }
+    }
+    /// Renew ahead of expiry, retrying a failure at a bounded cadence; the
+    /// controller keeps running on a failed attempt, since the credential it
+    /// holds still authorizes until it expires.
+    async fn maintain_credential(
+        &mut self,
+        pool: &PeerConnectionPool,
+        swap: &CredentialSwap,
+        now: i64,
+    ) {
+        if self.state.node == self.state.genesis.founder.node
+            || (!self.registry_ahead
+                && now
+                    < self
+                        .receipt
+                        .expires_at
+                        .saturating_sub(RENEWAL_WINDOW_SECONDS))
+            || now.saturating_sub(self.last_renewal_attempt) < RENEWAL_RETRY_SECONDS
+        {
+            return;
+        }
+        self.last_renewal_attempt = now;
+        self.last_renewal_error = self.renew(pool, swap, now).await.err();
+    }
+    /// One renewal: ask the sponsor under the credential held, install the
+    /// renewed receipt over it under the same key, then present the new
+    /// certificate on the listener, the peer pool and the placement agent.
+    /// A retry after a crash between the sponsor's commit and this install
+    /// is answered with the committed renewal and converges here.
+    async fn renew(
+        &mut self,
+        pool: &PeerConnectionPool,
+        swap: &CredentialSwap,
+        now: i64,
+    ) -> Result<(), RenewalError> {
+        if self.state.node == self.state.genesis.founder.node {
+            return Err(RenewalError::Unsupported);
+        }
+        let cluster = self.state.genesis.founder.cluster;
+        let key = focal_enrollment::JoinKey::open_or_create(
+            self.root.join("JOIN").join("node-key"),
+            cluster,
+        )
+        .map_err(|_| RenewalError::Identity)?;
+        let request = self
+            .credentials
+            .renewal_request(&key, &self.receipt)
+            .map_err(|_| RenewalError::Identity)?;
+        let address: std::net::SocketAddr = self
+            .state
+            .sponsor
+            .endpoint
+            .parse()
+            .map_err(|_| RenewalError::Identity)?;
+        let bind: std::net::SocketAddr = if address.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        }
+        .parse()
+        .map_err(|_| RenewalError::Identity)?;
+        let client = EnrollmentClient::bind(bind, TransportLimits::default())
+            .map_err(|_| RenewalError::Unavailable)?;
+        let renewed = client
+            .renew(address, &self.state.sponsor, request, now)
+            .await;
+        client.close();
+        let receipt = renewed.map_err(|error| match error {
+            JoinTransportError::Rejected(failure) => RenewalError::Rejected(failure),
+            JoinTransportError::Enrollment(_) => RenewalError::Identity,
+            _ => RenewalError::Unavailable,
+        })?;
+        // The receipt is issued at the sponsor's clock after the exchange.
+        let now = now.max(unix_time().map_err(|_| RenewalError::Identity)?);
+        let material = key
+            .renew(&receipt, &self.state.sponsor.ca_certificate, now)
+            .map_err(|_| RenewalError::Install)?;
+        swap.listener
+            .as_ref()
+            .ok_or(RenewalError::Install)?
+            .replace(&material)
+            .map_err(|_| RenewalError::Install)?;
+        let tls = client_tls(
+            TlsIdentity::from_pkcs8(
+                material.certificate_chain().to_vec(),
+                material.private_key_der().to_vec(),
+            ),
+            vec![self.state.sponsor.ca_certificate.clone()],
+            &ControlHost::wire_limits(),
+        )
+        .map_err(|_| RenewalError::Install)?;
+        pool.replace_identity(tls)
+            .map_err(|_| RenewalError::Install)?;
+        swap.placement
+            .replace_credentials(material.clone())
+            .map_err(|_| RenewalError::Install)?;
+        self.credentials = material;
+        self.receipt = receipt;
+        self.registry_ahead = false;
+        self.renewals = self.renewals.saturating_add(1);
+        Ok(())
     }
     fn refresh(
         &mut self,
@@ -764,9 +965,14 @@ impl NetworkController {
             return Err(ControllerError::Identity);
         }
         let grants = active_grants(&enrollment, &self.state, now)?;
+        self.registry_ahead = enrollment
+            .enrollments()
+            .find(|known| known.identity.node_id == Some(self.state.node))
+            .is_some_and(|known| known.expires_at > self.receipt.expires_at);
         let next_transition = enrollment
             .enrollments()
             .flat_map(|receipt| [receipt.issued_at, receipt.expires_at])
+            .chain(enrollment.retired(now).map(|(_, retire_at)| retire_at))
             .filter(|time| *time > now)
             .min()
             .unwrap_or(i64::MAX);
@@ -841,31 +1047,49 @@ impl NetworkController {
         registry: &PeerRegistry,
     ) -> Result<(), ControllerError> {
         let fingerprint = certificate_fingerprint(&self.receipt.certificate);
-        if let Some(contact) = observed
+        let (sequence, expected_generation) = match observed
             .contacts()
             .contacts
             .records
             .iter()
             .find(|contact| contact.node == self.state.node)
         {
-            if contact.certificate_fingerprint != fingerprint
-                || contact.advertise != self.state.advertise
+            Some(contact)
+                if contact.certificate_fingerprint == fingerprint
+                    && contact.advertise == self.state.advertise =>
             {
-                return Err(ControllerError::Identity);
+                return Ok(());
             }
-            return Ok(());
-        }
+            // A committed renewal this node has not installed yet is announced
+            // by the renewal, never regressed to the receipt still held.
+            Some(contact)
+                if contact.principal == self.receipt.identity.principal && self.registry_ahead =>
+            {
+                return Ok(());
+            }
+            // A renewed certificate is announced again under the committed
+            // generation; another principal's record for this node is not ours.
+            Some(contact) if contact.principal == self.receipt.identity.principal => (
+                contact
+                    .generation
+                    .checked_add(1)
+                    .ok_or(ControllerError::Capacity)?,
+                contact.generation,
+            ),
+            Some(_) => return Err(ControllerError::Identity),
+            None => (1, 0),
+        };
         let request = RequestEnvelope {
             protocol: PROTOCOL_VERSION,
             ledger: self.state.genesis.root_namespace,
             route_epoch: RouteEpoch(1),
             request_epoch: RequestEpoch(1),
-            request_id: RequestId(self.receipt.request),
+            request_id: contact_request_id(self.receipt.request, sequence),
             operation: Operation::NodeContact {
                 group: self.state.genesis.root.group,
-                sequence: 1,
-                acknowledged_through: 0,
-                expected_generation: 0,
+                sequence,
+                acknowledged_through: sequence.saturating_sub(1),
+                expected_generation,
                 advertise: self.state.advertise,
             },
         };
@@ -878,10 +1102,10 @@ impl NetworkController {
                     ControlHost::wire_limits().max_frame_bytes as usize,
                 )
                 .map_err(ControlFailure::from)?;
-                check_contact_reply(reply, &self.receipt)?;
+                check_contact_reply(reply, &self.receipt, sequence)?;
             }
         } else {
-            self.announce_remote(pool, &request, host.progress().leader)
+            self.announce_remote(pool, &request, host.progress().leader, sequence)
                 .await?;
         }
         Ok(())
@@ -891,6 +1115,7 @@ impl NetworkController {
         pool: &PeerConnectionPool,
         request: &RequestEnvelope,
         leader: u64,
+        sequence: u64,
     ) -> Result<(), ControllerError> {
         // The preferred peer has its own deadline below the round deadline;
         // stale leader progress cannot consume every round before discovery.
@@ -906,7 +1131,7 @@ impl NetworkController {
                 ControlHost::wire_limits().max_frame_bytes as usize,
             )
             .map_err(ControlFailure::from)?;
-            if check_contact_reply(reply, &self.receipt)? {
+            if check_contact_reply(reply, &self.receipt, sequence)? {
                 return Ok(());
             }
         }
@@ -932,7 +1157,7 @@ impl NetworkController {
                     ControlHost::wire_limits().max_frame_bytes as usize,
                 )
                 .map_err(ControlFailure::from)?;
-                if check_contact_reply(reply, &self.receipt)? {
+                if check_contact_reply(reply, &self.receipt, sequence)? {
                     break;
                 }
             }
@@ -940,16 +1165,28 @@ impl NetworkController {
         Ok(())
     }
 }
+/// The wire request id of one contact announcement: distinct per sequence
+/// so a renewed announcement is never read as a retry of the first.
+fn contact_request_id(request: [u8; 16], sequence: u64) -> RequestId {
+    let mut input = [0; 24];
+    input[..16].copy_from_slice(&request);
+    input[16..].copy_from_slice(&sequence.to_be_bytes());
+    let digest = blake3::derive_key("focal.node-contact.request.v1", &input);
+    let mut id = [0; 16];
+    id.copy_from_slice(&digest[..16]);
+    RequestId(id)
+}
 fn check_contact_reply(
     reply: ControlReply,
     expected: &EnrollmentReceipt,
+    sequence: u64,
 ) -> Result<bool, ControllerError> {
     match reply {
         ControlReply::Committed(receipt)
             if receipt.committed_index > 0
                 && receipt.committed_term > 0
                 && receipt.request.client == expected.identity.principal
-                && receipt.request.sequence == 1 =>
+                && receipt.request.sequence == sequence =>
         {
             Ok(true)
         }
@@ -960,6 +1197,15 @@ fn check_contact_reply(
             | ControlFailure::Unavailable
             | ControlFailure::OutcomeUnknown,
         ) => Ok(false),
+        // The root derives the contact command from the announcement with its
+        // own decision time, so a retry after a lost reply is never the exact
+        // request the root retained under this sequence: a conflict means an
+        // earlier attempt already committed, and the next observation of the
+        // contact table settles it. A generation the observation had not yet
+        // caught up with is re-derived from the next observation the same way.
+        ControlReply::Rejected(ControlFailure::RetryConflict | ControlFailure::CompareFailed) => {
+            Ok(false)
+        }
         ControlReply::Rejected(error) => Err(error.into()),
         _ => Err(ControllerError::Identity),
     }

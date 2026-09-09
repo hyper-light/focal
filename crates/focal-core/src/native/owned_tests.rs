@@ -385,6 +385,7 @@ fn authored_content(claim: &ClaimState) -> ClaimDescriptor {
                 generation: 1,
                 at: 100,
             }),
+            policy: None,
         },
         authored_claim::Limits {
             description_bytes: 256,

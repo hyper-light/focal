@@ -90,6 +90,8 @@ fn received_target_prices_all_retry_versions_and_graph_consequences_before_entry
                 .len()
     );
     assert_eq!(reports, 2);
+    let report_index = crate::native::index_rows::report_rows(16).unwrap();
+    let status = crate::native::index_rows::STATUS_ROWS;
     assert_eq!(
         envelope.slots(),
         CompletionSlots {
@@ -99,14 +101,23 @@ fn received_target_prices_all_retry_versions_and_graph_consequences_before_entry
             outcomes: 2,
             events: 14 + 2 * cohort.events(),
             sequences: 2,
-            new_rows: 22 + 2 * cohort.events(),
+            // Eleven primary rows and the artifact's twenty index rows per
+            // report (doc 22 §7).
+            new_rows: 2 * (11 + report_index) + 2 * cohort.events(),
             ..CompletionSlots::default()
         }
     );
     let storage = envelope.report_storage(CompletionUse::Regular).unwrap();
-    assert_eq!(storage.limits().changed_keys, 16 + cohort.changed_keys());
+    // Sixteen primary changes, the cohort's rows, the report's index rows, a
+    // status move for the parent and every sealed cohort claim, and the due
+    // timers the report can retire: every deleted key beyond the status moves.
+    let timers = storage.limits().deleted_keys - (1 + cohort.claims());
+    assert!(timers > 1 + cohort.claims() + cohort.evaluations());
+    let changed =
+        16 + cohort.changed_keys() + report_index + status * (1 + cohort.claims()) + timers;
+    assert_eq!(storage.limits().changed_keys, changed);
     let journal = crate::native::completion_book::journal_bytes(1 + cohort.evaluations()).unwrap();
-    let writes = crate::native::mutation::bytes(16 + cohort.changed_keys()).unwrap();
+    let writes = crate::native::mutation::bytes(changed).unwrap();
     assert!(journal > 0);
     assert_eq!(
         envelope
@@ -331,16 +342,24 @@ fn incoming_topology_growth_is_detected_even_when_original_parent_row_did_not_ch
     assert!(check(&fixture, envelope).is_err());
     assert_eq!(fixture.core.state.budget.stats(), before);
     let larger = quote(&fixture);
+    // The new dependent joins the graph: one more changed claim, its event
+    // and its status move beside the report's index rows and the due timers
+    // the report can retire.
+    let cohort = larger.cohort();
+    let storage = larger.report_storage(CompletionUse::Regular).unwrap();
+    let timers = storage.limits().deleted_keys - (2 + cohort.claims());
     assert_eq!(
-        larger
-            .report_storage(CompletionUse::Regular)
-            .unwrap()
-            .limits()
-            .changed_keys,
-        18 + larger.cohort().changed_keys()
+        storage.limits().changed_keys,
+        18 + cohort.changed_keys()
+            + crate::native::index_rows::report_rows(16).unwrap()
+            + crate::native::index_rows::STATUS_ROWS * (2 + cohort.claims())
+            + timers
     );
     assert_eq!(larger.slots().events, 16 + 2 * larger.cohort().events());
-    assert_eq!(larger.slots().new_rows, 24 + 2 * larger.cohort().events());
+    assert_eq!(
+        larger.slots().new_rows,
+        2 * (12 + crate::native::index_rows::report_rows(16).unwrap()) + 2 * cohort.events()
+    );
     check(&fixture, larger).unwrap();
 }
 

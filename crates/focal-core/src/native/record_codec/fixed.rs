@@ -36,6 +36,11 @@ pub enum RowFamily {
     ClaimIdentity,
     DefinitionIdentity,
     CreationResult,
+    LegacyTestament,
+    LegacyEvidenceSet,
+    LegacyRun,
+    LegacyDefinition,
+    Index,
 }
 
 pub(super) fn family(value: Key) -> Result<RowFamily, Error> {
@@ -70,6 +75,24 @@ pub(super) fn family(value: Key) -> Result<RowFamily, Error> {
         Key::ClaimIdentity(..) => RowFamily::ClaimIdentity,
         Key::DefinitionIdentity(..) => RowFamily::DefinitionIdentity,
         Key::CreationResult(_) => RowFamily::CreationResult,
+        Key::LegacyTestament(_) => RowFamily::LegacyTestament,
+        Key::LegacyEvidenceSet(_) => RowFamily::LegacyEvidenceSet,
+        Key::LegacyRun(..) => RowFamily::LegacyRun,
+        Key::LegacyDefinition(_) => RowFamily::LegacyDefinition,
+        Key::ByIssuer(..)
+        | Key::BySubject(..)
+        | Key::ByStatus(..)
+        | Key::ByAction(..)
+        | Key::ByScope(..)
+        | Key::ByRelation(..)
+        | Key::ByProducer(..)
+        | Key::ByArtifactKind(..)
+        | Key::BySchema(..)
+        | Key::ArtifactInput(..)
+        | Key::ByEvaluator(..)
+        | Key::ByVerdict(..)
+        | Key::ByCreated(..)
+        | Key::DueTimer(..) => RowFamily::Index,
         Key::End => return Err(Error::InvalidTag("sentinel key")),
     })
 }
@@ -106,6 +129,24 @@ pub(super) fn key(s: &mut impl Sink, key: Key) -> Result<(), Error> {
         Key::ClaimIdentity(..) => 27,
         Key::DefinitionIdentity(..) => 28,
         Key::CreationResult(_) => 29,
+        Key::LegacyTestament(_) => 30,
+        Key::LegacyEvidenceSet(_) => 31,
+        Key::LegacyRun(..) => 32,
+        Key::LegacyDefinition(_) => 33,
+        Key::ByIssuer(..) => 34,
+        Key::BySubject(..) => 35,
+        Key::ByStatus(..) => 36,
+        Key::ByAction(..) => 37,
+        Key::ByScope(..) => 38,
+        Key::ByRelation(..) => 39,
+        Key::ByProducer(..) => 40,
+        Key::ByArtifactKind(..) => 41,
+        Key::BySchema(..) => 42,
+        Key::ArtifactInput(..) => 43,
+        Key::ByEvaluator(..) => 44,
+        Key::ByVerdict(..) => 45,
+        Key::ByCreated(..) => 46,
+        Key::DueTimer(..) => 47,
         Key::End => return Err(Error::InvalidTag("sentinel key")),
     };
     write_u8(s, tag)?;
@@ -147,6 +188,74 @@ pub(super) fn key(s: &mut impl Sink, key: Key) -> Result<(), Error> {
             write_u16(s, schema)?;
             raw(s, &hash.0)
         }
+        Key::LegacyTestament(id) => raw(s, &id.0),
+        Key::LegacyEvidenceSet(id) => raw(s, &id.0),
+        Key::LegacyRun(id, ordinal) => {
+            raw(s, &id.0)?;
+            write_u32(s, ordinal)
+        }
+        Key::LegacyDefinition(id) => raw(s, &id.0),
+        Key::ByIssuer(participant, claim) | Key::BySubject(participant, claim) => {
+            raw(s, &participant.0)?;
+            raw(s, &claim.0)
+        }
+        Key::ByStatus(code, claim) | Key::ByAction(code, claim) => {
+            write_u16(s, code)?;
+            raw(s, &claim.0)
+        }
+        Key::ByScope(kind, hash, claim) => {
+            write_u16(s, kind)?;
+            raw(s, &hash.0)?;
+            raw(s, &claim.0)
+        }
+        Key::ByRelation(kind, target, claim) => {
+            write_u16(s, kind)?;
+            raw(s, &target.0)?;
+            raw(s, &claim.0)
+        }
+        Key::ByProducer(participant, artifact) => {
+            raw(s, &participant.0)?;
+            raw(s, &artifact.0)
+        }
+        Key::ByArtifactKind(hash, artifact) | Key::BySchema(hash, artifact) => {
+            raw(s, &hash.0)?;
+            raw(s, &artifact.0)
+        }
+        Key::ArtifactInput(input, artifact) => {
+            raw(s, &input.0)?;
+            raw(s, &artifact.0)
+        }
+        Key::ByEvaluator(participant, validation) => {
+            raw(s, &participant.0)?;
+            raw(s, &validation.0)
+        }
+        Key::ByVerdict(code, k) => {
+            write_u16(s, code)?;
+            result_key(s, k)
+        }
+        Key::ByCreated(family, sequence, object) => {
+            write_u16(s, family)?;
+            write_u64(s, sequence.0)?;
+            raw(s, &object.0)
+        }
+        Key::DueTimer(at, target) => {
+            write_u64(s, at)?;
+            match target {
+                TimerTarget::Claim(claim) => {
+                    write_u8(s, 0)?;
+                    raw(s, &claim.0)
+                }
+                TimerTarget::Evaluation(k) => {
+                    write_u8(s, 1)?;
+                    types::evaluation(s, k)
+                }
+                TimerTarget::Monitor(claim, monitor) => {
+                    write_u8(s, 2)?;
+                    raw(s, &claim.0)?;
+                    raw(s, &monitor.0)
+                }
+            }
+        }
         Key::End => Err(Error::InvalidTag("sentinel key")),
     }
 }
@@ -187,6 +296,7 @@ pub(super) fn invocation(s: &mut impl Sink, v: NativeInvocation) -> Result<(), E
             raw(s, &k.timer.0)?;
             write_u64(s, k.generation)
         }
+        NativeInvocation::Import => write_u8(s, 4),
     }
 }
 pub(super) fn outcome(s: &mut impl Sink, v: NativeOutcome) -> Result<(), Error> {
@@ -245,6 +355,7 @@ fn operation(v: NativeOperation) -> u8 {
         NativeOperation::ReportWork => 27,
         NativeOperation::EvaluationDeadline => 28,
         NativeOperation::ClaimDeadline => 29,
+        NativeOperation::Import => 30,
     }
 }
 fn read_operation(c: &mut Cursor<'_>) -> Result<NativeOperation, Error> {
@@ -279,6 +390,7 @@ fn read_operation(c: &mut Cursor<'_>) -> Result<NativeOperation, Error> {
         27 => NativeOperation::ReportWork,
         28 => NativeOperation::EvaluationDeadline,
         29 => NativeOperation::ClaimDeadline,
+        30 => NativeOperation::Import,
         _ => return Err(Error::InvalidTag("operation")),
     })
 }
@@ -341,6 +453,7 @@ pub(super) fn read_invocation(c: &mut Cursor<'_>) -> Result<NativeInvocation, Er
             timer: TimerId(c.fixed()?),
             generation: c.u64()?,
         }),
+        4 => NativeInvocation::Import,
         _ => return Err(Error::InvalidTag("invocation namespace")),
     })
 }
@@ -390,6 +503,37 @@ pub(super) fn read_key(c: &mut Cursor<'_>) -> Result<Key, Error> {
         27 => Key::ClaimIdentity(c.u16()?, ContentHash(c.fixed()?)),
         28 => Key::DefinitionIdentity(c.u16()?, ContentHash(c.fixed()?)),
         29 => Key::CreationResult(read_invocation(c)?),
+        30 => Key::LegacyTestament(TestamentId(c.fixed()?)),
+        31 => Key::LegacyEvidenceSet(focal_model::EvidenceSetId(c.fixed()?)),
+        32 => Key::LegacyRun(ValidationId(c.fixed()?), c.u32()?),
+        33 => Key::LegacyDefinition(ValidationId(c.fixed()?)),
+        34 => Key::ByIssuer(ParticipantId(c.fixed()?), ClaimId(c.fixed()?)),
+        35 => Key::BySubject(ParticipantId(c.fixed()?), ClaimId(c.fixed()?)),
+        36 => Key::ByStatus(c.u16()?, ClaimId(c.fixed()?)),
+        37 => Key::ByAction(c.u16()?, ClaimId(c.fixed()?)),
+        38 => Key::ByScope(c.u16()?, ContentHash(c.fixed()?), ClaimId(c.fixed()?)),
+        39 => Key::ByRelation(c.u16()?, ClaimId(c.fixed()?), ClaimId(c.fixed()?)),
+        40 => Key::ByProducer(ParticipantId(c.fixed()?), ArtifactId(c.fixed()?)),
+        41 => Key::ByArtifactKind(ContentHash(c.fixed()?), ArtifactId(c.fixed()?)),
+        42 => Key::BySchema(ContentHash(c.fixed()?), ArtifactId(c.fixed()?)),
+        43 => Key::ArtifactInput(focal_model::ObjectId(c.fixed()?), ArtifactId(c.fixed()?)),
+        44 => Key::ByEvaluator(ParticipantId(c.fixed()?), ValidationId(c.fixed()?)),
+        45 => Key::ByVerdict(c.u16()?, read_result(c)?),
+        46 => Key::ByCreated(
+            c.u16()?,
+            SessionSeq(c.u64()?),
+            focal_model::ObjectId(c.fixed()?),
+        ),
+        47 => {
+            let at = c.u64()?;
+            let target = match c.u8()? {
+                0 => TimerTarget::Claim(ClaimId(c.fixed()?)),
+                1 => TimerTarget::Evaluation(read_evaluation(c)?),
+                2 => TimerTarget::Monitor(ClaimId(c.fixed()?), MonitorId(c.fixed()?)),
+                _ => return Err(Error::InvalidTag("timer target")),
+            };
+            Key::DueTimer(at, target)
+        }
         _ => return Err(Error::InvalidTag("row family")),
     })
 }

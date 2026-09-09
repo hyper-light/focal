@@ -145,6 +145,11 @@ impl CanonicalContent for ClaimContent {
                     e.u16(4);
                     e.fixed(&r.0)
                 }
+                RelationTarget::Evidence(a) => {
+                    e.u16(5);
+                    e.fixed(&a.id.0);
+                    e.fixed(&a.hash.0)
+                }
             }
         }
         e.length(self.scopes.len());

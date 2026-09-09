@@ -19,34 +19,39 @@ struct CommandEnvelope {
     owner_term: u64,
     request: ControlRequest,
 }
+/// Checkpoint schemas 1–3 carry the schema 1 partition directory; schema 4
+/// carries the current one. The layouts are otherwise identical, so the
+/// state type is the only parameter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct Checkpoint {
+struct Checkpoint<S = ControlBootstrap> {
     schema: u16,
     identity: ControlIdentity,
     applied_index: u64,
-    state: ControlBootstrap,
+    state: S,
     retries: RetryCheckpoint,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct CheckpointV2 {
+struct CheckpointV2<S = ControlBootstrap> {
     schema: u16,
     identity: ControlIdentity,
     applied_index: u64,
-    state: ControlBootstrap,
+    state: S,
     retries: RetryCheckpoint,
     authority: ControlAuthoritySnapshot,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct CheckpointV3 {
+struct CheckpointV3<S = ControlBootstrap> {
     schema: u16,
     identity: ControlIdentity,
     applied_index: u64,
-    state: ControlBootstrap,
+    state: S,
     retries: RetryCheckpoint,
     authority: Option<ControlAuthoritySnapshot>,
     configuration_index: u64,
     contacts: Option<ContactCheckpoint>,
 }
+const CHECKPOINT_SCHEMA: u16 = 4;
+const COMMAND_SCHEMA: u16 = 2;
 struct Pending {
     request: ControlRequestId,
     request_hash: [u8; 32],
@@ -332,6 +337,14 @@ impl ControlReplica {
             _ => None,
         }
     }
+    /// The enrollment registry this owner authorizes peers against: its own
+    /// for the root, the installed authority's copy for a partition.
+    pub fn installed_enrollment(&self) -> Option<&EnrollmentRegistry> {
+        self.machine
+            .authority()
+            .and_then(|authority| authority.enrollment(self.enrollment()).ok())
+            .or_else(|| self.enrollment())
+    }
     pub fn partition(&self) -> Option<&DirectoryPartition> {
         match &self.machine {
             Machine::Partition { directory, .. } => Some(directory),
@@ -481,7 +494,7 @@ impl ControlReplica {
         }
         let status = self.node.status();
         let envelope = CommandEnvelope {
-            schema: 1,
+            schema: COMMAND_SCHEMA,
             identity: self.identity,
             owner_node: status.node_id,
             owner_term: status.term,
@@ -575,22 +588,32 @@ impl ControlReplica {
                 charge(snapshot.data.len().saturating_add(8192), 32)?,
             )?;
             let (schema, _) = postcard::take_from_bytes::<u16>(&snapshot.data)?;
+            let limit = self.options.limits.max_checkpoint_bytes;
             let (checkpoint, authority, configuration_index, contacts) = match schema {
-                1 => (
-                    decode::<Checkpoint>(&snapshot.data, self.options.limits.max_checkpoint_bytes)?,
-                    None,
-                    0,
-                    None,
-                ),
-                2 => {
-                    let newer: CheckpointV2 =
-                        decode(&snapshot.data, self.options.limits.max_checkpoint_bytes)?;
+                1 => {
+                    let legacy: Checkpoint<LegacyControlBootstrap> = decode(&snapshot.data, limit)?;
                     (
                         Checkpoint {
-                            schema: 1,
+                            schema: CHECKPOINT_SCHEMA,
+                            identity: legacy.identity,
+                            applied_index: legacy.applied_index,
+                            state: legacy.state.try_into()?,
+                            retries: legacy.retries,
+                        },
+                        None,
+                        0,
+                        None,
+                    )
+                }
+                2 => {
+                    let newer: CheckpointV2<LegacyControlBootstrap> =
+                        decode(&snapshot.data, limit)?;
+                    (
+                        Checkpoint {
+                            schema: CHECKPOINT_SCHEMA,
                             identity: newer.identity,
                             applied_index: newer.applied_index,
-                            state: newer.state,
+                            state: newer.state.try_into()?,
                             retries: newer.retries,
                         },
                         Some(newer.authority),
@@ -599,11 +622,26 @@ impl ControlReplica {
                     )
                 }
                 3 => {
-                    let newer: CheckpointV3 =
-                        decode(&snapshot.data, self.options.limits.max_checkpoint_bytes)?;
+                    let newer: CheckpointV3<LegacyControlBootstrap> =
+                        decode(&snapshot.data, limit)?;
                     (
                         Checkpoint {
-                            schema: 1,
+                            schema: CHECKPOINT_SCHEMA,
+                            identity: newer.identity,
+                            applied_index: newer.applied_index,
+                            state: newer.state.try_into()?,
+                            retries: newer.retries,
+                        },
+                        newer.authority,
+                        newer.configuration_index,
+                        newer.contacts,
+                    )
+                }
+                4 => {
+                    let newer: CheckpointV3 = decode(&snapshot.data, limit)?;
+                    (
+                        Checkpoint {
+                            schema: CHECKPOINT_SCHEMA,
                             identity: newer.identity,
                             applied_index: newer.applied_index,
                             state: newer.state,
@@ -616,7 +654,7 @@ impl ControlReplica {
                 }
                 _ => return Err(ControlError::Corrupt("checkpoint schema")),
             };
-            if checkpoint.schema != 1
+            if checkpoint.schema != CHECKPOINT_SCHEMA
                 || checkpoint.identity != self.identity
                 || checkpoint.applied_index != snapshot.index
                 || checkpoint.applied_index < self.applied_index
@@ -747,7 +785,9 @@ impl ControlReplica {
             )?;
             let envelope: CommandEnvelope =
                 decode(&entry.data, self.options.limits.max_command_bytes)?;
-            if envelope.schema != 1
+            // Schema 1 entries predate disk load reports and plan observations;
+            // their layout is otherwise identical and decodes above.
+            if !(1..=COMMAND_SCHEMA).contains(&envelope.schema)
                 || envelope.identity != self.identity
                 || envelope.owner_node == 0
                 || envelope.owner_term != entry.term
@@ -858,46 +898,22 @@ impl ControlReplica {
             BudgetLane::Completion,
             charge(estimate, 32)?,
         )?;
-        let checkpoint = Checkpoint {
-            schema: 1,
-            identity: self.identity,
-            applied_index: self.applied_index,
-            state: self.machine.export()?,
-            retries: self.retries.checkpoint.clone(),
-        };
         let authority = self
             .machine
             .export_authority(self.identity, self.applied_index)?;
-        let bytes = if self.configuration_index > 0 || self.machine.contacts().is_some() {
-            encode(
-                &CheckpointV3 {
-                    schema: 3,
-                    identity: checkpoint.identity,
-                    applied_index: checkpoint.applied_index,
-                    state: checkpoint.state,
-                    retries: checkpoint.retries,
-                    authority,
-                    configuration_index: self.configuration_index,
-                    contacts: self.machine.contacts().cloned(),
-                },
-                self.options.limits.max_checkpoint_bytes,
-            )?
-        } else {
-            match authority {
-                None => encode(&checkpoint, self.options.limits.max_checkpoint_bytes)?,
-                Some(authority) => encode(
-                    &CheckpointV2 {
-                        schema: 2,
-                        identity: checkpoint.identity,
-                        applied_index: checkpoint.applied_index,
-                        state: checkpoint.state,
-                        retries: checkpoint.retries,
-                        authority,
-                    },
-                    self.options.limits.max_checkpoint_bytes,
-                )?,
-            }
-        };
+        let bytes = encode(
+            &CheckpointV3 {
+                schema: CHECKPOINT_SCHEMA,
+                identity: self.identity,
+                applied_index: self.applied_index,
+                state: self.machine.export()?,
+                retries: self.retries.checkpoint.clone(),
+                authority,
+                configuration_index: self.configuration_index,
+                contacts: self.machine.contacts().cloned(),
+            },
+            self.options.limits.max_checkpoint_bytes,
+        )?;
         let result = self.node.checkpoint(self.applied_index, bytes);
         if result.is_err() {
             self.failed = true;

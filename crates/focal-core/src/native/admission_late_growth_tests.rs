@@ -50,7 +50,8 @@ fn fixture() -> (Fixture, MemoryBudget) {
             preparation_bytes: 1024 * 1024,
             evaluations_per_claim: 256,
             range: RangeConfig {
-                max_batch_entries: 128,
+                // Fifty definitions and their index rows in one creation.
+                max_batch_entries: 256,
                 page_entries: 4,
                 ..RangeConfig::default()
             },

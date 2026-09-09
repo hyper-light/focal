@@ -893,3 +893,351 @@ fn node_statements_bind_payload_cluster_certificate_role_and_revocation() {
         Err(EnrollmentError::Unauthorized)
     ));
 }
+
+fn enroll_node(
+    dir: &tempfile::TempDir,
+    registry: &mut EnrollmentRegistry,
+    authority: &BootstrapAuthority,
+    name: &str,
+) -> (JoinKey, EnrollmentReceipt, CredentialMaterial) {
+    let invitation = invite(registry, authority, EnrollmentRole::Node);
+    let key = JoinKey::open_or_create(dir.path().join(name), [1; 16]).unwrap();
+    let request = invitation.request(&key, now()).unwrap();
+    commit(
+        registry,
+        registry.prepare_join(authority, &request, now()).unwrap(),
+    );
+    let receipt = registry.release(&request, now()).unwrap();
+    let material = key
+        .complete(&receipt, authority.ca_certificate(), now())
+        .unwrap();
+    (key, receipt, material)
+}
+
+#[test]
+fn a_renewal_keeps_the_key_and_identity_retires_the_old_certificate_after_grace_and_is_idempotent()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let authority = authority(&dir, [1; 16]);
+    let mut registry = registry(&authority);
+    let (key, first, material) = enroll_node(&dir, &mut registry, &authority, "node");
+    assert_eq!(
+        certificate_key_hash(&first.certificate).unwrap(),
+        first.public_key
+    );
+    let request = material.renewal_request(&key, &first).unwrap();
+    assert_eq!(request.holds_until(), first.expires_at);
+    let at = now() + 10;
+    let RenewPreparation::Commit(command) = registry
+        .prepare_renew(&authority, &request, at, 30)
+        .unwrap()
+    else {
+        panic!("a first renewal commits")
+    };
+    assert_eq!(command.renewed_invitation(), Some(first.invitation));
+    assert!(command.revoked_invitation().is_none());
+    // Nothing is released before the commit is applied.
+    assert!(matches!(
+        registry.release_renewal(&request, at),
+        Err(EnrollmentError::NotCommitted)
+    ));
+    registry
+        .apply_committed(&command, registry.applied_index() + 1)
+        .unwrap();
+    let renewed = registry.release_renewal(&request, at).unwrap();
+    assert_eq!(renewed.identity, first.identity);
+    assert_eq!(renewed.public_key, first.public_key);
+    assert_eq!(renewed.request, first.request);
+    assert_eq!(renewed.csr_hash, first.csr_hash);
+    assert_eq!(renewed.issued_at, at);
+    assert_eq!(
+        renewed.expires_at,
+        at + EnrollmentLimits::default().credential_lifetime as i64
+    );
+    assert_ne!(renewed.certificate, first.certificate);
+    assert_eq!(
+        certificate_key_hash(&renewed.certificate).unwrap(),
+        first.public_key
+    );
+    // Both certificates authorize during the grace; only the new one after.
+    assert_eq!(
+        registry
+            .authorize_certificate(&first.certificate, at + 29)
+            .unwrap(),
+        first.identity
+    );
+    assert_eq!(
+        registry
+            .authorize_certificate(&renewed.certificate, at + 29)
+            .unwrap(),
+        first.identity
+    );
+    assert_eq!(registry.retired(at + 29).count(), 1);
+    assert_eq!(registry.retired(at + 30).count(), 0);
+    assert!(matches!(
+        registry.authorize_certificate(&first.certificate, at + 30),
+        Err(EnrollmentError::Expired)
+    ));
+    assert!(
+        registry
+            .authorize_certificate(&renewed.certificate, at + 30)
+            .is_ok()
+    );
+    assert_eq!(registry.enrollments().count(), 1);
+    // The same request again finds the committed renewal; a request signed
+    // under the retired certificate still does while it authorizes.
+    assert!(matches!(
+        registry.prepare_renew(&authority, &request, at + 5, 30).unwrap(),
+        RenewPreparation::Existing(receipt) if receipt == renewed
+    ));
+    assert!(matches!(
+        registry.prepare_renew(&authority, &request, at + 31, 30),
+        Err(EnrollmentError::Expired)
+    ));
+    // Under the renewed credential a further renewal commits again.
+    let material = key.renew(&renewed, authority.ca_certificate(), at).unwrap();
+    assert_eq!(material.certificate_chain()[0], renewed.certificate);
+    assert_eq!(key.enrollment().unwrap().unwrap(), renewed);
+    // Installing the older receipt again is refused; the same one is a no-op.
+    assert!(matches!(
+        key.renew(&first, authority.ca_certificate(), at),
+        Err(EnrollmentError::Conflict)
+    ));
+    key.renew(&renewed, authority.ca_certificate(), at).unwrap();
+    let again = material.renewal_request(&key, &renewed).unwrap();
+    let RenewPreparation::Commit(second) = registry
+        .prepare_renew(&authority, &again, at + 40, 30)
+        .unwrap()
+    else {
+        panic!("a renewal under the current certificate commits")
+    };
+    registry
+        .apply_committed(&second, registry.applied_index() + 1)
+        .unwrap();
+    // The first certificate's grace has passed: it left the retired table.
+    assert_eq!(registry.retired(at + 41).count(), 1);
+    assert!(matches!(
+        registry.authorize_certificate(&first.certificate, at + 41),
+        Err(EnrollmentError::Unauthorized)
+    ));
+    // A restored registry validates the retired table and keeps authorizing.
+    let restored = EnrollmentRegistry::restore(
+        &registry.checkpoint().unwrap(),
+        [1; 16],
+        EnrollmentLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(restored.retired(at + 41).count(), 1);
+    assert!(
+        restored
+            .authorize_certificate(&renewed.certificate, at + 41)
+            .is_ok()
+    );
+    let latest = restored.release_renewal(&again, at + 41).unwrap();
+    assert!(
+        restored
+            .authorize_certificate(&latest.certificate, at + 41)
+            .is_ok()
+    );
+    assert_eq!(restored.charged_bytes(), registry.charged_bytes());
+}
+
+#[test]
+fn renewals_need_the_holder_s_own_key_and_a_live_unrevoked_enrollment() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = authority(&dir, [1; 16]);
+    let mut registry = registry(&authority);
+    let (key, receipt, material) = enroll_node(&dir, &mut registry, &authority, "node");
+    // A renewal decided within the second the certificate was issued cannot
+    // extend it and is refused rather than committed for nothing.
+    let same_second = material.renewal_request(&key, &receipt).unwrap();
+    let refused = registry
+        .prepare_renew(&authority, &same_second, receipt.issued_at, 30)
+        .err();
+    assert!(
+        matches!(refused, Some(EnrollmentError::Conflict)),
+        "{refused:?}"
+    );
+    let (other_key, other_receipt, other_material) =
+        enroll_node(&dir, &mut registry, &authority, "other");
+    // A request signed by another enrolled node, or naming another node's
+    // receipt, is refused.
+    let forged = other_material.renewal_request(&key, &receipt);
+    assert!(forged.is_ok());
+    assert!(matches!(
+        registry.prepare_renew(&authority, &forged.unwrap(), now(), 30),
+        Err(EnrollmentError::Unauthorized)
+    ));
+    let mismatched = material
+        .renewal_request(&other_key, &other_receipt)
+        .unwrap();
+    assert!(matches!(
+        registry.prepare_renew(&authority, &mismatched, now(), 30),
+        Err(EnrollmentError::Unauthorized)
+    ));
+    // A client credential cannot renew through the node statement path.
+    let client_invitation = invite(&mut registry, &authority, EnrollmentRole::Client);
+    let client_key = JoinKey::open_or_create(dir.path().join("client"), [1; 16]).unwrap();
+    let request = client_invitation.request(&client_key, now()).unwrap();
+    let preparation = registry.prepare_join(&authority, &request, now()).unwrap();
+    commit(&mut registry, preparation);
+    let client_receipt = registry.release(&request, now()).unwrap();
+    let client_material = client_key
+        .complete(&client_receipt, authority.ca_certificate(), now())
+        .unwrap();
+    let client_request = client_material
+        .renewal_request(&client_key, &client_receipt)
+        .unwrap();
+    assert!(matches!(
+        registry.prepare_renew(&authority, &client_request, now(), 30),
+        Err(EnrollmentError::Unauthorized)
+    ));
+    // A revoked enrollment cannot renew, and a committed renewal of a
+    // revoked enrollment authorizes neither certificate.
+    let request = material.renewal_request(&key, &receipt).unwrap();
+    // The sponsor decides later than the enrollment it renews.
+    let later = now() + 5;
+    let RenewPreparation::Commit(command) = registry
+        .prepare_renew(&authority, &request, later, 30)
+        .unwrap()
+    else {
+        panic!("commit")
+    };
+    let revoke = registry.prepare_revoke(receipt.invitation, later).unwrap();
+    registry
+        .apply_committed(&revoke, registry.applied_index() + 1)
+        .unwrap();
+    assert!(matches!(
+        registry.apply_committed(&command, registry.applied_index() + 1),
+        Err(EnrollmentError::Conflict)
+    ));
+    assert!(matches!(
+        registry.prepare_renew(&authority, &request, later, 30),
+        Err(EnrollmentError::Revoked)
+    ));
+    // A stale command against a moved registry is a conflict, never applied.
+    let stale = registry
+        .prepare_revoke(other_receipt.invitation, later)
+        .unwrap();
+    registry
+        .apply_committed(&stale, registry.applied_index() + 1)
+        .unwrap();
+    assert!(matches!(
+        registry.authorize_certificate(&receipt.certificate, later),
+        Err(EnrollmentError::Revoked)
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_renews_over_the_enrollment_transport_and_a_join_only_handler_refuses() {
+    use std::sync::Mutex;
+    let dir = tempfile::tempdir().unwrap();
+    let authority = Arc::new(authority(&dir, [1; 16]));
+    let mut registry = registry(&authority);
+    let (key, receipt, material) = enroll_node(&dir, &mut registry, &authority, "node");
+    let registry = Arc::new(Mutex::new(registry));
+    struct Renewing {
+        registry: Arc<Mutex<EnrollmentRegistry>>,
+        authority: Arc<BootstrapAuthority>,
+    }
+    impl JoinHandler for Renewing {
+        fn handle(&self, _: JoinRequest) -> JoinFuture<'_> {
+            Box::pin(async { JoinResponse::Rejected(JoinFailure::Unauthorized) })
+        }
+        fn renew(&self, request: RenewRequest) -> JoinFuture<'_> {
+            let mut registry = self.registry.lock().unwrap();
+            // The sponsor decides later than the enrollment it renews.
+            let at = now() + 5;
+            let response = match registry.prepare_renew(&self.authority, &request, at, 30) {
+                Ok(RenewPreparation::Existing(receipt)) => JoinResponse::Enrolled(receipt),
+                Ok(RenewPreparation::Commit(command)) => {
+                    let prepared = registry.prepare_command(&command).unwrap();
+                    let index = registry.applied_index() + 1;
+                    registry.publish(prepared, index).unwrap();
+                    JoinResponse::Enrolled(registry.release_renewal(&request, at).unwrap())
+                }
+                Err(error) => JoinResponse::Rejected(JoinFailure::from(&error)),
+            };
+            Box::pin(async move { response })
+        }
+    }
+    let server = Arc::new(
+        EnrollmentServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            &authority.server_identity(),
+            TransportLimits::default(),
+        )
+        .unwrap(),
+    );
+    let handler: Arc<dyn JoinHandler> = Arc::new(Renewing {
+        registry: registry.clone(),
+        authority: authority.clone(),
+    });
+    let running = server.clone();
+    let task = tokio::spawn(async move { running.serve(handler).await });
+    let client =
+        EnrollmentClient::bind("127.0.0.1:0".parse().unwrap(), TransportLimits::default()).unwrap();
+    let trust = ServerTrust {
+        endpoint: server.local_addr().unwrap().to_string(),
+        server_name: "localhost".into(),
+        ca_certificate: authority.ca_certificate().to_vec(),
+        server_fingerprint: server_fingerprint(authority.server_certificate()),
+    };
+    let request = material.renewal_request(&key, &receipt).unwrap();
+    let renewed = client
+        .renew(server.local_addr().unwrap(), &trust, request.clone(), now())
+        .await
+        .unwrap();
+    assert!(renewed.expires_at > receipt.expires_at);
+    assert_eq!(renewed.public_key, receipt.public_key);
+    // The same request again is answered with the committed renewal.
+    let again = client
+        .renew(server.local_addr().unwrap(), &trust, request, now())
+        .await
+        .unwrap();
+    assert_eq!(again, renewed);
+    // A wrong leaf pin never reaches the handler.
+    let mut bad = trust.clone();
+    bad.server_fingerprint[0] ^= 1;
+    let request = material.renewal_request(&key, &receipt).unwrap();
+    assert!(matches!(
+        client
+            .renew(server.local_addr().unwrap(), &bad, request, now())
+            .await,
+        Err(JoinTransportError::Enrollment(
+            EnrollmentError::Unauthorized
+        ))
+    ));
+    client.close();
+    server.close();
+    task.await.unwrap().unwrap();
+    // A handler that only enrolls refuses renewals by default.
+    let server = Arc::new(
+        EnrollmentServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            &authority.server_identity(),
+            TransportLimits::default(),
+        )
+        .unwrap(),
+    );
+    let join_only: Arc<dyn JoinHandler> =
+        Arc::new(|_: JoinRequest| async { JoinResponse::Rejected(JoinFailure::Unauthorized) });
+    let running = server.clone();
+    let task = tokio::spawn(async move { running.serve(join_only).await });
+    let client =
+        EnrollmentClient::bind("127.0.0.1:0".parse().unwrap(), TransportLimits::default()).unwrap();
+    let trust = ServerTrust {
+        endpoint: server.local_addr().unwrap().to_string(),
+        ..trust
+    };
+    let request = material.renewal_request(&key, &renewed).unwrap();
+    assert!(matches!(
+        client
+            .renew(server.local_addr().unwrap(), &trust, request, now())
+            .await,
+        Err(JoinTransportError::Rejected(JoinFailure::Unauthorized))
+    ));
+    client.close();
+    server.close();
+    task.await.unwrap().unwrap();
+}

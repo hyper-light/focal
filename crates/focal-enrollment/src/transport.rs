@@ -108,6 +108,12 @@ pub type JoinFuture<'a> = Pin<Box<dyn Future<Output = JoinResponse> + Send + 'a>
 /// Handler cancellation must never be interpreted as cancellation of a log entry.
 pub trait JoinHandler: Send + Sync + 'static {
     fn handle(&self, request: JoinRequest) -> JoinFuture<'_>;
+    /// Renew a credential the requester proves it holds. Handlers that only
+    /// enroll refuse renewals.
+    fn renew(&self, request: RenewRequest) -> JoinFuture<'_> {
+        let _ = request;
+        Box::pin(async { JoinResponse::Rejected(JoinFailure::Unauthorized) })
+    }
 }
 impl<F, Fut> JoinHandler for F
 where
@@ -125,7 +131,13 @@ impl JoinHandler for Arc<dyn JoinHandler> {
     fn handle(&self, request: JoinRequest) -> JoinFuture<'_> {
         self.as_ref().handle(request)
     }
+    fn renew(&self, request: RenewRequest) -> JoinFuture<'_> {
+        self.as_ref().renew(request)
+    }
 }
+const FRAME_JOIN: u16 = 1;
+const FRAME_RESPONSE: u16 = 2;
+const FRAME_RENEW: u16 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JoinTransportError {
@@ -227,16 +239,28 @@ pub async fn serve_enrollment_connection<H: JoinHandler>(
                 .accept_bi()
                 .await
                 .map_err(|_| JoinTransportError::Unavailable)?;
-            let request: JoinRequest = read_frame(&mut receive, 1).await?;
+            let (kind, bytes) = read_any_frame(&mut receive).await?;
             // A FIN, not a partial request or stalled suffix, admits metadata work.
             require_end(&mut receive).await?;
-            let response = handler.handle(request).await;
+            let response = match kind {
+                FRAME_JOIN => {
+                    let request: JoinRequest =
+                        decode(&bytes).map_err(|_| JoinTransportError::InvalidFrame)?;
+                    handler.handle(request).await
+                }
+                FRAME_RENEW => {
+                    let request: RenewRequest =
+                        decode(&bytes).map_err(|_| JoinTransportError::InvalidFrame)?;
+                    handler.renew(request).await
+                }
+                _ => return Err(JoinTransportError::InvalidFrame),
+            };
             let response = if encode(&response).is_ok() {
                 response
             } else {
                 JoinResponse::Rejected(JoinFailure::OutcomeUnknown)
             };
-            write_frame(&mut send, 2, &response).await?;
+            write_frame(&mut send, FRAME_RESPONSE, &response).await?;
             send.finish()
                 .map_err(|_| JoinTransportError::OutcomeUnknown)?;
             send.stopped()
@@ -317,10 +341,10 @@ impl EnrollmentClient {
                 .open_bi()
                 .await
                 .map_err(|_| JoinTransportError::OutcomeUnknown)?;
-            write_frame(&mut send, 1, &request).await?;
+            write_frame(&mut send, FRAME_JOIN, &request).await?;
             send.finish()
                 .map_err(|_| JoinTransportError::OutcomeUnknown)?;
-            let response = read_frame(&mut receive, 2).await?;
+            let response = read_frame(&mut receive, FRAME_RESPONSE).await?;
             require_end(&mut receive).await?;
             Ok::<JoinResponse, JoinTransportError>(response)
         })
@@ -349,9 +373,107 @@ impl EnrollmentClient {
             }
         }
     }
+    /// Renew a held credential at the sponsor: the request is signed by the
+    /// credential the caller holds and answered with the committed receipt.
+    pub async fn renew(
+        &self,
+        address: SocketAddr,
+        trust: &ServerTrust,
+        request: RenewRequest,
+        now: i64,
+    ) -> Result<EnrollmentReceipt, JoinTransportError> {
+        require_runtime()?;
+        let _permit = self
+            .inflight
+            .try_acquire()
+            .map_err(|_| JoinTransportError::Unavailable)?;
+        if trust.ca_certificate.is_empty() {
+            return Err(EnrollmentError::Invalid.into());
+        }
+        let mut tls = quinn::ClientConfig::new(Arc::new(
+            QuicClientConfig::try_from(trust.client_config()?)
+                .map_err(|_| EnrollmentError::Crypto)?,
+        ));
+        tls.transport_config(self.limits.quic()?);
+        let connecting = self
+            .endpoint
+            .connect_with(tls, address, &trust.server_name)
+            .map_err(|_| JoinTransportError::Unavailable)?;
+        let connection = tokio::time::timeout(self.limits.timeout, connecting)
+            .await
+            .map_err(|_| JoinTransportError::Unavailable)?
+            .map_err(|_| JoinTransportError::Unavailable)?;
+        trust.verify_quic(&connection, now)?;
+        let response = tokio::time::timeout(self.limits.timeout, async {
+            let (mut send, mut receive) = connection
+                .open_bi()
+                .await
+                .map_err(|_| JoinTransportError::OutcomeUnknown)?;
+            write_frame(&mut send, FRAME_RENEW, &request).await?;
+            send.finish()
+                .map_err(|_| JoinTransportError::OutcomeUnknown)?;
+            let response = read_frame(&mut receive, FRAME_RESPONSE).await?;
+            require_end(&mut receive).await?;
+            Ok::<JoinResponse, JoinTransportError>(response)
+        })
+        .await
+        .map_err(|_| JoinTransportError::OutcomeUnknown)?
+        .map_err(|_| JoinTransportError::OutcomeUnknown)?;
+        connection.close(0u8.into(), b"complete");
+        match response {
+            JoinResponse::Rejected(JoinFailure::OutcomeUnknown) => {
+                Err(JoinTransportError::OutcomeUnknown)
+            }
+            JoinResponse::Rejected(error) => Err(JoinTransportError::Rejected(error)),
+            JoinResponse::Enrolled(receipt) => {
+                if receipt.invitation != request.invitation_id()
+                    || receipt.request != request.request_id()
+                    || receipt.identity.cluster != trust_cluster(&request)
+                    || receipt.expires_at <= now
+                    || receipt.expires_at <= request.holds_until()
+                    || pki::verify_issued(&receipt, &trust.ca_certificate).is_err()
+                {
+                    return Err(JoinTransportError::OutcomeUnknown);
+                }
+                Ok(receipt)
+            }
+        }
+    }
     pub fn close(&self) {
         self.endpoint.close(0u8.into(), b"shutdown");
     }
+}
+fn trust_cluster(request: &RenewRequest) -> ClusterId {
+    request.cluster()
+}
+
+async fn read_any_frame<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<(u16, Zeroizing<Vec<u8>>), JoinTransportError> {
+    let mut header = [0; HEADER];
+    reader
+        .read_exact(&mut header)
+        .await
+        .map_err(|_| JoinTransportError::InvalidFrame)?;
+    let kind = u16::from_be_bytes(
+        header[10..12]
+            .try_into()
+            .map_err(|_| JoinTransportError::InvalidFrame)?,
+    );
+    let length = u32::from_be_bytes(
+        header[12..16]
+            .try_into()
+            .map_err(|_| JoinTransportError::InvalidFrame)?,
+    ) as usize;
+    if &header[..8] != MAGIC || header[8..10] != 1u16.to_be_bytes() || length > MAX_MESSAGE_BYTES {
+        return Err(JoinTransportError::InvalidFrame);
+    }
+    let mut bytes = Zeroizing::new(vec![0; length]);
+    reader
+        .read_exact(&mut bytes)
+        .await
+        .map_err(|_| JoinTransportError::InvalidFrame)?;
+    Ok((kind, bytes))
 }
 
 async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(

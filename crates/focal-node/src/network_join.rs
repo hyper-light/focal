@@ -394,6 +394,9 @@ impl PendingJoin {
         .catch_unwind()
         .await
         .map_err(|_| JoinError::Runtime)??;
+        // The receipt is issued at the sponsor's clock after the exchange; a
+        // caller's earlier sample must not read a fresh receipt as future-dated.
+        let now = now.max(crate::network_bootstrap::unix_time().map_err(|_| JoinError::Runtime)?);
         // Verification persists the public receipt before a caller can lose it.
         drop(self.verify(&receipt, now)?);
         Ok(receipt)

@@ -257,7 +257,7 @@ fn check_fields(
     if fields.kind.len() > limits.kind_bytes
         || fields.metadata.len() > limits.metadata_bytes
         || inline > limits.inline_bytes
-        || inputs > limits.inputs
+        || inputs > limits.inputs.min(super::MAX_INPUTS)
         || visibility > limits.visibility_labels
     {
         return Err(ContractError::Capacity);

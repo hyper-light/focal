@@ -226,6 +226,12 @@ impl Session {
         input: &ManagedAuthenticatedInput,
     ) -> Result<ManagedSubmission, LedgerError> {
         self.check()?;
+        if self.activation.is_native() {
+            return Ok(ManagedSubmission::Domain(DomainOutcome::refuse(
+                ErrorCode::UnsupportedSchema,
+                "legacy managed commands are refused after native activation",
+            )));
+        }
         self.managed_input_size(input)?;
         // The shared encoder streams the frozen canonical body into BLAKE3.
         let hash = managed_command_hash(input).map_err(|_| ManagedError::Capacity)?;
@@ -377,6 +383,10 @@ impl Session {
         {
             return Ok(false);
         }
+        if self.activation.is_native() && data.starts_with(MANAGED_DOMAIN_MAGIC) {
+            // A legacy domain mutation after activation cannot have been admitted.
+            return Err(LedgerError::Corrupt);
+        }
         if !self.consensus.decoder_floor_ready(managed_format_hash()) {
             return Err(LedgerError::Corrupt);
         }
@@ -461,6 +471,9 @@ impl Session {
                 events._charges.push(charge);
             }
             ManagedCandidate::Cursor(mut candidate) => {
+                candidate
+                    .registry
+                    .set_cursor_sequence(self.stream_published());
                 candidate.registry.set_index(index)?;
                 let receipt = candidate
                     .registry
@@ -669,11 +682,12 @@ impl Session {
             .and_then(|n| n.checked_mul(3))
             .ok_or(LedgerError::Capacity)?;
         let _scratch = self.managed_charge(meta_bytes)?;
+        let published = self.stream_published();
         let prepared = if committed {
             self.cursors
-                .prepare_committed(&input.command, self.sequence())?
+                .prepare_committed(&input.command, published)?
         } else {
-            self.cursors.prepare(&input.command, self.sequence())?
+            self.cursors.prepare(&input.command, published)?
         };
         let record = consumer
             .and_then(|id| prepared.checkpoint().consumers.get(&id))

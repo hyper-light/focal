@@ -96,19 +96,15 @@ impl DurableNode {
                 0,
                 if membership_pending { 1024 } else { 0 },
             )?;
-            let allocation = memory::reserve(
+            // Nothing has been taken from Raft yet: a refused staging reservation
+            // leaves the replica exactly as it was, so the caller retries once
+            // memory returns instead of losing the node to a transient shortage.
+            self.active_allocation = Some(memory::reserve(
                 &self.budget,
                 BudgetKind::Pending,
                 BudgetLane::Completion,
                 bytes,
-            );
-            match allocation {
-                Ok(allocation) => self.active_allocation = Some(allocation),
-                Err(error) => {
-                    self.failed = true;
-                    return Err(error);
-                }
-            }
+            )?);
             let events = self.recovered_events.take().unwrap_or_else(|| NodeEvents {
                 snapshot: self.recovered_snapshot.take(),
                 allocation: self.recovered_allocation.take(),

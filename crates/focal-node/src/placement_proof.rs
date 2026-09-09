@@ -13,7 +13,7 @@ use focal_model::ContentHash;
 use std::collections::BTreeMap;
 
 const WORKSPACE: usize = 1024 * 1024;
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProofWindow {
     pub issued_at: i64,
     pub expires_at: i64,
@@ -52,6 +52,16 @@ impl AccountedAuthorityProof {
 impl SessionProofPermit {
     pub fn statement(&self) -> &AuthorityStatement {
         &self.statement
+    }
+    /// The attestation a self-signed readiness or custody fact carries: the
+    /// digest of the statement whose body has a zero attestation field.
+    pub fn attestation(&self) -> Result<ContentHash, PlacementProofError> {
+        focal_directory::AuthorityProof {
+            statement: self.statement.clone(),
+            signatures: Vec::new(),
+        }
+        .attestation()
+        .map_err(PlacementProofError::from)
     }
     pub fn sign(
         self,
@@ -178,7 +188,7 @@ pub fn prepare_session_proof(
         .map_err(|_| PlacementProofError::Unauthorized)?;
     if identity.role != EnrollmentRole::Node
         || identity.principal != node.principal
-        || ContentHash(server_fingerprint(&enrolled.certificate)) != node.enrollment.identity
+        || ContentHash(enrolled.public_key) != node.enrollment.identity
     {
         return Err(PlacementProofError::Unauthorized);
     }
@@ -219,6 +229,7 @@ pub fn prepare_session_proof(
             NodeRecord {
                 enrollment: grant.enrollment.clone(),
                 load: None,
+                liveness: None,
             },
         );
     }
@@ -242,6 +253,234 @@ pub fn prepare_session_proof(
     match authority
         .verifier(enrollment, std::slice::from_ref(&proof), now)?
         .verify_session_fence(fence)
+    {
+        Err(DirectoryError::Quorum) => {}
+        Err(error) => return Err(error.into()),
+        Ok(()) => return Err(PlacementProofError::Unauthorized),
+    }
+    Ok(SessionProofPermit {
+        statement: proof.statement,
+        certificate: server_fingerprint(&enrolled.certificate),
+        _allocation: allocation,
+    })
+}
+
+/// Prepare this node's own readiness statement for a session it is assigned
+/// to. The body must already describe verified custody; the control owner
+/// checks that the session's installed group names this node at its enrolled
+/// generation, that its enrollment is current for the whole window, and that
+/// the fact is one only this node may sign. The permit is signed with the
+/// node's credential and the returned attestation completes the fact.
+pub fn prepare_replica_ready_proof(
+    owner: &ControlReplica,
+    ready: &focal_directory::ReplicaReady,
+    group: focal_directory::LogGroupId,
+    window: ProofWindow,
+    now: i64,
+    budget: &MemoryBudget,
+) -> Result<SessionProofPermit, PlacementProofError> {
+    let allocation = budget
+        .reserve(BudgetKind::Control, BudgetLane::Completion, WORKSPACE)
+        .map_err(|_| PlacementProofError::Capacity)?
+        .commit();
+    drop(owner.read_local(&ControlRead::Configuration)?);
+    if owner.identity().scope != ControlScope::Root
+        || ready.attestation != ContentHash([0; 32])
+        || ready.custody == ContentHash([0; 32])
+        || ready.route_epoch.0 == 0
+        || window.expires_at <= window.issued_at
+        || window.issued_at > now
+        || window.expires_at <= now
+    {
+        return Err(PlacementProofError::Unauthorized);
+    }
+    let authority = owner.authority().ok_or(PlacementProofError::Unauthorized)?;
+    let enrollment = owner
+        .enrollment()
+        .ok_or(PlacementProofError::Unauthorized)?;
+    let checkpoint = authority.checkpoint();
+    if checkpoint.revision == 0
+        || checkpoint.applied_index == 0
+        || checkpoint.applied_index > owner.applied_index()
+        || enrollment.applied_index() > owner.applied_index()
+        || checkpoint.anchor.cluster.0 != owner.identity().cluster.0
+    {
+        return Err(PlacementProofError::Unauthorized);
+    }
+    let grant = authority
+        .group(group)
+        .ok_or(PlacementProofError::Unauthorized)?;
+    let node = authority
+        .node(ready.node)
+        .ok_or(PlacementProofError::Unauthorized)?;
+    let generation = node.enrollment.generation;
+    if grant.scope != GroupScope::Session(ready.ledger)
+        || ready.node_generation != generation
+        || (grant.voters.get(&ready.node) != Some(&generation)
+            && grant.outgoing_voters.get(&ready.node) != Some(&generation)
+            && grant.learners.get(&ready.node) != Some(&generation))
+        || grant.expires_at <= now
+        || window.expires_at > grant.expires_at
+        || node.expires_at < window.expires_at
+    {
+        return Err(PlacementProofError::Unauthorized);
+    }
+    let verifier = authority.verifier(enrollment, &[], now)?;
+    verifier.verify_enrollment(&node.enrollment)?;
+    let enrolled = enrollment
+        .enrollments()
+        .find(|receipt| receipt.identity.node_id == Some(ready.node))
+        .ok_or(PlacementProofError::Unauthorized)?;
+    let identity = enrollment
+        .authorize_certificate(&enrolled.certificate, now)
+        .map_err(|_| PlacementProofError::Unauthorized)?;
+    if identity.role != EnrollmentRole::Node
+        || identity.principal != node.principal
+        || ContentHash(enrolled.public_key) != node.enrollment.identity
+    {
+        return Err(PlacementProofError::Unauthorized);
+    }
+    Ok(SessionProofPermit {
+        statement: AuthorityStatement {
+            anchor: checkpoint.anchor.clone(),
+            authority_revision: checkpoint.revision,
+            enrollment_revision: enrollment.revision(),
+            group,
+            group_genesis: grant.genesis,
+            membership_epoch: grant.membership_epoch,
+            issued_at: window.issued_at,
+            expires_at: window.expires_at,
+            fact: AuthorityFact::Replica(ready.clone()),
+        },
+        certificate: server_fingerprint(&enrolled.certificate),
+        _allocation: allocation,
+    })
+}
+
+/// The committed coordinates of one session-log configuration change, as
+/// the signer's own replica applied it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MembershipRecord {
+    pub index: focal_model::RaftIndex,
+    pub term: focal_model::RaftTerm,
+    pub record_hash: ContentHash,
+}
+
+/// Prepare this node's signature over a session group's next membership. The
+/// caller has already checked the fact against its own replica's applied
+/// configuration; the control owner checks that this node is a current voter
+/// of the group, that `next` is a legal successor of the installed grant and
+/// that every named node is enrolled for the window.
+pub fn prepare_membership_proof(
+    owner: &ControlReplica,
+    node: u64,
+    next: &focal_directory::GroupAuthorityGrant,
+    record: &MembershipRecord,
+    window: ProofWindow,
+    now: i64,
+    budget: &MemoryBudget,
+) -> Result<SessionProofPermit, PlacementProofError> {
+    let allocation = budget
+        .reserve(BudgetKind::Control, BudgetLane::Completion, WORKSPACE)
+        .map_err(|_| PlacementProofError::Capacity)?
+        .commit();
+    drop(owner.read_local(&ControlRead::Configuration)?);
+    if owner.identity().scope != ControlScope::Root
+        || record.index.0 == 0
+        || record.term.0 == 0
+        || record.record_hash == ContentHash([0; 32])
+        || window.expires_at <= window.issued_at
+        || window.issued_at > now
+        || window.expires_at <= now
+    {
+        return Err(PlacementProofError::Unauthorized);
+    }
+    let authority = owner.authority().ok_or(PlacementProofError::Unauthorized)?;
+    let enrollment = owner
+        .enrollment()
+        .ok_or(PlacementProofError::Unauthorized)?;
+    let checkpoint = authority.checkpoint();
+    if checkpoint.revision == 0
+        || checkpoint.applied_index == 0
+        || checkpoint.applied_index > owner.applied_index()
+        || enrollment.applied_index() > owner.applied_index()
+        || checkpoint.anchor.cluster.0 != owner.identity().cluster.0
+    {
+        return Err(PlacementProofError::Unauthorized);
+    }
+    let current = authority
+        .group(next.group)
+        .ok_or(PlacementProofError::Unauthorized)?;
+    let signer = authority
+        .node(node)
+        .ok_or(PlacementProofError::Unauthorized)?;
+    let generation = signer.enrollment.generation;
+    if !matches!(current.scope, GroupScope::Session(_))
+        || next.scope != current.scope
+        || next.genesis != current.genesis
+        || (current.voters.get(&node) != Some(&generation)
+            && current.outgoing_voters.get(&node) != Some(&generation))
+        || current.expires_at <= now
+        || window.expires_at > current.expires_at
+        || next.expires_at < window.expires_at
+    {
+        return Err(PlacementProofError::Unauthorized);
+    }
+    let verifier = authority.verifier(enrollment, &[], now)?;
+    for (member, member_generation) in next
+        .voters
+        .iter()
+        .chain(&next.outgoing_voters)
+        .chain(&next.learners)
+    {
+        let grant = authority
+            .node(*member)
+            .ok_or(PlacementProofError::Unauthorized)?;
+        if grant.enrollment.generation != *member_generation
+            || !grant.enrollment.eligible
+            || grant.expires_at < next.expires_at
+        {
+            return Err(PlacementProofError::Unauthorized);
+        }
+        verifier.verify_enrollment(&grant.enrollment)?;
+    }
+    let enrolled = enrollment
+        .enrollments()
+        .find(|receipt| receipt.identity.node_id == Some(node))
+        .ok_or(PlacementProofError::Unauthorized)?;
+    let identity = enrollment
+        .authorize_certificate(&enrolled.certificate, now)
+        .map_err(|_| PlacementProofError::Unauthorized)?;
+    if identity.role != EnrollmentRole::Node
+        || identity.principal != signer.principal
+        || ContentHash(enrolled.public_key) != signer.enrollment.identity
+    {
+        return Err(PlacementProofError::Unauthorized);
+    }
+    let proof = AuthorityProof {
+        statement: AuthorityStatement {
+            anchor: checkpoint.anchor.clone(),
+            authority_revision: checkpoint.revision,
+            enrollment_revision: enrollment.revision(),
+            group: next.group,
+            group_genesis: current.genesis,
+            membership_epoch: current.membership_epoch,
+            issued_at: window.issued_at,
+            expires_at: window.expires_at,
+            fact: AuthorityFact::Membership {
+                next: next.clone(),
+                index: record.index,
+                term: record.term,
+                record_hash: record.record_hash,
+            },
+        },
+        signatures: Vec::new(),
+    };
+    // The consumer's shape and epoch checks run now; the unsigned share must
+    // fail solely because it has no quorum signatures.
+    match authority
+        .verifier(enrollment, std::slice::from_ref(&proof), now)?
+        .verify_membership(&proof)
     {
         Err(DirectoryError::Quorum) => {}
         Err(error) => return Err(error.into()),

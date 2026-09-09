@@ -293,6 +293,7 @@ fn authored() -> NativeCommand {
             requirements: &requirements,
             slots: &[],
             deadline: Some(deadline()),
+            policy: None,
         },
         claim_descriptor::Limits {
             description_bytes: 64,
@@ -932,7 +933,7 @@ fn malformed_headers_closed_tags_options_text_and_lengths_refuse_structurally() 
     };
     let (mut bytes, _) = encode(frame(&input, NativeContentProfile::AuthoredV1));
     let schema = HEADER + 4 + 48;
-    bytes[schema..schema + 2].copy_from_slice(&2u16.to_le_bytes());
+    bytes[schema..schema + 2].copy_from_slice(&3u16.to_le_bytes());
     refusal(&bytes, unlimited(), CodecError::InvalidTag("claim schema"));
 }
 

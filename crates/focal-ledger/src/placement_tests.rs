@@ -46,7 +46,10 @@ fn placement_request(
 }
 #[test]
 fn placement_lifecycle_keeps_domain_clock_and_replays_exact_empty_prefix_fences() {
-    for checkpoint in [false, true] {
+    // A cutover carries the group's actual membership epoch, which several
+    // committed learner changes may have raised above the one this placement
+    // implies; both the live rule and the checkpoint validator accept it.
+    for (checkpoint, cutover_epoch) in [(false, 1), (true, 1), (true, 3)] {
         let dir = tempfile::tempdir().unwrap();
         let mut session =
             Session::open(dir.path(), identity(), config(), SessionLimits::default()).unwrap();
@@ -59,10 +62,18 @@ fn placement_lifecycle_keeps_domain_clock_and_replays_exact_empty_prefix_fences(
         let first = session.placement_receipt(&created).unwrap().unwrap();
         assert_eq!(first.sequence, SessionSeq(0));
         assert!(first.index.0 > 0);
-        let cutover = placement_request(&session, SessionFenceKind::Cutover, 2);
+        let mut stale = placement_request(&session, SessionFenceKind::Cutover, 2);
+        stale.membership_epoch = 0;
+        assert!(matches!(
+            session.propose_placement(&stale),
+            Err(LedgerError::PlacementConflict)
+        ));
+        let mut cutover = placement_request(&session, SessionFenceKind::Cutover, 2);
+        cutover.membership_epoch = cutover_epoch;
         session.propose_placement(&cutover).unwrap();
         session.poll().unwrap();
         let sealed = session.placement_receipt(&cutover).unwrap().unwrap();
+        assert_eq!(sealed.membership_epoch, cutover_epoch);
         assert_eq!(sealed.sequence, SessionSeq(0));
         assert!(sealed.index > first.index);
         let input = input(
@@ -91,7 +102,8 @@ fn placement_lifecycle_keeps_domain_clock_and_replays_exact_empty_prefix_fences(
             session.placement_receipt(&cutover).unwrap(),
             Some(sealed.clone())
         );
-        let activated = placement_request(&session, SessionFenceKind::Activated, 2);
+        let mut activated = placement_request(&session, SessionFenceKind::Activated, 2);
+        activated.membership_epoch = cutover_epoch;
         session.propose_placement(&activated).unwrap();
         session.poll().unwrap();
         let final_fence = session.placement_receipt(&activated).unwrap().unwrap();

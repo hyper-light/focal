@@ -428,3 +428,118 @@ fn managed_flags_json_yaml_keep_shared_authored_identity_and_explicit_path_synta
         Some(2)
     );
 }
+
+/// One CLI invocation whose managed generations rotate after `bound` ordinals.
+fn rotating(root: &Path, bound: &str, args: &[&str]) -> Value {
+    let output = command(root, args)
+        .env("FOCAL_MANAGED_ROTATION", bound)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{args:?}: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "{args:?}: {error}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
+}
+
+#[test]
+fn a_bounded_generation_rotates_automatically_and_retires_its_references_across_processes() {
+    let root = tempfile::tempdir_in("/tmp").unwrap();
+    let server = start(root.path());
+    let initial = sequence(root.path()).as_u64().unwrap();
+    let document = claim().to_string();
+    let mut ids = Vec::new();
+    // Each command is its own process; the shared bound is saved with the
+    // owner record on first use and every later process must match it.
+    for _ in 0..7 {
+        let reply = rotating(
+            root.path(),
+            "3",
+            &["submit", "claim", "--json", &document, "--format", "json"],
+        );
+        assert_eq!(reply["condition"], "Committed", "{reply}");
+        ids.push(reply["operation_id"].as_str().unwrap().to_string());
+    }
+    assert_eq!(sequence(root.path()).as_u64().unwrap(), initial + 7);
+    // Generations: ordinals 1..3 of generation one, then a rotation, and so
+    // on; the managed reference carries the generation and ordinal.
+    let generation = |id: &str| u64::from_str_radix(id.split(':').nth(2).unwrap(), 16).unwrap();
+    let ordinal = |id: &str| u64::from_str_radix(id.split(':').nth(3).unwrap(), 16).unwrap();
+    let generations: Vec<u64> = ids.iter().map(|id| generation(id)).collect();
+    let ordinals: Vec<u64> = ids.iter().map(|id| ordinal(id)).collect();
+    assert_eq!(ordinals, [1, 2, 3, 1, 2, 3, 1], "{ids:?}");
+    assert!(generations[0] == generations[1] && generations[1] == generations[2]);
+    assert!(generations[3] > generations[2], "{generations:?}");
+    assert!(generations[6] > generations[5], "{generations:?}");
+    assert!(
+        std::fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("CLI.requests.g")),
+        "the rotated generation lives in its own store"
+    );
+    assert!(!root.path().join("CLI.requests").exists());
+    // A different bound cannot open the saved owner record.
+    let mismatch = command(
+        root.path(),
+        &["submit", "claim", "--json", &document, "--format", "json"],
+    )
+    .env("FOCAL_MANAGED_ROTATION", "4")
+    .output()
+    .unwrap();
+    assert!(!mismatch.status.success());
+    // Retired references stay retired across processes and a restart, and
+    // never execute again; nothing is pending.
+    for id in &ids[..6] {
+        let inspected = rotating(
+            root.path(),
+            "3",
+            &[
+                "request",
+                "inspect",
+                "--operation-id",
+                id,
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(inspected["condition"], "Retired", "{inspected}");
+    }
+    assert_eq!(
+        rotating(
+            root.path(),
+            "3",
+            &["request", "pending", "--format", "json"]
+        )["operations"],
+        json!([])
+    );
+    drop(server);
+    let _server = start(root.path());
+    let retry = command(
+        root.path(),
+        &["request", "retry", "--operation-id", &ids[0]],
+    )
+    .env("FOCAL_MANAGED_ROTATION", "3")
+    .output()
+    .unwrap();
+    assert_eq!(retry.status.code(), Some(5));
+    assert_eq!(sequence(root.path()).as_u64().unwrap(), initial + 7);
+    let reply = rotating(
+        root.path(),
+        "3",
+        &["submit", "claim", "--json", &document, "--format", "json"],
+    );
+    assert_eq!(reply["condition"], "Committed", "{reply}");
+    assert_eq!(ordinal(reply["operation_id"].as_str().unwrap()), 2);
+    assert_eq!(sequence(root.path()).as_u64().unwrap(), initial + 8);
+}

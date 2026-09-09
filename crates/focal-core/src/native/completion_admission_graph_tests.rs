@@ -57,9 +57,19 @@ fn isolated_required_parent_is_protected_and_failure_credit_is_still_one_time() 
     let failure = envelope
         .report_storage(CompletionUse::AdmissionFailure)
         .unwrap();
+    // Eleven primary rows, the cohort's rows, the report artifact's index
+    // rows and verdict, a status move for the parent and every sealed
+    // cohort claim, and the due timers the failure can retire: every
+    // deleted key beyond the status moves (doc 22 §7).
+    let cohort = envelope.cohort();
+    let timers = failure.limits().deleted_keys - (1 + cohort.claims());
+    assert!(timers > 1 + cohort.claims() + cohort.evaluations());
     assert_eq!(
         failure.limits().changed_keys,
-        11 + envelope.cohort().changed_keys()
+        11 + cohort.changed_keys()
+            + crate::native::index_rows::report_rows(16).unwrap()
+            + crate::native::index_rows::STATUS_ROWS * (1 + cohort.claims())
+            + timers
     );
     assert_eq!(
         envelope.slots().events,
@@ -199,8 +209,25 @@ fn new_incoming_member_and_insufficient_failure_shape_refuse_without_changing_bu
         .changed_keys;
     drop(current_members);
     let baseline = core.state.budget.stats();
+    // One row short of the failed shape narrows the promised result artifact
+    // by one input (doc 22 §7) rather than refusing.
+    let inputs = current.descriptor_limits().inputs;
+    assert!(inputs > 0);
     let mut limited = core.limits;
     limited.range.max_batch_entries = changes - 1;
+    let (narrowed, narrowed_members) = quote(&core, limited).unwrap();
+    assert_eq!(narrowed.descriptor_limits().inputs, inputs - 1);
+    assert_eq!(
+        narrowed
+            .report_storage(CompletionUse::AdmissionFailure)
+            .unwrap()
+            .limits()
+            .changed_keys,
+        changes - 1
+    );
+    drop(narrowed_members);
+    // Below the shape of an input-free result artifact nothing can narrow.
+    limited.range.max_batch_entries = changes - inputs - 1;
     assert!(quote(&core, limited).is_err());
     assert_eq!(core.state.budget.stats(), baseline);
 }

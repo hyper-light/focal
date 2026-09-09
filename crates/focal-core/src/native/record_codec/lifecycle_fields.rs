@@ -91,6 +91,15 @@ pub(super) fn cancellation(
     claim_cut(sink, value.cut)
 }
 
+pub(super) fn claim_origin(sink: &mut impl Sink, value: claim::ClaimOrigin) -> Result<(), Error> {
+    write_u8(
+        sink,
+        match value {
+            claim::ClaimOrigin::Native => 0,
+            claim::ClaimOrigin::Legacy => 1,
+        },
+    )
+}
 pub(super) fn claim_status(sink: &mut impl Sink, value: ClaimStatus) -> Result<(), Error> {
     write_u16(
         sink,

@@ -10,7 +10,6 @@ use focal_directory::{
     ClusterId, Delegation, GroupScope, LogGroupId, NamespaceKey, NamespaceRange,
     PartitionCheckpoint, PartitionId, RegionId,
 };
-use focal_enrollment::server_fingerprint;
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::{ContentHash, LedgerId, SessionId, TenantId};
 use std::collections::BTreeMap;
@@ -88,7 +87,7 @@ impl FirstDirectoryPlan {
     pub fn bootstrap(&self) -> ControlBootstrap {
         ControlBootstrap::Partition {
             directory: PartitionCheckpoint {
-                schema: 1,
+                schema: focal_directory::PARTITION_CHECKPOINT_SCHEMA,
                 cluster: ClusterId(self.cluster),
                 delegation: self.delegation(),
                 revision: 0,
@@ -416,7 +415,7 @@ pub(crate) fn authorize_first_directory(
         .find(|receipt| {
             receipt.identity.node_id == Some(plan.founder_node)
                 && receipt.identity.principal == node.principal
-                && ContentHash(server_fingerprint(&receipt.certificate)) == node.enrollment.identity
+                && ContentHash(receipt.public_key) == node.enrollment.identity
         })
         .ok_or(DirectoryBootstrapError::Unauthorized)?;
     let identity = enrollment
@@ -530,7 +529,7 @@ pub(crate) fn next_first_directory_command(
         .find(|receipt| {
             receipt.identity.node_id == Some(plan.founder_node)
                 && receipt.identity.principal == node.principal
-                && ContentHash(server_fingerprint(&receipt.certificate)) == node.enrollment.identity
+                && ContentHash(receipt.public_key) == node.enrollment.identity
         })
         .ok_or(DirectoryBootstrapError::Unauthorized)?;
     let identity = enrollment

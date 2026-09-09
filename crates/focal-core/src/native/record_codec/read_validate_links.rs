@@ -309,7 +309,7 @@ pub(super) fn row(
                         fence,
                         holder,
                     } => {
-                        if fence.epoch != 1 {
+                        if fence.epoch != 1 && event.invocation != NativeInvocation::Import {
                             return Err(invalid());
                         }
                         (claim, fence, holder)
@@ -352,10 +352,11 @@ pub(super) fn row(
                 };
                 if recorded.sequence != event.sequence
                     || recorded_claim.after != binding
-                    || !matches!(
+                    || !(matches!(
                         recorded_claim.kind,
                         NativeEventKind::Received | NativeEventKind::ReceiptAdopted
-                    )
+                    ) || event.invocation == NativeInvocation::Import
+                        && matches!(recorded_claim.kind, NativeEventKind::Imported(_)))
                 {
                     return Err(invalid());
                 }

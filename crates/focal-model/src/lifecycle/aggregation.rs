@@ -25,7 +25,7 @@ pub(crate) use acceptance::acceptance_for;
 pub(in crate::lifecycle) use acceptance::preparation::{SourceShape, check_sources};
 pub use acceptance::{
     AcceptancePlan, AcceptancePolicy, AcceptanceSource, AcceptanceSourcePasses,
-    AcceptanceSourcePlan, DeclaredObligation, EvaluationRegistry, ObligationTarget,
+    AcceptanceSourcePlan, DeclaredObligation, EvaluationRegistry, ObligationTarget, PolicyShape,
     RegisteredEvaluation, SealedTargets,
 };
 pub use admission::{

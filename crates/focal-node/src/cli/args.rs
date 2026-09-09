@@ -63,6 +63,11 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: ValidationCommand,
     },
+    /// Native engine: generate and post a closed claim's result testament.
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
+    },
     /// Register immutable evidence or inspect and cancel durable payload uploads.
     Artifact {
         #[command(subcommand)]
@@ -161,7 +166,9 @@ pub(crate) struct ClaimArgs {
     /// Repeat KIND:KEY, for example file:src/lib.rs.
     #[arg(long)]
     pub scope: Vec<String>,
-    /// Repeat KIND:CLAIM_ID; issuer, subject, action and cause are derived.
+    /// Repeat KIND:CLAIM_ID, or reviews:artifact:ID@HASH / derived_from:artifact:ID@HASH
+    /// for exact committed evidence on a native ledger; issuer, subject, action
+    /// and cause are derived.
     #[arg(long)]
     pub relation: Vec<String>,
     /// Repeat a JSON/YAML validation specification file.
@@ -173,8 +180,98 @@ pub(crate) struct ClaimArgs {
     /// Exact timer/generation/time document; does not set the server clock.
     #[arg(long)]
     pub deadline_json: Option<String>,
+    /// Native engine: one acceptance slot per JSON document.
+    #[arg(long)]
+    pub slot_json: Vec<String>,
+    /// Native engine: the committed parent claim this claim is caused by.
+    #[arg(long)]
+    pub parent: Option<String>,
+    /// Native engine: response cycles the claim admits (default 4).
+    #[arg(long)]
+    pub max_responses: Option<u32>,
+    /// Native engine: the immutable follow-up policy as JSON
+    /// (corrective_allowed, max_follow_ups, single_issuer, escalation).
+    #[arg(long)]
+    pub policy_json: Option<String>,
     #[command(flatten)]
     pub mutation: MutationOptions,
+}
+/// The authored fields shared by the native peer verbs (challenge, consult,
+/// correct, follow-up); each verb adds what it follows.
+#[derive(Args)]
+pub(crate) struct PeerClaimArgs {
+    #[command(flatten)]
+    pub input: DocumentInput,
+    #[arg(long)]
+    pub id: Option<String>,
+    #[arg(long)]
+    pub occurrence: Option<String>,
+    /// The obligation, or the query of a consultation.
+    #[arg(long)]
+    pub description: Option<String>,
+    /// Exact subject participant ID; a correction or follow-up defaults to
+    /// the subject of the claim it follows.
+    #[arg(long)]
+    pub target: Option<String>,
+    /// Challenge: the exact committed artifact disputed, ID or ID@HASH.
+    #[arg(long)]
+    pub artifact: Option<String>,
+    /// Repeat KIND:KEY, for example file:src/lib.rs.
+    #[arg(long)]
+    pub scope: Vec<String>,
+    /// Repeat KIND:CLAIM_ID or reviews:artifact:ID@HASH.
+    #[arg(long)]
+    pub relation: Vec<String>,
+    /// Repeat a JSON/YAML validation specification file.
+    #[arg(long)]
+    pub validation_file: Vec<PathBuf>,
+    /// Repeat an inline JSON validation specification.
+    #[arg(long)]
+    pub validation_json: Vec<String>,
+    /// Exact timer/generation/time document; does not set the server clock.
+    #[arg(long)]
+    pub deadline_json: Option<String>,
+    /// One acceptance slot per JSON document.
+    #[arg(long)]
+    pub slot_json: Vec<String>,
+    /// The committed live parent claim this claim is caused by.
+    #[arg(long)]
+    pub parent: Option<String>,
+    /// Response cycles the claim admits (default 4).
+    #[arg(long)]
+    pub max_responses: Option<u32>,
+    /// The immutable follow-up policy as JSON (corrective_allowed,
+    /// max_follow_ups, single_issuer, escalation); mandatory for a challenge.
+    #[arg(long)]
+    pub policy_json: Option<String>,
+    #[command(flatten)]
+    pub mutation: MutationOptions,
+}
+#[derive(Args)]
+pub(crate) struct CorrectArgs {
+    /// The committed challenge whose verdict failed.
+    #[arg(long)]
+    pub challenge: Option<String>,
+    /// The report artifact of that terminal verdict, ID or ID@HASH.
+    #[arg(long)]
+    pub verdict: Option<String>,
+    #[command(flatten)]
+    pub claim: PeerClaimArgs,
+}
+#[derive(Args)]
+pub(crate) struct FollowUpArgs {
+    /// The committed consultation this follow-up refines.
+    #[arg(long)]
+    pub refines: Option<String>,
+    #[command(flatten)]
+    pub claim: PeerClaimArgs,
+}
+#[derive(Args)]
+pub(crate) struct LineageArgs {
+    /// Exact claim ID.
+    pub id: String,
+    #[command(flatten)]
+    pub output: OutputOptions,
 }
 #[derive(Args)]
 pub(crate) struct TestamentArgs {
@@ -202,6 +299,12 @@ pub(crate) struct TestamentArgs {
     /// complete, partial, refused, impossible, interrupted, or failed. Non-complete requires error evidence.
     #[arg(long)]
     pub outcome: Option<String>,
+    /// Native engine: manifest entry `SLOT=ARTIFACT_ID:HASH`.
+    #[arg(long)]
+    pub slot: Vec<String>,
+    /// Native engine: cited diagnostic `ARTIFACT_ID:HASH`.
+    #[arg(long)]
+    pub diagnostic: Vec<String>,
     #[command(flatten)]
     pub mutation: MutationOptions,
 }
@@ -231,6 +334,83 @@ pub(crate) struct ArtifactArgs {
     /// Opaque metadata bytes from a bounded file.
     #[arg(long)]
     pub metadata_file: Option<PathBuf>,
+    /// Native engine: the manifest slot this work output fills.
+    #[arg(long)]
+    pub slot: Option<u32>,
+    /// Native engine: input object reference as JSON `{"kind":..,"id":..}`.
+    #[arg(long)]
+    pub input_json: Vec<String>,
+    /// Native engine: visibility label.
+    #[arg(long)]
+    pub visibility: Vec<String>,
+    #[command(flatten)]
+    pub mutation: MutationOptions,
+}
+/// Native engine only: a diagnostic for failed or impossible work.
+#[derive(Args)]
+pub(crate) struct DiagnosticArgs {
+    #[command(flatten)]
+    pub input: DocumentInput,
+    #[arg(long)]
+    pub claim: Option<String>,
+    /// One of work, production, structure or metadata.
+    #[arg(long)]
+    pub reason: Option<String>,
+    #[arg(long)]
+    pub id: Option<String>,
+    #[arg(long)]
+    pub kind: Option<String>,
+    #[arg(long)]
+    pub schema_hash: Option<String>,
+    #[arg(long, conflicts_with = "text")]
+    pub payload_file: Option<PathBuf>,
+    #[arg(long, conflicts_with = "payload_file")]
+    pub text: Option<String>,
+    #[arg(long)]
+    pub metadata_file: Option<PathBuf>,
+    #[arg(long)]
+    pub input_json: Vec<String>,
+    #[arg(long)]
+    pub visibility: Vec<String>,
+    #[command(flatten)]
+    pub mutation: MutationOptions,
+}
+/// Native engine only: the evaluator's fenced report with its result artifact.
+#[derive(Args)]
+pub(crate) struct ReportArgs {
+    #[command(flatten)]
+    pub input: DocumentInput,
+    #[arg(long)]
+    pub claim: Option<String>,
+    #[arg(long)]
+    pub validation: Option<String>,
+    #[arg(long)]
+    pub slot: Option<u32>,
+    /// whole_work (default), admission or increment.
+    #[arg(long)]
+    pub phase: Option<String>,
+    /// The increment's work artifact when several are current.
+    #[arg(long)]
+    pub target: Option<String>,
+    /// One of pass, fail, incomplete or error.
+    #[arg(long)]
+    pub verdict: Option<String>,
+    #[arg(long)]
+    pub id: Option<String>,
+    #[arg(long)]
+    pub kind: Option<String>,
+    #[arg(long)]
+    pub schema_hash: Option<String>,
+    #[arg(long, conflicts_with = "text")]
+    pub payload_file: Option<PathBuf>,
+    #[arg(long, conflicts_with = "payload_file")]
+    pub text: Option<String>,
+    #[arg(long)]
+    pub metadata_file: Option<PathBuf>,
+    #[arg(long)]
+    pub input_json: Vec<String>,
+    #[arg(long)]
+    pub visibility: Vec<String>,
     #[command(flatten)]
     pub mutation: MutationOptions,
 }
@@ -297,6 +477,35 @@ pub(crate) struct Filters {
     /// Inclusive creation SessionSeq upper bound.
     #[arg(long)]
     pub created_through: Option<u64>,
+    /// Native engine: exact validation definition ID (list evaluations).
+    #[arg(long)]
+    pub validation: Option<String>,
+    /// Native engine: accepted verdict pass, fail, incomplete or error (list evaluations).
+    #[arg(long)]
+    pub verdict: Option<String>,
+    /// Native engine: receipt holder participant (list receipts).
+    #[arg(long)]
+    pub holder: Option<String>,
+    /// Native engine: exclusive event position SEQUENCE:ORDINAL (list events).
+    #[arg(long)]
+    pub after: Option<String>,
+}
+impl Filters {
+    /// The first flag only the native engine serves, so the V1 path refuses
+    /// it instead of ignoring it.
+    pub(crate) fn native_only(&self) -> Option<&'static str> {
+        if self.validation.is_some() {
+            Some("--validation")
+        } else if self.verdict.is_some() {
+            Some("--verdict")
+        } else if self.holder.is_some() {
+            Some("--holder")
+        } else if self.after.is_some() {
+            Some("--after")
+        } else {
+            None
+        }
+    }
 }
 #[derive(Args)]
 pub(crate) struct ListArgs {
@@ -327,6 +536,14 @@ pub(crate) enum ListCommand {
     Artifacts(ListArgs),
     /// Select validation requirements by claim, evaluator, kind, phase and mode.
     Validations(ListArgs),
+    /// Native engine: select current evaluations by claim, validation, evaluator and verdict.
+    Evaluations(ListArgs),
+    /// Native engine: select receipts by holder and claim.
+    Receipts(ListArgs),
+    /// Native engine: the monitors registered on one claim (--claim).
+    Monitors(ListArgs),
+    /// Native engine: the publication history after an event position (--after).
+    Events(ListArgs),
 }
 #[derive(Args)]
 pub(crate) struct GetArgs {
@@ -366,6 +583,19 @@ pub(crate) struct GetValidationArgs {
     /// Include the owning claim and current testament at the same ledger snapshot.
     #[arg(long)]
     pub context: bool,
+    /// Native engine: whole_work (default), admission or increment, selecting
+    /// the evaluation the context describes.
+    #[arg(long, requires = "context")]
+    pub phase: Option<String>,
+    /// Native engine: restrict the whole-work evaluation to one slot.
+    #[arg(long, requires = "context")]
+    pub slot: Option<u32>,
+    /// Native engine: the increment's work artifact.
+    #[arg(long, requires = "context")]
+    pub target: Option<String>,
+    /// Native engine: the exact evaluation generation.
+    #[arg(long, requires = "context")]
+    pub generation: Option<u64>,
     #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=256))]
     pub limit: u32,
     /// Resume the same requirement at the exact previous ledger prefix.
@@ -407,8 +637,8 @@ pub(crate) struct CancelArgs {
     pub input: DocumentInput,
     #[arg(required_unless_present_any = ["json", "yaml", "file"])]
     pub id: Option<String>,
+    /// Required on the V1 engine; the native engine records no reason.
     #[arg(long)]
-    #[arg(required_unless_present_any = ["json", "yaml", "file"])]
     pub reason: Option<String>,
     #[command(flatten)]
     pub mutation: MutationOptions,
@@ -420,6 +650,18 @@ pub(crate) enum ClaimCommand {
     Post(ClaimIdArgs),
     Progress(ProgressArgs),
     Cancel(CancelArgs),
+    /// Native engine: release the owned scope of your terminal claim.
+    ReleaseScope(ClaimIdArgs),
+    /// Native engine: challenge a participant to prove or redo stated work, with an immutable follow-up policy.
+    Challenge(Box<PeerClaimArgs>),
+    /// Native engine: consult a participant for work answering a query.
+    Consult(Box<PeerClaimArgs>),
+    /// Native engine: correct a failed challenge on the exact report of its verdict.
+    Correct(Box<CorrectArgs>),
+    /// Native engine: file a follow-up consultation refining a committed consultation.
+    FollowUp(Box<FollowUpArgs>),
+    /// Native engine: read a claim's cause ancestors, corrections, refinements and children at one prefix.
+    Lineage(LineageArgs),
     /// Create a new immutable successor; preserve the predecessor's history.
     Supersede(Box<SupersedeArgs>),
 }
@@ -435,6 +677,10 @@ pub(crate) struct SupersedeArgs {
 pub(crate) enum TestamentCommand {
     /// Receive this exact closing testament as its claim's issuer.
     Receive(ReceiveTestamentArgs),
+    /// Native engine: post your closed testament to the issuer.
+    Post(ReceiveTestamentArgs),
+    /// Close the current work cycle (alias of `submit testament`).
+    Submit(Box<TestamentArgs>),
 }
 #[derive(Args)]
 pub(crate) struct ReceiveTestamentArgs {
@@ -456,6 +702,12 @@ pub(crate) enum ValidationCommand {
     BeginIncrement(IncrementValidationArgs),
     /// Apply the recorded required outcomes and graph conditions, not a caller verdict.
     Complete(ValidationClaimArgs),
+    /// Native engine: report the begun attempt's verdict with its evidence.
+    Report(Box<ReportArgs>),
+    /// Native engine: as the issuer, seal the claim's increment targets.
+    SealIncrements(ClaimFlagArgs),
+    /// Native engine: as the issuer, close the increment cohort of the received testament and enter whole-work evaluation.
+    EnterWholeWork(ReceiveTestamentArgs),
 }
 #[derive(Args)]
 pub(crate) struct ValidationClaimArgs {
@@ -464,6 +716,59 @@ pub(crate) struct ValidationClaimArgs {
     #[arg(long)]
     #[arg(required_unless_present_any = ["json", "yaml", "file"])]
     pub claim: Option<String>,
+    /// Native engine: the declaration whose current evaluation begins.
+    #[arg(long)]
+    pub validation: Option<String>,
+    /// Native engine: restrict to one manifest slot.
+    #[arg(long)]
+    pub slot: Option<u32>,
+    /// Native engine: whole_work (default), admission or increment.
+    #[arg(long)]
+    pub phase: Option<String>,
+    /// Native engine: the increment's work artifact when several are current.
+    #[arg(long)]
+    pub target: Option<String>,
+    #[command(flatten)]
+    pub mutation: MutationOptions,
+}
+/// A native verb addressing one claim by `--claim`.
+#[derive(Args)]
+pub(crate) struct ClaimFlagArgs {
+    #[command(flatten)]
+    pub input: DocumentInput,
+    #[arg(long)]
+    #[arg(required_unless_present_any = ["json", "yaml", "file"])]
+    pub claim: Option<String>,
+    #[command(flatten)]
+    pub mutation: MutationOptions,
+}
+#[derive(Subcommand)]
+pub(crate) enum AuditCommand {
+    /// Generate the result testament of your closed claim.
+    Generate(AuditArgs),
+    /// Post a generated result testament.
+    Post(AuditPostArgs),
+}
+#[derive(Args)]
+pub(crate) struct AuditArgs {
+    #[command(flatten)]
+    pub input: DocumentInput,
+    #[arg(long)]
+    #[arg(required_unless_present_any = ["json", "yaml", "file"])]
+    pub claim: Option<String>,
+    /// New testament identity; generated once and journaled if omitted.
+    #[arg(long)]
+    pub id: Option<String>,
+    #[command(flatten)]
+    pub mutation: MutationOptions,
+}
+#[derive(Args)]
+pub(crate) struct AuditPostArgs {
+    #[command(flatten)]
+    pub input: DocumentInput,
+    /// The generated result testament.
+    #[arg(required_unless_present_any = ["json", "yaml", "file"])]
+    pub id: Option<String>,
     #[command(flatten)]
     pub mutation: MutationOptions,
 }
@@ -527,6 +832,73 @@ pub(crate) enum ArtifactCommand {
     },
     /// Register evidence as yourself; does not attach it to a respondent's manifest.
     Register(Box<RegisterArtifactArgs>),
+    /// Native engine: submit work output for one manifest slot (alias of `submit artifact`).
+    Submit(Box<ArtifactArgs>),
+    /// Native engine: submit a diagnostic for failed or impossible work.
+    Diagnostic(Box<DiagnosticArgs>),
+    /// Native engine: as the holder, record a slot as failed, citing your committed production diagnostic.
+    Fail(FailArgs),
+    /// Native engine: as the issuer, receive one generated work artifact.
+    Receive(ArtifactTargetArgs),
+    /// Native engine: as the issuer, reject one work artifact for a structure or metadata failure with your diagnostic.
+    Reject(Box<RejectArgs>),
+}
+#[derive(Args)]
+pub(crate) struct FailArgs {
+    #[command(flatten)]
+    pub input: DocumentInput,
+    #[arg(long)]
+    pub claim: Option<String>,
+    #[arg(long)]
+    pub slot: Option<u32>,
+    /// DIAGNOSTIC_ID or DIAGNOSTIC_ID:HASH of your committed production diagnostic.
+    #[arg(long)]
+    pub diagnostic: Option<String>,
+    #[command(flatten)]
+    pub mutation: MutationOptions,
+}
+#[derive(Args)]
+pub(crate) struct ArtifactTargetArgs {
+    #[command(flatten)]
+    pub input: DocumentInput,
+    /// The work artifact.
+    #[arg(required_unless_present_any = ["json", "yaml", "file"])]
+    pub id: Option<String>,
+    #[arg(long)]
+    #[arg(required_unless_present_any = ["json", "yaml", "file"])]
+    pub claim: Option<String>,
+    #[command(flatten)]
+    pub mutation: MutationOptions,
+}
+#[derive(Args)]
+pub(crate) struct RejectArgs {
+    #[command(flatten)]
+    pub input: DocumentInput,
+    /// The work artifact being rejected.
+    pub artifact: Option<String>,
+    #[arg(long)]
+    pub claim: Option<String>,
+    /// structure or metadata.
+    #[arg(long)]
+    pub reason: Option<String>,
+    #[arg(long)]
+    pub id: Option<String>,
+    #[arg(long)]
+    pub kind: Option<String>,
+    #[arg(long)]
+    pub schema_hash: Option<String>,
+    #[arg(long, conflicts_with = "text")]
+    pub payload_file: Option<PathBuf>,
+    #[arg(long, conflicts_with = "payload_file")]
+    pub text: Option<String>,
+    #[arg(long)]
+    pub metadata_file: Option<PathBuf>,
+    #[arg(long)]
+    pub input_json: Vec<String>,
+    #[arg(long)]
+    pub visibility: Vec<String>,
+    #[command(flatten)]
+    pub mutation: MutationOptions,
 }
 #[derive(Args)]
 pub(crate) struct RegisterArtifactArgs {
@@ -570,6 +942,24 @@ pub(crate) struct AcquireArgs {
 #[derive(Subcommand)]
 pub(crate) enum ReceiptCommand {
     Acquire(AcquireArgs),
+    /// Native engine: as the issuer, replace the claim's current holder.
+    Adopt(AdoptArgs),
+}
+#[derive(Args)]
+pub(crate) struct AdoptArgs {
+    #[command(flatten)]
+    pub input: DocumentInput,
+    #[arg(required_unless_present_any = ["json", "yaml", "file"])]
+    pub claim: Option<String>,
+    /// The new holder (a participant id or self).
+    #[arg(long)]
+    #[arg(required_unless_present_any = ["json", "yaml", "file"])]
+    pub holder: Option<String>,
+    /// New receipt identity; generated once and journaled if omitted.
+    #[arg(long)]
+    pub id: Option<String>,
+    #[command(flatten)]
+    pub mutation: MutationOptions,
 }
 #[derive(Args)]
 pub(crate) struct BeginEvidenceArgs {

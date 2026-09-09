@@ -74,10 +74,13 @@ pub fn placement_digest(spec: &PlacementSpec) -> Result<ContentHash, DirectoryEr
 
 /// Construct a minimum independent-domain placement from measured load and
 /// declared constraints. A proposal executes no join, transfer, or promotion.
+/// Nodes reporting less than `min_disk_available` bytes of headroom are not
+/// candidates: a copy that cannot be installed is never planned.
 pub fn propose_placement(
     nodes: &BTreeMap<u64, NodeRecord>,
     policy: &PlacementPolicy,
     max_members: usize,
+    min_disk_available: u64,
 ) -> Result<PlacementProposal, DirectoryError> {
     let needed = usize::from(policy.durability.max_failures)
         .checked_mul(2)
@@ -91,11 +94,13 @@ pub fn propose_placement(
         .filter_map(|node| {
             let load = node.load?;
             (node.enrollment.eligible
+                && node.is_alive()
                 && failure_domain(&node.enrollment, policy.durability.survive).is_ok()
                 && (policy.residency.is_empty()
                     || policy.residency.contains(&node.enrollment.region))
                 && load.generation == node.enrollment.generation
-                && load.available_memory >= policy.required_memory)
+                && load.available_memory >= policy.required_memory
+                && load.disk_available >= min_disk_available)
                 .then_some((node, load))
         })
         .collect();
@@ -105,6 +110,7 @@ pub fn propose_placement(
                 && !policy.home_regions.contains(&node.enrollment.region),
             load.active_weight,
             std::cmp::Reverse(load.available_memory),
+            std::cmp::Reverse(load.disk_available),
             node.enrollment.node,
         )
     });
@@ -192,6 +198,9 @@ pub fn verify_placement(
             if !node.enrollment.eligible || node.enrollment.generation != *generation {
                 return Err(DirectoryError::StaleNode);
             }
+            if !node.is_alive() {
+                return Err(DirectoryError::DeadNode);
+            }
             if !spec.policy.residency.is_empty()
                 && !spec.policy.residency.contains(&node.enrollment.region)
             {
@@ -244,12 +253,15 @@ pub fn verify_placement(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Domain {
+pub(crate) enum Domain {
     Node(u64),
     Zone(RegionId, ZoneId),
     Region(RegionId),
 }
-fn failure_domain(node: &NodeEnrollment, class: FailureClass) -> Result<Domain, DirectoryError> {
+pub(crate) fn failure_domain(
+    node: &NodeEnrollment,
+    class: FailureClass,
+) -> Result<Domain, DirectoryError> {
     match class {
         FailureClass::Node => Ok(Domain::Node(node.node)),
         FailureClass::Zone if node.region.0 != [0; 16] && node.zone.0 != [0; 16] => {

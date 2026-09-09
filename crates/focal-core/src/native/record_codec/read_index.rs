@@ -18,9 +18,29 @@ enum Value<'a> {
     Claim(&'a [u8]),
     Artifact(Origin),
 }
+/// Who proved an artifact's custody: a participant request, or the import
+/// translation, whose key derives from the descriptor's producer (23 §5.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ArtifactRequest {
+    Request(RequestKey),
+    Import,
+}
+impl ArtifactRequest {
+    pub(super) fn resolve(
+        self,
+        ledger: LedgerId,
+        id: ArtifactId,
+        producer: ParticipantId,
+    ) -> RequestKey {
+        match self {
+            Self::Request(key) => key,
+            Self::Import => import_request(ledger, id, producer),
+        }
+    }
+}
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Origin {
-    pub(super) request: RequestKey,
+    pub(super) request: ArtifactRequest,
     pub(super) binding: Binding,
     pub(super) position: PublicationPosition,
 }
@@ -50,7 +70,25 @@ pub(super) fn phase(key: Key) -> Result<usize, NativeError> {
         | Key::Event(..)
         | Key::ClaimIdentity(..)
         | Key::DefinitionIdentity(..)
-        | Key::CreationResult(_) => 0,
+        | Key::CreationResult(_)
+        | Key::LegacyTestament(_)
+        | Key::LegacyEvidenceSet(_)
+        | Key::LegacyRun(..)
+        | Key::LegacyDefinition(_)
+        | Key::ByIssuer(..)
+        | Key::BySubject(..)
+        | Key::ByStatus(..)
+        | Key::ByAction(..)
+        | Key::ByScope(..)
+        | Key::ByRelation(..)
+        | Key::ByProducer(..)
+        | Key::ByArtifactKind(..)
+        | Key::BySchema(..)
+        | Key::ArtifactInput(..)
+        | Key::ByEvaluator(..)
+        | Key::ByVerdict(..)
+        | Key::ByCreated(..)
+        | Key::DueTimer(..) => 0,
         Key::Definition(_) | Key::ClaimContent(_) => 1,
         Key::Artifact(_) => 2,
         Key::Diagnostic(_) | Key::Work(_) => 3,
@@ -144,8 +182,10 @@ impl<'a> Index<'a> {
                         return Err(invalid());
                     }
                     if let NativeFact::Artifact { binding } = event.fact {
-                        let NativeInvocation::Request(request) = event.invocation else {
-                            return Err(invalid());
+                        let request = match event.invocation {
+                            NativeInvocation::Request(request) => ArtifactRequest::Request(request),
+                            NativeInvocation::Import => ArtifactRequest::Import,
+                            _ => return Err(invalid()),
                         };
                         if binding.ledger != checkpoint.header().ledger || binding.object.is_zero()
                         {

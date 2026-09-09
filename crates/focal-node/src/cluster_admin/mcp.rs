@@ -108,6 +108,7 @@ impl AdminBackend for ClusterAdmin {
                     id,
                     expected_revision,
                 } => self.revoke(id, expected_revision).await,
+                AdminAction::RenewCredential => self.renew_credential().await,
                 AdminAction::Status => self.read(AdminRead::Membership).await,
                 AdminAction::Configuration => self.read(AdminRead::Configuration).await,
                 AdminAction::Contacts => self.read(AdminRead::Contacts).await,

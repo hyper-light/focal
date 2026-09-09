@@ -1,9 +1,8 @@
 //! Scoped statements from authenticated enrolled peers. An embedding producer
 //! signs only after its corresponding log/custody operation is durably committed.
 use crate::*;
-use focal_enrollment::{
-    CredentialMaterial, EnrollmentRegistry, SignedNodeStatement, server_fingerprint,
-};
+use focal_enrollment::certificate_key_hash;
+use focal_enrollment::{CredentialMaterial, EnrollmentRegistry, SignedNodeStatement};
 use focal_model::{ContentHash, RaftIndex, RaftTerm};
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +25,8 @@ pub enum AuthorityFact {
         term: RaftTerm,
         record_hash: ContentHash,
     },
+    /// Self-signed like `Replica`: the attestation field is zero in the body.
+    Custody(CustodyProof),
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorityStatement {
@@ -185,9 +186,13 @@ impl InstalledAuthorityVerifier<'_> {
                 .registry
                 .node(node)
                 .ok_or(DirectoryError::UnverifiedAuthority)?;
+            // The signing certificate is authorized by the registry above; the
+            // grant binds the key it carries, so a renewed certificate of the
+            // same key keeps signing for the same enrollment.
+            let key = certificate_key_hash(&signature.certificate)
+                .map_err(|_| DirectoryError::UnverifiedAuthority)?;
             if enrolled.principal != identity.principal
-                || enrolled.enrollment.identity
-                    != ContentHash(server_fingerprint(&signature.certificate))
+                || enrolled.enrollment.identity != ContentHash(key)
                 || !enrolled.enrollment.eligible
                 || enrolled.expires_at < proof.statement.expires_at
             {
@@ -230,7 +235,7 @@ impl InstalledAuthorityVerifier<'_> {
         }
         Ok(())
     }
-    pub(crate) fn verify_membership(&self, proof: &AuthorityProof) -> Result<(), DirectoryError> {
+    pub fn verify_membership(&self, proof: &AuthorityProof) -> Result<(), DirectoryError> {
         let current = self.group_for(proof)?;
         let AuthorityFact::Membership {
             next,
@@ -241,13 +246,23 @@ impl InstalledAuthorityVerifier<'_> {
         else {
             return Err(DirectoryError::WrongOperation);
         };
+        // A membership epoch counts voter-set changes, matching the epoch a
+        // session fence carries; adding or removing learners keeps it.
+        let voters_changed =
+            next.voters != current.voters || next.outgoing_voters != current.outgoing_voters;
+        let expected_epoch = if voters_changed {
+            current.membership_epoch.checked_add(1)
+        } else {
+            Some(current.membership_epoch)
+        };
         if index.0 == 0
             || term.0 == 0
             || !types::nonzero_hash(*record_hash)
             || next.group != current.group
             || next.genesis != current.genesis
             || next.scope != current.scope
-            || current.membership_epoch.checked_add(1) != Some(next.membership_epoch)
+            || expected_epoch != Some(next.membership_epoch)
+            || (!voters_changed && next.learners == current.learners)
         {
             return Err(DirectoryError::StaleEpoch);
         }
@@ -329,6 +344,26 @@ impl AuthorityVerifier for InstalledAuthorityVerifier<'_> {
             return Err(DirectoryError::UnverifiedAuthority);
         }
         self.signatures(proof, Some(ready.node))
+    }
+    fn verify_custody(&self, proof: &CustodyProof) -> Result<(), DirectoryError> {
+        let mut body = proof.clone();
+        body.attestation = ContentHash([0; 32]);
+        let signed = self.proofs.iter().find(|candidate| matches!(&candidate.statement.fact, AuthorityFact::Custody(value) if value == &body))
+            .ok_or(DirectoryError::UnverifiedAuthority)?;
+        let group = self.group_for(signed)?;
+        let node = self
+            .registry
+            .node(proof.node)
+            .ok_or(DirectoryError::Missing)?;
+        if group.scope != GroupScope::Session(proof.ledger)
+            || proof.node_generation != node.enrollment.generation
+            || proof.custody_epoch == 0
+            || !types::nonzero_hash(proof.content)
+            || proof.attestation != signed.attestation()?
+        {
+            return Err(DirectoryError::UnverifiedAuthority);
+        }
+        self.signatures(signed, Some(proof.node))
     }
     fn verify_delegation(&self, fence: &DelegationFence) -> Result<(), DirectoryError> {
         if fence.cluster != self.registry.checkpoint().anchor.cluster

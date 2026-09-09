@@ -40,7 +40,7 @@ impl WatchStore {
                 CATALOGUE,
                 MAGIC,
                 &encode(&Catalogue {
-                    schema: 1,
+                    schema: 2,
                     context,
                     entries: vec![],
                 })?,
@@ -134,7 +134,7 @@ impl WatchStore {
         if !rest.is_empty() || encode(&state)? != bytes {
             return Err(WatchError::Corrupt);
         }
-        if state.schema != 1 || state.context != self.context || state.entries.len() > MAX_WATCHES {
+        if state.schema != 2 || state.context != self.context || state.entries.len() > MAX_WATCHES {
             return Err(WatchError::Corrupt);
         }
         for (index, entry) in state.entries.iter().enumerate() {

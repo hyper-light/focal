@@ -133,6 +133,7 @@ fn claim_content(
             requirements: pins,
             slots: &[],
             deadline: None,
+            policy: None,
         },
         claim_descriptor::Limits {
             description_bytes: 256,

@@ -80,6 +80,10 @@ pub(super) fn copy(row: &Row) -> Result<Row, MemoryError> {
     match row {
         Row::ClaimIdentity(id) => Ok(Row::ClaimIdentity(*id)),
         Row::DefinitionIdentity(id) => Ok(Row::DefinitionIdentity(*id)),
+        Row::LegacyTestament(row) => row.copy().map(Row::LegacyTestament),
+        Row::LegacyEvidenceSet(row) => row.copy().map(Row::LegacyEvidenceSet),
+        Row::LegacyRun(row) => row.copy().map(Row::LegacyRun),
+        Row::LegacyDefinition(row) => row.copy().map(Row::LegacyDefinition),
         Row::ClaimContent(row) => {
             #[cfg(test)]
             copy_failure()?;
@@ -129,6 +133,7 @@ pub(super) fn copy(row: &Row) -> Result<Row, MemoryError> {
             row.copy().map(Row::Evaluation)
         }
         Row::ArtifactIdentity(id) => Ok(Row::ArtifactIdentity(*id)),
+        Row::Index => Ok(Row::Index),
         Row::Artifact(row) => {
             #[cfg(test)]
             copy_failure()?;
@@ -1300,7 +1305,14 @@ impl<'a> Fresh<'a> {
                     .rows
                     .future_write_envelope(focal_memory::RangeWriteLimits {
                         changed_keys: construction.max_changes,
-                        deleted_keys: 0,
+                        // Status rows of every moved claim and the due
+                        // timers a report can retire (doc 22 §7).
+                        deleted_keys: add(
+                            construction.max_claim_rows,
+                            construction.max_timer_rows,
+                        )?
+                        .min(construction.max_changes),
+                        deleted_heap: 0,
                         incoming_heap: add(
                             construction.scratch_bytes,
                             add(
@@ -1477,6 +1489,7 @@ impl<'a> Fresh<'a> {
             plan.rows.len(),
             extras.rows.len(),
             usize::try_from(outcome.events).map_err(|_| NativeError::Capacity("events"))?,
+            0,
         )?;
         transactions::increment(
             &mut meta.events,
@@ -1498,6 +1511,7 @@ impl<'a> Fresh<'a> {
             outcome,
             meta: final_meta,
             seals,
+            index,
         } = original
             .with_seals(&mut scratch)?
             .into_changes(construction.changes_bytes, &mut scratch)?;
@@ -1507,9 +1521,9 @@ impl<'a> Fresh<'a> {
             usize::try_from(outcome.events).map_err(|_| NativeError::Capacity("event count"))?;
         let final_extras = changes
             .len()
-            .checked_sub(add(add(changed, events)?, 2)?)
+            .checked_sub(add(add(changed, events)?, add(2, index)?)?)
             .ok_or(ContractError::InvalidManifest)?;
-        construction.check_counts(changed, final_extras, events)?;
+        construction.check_counts(changed, final_extras, events, index)?;
         if final_meta.events != add(view.meta().events, events)? {
             return Err(ContractError::InvalidManifest.into());
         }

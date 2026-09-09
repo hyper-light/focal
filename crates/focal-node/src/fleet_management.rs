@@ -133,6 +133,18 @@ pub(in crate::fleet) enum ManagementWork {
         reply: Reply<FleetRemoval>,
         permit: ManagementPermit,
     },
+    /// Register one more tenant on the running worker: its scheduler quota
+    /// and its budgets. Idempotent for an already admitted tenant.
+    AdmitTenant {
+        tenant: FleetTenant,
+        reply: Reply<()>,
+        permit: ManagementPermit,
+    },
+    /// The queue usage of every admitted tenant.
+    TenantUsage {
+        reply: Reply<BTreeMap<TenantId, QueueUsage>>,
+        permit: ManagementPermit,
+    },
     Quiesce {
         reply: oneshot::Sender<()>,
         _permit: ManagementPermit,
@@ -342,6 +354,38 @@ impl FleetManager {
                 replica: None,
             })
     }
+    /// Whether the fleet hosts sessions of `tenant`.
+    pub fn is_admitted(&self, tenant: TenantId) -> bool {
+        self.state.borrow().tenants.contains_key(&tenant)
+    }
+    /// Admit one more tenant at runtime. The budget must descend from the
+    /// fleet's; sessions of the tenant are then installable under it.
+    pub async fn admit_tenant(&self, tenant: FleetTenant) -> Result<(), FleetError> {
+        if tenant.tenant.is_zero() || !tenant.budget.is_within(&self.budget) {
+            return Err(FleetError::InvalidSession);
+        }
+        let permit = self.permit()?;
+        let (reply, response) = oneshot::channel();
+        self.send(ManagementWork::AdmitTenant {
+            tenant,
+            reply,
+            permit,
+        })?;
+        response
+            .await
+            .map_err(|_| FleetError::Unavailable)?
+            .map(|_| ())
+    }
+    /// The queue usage of every admitted tenant, from the worker.
+    pub async fn tenant_usage(&self) -> Result<BTreeMap<TenantId, QueueUsage>, FleetError> {
+        let permit = self.permit()?;
+        let (reply, response) = oneshot::channel();
+        self.send(ManagementWork::TenantUsage { reply, permit })?;
+        response
+            .await
+            .map_err(|_| FleetError::Unavailable)?
+            .map(|reply| reply.value)
+    }
     fn send(&self, work: ManagementWork) -> Result<(), FleetError> {
         self.sender
             .try_send(FleetInput::Management(work))
@@ -462,8 +506,64 @@ pub(super) struct ManagementOwner {
     max_sessions: usize,
     sender: mpsc::SyncSender<FleetInput>,
     outbound: async_mpsc::Sender<ReplicationFrame>,
+    /// The queue-slot allowance every tenant's per-session slots descend from.
+    items: MemoryBudget,
+}
+/// The scheduler quota every tenant receives.
+fn tenant_quota(weight: u32, max_sessions: usize) -> TenantQuota {
+    TenantQuota {
+        weight,
+        max_items: 256,
+        reserved_items: 32,
+        max_bytes: 16 * 1024 * 1024,
+        reserved_bytes: 2 * 1024 * 1024,
+        session_items: 128,
+        session_reserved_items: 16,
+        session_bytes: 8 * 1024 * 1024,
+        session_reserved_bytes: 1024 * 1024,
+        max_sessions,
+    }
 }
 impl ManagementOwner {
+    fn admit_tenant(
+        &mut self,
+        group: &mut GroupOwner,
+        tenant: FleetTenant,
+    ) -> Result<(), FleetError> {
+        if self.state.borrow().tenants.contains_key(&tenant.tenant) {
+            return Ok(());
+        }
+        group
+            .scheduler
+            .register_tenant(
+                tenant.tenant,
+                tenant_quota(tenant.weight, self.max_sessions),
+            )
+            .map_err(|error| match error {
+                DirectoryError::Duplicate => FleetError::Conflict,
+                _ => FleetError::Capacity,
+            })?;
+        let items = self
+            .items
+            .child(256, 32)
+            .map_err(|_| FleetError::Capacity)?;
+        self.state.send_modify(|state| {
+            state.tenants.insert(tenant.tenant, (tenant.budget, items));
+        });
+        Ok(())
+    }
+    fn tenant_usage(
+        &self,
+        group: &GroupOwner,
+    ) -> Result<BTreeMap<TenantId, QueueUsage>, FleetError> {
+        let mut usage = BTreeMap::new();
+        for tenant in self.state.borrow().tenants.keys() {
+            if let Some(entry) = group.scheduler.usage(*tenant) {
+                usage.insert(*tenant, entry);
+            }
+        }
+        Ok(usage)
+    }
     pub(super) fn has_manager(&self) -> bool {
         self.state.receiver_count() != 0
     }
@@ -695,6 +795,24 @@ impl ManagementOwner {
                     _permit: permit,
                 }));
             }
+            ManagementWork::AdmitTenant {
+                tenant,
+                reply,
+                permit,
+            } => {
+                let result = self.admit_tenant(group, tenant);
+                let _ = reply.send(result.map(|value| FleetReply {
+                    value,
+                    _permit: permit,
+                }));
+            }
+            ManagementWork::TenantUsage { reply, permit } => {
+                let result = self.tenant_usage(group);
+                let _ = reply.send(result.map(|value| FleetReply {
+                    value,
+                    _permit: permit,
+                }));
+            }
             ManagementWork::Quiesce { reply, .. } => {
                 self.state.send_modify(|state| state.quiesced = true);
                 let _ = reply.send(());
@@ -798,18 +916,7 @@ impl ReplicaFleet {
             scheduler
                 .register_tenant(
                     tenant.tenant,
-                    TenantQuota {
-                        weight: tenant.weight,
-                        max_items: 256,
-                        reserved_items: 32,
-                        max_bytes: 16 * 1024 * 1024,
-                        reserved_bytes: 2 * 1024 * 1024,
-                        session_items: 128,
-                        session_reserved_items: 16,
-                        session_bytes: 8 * 1024 * 1024,
-                        session_reserved_bytes: 1024 * 1024,
-                        max_sessions: config.max_sessions,
-                    },
+                    tenant_quota(tenant.weight, config.max_sessions),
                 )
                 .map_err(|_| LedgerError::Capacity)?;
             tenant_budgets.insert(tenant.tenant, (tenant.budget, item_budget.child(256, 32)?));
@@ -846,6 +953,7 @@ impl ReplicaFleet {
             max_sessions: config.max_sessions,
             sender,
             outbound,
+            items: item_budget,
         };
         let group = GroupOwner {
             sessions: BTreeMap::new(),

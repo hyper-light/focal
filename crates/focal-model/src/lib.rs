@@ -19,6 +19,7 @@ pub mod durable_v1;
 mod ids;
 pub mod lifecycle;
 mod managed;
+pub mod native_event;
 mod objects;
 mod reconciliation;
 #[doc(hidden)]

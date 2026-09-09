@@ -16,6 +16,7 @@ use focal_model::{
 
 #[path = "read_claim_build.rs"]
 mod build;
+pub(super) use build::policy_shape;
 #[path = "read_claim_sources.rs"]
 mod sources;
 pub(super) use build::Limits;
@@ -62,6 +63,7 @@ impl<'a> Input<'a> {
             issuer: fields::participant(c)?,
             subject: fields::participant(c)?,
             created: fields::sequence(c)?,
+            origin: fields::claim_origin(c)?,
             status: fields::claim_status(c)?,
             receipt: fields::optional(c, fields::entitlement)?,
             max_responses: c.u32()?,

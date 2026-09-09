@@ -364,3 +364,27 @@ fn stored_wrapper_needs_neither_clone_nor_live_serde_for_its_fields() {
     assert_eq!(decoded.content_hash(), ContentHash([0xfe; 32]));
     assert_eq!(decoded.lifecycle().0, [4, 5]);
 }
+
+#[test]
+fn the_frozen_codec_refuses_exact_evidence_relation_targets() {
+    use crate::{ArtifactId, ArtifactRef, Relation, RelationKind, RelationTarget};
+    let relation = Relation {
+        kind: RelationKind::Reviews,
+        target: RelationTarget::Evidence(ArtifactRef {
+            id: ArtifactId::from_u128(4),
+            hash: ContentHash([5; 32]),
+        }),
+    };
+    assert!(postcard::to_stdvec(&Ref(&relation)).is_err());
+    let claim_relation = Relation {
+        kind: RelationKind::Reviews,
+        target: RelationTarget::Object(ObjectRef::claim(
+            LedgerId {
+                tenant: TenantId::from_u128(1),
+                session: SessionId::from_u128(2),
+            },
+            ClaimId::from_u128(4),
+        )),
+    };
+    assert!(postcard::to_stdvec(&Ref(&claim_relation)).is_ok());
+}

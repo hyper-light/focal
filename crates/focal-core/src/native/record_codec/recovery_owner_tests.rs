@@ -5,6 +5,7 @@ use super::tests as checkpoint;
 use super::*;
 use crate::native::report_tests as f;
 use focal_evidence::BuiltinNativeSchemas;
+use focal_evidence::ContentStore;
 use focal_memory::{Allocation, BudgetKind};
 use focal_model::lifecycle::artifact_descriptor::{ResultProvenance, WorkProvenance, WorkRole};
 use focal_model::lifecycle::evidence::EvidenceFailure;

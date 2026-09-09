@@ -100,6 +100,7 @@ fn decode_fixed(key: Key, c: &mut Cursor<'_>) -> Result<Option<Row>, CodecError>
             monitors: count(c)?,
             monitor_links: count(c)?,
             creation_results: count(c)?,
+            legacy: count(c)?,
             logical_time: c.u64()?,
         }),
         Key::ArtifactIdentity(_) => Row::ArtifactIdentity(ArtifactId(c.fixed()?)),
@@ -130,6 +131,25 @@ fn decode_fixed(key: Key, c: &mut Cursor<'_>) -> Result<Option<Row>, CodecError>
         Key::Outcome(_) => Row::Outcome(fixed::read_outcome(c)?),
         Key::ClaimIdentity(..) => Row::ClaimIdentity(ClaimId(c.fixed()?)),
         Key::DefinitionIdentity(..) => Row::DefinitionIdentity(ValidationId(c.fixed()?)),
+        Key::ByIssuer(..)
+        | Key::BySubject(..)
+        | Key::ByStatus(..)
+        | Key::ByAction(..)
+        | Key::ByScope(..)
+        | Key::ByRelation(..)
+        | Key::ByProducer(..)
+        | Key::ByArtifactKind(..)
+        | Key::BySchema(..)
+        | Key::ArtifactInput(..)
+        | Key::ByEvaluator(..)
+        | Key::ByVerdict(..)
+        | Key::ByCreated(..)
+        | Key::DueTimer(..) => {
+            if c.u8()? != 1 {
+                return Err(CodecError::InvalidTag("index row"));
+            }
+            Row::Index
+        }
         _ => return Ok(None),
     }))
 }
@@ -199,6 +219,7 @@ fn invocation(value: NativeInvocation) -> bool {
                 && !key.timer.is_zero()
                 && key.generation != 0
         }
+        NativeInvocation::Import => true,
     }
 }
 
@@ -284,6 +305,7 @@ pub(super) fn check_fixed(key: Key, row: &Row, ledger: LedgerId) -> Result<(), N
                     NativeOperation::EvaluationDeadline
                         | NativeOperation::ClaimDeadline
                         | NativeOperation::MonitorDeadline
+                        | NativeOperation::Import
                 ),
                 NativeInvocation::EvaluationDeadline(_) => {
                     row.operation == NativeOperation::EvaluationDeadline
@@ -293,6 +315,9 @@ pub(super) fn check_fixed(key: Key, row: &Row, ledger: LedgerId) -> Result<(), N
                 }
                 NativeInvocation::MonitorDeadline(_) => {
                     row.operation == NativeOperation::MonitorDeadline
+                }
+                NativeInvocation::Import => {
+                    row.operation == NativeOperation::Import && row.sequence == SessionSeq(1)
                 }
             };
             key == row.invocation
@@ -306,6 +331,54 @@ pub(super) fn check_fixed(key: Key, row: &Row, ledger: LedgerId) -> Result<(), N
         }
         (Key::DefinitionIdentity(schema, hash), Row::DefinitionIdentity(id)) => {
             schema != 0 && hash.0 != [0; 32] && !id.is_zero()
+        }
+        (Key::ByIssuer(participant, claim) | Key::BySubject(participant, claim), Row::Index) => {
+            !participant.is_zero() && !claim.is_zero()
+        }
+        (Key::ByStatus(code, claim), Row::Index) => {
+            ClaimStatus::from_code(code).is_some() && !claim.is_zero()
+        }
+        (Key::ByAction(code, claim), Row::Index) => {
+            focal_model::ActionType::from_code(code).is_some() && !claim.is_zero()
+        }
+        (Key::ByScope(kind, hash, claim), Row::Index) => {
+            focal_model::ScopeKind::from_code(kind).is_some()
+                && hash.0 != [0; 32]
+                && !claim.is_zero()
+        }
+        (Key::ByRelation(kind, target, claim), Row::Index) => {
+            focal_model::RelationKind::from_code(kind).is_some()
+                && !target.is_zero()
+                && !claim.is_zero()
+                && target != claim
+        }
+        (Key::ByProducer(participant, artifact), Row::Index) => {
+            !participant.is_zero() && !artifact.is_zero()
+        }
+        (Key::ByArtifactKind(hash, artifact) | Key::BySchema(hash, artifact), Row::Index) => {
+            hash.0 != [0; 32] && !artifact.is_zero()
+        }
+        (Key::ArtifactInput(input, artifact), Row::Index) => {
+            !input.is_zero() && !artifact.is_zero()
+        }
+        (Key::ByEvaluator(participant, validation), Row::Index) => {
+            !participant.is_zero() && !validation.is_zero()
+        }
+        (Key::ByVerdict(code, key), Row::Index) => {
+            focal_model::VerdictValue::from_code(code).is_some() && evaluation(key.evaluation)
+        }
+        (Key::ByCreated(family, sequence, object), Row::Index) => {
+            focal_model::ObjectKind::from_code(family).is_some()
+                && sequence.0 != 0
+                && !object.is_zero()
+        }
+        (Key::DueTimer(at, target), Row::Index) => {
+            at != 0
+                && match target {
+                    TimerTarget::Claim(claim) => !claim.is_zero(),
+                    TimerTarget::Evaluation(key) => evaluation(key),
+                    TimerTarget::Monitor(claim, monitor) => !claim.is_zero() && !monitor.is_zero(),
+                }
         }
         _ => false,
     };

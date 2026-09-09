@@ -5,6 +5,10 @@ use crate::{
     operation_store::{OperationIntent, files::Directory},
     pending::OperationContext,
 };
+use focal_wire::{
+    MAX_NATIVE_LIST_VISITS, NATIVE_PROTOCOL_VERSION, NativeClaimExpand, NativeListFilter,
+    NativeListRequest, NativeReadQuery, NativeReadRequest,
+};
 use std::path::Path;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -18,6 +22,15 @@ enum Phase {
     Tail {
         cursor: CursorToken,
     },
+    /// The client-driven seed of a native watch: `token` is the published
+    /// stream position the source reported when it pinned the snapshot at
+    /// `cursor`; seed reads are linearizable, so they see a prefix at least
+    /// that new.
+    NativeSeed {
+        cursor: CursorToken,
+        token: ReadToken,
+        next: NativeSeedNext,
+    },
 }
 #[derive(Clone, Serialize, Deserialize)]
 enum Pending {
@@ -26,6 +39,7 @@ enum Pending {
         operation: StreamRequest,
     },
     Read(RequestEnvelope),
+    NativeRead(RequestEnvelope),
 }
 #[derive(Serialize, Deserialize)]
 struct State {
@@ -63,6 +77,13 @@ impl State {
                 }
             }
             Phase::Tail { cursor } => self.cursor(cursor)?,
+            Phase::NativeSeed { cursor, token, .. } => {
+                if self.options.engine != WatchEngine::Native {
+                    return Err(WatchError::Corrupt);
+                }
+                self.cursor(cursor)?;
+                self.token(token)?;
+            }
         }
         if let Some(key) = self.cleanup {
             self.key(key)?;
@@ -97,6 +118,15 @@ impl State {
                             acknowledged: Some(cursor),
                             credits: self.options.credits(),
                         },
+                        Phase::NativeSeed {
+                            cursor,
+                            next: NativeSeedNext::Complete,
+                            ..
+                        } => StreamRequest::CompleteSeed {
+                            cursor,
+                            filter: self.options.filter(),
+                            snapshot: cursor.position.sequence,
+                        },
                         _ => return Err(WatchError::Corrupt),
                     };
                     if operation != &expected {
@@ -127,6 +157,23 @@ impl State {
                                 },
                                 max_items: self.options.max_items,
                             })
+                    {
+                        return Err(WatchError::Corrupt);
+                    }
+                }
+                Pending::NativeRead(request) => {
+                    let Phase::NativeSeed { next, .. } = &self.phase else {
+                        return Err(WatchError::Corrupt);
+                    };
+                    let Some(operation) = self.native_seed_operation(next) else {
+                        return Err(WatchError::Corrupt);
+                    };
+                    if request.protocol != NATIVE_PROTOCOL_VERSION
+                        || request.ledger != self.context.ledger
+                        || request.request_epoch != RequestEpoch(1)
+                        || request.request_id.is_zero()
+                        || request.route_epoch.0 == 0
+                        || request.operation != operation
                     {
                         return Err(WatchError::Corrupt);
                     }
@@ -182,6 +229,17 @@ impl State {
                         &WireLimits::default(),
                     )
                     .map_err(|_| WatchError::Corrupt)?;
+                }
+                WatchPage::NativeSeed { token, objects, .. } => {
+                    if !matches!(self.phase, Phase::NativeSeed { .. }) {
+                        return Err(WatchError::Corrupt);
+                    }
+                    self.token(*token)?;
+                    if self.options.engine != WatchEngine::Native
+                        || objects.len() > self.options.max_items as usize
+                    {
+                        return Err(WatchError::Corrupt);
+                    }
                 }
                 WatchPage::Events { page } => {
                     self.token(page.token)?;
@@ -263,6 +321,74 @@ impl State {
             Ok(())
         }
     }
+    /// The first native seed step for the saved options: every claim of a
+    /// claim filter is read with its responses and evaluations; an unfiltered
+    /// watch lists the family (responses are reached through their claims).
+    fn native_seed_start(&self) -> NativeSeedNext {
+        if self.options.claims.is_empty() {
+            NativeSeedNext::List { cursor: None }
+        } else {
+            NativeSeedNext::Claim { index: 0 }
+        }
+    }
+    /// The exact native read one seed step sends; `None` once the seed is
+    /// complete. A linearizable read after the source pinned the snapshot is
+    /// served at a prefix no older than that snapshot; lists are served at
+    /// the authority's committed prefix the same way.
+    fn native_seed_operation(&self, next: &NativeSeedNext) -> Option<Operation> {
+        match next {
+            NativeSeedNext::Claim { index } => {
+                let id = *self.options.claims.get(*index as usize)?;
+                Some(Operation::NativeRead(NativeReadRequest {
+                    consistency: ReadConsistency::Linearizable,
+                    query: NativeReadQuery::Claim {
+                        id,
+                        expand: NativeClaimExpand {
+                            content: true,
+                            scopes: true,
+                            responses: true,
+                            evaluations: true,
+                            history: false,
+                        },
+                    },
+                    max_items: self.options.max_items,
+                }))
+            }
+            NativeSeedNext::List { cursor } => {
+                let filter = match self.options.family {
+                    Some(ObjectKind::Artifact) => NativeListFilter::Artifacts {
+                        producer: None,
+                        kind: None,
+                        schema: None,
+                        input: None,
+                    },
+                    Some(ObjectKind::Validation) => NativeListFilter::Definitions {
+                        claim: None,
+                        evaluator: None,
+                    },
+                    None | Some(ObjectKind::Claim) | Some(ObjectKind::Testament) => {
+                        NativeListFilter::Claims {
+                            issuer: None,
+                            subject: None,
+                            status: None,
+                            action: None,
+                            scope: None,
+                            relation: None,
+                            created_after: None,
+                        }
+                    }
+                };
+                let max_items = self.options.max_items.min(NATIVE_SEED_ITEMS);
+                Some(Operation::NativeList(NativeListRequest {
+                    filter,
+                    cursor: cursor.clone(),
+                    max_items,
+                    max_visits: max_items.saturating_mul(16).min(MAX_NATIVE_LIST_VISITS),
+                }))
+            }
+            NativeSeedNext::Complete => None,
+        }
+    }
 }
 
 /// An owned exact request. Keep it until `accept`; dropping it leaves the
@@ -306,7 +432,7 @@ impl WatchJournal {
                 *target = *source;
             }
             let state = State {
-                schema: 1,
+                schema: 2,
                 context,
                 name: name.into(),
                 options: options.clone(),
@@ -328,7 +454,7 @@ impl WatchJournal {
         if !rest.is_empty() || encode(&state)? != bytes {
             return Err(WatchError::Corrupt);
         }
-        if state.schema != 1
+        if state.schema != 2
             || state.context != context
             || state.name != name
             || state.options != options
@@ -379,8 +505,10 @@ impl WatchJournal {
             acknowledged: self.state.acknowledged,
             pending: self.state.pending.is_some(),
             delivery: self.state.delivery.as_ref().map(|d| d.id),
-            seeding: matches!(self.state.phase, Phase::Seed { .. })
-                || matches!(self.state.phase, Phase::Start) && self.state.options.seed,
+            seeding: matches!(
+                self.state.phase,
+                Phase::Seed { .. } | Phase::NativeSeed { .. }
+            ) || matches!(self.state.phase, Phase::Start) && self.state.options.seed,
         }
     }
     pub fn delivery(&self) -> Option<&WatchDelivery> {
@@ -462,6 +590,24 @@ impl WatchJournal {
                     acknowledged: Some(cursor),
                     credits,
                 }),
+                Phase::NativeSeed {
+                    cursor,
+                    next: NativeSeedNext::Complete,
+                    ..
+                } => Some(StreamRequest::CompleteSeed {
+                    cursor,
+                    filter,
+                    snapshot: cursor.position.sequence,
+                }),
+                Phase::NativeSeed { ref next, .. } => {
+                    let operation = self
+                        .state
+                        .native_seed_operation(next)
+                        .ok_or(WatchError::Corrupt)?;
+                    let request = self.envelope(fresh(ids)?, operation);
+                    self.state.pending = Some(Pending::NativeRead(request));
+                    None
+                }
             };
             if let Some(operation) = operation {
                 let status = self.requests.store()?.status()?;
@@ -481,7 +627,7 @@ impl WatchJournal {
         }
         let pending = self.state.pending.as_ref().ok_or(WatchError::Corrupt)?;
         let request = match pending {
-            Pending::Read(request) => request.clone(),
+            Pending::Read(request) | Pending::NativeRead(request) => request.clone(),
             Pending::Managed { key, operation } => {
                 let store = self.requests.store()?;
                 let id = ManagedOperationId::from_key(*key)?;
@@ -556,6 +702,50 @@ impl WatchJournal {
             (Pending::Read(saved), Response::Read(page)) if saved == &action.request => {
                 WatchPage::Seed { page }
             }
+            (Pending::NativeRead(saved), Response::NativeRead(page))
+                if saved == &action.request =>
+            {
+                let Phase::NativeSeed {
+                    next: NativeSeedNext::Claim { index },
+                    ..
+                } = self.state.phase
+                else {
+                    return Err(WatchError::InvalidResponse);
+                };
+                let next = index.checked_add(1).ok_or(WatchError::Capacity)?;
+                WatchPage::NativeSeed {
+                    token: page.token,
+                    objects: page.objects,
+                    next: if (next as usize) < self.state.options.claims.len() {
+                        NativeSeedNext::Claim { index: next }
+                    } else {
+                        NativeSeedNext::Complete
+                    },
+                }
+            }
+            (Pending::NativeRead(saved), Response::NativeListed(page))
+                if saved == &action.request =>
+            {
+                if !matches!(
+                    self.state.phase,
+                    Phase::NativeSeed {
+                        next: NativeSeedNext::List { .. },
+                        ..
+                    }
+                ) {
+                    return Err(WatchError::InvalidResponse);
+                }
+                WatchPage::NativeSeed {
+                    token: page.token,
+                    objects: page.objects,
+                    next: match page.next {
+                        Some(cursor) => NativeSeedNext::List {
+                            cursor: Some(cursor),
+                        },
+                        None => NativeSeedNext::Complete,
+                    },
+                }
+            }
             (Pending::Managed { key, operation }, Response::Managed(reply)) => {
                 if !matches!(&action.request.operation,Operation::Managed{key:actual,operation:ManagedOperation::Cursor(actual_op)} if actual==key&&actual_op==operation)
                 {
@@ -570,6 +760,20 @@ impl WatchJournal {
                     self.state.cleanup = cleanup;
                     self.state.phase = Phase::Tail {
                         cursor: stream.cursor,
+                    };
+                    self.state.pending = None;
+                    return self.save();
+                }
+                if self.state.options.engine == WatchEngine::Native
+                    && matches!(operation, StreamRequest::Open { seed: true, .. })
+                {
+                    // The source pinned the snapshot; the seed itself is read
+                    // by this journal, so nothing is delivered for the open.
+                    self.state.cleanup = cleanup;
+                    self.state.phase = Phase::NativeSeed {
+                        cursor: stream.cursor,
+                        token: stream.token,
+                        next: self.state.native_seed_start(),
                     };
                     self.state.pending = None;
                     return self.save();
@@ -643,6 +847,16 @@ impl WatchJournal {
             WatchPage::Events { page } => Phase::Tail {
                 cursor: page.cursor,
             },
+            WatchPage::NativeSeed { next, .. } => {
+                let Phase::NativeSeed { cursor, token, .. } = self.state.phase else {
+                    return Err(WatchError::Corrupt);
+                };
+                Phase::NativeSeed {
+                    cursor,
+                    token,
+                    next: next.clone(),
+                }
+            }
         };
         self.state.acknowledged = delivery.number;
         self.state.last_ack = Some(id);
@@ -663,20 +877,27 @@ impl WatchJournal {
                     family == ObjectKind::Validation
                 }
             }),
+            WatchPage::NativeSeed { objects, .. } => {
+                objects.retain(|object| native_family(object) == Some(family));
+            }
             WatchPage::Events { page } => page.events.retain(|event| match event {
-                StreamEvent::Delta { delta, .. } => match delta.fact {
-                    DeltaFact::Artifact(_) => family == ObjectKind::Artifact,
-                    DeltaFact::Testament { .. } => family == ObjectKind::Testament,
-                    DeltaFact::ValidationScheduled(_) | DeltaFact::Verdict(_) => {
-                        family == ObjectKind::Validation
+                StreamEvent::Delta { delta, .. } => match &delta.fact {
+                    DeltaFact::Native(record) => {
+                        native_fact_family(&record.fact).is_some_and(|kind| {
+                            kind == family
+                                || family == ObjectKind::Validation
+                                    && matches!(
+                                        record.fact,
+                                        focal_wire::NativeFactRecord::Claim(
+                                            focal_wire::NativeClaimEventRecord {
+                                                kind: focal_wire::NativeEventKindRecord::Created,
+                                                ..
+                                            }
+                                        )
+                                    )
+                        })
                     }
-                    DeltaFact::Status {
-                        previous: None,
-                        current: ClaimStatus::Generated,
-                        ..
-                    } => family == ObjectKind::Claim || family == ObjectKind::Validation,
-                    DeltaFact::Epoch(_) => false,
-                    _ => family == ObjectKind::Claim,
+                    fact => legacy_family(fact, family),
                 },
                 _ => true,
             }),
@@ -685,7 +906,9 @@ impl WatchJournal {
     }
     fn envelope(&self, id: RequestId, operation: Operation) -> RequestEnvelope {
         RequestEnvelope {
-            protocol: if matches!(operation, Operation::Managed { .. }) {
+            protocol: if self.state.options.engine == WatchEngine::Native {
+                NATIVE_PROTOCOL_VERSION
+            } else if matches!(operation, Operation::Managed { .. }) {
                 focal_wire::MANAGED_PROTOCOL_VERSION
             } else {
                 focal_wire::PROTOCOL_VERSION
@@ -712,6 +935,64 @@ impl WatchJournal {
         self.failed = false;
         Ok(())
     }
+}
+/// The presentation family of one legacy delta fact.
+fn legacy_family(fact: &DeltaFact, family: ObjectKind) -> bool {
+    match fact {
+        DeltaFact::Artifact(_) => family == ObjectKind::Artifact,
+        DeltaFact::Testament { .. } => family == ObjectKind::Testament,
+        DeltaFact::ValidationScheduled(_) | DeltaFact::Verdict(_) => {
+            family == ObjectKind::Validation
+        }
+        DeltaFact::Status {
+            previous: None,
+            current: ClaimStatus::Generated,
+            ..
+        } => family == ObjectKind::Claim || family == ObjectKind::Validation,
+        DeltaFact::Epoch(_) => false,
+        DeltaFact::Native(_) => false,
+        _ => family == ObjectKind::Claim,
+    }
+}
+/// The presentation family of one native fact; receipts, registrations and
+/// claim events belong to the claim, evidence to artifacts, responses and
+/// result testaments to testaments, definitions and evaluations to validation.
+fn native_fact_family(fact: &focal_wire::NativeFactRecord) -> Option<ObjectKind> {
+    use focal_wire::NativeFactRecord as F;
+    Some(match fact {
+        F::Claim(_) | F::Receipt { .. } | F::ReceiptAdopted { .. } | F::Registrations { .. } => {
+            ObjectKind::Claim
+        }
+        F::Work { .. } | F::Diagnostic { .. } | F::Artifact { .. } => ObjectKind::Artifact,
+        F::Response { .. } | F::ResultTestament { .. } => ObjectKind::Testament,
+        F::Definition { .. }
+        | F::Evaluation { .. }
+        | F::Accepted { .. }
+        | F::Delivery { .. }
+        | F::Missing { .. } => ObjectKind::Validation,
+    })
+}
+/// The presentation family of one native seed object.
+fn native_family(object: &NativeObject) -> Option<ObjectKind> {
+    Some(match object {
+        NativeObject::Claim(_) | NativeObject::Receipt(_) | NativeObject::Monitor(_) => {
+            ObjectKind::Claim
+        }
+        NativeObject::Artifact(_) | NativeObject::Work(_) | NativeObject::Diagnostic(_) => {
+            ObjectKind::Artifact
+        }
+        NativeObject::Response(_) | NativeObject::ResultTestament(_) => ObjectKind::Testament,
+        NativeObject::Definition(_)
+        | NativeObject::Evaluation(_)
+        | NativeObject::Result(_)
+        | NativeObject::Context(_) => ObjectKind::Validation,
+        NativeObject::Outcome(_)
+        | NativeObject::CreationResult(_)
+        | NativeObject::Event(_)
+        | NativeObject::Standing(_)
+        | NativeObject::Legacy(_)
+        | NativeObject::Missing(_) => return None,
+    })
 }
 
 #[cfg(test)]

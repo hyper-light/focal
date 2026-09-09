@@ -241,6 +241,15 @@ pub(in crate::native) fn check_plan(
                     return Err(ContractError::InvalidPolicy.into());
                 }
                 pair(body, profile, state, &mut visits)?;
+                super::peer::check_one(
+                    Principal::Actor(proof.request.principal),
+                    body,
+                    extras.rows.iter().filter_map(|extra| {
+                        super::super::authored_reads::content(Some(&extra.row))
+                    }),
+                    view,
+                    &mut VisitBudget::new(limits.plan_edges),
+                )?;
                 if !matches!(find(extras, Key::ClaimIdentity(body.schema(), body.content_hash()), &mut visits)?.map(|row| &row.row), Some(Row::ClaimIdentity(found)) if found == id)
                 {
                     return Err(ContractError::InvalidPolicy.into());
@@ -432,6 +441,13 @@ pub(in crate::native) fn check_storage(core: &Core<NativeState>) -> Result<(), N
                         && (target.ledger != view.ledger()
                             || target.kind != ObjectKind::Claim
                             || view.claim(ClaimId(target.id.0)).is_none())
+                    {
+                        return Err(ContractError::InvalidTarget.into());
+                    }
+                    if let RelationTarget::Evidence(evidence) = relation.target
+                        && as_artifact(view.get(Key::Artifact(evidence.id))).is_none_or(
+                            |artifact| artifact.descriptor().content_hash() != evidence.hash,
+                        )
                     {
                         return Err(ContractError::InvalidTarget.into());
                     }

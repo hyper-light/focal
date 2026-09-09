@@ -585,3 +585,271 @@ fn concurrent_processes_adopt_one_exact_registration_discovery_intent() {
         .unwrap();
     assert_eq!(postcard::to_stdvec(&pending).unwrap(), a);
 }
+
+fn closed_reply(request: &RequestEnvelope, index: u64) -> ResponseEnvelope {
+    let Operation::RequestStreamControl {
+        cluster,
+        command: command @ RequestStreamCommand::Close { stream, .. },
+    } = &request.operation
+    else {
+        panic!("close")
+    };
+    request.reply(Response::RequestStreamControlled(
+        RequestStreamControlReply {
+            token: token(request),
+            receipt: RequestStreamControlReceipt {
+                cluster: *cluster,
+                ledger: request.ledger,
+                principal: context().principal,
+                id: request.request_id,
+                intent_hash: request_stream_control_hash(
+                    *cluster,
+                    request.ledger,
+                    context().principal,
+                    command,
+                )
+                .unwrap(),
+                raft_index: index,
+                outcome: RequestStreamControlOutcome::Closed {
+                    stream: *stream,
+                    vacant_generation: stream.generation,
+                },
+            },
+        },
+    ))
+}
+/// A registration reply whose assigned generation is `generation`, exactly
+/// one above the presented generation the registration cited.
+fn registered_reply(request: &RequestEnvelope, index: u64, generation: u64) -> ResponseEnvelope {
+    let Operation::RequestStreamControl {
+        cluster,
+        command:
+            command @ RequestStreamCommand::Register {
+                slot,
+                owner,
+                window,
+                ..
+            },
+    } = &request.operation
+    else {
+        panic!("register")
+    };
+    request.reply(Response::RequestStreamControlled(
+        RequestStreamControlReply {
+            token: token(request),
+            receipt: RequestStreamControlReceipt {
+                cluster: *cluster,
+                ledger: request.ledger,
+                principal: context().principal,
+                id: request.request_id,
+                intent_hash: request_stream_control_hash(
+                    *cluster,
+                    request.ledger,
+                    context().principal,
+                    command,
+                )
+                .unwrap(),
+                raft_index: index,
+                outcome: RequestStreamControlOutcome::Registered(RequestStreamState::Active {
+                    stream: RequestStreamIdentity {
+                        cluster: context().cluster,
+                        ledger: context().ledger,
+                        principal: context().principal,
+                        slot: *slot,
+                        generation,
+                    },
+                    owner: *owner,
+                    revision: 1,
+                    window: *window,
+                    acknowledged_through: 0,
+                }),
+            },
+        },
+    ))
+}
+
+#[test]
+fn a_drained_generation_at_its_rotation_bound_closes_and_the_next_registers_in_a_fresh_store() {
+    let dir = private_dir();
+    let rotate = |dir: &Path| {
+        ManagedRequests::open_with(dir, "CLI.requests", context(), limits(), 2).unwrap()
+    };
+    let owner = rotate(dir.path());
+    // The bound is part of the saved record: another bound cannot open it.
+    assert!(matches!(
+        ManagedRequests::open_with(dir.path(), "CLI.requests", context(), limits(), 3),
+        Err(ManagedRequestsError::Store(StoreError::LimitsMismatch))
+    ));
+    let mut entropy = ids(100);
+    register(&owner, &mut entropy);
+    let store = owner.store().unwrap();
+    let first = complete(&store, 7);
+    let second = complete(&store, 8);
+    owner.mark_delivered(first).unwrap();
+    // One delivered result below the bound acknowledges but does not close.
+    let ack = owner.maintenance(&mut entropy).unwrap().unwrap();
+    assert!(matches!(
+        ack.operation,
+        Operation::RequestStreamControl {
+            command: RequestStreamCommand::Acknowledge { through: 1, .. },
+            ..
+        }
+    ));
+    owner
+        .accept_maintenance(&ack, control_reply(&ack, 12))
+        .unwrap();
+    assert!(owner.maintenance(&mut entropy).unwrap().is_none());
+    assert_eq!(owner.store().unwrap().status().unwrap().issued_through, 2);
+    owner.mark_delivered(second).unwrap();
+    let ack = owner.maintenance(&mut entropy).unwrap().unwrap();
+    owner
+        .accept_maintenance(&ack, control_reply(&ack, 13))
+        .unwrap();
+    // Every ordinal of the bounded generation is retired: issuance stops
+    // durably and the exact close is issued; a reservation is refused.
+    let close = owner.maintenance(&mut entropy).unwrap().unwrap();
+    assert!(matches!(
+        close.operation,
+        Operation::RequestStreamControl {
+            command: RequestStreamCommand::Close {
+                issued_through: 2,
+                ..
+            },
+            ..
+        }
+    ));
+    assert!(matches!(
+        owner.store().unwrap().reserve(RequestId::from_u128(9)),
+        Err(ManagedStoreError::Stopped)
+    ));
+    // A lost reply re-issues the same close from a fresh process.
+    assert_eq!(
+        rotate(dir.path())
+            .maintenance(&mut ids(300))
+            .unwrap()
+            .unwrap(),
+        close
+    );
+    owner
+        .accept_maintenance(&close, closed_reply(&close, 14))
+        .unwrap();
+    // Rotation: the closed generation is fenced locally, its store removed,
+    // and the slot is observed again before registering above it.
+    let read = owner.maintenance(&mut entropy).unwrap().unwrap();
+    assert!(matches!(
+        read.operation,
+        Operation::RequestStreamRead {
+            query: RequestStreamQuery::Slot { slot: 0 },
+            ..
+        }
+    ));
+    assert!(matches!(owner.store(), Err(ManagedRequestsError::NotReady)));
+    assert!(!dir.path().join("CLI.requests").exists());
+    assert_eq!(
+        rotate(dir.path())
+            .maintenance(&mut ids(400))
+            .unwrap()
+            .unwrap(),
+        read
+    );
+    // The vacant slot presents the registry watermark (another pair has
+    // reached generation two), above the closed generation one.
+    owner
+        .accept_maintenance(
+            &read,
+            read_reply(
+                &read,
+                RequestStreamState::Vacant {
+                    slot: 0,
+                    generation: 2,
+                },
+            ),
+        )
+        .unwrap();
+    let register = owner.maintenance(&mut entropy).unwrap().unwrap();
+    assert!(matches!(
+        register.operation,
+        Operation::RequestStreamControl {
+            command: RequestStreamCommand::Register {
+                slot: 0,
+                expected_generation: 2,
+                ..
+            },
+            ..
+        }
+    ));
+    // Assigned exactly one above the presented generation: three.
+    owner
+        .accept_maintenance(&register, registered_reply(&register, 15, 3))
+        .unwrap();
+    assert!(owner.maintenance(&mut entropy).unwrap().is_none());
+    let status = owner.store().unwrap().status().unwrap();
+    assert_eq!(status.stream.generation, 3);
+    assert_eq!(status.issued_through, 0);
+    assert!(dir.path().join("CLI.requests.g2").is_dir());
+    // The retired generation's references are retired, never fresh, and the
+    // new generation issues from ordinal one.
+    assert!(matches!(
+        owner.store().unwrap().receipt(first),
+        Err(ManagedStoreError::Retired)
+    ));
+    let next = owner
+        .store()
+        .unwrap()
+        .reserve(RequestId::from_u128(41))
+        .unwrap();
+    assert_eq!(next.key(context()).ordinal, 1);
+    assert_eq!(next.key(context()).stream.generation, 3);
+    // A reopened coordinator sees the same generation and store.
+    assert_eq!(
+        rotate(dir.path()).store().unwrap().status().unwrap().stream,
+        status.stream
+    );
+}
+
+#[test]
+fn a_rotation_interrupted_between_its_fence_and_the_store_removal_finishes_on_the_next_open() {
+    let dir = private_dir();
+    let owner = open(dir.path());
+    register(&owner, &mut ids(100));
+    let old = dir.path().join("CLI.requests");
+    assert!(old.is_dir());
+    // The durable state a crash leaves after `begin_rotation` recorded the
+    // fence and the next store but before the retired store was removed.
+    let (directory, mut state) = owner.load().unwrap();
+    state.retired.push(Retired {
+        slot: 0,
+        generation: 1,
+    });
+    state.cleanup = Some("CLI.requests".to_string());
+    state.child = Some("CLI.requests.g2".to_string());
+    state.phase = Phase::Scan { slot: 0 };
+    state.accepted = None;
+    owner.save(&directory, &state, true).unwrap();
+    drop(directory);
+    // Every open finishes the removal before any other action; the retired
+    // store is gone, nothing is ready, and the slot is observed again.
+    let reopened = open(dir.path());
+    assert!(!old.exists());
+    let (_, state) = reopened.load().unwrap();
+    assert_eq!(state.cleanup, None);
+    assert_eq!(state.child.as_deref(), Some("CLI.requests.g2"));
+    assert!(matches!(
+        reopened.store(),
+        Err(ManagedRequestsError::NotReady)
+    ));
+    let read = reopened.maintenance(&mut ids(200)).unwrap().unwrap();
+    assert!(matches!(
+        read.operation,
+        Operation::RequestStreamRead {
+            query: RequestStreamQuery::Slot { slot: 0 },
+            ..
+        }
+    ));
+    // A second interruption with the store already gone is not an error.
+    let (directory, mut state) = reopened.load().unwrap();
+    state.cleanup = Some("CLI.requests".to_string());
+    reopened.save(&directory, &state, true).unwrap();
+    drop(directory);
+    assert_eq!(open(dir.path()).load().unwrap().1.cleanup, None);
+}

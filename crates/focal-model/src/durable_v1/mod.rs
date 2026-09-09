@@ -52,6 +52,22 @@ impl<T: V1> Serialize for Sequence<'_, T> {
     }
 }
 
+/// Exact historical Postcard bytes of one value, for retention verbatim.
+pub fn encode<T: V1>(value: &T) -> Result<Vec<u8>, postcard::Error> {
+    postcard::to_stdvec(&Ref(value))
+}
+
+/// Decode exact historical Postcard bytes; trailing bytes are an error.
+pub fn decode<T: V1>(bytes: &[u8]) -> Result<T, postcard::Error> {
+    let mut deserializer = postcard::Deserializer::from_bytes(bytes);
+    let value = T::deserialize_v1(&mut deserializer)?;
+    let rest = deserializer.finalize()?;
+    if !rest.is_empty() {
+        return Err(postcard::Error::DeserializeBadEncoding);
+    }
+    Ok(value)
+}
+
 /// Raw historical Postcard BLAKE3 commitment, without a domain/header prefix.
 /// Streams into the existing bounded digest buffer without a payload allocation.
 pub fn hash<T: V1>(value: &T) -> Result<crate::ContentHash, postcard::Error> {

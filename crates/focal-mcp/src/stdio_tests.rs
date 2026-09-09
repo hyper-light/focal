@@ -79,6 +79,13 @@ struct Running {
 }
 impl Running {
     fn start(path: &Path, reopen: bool) -> Self {
+        Self::start_with(path, reopen, |backend| backend)
+    }
+    fn start_with(
+        path: &Path,
+        reopen: bool,
+        configure: impl FnOnce(Backend<Controlled>) -> Backend<Controlled>,
+    ) -> Self {
         let store = if reopen {
             OperationStore::open(path, StoreLimits::default())
         } else {
@@ -98,7 +105,7 @@ impl Running {
             1,
         )
         .unwrap();
-        let backend = Backend::new(client, build(), context(), store).unwrap();
+        let backend = configure(Backend::new(client, build(), context(), store).unwrap());
         let (client, server) = UnixStream::pair().unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -125,6 +132,10 @@ impl Running {
     }
     fn tool(&mut self, id: u64, name: &str, args: Value) {
         self.rpc(id, "tools/call", json!({"name":name,"arguments":args}));
+    }
+    fn tool_response(&mut self, id: u64, name: &str, args: Value) -> Value {
+        self.tool(id, name, args);
+        self.response(id)
     }
     fn send(&mut self, value: Value) {
         serde_json::to_writer(&mut self.input, &value).unwrap();
@@ -389,5 +400,7 @@ fn unknown_reply_and_eof_leave_exact_epoch_request_recoverable() {
     assert_eq!(journal.next_request().unwrap(), Some(&saved));
 }
 
+#[path = "native_stdio_tests.rs"]
+mod native;
 #[path = "traversal_backend_tests.rs"]
 mod traversal;

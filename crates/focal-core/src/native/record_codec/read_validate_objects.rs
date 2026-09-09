@@ -56,6 +56,7 @@ pub(super) fn claim(
             usize::try_from(receipt.fence.epoch).map_err(|_| ContractError::Capacity)?,
         )?;
     }
+    super::read_validate_index::require_claim(id, claim, read)?;
     let declarations = claim.acceptance().declarations();
     counts.declared_definitions = sum(counts.declared_definitions, declarations.len())?;
     read.charge(sum(declarations.len(), 1)?)?;
@@ -199,6 +200,7 @@ pub(super) fn claim(
         if registration.target() != value.target() || registration.receipt() != value.receipt() {
             return Err(invalid());
         }
+        super::read_validate_index::require_evaluation(key, value, read)?;
     }
     let mut last_registration = None;
     history.registrations(id, read, |event| {
@@ -222,6 +224,7 @@ pub(super) fn claim(
     let (mut last, mut status, mut position, mut children, mut monitors, mut local_seal) =
         (None, None, None, 0usize, 0usize, None);
     let (mut terminal_at, mut owner_released) = (None, None);
+    let mut imported_open = false;
     history.events(Key::Claim(id), read, |event| {
         read.charge(128)?;
         let NativeFact::Claim(recorded) = event.fact else {
@@ -229,8 +232,14 @@ pub(super) fn claim(
         };
         match last {
             None => {
+                let opening = match recorded.kind {
+                    NativeEventKind::Created => true,
+                    NativeEventKind::Imported(_) => event.invocation == NativeInvocation::Import,
+                    _ => false,
+                };
+                imported_open = matches!(recorded.kind, NativeEventKind::Imported(_));
                 if recorded.before.is_some()
-                    || recorded.kind != NativeEventKind::Created
+                    || !opening
                     || recorded.after.revision != ObjectRevision(1)
                     || event.sequence != claim.created()
                 {
@@ -276,6 +285,11 @@ pub(super) fn claim(
                     return Err(invalid());
                 }
             }
+            NativeEventKind::Imported(legacy) => {
+                if event.invocation != NativeInvocation::Import || legacy.0 == 0 {
+                    return Err(invalid());
+                }
+            }
             _ => (),
         }
         if recorded.status.is_terminal() && terminal_at.is_none() {
@@ -298,6 +312,16 @@ pub(super) fn claim(
         || local_seal != claim.local_sealed_at()
         || owner_released != claim.scopes().release_cut().map(|cut| cut.position)
         || scopes.last_cut > read.prefix
+    {
+        return Err(invalid());
+    }
+    // Origin is proven by the chain, the empty policy and the import position.
+    let legacy = claim.origin() == focal_model::lifecycle::claim::ClaimOrigin::Legacy;
+    if legacy != imported_open
+        || legacy
+            && (claim.acceptance().slot_count() != 0
+                || !claim.acceptance().declarations().is_empty()
+                || claim.created() != SessionSeq(1))
     {
         return Err(invalid());
     }
@@ -335,6 +359,7 @@ pub(super) fn definition(
     let claim = read.claim(declaration.claim())?;
     read.charge(const { (usize::BITS as usize + 1) * 16 })?;
     claim.acceptance().check_declaration(declaration)?;
+    super::read_validate_index::require_definition(declaration, read)?;
     let mut found = false;
     history.events(Key::Definition(id), read, |event| {
         read.charge(64)?;
@@ -380,6 +405,80 @@ pub(super) fn definition(
         }
         _ => return Err(invalid()),
     }
+    Ok(())
+}
+
+/// Legacy rows exist only in an imported ledger, name an imported claim and
+/// keep their frozen bytes within the configured bound (23 §5.2). Their bodies
+/// are decoded with the frozen legacy codec and never reinterpreted.
+pub(super) fn legacy(
+    key: Key,
+    row: &Row,
+    read: &ValidationRead<'_, '_>,
+) -> Result<(), NativeError> {
+    read.charge(64)?;
+    let bytes = match (key, row) {
+        (Key::LegacyTestament(id), Row::LegacyTestament(value)) if !id.is_zero() => value.bytes(),
+        (Key::LegacyEvidenceSet(id), Row::LegacyEvidenceSet(value)) if !id.is_zero() => {
+            value.bytes()
+        }
+        (Key::LegacyRun(id, _), Row::LegacyRun(value)) if !id.is_zero() => value.bytes(),
+        (Key::LegacyDefinition(id), Row::LegacyDefinition(value)) if !id.is_zero() => value.bytes(),
+        _ => return Err(invalid()),
+    };
+    if bytes.is_empty() || bytes.len() > read.limits.legacy_row_bytes {
+        return Err(invalid());
+    }
+    read.charge(bytes.len())?;
+    let Row::Outcome(outcome) = read.require(Key::Outcome(NativeInvocation::Import))? else {
+        return Err(invalid());
+    };
+    if outcome.operation != NativeOperation::Import || outcome.ledger != read.ledger {
+        return Err(invalid());
+    }
+    let claim = match key {
+        Key::LegacyTestament(_) => {
+            let testament: focal_model::Testament =
+                focal_model::durable_v1::decode(bytes).map_err(|_| invalid())?;
+            let content = testament.content();
+            if content.ledger != read.ledger {
+                return Err(invalid());
+            }
+            content.claim
+        }
+        Key::LegacyEvidenceSet(id) => {
+            let set: focal_model::EvidenceSet =
+                focal_model::durable_v1::decode(bytes).map_err(|_| invalid())?;
+            if set.id != id {
+                return Err(invalid());
+            }
+            set.claim
+        }
+        Key::LegacyRun(id, _) => {
+            let run: focal_model::ValidationRun =
+                focal_model::durable_v1::decode(bytes).map_err(|_| invalid())?;
+            if run.id.validation != id
+                || !matches!(
+                    read.require(Key::LegacyDefinition(id))?,
+                    Row::LegacyDefinition(_)
+                )
+            {
+                return Err(invalid());
+            }
+            run.claim
+        }
+        Key::LegacyDefinition(_) => {
+            let validation: focal_model::Validation =
+                focal_model::durable_v1::decode(bytes).map_err(|_| invalid())?;
+            let content = validation.content();
+            if content.ledger != read.ledger {
+                return Err(invalid());
+            }
+            content.claim
+        }
+        _ => return Err(invalid()),
+    };
+    read.claim(claim)?;
     Ok(())
 }
 

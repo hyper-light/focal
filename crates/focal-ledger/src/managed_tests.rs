@@ -18,11 +18,20 @@ fn stream_control(id: u128, command: RequestStreamCommand) -> RequestStreamContr
 }
 fn stream_register(s: &mut Session, slot: u32, window: u32) -> RequestStreamIdentity {
     durable_managed_support(s);
+    // A registration cites the generation the slot presents, which is the
+    // registry watermark on a vacant pair.
+    let RequestStreamState::Vacant { generation, .. } = s
+        .request_streams
+        .state(ParticipantId::from_u128(1), slot)
+        .unwrap()
+    else {
+        panic!("slot {slot} is not vacant")
+    };
     let request = stream_control(
         1000 + u128::from(slot),
         RequestStreamCommand::Register {
             slot,
-            expected_generation: 0,
+            expected_generation: generation,
             owner: RequestId::from_u128(2000 + u128::from(slot)),
             window,
         },
@@ -1016,7 +1025,7 @@ fn managed_exhausted_generation_can_close_but_never_wraps_on_register() {
     }
     data.latest.as_mut().unwrap().outcome = RequestStreamControlOutcome::Registered(data.state);
     s.request_streams
-        .restore(checkpoint, s.sequence(), s.applied_raft, &s.budget)
+        .restore(checkpoint, s.sequence(), s.applied_raft, &s.budget, None)
         .unwrap();
     s.checkpoint().unwrap();
     let close = stream_control(
@@ -1094,5 +1103,226 @@ fn managed_capability_is_lazy_durable_and_recovered_decoder_must_confirm_before_
     assert_eq!(
         recovered.managed_support().unwrap().format_hash,
         support.format_hash
+    );
+}
+
+fn principal_control(
+    principal: u128,
+    id: u128,
+    command: RequestStreamCommand,
+) -> RequestStreamControlInput {
+    RequestStreamControlInput {
+        cluster: [9; 16],
+        ledger: identity(),
+        principal: ParticipantId::from_u128(principal),
+        id: RequestId::from_u128(id),
+        command,
+    }
+}
+fn commit_control(s: &mut Session, input: &RequestStreamControlInput) -> RequestStreamControlOutcome {
+    assert!(matches!(
+        s.propose_request_stream(input).unwrap(),
+        RequestStreamSubmission::Pending(_)
+    ));
+    s.poll().unwrap();
+    s.request_stream_receipt(input).unwrap().unwrap().outcome.clone()
+}
+fn registered(outcome: RequestStreamControlOutcome) -> RequestStreamIdentity {
+    match outcome {
+        RequestStreamControlOutcome::Registered(RequestStreamState::Active { stream, .. }) => {
+            stream
+        }
+        other => panic!("{other:?}"),
+    }
+}
+/// Register slot zero for a principal against the generation it observes.
+fn register_for(s: &mut Session, principal: u128, id: u128, expected: u64) -> RequestStreamIdentity {
+    registered(commit_control(
+        s,
+        &principal_control(
+            principal,
+            id,
+            RequestStreamCommand::Register {
+                slot: 0,
+                expected_generation: expected,
+                owner: RequestId::from_u128(id + 1),
+                window: 4,
+            },
+        ),
+    ))
+}
+fn close_for(s: &mut Session, stream: RequestStreamIdentity, id: u128) {
+    let outcome = commit_control(
+        s,
+        &principal_control(
+            u128::from_be_bytes(stream.principal.0),
+            id,
+            RequestStreamCommand::Close {
+                stream,
+                expected_revision: 1,
+                issued_through: 0,
+            },
+        ),
+    );
+    assert!(matches!(outcome, RequestStreamControlOutcome::Closed { .. }), "{outcome:?}");
+}
+
+#[test]
+fn registry_at_capacity_evicts_the_longest_closed_pair_and_never_reuses_a_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = SessionLimits {
+        request_streams: RequestStreamLimits {
+            max_slots: 2,
+            ..RequestStreamLimits::default()
+        },
+        ..SessionLimits::default()
+    };
+    let mut s = Session::open(dir.path(), identity(), config(), limits.clone()).unwrap();
+    elect(&mut s);
+    durable_managed_support(&mut s);
+    // Principal 1 registers and closes. Principal 2's vacant pair presents
+    // the registry watermark, not its own zero: a registration citing zero
+    // conflicts and one citing the watermark is assigned exactly one above.
+    let first = register_for(&mut s, 1, 5_000, 0);
+    assert_eq!(first.generation, 1);
+    close_for(&mut s, first, 5_002);
+    assert_eq!(
+        s.request_streams.state(first.principal, 0).unwrap(),
+        RequestStreamState::Vacant {
+            slot: 0,
+            generation: 1
+        }
+    );
+    assert_eq!(
+        s.request_streams.state(ParticipantId::from_u128(2), 0).unwrap(),
+        RequestStreamState::Vacant {
+            slot: 0,
+            generation: 1
+        }
+    );
+    let stale = principal_control(
+        2,
+        5_008,
+        RequestStreamCommand::Register {
+            slot: 0,
+            expected_generation: 0,
+            owner: RequestId::from_u128(5_009),
+            window: 4,
+        },
+    );
+    assert!(matches!(
+        s.propose_request_stream(&stale),
+        Err(LedgerError::Managed(ManagedError::Conflict))
+    ));
+    let second = register_for(&mut s, 2, 5_010, 1);
+    assert_eq!(second.generation, 2);
+    // At capacity a third principal takes the closed pair's place. The
+    // evicted principal's old identity is refused as unregistered, its old
+    // receipts resolve Unknown, and nothing of it is exposed to others.
+    let third = register_for(&mut s, 3, 5_020, 2);
+    assert_eq!(third.generation, 3);
+    // The evicted pair is gone; the slot presents the watermark to its
+    // former principal like any unregistered pair.
+    assert_eq!(
+        s.request_streams.state(first.principal, 0).unwrap(),
+        RequestStreamState::Vacant {
+            slot: 0,
+            generation: 3
+        }
+    );
+    let late = principal_control(
+        1,
+        5_003,
+        RequestStreamCommand::Seal {
+            key: ManagedRequestKey {
+                stream: first,
+                ordinal: 1,
+                id: RequestId::from_u128(5_004),
+            },
+            expected_revision: 1,
+            family: ManagedRequestFamily::Domain,
+            intent_hash: ContentHash([3; 32]),
+        },
+    );
+    let refused = s.propose_request_stream(&late);
+    assert!(
+        matches!(
+            refused,
+            Err(LedgerError::Managed(ManagedError::NotRegistered))
+        ),
+        "{refused:?}"
+    );
+    let read = s
+        .request_stream_read(
+            first.principal,
+            &RequestStreamQuery::Receipt {
+                key: ManagedRequestKey {
+                    stream: first,
+                    ordinal: 1,
+                    id: RequestId::from_u128(5_004),
+                },
+            },
+        )
+        .unwrap()
+        .to_owned()
+        .unwrap();
+    assert!(matches!(
+        read.result,
+        RequestStreamReadResult::Receipt {
+            resolution: ManagedReceiptResolution::Unknown,
+            ..
+        }
+    ));
+    assert!(matches!(
+        s.request_stream_read(second.principal, &RequestStreamQuery::Slot { slot: 0 })
+            .unwrap()
+            .to_owned()
+            .unwrap()
+            .result,
+        RequestStreamReadResult::Slot(RequestStreamState::Active { stream, .. }) if stream == second
+    ));
+    // Both remaining pairs are active: a fourth principal finds no room.
+    let full = principal_control(
+        4,
+        5_030,
+        RequestStreamCommand::Register {
+            slot: 0,
+            expected_generation: 3,
+            owner: RequestId::from_u128(5_031),
+            window: 4,
+        },
+    );
+    assert!(matches!(
+        s.propose_request_stream(&full),
+        Err(LedgerError::Managed(ManagedError::Capacity))
+    ));
+    // After the third closes, the evicted principal returns as a fresh pair
+    // and receives a generation above every one the registry ever assigned:
+    // its own delayed generation-one traffic can never match the new stream.
+    close_for(&mut s, third, 5_022);
+    let again = register_for(&mut s, 1, 5_040, 3);
+    assert_eq!(again.generation, 4);
+    assert_eq!(s.request_streams.next_generation(), 4);
+    // The watermark survives the checkpoint and a restart in the SS7 envelope.
+    s.checkpoint().unwrap();
+    drop(s);
+    let s = Session::open(dir.path(), identity(), config(), limits).unwrap();
+    assert_eq!(s.request_streams.next_generation(), 4);
+    assert_eq!(
+        s.request_streams.state(again.principal, 0).unwrap(),
+        RequestStreamState::Active {
+            stream: again,
+            owner: RequestId::from_u128(5_041),
+            revision: 1,
+            window: 4,
+            acknowledged_through: 0,
+        }
+    );
+    assert_eq!(
+        s.request_streams.state(third.principal, 0).unwrap(),
+        RequestStreamState::Vacant {
+            slot: 0,
+            generation: 4
+        }
     );
 }

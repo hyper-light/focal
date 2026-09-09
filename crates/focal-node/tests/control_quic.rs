@@ -45,6 +45,9 @@ impl AuthorityVerifier for RejectUnverifiedEvidence {
     fn verify_replica_ready(&self, _: &ReplicaReady) -> Result<(), DirectoryError> {
         Err(DirectoryError::UnverifiedAuthority)
     }
+    fn verify_custody(&self, _: &CustodyProof) -> Result<(), DirectoryError> {
+        Err(DirectoryError::UnverifiedAuthority)
+    }
     fn verify_delegation(&self, _: &DelegationFence) -> Result<(), DirectoryError> {
         Err(DirectoryError::UnverifiedAuthority)
     }

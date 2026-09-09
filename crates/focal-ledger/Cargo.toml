@@ -23,5 +23,7 @@ serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+focal-core = { version = "0.1.0", path = "../focal-core", features = ["test-support"] }
+focal-consensus = { version = "0.1.0", path = "../focal-consensus", features = ["test-support"] }
 tempfile.workspace = true
 focal-sim = { version = "0.1.0", path = "../focal-sim" }

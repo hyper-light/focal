@@ -37,6 +37,10 @@ pub struct NodeSettings {
     pub listen: Option<SocketAddr>,
     pub advertise: Option<String>,
     pub seeds: Vec<String>,
+    /// Tenants this node hosts sessions for at most, its own included;
+    /// default 8, at most 1024. A placement that would need one more is
+    /// refused by this node as `NodeCapacity`.
+    pub max_tenants: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +141,14 @@ impl Settings {
             return Err(ConfigError::Invalid {
                 field: "node.seeds",
                 reason: "must contain unique nonempty endpoints",
+            });
+        }
+        if self.node.max_tenants.is_some_and(|count| {
+            count == 0 || count > crate::admission::AdmissionPolicy::MAX_TENANTS
+        }) {
+            return Err(ConfigError::Invalid {
+                field: "node.max_tenants",
+                reason: "must be between 1 and 1024",
             });
         }
         for (field, value) in [
@@ -255,6 +267,23 @@ mod tests {
         );
         assert!(Settings::from_yaml("version: 1\nshards: 3").is_err());
         assert!(Settings::from_yaml("version: 1\nnode:\n  shards: 3").is_err());
+    }
+    #[test]
+    fn the_tenant_bound_is_optional_and_bounded() {
+        assert_eq!(Settings::default().node.max_tenants, None);
+        assert_eq!(
+            Settings::from_yaml("version: 1\nnode:\n  max_tenants: 3")
+                .unwrap()
+                .node
+                .max_tenants,
+            Some(3)
+        );
+        for bad in ["0", "1025", "-1", "many"] {
+            assert!(
+                Settings::from_yaml(&format!("version: 1\nnode:\n  max_tenants: {bad}")).is_err(),
+                "{bad}"
+            );
+        }
     }
     #[test]
     fn omitted_policy_does_not_reset_a_committed_guarantee() {

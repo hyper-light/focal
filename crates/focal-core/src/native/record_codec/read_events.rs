@@ -9,7 +9,7 @@ use crate::native::{
     NativeClaimEvent, NativeEvaluationEventKind, NativeEvent, NativeEventKind, NativeFact,
     NativeMonitorEvent,
 };
-use focal_model::{ClaimId, MonitorId};
+use focal_model::{ClaimId, MonitorId, SessionSeq};
 
 #[cfg(test)]
 #[path = "read_events_tests.rs"]
@@ -143,6 +143,7 @@ pub(super) fn claim_kind(c: &mut Cursor<'_>) -> Result<NativeEventKind, Error> {
         19 => NativeEventKind::ResponseObserved,
         20 => NativeEventKind::Expired,
         21 => NativeEventKind::Deadlocked,
+        22 => NativeEventKind::Imported(SessionSeq(c.u64()?)),
         _ => return Err(Error::InvalidTag("claim event kind")),
     })
 }

@@ -113,6 +113,9 @@ pub(crate) enum CredentialCommand {
         #[arg(long)]
         expected_revision: Option<u64>,
     },
+    /// Renew this node's own credential now: the same key under a fresh
+    /// certificate and lifetime, presented on every path at once.
+    Renew,
 }
 #[derive(Subcommand)]
 pub(crate) enum MembershipCommand {
@@ -171,6 +174,12 @@ pub(crate) enum ReplicaCommand {
         #[arg(long)]
         expected_configuration_index: Option<u64>,
     },
+    /// Propose committed activation of native history on an empty ledger;
+    /// every voter must already promise the native decoder.
+    ActivateNative {
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Observe a bounded live page of this physical node's installed application replicas.
     List {
         #[arg(long)]
@@ -202,6 +211,32 @@ pub(crate) fn run(
 ) -> crate::Result<()> {
     if let ClusterCommand::Invite { node, output } = command {
         return runtime.block_on(crate::invite(settings, &node, &output));
+    }
+    // A laptop node has no admin socket: its activation runs offline against
+    // the exclusive data directory and returns once the record is applied.
+    if let ClusterCommand::Replicas {
+        command: ReplicaCommand::ActivateNative { session: None },
+    } = &command
+        && !focal_node::network_state::network_requested(&settings.data_dir()?, settings)
+    {
+        let activation = focal_node::native_activation::activate_local(
+            settings,
+            focal_ledger::NativeContentProfile::AuthoredV1,
+        )?;
+        let group: String = activation
+            .group
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        return crate::print_json(&serde_json::json!({
+            "schema_version": 1,
+            "result": focal_client::admin::AdminResult::ReplicaNativeActivationProposed {
+                session: activation.ledger.session.to_string(),
+                group,
+            },
+            "activated": activation.activation.is_native(),
+            "proposed": activation.proposed,
+        }));
     }
     let admin = ClusterAdmin::open(settings)?;
     let result = match command {
@@ -255,6 +290,7 @@ pub(crate) fn run(
                 focal_client::input::parse_id(&invitation)?,
                 expected_revision,
             )),
+            CredentialCommand::Renew => runtime.block_on(admin.renew_credential()),
         },
         ClusterCommand::Membership { command } => match command {
             MembershipCommand::Show => runtime.block_on(admin.read(AdminRead::Configuration)),
@@ -337,6 +373,9 @@ fn replicas(
             node,
             expected_configuration_index,
         )),
+        ReplicaCommand::ActivateNative { session: value } => {
+            runtime.block_on(admin.replica_activate_native(session(value)?))
+        }
         ReplicaCommand::List { after, limit } => runtime.block_on(
             admin.replica_list(
                 after

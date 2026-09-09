@@ -60,6 +60,9 @@ impl AuthorityVerifier for NoDirectoryAuthority {
     ) -> Result<(), DirectoryError> {
         Err(DirectoryError::UnverifiedAuthority)
     }
+    fn verify_custody(&self, _: &focal_directory::CustodyProof) -> Result<(), DirectoryError> {
+        Err(DirectoryError::UnverifiedAuthority)
+    }
 }
 #[derive(Serialize, Deserialize)]
 struct Genesis {

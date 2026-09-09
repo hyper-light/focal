@@ -230,7 +230,6 @@ fn demand(envelope: CompletionEnvelope, credit: Credit) -> Result<Totals, Native
 impl Totals {
     fn replace(self, old: Self, new: Self) -> Result<Self, NativeError> {
         Ok(Self {
-            record_buffers: None,
             retained: add(sub(self.retained, old.retained)?, new.retained)?,
             workspace: self.workspace.max(new.workspace),
             reports: add(sub(self.reports, old.reports)?, new.reports)?,
@@ -247,6 +246,7 @@ impl CompletionBook {
         let ceiling = source.reservation_limit(BudgetLane::Ordinary);
         let pool = source.elastic_funded_child(BudgetLane::Ordinary, ceiling, 0)?;
         Ok(Self {
+            record_buffers: None,
             entries: CompletionIndex::new(),
             respondents: CompletionIndex::new(),
             protections: protections::Protections::new(),
@@ -281,6 +281,10 @@ impl CompletionBook {
         self.entries
             .get(key)
             .map(|entry| entry.credit.remaining_reports)
+    }
+    #[cfg(test)]
+    pub(super) fn envelope_for_test(&self, key: EvaluationKey) -> Option<&CompletionEnvelope> {
+        self.entries.get(key).map(|entry| &entry.envelope)
     }
     #[cfg(test)]
     pub(super) fn funded_capacity(&self) -> usize {

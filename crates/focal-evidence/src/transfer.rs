@@ -168,12 +168,23 @@ impl ContentStore {
                 .root
                 .join("objects")
                 .join(hex(&transfer.reference.domain.0));
+            // Custody transfers are fleet work: they draw on the completion
+            // lane so a tenant's uploads cannot starve replication.
+            let copy = disk_reserve(
+                &self.disk,
+                &self.root,
+                DiskKind::Content,
+                focal_memory::BudgetLane::Completion,
+                u64::try_from(bytes.len()).map_err(|_| ContentError::Capacity)?,
+            )?;
             durable_directory(&directory)?;
             install_verified_chunk(
                 &directory.join(format!("{}.chunk", chunk.hash)),
                 bytes,
                 chunk.hash,
-            )
+            )?;
+            copy.commit();
+            Ok(())
         })();
         self.mark_failure(&result);
         result
@@ -218,11 +229,19 @@ impl ContentStore {
                 .root
                 .join("objects")
                 .join(hex(&transfer.reference.domain.0));
+            let manifest = disk_reserve(
+                &self.disk,
+                &self.root,
+                DiskKind::Content,
+                focal_memory::BudgetLane::Completion,
+                u64::try_from(transfer.encoded.len()).map_err(|_| ContentError::Capacity)?,
+            )?;
             durable_directory(&directory)?;
             atomic_install(
                 &directory.join(format!("{}.manifest", transfer.reference.root)),
                 &transfer.encoded,
             )?;
+            manifest.commit();
             Ok(transfer.reference.clone())
         })();
         self.mark_failure(&result);

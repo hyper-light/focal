@@ -107,6 +107,15 @@ fn name(value: &str) -> Result<()> {
 }
 impl Store {
     fn open(root: &Path, create: bool) -> Result<Option<Self>> {
+        Self::open_with(root, create, false)
+    }
+    /// Open the catalogue for reading beside other processes of this data
+    /// directory: ordinary commands select their context without excluding
+    /// each other, while `context` commands still own the catalogue exclusively.
+    fn open_read(root: &Path) -> Result<Option<Self>> {
+        Self::open_with(root, false, true)
+    }
+    fn open_with(root: &Path, create: bool, shared: bool) -> Result<Option<Self>> {
         let path = root.join(CATALOG);
         let marker = root.join(MARKER);
         let initialized = exists(&marker)?;
@@ -132,10 +141,14 @@ impl Store {
             file.sync_all()?;
             File::open(root)?.sync_all()?;
         }
-        let mut journal = PrivateJournal::open(&path).map_err(other)?;
+        let mut journal = if shared {
+            PrivateJournal::open_shared(&path).map_err(other)?
+        } else {
+            PrivateJournal::open(&path).map_err(other)?
+        };
         let catalog = match journal.read().map_err(other)? {
             Some(bytes) => parse_document::<Catalog>(&bytes, InputFormat::Json)?,
-            None if !initialized => {
+            None if !initialized && !shared => {
                 let catalog = Catalog {
                     schema: 1,
                     ..Catalog::default()
@@ -399,7 +412,7 @@ pub(super) fn selected(
         return Ok(None);
     }
     let root = settings.data_dir().map_err(other)?;
-    let store = Store::open(&root, false)?;
+    let store = Store::open_read(&root)?;
     let selection =
         requested.or_else(|| store.as_ref().and_then(|s| s.catalog.selected.as_deref()));
     let Some(selection) = selection else {
@@ -487,8 +500,8 @@ pub(super) fn connect(profile: Profile, history: PathBuf) -> Result<Context> {
             Ok(context)
         }
         Profile::Enrolled { enrollment } => {
-            let pending =
-                focal_node::network_join::PendingClientJoin::resume(enrollment).map_err(other)?;
+            let pending = focal_node::network_join::PendingClientJoin::resume_shared(enrollment)
+                .map_err(other)?;
             let receipt = pending.enrollment().map_err(other)?.ok_or(InputError::Invalid("client enrollment is pending; retry context enroll with its original invitation"))?;
             let credentials = pending.credentials(now()?).map_err(other)?;
             let founder = &pending.invitation().genesis().founder;

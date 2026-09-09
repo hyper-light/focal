@@ -762,6 +762,7 @@ fn authored_content(
             requirements: &requirements,
             slots: &[],
             deadline: None,
+            policy: None,
         },
         Limits {
             description_bytes: 128,

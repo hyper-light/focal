@@ -627,6 +627,7 @@ dependencies = [
  "focal-core",
  "focal-memory",
  "focal-model",
+ "focal-native-client",
  "focal-wire",
  "getrandom 0.3.4",
  "serde",
@@ -652,6 +653,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "focal-native-client"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "focal-client",
+ "focal-core",
+ "focal-evidence",
+ "focal-memory",
+ "focal-model",
+ "focal-wire",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "focal-node"
 version = "0.1.0"
 dependencies = [
@@ -661,6 +678,7 @@ dependencies = [
  "focal-client",
  "focal-consensus",
  "focal-control",
+ "focal-core",
  "focal-directory",
  "focal-enrollment",
  "focal-evidence",
@@ -670,6 +688,8 @@ dependencies = [
  "focal-mcp",
  "focal-memory",
  "focal-model",
+ "focal-native-client",
+ "focal-node",
  "focal-runtime",
  "focal-stream",
  "focal-wire",

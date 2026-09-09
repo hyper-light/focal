@@ -4,10 +4,18 @@ use focal_model::{LedgerId, RouteEpoch};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Where a placement change stands. `Planned` is set by the plan itself;
+/// every later phase except `Cutover` is derived from committed assignment
+/// progress, and `Cutover` from the committed barrier fence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlacementPhase {
     Planned,
     Preparing,
+    Catchup,
+    Custody,
+    Promoting,
+    Cutover,
+    Failed,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingPlacement {
@@ -19,6 +27,10 @@ pub struct PendingPlacement {
     pub phase: PlacementPhase,
     pub ready: BTreeMap<u64, ReplicaReady>,
     pub barrier: Option<SessionFence>,
+    /// Load-report epochs the planner relied on, per selected node.
+    pub observations: BTreeMap<u64, u64>,
+    /// One entry per node of the desired placement once preparation began.
+    pub progress: BTreeMap<u64, AssignmentProgress>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionDescriptor {
@@ -31,7 +43,14 @@ pub struct SessionDescriptor {
     pub active: PlacementSpec,
     pub authority: SessionFence,
     pub pending: Option<PendingPlacement>,
+    /// Copies the last activation left behind; they hold data until retired.
+    pub retiring: BTreeMap<u64, AssignmentProgress>,
+    /// The newest refusals, oldest first, bounded by `PartitionConfig::max_refusals`.
+    pub refusals: Vec<Refusal>,
 }
+/// The current partition checkpoint layout; schema 1 and 2 checkpoints
+/// convert on decode ([`PartitionCheckpoint::decode_any`]).
+pub const PARTITION_CHECKPOINT_SCHEMA: u16 = 3;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartitionCheckpoint {
     pub schema: u16,
@@ -71,6 +90,16 @@ pub enum PartitionOperation {
     ReportLoad {
         load: NodeLoad,
     },
+    /// The detector's verdict about one node at its current enrollment
+    /// generation, committed by the partition owner's leader (§12).
+    Liveness {
+        node: u64,
+        generation: u64,
+        alive: bool,
+        incarnation: u64,
+        witness: u64,
+        decided_at: i64,
+    },
     CreateSession {
         ledger: LedgerId,
         log_group: LogGroupId,
@@ -88,6 +117,9 @@ pub enum SessionChange {
     Plan {
         operation: OperationId,
         desired: PlacementSpec,
+        /// Load-report epochs the planner relied on; each must name a node of
+        /// the desired placement whose committed report is at least that new.
+        observations: BTreeMap<u64, u64>,
     },
     BeginPreparation {
         operation: OperationId,
@@ -106,6 +138,27 @@ pub enum SessionChange {
     Abort {
         operation: OperationId,
     },
+    /// Controller-observed progress of one assignment; monotone per attempt.
+    Progress {
+        operation: OperationId,
+        progress: AssignmentProgress,
+    },
+    /// A refusal the controller or an agent recorded; a named node fails its
+    /// assignment, an unnamed refusal concerns the plan as a whole.
+    Refuse {
+        operation: OperationId,
+        refusal: Refusal,
+    },
+    /// Begin draining a copy the activation `operation` left behind.
+    Drain {
+        operation: OperationId,
+        node: u64,
+    },
+    /// Forget a drained copy once nothing pins it.
+    Retire {
+        operation: OperationId,
+        node: u64,
+    },
 }
 #[derive(Debug, Clone, Copy)]
 pub struct PartitionConfig {
@@ -114,6 +167,9 @@ pub struct PartitionConfig {
     pub max_members: usize,
     pub max_policy_regions: usize,
     pub max_endpoint_bytes: usize,
+    pub max_refusals: usize,
+    /// Disk headroom a node must report before it is planned into a placement.
+    pub min_disk_available: u64,
 }
 impl Default for PartitionConfig {
     fn default() -> Self {
@@ -123,6 +179,8 @@ impl Default for PartitionConfig {
             max_members: 31,
             max_policy_regions: 64,
             max_endpoint_bytes: 512,
+            max_refusals: 16,
+            min_disk_available: 64 * 1024 * 1024,
         }
     }
 }
@@ -156,7 +214,7 @@ impl DirectoryPartition {
     ) -> Result<Self, DirectoryError> {
         Self::restore(
             PartitionCheckpoint {
-                schema: 1,
+                schema: PARTITION_CHECKPOINT_SCHEMA,
                 cluster,
                 delegation,
                 revision: 0,
@@ -296,15 +354,12 @@ impl DirectoryPartition {
                 tree_row::<(LedgerId, SessionDescriptor)>(),
                 placement::spec_charge(placement)?,
             )?,
-            PartitionOperation::Session {
-                change: SessionChange::Plan { desired, .. },
-                ..
-            } => placement::spec_charge(desired)?,
-            PartitionOperation::Session {
-                change: SessionChange::Ready { .. },
-                ..
-            } => tree_row::<(u64, ReplicaReady)>(),
-            _ => 0,
+            PartitionOperation::Session { ledger, change, .. } => {
+                partition_session::change_charge(&self.root.state, *ledger, change)?
+            }
+            PartitionOperation::SealForTransfer { .. }
+            | PartitionOperation::ReportLoad { .. }
+            | PartitionOperation::Liveness { .. } => 0,
         };
         let allocation = self
             .budget
@@ -368,6 +423,7 @@ impl DirectoryPartition {
                     NodeRecord {
                         enrollment: node.clone(),
                         load: None,
+                        liveness: None,
                     },
                 );
             }
@@ -383,6 +439,37 @@ impl DirectoryPartition {
                     return Err(DirectoryError::StaleNode);
                 }
                 node.load = Some(*load);
+            }
+            PartitionOperation::Liveness {
+                node,
+                generation,
+                alive,
+                incarnation,
+                witness,
+                decided_at,
+            } => {
+                let record = state.nodes.get_mut(node).ok_or(DirectoryError::Missing)?;
+                if record.enrollment.generation != *generation {
+                    return Err(DirectoryError::StaleNode);
+                }
+                // A verdict never goes back: an older incarnation is stale,
+                // and the same incarnation may only change the verdict.
+                if let Some(current) = record.liveness {
+                    if *incarnation < current.incarnation
+                        || (*incarnation == current.incarnation && *alive == current.alive)
+                        || *decided_at < current.decided_at
+                    {
+                        return Err(DirectoryError::StaleNode);
+                    }
+                } else if *alive {
+                    return Err(DirectoryError::Duplicate);
+                }
+                record.liveness = Some(NodeLiveness {
+                    alive: *alive,
+                    incarnation: *incarnation,
+                    witness: *witness,
+                    decided_at: *decided_at,
+                });
             }
             PartitionOperation::CreateSession {
                 ledger,
@@ -412,7 +499,7 @@ impl DirectoryPartition {
                 {
                     return Err(DirectoryError::StaleEpoch);
                 }
-                validate_fence(authority, placement)?;
+                partition_session::validate_fence(authority, placement)?;
                 verifier.verify_session_fence(authority)?;
                 state.sessions.insert(
                     *ledger,
@@ -426,6 +513,8 @@ impl DirectoryPartition {
                         active: placement.clone(),
                         authority: authority.clone(),
                         pending: None,
+                        retiring: BTreeMap::new(),
+                        refusals: Vec::new(),
                     },
                 );
             }
@@ -441,7 +530,13 @@ impl DirectoryPartition {
                 if session.revision != *expected_revision {
                     return Err(DirectoryError::CompareFailed);
                 }
-                apply_session(session, change, &state.nodes, self.config, verifier)?;
+                partition_session::apply_session(
+                    session,
+                    change,
+                    &state.nodes,
+                    self.config,
+                    verifier,
+                )?;
                 session.revision = session
                     .revision
                     .checked_add(1)
@@ -471,201 +566,26 @@ impl DirectoryPartition {
 pub fn partition_checkpoint_digest(
     state: &PartitionCheckpoint,
 ) -> Result<focal_model::ContentHash, DirectoryError> {
-    crate::digest(b"focal:directory-partition-checkpoint:v1\0", state)
+    crate::digest(b"focal:directory-partition-checkpoint:v2\0", state)
 }
 
-fn apply_session(
-    session: &mut SessionDescriptor,
-    change: &SessionChange,
-    nodes: &BTreeMap<u64, NodeRecord>,
-    config: PartitionConfig,
-    verifier: &impl AuthorityVerifier,
-) -> Result<(), DirectoryError> {
-    match change {
-        SessionChange::Plan { operation, desired } => {
-            if let Some(pending) = &session.pending {
-                return if pending.operation == *operation && pending.desired == *desired {
-                    Ok(())
-                } else {
-                    Err(DirectoryError::Phase)
-                };
-            }
-            if session.authority.operation == *operation {
-                return Err(DirectoryError::WrongOperation);
-            }
-            verify_placement(desired, nodes, config.max_members)?;
-            session.pending = Some(PendingPlacement {
-                operation: *operation,
-                next_route: RouteEpoch(
-                    session
-                        .route_epoch
-                        .0
-                        .checked_add(1)
-                        .ok_or(DirectoryError::CounterExhausted)?,
-                ),
-                next_membership: session
-                    .membership_epoch
-                    .checked_add(u64::from(
-                        desired.placement.voters != session.active.placement.voters,
-                    ))
-                    .ok_or(DirectoryError::CounterExhausted)?,
-                next_placement: session
-                    .placement_epoch
-                    .checked_add(1)
-                    .ok_or(DirectoryError::CounterExhausted)?,
-                desired: desired.clone(),
-                phase: PlacementPhase::Planned,
-                ready: BTreeMap::new(),
-                barrier: None,
-            });
-        }
-        SessionChange::BeginPreparation { operation } => {
-            pending(session, *operation)?.phase = PlacementPhase::Preparing;
-        }
-        SessionChange::Ready { ready } => {
-            if ready.ledger != session.ledger {
-                return Err(DirectoryError::OutsideNamespace);
-            }
-            let plan = pending(session, ready.operation)?;
-            if plan.phase != PlacementPhase::Preparing {
-                return Err(DirectoryError::Phase);
-            }
-            if ready.route_epoch != plan.next_route
-                || plan.desired.placement.generation(ready.node) != Some(ready.node_generation)
-            {
-                return Err(DirectoryError::StaleEpoch);
-            }
-            if nodes
-                .get(&ready.node)
-                .is_none_or(|node| node.enrollment.generation != ready.node_generation)
-            {
-                return Err(DirectoryError::StaleNode);
-            }
-            if plan
-                .ready
-                .get(&ready.node)
-                .is_some_and(|old| old.through > ready.through)
-            {
-                return Err(DirectoryError::StaleEpoch);
-            }
-            if !types::nonzero_hash(ready.attestation) || !types::nonzero_hash(ready.custody) {
-                return Err(DirectoryError::Custody);
-            }
-            verifier.verify_replica_ready(ready)?;
-            plan.ready.insert(ready.node, ready.clone());
-        }
-        SessionChange::Cutover {
-            operation,
-            authority,
-        } => {
-            validate_transition_fence(session, *operation, authority, SessionFenceKind::Cutover)?;
-            if authority.sequence < session.authority.sequence
-                || authority.index <= session.authority.index
-                || authority.term < session.authority.term
-            {
-                return Err(DirectoryError::StaleEpoch);
-            }
-            verifier.verify_session_fence(authority)?;
-            let plan = pending(session, *operation)?;
-            if plan.phase != PlacementPhase::Preparing {
-                return Err(DirectoryError::Phase);
-            }
-            if plan
-                .barrier
-                .as_ref()
-                .is_some_and(|previous| previous != authority)
-            {
-                return Err(DirectoryError::CompareFailed);
-            }
-            plan.barrier = Some(authority.clone());
-        }
-        SessionChange::Activate {
-            operation,
-            authority,
-        } => {
-            if session.pending.is_none() && session.authority == *authority {
-                return Ok(());
-            }
-            validate_transition_fence(session, *operation, authority, SessionFenceKind::Activated)?;
-            let plan = session.pending.as_ref().ok_or(DirectoryError::Phase)?;
-            let barrier = plan.barrier.as_ref().ok_or(DirectoryError::NotReady)?;
-            if authority.sequence < barrier.sequence
-                || authority.index <= barrier.index
-                || authority.term < barrier.term
-            {
-                return Err(DirectoryError::StaleEpoch);
-            }
-            verify_placement(&plan.desired, nodes, config.max_members)?;
-            for node in plan.desired.placement.nodes() {
-                let ready = plan.ready.get(&node).ok_or(DirectoryError::NotReady)?;
-                if ready.through < barrier.sequence {
-                    return Err(DirectoryError::NotReady);
-                }
-            }
-            verifier.verify_session_fence(authority)?;
-            let plan = session.pending.take().ok_or(DirectoryError::Phase)?;
-            session.route_epoch = plan.next_route;
-            session.membership_epoch = plan.next_membership;
-            session.placement_epoch = plan.next_placement;
-            session.active = plan.desired;
-            session.authority = authority.clone();
-        }
-        SessionChange::Abort { operation } => {
-            if pending(session, *operation)?.barrier.is_some() {
-                return Err(DirectoryError::Phase);
-            }
-            session.pending = None;
-        }
-    }
-    Ok(())
-}
-fn pending(
-    session: &mut SessionDescriptor,
-    operation: OperationId,
-) -> Result<&mut PendingPlacement, DirectoryError> {
-    let plan = session.pending.as_mut().ok_or(DirectoryError::Phase)?;
-    if plan.operation != operation {
-        return Err(DirectoryError::WrongOperation);
-    }
-    Ok(plan)
-}
-fn validate_transition_fence(
-    session: &SessionDescriptor,
-    operation: OperationId,
-    fence: &SessionFence,
-    kind: SessionFenceKind,
-) -> Result<(), DirectoryError> {
-    let pending = session.pending.as_ref().ok_or(DirectoryError::Phase)?;
-    if pending.operation != operation || fence.operation != operation {
-        return Err(DirectoryError::WrongOperation);
-    }
-    if fence.kind != kind
-        || fence.ledger != session.ledger
-        || fence.log_group != session.log_group
-        || fence.from_route != session.route_epoch
-        || fence.to_route != pending.next_route
-        || fence.membership_epoch != pending.next_membership
-        || fence.placement_epoch != pending.next_placement
-    {
-        return Err(DirectoryError::StaleEpoch);
-    }
-    validate_fence(fence, &pending.desired)
-}
-fn validate_fence(fence: &SessionFence, spec: &PlacementSpec) -> Result<(), DirectoryError> {
-    if fence.index.0 == 0 || fence.term.0 == 0 || !types::nonzero_hash(fence.record_hash) {
-        return Err(DirectoryError::UnverifiedAuthority);
-    }
-    if fence.placement_digest != placement_digest(spec)? {
-        return Err(DirectoryError::CompareFailed);
-    }
-    Ok(())
-}
 fn validate_input(
     operation: &PartitionOperation,
     config: PartitionConfig,
 ) -> Result<(), DirectoryError> {
     match operation {
         PartitionOperation::Enroll { node, .. } => validate_enrollment(node, config)?,
+        PartitionOperation::Liveness {
+            node,
+            generation,
+            witness,
+            decided_at,
+            ..
+        } => {
+            if *node == 0 || *generation == 0 || *witness == 0 || *decided_at <= 0 {
+                return Err(DirectoryError::Invalid("node liveness"));
+            }
+        }
         PartitionOperation::CreateSession { placement, .. }
         | PartitionOperation::Session {
             change: SessionChange::Plan {
@@ -710,7 +630,7 @@ fn validate_partition(
 ) -> Result<(), DirectoryError> {
     state.delegation.namespace.validate()?;
     control::validate_delegation(&state.delegation, state.cluster)?;
-    if state.schema != 1
+    if state.schema != PARTITION_CHECKPOINT_SCHEMA
         || state.delegation.epoch == 0
         || config.max_nodes == 0
         || config.max_sessions == 0
@@ -738,6 +658,12 @@ fn validate_partition(
         }) {
             return Err(DirectoryError::StaleNode);
         }
+        if node
+            .liveness
+            .is_some_and(|liveness| liveness.witness == 0 || liveness.decided_at <= 0)
+        {
+            return Err(DirectoryError::Invalid("node liveness"));
+        }
     }
     let mut groups = BTreeSet::new();
     for (ledger, session) in &state.sessions {
@@ -755,7 +681,7 @@ fn validate_partition(
             return Err(DirectoryError::StaleEpoch);
         }
         validate_spec_size(&session.active, config)?;
-        validate_fence(&session.authority, &session.active)?;
+        partition_session::validate_fence(&session.authority, &session.active)?;
         if session.authority.ledger != *ledger
             || session.authority.log_group != session.log_group
             || session.authority.to_route != session.route_epoch
@@ -779,8 +705,25 @@ fn validate_partition(
         {
             return Err(DirectoryError::Invalid("leader absent from voters"));
         }
+        if session.refusals.len() > config.max_refusals {
+            return Err(DirectoryError::Capacity);
+        }
+        for (node, copy) in &session.retiring {
+            if *node != copy.node
+                || copy.roles.is_empty()
+                || copy.refusal.is_some()
+                || session.active.placement.nodes().contains(node)
+                || !matches!(
+                    copy.phase,
+                    AssignmentPhase::Active | AssignmentPhase::Draining
+                )
+            {
+                return Err(DirectoryError::Phase);
+            }
+        }
         if let Some(plan) = &session.pending {
             validate_spec_size(&plan.desired, config)?;
+            partition_session::validate_progress(plan)?;
             if plan.ready.len() > config.max_members.saturating_mul(3)
                 || plan.next_route.0
                     != session
@@ -797,9 +740,24 @@ fn validate_partition(
                 return Err(DirectoryError::StaleEpoch);
             }
             if plan.phase == PlacementPhase::Planned
-                && (!plan.ready.is_empty() || plan.barrier.is_some())
+                && (!plan.ready.is_empty() || plan.barrier.is_some() || !plan.progress.is_empty())
             {
                 return Err(DirectoryError::Phase);
+            }
+            if plan.phase != PlacementPhase::Planned
+                && plan.progress.len() != plan.desired.placement.nodes().len()
+            {
+                return Err(DirectoryError::Phase);
+            }
+            if plan.phase != partition_progress::derive_phase(plan) {
+                return Err(DirectoryError::Phase);
+            }
+            if plan
+                .observations
+                .keys()
+                .any(|node| plan.desired.placement.generation(*node).is_none())
+            {
+                return Err(DirectoryError::Invalid("observation outside placement"));
             }
             for (node, ready) in &plan.ready {
                 if *node != ready.node
@@ -814,7 +772,7 @@ fn validate_partition(
                 }
             }
             if let Some(barrier) = &plan.barrier {
-                validate_transition_fence(
+                partition_session::validate_transition_fence(
                     session,
                     plan.operation,
                     barrier,
@@ -848,14 +806,30 @@ fn partition_charge(state: &PartitionCheckpoint) -> Result<usize, DirectoryError
     }
     for session in state.sessions.values() {
         bytes = add(bytes, placement::spec_charge(&session.active)?)?;
+        bytes = add(
+            bytes,
+            add(
+                mul(session.refusals.capacity(), size_of::<Refusal>())?,
+                ALLOCATOR_OVERHEAD,
+            )?,
+        )?;
+        for copy in session.retiring.values() {
+            bytes = add(bytes, partition_progress::progress_charge(copy)?)?;
+        }
         if let Some(plan) = &session.pending {
             bytes = add(
                 bytes,
                 add(
                     placement::spec_charge(&plan.desired)?,
-                    mul(plan.ready.len(), tree_row::<(u64, ReplicaReady)>())?,
+                    add(
+                        mul(plan.ready.len(), tree_row::<(u64, ReplicaReady)>())?,
+                        mul(plan.observations.len(), tree_row::<(u64, u64)>())?,
+                    )?,
                 )?,
             )?;
+            for progress in plan.progress.values() {
+                bytes = add(bytes, partition_progress::progress_charge(progress)?)?;
+            }
         }
     }
     Ok(bytes)

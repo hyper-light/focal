@@ -63,6 +63,7 @@ fn spec(relations: &[Relation]) -> ClaimSpec<'_> {
             generation: 11,
             at: 12,
         }),
+        policy: None,
     }
 }
 fn build(spec: ClaimSpec<'_>) -> ClaimDescriptor {
@@ -366,7 +367,7 @@ fn malformed_local_fields_and_unsupported_relations_refuse_before_allocation() {
             ..spec(&source)
         },
         ClaimSpec {
-            schema: 2,
+            schema: 3,
             ..spec(&source)
         },
         ClaimSpec {
@@ -782,4 +783,154 @@ fn complete_slot_contract_is_owned_hashed_bounded_and_preserves_zero_check_slots
             .is_err()
         );
     }
+}
+
+#[test]
+fn schema_two_carries_the_follow_up_policy_and_exact_evidence_while_schema_one_refuses_them() {
+    use crate::{ArtifactId, ArtifactRef, Escalation, PeerPolicy};
+    let relations = relations();
+    let policy = PeerPolicy {
+        corrective_allowed: true,
+        max_follow_ups: 3,
+        single_issuer: true,
+        escalation: Escalation::Evaluator,
+    };
+    // The frozen schema never carries a policy.
+    assert!(matches!(
+        ClaimDescriptor::prepare(
+            ClaimSpec {
+                policy: Some(policy),
+                ..spec(&relations)
+            },
+            limits()
+        ),
+        Err(ContractError::InvalidPolicy)
+    ));
+    let plain = build(spec(&relations));
+    let bare = build(ClaimSpec {
+        schema: 2,
+        ..spec(&relations)
+    });
+    let governed = build(ClaimSpec {
+        schema: 2,
+        policy: Some(policy),
+        ..spec(&relations)
+    });
+    assert_eq!(plain.policy(), None);
+    assert_eq!(bare.policy(), None);
+    assert_eq!(governed.policy(), Some(policy));
+    // The policy section is part of the schema-2 identity, present or absent.
+    assert_ne!(plain.content_hash(), bare.content_hash());
+    assert_ne!(bare.content_hash(), governed.content_hash());
+    assert!(matches!(
+        ClaimDescriptor::prepare(
+            ClaimSpec {
+                schema: 2,
+                policy: Some(PeerPolicy {
+                    max_follow_ups: 1025,
+                    ..policy
+                }),
+                ..spec(&relations)
+            },
+            limits()
+        ),
+        Err(ContractError::InvalidPolicy)
+    ));
+    // Exact evidence: a review at schema 2 is accepted; schema 1, a zero
+    // hash and a dependency edge are refused.
+    let evidence = ArtifactRef {
+        id: ArtifactId::from_u128(40),
+        hash: ContentHash([7; 32]),
+    };
+    let mut reviewing = relations.clone();
+    reviewing.push(Relation {
+        kind: RelationKind::Reviews,
+        target: RelationTarget::Evidence(evidence),
+    });
+    reviewing.sort();
+    let reviewed = build(ClaimSpec {
+        schema: 2,
+        ..spec(&reviewing)
+    });
+    assert!(reviewed.relations().iter().any(|relation| {
+        relation.kind == RelationKind::Reviews
+            && relation.target == RelationTarget::Evidence(evidence)
+    }));
+    assert!(matches!(
+        ClaimDescriptor::prepare(spec(&reviewing), limits()),
+        Err(ContractError::InvalidPolicy)
+    ));
+    let mut zero = relations.clone();
+    zero.push(Relation {
+        kind: RelationKind::Reviews,
+        target: RelationTarget::Evidence(ArtifactRef {
+            id: ArtifactId::from_u128(40),
+            hash: ContentHash([0; 32]),
+        }),
+    });
+    zero.sort();
+    assert!(matches!(
+        ClaimDescriptor::prepare(
+            ClaimSpec {
+                schema: 2,
+                ..spec(&zero)
+            },
+            limits()
+        ),
+        Err(ContractError::InvalidTarget)
+    ));
+    let mut dependent = relations.clone();
+    dependent.push(Relation {
+        kind: RelationKind::DependsOn,
+        target: RelationTarget::Evidence(evidence),
+    });
+    dependent.sort();
+    assert!(matches!(
+        ClaimDescriptor::prepare(
+            ClaimSpec {
+                schema: 2,
+                ..spec(&dependent)
+            },
+            limits()
+        ),
+        Err(ContractError::InvalidTarget)
+    ));
+    // A corrective `invalidates` relation names a committed claim at schema
+    // 2 only, and never the correction itself.
+    let mut invalidating = relations.clone();
+    invalidating.push(Relation {
+        kind: RelationKind::Invalidates,
+        target: RelationTarget::Object(ObjectRef::claim(ledger(), ClaimId::from_u128(31))),
+    });
+    invalidating.sort();
+    let corrective = build(ClaimSpec {
+        schema: 2,
+        ..spec(&invalidating)
+    });
+    assert!(corrective.relations().iter().any(|relation| {
+        relation.kind == RelationKind::Invalidates
+            && relation.target
+                == RelationTarget::Object(ObjectRef::claim(ledger(), ClaimId::from_u128(31)))
+    }));
+    assert!(matches!(
+        ClaimDescriptor::prepare(spec(&invalidating), limits()),
+        Err(ContractError::InvalidPolicy)
+    ));
+    let own = spec(&relations).id;
+    let mut reflexive = relations;
+    reflexive.push(Relation {
+        kind: RelationKind::Invalidates,
+        target: RelationTarget::Object(ObjectRef::claim(ledger(), own)),
+    });
+    reflexive.sort();
+    assert!(matches!(
+        ClaimDescriptor::prepare(
+            ClaimSpec {
+                schema: 2,
+                ..spec(&reflexive)
+            },
+            limits()
+        ),
+        Err(ContractError::InvalidTarget)
+    ));
 }

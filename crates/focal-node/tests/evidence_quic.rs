@@ -162,6 +162,10 @@ impl Pki {
     }
 }
 #[derive(Clone)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one test-owned service per replica; both variants are cloned handles"
+)]
 enum TestService {
     Single(FleetService),
     Managed(ManagedService),

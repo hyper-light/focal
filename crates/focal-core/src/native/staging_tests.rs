@@ -311,11 +311,19 @@ fn owner_reserves_descriptors_and_containers_before_entering_transaction() {
     let descriptors = array::<Extra>(limits.range.max_batch_entries / 2).unwrap() * 2;
     let changes = array::<Change<Key, Row>>(limits.range.max_batch_entries).unwrap()
         + array::<claim_changes::History>(limits.plan_nodes).unwrap();
+    // A post moves each of its plan claims between status index keys and
+    // registers each admission evaluation's due timer, bounded by the batch.
+    let index = array::<crate::native::index_rows::IndexChange>(
+        (2 * limits.plan_nodes + limits.range.max_batch_entries)
+            .min(limits.range.max_batch_entries),
+    )
+    .unwrap();
     let entire_charge = limits.preparation_bytes
         + descriptors
         + changes
         + containers(limits.plan_nodes).unwrap()
-        + event_containers(limits.range.max_batch_entries).unwrap();
+        + event_containers(limits.range.max_batch_entries).unwrap()
+        + index;
     // Leave every descriptor and all but one container byte available. No
     // candidate may enter semantic execution under this incomplete reservation.
     let pressure = budget

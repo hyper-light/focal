@@ -15,7 +15,9 @@ pub(super) fn check(
 ) -> Result<(), NativeError> {
     // Reports need nine writes, or eleven when a Required result first makes
     // the Posted parent PostFailed. Begin cannot admit only the success branch.
-    if limits.range.max_batch_entries < 11 {
+    // Eleven primary rows plus the smallest report's index rows: a result
+    // artifact without inputs, its verdict, and the parent's status move.
+    if limits.range.max_batch_entries < super::index_rows::MINIMUM_FAILED_REPORT_ROWS {
         return Err(NativeError::Capacity("admission completion write set"));
     }
     if claim.acceptance().declarations().len() > limits.definitions

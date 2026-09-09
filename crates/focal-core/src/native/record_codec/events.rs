@@ -185,8 +185,12 @@ fn claim_kind(s: &mut impl Sink, kind: NativeEventKind) -> Result<(), Error> {
         NativeEventKind::ResponseObserved => 19,
         NativeEventKind::Expired => 20,
         NativeEventKind::Deadlocked => 21,
+        NativeEventKind::Imported(_) => 22,
     };
     write_u8(s, tag)?;
+    if let NativeEventKind::Imported(legacy) = kind {
+        write_u64(s, legacy.0)?;
+    }
     if let NativeEventKind::Monitor(event) = kind {
         match event {
             NativeMonitorEvent::Registered { id, cut } => {

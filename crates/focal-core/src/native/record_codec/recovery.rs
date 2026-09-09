@@ -3,7 +3,7 @@
 //! no participant action is replayed, and this API makes no Session/Raft promise.
 use super::*;
 use focal_evidence::{
-    ContentStore, NativeLocalCustody, NativeSchemaVerifier, NativeVerificationBudget,
+    NativeCustodyReader, NativeLocalCustody, NativeSchemaVerifier, NativeVerificationBudget,
 };
 use focal_memory::{BudgetLane, RangeHydrationLimits};
 use focal_model::lifecycle::{
@@ -79,15 +79,15 @@ impl Limits {
         }
     }
 }
-pub(super) struct Custody<'a, S> {
-    store: &'a ContentStore,
+pub(super) struct Custody<'a, S, R> {
+    store: &'a R,
     schemas: &'a S,
     budget: &'a MemoryBudget,
     work: &'a Meter,
 }
-impl<'a, S> Custody<'a, S> {
+impl<'a, S, R> Custody<'a, S, R> {
     pub(super) fn new(
-        store: &'a ContentStore,
+        store: &'a R,
         schemas: &'a S,
         budget: &'a MemoryBudget,
         work: &'a Meter,
@@ -100,7 +100,7 @@ impl<'a, S> Custody<'a, S> {
         }
     }
 }
-impl<S: NativeSchemaVerifier> read_evidence::Custody for Custody<'_, S> {
+impl<S: NativeSchemaVerifier, R: NativeCustodyReader> read_evidence::Custody for Custody<'_, S, R> {
     fn recover(
         &self,
         request: RequestKey,
@@ -169,12 +169,12 @@ impl<C> Shared<'_, '_, C> {
 /// On any refusal, all provisional roots, rows, indices and reservations drop.
 /// Success proves intrinsic/cross-row consistency of this Core snapshot; it
 /// neither activates a wire decoder nor acknowledges a replicated log entry.
-pub fn restore<S: NativeSchemaVerifier>(
+pub fn restore<S: NativeSchemaVerifier, R: NativeCustodyReader>(
     checkpoint: &checkpoint::StructuralCheckpoint<'_>,
     range: RangeId,
     mut limits: Limits,
     budget: MemoryBudget,
-    store: &ContentStore,
+    store: &R,
     schemas: &S,
 ) -> Result<Core<NativeState>, NativeError> {
     let header = checkpoint.header();
@@ -232,15 +232,10 @@ pub fn restore<S: NativeSchemaVerifier>(
         owner = owner
             .insert_sources(count, sources, |row| {
                 // Range reconstruction copies only retained neighbors of changed
-                // pages. Prepay the node's bounded maximum row traversal before the
+                // pages. Prepay the copied row's bounded traversal before the
                 // existing fallible copier touches any nested collection.
-                let work = limits
-                    .native
-                    .range
-                    .max_entry_bytes
-                    .checked_mul(8)
-                    .and_then(|n| n.checked_add(4096))
-                    .ok_or(MemoryError::CounterExhausted("recovery neighbor copy work"))?;
+                let work =
+                    read_dispatch::objects::copy_work(row).map_err(|error| shared.refuse(error))?;
                 meters
                     .model
                     .charge(work)

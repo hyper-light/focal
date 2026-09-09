@@ -33,8 +33,13 @@ the issued identity. A new credential does not promote a voter or add custody.
 Use `cluster.invitations.list` with its revision-bound continuation to inspect
 issuance. Authorized revocation uses `cluster.invitations.revoke` or
 `cluster.credentials.revoke` with the observed revision. Completion: confirm
-committed revocation; disconnect alone does not revoke a credential. These tools
-do not renew the same identity or rotate a running node's key.
+committed revocation; disconnect alone does not revoke a credential.
+`cluster.credentials.renew` renews the local node's own credential now (the
+same key under a fresh certificate and lifetime; a node renews itself ahead
+of expiry without being asked). Completion: the reply names the new expiry and
+fingerprint; a retry after an interruption converges on the committed
+renewal. It does not rotate the key, and the founder's identity is not
+renewed this way.
 
 ## Change the selected consensus configuration
 
@@ -69,3 +74,12 @@ administration. Each larger deployment adds only its needed identity, endpoint
 and placement choices. Describe unimplemented drain, credential renewal,
 deployment activation or global guarantees as unavailable; avoid substituting
 a successful command from another scope.
+
+## Native engine
+
+`cluster.node.health` and `cluster.status` report each hosted ledger's engine
+(the active storage format, its effective guarantee and decoder floor).
+Activating the native engine is an offline operator command of the CLI
+(`focal cluster replicas activate-native`, run before the node listens) and
+has no MCP tool; a running native ledger needs no cluster administration
+beyond the changes above, and no tool here changes an engine in place.

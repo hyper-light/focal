@@ -201,7 +201,9 @@ Declaration retains its actual supplied Binding. External definition, schema,
 version, policy and requirement-specification pins remain explicit hash fields.
 
 Claim relations are `(kind u16, tagged target)`: target Participant `0` + ID,
-Object `1` + ObjectRef, Action `2` + action `u16`, Root `3` + ID. Relation kinds
+Object `1` + ObjectRef, Action `2` + action `u16`, Root `3` + ID, Evidence `4` +
+artifact ID + descriptor hash (an exact committed artifact; descriptor schema 2
+only, cited by `reviews` and `derived_from`). Relation kinds
 `1..15` are Issuer, Subject, Evaluator, ClaimAction, Supersedes, DependsOn, Awaits,
 CausedBy, Refines, ConflictsWith, DerivedFrom, Reviews, Amends, ContributedBy and
 Invalidates. Actions `1..10` are Work, Consultation, Challenge, Feedback, Approval,
@@ -211,6 +213,55 @@ UxSurface numbered `1..6`. Requirement pins are `(validation ID, specification
 hash)`. A slot is `(index u32, missing index u32, mode, checks)`; each check is
 `(declaration index u32, validation ID, mode)`. Mode is Required `0` or Observe `1`.
 Empty check arrays preserve the explicit slot's delivery obligation.
+
+In descriptor schema 1 the role relations (issuer, subject, claim action and
+cause) are derived by the descriptor's role builder and every other authored
+relation targets a committed claim of the same ledger. Descriptor schema 2
+(2026-09-09) adds two things and nothing else: `reviews` and `derived_from`
+relations may target exact evidence (tag 4), which the owner admits only when
+that artifact is committed at that descriptor hash on the same ledger; and an
+optional follow-up policy follows the deadline (`u8` presence, then
+`corrective_allowed u8`, `max_follow_ups u16` at most 1024, `single_issuer u8`,
+`escalation u8` = none `0`, holder `1`, evaluator `2`). Schema-1 bytes and
+hashes are unchanged; a schema-1 descriptor carrying a policy is refused, and
+the schema-2 content hash covers the policy section explicitly (present or
+absent). Schema 2 also admits the corrective `invalidates` relation (kind
+15) to a committed claim, never to the descriptor itself. The host-side
+compiler selects schema 2 exactly when a document carries a `policy`, an
+`artifact:ID@HASH` relation target or an `invalidates` relation.
+
+Peer follow-ups (R5, decision F29) are ordinary authored claims gated by the
+authored policy of the claim they follow, and never reopen it: a terminal or
+released claim cannot own a child, so a follow-up links through an authored
+relation instead of `caused_by`. A **correction** (action `correction`)
+`invalidates` exactly one committed claim whose action is `challenge` and
+whose policy has `corrective_allowed`, and `reviews` exactly one exact
+artifact: the report of that challenge's terminal Fail, Incomplete or Error
+verdict at the challenge's current registration generation (a passing or
+still-retryable verdict is `InvalidTransition`, a stale generation
+`StaleEvaluation`, any other artifact `MissingEvidence`, another kind of
+claim `InvalidTarget`, a missing or forbidding policy `InvalidPolicy`). Its
+author is the challenge's issuer, its current receipt holder unless
+`escalation` is `none`, or, under `escalation: evaluator`, the evaluator who
+reported the cited verdict; anyone else is `WrongActor`. Under
+`single_issuer` a second correction of the same challenge, committed or in
+the same batch, is `ConflictingCause`. A **follow-up consultation** (action
+`consultation`) `refines` the consultation it continues; when that claim
+carries a policy its `escalation` names who may file (issuer, holder, or a
+designated evaluator of its declarations) and `max_follow_ups` bounds the
+consultations refining it, counted from the relation index across the
+committed prefix and the batch (`InvalidPolicy` once exhausted); a claim
+without a policy bounds nobody. The same escalation governs `caused_by`
+children of a live parent: `none` reserves them to the issuer, `holder`
+(the schema-1 rule) admits the current receipt holder, `evaluator` also
+admits a designated evaluator. The leader applies these rules at admission
+and every replica at replay, each claim's citation walk and index scans
+bounded by `plan_edges` of their own. A slot's `missing_declaration_index`
+is a virtual declaration index: it must name no authored declaration, differ
+from every check's declaration index and be unique per slot. The host-side
+compiler ([focal-native-client](../../crates/focal-native-client/src/compile.rs))
+enforces both before a frame is encoded, so a document that violates them is
+refused locally with the same closed categories the owner would return.
 
 Common declaration fields are claim ID, issuer ID, index `u32`, kind `u16`,
 declared phase `u16`, mode, target declaration, program, Deadline. Kinds `1..7`

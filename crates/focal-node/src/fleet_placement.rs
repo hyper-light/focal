@@ -20,6 +20,9 @@ impl PlacementReply {
 pub(super) struct PlacementCall {
     request: SessionPlacementRequest,
     response: oneshot::Sender<Result<PlacementReply, LedgerError>>,
+    /// Answer only from the committed record this replica applied; never
+    /// propose. Any replica, leader or follower, can witness.
+    witness_only: bool,
 }
 pub(super) struct PendingPlacementCall {
     call: PlacementCall,
@@ -36,7 +39,9 @@ impl PendingPlacementCall {
             charge,
             ..
         } = self;
-        let PlacementCall { request, response } = call;
+        let PlacementCall {
+            request, response, ..
+        } = call;
         drop(request);
         drop(context);
         let _ = response.send(result.map(|witness| PlacementReply {
@@ -52,6 +57,21 @@ impl ReplicaHost {
     pub async fn propose_placement(
         &self,
         request: SessionPlacementRequest,
+    ) -> Result<PlacementReply, LedgerError> {
+        self.placement_call(request, false).await
+    }
+    /// The committed record answering `request` on this replica, whether it
+    /// leads or follows; `NotReady` while the record is not yet applied here.
+    pub async fn placement_witness(
+        &self,
+        request: SessionPlacementRequest,
+    ) -> Result<PlacementReply, LedgerError> {
+        self.placement_call(request, true).await
+    }
+    async fn placement_call(
+        &self,
+        request: SessionPlacementRequest,
+        witness_only: bool,
     ) -> Result<PlacementReply, LedgerError> {
         request.validate()?;
         let encoded = postcard::experimental::serialized_size(&request)?;
@@ -69,7 +89,11 @@ impl ReplicaHost {
         let (response, receive) = oneshot::channel();
         self.sender
             .try_send(Work::Placement(
-                Box::new(PlacementCall { request, response }),
+                Box::new(PlacementCall {
+                    request,
+                    response,
+                    witness_only,
+                }),
                 charge,
             ))
             .map_err(|error| match error {
@@ -81,6 +105,21 @@ impl ReplicaHost {
 }
 impl Owner {
     pub(super) fn accept_placement(&mut self, call: PlacementCall, charge: Allocation) {
+        if call.witness_only {
+            let result = match self.session.placement_witness(&call.request) {
+                Ok(Some(witness)) => Ok(PlacementReply {
+                    witness,
+                    _charge: charge,
+                }),
+                Ok(None) => Err(LedgerError::NotReady {
+                    leader: self.session.status().leader_id,
+                }),
+                Err(error) => Err(error),
+            };
+            drop(call.request);
+            let _ = call.response.send(result);
+            return;
+        }
         let result = (|| {
             if self.placement.is_some() || self.stopping.is_some() {
                 return Err(LedgerError::Capacity);

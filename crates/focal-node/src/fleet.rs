@@ -12,13 +12,17 @@ use focal_consensus::StateRole;
 #[path = "fleet_diagnostics.rs"]
 mod diagnostics;
 pub use diagnostics::ReplicaDiagnosticsReply;
+#[path = "fleet_registration.rs"]
+mod registration;
 use focal_ledger::{
     LedgerError, ManagedSubmission, RequestStreamSubmission, Session, SessionEvents, Submission,
 };
+use focal_ledger::{LegacyImportPayloads, PendingImport};
 pub use focal_ledger::{MembershipView, SessionMembershipReceipt, SessionMembershipRequest};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::*;
 use focal_wire::*;
+pub use registration::RegistrationFactsReply;
 use std::{
     collections::VecDeque,
     future::Future,
@@ -51,6 +55,12 @@ use placement_owner::{PendingPlacementCall, PlacementCall};
 #[cfg(test)]
 #[path = "fleet_completion_tests.rs"]
 mod completion_tests;
+#[cfg(test)]
+#[path = "fleet_import_tests.rs"]
+mod import_tests;
+#[cfg(test)]
+#[path = "fleet_native_tests.rs"]
+mod native_tests;
 
 #[cfg(test)]
 #[path = "fleet_stop_tests.rs"]
@@ -67,6 +77,10 @@ mod membership_tests;
 #[cfg(test)]
 #[path = "fleet_evidence_tests.rs"]
 mod evidence_tests;
+
+#[cfg(test)]
+#[path = "fleet_admission_tests.rs"]
+mod admission_tests;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplicaConfig {
@@ -128,10 +142,28 @@ pub struct ReplicaProgress {
     pub sequence: SessionSeq,
     pub dropped_replication: u64,
     pub stopped: bool,
+    /// A native import this replica cannot apply until its host seals the
+    /// inline legacy payloads with the recorded chunking (23 §5.2).
+    pub import_pending: Option<PendingImport>,
 }
+/// The content parameters an activation proposal records for an import.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActivateNativeCall {
+    /// Profile of a genesis activation; a populated prefix is always imported
+    /// with the projection profile (23 §5).
+    pub profile: focal_ledger::NativeContentProfile,
+    pub chunk_bytes: usize,
+    pub max_manifest_bytes: usize,
+}
+/// Largest total of inline legacy payloads copied out for host sealing.
+const IMPORT_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 enum Work {
     Diagnostics(
         oneshot::Sender<Result<ReplicaDiagnosticsReply, LedgerError>>,
+        Allocation,
+    ),
+    Registration(
+        oneshot::Sender<Result<RegistrationFactsReply, LedgerError>>,
         Allocation,
     ),
     Request(
@@ -151,6 +183,15 @@ enum Work {
     ),
     Membership(Box<MembershipCall>, Allocation),
     ManagedSupport(Box<SupportCall>, Allocation),
+    ActivateNative(
+        ActivateNativeCall,
+        oneshot::Sender<Result<(), LedgerError>>,
+        Allocation,
+    ),
+    ImportPayloads(
+        oneshot::Sender<Result<Option<LegacyImportPayloads>, LedgerError>>,
+        Allocation,
+    ),
     Placement(Box<PlacementCall>, Allocation),
     Evidence(Box<EvidenceCall>, Allocation),
     Stop(oneshot::Sender<Result<(), LedgerError>>),
@@ -163,6 +204,7 @@ pub(crate) struct ReceiptProbe {
 struct AdmittedRequest {
     verified: VerifiedRequest,
     witness: Option<EvidenceWitness>,
+    native: Option<focal_evidence::VerifiedNativeArtifact>,
 }
 struct MembershipCall {
     request: Option<SessionMembershipRequest>,
@@ -308,6 +350,17 @@ impl ReplicaOwner {
 #[allow(clippy::large_enum_variant)]
 enum WaitingFor {
     Mutation(RequestKey),
+    NativeMutation {
+        key: RequestKey,
+        outcome: focal_core::native::NativeOutcome,
+    },
+    NativeRead {
+        correlation: focal_ledger::ReadCorrelation,
+        principal: ParticipantId,
+        role: NativePeerRole,
+        profile: NativeProfile,
+        read: NativeReadRequest,
+    },
     ManagedMutation {
         key: ManagedRequestKey,
         intent: ContentHash,
@@ -508,6 +561,7 @@ impl ReplicaHost {
                 sequence: session.sequence(),
                 dropped_replication: 0,
                 stopped: false,
+                import_pending: None,
             },
             _allocation: None,
         });
@@ -623,6 +677,43 @@ impl ReplicaHost {
             })?;
         receive.await.map_err(|_| LedgerError::OutcomeUnknown)?
     }
+    /// Propose the replicated activation of native history on this ledger's
+    /// authority. Completion is observed through diagnostics: the record must
+    /// commit and apply on every replica before native admission opens.
+    pub async fn activate_native(&self, call: ActivateNativeCall) -> Result<(), LedgerError> {
+        let charge = self
+            .budget
+            .reserve(BudgetKind::Control, BudgetLane::Completion, 64 * 1024)?
+            .commit();
+        let (send, receive) = oneshot::channel();
+        self.sender
+            .try_send(Work::ActivateNative(call, send, charge))
+            .map_err(|error| match error {
+                HostQueueError::Full => LedgerError::Capacity,
+                HostQueueError::Disconnected => LedgerError::Failed,
+            })?;
+        receive.await.map_err(|_| LedgerError::OutcomeUnknown)?
+    }
+    /// The inline legacy payloads a host must seal before this ledger's
+    /// populated prefix can be imported; `None` when the prefix is empty.
+    pub async fn import_payloads(&self) -> Result<Option<LegacyImportPayloads>, LedgerError> {
+        let charge = self
+            .budget
+            .reserve(
+                BudgetKind::Control,
+                BudgetLane::Completion,
+                IMPORT_PAYLOAD_BYTES.saturating_add(64 * 1024),
+            )?
+            .commit();
+        let (send, receive) = oneshot::channel();
+        self.sender
+            .try_send(Work::ImportPayloads(send, charge))
+            .map_err(|error| match error {
+                HostQueueError::Full => LedgerError::Capacity,
+                HostQueueError::Disconnected => LedgerError::Failed,
+            })?;
+        receive.await.map_err(|_| LedgerError::OutcomeUnknown)?
+    }
     /// Trusted in-process control read, completed behind a quorum ReadIndex.
     pub async fn membership(&self) -> Result<MembershipReply, LedgerError> {
         self.membership_call(None).await
@@ -690,14 +781,17 @@ impl RequestHandler for ReplicaHost {
     fn supports_participant_requests(&self) -> bool {
         true
     }
+    fn supports_native_requests(&self) -> bool {
+        true
+    }
     fn handle(
         &self,
         request: VerifiedRequest,
     ) -> Pin<Box<dyn Future<Output = ResponseEnvelope> + Send + '_>> {
-        Box::pin(async move { self.submit_inner(request, None).await.into_envelope() })
+        Box::pin(async move { self.submit_inner(request, None, None).await.into_envelope() })
     }
     fn handle_accounted(&self, request: VerifiedRequest) -> OwnedHandlerFuture<'_> {
-        Box::pin(self.submit_inner(request, None))
+        Box::pin(self.submit_inner(request, None, None))
     }
 }
 impl ReplicaHost {
@@ -706,12 +800,22 @@ impl ReplicaHost {
         request: VerifiedRequest,
         witness: EvidenceWitness,
     ) -> OwnedResponse {
-        self.submit_inner(request, Some(witness)).await
+        self.submit_inner(request, Some(witness), None).await
+    }
+    /// Submit an artifact-bearing native frame whose payload the content host
+    /// has sealed and verified; the owner checks the evidence against the frame.
+    pub(crate) async fn submit_with_native_evidence(
+        &self,
+        request: VerifiedRequest,
+        evidence: focal_evidence::VerifiedNativeArtifact,
+    ) -> OwnedResponse {
+        self.submit_inner(request, None, Some(evidence)).await
     }
     async fn submit_inner(
         &self,
         request: VerifiedRequest,
         witness: Option<EvidenceWitness>,
+        native: Option<focal_evidence::VerifiedNativeArtifact>,
     ) -> OwnedResponse {
         let unknown = request.request().reply(Response::Error(
             if matches!(
@@ -721,6 +825,8 @@ impl ReplicaHost {
                     | Operation::Reconcile(_)
                     | Operation::RequestStreamRead { .. }
                     | Operation::ManagedSupport { .. }
+                    | Operation::NativeRead(_)
+                    | Operation::NativeList(_)
             ) {
                 AccessError::Unavailable
             } else {
@@ -774,7 +880,11 @@ impl ReplicaHost {
             | Operation::List(_)
             | Operation::Select(_)
             | Operation::Traverse(_)
-            | Operation::Validators(_) => self.client_frame_bytes as usize,
+            | Operation::Validators(_)
+            | Operation::NativeRead(_)
+            | Operation::NativeList(_) => self.client_frame_bytes as usize,
+            // A native receipt, ticket or refusal is a small fixed document.
+            Operation::Native { .. } => 4096,
             Operation::Stream(stream) => {
                 stream.credits().bytes.min(self.client_frame_bytes) as usize
             }
@@ -808,6 +918,7 @@ impl ReplicaHost {
             Box::new(AdmittedRequest {
                 verified: request,
                 witness,
+                native,
             }),
             send,
             charge.commit(),
@@ -897,6 +1008,12 @@ impl Owner {
                 Ok(_) | Err(LedgerError::Capacity | LedgerError::NotReady { .. }) => {}
                 Err(error) => return Err(error),
             }
+            // Trusted native timers fire from the leader's clock; a deferred
+            // or refused timer waits for a later tick or its primary row.
+            match crate::native_timers::sweep(&mut self.session) {
+                Ok(_) | Err(LedgerError::Capacity | LedgerError::NotReady { .. }) => {}
+                Err(error) => return Err(error),
+            }
         }
         self.views
             .advance(&mut self.session)
@@ -975,8 +1092,17 @@ impl Owner {
             Work::Diagnostics(response, charge) => {
                 let _ = response.send(Ok(self.diagnostics(charge)));
             }
+            Work::Registration(response, charge) => {
+                let _ = response.send(self.registration_facts(charge));
+            }
             Work::Request(request, response, charge) => {
-                self.request(request.verified, response, charge, request.witness);
+                self.request(
+                    request.verified,
+                    response,
+                    charge,
+                    request.witness,
+                    request.native,
+                );
                 self.drain()?;
             }
             Work::Probe(request, response, charge) => {
@@ -1011,6 +1137,35 @@ impl Owner {
                 let _ = response.send(result);
             }
             Work::ManagedSupport(call, charge) => self.accept_managed_support(*call, charge),
+            Work::ActivateNative(call, response, charge) => {
+                let result = if self.session.legacy_populated() {
+                    wall_ms().and_then(|now| {
+                        self.session.propose_native_import(
+                            focal_ledger::NativeContentProfile::ProjectionOnly,
+                            None,
+                            now,
+                            call.chunk_bytes,
+                            call.max_manifest_bytes,
+                        )
+                    })
+                } else {
+                    self.session.propose_native_activation(call.profile)
+                };
+                drop(charge);
+                self.drain()?;
+                let _ = response.send(result);
+            }
+            Work::ImportPayloads(response, charge) => {
+                let result = if self.session.legacy_populated() {
+                    self.session
+                        .legacy_import_payloads(IMPORT_PAYLOAD_BYTES)
+                        .map(Some)
+                } else {
+                    Ok(None)
+                };
+                drop(charge);
+                let _ = response.send(result);
+            }
             Work::Membership(call, charge) => {
                 self.accept_membership(*call, charge);
                 self.drain()?;
@@ -1037,7 +1192,17 @@ impl Owner {
                     // A pending proposal remains recoverable in Raft's log;
                     // it is not turned into an acknowledged checkpoint.
                     if self.session.pending_count() == 0 {
-                        self.session.checkpoint()
+                        match self.session.checkpoint() {
+                            // Nothing can be checkpointed yet (a native genesis
+                            // still in flight): the log is durable; a later
+                            // start checkpoints normally.
+                            Err(LedgerError::Native(error))
+                                if error.class() == focal_ledger::FailureClass::Retryable =>
+                            {
+                                Ok(())
+                            }
+                            other => other,
+                        }
                     } else {
                         Ok(())
                     }
@@ -1086,6 +1251,7 @@ impl Owner {
                     | WaitingFor::Monitor { .. }
                     | WaitingFor::Reconcile { .. }
                     | WaitingFor::RequestStreamRead { .. }
+                    | WaitingFor::NativeRead { .. }
             ) {
                 AccessError::Unavailable
             } else {
@@ -1105,6 +1271,7 @@ impl Owner {
                 sequence: self.session.sequence(),
                 dropped_replication: self.dropped,
                 stopped,
+                import_pending: self.session.pending_import(),
             }
         });
     }
@@ -1114,6 +1281,7 @@ impl Owner {
         response: oneshot::Sender<OwnedResponse>,
         charge: Allocation,
         witness: Option<EvidenceWitness>,
+        native: Option<focal_evidence::VerifiedNativeArtifact>,
     ) {
         let header = verified
             .request()
@@ -1668,6 +1836,116 @@ impl Owner {
                             .map(Response::Read)
                     }
                 }
+                Operation::Native { frame } => {
+                    if self.pending.len() == self.config.pending_clients {
+                        return Err(AccessError::Capacity);
+                    }
+                    let header = native_frame_admissible(frame, peer, request)?;
+                    // Artifact payloads reach this owner only through the data
+                    // service, which had the exclusive content writer seal and
+                    // verify them first; the owner still checks that evidence
+                    // against the exact frame before admission.
+                    if crate::native_ingress::artifact_bearing(header.command) && native.is_none() {
+                        return Err(AccessError::UnsupportedOperation);
+                    }
+                    let context = crate::native_ingress::context(peer, &self.session)?;
+                    crate::fault::hit(crate::fault::FaultSite::BeforePropose);
+                    match self.session.propose_native_frame(
+                        context,
+                        frame,
+                        focal_ledger::NativeCustody::Evidence(native.as_ref()),
+                    ) {
+                        Ok(focal_ledger::NativeSubmission::Committed(outcome)) => {
+                            crate::fault::hit(crate::fault::FaultSite::AfterCommitBeforeReply);
+                            Ok(Response::Native(NativeMutationReply::Committed(
+                                crate::native_documents::outcome(outcome),
+                            )))
+                        }
+                        Ok(focal_ledger::NativeSubmission::Pending { outcome, .. }) => {
+                            waiting = Some((
+                                WaitingFor::NativeMutation {
+                                    key: header.key,
+                                    outcome,
+                                },
+                                deadline,
+                            ));
+                            Ok(Response::Error(AccessError::OutcomeUnknown))
+                        }
+                        Err(error) => crate::native_ingress::failure(error).map(Response::Native),
+                    }
+                }
+                Operation::NativeRead(read) => {
+                    read.validate(&self.client_limits)?;
+                    let profile = crate::native_reads::profile(&self.session)?;
+                    let role = crate::native_reads::role(peer)?;
+                    if matches!(read.consistency, ReadConsistency::Linearizable) {
+                        if !self.session.is_authoritative() {
+                            return Err(AccessError::Unavailable);
+                        }
+                        if self.pending.len() == self.config.pending_clients {
+                            return Err(AccessError::Capacity);
+                        }
+                        self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
+                        let correlation = crate::native_reads::correlation(
+                            peer.principal(),
+                            request.request_id,
+                            self.nonce,
+                        );
+                        self.session
+                            .native_read_index(correlation)
+                            .map_err(access)?;
+                        waiting = Some((
+                            WaitingFor::NativeRead {
+                                correlation,
+                                principal: peer.principal(),
+                                role,
+                                profile,
+                                read: read.clone(),
+                            },
+                            deadline,
+                        ));
+                        Ok(Response::Error(AccessError::Unavailable))
+                    } else {
+                        let core = self.session.native_core().map_err(access)?;
+                        crate::native_reads::check_consistency(
+                            core,
+                            self.session.ledger(),
+                            &read.consistency,
+                        )?;
+                        crate::native_reads::page(
+                            &crate::native_reads::Reader {
+                                core,
+                                ledger: self.session.ledger(),
+                                profile,
+                                principal: peer.principal(),
+                                role,
+                                route: request.route_epoch,
+                            },
+                            read,
+                        )
+                        .map(Response::NativeRead)
+                    }
+                }
+                Operation::NativeList(list) => {
+                    list.validate(&self.client_limits)?;
+                    let profile = crate::native_reads::profile(&self.session)?;
+                    let role = crate::native_reads::role(peer)?;
+                    let key = *self.views.list_key()?;
+                    let core = self.session.native_core().map_err(access)?;
+                    crate::native_lists::serve(
+                        &crate::native_reads::Reader {
+                            core,
+                            ledger: self.session.ledger(),
+                            profile,
+                            principal: peer.principal(),
+                            role,
+                            route: request.route_epoch,
+                        },
+                        &key,
+                        list,
+                    )
+                    .map(Response::NativeListed)
+                }
                 _ => Err(AccessError::UnsupportedOperation),
             }
         })();
@@ -1733,15 +2011,32 @@ impl Owner {
         self.drain_with_runtime(true)
     }
     fn drain_with_runtime(&mut self, drive_runtime: bool) -> Result<(), LedgerError> {
+        // A retained delivery (a retryable native refusal, an import waiting
+        // for sealed custody) resumes at the next poll; it never stops the
+        // replica.
         let events = if self.nonblocking {
-            let Some(events) = self.session.try_poll()? else {
-                self.expire_pending();
-                self.publish_progress(false);
-                return Ok(());
-            };
-            events
+            match self.session.try_poll() {
+                Ok(Some(events)) => events,
+                Ok(None) => {
+                    self.expire_pending();
+                    self.publish_progress(false);
+                    return Ok(());
+                }
+                Err(LedgerError::Retry) => {
+                    self.publish_progress(false);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
         } else {
-            self.session.poll()?
+            match self.session.poll() {
+                Ok(events) => events,
+                Err(LedgerError::Retry) => {
+                    self.publish_progress(false);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
         };
         if drive_runtime && let Some(runtime) = &mut self.runtime {
             match runtime.drive(&mut self.session) {
@@ -1839,6 +2134,7 @@ impl Owner {
                 && !matches!(
                     pending.waiting,
                     WaitingFor::Mutation(_)
+                        | WaitingFor::NativeMutation { .. }
                         | WaitingFor::ManagedMutation { .. }
                         | WaitingFor::PeerPersistence
                 )
@@ -1962,6 +2258,52 @@ impl Owner {
                     .receipt(key)
                     .cloned()
                     .map(|receipt| Response::Submitted(MutationReply::Committed(receipt))),
+                WaitingFor::NativeMutation { key, outcome } => {
+                    match self.session.native_outcome(*key) {
+                        Ok(Some(committed)) if committed == *outcome => {
+                            crate::fault::hit(crate::fault::FaultSite::AfterCommitBeforeReply);
+                            Some(Response::Native(NativeMutationReply::Committed(
+                                crate::native_documents::outcome(committed),
+                            )))
+                        }
+                        Ok(Some(_)) => Some(Response::Native(NativeMutationReply::Refused(
+                            NativeRefusal {
+                                kind: NativeRefusalKind::Conflict,
+                                detail: "request key committed another native intent".into(),
+                            },
+                        ))),
+                        Ok(None) => None,
+                        Err(error) => Some(Response::Error(access(error))),
+                    }
+                }
+                WaitingFor::NativeRead {
+                    correlation,
+                    principal,
+                    role,
+                    profile,
+                    read,
+                } if pending.term == status.term && self.session.is_authoritative() => events
+                    .native_read_boundaries
+                    .iter()
+                    .find(|boundary| boundary.correlation == *correlation)
+                    .map(
+                        |boundary| match self.session.native_read_at_least(*boundary) {
+                            Ok(core) => crate::native_reads::page(
+                                &crate::native_reads::Reader {
+                                    core,
+                                    ledger: self.session.ledger(),
+                                    profile: *profile,
+                                    principal: *principal,
+                                    role: *role,
+                                    route: pending.header.route_epoch,
+                                },
+                                read,
+                            )
+                            .map(Response::NativeRead)
+                            .unwrap_or_else(Response::Error),
+                            Err(error) => Response::Error(access(error)),
+                        },
+                    ),
                 WaitingFor::Read {
                     context,
                     principal,

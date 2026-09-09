@@ -1,7 +1,10 @@
 //! One physical disk owner. Group callers own their Raft state and wait for the
 //! covering flush; independent callers can share one fsync without sharing locks.
 use super::*;
-use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
+use focal_memory::{
+    Allocation, BudgetKind, BudgetLane, DiskBudget, DiskBudgetConfig, DiskKind, DiskReservation,
+    MemoryBudget,
+};
 use std::{
     collections::BTreeMap,
     future::Future,
@@ -88,11 +91,14 @@ impl WalPause {
 }
 struct Handle {
     owner: WalWriterId,
+    directory: std::path::PathBuf,
     sender: Option<mpsc::SyncSender<Command>>,
     thread: Option<JoinHandle<()>>,
     options: WalOptions,
     budget: MemoryBudget,
     slots: MemoryBudget,
+    /// The volume envelope every batch is promised from before it is queued.
+    disk: DiskBudget,
     _configuration: Allocation,
 }
 impl Drop for Handle {
@@ -199,6 +205,8 @@ struct Batch {
     bytes: usize,
     index: Option<IndexChunk>,
     reply: Reply<DurablePosition>,
+    /// Committed once the batch reached its durable fence; returned otherwise.
+    disk: DiskReservation,
     _allocation: Allocation,
     _slot: Allocation,
 }
@@ -372,14 +380,30 @@ impl SharedWal {
             .map_err(|_| LogError::Capacity)?;
         Self::open_with_budget(directory, options, WalWriterLimits::default(), budget)
     }
-    /// Node hosts can attach the writer to their hierarchical RAM budget.
+    /// Node hosts can attach the writer to their hierarchical RAM budget. The
+    /// writer then guards its volume with the standard disk watermark alone.
     pub fn open_with_budget(
         directory: impl AsRef<Path>,
         options: WalOptions,
         limits: WalWriterLimits,
         budget: MemoryBudget,
     ) -> Result<Self, LogError> {
+        let disk = DiskBudget::new(DiskBudgetConfig::default()).map_err(|_| LogError::Capacity)?;
+        Self::open_with_budgets(directory, options, limits, budget, disk)
+    }
+    /// Attach the writer to the RAM budget and to the disk envelope shared by
+    /// every durable owner of the same volume: a batch is promised its bytes
+    /// before it is queued and refused with `Capacity` before any
+    /// acknowledgement when the volume cannot take it.
+    pub fn open_with_budgets(
+        directory: impl AsRef<Path>,
+        options: WalOptions,
+        limits: WalWriterLimits,
+        budget: MemoryBudget,
+        disk: DiskBudget,
+    ) -> Result<Self, LogError> {
         reject_replay_reentry()?;
+        let directory_path = directory.as_ref().to_path_buf();
         if !(1..=4096).contains(&limits.queue_items)
             || !(1..=64).contains(&limits.max_batch_requests)
             || !(1..=65536).contains(&limits.max_groups)
@@ -451,13 +475,48 @@ impl SharedWal {
             .spawn(move || writer.run(receiver))?;
         Ok(Self(Arc::new(Handle {
             owner,
+            directory: directory_path,
             sender: Some(sender),
             thread: Some(thread),
             options,
             budget,
             slots,
+            disk,
             _configuration: configuration,
         })))
+    }
+    /// Free bytes of the volume holding this WAL directory that no queued
+    /// write has been promised yet, from a sample the disk envelope refreshes
+    /// at its bounded cadence. Admission watermarks compare against this
+    /// before any in-memory acknowledgement; while the volume cannot be
+    /// sampled it is zero.
+    pub fn available_bytes(&self) -> Result<u64, LogError> {
+        let directory = &self.0.directory;
+        self.0
+            .disk
+            .refresh_with(|| fs2::available_space(directory).ok());
+        Ok(self.0.disk.uncommitted_free())
+    }
+    /// The disk envelope this writer draws from, for the other durable owners
+    /// of the same volume.
+    pub fn disk_budget(&self) -> DiskBudget {
+        self.0.disk.clone()
+    }
+    fn disk_reserve(
+        &self,
+        kind: DiskKind,
+        lane: BudgetLane,
+        bytes: usize,
+    ) -> Result<DiskReservation, LogError> {
+        let directory = &self.0.directory;
+        self.0
+            .disk
+            .refresh_with(|| fs2::available_space(directory).ok());
+        let bytes = u64::try_from(bytes).map_err(|_| LogError::Capacity)?;
+        self.0
+            .disk
+            .reserve(kind, lane, bytes)
+            .map_err(|_| LogError::Capacity)
     }
     fn send(&self, command: Command) -> Result<(), LogError> {
         self.0
@@ -530,6 +589,15 @@ impl SharedWal {
             .and_then(|n| n.checked_add(512))
             .ok_or(LogError::Capacity)?;
         let allocation = reserve(&self.0.budget, BudgetKind::Pending, lane, amount)?;
+        let disk = self.disk_reserve(
+            if checkpoint {
+                DiskKind::Checkpoint
+            } else {
+                DiskKind::Wal
+            },
+            lane,
+            bytes,
+        )?;
         let mut encoded = Vec::new();
         encoded
             .try_reserve_exact(records.len())
@@ -551,6 +619,7 @@ impl SharedWal {
             bytes,
             index: Some(index),
             reply,
+            disk,
             _allocation: allocation,
             _slot: slot,
         };
@@ -608,6 +677,10 @@ fn default_lane(records: &[Record]) -> Result<BudgetLane, LogError> {
 }
 
 impl WalLease {
+    /// Free bytes on the filesystem holding the shared WAL, sampled now.
+    pub fn available_bytes(&self) -> Result<u64, LogError> {
+        self.shared.available_bytes()
+    }
     /// Visitors may enqueue async writes, but synchronous WAL reentry and
     /// waiting on an unfinished append return `ReplayReentry`. Finish replay
     /// before awaiting durability; cancelling interest does not cancel a write.
@@ -988,11 +1061,15 @@ impl Writer {
                 }
                 self.wal.failed = failure.is_some();
                 for batch in completed {
-                    batch.reply.finish(if self.wal.failed {
-                        Err(failure.take().unwrap_or(LogError::Failed))
+                    let Batch { reply, disk, .. } = batch;
+                    if self.wal.failed {
+                        reply.finish(Err(failure.take().unwrap_or(LogError::Failed)));
                     } else {
-                        Ok(position)
-                    });
+                        // The bytes are behind the durable fence: charge them
+                        // to the volume rather than returning the promise.
+                        disk.commit();
+                        reply.finish(Ok(position));
+                    }
                 }
             }
             Err(error) => {
@@ -1035,7 +1112,11 @@ impl Writer {
             self.index = index;
             Ok(position)
         })();
-        batch.reply.finish(result);
+        let Batch { reply, disk, .. } = batch;
+        if result.is_ok() {
+            disk.commit();
+        }
+        reply.finish(result);
     }
     fn replay(
         &mut self,

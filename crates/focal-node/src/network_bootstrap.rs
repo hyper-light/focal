@@ -200,7 +200,7 @@ impl FoundingNetwork {
             return Err(NodeError::Identity.into());
         }
         state.validate(identity)?;
-        let wal = SharedWal::open_with_budget(
+        let wal = SharedWal::open_with_budgets(
             directory.root().join("wal"),
             WalOptions::new(WalIdentity {
                 cluster: identity.cluster,
@@ -209,6 +209,7 @@ impl FoundingNetwork {
             }),
             WalWriterLimits::default(),
             budget.child(256 * 1024 * 1024, 64 * 1024 * 1024)?,
+            crate::network_service::disk_budget().map_err(NodeError::Content)?,
         )?;
         let mut control = ControlReplica::open_on_wal(
             options,

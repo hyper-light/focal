@@ -20,3 +20,8 @@ tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+# Public, fallible workflow fixtures for integration tests in other crates.
+# Never enabled by production binaries.
+test-support = []

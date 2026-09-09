@@ -17,8 +17,48 @@ pub enum ResultKind {
     List,
     Reconcile,
 }
+/// Which negotiated wire profile carries the operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireProfile {
+    /// Frozen V1 command envelopes (protocols 1–3).
+    V1,
+    /// `FCNINPUT1` frames on the native profile (protocol 4).
+    Native,
+}
+/// Which durable client identity makes a retry exact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryIdentity {
+    /// Managed request streams: `m1:` operation references.
+    ManagedM1,
+    /// The native operation journal: `n1:` references carrying the exact frame.
+    NativeN1,
+    /// The root administration journal: `a1:` references.
+    AdminA1,
+    /// The application-replica administration journal: `r1:` references.
+    ReplicaR1,
+    /// Repeating the exact arguments resumes the same durable work (a named
+    /// watch, a caller-identified upload).
+    Exact,
+    /// Every call is a fresh intent; only a read is safe to repeat.
+    Fresh,
+}
+/// Which adapter surface serves the operation. One registry names every
+/// tool the CLI and the MCP adapter expose; the host filters by the
+/// standing it can prove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    /// Participant application operations on the active engine.
+    Application,
+    /// Durable named watches.
+    Watch,
+    /// Chunked payload transfer and retrieval.
+    Transfer,
+    /// Local physical-node administration.
+    Administration,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum InputKind {
+    Native(super::native_catalog::NativeInputKind),
     MonitorRegister,
     MonitorGet,
     Summary,
@@ -44,6 +84,9 @@ pub(super) enum InputKind {
     List,
     RequestEpoch,
     RequestStatus,
+    /// A reviewed JSON Schema literal for a surface whose input is not one
+    /// of the authored documents.
+    Literal(&'static str),
 }
 #[derive(Debug, Clone, Copy)]
 pub struct OperationDescriptor {
@@ -55,6 +98,13 @@ pub struct OperationDescriptor {
     pub destructive: bool,
     pub result_kind: ResultKind,
     pub max_input_bytes: usize,
+    pub wire: WireProfile,
+    pub retry: RetryIdentity,
+    pub surface: Surface,
+    /// The human CLI command that performs the same operation, as the
+    /// space-separated subcommand path under `focal`; absent when the CLI
+    /// performs it only implicitly.
+    pub cli_path: Option<&'static str>,
     pub(super) input: InputKind,
     pub(super) family: Option<ObjectKind>,
 }
@@ -66,6 +116,11 @@ impl OperationDescriptor {
     /// durable operation ID supplies retry idempotency, not the tool name.
     pub const fn idempotent(&self) -> bool {
         !self.mutation
+    }
+    /// Whether repeating the same call (with its durable reference or exact
+    /// arguments) resumes the same work instead of creating new intent.
+    pub const fn repeatable(&self) -> bool {
+        !self.mutation || !matches!(self.retry, RetryIdentity::Fresh)
     }
     pub fn input_schema(&self) -> Result<serde_json::Value, InputError> {
         super::schema::input(self)
@@ -85,6 +140,10 @@ macro_rules! descriptor {
             destructive: $destructive,
             result_kind: ResultKind::$kind,
             max_input_bytes: MAX_INPUT_BYTES,
+            wire: WireProfile::V1,
+            retry: RetryIdentity::ManagedM1,
+            surface: Surface::Application,
+            cli_path: None,
             input: InputKind::$input,
             family: $family,
         };
@@ -595,12 +654,31 @@ pub enum OperationOutput {
         content_hash: focal_model::ContentHash,
         chunk: focal_wire::ContentChunk,
     },
+    /// A committed native receipt with the identities the frame minted.
+    Native {
+        receipt: focal_wire::NativeReceipt,
+        created: Vec<crate::native_store::NativeIdentity>,
+    },
+    NativeRead {
+        page: Box<focal_wire::NativeReadPage>,
+    },
+    NativeList {
+        page: Box<focal_wire::NativeListPage>,
+    },
+    /// A closed native refusal; the exact journaled frame stays retained.
+    NativeRefused {
+        refusal: focal_wire::NativeRefusal,
+    },
+    NativeWait {
+        result: super::NativeWaitResult,
+    },
 }
 impl ApplicationResult {
     pub fn is_error(&self) -> bool {
         matches!(
             &self.result,
             OperationOutput::Error { .. }
+                | OperationOutput::NativeRefused { .. }
                 | OperationOutput::Mutation {
                     reply: MutationReply::Pending(_)
                         | MutationReply::Domain(DomainOutcome::Refuse { .. })
@@ -608,7 +686,7 @@ impl ApplicationResult {
         )
     }
     pub fn validate_metadata(&self) -> Result<(), InputError> {
-        if self.schema_version != 1
+        if !matches!(self.schema_version, 1 | 2)
             || self.condition.is_empty()
             || self.condition.len() > 64
             || self
@@ -633,4 +711,24 @@ impl From<AccessError> for OperationOutput {
             detail: error.to_string(),
         }
     }
+}
+
+/// The descriptor of a watch, transfer or administration tool by name.
+pub fn find_surface(name: &str) -> Option<&'static OperationDescriptor> {
+    super::watch_descriptors()
+        .iter()
+        .chain(super::transfer_descriptors())
+        .chain(super::admin_descriptors())
+        .find(|descriptor| descriptor.name == name)
+}
+/// Which surface serves `name`; the application surface covers both engines'
+/// catalogues and the recovery tools are the adapter's own.
+pub fn surface_of(name: &str) -> Option<Surface> {
+    if let Some(descriptor) = find_surface(name) {
+        return Some(descriptor.surface);
+    }
+    if find(name).is_some() || super::find_native(name).is_some() {
+        return Some(Surface::Application);
+    }
+    None
 }

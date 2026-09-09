@@ -179,7 +179,11 @@ fn artifact(
                 binding: descriptor.binding(),
             },
     )?;
-    let request = actor(event, descriptor.producer())?;
+    super::read_validate_index::require_artifact(descriptor, read)?;
+    let request = match event.invocation {
+        NativeInvocation::Import => import_request(read.ledger, id, descriptor.producer()),
+        _ => actor(event, descriptor.producer())?,
+    };
     value.custody().check(request, descriptor)?;
     require(value.custody().local_revision() == 1)?;
     let provenance = match (descriptor.work_provenance(), descriptor.result_provenance()) {
@@ -262,6 +266,8 @@ fn artifact(
             )?;
             true
         }
+        // A legacy artifact keeps its standalone registration (23 §5.2).
+        (None, None) => event.invocation == NativeInvocation::Import,
         _ => false,
     };
     require(provenance)?;
@@ -274,6 +280,18 @@ fn artifact(
     )?;
     for input in descriptor.inputs() {
         require(input.ledger == read.ledger)?;
+        if event.invocation == NativeInvocation::Import {
+            // Legacy inputs name legacy objects; all were recorded before the
+            // import position and inherit no native visibility rule.
+            let object = match input.kind {
+                ObjectKind::Claim => Key::Claim(ClaimId(input.id.0)),
+                ObjectKind::Validation => Key::LegacyDefinition(ValidationId(input.id.0)),
+                ObjectKind::Artifact => Key::Artifact(ArtifactId(input.id.0)),
+                ObjectKind::Testament => Key::LegacyTestament(TestamentId(input.id.0)),
+            };
+            read.require(object)?;
+            continue;
+        }
         let object = match input.kind {
             ObjectKind::Claim => Key::Claim(ClaimId(input.id.0)),
             ObjectKind::Validation => Key::Definition(ValidationId(input.id.0)),
@@ -326,6 +344,7 @@ fn accepted(
             && event.fact == NativeFact::Accepted { key }
             && event.ordinal == 2,
     )?;
+    super::read_validate_index::require_accepted(key, result.verdict(), read)?;
     let artifact = exact_artifact(read, value.artifact().reference())?;
     let descriptor = artifact.descriptor();
     actor(event, value.attempt().evaluator)?;

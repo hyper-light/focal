@@ -1,9 +1,10 @@
 # Managed request streams and safe retirement
 
-Status: P17.11 implementation in progress, 2026-09-06. This document fixes the
-identity, ownership and recovery contract. [09](09-implementation-status.md)
-records qualification; the remaining lifecycle and throughput gates below remain
-required before P17.11 is complete.
+Status: P17.11 ownership, acknowledgment, sealing, bounded close and automatic
+rotation are implemented (2026-09-09). This document fixes the identity,
+ownership and recovery contract. [09](09-implementation-status.md) records
+qualification; the throughput and multi-machine gates listed at the end remain
+required before P17.11 is closed.
 
 ## Identity and compatibility
 
@@ -91,14 +92,27 @@ RAM; older control preconditions fail or reconcile against committed state.
 Control results, managed receipts and queries remain separate from legacy epoch
 reconciliation's unchanged `Unknown`/`BelowFloor` semantics.
 
-The initial registry defaults to 64 remembered `(principal, slot)` pairs,
-256 ordinals per window and eight MiB per slot, subject to the owner's memory
-budget. Closed generations remain in those bounded pairs; closing allows that
-principal to reuse its slot, rather than freeing its identity fence. Sustained
-principal churn and reassignment of finite slots across principals therefore
-require a separate globally monotone slot-generation contract and privacy-safe
-occupancy discovery before claiming indefinite registry recycling. Increasing a
-quota alone does not establish that property.
+The registry defaults to 64 remembered `(principal, slot)` pairs, 256
+ordinals per window and eight MiB per slot, subject to the owner's memory
+budget. Closed generations remain in those bounded pairs as vacant fences, so
+a principal reuses its own slot above its last generation. Under principal
+churn the registry recycles pairs at capacity: a registration that finds no
+pair for its principal evicts the vacant pair with the smallest committed
+stamp (the longest-closed one), selected identically on every replica from
+the same committed rows; an occupied pair is never evicted, and a full
+registry of occupied pairs refuses with `Capacity`. The fence an evicted pair
+carried survives through the registry's **slot-generation watermark**: the
+highest generation it ever assigned, advanced on every registration and
+persisted in the `FOCALSS7` checkpoint envelope (an SS6 checkpoint derives it
+from its retained pairs). A vacant pair presents `max(last generation,
+watermark)` to reads and registrations; a registration cites that presented
+generation and is assigned exactly one above it, which is the rule the frozen
+client validators hold every reply to. A reassigned or re-created pair can
+therefore never reissue a generation another principal's delayed traffic
+still names: the evicted principal's old identity is refused as unregistered,
+its old receipts read as `Unknown`, and an occupancy read of another
+principal's slot reveals neither its owner nonce nor its receipts (the
+registry answers only for the authenticated principal's own pairs).
 
 ## Durable client ownership
 
@@ -139,9 +153,12 @@ old operation ID fresh.
 
 An adapter that automatically creates a store must keep an initialization marker
 outside that directory. Missing initialized state is a recovery error, not first
-use. A closed store remains a retired namespace; future automatic store rotation
-must preserve the generation fence without accumulating an unbounded directory
-catalogue. No time-based deletion or process-exit acknowledgment is authorized.
+use. A closed store remains a retired namespace. Automatic rotation preserves
+the generation fence without accumulating an unbounded directory catalogue: the
+coordinator record (`FCLMCO02`) names the active generation's child store, the
+store being removed and the last sixteen retired `(slot, generation)` fences;
+the server keeps every slot's last generation regardless. No time-based
+deletion or process-exit acknowledgment is authorized.
 
 Current client limits are a 32-ordinal default window, configurable up to 256;
 one MiB per expanded wire request or receipt; 256 KiB authored intent; a 256 KiB
@@ -212,10 +229,21 @@ satisfy this. Older permissive data directories produce an actionable permission
 error; the CLI does not silently chmod them. The [manual guide](../manual-cli.md)
 describes owner-controlled migration and the preserved explicit legacy path.
 
-Automatic close/rotation is not implemented. The adapter also does not solve
-indefinite principal churn, cross-principal slot reassignment or managed epoch
-batching. Separate CLI/MCP windows prevent an unconsumed MCP result from filling
-the ordinary CLI window; they do not eliminate the need to resolve unknown gaps.
+Automatic close and rotation are bounded by ordinal count, never by time. A
+generation issues at most its rotation bound of ordinals (65,536 by default;
+`FOCAL_MANAGED_ROTATION` sets a smaller bound for campaigns, and the bound is
+saved with the coordinator record so a different value cannot open it). Once
+the frontier reaches the bound and every ordinal through it is retired, the
+store stops issuance durably, the coordinator issues the exact close, and on
+the `Closed` reply it records the retired fence, removes the old child store
+and observes the slot again before registering above the presented
+generation; a crash between those steps resumes them on the next open, and a
+lost close or read reply re-issues the same request. References into a
+retired generation report `Retired` and never execute again; a reservation
+refused during the drain reports `Stopped`. The adapter still does not batch
+managed epochs. Separate CLI/MCP windows prevent an unconsumed MCP result from
+filling the ordinary CLI window; they do not eliminate the need to resolve
+unknown gaps.
 
 ## Wire activation and upgrades
 
@@ -290,13 +318,12 @@ precede introducing a record any voter cannot replay.
 ## Remaining implementation and qualification
 
 P17.11 remains open until all nine gates in [13](13-cli-and-agent-implementation-plan.md)
-pass together. Required remaining integration includes:
+pass together. Bounded close, automatic rotation, registry recycling under the
+slot-generation watermark and privacy-safe occupancy are implemented and
+qualified on one machine ([09](09-implementation-status.md), "Bounded
+generations: automatic rotation and registry recycling"). Required remaining
+integration includes:
 
-- Automatic bounded close and namespace rotation without changing legacy ID
-  semantics or losing initialized-store and retired-generation fences.
-- Principal-churn qualification and, where slots are reassigned across principals,
-  a persistent global slot generation with old-principal fences and occupancy
-  responses that cannot expose another principal's receipts or ownership nonce.
 - Managed batch/epoch execution over the existing bounded apply engine. The
   initial single-pending managed entry boundary is a correctness increment;
   throughput and cross-stream fairness still require measurement and refinement.

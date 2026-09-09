@@ -225,7 +225,7 @@ fn reconstruction_keeps_both_generated_posts_after_later_cycles_close() {
         before.demand(before.maximum).unwrap().retained_bytes
             - after.demand(after.maximum).unwrap().retained_bytes,
         before.post.storage.additional_retained_bytes()
-            + crate::native::mutation::bytes(6).unwrap()
+            + crate::native::mutation::bytes(6 + crate::native::index_rows::STATUS_ROWS).unwrap()
     );
 }
 

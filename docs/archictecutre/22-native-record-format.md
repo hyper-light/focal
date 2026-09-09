@@ -34,7 +34,7 @@ The ordered envelope is:
 | Field | Encoding |
 |---|---|
 | Magic | Eight bytes, `FCMUTATE` |
-| Version | `u16`, currently 2 |
+| Version | `u16`, currently 3 (version 3 adds the secondary index families of §7; the root checkpoint `FCNROOTS` advances to 3 with it) |
 | Content profile | `u8`: 0 projection-only; 1 complete authored V1 descriptors |
 | Ledger | Tenant ID followed by session ID, 16 bytes each |
 | Original range incarnation | 16-byte little-endian `RangeId` |
@@ -127,9 +127,12 @@ Each change contains a mutation tag (`0` deletion, `1` put), a typed key, a `u32
 body length and the exact body bytes. A deletion has no body. A put has a nonempty
 body. A present `MonitorLink(None)` has its own one-byte body; it is a retained
 tombstone, not a deleted key. Every record includes the final Meta row and its
-exact outcome row. They cannot be deleted.
+exact outcome row. They cannot be deleted. The record's `Event` rows are the
+facts its stream deltas are derived from ([23 §6](23-native-activation-and-import.md)):
+retained with the prefix, they are the native part of the ledger's delta
+history, and no separate delta tail exists for native records.
 
-The 30 key-family tags are explicit:
+The 47 key-family tags are explicit (30–33 are the frozen legacy rows an import retains, 23 §5; they never occur in a mutation record; 34–46 are the secondary index families of §7, unit rows whose body is one byte):
 
 | Tag | Family | Tag | Family |
 |---|---|---|---|
@@ -148,8 +151,17 @@ The 30 key-family tags are explicit:
 | 12 | Accepted | 27 | ClaimIdentity |
 | 13 | DeliveryResult | 28 | DefinitionIdentity |
 | 14 | Receipt | 29 | CreationResult |
+| 30 | LegacyTestament | 32 | LegacyRun |
+| 31 | LegacyEvidenceSet | 33 | LegacyDefinition |
+| 34 | ByIssuer(participant, claim) | 41 | ByArtifactKind(kind digest, artifact) |
+| 35 | BySubject(participant, claim) | 42 | BySchema(schema hash, artifact) |
+| 36 | ByStatus(status code, claim) | 43 | ArtifactInput(object, artifact) |
+| 37 | ByAction(action code, claim) | 44 | ByEvaluator(participant, validation) |
+| 38 | ByScope(kind code, key digest, claim) | 45 | ByVerdict(verdict code, result key) |
+| 39 | ByRelation(kind code, target claim, claim) | 46 | ByCreated(family code, sequence, object) |
+| 40 | ByProducer(participant, artifact) | 47 | DueTimer(logical time, target: claim, evaluation key or claim+monitor) |
 
-There is no encoded End sentinel. Key payloads and outcome tags are defined in
+Invocation namespaces are `0` request, `1`–`3` the three timers and `4` the one-time import; operation tag `30` is `Import`; claim event kind `22` is `Imported(legacy sequence)`; a claim body carries its origin byte (`0` native, `1` legacy) after `created`; the Meta row counts legacy rows after creation results. There is no encoded End sentinel. Key payloads and outcome tags are defined in
 the explicit fixed-field writer/reader above. The body implementations are
 [scalar/index and dispatch rows](../../crates/focal-core/src/native/record_codec/rows.rs),
 [claim, evaluation and audit rows](../../crates/focal-core/src/native/record_codec/lifecycle.rs),
@@ -383,21 +395,180 @@ retention operation and its successor invariants.
 
 Native integration still requires:
 
-1. Integrate the qualified restored-Core/`NativeOwner::with_schemas` path into
-   service startup before accepting new traffic. Evaluator and respondent RAM
-   credit recovery is covered by component pressure tests; complete service
-   recovery and durable completion-buffer funding remain required.
-2. Connect the qualified exact-predecessor mutation application to the trusted
-   durable log chain and map original range incarnations into restored owners.
-   Retention/deletion still needs its own operation and invariants; no current
-   native lifecycle operation physically deletes retained history.
-3. Online checkpoint ownership and the enclosing Session checkpoint metadata;
-   encoded-buffer funding and the exact record-hash/ticket/Raft-index/native-prefix
-   mapping. Publish committed heads only and discard only resolved suffixes.
-4. Replicated decoder activation, compatible membership fences, restart/fault
-   qualification and shared live CLI/MCP dispatch.
+1. Activation of the durable native Session inside the running service next to
+   the ancillary Session protocols, populated V1 import, and replicated decoder
+   activation with membership fences (18 §3–5).
+2. Retention/deletion with its own operation and successor invariants; no
+   current native lifecycle operation physically deletes retained history.
+3. Shared live CLI/MCP dispatch of native operations and the two-participant
+   restart acceptance gate.
+
+The durable log chain, incarnation mapping, online checkpoint ownership,
+encoded-buffer funding and the exact record-hash/ticket/Raft-index/native-prefix
+mapping are implemented by the Session contract in section 6.
 
 The same physical checksummed WAL and durable Ready publication machinery remain
 the intended persistence layer. This format adds the missing native application
 facts; it does not replace that machinery or silently activate an incomplete
 decoder.
+
+`FCNSESS1` version 2 records `records_floor` after the recording term: the native prefix that holds no record (zero at genesis, one after an import). A recording range exists exactly when the prefix has advanced past it. Version 3 follows it with `activation_index`, the Raft index of the committed activation record (never zero, never beyond the applied index), so a restored replica reports the exact activation position rather than a bound derived from the sealed legacy prefix.
+
+## 7. Secondary index families
+
+Bounded lists need an ordered key range per predicate; scanning a primary
+family and filtering would make every list cost the family, and the node's
+trusted timers need the due deadlines in time order. The native store
+therefore keeps fourteen secondary index families (tags 34–47) as
+ordinary rows of the same range, recorded, replayed, checkpointed and
+restored like every other row
+([index_rows.rs](../../crates/focal-core/src/native/index_rows.rs),
+[index_scan.rs](../../crates/focal-core/src/native/index_scan.rs)). An index
+row is a unit value: its key is the whole fact, its body one byte, its heap
+charge zero. Every index row is derived from exactly one primary row:
+
+| Primary row | Index rows it implies |
+|---|---|
+| Claim (at creation) | `ByIssuer`, `BySubject`, `ByCreated(claim family)`, `ByStatus`; with authored content also `ByAction`, one `ByScope` per scope (kind code and the BLAKE3 digest of the key under `focal.native.index.scope-key.v1`) and one `ByRelation` per relation whose target is a claim or exact evidence (the target column holds that claim's or artifact's identity) |
+| Claim (status change) | delete `ByStatus(old)`, put `ByStatus(new)` |
+| Artifact | `ByProducer`, `ByArtifactKind` (digest of the kind under `focal.native.index.artifact-kind.v1`), `BySchema`, one `ArtifactInput` per cited input |
+| Definition | one `ByEvaluator` per designated principal (the issuer of a delivery program, otherwise the check evaluator and any distinct quality evaluator) |
+| Accepted result | `ByVerdict` |
+| Claim with a deadline | `DueTimer(at, Claim)` until the claim's timer has been delivered (its outcome row exists); a terminal transition leaves it, so the timer fires once on the terminal claim and retires the row |
+| Monitor (a scope of its claim row) | `DueTimer(at, Monitor)` while the scope is active and its timer has not been delivered |
+| Evaluation | `DueTimer(at, Evaluation)` with the declaration's deadline while the evaluation is neither terminal nor fenced and its timer has not been delivered |
+
+Artifacts, definitions and testaments carry no creation row: their primary
+key ranges are already ordered, and a time-ordered read goes through the
+event log. Two families change after creation. `ByStatus` moves when a
+claim's status moves; the deletion of its old key is an ordinary delete
+change. A `DueTimer` row is retired by the transition that settles its
+timer (a fenced or terminal evaluation, a released or cancelled monitor) or
+by the timer's own delivery: consumption is the retained outcome row of the
+timer's invocation, which every reader (leader, replay, checkpoint) can see,
+so a delivered timer whose target row did not change still carries the
+deletion of its row. The node's sweep
+([native_timers.rs](../../crates/focal-node/src/native_timers.rs)) scans
+`DueTimer` rows due at its logical time, reads each timer's identity from the
+primary row and delivers at most sixty-four per tick; a redelivered timer is
+an exact retry that resolves to its recorded outcome, and a restart needs no
+memory because the next sweep rescans the index (doc 17 §11).
+
+The derivation is one function shared by three readers. The leader derives
+the index changes from the exact primary rows a plan writes, before ownership
+moves, and records them beside the primary changes
+([original_plan.rs](../../crates/focal-core/src/native/original_plan.rs)).
+Replay rederives every index put and delete from the replayed primary rows
+and requires the record to carry exactly those changes, and requires every
+changed claim, new artifact, new definition and new accepted result to be
+covered by every change its derivation yields
+([replay_validate_index.rs](../../crates/focal-core/src/native/record_codec/replay_validate_index.rs)).
+Checkpoint validation requires every retained index row to rederive from the
+primary row it names and every retained primary row to be covered
+([read_validate_index.rs](../../crates/focal-core/src/native/record_codec/read_validate_index.rs)).
+The import image writes the same rows for translated claims and artifacts
+([import.rs](../../crates/focal-core/src/native/import.rs)), so an imported
+prefix validates under the same rules. Index rows restore in phase 0 and live
+in their own page partition, so their pages never mix with heap-bearing rows.
+
+Index rows are funded like every other row. Each operation's construction
+ceiling includes the most index rows it can write: two status rows per
+changed claim, the artifact and verdict rows of a report, the artifact rows
+of a diagnostic, the batch itself for a creation, and the due timers it can
+change (one per created claim, per registered evaluation and per monitor
+registration; for a report its own evaluation's, every sealed cohort
+evaluation's and every graph consequence's; for a timer its own consumption)
+([prepare_budget.rs](../../crates/focal-core/src/native/prepare_budget.rs));
+a write envelope admits those timer rows as deletions beside the status
+moves.
+Completion and respondent promises quote them in their write envelopes and
+record buffers, so a promised report or diagnostic is never short of rows
+when it arrives. Two consequences are recorded rather than hidden. First,
+the number of inputs a promised artifact may cite is bounded by
+`NativeLimits::artifact_inputs` (default 16, never above the model's ceiling
+of 64) and narrowed further when the batch leaves no room, so a small batch
+narrows the promise instead of refusing every report. Second, every changed
+key is priced by the range layer as a possible page copy, so an operation's
+retained promise grows with its index rows; the range envelope prices a
+deletion by the deleted entry's declared heap (`deleted_heap`), which is
+zero for an index row, rather than by the largest entry the range admits.
+A creation of `n` definitions writes roughly `3n + 8` rows; the standard
+session batch of 256 therefore admits about 80 definitions per creation.
+
+Lists over these families are stateless on the node
+([native_lists.rs](../../crates/focal-node/src/native_lists.rs)): the filter
+selects one indexed predicate (a relation or scope, then a participant, then
+the action or status family, then creation order; an artifact's cited input,
+then producer, schema and kind; a verdict for evaluations), the rest filter
+residually within the caller's visit allowance, and the continuation names
+the last visited row rather than the last match, so an empty page may still
+continue and only an absent cursor ends a list. A cursor carries a keyed
+BLAKE3 digest over the ledger, principal, route epoch and exact filter under a
+per-incarnation node key; a cursor reused under another filter or principal,
+tampered with, or issued by a previous incarnation is refused rather than
+repositioned. Because every family but `ByStatus` is written once, a cursor
+stays valid while the prefix grows: a later page sees later rows at a later
+prefix, which the page's token names.
+
+## 6. Durable Session contract
+
+[NativeSession](../../crates/focal-ledger/src/native_session.rs) binds this
+record format to one Raft group through the consensus replica. Its contract:
+
+1. **One decoder identity.** The enclosing session checkpoint descriptor hash
+   ([native_checkpoint.rs](../../crates/focal-ledger/src/native_checkpoint.rs))
+   names the session envelope (`FCNSESS1`), the input frames (`FCNINPUT1`), the
+   recorded mutations (`FCMUTATE3`) and the root checkpoints (`FCNROOTS3`)
+   together. The session confirms exactly that hash as the group's durable
+   decoder floor and refuses a log whose floor differs.
+2. **Genesis is a committed fact.** The first native-domain entry a leader
+   proposes is `FCNGENES1`
+   ([native_session_genesis.rs](../../crates/focal-ledger/src/native_session_genesis.rs)):
+   cluster, group, ledger, content profile, decoder hash and the derived genesis
+   digest. Followers validate it against their physical identities; no mutation
+   is admitted or applied before the genesis is applied; the enclosing checkpoint
+   retains it in its activation. A supported decoder hash alone never binds a
+   ledger to a group.
+3. **The native prefix is not the Raft index.** Every delivered `NativeCommit`
+   carries the Raft index and term, the record hash and the outcome. Each
+   mutation advances the native sequence by one; genesis, membership and Raft
+   no-ops advance only the Raft prefix. Membership and native entries are merged
+   by Raft index during delivery, so the configuration index never exceeds the
+   applied index at a retained cursor.
+4. **Suffix disposition needs evidence.** Unresolved candidates are discarded
+   only on one of four proofs: the committed head matches (publish), a different
+   committed native record at the candidate's base (conflicting prefix), an
+   installed authoritative snapshot, or a fully applied entry of a newer term
+   (barrier). A role change alone only marks the owner for reconstruction.
+5. **Reads correlate.** Callers supply a 16-byte correlation; the readiness
+   barrier of each term uses a reserved internal context. A read boundary names
+   the applied Raft index and native sequence at which the read may be served.
+6. **Failure classes.** Memory and capacity refusals, missing custody, consensus
+   staging and persistence-pending conditions are retryable and retain the
+   candidate or delivery. Authority loss retains candidates for suffix
+   disposition. Corruption, format and contract violations fail closed until the
+   log is reopened; a refused consensus staging reservation before any Raft state
+   is taken is retryable, never fatal.
+7. **Incarnations.** A replica that installs an authoritative snapshot produces
+   later records under a derived incarnation of the genesis, node, snapshot index
+   and term, never under the checkpoint's own producer range. The recorded
+   producer of committed history is unchanged by restarts.
+8. **Admission promises.** Admission reserves RAM for report construction, the
+   encoded record buffer and retained pages, never disk, quorum or fan-out. A
+   configurable free-space watermark on the WAL filesystem refuses fresh
+   candidates before any in-memory acknowledgement; committed work is still
+   answered from the root without disk.
+
+Evidence: the one-node disk-backed
+[workflow](../../crates/focal-ledger/src/native_session_workflow_tests.rs) and
+[session](../../crates/focal-ledger/src/native_session_tests.rs) suites, and the
+three-voter [cluster suite](../../crates/focal-ledger/src/native_session_cluster_tests.rs)
+covering follower replay equality, barrier and conflict proofs, crash after
+commit before reply, snapshot catch-up and planned handover, correlated read
+barriers, missing custody, memory pressure and corrupted record bytes in
+transit. The record bound that funds every promise is proven per row family in
+[bound_tests.rs](../../crates/focal-core/src/native/record_codec/bound_tests.rs).
+
+The unified Session hosts this engine after a committed activation record;
+[23](23-native-activation-and-import.md) records the field matrix, the
+activation protocol, the `FOCALSS6`/`FOCALSS7` envelopes and the import design.

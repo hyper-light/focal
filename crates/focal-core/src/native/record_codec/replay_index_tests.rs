@@ -246,7 +246,10 @@ fn actual_report_artifact_origin_preserves_request_binding_and_original_ordinal(
     let origin = index
         .artifact(&slots, descriptor.id(), &parsing, &work)
         .unwrap();
-    assert_eq!(origin.request, request);
+    assert_eq!(
+        origin.request,
+        read_index::ArtifactRequest::Request(request)
+    );
     assert_eq!(origin.binding, descriptor.binding());
     assert_eq!(
         origin.position,

@@ -1,11 +1,20 @@
+use crate::native_session::{
+    FailureClass, NativeCommit, NativeOutput, NativeReadBoundary, NativeSessionError,
+    NativeSessionLimits, NativeSubmission, NativeTimerInput, ReadCorrelation, engine,
+};
 use crate::request_streams::{
     ManagedError, PreparedStream, RequestStreamLimits, RequestStreams, RequestStreamsCheckpoint,
 };
 use focal_consensus::{ConsensusError, DurableNode, Message, NodeConfig, NodeStatus, StateRole};
+use focal_core::native::{
+    NativeContentProfile, NativeContext, NativeInput, NativeInvocation, NativeOutcome, NativeOwner,
+    NativeOwnerError, NativeStaging, NativeState,
+};
 use focal_core::{
     ApplyResult, Core, CoreError, CoreView, EpochError, EpochLimits, EpochOutput, EpochReport,
     PendingState, PreparedMutation, RowPatch, State,
 };
+use focal_evidence::{BuiltinNativeSchemas, ContentReader, ContentStore, VerifiedNativeArtifact};
 use focal_graph::{
     GraphConfig, GraphError, GraphSnapshot, GraphStore, PreparedGraph, reference_charge,
 };
@@ -32,6 +41,8 @@ const LEGACY_CURSOR_MAGIC: &[u8] = b"FOCALCU1";
 const CURSOR_MAINTENANCE_MAGIC: &[u8] = b"FOCALCM1";
 const SNAPSHOT_V2_MAGIC: &[u8] = b"FOCALSS2";
 const SNAPSHOT_V3_MAGIC: &[u8] = b"FOCALSS3";
+const SNAPSHOT_V6_MAGIC: &[u8] = b"FOCALSS6";
+const SNAPSHOT_V7_MAGIC: &[u8] = b"FOCALSS7";
 
 #[derive(Debug, Clone)]
 pub struct SessionLimits {
@@ -114,6 +125,16 @@ pub enum LedgerError {
     ResyncRequired,
     #[error("requested sequence is not yet published")]
     Behind,
+    #[error("native: {0}")]
+    Native(#[from] NativeSessionError),
+    #[error("delivery retained after a retryable refusal; poll again")]
+    Retry,
+    #[error("this replica does not host the native engine")]
+    NativeUnsupported,
+    #[error("native activation conflicts with the committed ledger state")]
+    ActivationConflict,
+    #[error("legacy import: {0}")]
+    Import(focal_core::native::ImportError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,7 +152,24 @@ pub struct SessionEvents {
     pub managed_committed: Vec<ManagedCommitted>,
     pub request_stream_committed: Vec<RequestStreamControlReceipt>,
     pub read_barriers: Vec<(Vec<u8>, SessionSeq)>,
+    pub native_committed: Vec<NativeCommit>,
+    pub native_read_boundaries: Vec<NativeReadBoundary>,
+    /// A flush refusal after committed output was produced; fatal classes have
+    /// already stopped the session, retryable ones resolve on the next poll.
+    pub native_flush_refusal: Option<NativeSessionError>,
     _charges: Vec<Allocation>,
+    _native_allocation: Option<Allocation>,
+}
+/// One drained delivery being applied; retained across retryable native
+/// refusals so the next poll resumes at the same entry.
+struct PendingDelivery {
+    events: focal_consensus::NodeEvents,
+    result: SessionEvents,
+    native: Option<NativeOutput>,
+    entry: usize,
+    membership: usize,
+    read: usize,
+    snapshot: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -206,6 +244,12 @@ pub struct Session {
     delta_bytes: usize,
     delta_floor: SessionSeq,
     failed: bool,
+    activation: LedgerActivation,
+    activation_record: Option<Vec<u8>>,
+    pending_activation: Option<(ActivationRecord, Allocation)>,
+    native: Option<Box<engine::NativeEngine<BuiltinNativeSchemas>>>,
+    hosting: Option<NativeHosting>,
+    retained: Option<PendingDelivery>,
 }
 
 impl Session {
@@ -224,6 +268,20 @@ impl Session {
         let consensus = DurableNode::open(config, path)?;
         Self::from_node(ledger, consensus, limits)
     }
+    /// Open with the resources to host the native engine. Recovery may replay a
+    /// committed activation or install a native checkpoint at once, so hosting
+    /// is a construction input, never a later attachment.
+    pub fn open_hosted(
+        path: impl AsRef<Path>,
+        ledger: LedgerId,
+        config: NodeConfig,
+        limits: SessionLimits,
+        hosting: NativeHosting,
+    ) -> Result<Self, LedgerError> {
+        let consensus = DurableNode::open(config, path)?;
+        let budget = MemoryBudget::new(limits.memory_bytes, limits.completion_reserve_bytes)?;
+        Self::from_node_budget(ledger, consensus, limits, budget, Some(hosting))
+    }
 
     pub fn from_node(
         ledger: LedgerId,
@@ -231,7 +289,17 @@ impl Session {
         limits: SessionLimits,
     ) -> Result<Self, LedgerError> {
         let budget = MemoryBudget::new(limits.memory_bytes, limits.completion_reserve_bytes)?;
-        Self::from_node_budget(ledger, consensus, limits, budget)
+        Self::from_node_budget(ledger, consensus, limits, budget, None)
+    }
+    /// `from_node` with the resources to host the native engine.
+    pub fn from_node_hosted(
+        ledger: LedgerId,
+        consensus: DurableNode,
+        limits: SessionLimits,
+        hosting: NativeHosting,
+    ) -> Result<Self, LedgerError> {
+        let budget = MemoryBudget::new(limits.memory_bytes, limits.completion_reserve_bytes)?;
+        Self::from_node_budget(ledger, consensus, limits, budget, Some(hosting))
     }
     /// A node/tenant owner supplies the parent allowance; all graph, reference,
     /// cursor, pending and retained-delta permits stay inside that hierarchy.
@@ -245,7 +313,21 @@ impl Session {
             return Err(LedgerError::Capacity);
         }
         let budget = parent.child(limits.memory_bytes, limits.completion_reserve_bytes)?;
-        Self::from_node_budget(ledger, consensus, limits, budget)
+        Self::from_node_budget(ledger, consensus, limits, budget, None)
+    }
+    /// `from_node_in` with the resources to host the native engine.
+    pub fn from_node_in_hosted(
+        ledger: LedgerId,
+        consensus: DurableNode,
+        limits: SessionLimits,
+        parent: &MemoryBudget,
+        hosting: NativeHosting,
+    ) -> Result<Self, LedgerError> {
+        if !consensus.is_budgeted_within(parent) {
+            return Err(LedgerError::Capacity);
+        }
+        let budget = parent.child(limits.memory_bytes, limits.completion_reserve_bytes)?;
+        Self::from_node_budget(ledger, consensus, limits, budget, Some(hosting))
     }
     pub fn is_budgeted_within(&self, parent: &MemoryBudget) -> bool {
         self.budget.is_within(parent) && self.consensus.is_budgeted_within(parent)
@@ -255,7 +337,11 @@ impl Session {
         mut consensus: DurableNode,
         limits: SessionLimits,
         budget: MemoryBudget,
+        hosting: Option<NativeHosting>,
     ) -> Result<Self, LedgerError> {
+        if hosting.as_ref().is_some_and(|hosting| hosting.range.0 == 0) {
+            return Err(LedgerError::Capacity);
+        }
         if limits.apply.max_commands == 0
             || limits.apply.max_workers == 0
             || limits.apply.max_bytes == 0
@@ -270,7 +356,11 @@ impl Session {
         }
         // A recovered decoder floor blocks every Raft action until the actual
         // application owner confirms its compiled persistent-format descriptor.
-        consensus.confirm_decoder(managed_format_hash())?;
+        if consensus.required_decoder() == Some(native_format_hash()) {
+            consensus.confirm_decoder_pair(managed_format_hash(), native_format_hash())?;
+        } else {
+            consensus.confirm_decoder(managed_format_hash())?;
+        }
         let core = Core::new(ledger, limits.core.clone());
         let core_charge = budget
             .reserve(
@@ -363,9 +453,21 @@ impl Session {
             delta_bytes: 0,
             delta_floor: SessionSeq(0),
             failed: false,
+            activation: LedgerActivation::V1,
+            activation_record: None,
+            pending_activation: None,
+            native: None,
+            hosting,
+            retained: None,
         };
         // Recovery consumes prior committed outcomes without executing their effects.
-        let _ = session.poll()?;
+        // A delivery retained at startup (an import waiting for its host to seal
+        // legacy payloads) is not an open failure; the host services it and the
+        // next poll resumes.
+        match session.poll() {
+            Ok(_) | Err(LedgerError::Retry) => {}
+            Err(error) => return Err(error),
+        }
         Ok(session)
     }
 
@@ -389,9 +491,19 @@ impl Session {
         self.consensus.tick()?;
         Ok(())
     }
+    #[cfg(test)]
+    pub(crate) fn set_randomized_election_timeout(
+        &mut self,
+        ticks: usize,
+    ) -> Result<(), LedgerError> {
+        self.check()?;
+        self.consensus.set_randomized_election_timeout(ticks)?;
+        Ok(())
+    }
     pub fn step(&mut self, message: Message) -> Result<(), LedgerError> {
         self.check()?;
         self.fence_managed_message(&message)?;
+        self.fence_native_message(&message)?;
         self.consensus.step(message)?;
         Ok(())
     }
@@ -424,7 +536,10 @@ impl Session {
         encoded: &[u8],
     ) -> Result<(), LedgerError> {
         self.check()?;
-        if self.consensus.decoder_floor_ready(managed_format_hash()) {
+        // Without the successor floor, every packet is inspected before Raft
+        // persists it: native history must not reach a replica that has not
+        // promised to decode it.
+        if self.consensus.decoder_floor_ready(native_format_hash()) {
             self.consensus.step_authenticated(peer_node_id, encoded)?;
             return Ok(());
         }
@@ -471,6 +586,7 @@ impl Session {
             .saturating_add(usize::from(self.pending_membership.is_some()))
             .saturating_add(usize::from(self.pending_placement.is_some()))
             .saturating_add(usize::from(self.pending_evidence.is_some()))
+            .saturating_add(usize::from(self.pending_activation.is_some()))
     }
 
     /// Explicitly local committed-prefix view; callers needing a linearizable read
@@ -522,7 +638,7 @@ impl Session {
     /// Includes unstarted Ready work, such as the internal leadership ReadIndex
     /// queued by the last publication. Idle owners need not poll their sessions.
     pub fn has_ready(&self) -> bool {
-        self.consensus.has_ready()
+        self.consensus.has_ready() || self.retained.is_some()
     }
     fn clear_pending(&mut self) {
         self.pending_rows.clear();
@@ -575,6 +691,17 @@ impl Session {
             return Err(LedgerError::NotReady {
                 leader: status.leader_id,
             });
+        }
+        if self.activation.is_native() {
+            return Ok(Submission::Domain(DomainOutcome::refuse(
+                ErrorCode::UnsupportedSchema,
+                "legacy commands are refused after native activation",
+            )));
+        }
+        // A proposed activation seals the legacy prefix it translated; nothing
+        // may change that prefix before the record commits or authority moves.
+        if self.pending_activation.is_some() {
+            return Err(LedgerError::Retry);
         }
         let key = RequestKey {
             principal: input.principal,
@@ -766,6 +893,15 @@ impl Session {
 
     pub fn poll(&mut self) -> Result<SessionEvents, LedgerError> {
         self.check()?;
+        if self.retained.is_some() {
+            // A retained delivery blocks new drains. Floor writes it may have
+            // staged complete here; the retried entry sees their outcome.
+            let progressed = self.consensus.try_finish_decoder_floor();
+            let result = progressed
+                .map_err(LedgerError::from)
+                .and_then(|_| self.resume_delivery());
+            return self.finish_poll(result);
+        }
         if self.consensus.checkpoint_pending() {
             self.consensus.finish_checkpoint()?;
         }
@@ -775,6 +911,14 @@ impl Session {
     }
     pub fn try_poll(&mut self) -> Result<Option<SessionEvents>, LedgerError> {
         self.check()?;
+        if self.retained.is_some() {
+            let result = self
+                .consensus
+                .try_finish_decoder_floor()
+                .map_err(LedgerError::from)
+                .and_then(|_| self.resume_delivery());
+            return self.finish_poll(result).map(Some);
+        }
         if self.consensus.checkpoint_pending() {
             match self.consensus.try_finish_checkpoint() {
                 Ok(false) => return Ok(None),
@@ -798,7 +942,7 @@ impl Session {
         if result.as_ref().is_err_and(|error| {
             !matches!(
                 error,
-                LedgerError::Consensus(ConsensusError::PersistencePending)
+                LedgerError::Consensus(ConsensusError::PersistencePending) | LedgerError::Retry
             )
         }) {
             self.failed = true;
@@ -808,14 +952,37 @@ impl Session {
             self.pending_maintenance = None;
             self.pending_membership = None;
             self.pending_placement = None;
+            self.pending_activation = None;
+            self.retained = None;
         }
         self.release_empty_slots()?;
         result
     }
     fn apply_events(
         &mut self,
-        mut events: focal_consensus::NodeEvents,
+        events: focal_consensus::NodeEvents,
     ) -> Result<SessionEvents, LedgerError> {
+        let delivery = self.begin_delivery(events)?;
+        self.drive(delivery)
+    }
+    fn resume_delivery(&mut self) -> Result<SessionEvents, LedgerError> {
+        let delivery = self.retained.take().ok_or(LedgerError::Failed)?;
+        self.drive(delivery)
+    }
+    /// Complete a delivery, or retain it when a retryable native refusal
+    /// (memory, missing custody) stops it; the next poll resumes at the same
+    /// entry and nothing is applied twice.
+    fn drive(&mut self, mut delivery: PendingDelivery) -> Result<SessionEvents, LedgerError> {
+        match self.continue_delivery(&mut delivery) {
+            Ok(()) => Ok(delivery.result),
+            Err(LedgerError::Native(error)) if error.class() == FailureClass::Retryable => {
+                self.retained = Some(delivery);
+                Err(LedgerError::Retry)
+            }
+            Err(error) => Err(error),
+        }
+    }
+    fn observe_authority(&mut self) -> (NodeStatus, bool) {
         let status = self.status();
         let leader = status.role == StateRole::Leader;
         if self.last_term != status.term || self.was_leader != leader {
@@ -825,11 +992,21 @@ impl Session {
             self.pending_maintenance = None;
             self.pending_membership = None;
             self.pending_placement = None;
+            self.pending_activation = None;
             self.ready_term = None;
             self.readiness_requested = None;
             self.last_term = status.term;
             self.was_leader = leader;
         }
+        if let Some(engine) = self.native.as_deref_mut() {
+            engine.observe(&status);
+        }
+        (status, leader)
+    }
+    fn begin_delivery(
+        &mut self,
+        mut events: focal_consensus::NodeEvents,
+    ) -> Result<PendingDelivery, LedgerError> {
         let event_charge = events.take_allocation();
         let mut result = SessionEvents {
             messages: std::mem::take(&mut events.messages),
@@ -899,100 +1076,226 @@ impl Session {
         if let Some(charge) = event_charge {
             result._charges.push(charge);
         }
-        if let Some(snapshot) = events.snapshot {
-            let decode_bytes = snapshot
-                .data
-                .len()
-                .checked_mul(64)
-                .and_then(|n| n.checked_add(4096))
-                .ok_or(LedgerError::Capacity)?;
-            let _decode =
-                self.budget
-                    .reserve(BudgetKind::Recovery, BudgetLane::Completion, decode_bytes)?;
-            self.restore_snapshot(
-                &snapshot.data,
-                snapshot.index,
-                snapshot.term,
-                &snapshot.configuration,
-            )?;
+        Ok(PendingDelivery {
+            events,
+            result,
+            native: None,
+            entry: 0,
+            membership: 0,
+            read: 0,
+            snapshot: false,
+        })
+    }
+    /// The configuration in force at the current delivery offset: the last
+    /// applied membership event of this delivery, else the one before it.
+    fn placement_configuration(
+        &self,
+        delivery: &PendingDelivery,
+    ) -> focal_consensus::MembershipConfiguration {
+        match delivery
+            .membership
+            .checked_sub(1)
+            .and_then(|last| delivery.events.membership.get(last))
+        {
+            Some(applied) => applied.after.clone(),
+            None => delivery
+                .events
+                .membership
+                .first()
+                .map(|first| first.before.clone())
+                .unwrap_or_else(|| self.consensus.membership_configuration()),
         }
-        let mut membership_events = events.membership.into_iter().peekable();
-        let mut placement_configuration = membership_events
-            .peek()
-            .map(|entry| entry.before.clone())
-            .unwrap_or_else(|| self.consensus.membership_configuration());
-        let mut offset = 0usize;
-        while let Some(entry) = events.committed.get(offset) {
-            if entry.index <= self.applied_raft {
+    }
+    fn apply_delivered_membership(
+        &mut self,
+        delivery: &mut PendingDelivery,
+        applied_index: u64,
+    ) -> Result<(), LedgerError> {
+        let membership = delivery
+            .events
+            .membership
+            .get(delivery.membership)
+            .ok_or(LedgerError::Corrupt)?;
+        if let Some(engine) = self.native.as_deref_mut() {
+            engine.apply_membership(membership, applied_index)?;
+        }
+        self.apply_membership(membership.clone())?;
+        delivery.membership = delivery
+            .membership
+            .checked_add(1)
+            .ok_or(LedgerError::Capacity)?;
+        Ok(())
+    }
+    fn continue_delivery(&mut self, delivery: &mut PendingDelivery) -> Result<(), LedgerError> {
+        let (status, leader) = self.observe_authority();
+        if !delivery.snapshot {
+            if let Some(snapshot) = &delivery.events.snapshot {
+                let decode_bytes = snapshot
+                    .data
+                    .len()
+                    .checked_mul(64)
+                    .and_then(|n| n.checked_add(4096))
+                    .ok_or(LedgerError::Capacity)?;
+                let _decode = self.budget.reserve(
+                    BudgetKind::Recovery,
+                    BudgetLane::Completion,
+                    decode_bytes,
+                )?;
+                self.restore_snapshot(
+                    &snapshot.data,
+                    snapshot.index,
+                    snapshot.term,
+                    &snapshot.configuration,
+                )?;
+            }
+            delivery.snapshot = true;
+        }
+        if self.native.is_some() && delivery.native.is_none() {
+            delivery.native = Some(NativeOutput::reserve(
+                &self.budget,
+                delivery.events.committed.len(),
+                delivery.events.read_states.len(),
+            )?);
+        }
+        let applied_index = delivery.events.applied_index;
+        while let Some(entry_index) = delivery
+            .events
+            .committed
+            .get(delivery.entry)
+            .map(|entry| entry.index)
+        {
+            if entry_index <= self.applied_raft {
                 return Err(LedgerError::Corrupt);
             }
-            while membership_events
-                .peek()
-                .is_some_and(|membership| membership.index < entry.index)
+            while delivery
+                .events
+                .membership
+                .get(delivery.membership)
+                .is_some_and(|membership| membership.index < entry_index)
             {
-                let membership = membership_events.next().ok_or(LedgerError::Corrupt)?;
-                placement_configuration = membership.after.clone();
-                self.apply_membership(membership)?;
+                self.apply_delivered_membership(delivery, applied_index)?;
             }
-            if self.apply_managed_entry(&entry.data, entry.index, &mut result)? {
+            let entry = delivery
+                .events
+                .committed
+                .get(delivery.entry)
+                .ok_or(LedgerError::Corrupt)?;
+            let next = delivery.entry.checked_add(1).ok_or(LedgerError::Capacity)?;
+            if entry.data.starts_with(ACTIVATION_MAGIC) {
+                self.apply_activation(entry)?;
                 self.applied_raft = entry.index;
-                offset = offset.checked_add(1).ok_or(LedgerError::Capacity)?;
+                delivery.entry = next;
+                if delivery.native.is_none() {
+                    delivery.native = Some(NativeOutput::reserve(
+                        &self.budget,
+                        delivery.events.committed.len().saturating_sub(next),
+                        delivery.events.read_states.len(),
+                    )?);
+                }
+                continue;
+            }
+            if engine::NativeEngine::<BuiltinNativeSchemas>::is_native_entry(&entry.data) {
+                let engine = self.native.as_deref_mut().ok_or(LedgerError::Corrupt)?;
+                let output = delivery.native.as_mut().ok_or(LedgerError::Corrupt)?;
+                if let Err(error) =
+                    engine.apply_entry(entry, applied_index, &self.consensus, output)
+                {
+                    if error.class() == FailureClass::FailClosed {
+                        self.failed = true;
+                    }
+                    return Err(error.into());
+                }
+                self.applied_raft = entry.index;
+                delivery.entry = next;
+                continue;
+            }
+            if self.apply_managed_entry(&entry.data, entry.index, &mut delivery.result)? {
+                self.applied_raft = entry.index;
+                delivery.entry = next;
                 continue;
             }
             if entry.data.starts_with(PLACEMENT_MAGIC) {
-                self.apply_placement_entry(
-                    &entry.data,
-                    entry.index,
-                    entry.term,
-                    &placement_configuration,
-                )?;
+                let configuration = self.placement_configuration(delivery);
+                self.apply_placement_entry(&entry.data, entry.index, entry.term, &configuration)?;
                 self.applied_raft = entry.index;
-                offset = offset.checked_add(1).ok_or(LedgerError::Capacity)?;
+                delivery.entry = next;
                 continue;
             }
             if entry.data.starts_with(CURSOR_MAINTENANCE_MAGIC) {
                 self.apply_maintenance_entry(&entry.data)?;
                 self.applied_raft = entry.index;
-                offset = offset.checked_add(1).ok_or(LedgerError::Capacity)?;
+                delivery.entry = next;
                 continue;
             }
             if entry.data.starts_with(CURSOR_MAGIC) || entry.data.starts_with(LEGACY_CURSOR_MAGIC) {
                 let (receipt, charge) = self.apply_cursor_entry(&entry.data, entry.index)?;
                 self.applied_raft = entry.index;
-                result.cursor_committed.push(receipt);
-                result._charges.push(charge);
-                offset = offset.checked_add(1).ok_or(LedgerError::Capacity)?;
+                delivery.result.cursor_committed.push(receipt);
+                delivery.result._charges.push(charge);
+                delivery.entry = next;
                 continue;
             }
-            if self.placement_state.paused() || !entry.data.starts_with(ENTRY_MAGIC) {
+            if self.placement_state.paused()
+                || !entry.data.starts_with(ENTRY_MAGIC)
+                || self.activation.is_native()
+            {
                 return Err(LedgerError::Corrupt);
             }
-            let tail = events.committed.get(offset..).ok_or(LedgerError::Corrupt)?;
+            let tail = delivery
+                .events
+                .committed
+                .get(delivery.entry..)
+                .ok_or(LedgerError::Corrupt)?;
             let count = tail
                 .iter()
                 .take(self.apply_config().max_commands)
                 .take_while(|entry| entry.data.starts_with(ENTRY_MAGIC))
                 .count();
-            let applied = self
-                .apply_domain_epoch(tail.get(..count).ok_or(LedgerError::Corrupt)?, &mut result)?;
-            offset = offset.checked_add(applied).ok_or(LedgerError::Capacity)?;
+            let applied = self.apply_domain_epoch(
+                tail.get(..count).ok_or(LedgerError::Corrupt)?,
+                &mut delivery.result,
+            )?;
+            delivery.entry = delivery
+                .entry
+                .checked_add(applied)
+                .ok_or(LedgerError::Capacity)?;
         }
         // Membership metadata is independent of domain command application, but
         // follows its own strictly ordered Raft indices and the snapshot fence.
-        for membership in membership_events {
-            self.apply_membership(membership)?;
+        while delivery
+            .events
+            .membership
+            .get(delivery.membership)
+            .is_some()
+        {
+            self.apply_delivered_membership(delivery, applied_index)?;
         }
-        self.applied_raft = self.applied_raft.max(events.applied_index);
-        for barrier in events.read_states {
+        self.applied_raft = self.applied_raft.max(applied_index);
+        if let Some(engine) = self.native.as_deref_mut() {
+            engine.finish_entries(applied_index)?;
+        }
+        while let Some(barrier) = delivery.events.read_states.get(delivery.read) {
             if barrier.index > self.applied_raft {
                 return Err(LedgerError::Corrupt);
             }
             if barrier.context == readiness_context(status.term) {
                 self.ready_term = Some(status.term);
+                if leader && let Some(engine) = self.native.as_deref_mut() {
+                    engine.promote(status.term, &self.consensus)?;
+                }
+            } else if engine::NativeEngine::<BuiltinNativeSchemas>::is_correlated_read(
+                &barrier.context,
+            ) {
+                let engine = self.native.as_deref_mut().ok_or(LedgerError::Corrupt)?;
+                let output = delivery.native.as_mut().ok_or(LedgerError::Corrupt)?;
+                engine.apply_correlated_read(barrier, output)?;
+            } else {
+                delivery
+                    .result
+                    .read_barriers
+                    .push((barrier.context.clone(), self.core.sequence()));
             }
-            result
-                .read_barriers
-                .push((barrier.context, self.core.sequence()));
+            delivery.read = delivery.read.checked_add(1).ok_or(LedgerError::Capacity)?;
         }
         if leader
             && self.consensus.has_committed_current_term()
@@ -1002,7 +1305,22 @@ impl Session {
             self.consensus.read_index(readiness_context(status.term))?;
             self.readiness_requested = Some(status.term);
         }
-        Ok(result)
+        if let Some(engine) = self.native.as_deref_mut() {
+            engine.settle(&status, &mut self.consensus)?;
+            if let Some(refusal) = engine.flush_after_delivery(&mut self.consensus) {
+                if refusal.class() == FailureClass::FailClosed {
+                    self.failed = true;
+                }
+                delivery.result.native_flush_refusal = Some(refusal);
+            }
+        }
+        if let Some(output) = delivery.native.take() {
+            let (committed, reads, allocation) = output.into_parts();
+            delivery.result.native_committed = committed;
+            delivery.result.native_read_boundaries = reads;
+            delivery.result._native_allocation = Some(allocation);
+        }
+        Ok(())
     }
 
     pub fn deltas_after(
@@ -1084,14 +1402,20 @@ fn readiness_context(term: u64) -> Vec<u8> {
     bytes
 }
 
+include!("native_hosting.rs");
 include!("managed_session.rs");
 include!("managed_support.rs");
 include!("apply_epoch.rs");
 include!("cursor_session.rs");
+include!("native_deltas.rs");
 include!("cursor_maintenance.rs");
 include!("membership_session.rs");
 include!("placement_session.rs");
 include!("evidence_snapshot.rs");
+
+#[cfg(test)]
+#[path = "session_native_tests.rs"]
+mod native_tests;
 
 #[cfg(test)]
 mod tests {

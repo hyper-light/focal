@@ -15,7 +15,11 @@ fn admission_error(error: ControlError) -> DirectoryBootstrapError {
     match error {
         ControlError::Capacity
         | ControlError::Busy
-        | ControlError::Memory(MemoryError::Capacity { .. } | MemoryError::AllocationFailed)
+        | ControlError::Memory(
+            MemoryError::Capacity { .. }
+            | MemoryError::DiskCapacity { .. }
+            | MemoryError::AllocationFailed,
+        )
         | ControlError::Consensus(ConsensusError::Capacity) => DirectoryBootstrapError::Capacity,
         ControlError::NotReady
         | ControlError::Consensus(

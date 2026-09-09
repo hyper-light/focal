@@ -311,6 +311,7 @@ fn spec(relations: &[Relation]) -> ClaimSpec<'_> {
         requirements: &PINS,
         slots: &SLOTS,
         deadline: None,
+        policy: None,
     }
 }
 fn limits() -> Limits {

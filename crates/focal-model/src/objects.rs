@@ -14,6 +14,32 @@ pub enum RelationTarget {
     Object(ObjectRef),
     Action(ActionType),
     Root(RootCommandId),
+    /// An exact committed artifact at its descriptor hash: the evidence a
+    /// challenge disputes or a correction cites (descriptor schema 2; never
+    /// V1 content).
+    Evidence(ArtifactRef),
+}
+/// How a challenge or consult may be followed up, authored immutably with the
+/// claim (descriptor schema 2). Absent on schema-1 claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PeerPolicy {
+    /// A failed challenge verdict may cause an authorized corrective claim.
+    pub corrective_allowed: bool,
+    /// How many follow-up consultations this claim may cause.
+    pub max_follow_ups: u16,
+    /// At most one correction may be caused by this claim.
+    pub single_issuer: bool,
+    /// Who, besides the issuer, may author the follow-up.
+    pub escalation: Escalation,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Escalation {
+    /// Only the claim's issuer.
+    None,
+    /// The issuer or the claim's current receipt holder.
+    Holder,
+    /// The issuer, the holder or a designated evaluator of the claim.
+    Evaluator,
 }
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Relation {

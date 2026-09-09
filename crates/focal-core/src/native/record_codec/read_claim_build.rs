@@ -87,6 +87,15 @@ impl Input<'_> {
     }
 }
 
+pub(in crate::native::record_codec) fn policy_shape(
+    origin: claim::ClaimOrigin,
+) -> aggregation::PolicyShape {
+    match origin {
+        claim::ClaimOrigin::Native => aggregation::PolicyShape::Authored,
+        claim::ClaimOrigin::Legacy => aggregation::PolicyShape::LegacyEmpty,
+    }
+}
+
 fn process<D: Objects + ?Sized>(
     input: &Input<'_>,
     objects: &D,
@@ -141,12 +150,13 @@ fn process<D: Objects + ?Sized>(
     })?;
     let acceptance_source = input.acceptance_source(objects, source);
     let acceptance = model.model(|visits| {
-        let plan = aggregation::AcceptancePolicy::prepare_source(
+        let plan = aggregation::AcceptancePolicy::prepare_source_with(
             input.acceptance,
             input.acceptance_issuer,
             &acceptance_source,
             limits.acceptance,
             visits,
+            policy_shape(fields.origin),
         )?;
         let used = plan.inspection_visits();
         Ok((plan, used))

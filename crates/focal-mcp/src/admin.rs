@@ -75,6 +75,7 @@ pub enum AdminAction {
         id: [u8; 16],
         expected_revision: Option<u64>,
     },
+    RenewCredential,
     InviteClient {
         name: String,
         output: String,
@@ -313,13 +314,15 @@ pub(crate) fn parse(
         "cluster.status"
         | "cluster.membership.show"
         | "cluster.nodes.list"
-        | "cluster.request.inspect" => {
+        | "cluster.request.inspect"
+        | "cluster.credentials.renew" => {
             let _: Empty = serde_json::from_value(value)
                 .map_err(|_| InputError::Invalid("unexpected cluster input"))?;
             match name {
                 "cluster.status" => AdminAction::Status,
                 "cluster.membership.show" => AdminAction::Configuration,
                 "cluster.nodes.list" => AdminAction::Contacts,
+                "cluster.credentials.renew" => AdminAction::RenewCredential,
                 _ => AdminAction::Inspect,
             }
         }

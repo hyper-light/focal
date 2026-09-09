@@ -309,6 +309,18 @@ impl Declaration {
     pub fn attempt_bound(&self) -> u32 {
         self.attempts
     }
+    /// Whether `actor` is the evaluator of one of this declaration's phases.
+    /// A delivery declaration designates nobody: its evaluator is the issuer.
+    pub fn designates(&self, actor: ParticipantId) -> bool {
+        match self.program() {
+            ProgramView::Delivery => false,
+            ProgramView::Programmatic { check, quality } => {
+                check.evaluator() == actor
+                    || quality.is_some_and(|policy| policy.evaluator() == actor)
+            }
+            ProgramView::Agentic { check } => check.evaluator() == actor,
+        }
+    }
     /// Every declared external-result schema, in handler order: proof followed
     /// by diagnostic for each check/fallback, then each quality/fallback. Pure
     /// delivery has none. Repeated schemas remain repeated; an owner may perform

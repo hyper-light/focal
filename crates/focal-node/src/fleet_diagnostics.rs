@@ -55,6 +55,12 @@ impl Owner {
             compiled_managed_decoder: hex(&Session::managed_decoder_hash()),
             required_decoder: self.session.required_decoder().map(|hash| hex(&hash)),
             managed_active: self.session.managed_protocol_active(),
+            compiled_native_decoder: hex(&Session::native_decoder_hash().0),
+            native_hosted: self.session.native_hosted(),
+            native_ready: self.session.native_support_ready(),
+            native_active: self.session.activation().is_native(),
+            native_import_pending: self.session.pending_import().is_some(),
+            native_authoritative: self.session.native_authoritative(),
         };
         ReplicaDiagnosticsReply {
             value,

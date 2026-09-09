@@ -110,7 +110,7 @@ async fn only_installed_group_and_real_committed_fence_can_produce_an_accounted_
             region: RegionId([0; 16]),
             zone: ZoneId([0; 16]),
             endpoint: settings.node.advertise.clone().unwrap(),
-            identity: ContentHash(server_fingerprint(&network.receipt.certificate)),
+            identity: ContentHash(network.receipt.public_key),
             authority_epoch: 1,
             attestation: ContentHash([0; 32]),
             eligible: true,

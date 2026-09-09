@@ -55,6 +55,7 @@ fn elastic_range_envelope_stays_fixed_across_growth_trim_and_full_parent_prepara
     let limits = RangeWriteLimits {
         changed_keys: 1,
         deleted_keys: 0,
+        deleted_heap: 0,
         incoming_heap: 1024 + ALLOCATOR_OVERHEAD,
         input_capacity: 1,
     };

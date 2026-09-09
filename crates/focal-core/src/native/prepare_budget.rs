@@ -14,6 +14,7 @@ mod tests;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ConstructionBudget {
+    pub(super) operation: NativeOperation,
     pub(super) scratch_bytes: usize,
     pub(super) changes_bytes: usize,
     pub(super) extras_count: usize,
@@ -24,6 +25,30 @@ pub(super) struct ConstructionBudget {
     pub(super) max_claim_rows: usize,
     pub(super) max_changes: usize,
     pub(super) max_events: usize,
+    /// Secondary index rows (doc 22 §7) the operation can write, funded
+    /// beside its primary rows and bounded by the same batch.
+    pub(super) max_index_rows: usize,
+    /// The due-timer rows among `max_index_rows` this operation can retire:
+    /// the deletions a write envelope must admit beyond status moves.
+    pub(super) max_timer_rows: usize,
+}
+
+fn changes_bytes(
+    max_changes: usize,
+    max_claim_rows: usize,
+    max_events: usize,
+    max_index_rows: usize,
+) -> Result<usize, NativeError> {
+    add(
+        add(
+            add(
+                array::<Change<Key, Row>>(max_changes)?,
+                array::<claim_changes::History>(max_claim_rows)?,
+            )?,
+            add(containers(max_claim_rows)?, event_containers(max_events)?)?,
+        )?,
+        array::<super::index_rows::IndexChange>(max_index_rows)?,
+    )
 }
 
 impl ConstructionBudget {
@@ -34,6 +59,10 @@ impl ConstructionBudget {
         let batch = limits.range.max_batch_entries;
         let (scratch_bytes, max_claim_rows, max_changes, extras_count, max_events) = match operation
         {
+            // Import never prepares a mutation; it is a one-time translation (23 §5).
+            NativeOperation::Import => {
+                return Err(focal_model::lifecycle::ContractError::InvalidTransition.into());
+            }
             NativeOperation::AdoptReceipt => (
                 limits.preparation_bytes,
                 1.min(limits.plan_nodes),
@@ -172,14 +201,21 @@ impl ConstructionBudget {
         // allocator bookkeeping; nested row heaps consume Scratch instead.
         let extras_array = array::<Extra>(extras_count)?;
         let extras_bytes = add(extras_array, extras_array)?;
-        let changes_bytes = add(
-            add(
-                array::<Change<Key, Row>>(max_changes)?,
-                array::<claim_changes::History>(max_claim_rows)?,
-            )?,
-            add(containers(max_claim_rows)?, event_containers(max_events)?)?,
+        let max_index_rows = super::index_rows::bound(
+            operation,
+            max_claim_rows,
+            extras_count,
+            max_events,
+            super::index_rows::input_bound(limits),
+            batch,
         )?;
+        let max_timer_rows =
+            super::index_rows::timer_bound(operation, max_claim_rows, extras_count, max_events)?
+                .min(max_index_rows);
+        let max_changes = add(max_changes, max_index_rows)?.min(batch);
+        let changes_bytes = changes_bytes(max_changes, max_claim_rows, max_events, max_index_rows)?;
         let budget = Self {
+            operation,
             scratch_bytes,
             changes_bytes,
             extras_count,
@@ -188,6 +224,8 @@ impl ConstructionBudget {
             max_claim_rows,
             max_changes,
             max_events,
+            max_index_rows,
+            max_timer_rows,
         };
         // Detect overflow of the complete reservation before any allocation.
         budget.pending_bytes()?;
@@ -223,23 +261,37 @@ impl ConstructionBudget {
         self.extras_count = self.extras_count.max(extras);
         self.max_extra_rows = self.max_extra_rows.max(extras);
         self.max_events = self.max_events.max(events);
+        // Every graph consequence may fence an evaluation or dispose of a
+        // monitor and retire its due timer (doc 22 §7).
+        let graph_timers = add(extras, events)?;
+        self.max_index_rows = self
+            .max_index_rows
+            .max(add(
+                super::index_rows::bound(
+                    self.operation,
+                    self.max_claim_rows,
+                    self.max_extra_rows,
+                    self.max_events,
+                    super::index_rows::input_bound(limits),
+                    limits.range.max_batch_entries,
+                )?,
+                graph_timers,
+            )?)
+            .min(limits.range.max_batch_entries);
+        self.max_timer_rows = add(self.max_timer_rows, graph_timers)?.min(self.max_index_rows);
         self.max_changes = self.max_changes.max(add(
             add(self.max_claim_rows, self.max_extra_rows)?,
-            add(self.max_events, 2)?,
+            add(add(self.max_events, 2)?, self.max_index_rows)?,
         )?);
         super::prepare::within(self.max_claim_rows, limits.plan_nodes)?;
         super::prepare::within(self.max_changes, limits.range.max_batch_entries)?;
         let extras_bytes = array::<Extra>(self.extras_count)?;
         self.extras_bytes = add(extras_bytes, extras_bytes)?;
-        self.changes_bytes = add(
-            add(
-                array::<Change<Key, Row>>(self.max_changes)?,
-                array::<claim_changes::History>(self.max_claim_rows)?,
-            )?,
-            add(
-                containers(self.max_claim_rows)?,
-                event_containers(self.max_events)?,
-            )?,
+        self.changes_bytes = changes_bytes(
+            self.max_changes,
+            self.max_claim_rows,
+            self.max_events,
+            self.max_index_rows,
         )?;
         self.pending_bytes()?;
         Ok(self)
@@ -251,21 +303,32 @@ impl ConstructionBudget {
         limits: NativeLimits,
     ) -> Result<Self, NativeError> {
         let batch = limits.range.max_batch_entries;
-        self.max_changes = add(self.max_changes, cohort.changed_keys())?.min(batch);
+        // Every sealed cohort claim may leave one status and enter another,
+        // and every sealed evaluation and terminal claim retires its timer.
+        let cohort_timers = super::index_rows::timer_rows(0, cohort.evaluations(), 0)?;
+        let cohort_index = add(add(cohort.claims(), cohort.claims())?, cohort_timers)?;
         self.max_events = add(self.max_events, cohort.events())?.min(batch);
         self.max_extra_rows = add(self.max_extra_rows, cohort.evaluations())?.min(batch);
+        self.max_index_rows = self.max_index_rows.max(super::index_rows::bound(
+            self.operation,
+            self.max_claim_rows,
+            self.max_extra_rows,
+            self.max_events,
+            super::index_rows::input_bound(limits),
+            batch,
+        )?);
+        self.max_index_rows = add(self.max_index_rows, cohort_index)?.min(batch);
+        self.max_timer_rows = add(self.max_timer_rows, cohort_timers)?.min(self.max_index_rows);
+        self.max_changes =
+            add(self.max_changes, add(cohort.changed_keys(), cohort_index)?)?.min(batch);
         // The suffix's nested allocations share the already reserved Scratch.
         // Its producer must fit the complete prefix and suffix in that ceiling.
         super::prepare::within(cohort.construction_bytes()?, self.scratch_bytes)?;
-        self.changes_bytes = add(
-            add(
-                array::<Change<Key, Row>>(self.max_changes)?,
-                array::<claim_changes::History>(self.max_claim_rows)?,
-            )?,
-            add(
-                containers(self.max_claim_rows)?,
-                event_containers(self.max_events)?,
-            )?,
+        self.changes_bytes = changes_bytes(
+            self.max_changes,
+            self.max_claim_rows,
+            self.max_events,
+            self.max_index_rows,
         )?;
         self.pending_bytes()?;
         Ok(self)
@@ -280,6 +343,7 @@ impl ConstructionBudget {
         claims: usize,
         extras: usize,
         events: usize,
+        index: usize,
     ) -> Result<(), NativeError> {
         if claims > self.max_claim_rows {
             return Err(NativeError::Capacity("construction claim rows"));
@@ -290,7 +354,10 @@ impl ConstructionBudget {
         if events > self.max_events {
             return Err(NativeError::Capacity("construction events"));
         }
-        let changes = add(add(claims, extras)?, add(events, 2)?)?;
+        if index > self.max_index_rows {
+            return Err(NativeError::Capacity("construction index rows"));
+        }
+        let changes = add(add(claims, extras)?, add(add(events, 2)?, index)?)?;
         if changes > self.max_changes {
             return Err(NativeError::Capacity("construction changes"));
         }

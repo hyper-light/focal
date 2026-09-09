@@ -339,9 +339,19 @@ pub(super) fn validate_registration(
     receipt: &RequestStreamControlReceipt,
 ) -> Result<(), ManagedStoreError> {
     validate_control_receipt(&state.registration, receipt)?;
-    let RequestStreamCommand::Register { owner, window, .. } = state.registration.command else {
+    let RequestStreamCommand::Register {
+        slot,
+        expected_generation,
+        owner,
+        window,
+    } = state.registration.command
+    else {
         return Err(ManagedStoreError::Corrupt);
     };
+    // The owner nonce is the compare-and-set identity; the assigned
+    // generation is exactly one above the presented generation this
+    // registration cited (the registry presents its watermark on vacant
+    // pairs, so the assignment still lies above every generation it issued).
     match receipt.outcome {
         RequestStreamControlOutcome::Registered(RequestStreamState::Active {
             stream,
@@ -349,7 +359,14 @@ pub(super) fn validate_registration(
             revision: 1,
             window: actual_window,
             acknowledged_through: 0,
-        }) if stream == state.stream()? && owner == actual_owner && window == actual_window => {
+        }) if stream.cluster == state.context.cluster
+            && stream.ledger == state.context.ledger
+            && stream.principal == state.context.principal
+            && stream.slot == slot
+            && expected_generation.checked_add(1) == Some(stream.generation)
+            && owner == actual_owner
+            && window == actual_window =>
+        {
             Ok(())
         }
         _ => Err(ManagedStoreError::ReceiptMismatch),

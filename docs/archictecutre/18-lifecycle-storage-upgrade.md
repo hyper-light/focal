@@ -311,7 +311,7 @@ both output and snapshot contracts.
 
 | Owner | Implemented explicit historical representation |
 |---|---|
-| Model outputs | `DeltaId`, `Delta`, eleven `DeltaFact` variants and five `EffectIntent` variants; their nested domain leaves already have V1 codecs |
+| Model outputs | `DeltaId`, `Delta`, eleven `DeltaFact` variants and five `EffectIntent` variants; their nested domain leaves already have V1 codecs. The twelfth variant, `DeltaFact::Native` (delta schema 2, derived on demand from native events), has no V1 encoding and the codec refuses it |
 | Native stream | Consumer IDs/keys, positions/offsets, tokens, filters, resync reasons, modes, records, `CursorCheckpoint`, `CursorCommand` and nine `CursorOperation` variants |
 | Ledger cursor metadata | `CursorInput`, `CursorReceipt`, and private `CursorMetadata { receipts, owners }` |
 | Ledger membership | `MembershipState`, membership request/receipt/context, and explicit adapters for consensus configuration and four membership-change variants |
@@ -1676,6 +1676,22 @@ candidate can be accepted. Verification and report construction spend that held
 capacity through exclusive owner loans. This contract covers RAM accounting and
 finite native record/counter allowances. It does not reserve disk or replica
 capacity, and low-level Core preparation alone does not provide it.
+
+**Admission promise (2026-09-08).** With record buffers enabled, admission holds
+exactly the report's construction and retained-page charges, its write set and
+one encoded record buffer sized by
+[`future_record_bytes`](../../crates/focal-core/src/native/record_codec/buffer.rs).
+That bound is proven rather than argued:
+[bound_tests](../../crates/focal-core/src/native/record_codec/bound_tests.rs)
+drives complete workflows at authored maxima, checks every changed key of every
+row family against its fixed row allowance plus four bytes per charged heap
+byte, checks every frame against the same quote function, and checks that each
+completion promise dominates the report it later funds. What admission does not
+reserve stays explicit: WAL disk, quorum acknowledgement and transport fan-out.
+The durable Session refuses fresh candidates below a configured free-space
+watermark on the WAL filesystem before any in-memory acknowledgement
+([`NativeSessionLimits::disk_headroom_bytes`](../../crates/focal-ledger/src/native_session.rs));
+full disk reservation accounting is a later package.
 
 1. **Pin the complete evaluation contract before accepting responsibility.**
    Resolve the actual effective claim, immutable declaration, complete registration
@@ -3629,9 +3645,12 @@ lifecycle events with assumed success. In particular:
   bytes and hashes. Retirement floors retain their original scope and meaning.
 
 Document 17 fixes the semantic result-evidence roles and single-artifact target
-rules. Their exact V2 wire/storage representation, legacy-provenance encoding,
-and executable conformance remain unfinished. Freeze and qualify those concrete
-representations before declaring the new decoder complete.
+rules. The concrete import representation that honours these rules is frozen in
+[23 §5](23-native-activation-and-import.md): legacy claims keep their recorded
+status history as `Imported` events with an explicit legacy origin and an empty
+acceptance policy, testaments, evidence sets, validations and runs are retained
+verbatim as frozen legacy rows, and artifacts are re-verified from local content
+under a derived import request key.
 
 ## 8. Required qualification
 

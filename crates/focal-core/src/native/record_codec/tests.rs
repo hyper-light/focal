@@ -38,7 +38,7 @@ fn graph_capture_format_has_an_explicit_version_boundary_from_dormant_native_v1(
     let mut core = fixture::core();
     let prepared = created(&core);
     let mut mutation = encode(&prepared);
-    assert_eq!(&mutation[8..10], &2u16.to_le_bytes());
+    assert_eq!(&mutation[8..10], &4u16.to_le_bytes());
     mutation[8..10].copy_from_slice(&1u16.to_le_bytes());
     let end = mutation.len() - 32;
     let mut digest = blake3::Hasher::new_derive_key("focal.native.record.v1");
@@ -52,7 +52,7 @@ fn graph_capture_format_has_an_explicit_version_boundary_from_dormant_native_v1(
     let plan = checkpoint::EncodingPlan::prepare(&core, limits()).unwrap();
     let mut root = vec![0; plan.quote().bytes];
     plan.write_into(&mut root).unwrap();
-    assert_eq!(&root[8..10], &2u16.to_le_bytes());
+    assert_eq!(&root[8..10], &4u16.to_le_bytes());
     root[8..10].copy_from_slice(&1u16.to_le_bytes());
     let end = root.len() - 32;
     let mut digest = blake3::Hasher::new_derive_key("focal.native.checkpoint.v1");

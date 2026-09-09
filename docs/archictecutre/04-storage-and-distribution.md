@@ -203,6 +203,17 @@ An underestimated allocation after commit cannot turn the committed mutation int
 uncommitted error: retain its log, stop publication, report capacity failure, and recover
 or move the range. This is why sizing and maximum fanout limits belong at admission.
 
+Disk is admitted the same way. One envelope per data volume
+(`focal_memory::DiskBudget`, [24](24-placement-execution-and-fleet-control.md)
+§10) promises every durable write its bytes before it is queued: WAL batches
+and checkpoint rewrites, upload staging, sealed objects, imported chunks and
+custody records. A promise is refused with a typed capacity error before any
+acknowledgement when the volume's sampled free bytes, less what is already
+promised, would fall below the headroom watermark (or, for ordinary work, the
+completion reserve); it is charged against the estimate once the write is
+behind its fence and returned if it never happens. The envelope samples the
+volume at a bounded cadence and refuses fresh work while it cannot.
+
 The sequencer's lifecycle/affordance projection is itself budgeted and measured.
 It can become the ceiling for one enormous session even if heavy artifact bytes are
 distributed. No document should claim that this projection remains small at arbitrary

@@ -1,4 +1,5 @@
 use super::InputError;
+use focal_model::lifecycle::evidence::EvidenceFailure;
 use focal_model::*;
 
 macro_rules! parser {
@@ -19,3 +20,5 @@ parser!(parse_outcome,OutcomeKind,{Complete=>"complete",Partial=>"partial",Refus
 parser!(parse_content_class,ContentClass,{Document=>"document",Evidence=>"evidence",Checkpoint=>"checkpoint"});
 parser!(parse_object_kind,ObjectKind,{Claim=>"claim",Testament=>"testament",Validation=>"validation",Artifact=>"artifact"});
 parser!(parse_status,ClaimStatus,{Generated=>"generated",Posted=>"posted",Received=>"received",Progressed=>"progressed",TestamentGenerated=>"testament_generated",TestamentAcknowledged=>"testament_acknowledged",Validating=>"validating",Satisfied=>"satisfied",PostFailed=>"post_failed",ReceiptFailed=>"receipt_failed",TestamentGenerationFailed=>"testament_generation_failed",ValidationIncomplete=>"validation_incomplete",ValidationFailed=>"validation_failed",ValidationErrored=>"validation_errored",Cancelled=>"cancelled",Expired=>"expired",Revoked=>"revoked",Superseded=>"superseded",DependencyFailed=>"dependency_failed",Deadlocked=>"deadlocked"});
+parser!(parse_evidence_failure,EvidenceFailure,{Work=>"work",Production=>"production",Structure=>"structure",Metadata=>"metadata"});
+parser!(parse_verdict,VerdictValue,{Pass=>"pass",Fail=>"fail",Incomplete=>"incomplete",Error=>"error"});

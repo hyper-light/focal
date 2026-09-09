@@ -115,6 +115,7 @@ fn passive_support_is_readonly_and_canceled_floor_input_never_registers() {
             Box::new(AdmittedRequest {
                 verified,
                 witness: None,
+                native: None,
             }),
             send,
             charge,
@@ -154,6 +155,7 @@ fn passive_support_is_readonly_and_canceled_floor_input_never_registers() {
             Box::new(AdmittedRequest {
                 verified,
                 witness: None,
+                native: None,
             }),
             send,
             charge,
@@ -425,6 +427,7 @@ fn deliver_frame(owner: &mut Owner, mut frame: ReplicationFrame, force_admission
             Box::new(AdmittedRequest {
                 verified,
                 witness: None,
+                native: None,
             }),
             send,
             charge,

@@ -35,11 +35,12 @@ pub(crate) fn serve(settings: &Settings, selection: Option<&str>) -> Result<()> 
     let store = Bootstrap::open(&root)
         .and_then(|bootstrap| bootstrap.finish(&operation))
         .map_err(|error| CliError::Other(Box::new(error)))?;
-    let managed = ManagedRequests::open(
+    let managed = ManagedRequests::open_with(
         &root,
         "MCP.requests",
         operation,
         ManagedStoreLimits::default(),
+        super::managed::rotation()?,
     )
     .map_err(|error| CliError::Other(Box::new(error)))?;
     let mut backend =
@@ -55,6 +56,11 @@ pub(crate) fn serve(settings: &Settings, selection: Option<&str>) -> Result<()> 
     let watches = focal_client::watch::WatchStore::open(&root, operation)
         .map_err(|error| CliError::Other(Box::new(error)))?;
     backend = backend.with_watches(watches)?;
+    // The engine probe runs inside the adapter on its worker runtime; this
+    // adapter's own native journal is opened only when the ledger is native.
+    backend = backend.with_native_journal(Box::new(NativeJournal {
+        parent: root.join("client"),
+    }));
     if let Some(admin_root) = admin_root {
         let mut admin_settings = Settings::default();
         admin_settings.node.data_dir = Some(admin_root);
@@ -66,6 +72,29 @@ pub(crate) fn serve(settings: &Settings, selection: Option<&str>) -> Result<()> 
     }
     focal_mcp::serve(backend, std::io::stdin(), std::io::stdout())
         .map_err(|error| CliError::Other(Box::new(error)))
+}
+
+/// The MCP adapter's `n1:` journal, beside the human CLI's under the context
+/// root; each adapter owns its identities and delivery marks.
+struct NativeJournal {
+    parent: PathBuf,
+}
+impl focal_mcp::NativeJournal for NativeJournal {
+    fn initialized(&self) -> bool {
+        super::native::initialized_in(&self.parent, super::native::MCP_STORE)
+    }
+    fn open(
+        self: Box<Self>,
+    ) -> std::result::Result<
+        focal_client::native_store::NativeOperationStore,
+        focal_mcp::JournalError,
+    > {
+        match super::native::store_in(&self.parent, super::native::MCP_STORE, true) {
+            Ok(Some(store)) => Ok(store),
+            Ok(None) => Err("native journal was not created".into()),
+            Err(error) => Err(Box::new(error)),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

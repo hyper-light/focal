@@ -559,9 +559,11 @@ fn memory_pressure_refuses_creation_but_completion_and_prepared_publication_succ
 #[test]
 fn late_batch_capacity_refusal_rolls_back_all_private_parent_changes() {
     let mut config = limits();
-    // One root includes claim + definition + both events + meta/outcome. An
-    // owned child additionally replaces its parent and records registration.
-    config.range.max_batch_entries = 6;
+    // One root includes claim + definition + both events + meta/outcome and
+    // its six index rows (issuer, subject, status, creation, the definition's
+    // evaluator and creation). An owned child additionally replaces its
+    // parent and records registration.
+    config.range.max_batch_entries = 12;
     let mut core = Core::new_native(
         ledger(),
         RangeId(1),

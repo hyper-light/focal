@@ -121,6 +121,7 @@ pub(in crate::lifecycle::claim_descriptor) fn build<'a>(
         requirements,
         slots,
         deadline: fields.deadline,
+        policy: fields.policy,
         roles: shape.roles.copy(),
         content_hash: shape.content_hash,
     };

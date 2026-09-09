@@ -84,6 +84,15 @@ pub struct AcceptanceSourcePasses {
     pub slots: usize,
 }
 
+/// Which acceptance shapes a hydration source may present. Authored policies
+/// need a required delivery obligation; a legacy claim's policy is empty by
+/// construction (23 §5.2) and never gains obligations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyShape {
+    Authored,
+    LegacyEmpty,
+}
+
 #[derive(Debug)]
 pub struct AcceptanceSourcePlan<'s, S: AcceptanceSource> {
     source: &'s S,
@@ -91,6 +100,7 @@ pub struct AcceptanceSourcePlan<'s, S: AcceptanceSource> {
     issuer: ParticipantId,
     limits: Limits,
     shape: Shape,
+    policy: PolicyShape,
 }
 impl<'s, S: AcceptanceSource> AcceptanceSourcePlan<'s, S> {
     pub fn claim(&self) -> Binding {
@@ -139,13 +149,44 @@ impl AcceptancePolicy {
         limits: Limits,
         max_visits: usize,
     ) -> Result<AcceptanceSourcePlan<'s, S>, ContractError> {
-        let shape = inspect(source, claim, issuer, limits, max_visits)?;
+        Self::prepare_source_with(
+            claim,
+            issuer,
+            source,
+            limits,
+            max_visits,
+            PolicyShape::Authored,
+        )
+    }
+    pub fn prepare_source_with<'s, S: AcceptanceSource>(
+        claim: Binding,
+        issuer: ParticipantId,
+        source: &'s S,
+        limits: Limits,
+        max_visits: usize,
+        policy: PolicyShape,
+    ) -> Result<AcceptanceSourcePlan<'s, S>, ContractError> {
+        let shape = inspect(source, claim, issuer, limits, max_visits, policy)?;
         Ok(AcceptanceSourcePlan {
             source,
             claim,
             issuer,
             limits,
             shape,
+            policy,
+        })
+    }
+    /// The empty policy of a legacy claim: no slots, no obligations, the same
+    /// identity a hydrated empty source produces.
+    pub fn legacy_empty(claim: Binding, issuer: ParticipantId) -> Result<Self, ContractError> {
+        if claim.object.is_zero() || issuer.is_zero() {
+            return Err(ContractError::InvalidPolicy);
+        }
+        Ok(Self {
+            claim,
+            issuer,
+            slots: Vec::new(),
+            declarations: Vec::new(),
         })
     }
 }
@@ -334,9 +375,13 @@ fn inspect<S: AcceptanceSource>(
     issuer: ParticipantId,
     limits: Limits,
     max_visits: usize,
+    policy: PolicyShape,
 ) -> Result<Shape, ContractError> {
     let mut visits = VisitBudget::new(max_visits);
     let counts = Counts::read(source, claim, issuer, limits, &mut visits)?;
+    if policy == PolicyShape::LegacyEmpty && (counts.slots != 0 || counts.declarations != 0) {
+        return Err(ContractError::InvalidPolicy);
+    }
     let slots = scan_slots(
         source,
         (claim, issuer),
@@ -393,7 +438,7 @@ fn inspect<S: AcceptanceSource>(
             row.target == ObligationTarget::Delivery && row.mode == ValidationMode::Required;
         Ok(())
     })?;
-    if !delivery {
+    if !delivery && policy == PolicyShape::Authored {
         return Err(ContractError::InvalidPolicy);
     }
     frame.slots(&mut visits, |event, visits| {
@@ -527,6 +572,7 @@ fn build<S: AcceptanceSource>(
         plan.issuer,
         plan.limits,
         visits.remaining(),
+        plan.policy,
     )?;
     visits.charge(actual.inspection_visits)?;
     if actual.counts != shape.counts

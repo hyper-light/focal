@@ -80,7 +80,11 @@ fn family_help_and_completions_match_shared_filter_admission() {
                 ListCommand::Claims(args)
                 | ListCommand::Testaments(args)
                 | ListCommand::Artifacts(args)
-                | ListCommand::Validations(args) => args,
+                | ListCommand::Validations(args)
+                | ListCommand::Evaluations(args)
+                | ListCommand::Receipts(args)
+                | ListCommand::Monitors(args)
+                | ListCommand::Events(args) => args,
             };
             let accepted = super::super::authored::filters(args.filters)
                 .build_operation(kind, &context())
@@ -170,4 +174,54 @@ fn all_shells_omit_hidden_family_filters_and_preserve_claim_selection() {
             }
         }
     }
+}
+
+/// Every shared descriptor that names a CLI path resolves to a real leaf of
+/// the command tree, so the registry cannot promise a verb the CLI lacks.
+#[test]
+fn every_surface_descriptor_cli_path_resolves_in_the_command_tree() {
+    use focal_client::operations::{admin_descriptors, transfer_descriptors, watch_descriptors};
+    let root = command();
+    let mut named = 0;
+    for descriptor in watch_descriptors()
+        .iter()
+        .chain(transfer_descriptors())
+        .chain(admin_descriptors())
+    {
+        let Some(path) = descriptor.cli_path else {
+            continue;
+        };
+        named += 1;
+        let mut current = &root;
+        for word in path.split(' ') {
+            current = current
+                .find_subcommand(word)
+                .unwrap_or_else(|| panic!("{}: `focal {path}` has no `{word}`", descriptor.name));
+        }
+        assert!(
+            !current.has_subcommands(),
+            "{}: `focal {path}` is not a leaf",
+            descriptor.name
+        );
+    }
+    assert!(named >= 34, "{named} descriptors name a CLI path");
+    // The registry is exactly the three surfaces plus the application catalogues.
+    for descriptor in watch_descriptors()
+        .iter()
+        .chain(transfer_descriptors())
+        .chain(admin_descriptors())
+    {
+        assert_eq!(
+            focal_client::operations::find_surface(descriptor.name).map(|d| d.surface),
+            Some(descriptor.surface)
+        );
+    }
+    assert_eq!(
+        focal_client::operations::surface_of("claim.submit"),
+        Some(focal_client::operations::Surface::Application)
+    );
+    assert_eq!(
+        focal_client::operations::surface_of("cluster.control"),
+        None
+    );
 }

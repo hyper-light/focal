@@ -179,7 +179,7 @@ impl Fixture {
                 region: RegionId([1; 16]),
                 zone: ZoneId([2; 16]),
                 endpoint: format!("node{node}.localhost:8443"),
-                identity: ContentHash(server_fingerprint(&receipt.certificate)),
+                identity: ContentHash(receipt.public_key),
                 authority_epoch: 1,
                 attestation: ContentHash([0; 32]),
                 eligible: true,
@@ -259,7 +259,9 @@ fn node_capability_allows_unknown_geography_without_promising_zone_or_region_sur
                         report: 1,
                         available_memory: 1024,
                         active_weight: *id,
+                        disk_available: 1024,
                     }),
+                    liveness: None,
                 },
             )
         })
@@ -273,19 +275,19 @@ fn node_capability_allows_unknown_geography_without_promising_zone_or_region_sur
         home_regions: Default::default(),
         required_memory: 1,
     };
-    let plan = propose_placement(&nodes, &policy, 31).unwrap();
+    let plan = propose_placement(&nodes, &policy, 31, 1).unwrap();
     assert!(plan.spec.placement.voters.contains_key(&2));
     policy.durability.survive = FailureClass::Region;
-    let regional = propose_placement(&nodes, &policy, 31).unwrap();
+    let regional = propose_placement(&nodes, &policy, 31, 1).unwrap();
     assert!(!regional.spec.placement.voters.contains_key(&2));
     assert!(regional.spec.placement.voters.contains_key(&3));
     policy.durability.survive = FailureClass::Zone;
     assert!(matches!(
-        propose_placement(&nodes, &policy, 31),
+        propose_placement(&nodes, &policy, 31, 1),
         Err(DirectoryError::NoPlacement)
     ));
     policy.durability.max_failures = 0;
-    let zonal = propose_placement(&nodes, &policy, 31).unwrap();
+    let zonal = propose_placement(&nodes, &policy, 31, 1).unwrap();
     assert_eq!(zonal.spec.placement.preferred_leader, 4);
     let mut bad = plan.spec;
     bad.policy.residency.insert(RegionId([0; 16]));
@@ -478,8 +480,9 @@ fn real_committed_configuration_needs_installed_quorum_and_exact_scoped_signatur
         .propose_conf_change(change)
         .unwrap();
     pump(&mut nodes);
+    // Adding a learner leaves the voter set, and so the membership epoch,
+    // unchanged; only a voter change advances it.
     let mut next = group.clone();
-    next.membership_epoch = 2;
     next.learners.insert(5, 1);
     let status = nodes[&2].status();
     for node in nodes.values() {

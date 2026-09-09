@@ -70,7 +70,13 @@ impl NativeCreationResult {
         if entry.requested.is_zero() || entry.resolved.is_zero() || entry.content.0 == [0; 32] {
             return Err(ContractError::InvalidTarget.into());
         }
-        if entry.schema != 1 {
+        // Claims exist in descriptor schemas 1 and 2 (doc 21 §5); validation
+        // definitions only in schema 1.
+        let supported = match entry.family {
+            NativeCreatedFamily::Claim => 1..=2,
+            NativeCreatedFamily::Validation => 1..=1,
+        };
+        if !supported.contains(&entry.schema) {
             return Err(ContractError::InvalidPolicy.into());
         }
         Ok(())

@@ -16,6 +16,7 @@ struct Adapter {
     transfer_contract_version: u16,
     watch_contract_version: u16,
     administration_contract_version: u16,
+    native_contract_version: u16,
 }
 #[derive(Deserialize)]
 struct Skill {
@@ -26,6 +27,7 @@ struct Skill {
     required_transfer_tools: Vec<Required>,
     required_watch_tools: Vec<Required>,
     required_admin_tools: Vec<Required>,
+    required_native_operations: Vec<Required>,
 }
 #[derive(Deserialize)]
 struct Required {
@@ -40,13 +42,23 @@ fn skills_require_only_real_advertised_tools_and_exact_recovery_contract() {
         "/../../skills/manifest.json"
     )))
     .unwrap();
-    assert_eq!(manifest.schema_version, 2);
+    assert_eq!(manifest.schema_version, 3);
     assert_eq!(manifest.adapter.name, "focal-mcp");
     assert_eq!(manifest.adapter.version, env!("CARGO_PKG_VERSION"));
     assert_eq!(manifest.adapter.recovery_contract_version, 2);
     assert_eq!(manifest.adapter.transfer_contract_version, 1);
     assert_eq!(manifest.adapter.watch_contract_version, 1);
     assert_eq!(manifest.adapter.administration_contract_version, 1);
+    assert_eq!(manifest.adapter.native_contract_version, 2);
+    let native_catalog = crate::catalog_native::catalog(&focal_wire::NativeStanding {
+        principal: focal_model::ParticipantId::from_u128(1),
+        role: focal_wire::NativePeerRole::Actor,
+        profile: focal_wire::NativeProfile::AuthoredV1,
+        native_sequence: focal_model::SessionSeq(1),
+        logical_time: 1,
+    })
+    .unwrap();
+    let mut required_native = BTreeSet::new();
     let mut catalog = catalog::catalog().unwrap();
     crate::catalog_transfer::append(&mut catalog).unwrap();
     crate::catalog_watch::append(&mut catalog).unwrap();
@@ -56,10 +68,12 @@ fn skills_require_only_real_advertised_tools_and_exact_recovery_contract() {
         assert_eq!(
             skill.version,
             match skill.name.as_str() {
-                "focal-claims" => 8,
-                "focal-evidence" => 7,
-                "focal-validation" => 3,
-                _ => 1,
+                "focal-claims" => 10,
+                "focal-evidence" => 8,
+                "focal-validation" => 4,
+                "focal-peers" => 1,
+                "focal-cluster" => 3,
+                _ => 2,
             }
         );
         for operation in skill.required_admin_tools {
@@ -107,6 +121,40 @@ fn skills_require_only_real_advertised_tools_and_exact_recovery_contract() {
                 );
             }
             required.insert(operation.name);
+        }
+        // Every native requirement is an advertised native tool whose
+        // `operation_id` is the optional `n1:` resume argument.
+        for operation in skill.required_native_operations {
+            assert_eq!(operation.version, manifest.adapter.native_contract_version);
+            let descriptor = focal_client::operations::find_native(&operation.name).unwrap();
+            assert_eq!(descriptor.version, operation.version);
+            let tool = native_catalog
+                .iter()
+                .find(|tool| tool.name == operation.name)
+                .unwrap_or_else(|| panic!("native tool not advertised: {}", operation.name));
+            assert!(tool.idempotent);
+            assert_eq!(tool.input_schema["additionalProperties"], false);
+            assert!(tool.input_schema["properties"].get("authority").is_none());
+            let resumable = tool.input_schema["properties"].get("operation_id");
+            assert_eq!(
+                resumable.is_some(),
+                descriptor.mutation,
+                "{}",
+                operation.name
+            );
+            if let Some(id) = resumable {
+                assert!(id["pattern"].as_str().unwrap().starts_with("^n1:"));
+                assert!(
+                    !tool
+                        .input_schema
+                        .get("required")
+                        .and_then(serde_json::Value::as_array)
+                        .unwrap_or(&Vec::new())
+                        .iter()
+                        .any(|field| field == "operation_id")
+                );
+            }
+            required_native.insert(operation.name);
         }
         for operation in skill.required_watch_tools {
             assert_eq!(operation.version, manifest.adapter.watch_contract_version);
@@ -231,5 +279,13 @@ fn skills_require_only_real_advertised_tools_and_exact_recovery_contract() {
             + crate::catalog_transfer::TOOL_COUNT
             + crate::catalog_watch::TOOL_COUNT
             + crate::catalog_admin::TOOL_COUNT
+    );
+    // The native requirements across the skills cover every native descriptor.
+    assert_eq!(
+        required_native,
+        focal_client::operations::native_descriptors()
+            .iter()
+            .map(|descriptor| descriptor.name.to_owned())
+            .collect::<BTreeSet<_>>()
     );
 }

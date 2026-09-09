@@ -168,6 +168,15 @@ Progress on terminal work remains observational/no-op according to the existing
 command contract. Receipt adoption changes entitlement/generation, not content or
 the claim's attained phase, and fences stale response/evaluation mutations.
 
+A terminal challenge or an answered consultation is never reopened by what
+follows it: a correction `invalidates` the challenge and a follow-up
+consultation `refines` its predecessor as new claims under their author's
+own cause, admitted only under the followed claim's authored policy and, for
+a correction, only on the exact report of the terminal Fail, Incomplete or
+Error verdict at the challenge's current registration generation
+([21 §5](21-native-input-format.md), decision F29). Neither changes the
+followed claim's status, revision or lineage.
+
 Later response generation, posting and receipt do not regress the claim's attained
 phase. Their own histories record those transitions. Local completion is not
 satisfaction: `DependsOn`, `Awaits`, SCC/fixpoint propagation, release and monitor
@@ -1080,9 +1089,16 @@ Work entry/reporting and Posted Required Admission already use bounded atomic
 aggregation and indexed graph consequences; other paths must
 preserve the same source checks, capacity promises and authorized begun late
 reports after ordinary business failure. Standing and grant policy must resolve
-actual stored facts rather than participant permission flags. Due-timer scheduling
-and recovery, native codecs, WAL/Ready integration, Session/quorum activation and
-CLI/MCP dispatch remain open. The live ledger still uses V1 semantics. The full
+actual stored facts rather than participant permission flags. Due-timer
+scheduling and recovery are the `DueTimer` index family of
+[22 §7](22-native-record-format.md#7-secondary-index-families): every
+undelivered claim, monitor and evaluation deadline is one row ordered by
+logical time, the node's leader sweeps the rows due at its clock each tick and
+delivers them through the three trusted owner entrypoints, a delivery retires
+its row through the same derivation every reader validates, and a restart
+simply rescans. Native codecs, WAL/Ready integration, Session/quorum
+activation and CLI/MCP dispatch are delivered by the R3 and R4 batches recorded
+in [09](09-implementation-status.md). The live ledger still uses V1 semantics. The full
 remaining sequence and qualification boundary are in
 [18 §6.12](18-lifecycle-storage-upgrade.md#612-runtime-scope-integration-sequence).
 

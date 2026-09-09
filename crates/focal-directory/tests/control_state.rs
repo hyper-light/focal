@@ -29,6 +29,9 @@ impl AuthorityVerifier for Evidence {
     fn verify_delegation(&self, value: &DelegationFence) -> Result<(), DirectoryError> {
         verify(value.destination_ready)
     }
+    fn verify_custody(&self, value: &CustodyProof) -> Result<(), DirectoryError> {
+        verify(value.attestation)
+    }
 }
 fn verify(hash: ContentHash) -> Result<(), DirectoryError> {
     if hash == VERIFIED {
@@ -107,6 +110,7 @@ fn nodes(partition: &mut DirectoryPartition) {
                     report: 1,
                     available_memory: 1_000_000,
                     active_weight: 4 - id,
+                    disk_available: 1 << 30,
                 },
             },
         );
@@ -183,6 +187,35 @@ fn change(partition: &mut DirectoryPartition, session: LedgerId, change: Session
         },
     );
 }
+fn ready(session: LedgerId, op: u128, route: u64, node: u64, through: u64) -> ReplicaReady {
+    ReplicaReady {
+        ledger: session,
+        operation: OperationId::from_u128(op),
+        route_epoch: RouteEpoch(route),
+        node,
+        node_generation: 1,
+        through: SessionSeq(through),
+        custody: VERIFIED,
+        attestation: VERIFIED,
+    }
+}
+fn promoted(
+    spec: &PlacementSpec,
+    node: u64,
+    through: u64,
+    custody_epoch: u64,
+) -> AssignmentProgress {
+    AssignmentProgress {
+        node,
+        node_generation: 1,
+        roles: roles_of(&spec.placement, node),
+        phase: AssignmentPhase::Promoted,
+        attempt: 1,
+        through: SessionSeq(through),
+        custody_epoch,
+        refusal: None,
+    }
+}
 fn attempt(
     partition: &DirectoryPartition,
     session: LedgerId,
@@ -245,6 +278,7 @@ fn independent_namespace_partitions_never_store_or_mutate_each_others_sessions()
                 report: 2,
                 available_memory: 100,
                 active_weight: 100,
+                disk_available: 1 << 30,
             },
         },
     };
@@ -275,6 +309,7 @@ fn placement_remains_active_until_cutover_and_all_exact_incarnations_are_ready()
         &directory.checkpoint().nodes,
         &policy(FailureClass::Region, 1),
         31,
+        1,
     )
     .unwrap()
     .spec;
@@ -284,6 +319,7 @@ fn placement_remains_active_until_cutover_and_all_exact_incarnations_are_ready()
         SessionChange::Plan {
             operation: OperationId::from_u128(2),
             desired: desired.clone(),
+            observations: BTreeMap::new(),
         },
     );
     assert_eq!(
@@ -310,6 +346,48 @@ fn placement_remains_active_until_cutover_and_all_exact_incarnations_are_ready()
         },
     );
     let barrier = fence(&desired, SessionFenceKind::Cutover, session, 2, 5, 2);
+    // The cutover fence commits the next membership epoch, so every desired
+    // voter must be promoted before the directory records it.
+    assert!(matches!(
+        attempt(
+            &directory,
+            session,
+            SessionChange::Cutover {
+                operation: OperationId::from_u128(2),
+                authority: barrier.clone()
+            }
+        ),
+        Err(DirectoryError::NotReady)
+    ));
+    for node in 1..=3 {
+        let through = if node == 3 { 4 } else { 5 };
+        change(
+            &mut directory,
+            session,
+            SessionChange::Ready {
+                ready: ready(session, 2, 2, node, through),
+            },
+        );
+        change(
+            &mut directory,
+            session,
+            SessionChange::Progress {
+                operation: OperationId::from_u128(2),
+                progress: promoted(&desired, node, through, 2),
+            },
+        );
+    }
+    assert_eq!(
+        directory
+            .get(session)
+            .unwrap()
+            .unwrap()
+            .pending
+            .as_ref()
+            .unwrap()
+            .phase,
+        PlacementPhase::Promoting
+    );
     change(
         &mut directory,
         session,
@@ -318,19 +396,17 @@ fn placement_remains_active_until_cutover_and_all_exact_incarnations_are_ready()
             authority: barrier,
         },
     );
-    for node in 1..=3 {
-        let ready = ReplicaReady {
-            ledger: session,
-            operation: OperationId::from_u128(2),
-            route_epoch: RouteEpoch(2),
-            node,
-            node_generation: 1,
-            through: SessionSeq(if node == 3 { 4 } else { 5 }),
-            custody: VERIFIED,
-            attestation: VERIFIED,
-        };
-        change(&mut directory, session, SessionChange::Ready { ready });
-    }
+    assert_eq!(
+        directory
+            .get(session)
+            .unwrap()
+            .unwrap()
+            .pending
+            .as_ref()
+            .unwrap()
+            .phase,
+        PlacementPhase::Cutover
+    );
     assert!(matches!(
         attempt(
             &directory,
@@ -350,16 +426,7 @@ fn placement_remains_active_until_cutover_and_all_exact_incarnations_are_ready()
         &mut directory,
         session,
         SessionChange::Ready {
-            ready: ReplicaReady {
-                ledger: session,
-                operation: OperationId::from_u128(2),
-                route_epoch: RouteEpoch(2),
-                node: 3,
-                node_generation: 1,
-                through: SessionSeq(5),
-                custody: VERIFIED,
-                attestation: VERIFIED,
-            },
+            ready: ready(session, 2, 2, 3, 5),
         },
     );
     let mut forged = activation.clone();
@@ -394,6 +461,7 @@ fn placement_remains_active_until_cutover_and_all_exact_incarnations_are_ready()
         (RouteEpoch(2), 2, 2)
     );
     assert!(active.pending.is_none());
+    assert!(active.retiring.is_empty());
     // Exact operation can be reconciled after a lost directory response.
     change(
         &mut directory,
@@ -489,6 +557,7 @@ fn membership_and_load_reports_bind_verified_node_incarnations() {
                 report: 99,
                 available_memory: u64::MAX,
                 active_weight: 0,
+                disk_available: 1 << 30,
             },
         },
     };
@@ -508,7 +577,7 @@ fn measured_placement_and_worst_domain_loss_cover_quorum_and_content_independent
     let mut directory = partition(budget(), 1, NamespaceRange::all());
     nodes(&mut directory);
     let regional = policy(FailureClass::Region, 1);
-    let proposal = propose_placement(&directory.checkpoint().nodes, &regional, 31).unwrap();
+    let proposal = propose_placement(&directory.checkpoint().nodes, &regional, 31, 1).unwrap();
     assert_eq!(proposal.spec.placement.preferred_leader, 3); // lowest measured load
     assert_eq!(proposal.observations.len(), 3);
     let mut bad = proposal.spec.clone();
@@ -520,7 +589,7 @@ fn measured_placement_and_worst_domain_loss_cover_quorum_and_content_independent
     let mut residency = regional;
     residency.residency = BTreeSet::from([RegionId::from_u128(1), RegionId::from_u128(2)]);
     assert_eq!(
-        propose_placement(&directory.checkpoint().nodes, &residency, 31),
+        propose_placement(&directory.checkpoint().nodes, &residency, 31, 1),
         Err(DirectoryError::NoPlacement)
     );
     let mut missing = directory.checkpoint().nodes.clone();
@@ -630,6 +699,7 @@ fn metadata_partition_transfer_is_sealed_cas_fenced_and_hash_checked() {
                 report: 2,
                 available_memory: 10,
                 active_weight: 1,
+                disk_available: 1 << 30,
             },
         },
     };
@@ -913,6 +983,7 @@ fn recovery_rejects_malformed_pending_fences_and_checkpoint_epochs() {
         SessionChange::Plan {
             operation: OperationId::from_u128(2),
             desired: initial_spec(),
+            observations: BTreeMap::new(),
         },
     );
     let checkpoint = directory.checkpoint().clone();
@@ -986,6 +1057,7 @@ fn empty_domain_placement_uses_increasing_raft_fences_without_invented_mutations
         SessionChange::Plan {
             operation: OperationId::from_u128(2),
             desired: spec.clone(),
+            observations: BTreeMap::new(),
         },
     );
     change(
@@ -1014,25 +1086,24 @@ fn empty_domain_placement_uses_increasing_raft_fences_without_invented_mutations
     change(
         &mut directory,
         session,
-        SessionChange::Cutover {
-            operation: OperationId::from_u128(2),
-            authority: cutover,
+        SessionChange::Ready {
+            ready: ready(session, 2, 2, 1, 0),
         },
     );
     change(
         &mut directory,
         session,
-        SessionChange::Ready {
-            ready: ReplicaReady {
-                ledger: session,
-                operation: OperationId::from_u128(2),
-                route_epoch: RouteEpoch(2),
-                node: 1,
-                node_generation: 1,
-                through: SessionSeq(0),
-                custody: VERIFIED,
-                attestation: VERIFIED,
-            },
+        SessionChange::Progress {
+            operation: OperationId::from_u128(2),
+            progress: promoted(&spec, 1, 0, 2),
+        },
+    );
+    change(
+        &mut directory,
+        session,
+        SessionChange::Cutover {
+            operation: OperationId::from_u128(2),
+            authority: cutover,
         },
     );
     let mut activated = fence(&spec, SessionFenceKind::Activated, session, 2, 0, 2);

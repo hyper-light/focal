@@ -1434,3 +1434,93 @@ fn authenticated_connection_moved_to_timerless_runtime_returns_connection_error(
     drop((peer, client, server));
     original.shutdown_background();
 }
+
+#[test]
+fn placement_control_and_session_sign_are_node_only_certificate_bound_and_bounded() {
+    let mut packet = request(101);
+    packet.operation = Operation::PlacementControl {
+        group: [7; 16],
+        request: vec![1, 2],
+    };
+    assert_eq!(packet.operation.registered_tag(), 28);
+    assert!(packet.operation.is_mutation());
+    let mut sign = request(102);
+    sign.operation = Operation::SessionSign {
+        group: [7; 16],
+        request: vec![3],
+    };
+    assert_eq!(sign.operation.registered_tag(), 29);
+    assert!(!sign.operation.is_mutation());
+    for role in [PeerRole::Actor, PeerRole::Evaluator, PeerRole::Runtime] {
+        let mut value = grant();
+        value.role = role;
+        for envelope in [&packet, &sign] {
+            assert!(matches!(
+                verify_request(
+                    AuthenticatedPeer::local(value.clone()).unwrap(),
+                    envelope.clone(),
+                    &limits()
+                ),
+                Err(AccessError::Unauthorized)
+            ));
+        }
+    }
+    // A trusted local Node grant carries no certificate and cannot speak for
+    // a remote identity on either operation.
+    let mut value = grant();
+    value.role = PeerRole::Node { node_id: 7 };
+    let local = AuthenticatedPeer::local(value.clone()).unwrap();
+    for envelope in [&packet, &sign] {
+        assert!(matches!(
+            verify_request(local.clone(), envelope.clone(), &limits()),
+            Err(AccessError::Unauthorized)
+        ));
+    }
+    let registry = PeerRegistry::new(1).unwrap();
+    let fingerprint = registry
+        .register_certificate(b"transport-verified-placement-certificate", value)
+        .unwrap();
+    let node = registry.authenticate(fingerprint).unwrap();
+    assert!(verify_request(node.clone(), packet.clone(), &limits()).is_ok());
+    assert!(verify_request(node.clone(), sign.clone(), &limits()).is_ok());
+    let reply = packet.reply(Response::Control {
+        response: vec![1, 2],
+    });
+    validate_response(&packet, &reply, None, &limits()).unwrap();
+    let reply = sign.reply(Response::Control {
+        response: vec![1, 2],
+    });
+    validate_response(&sign, &reply, None, &limits()).unwrap();
+    packet.operation = Operation::PlacementControl {
+        group: [0; 16],
+        request: vec![1, 2],
+    };
+    assert!(matches!(
+        verify_request(node.clone(), packet.clone(), &limits()),
+        Err(AccessError::InvalidRequest)
+    ));
+    packet.operation = Operation::PlacementControl {
+        group: [7; 16],
+        request: vec![1; MAX_PLACEMENT_CONTROL_REQUEST_BYTES + 1],
+    };
+    assert!(matches!(
+        verify_request(node.clone(), packet.clone(), &limits()),
+        Err(AccessError::Capacity)
+    ));
+    sign.operation = Operation::SessionSign {
+        group: [7; 16],
+        request: vec![1; MAX_SESSION_SIGN_REQUEST_BYTES + 1],
+    };
+    assert!(matches!(
+        verify_request(node.clone(), sign.clone(), &limits()),
+        Err(AccessError::Capacity)
+    ));
+    sign.operation = Operation::SessionSign {
+        group: [7; 16],
+        request: Vec::new(),
+    };
+    assert!(matches!(
+        verify_request(node, sign, &limits()),
+        Err(AccessError::InvalidRequest)
+    ));
+}

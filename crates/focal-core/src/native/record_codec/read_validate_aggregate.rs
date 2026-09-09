@@ -298,6 +298,19 @@ pub(super) fn validate_source(
         works = add(works, 1)?;
     }
     rows.check()?;
+    // A legacy claim carries no native obligations, responses, work or
+    // evaluations: its recorded status is the fact, nothing is derived (23 §5).
+    if claim.origin() == focal_model::lifecycle::claim::ClaimOrigin::Legacy {
+        if works != 0
+            || claim.response_count() != 0
+            || !registry.rows().is_empty()
+            || claim.acceptance().slot_count() != 0
+            || !claim.acceptance().declarations().is_empty()
+        {
+            return Err(invalid());
+        }
+        return Ok(());
+    }
     let (checks, declarations) = policy_work(claim, read)?;
     let shape = ProjectionShape {
         responses: claim.response_count(),

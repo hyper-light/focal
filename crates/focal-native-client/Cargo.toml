@@ -1,0 +1,23 @@
+[package]
+name = "focal-native-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+focal-model = { version = "0.1.0", path = "../focal-model" }
+focal-core = { version = "0.1.0", path = "../focal-core" }
+focal-memory = { version = "0.1.0", path = "../focal-memory" }
+focal-evidence = { version = "0.1.0", path = "../focal-evidence" }
+focal-wire = { version = "0.1.0", path = "../focal-wire" }
+focal-client = { version = "0.1.0", path = "../focal-client" }
+blake3.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

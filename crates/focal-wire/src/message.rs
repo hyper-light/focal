@@ -166,9 +166,44 @@ pub enum Operation {
         id: MonitorId,
     },
     Select(crate::SelectionRequest),
+    /// One borrowed native input frame (`FCNINPUT`), journaled and admitted
+    /// exactly as sent; only the native profile carries it.
+    Native {
+        frame: Vec<u8>,
+    },
+    NativeRead(crate::NativeReadRequest),
+    NativeList(crate::NativeListRequest),
+    /// Node-only placement protocol to a directory partition owner: bounded
+    /// reads, and submits of the sender's own enrollment, load, progress and
+    /// readiness. Never a plan, a fence, or another node's facts.
+    PlacementControl {
+        group: [u8; 16],
+        request: Vec<u8>,
+    },
+    /// Ask the authenticated node to sign one session fact it can witness from
+    /// its own hosted replica of `group`. The reply carries that node's
+    /// signature alone; a quorum is assembled by the caller.
+    SessionSign {
+        group: [u8; 16],
+        request: Vec<u8>,
+    },
+    /// Node-only liveness probe: a direct probe of the receiver or an indirect
+    /// probe it relays to one of its peers, carrying the sender's network
+    /// coordinate, local health and a bounded piggyback of membership updates.
+    /// Answered from the receiver's published state without an owner round
+    /// trip; it grants nothing and commits nothing.
+    Probe {
+        request: Vec<u8>,
+    },
 }
+/// A probe with its coordinate, health and bounded piggyback.
+pub const MAX_PROBE_BYTES: usize = 8 * 1024;
 /// Read-only metadata selectors contain no variable-length collections.
 pub const MAX_PEER_CONTROL_REQUEST_BYTES: usize = 64;
+/// A readiness report carries one signed statement and its certificate.
+pub const MAX_PLACEMENT_CONTROL_REQUEST_BYTES: usize = 256 * 1024;
+/// One placement request with its policy and members.
+pub const MAX_SESSION_SIGN_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_ENROLLMENT_CONTROL_REQUEST_BYTES: usize = 128 * 1024;
 impl Operation {
     /// IDs are registered protocol values, independent of Rust enum layout.
@@ -198,6 +233,12 @@ impl Operation {
             Self::Summary => 22,
             Self::Monitor { .. } => 23,
             Self::Select(_) => 24,
+            Self::Native { .. } => 25,
+            Self::NativeRead(_) => 26,
+            Self::NativeList(_) => 27,
+            Self::PlacementControl { .. } => 28,
+            Self::SessionSign { .. } => 29,
+            Self::Probe { .. } => 30,
         }
     }
     pub fn is_mutation(&self) -> bool {
@@ -213,6 +254,8 @@ impl Operation {
                 | Self::EnrollmentControl { .. }
                 | Self::Managed { .. }
                 | Self::RequestStreamControl { .. }
+                | Self::Native { .. }
+                | Self::PlacementControl { .. }
         )
     }
 }
@@ -537,7 +580,9 @@ pub enum Response {
     Stream(StreamReply),
     Upload(UploadReply),
     Content(ContentChunk),
-    Control { response: Vec<u8> },
+    Control {
+        response: Vec<u8>,
+    },
     Custody(CustodyReply),
     Listed(crate::ListPage),
     Reconciled(crate::ReconcileReply),
@@ -549,6 +594,12 @@ pub enum Response {
     Validators(crate::ListPage),
     Summary(crate::LedgerSummary),
     Monitor(crate::MonitorPage),
+    Native(crate::NativeMutationReply),
+    NativeRead(crate::NativeReadPage),
+    NativeListed(crate::NativeListPage),
+    /// The receiver's probe reply: its acknowledgement or relayed outcome,
+    /// coordinate, health and piggyback.
+    Probe(Vec<u8>),
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponseEnvelope {
@@ -584,6 +635,13 @@ impl Negotiated {
                 | (
                     PEER_PROTOCOL_VERSION,
                     PROTOCOL_VERSION | MANAGED_PROTOCOL_VERSION | PEER_PROTOCOL_VERSION
+                )
+                | (
+                    crate::NATIVE_PROTOCOL_VERSION,
+                    PROTOCOL_VERSION
+                        | MANAGED_PROTOCOL_VERSION
+                        | PEER_PROTOCOL_VERSION
+                        | crate::NATIVE_PROTOCOL_VERSION
                 )
         )
     }
@@ -650,11 +708,27 @@ impl WireLimits {
         managed: bool,
         participant: bool,
     ) -> Result<Negotiated, AccessError> {
+        self.negotiate_native(hello, managed, participant, false)
+    }
+    /// The native profile is offered only by a handler that admits native
+    /// frames and managed requests; it implies every earlier profile.
+    pub fn negotiate_native(
+        &self,
+        hello: &Hello,
+        managed: bool,
+        participant: bool,
+        native: bool,
+    ) -> Result<Negotiated, AccessError> {
         if hello.versions.len() > 16 {
             return Err(AccessError::UnsupportedProtocol);
         }
-        let protocol = if managed && participant && hello.versions.contains(&PEER_PROTOCOL_VERSION)
+        let protocol = if managed
+            && participant
+            && native
+            && hello.versions.contains(&crate::NATIVE_PROTOCOL_VERSION)
         {
+            crate::NATIVE_PROTOCOL_VERSION
+        } else if managed && participant && hello.versions.contains(&PEER_PROTOCOL_VERSION) {
             PEER_PROTOCOL_VERSION
         } else if managed && hello.versions.contains(&MANAGED_PROTOCOL_VERSION) {
             MANAGED_PROTOCOL_VERSION

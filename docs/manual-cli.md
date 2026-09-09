@@ -392,13 +392,251 @@ snapshot expires. This is a bounded graph read, not a download of the whole ledg
 or a lifecycle-history reconstruction. MCP `ledger.traverse` and the Rust SDK use
 the same query and page contract.
 
+## Native engine verbs
+
+A ledger activated on the native engine (`focal cluster replicas activate-native`,
+[cluster-admin.md](cluster-admin.md)) answers the same verbs through the native
+wire profile. The CLI probes the engine once per invocation with a standing
+read; on a native ledger it compiles every document into one exact `FCNINPUT`
+frame, journals it under an `n1:` reference before sending, and resends the
+identical bytes until the owner commits or refuses it. Native and V1 differ in
+what a document may say, so the native descriptors are version 2 of the same
+names (`focal schema get claim.submit --native`, `focal schema coverage`).
+
+The two-party cycle on a native ledger:
+
+```text
+# issuer: one required receipt (delivery) check plus one programmatic check on slot 0
+focal submit claim --description 'Run the suite.' --target <ALICE> \
+  --validation-json '{"kind":"receipt","description":"Record delivery.","deadline":{"at":4102444800000}}' \
+  --validation-json '{"kind":"test","description":"The suite passes.","target":{"type":"slot","index":0,"name":"report"},"evaluator":"self","handlers":[{"id":<HANDLER>,"version":<VERSION>}],"deadline":{"at":4102444800000}}' \
+  --slot-json '{"slot":0,"checks":[{"declaration":1}]}' --format json
+focal claim post <CLAIM>
+# respondent (an enrolled client context)
+focal --client-context alice receipt acquire <CLAIM>
+focal --client-context alice artifact submit --claim <CLAIM> --slot 0 --text '{"passed":3,"failed":0,"skipped":0}'
+focal --client-context alice testament submit --claim <CLAIM> --summary 'Suite passed.' \
+  --confidence committed --outcome complete --slot 0=<ARTIFACT>:<HASH>
+focal --client-context alice testament post <TESTAMENT> --claim <CLAIM>
+# issuer receives, evaluates and reports; acceptance is derived by the owner
+focal testament receive <TESTAMENT> --claim <CLAIM>
+focal validation begin --claim <CLAIM> --validation <VALIDATION>
+focal validation report --claim <CLAIM> --validation <VALIDATION> --verdict pass --text '{"passed":3,"failed":0,"skipped":0}'
+focal get claim <CLAIM>
+```
+
+A native claim may cite exact evidence and carry a follow-up policy. A
+`reviews` or `derived_from` relation may target `artifact:ID@HASH`, the
+artifact at its committed descriptor hash (`--relation
+reviews:artifact:<ARTIFACT>@<HASH>`, or `"relations":[{"kind":"reviews","target":"artifact:…@…"}]`
+in a document); the owner refuses an unknown artifact, a different hash or
+any other relation kind naming evidence, and a pending artifact cannot be
+cited. A document's `policy` (`corrective_allowed`, `max_follow_ups` up to
+1,024, `single_issuer`, `escalation` of `none`, `holder` or `evaluator`) is
+authored immutably with the claim and read back by `get claim`. Either
+selects descriptor schema 2; every other claim keeps schema 1, so existing
+identities and hashes are unchanged.
+
+The owner admits peer follow-ups under that policy. A correction is a claim
+with `--action correction`, `--relation invalidates:claim:<CHALLENGE>` and
+`--relation reviews:artifact:<REPORT>@<HASH>` naming the report of the
+challenge's failed verdict; the challenge must allow corrections, the report
+must be its terminal Fail, Incomplete or Error verdict at the current
+registration generation, the author must be the challenge's issuer, its
+holder (unless escalation is `none`) or, under `escalation: evaluator`, the
+evaluator who reported that verdict, and `single_issuer` refuses a second
+correction (`conflicting_cause`, exit 5). The other refusals are typed too:
+`invalid_target` for a claim that is no challenge (exit 2), `invalid_policy`
+when its policy forbids corrections (2), `missing_evidence` when the cited
+artifact is not its verdict (2), `invalid_transition` when the verdict
+passed or may still be retried (5), `stale_evaluation` when the challenge
+was re-registered since (5) and `unauthorized` for anyone else (3). A
+follow-up consultation is a claim with `--action consultation` and
+`--relation refines:claim:<CONSULT>`; the refined consultation's
+`escalation` names who may file it (`unauthorized`) and `max_follow_ups`
+bounds how many (`invalid_policy`, exit 2). Neither reopens the claim it
+follows.
+
+The peer verbs package these shapes; each is an authored shape of `submit
+claim` with the same frame, `n1:` identity and receipt:
+
+```text
+focal claim challenge --target <ALICE> --description 'Prove the report covers the edge cases.' \
+  --artifact <ARTIFACT>[@<HASH>] --validation-json '...' --slot-json '...' \
+  --policy-json '{"corrective_allowed":true,"max_follow_ups":1,"single_issuer":true,"escalation":"evaluator"}'
+focal claim consult --target <ALICE> --description 'Which cases does the parser leave undefined?' \
+  --validation-json '...' --policy-json '{"max_follow_ups":2,"escalation":"holder"}'
+focal claim correct --challenge <CHALLENGE> --verdict <REPORT>[@<HASH>] \
+  --description 'Redo the inspection with the missing cases.' --validation-json '...'
+focal claim follow-up --refines <CONSULT> --description 'And the unicode cases?' --validation-json '...'
+focal claim lineage <CLAIM> --format json
+focal claim wait <CLAIM> --until testament --timeout-ms 10000
+```
+
+`claim challenge` needs `--policy-json`; `--artifact` names the disputed
+artifact, whose hash is read from the ledger when omitted. `claim correct`
+cites the report artifact of the challenge's failed verdict (read it from
+`get claim`: the evaluation's `last_result.evidence`); `--target` defaults
+to the challenge's subject, and the correction's occurrence identity derives
+from the challenge, the verdict and you, so the same correction sent twice
+is one claim. `claim follow-up` refines a committed consultation and
+defaults its target to that consultation's subject; its identity derives
+from the refined claim, the query and you. Every verb also takes the
+document form (`--json`, `--yaml`, `--file`) with the same fields as the MCP
+tools. `claim lineage` prints one page of committed claims: the claim with
+its content, its `caused_by` ancestors nearest first, then the corrections
+that invalidate it, the consultations that refine it and the children it
+caused, each with its content and all read at or after the first read's
+token. `claim wait` observes a native claim like the V1 observer (31 probes,
+one second apart, at most 30 seconds) and adds `--until testament`, met once
+the issuer has received a closing testament.
+
+Every mutation prints `{"schema_version":2,"operation_id":"n1:…","condition":"Committed","result":{"kind":"native","receipt":…,"created":[…]}}`
+(`--format json`); `created` lists the identities the frame minted (claim,
+validation, receipt, artifact or testament). A closed refusal prints
+`condition` from its category with the owner's detail and exits with the
+matching class (invalid input 2, unauthorized 3, not found 4, stale or
+conflicting 5, capacity 6); a pending ticket or a lost reply exits 7 with a
+`Recovery:` line naming `focal request retry --operation-id n1:…`, which
+resends the exact journaled frame and prints the receipt once it commits. A
+committed receipt is durable in the journal before it is printed, so a reply
+lost on a broken pipe is found with `focal request pending` and reprinted by
+the same retry. `focal request inspect --operation-id n1:…` shows the
+recorded receipt or refusal without sending anything; with `--remote` it
+reads the owner's committed outcome for that request key instead, which
+also observes an operation the MCP adapter journaled under the same context
+([mcp.md](mcp.md#native-engine-tools)).
+
+Reads on a native ledger return native documents: `focal get claim ID` (with
+its content, scopes, responses and evaluations), `focal get testament ID`,
+`focal get artifact ID` and `focal get validation ID` (the definition and its
+current evaluations at one prefix); `focal get validation ID --context`
+composes, at one prefix, everything an evaluator needs: the claim, the
+definition, the registration and evaluation selected like `validation
+begin` (`--phase admission|increment`, `--slot N`, `--target ARTIFACT`,
+`--generation N`), the target's manifest with each artifact's custody, the
+accepted results after `--cursor REVISION` (at most `--limit`) and the
+delivery result of the same response; `focal status` prints the standing
+read.
+Frozen vocabularies (claim status, validation mode) print as their registered
+codes. Native-specific flags: `--slot`, `--parent`, `--max-responses` and
+`--slot-json` on `submit claim`; `--slot SLOT=ID:HASH` and `--diagnostic
+ID:HASH` on `testament submit`; `--slot` on `artifact submit`; `artifact
+diagnostic --reason work|production|structure|metadata`; `--validation` and
+`--slot` on `validation begin`; `validation report --verdict
+pass|fail|incomplete|error`. V1-only fences (`--receipt`, `--evidence-set`,
+`--expected-revision`, `--operation PATH`) are refused on a native ledger
+rather than ignored. Claim, evaluation and monitor deadlines are logical
+milliseconds since the Unix epoch and fire from the node's clock once a
+second (a claim expires, an evaluation is fenced, a monitor is settled or
+expires) without any command; `get claim` and `list monitors` show the
+outcome. Claim batches, graph traversal, validator listing and chunked
+uploads are not offered on the native engine; the CLI says so explicitly
+instead of answering from the wrong engine. Failed work is
+evidence, never an omission: `testament submit --outcome failed` (or any
+non-complete outcome) must cite at least one of the holder's own committed
+work diagnostics with `--diagnostic ID:HASH` and is refused before sending
+without one (exit 2); the claimant reads the diagnostic through `get
+artifact` and the testament's `diagnostics` name the exact reference. A check
+whose slot the frozen manifest lacks can be neither begun nor reported (exit
+4); `validation enter-whole-work TESTAMENT --claim ID` assesses it, ending
+the required check and the claim `ValidationIncomplete` without any
+manufactured verdict. An evaluator that cannot run its handler reports
+`--verdict error`: the error report is retained with its exact target and
+attempt, and while the handler's declared `attempts` remain the evaluation
+stays open on the next attempt (`attempt_index` counts from zero) for a
+further `validation report`; only the final attempt makes it `Errored`. On the native engine `--parent CLAIM_ID` (or `"parent"` in the document) names the committed claim this claim is caused by: the command reads the parent's current binding and receipt and pins them, and the owner admits the child only from the parent's issuer or its current receipt holder while the parent is live, registering the child on the parent; a forged parent is refused before sending (exit 4), a third party is refused as unauthorized (exit 3), and a terminal or changed parent is refused with a typed outcome (exit 5). Cancelling the parent cancels its pending children.
+
+Every remaining owner operation has a verb on a native ledger. Evaluations of
+the admission and increment phases are selected on the same `validation
+begin` and `validation report` commands with `--phase admission|increment`
+(the default is `whole_work`) and, when several increments are current,
+`--target WORK_ARTIFACT`; the admission evaluation exists once the claim is
+posted, an increment evaluation once the holder submits that artifact. The
+issuer's verbs over a cycle are `artifact receive ID --claim ID` (a
+generated output), `artifact reject ID --claim ID --reason
+structure|metadata --text ERROR_JSON` (the diagnostic inherits the rejected
+product's visibility), `validation seal-increments --claim ID` (while the
+response is open) and `validation enter-whole-work TESTAMENT --claim ID`
+(after receiving it; a plain `validation begin` enters implicitly). The
+holder records an unproducible slot with `artifact fail --claim ID --slot N
+--diagnostic ID[:HASH]`, citing its own committed `artifact diagnostic
+--reason production`. The issuer replaces the holder with `receipt adopt
+CLAIM --holder PARTICIPANT|self` (the old receipt is fenced one epoch
+earlier; testimony under it is refused as stale), releases a terminal
+claim's owned scope with `claim release-scope ID`, and audits a closed claim
+with `audit generate --claim ID` then `audit post TESTAMENT` (read with `get
+testament`). Durable waits are `monitor register --owner CLAIM --root
+satisfied|terminal|released:CLAIM… --at LOGICAL_MS`, `monitor rebind
+MONITOR --owner CLAIM --predecessor CLAIM --successor CLAIM` (the successor
+must be a committed claim that `supersedes` the predecessor) and, once the
+owning claim is terminal, `monitor cancel MONITOR --owner CLAIM`; `list
+monitors --claim ID` shows registrations, rebindings and dispositions. Each
+verb accepts the same `--json|--yaml|--file` document as its MCP tool
+(`focal schema get receipt.adopt --native`); minted identities are reported
+under `created` (`Receipt`, `ResultTestament`, `Monitor`, `Artifact`).
+
+```text
+focal validation begin --claim <CLAIM> --validation <ADMISSION> --phase admission
+focal validation report --claim <CLAIM> --validation <ADMISSION> --phase admission --verdict pass --text '{"passed":1,"failed":0,"skipped":0}'
+focal validation begin --claim <CLAIM> --validation <INCREMENT> --phase increment --target <ARTIFACT>
+focal artifact receive <ARTIFACT> --claim <CLAIM>
+focal validation seal-increments --claim <CLAIM>
+focal validation enter-whole-work <TESTAMENT> --claim <CLAIM>
+focal claim release-scope <CLAIM>
+focal audit generate --claim <CLAIM>
+focal audit post <RESULT_TESTAMENT>
+focal --client-context alice artifact fail --claim <CLAIM> --slot 1 --diagnostic <DIAGNOSTIC>
+focal artifact reject <ARTIFACT> --claim <CLAIM> --reason structure --text '{"code":"malformed","message":"Not a test report."}'
+focal receipt adopt <CLAIM> --holder self
+focal monitor register --owner <CLAIM> --root satisfied:<OTHER> --at 4102444800000
+focal monitor rebind <MONITOR> --owner <CLAIM> --predecessor <OTHER> --successor <SUCCESSOR>
+focal monitor cancel <MONITOR> --owner <CLAIM>
+```
+
+Lists on a native ledger are bounded scans over the native index families
+([22 §7](archictecutre/22-native-record-format.md)). The shared `list`
+flags select one indexed predicate and the rest filter within
+`--max-visits`, so a page may be empty and still print a `CURSOR`; only a
+page without one ends the list, and `--all` follows the continuation for
+you. Four families are native-only:
+
+```text
+focal list claims --target <ALICE> --status posted
+focal list claims --scope file:src/lib.rs
+focal list claims --relation reviews=claim:<CLAIM> --created-after 3
+focal list artifacts --producer <ALICE> --kind test-report
+focal list validations --claim <CLAIM> --evaluator self
+focal list evaluations --verdict pass
+focal list testaments --claim <CLAIM>
+focal list receipts --holder <ALICE>
+focal list monitors --claim <CLAIM>
+focal list events --after 4:0 --limit 50 --all
+```
+
+Claims index issuer (`--source`), subject (`--target`), status, action, one
+`--scope`, one `--relation KIND=claim:ID` (or `reviews=artifact:ID`, with an
+optional `@HASH` to require one committed hash) and `--created-after`; artifacts
+index `--producer`, `--kind`, `--schema-hash` and one `--input KIND:ID`;
+validations `--claim` and `--evaluator`; evaluations `--claim`,
+`--validation`, `--evaluator` and `--verdict`; receipts `--holder` and
+`--claim`; testaments and monitors need `--claim`; events take `--after
+SEQUENCE:ORDINAL`. A flag a family does not index (`--caused-by`, `--phase`,
+a second `--scope`) is refused rather than ignored. JSON output is the
+version 2 result shape with `result.kind = "native_list"`; pass `page.next`
+back as `--cursor` in hexadecimal with the same flags. A cursor is bound to
+the ledger, principal, route and exact filter and to the node incarnation
+that issued it: a tampered, reused or stale cursor is refused.
+
 ## Output and recovery
 
 The default output is a compact table. `--format json` and `--format yaml` emit the same versioned structured results with readable top-level IDs, complete typed object/receipt data, read tokens and cursors. YAML is serialized directly to the output sink without making a second whole-result tree. Nested model values retain their frozen wire representation: IDs are byte arrays and vocabularies are numeric codes. `focal schema get domain-registry` provides those codes. Authored input uses readable string IDs and snake-case vocabulary names.
 
 Lists expose `--max-visits` separately from `--limit`: the first bounds examined records, the second bounds returned matches. A page can contain no matches and still carry a continuation. Resume with the same filters and limits. `status` uses the selected client context, including a named remote connection; it does not substitute the local data directory's ledger.
 
-Ordinary mutations use a private managed request stream automatically. The CLI durably reserves an `m1:…` ID and saves normalized input, generated IDs and the exact request before sending. Successful commands print their object outcome without recovery diagnostics. An unresolved command or failed result output prints a copyable recovery command on stderr; a broken diagnostic stream never prevents submission or replaces the original failure. If preparation has not completed, recovery points to pending discovery and explicit sealing rather than retrying an unprepared request. After an abrupt process kill, `focal request pending` discovers its durable reservation or prepared operation even if no output appeared. The data directory must already be private (mode `0700`); newly created node directories satisfy this. An older, publicly searchable directory is rejected rather than silently changing permissions. Its owner can make the selected directory private with `chmod 700 /path/to/data-dir` before using managed requests. Explicit legacy `--operation` journals retain their previous directory requirements. The stream is bound to the selected cluster, ledger and authenticated principal. It does not advance the legacy principal-wide epoch floor.
+Ordinary mutations use a private managed request stream automatically. The CLI durably reserves an `m1:…` ID and saves normalized input, generated IDs and the exact request before sending. Successful commands print their object outcome without recovery diagnostics. An unresolved command or failed result output prints a copyable recovery command on stderr; a broken diagnostic stream never prevents submission or replaces the original failure. If preparation has not completed, recovery points to pending discovery and explicit sealing rather than retrying an unprepared request. After an abrupt process kill, `focal request pending` discovers its durable reservation or prepared operation even if no output appeared. The data directory must already be private (mode `0700`); newly created node directories satisfy this. An older, publicly searchable directory is rejected rather than silently changing permissions. Its owner can make the selected directory private with `chmod 700 /path/to/data-dir` before using managed requests. Explicit legacy `--operation` journals retain their previous directory requirements. The stream is bound to the selected cluster, ledger and authenticated principal. It does not advance the legacy principal-wide epoch floor. A stream generation issues at most 65,536 IDs; once every one of them is acknowledged, the CLI closes the generation, removes its store and registers the next one on the same slot automatically, without deleting anything by age. IDs of a closed generation report `Retired` from `request inspect` and never execute again. `FOCAL_MANAGED_ROTATION=N` lowers the bound for fault campaigns; the bound is saved with the coordinator on first use, so every later invocation must use the same value.
+
+Several processes of one participant may run at once on the same data directory: CLI invocations beside each other and beside `focal mcp serve`. Ordinary commands read the context catalogue and an enrolled context's credentials under shared locks, so readers never exclude each other; only `context` commands hold them exclusively, and a reader that finds a writer active fails closed rather than waiting. The native request journal is created once under a short creation lock (a creation interrupted before its marker is redone, never reused), and its per-operation lock is waited for briefly instead of failing. A node that refuses a request for capacity (its ingress is full, or the WAL volume is below its free-space watermark) admitted nothing, so the client resends the same request up to three times with backoff and then reports the refusal itself, never an unknown outcome; a journaled native reference refused this way stays `Pending` and commits exactly once on a later `request retry`. A node that died or restarted is noticed by an enrolled client within ten seconds of silence (QUIC keep-alive and idle bound); reconnecting to an endpoint that is still down is bounded by the request timeout. `FOCAL_DISK_HEADROOM_BYTES=N` sets the free bytes the WAL volume must keep before fresh native work is admitted (the standard watermark is 64 MiB; `0` disables it); exact retries of committed work never need headroom.
 
 After a verified receipt, the CLI writes and flushes the result, records delivery durably, and acknowledges only the contiguous prefix of delivered results. Normal use therefore continues beyond the bounded request window without manual cleanup. A timeout, domain refusal, canceled wait or failed output leaves the request recoverable. If cleanup fails after successful output, business success remains success; the next command resumes the saved cleanup. A retired ID cannot execute again and its complete receipt may no longer be available. Successful flush means delivery to the selected output stream, not proof that another application consumed it.
 
@@ -570,6 +808,8 @@ Seed pages contain real graph objects. Claim-filtered seeds use the committed as
 
 Tail output contains the original delta and resolved/resync markers. Family selection retains its recorded facts; validation watches also retain original claim-generation facts because those commits create their pinned requirements. These are not synthesized independent artifact/testament lifecycle events. The future independent lifecycle history remains a separate storage upgrade.
 
+On a native ledger the same commands run unchanged. The watch speaks the native wire profile, seeds through linearizable native reads after the source pins the snapshot instead of a server-side snapshot scan (a `--claim` filter reads each claim with its responses and evaluations; `claims`, `testaments` and `all` without a filter list every claim, `artifacts` lists the artifacts and `validations` the definitions), and then follows the tail of schema-2 deltas derived from the committed native records. Each seed page is a `NativeSeed` delivery (`token` names the native prefix the objects were read at, `next` the following step); each tail delta carries `schema: 2`, a `Native` fact with the exact committed event (`sequence`/`ordinal` are the native record position), the nearest legacy `action`, the `actor` (zero for trusted timers and the import) and the `claim`. Table output prints native changes as `CHANGE <sequence> <action> <claim> native:<record>.<ordinal> <fact>`. Facts committed between the snapshot and the seed's read prefix appear in the seed and again as deltas; deduplicate by object binding. The engine a watch was created for is saved with its options, so a name keeps its engine across resumes; watch journals written by earlier development builds are refused.
+
 There are at most 16 saved watch names per selected context, each with an independent four-slot managed cursor stream and bounded journal. CLI and MCP can inspect/resume the same names, while ordinary mutation streams remain separate. Names/options are immutable; use `--name` for a distinct watch. Preserve `WATCHES.watch-owner`, `WATCHES.watch-lock`, the `watch-*.watch-*` files and their adjacent managed `.requests` state together. Automatic watch deletion, slot rotation and expired-cursor repair are not implemented; deleting initialized files is not recovery.
 
 ## Validate authored input and review a raw request
@@ -724,9 +964,10 @@ focal claim wait --file wait.yaml --format yaml
 
 Replace `CLAIM_ID` with the actual ID. The document form is
 `{ "claim": "CLAIM_ID", "until": "satisfied", "timeout_ms": 5000 }`;
-`until` accepts `satisfied`, `terminal`, or `released`. `timeout_ms` defaults to
-30000 and accepts 1–30000. The MCP tool `claim.wait` takes this same document and
-has no `operation_id` or reservation step.
+`until` accepts `satisfied`, `terminal`, or `released`, and on a native ledger
+also `testament` (the issuer has received a closing testament). `timeout_ms`
+defaults to 30000 and accepts 1–30000. The MCP tool `claim.wait` takes this
+same document and has no `operation_id` or reservation step.
 
 The observer performs fresh quorum claim reads, keeping only the latest observed
 status, revision, local-completion flag, release flag and read token. It makes at

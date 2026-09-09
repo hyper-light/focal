@@ -26,6 +26,9 @@
 mod arena;
 mod budget;
 mod content;
+mod disk;
+#[cfg(test)]
+mod disk_tests;
 #[cfg(test)]
 mod funded_budget_tests;
 mod index;
@@ -43,6 +46,9 @@ pub use budget::{
     Allocation, BudgetKind, BudgetLane, BudgetStats, ElasticFundedPool, MemoryBudget, Reservation,
 };
 pub use content::{ImmutableContent, VersionedRecord};
+pub use disk::{
+    DISK_KIND_COUNT, DiskBudget, DiskBudgetConfig, DiskKind, DiskReservation, DiskStats,
+};
 pub use index::StableIndex;
 pub use owner::OwnerId;
 pub use range::{
@@ -64,6 +70,12 @@ pub enum MemoryError {
     Capacity {
         requested: usize,
         available: usize,
+    },
+    /// A volume cannot promise the bytes a durable write needs; retryable
+    /// once space is reclaimed or the sample changes.
+    DiskCapacity {
+        requested: u64,
+        available: u64,
     },
     AllocationFailed,
     CounterExhausted(&'static str),
@@ -113,4 +125,4 @@ pub(crate) fn checked_mul(left: usize, right: usize) -> Result<usize, MemoryErro
 }
 
 /// Conservative bookkeeping for each allocation the engine itself creates.
-pub(crate) const ALLOCATOR_OVERHEAD: usize = 4 * std::mem::size_of::<usize>();
+pub const ALLOCATOR_OVERHEAD: usize = 4 * std::mem::size_of::<usize>();

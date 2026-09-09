@@ -138,7 +138,8 @@ fn core(visits: usize) -> Core<NativeState> {
         NativeLimits {
             range: RangeConfig {
                 page_entries: 4,
-                max_batch_entries: 128,
+                // Sixty-four definitions and their index rows in one creation.
+                max_batch_entries: 256,
                 ..RangeConfig::default()
             },
             preparation_bytes: 1024 * 1024,
@@ -311,7 +312,13 @@ fn begin_requires_failure_write_capacity_and_checks_actor_first() {
     let mut core = posted(1, 256, 1, false);
     let baseline = core.native_stats();
     let budget = core.state.budget.stats();
-    for capacity in 4..11 {
+    // The smallest failed report writes eleven primary rows, a result
+    // artifact's three index rows, its verdict row and the parent's two
+    // status rows (doc 22 §7): seventeen in all. A smaller batch cannot hold
+    // any failed report, so admission is refused by shape.
+    let minimum = crate::native::index_rows::MINIMUM_FAILED_REPORT_ROWS;
+    assert_eq!(minimum, 17);
+    for capacity in 4..minimum {
         core.limits.range.max_batch_entries = capacity;
         assert!(matches!(
             core.prepare_native(
@@ -330,7 +337,7 @@ fn begin_requires_failure_write_capacity_and_checks_actor_first() {
         assert_eq!(core.native_stats(), baseline);
         assert_eq!(core.state.budget.stats(), budget);
     }
-    core.limits.range.max_batch_entries = 11;
+    core.limits.range.max_batch_entries = minimum;
     let next = fixture::prepared(core.prepare_native(
         fixture::context(fixture::EVALUATOR, 30),
         begin(&core, 1, 3),

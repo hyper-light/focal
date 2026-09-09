@@ -114,6 +114,13 @@ impl V1 for RelationTarget {
             Self::Object(value) => RelationTargetRefV1::Object(Ref(value)),
             Self::Action(value) => RelationTargetRefV1::Action(Ref(value)),
             Self::Root(value) => RelationTargetRefV1::Root(Ref(value)),
+            // Exact evidence targets exist only in native descriptor schema 2;
+            // the frozen V1 codec never carries them.
+            Self::Evidence(_) => {
+                return Err(serde::ser::Error::custom(
+                    "evidence relation targets are not V1 content",
+                ));
+            }
         };
         value.serialize(serializer)
     }

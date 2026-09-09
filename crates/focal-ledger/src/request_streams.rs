@@ -105,12 +105,23 @@ pub(crate) struct RequestStreams {
     ledger: LedgerId,
     limits: RequestStreamLimits,
     slots: Vec<StreamSlot>,
+    /// The largest generation ever assigned by this registry (15 §"Session
+    /// owner and controls"): every registration assigns above it, so a
+    /// remembered pair evicted at capacity can never see one of its old
+    /// generations reused by a later registration.
+    next_generation: u64,
     _slots_charge: Option<Allocation>,
 }
 pub(crate) struct PreparedStream {
     position: usize,
     replacing: bool,
     base: Option<(u64, u64)>,
+    /// A closed, vacant pair this publication evicts to make room for a new
+    /// pair at capacity: its index and stamp, checked again at publication.
+    evict: Option<(usize, (u64, u64))>,
+    /// The generation a registration assigned; publication raises the
+    /// registry watermark to it.
+    assigned: Option<u64>,
     data: StreamSlotData,
     charge: Allocation,
 }
@@ -120,6 +131,16 @@ impl PreparedStream {
     }
     pub fn receipt(&self, key: &ManagedRequestKey) -> Option<&ManagedReceipt> {
         self.data.rows.iter().find(|row| row.key == *key)
+    }
+    /// A cursor receipt names the published end of the ledger's stream line
+    /// at apply (23 §6); like the index it is fixed only while publishing the
+    /// committed entry, identically on every replica.
+    pub fn set_cursor_sequence(&mut self, sequence: SessionSeq) {
+        for row in &mut self.data.rows {
+            if row.raft_index == 0 && matches!(row.outcome, ManagedReceiptOutcome::Cursor { .. }) {
+                row.sequence = sequence;
+            }
+        }
     }
     /// Index is unknown during proposal. It becomes part of the immutable result
     /// only while publishing the corresponding durably committed entry.
@@ -164,8 +185,13 @@ impl RequestStreams {
             ledger,
             limits,
             slots: Vec::new(),
+            next_generation: 0,
             _slots_charge: None,
         })
+    }
+    /// The registry's generation watermark, persisted with the checkpoint.
+    pub(crate) fn next_generation(&self) -> u64 {
+        self.next_generation
     }
     fn locate(&self, principal: ParticipantId, slot: u32) -> Result<usize, usize> {
         self.slots.binary_search_by_key(&(principal, slot), |row| {
@@ -192,17 +218,32 @@ impl RequestStreams {
         slot: u32,
     ) -> Result<RequestStreamState, ManagedError> {
         self.validate_scope(principal)?;
-        Ok(self
-            .locate(principal, slot)
-            .ok()
-            .and_then(|i| self.slots.get(i))
-            .map_or(
-                RequestStreamState::Vacant {
-                    slot,
-                    generation: 0,
-                },
-                |row| row.data.state,
-            ))
+        Ok(self.presented(
+            self.locate(principal, slot)
+                .ok()
+                .and_then(|i| self.slots.get(i))
+                .map_or(
+                    RequestStreamState::Vacant {
+                        slot,
+                        generation: 0,
+                    },
+                    |row| row.data.state,
+                ),
+        ))
+    }
+    /// The state a principal observes. A vacant pair presents the registry
+    /// watermark rather than its own last generation, so the next
+    /// registration on it is assigned exactly the presented generation plus
+    /// one and still lies above every generation this registry ever issued:
+    /// an evicted pair's delayed traffic can never match a reused stream.
+    fn presented(&self, state: RequestStreamState) -> RequestStreamState {
+        match state {
+            RequestStreamState::Vacant { slot, generation } => RequestStreamState::Vacant {
+                slot,
+                generation: generation.max(self.next_generation),
+            },
+            active => active,
+        }
     }
     fn active(&self, stream: &RequestStreamIdentity) -> Result<&StreamSlotData, ManagedError> {
         self.validate_stream(stream)?;
@@ -356,11 +397,33 @@ impl RequestStreams {
         extra: usize,
         lane: BudgetLane,
         budget: &MemoryBudget,
+        registering: bool,
     ) -> Result<PreparedStream, LedgerError> {
         let location = self.locate(principal, slot);
-        if location.is_err() && self.slots.len() >= self.limits.max_slots {
-            return Err(ManagedError::Capacity.into());
+        if location.is_err() && !registering {
+            // Only a registration creates a pair; every other command names
+            // one that must already exist.
+            return Err(ManagedError::NotRegistered.into());
         }
+        // At capacity a new pair may take the place of the longest-closed
+        // vacant pair: its generation fence survives through the registry
+        // watermark, and every replica selects the same victim from the
+        // same committed rows.
+        let evict = if location.is_err() && self.slots.len() >= self.limits.max_slots {
+            let victim = self
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| matches!(row.data.state, RequestStreamState::Vacant { .. }))
+                .min_by_key(|(_, row)| row.data.stamp())
+                .map(|(index, row)| (index, row.data.stamp()));
+            match victim {
+                Some(victim) => Some(victim),
+                None => return Err(ManagedError::Capacity.into()),
+            }
+        } else {
+            None
+        };
         if self.slots.capacity() < self.limits.max_slots {
             let bytes = self
                 .limits
@@ -401,6 +464,8 @@ impl RequestStreams {
             position: location.unwrap_or_else(|i| i),
             replacing: location.is_ok(),
             base,
+            evict,
+            assigned: None,
             data,
             charge,
         })
@@ -434,6 +499,7 @@ impl RequestStreams {
             extra,
             lane,
             budget,
+            false,
         )?;
         let i = next
             .data
@@ -470,8 +536,14 @@ impl RequestStreams {
             .and_then(|n| n.checked_add(8192))
             .and_then(|n| n.checked_add(retained))
             .ok_or(ManagedError::Capacity)?;
-        let mut next =
-            self.candidate(input.principal, slot, extra, BudgetLane::Completion, budget)?;
+        let mut next = self.candidate(
+            input.principal,
+            slot,
+            extra,
+            BudgetLane::Completion,
+            budget,
+            matches!(input.command, RequestStreamCommand::Register { .. }),
+        )?;
         let outcome = match &input.command {
             RequestStreamCommand::Register {
                 expected_generation,
@@ -479,9 +551,14 @@ impl RequestStreams {
                 window,
                 ..
             } => {
-                let RequestStreamState::Vacant { generation, .. } = next.data.state else {
+                let RequestStreamState::Vacant { generation, .. } = self.presented(next.data.state)
+                else {
                     return Err(ManagedError::Conflict.into());
                 };
+                // The registration cites the presented generation (the pair's
+                // last one or the registry watermark, whichever is higher) and
+                // is assigned exactly one above it, which is the rule every
+                // client validator holds the reply to.
                 if generation != *expected_generation
                     || owner.is_zero()
                     || *window == 0
@@ -489,13 +566,15 @@ impl RequestStreams {
                 {
                     return Err(ManagedError::Conflict.into());
                 }
+                let assigned = generation.checked_add(1).ok_or(ManagedError::Capacity)?;
                 let stream = RequestStreamIdentity {
                     cluster: self.cluster,
                     ledger: self.ledger,
                     principal: input.principal,
                     slot,
-                    generation: generation.checked_add(1).ok_or(ManagedError::Capacity)?,
+                    generation: assigned,
                 };
+                next.assigned = Some(assigned);
                 next.data.state = RequestStreamState::Active {
                     stream,
                     owner: *owner,
@@ -653,11 +732,27 @@ impl RequestStreams {
             s.data.principal == prepared.data.principal && s.data.slot() == prepared.data.slot()
         });
         let base = current.map(|s| s.data.stamp());
+        let room = match prepared.evict {
+            Some((index, stamp)) => {
+                let victim = self.slots.get(index).ok_or(LedgerError::Corrupt)?;
+                if prepared.replacing
+                    || !matches!(victim.data.state, RequestStreamState::Vacant { .. })
+                    || victim.data.stamp() != stamp
+                    || (victim.data.principal, victim.data.slot())
+                        == (prepared.data.principal, prepared.data.slot())
+                {
+                    return Err(LedgerError::Corrupt);
+                }
+                true
+            }
+            None => self.slots.len() < self.slots.capacity(),
+        };
         if base != prepared.base
             || prepared.replacing != base.is_some()
-            || (!prepared.replacing
-                && (self.slots.len() == self.slots.capacity()
-                    || prepared.position > self.slots.len()))
+            || (!prepared.replacing && (!room || prepared.position > self.slots.len()))
+            || prepared
+                .assigned
+                .is_some_and(|generation| generation <= self.next_generation)
         {
             return Err(LedgerError::Corrupt);
         }
@@ -675,10 +770,22 @@ impl RequestStreams {
                 .get_mut(prepared.position)
                 .ok_or(LedgerError::Corrupt)? = slot;
         } else {
-            if self.slots.len() == self.slots.capacity() || prepared.position > self.slots.len() {
+            let mut position = prepared.position;
+            if let Some((index, _)) = prepared.evict {
+                // The victim was selected from the same rows; removing it
+                // first keeps the sorted position exact without allocating.
+                self.slots.remove(index);
+                if index < position {
+                    position = position.checked_sub(1).ok_or(LedgerError::Corrupt)?;
+                }
+            }
+            if self.slots.len() == self.slots.capacity() || position > self.slots.len() {
                 return Err(LedgerError::Corrupt);
             }
-            self.slots.insert(prepared.position, slot);
+            self.slots.insert(position, slot);
+        }
+        if let Some(generation) = prepared.assigned {
+            self.next_generation = self.next_generation.max(generation);
         }
         self.activated = true;
         Ok(())
@@ -699,12 +806,16 @@ impl RequestStreams {
             slots: self.slots.iter().map(|s| s.data.clone()).collect(),
         }
     }
+    /// `next_generation` is the persisted watermark (`FOCALSS7`); an older
+    /// checkpoint without one restores the largest retained generation, which
+    /// is exact because such checkpoints never evicted a pair.
     pub fn restore(
         &mut self,
         state: RequestStreamsCheckpoint,
         sequence: SessionSeq,
         index: u64,
         budget: &MemoryBudget,
+        next_generation: Option<u64>,
     ) -> Result<(), LedgerError> {
         if state.slots.len() > self.limits.max_slots
             || (state.activated == state.slots.is_empty())
@@ -712,6 +823,17 @@ impl RequestStreams {
         {
             return Err(LedgerError::Corrupt);
         }
+        let retained = state
+            .slots
+            .iter()
+            .map(StreamSlotData::generation)
+            .max()
+            .unwrap_or(0);
+        let watermark = match next_generation {
+            Some(watermark) if watermark >= retained => watermark,
+            Some(_) => return Err(LedgerError::Corrupt),
+            None => retained,
+        };
         let mut restored = Self::new(self.cluster, self.ledger, self.limits)?;
         for data in state.slots {
             if data.principal.is_zero() || restored.locate(data.principal, data.slot()).is_ok() {
@@ -817,18 +939,22 @@ impl RequestStreams {
                 }
                 _ => return Err(LedgerError::Corrupt),
             }
+            // Restoration re-creates each retained pair as a registration
+            // would, below the checked capacity, so nothing is evicted.
             let mut next = restored.candidate(
                 data.principal,
                 data.slot(),
                 data.charge()?,
                 BudgetLane::Completion,
                 budget,
+                true,
             )?;
             next.data = data;
             let next = restored.finish_candidate(next)?;
             restored.publish(next)?;
         }
         restored.activated = state.activated;
+        restored.next_generation = watermark;
         *self = restored;
         Ok(())
     }

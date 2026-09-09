@@ -57,6 +57,7 @@ pub struct ClaimSnapshotV1 {
     pub local_complete: bool,
     pub local_sealed_at: Option<SessionSeq>,
     pub terminal_cut: Option<ClaimTerminalSnapshotV1>,
+    pub origin: ClaimOrigin,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaimResponseSnapshotV1 {
@@ -128,6 +129,7 @@ impl ClaimState {
             local_complete: self.local_complete,
             local_sealed_at: self.local_sealed_at,
             terminal_cut: self.terminal_cut.map(ClaimTerminalCut::snapshot_v1),
+            origin: self.origin,
         }
     }
     pub fn response_snapshots_v1(
@@ -328,6 +330,7 @@ impl<R: ClaimResponseSource + ?Sized, S: scope::RegistrySnapshotSource + ?Sized>
             local_complete: self.fields.local_complete,
             local_sealed_at: self.fields.local_sealed_at,
             terminal_cut: self.terminal,
+            origin: self.fields.origin,
         };
         bytes::fits(
             complete::<ClaimState>(
@@ -369,6 +372,15 @@ fn scalar_state(
         {
             return Err(ContractError::InvalidCut);
         }
+    }
+    // A legacy claim keeps the status its own engine recorded; the native
+    // structures those statuses presuppose were never recorded (23 §5.2).
+    if value.origin == ClaimOrigin::Legacy {
+        return if value.responses == 0 {
+            Ok(())
+        } else {
+            Err(ContractError::InvalidTransition)
+        };
     }
     match value.status {
         ClaimStatus::Generated
@@ -639,6 +651,10 @@ fn response_cut_matches(fields: ClaimSnapshotV1, row: ResponseRecord) -> bool {
             .is_some_and(|receipt| receipt.fence == row.link.receipt)
 }
 fn received_state(fields: ClaimSnapshotV1, any: bool, current: bool) -> Result<(), ContractError> {
+    // Legacy claims recorded no native responses; their status stands alone.
+    if fields.origin == ClaimOrigin::Legacy {
+        return Ok(());
+    }
     if matches!(
         fields.status,
         ClaimStatus::TestamentAcknowledged

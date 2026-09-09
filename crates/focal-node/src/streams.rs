@@ -4,8 +4,8 @@
 //! on the multi-voter path.
 use crate::{host::access, reads::ReadViews};
 use focal_ledger::{
-    CursorInput, CursorSubmission, LedgerError, ManagedCursorInput, ManagedSubmission, Session,
-    SessionEvents,
+    CursorInput, CursorSubmission, LedgerError, ManagedCursorInput, ManagedSubmission,
+    ReadCorrelation, Session, SessionEvents,
 };
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::*;
@@ -58,6 +58,10 @@ pub(crate) struct PendingStream {
     max_items: u32,
     stage: Stage,
     seed: Option<ReadPage>,
+    /// The ledger runs the native engine: the barrier is the native read
+    /// boundary, positions live on the stream line (23 §6), the seed is read
+    /// by the client and the reply token names the native prefix.
+    native: bool,
     _charge: Allocation,
 }
 impl PendingStream {
@@ -130,6 +134,13 @@ impl Streams {
         if !session.is_authoritative() {
             return Err(AccessError::Unavailable);
         }
+        // A native ledger streams schema-2 deltas; only the native profile
+        // proves the consumer decodes them, so older profiles are refused at
+        // the door rather than handed facts they cannot read.
+        let native = session.activation().is_native();
+        if native && request.protocol != NATIVE_PROTOCOL_VERSION {
+            return Err(AccessError::UnsupportedProtocol);
+        }
         let scope = stream_scope(peer, request.ledger, stream.filter())?;
         let request_bytes = postcard::experimental::serialized_size(stream)
             .map_err(|_| AccessError::InvalidRequest)?;
@@ -172,7 +183,13 @@ impl Streams {
         let mut context = b"focal.stream.read.v1\0".to_vec();
         context.extend_from_slice(&self.incarnation);
         context.extend_from_slice(&self.next.to_be_bytes());
-        session.read_index(context.clone()).map_err(cursor_error)?;
+        if native {
+            session
+                .native_read_index(correlation(&context))
+                .map_err(cursor_error)?;
+        } else {
+            session.read_index(context.clone()).map_err(cursor_error)?;
+        }
         Ok(PendingStream {
             ledger: request.ledger,
             route_epoch: request.route_epoch,
@@ -185,6 +202,7 @@ impl Streams {
             max_items: limits.max_items,
             stage: Stage::Barrier(context),
             seed: None,
+            native,
             _charge: allocation,
         })
     }
@@ -214,17 +232,33 @@ impl Streams {
             return Err(pending.interrupted());
         }
         if let Stage::Barrier(context) = &pending.stage {
-            let Some((_, prefix)) = events
-                .read_barriers
-                .iter()
-                .find(|(value, _)| value == context)
-            else {
-                return Ok(None);
+            // The barrier prefix is a stream-line position on both engines.
+            let prefix = if pending.native {
+                let wanted = correlation(context);
+                match events
+                    .native_read_boundaries
+                    .iter()
+                    .find(|boundary| boundary.correlation == wanted)
+                {
+                    Some(boundary) => session
+                        .stream_sequence_of(boundary.native_sequence)
+                        .map_err(access)?,
+                    None => return Ok(None),
+                }
+            } else {
+                match events
+                    .read_barriers
+                    .iter()
+                    .find(|(value, _)| value == context)
+                {
+                    Some((_, prefix)) => *prefix,
+                    None => return Ok(None),
+                }
             };
             let original = original_cursor_token(session, pending.key, pending.intent_hash)?;
             let now = wall_ms()?.max(session.cursor_clock());
             let operation =
-                Self::operation(session, views, pending, original, *prefix, now, limits)?;
+                Self::operation(session, views, pending, original, prefix, now, limits)?;
             let command = CursorCommand {
                 expected_revision: session.cursor_revision(),
                 now,
@@ -293,6 +327,19 @@ impl Streams {
                 }
                 if credits.items == 0 || credits.bytes as usize <= REPLY_OVERHEAD + 256 {
                     return Err(AccessError::Capacity);
+                }
+                if pending.native {
+                    // The native engine keeps no historical snapshot for a
+                    // server-side seed: the client reads its seed at a prefix
+                    // no older than this snapshot and the tail from here, so
+                    // every fact between the two arrives at least once.
+                    return Ok(CursorOperation::BeginSeed {
+                        consumer: *consumer,
+                        scope: pending.scope,
+                        filter: filter.clone(),
+                        snapshot: barrier,
+                        expires_at,
+                    });
                 }
                 // Capture the immutable prefix before committing its tail pin.
                 // A retry uses its original snapshot; it cannot silently seed a
@@ -427,9 +474,11 @@ impl Streams {
         if current.expires_at <= now || matches!(current.mode, CursorMode::Resync { .. }) {
             return Err(AccessError::ResyncRequired { floor: None });
         }
+        // The token names the published end of the stream line, which every
+        // cursor position is bounded by on both engines (23 §6).
         let token = ReadToken {
             ledger: pending.ledger,
-            sequence: session.sequence(),
+            sequence: session.stream_published(),
             route_epoch: pending.route_epoch,
         };
         let mut reply = StreamReply {
@@ -439,7 +488,10 @@ impl Streams {
             seed: pending.seed.take(),
             events: Vec::new(),
         };
-        if reply.seed.is_some() || matches!(&pending.stream, StreamRequest::CompleteSeed { .. }) {
+        if reply.seed.is_some()
+            || matches!(&pending.stream, StreamRequest::CompleteSeed { .. })
+            || matches!(current.mode, CursorMode::Seeding { .. })
+        {
             return Ok(reply);
         }
         // Current durable progress can exceed an old request receipt. Never
@@ -564,8 +616,16 @@ fn check_cursor(
     }
     cursor
         .position
-        .validate(session.ledger(), session.sequence())
+        .validate(session.ledger(), session.stream_published())
         .map_err(stream_error)
+}
+/// The native read barrier correlation of one stream request's context.
+fn correlation(context: &[u8]) -> ReadCorrelation {
+    let mut hash = blake3::Hasher::new_derive_key("focal.stream.native-barrier.v1");
+    hash.update(context);
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&hash.finalize().as_bytes()[..16]);
+    ReadCorrelation(bytes)
 }
 fn cursor_error(error: LedgerError) -> AccessError {
     match error {
