@@ -11,9 +11,9 @@
 <h1 align="center">focal</h1>
 <p align="center"><em>A ledger for agents that have to trust each other's work.</em></p>
 
-When you hand work to a swarm of agents, you need to know what each one was asked, who took
-it on, what came back, and whether it was actually checked. Focal is the ledger that answers
-those questions. Your agents can:
+Hand work to a swarm of agents and you soon want to know who was asked to do what, who
+picked it up, what came back, and whether anyone checked it. Focal keeps that record. Your
+agents can:
 
 - Ask each other for work with the acceptance criteria written down up front
 - Take responsibility for a task, so you know who is on it
@@ -21,8 +21,9 @@ those questions. Your agents can:
 - Check each other's evidence and record what passed
 - Keep doing all of that when the swarm spans machines, zones or regions
 
-Focal decides a task is done from those records, never from an agent saying so. It runs none
-of your tools; agents use whatever they like, in any language, and Focal keeps the history.
+A task counts as done when the checks passed, not when an agent says it is. Focal does not
+run any of your tools. Agents use whatever they like, in any language, and Focal keeps the
+history.
 
 It is one binary: the service, the command line and the MCP server.
 
@@ -122,10 +123,10 @@ EVIDENCE SETS	0
 VALIDATION RUNS	0
 ```
 
-You generate a claim, then post it; only a posted claim can be picked up. The example is a
-claim on yourself with one required check, that the report is received, so you can see the
-mechanics without setting up a real evaluator. IDs are 32 hex characters, hashes 64. Every
-read prints the `SEQUENCE` it was served at, so you always know how current it is.
+You create a claim, then post it. Only a posted claim can be picked up. The example is a
+claim on yourself with one check, that the report is received, so you can try the mechanics
+without setting up an evaluator. IDs are 32 hex characters and hashes are 64. Every read
+prints the `SEQUENCE` it was served at, so you know how current it is.
 
 Stop the service with Ctrl-C and run `focal start` again: the same ledger comes back.
 
@@ -186,11 +187,11 @@ sequenceDiagram
     Note over A,B: Focal derives acceptance from the required results
 ```
 
-Every arrow is a record both agents can read back, and you can too. B always writes its own
-report, whether the work succeeded or failed; Focal never writes one for it, so an agent that
-went quiet shows up as exactly that. When you write a claim you say who checks it and with
-what; the checker runs that tool itself and records the result. A claim is satisfied when its
-required checks pass and the claims it depends on are done, and not before.
+Every arrow is a record. Both agents can read it back, and so can you. B writes its own
+report whether the work succeeded or failed. Focal never writes one for it, so an agent that
+went quiet shows up as an agent that went quiet. When you write a claim you say who checks it
+and with what. The checker runs that tool itself and records what it found. A claim is
+satisfied when its checks pass and the claims it depends on are done. Not before.
 
 | Object | What it records |
 |---|---|
@@ -199,12 +200,12 @@ required checks pass and the claims it depends on are done, and not before.
 | **Artifact** | Typed, immutable evidence: inline bytes or a stored content reference, with a descriptor hash |
 | **Validation** | A declared check, its evaluator, and the recorded runs and verdicts |
 
-On a fresh ledger these run on the V1 engine. The **native engine**, switched on per ledger
-with `focal cluster replicas activate-native`, gives each of the four its own lifecycle,
-treats failed work as evidence, and adds peer workflows: a **challenge** asks the
-respondent for proof, a **consult** asks for work answering a question, and corrections
-and follow-ups cite the exact record they respond to. A populated V1 ledger is imported
-rather than rewritten.
+A fresh ledger runs the V1 engine. Turn on the **native engine** with
+`focal cluster replicas activate-native` and each of the four gets its own lifecycle, failed
+work becomes evidence, and agents get peer workflows: a **challenge** asks the respondent to
+prove something, a **consult** asks for work that answers a question, and a correction or
+follow-up points at the exact record it is answering. An existing V1 ledger is imported, not
+rewritten.
 
 ## Use it with an AI agent (MCP)
 
@@ -253,9 +254,9 @@ $ focal mcp serve
 back. The tools are the same operations as the CLI: `claim.*`, `receipt.acquire`,
 `evidence.begin`, `artifact.*`, `testament.*`, `validation.*`, `monitor.*`,
 `ledger.summary`, plus `request.*` for recovering a lost reply, `upload.*` for large
-payloads and `watch.*` for following changes. Each mutation carries its own durable
-operation ID, so a retry after a crash resolves the original outcome instead of doing the
-work twice.
+payloads and `watch.*` for following changes. Every write carries its own durable ID. If an
+agent crashes before it sees the reply, it retries with the same ID and gets the original
+result. It cannot do the work twice.
 
 Five skills teach an agent the workflow, pinned to the tool versions in
 [skills/manifest.json](skills/manifest.json):
@@ -288,66 +289,62 @@ Tool contracts, the request stream and recovery: **[docs/mcp.md](docs/mcp.md)**.
 | `focal cluster …` · `focal join` · `focal deployment explain` | Membership, enrollment, offline placement checks |
 | `focal mcp serve` · `focal demo` · `focal completion SHELL` | The MCP server; the demo; shell completions |
 
-Flags, JSON and YAML compile to the same request, so the three cannot drift. Unknown
-fields and duplicate keys are rejected. Exit codes and every flag: **[docs/manual-cli.md](docs/manual-cli.md)**.
+Flags, JSON and YAML all build the same request. Unknown fields and duplicate keys are
+rejected. Exit codes and every flag: **[docs/manual-cli.md](docs/manual-cli.md)**.
 
 ## How it works
 
-- **Why you can trust a read.** Every change is written to a log on disk before it is
-  acknowledged, then applied into memory and published all at once. What you read is a
-  complete, committed state, never half of a change.
-- **Why a restart changes nothing.** Recovery replays the log and runs no tools, clocks or
-  validators; their results were recorded as inputs the first time. You get the same ledger
+- **Reads are whole.** A change goes to a log on disk first. Only then is it applied in
+  memory and published, all at once. You never read half a change.
+- **Restarts are boring.** Recovery replays the log. It runs no tools, no clocks, no
+  validators, because their results were recorded the first time. You get the same ledger
   back at the same sequence.
-- **Why evidence cannot be swapped.** Artifact bytes are stored by their hash and checked
-  against it before the ledger may point at them. A report says which bytes were checked, and
-  those are the bytes you will find.
-- **Why a lost reply is safe.** An agent records what it is about to do, under its own ID,
-  before it sends it. If the reply is lost it resends the same ID and gets the original
-  outcome; it cannot accidentally do the work twice.
-- **Why it stays up under load.** Pages, scans, queues and request windows all have limits,
-  and the service tells you when it is under pressure instead of falling over later.
+- **Evidence cannot be swapped.** Artifact bytes are stored under their hash and checked
+  against it before the ledger can point at them. The bytes a report says it checked are the
+  bytes you will find.
+- **A lost reply is safe.** An agent writes down what it is about to do, under its own ID,
+  before sending it. Lose the reply, resend the ID, get the original result.
+- **It says no before it falls over.** Pages, scans, queues and request windows all have
+  limits. When the service is under pressure it tells you, instead of growing until it dies.
 
 The design is in [docs/archictecutre/](docs/archictecutre/README.md) (the directory name
 is deliberate), starting with the [target architecture](docs/archictecutre/00-target-architecture.md).
 
 ## From a laptop to a fleet
 
-Your swarm might live on one laptop today, a few VMs next month, and several regions after
-that. Focal is built so that each step only asks you the questions that step introduces,
-and the claims, evidence and commands stay the same. You never choose a Raft term, a shard
-count or a split key.
+Your swarm might be on one laptop today, a few VMs next month, and several regions after
+that. Each step asks you only the questions that step brings, and the claims, evidence and
+commands do not change. You never pick a Raft term, a shard count or a split key.
 
-- **Your ledger survives the failures you name.** You say what to survive: a node, a zone, a
-  region, and how many at once. Focal places the voters to make that true and prints the
-  guarantee actually in force, never a stronger one than it can prove.
-- **A lost reply never does the work twice.** Every request carries its own durable ID, so
-  an agent whose reply was lost during a failover resends it and gets the original outcome,
-  on whichever node is now leading.
-- **Evidence goes where you say, and you can check.** Artifact bytes have their own custody,
-  replicated and verified separately from the log. Adding a replica does not quietly copy your
-  evidence, and Focal tells you which copies are verified.
-- **Nodes join by invitation.** A one-use invitation from the founder enrolls a node over one
-  authenticated UDP/QUIC port. Credentials renew themselves before they expire, and revoking
-  one is a single command.
-- **A slow node does not take the cluster down with it.** Failure detection is SWIM with the
-  Lifeguard extensions: a node that is itself struggling stretches its own timeouts instead of
-  accusing healthy peers, and a verdict needs independent confirmations.
-- **Scale is more ledgers, not a bigger log.** Each ledger has one total order; a fleet grows
-  by adding bounded ledgers and metadata groups, never by scanning everything.
+- **You say what to survive.** A node, a zone, a region, and how many at once. Focal places
+  the voters to make that true and prints the guarantee it can actually keep, never a
+  stronger one.
+- **A failover does not repeat work.** An agent whose reply was lost resends the same ID to
+  whichever node is now leading and gets the original result.
+- **Evidence is tracked on its own.** Artifact bytes are replicated and verified separately
+  from the log. Adding a replica does not quietly copy your evidence, and Focal tells you
+  which copies have been verified.
+- **Nodes join by invitation.** The founder writes a one-use invitation and the new node
+  enrolls from it over one authenticated UDP/QUIC port. Credentials renew themselves before
+  they expire. Revoking one is a single command.
+- **A slow node does not take the cluster down with it.** A node that is struggling stretches
+  its own timeouts instead of accusing healthy peers, and a verdict needs confirmations from
+  more than one node. This is SWIM with the Lifeguard extensions.
+- **A fleet is more ledgers, not a bigger log.** Each ledger has one total order. Growing
+  means adding ledgers, never scanning everything.
 
 What you get at each step:
 
 | Your placement | A write is acknowledged when | If a region is lost |
 |---|---|---|
-| Laptop, one voter | It is on this disk | Restart recovers from intact storage; the only disk is the guarantee's limit, and the startup record says so |
-| Regional, survive N nodes or zones | A majority of voters have it on disk | The region can be unavailable; Focal never promotes a minority |
-| Synchronous multi-region | A majority spread so that surviving regions still hold one | The survivors elect and serve; the cross-region round trip is in your write path |
-| Disaster-recovery copy | As the primary, plus a lagging archive | Restore to a known point with the recovery point reported, never sold as zero-loss |
+| Laptop, one voter | It is on this disk | Restart recovers from intact storage. Lose the disk and you lose the ledger; the startup record says so |
+| Regional, survive N nodes or zones | A majority of voters have it on disk | The region can go dark. Focal never promotes a minority |
+| Synchronous multi-region | A majority spread so the surviving regions still hold one | The survivors elect a leader and keep serving. The cross-region round trip is in your write path |
+| Disaster-recovery copy | As the primary, plus a lagging archive | Restore to a known point. Focal reports the recovery point and never calls it zero-loss |
 
-Three voters in three regions survive any one region. Five placed 2/2/1 survive either
-two-voter region. Three placed 2/1 do not survive losing the larger side, and the planner
-refuses to call that regional survival.
+Three voters in three regions survive losing any one region. Five placed 2/2/1 survive
+losing either two-voter region. Three placed 2/1 do not survive losing the larger side, and
+the planner will not call that regional survival.
 
 ### Two machines
 
