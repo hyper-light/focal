@@ -4,8 +4,8 @@ Redrawn directly as SVG on 2026-09-09 after Ada supplied prism references. The l
 simple end-on triangular profile shown in the
 [Newton artwork](https://deltavcreations.com/portfolio/prism-light-spectrum-artwork-newton/).
 Three incoming rays meet at the right face and continue as one outgoing ray, following Ada's
-requested focus direction. The front interior is transparent and every segment is straight.
-A shallow side face adds depth, with a faint fill and lighter rear edges.
+requested focus direction. Translucent interior faces and a faint rear triangle give the
+prism volume within its original silhouette. Every outline and ray segment is straight.
 
 ## Files and construction
 
@@ -22,10 +22,21 @@ intersection with the left side. The shared exit is the intersection of the righ
 with y = 158. The SVG contains straight line segments only. Its viewBox preserves the
 drawing's proportions as it scales.
 
-The rear triangle is translated by (28, -10). Only the right side face is visible: its
-joining edges are parallel, and its rear edge is parallel to the front edge. The side
-fill uses 8% ink opacity and its far edges use 55%. The accepted front profile and all
-ray paths are unchanged.
+The rear triangle recedes toward the vanishing point (240, 180) at 76% of the front
+size. Its vertices are (285.6, 70.56), (185.28, 243.84), and (385.92, 243.84). The
+three connecting edges point toward the same vanishing point. Shaded left, right, and
+base faces stay inside the front outline, with 25% ink opacity on the rear edges.
+Linear opacity gradients give the interior a glass-like finish; the surrounding
+background remains transparent. The accepted front profile and all ray paths are
+unchanged.
+
+The PNG export can be reproduced from the repository root with:
+
+```sh
+rsvg-convert --width 1164 --height 540 \
+  --output docs/assets/brand/focal-prism-transparent.png \
+  docs/assets/brand/focal-prism.svg
+```
 
 The root README selects a theme with a `<picture>` element and links to the preview.
 The artwork has no external images, fonts, or scripts.
