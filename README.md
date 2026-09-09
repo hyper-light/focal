@@ -19,6 +19,7 @@ those questions. Your agents can:
 - Take responsibility for a task, so you know who is on it
 - Report what they did, success or failure, with the evidence attached
 - Check each other's evidence and record what passed
+- Keep doing all of that when the swarm spans machines, zones or regions
 
 Focal decides a task is done from those records, never from an agent saying so. It runs none
 of your tools; agents use whatever they like, in any language, and Focal keeps the history.
@@ -310,10 +311,48 @@ fields and duplicate keys are rejected. Exit codes and every flag: **[docs/manua
 The design is in [docs/archictecutre/](docs/archictecutre/README.md) (the directory name
 is deliberate), starting with the [target architecture](docs/archictecutre/00-target-architecture.md).
 
-## More than one machine
+## From a laptop to a fleet
 
-Nodes talk over one UDP/QUIC port with mutually authenticated identities. The founder
-writes a one-use invitation; a second node enrolls from it and starts:
+Your swarm might live on one laptop today, a few VMs next month, and several regions after
+that. Focal is built so that each step only asks you the questions that step introduces,
+and the claims, evidence and commands stay the same. You never choose a Raft term, a shard
+count or a split key.
+
+- **Your ledger survives the failures you name.** You say what to survive: a node, a zone, a
+  region, and how many at once. Focal places the voters to make that true and prints the
+  guarantee actually in force, never a stronger one than it can prove.
+- **A lost reply never does the work twice.** Every request carries its own durable ID, so
+  an agent whose reply was lost during a failover resends it and gets the original outcome,
+  on whichever node is now leading.
+- **Evidence goes where you say, and you can check.** Artifact bytes have their own custody,
+  replicated and verified separately from the log. Adding a replica does not quietly copy your
+  evidence, and Focal tells you which copies are verified.
+- **Nodes join by invitation.** A one-use invitation from the founder enrolls a node over one
+  authenticated UDP/QUIC port. Credentials renew themselves before they expire, and revoking
+  one is a single command.
+- **A slow node does not take the cluster down with it.** Failure detection is SWIM with the
+  Lifeguard extensions: a node that is itself struggling stretches its own timeouts instead of
+  accusing healthy peers, and a verdict needs independent confirmations.
+- **Scale is more ledgers, not a bigger log.** Each ledger has one total order; a fleet grows
+  by adding bounded ledgers and metadata groups, never by scanning everything.
+
+What you get at each step:
+
+| Your placement | A write is acknowledged when | If a region is lost |
+|---|---|---|
+| Laptop, one voter | It is on this disk | Restart recovers from intact storage; the only disk is the guarantee's limit, and the startup record says so |
+| Regional, survive N nodes or zones | A majority of voters have it on disk | The region can be unavailable; Focal never promotes a minority |
+| Synchronous multi-region | A majority spread so that surviving regions still hold one | The survivors elect and serve; the cross-region round trip is in your write path |
+| Disaster-recovery copy | As the primary, plus a lagging archive | Restore to a known point with the recovery point reported, never sold as zero-loss |
+
+Three voters in three regions survive any one region. Five placed 2/2/1 survive either
+two-voter region. Three placed 2/1 do not survive losing the larger side, and the planner
+refuses to call that regional survival.
+
+### Two machines
+
+The founder advertises an endpoint and writes a one-use invitation; the second machine
+enrolls from it and starts:
 
 ```sh
 focal --data-dir ~/focal-founder start --advertise 192.0.2.10:7443
@@ -328,9 +367,27 @@ focal --data-dir ~/focal-node start
 > Joining lets the new node take part in the cluster; it does not yet copy your ledger onto
 > it or make your data survive the loss of the first machine. Today you do that yourself with
 > `cluster membership` and `cluster replicas`; the automatic placement that will do it for you
-> is the next batch of work. Two nodes on one laptop, hosts on
-different machines, and the administration commands are in
-[docs/network-startup.md](docs/network-startup.md) and [docs/cluster-admin.md](docs/cluster-admin.md).
+> is the next batch of work.
+
+Two nodes on one laptop, hosts on different machines, and every administration command are
+in [docs/network-startup.md](docs/network-startup.md) and [docs/cluster-admin.md](docs/cluster-admin.md).
+
+### Where each step stands
+
+| Step | What you decide | Today (2026-09-09) |
+|---|---|---|
+| Laptop | Where to keep the data | Works: durable service, restart, the full workflow through CLI and MCP |
+| VMs or bare metal | Reachable addresses, who may join, how many node failures to survive | Works: join, authenticated transport, membership, leader transfer, credential renewal. In the test suite only: a placement controller that expands a ledger to three hosts and heals a lost one. Not yet: the `cluster plan` and `deployment apply` commands that expose it |
+| Kubernetes | Storage and packaging | Planned; no manifests or images yet |
+| Several zones | Verified failure domains, what zone loss you accept | The planner and `deployment explain` (offline); zone-loss qualification remains |
+| Several regions | Residency, home regions, the latency you will pay for remote durability | Architecture and schema; the geographic executor remains |
+| Global fleet | Per-tenant geography and resource policy | Target; the partitioned directory exists, scale qualification remains |
+
+> [!NOTE]
+> Small-cluster tests are not evidence of global throughput, and Focal has no published
+> benchmark yet. The contract for each step is
+> [08](docs/archictecutre/08-stepped-complexity-and-deployment.md); the placement design is
+> [24](docs/archictecutre/24-placement-execution-and-fleet-control.md).
 
 ## Documentation
 
