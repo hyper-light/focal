@@ -1,9 +1,9 @@
 <p align="center">
-  <a href="docs/assets/brand/focal-fork-preview.png">
+  <a href="docs/assets/brand/focal-focus-preview.png">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/assets/brand/focal-fork-dark.svg">
-      <source media="(prefers-color-scheme: light)" srcset="docs/assets/brand/focal-fork-light.svg">
-      <img src="docs/assets/brand/focal-fork-light.svg" alt="Focal logo: a futuristic tuning fork with a notched ledger stem" width="90" height="90">
+      <source media="(prefers-color-scheme: dark)" srcset="docs/assets/brand/focal-focus-dark.svg">
+      <source media="(prefers-color-scheme: light)" srcset="docs/assets/brand/focal-focus-light.svg">
+      <img src="docs/assets/brand/focal-focus-light.svg" alt="Focal logo: a faceted optical prism bending separate beams toward one focal point" width="90" height="90">
     </picture>
   </a>
 </p>
