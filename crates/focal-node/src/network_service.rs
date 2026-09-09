@@ -50,8 +50,8 @@ use tokio::sync::{mpsc as async_mpsc, oneshot};
 
 #[path = "network_directory.rs"]
 mod network_directory;
-pub use network_directory::DirectoryHandle;
 use network_directory::DirectoryStartup;
+pub use network_directory::{DirectoryHandle, HostRequest, HostedPartition, MAX_HOSTED_PARTITIONS};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
@@ -164,8 +164,12 @@ impl RequestHandler for DataService {
             if group == Some(self.root_group) {
                 return self.control.handle_accounted(request).await;
             }
-            if group == Some(self.directory.group()) {
-                return match self.directory.host() {
+            if let Some(group) = group
+                && group != self.root_group
+                && (group == self.directory.group()
+                    || self.directory.host_of_group(group).is_some())
+            {
+                return match self.directory.host_of_group(group) {
                     Some(directory) => directory.handle_accounted(request).await,
                     None => OwnedResponse::new(
                         request
@@ -193,6 +197,9 @@ impl PhysicalOwner {
         }
     }
 }
+/// Root control, the first partition, the session log and the content store,
+/// plus one slot for every partition a split may add on this node.
+const OWNER_SLOTS: usize = 4 + network_directory::MAX_HOSTED_PARTITIONS;
 struct OwnerGate {
     sender: Option<mpsc::SyncSender<OwnerRegistration>>,
     finished: oneshot::Receiver<Result<(), ServiceError>>,
@@ -212,7 +219,7 @@ impl OwnerGate {
             .commit();
         let mut owners = Vec::new();
         owners
-            .try_reserve_exact(4)
+            .try_reserve_exact(OWNER_SLOTS)
             .map_err(|_| ServiceError::Owner("owner registry capacity"))?;
         let (sender, receiver) = mpsc::sync_channel::<OwnerRegistration>(5);
         let (done, finished) = oneshot::channel();
@@ -230,7 +237,7 @@ impl OwnerGate {
                     let Some(owner) = registration.owner else {
                         continue;
                     };
-                    if owners.len() < 4 {
+                    if owners.len() < OWNER_SLOTS {
                         owners.push(owner);
                     } else if let Err(error) = PhysicalOwner::join(owner) {
                         result = Err(error);
@@ -482,6 +489,7 @@ impl NetworkService {
             state.genesis.founder.node,
             wal.clone(),
             budget.child(192 * 1024 * 1024, 64 * 1024 * 1024)?,
+            root.clone(),
         )?;
         let authority = FounderControlAuthority::from_genesis(&state.genesis)?;
         let registry = PeerRegistry::new(4096)?;

@@ -32,7 +32,7 @@ async fn directory_owner_is_registered_before_blocking_recovery_and_retains_esca
         immediate
     });
     let (host, owner, outgoing) =
-        ControlHost::spawn_directory(permit, network.wal.clone(), budget.clone()).unwrap();
+        ControlHost::spawn_directory(permit, network.wal.clone(), budget.clone(), None).unwrap();
     let before = host.progress();
     returned.send(()).unwrap();
     assert!(
@@ -103,7 +103,7 @@ async fn directory_startup_failure_closes_ingress_and_preserves_host_charge_afte
     )
     .unwrap();
     let (host, owner, outgoing) =
-        ControlHost::spawn_directory(permit, wrong, budget.clone()).unwrap();
+        ControlHost::spawn_directory(permit, wrong, budget.clone(), None).unwrap();
     tokio::time::timeout(Duration::from_secs(5), host.closed())
         .await
         .unwrap();

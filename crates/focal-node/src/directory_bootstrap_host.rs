@@ -67,7 +67,7 @@ impl ControlHost {
         let (response, receive) = oneshot::channel();
         self.sender
             .try_send(Work::PrepareDirectory {
-                plan,
+                plan: Box::new(plan),
                 response,
                 input,
             })

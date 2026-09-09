@@ -29,7 +29,7 @@ pub(crate) fn controller_peer(running: &Running) -> AuthenticatedPeer {
     })
     .unwrap()
 }
-async fn observe(
+pub(crate) async fn observe(
     running: &Running,
     host: &ControlHost,
     id: u128,

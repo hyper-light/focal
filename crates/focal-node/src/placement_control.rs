@@ -74,7 +74,11 @@ pub(crate) fn decode_placement_control(
                 PartitionOperation::ReportLoad { load } => load.node == node_id,
                 // A verdict about a node is the partition leader's own
                 // detector's to commit, never a node's word over the wire.
-                PartitionOperation::Liveness { .. } => false,
+                PartitionOperation::Liveness { .. }
+                | PartitionOperation::SealForSplit { .. }
+                | PartitionOperation::Release { .. }
+                | PartitionOperation::Absorb { .. }
+                | PartitionOperation::Install { .. } => false,
                 PartitionOperation::Session { change, .. } => match change {
                     SessionChange::Ready { ready } => ready.node == node_id,
                     // A node reports its own installation and, from its own

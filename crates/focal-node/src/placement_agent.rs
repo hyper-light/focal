@@ -34,8 +34,8 @@ use focal_control::{
     VerifiedPartitionCommand,
 };
 use focal_directory::{
-    AssignmentPhase, AssignmentProgress, NodeLoad, OperationId, PartitionCheckpoint,
-    PartitionCommand, PartitionOperation, PlacementPhase, ReplicaReady, SessionChange,
+    AssignmentPhase, AssignmentProgress, Delegation, NodeLoad, OperationId, PartitionCheckpoint,
+    PartitionCommand, PartitionId, PartitionOperation, PlacementPhase, ReplicaReady, SessionChange,
     SessionDescriptor, roles_of,
 };
 use focal_enrollment::{CredentialMaterial, PrivateJournal};
@@ -98,6 +98,8 @@ pub enum AgentError {
     Custody(#[from] AccessError),
     #[error("network clock: {0}")]
     Network(#[from] crate::network_bootstrap::NetworkError),
+    #[error("partition host: {0}")]
+    Bootstrap(#[from] crate::directory_bootstrap::DirectoryBootstrapError),
     #[error("replica open: {0}")]
     Consensus(#[from] ConsensusError),
     #[error("replica fleet: {0}")]
@@ -138,6 +140,11 @@ impl AgentError {
                 | Self::Custody(AccessError::Unavailable | AccessError::Capacity)
                 | Self::Transport(_)
                 | Self::Fleet(FleetError::Capacity | FleetError::Unavailable)
+                | Self::Bootstrap(
+                    crate::directory_bootstrap::DirectoryBootstrapError::Unavailable
+                        | crate::directory_bootstrap::DirectoryBootstrapError::NotReady
+                        | crate::directory_bootstrap::DirectoryBootstrapError::Capacity
+                )
                 | Self::Capacity
                 | Self::Behind
                 | Self::Collect(_)
@@ -156,7 +163,33 @@ pub enum AgentStep {
 
 struct Journals {
     root: IntentJournal,
-    partition: IntentJournal,
+    /// One exact-retry journal per partition this node acts on, opened the
+    /// first time the root's delegation is visited.
+    partitions: BTreeMap<PartitionId, IntentJournal>,
+}
+/// One partition as this tick observed it: the root's delegation, how it is
+/// reached, and its committed state and installed authority.
+type Observed = (
+    Delegation,
+    PartitionAccess,
+    ControlSnapshot,
+    ControlAuthoritySnapshot,
+);
+fn observed_partition(
+    observed: &[Observed],
+    partition: PartitionId,
+) -> Option<(
+    &PartitionCheckpoint,
+    &ControlSnapshot,
+    &ControlAuthoritySnapshot,
+)> {
+    observed
+        .iter()
+        .find(|(delegation, ..)| delegation.partition == partition)
+        .and_then(|(_, _, snapshot, installed)| match &snapshot.state {
+            ControlBootstrap::Partition { directory } => Some((directory, snapshot, installed)),
+            _ => None,
+        })
 }
 
 /// A copy this node installed for a committed plan, reopened at every start.
@@ -282,7 +315,10 @@ pub struct PlacementAgent {
     installs: Option<InstallJournal>,
     reopened: bool,
     nonce: u64,
-    last_load: Option<(i64, u64)>,
+    /// The partition the current step acts on; every partition intent and
+    /// load report is keyed by it.
+    current_partition: Option<PartitionId>,
+    last_load: BTreeMap<PartitionId, (i64, u64)>,
     /// The last readiness attempt per plan, so a refused or pending attempt
     /// does not export a checkpoint on every tick.
     last_ready: Option<(LedgerId, OperationId, i64)>,
@@ -338,7 +374,8 @@ impl PlacementAgent {
             installs: None,
             reopened: false,
             nonce: 0,
-            last_load: None,
+            current_partition: None,
+            last_load: BTreeMap::new(),
             last_ready: None,
             last_error: None,
             ticks: 0,
@@ -417,7 +454,10 @@ impl PlacementAgent {
         .await
         .unwrap_or(Err(AgentError::Runtime))
     }
-    /// One bounded pass; public for the service tests.
+    /// One bounded pass; public for the service tests. Every partition the
+    /// root delegates is visited in namespace order: hosted partitions this
+    /// node leads locally, the rest through the founder; a sealed partition
+    /// only reshapes ([24](../../../docs/archictecutre/24-placement-execution-and-fleet-control.md) §13).
     pub async fn tick(
         &mut self,
         handles: &NetworkHandles,
@@ -432,29 +472,7 @@ impl PlacementAgent {
             self.reopen_installed(handles).await?;
             self.reopened = true;
         }
-        let access = match handles.directory.host() {
-            Some(host) => {
-                let progress = host.progress();
-                if progress.stopped {
-                    return Err(AgentError::Stopped);
-                }
-                if progress.applied_index == 0 || progress.leader != node {
-                    return Ok(AgentStep::Idle);
-                }
-                PartitionAccess::Local(host)
-            }
-            None => PartitionAccess::Remote {
-                target: self.state.genesis.founder.node,
-                group: handles.directory.group(),
-            },
-        };
         if self.journals.is_none() {
-            let (partition, partition_client) = match &access {
-                PartitionAccess::Local(host) => (host.progress().identity, client),
-                PartitionAccess::Remote { .. } => {
-                    (self.remote_identity(handles, pool).await?, self.principal.0)
-                }
-            };
             self.journals = Some(Journals {
                 root: IntentJournal::open(
                     &self.root,
@@ -462,32 +480,22 @@ impl PlacementAgent {
                     self.state.genesis.root,
                     client,
                 )?,
-                partition: IntentJournal::open(
-                    &self.root,
-                    "placement-partition",
-                    partition,
-                    partition_client,
-                )?,
+                partitions: BTreeMap::new(),
             });
         }
         let root_peer = self.peer(client, self.state.genesis.root_namespace)?;
         let namespace = handles.directory.namespace();
         let partition_peer = self.peer(client, namespace)?;
-        let journals = self.journals.as_mut().ok_or(AgentError::Identity)?;
-        if journals.root.pending().is_some() {
-            let control = &handles.control;
-            journals
-                .root
-                .advance(control, |request| control.submit(root_peer, request))
-                .await?;
-            return Ok(AgentStep::Advanced);
-        }
-        if journals.partition.pending().is_some() {
-            let submit = |request: ControlRequest| {
-                submit_partition(&access, pool, namespace, partition_peer.clone(), request)
-            };
-            journals.partition.advance(&handles.control, submit).await?;
-            return Ok(AgentStep::Advanced);
+        {
+            let journals = self.journals.as_mut().ok_or(AgentError::Identity)?;
+            if journals.root.pending().is_some() {
+                let control = &handles.control;
+                journals
+                    .root
+                    .advance(control, |request| control.submit(root_peer, request))
+                    .await?;
+                return Ok(AgentStep::Advanced);
+            }
         }
         let now = unix_time()?;
         let root = match handles.control.observe_root().await {
@@ -495,105 +503,224 @@ impl PlacementAgent {
             Err(ControlFailure::NotReady | ControlFailure::Capacity) => return Ok(AgentStep::Idle),
             Err(error) => return Err(error.into()),
         };
-        let Some((snapshot, installed)) = self
-            .observe_partition(&access, pool, namespace, partition_peer.clone())
-            .await?
+        let ControlBootstrap::Root {
+            directory: root_directory,
+            ..
+        } = &root.snapshot().state
         else {
-            return Ok(AgentStep::Idle);
-        };
-        let ControlBootstrap::Partition { directory } = &snapshot.state else {
             return Err(AgentError::Identity);
         };
-        if let Some(ledger) = &handles.ledger
-            && let Some(step) = self
-                .register_founder(
-                    handles, &access, pool, ledger, &root, &snapshot, &installed, now,
-                )
-                .await?
-        {
-            return Ok(step);
-        }
-        if let Some(step) = self
-            .enroll_self(
-                handles, &access, pool, directory, &snapshot, &installed, now,
-            )
-            .await?
-        {
-            return Ok(step);
-        }
-        if let Some(step) = self
-            .report_load(
-                handles, &access, pool, directory, &snapshot, &installed, now,
-            )
-            .await?
-        {
-            return Ok(step);
-        }
-        self.report_liveness_facts(handles, directory);
-        for descriptor in directory.sessions.values() {
-            self.sync_custody(handles, descriptor).await?;
-            if let Some(step) = self
-                .install_assignment(
-                    handles, &access, pool, descriptor, &snapshot, &installed, now,
-                )
+        let delegations: Vec<Delegation> = root_directory.delegations.values().copied().collect();
+        // Every partition this node can act on, observed at one prefix each.
+        let mut observed: Vec<Observed> = Vec::new();
+        for delegation in &delegations {
+            let access = match handles.directory.host_of(delegation.partition) {
+                Some(host) => {
+                    let progress = host.progress();
+                    if progress.stopped {
+                        return Err(AgentError::Stopped);
+                    }
+                    if progress.applied_index == 0 || progress.leader != node {
+                        continue;
+                    }
+                    PartitionAccess::Local(host)
+                }
+                None => PartitionAccess::Remote {
+                    target: self.state.genesis.founder.node,
+                    group: delegation.log_group.0,
+                },
+            };
+            self.open_partition_journal(handles, pool, delegation, &access, client)
+                .await?;
+            self.current_partition = Some(delegation.partition);
+            let journals = self.journals.as_mut().ok_or(AgentError::Identity)?;
+            let journal = journals
+                .partitions
+                .get_mut(&delegation.partition)
+                .ok_or(AgentError::Identity)?;
+            if journal.pending().is_some() {
+                let submit = |request: ControlRequest| {
+                    submit_partition(&access, pool, namespace, partition_peer.clone(), request)
+                };
+                journal.advance(&handles.control, submit).await?;
+                return Ok(AgentStep::Advanced);
+            }
+            if let Some((snapshot, installed)) = self
+                .observe_partition(&access, pool, namespace, partition_peer.clone())
                 .await?
             {
-                return Ok(step);
-            }
-            if let Some(step) = self
-                .report_ready(
-                    handles, &access, pool, descriptor, &snapshot, &installed, now,
-                )
-                .await?
-            {
-                return Ok(step);
+                observed.try_reserve(1).map_err(|_| AgentError::Capacity)?;
+                observed.push((*delegation, access, snapshot, installed));
             }
         }
-        if let PartitionAccess::Local(host) = &access {
-            let progress = host.progress();
-            if progress.leader == progress.node
+        if observed.is_empty() {
+            return Ok(AgentStep::Idle);
+        }
+        self.report_liveness_facts(handles, &observed);
+        let root_leader = handles.control.progress().leader == node;
+        for (delegation, access, snapshot, installed) in &observed {
+            let ControlBootstrap::Partition { directory } = &snapshot.state else {
+                return Err(AgentError::Identity);
+            };
+            self.current_partition = Some(delegation.partition);
+            if let PartitionAccess::Local(host) = access
+                && root_leader
                 && let Some(step) = self
-                    .commit_liveness(
+                    .reshape(
                         handles,
+                        pool,
+                        &root,
+                        root_directory,
+                        delegation,
+                        host,
                         directory,
-                        &snapshot,
-                        &installed,
+                        &observed,
+                        snapshot,
+                        installed,
                         now,
-                        progress.applied_index,
                     )
                     .await?
             {
                 return Ok(step);
             }
-            for descriptor in directory.sessions.values() {
-                if let Some(step) = self
-                    .control(
-                        handles, pool, descriptor, directory, &snapshot, &installed, &root, now,
+            if directory.sealed.is_some() {
+                continue;
+            }
+            if let Some(ledger) = &handles.ledger
+                && delegation.namespace.contains(self.identity.ledger)
+                && let Some(step) = self
+                    .register_founder(
+                        handles, access, pool, ledger, &root, snapshot, installed, now,
                     )
+                    .await?
+            {
+                return Ok(step);
+            }
+            if let Some(step) = self
+                .enroll_self(handles, access, pool, directory, snapshot, installed, now)
+                .await?
+            {
+                return Ok(step);
+            }
+            if let Some(step) = self
+                .report_load(handles, access, pool, directory, snapshot, installed, now)
+                .await?
+            {
+                return Ok(step);
+            }
+            for descriptor in directory.sessions.values() {
+                self.sync_custody(handles, descriptor).await?;
+                if let Some(step) = self
+                    .install_assignment(handles, access, pool, descriptor, snapshot, installed, now)
+                    .await?
+                {
+                    return Ok(step);
+                }
+                if let Some(step) = self
+                    .report_ready(handles, access, pool, descriptor, snapshot, installed, now)
                     .await?
                 {
                     return Ok(step);
                 }
             }
+            if let PartitionAccess::Local(host) = access {
+                let progress = host.progress();
+                if progress.leader == progress.node
+                    && let Some(step) = self
+                        .commit_liveness(
+                            handles,
+                            directory,
+                            snapshot,
+                            installed,
+                            now,
+                            progress.applied_index,
+                        )
+                        .await?
+                {
+                    return Ok(step);
+                }
+                for descriptor in directory.sessions.values() {
+                    if let Some(step) = self
+                        .control(
+                            handles, pool, descriptor, directory, snapshot, installed, &root, now,
+                        )
+                        .await?
+                    {
+                        return Ok(step);
+                    }
+                }
+            }
         }
         Ok(AgentStep::Idle)
     }
+    /// Open the exact-retry journal of one partition the first time its
+    /// delegation is visited: the first partition keeps its historical name,
+    /// every later one is named by its identifier.
+    async fn open_partition_journal(
+        &mut self,
+        handles: &NetworkHandles,
+        pool: &PeerConnectionPool,
+        delegation: &Delegation,
+        access: &PartitionAccess,
+        client: [u8; 16],
+    ) -> Result<(), AgentError> {
+        if self
+            .journals
+            .as_ref()
+            .is_some_and(|journals| journals.partitions.contains_key(&delegation.partition))
+        {
+            return Ok(());
+        }
+        let (identity, partition_client) = match access {
+            PartitionAccess::Local(host) => (host.progress().identity, client),
+            PartitionAccess::Remote { .. } => (
+                self.remote_identity(handles, pool, delegation.log_group.0)
+                    .await?,
+                self.principal.0,
+            ),
+        };
+        let name = if delegation.partition == handles.directory.plan().partition() {
+            "placement-partition".to_owned()
+        } else {
+            format!(
+                "placement-partition-{:032x}",
+                u128::from_be_bytes(delegation.partition.0)
+            )
+        };
+        let journal = IntentJournal::open(&self.root, &name, identity, partition_client)?;
+        let journals = self.journals.as_mut().ok_or(AgentError::Identity)?;
+        if journals.partitions.len()
+            >= crate::network_service::MAX_HOSTED_PARTITIONS.saturating_add(1)
+        {
+            return Err(AgentError::Capacity);
+        }
+        journals.partitions.insert(delegation.partition, journal);
+        Ok(())
+    }
     /// Tell the failure detector who its members are (every other eligible
-    /// enrolled node at its generation), how far this node has progressed,
-    /// and whether admission is refusing capacity.
-    fn report_liveness_facts(&mut self, handles: &NetworkHandles, directory: &PartitionCheckpoint) {
+    /// enrolled node of every observed partition, at its highest generation),
+    /// how far this node has progressed, and whether admission is refusing
+    /// capacity.
+    fn report_liveness_facts(&mut self, handles: &NetworkHandles, observed: &[Observed]) {
         self.ticks = self.ticks.saturating_add(1);
         let node = self.state.node;
-        let generation = directory
-            .nodes
-            .get(&node)
-            .map_or(0, |record| record.enrollment.generation);
-        let members = directory
-            .nodes
-            .iter()
-            .filter(|(id, record)| **id != node && record.enrollment.eligible)
-            .map(|(id, record)| (*id, record.enrollment.generation))
-            .collect();
+        let mut generation = 0;
+        let mut members: BTreeMap<u64, u64> = BTreeMap::new();
+        for (_, _, snapshot, _) in observed {
+            let ControlBootstrap::Partition { directory } = &snapshot.state else {
+                continue;
+            };
+            if let Some(record) = directory.nodes.get(&node) {
+                generation = generation.max(record.enrollment.generation);
+            }
+            for (id, record) in &directory.nodes {
+                if *id == node || !record.enrollment.eligible {
+                    continue;
+                }
+                let known = members.entry(*id).or_insert(0);
+                *known = (*known).max(record.enrollment.generation);
+            }
+        }
         let report = self
             .admission
             .report(&self.wal.disk_budget().stats(), &BTreeMap::new());
@@ -729,9 +856,9 @@ impl PlacementAgent {
         &mut self,
         handles: &NetworkHandles,
         pool: &PeerConnectionPool,
+        group: [u8; 16],
     ) -> Result<focal_control::ControlIdentity, AgentError> {
         let target = self.state.genesis.founder.node;
-        let group = handles.directory.group();
         match self
             .remote_read(
                 pool,
@@ -797,8 +924,14 @@ impl PlacementAgent {
         handles: &NetworkHandles,
         command: ControlCommand,
     ) -> Result<AgentStep, AgentError> {
+        let partition = self.current_partition.ok_or(AgentError::Identity)?;
         let journals = self.journals.as_mut().ok_or(AgentError::Identity)?;
-        journals.partition.intend(&handles.control, command).await?;
+        journals
+            .partitions
+            .get_mut(&partition)
+            .ok_or(AgentError::Identity)?
+            .intend(&handles.control, command)
+            .await?;
         Ok(AgentStep::Advanced)
     }
     async fn reopen_installed(&mut self, handles: &NetworkHandles) -> Result<(), AgentError> {
@@ -1113,7 +1246,8 @@ impl PlacementAgent {
             return Ok(None);
         };
         let generation = record.enrollment.generation;
-        let due = match (self.last_load, record.load) {
+        let partition = self.current_partition.ok_or(AgentError::Identity)?;
+        let due = match (self.last_load.get(&partition).copied(), record.load) {
             (_, None) => true,
             (None, Some(_)) => true,
             (Some((at, reported)), Some(load)) => {
@@ -1159,7 +1293,7 @@ impl PlacementAgent {
         if snapshot.revisions.partition != directory.revision {
             return Err(AgentError::Identity);
         }
-        self.last_load = Some((now, generation));
+        self.last_load.insert(partition, (now, generation));
         self.intend_partition(handles, command).await.map(Some)
     }
     /// Install the copy a plan assigns to this node and report `Installed`.
@@ -1500,10 +1634,11 @@ impl PlacementAgent {
                 .report(&self.wal.disk_budget().stats(), &usage),
             node: self.state.node,
             root_intents: self.journals.as_ref().map_or(0, |j| j.root.completed()),
-            partition_intents: self
-                .journals
-                .as_ref()
-                .map_or(0, |j| j.partition.completed()),
+            partition_intents: self.journals.as_ref().map_or(0, |j| {
+                j.partitions.values().fold(0_u64, |sum, journal| {
+                    sum.saturating_add(journal.completed())
+                })
+            }),
             installed: self
                 .installs
                 .as_ref()
@@ -1519,9 +1654,14 @@ impl PlacementAgent {
         self.last_error.as_ref()
     }
     pub fn intents(&self) -> Option<(u64, u64)> {
-        self.journals
-            .as_ref()
-            .map(|journals| (journals.root.completed(), journals.partition.completed()))
+        self.journals.as_ref().map(|journals| {
+            (
+                journals.root.completed(),
+                journals.partitions.values().fold(0_u64, |sum, journal| {
+                    sum.saturating_add(journal.completed())
+                }),
+            )
+        })
     }
 }
 
@@ -1584,6 +1724,8 @@ impl crate::fleet::FleetManager {
 
 #[path = "placement_controller.rs"]
 mod controller;
+#[path = "partition_split.rs"]
+pub mod split;
 
 #[cfg(test)]
 #[path = "placement_agent_tests.rs"]

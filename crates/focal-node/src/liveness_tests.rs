@@ -68,18 +68,16 @@ async fn a_stopped_host_is_committed_dead_by_the_partition_leader_and_revived_on
     // coordinate from the round trips.
     let view = confirmed(&founder, &[node_a, node_b]).await;
     assert!(view.incarnation > 0);
-    assert!(view.probes_sent > 0);
-    assert!(view.events.iter().any(|event| {
-        matches!(event, LivenessEvent::Confirmed { node } if *node == node_a || *node == node_b)
-    }));
+    assert!(view.counters.probes_sent > 0);
+    assert!(view.counters.confirmations >= 2);
     confirmed(&peer_a, &[founder_node, node_b]).await;
     // Its own acknowledged probes place it in the coordinate space; the
     // founder's probes are answered from the driver's state.
     let peer_view = view_when(&peer_a, "coordinate learned", |view| {
-        view.coordinate.samples > 0 && view.probes_answered > 0
+        view.coordinate.samples > 0 && view.counters.probes_answered > 0
     })
     .await;
-    assert!(peer_view.probes_sent > 0);
+    assert!(peer_view.counters.probes_sent > 0);
     // Alive is the default: no verdict is committed for a healthy host.
     let (checkpoint, _, _) = wait_for(&founder, &host, "hosts enrolled", |state| {
         state.nodes.contains_key(&node_a) && state.nodes.contains_key(&node_b)
@@ -113,19 +111,10 @@ async fn a_stopped_host_is_committed_dead_by_the_partition_leader_and_revived_on
         view.member(node_b).unwrap().incarnation,
         verdict.incarnation
     );
-    assert!(
-        view.events.iter().any(|event| {
-            matches!(event, LivenessEvent::ProbeTimeout { node } if *node == node_b)
-        })
-    );
-    assert!(view.events.iter().any(|event| {
-        matches!(event, LivenessEvent::Suspected { node, .. } if *node == node_b)
-    }));
-    assert!(
-        view.events
-            .iter()
-            .any(|event| { matches!(event, LivenessEvent::Died { node, .. } if *node == node_b) })
-    );
+    // The death came from probes that timed out and a suspicion that
+    // expired here or a peer's gossiped death of the same incarnation.
+    assert!(view.counters.probe_timeouts >= 1);
+    assert!(view.counters.deaths >= 1);
     // A death is never duplicated: the committed fact stays at one verdict.
     tokio::time::sleep(Duration::from_millis(1500)).await;
     let (still, _, _) = wait_for(&founder, &host, "verdict stable", |_| true)
@@ -150,11 +139,7 @@ async fn a_stopped_host_is_committed_dead_by_the_partition_leader_and_revived_on
     assert_eq!(revived.nodes[&node_b].enrollment.generation, 1);
     assert!(revived.nodes[&node_b].is_alive());
     let view = founder.handles.liveness.view();
-    assert!(
-        view.events.iter().any(|event| {
-            matches!(event, LivenessEvent::Revived { node, .. } if *node == node_b)
-        })
-    );
+    assert!(view.counters.revivals >= 1);
     // Host a sees the same membership through its own probes and gossip.
     let peer_view = confirmed(&peer_a, &[founder_node, node_b]).await;
     assert!(peer_view.member(node_b).unwrap().incarnation >= revival.incarnation);
@@ -232,6 +217,7 @@ async fn probes_bind_their_sender_refute_self_suspicion_and_ration_extensions() 
     let after = handle.view();
     assert_eq!(after.member(node_a).unwrap().extensions, 1);
     assert_eq!(after.member(node_a).unwrap().extended_ms, millis);
+    assert_eq!(after.counters.extensions_granted, 1);
     assert!(after.events.iter().any(|event| {
         matches!(event, LivenessEvent::ExtensionGranted { node, .. } if *node == node_a)
     }));
@@ -253,6 +239,7 @@ async fn probes_bind_their_sender_refute_self_suspicion_and_ration_extensions() 
     let reply = answer(handle, node_a, &request).await;
     assert_eq!(reply.extension, Some(ExtensionOutcome::Denied));
     assert_eq!(handle.view().member(node_a).unwrap().extensions, 1);
+    assert_eq!(handle.view().counters.extensions_denied, 2);
 
     // Gossip that suspects this node at its incarnation is refuted by moving
     // past it; the refutation rides the answer.
@@ -274,6 +261,7 @@ async fn probes_bind_their_sender_refute_self_suspicion_and_ration_extensions() 
     }));
     let after = handle.view();
     assert_eq!(after.incarnation, before + 1);
+    assert_eq!(after.counters.self_refutations, 1);
     assert!(after.events.iter().any(|event| {
         matches!(
             event,

@@ -493,6 +493,112 @@ pub fn prepare_membership_proof(
     })
 }
 
+/// Prepare this node's signature over a delegation fence as a voter of the
+/// source group (`source`) or of the destination group; the root verifies
+/// one majority from each group before it commits a transfer, split or
+/// merge. Local only.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one bounded validation over borrowed owner state"
+)]
+pub fn prepare_delegation_proof(
+    owner: &ControlReplica,
+    node: u64,
+    group: focal_directory::LogGroupId,
+    fence: &focal_directory::DelegationFence,
+    source: bool,
+    window: ProofWindow,
+    now: i64,
+    budget: &MemoryBudget,
+) -> Result<SessionProofPermit, PlacementProofError> {
+    let allocation = budget
+        .reserve(BudgetKind::Control, BudgetLane::Completion, WORKSPACE)
+        .map_err(|_| PlacementProofError::Capacity)?
+        .commit();
+    drop(owner.read_local(&ControlRead::Configuration)?);
+    if owner.identity().scope != ControlScope::Root
+        || fence.source == fence.destination
+        || fence.sealed_revision == 0
+        || window.expires_at <= window.issued_at
+        || window.issued_at > now
+        || window.expires_at <= now
+    {
+        return Err(PlacementProofError::Unauthorized);
+    }
+    let authority = owner.authority().ok_or(PlacementProofError::Unauthorized)?;
+    let enrollment = owner
+        .enrollment()
+        .ok_or(PlacementProofError::Unauthorized)?;
+    let checkpoint = authority.checkpoint();
+    if checkpoint.revision == 0
+        || checkpoint.applied_index == 0
+        || checkpoint.applied_index > owner.applied_index()
+        || enrollment.applied_index() > owner.applied_index()
+        || checkpoint.anchor.cluster != fence.cluster
+    {
+        return Err(PlacementProofError::Unauthorized);
+    }
+    let current = authority
+        .group(group)
+        .ok_or(PlacementProofError::Unauthorized)?;
+    let signer = authority
+        .node(node)
+        .ok_or(PlacementProofError::Unauthorized)?;
+    let generation = signer.enrollment.generation;
+    let expected = if source {
+        fence.source
+    } else {
+        fence.destination
+    };
+    let scoped = matches!(
+        current.scope,
+        GroupScope::Partition { partition, .. } if partition == expected
+    );
+    if !scoped
+        || (current.voters.get(&node) != Some(&generation)
+            && current.outgoing_voters.get(&node) != Some(&generation))
+        || current.expires_at <= now
+        || window.expires_at > current.expires_at
+    {
+        return Err(PlacementProofError::Unauthorized);
+    }
+    let verifier = authority.verifier(enrollment, &[], now)?;
+    verifier.verify_enrollment(&signer.enrollment)?;
+    let enrolled = enrollment
+        .enrollments()
+        .find(|receipt| receipt.identity.node_id == Some(node))
+        .ok_or(PlacementProofError::Unauthorized)?;
+    let identity = enrollment
+        .authorize_certificate(&enrolled.certificate, now)
+        .map_err(|_| PlacementProofError::Unauthorized)?;
+    if identity.role != EnrollmentRole::Node
+        || identity.principal != signer.principal
+        || ContentHash(enrolled.public_key) != signer.enrollment.identity
+    {
+        return Err(PlacementProofError::Unauthorized);
+    }
+    let statement = AuthorityStatement {
+        anchor: checkpoint.anchor.clone(),
+        authority_revision: checkpoint.revision,
+        enrollment_revision: enrollment.revision(),
+        group,
+        group_genesis: current.genesis,
+        membership_epoch: current.membership_epoch,
+        issued_at: window.issued_at,
+        expires_at: window.expires_at,
+        fact: if source {
+            AuthorityFact::DelegationSource(*fence)
+        } else {
+            AuthorityFact::DelegationDestination(*fence)
+        },
+    };
+    Ok(SessionProofPermit {
+        statement,
+        certificate: server_fingerprint(&enrolled.certificate),
+        _allocation: allocation,
+    })
+}
+
 #[cfg(test)]
 #[path = "placement_proof_tests.rs"]
 mod tests;

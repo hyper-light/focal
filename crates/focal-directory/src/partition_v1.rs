@@ -54,7 +54,7 @@ pub struct PartitionCheckpointV1 {
     pub cluster: ClusterId,
     pub delegation: Delegation,
     pub revision: u64,
-    pub sealed: Option<PartitionSeal>,
+    pub sealed: Option<PartitionSealV3>,
     pub nodes: BTreeMap<u64, NodeRecordV1>,
     pub sessions: BTreeMap<LedgerId, SessionDescriptorV1>,
 }
@@ -139,6 +139,27 @@ impl TryFrom<SessionDescriptorV1> for SessionDescriptor {
         })
     }
 }
+/// The seal of schemas 1–3: a whole-namespace transfer, so the moved range
+/// is the delegation's namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionSealV3 {
+    pub operation: OperationId,
+    pub destination: PartitionId,
+    pub next_epoch: u64,
+    pub revision: u64,
+}
+impl PartitionSealV3 {
+    pub fn into_current(self, namespace: NamespaceRange, source: PartitionId) -> PartitionSeal {
+        PartitionSeal {
+            operation: self.operation,
+            destination: self.destination,
+            next_epoch: self.next_epoch,
+            revision: self.revision,
+            moved: namespace,
+            source,
+        }
+    }
+}
 /// The schema 2 node record: no liveness verdict yet.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeRecordV2 {
@@ -152,7 +173,7 @@ pub struct PartitionCheckpointV2 {
     pub cluster: ClusterId,
     pub delegation: Delegation,
     pub revision: u64,
-    pub sealed: Option<PartitionSeal>,
+    pub sealed: Option<PartitionSealV3>,
     pub nodes: BTreeMap<u64, NodeRecordV2>,
     pub sessions: BTreeMap<LedgerId, SessionDescriptor>,
 }
@@ -190,12 +211,16 @@ impl TryFrom<PartitionCheckpointV1> for PartitionCheckpointV2 {
 /// alive until the detector commits one.
 impl From<PartitionCheckpointV2> for PartitionCheckpoint {
     fn from(value: PartitionCheckpointV2) -> Self {
+        let namespace = value.delegation.namespace;
+        let source = value.delegation.partition;
         Self {
             schema: PARTITION_CHECKPOINT_SCHEMA,
             cluster: value.cluster,
             delegation: value.delegation,
             revision: value.revision,
-            sealed: value.sealed,
+            sealed: value
+                .sealed
+                .map(|seal| seal.into_current(namespace, source)),
             nodes: value
                 .nodes
                 .into_iter()
@@ -214,6 +239,35 @@ impl From<PartitionCheckpointV2> for PartitionCheckpoint {
         }
     }
 }
+/// The schema 3 partition checkpoint: liveness verdicts, but a seal that
+/// can only move the whole namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionCheckpointV3 {
+    pub schema: u16,
+    pub cluster: ClusterId,
+    pub delegation: Delegation,
+    pub revision: u64,
+    pub sealed: Option<PartitionSealV3>,
+    pub nodes: BTreeMap<u64, NodeRecord>,
+    pub sessions: BTreeMap<LedgerId, SessionDescriptor>,
+}
+impl From<PartitionCheckpointV3> for PartitionCheckpoint {
+    fn from(value: PartitionCheckpointV3) -> Self {
+        let namespace = value.delegation.namespace;
+        let source = value.delegation.partition;
+        Self {
+            schema: PARTITION_CHECKPOINT_SCHEMA,
+            cluster: value.cluster,
+            delegation: value.delegation,
+            revision: value.revision,
+            sealed: value
+                .sealed
+                .map(|seal| seal.into_current(namespace, source)),
+            nodes: value.nodes,
+            sessions: value.sessions,
+        }
+    }
+}
 impl TryFrom<PartitionCheckpointV1> for PartitionCheckpoint {
     type Error = DirectoryError;
     fn try_from(value: PartitionCheckpointV1) -> Result<Self, DirectoryError> {
@@ -221,7 +275,7 @@ impl TryFrom<PartitionCheckpointV1> for PartitionCheckpoint {
     }
 }
 impl PartitionCheckpoint {
-    /// Decode a checkpoint at any schema. Schema 1 and 2 convert as above; the
+    /// Decode a checkpoint at any schema. Schemas 1 to 3 convert as above; the
     /// result still passes every current validation before it is installed.
     pub fn decode_any(bytes: &[u8]) -> Result<Self, DirectoryError> {
         let (schema, _) = postcard::take_from_bytes::<u16>(bytes)
@@ -237,8 +291,13 @@ impl PartitionCheckpoint {
                     .map_err(|_| DirectoryError::Invalid("partition checkpoint v2"))?;
                 (Self::from(value), rest)
             }
-            3 => postcard::take_from_bytes::<Self>(bytes)
-                .map_err(|_| DirectoryError::Invalid("partition checkpoint v3"))?,
+            3 => {
+                let (value, rest) = postcard::take_from_bytes::<PartitionCheckpointV3>(bytes)
+                    .map_err(|_| DirectoryError::Invalid("partition checkpoint v3"))?;
+                (Self::from(value), rest)
+            }
+            4 => postcard::take_from_bytes::<Self>(bytes)
+                .map_err(|_| DirectoryError::Invalid("partition checkpoint v4"))?,
             _ => return Err(DirectoryError::Invalid("partition checkpoint schema")),
         };
         if !rest.is_empty() {

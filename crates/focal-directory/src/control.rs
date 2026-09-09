@@ -10,7 +10,7 @@ pub struct RegionRecord {
     pub label: String,
     pub authority_epoch: u64,
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Delegation {
     pub namespace: NamespaceRange,
     pub partition: PartitionId,
@@ -51,6 +51,26 @@ pub enum RootOperation {
         start: NamespaceKey,
         expected_epoch: u64,
         destination: Delegation,
+        fence: DelegationFence,
+    },
+    /// Split the delegation at `start` into `[start, at)` kept by its
+    /// partition at the next epoch and `[at, end)` owned by `destination`,
+    /// under one fence both groups signed over the sealed image (§13).
+    Split {
+        start: NamespaceKey,
+        at: NamespaceKey,
+        expected_epoch: u64,
+        destination: Delegation,
+        fence: DelegationFence,
+    },
+    /// Merge the delegation at `right` into the one at `start` below it,
+    /// which continues at its next epoch over the union; the right partition
+    /// stays sealed and retires.
+    Merge {
+        start: NamespaceKey,
+        right: NamespaceKey,
+        expected_epoch: u64,
+        right_expected_epoch: u64,
         fence: DelegationFence,
     },
 }
@@ -219,7 +239,7 @@ impl RootDirectory {
                 }
                 state
                     .delegations
-                    .insert(delegation.namespace.start, delegation.clone());
+                    .insert(delegation.namespace.start, *delegation);
             }
             RootOperation::Transfer {
                 start,
@@ -263,9 +283,120 @@ impl RootDirectory {
                     return Err(DirectoryError::Duplicate);
                 }
                 authority.verify_delegation(fence)?;
-                let mut destination = destination.clone();
-                destination.activation = Some(fence.clone());
+                let mut destination = *destination;
+                destination.activation = Some(*fence);
                 state.delegations.insert(*start, destination);
+            }
+            RootOperation::Split {
+                start,
+                at,
+                expected_epoch,
+                destination,
+                fence,
+            } => {
+                let old = *state
+                    .delegations
+                    .get(start)
+                    .ok_or(DirectoryError::Missing)?;
+                if old.epoch != *expected_epoch {
+                    return Err(DirectoryError::CompareFailed);
+                }
+                let next_epoch = expected_epoch
+                    .checked_add(1)
+                    .ok_or(DirectoryError::CounterExhausted)?;
+                if fence.cluster != state.cluster {
+                    return Err(DirectoryError::WrongCluster);
+                }
+                if *at == old.namespace.start || !old.namespace.contains_key(*at) {
+                    return Err(DirectoryError::Invalid("split key"));
+                }
+                let moved = NamespaceRange {
+                    start: *at,
+                    end: old.namespace.end,
+                };
+                let kept = NamespaceRange {
+                    start: old.namespace.start,
+                    end: Some(*at),
+                };
+                if fence.source != old.partition
+                    || fence.destination != destination.partition
+                    || fence.namespace != moved
+                    || destination.namespace != moved
+                    || destination.epoch != next_epoch
+                    || fence.from_epoch != *expected_epoch
+                    || fence.to_epoch != next_epoch
+                    || fence.sealed_revision == 0
+                    || !types::nonzero_hash(fence.checkpoint)
+                    || !types::nonzero_hash(fence.destination_ready)
+                {
+                    return Err(DirectoryError::StaleEpoch);
+                }
+                if old.partition == destination.partition
+                    || old.log_group == destination.log_group
+                    || state.delegations.values().any(|value| {
+                        value.namespace.start != *start
+                            && (value.partition == destination.partition
+                                || value.log_group == destination.log_group)
+                    })
+                {
+                    return Err(DirectoryError::Duplicate);
+                }
+                authority.verify_delegation(fence)?;
+                let mut kept_delegation = old;
+                kept_delegation.namespace = kept;
+                kept_delegation.epoch = next_epoch;
+                kept_delegation.activation = Some(*fence);
+                let mut destination = *destination;
+                destination.activation = Some(*fence);
+                state.delegations.insert(*start, kept_delegation);
+                state.delegations.insert(*at, destination);
+            }
+            RootOperation::Merge {
+                start,
+                right,
+                expected_epoch,
+                right_expected_epoch,
+                fence,
+            } => {
+                let left = *state
+                    .delegations
+                    .get(start)
+                    .ok_or(DirectoryError::Missing)?;
+                let upper = *state
+                    .delegations
+                    .get(right)
+                    .ok_or(DirectoryError::Missing)?;
+                if left.epoch != *expected_epoch || upper.epoch != *right_expected_epoch {
+                    return Err(DirectoryError::CompareFailed);
+                }
+                let next_epoch = expected_epoch
+                    .checked_add(1)
+                    .ok_or(DirectoryError::CounterExhausted)?;
+                if fence.cluster != state.cluster {
+                    return Err(DirectoryError::WrongCluster);
+                }
+                if left.namespace.end != Some(*right)
+                    || fence.source != upper.partition
+                    || fence.destination != left.partition
+                    || fence.namespace != upper.namespace
+                    || fence.from_epoch != *expected_epoch
+                    || fence.to_epoch != next_epoch
+                    || fence.sealed_revision == 0
+                    || !types::nonzero_hash(fence.checkpoint)
+                    || !types::nonzero_hash(fence.destination_ready)
+                {
+                    return Err(DirectoryError::StaleEpoch);
+                }
+                authority.verify_delegation(fence)?;
+                let mut merged = left;
+                merged.namespace = NamespaceRange {
+                    start: *start,
+                    end: upper.namespace.end,
+                };
+                merged.epoch = next_epoch;
+                merged.activation = Some(*fence);
+                state.delegations.remove(right);
+                state.delegations.insert(*start, merged);
             }
         }
         state.revision = revision;
@@ -343,10 +474,21 @@ pub(crate) fn validate_delegation(
     match &delegation.activation {
         None if delegation.epoch != 1 => return Err(DirectoryError::StaleEpoch),
         Some(fence) => {
+            // The fence that activated this delegation: the whole namespace
+            // arriving (a transfer or the upper part of a split), the upper
+            // part leaving (the kept part of a split), or the upper part
+            // arriving next to what was already held (a merge).
+            let arrived = fence.destination == delegation.partition
+                && fence.namespace == delegation.namespace;
+            let released = fence.source == delegation.partition
+                && delegation.namespace.end == Some(fence.namespace.start);
+            let absorbed = fence.destination == delegation.partition
+                && fence.namespace.end == delegation.namespace.end
+                && fence.namespace.start != delegation.namespace.start
+                && delegation.namespace.contains_key(fence.namespace.start);
             if fence.cluster != cluster
-                || fence.destination != delegation.partition
                 || fence.source == fence.destination
-                || fence.namespace != delegation.namespace
+                || !(arrived || released || absorbed)
                 || fence.to_epoch != delegation.epoch
                 || fence.from_epoch.checked_add(1) != Some(fence.to_epoch)
                 || fence.sealed_revision == 0

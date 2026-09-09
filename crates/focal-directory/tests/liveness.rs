@@ -357,7 +357,7 @@ fn schema_two_and_three_checkpoints_both_restore_and_verdicts_survive_a_round_tr
     let legacy = PartitionCheckpointV2 {
         schema: 2,
         cluster: checkpoint.cluster,
-        delegation: checkpoint.delegation.clone(),
+        delegation: checkpoint.delegation,
         revision: checkpoint.revision,
         sealed: None,
         nodes: checkpoint

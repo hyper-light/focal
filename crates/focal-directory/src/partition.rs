@@ -50,7 +50,7 @@ pub struct SessionDescriptor {
 }
 /// The current partition checkpoint layout; schema 1 and 2 checkpoints
 /// convert on decode ([`PartitionCheckpoint::decode_any`]).
-pub const PARTITION_CHECKPOINT_SCHEMA: u16 = 3;
+pub const PARTITION_CHECKPOINT_SCHEMA: u16 = 4;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartitionCheckpoint {
     pub schema: u16,
@@ -69,6 +69,39 @@ pub struct PartitionSeal {
     pub destination: PartitionId,
     pub next_epoch: u64,
     pub revision: u64,
+    /// The keys leaving this partition: its whole namespace for a transfer
+    /// or a merge, the upper part from the split key for a split.
+    pub moved: NamespaceRange,
+    /// The partition that sealed: itself in its own state, the origin in the
+    /// image a destination bootstraps from.
+    pub source: PartitionId,
+}
+/// The group and partition identities a split's destination takes: derived
+/// from the cluster and the split operation, so the source's voters, the
+/// root and the destination all name the same ones.
+pub fn split_group_id(cluster: ClusterId, operation: OperationId) -> LogGroupId {
+    LogGroupId(split_identity(
+        "focal.directory.split-group.v1",
+        cluster,
+        operation,
+    ))
+}
+pub fn split_partition_id(cluster: ClusterId, operation: OperationId) -> PartitionId {
+    PartitionId(split_identity(
+        "focal.directory.split-partition.v1",
+        cluster,
+        operation,
+    ))
+}
+fn split_identity(domain: &'static str, cluster: ClusterId, operation: OperationId) -> [u8; 16] {
+    let mut hash = blake3::Hasher::new_derive_key(domain);
+    hash.update(&cluster.0);
+    hash.update(&operation.0);
+    let mut id = [0; 16];
+    for (target, source) in id.iter_mut().zip(hash.finalize().as_bytes()) {
+        *target = *source;
+    }
+    id
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartitionCommand {
@@ -82,6 +115,32 @@ pub enum PartitionOperation {
         operation: OperationId,
         destination: PartitionId,
         next_epoch: u64,
+    },
+    /// Seal the keys at and above `at` for `destination`; the lower part keeps
+    /// serving once the root has committed the split and this partition has
+    /// released the upper part (§13).
+    SealForSplit {
+        operation: OperationId,
+        destination: PartitionId,
+        next_epoch: u64,
+        at: NamespaceKey,
+    },
+    /// The source of a committed split narrows to the delegation the root
+    /// holds for it and drops the sessions that left.
+    Release {
+        delegation: Delegation,
+    },
+    /// The destination of a committed merge takes the sealed checkpoint of
+    /// the partition above it under the delegation the root holds for it.
+    Absorb {
+        delegation: Delegation,
+        moved: Box<PartitionCheckpoint>,
+    },
+    /// A group bootstrapped on a sealed image (a transfer or split
+    /// destination) becomes the partition the root delegated to it; its own
+    /// first committed command, so every voter installs the same state.
+    Install {
+        delegation: Delegation,
     },
     Enroll {
         node: NodeEnrollment,
@@ -170,6 +229,9 @@ pub struct PartitionConfig {
     pub max_refusals: usize,
     /// Disk headroom a node must report before it is planned into a placement.
     pub min_disk_available: u64,
+    /// Sessions a merge may move in one committed `Absorb` command, which
+    /// carries the sealed checkpoint; larger partitions are not merged.
+    pub max_absorb_sessions: usize,
 }
 impl Default for PartitionConfig {
     fn default() -> Self {
@@ -181,6 +243,7 @@ impl Default for PartitionConfig {
             max_endpoint_bytes: 512,
             max_refusals: 16,
             min_disk_available: 64 * 1024 * 1024,
+            max_absorb_sessions: 256,
         }
     }
 }
@@ -262,27 +325,8 @@ impl DirectoryPartition {
         budget: MemoryBudget,
     ) -> Result<Self, DirectoryError> {
         validate_partition(&state, config)?;
-        let fence = delegation
-            .activation
-            .as_ref()
-            .ok_or(DirectoryError::UnverifiedAuthority)?;
-        let seal = state.sealed.as_ref().ok_or(DirectoryError::NotReady)?;
-        if fence.cluster != state.cluster
-            || fence.source != state.delegation.partition
-            || fence.destination != delegation.partition
-            || seal.destination != delegation.partition
-            || fence.namespace != state.delegation.namespace
-            || delegation.namespace != state.delegation.namespace
-            || fence.from_epoch != state.delegation.epoch
-            || fence.to_epoch != delegation.epoch
-            || seal.next_epoch != delegation.epoch
-            || fence.operation != seal.operation
-            || seal.revision != state.revision
-            || fence.sealed_revision != state.revision
-        {
-            return Err(DirectoryError::StaleEpoch);
-        }
-        verifier.verify_delegation(fence)?;
+        let fence = check_install(&state, &delegation)?;
+        verifier.verify_delegation(&fence)?;
         if fence.checkpoint != partition_checkpoint_digest(&state)? {
             return Err(DirectoryError::CompareFailed);
         }
@@ -292,6 +336,12 @@ impl DirectoryPartition {
     }
     pub fn revision(&self) -> u64 {
         self.root.state.revision
+    }
+    /// The checkpoint a split's destination installs: this partition's sealed
+    /// state carrying only the sessions of the moved range. Deterministic, so
+    /// every voter of the source group derives the same image and digest.
+    pub fn split_image(&self) -> Result<PartitionCheckpoint, DirectoryError> {
+        split_image(&self.root.state)
     }
     pub fn get(&self, ledger: LedgerId) -> Result<Option<&SessionDescriptor>, DirectoryError> {
         if !self.root.state.delegation.namespace.contains(ledger) {
@@ -332,7 +382,14 @@ impl DirectoryPartition {
         command: &PartitionCommand,
         verifier: &impl AuthorityVerifier,
     ) -> Result<PreparedPartitionUpdate, DirectoryError> {
-        if self.root.state.sealed.is_some() {
+        // A sealed partition changes nothing more, except that the source of
+        // a split releases the part that left once the root committed it.
+        if self.root.state.sealed.is_some()
+            && !matches!(
+                command.operation,
+                PartitionOperation::Release { .. } | PartitionOperation::Install { .. }
+            )
+        {
             return Err(DirectoryError::StaleEpoch);
         }
         if command.expected_revision != self.revision() {
@@ -357,7 +414,11 @@ impl DirectoryPartition {
             PartitionOperation::Session { ledger, change, .. } => {
                 partition_session::change_charge(&self.root.state, *ledger, change)?
             }
+            PartitionOperation::Absorb { moved, .. } => partition_charge(moved)?,
             PartitionOperation::SealForTransfer { .. }
+            | PartitionOperation::SealForSplit { .. }
+            | PartitionOperation::Release { .. }
+            | PartitionOperation::Install { .. }
             | PartitionOperation::ReportLoad { .. }
             | PartitionOperation::Liveness { .. } => 0,
         };
@@ -391,7 +452,163 @@ impl DirectoryPartition {
                     destination: *destination,
                     next_epoch: *next_epoch,
                     revision,
+                    moved: state.delegation.namespace,
+                    source: state.delegation.partition,
                 });
+            }
+            PartitionOperation::SealForSplit {
+                operation,
+                destination,
+                next_epoch,
+                at,
+            } => {
+                let namespace = state.delegation.namespace;
+                if *destination == state.delegation.partition
+                    || *next_epoch
+                        != state
+                            .delegation
+                            .epoch
+                            .checked_add(1)
+                            .ok_or(DirectoryError::CounterExhausted)?
+                {
+                    return Err(DirectoryError::StaleEpoch);
+                }
+                if *at == namespace.start || !namespace.contains_key(*at) {
+                    return Err(DirectoryError::Invalid("split key"));
+                }
+                state.sealed = Some(PartitionSeal {
+                    operation: *operation,
+                    destination: *destination,
+                    next_epoch: *next_epoch,
+                    revision,
+                    moved: NamespaceRange {
+                        start: *at,
+                        end: namespace.end,
+                    },
+                    source: state.delegation.partition,
+                });
+            }
+            PartitionOperation::Release { delegation } => {
+                let seal = state.sealed.clone().ok_or(DirectoryError::NotReady)?;
+                let old = &state.delegation;
+                if seal.moved == old.namespace {
+                    // A whole transfer or merge source never serves again.
+                    return Err(DirectoryError::WrongOperation);
+                }
+                let fence = delegation
+                    .activation
+                    .as_ref()
+                    .ok_or(DirectoryError::UnverifiedAuthority)?;
+                let kept = NamespaceRange {
+                    start: old.namespace.start,
+                    end: Some(seal.moved.start),
+                };
+                if delegation.partition != old.partition
+                    || delegation.log_group != old.log_group
+                    || delegation.epoch != seal.next_epoch
+                    || delegation.namespace != kept
+                    || fence.cluster != state.cluster
+                    || fence.source != old.partition
+                    || fence.destination != seal.destination
+                    || fence.namespace != seal.moved
+                    || fence.operation != seal.operation
+                    || fence.from_epoch != old.epoch
+                    || fence.to_epoch != seal.next_epoch
+                    || fence.sealed_revision != seal.revision
+                {
+                    return Err(DirectoryError::StaleEpoch);
+                }
+                verifier.verify_delegation(fence)?;
+                if fence.checkpoint != partition_checkpoint_digest(&split_image_of(&state, &seal)?)?
+                {
+                    return Err(DirectoryError::CompareFailed);
+                }
+                state
+                    .sessions
+                    .retain(|ledger, _| !seal.moved.contains(*ledger));
+                state.delegation = *delegation;
+                state.sealed = None;
+            }
+            PartitionOperation::Install { delegation } => {
+                let fence = check_install(&state, delegation)?;
+                verifier.verify_delegation(&fence)?;
+                // This state is the image itself: the first command a
+                // bootstrapped destination applies.
+                if fence.checkpoint != partition_checkpoint_digest(&state)? {
+                    return Err(DirectoryError::CompareFailed);
+                }
+                state.delegation = *delegation;
+                state.sealed = None;
+            }
+            PartitionOperation::Absorb { delegation, moved } => {
+                let old = &state.delegation;
+                let fence = delegation
+                    .activation
+                    .as_ref()
+                    .ok_or(DirectoryError::UnverifiedAuthority)?;
+                let seal = moved.sealed.as_ref().ok_or(DirectoryError::NotReady)?;
+                let next_epoch = old
+                    .epoch
+                    .checked_add(1)
+                    .ok_or(DirectoryError::CounterExhausted)?;
+                let union = NamespaceRange {
+                    start: old.namespace.start,
+                    end: moved.delegation.namespace.end,
+                };
+                if moved.schema != PARTITION_CHECKPOINT_SCHEMA
+                    || moved.cluster != state.cluster
+                    || moved.delegation.partition == old.partition
+                    || old.namespace.end != Some(moved.delegation.namespace.start)
+                    || seal.moved != moved.delegation.namespace
+                    || seal.destination != old.partition
+                    || seal.revision != moved.revision
+                    || delegation.partition != old.partition
+                    || delegation.log_group != old.log_group
+                    || delegation.epoch != next_epoch
+                    || delegation.namespace != union
+                    || fence.cluster != state.cluster
+                    || fence.source != moved.delegation.partition
+                    || fence.destination != old.partition
+                    || fence.namespace != seal.moved
+                    || fence.operation != seal.operation
+                    || fence.from_epoch != old.epoch
+                    || fence.to_epoch != next_epoch
+                    || fence.sealed_revision != seal.revision
+                {
+                    return Err(DirectoryError::StaleEpoch);
+                }
+                if moved.sessions.len() > self.config.max_absorb_sessions {
+                    return Err(DirectoryError::Capacity);
+                }
+                verifier.verify_delegation(fence)?;
+                if fence.checkpoint != partition_checkpoint_digest(moved)? {
+                    return Err(DirectoryError::CompareFailed);
+                }
+                let groups: BTreeSet<LogGroupId> = state
+                    .sessions
+                    .values()
+                    .map(|session| session.log_group)
+                    .collect();
+                for (ledger, session) in &moved.sessions {
+                    if state.sessions.contains_key(ledger) || groups.contains(&session.log_group) {
+                        return Err(DirectoryError::Duplicate);
+                    }
+                }
+                for (ledger, session) in &moved.sessions {
+                    state.sessions.insert(*ledger, session.clone());
+                }
+                // A node known to both keeps the record at the higher
+                // generation; equal generations keep the destination's.
+                for (id, record) in &moved.nodes {
+                    let replace = state.nodes.get(id).is_none_or(|mine| {
+                        mine.enrollment.generation < record.enrollment.generation
+                    });
+                    if replace {
+                        state.nodes.insert(*id, record.clone());
+                    }
+                }
+                state.delegation = *delegation;
+                state.sealed = None;
             }
             PartitionOperation::Enroll {
                 node,
@@ -568,6 +785,72 @@ pub fn partition_checkpoint_digest(
 ) -> Result<focal_model::ContentHash, DirectoryError> {
     crate::digest(b"focal:directory-partition-checkpoint:v2\0", state)
 }
+/// The image a split's destination installs from a sealed source state.
+pub fn split_image(state: &PartitionCheckpoint) -> Result<PartitionCheckpoint, DirectoryError> {
+    let seal = state.sealed.as_ref().ok_or(DirectoryError::NotReady)?;
+    split_image_of(state, seal)
+}
+fn split_image_of(
+    state: &PartitionCheckpoint,
+    seal: &PartitionSeal,
+) -> Result<PartitionCheckpoint, DirectoryError> {
+    // The image is the destination from the start: the split's derived group
+    // and partition, the provisional delegation the root activates, the
+    // source's seal.
+    if seal.moved == state.delegation.namespace || seal.source != state.delegation.partition {
+        return Err(DirectoryError::WrongOperation);
+    }
+    let mut image = state.clone();
+    image
+        .sessions
+        .retain(|ledger, _| seal.moved.contains(*ledger));
+    image.delegation = Delegation {
+        namespace: seal.moved,
+        partition: seal.destination,
+        region: state.delegation.region,
+        log_group: split_group_id(state.cluster, seal.operation),
+        epoch: seal.next_epoch,
+        activation: None,
+    };
+    Ok(image)
+}
+/// The fence under which a sealed state (a source's own, or an image shaped
+/// as its destination) becomes `delegation`.
+fn check_install(
+    state: &PartitionCheckpoint,
+    delegation: &Delegation,
+) -> Result<DelegationFence, DirectoryError> {
+    let fence = delegation
+        .activation
+        .ok_or(DirectoryError::UnverifiedAuthority)?;
+    let seal = state.sealed.as_ref().ok_or(DirectoryError::NotReady)?;
+    let own = &state.delegation;
+    // A transfer image still carries the source's delegation at its epoch; a
+    // split image already carries the destination's provisional one.
+    let shaped = (own.partition == seal.source && own.epoch == fence.from_epoch)
+        || (own.partition == seal.destination
+            && own.log_group == delegation.log_group
+            && own.namespace == seal.moved
+            && own.epoch == seal.next_epoch
+            && own.activation.is_none());
+    if !shaped
+        || fence.cluster != state.cluster
+        || fence.source != seal.source
+        || fence.destination != delegation.partition
+        || seal.destination != delegation.partition
+        || fence.namespace != seal.moved
+        || delegation.namespace != seal.moved
+        || fence.from_epoch.checked_add(1) != Some(fence.to_epoch)
+        || fence.to_epoch != delegation.epoch
+        || seal.next_epoch != delegation.epoch
+        || fence.operation != seal.operation
+        || seal.revision != state.revision
+        || fence.sealed_revision != state.revision
+    {
+        return Err(DirectoryError::StaleEpoch);
+    }
+    Ok(fence)
+}
 
 fn validate_input(
     operation: &PartitionOperation,
@@ -575,6 +858,25 @@ fn validate_input(
 ) -> Result<(), DirectoryError> {
     match operation {
         PartitionOperation::Enroll { node, .. } => validate_enrollment(node, config)?,
+        PartitionOperation::Release { delegation }
+        | PartitionOperation::Install { delegation }
+        | PartitionOperation::Absorb { delegation, .. } => {
+            delegation.namespace.validate()?;
+            if delegation.activation.is_none() {
+                return Err(DirectoryError::UnverifiedAuthority);
+            }
+            if let PartitionOperation::Absorb { moved, .. } = operation {
+                moved.delegation.namespace.validate()?;
+                if moved.sealed.is_none() {
+                    return Err(DirectoryError::NotReady);
+                }
+                if moved.nodes.len() > config.max_nodes
+                    || moved.sessions.len() > config.max_absorb_sessions
+                {
+                    return Err(DirectoryError::Capacity);
+                }
+            }
+        }
         PartitionOperation::Liveness {
             node,
             generation,
@@ -629,7 +931,17 @@ fn validate_partition(
     config: PartitionConfig,
 ) -> Result<(), DirectoryError> {
     state.delegation.namespace.validate()?;
-    control::validate_delegation(&state.delegation, state.cluster)?;
+    // A sealed image shaped as its destination carries a provisional
+    // delegation the root has not activated yet; everything else validates
+    // as a committed delegation.
+    let provisional = state.delegation.activation.is_none()
+        && state
+            .sealed
+            .as_ref()
+            .is_some_and(|seal| seal.destination == state.delegation.partition);
+    if !provisional {
+        control::validate_delegation(&state.delegation, state.cluster)?;
+    }
     if state.schema != PARTITION_CHECKPOINT_SCHEMA
         || state.delegation.epoch == 0
         || config.max_nodes == 0
@@ -642,9 +954,20 @@ fn validate_partition(
         return Err(DirectoryError::Capacity);
     }
     if state.sealed.as_ref().is_some_and(|seal| {
+        let own = &state.delegation;
+        let source_shaped = seal.source == own.partition
+            && seal.destination != own.partition
+            && own.epoch.checked_add(1) == Some(seal.next_epoch)
+            && seal.moved.end == own.namespace.end
+            && own.namespace.contains_key(seal.moved.start);
+        let destination_shaped = seal.destination == own.partition
+            && seal.source != own.partition
+            && own.epoch == seal.next_epoch
+            && own.namespace == seal.moved
+            && own.log_group == split_group_id(state.cluster, seal.operation);
         seal.revision != state.revision
-            || seal.destination == state.delegation.partition
-            || state.delegation.epoch.checked_add(1) != Some(seal.next_epoch)
+            || seal.moved.validate().is_err()
+            || !(source_shaped || destination_shaped)
     }) {
         return Err(DirectoryError::StaleEpoch);
     }

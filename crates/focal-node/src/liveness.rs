@@ -18,7 +18,7 @@ pub mod suspicion;
 pub mod wire;
 
 pub use driver::{
-    LivenessConfig, LivenessDriver, LivenessEvent, LivenessHandle, LivenessView, LocalFacts,
-    MemberView, ProbeError,
+    LivenessConfig, LivenessCounters, LivenessDriver, LivenessEvent, LivenessHandle, LivenessView,
+    LocalFacts, MemberView, ProbeError,
 };
 pub use gossip::MemberStatus;

@@ -7,8 +7,8 @@ use focal_control::{
     ControlReceipt, ControlReplica, ControlRequest, ControlRequestId, ControlScope,
 };
 use focal_directory::{
-    ClusterId, Delegation, GroupScope, LogGroupId, NamespaceKey, NamespaceRange,
-    PartitionCheckpoint, PartitionId, RegionId,
+    ClusterId, Delegation, GroupScope, LogGroupId, NamespaceRange, PartitionCheckpoint,
+    PartitionId, RegionId,
 };
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::{ContentHash, LedgerId, SessionId, TenantId};
@@ -36,31 +36,110 @@ pub enum DirectoryBootstrapError {
 /// Stable coordinates for one initial interval. These identifiers neither
 /// authorize opening a group nor provide a table of individual sessions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FirstDirectoryPlan {
+pub struct PartitionPlan {
     cluster: [u8; 16],
     founder_node: u64,
     partition: PartitionId,
     group: LogGroupId,
     namespace: LedgerId,
+    /// The delegation the root holds (or will hold) for this partition.
+    delegation: Delegation,
+    /// The digest of the sealed image a split destination bootstraps from;
+    /// none for the first partition, which starts empty.
+    image: Option<ContentHash>,
+    /// The control genesis of the bootstrap state, fixed at planning so the
+    /// identity never depends on re-deriving the image.
+    genesis: [u8; 32],
 }
-impl FirstDirectoryPlan {
+/// The first partition's plan; every later partition uses the same shape.
+pub type FirstDirectoryPlan = PartitionPlan;
+impl PartitionPlan {
     pub fn derive(cluster: [u8; 16], founder_node: u64) -> Result<Self, DirectoryBootstrapError> {
         if cluster == [0; 16] || founder_node == 0 {
             return Err(DirectoryBootstrapError::Unauthorized);
         }
         let partition = PartitionId(derived_id("focal.directory.first-partition.v1", cluster)?);
         let group = LogGroupId(derived_id("focal.directory.first-group.v1", cluster)?);
-        let namespace = LedgerId {
-            tenant: TenantId(derived_id("focal.directory.rpc-tenant.v1", cluster)?),
-            session: SessionId(derived_id("focal.directory.rpc-session.v1", cluster)?),
+        let namespace = rpc_namespace(cluster)?;
+        let delegation = Delegation {
+            namespace: NamespaceRange::all(),
+            partition,
+            region: RegionId::UNKNOWN,
+            log_group: group,
+            epoch: 1,
+            activation: None,
         };
-        Ok(Self {
+        let mut plan = Self {
             cluster,
             founder_node,
             partition,
             group,
             namespace,
-        })
+            delegation,
+            image: None,
+            genesis: [0; 32],
+        };
+        plan.genesis = plan.bootstrap(None)?.identity(&plan.options())?.genesis;
+        Ok(plan)
+    }
+    /// The plan of a split's destination: a fresh group on `founder_node`
+    /// whose first state is the source's sealed image, under the delegation
+    /// the root commits with the split (its activation fence included).
+    pub fn split_destination(
+        cluster: [u8; 16],
+        founder_node: u64,
+        delegation: Delegation,
+        image: &PartitionCheckpoint,
+    ) -> Result<Self, DirectoryBootstrapError> {
+        if cluster == [0; 16]
+            || founder_node == 0
+            || delegation.activation.is_none()
+            || image.cluster.0 != cluster
+            || image.sealed.as_ref().is_none_or(|seal| {
+                seal.destination != delegation.partition || seal.moved != delegation.namespace
+            })
+        {
+            return Err(DirectoryBootstrapError::Unauthorized);
+        }
+        let digest = focal_directory::partition_checkpoint_digest(image)
+            .map_err(|_| DirectoryBootstrapError::Inconsistent)?;
+        let mut plan = Self {
+            cluster,
+            founder_node,
+            partition: delegation.partition,
+            group: delegation.log_group,
+            namespace: rpc_namespace(cluster)?,
+            delegation,
+            image: Some(digest),
+            genesis: [0; 32],
+        };
+        plan.genesis = plan
+            .bootstrap(Some(image.clone()))?
+            .identity(&plan.options())?
+            .genesis;
+        Ok(plan)
+    }
+    pub fn range(&self) -> NamespaceRange {
+        self.delegation.namespace
+    }
+    pub fn image(&self) -> Option<ContentHash> {
+        self.image
+    }
+    /// Whether a partition checkpoint is the state this plan hosts: its
+    /// delegation once installed, or the sealed image it bootstraps from,
+    /// which already carries the provisional delegation of this partition.
+    pub fn accepts(&self, checkpoint: &PartitionCheckpoint) -> bool {
+        let own = &checkpoint.delegation;
+        (*own == self.delegation && checkpoint.sealed.is_none())
+            || (self.image.is_some()
+                && own.partition == self.partition
+                && own.log_group == self.group
+                && own.namespace == self.delegation.namespace
+                && own.epoch == self.delegation.epoch
+                && own.activation.is_none()
+                && checkpoint.sealed.as_ref().is_some_and(|seal| {
+                    seal.destination == self.partition && seal.moved == self.delegation.namespace
+                }))
     }
     pub fn partition(&self) -> PartitionId {
         self.partition
@@ -71,34 +150,53 @@ impl FirstDirectoryPlan {
     pub fn namespace(&self) -> LedgerId {
         self.namespace
     }
+    pub fn cluster(&self) -> [u8; 16] {
+        self.cluster
+    }
     pub fn founder_node(&self) -> u64 {
         self.founder_node
     }
     pub fn delegation(&self) -> Delegation {
-        Delegation {
-            namespace: NamespaceRange::all(),
-            partition: self.partition,
-            region: RegionId::UNKNOWN,
-            log_group: self.group,
-            epoch: 1,
-            activation: None,
-        }
+        self.delegation
     }
-    pub fn bootstrap(&self) -> ControlBootstrap {
-        ControlBootstrap::Partition {
-            directory: PartitionCheckpoint {
+    /// The bootstrap state: empty for the first partition, the hash-checked
+    /// sealed image for a split destination.
+    pub fn bootstrap(
+        &self,
+        image: Option<PartitionCheckpoint>,
+    ) -> Result<ControlBootstrap, DirectoryBootstrapError> {
+        let directory = match (self.image, image) {
+            (None, None) => PartitionCheckpoint {
                 schema: focal_directory::PARTITION_CHECKPOINT_SCHEMA,
                 cluster: ClusterId(self.cluster),
-                delegation: self.delegation(),
+                delegation: self.delegation,
                 revision: 0,
                 sealed: None,
                 nodes: BTreeMap::new(),
                 sessions: BTreeMap::new(),
             },
-        }
+            (Some(expected), Some(image)) => {
+                let digest = focal_directory::partition_checkpoint_digest(&image)
+                    .map_err(|_| DirectoryBootstrapError::Inconsistent)?;
+                if digest != expected || !self.accepts(&image) {
+                    return Err(DirectoryBootstrapError::Unauthorized);
+                }
+                image
+            }
+            _ => return Err(DirectoryBootstrapError::Unauthorized),
+        };
+        Ok(ControlBootstrap::Partition { directory })
     }
     pub fn identity(&self) -> Result<ControlIdentity, DirectoryBootstrapError> {
-        Ok(self.bootstrap().identity(&self.options())?)
+        if self.genesis == [0; 32] {
+            return Err(DirectoryBootstrapError::Inconsistent);
+        }
+        Ok(ControlIdentity {
+            cluster: ClusterId(self.cluster),
+            group: self.group.0,
+            scope: focal_control::ControlScope::Partition(self.partition),
+            genesis: self.genesis,
+        })
     }
     fn options(&self) -> ControlOptions {
         ControlOptions::new(NodeConfig::single(
@@ -112,6 +210,12 @@ impl FirstDirectoryPlan {
     }
 }
 
+fn rpc_namespace(cluster: [u8; 16]) -> Result<LedgerId, DirectoryBootstrapError> {
+    Ok(LedgerId {
+        tenant: TenantId(derived_id("focal.directory.rpc-tenant.v1", cluster)?),
+        session: SessionId(derived_id("focal.directory.rpc-session.v1", cluster)?),
+    })
+}
 fn derived_id(
     domain: &'static str,
     cluster: [u8; 16],
@@ -171,8 +275,7 @@ fn validate_destination(
         .partition()
         .ok_or(DirectoryBootstrapError::Unauthorized)?;
     let configuration = replica.configuration().configuration;
-    if partition.checkpoint().delegation != plan.delegation()
-        || partition.checkpoint().sealed.is_some()
+    if !plan.accepts(partition.checkpoint())
         || configuration.voters.as_slice() != [plan.founder_node]
         || !configuration.learners.is_empty()
         || !configuration.voters_outgoing.is_empty()
@@ -374,8 +477,13 @@ pub(crate) fn authorize_first_directory(
         return Err(DirectoryBootstrapError::Unauthorized);
     }
     let root = owner.root().ok_or(DirectoryBootstrapError::Unauthorized)?;
-    if root.checkpoint().delegations.get(&NamespaceKey::MIN) != Some(&plan.delegation()) {
-        return Err(DirectoryBootstrapError::Unauthorized);
+    // The first partition needs its delegation committed; a split destination
+    // is authorized before the root commits the split (the split needs the
+    // destination group's signature), so its delegation may still be absent.
+    match root.checkpoint().delegations.get(&plan.range().start) {
+        Some(existing) if *existing == plan.delegation() => {}
+        None if plan.image.is_some() => {}
+        _ => return Err(DirectoryBootstrapError::Unauthorized),
     }
     let authority = owner
         .authority()
@@ -397,7 +505,7 @@ pub(crate) fn authorize_first_directory(
         || group.scope
             != (GroupScope::Partition {
                 partition: plan.partition,
-                namespace: NamespaceRange::all(),
+                namespace: plan.range(),
             })
         || group.membership_epoch != 1
         || group.voters.len() != 1
@@ -541,10 +649,11 @@ pub(crate) fn next_first_directory_command(
         return Err(DirectoryBootstrapError::Unauthorized);
     }
     let delegation = plan.delegation();
-    match directory.delegations.get(&NamespaceKey::MIN) {
+    match directory.delegations.get(&plan.range().start) {
         Some(existing) if *existing != delegation => {
             return Err(DirectoryBootstrapError::Unauthorized);
         }
+        None if plan.image.is_some() => {}
         None => {
             if !directory.delegations.is_empty() {
                 return Err(DirectoryBootstrapError::Unauthorized);
@@ -569,7 +678,7 @@ pub(crate) fn next_first_directory_command(
         genesis: ContentHash(plan.identity()?.genesis),
         scope: GroupScope::Partition {
             partition: plan.partition,
-            namespace: NamespaceRange::all(),
+            namespace: plan.range(),
         },
         membership_epoch: 1,
         voters: BTreeMap::from([(plan.founder_node, node.enrollment.generation)]),
@@ -608,6 +717,7 @@ impl PartitionBootstrapPermit {
         self,
         wal: SharedWal,
         budget: &MemoryBudget,
+        image: Option<PartitionCheckpoint>,
     ) -> Result<BootstrappedDirectory, DirectoryBootstrapError> {
         let now = crate::network_bootstrap::unix_time()
             .map_err(|_| DirectoryBootstrapError::Unavailable)?;
@@ -622,17 +732,19 @@ impl PartitionBootstrapPermit {
         } = self;
         let source = snapshot.source;
         let source_index = snapshot.source_index;
-        let mut replica =
-            ControlReplica::open_on_wal(plan.options(), plan.bootstrap(), budget.clone(), wal)?;
+        let mut replica = ControlReplica::open_on_wal(
+            plan.options(),
+            plan.bootstrap(image)?,
+            budget.clone(),
+            wal,
+        )?;
         // Single-voter recovery settles any previous unknown activation before
         // inspecting its durable receipt or selecting its successor sequence.
         establish_barrier(&mut replica, plan)?;
         let recovered = replica
             .partition()
             .ok_or(DirectoryBootstrapError::Inconsistent)?;
-        if recovered.checkpoint().delegation != plan.delegation()
-            || recovered.checkpoint().sealed.is_some()
-        {
+        if !plan.accepts(recovered.checkpoint()) {
             return Err(DirectoryBootstrapError::Unauthorized);
         }
         let _export = budget

@@ -7277,8 +7277,15 @@ the founder at its incarnation is refuted by the next incarnation, the
 refutation rides the answer, stale gossip changes nothing),
 `liveness_tests::the_driver_refuses_an_unusable_configuration_and_charges_its_state`,
 and the four algorithm tests in `liveness/algorithm_tests.rs`. The peer pool
-accepting `Response::Probe` was the fault the fleet test exposed (every
-acknowledgement had been classified as lost). The first whole-workspace run
+accepting `Response::Probe` was the first fault the fleet test exposed (every
+acknowledgement had been classified as lost); the second was starvation: the
+session-log leader's replication retransmissions to the stopped host held
+that peer's two inflight permits, so every probe of it returned `Busy` and
+the leader could never suspect the host itself (it learned the death only
+from a peer's gossip). Probes now travel on their own lane in the pool
+(`PeerPoolLimits.max_probe_inflight`, sixteen overall and one per peer, the
+connection still shared), so no data-plane traffic can starve the
+detector. The first whole-workspace run
 (12:16–12:24 CDT) aborted `focal-node`'s library binary with a stack
 overflow in `network_service::tests::missing_runtime_drivers_fail_before_ingress_and_release_started_owners`:
 the service's task set (`run_tasks`, 176 KiB of pinned driver state, 380 KiB
@@ -7290,7 +7297,16 @@ futures crossed that bound once the liveness driver joined the select.
 caller's stack carries only its own frame; the measurement was taken with a
 temporary size trace and removed.
 
-EVIDENCE_PLACEHOLDER
+**Evidence** (macOS arm64, this tree, 12:47–12:56 CDT):
+`bash scripts/cargo.sh test --workspace --offline --no-fail-fast` — **2,451 tests across 103 test binaries, 0 failures**;
+`bash scripts/cargo.sh clippy --workspace --all-targets --offline -- -D warnings` clean;
+`bash scripts/check-production.sh` clean; `cargo fmt --all --check` and the
+`--locked` check clean; `python3 scripts/check-contracts.py` clean. Earlier runs of this batch: 12:16–12:24
+aborted `focal-node`'s library binary with the stack overflow described
+above (every other binary passed); 12:28–12:36 failed the fleet liveness test
+on the bounded event ring (replaced by the monotone counters) and, under
+load, the two A4 campaigns (`cli_native_a4.rs`, `mcp_native_a4.rs`), which
+pass alone and passed in the final run.
 
 **Limits recorded.** See [24](24-placement-execution-and-fleet-control.md) §12:
 node-local constants, flat membership, the founder never judged, the

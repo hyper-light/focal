@@ -675,10 +675,10 @@ fn metadata_partition_transfer_is_sealed_cas_fenced_and_hash_checked() {
         root.prepare(&command, &Evidence),
         Err(DirectoryError::CompareFailed)
     ));
-    let active = root.resolve(ledger(1, 1)).unwrap().clone();
+    let active = *root.resolve(ledger(1, 1)).unwrap();
     let installed = DirectoryPartition::install_transferred(
         checkpoint.clone(),
-        active.clone(),
+        active,
         &Evidence,
         PartitionConfig::default(),
         allowance.clone(),
@@ -793,9 +793,7 @@ fn unknown_geography_delegates_without_region_rows_and_preserves_transfer_fences
         .prepare(
             &RootCommand {
                 expected_revision: 0,
-                operation: RootOperation::Delegate {
-                    delegation: first.clone(),
-                },
+                operation: RootOperation::Delegate { delegation: first },
             },
             &Evidence,
         )
@@ -861,16 +859,16 @@ fn unknown_geography_delegates_without_region_rows_and_preserves_transfer_fences
             fence,
         },
     };
-    let mut forged = fence.clone();
+    let mut forged = fence;
     forged.destination_ready = ContentHash([1; 32]);
     assert!(matches!(
-        root.prepare(&transfer(destination.clone(), forged), &Evidence),
+        root.prepare(&transfer(destination, forged), &Evidence),
         Err(DirectoryError::UnverifiedAuthority)
     ));
-    let mut missing_region = destination.clone();
+    let mut missing_region = destination;
     missing_region.region = RegionId::from_u128(99);
     assert!(matches!(
-        root.prepare(&transfer(missing_region, fence.clone()), &Evidence),
+        root.prepare(&transfer(missing_region, fence), &Evidence),
         Err(DirectoryError::Invalid("delegation metadata"))
     ));
     let prepared = root
@@ -879,7 +877,7 @@ fn unknown_geography_delegates_without_region_rows_and_preserves_transfer_fences
     root.publish(prepared).unwrap();
     let installed = DirectoryPartition::install_transferred(
         checkpoint,
-        root.resolve(ledger(1, 1)).unwrap().clone(),
+        *root.resolve(ledger(1, 1)).unwrap(),
         &Evidence,
         PartitionConfig::default(),
         budget(),

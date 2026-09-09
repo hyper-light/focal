@@ -247,7 +247,7 @@ async fn founder_registration_preserves_existing_application_and_replays_exact_m
     );
     let permit = host.prepare_directory(partition_plan).await.unwrap();
     let mut partition = permit
-        .open(network.wal.clone(), &budget())
+        .open(network.wal.clone(), &budget(), None)
         .unwrap()
         .into_replica();
     let window = ProofWindow {
@@ -317,7 +317,7 @@ async fn founder_registration_preserves_existing_application_and_replays_exact_m
     drop(partition);
     let permit = host.prepare_directory(partition_plan).await.unwrap();
     let partition = permit
-        .open(network.wal.clone(), &budget())
+        .open(network.wal.clone(), &budget(), None)
         .unwrap()
         .into_replica();
     let (state, installed) = views(&partition);

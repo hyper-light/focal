@@ -81,7 +81,7 @@ async fn live_directory_refresh_installs_revocation_retries_exactly_and_rejects_
         .unwrap();
     let initial = authorize_first_directory(&network.control, plan, now, &budget).unwrap();
     let stale = authorize_first_directory(&network.control, plan, now, &budget).unwrap();
-    let opened = initial.open(network.wal.clone(), &budget).unwrap();
+    let opened = initial.open(network.wal.clone(), &budget, None).unwrap();
     let expires_at = network
         .control
         .authority()
@@ -181,7 +181,7 @@ async fn live_directory_refresh_installs_revocation_retries_exactly_and_rejects_
     assert_eq!(budget.stats().used, 0);
     let reopened = authorize_first_directory(&network.control, plan, now, &budget)
         .unwrap()
-        .open(network.wal.clone(), &budget)
+        .open(network.wal.clone(), &budget, None)
         .unwrap();
     assert_eq!(
         reopened.replica().receipt(receipt.receipt.request).unwrap(),
@@ -236,7 +236,7 @@ async fn stop_commits_admitted_refresh_without_starting_a_postcommit_read_before
     let budget = budget();
     let opened = authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget)
         .unwrap()
-        .open(network.wal.clone(), &budget)
+        .open(network.wal.clone(), &budget, None)
         .unwrap();
     let revision = network.control.authority().unwrap().revision();
     commit(
@@ -297,7 +297,7 @@ async fn stop_commits_admitted_refresh_without_starting_a_postcommit_read_before
     let mut reopened =
         authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget)
             .unwrap()
-            .open(network.wal.clone(), &budget)
+            .open(network.wal.clone(), &budget, None)
             .unwrap()
             .into_replica();
     assert_eq!(reopened.receipt(request.id).unwrap(), Some(receipt));
@@ -316,7 +316,7 @@ async fn canceled_admitted_refresh_keeps_exact_intent_and_recovers_unknown_commi
     let budget = budget();
     let opened = authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget)
         .unwrap()
-        .open(network.wal.clone(), &budget)
+        .open(network.wal.clone(), &budget, None)
         .unwrap();
     let revision = network.control.authority().unwrap().revision();
     commit(
@@ -407,7 +407,7 @@ async fn canceled_admitted_refresh_keeps_exact_intent_and_recovers_unknown_commi
             plan.identity().unwrap().cluster.0,
             plan.group().0,
         )),
-        plan.bootstrap(),
+        plan.bootstrap(None).unwrap(),
         budget.clone(),
         network.wal.clone(),
     )

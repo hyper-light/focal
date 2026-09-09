@@ -135,7 +135,7 @@ async fn committed_delegation_bootstraps_shared_wal_and_restarts_or_refreshes_ex
     let permit =
         authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget).unwrap();
     assert!(budget.stats().used > 0);
-    let opened = permit.open(network.wal.clone(), &budget).unwrap();
+    let opened = permit.open(network.wal.clone(), &budget, None).unwrap();
     assert_eq!(opened.plan(), plan);
     assert_eq!(opened.replica().identity(), plan.identity().unwrap());
     assert_eq!(network.control.applied_index(), owner_index);
@@ -166,7 +166,7 @@ async fn committed_delegation_bootstraps_shared_wal_and_restarts_or_refreshes_ex
 
     let opened = authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget)
         .unwrap()
-        .open(network.wal.clone(), &budget)
+        .open(network.wal.clone(), &budget, None)
         .unwrap();
     assert_eq!(
         opened
@@ -189,7 +189,7 @@ async fn committed_delegation_bootstraps_shared_wal_and_restarts_or_refreshes_ex
     );
     let opened = authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget)
         .unwrap()
-        .open(network.wal.clone(), &budget)
+        .open(network.wal.clone(), &budget, None)
         .unwrap();
     assert_eq!(
         opened
@@ -237,7 +237,7 @@ async fn directory_permit_rejects_wrong_assignment_revocation_expiry_and_unfunde
         authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget).unwrap();
     permit.expires_at = unix_time().unwrap();
     assert!(matches!(
-        permit.open(network.wal.clone(), &budget),
+        permit.open(network.wal.clone(), &budget, None),
         Err(DirectoryBootstrapError::Unauthorized)
     ));
     assert_eq!(budget.stats().used, 0);
@@ -405,7 +405,7 @@ async fn interrupted_activation_recovers_the_logged_request_before_selecting_a_s
         authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget).unwrap();
     let mut replica = ControlReplica::open_on_wal(
         plan.options(),
-        plan.bootstrap(),
+        plan.bootstrap(None).unwrap(),
         budget.clone(),
         network.wal.clone(),
     )
@@ -439,7 +439,7 @@ async fn interrupted_activation_recovers_the_logged_request_before_selecting_a_s
     let network = FoundingNetwork::open(&settings).await.unwrap();
     let mut replica = ControlReplica::open_on_wal(
         plan.options(),
-        plan.bootstrap(),
+        plan.bootstrap(None).unwrap(),
         budget.clone(),
         network.wal.clone(),
     )
@@ -457,7 +457,7 @@ async fn interrupted_activation_recovers_the_logged_request_before_selecting_a_s
     drop(replica);
     let opened = authorize_first_directory(&network.control, plan, unix_time().unwrap(), &budget)
         .unwrap()
-        .open(network.wal.clone(), &budget)
+        .open(network.wal.clone(), &budget, None)
         .unwrap();
     assert_eq!(
         opened

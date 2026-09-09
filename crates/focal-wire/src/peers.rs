@@ -24,6 +24,10 @@ pub struct PeerPoolLimits {
     pub max_connections: usize,
     pub max_inflight: usize,
     pub per_peer_inflight: usize,
+    /// Liveness probes in flight at once, on their own lane: one per peer
+    /// and this many overall, so replication or control traffic to a peer
+    /// that stopped answering can never starve the failure detector.
+    pub max_probe_inflight: usize,
     pub attempts: u8,
     pub timeout: Duration,
     pub retry_backoff: Duration,
@@ -35,6 +39,7 @@ impl Default for PeerPoolLimits {
             max_connections: 128,
             max_inflight: 256,
             per_peer_inflight: 2,
+            max_probe_inflight: 16,
             attempts: 2,
             timeout: Duration::from_secs(5),
             retry_backoff: Duration::from_millis(10),
@@ -50,6 +55,7 @@ impl PeerPoolLimits {
             || self.max_inflight == 0
             || self.max_inflight > 65536
             || !(1..=2).contains(&self.per_peer_inflight)
+            || !(1..=64).contains(&self.max_probe_inflight)
             || !(1..=3).contains(&self.attempts)
             || self.timeout.is_zero()
             || self.timeout > Duration::from_secs(120)
@@ -105,6 +111,8 @@ struct Slot {
     endpoint: PeerEndpoint,
     retired: AtomicBool,
     inflight: Semaphore,
+    /// The probe lane: one liveness probe to this peer at a time.
+    probes: Semaphore,
     connection: AsyncMutex<Option<Connected>>,
     generation: AtomicU64,
     _reservation: OwnedSemaphorePermit,
@@ -145,6 +153,7 @@ pub struct PeerConnectionPool {
     limits: PeerPoolLimits,
     state: Mutex<State>,
     inflight: Semaphore,
+    probe_inflight: Semaphore,
     // OwnedSemaphorePermit lives in slots that can outlive cache membership.
     connections: Arc<Semaphore>,
     counters: Counters,
@@ -155,6 +164,7 @@ impl PeerConnectionPool {
         Ok(Self {
             connector,
             inflight: Semaphore::new(limits.max_inflight),
+            probe_inflight: Semaphore::new(limits.max_probe_inflight),
             connections: Arc::new(Semaphore::new(limits.max_connections)),
             limits,
             state: Mutex::new(State {
@@ -419,15 +429,18 @@ impl PeerConnectionPool {
         {
             return Err(PeerSendError::InvalidRequest);
         }
-        let _inflight = self
-            .inflight
-            .try_acquire()
-            .map_err(|_| PeerSendError::Busy)?;
+        let probe = matches!(request.operation, Operation::Probe { .. });
+        let _inflight = if probe {
+            &self.probe_inflight
+        } else {
+            &self.inflight
+        }
+        .try_acquire()
+        .map_err(|_| PeerSendError::Busy)?;
         tokio::time::timeout(self.limits.timeout, async {
             for attempt in 0..self.limits.attempts {
                 let slot = self.slot(target)?;
-                let _peer = slot
-                    .inflight
+                let _peer = if probe { &slot.probes } else { &slot.inflight }
                     .try_acquire()
                     .map_err(|_| PeerSendError::Busy)?;
                 let (generation, remote) = match self.connection(&slot).await {
@@ -517,6 +530,7 @@ impl PeerConnectionPool {
             endpoint,
             retired: AtomicBool::new(false),
             inflight: Semaphore::new(self.limits.per_peer_inflight),
+            probes: Semaphore::new(1),
             connection: AsyncMutex::new(None),
             generation: AtomicU64::new(0),
             _reservation: reservation,

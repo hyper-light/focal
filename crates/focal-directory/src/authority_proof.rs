@@ -386,12 +386,26 @@ impl AuthorityVerifier for InstalledAuthorityVerifier<'_> {
                 })
                 .ok_or(DirectoryError::UnverifiedAuthority)?;
             let group = self.group_for(proof)?;
-            if group.scope
-                != (GroupScope::Partition {
-                    partition,
-                    namespace: fence.namespace,
-                })
-            {
+            // The source group holds the moved keys (all of them for a
+            // transfer or a merge, the upper part for a split); the
+            // destination group holds them already (a transfer or split
+            // destination bootstrapped on the sealed image) or the keys
+            // right below them (a merge destination).
+            let scoped = match group.scope {
+                GroupScope::Partition {
+                    partition: scoped,
+                    namespace,
+                } if scoped == partition => {
+                    let holds = namespace.start <= fence.namespace.start
+                        && namespace.end.is_none_or(|end| {
+                            fence.namespace.end.is_some_and(|moved| moved <= end)
+                        });
+                    let below = namespace.end == Some(fence.namespace.start);
+                    holds || (!source && below)
+                }
+                _ => false,
+            };
+            if !scoped {
                 return Err(DirectoryError::OutsideNamespace);
             }
             self.signatures(proof, None)?;

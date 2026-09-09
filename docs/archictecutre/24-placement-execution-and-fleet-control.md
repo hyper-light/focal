@@ -499,7 +499,9 @@ was never reachable is *unconfirmed* and cannot be suspected; a peer becomes
 *confirmed* on its first acknowledgement. Each period the driver probes the
 next member of a shuffled round (`Operation::Probe`, registered tag 30, Node
 role, certificate-bound, at most 8 KiB, answered by the data service from the
-driver's published state without an owner round trip). A direct probe that
+driver's state without an owner round trip, and sent on the peer pool's own
+probe lane so replication to an unresponsive peer cannot starve the
+detector). A direct probe that
 times out is followed by indirect probes through up to three other members,
 which probe the target themselves and relay its answer; only when none
 answers does suspicion start. Probe and acknowledgement carry the sender's

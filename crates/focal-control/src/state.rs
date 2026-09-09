@@ -767,7 +767,7 @@ mod legacy_tests {
             directory: PartitionCheckpointV1 {
                 schema: 1,
                 cluster: ClusterId(CLUSTER),
-                delegation: delegation.clone(),
+                delegation,
                 revision: 0,
                 sealed: None,
                 nodes: BTreeMap::new(),

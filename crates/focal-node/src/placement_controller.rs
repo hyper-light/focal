@@ -160,7 +160,7 @@ impl PlacementAgent {
             }
         }
     }
-    fn window(&self, now: i64) -> Result<ProofWindow, AgentError> {
+    pub(super) fn window(&self, now: i64) -> Result<ProofWindow, AgentError> {
         Ok(ProofWindow {
             issued_at: now,
             expires_at: now.checked_add(PROOF_WINDOW).ok_or(AgentError::Capacity)?,
@@ -592,7 +592,7 @@ impl PlacementAgent {
         }
     }
     /// The bounds the partition applies to every placement it accepts.
-    fn partition_config(&self) -> focal_directory::PartitionConfig {
+    pub(super) fn partition_config(&self) -> focal_directory::PartitionConfig {
         focal_directory::PartitionConfig::default()
     }
 }

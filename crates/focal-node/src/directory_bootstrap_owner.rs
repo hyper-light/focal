@@ -3,6 +3,7 @@
 //! registered handle synchronously; there is no detached bootstrap task.
 use super::*;
 use crate::directory_bootstrap::{DirectoryBootstrapError, PartitionBootstrapPermit};
+use focal_directory::PartitionCheckpoint;
 use focal_log::SharedWal;
 
 const DIRECTORY_STACK_BYTES: usize = 2 * 1024 * 1024;
@@ -34,6 +35,7 @@ impl ControlHost {
         permit: PartitionBootstrapPermit,
         wal: SharedWal,
         budget: MemoryBudget,
+        image: Option<PartitionCheckpoint>,
     ) -> Result<(Self, ControlOwner, DirectoryReplication), DirectoryBootstrapError> {
         let plan = permit.plan();
         let identity = plan.identity()?;
@@ -92,7 +94,7 @@ impl ControlHost {
             .spawn(move || {
                 let _outcome = catch_unwind(AssertUnwindSafe(
                     || -> Result<(), DirectoryBootstrapError> {
-                        let opened = permit.open(wal, &budget)?;
+                        let opened = permit.open(wal, &budget, image)?;
                         let owner = Owner {
                             replica: opened.into_replica(),
                             initial: None,

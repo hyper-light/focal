@@ -1031,7 +1031,7 @@ fn schema_one_checkpoints_restore_with_progress_derived_from_readiness() {
     let legacy = PartitionCheckpointV1 {
         schema: 1,
         cluster: current.cluster,
-        delegation: current.delegation.clone(),
+        delegation: current.delegation,
         revision: current.revision,
         sealed: None,
         nodes: current

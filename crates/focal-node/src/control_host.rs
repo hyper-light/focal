@@ -145,8 +145,21 @@ enum Work {
         >,
         _input: Allocation,
     },
+    PrepareDelegationProof {
+        group: focal_directory::LogGroupId,
+        fence: Box<focal_directory::DelegationFence>,
+        source: bool,
+        window: crate::placement_proof::ProofWindow,
+        response: oneshot::Sender<
+            Result<
+                crate::placement_proof::SessionProofPermit,
+                crate::placement_proof::PlacementProofError,
+            >,
+        >,
+        _input: Allocation,
+    },
     PrepareDirectory {
-        plan: crate::directory_bootstrap::FirstDirectoryPlan,
+        plan: Box<crate::directory_bootstrap::FirstDirectoryPlan>,
         response: DirectoryReply,
         input: Allocation,
     },
@@ -349,6 +362,43 @@ impl ControlHost {
             .try_send(Work::PrepareMembershipProof {
                 next: Box::new(next),
                 record,
+                window,
+                response,
+                _input: input,
+            })
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => PlacementProofError::Capacity,
+                mpsc::TrySendError::Disconnected(_) => PlacementProofError::Unavailable,
+            })?;
+        receive
+            .await
+            .map_err(|_| PlacementProofError::Unavailable)?
+    }
+    /// Validate a delegation fence against the installed authority and return
+    /// a permit this node's credential signs as a voter of `group`, the
+    /// source group (`source`) or the destination group. Local only.
+    pub async fn prepare_delegation_proof(
+        &self,
+        group: focal_directory::LogGroupId,
+        fence: focal_directory::DelegationFence,
+        source: bool,
+        window: crate::placement_proof::ProofWindow,
+    ) -> Result<
+        crate::placement_proof::SessionProofPermit,
+        crate::placement_proof::PlacementProofError,
+    > {
+        use crate::placement_proof::PlacementProofError;
+        let input = self
+            .budget
+            .reserve(BudgetKind::Control, BudgetLane::Completion, 512)
+            .map_err(|_| PlacementProofError::Capacity)?
+            .commit();
+        let (response, receive) = oneshot::channel();
+        self.sender
+            .try_send(Work::PrepareDelegationProof {
+                group,
+                fence: Box::new(fence),
+                source,
                 window,
                 response,
                 _input: input,
@@ -722,7 +772,7 @@ impl<V: AuthorityVerifier> Owner<V> {
                 input,
             } => {
                 self.drain()?;
-                self.prepare_directory(plan, response, input);
+                self.prepare_directory(*plan, response, input);
                 self.drain()?;
             }
             Work::PrepareSessionProof {
@@ -784,6 +834,32 @@ impl<V: AuthorityVerifier> Owner<V> {
                             node,
                             &next,
                             &record,
+                            window,
+                            now,
+                            &self.budget,
+                        )
+                    });
+                let _ = response.send(result);
+            }
+            Work::PrepareDelegationProof {
+                group,
+                fence,
+                source,
+                window,
+                response,
+                _input,
+            } => {
+                self.drain()?;
+                let node = self.replica.status().node_id;
+                let result = crate::network_bootstrap::unix_time()
+                    .map_err(|_| crate::placement_proof::PlacementProofError::Unavailable)
+                    .and_then(|now| {
+                        crate::placement_proof::prepare_delegation_proof(
+                            &self.replica,
+                            node,
+                            group,
+                            &fence,
+                            source,
                             window,
                             now,
                             &self.budget,

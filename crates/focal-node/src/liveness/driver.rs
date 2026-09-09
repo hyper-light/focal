@@ -182,6 +182,24 @@ pub enum LivenessEvent {
         outcome: ExtensionOutcome,
     },
 }
+/// Monotone counts of what the driver decided; the event ring is bounded
+/// and may have dropped the corresponding events.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LivenessCounters {
+    pub ticks: u64,
+    pub late_ticks: u64,
+    pub probes_sent: u64,
+    pub probes_answered: u64,
+    pub probe_timeouts: u64,
+    pub confirmations: u64,
+    pub suspicions: u64,
+    pub refutations: u64,
+    pub deaths: u64,
+    pub revivals: u64,
+    pub self_refutations: u64,
+    pub extensions_granted: u64,
+    pub extensions_denied: u64,
+}
 #[derive(Debug, Clone, PartialEq)]
 pub struct LivenessView {
     pub node: u64,
@@ -191,9 +209,7 @@ pub struct LivenessView {
     pub coordinate: NetworkCoordinate,
     pub members: BTreeMap<u64, MemberView>,
     pub events: VecDeque<LivenessEvent>,
-    pub ticks: u64,
-    pub probes_sent: u64,
-    pub probes_answered: u64,
+    pub counters: LivenessCounters,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ProbeError {
@@ -313,9 +329,7 @@ impl LivenessView {
             coordinate: NetworkCoordinate::origin(&config.vivaldi),
             members: BTreeMap::new(),
             events: VecDeque::new(),
-            ticks: 0,
-            probes_sent: 0,
-            probes_answered: 0,
+            counters: LivenessCounters::default(),
         }
     }
     pub fn member(&self, node: u64) -> Option<&MemberView> {
@@ -401,9 +415,7 @@ struct State {
     sequence: u64,
     nonce: u64,
     rng: u64,
-    ticks: u64,
-    probes_sent: u64,
-    probes_answered: u64,
+    counters: LivenessCounters,
     witness: u64,
     overloaded: bool,
     /// The accuser to ask for time, once, after learning of a suspicion.
@@ -427,9 +439,7 @@ impl State {
             sequence: 0,
             nonce: 0,
             rng: started ^ node.rotate_left(17) ^ 0x9E37_79B9_7F4A_7C15,
-            ticks: 0,
-            probes_sent: 0,
-            probes_answered: 0,
+            counters: LivenessCounters::default(),
             witness: 0,
             overloaded: false,
             pending_extension: None,
@@ -446,6 +456,24 @@ impl State {
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
     fn event(&mut self, event: LivenessEvent) {
+        let counter = match event {
+            LivenessEvent::Confirmed { .. } => Some(&mut self.counters.confirmations),
+            LivenessEvent::Suspected { .. } => Some(&mut self.counters.suspicions),
+            LivenessEvent::Refuted { .. } => Some(&mut self.counters.refutations),
+            LivenessEvent::Died { .. } => Some(&mut self.counters.deaths),
+            LivenessEvent::Revived { .. } => Some(&mut self.counters.revivals),
+            LivenessEvent::ProbeTimeout { .. } => Some(&mut self.counters.probe_timeouts),
+            LivenessEvent::LateTick { .. } => Some(&mut self.counters.late_ticks),
+            LivenessEvent::SelfRefutation { .. } => Some(&mut self.counters.self_refutations),
+            LivenessEvent::ExtensionGranted { .. } => Some(&mut self.counters.extensions_granted),
+            LivenessEvent::ExtensionDenied { .. } => Some(&mut self.counters.extensions_denied),
+            LivenessEvent::Confirmation { .. }
+            | LivenessEvent::ExtensionRequested { .. }
+            | LivenessEvent::ExtensionAnswered { .. } => None,
+        };
+        if let Some(counter) = counter {
+            *counter = counter.saturating_add(1);
+        }
         if self.events.len() >= MAX_EVENTS {
             self.events.pop_front();
         }
@@ -556,9 +584,7 @@ impl LivenessDriver {
                 })
                 .collect(),
             events: state.events.clone(),
-            ticks: state.ticks,
-            probes_sent: state.probes_sent,
-            probes_answered: state.probes_answered,
+            counters: state.counters,
         };
         self.view.send_replace(view);
     }
@@ -593,7 +619,7 @@ impl LivenessDriver {
         pool: &'a PeerConnectionPool,
         inflight: &mut Inflight<'a>,
     ) -> bool {
-        self.state.ticks = self.state.ticks.saturating_add(1);
+        self.state.counters.ticks = self.state.counters.ticks.saturating_add(1);
         self.sync_facts(now_ms);
         self.expire_suspicions(now_ms);
         if self.state.generation == 0 || self.state.members.is_empty() {
@@ -775,7 +801,7 @@ impl LivenessDriver {
             indirect_outstanding: 0,
             acknowledged: false,
         });
-        self.state.probes_sent = self.state.probes_sent.saturating_add(1);
+        self.state.counters.probes_sent = self.state.counters.probes_sent.saturating_add(1);
         self.state.inflight = self.state.inflight.saturating_add(1);
         let with_extension = extension.is_some();
         inflight.push(Box::pin(async move {
@@ -832,7 +858,7 @@ impl LivenessDriver {
             );
             let envelope = self.envelope(body);
             self.state.inflight = self.state.inflight.saturating_add(1);
-            self.state.probes_sent = self.state.probes_sent.saturating_add(1);
+            self.state.counters.probes_sent = self.state.counters.probes_sent.saturating_add(1);
             sent = sent.saturating_add(1);
             inflight.push(Box::pin(async move {
                 let result = probe(pool, via, &envelope, timeout).await;
@@ -880,7 +906,8 @@ impl LivenessDriver {
         match request.kind {
             ProbeKind::Direct => {
                 self.state.health.on_successful_answer();
-                self.state.probes_answered = self.state.probes_answered.saturating_add(1);
+                self.state.counters.probes_answered =
+                    self.state.counters.probes_answered.saturating_add(1);
                 let answer = self.reply(ProbeOutcome::Ack, request.sequence, extension);
                 let _ = reply.send(answer);
             }
@@ -902,7 +929,7 @@ impl LivenessDriver {
                 let timeout = Duration::from_millis(self.timeout_for(target));
                 let envelope = self.envelope(body);
                 self.state.inflight = self.state.inflight.saturating_add(1);
-                self.state.probes_sent = self.state.probes_sent.saturating_add(1);
+                self.state.counters.probes_sent = self.state.counters.probes_sent.saturating_add(1);
                 inflight.push(Box::pin(async move {
                     let result = probe(pool, target, &envelope, timeout).await;
                     Done::Relay {
@@ -1095,7 +1122,7 @@ impl LivenessDriver {
             }
             Err(PeerSendError::Closed) => Verdict::Closed,
             Err(PeerSendError::Lost) => Verdict::Failed,
-            // No route, a busy transport or a peer that answered with a
+            // No route, a busy probe lane or a peer that answered with a
             // refusal says nothing about the peer's life.
             Err(_) => Verdict::Inconclusive,
         }

@@ -391,9 +391,7 @@ fn saved_verified_partition_compare_precedes_newer_committed_clock_after_restart
     roots.commit(ControlCommand::VerifiedRoot(VerifiedRootCommand {
         command: RootCommand {
             expected_revision: 0,
-            operation: RootOperation::Delegate {
-                delegation: delegation.clone(),
-            },
+            operation: RootOperation::Delegate { delegation },
         },
         evidence: evidence(&snapshot, NOW),
     }));
@@ -687,9 +685,7 @@ fn quorum_activation_installed_topology_revocation_and_checkpoint_replay_are_aut
     roots.commit(ControlCommand::VerifiedRoot(VerifiedRootCommand {
         command: RootCommand {
             expected_revision: 1,
-            operation: RootOperation::Delegate {
-                delegation: delegation.clone(),
-            },
+            operation: RootOperation::Delegate { delegation },
         },
         evidence: evidence(&snapshot, NOW + 1),
     }));
