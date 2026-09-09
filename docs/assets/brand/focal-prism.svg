@@ -1,9 +1,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="194" height="90" viewBox="20 20 560 260" role="img" aria-labelledby="title desc">
   <title id="title">Focal prism logo</title>
-  <desc id="desc">An open triangular prism with three straight incoming light paths converging into one outgoing ray.</desc>
-  <!-- End-on prism profile, following the user's Newton artwork reference.
-       Ray entry and exit points are intersections with the two sloping sides.
-       The drawing uses straight segments only and has a transparent interior. -->
+  <desc id="desc">A triangular prism with a shallow side face and three straight incoming light paths converging into one outgoing ray.</desc>
+  <!-- The front profile and ray paths follow the accepted Newton-inspired mark.
+       The rear triangle is the front triangle translated by (28, -10).
+       Only its visible right edge and the two parallel joining edges are drawn.
+       A faint side fill and lighter far edges establish depth. -->
+  <path d="M 300 36 L 328 26 L 460 254 L 432 264 Z" fill="#000000" fill-opacity="0.08"/>
+  <path d="M 300 36 L 328 26 L 460 254 L 432 264" fill="none" stroke="#000000" stroke-width="3.5" stroke-opacity="0.55" stroke-linecap="butt" stroke-linejoin="miter"/>
   <g fill="none" stroke="#000000" stroke-linecap="butt" stroke-linejoin="miter">
     <path d="M 300 36 L 432 264 H 168 Z" stroke-width="6"/>
     <g stroke-width="4.5">

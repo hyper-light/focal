@@ -4,7 +4,8 @@ Redrawn directly as SVG on 2026-09-09 after Ada supplied prism references. The l
 simple end-on triangular profile shown in the
 [Newton artwork](https://deltavcreations.com/portfolio/prism-light-spectrum-artwork-newton/).
 Three incoming rays meet at the right face and continue as one outgoing ray, following Ada's
-requested focus direction. The interior is transparent and every segment is straight.
+requested focus direction. The front interior is transparent and every segment is straight.
+A shallow side face adds depth, with a faint fill and lighter rear edges.
 
 ## Files and construction
 
@@ -20,6 +21,11 @@ The triangle vertices are (300, 36), (168, 264), and (432, 264). Each ray enters
 intersection with the left side. The shared exit is the intersection of the right side
 with y = 158. The SVG contains straight line segments only. Its viewBox preserves the
 drawing's proportions as it scales.
+
+The rear triangle is translated by (28, -10). Only the right side face is visible: its
+joining edges are parallel, and its rear edge is parallel to the front edge. The side
+fill uses 8% ink opacity and its far edges use 55%. The accepted front profile and all
+ray paths are unchanged.
 
 The root README selects a theme with a `<picture>` element and links to the preview.
 The artwork has no external images, fonts, or scripts.
