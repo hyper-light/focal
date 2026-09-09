@@ -44,14 +44,16 @@ Receipt: e2c5670ea738bf9bfd18035388f80e8f (epoch 1)
 Claim: d4cc83c48c5ad2bafaa1802bb87c3e07
 ```
 
-*Console output in this README was captured from a debug build at `125effd` on macOS with
-`--data-dir` pointed at a scratch directory; JSON is trimmed where marked with `...`.*
+> [!NOTE]
+> Console output in this README was captured from a debug build at `125effd` on macOS with
+> `--data-dir` pointed at a scratch directory; JSON is trimmed where marked with `...`.
 
-Focal has no release yet. The local service, the whole claim and evidence workflow through
-the CLI and MCP, restart recovery, durable retries, and joining nodes into a cluster all
-work today. Automatic placement across hosts, range movement, archival and restore,
-Kubernetes packaging, multi-region operation and Windows are still being built.
-[docs/REMAINING.md](docs/REMAINING.md) lists each piece and what closes it.
+> [!IMPORTANT]
+> Focal has no release yet. The local service, the whole claim and evidence workflow through
+> the CLI and MCP, restart recovery, durable retries, and joining nodes into a cluster all
+> work today. Automatic placement across hosts, range movement, archival and restore,
+> Kubernetes packaging, multi-region operation and Windows are still being built.
+> [docs/REMAINING.md](docs/REMAINING.md) lists each piece and what closes it.
 
 ## Install
 
@@ -66,11 +68,12 @@ sudo mv target/release/focal /usr/local/bin/   # or add target/release to PATH
 focal --help
 ```
 
-The release workflow builds one raw binary per platform (macOS arm64 and x64, Linux arm64
-and x64 on glibc and static musl), smoke-tests each on its own hardware, and attaches them
-with `SHA256SUMS`. When a release is published, download the file for your platform, check
-its digest, `chmod +x` it and put it on your `PATH`; nothing else is needed. Windows needs
-its own transport and filesystem port first.
+> [!NOTE]
+> The release workflow builds one raw binary per platform (macOS arm64 and x64, Linux arm64
+> and x64 on glibc and static musl), smoke-tests each on its own hardware, and attaches them
+> with `SHA256SUMS`. When a release is published, download the file for your platform, check
+> its digest, `chmod +x` it and put it on your `PATH`; nothing else is needed. Windows needs
+> its own transport and filesystem port first.
 
 ## Quickstart
 
@@ -83,9 +86,10 @@ focal start
 It creates a private data directory (`~/Library/Application Support/Focal` on macOS,
 `~/.local/share/focal` on Linux), an identity, and a local Unix socket. There is no
 configuration file and no network port. To keep a ledger somewhere else, pass
-`--data-dir /absolute/path` to every command, including `start`. The startup record says
-what durability you actually have: on a laptop, writes are synced to this disk and loss of
-the disk loses the ledger.
+`--data-dir /absolute/path` to every command, including `start`. 
+> [!WARNING]
+> The startup record says what durability you actually have. On a laptop, writes are synced
+> to this disk and loss of the disk loses the ledger.
 
 In another terminal, make a claim from the built-in example and post it:
 
@@ -127,8 +131,10 @@ Stop the service with Ctrl-C and run `focal start` again: the same ledger comes 
 ### Run the whole workflow
 
 The demo takes a claim all the way through: post, receipt, a stored test report, a
-testament, its receipt by the claimant, a recorded validation, and the derived result. It
-owns its directory, so give it one that no service is using:
+testament, its receipt by the claimant, a recorded validation, and the derived result.
+
+> [!WARNING]
+> The demo owns its directory. Give it one that no running service is using.
 
 ```console
 $ focal --data-dir /tmp/focal-demo demo
@@ -142,7 +148,8 @@ $ focal --data-dir /tmp/focal-demo demo      # the same claim and proof, nothing
 `status: 8` is `Satisfied` and `validation: 1` is `Pass`; `focal schema get domain-registry`
 prints the vocabulary. The second run recovers rather than repeats.
 
-To do the same by hand as two participants, the respondent side is:
+<details>
+<summary>The same steps by hand, as the respondent</summary>
 
 ```sh
 focal receipt acquire CLAIM_ID
@@ -155,10 +162,12 @@ focal submit testament --claim CLAIM_ID --receipt RECEIPT_ID --receipt-epoch 1 \
   --summary 'Checked report attached' --confidence committed --outcome complete
 ```
 
-and the claimant then receives the testament, reads the artifact, and records the
-validation. Failed work is reported the same way, with an error artifact instead of a
-report; a testament that says "failed" is still a testament. Every step with its flags is
-in the [manual](docs/manual-cli.md#deliver-artifacts-and-a-testament).
+The claimant then receives the testament, reads the artifact, and records the validation.
+Failed work is reported the same way, with an error artifact instead of a report; a
+testament that says "failed" is still a testament. Every step with its flags is in the
+[manual](docs/manual-cli.md#deliver-artifacts-and-a-testament).
+
+</details>
 
 ## What two agents see
 
@@ -199,7 +208,12 @@ rather than rewritten.
 ## Use it with an AI agent (MCP)
 
 `focal mcp serve` is a [Model Context Protocol] server over stdio. Start the service, then
-point your client at the binary and the same data directory, both by absolute path:
+point your client at it:
+
+> [!TIP]
+> Give the client the binary and the data directory by absolute path. MCP clients start
+> servers with no working directory and often no `PATH`, and the adapter must see the same
+> ledger the service owns.
 
 **Claude Code**
 ```sh
@@ -310,10 +324,11 @@ focal --data-dir ~/focal-node join --invite-file worker-2.invite --advertise 192
 focal --data-dir ~/focal-node start
 ```
 
-Joining lets the new node take part in the cluster; it does not yet copy your ledger onto
-it or make your data survive the loss of the first machine. Today you do that yourself with
-`cluster membership` and `cluster replicas`; the automatic placement that will do it for you
-is the next batch of work. Two nodes on one laptop, hosts on
+> [!IMPORTANT]
+> Joining lets the new node take part in the cluster; it does not yet copy your ledger onto
+> it or make your data survive the loss of the first machine. Today you do that yourself with
+> `cluster membership` and `cluster replicas`; the automatic placement that will do it for you
+> is the next batch of work. Two nodes on one laptop, hosts on
 different machines, and the administration commands are in
 [docs/network-startup.md](docs/network-startup.md) and [docs/cluster-admin.md](docs/cluster-admin.md).
 
