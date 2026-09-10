@@ -1,6 +1,9 @@
 use super::*;
 use crate::network_admin::{ReplicaAdminCommand, ReplicaAdminReply};
-use focal_client::admin::{AdminReplicaMembership, AdminReplicaStatus};
+use focal_client::admin::{
+    AdminRangeHistory, AdminRangeMember, AdminRangePending, AdminRangeView, AdminReplicaMembership,
+    AdminReplicaStatus,
+};
 use focal_ledger::{MembershipView, SessionMembershipReceipt, SessionMembershipRequest};
 use focal_model::SessionId;
 
@@ -75,6 +78,89 @@ impl ClusterAdmin {
                 Ok(AdminResult::ReplicaNativeActivationProposed {
                     session: session.to_string(),
                     group: hex(&group),
+                })
+            }
+            _ => Err(ClusterAdminError::Invalid),
+        }
+    }
+    /// Checkpoint one installed replica's applied prefix now; the reply
+    /// arrives once the envelope is installed and the log compacted.
+    pub async fn replica_checkpoint(&self, session: SessionId) -> Result<AdminResult> {
+        let (group, _) = self.replica_configuration(session, None).await?;
+        match self
+            .replica_exchange(ReplicaAdminCommand::Checkpoint { session, group })
+            .await?
+        {
+            ReplicaAdminReply::Checkpointed {
+                session: actual,
+                group: actual_group,
+            } if actual == session && actual_group == group => {
+                Ok(AdminResult::ReplicaCheckpointed {
+                    session: session.to_string(),
+                    group: hex(&group),
+                })
+            }
+            _ => Err(ClusterAdminError::Invalid),
+        }
+    }
+    /// The committed movement map of one native session (25 §6).
+    pub async fn replica_ranges(&self, session: SessionId) -> Result<AdminResult> {
+        match self
+            .replica_exchange(ReplicaAdminCommand::Ranges {
+                session,
+                group: None,
+            })
+            .await?
+        {
+            ReplicaAdminReply::Ranges {
+                session: actual,
+                group,
+                view,
+            } if actual == session && group != [0; 16] => {
+                let member = |item: &crate::fleet::RangeMemberView| AdminRangeMember {
+                    id: hex(&item.id.0.to_le_bytes()),
+                    generation: item.generation,
+                    start: item.start.map(|affinity| hex(&affinity)),
+                    end: item.end.map(|affinity| hex(&affinity)),
+                    holder: item.holder.map(|replica| replica.node),
+                    holder_generation: item.holder.map(|replica| replica.generation),
+                    readers: item.readers.iter().map(|replica| replica.node).collect(),
+                    entries: item.entries,
+                };
+                let hexes = |ids: &[focal_memory::RangeId]| -> Vec<String> {
+                    ids.iter().map(|id| hex(&id.0.to_le_bytes())).collect()
+                };
+                Ok(AdminResult::ReplicaRanges {
+                    session: session.to_string(),
+                    group: hex(&group),
+                    ranges: AdminRangeView {
+                        epoch: view.epoch.0,
+                        ordinal: view.ordinal,
+                        prefix: view.prefix.0,
+                        in_flight: view.in_flight,
+                        refusals: view.refusals,
+                        members: view.members.iter().map(member).collect(),
+                        pending: view.pending.as_ref().map(|pending| AdminRangePending {
+                            operation: hex(&pending.operation.0),
+                            old_epoch: pending.old_epoch.0,
+                            seed: pending.seed.0,
+                            sources: hexes(&pending.sources),
+                            replacements: pending.replacements.iter().map(member).collect(),
+                            snapshots: hexes(&pending.snapshots),
+                            barrier: pending.barrier.map(|sequence| sequence.0),
+                            seals: hexes(&pending.seals),
+                            ready: hexes(&pending.ready),
+                        }),
+                        history: view
+                            .history
+                            .iter()
+                            .map(|old| AdminRangeHistory {
+                                operation: hex(&old.operation.0),
+                                epoch: old.epoch.0,
+                                proofs: hex(&old.proofs.0),
+                            })
+                            .collect(),
+                    },
                 })
             }
             _ => Err(ClusterAdminError::Invalid),

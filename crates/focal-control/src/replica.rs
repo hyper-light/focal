@@ -190,6 +190,9 @@ impl ControlReplica {
                     .ok_or(ControlError::Capacity)?
             }
             ControlRead::Invitation { .. } | ControlRead::PrepareRevocation { .. } => 4096,
+            ControlRead::PrepareEligibility { .. } => 8192,
+            ControlRead::Route { .. } => 4096,
+            ControlRead::RouteChanges { .. } => self.machine.route_log_charge(),
             ControlRead::AdminReceipt { .. } => 2048 * 16 + 4096,
             ControlRead::StateAndAuthority => {
                 return self
@@ -267,6 +270,57 @@ impl ControlReplica {
                     command,
                 })
             }
+            ControlRead::PrepareEligibility { node, eligible } => {
+                let registry = self.enrollment().ok_or(ControlError::WrongOwner)?;
+                let authority = self.authority().ok_or(ControlError::NotReady)?;
+                let grant = authority.node(*node).ok_or(ControlError::Invalid)?;
+                if grant.enrollment.eligible == *eligible {
+                    return Ok(ControlReadResult::PreparedEligibility {
+                        identity: self.identity,
+                        applied_index: self.applied_index,
+                        node: *node,
+                        generation: grant.enrollment.generation,
+                        eligible: *eligible,
+                        command: None,
+                    });
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|_| ControlError::NotReady)?
+                    .as_secs();
+                let generation = grant
+                    .enrollment
+                    .generation
+                    .checked_add(1)
+                    .ok_or(ControlError::Capacity)?;
+                // The same enrollment at its next generation with the requested
+                // eligibility; the attestation is the registry's to set.
+                let mut enrollment = grant.enrollment.clone();
+                enrollment.generation = generation;
+                enrollment.eligible = *eligible;
+                enrollment.attestation = focal_model::ContentHash([0; 32]);
+                let command = focal_directory::AuthorityCommand {
+                    expected_revision: authority.revision(),
+                    enrollment_revision: registry.revision(),
+                    decided_at: i64::try_from(now).map_err(|_| ControlError::NotReady)?,
+                    operation: focal_directory::AuthorityOperation::GrantNode {
+                        grant: focal_directory::NodeTopologyGrant {
+                            enrollment,
+                            principal: grant.principal,
+                            expires_at: grant.expires_at,
+                        },
+                        expected_generation: Some(grant.enrollment.generation),
+                    },
+                };
+                Ok(ControlReadResult::PreparedEligibility {
+                    identity: self.identity,
+                    applied_index: self.applied_index,
+                    node: *node,
+                    generation,
+                    eligible: *eligible,
+                    command: Some(Box::new(command)),
+                })
+            }
             ControlRead::Configuration => {
                 Ok(ControlReadResult::Configuration(self.configuration()))
             }
@@ -288,6 +342,24 @@ impl ControlReplica {
                 }))
             }
             ControlRead::Contacts => Err(ControlError::WrongOwner),
+            ControlRead::Route { ledger } => {
+                let partition = self.partition().ok_or(ControlError::WrongOwner)?;
+                let epoch = partition.checkpoint().delegation.epoch;
+                match partition.lookup(*ledger, epoch) {
+                    Ok(route) => Ok(ControlReadResult::Route(Some(route))),
+                    Err(
+                        focal_directory::DirectoryError::Missing
+                        | focal_directory::DirectoryError::OutsideNamespace,
+                    ) => Ok(ControlReadResult::Route(None)),
+                    Err(error) => Err(error.into()),
+                }
+            }
+            ControlRead::RouteChanges { after_revision } => {
+                let partition = self.partition().ok_or(ControlError::WrongOwner)?;
+                Ok(ControlReadResult::RouteChanges(
+                    partition.route_changes(*after_revision),
+                ))
+            }
             ControlRead::State => Ok(ControlReadResult::State(ControlSnapshot {
                 identity: self.identity,
                 applied_index: self.applied_index,

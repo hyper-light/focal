@@ -323,6 +323,11 @@ async fn a_populated_ledger_is_imported_through_the_node_after_its_host_seals_th
         NativeHosting {
             limits: NativeSessionLimits::standard(domain()),
             reader: ContentReader::open(&content_dir).unwrap(),
+            seeds: focal_evidence::SeedStore::open(
+                content_dir.join("seeds"),
+                focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default()).unwrap(),
+            )
+            .unwrap(),
             range: RangeId(1),
         },
     )

@@ -66,6 +66,25 @@ pub(crate) fn decode_placement_control(
             if request.id.client != verified.peer().principal().0 {
                 return Err(ControlFailure::Unauthorized);
             }
+            // A node bootstraps the group of a session it created alone: a
+            // grant naming only itself (24 §16); every other root authority
+            // change is the controller's.
+            if let ControlCommand::Authority(focal_directory::AuthorityCommand {
+                operation: focal_directory::AuthorityOperation::BootstrapGroup { grant },
+                ..
+            }) = &request.command
+            {
+                let own = matches!(grant.scope, focal_directory::GroupScope::Session(_))
+                    && grant.membership_epoch == 1
+                    && grant.voters.len() == 1
+                    && grant.voters.contains_key(&node_id)
+                    && grant.outgoing_voters.is_empty()
+                    && grant.learners.is_empty();
+                if !own {
+                    return Err(ControlFailure::Unauthorized);
+                }
+                return Ok(rpc);
+            }
             let ControlCommand::VerifiedPartition(command) = &request.command else {
                 return Err(ControlFailure::Unauthorized);
             };
@@ -134,6 +153,8 @@ pub struct AgentStatus {
     pub partition_intents: u64,
     pub installed: Vec<focal_model::LedgerId>,
     pub last_error: Option<String>,
+    /// The last intent the owner refused before admission (24 §7).
+    pub last_refusal: Option<String>,
     /// The tenants this node hosts, their queues, and the node's memory and
     /// volume envelopes.
     pub admission: crate::admission::AdmissionReport,
@@ -144,6 +165,108 @@ pub enum AgentJob {
     Status(oneshot::Sender<AgentStatus>),
     /// The node's renewed credential: every later signature uses it.
     Credentials(Box<focal_enrollment::CredentialMaterial>),
+    /// Every partition the agent last observed, for the operator's view.
+    Directory(oneshot::Sender<DirectoryReport>),
+    /// Create (or find again) an application session on this node.
+    CreateSession(Box<CreateSessionJob>),
+    /// Plan a session's placement under a requested durability.
+    PlanSession(Box<PlanSessionJob>),
+    /// Move one member of a session's range group to a node (25 §6).
+    MoveRange(Box<MoveRangeJob>),
+    /// Restore a session from a verified backup onto this node (26 §6).
+    RestoreSession(Box<RestoreSessionJob>),
+}
+/// One operator request to restore a session from a backup.
+pub struct RestoreSessionJob {
+    pub request: crate::backup::RestoreRequest,
+    pub reply:
+        oneshot::Sender<Result<crate::backup::RestoredSession, crate::placement_agent::AgentError>>,
+}
+/// One operator request to move a member: answered by the authority's next
+/// controller pass over the session, which knows the node's generation.
+pub struct MoveRangeJob {
+    pub ledger: focal_model::LedgerId,
+    pub member: focal_memory::RangeId,
+    pub node: u64,
+    pub reply:
+        oneshot::Sender<Result<focal_ranges::TransferId, crate::placement_agent::AgentError>>,
+}
+/// One operator request to place a session under a durability: answered by
+/// the agent's next pass over the partition holding the session.
+pub struct PlanSessionJob {
+    pub ledger: focal_model::LedgerId,
+    pub durability: focal_directory::DurabilityIntent,
+    /// Propose and report without journaling a plan (doc 08 §9).
+    pub dry_run: bool,
+    pub reply: oneshot::Sender<Result<PlannedSession, crate::placement_agent::AgentError>>,
+}
+/// How a plan request was answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanState {
+    /// A plan under the requested durability was journaled for the partition.
+    Planned,
+    /// The session already has a pending plan; this is it.
+    Pending,
+    /// The active placement already provides the requested durability.
+    Satisfied,
+}
+/// The plan an operator's request denotes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedSession {
+    pub ledger: focal_model::LedgerId,
+    pub operation: focal_directory::OperationId,
+    pub voters: Vec<u64>,
+    pub state: PlanState,
+}
+/// One application session to create on this node ([24](../../../docs/archictecutre/24-placement-execution-and-fleet-control.md) §16).
+pub struct CreateSessionJob {
+    pub tenant: focal_model::TenantId,
+    pub name: String,
+    pub reply: oneshot::Sender<Result<CreatedSession, crate::placement_agent::AgentError>>,
+}
+/// The session a create request names, whether this call opened it or an
+/// earlier one did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreatedSession {
+    pub ledger: focal_model::LedgerId,
+    pub group: [u8; 16],
+    pub node: u64,
+    /// The session already existed on this node: an exact retry.
+    pub existing: bool,
+}
+/// The longest session name a create request carries.
+pub const MAX_SESSION_NAME: usize = 128;
+/// The session identity a name denotes within a cluster and tenant: the
+/// same name is the same session, so a repeated request is an exact retry.
+pub fn created_session_id(
+    cluster: [u8; 16],
+    tenant: focal_model::TenantId,
+    name: &str,
+) -> Option<focal_model::SessionId> {
+    if name.is_empty() || name.len() > MAX_SESSION_NAME || tenant.is_zero() {
+        return None;
+    }
+    let mut hasher = blake3::Hasher::new_derive_key("focal.session.created.v1");
+    hasher.update(&cluster);
+    hasher.update(&tenant.0);
+    hasher.update(&u32::try_from(name.len()).ok()?.to_le_bytes());
+    hasher.update(name.as_bytes());
+    let mut id = [0; 16];
+    id.copy_from_slice(hasher.finalize().as_bytes().get(..16)?);
+    if id == [0; 16] {
+        return None;
+    }
+    Some(focal_model::SessionId(id))
+}
+/// The partitions the agent acts on as it last observed them, with the
+/// root's delegation of each.
+#[derive(Debug, Clone, Default)]
+pub struct DirectoryReport {
+    pub observed_at: i64,
+    pub partitions: Vec<(
+        focal_directory::Delegation,
+        focal_directory::PartitionCheckpoint,
+    )>,
 }
 /// A bounded handle to the placement agent; every clone shares one queue.
 #[derive(Clone)]
@@ -167,6 +290,97 @@ impl PlacementHandle {
         material: focal_enrollment::CredentialMaterial,
     ) -> Result<(), PlacementProofError> {
         self.send(AgentJob::Credentials(Box::new(material)))
+    }
+    /// Create an application session on this node, or find the one the same
+    /// name already denotes.
+    pub async fn create_session(
+        &self,
+        tenant: focal_model::TenantId,
+        name: String,
+    ) -> Result<CreatedSession, crate::placement_agent::AgentError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(AgentJob::CreateSession(Box::new(CreateSessionJob {
+            tenant,
+            name,
+            reply,
+        })))
+        .map_err(|error| match error {
+            PlacementProofError::Capacity => crate::placement_agent::AgentError::Capacity,
+            _ => crate::placement_agent::AgentError::Stopped,
+        })?;
+        receive
+            .await
+            .map_err(|_| crate::placement_agent::AgentError::Stopped)?
+    }
+    /// Restore a session from a verified backup onto this node (26 §6).
+    pub async fn restore_session(
+        &self,
+        request: crate::backup::RestoreRequest,
+    ) -> Result<crate::backup::RestoredSession, crate::placement_agent::AgentError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(AgentJob::RestoreSession(Box::new(RestoreSessionJob {
+            request,
+            reply,
+        })))
+        .map_err(|error| match error {
+            PlacementProofError::Capacity => crate::placement_agent::AgentError::Capacity,
+            _ => crate::placement_agent::AgentError::Stopped,
+        })?;
+        receive
+            .await
+            .map_err(|_| crate::placement_agent::AgentError::Stopped)?
+    }
+    /// Plan a session's placement under a durability; answered by the agent's
+    /// next pass over the partition holding the session.
+    pub async fn plan_session(
+        &self,
+        ledger: focal_model::LedgerId,
+        durability: focal_directory::DurabilityIntent,
+        dry_run: bool,
+    ) -> Result<PlannedSession, crate::placement_agent::AgentError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(AgentJob::PlanSession(Box::new(PlanSessionJob {
+            ledger,
+            durability,
+            dry_run,
+            reply,
+        })))
+        .map_err(|error| match error {
+            PlacementProofError::Capacity => crate::placement_agent::AgentError::Capacity,
+            _ => crate::placement_agent::AgentError::Stopped,
+        })?;
+        receive
+            .await
+            .map_err(|_| crate::placement_agent::AgentError::Stopped)?
+    }
+    /// Move one member of a session's range group to `node` (25 §6); the
+    /// reply names the transfer the request denotes.
+    pub async fn move_range(
+        &self,
+        ledger: focal_model::LedgerId,
+        member: focal_memory::RangeId,
+        node: u64,
+    ) -> Result<focal_ranges::TransferId, crate::placement_agent::AgentError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(AgentJob::MoveRange(Box::new(MoveRangeJob {
+            ledger,
+            member,
+            node,
+            reply,
+        })))
+        .map_err(|error| match error {
+            PlacementProofError::Capacity => crate::placement_agent::AgentError::Capacity,
+            _ => crate::placement_agent::AgentError::Stopped,
+        })?;
+        receive
+            .await
+            .map_err(|_| crate::placement_agent::AgentError::Stopped)?
+    }
+    /// The partitions as the agent last observed them.
+    pub async fn directory(&self) -> Result<DirectoryReport, PlacementProofError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(AgentJob::Directory(reply))?;
+        receive.await.map_err(|_| PlacementProofError::Unavailable)
     }
     /// The agent's current diagnostic view.
     pub async fn status(&self) -> Result<AgentStatus, PlacementProofError> {

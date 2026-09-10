@@ -1241,3 +1241,69 @@ async fn a_node_renews_over_the_enrollment_transport_and_a_join_only_handler_ref
     server.close();
     task.await.unwrap().unwrap();
 }
+
+#[test]
+fn tenants_are_admitted_once_under_the_founder_authority_and_survive_restore_and_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = authority(&dir, [7; 16]);
+    let mut registry = registry(&authority);
+    assert_eq!(registry.tenants().count(), 0);
+    let tenant = [5; 16];
+    assert!(matches!(
+        registry.prepare_admit_tenant(&authority, [0; 16], now()),
+        Err(EnrollmentError::Invalid)
+    ));
+    let command = registry
+        .prepare_admit_tenant(&authority, tenant, now())
+        .unwrap();
+    assert_eq!(command.admitted_tenant(), Some(tenant));
+    assert!(command.revoked_invitation().is_none());
+    registry
+        .apply_committed(&command, registry.applied_index() + 1)
+        .unwrap();
+    assert!(registry.admits_tenant(tenant));
+    assert_eq!(registry.tenants().collect::<Vec<_>>(), vec![tenant]);
+    // Admitting again is a conflict the operator reads as done; the stale
+    // command replayed against the advanced revision is refused too.
+    assert!(matches!(
+        registry.prepare_admit_tenant(&authority, tenant, now()),
+        Err(EnrollmentError::Conflict)
+    ));
+    assert!(matches!(
+        registry.apply_committed(&command, registry.applied_index() + 1),
+        Err(EnrollmentError::Conflict)
+    ));
+    // A restore keeps the admission; a schema-2 checkpoint restores with none.
+    let bytes = registry.checkpoint().unwrap();
+    let restored =
+        EnrollmentRegistry::restore(&bytes, authority.cluster(), EnrollmentLimits::default())
+            .unwrap();
+    assert!(restored.admits_tenant(tenant));
+    let legacy = registry.encode_as_schema_two_for_tests().unwrap();
+    let upgraded =
+        EnrollmentRegistry::restore(&legacy, authority.cluster(), EnrollmentLimits::default())
+            .unwrap();
+    assert_eq!(upgraded.tenants().count(), 0);
+    assert_eq!(upgraded.revision(), registry.revision());
+    let tight = EnrollmentLimits {
+        max_tenants: 1,
+        ..EnrollmentLimits::default()
+    };
+    let mut small = EnrollmentRegistry::new(
+        authority.cluster(),
+        authority.ca_certificate().to_vec(),
+        2,
+        tight,
+    )
+    .unwrap();
+    let first = small
+        .prepare_admit_tenant(&authority, [1; 16], now())
+        .unwrap();
+    small
+        .apply_committed(&first, small.applied_index() + 1)
+        .unwrap();
+    assert!(matches!(
+        small.prepare_admit_tenant(&authority, [2; 16], now()),
+        Err(EnrollmentError::Capacity)
+    ));
+}

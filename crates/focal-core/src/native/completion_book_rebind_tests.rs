@@ -234,13 +234,15 @@ fn with_seals(
     }
     let range = match tail {
         Some(tail) => core.state.rows.plan_after(
-            &tail.range,
+            &core.state.budget,
+            &tail.fragments,
             outcome.sequence.0,
             changes,
             BudgetLane::Completion,
             usize::MAX,
         ),
         None => core.state.rows.plan_batch(
+            &core.state.budget,
             outcome.sequence.0,
             changes,
             BudgetLane::Completion,
@@ -272,7 +274,7 @@ fn with_seals(
     );
     (
         NativePrepared {
-            range,
+            fragments: range,
             outcome,
             writes: crate::native::mutation::WriteSet::unrecorded(),
         },

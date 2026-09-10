@@ -22,6 +22,14 @@ impl TransferManifest {
     pub fn stream_digest(&self) -> ContentHash {
         self.manifest.stream_digest
     }
+    /// The hash and length of one chunk of the tree.
+    pub fn chunk(&self, index: usize) -> Result<(ContentHash, u32), ContentError> {
+        self.manifest
+            .chunks
+            .get(index)
+            .map(|chunk| (chunk.hash, chunk.length))
+            .ok_or(ContentError::Invalid)
+    }
     pub fn chunk_length(&self, index: usize) -> Result<usize, ContentError> {
         usize::try_from(
             self.manifest
@@ -247,6 +255,102 @@ impl ContentStore {
         self.mark_failure(&result);
         result
     }
+}
+
+impl ContentReader {
+    /// Describe an installed object from its manifest alone: the reference
+    /// is derived from the manifest the root names, so a caller that knows
+    /// only the root (a bundle header, a backup inventory) can export the
+    /// exact authenticated tree.
+    pub fn describe_object(
+        &self,
+        domain: ContentDomainId,
+        root: ContentHash,
+    ) -> Result<TransferManifest, ContentError> {
+        let path = self
+            .root
+            .join("objects")
+            .join(hex(&domain.0))
+            .join(format!("{root}.manifest"));
+        let encoded = read_bounded(&path, MAX_TRANSFER_MANIFEST_BYTES)?;
+        describe_encoded(domain, root, encoded)
+    }
+    /// One authenticated chunk of an object described by `describe_object`.
+    pub fn read_transfer_chunk(
+        &self,
+        transfer: &TransferManifest,
+        index: usize,
+    ) -> Result<Vec<u8>, ContentError> {
+        let chunk = transfer
+            .manifest
+            .chunks
+            .get(index)
+            .ok_or(ContentError::Invalid)?;
+        if chunk.length as usize > MAX_TRANSFER_CHUNK_BYTES {
+            return Err(ContentError::Capacity);
+        }
+        let path = self
+            .root
+            .join("objects")
+            .join(hex(&transfer.reference.domain.0))
+            .join(format!("{}.chunk", chunk.hash));
+        let bytes = read_bounded(&path, chunk.length as usize)?;
+        if bytes.len() != chunk.length as usize
+            || ContentHash(*blake3::hash(&bytes).as_bytes()) != chunk.hash
+        {
+            return Err(ContentError::Corrupt);
+        }
+        Ok(bytes)
+    }
+}
+
+/// Validate an encoded manifest against the root that names it and derive
+/// the object's reference from its own fields.
+pub fn describe_encoded(
+    domain: ContentDomainId,
+    root: ContentHash,
+    encoded: Vec<u8>,
+) -> Result<TransferManifest, ContentError> {
+    if encoded.len() > MAX_TRANSFER_MANIFEST_BYTES {
+        return Err(ContentError::Capacity);
+    }
+    if !encoded.starts_with(MANIFEST_MAGIC)
+        || ContentHash(*blake3::hash(&encoded).as_bytes()) != root
+    {
+        return Err(ContentError::Corrupt);
+    }
+    let manifest = decode_manifest(
+        encoded
+            .get(MANIFEST_MAGIC.len()..)
+            .ok_or(ContentError::Corrupt)?,
+    )?;
+    let total = manifest
+        .chunks
+        .iter()
+        .try_fold(0u64, |sum, chunk| sum.checked_add(u64::from(chunk.length)))
+        .ok_or(ContentError::Corrupt)?;
+    if manifest.schema != 1
+        || manifest.domain != domain
+        || total != manifest.length
+        || manifest.length > MAX_TRANSFER_CONTENT_BYTES
+        || manifest
+            .chunks
+            .iter()
+            .any(|chunk| chunk.length == 0 || chunk.length as usize > MAX_TRANSFER_CHUNK_BYTES)
+    {
+        return Err(ContentError::Corrupt);
+    }
+    let reference = ContentRef {
+        domain,
+        root,
+        length: manifest.length,
+        class: manifest.class,
+    };
+    Ok(TransferManifest {
+        reference,
+        encoded,
+        manifest,
+    })
 }
 
 #[cfg(test)]

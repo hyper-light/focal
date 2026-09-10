@@ -323,6 +323,7 @@ pub(super) fn heap(row: &Row) -> Result<usize, NativeError> {
         | Row::Receipt(_)
         | Row::Cycle(_)
         | Row::RetiredCycleHead(_)
+        | Row::Retired(_)
         | Row::RetiredCycle(_)
         | Row::WorkSlot(_)
         | Row::ClaimResultTestament(_)

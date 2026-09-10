@@ -238,47 +238,48 @@ impl Core<NativeState> {
             .filter(|entry| matches!(entry.value, Row::Index))
             .filter_map(|entry| hit(entry.key))
     }
-    /// Claim identities in key order after `after`.
-    pub fn native_claims_from(&self, after: Option<ClaimId>) -> impl Iterator<Item = ClaimId> + '_ {
-        let start = Key::Claim(after.unwrap_or(ClaimId(MIN_ID)));
+    /// Identities of one primary family in identity order after `after`,
+    /// from its identity index (22 §7): one contiguous scan although every
+    /// object's own rows sit under the object (25 §3).
+    fn native_objects_from(
+        &self,
+        kind: ObjectKind,
+        after: Option<[u8; 16]>,
+    ) -> impl Iterator<Item = [u8; 16]> + '_ {
+        let code = kind.code();
+        let start = Key::ByObject(code, ObjectId(after.unwrap_or(MIN_ID)));
         self.state
             .rows
             .entries_from(&start, after.is_some())
-            .take_while(|entry| matches!(entry.key, Key::Claim(_)))
+            .take_while(
+                move |entry| matches!(entry.key, Key::ByObject(family, _) if family == code),
+            )
+            .filter(|entry| matches!(entry.value, Row::Index))
             .filter_map(|entry| match entry.key {
-                Key::Claim(id) => Some(id),
+                Key::ByObject(_, object) => Some(object.0),
                 _ => None,
             })
     }
-    /// Artifact identities in key order after `after`.
+    /// Claim identities in identity order after `after`.
+    pub fn native_claims_from(&self, after: Option<ClaimId>) -> impl Iterator<Item = ClaimId> + '_ {
+        self.native_objects_from(ObjectKind::Claim, after.map(|id| id.0))
+            .map(ClaimId)
+    }
+    /// Artifact identities in identity order after `after`.
     pub fn native_artifacts_from(
         &self,
         after: Option<ArtifactId>,
     ) -> impl Iterator<Item = ArtifactId> + '_ {
-        let start = Key::Artifact(after.unwrap_or(ArtifactId(MIN_ID)));
-        self.state
-            .rows
-            .entries_from(&start, after.is_some())
-            .take_while(|entry| matches!(entry.key, Key::Artifact(_)))
-            .filter_map(|entry| match entry.key {
-                Key::Artifact(id) => Some(id),
-                _ => None,
-            })
+        self.native_objects_from(ObjectKind::Artifact, after.map(|id| id.0))
+            .map(ArtifactId)
     }
-    /// Declaration identities in key order after `after`.
+    /// Declaration identities in identity order after `after`.
     pub fn native_definitions_from(
         &self,
         after: Option<ValidationId>,
     ) -> impl Iterator<Item = ValidationId> + '_ {
-        let start = Key::Definition(after.unwrap_or(ValidationId(MIN_ID)));
-        self.state
-            .rows
-            .entries_from(&start, after.is_some())
-            .take_while(|entry| matches!(entry.key, Key::Definition(_)))
-            .filter_map(|entry| match entry.key {
-                Key::Definition(id) => Some(id),
-                _ => None,
-            })
+        self.native_objects_from(ObjectKind::Validation, after.map(|id| id.0))
+            .map(ValidationId)
     }
     /// Receipts in identity order after `after`.
     pub fn native_receipts_from(
@@ -295,15 +296,14 @@ impl Core<NativeState> {
                 _ => None,
             })
     }
-    /// Evaluation keys in key order (claim first) after `after`, optionally
-    /// restricted to one claim.
-    pub fn native_evaluations_from(
+    /// One claim's evaluation keys in key order, after `after` when given.
+    fn claim_evaluations_from(
         &self,
-        claim: Option<ClaimId>,
+        claim: ClaimId,
         after: Option<EvaluationKey>,
     ) -> impl Iterator<Item = EvaluationKey> + '_ {
         let start = Key::Evaluation(after.unwrap_or(EvaluationKey {
-            claim: claim.unwrap_or(ClaimId(MIN_ID)),
+            claim,
             validation: ValidationId(MIN_ID),
             target: EvaluationTarget::Admission,
             generation: 0,
@@ -311,13 +311,36 @@ impl Core<NativeState> {
         self.state
             .rows
             .entries_from(&start, after.is_some())
-            .take_while(move |entry| match entry.key {
-                Key::Evaluation(key) => claim.is_none_or(|claim| key.claim == claim),
-                _ => false,
-            })
+            .take_while(
+                move |entry| matches!(entry.key, Key::Evaluation(key) if key.claim == claim),
+            )
             .filter_map(|entry| match entry.key {
                 Key::Evaluation(key) => Some(key),
                 _ => None,
             })
+    }
+    /// Evaluation keys in key order (claim first) after `after`, optionally
+    /// restricted to one claim. An unrestricted listing walks the claims in
+    /// identity order and each claim's contiguous evaluation span, so it
+    /// visits no row outside those spans.
+    pub fn native_evaluations_from(
+        &self,
+        claim: Option<ClaimId>,
+        after: Option<EvaluationKey>,
+    ) -> Box<dyn Iterator<Item = EvaluationKey> + '_> {
+        if let Some(claim) = claim {
+            return Box::new(self.claim_evaluations_from(claim, after));
+        }
+        // The claim the resume position lies in finishes first; later claims
+        // follow from the identity index.
+        let current = after.map(|key| key.claim);
+        let head = current
+            .map(|claim| self.claim_evaluations_from(claim, after))
+            .into_iter()
+            .flatten();
+        let rest = self
+            .native_claims_from(current)
+            .flat_map(move |claim| self.claim_evaluations_from(claim, None));
+        Box::new(head.chain(rest))
     }
 }

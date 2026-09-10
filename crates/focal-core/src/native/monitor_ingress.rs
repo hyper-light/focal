@@ -15,7 +15,7 @@ impl Core<NativeState> {
         }
         self.state
             .rows
-            .validate_chain(pending.clone().map(|item| &item.range))?;
+            .validate_chain(pending.clone().map(|item| &item.fragments))?;
         let intent = intent::monitor_deadline_fingerprint(self.state.ledger, input)?;
         let view = View {
             state: &self.state,

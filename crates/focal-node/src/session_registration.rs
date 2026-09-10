@@ -25,7 +25,7 @@ use focal_enrollment::{EnrollmentLimits, EnrollmentRegistry, EnrollmentRole, ser
 use focal_ledger::{CommittedPlacement, MembershipView, Session, SessionPlacementRequest};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::{ContentHash, LedgerId, RouteEpoch, SessionSeq};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_POLICY_BYTES: usize = 64 * 1024;
@@ -53,7 +53,7 @@ type Result<T> = std::result::Result<T, SessionRegistrationError>;
 /// The facts a registration reads from a session, whether it still owns the
 /// `Session` or the fleet hosts it. Read on the owner thread so every field
 /// describes one applied prefix; nothing here is accepted from a peer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostedSessionFacts {
     pub cluster: [u8; 16],
     pub ledger: LedgerId,
@@ -119,10 +119,33 @@ impl FirstSessionPlan {
         let facts = HostedSessionFacts::from_session(session)?;
         Self::capture_facts(&facts, network, settings, required_memory, budget)
     }
-    /// `capture` over facts exported by a hosted replica.
+    /// `capture` over facts exported by a hosted replica of the founder's
+    /// own session.
     pub fn capture_facts(
         facts: &HostedSessionFacts,
         network: &NetworkGenesis,
+        settings: &Settings,
+        required_memory: u64,
+        budget: &MemoryBudget,
+    ) -> Result<Self> {
+        Self::capture_hosted(
+            facts,
+            network,
+            &network.founder,
+            settings,
+            required_memory,
+            budget,
+        )
+    }
+    /// `capture_facts` for any session a node hosts alone: `host` is the
+    /// node's identity at the session's ledger (the founder's own identity
+    /// for the founder session). The plan registers the session under the
+    /// hosting node's committed enrollment exactly as the founder's was
+    /// ([24](../../../docs/archictecutre/24-placement-execution-and-fleet-control.md) §16).
+    pub fn capture_hosted(
+        facts: &HostedSessionFacts,
+        network: &NetworkGenesis,
+        host: &NodeIdentity,
         settings: &Settings,
         required_memory: u64,
         budget: &MemoryBudget,
@@ -145,7 +168,15 @@ impl FirstSessionPlan {
         network
             .validate(&network.founder)
             .map_err(|_| SessionRegistrationError::Unauthorized)?;
-        let founder = &network.founder;
+        if host.cluster != network.founder.cluster
+            || host.root != network.founder.root
+            || host.node == 0
+            || host.ledger.tenant.is_zero()
+            || host.ledger.session.0 == [0; 16]
+        {
+            return Err(SessionRegistrationError::Unauthorized);
+        }
+        let founder = host;
         let membership = &facts.membership;
         if facts.cluster != founder.cluster
             || facts.ledger != founder.ledger

@@ -539,6 +539,52 @@ fn authority_spoofing_unknown_fields_and_open_epoch_capability_are_rejected() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn unix_watched_grant_governs_connections_accepted_after_it_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("focal.sock");
+    let handler: Arc<dyn RequestHandler> =
+        Arc::new(|verified: VerifiedRequest| async move { response(verified.request()) });
+    let other = TenantId::from_u128(0x7e);
+    let mut narrow = grant();
+    narrow.tenants = BTreeSet::from([other]);
+    let (sender, receiver) = tokio::sync::watch::channel(narrow);
+    let server = Arc::new(UnixServer::bind_watched(&socket, receiver, limits()).unwrap());
+    let running = server.clone();
+    let handling = handler.clone();
+    let task = tokio::spawn(async move { running.serve(handling).await });
+    let remote = UnixRemote::new(&socket, limits()).unwrap();
+    // The bound grant names another tenant: the request's ledger is refused.
+    assert!(matches!(
+        remote.request(&request(1)).await.unwrap().result,
+        Response::Error(AccessError::Unauthorized)
+    ));
+    // Widening the grant serves the next connection under the new value
+    // without rebinding the socket.
+    sender.send_modify(|current| {
+        current.tenants.insert(ledger().tenant);
+    });
+    let expected = dispatch(
+        handler.as_ref(),
+        AuthenticatedPeer::local(grant()).unwrap(),
+        request(2),
+        &limits(),
+    )
+    .await;
+    assert_eq!(remote.request(&request(2)).await.unwrap(), expected);
+    // Narrowing it again refuses again; the sender outlives every connection.
+    sender.send_modify(|current| {
+        current.tenants.remove(&ledger().tenant);
+    });
+    assert!(matches!(
+        remote.request(&request(3)).await.unwrap().result,
+        Response::Error(AccessError::Unauthorized)
+    ));
+    server.close();
+    task.await.unwrap().unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn unix_uses_owner_credentials_and_same_verified_handler() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();

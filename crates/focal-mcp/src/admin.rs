@@ -19,6 +19,31 @@ pub enum AdminAction {
     ReplicaDiagnostics {
         session: Option<[u8; 16]>,
     },
+    RetentionShow {
+        session: Option<[u8; 16]>,
+    },
+    ArchiveShow {
+        session: Option<[u8; 16]>,
+        claim: [u8; 16],
+    },
+    GcShow,
+    StorageShow,
+    GcRestore {
+        domain: [u8; 16],
+        root: [u8; 32],
+    },
+    BackupCreate {
+        tenant: Option<[u8; 16]>,
+        session: Option<[u8; 16]>,
+        output: String,
+    },
+    BackupVerify {
+        input: String,
+    },
+    Restore {
+        input: String,
+        new_incarnation: bool,
+    },
     ReplicaTransfer {
         session: Option<[u8; 16]>,
         node: u64,
@@ -76,10 +101,70 @@ pub enum AdminAction {
         expected_revision: Option<u64>,
     },
     RenewCredential,
+    Placement,
+    Plan,
     InviteClient {
         name: String,
         output: String,
     },
+    AdmitTenant {
+        tenant: [u8; 16],
+    },
+    Tenants,
+    CreateSession {
+        tenant: [u8; 16],
+        name: String,
+    },
+    PlanSession {
+        tenant: [u8; 16],
+        session: [u8; 16],
+        survive: String,
+        max_failures: u16,
+        dry_run: bool,
+    },
+    NodeEligibility {
+        node: u64,
+        eligible: bool,
+    },
+    RemoveNode {
+        node: u64,
+    },
+    ReplaceNode {
+        node: u64,
+        replacement: u64,
+    },
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NodeArg {
+    node: u64,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplaceArgs {
+    node: u64,
+    replacement: u64,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanSession {
+    tenant: String,
+    session: String,
+    survive: Option<String>,
+    max_failures: u16,
+    #[serde(default)]
+    dry_run: bool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Tenant {
+    tenant: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateSession {
+    tenant: String,
+    name: String,
 }
 #[derive(Debug, thiserror::Error)]
 #[error("{detail}")]
@@ -158,6 +243,37 @@ struct ReplicaSession {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ArchiveShow {
+    session: Option<String>,
+    claim: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GcRestore {
+    domain: String,
+    root: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupCreate {
+    tenant: Option<String>,
+    session: Option<String>,
+    output: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupVerify {
+    input: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Restore {
+    input: String,
+    #[serde(default)]
+    new_incarnation: bool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReplicaChange {
     session: Option<String>,
     node: Option<u64>,
@@ -183,6 +299,76 @@ pub(crate) fn parse(
                 .map_err(|_| InputError::Invalid("replica diagnostics"))?;
             AdminAction::ReplicaDiagnostics {
                 session: parse_session(args.session)?,
+            }
+        }
+        "cluster.retention.show" => {
+            let args: ReplicaSession = serde_json::from_value(value)
+                .map_err(|_| InputError::Invalid("retention session"))?;
+            AdminAction::RetentionShow {
+                session: parse_session(args.session)?,
+            }
+        }
+        "cluster.gc.show" => {
+            let _: Empty = serde_json::from_value(value)
+                .map_err(|_| InputError::Invalid("collector inspection"))?;
+            AdminAction::GcShow
+        }
+        "cluster.storage.show" => {
+            let _: Empty = serde_json::from_value(value)
+                .map_err(|_| InputError::Invalid("storage inspection"))?;
+            AdminAction::StorageShow
+        }
+        "cluster.gc.restore" => {
+            let args: GcRestore = serde_json::from_value(value)
+                .map_err(|_| InputError::Invalid("quarantined object"))?;
+            AdminAction::GcRestore {
+                domain: focal_client::input::parse_id(&args.domain)?,
+                root: focal_client::input::parse_hash(&args.root)?.0,
+            }
+        }
+        "cluster.backup.create" => {
+            let args: BackupCreate =
+                serde_json::from_value(value).map_err(|_| InputError::Invalid("backup output"))?;
+            if args.output.is_empty() || args.output.len() > 4096 {
+                return Err(InputError::Invalid("backup output"));
+            }
+            if args.tenant.is_some() && args.session.is_none() {
+                return Err(InputError::Invalid("a tenant needs its session"));
+            }
+            AdminAction::BackupCreate {
+                tenant: args
+                    .tenant
+                    .map(|tenant| focal_client::input::parse_id(&tenant))
+                    .transpose()?,
+                session: parse_session(args.session)?,
+                output: args.output,
+            }
+        }
+        "cluster.backup.verify" => {
+            let args: BackupVerify =
+                serde_json::from_value(value).map_err(|_| InputError::Invalid("backup input"))?;
+            if args.input.is_empty() || args.input.len() > 4096 {
+                return Err(InputError::Invalid("backup input"));
+            }
+            AdminAction::BackupVerify { input: args.input }
+        }
+        "cluster.restore" => {
+            let args: Restore =
+                serde_json::from_value(value).map_err(|_| InputError::Invalid("restore input"))?;
+            if args.input.is_empty() || args.input.len() > 4096 {
+                return Err(InputError::Invalid("restore input"));
+            }
+            AdminAction::Restore {
+                input: args.input,
+                new_incarnation: args.new_incarnation,
+            }
+        }
+        "cluster.archive.show" => {
+            let args: ArchiveShow =
+                serde_json::from_value(value).map_err(|_| InputError::Invalid("archive claim"))?;
+            AdminAction::ArchiveShow {
+                session: parse_session(args.session)?,
+                claim: focal_client::input::parse_id(&args.claim)?,
             }
         }
         "cluster.replicas.transfer" => {
@@ -311,11 +497,53 @@ pub(crate) fn parse(
                 expected_revision: args.expected_revision,
             }
         }
+        "cluster.tenants.admit" => {
+            let args: Tenant =
+                serde_json::from_value(value).map_err(|_| InputError::Invalid("tenant"))?;
+            AdminAction::AdmitTenant {
+                tenant: focal_client::input::parse_id(&args.tenant)?,
+            }
+        }
+        "cluster.sessions.create" => {
+            let args: CreateSession = serde_json::from_value(value)
+                .map_err(|_| InputError::Invalid("tenant and session name"))?;
+            if args.name.is_empty()
+                || args.name.len() > 63
+                || !args
+                    .name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            {
+                return Err(InputError::Invalid("session name"));
+            }
+            AdminAction::CreateSession {
+                tenant: focal_client::input::parse_id(&args.tenant)?,
+                name: args.name,
+            }
+        }
+        "cluster.sessions.plan" => {
+            let args: PlanSession = serde_json::from_value(value)
+                .map_err(|_| InputError::Invalid("session placement request"))?;
+            let survive = args.survive.unwrap_or_else(|| "node".into());
+            if !matches!(survive.as_str(), "node" | "zone" | "region") || args.max_failures > 255 {
+                return Err(InputError::Invalid("durability"));
+            }
+            AdminAction::PlanSession {
+                tenant: focal_client::input::parse_id(&args.tenant)?,
+                session: focal_client::input::parse_id(&args.session)?,
+                survive,
+                max_failures: args.max_failures,
+                dry_run: args.dry_run,
+            }
+        }
         "cluster.status"
         | "cluster.membership.show"
         | "cluster.nodes.list"
         | "cluster.request.inspect"
-        | "cluster.credentials.renew" => {
+        | "cluster.credentials.renew"
+        | "cluster.placement"
+        | "cluster.plan"
+        | "cluster.tenants.list" => {
             let _: Empty = serde_json::from_value(value)
                 .map_err(|_| InputError::Invalid("unexpected cluster input"))?;
             match name {
@@ -323,7 +551,39 @@ pub(crate) fn parse(
                 "cluster.membership.show" => AdminAction::Configuration,
                 "cluster.nodes.list" => AdminAction::Contacts,
                 "cluster.credentials.renew" => AdminAction::RenewCredential,
+                "cluster.placement" => AdminAction::Placement,
+                "cluster.plan" => AdminAction::Plan,
+                "cluster.tenants.list" => AdminAction::Tenants,
                 _ => AdminAction::Inspect,
+            }
+        }
+        "cluster.nodes.drain" | "cluster.nodes.undrain" | "cluster.nodes.remove" => {
+            let args: NodeArg =
+                serde_json::from_value(value).map_err(|_| InputError::Invalid("cluster node"))?;
+            if args.node == 0 {
+                return Err(InputError::Invalid("zero cluster node"));
+            }
+            match name {
+                "cluster.nodes.drain" => AdminAction::NodeEligibility {
+                    node: args.node,
+                    eligible: false,
+                },
+                "cluster.nodes.undrain" => AdminAction::NodeEligibility {
+                    node: args.node,
+                    eligible: true,
+                },
+                _ => AdminAction::RemoveNode { node: args.node },
+            }
+        }
+        "cluster.nodes.replace" => {
+            let args: ReplaceArgs = serde_json::from_value(value)
+                .map_err(|_| InputError::Invalid("node and replacement"))?;
+            if args.node == 0 || args.replacement == 0 || args.node == args.replacement {
+                return Err(InputError::Invalid("node and replacement"));
+            }
+            AdminAction::ReplaceNode {
+                node: args.node,
+                replacement: args.replacement,
             }
         }
         "cluster.membership.add_learner"
@@ -463,6 +723,24 @@ mod tests {
                 | "cluster.invitations.revoke"
                 | "cluster.credentials.revoke" => json!({"id":"01010101010101010101010101010101"}),
                 "cluster.client.invite" => json!({"name":"alice","output":"/tmp/alice.invite"}),
+                "cluster.tenants.admit" => json!({"tenant":"09090909090909090909090909090909"}),
+                "cluster.archive.show" => json!({"claim":"01010101010101010101010101010101"}),
+                "cluster.gc.restore" => {
+                    json!({"domain":"01010101010101010101010101010101","root":"0202020202020202020202020202020202020202020202020202020202020202"})
+                }
+                "cluster.backup.create" => json!({"output":"/tmp/focal-backup"}),
+                "cluster.backup.verify" => json!({"input":"/tmp/focal-backup"}),
+                "cluster.restore" => json!({"input":"/tmp/focal-backup","new_incarnation":true}),
+                "cluster.sessions.create" => {
+                    json!({"tenant":"09090909090909090909090909090909","name":"orders"})
+                }
+                "cluster.sessions.plan" => {
+                    json!({"tenant":"09090909090909090909090909090909","session":"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a","survive":"node","max_failures":1,"dry_run":true})
+                }
+                "cluster.nodes.drain" | "cluster.nodes.undrain" | "cluster.nodes.remove" => {
+                    json!({"node":2})
+                }
+                "cluster.nodes.replace" => json!({"node":2,"replacement":3}),
                 _ => json!({}),
             };
             assert!(
@@ -477,6 +755,21 @@ mod tests {
         assert!(parse("cluster.control", args(json!({"request":[]}))).is_err());
         assert!(parse("cluster.membership.promote", args(json!({"node":0}))).is_err());
         assert!(parse("cluster.invitations.list", args(json!({"limit":65}))).is_err());
+        assert!(
+            parse(
+                "cluster.sessions.create",
+                args(json!({"tenant":"09090909090909090909090909090909","name":"bad name"}))
+            )
+            .is_err()
+        );
+        assert!(parse("cluster.tenants.admit", args(json!({"tenant":"zz"}))).is_err());
+        assert!(
+            parse(
+                "cluster.sessions.plan",
+                args(json!({"tenant":"09090909090909090909090909090909","session":"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a","survive":"planet","max_failures":1}))
+            )
+            .is_err()
+        );
         assert!(
             parse(
                 "cluster.request.retry",

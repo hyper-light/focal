@@ -22,15 +22,30 @@ pub(crate) enum ContextCommand {
     /// Save a connection. Existing names cannot silently change identity.
     Add {
         name: String,
-        #[arg(long, conflicts_with = "file", required_unless_present = "file")]
+        #[arg(
+            long,
+            conflicts_with_all = ["file", "enrolled_as"],
+            required_unless_present_any = ["file", "enrolled_as"]
+        )]
         node_data_dir: Option<PathBuf>,
+        /// With `--node-data-dir` and `--session`: the tenant of the session
+        /// the node serves through its local socket.
+        #[arg(long, requires = "node_data_dir", requires = "session")]
+        tenant: Option<String>,
         /// Strict connection document; contains private credential paths, never key bytes.
         #[arg(
             long,
-            conflicts_with = "node_data_dir",
-            required_unless_present = "node_data_dir"
+            conflicts_with_all = ["node_data_dir", "enrolled_as"],
+            required_unless_present_any = ["node_data_dir", "enrolled_as"]
         )]
         file: Option<PathBuf>,
+        /// The enrolled context whose identity this one reuses, addressing
+        /// another session of the same tenant (`--session`).
+        #[arg(long, requires = "session")]
+        enrolled_as: Option<String>,
+        /// The session the new context addresses, as a 32-hex-digit id.
+        #[arg(long)]
+        session: Option<String>,
     },
     /// Redeem a private client invitation; retry with the same name after interruption.
     Enroll {
@@ -51,8 +66,22 @@ pub(crate) enum ContextCommand {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "transport", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Profile {
-    Unix { node_data_dir: PathBuf },
-    Enrolled { enrollment: PathBuf },
+    Unix {
+        node_data_dir: PathBuf,
+        /// Another ledger the node serves through its local socket: a session
+        /// of a served tenant that an operator created or restored (26 §6).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tenant: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+    },
+    Enrolled {
+        enrollment: PathBuf,
+        /// A session of the enrolled tenant other than the founder's own:
+        /// one an operator created or restored (26 §6).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+    },
     Quic(Box<QuicProfile>),
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,8 +215,31 @@ impl Store {
 impl Profile {
     fn validate(&self) -> Result<()> {
         match self {
-            Self::Unix { node_data_dir } => absolute(node_data_dir),
-            Self::Enrolled { enrollment } => absolute(enrollment),
+            Self::Unix {
+                node_data_dir,
+                tenant,
+                session,
+            } => {
+                if let Some(tenant) = tenant {
+                    parse_id(tenant)?;
+                }
+                if let Some(session) = session {
+                    parse_id(session)?;
+                }
+                if tenant.is_some() != session.is_some() {
+                    return Err(InputError::Invalid("tenant and session go together").into());
+                }
+                absolute(node_data_dir)
+            }
+            Self::Enrolled {
+                enrollment,
+                session,
+            } => {
+                if let Some(session) = session {
+                    parse_id(session)?;
+                }
+                absolute(enrollment)
+            }
             Self::Quic(profile) => {
                 let QuicProfile {
                     endpoint,
@@ -231,12 +283,24 @@ impl Profile {
     }
     fn redacted(&self) -> serde_json::Value {
         match self {
-            Self::Unix { node_data_dir } => {
-                serde_json::json!({"transport":"unix","node_data_dir":node_data_dir})
-            }
-            Self::Enrolled { .. } => {
-                serde_json::json!({"transport":"quic","credentials":"enrolled private identity"})
-            }
+            Self::Unix {
+                node_data_dir,
+                tenant,
+                session,
+            } => match (tenant, session) {
+                (Some(tenant), Some(session)) => {
+                    serde_json::json!({"transport":"unix","node_data_dir":node_data_dir,"tenant":tenant,"session":session})
+                }
+                _ => serde_json::json!({"transport":"unix","node_data_dir":node_data_dir}),
+            },
+            Self::Enrolled { session, .. } => match session {
+                Some(session) => {
+                    serde_json::json!({"transport":"quic","credentials":"enrolled private identity","session":session})
+                }
+                None => {
+                    serde_json::json!({"transport":"quic","credentials":"enrolled private identity"})
+                }
+            },
             Self::Quic(profile) => {
                 let QuicProfile {
                     endpoint,
@@ -307,14 +371,39 @@ pub(crate) fn run(
         ContextCommand::Add {
             name: selected,
             node_data_dir,
+            tenant,
             file,
+            enrolled_as,
+            session,
         } => {
             name(&selected)?;
-            let profile = match (node_data_dir, file) {
-                (Some(path), None) => Profile::Unix {
+            let profile = match (node_data_dir, file, enrolled_as) {
+                (None, None, Some(source)) => {
+                    let session = session.ok_or(InputError::Invalid("session"))?;
+                    parse_id(&session)?;
+                    match store
+                        .as_ref()
+                        .and_then(|store| store.catalog.profiles.get(&source))
+                    {
+                        Some(Profile::Enrolled { enrollment, .. }) => Profile::Enrolled {
+                            enrollment: enrollment.clone(),
+                            session: Some(session),
+                        },
+                        Some(_) => {
+                            return Err(InputError::Invalid(
+                                "only an enrolled context can address another session",
+                            )
+                            .into());
+                        }
+                        None => return Err(CliError::NotFound),
+                    }
+                }
+                (Some(path), None, None) => Profile::Unix {
                     node_data_dir: fs::canonicalize(path)?,
+                    tenant,
+                    session,
                 },
-                (None, Some(path)) => parse_document(
+                (None, Some(path), None) => parse_document(
                     &super::documents::read_bytes(&path, LIMIT)?,
                     if path
                         .extension()
@@ -325,7 +414,12 @@ pub(crate) fn run(
                         InputFormat::Json
                     },
                 )?,
-                _ => return Err(InputError::Invalid("choose node-data-dir or file").into()),
+                _ => {
+                    return Err(InputError::Invalid(
+                        "choose node-data-dir, file, or enrolled-as with session",
+                    )
+                    .into());
+                }
             };
             profile.validate()?;
             let store = store.as_mut().ok_or(CliError::InvalidResponse)?;
@@ -492,14 +586,31 @@ impl ClientTransport for Transport {
 pub(super) fn connect(profile: Profile, history: PathBuf) -> Result<Context> {
     profile.validate()?;
     match profile {
-        Profile::Unix { node_data_dir } => {
+        Profile::Unix {
+            node_data_dir,
+            tenant,
+            session,
+        } => {
             let mut settings = Settings::default();
             settings.node.data_dir = Some(node_data_dir);
             let mut context = Context::open_local(&settings)?;
             context.root = history;
+            // The node serves the sessions of every tenant it admits through
+            // its local socket; a saved connection may address one of them.
+            if let (Some(tenant), Some(session)) = (tenant, session) {
+                let ledger = LedgerId {
+                    tenant: TenantId(parse_id(&tenant)?),
+                    session: SessionId(parse_id(&session)?),
+                };
+                context.build.ledger = ledger;
+                context.operation.ledger = ledger;
+            }
             Ok(context)
         }
-        Profile::Enrolled { enrollment } => {
+        Profile::Enrolled {
+            enrollment,
+            session,
+        } => {
             let pending = focal_node::network_join::PendingClientJoin::resume_shared(enrollment)
                 .map_err(other)?;
             let receipt = pending.enrollment().map_err(other)?.ok_or(InputError::Invalid("client enrollment is pending; retry context enroll with its original invitation"))?;
@@ -517,15 +628,24 @@ pub(super) fn connect(profile: Profile, history: PathBuf) -> Result<Context> {
             )
             .map_err(other)?;
             let actor = ParticipantId(receipt.identity.principal);
+            // The enrolled identity may address another session of its
+            // tenant: one the operator created or restored.
+            let ledger = match session {
+                Some(session) => LedgerId {
+                    tenant: founder.ledger.tenant,
+                    session: SessionId(parse_id(&session)?),
+                },
+                None => founder.ledger,
+            };
             let build = BuildContext {
-                ledger: founder.ledger,
+                ledger,
                 actor,
                 root: founder.root,
                 policy_revision: 1,
             };
             let operation = OperationContext {
                 cluster: founder.cluster,
-                ledger: founder.ledger,
+                ledger,
                 principal: actor,
             };
             let transport = Transport::Quic(Box::new(Remote {
@@ -617,7 +737,7 @@ pub(super) fn connect(profile: Profile, history: PathBuf) -> Result<Context> {
 pub(crate) fn admin_settings(settings: &Settings, selection: Option<&str>) -> Result<Settings> {
     match selected(settings, selection)? {
         None => Ok(settings.clone()),
-        Some((Profile::Unix { node_data_dir }, _, _)) => {
+        Some((Profile::Unix { node_data_dir, .. }, _, _)) => {
             let mut resolved=Settings::default();
             resolved.node.data_dir=Some(node_data_dir);
             Ok(resolved)
@@ -651,6 +771,7 @@ fn enroll(
     let path = root.join(CATALOG).join(format!("enrollment-{selected}"));
     let profile = Profile::Enrolled {
         enrollment: path.clone(),
+        session: None,
     };
     if let Some(old) = store
         .catalog
@@ -767,6 +888,8 @@ mod tests {
             "alice".into(),
             Profile::Unix {
                 node_data_dir: root.path().into(),
+                tenant: None,
+                session: None,
             },
         );
         store.catalog.selected = Some("alice".into());
@@ -850,6 +973,8 @@ mod tests {
             "near".into(),
             Profile::Unix {
                 node_data_dir: node.clone(),
+                tenant: None,
+                session: None,
             },
         );
         store.catalog.selected = Some("near".into());
@@ -859,6 +984,7 @@ mod tests {
             "far".into(),
             Profile::Enrolled {
                 enrollment: root.path().join("private-enrollment"),
+                session: None,
             },
         );
         store.save().unwrap();

@@ -506,7 +506,7 @@ fn two_authorized_increment_registry_seals_publish_together_after_the_actual_pen
         .state
         .rows
         .prepare_after_with(
-            &receipt.range,
+            &receipt.fragments,
             sequence.0,
             changes,
             BudgetLane::Ordinary,
@@ -514,7 +514,7 @@ fn two_authorized_increment_registry_seals_publish_together_after_the_actual_pen
         )
         .unwrap();
     let sealed = NativePrepared {
-        range,
+        fragments: range,
         outcome,
         writes: mutation::WriteSet::unrecorded(),
     };

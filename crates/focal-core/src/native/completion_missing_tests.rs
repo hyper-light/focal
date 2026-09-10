@@ -72,7 +72,7 @@ fn altered(
         usize::try_from(original.outcome.events).unwrap()
     );
     let changes = original
-        .range
+        .fragments
         .entries()
         .map(|entry| {
             let (row, heap) = match entry.key {
@@ -99,7 +99,7 @@ fn altered(
         )
         .unwrap();
     NativePrepared {
-        range,
+        fragments: range,
         outcome: original.outcome,
         writes: crate::native::mutation::WriteSet::unrecorded(),
     }
@@ -262,7 +262,7 @@ fn collector_requires_the_structural_fact_and_entry_order_without_creating_repor
     let original = events(prepared);
     let (missing, key) = observer(&original);
     let entry = crate::native::response_reads::as_response_record(
-        prepared.range.get(&Key::Response(RESPONSE)),
+        prepared.fragments.get(&Key::Response(RESPONSE)),
     )
     .unwrap()
     .entered()

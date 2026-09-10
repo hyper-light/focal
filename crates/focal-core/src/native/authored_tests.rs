@@ -14,8 +14,8 @@ mod integrity_tests;
 #[path = "authored_lifecycle_tests.rs"]
 mod lifecycle_tests;
 
-const ISSUER: ParticipantId = ParticipantId::from_u128(1);
-const SUBJECT: ParticipantId = ParticipantId::from_u128(2);
+pub(in crate::native) const ISSUER: ParticipantId = ParticipantId::from_u128(1);
+pub(in crate::native) const SUBJECT: ParticipantId = ParticipantId::from_u128(2);
 
 fn ledger() -> LedgerId {
     LedgerId {
@@ -24,7 +24,7 @@ fn ledger() -> LedgerId {
     }
 }
 
-fn limits() -> NativeLimits {
+pub(in crate::native) fn limits() -> NativeLimits {
     NativeLimits {
         range: RangeConfig {
             page_entries: 8,
@@ -38,7 +38,7 @@ fn limits() -> NativeLimits {
     }
 }
 
-fn core() -> Core<NativeState> {
+pub(in crate::native) fn core() -> Core<NativeState> {
     Core::new_native_authored(
         ledger(),
         RangeId(405),
@@ -176,7 +176,7 @@ fn proposal_with(
     }
 }
 
-fn proposal(id: u128, validation_id: u128) -> NativeAuthoredProposal {
+pub(in crate::native) fn proposal(id: u128, validation_id: u128) -> NativeAuthoredProposal {
     proposal_with(id, validation_id, SUBJECT, ActionType::Work, &[])
 }
 
@@ -191,7 +191,7 @@ fn relation(kind: RelationKind, id: u128) -> Relation {
     }
 }
 
-fn key(id: u128) -> RequestKey {
+pub(in crate::native) fn key(id: u128) -> RequestKey {
     RequestKey {
         principal: ISSUER,
         epoch: RequestEpoch(1),
@@ -206,14 +206,14 @@ fn context(actor: ParticipantId) -> NativeContext {
     }
 }
 
-fn input(request: u128, command: NativeCommand) -> NativeInput {
+pub(in crate::native) fn input(request: u128, command: NativeCommand) -> NativeInput {
     NativeInput {
         request: key(request),
         command,
     }
 }
 
-fn create(request: u128, claims: Vec<NativeAuthoredProposal>) -> NativeInput {
+pub(in crate::native) fn create(request: u128, claims: Vec<NativeAuthoredProposal>) -> NativeInput {
     input(request, NativeCommand::CreateAuthored { claims })
 }
 
@@ -231,7 +231,10 @@ fn prepare(
     }
 }
 
-fn publish(core: &mut Core<NativeState>, input: NativeInput) -> NativeOutcome {
+pub(in crate::native) fn publish(
+    core: &mut Core<NativeState>,
+    input: NativeInput,
+) -> NativeOutcome {
     let prepared = prepare(core, input, &[]);
     core.publish_native(prepared).unwrap()
 }

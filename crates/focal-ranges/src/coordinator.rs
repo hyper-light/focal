@@ -32,12 +32,16 @@ pub struct HistoricalMap {
 pub struct RangeCheckpoint {
     pub schema: u16,
     pub map: RangeMap,
+    /// One more per applied movement record; zero before the first.
+    pub control_ordinal: u64,
+    /// The native prefix the last movement record applied at.
     pub control_sequence: SessionSeq,
     pub last_commit: Option<CommitProof>,
     pub published: SessionSeq,
     pub pending: Option<TransferState>,
     pub history: Vec<HistoricalMap>,
 }
+pub const CHECKPOINT_SCHEMA: u16 = 2;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RangeOperation {
     Begin(RangeIntent),
@@ -116,8 +120,14 @@ impl ActivationCertificate {
         verify_commit(
             &self.commit,
             self.intent.ledger,
+            self.commit.ordinal,
             self.commit.sequence,
-            range_command_hash(self.intent.ledger, self.commit.sequence, &operation)?,
+            range_command_hash(
+                self.intent.ledger,
+                self.commit.ordinal,
+                self.commit.sequence,
+                &operation,
+            )?,
             verifier,
         )?;
         if self.commit.sequence <= self.barrier.sequence || self.barrier.sequence < self.intent.seed
@@ -135,10 +145,22 @@ impl ActivationCertificate {
 }
 pub fn range_command_hash(
     ledger: LedgerId,
+    ordinal: u64,
     sequence: SessionSeq,
     operation: &RangeOperation,
 ) -> Result<ContentHash, RangeError> {
-    digest("focal.range-command.v1", &(ledger, sequence, operation))
+    digest(
+        "focal.range-command.v2",
+        &(ledger, ordinal, sequence, operation),
+    )
+}
+/// The replica holders a transfer must hear from: proofs are demanded only
+/// of ranges a replica holds; the voters' proof is the log.
+fn replica_held(ranges: &[RangeDescriptor]) -> usize {
+    ranges
+        .iter()
+        .filter(|range| range.meta.owner.replica().is_some())
+        .count()
 }
 fn proof_digest(
     intent: &RangeIntent,
@@ -158,8 +180,9 @@ struct Version {
 }
 pub struct PreparedRangeCommand {
     owner: focal_memory::OwnerId,
-    base_sequence: SessionSeq,
+    base_ordinal: u64,
     next: Version,
+    ordinal: u64,
     sequence: SessionSeq,
     hash: ContentHash,
     operation: RangeOperation,
@@ -171,6 +194,15 @@ impl PreparedRangeCommand {
     }
     pub fn hash(&self) -> ContentHash {
         self.hash
+    }
+    pub fn ordinal(&self) -> u64 {
+        self.ordinal
+    }
+    pub fn sequence(&self) -> SessionSeq {
+        self.sequence
+    }
+    pub fn operation(&self) -> &RangeOperation {
+        &self.operation
     }
 }
 pub struct RangeCoordinator {
@@ -193,8 +225,9 @@ impl RangeCoordinator {
     ) -> Result<Self, RangeError> {
         Self::restore(
             RangeCheckpoint {
-                schema: 1,
+                schema: CHECKPOINT_SCHEMA,
                 map,
+                control_ordinal: 0,
                 control_sequence: SessionSeq(0),
                 last_commit: None,
                 published: SessionSeq(0),
@@ -302,14 +335,19 @@ impl RangeCoordinator {
             unchanged,
         })
     }
+    /// Check one movement record against the committed state: `ordinal` must
+    /// be the next control ordinal (the same one with the same command is the
+    /// record already applied), `sequence` the native prefix it applies at.
     pub fn prepare(
         &self,
+        ordinal: u64,
         sequence: SessionSeq,
         operation: RangeOperation,
         verifier: &impl RangeVerifier,
     ) -> Result<PreparedRangeCommand, RangeError> {
-        let hash = range_command_hash(self.map().ledger(), sequence, &operation)?;
-        if sequence == self.root.state.control_sequence
+        let hash = range_command_hash(self.map().ledger(), ordinal, sequence, &operation)?;
+        if ordinal == self.root.state.control_ordinal
+            && sequence == self.root.state.control_sequence
             && self
                 .root
                 .state
@@ -327,19 +365,30 @@ impl RangeCoordinator {
                 .commit();
             return Ok(PreparedRangeCommand {
                 owner: self.owner,
-                base_sequence: self.root.state.control_sequence,
+                base_ordinal: self.root.state.control_ordinal,
                 next: Version {
                     state: self.root.state.clone(),
                     _allocation: allocation,
                 },
+                ordinal,
                 sequence,
                 hash,
                 operation,
                 existing: true,
             });
         }
-        if sequence <= self.root.state.control_sequence {
+        if ordinal
+            != self
+                .root
+                .state
+                .control_ordinal
+                .checked_add(1)
+                .ok_or(RangeError::Overflow)?
+        {
             return Err(RangeError::RetryTooOld);
+        }
+        if sequence < self.root.state.control_sequence {
+            return Err(RangeError::Conflict);
         }
         let command_bytes = postcard::experimental::serialized_size(&operation)?;
         if command_bytes > self.limits.max_checkpoint_bytes {
@@ -399,11 +448,13 @@ impl RangeCoordinator {
                 hash,
             } => {
                 let pending = pending(&mut state, *operation)?;
+                // A seed names a replica-held replacement; the voters seed
+                // theirs from the log.
                 if !pending
                     .intent
                     .replacements
                     .iter()
-                    .any(|item| item.id == *range)
+                    .any(|item| item.id == *range && item.meta.owner.replica().is_some())
                     || !nonzero(*hash)
                 {
                     return Err(RangeError::Checksum);
@@ -415,7 +466,7 @@ impl RangeCoordinator {
             }
             RangeOperation::Barrier { operation } => {
                 let pending = pending(&mut state, *operation)?;
-                if pending.snapshots.len() != pending.intent.replacements.len() {
+                if pending.snapshots.len() != replica_held(&pending.intent.replacements) {
                     return Err(RangeError::NotReady);
                 }
                 if pending.barrier.is_some() {
@@ -424,7 +475,7 @@ impl RangeCoordinator {
                 if sequence < pending.intent.seed {
                     return Err(RangeError::StaleEpoch);
                 }
-                pending.barrier = Some(placeholder(pending.intent.ledger, sequence, hash));
+                pending.barrier = Some(placeholder(pending.intent.ledger, ordinal, sequence, hash));
             }
             RangeOperation::SourceSealed(proof) => {
                 let source = state
@@ -438,7 +489,7 @@ impl RangeCoordinator {
                     || proof.old_epoch != pending.intent.old_epoch
                     || !pending.intent.sources.contains(&proof.range)
                     || proof.range_generation != source.generation
-                    || proof.replica != source.owner
+                    || source.meta.owner != Holder::Replica(proof.replica)
                     || proof.cut != barrier.sequence
                     || !nonzero(proof.checkpoint)
                     || !nonzero(proof.attestation)
@@ -467,7 +518,7 @@ impl RangeCoordinator {
                 if proof.ledger != pending.intent.ledger
                     || proof.new_epoch != pending.desired.epoch()
                     || proof.range_generation != target.generation
-                    || proof.replica != target.owner
+                    || target.meta.owner != Holder::Replica(proof.replica)
                     || proof.seed != pending.intent.seed
                     || proof.through < barrier.sequence
                     || pending.snapshots.get(&proof.range) != Some(&proof.snapshot)
@@ -507,17 +558,29 @@ impl RangeCoordinator {
                 {
                     return Err(RangeError::Checksum);
                 }
-                if pending.source_seals.len() != pending.intent.sources.len()
-                    || pending.ready.len() != pending.intent.replacements.len()
-                    || sequence <= barrier.sequence
+                let sources: Vec<RangeDescriptor> = pending
+                    .intent
+                    .sources
+                    .iter()
+                    .filter_map(|id| state.map.get(*id).cloned())
+                    .collect();
+                if sources.len() != pending.intent.sources.len()
+                    || pending.source_seals.len() != replica_held(&sources)
+                    || pending.ready.len() != replica_held(&pending.intent.replacements)
+                    || sequence < barrier.sequence
                 {
                     return Err(RangeError::NotReady);
                 }
+                // Progress is demanded of the replica-held members that stay;
+                // the voters' members progress with the log itself.
                 let others: Vec<_> = state
                     .map
                     .ranges()
                     .iter()
-                    .filter(|range| !pending.intent.sources.contains(&range.id))
+                    .filter(|range| {
+                        !pending.intent.sources.contains(&range.id)
+                            && range.meta.owner.replica().is_some()
+                    })
                     .collect();
                 if unchanged.len() != others.len() {
                     return Err(RangeError::NotReady);
@@ -545,7 +608,7 @@ impl RangeCoordinator {
                     sources: pending.source_seals,
                     destinations: pending.ready,
                     unchanged: unchanged.clone(),
-                    commit: placeholder(state.map.ledger(), sequence, hash),
+                    commit: placeholder(state.map.ledger(), ordinal, sequence, hash),
                 };
                 state.history.push(HistoricalMap {
                     map: state.map.clone(),
@@ -585,24 +648,56 @@ impl RangeCoordinator {
                 state.history.remove(position);
             }
         }
+        state.control_ordinal = ordinal;
         state.control_sequence = sequence;
-        state.last_commit = Some(placeholder(state.map.ledger(), sequence, hash));
+        state.last_commit = Some(placeholder(state.map.ledger(), ordinal, sequence, hash));
         if state_charge(&state)? > bytes {
             return Err(RangeError::Capacity);
         }
         // Incomplete commit proofs exist only inside this private preparation.
         Ok(PreparedRangeCommand {
             owner: self.owner,
-            base_sequence: self.root.state.control_sequence,
+            base_ordinal: self.root.state.control_ordinal,
             next: Version {
                 state,
                 _allocation: allocation,
             },
+            ordinal,
             sequence,
             hash,
             operation,
             existing: false,
         })
+    }
+    /// Re-lay the map after a committed layout change (25 §6): the sources
+    /// are replaced by their successors, each carrying its parent's
+    /// placement, under the next range epoch. Refused while a transfer is
+    /// pending, so the map and the layout never diverge; the history and
+    /// the pending state are untouched.
+    pub fn relayout(
+        &mut self,
+        sources: &BTreeSet<RangeId>,
+        replacements: Vec<RangeDescriptor>,
+    ) -> Result<(), RangeError> {
+        if self.root.state.pending.is_some() {
+            return Err(RangeError::Phase);
+        }
+        let mut state = self.root.state.clone();
+        state.map = state.map.replace(sources, replacements, self.limits)?;
+        let allocation = self
+            .budget
+            .reserve(
+                BudgetKind::Control,
+                BudgetLane::Completion,
+                state_charge(&state)?,
+            )?
+            .commit();
+        self.progress.clear();
+        self.root = Version {
+            state,
+            _allocation: allocation,
+        };
+        Ok(())
     }
     pub fn publish(
         &mut self,
@@ -610,14 +705,14 @@ impl RangeCoordinator {
         proof: &CommitProof,
         verifier: &impl RangeVerifier,
     ) -> Result<(), RangeError> {
-        if self.owner != prepared.owner
-            || self.root.state.control_sequence != prepared.base_sequence
+        if self.owner != prepared.owner || self.root.state.control_ordinal != prepared.base_ordinal
         {
             return Err(RangeError::StalePreparation);
         }
         verify_commit(
             proof,
             self.map().ledger(),
+            prepared.ordinal,
             prepared.sequence,
             prepared.hash,
             verifier,
@@ -629,13 +724,9 @@ impl RangeCoordinator {
                 Err(RangeError::Conflict)
             };
         }
-        if self
-            .root
-            .state
-            .last_commit
-            .as_ref()
-            .is_some_and(|old| proof.index <= old.index || proof.term < old.term)
-        {
+        if self.root.state.last_commit.as_ref().is_some_and(|old| {
+            proof.index <= old.index || proof.term < old.term || proof.ordinal <= old.ordinal
+        }) {
             return Err(RangeError::StaleEpoch);
         }
         let state = &mut prepared.next.state;
@@ -708,15 +799,21 @@ impl RangeCoordinator {
         }
         Ok(())
     }
+    /// The prefix every holder has materialized: the least progress among
+    /// the replica-held members (each must have reported at this term),
+    /// bounded by the committed prefix; a group the voters alone hold
+    /// publishes what the log committed.
     pub fn published(&self) -> Option<SessionSeq> {
-        if self.progress.len() != self.map().ranges().len() {
+        let held = replica_held(self.map().ranges());
+        if self.progress.len() != held {
             return None;
         }
         let candidate = self
             .progress
             .values()
             .map(|proof| proof.through)
-            .min()?
+            .min()
+            .unwrap_or(self.committed)
             .min(self.committed);
         (candidate >= self.root.state.published).then_some(candidate)
     }
@@ -760,9 +857,15 @@ impl RangeCoordinator {
         self.pins.advance(now)
     }
 }
-fn placeholder(ledger: LedgerId, sequence: SessionSeq, command: ContentHash) -> CommitProof {
+fn placeholder(
+    ledger: LedgerId,
+    ordinal: u64,
+    sequence: SessionSeq,
+    command: ContentHash,
+) -> CommitProof {
     CommitProof {
         ledger,
+        ordinal,
         sequence,
         index: focal_model::RaftIndex(0),
         term: RaftTerm(0),
@@ -787,7 +890,7 @@ fn validate_progress(map: &RangeMap, proof: &RangeProgress) -> Result<(), RangeE
     let range = map.get(proof.range).ok_or(RangeError::Missing)?;
     if proof.epoch != map.epoch()
         || proof.range_generation != range.generation
-        || proof.replica != range.owner
+        || range.meta.owner != Holder::Replica(proof.replica)
     {
         return Err(RangeError::Generation);
     }
@@ -804,12 +907,13 @@ fn state_charge(state: &RangeCheckpoint) -> Result<usize, RangeError> {
 }
 fn validate_checkpoint(state: &RangeCheckpoint, limits: RangeLimits) -> Result<(), RangeError> {
     state.map.validate(limits)?;
-    if state.schema != 1 || state.history.len() > limits.max_history {
+    if state.schema != CHECKPOINT_SCHEMA || state.history.len() > limits.max_history {
         return Err(RangeError::Capacity);
     }
-    if (state.control_sequence.0 == 0) != state.last_commit.is_none()
+    if (state.control_ordinal == 0) != state.last_commit.is_none()
         || state.last_commit.as_ref().is_some_and(|proof| {
             proof.ledger != state.map.ledger()
+                || proof.ordinal != state.control_ordinal
                 || proof.sequence != state.control_sequence
                 || proof.index.0 == 0
                 || proof.term.0 == 0
@@ -837,10 +941,12 @@ fn validate_checkpoint(state: &RangeCheckpoint, limits: RangeLimits) -> Result<(
         if let Some(barrier) = &pending.barrier {
             if barrier.sequence < pending.intent.seed
                 || barrier.sequence > state.control_sequence
+                || barrier.ordinal > state.control_ordinal
                 || barrier.ledger != state.map.ledger()
                 || barrier.command
                     != range_command_hash(
                         state.map.ledger(),
+                        barrier.ordinal,
                         barrier.sequence,
                         &RangeOperation::Barrier {
                             operation: pending.intent.operation,

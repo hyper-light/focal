@@ -59,8 +59,10 @@ impl ConstructionBudget {
         let batch = limits.range.max_batch_entries;
         let (scratch_bytes, max_claim_rows, max_changes, extras_count, max_events) = match operation
         {
-            // Import never prepares a mutation; it is a one-time translation (23 §5).
-            NativeOperation::Import => {
+            // Import never prepares a mutation; it is a one-time translation
+            // (23 §5). A retirement is a session decision applied through the
+            // core, never an admitted mutation (26 §4).
+            NativeOperation::Import | NativeOperation::Retire => {
                 return Err(focal_model::lifecycle::ContractError::InvalidTransition.into());
             }
             NativeOperation::AdoptReceipt => (

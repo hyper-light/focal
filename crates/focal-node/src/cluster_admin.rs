@@ -58,6 +58,16 @@ pub enum ClusterAdminError {
     Invalid,
     #[error("invitation was not found in the committed enrollment registry")]
     NotFound,
+    #[error(
+        "node {node} still holds copies of {sessions} session(s); wait for the drain to finish"
+    )]
+    NodeHolding { node: u64, sessions: usize },
+    #[error("node {0} is still eligible for placement; drain it first")]
+    NotDrained(u64),
+    #[error("node {0} is not enrolled in the directory")]
+    UnknownNode(u64),
+    #[error("node {0} is not alive, eligible and reporting; it cannot take over")]
+    NotReady(u64),
     #[error("bounded admin capacity or request sequence is exhausted")]
     Capacity,
 }
@@ -93,6 +103,14 @@ impl ClusterAdminError {
                 code: "not_found",
                 exit_code: 4,
             },
+            Self::UnknownNode(_) => Failure {
+                condition: "NotFound",
+                code: "unknown_node",
+                exit_code: 4,
+            },
+            Self::NodeHolding { .. } => Failure::error("node_holding", 5),
+            Self::NotDrained(_) => Failure::error("not_drained", 5),
+            Self::NotReady(_) => Failure::error("node_not_ready", 5),
             Self::Invalid | Self::Control(ControlFailure::Invalid | ControlFailure::RetryOrder) => {
                 Failure::error("invalid_input", 2)
             }
@@ -181,8 +199,164 @@ impl ClusterAdmin {
                     diagnostics: *value,
                 })
             }
+            (OperatorRead::Storage, OperatorReply::Storage(value))
+                if value.node == self.identity.node =>
+            {
+                Ok(AdminResult::Storage { storage: *value })
+            }
+            (OperatorRead::Gc, OperatorReply::Gc(value))
+                if value.node == self.identity.node
+                    && value
+                        .last
+                        .is_none_or(|pass| pass.finished_ms >= pass.started_ms) =>
+            {
+                Ok(AdminResult::Gc { gc: *value })
+            }
+            (OperatorRead::Archive { session, claim }, OperatorReply::Archive(value))
+                if value.as_ref().is_none_or(|archive| {
+                    archive.session == session.to_string()
+                        && archive.claim == hex(&claim.0)
+                        && focal_client::input::parse_id(&archive.group).is_ok()
+                        && focal_client::input::parse_hash(&archive.bundle).is_ok()
+                        && archive.bytes != 0
+                        && archive.through != 0
+                        && archive.retired_at > archive.through
+                }) =>
+            {
+                Ok(AdminResult::Archive {
+                    session: session.to_string(),
+                    claim: hex(&claim.0),
+                    archive: value.map(|archive| *archive),
+                })
+            }
             _ => Err(ClusterAdminError::Invalid),
         }
+    }
+    /// A native session's retention floor and archive counts (26 §3, §4),
+    /// read from the replica's diagnostics.
+    pub async fn retention(&self, session: focal_model::SessionId) -> Result<AdminResult> {
+        match self
+            .operator(crate::network_admin::OperatorRead::Replica { session })
+            .await?
+        {
+            AdminResult::ReplicaDiagnostics { diagnostics } => Ok(AdminResult::Retention {
+                session: diagnostics.session,
+                group: diagnostics.group,
+                retention: diagnostics.retention,
+            }),
+            _ => Err(ClusterAdminError::Invalid),
+        }
+    }
+    /// The collector's state on this node (26 §5).
+    pub async fn gc(&self) -> Result<AdminResult> {
+        self.operator(crate::network_admin::OperatorRead::Gc).await
+    }
+    /// The storage view of this node (26 §7).
+    pub async fn storage(&self) -> Result<AdminResult> {
+        self.operator(crate::network_admin::OperatorRead::Storage)
+            .await
+    }
+    /// Bring a quarantined content object back (26 §5).
+    pub async fn gc_restore(
+        &self,
+        domain: focal_model::ContentDomainId,
+        root: focal_model::ContentHash,
+    ) -> Result<AdminResult> {
+        let bytes = self
+            .exchange_bytes(AdminCommand::GcRestore {
+                domain: domain.0,
+                root: root.0,
+            })
+            .await?;
+        let (reply, tail): (crate::network_admin::GcRestoreReply, _) =
+            postcard::take_from_bytes(&bytes).map_err(|_| ClusterAdminError::Invalid)?;
+        if !tail.is_empty() || reply.schema != crate::network_admin::GC_RESTORE_REPLY_SCHEMA {
+            return Err(ClusterAdminError::Invalid);
+        }
+        Ok(AdminResult::GcRestored {
+            domain: hex(&domain.0),
+            root: hex(&root.0),
+            restored: reply.restored,
+        })
+    }
+    /// Write a backup of a hosted session at its committed prefix into
+    /// `output` on this node (26 §6).
+    pub async fn backup_create(
+        &self,
+        ledger: focal_model::LedgerId,
+        output: &Path,
+    ) -> Result<AdminResult> {
+        let output = std::path::absolute(output)?
+            .to_str()
+            .ok_or(ClusterAdminError::Invalid)?
+            .to_owned();
+        let bytes = self
+            .exchange_bytes(AdminCommand::BackupCreate {
+                tenant: ledger.tenant.0,
+                session: ledger.session.0,
+                output,
+            })
+            .await?;
+        let (reply, tail): (crate::network_admin::BackupCreatedReply, _) =
+            postcard::take_from_bytes(&bytes).map_err(|_| ClusterAdminError::Invalid)?;
+        if !tail.is_empty()
+            || reply.schema != crate::network_admin::BACKUP_CREATED_REPLY_SCHEMA
+            || reply.backup.prefix.session != ledger.session.to_string()
+            || reply.backup.prefix.tenant != ledger.tenant.to_string()
+            || reply.backup.prefix.node != self.identity.node
+        {
+            return Err(ClusterAdminError::Invalid);
+        }
+        Ok(AdminResult::BackupCreated {
+            backup: reply.backup,
+        })
+    }
+    /// Verify a backup directory offline (26 §6): no running node and no
+    /// data directory are needed, only a binary that can read the format.
+    pub fn backup_verify(input: &Path) -> Result<AdminResult> {
+        let verification = crate::backup::verify(input).map_err(|error| match error {
+            focal_ledger::backup::BackupError::Io(error) => ClusterAdminError::Io(error),
+            focal_ledger::backup::BackupError::Missing(_)
+            | focal_ledger::backup::BackupError::Corrupt(_)
+            | focal_ledger::backup::BackupError::Unsupported => ClusterAdminError::Corrupt,
+            focal_ledger::backup::BackupError::Exists => ClusterAdminError::Invalid,
+            _ => ClusterAdminError::Capacity,
+        })?;
+        Ok(AdminResult::BackupVerified { verification })
+    }
+    /// Restore a session from a verified backup onto this node (26 §6).
+    pub async fn restore(&self, input: &Path, new_incarnation: bool) -> Result<AdminResult> {
+        let input = std::path::absolute(input)?
+            .to_str()
+            .ok_or(ClusterAdminError::Invalid)?
+            .to_owned();
+        let bytes = self
+            .exchange_bytes(AdminCommand::Restore {
+                input,
+                new_incarnation,
+            })
+            .await?;
+        let (reply, tail): (crate::network_admin::RestoredReply, _) =
+            postcard::take_from_bytes(&bytes).map_err(|_| ClusterAdminError::Invalid)?;
+        if !tail.is_empty()
+            || reply.schema != crate::network_admin::RESTORED_REPLY_SCHEMA
+            || reply.restored.node != self.identity.node
+        {
+            return Err(ClusterAdminError::Invalid);
+        }
+        Ok(AdminResult::Restored {
+            restored: reply.restored,
+        })
+    }
+    /// A retired claim's archive bundle as this node holds and verifies it
+    /// (26 §4).
+    pub async fn archive(
+        &self,
+        session: focal_model::SessionId,
+        claim: focal_model::ClaimId,
+    ) -> Result<AdminResult> {
+        self.operator(crate::network_admin::OperatorRead::Archive { session, claim })
+            .await
     }
     /// Renew this node's own credential now, through its running controller.
     pub async fn renew_credential(&self) -> Result<AdminResult> {
@@ -208,10 +382,130 @@ impl ClusterAdmin {
             CredentialReply::Failed(error) => Err(error.into()),
         }
     }
+    async fn placement_reply(&self) -> Result<crate::network_admin::PlacementReply> {
+        let bytes = self.exchange_bytes(AdminCommand::Placement).await?;
+        let (reply, tail): (crate::network_admin::PlacementReply, _) =
+            postcard::take_from_bytes(&bytes).map_err(|_| ClusterAdminError::Invalid)?;
+        if !tail.is_empty() || reply.schema != crate::network_admin::PLACEMENT_REPLY_SCHEMA {
+            return Err(ClusterAdminError::Invalid);
+        }
+        Ok(reply)
+    }
+    /// Every partition this node acts on, with each session's guarantee.
+    pub async fn placement(&self) -> Result<AdminResult> {
+        Ok(AdminResult::Placement {
+            placement: self.placement_view().await?,
+        })
+    }
+    /// The placement view itself (deployment planning composes it).
+    pub async fn placement_view(&self) -> Result<focal_client::admin::AdminPlacement> {
+        Ok(self.placement_reply().await?.placement)
+    }
+    /// The controller's next bounded actions.
+    pub async fn plan(&self) -> Result<AdminResult> {
+        let reply = self.placement_reply().await?;
+        Ok(AdminResult::Plan {
+            actions: reply.actions,
+        })
+    }
+    async fn tenants_reply(
+        &self,
+        command: AdminCommand,
+    ) -> Result<crate::network_admin::TenantsReply> {
+        let bytes = self.exchange_bytes(command).await?;
+        let (reply, tail): (crate::network_admin::TenantsReply, _) =
+            postcard::take_from_bytes(&bytes).map_err(|_| ClusterAdminError::Invalid)?;
+        if !tail.is_empty()
+            || reply.schema != crate::network_admin::TENANTS_REPLY_SCHEMA
+            || reply.founder != self.identity.ledger.tenant.0
+            || reply.applied_index == 0
+            || reply.admitted.len() > 65536
+            || !reply
+                .admitted
+                .windows(2)
+                .all(|pair| matches!(pair, [left, right] if left < right))
+        {
+            return Err(ClusterAdminError::Invalid);
+        }
+        Ok(reply)
+    }
+    fn tenants_view(reply: crate::network_admin::TenantsReply) -> AdminResult {
+        AdminResult::Tenants {
+            founder: focal_model::TenantId(reply.founder).to_string(),
+            applied_index: reply.applied_index,
+            revision: reply.revision,
+            admitted: reply
+                .admitted
+                .into_iter()
+                .map(|tenant| focal_model::TenantId(tenant).to_string())
+                .collect(),
+        }
+    }
+    /// The tenants the cluster serves.
+    pub async fn tenants(&self) -> Result<AdminResult> {
+        Ok(Self::tenants_view(
+            self.tenants_reply(AdminCommand::Tenants).await?,
+        ))
+    }
+    /// Admit a tenant through the founder's enrollment authority; a retry of
+    /// an admitted tenant reads as done.
+    pub async fn admit_tenant(&self, tenant: [u8; 16]) -> Result<AdminResult> {
+        if tenant == [0; 16] {
+            return Err(ClusterAdminError::Invalid);
+        }
+        let reply = self
+            .tenants_reply(AdminCommand::AdmitTenant { tenant })
+            .await?;
+        if !reply.admitted.contains(&tenant) {
+            return Err(ClusterAdminError::Invalid);
+        }
+        Ok(Self::tenants_view(reply))
+    }
+    /// Create an application session on this node for a served tenant, or
+    /// find the one the same name already denotes.
+    pub async fn create_session(&self, tenant: [u8; 16], name: &str) -> Result<AdminResult> {
+        if tenant == [0; 16] {
+            return Err(ClusterAdminError::Invalid);
+        }
+        let bytes = self
+            .exchange_bytes(AdminCommand::CreateSession {
+                tenant,
+                name: name.into(),
+            })
+            .await?;
+        let (reply, tail): (crate::network_admin::SessionCreatedReply, _) =
+            postcard::take_from_bytes(&bytes).map_err(|_| ClusterAdminError::Invalid)?;
+        let expected = crate::placement_control::created_session_id(
+            self.identity.cluster,
+            focal_model::TenantId(tenant),
+            name,
+        )
+        .ok_or(ClusterAdminError::Invalid)?;
+        if !tail.is_empty()
+            || reply.schema != crate::network_admin::SESSION_CREATED_REPLY_SCHEMA
+            || reply.tenant != tenant
+            || reply.session != expected.0
+            || reply.node != self.identity.node
+            || reply.group == [0; 16]
+        {
+            return Err(ClusterAdminError::Invalid);
+        }
+        Ok(AdminResult::SessionCreated {
+            name: name.into(),
+            tenant: focal_model::TenantId(reply.tenant).to_string(),
+            session: focal_model::SessionId(reply.session).to_string(),
+            group: hex(&reply.group),
+            node: reply.node,
+            existing: reply.existing,
+        })
+    }
     pub fn open(settings: &Settings) -> Result<Self> {
         let root = settings.data_dir()?;
         let identity = decode_identity(&root.join("IDENTITY"))?;
         Ok(Self { root, identity })
+    }
+    pub fn root(&self) -> &Path {
+        &self.root
     }
     pub fn identity(&self) -> &NodeIdentity {
         &self.identity
@@ -544,6 +838,242 @@ impl ClusterAdmin {
         let (_, saved) = self.journal(false)?;
         saved_view(self.identity.node, &saved)
     }
+    /// Set a node's placement eligibility (24 §19): the root re-issues the
+    /// node's grant at its next generation, after which the controller heals
+    /// every placement that named the node and retires its copies (drain),
+    /// or considers it again (undrain). Exact on retry; a node already in the
+    /// requested state commits nothing.
+    pub async fn node_eligibility(&self, node: u64, eligible: bool) -> Result<AdminResult> {
+        if node == 0 {
+            return Err(ClusterAdminError::Invalid);
+        }
+        let (mut journal, mut saved) = self.journal(true)?;
+        if saved
+            .latest
+            .as_ref()
+            .is_some_and(|latest| latest.receipt.is_none() && !latest.superseded)
+        {
+            return Err(ClusterAdminError::Pending);
+        }
+        let reply = self
+            .exchange(AdminCommand::Read(AdminRead::PrepareEligibility {
+                node,
+                eligible,
+            }))
+            .await;
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(ClusterAdminError::Control(ControlFailure::Invalid)) => {
+                return Err(ClusterAdminError::UnknownNode(node));
+            }
+            Err(error) => return Err(error),
+        };
+        let ControlReply::Read(ControlReadResult::PreparedEligibility {
+            identity,
+            applied_index,
+            node: prepared,
+            generation,
+            eligible: prepared_eligible,
+            command,
+        }) = reply
+        else {
+            return Err(ClusterAdminError::Invalid);
+        };
+        if identity.cluster.0 != self.identity.cluster
+            || identity.group != crate::network_state::root_group(self.identity.cluster)
+            || applied_index == 0
+            || prepared != node
+            || prepared_eligible != eligible
+        {
+            return Err(ClusterAdminError::Invalid);
+        }
+        let Some(command) = command else {
+            return Ok(AdminResult::NodeEligibility {
+                node,
+                generation,
+                eligible,
+                changed: false,
+                operation_id: None,
+                committed_index: None,
+            });
+        };
+        let focal_directory::AuthorityOperation::GrantNode {
+            grant,
+            expected_generation: Some(expected),
+        } = &command.operation
+        else {
+            return Err(ClusterAdminError::Invalid);
+        };
+        if grant.enrollment.node != node
+            || grant.enrollment.eligible != eligible
+            || grant.enrollment.generation != generation
+            || Some(generation) != expected.checked_add(1)
+        {
+            return Err(ClusterAdminError::Invalid);
+        }
+        let sequence = saved.next_control;
+        let operation = saved.next;
+        saved.next = operation
+            .checked_add(1)
+            .ok_or(ClusterAdminError::Capacity)?;
+        sequence.checked_add(1).ok_or(ClusterAdminError::Capacity)?;
+        saved.latest = Some(Latest {
+            operation,
+            request: ControlRequest {
+                id: ControlRequestId {
+                    client: admin_principal(&self.identity).0,
+                    sequence,
+                },
+                acknowledged_through: sequence.checked_sub(1).ok_or(ClusterAdminError::Corrupt)?,
+                command: ControlCommand::Authority(*command),
+            },
+            receipt: None,
+            superseded: false,
+        });
+        save(&mut journal, &saved)?;
+        match self.drive(&mut journal, &mut saved).await? {
+            AdminResult::Committed {
+                operation_id,
+                committed_index,
+                ..
+            } => Ok(AdminResult::NodeEligibility {
+                node,
+                generation,
+                eligible,
+                changed: true,
+                operation_id: Some(operation_id),
+                committed_index: Some(committed_index),
+            }),
+            _ => Err(ClusterAdminError::Invalid),
+        }
+    }
+    /// Remove a drained node (24 §19): refused while its grant is eligible
+    /// or any session still names it (a voter, materializer, content copy
+    /// or retiring copy); then its root-group membership is removed when it
+    /// has one and the invitation that enrolled it is revoked. Each step is
+    /// an exact journaled request, so a repeated command resumes.
+    pub async fn remove_node(&self, node: u64) -> Result<AdminResult> {
+        if node == 0 || node == self.identity.node {
+            return Err(ClusterAdminError::Invalid);
+        }
+        let placement = self.placement_view().await?;
+        let mut record = None;
+        let mut holding = 0usize;
+        for partition in &placement.partitions {
+            if let Some(found) = partition.nodes.iter().find(|entry| entry.node == node) {
+                record = Some(found.clone());
+            }
+            holding = holding.saturating_add(
+                partition
+                    .sessions
+                    .iter()
+                    .filter(|session| {
+                        session.voters.contains(&node)
+                            || session.materializers.contains(&node)
+                            || session.content_copies.contains(&node)
+                            || session.retiring.contains(&node)
+                            || session.pending.as_ref().is_some_and(|pending| {
+                                pending.voters.contains(&node)
+                                    || pending
+                                        .progress
+                                        .iter()
+                                        .any(|progress| progress.node == node)
+                            })
+                    })
+                    .count(),
+            );
+        }
+        let record = record.ok_or(ClusterAdminError::UnknownNode(node))?;
+        if record.eligible {
+            return Err(ClusterAdminError::NotDrained(node));
+        }
+        if holding > 0 {
+            return Err(ClusterAdminError::NodeHolding {
+                node,
+                sessions: holding,
+            });
+        }
+        let current = self.configuration().await?;
+        let membership_removed = if current.configuration.contains(node) {
+            self.membership(MembershipChange::Remove { node }, None)
+                .await?;
+            true
+        } else {
+            false
+        };
+        // The invitation that enrolled the node, wherever it pages.
+        let mut after = None;
+        let mut invitation = None;
+        for _ in 0..64 {
+            let AdminResult::Invitations { entries, next, .. } = self
+                .read(AdminRead::Invitations {
+                    after,
+                    limit: 64,
+                    expected_revision: None,
+                })
+                .await?
+            else {
+                return Err(ClusterAdminError::Invalid);
+            };
+            if let Some(entry) = entries.iter().find(|entry| {
+                entry
+                    .credential
+                    .as_ref()
+                    .is_some_and(|credential| credential.node == Some(node))
+            }) {
+                invitation = Some((entry.id.clone(), entry.revoked));
+                break;
+            }
+            match next {
+                Some(next) => {
+                    after = Some(
+                        focal_client::input::parse_id(&next)
+                            .map_err(|_| ClusterAdminError::Invalid)?,
+                    );
+                }
+                None => break,
+            }
+        }
+        let (invitation, revoked) = match invitation {
+            Some((id, true)) => (Some(id), false),
+            Some((id, false)) => {
+                self.revoke(
+                    focal_client::input::parse_id(&id).map_err(|_| ClusterAdminError::Invalid)?,
+                    None,
+                )
+                .await?;
+                (Some(id), true)
+            }
+            None => (None, false),
+        };
+        Ok(AdminResult::NodeRemoved {
+            node,
+            membership_removed,
+            invitation,
+            revoked,
+        })
+    }
+    /// Replace a node (24 §19): drain `node` once `replacement` is enrolled,
+    /// alive, eligible and reporting, so the healed placements have a host
+    /// to move to. The planner chooses among every eligible node.
+    pub async fn replace_node(&self, node: u64, replacement: u64) -> Result<AdminResult> {
+        if node == 0 || replacement == 0 || node == replacement {
+            return Err(ClusterAdminError::Invalid);
+        }
+        let placement = self.placement_view().await?;
+        let ready = placement.partitions.iter().any(|partition| {
+            partition.nodes.iter().any(|entry| {
+                entry.node == replacement
+                    && entry.alive
+                    && entry.eligible
+                    && entry.disk_available.is_some()
+            })
+        });
+        if !ready {
+            return Err(ClusterAdminError::NotReady(replacement));
+        }
+        self.node_eligibility(node, false).await
+    }
     pub async fn transfer(&self, target: u64, expected_index: Option<u64>) -> Result<AdminResult> {
         let current = self.configuration().await?;
         if expected_index.is_some_and(|index| index != current.configuration_index) {
@@ -648,6 +1178,125 @@ impl ClusterAdmin {
             save(&mut journal, &saved)?;
         }
         saved_view(self.identity.node, &saved)
+    }
+    /// The tenant of this node's own session.
+    pub fn tenant(&self) -> focal_model::TenantId {
+        self.identity.ledger.tenant
+    }
+    /// Move one member of a session's range group to a node (25 §6); the
+    /// reply names the transfer the request denotes.
+    pub async fn move_range(
+        &self,
+        tenant: [u8; 16],
+        session: [u8; 16],
+        member: [u8; 16],
+        node: u64,
+    ) -> Result<AdminResult> {
+        if tenant == [0; 16] || session == [0; 16] || member == [0; 16] || node == 0 {
+            return Err(ClusterAdminError::Invalid);
+        }
+        let bytes = self
+            .exchange_bytes(AdminCommand::MoveRange {
+                tenant,
+                session,
+                member,
+                node,
+            })
+            .await?;
+        let (reply, tail): (crate::network_admin::RangeMovedReply, _) =
+            postcard::take_from_bytes(&bytes).map_err(|_| ClusterAdminError::Invalid)?;
+        if !tail.is_empty()
+            || reply.schema != crate::network_admin::RANGE_MOVED_REPLY_SCHEMA
+            || reply.tenant != tenant
+            || reply.session != session
+            || reply.member != member
+            || reply.node != node
+            || reply.operation == [0; 16]
+        {
+            return Err(ClusterAdminError::Invalid);
+        }
+        Ok(AdminResult::RangeMoveProposed {
+            tenant: hex(&tenant),
+            session: hex(&session),
+            member: hex(&member),
+            node,
+            operation: hex(&reply.operation),
+        })
+    }
+    /// Plan a session's placement under a requested durability; the reply
+    /// names the plan the request denotes (`planned`, `pending` when one is
+    /// under way, `satisfied` when the active placement already provides it).
+    /// A dry run reports the same plan without journaling it.
+    pub async fn plan_session(
+        &self,
+        tenant: [u8; 16],
+        session: [u8; 16],
+        survive: &str,
+        max_failures: u16,
+        dry_run: bool,
+    ) -> Result<AdminResult> {
+        let survive_code = match survive {
+            "node" => 0,
+            "zone" => 1,
+            "region" => 2,
+            _ => return Err(ClusterAdminError::Invalid),
+        };
+        let reply = self
+            .plan_session_reply(tenant, session, survive_code, max_failures, dry_run)
+            .await?;
+        Ok(AdminResult::SessionPlanned {
+            tenant: focal_model::TenantId(reply.tenant).to_string(),
+            session: focal_model::SessionId(reply.session).to_string(),
+            operation: hex(&reply.operation),
+            voters: reply.voters,
+            survive: survive.into(),
+            max_failures,
+            state: match reply.state {
+                0 => "planned",
+                1 => "pending",
+                _ => "satisfied",
+            }
+            .into(),
+            dry_run,
+        })
+    }
+    /// The validated placement request reply (survive code 0 node, 1 zone,
+    /// 2 region).
+    pub async fn plan_session_reply(
+        &self,
+        tenant: [u8; 16],
+        session: [u8; 16],
+        survive_code: u8,
+        max_failures: u16,
+        dry_run: bool,
+    ) -> Result<crate::network_admin::SessionPlannedReply> {
+        if tenant == [0; 16] || session == [0; 16] || max_failures > 255 || survive_code > 2 {
+            return Err(ClusterAdminError::Invalid);
+        }
+        let bytes = self
+            .exchange_bytes(AdminCommand::PlanSession {
+                tenant,
+                session,
+                survive: survive_code,
+                max_failures,
+                dry_run,
+            })
+            .await?;
+        let (reply, tail): (crate::network_admin::SessionPlannedReply, _) =
+            postcard::take_from_bytes(&bytes).map_err(|_| ClusterAdminError::Invalid)?;
+        if !tail.is_empty()
+            || reply.schema != crate::network_admin::SESSION_PLANNED_REPLY_SCHEMA
+            || reply.tenant != tenant
+            || reply.session != session
+            || reply.operation == [0; 16]
+            || reply.voters.is_empty()
+            || reply.voters.len() > 64
+            || reply.state > 2
+            || reply.dry_run != dry_run
+        {
+            return Err(ClusterAdminError::Invalid);
+        }
+        Ok(reply)
     }
     async fn exchange(&self, command: AdminCommand) -> Result<ControlReply> {
         match ControlReply::decode(
@@ -874,6 +1523,10 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 fn mutation_command(request: ControlRequest) -> Result<AdminCommand> {
     match &request.command {
         ControlCommand::Membership(_) => Ok(AdminCommand::Membership(Box::new(request))),
+        ControlCommand::Authority(focal_directory::AuthorityCommand {
+            operation: focal_directory::AuthorityOperation::GrantNode { .. },
+            ..
+        }) => Ok(AdminCommand::Authority(Box::new(request))),
         ControlCommand::Enrollment(command) if command.revoked_invitation().is_some() => {
             Ok(AdminCommand::Revocation(Box::new(request)))
         }

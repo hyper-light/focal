@@ -516,14 +516,33 @@ pub(in crate::native) fn check_storage(core: &Core<NativeState>) -> Result<(), N
                 if outcome.operation != NativeOperation::Create || outcome.invocation != *key {
                     return Err(ContractError::InvalidPolicy.into());
                 }
+                // A created claim that retired to the archive (26 §4) left
+                // its identity with it; its continuation vouches for the
+                // entry, and the definitions created beside it left with
+                // their claim.
+                let retired = result.get().entries().iter().any(|object| {
+                    object.family == NativeCreatedFamily::Claim
+                        && matches!(
+                            view.get(Key::Retired(ClaimId(object.resolved.0))),
+                            Some(Row::Retired(_))
+                        )
+                });
                 for object in result.get().entries() {
                     visits.charge(1)?;
                     let matches = match object.family {
                         NativeCreatedFamily::Claim => {
                             matches!(view.get(Key::ClaimIdentity(object.schema, object.content)), Some(Row::ClaimIdentity(id)) if id.0 == object.resolved.0)
+                                || matches!(
+                                    view.get(Key::Retired(ClaimId(object.resolved.0))),
+                                    Some(Row::Retired(_))
+                                )
                         }
                         NativeCreatedFamily::Validation => {
                             matches!(view.get(Key::DefinitionIdentity(object.schema, object.content)), Some(Row::DefinitionIdentity(id)) if id.0 == object.resolved.0)
+                                || (retired
+                                    && view
+                                        .get(Key::Definition(ValidationId(object.resolved.0)))
+                                        .is_none())
                         }
                     };
                     if !matches {

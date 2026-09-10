@@ -228,13 +228,13 @@ fn native_operations_carry_registered_tags_actor_capability_and_mutation_class()
         .collect();
     assert_eq!(tags.len(), NativeOperationKind::ALL.len());
     assert_eq!(names.len(), NativeOperationKind::ALL.len());
-    assert_eq!(tags.iter().max(), Some(&30));
+    assert_eq!(tags.iter().max(), Some(&31));
     assert_eq!(
         NativeOperationKind::ALL
             .iter()
             .filter(|kind| !kind.participant_authored())
             .count(),
-        4
+        5
     );
     assert_eq!(
         NativeProfile::from_registered(1),

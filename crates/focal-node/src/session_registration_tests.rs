@@ -386,6 +386,91 @@ async fn registration_refuses_stronger_policy_foreign_identity_and_expired_node_
     foreign.founder.issuer = ParticipantId::from_u128(999);
     assert!(FirstSessionPlan::capture(&session, &foreign, &settings, required, &memory).is_err());
     assert_eq!(memory.stats().used, 0);
+    // A session the node hosts alone at another ledger registers under the
+    // node's identity at that ledger, with its own operation identity; the
+    // founder's plan refuses it, as does a host from another cluster, a
+    // zero node or a ledger the facts do not describe.
+    let created = LedgerId {
+        tenant: TenantId::from_u128(9),
+        session: SessionId::from_u128(77),
+    };
+    let mut facts = HostedSessionFacts::from_session(&session).unwrap();
+    facts.ledger = created;
+    let mut host = network.state.genesis.founder.clone();
+    host.ledger = created;
+    let hosted = FirstSessionPlan::capture_hosted(
+        &facts,
+        &network.state.genesis,
+        &host,
+        &settings,
+        required,
+        &memory,
+    )
+    .unwrap();
+    assert_eq!(hosted.ledger(), created);
+    assert_eq!(hosted.founder(), &host);
+    let founder_plan = FirstSessionPlan::capture(
+        &session,
+        &network.state.genesis,
+        &settings,
+        required,
+        &memory,
+    )
+    .unwrap();
+    assert_ne!(hosted.operation(), founder_plan.operation());
+    assert_ne!(hosted.client(), founder_plan.client());
+    assert!(
+        FirstSessionPlan::capture_facts(
+            &facts,
+            &network.state.genesis,
+            &settings,
+            required,
+            &memory
+        )
+        .is_err()
+    );
+    let mut elsewhere = host.clone();
+    elsewhere.cluster = [200; 16];
+    assert!(
+        FirstSessionPlan::capture_hosted(
+            &facts,
+            &network.state.genesis,
+            &elsewhere,
+            &settings,
+            required,
+            &memory
+        )
+        .is_err()
+    );
+    let mut nobody = host.clone();
+    nobody.node = 0;
+    assert!(
+        FirstSessionPlan::capture_hosted(
+            &facts,
+            &network.state.genesis,
+            &nobody,
+            &settings,
+            required,
+            &memory
+        )
+        .is_err()
+    );
+    let mut other = host.clone();
+    other.ledger.session = SessionId::from_u128(78);
+    assert!(
+        FirstSessionPlan::capture_hosted(
+            &facts,
+            &network.state.genesis,
+            &other,
+            &settings,
+            required,
+            &memory
+        )
+        .is_err()
+    );
+    drop(hosted);
+    drop(founder_plan);
+    assert_eq!(memory.stats().used, 0);
     let plan = FirstSessionPlan::capture(
         &session,
         &network.state.genesis,

@@ -637,9 +637,12 @@ impl Session {
         let request_stream_charge = self.request_streams.checkpoint_charge()?;
         // The native section is encoded under its own permit; the envelope
         // copies it once more into the final bytes.
-        let native = match self.native.as_deref() {
-            Some(engine) => Some(engine.encode_checkpoint(&self.consensus)?),
-            None => None,
+        let native = match (self.native.as_deref_mut(), self.hosting.as_mut()) {
+            (Some(engine), Some(hosting)) => {
+                Some(engine.encode_checkpoint(&self.consensus, &mut hosting.seeds)?)
+            }
+            (Some(_), None) => return Err(LedgerError::NativeUnsupported),
+            (None, _) => None,
         };
         let native_bytes = native.as_ref().map_or(0, |(bytes, _)| bytes.len());
         let amount = reference_charge(self.core.snapshot())?
@@ -880,16 +883,23 @@ impl Session {
         // of the stream line it defines (23 §6), never against the sealed
         // legacy prefix alone.
         let native = match &native_section {
-            Some((activation, native)) => Some(self.native_from_checkpoint(
-                activation,
-                native,
-                index,
-                term,
-                configuration,
-            )?),
+            Some((activation, native)) => {
+                match self.native_from_checkpoint(activation, native, index, term, configuration) {
+                    Ok(restored) => Some(restored),
+                    // The Core root is seeded and chunks are missing: record
+                    // them for the host and keep the delivery retained; the
+                    // engine that would have been built was not adopted.
+                    Err(LedgerError::Native(NativeSessionError::CustodyPending)) => {
+                        self.seed_pending = self.missing_seed(native, index, term)?;
+                        return Err(LedgerError::Native(NativeSessionError::CustodyPending));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             None if self.activation.is_native() => return Err(LedgerError::Corrupt),
             None => None,
         };
+        self.seed_pending = None;
         let published = match &native {
             Some((engine, activation, _)) => {
                 stream_line(*activation, recovered.sequence(), engine.sequence()?)?

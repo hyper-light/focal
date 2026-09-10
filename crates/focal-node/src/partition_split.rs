@@ -24,30 +24,41 @@ pub const DEFAULT_MERGE_SESSIONS: usize = 256;
 const SPLIT_ENV: &str = "FOCAL_PARTITION_SPLIT_SESSIONS";
 const MERGE_ENV: &str = "FOCAL_PARTITION_MERGE_SESSIONS";
 
+/// In-process test knobs, one per cluster so parallel tests in one process
+/// never reshape each other's partitions.
 #[cfg(any(test, feature = "test-support"))]
-static SPLIT_OVERRIDE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+type Override = Option<([u8; 16], usize, usize)>;
 #[cfg(any(test, feature = "test-support"))]
-static MERGE_OVERRIDE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-/// In-process test knob: `split` sessions split a partition, `merge` is the
-/// bound both halves must be under to merge (`usize::MAX` for "never").
+static OVERRIDES: std::sync::Mutex<[Override; 8]> = std::sync::Mutex::new([None; 8]);
+/// In-process test knob for one cluster: `split` sessions split a partition,
+/// `merge` is the bound both halves must be under to merge.
 #[cfg(any(test, feature = "test-support"))]
-pub fn override_thresholds(split: usize, merge: usize) {
-    SPLIT_OVERRIDE.store(split, std::sync::atomic::Ordering::Release);
-    MERGE_OVERRIDE.store(
-        merge.saturating_add(1),
-        std::sync::atomic::Ordering::Release,
-    );
-}
-/// The thresholds in force: the defaults, or the knobs when set.
-pub fn thresholds() -> (usize, usize) {
-    #[cfg(any(test, feature = "test-support"))]
-    {
-        let split = SPLIT_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);
-        let merge = MERGE_OVERRIDE.load(std::sync::atomic::Ordering::Acquire);
-        if split > 0 && merge > 0 {
-            return (split, merge.saturating_sub(1));
+pub fn override_thresholds(cluster: [u8; 16], split: usize, merge: usize) {
+    if let Ok(mut overrides) = OVERRIDES.lock() {
+        let slot = overrides
+            .iter()
+            .position(|entry| entry.is_some_and(|(id, ..)| id == cluster))
+            .or_else(|| overrides.iter().position(Option::is_none));
+        if let Some(slot) = slot
+            && let Some(entry) = overrides.get_mut(slot)
+        {
+            *entry = Some((cluster, split, merge));
         }
     }
+}
+/// The thresholds in force for `cluster`: the defaults, or the knobs when set.
+pub fn thresholds(cluster: [u8; 16]) -> (usize, usize) {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        if let Ok(overrides) = OVERRIDES.lock()
+            && let Some((_, split, merge)) =
+                overrides.iter().flatten().find(|(id, ..)| *id == cluster)
+        {
+            return ((*split).max(1), *merge);
+        }
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    let _ = cluster;
     let read = |name: &str, default: usize| {
         std::env::var(name)
             .ok()
@@ -114,24 +125,8 @@ impl PlacementAgent {
         let _ = host;
         let node = self.state.node;
         let cluster = self.state.genesis.founder.cluster;
-        let (split_at, merge_at) = thresholds();
+        let (split_at, merge_at) = thresholds(cluster);
         let own = &directory.delegation;
-        let _ = std::io::Write::write_fmt(
-            &mut std::io::stderr().lock(),
-            format_args!(
-                "TRACE {}\n",
-                format!(
-                    "reshape partition {:?} sealed={} sessions={} split_at={} merge_at={} root_epoch={} own_epoch={}",
-                    own.partition.0[..4].to_vec(),
-                    directory.sealed.is_some(),
-                    directory.sessions.len(),
-                    split_at,
-                    merge_at,
-                    delegation.epoch,
-                    own.epoch
-                )
-            ),
-        );
         match &directory.sealed {
             None => {
                 // A merge the root already committed: this partition still
@@ -156,13 +151,24 @@ impl PlacementAgent {
                     return Ok(None);
                 }
                 if directory.sessions.len() >= split_at {
-                    let at = directory
+                    // Split at the median of the keys strictly above the
+                    // start; a partition whose sessions all share its start key
+                    // has no valid split and stays whole.
+                    let candidates = directory
                         .sessions
                         .keys()
-                        .nth(directory.sessions.len().saturating_div(2))
                         .map(|ledger| NamespaceKey::of(*ledger))
-                        .filter(|at| *at != own.namespace.start)
-                        .ok_or(AgentError::Identity)?;
+                        .filter(|key| *key != own.namespace.start)
+                        .count();
+                    let Some(at) = directory
+                        .sessions
+                        .keys()
+                        .map(|ledger| NamespaceKey::of(*ledger))
+                        .filter(|key| *key != own.namespace.start)
+                        .nth(candidates.saturating_div(2))
+                    else {
+                        return Ok(None);
+                    };
                     let operation = reshape_operation(cluster, own.partition, directory.revision);
                     let destination = split_partition_id(ClusterId(cluster), operation);
                     let command = ControlCommand::VerifiedPartition(VerifiedPartitionCommand {
@@ -347,33 +353,9 @@ impl PlacementAgent {
         };
         // 1. The root grants the destination group (this node its single
         // voter), then the group hosts the sealed image under a root permit.
-        let _ = std::io::Write::write_fmt(
-            &mut std::io::stderr().lock(),
-            format_args!(
-                "TRACE {}\n",
-                format!(
-                    "continue_split hosted={} root_has_dest={}",
-                    handles.directory.host_of(seal.destination).is_some(),
-                    root.delegations.contains_key(&seal.moved.start)
-                )
-            ),
-        );
         let Some(destination_host) = handles.directory.host_of(seal.destination) else {
             let plan = PartitionPlan::split_destination(cluster, node, destination, &image)?;
             let derived = next_first_directory_command(plan, observation, now, &self.budget);
-            let _ = std::io::Write::write_fmt(
-                &mut std::io::stderr().lock(),
-                format_args!(
-                    "TRACE {}\n",
-                    format!(
-                        "grant derivation {:?}",
-                        derived
-                            .as_ref()
-                            .map(|c| c.is_some())
-                            .map_err(|e| format!("{e:?}"))
-                    )
-                ),
-            );
             match derived {
                 Ok(Some(command)) => {
                     let journals = self.journals.as_mut().ok_or(AgentError::Identity)?;
@@ -436,6 +418,12 @@ impl PlacementAgent {
                     return Ok(Some(AgentStep::Idle));
                 };
                 if state.sealed.is_some() {
+                    // The partition verifies the same fence the root did,
+                    // under both groups' signatures at its installed authority.
+                    let mut evidence = control_evidence(installed, cluster, now, &self.budget)?;
+                    evidence.proofs = self
+                        .delegation_proofs(handles, own.log_group, group, fence, now)
+                        .await?;
                     let command = ControlCommand::VerifiedPartition(VerifiedPartitionCommand {
                         command: PartitionCommand {
                             expected_revision: state.revision,
@@ -444,7 +432,7 @@ impl PlacementAgent {
                                 delegation: *existing,
                             },
                         },
-                        evidence: control_evidence(installed, cluster, now, &self.budget)?,
+                        evidence,
                     });
                     if snapshot.revisions.partition != state.revision {
                         return Err(AgentError::Identity);
@@ -462,18 +450,23 @@ impl PlacementAgent {
                     .ok_or(AgentError::Identity)?;
                 let (_, source_snapshot, source_installed) =
                     observed_partition(observed, own.partition).ok_or(AgentError::Identity)?;
+                let mut evidence = control_evidence(source_installed, cluster, now, &self.budget)?;
+                evidence.proofs = self
+                    .delegation_proofs(handles, own.log_group, group, fence, now)
+                    .await?;
                 let command = ControlCommand::VerifiedPartition(VerifiedPartitionCommand {
                     command: PartitionCommand {
                         expected_revision: directory.revision,
                         delegation_epoch: own.epoch,
                         operation: PartitionOperation::Release { delegation: *kept },
                     },
-                    evidence: control_evidence(source_installed, cluster, now, &self.budget)?,
+                    evidence,
                 });
                 if source_snapshot.revisions.partition != directory.revision {
                     return Err(AgentError::Identity);
                 }
-                self.intend_partition(handles, command).await.map(Some)
+                let step = self.intend_partition(handles, command).await;
+                step.map(Some)
             }
             Some(_) => Err(AgentError::Identity),
         }
@@ -514,6 +507,16 @@ impl PlacementAgent {
         if moved.sealed.is_none() {
             return Err(AgentError::Identity);
         }
+        let mut evidence = control_evidence(installed, cluster, now, &self.budget)?;
+        evidence.proofs = self
+            .delegation_proofs(
+                handles,
+                moved.delegation.log_group,
+                directory.delegation.log_group,
+                fence,
+                now,
+            )
+            .await?;
         let command = ControlCommand::VerifiedPartition(VerifiedPartitionCommand {
             command: PartitionCommand {
                 expected_revision: directory.revision,
@@ -523,7 +526,7 @@ impl PlacementAgent {
                     moved: Box::new(moved),
                 },
             },
-            evidence: control_evidence(installed, cluster, now, &self.budget)?,
+            evidence,
         });
         if snapshot.revisions.partition != directory.revision {
             return Err(AgentError::Identity);

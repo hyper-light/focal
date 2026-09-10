@@ -612,9 +612,9 @@
     },
     {
       "name": "focal-cluster",
-      "version": 3,
+      "version": 13,
       "path": "focal-cluster/SKILL.md",
-      "blake3": "caaded0f6de7ba5794bfa33587b726d43f4538f03354b409cb3198f69d1d0668",
+      "blake3": "a14ffe0c86f40c0c015defb4a93574e20e659283fe1ed32a1daf66450ec2e3c8",
       "references": [
         "references/admin-workflow.md"
       ],
@@ -623,6 +623,18 @@
       "required_transfer_tools": [],
       "required_watch_tools": [],
       "required_admin_tools": [
+        {
+          "name": "cluster.backup.create",
+          "version": 1
+        },
+        {
+          "name": "cluster.backup.verify",
+          "version": 1
+        },
+        {
+          "name": "cluster.archive.show",
+          "version": 1
+        },
         {
           "name": "cluster.client.invite",
           "version": 1
@@ -637,6 +649,14 @@
         },
         {
           "name": "cluster.credentials.revoke",
+          "version": 1
+        },
+        {
+          "name": "cluster.gc.restore",
+          "version": 1
+        },
+        {
+          "name": "cluster.gc.show",
           "version": 1
         },
         {
@@ -696,6 +716,30 @@
           "version": 1
         },
         {
+          "name": "cluster.nodes.drain",
+          "version": 1
+        },
+        {
+          "name": "cluster.nodes.undrain",
+          "version": 1
+        },
+        {
+          "name": "cluster.nodes.remove",
+          "version": 1
+        },
+        {
+          "name": "cluster.nodes.replace",
+          "version": 1
+        },
+        {
+          "name": "cluster.placement",
+          "version": 1
+        },
+        {
+          "name": "cluster.plan",
+          "version": 1
+        },
+        {
           "name": "cluster.replicas.add_learner",
           "version": 1
         },
@@ -752,7 +796,35 @@
           "version": 1
         },
         {
+          "name": "cluster.restore",
+          "version": 1
+        },
+        {
+          "name": "cluster.retention.show",
+          "version": 1
+        },
+        {
+          "name": "cluster.sessions.create",
+          "version": 1
+        },
+        {
+          "name": "cluster.sessions.plan",
+          "version": 2
+        },
+        {
           "name": "cluster.status",
+          "version": 1
+        },
+        {
+          "name": "cluster.storage.show",
+          "version": 1
+        },
+        {
+          "name": "cluster.tenants.admit",
+          "version": 1
+        },
+        {
+          "name": "cluster.tenants.list",
           "version": 1
         }
       ],

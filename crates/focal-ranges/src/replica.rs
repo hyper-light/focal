@@ -46,7 +46,7 @@ impl SeedManifest {
         digest("focal.range-seed.v1", self)
     }
     pub fn validate(&self, limits: RangeLimits) -> Result<(), RangeError> {
-        self.destination.validate(limits)?;
+        validate_descriptor(&self.destination, limits)?;
         if self.source_epoch.0.checked_add(1) != Some(self.target_epoch.0)
             || self.blocks.len() > limits.max_blocks
         {
@@ -60,8 +60,8 @@ impl SeedManifest {
                 || block.rows > limits.max_block_rows
                 || block.bytes > limits.max_block_bytes
                 || block.first > block.last
-                || !self.destination.span.contains(block.first)
-                || !self.destination.span.contains(block.last)
+                || !self.destination.span.contains(&block.first)
+                || !self.destination.span.contains(&block.last)
                 || previous.is_some_and(|last| last >= block.first)
                 || !nonzero(block.hash)
             {
@@ -402,7 +402,7 @@ impl RangeReplica {
         limits: RangeLimits,
         budget: MemoryBudget,
     ) -> Result<Self, RangeError> {
-        descriptor.validate(limits)?;
+        validate_descriptor(&descriptor, limits)?;
         let store = RangeStore::new(
             focal_memory::RangeId(incarnation),
             0,
@@ -506,7 +506,7 @@ impl RangeReplica {
             || batch
                 .writes
                 .iter()
-                .any(|write| !self.descriptor.span.contains(write.key()))
+                .any(|write| !self.descriptor.span.contains(&write.key()))
         {
             return Err(RangeError::Capacity);
         }
@@ -596,6 +596,7 @@ impl RangeReplica {
         verify_commit(
             proof,
             self.ledger,
+            0,
             prepared.sequence,
             prepared.decision,
             verifier,
@@ -625,12 +626,14 @@ impl RangeReplica {
         }
         let hash = range_command_hash(
             self.ledger,
+            certificate.commit.ordinal,
             certificate.commit.sequence,
             &RangeOperation::Begin(certificate.intent.clone()),
         )?;
         verify_commit(
             &certificate.commit,
             self.ledger,
+            certificate.commit.ordinal,
             certificate.commit.sequence,
             hash,
             verifier,
@@ -676,9 +679,11 @@ impl RangeReplica {
         verify_commit(
             &certificate.commit,
             self.ledger,
+            certificate.commit.ordinal,
             certificate.commit.sequence,
             range_command_hash(
                 self.ledger,
+                certificate.commit.ordinal,
                 certificate.commit.sequence,
                 &RangeOperation::Barrier {
                     operation: armed.operation,
@@ -708,7 +713,7 @@ impl RangeReplica {
             old_epoch: epoch,
             range: self.descriptor.id,
             range_generation: self.descriptor.generation,
-            replica: self.descriptor.owner,
+            replica: self.descriptor.meta.replica_owner()?,
             cut,
             checkpoint,
             attestation: ContentHash([0; 32]),
@@ -729,7 +734,7 @@ impl RangeReplica {
             new_epoch: target_epoch,
             range: self.descriptor.id,
             range_generation: self.descriptor.generation,
-            replica: self.descriptor.owner,
+            replica: self.descriptor.meta.replica_owner()?,
             seed: self.seed,
             through: self.prefix(),
             snapshot: self.snapshot,
@@ -790,7 +795,7 @@ impl RangeReplica {
         prefix: SessionSeq,
         new_token: bool,
     ) -> Result<(), RangeError> {
-        if replica != self.descriptor.owner {
+        if self.descriptor.meta.owner != Holder::Replica(replica) {
             return Err(RangeError::Generation);
         }
         match self.role {
@@ -867,7 +872,7 @@ impl RangeReplica {
             mul(add(bytes.len(), 8192)?, 32)?,
         )?;
         let checkpoint: ReplicaCheckpoint = decode(bytes, limits.max_checkpoint_bytes)?;
-        checkpoint.descriptor.validate(limits)?;
+        validate_descriptor(&checkpoint.descriptor, limits)?;
         if checkpoint.schema != 1
             || checkpoint.rows.len() > limits.max_replica_rows
             || checkpoint.receipts.len() > limits.max_receipts
@@ -875,7 +880,7 @@ impl RangeReplica {
             || checkpoint
                 .rows
                 .iter()
-                .any(|row| !checkpoint.descriptor.span.contains(row.key))
+                .any(|row| !checkpoint.descriptor.span.contains(&row.key))
             || checkpoint
                 .rows
                 .iter()

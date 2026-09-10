@@ -3,6 +3,31 @@
 //! Integration tests in other crates (Session, node, CLI) use them so one
 //! definition of a claim, its evidence and its evaluation drives every layer.
 use super::*;
+
+/// A `Cell` that is `Sync`: test schema verifiers count their calls through
+/// it, since a verifier is shared with the materializer's workers.
+#[derive(Debug, Default)]
+pub struct SyncCell<T>(std::sync::Mutex<T>);
+impl<T> SyncCell<T> {
+    pub fn new(value: T) -> Self {
+        Self(std::sync::Mutex::new(value))
+    }
+    pub fn get(&self) -> T
+    where
+        T: Copy,
+    {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+    pub fn set(&self, value: T) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = value;
+    }
+}
 use focal_evidence::{error_report_schema, test_report_schema};
 use focal_model::lifecycle::creation::Owner;
 use focal_model::lifecycle::{

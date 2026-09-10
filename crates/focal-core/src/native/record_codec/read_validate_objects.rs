@@ -541,20 +541,48 @@ pub(super) fn authored(
                 return Err(invalid());
             }
             read.charge(sum(value.get().entries().len(), 1)?)?;
+            // A created claim that retired (26 §4) left its identity with
+            // the family; its continuation vouches for the entry, and the
+            // definitions created beside it left with their claim.
+            let mut retired = false;
+            for object in value.get().entries() {
+                if object.family == NativeCreatedFamily::Claim
+                    && matches!(
+                        read.get(Key::Retired(ClaimId(object.resolved.0)))?,
+                        Some(Row::Retired(_))
+                    )
+                {
+                    retired = true;
+                }
+            }
             for object in value.get().entries() {
                 let resolved = match object.family {
                     NativeCreatedFamily::Claim => {
-                        match read.require(Key::ClaimIdentity(object.schema, object.content))? {
-                            Row::ClaimIdentity(id) => id.0,
+                        match read.get(Key::ClaimIdentity(object.schema, object.content))? {
+                            Some(Row::ClaimIdentity(id)) => id.0,
+                            None if matches!(
+                                read.get(Key::Retired(ClaimId(object.resolved.0)))?,
+                                Some(Row::Retired(_))
+                            ) =>
+                            {
+                                object.resolved.0
+                            }
                             _ => return Err(invalid()),
                         }
                     }
-                    NativeCreatedFamily::Validation => match read
-                        .require(Key::DefinitionIdentity(object.schema, object.content))?
-                    {
-                        Row::DefinitionIdentity(id) => id.0,
-                        _ => return Err(invalid()),
-                    },
+                    NativeCreatedFamily::Validation => {
+                        match read.get(Key::DefinitionIdentity(object.schema, object.content))? {
+                            Some(Row::DefinitionIdentity(id)) => id.0,
+                            None if retired
+                                && read
+                                    .get(Key::Definition(ValidationId(object.resolved.0)))?
+                                    .is_none() =>
+                            {
+                                object.resolved.0
+                            }
+                            _ => return Err(invalid()),
+                        }
+                    }
                 };
                 if resolved != object.resolved.0
                     || outcome.created != 0 && object.requested != object.resolved

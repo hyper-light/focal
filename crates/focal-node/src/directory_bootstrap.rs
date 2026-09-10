@@ -125,21 +125,12 @@ impl PartitionPlan {
     pub fn image(&self) -> Option<ContentHash> {
         self.image
     }
-    /// Whether a partition checkpoint is the state this plan hosts: its
-    /// delegation once installed, or the sealed image it bootstraps from,
-    /// which already carries the provisional delegation of this partition.
+    /// Whether a partition checkpoint belongs to the group this plan hosts:
+    /// the partition and group must be this plan's, whatever the delegation
+    /// became through splits, merges and seals since.
     pub fn accepts(&self, checkpoint: &PartitionCheckpoint) -> bool {
-        let own = &checkpoint.delegation;
-        (*own == self.delegation && checkpoint.sealed.is_none())
-            || (self.image.is_some()
-                && own.partition == self.partition
-                && own.log_group == self.group
-                && own.namespace == self.delegation.namespace
-                && own.epoch == self.delegation.epoch
-                && own.activation.is_none()
-                && checkpoint.sealed.as_ref().is_some_and(|seal| {
-                    seal.destination == self.partition && seal.moved == self.delegation.namespace
-                }))
+        checkpoint.delegation.partition == self.partition
+            && checkpoint.delegation.log_group == self.group
     }
     pub fn partition(&self) -> PartitionId {
         self.partition
@@ -174,6 +165,8 @@ impl PartitionPlan {
                 sealed: None,
                 nodes: BTreeMap::new(),
                 sessions: BTreeMap::new(),
+                routes: std::collections::VecDeque::new(),
+                routes_from: 0,
             },
             (Some(expected), Some(image)) => {
                 let digest = focal_directory::partition_checkpoint_digest(&image)
@@ -477,13 +470,17 @@ pub(crate) fn authorize_first_directory(
         return Err(DirectoryBootstrapError::Unauthorized);
     }
     let root = owner.root().ok_or(DirectoryBootstrapError::Unauthorized)?;
-    // The first partition needs its delegation committed; a split destination
-    // is authorized before the root commits the split (the split needs the
+    // The first partition needs a delegation committed to it (whatever its
+    // namespace and epoch after splits and merges); a split destination is
+    // authorized before the root commits the split (the split needs the
     // destination group's signature), so its delegation may still be absent.
-    match root.checkpoint().delegations.get(&plan.range().start) {
-        Some(existing) if *existing == plan.delegation() => {}
-        None if plan.image.is_some() => {}
-        _ => return Err(DirectoryBootstrapError::Unauthorized),
+    let delegated = root
+        .checkpoint()
+        .delegations
+        .values()
+        .any(|delegation| delegation.partition == plan.partition);
+    if !delegated && plan.image.is_none() {
+        return Err(DirectoryBootstrapError::Unauthorized);
     }
     let authority = owner
         .authority()
@@ -649,12 +646,13 @@ pub(crate) fn next_first_directory_command(
         return Err(DirectoryBootstrapError::Unauthorized);
     }
     let delegation = plan.delegation();
-    match directory.delegations.get(&plan.range().start) {
-        Some(existing) if *existing != delegation => {
-            return Err(DirectoryBootstrapError::Unauthorized);
-        }
-        None if plan.image.is_some() => {}
-        None => {
+    let delegated = directory
+        .delegations
+        .values()
+        .any(|existing| existing.partition == plan.partition);
+    match (delegated, plan.image.is_some()) {
+        (true, _) | (false, true) => {}
+        (false, false) => {
             if !directory.delegations.is_empty() {
                 return Err(DirectoryBootstrapError::Unauthorized);
             }
@@ -671,7 +669,6 @@ pub(crate) fn next_first_directory_command(
                 },
             })));
         }
-        Some(_) => {}
     }
     let grant = GroupAuthorityGrant {
         group: plan.group,

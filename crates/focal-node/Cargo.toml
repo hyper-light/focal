@@ -29,6 +29,7 @@ focal-evidence = { version = "0.1.0", path = "../focal-evidence" }
 focal-graph = { version = "0.1.0", path = "../focal-graph" }
 focal-memory = { version = "0.1.0", path = "../focal-memory" }
 focal-ledger = { version = "0.1.0", path = "../focal-ledger" }
+focal-ranges = { version = "0.1.0", path = "../focal-ranges" }
 focal-log = { version = "0.1.0", path = "../focal-log" }
 focal-model = { version = "0.1.0", path = "../focal-model" }
 focal-native-client = { version = "0.1.0", path = "../focal-native-client" }

@@ -677,6 +677,11 @@ fn default_lane(records: &[Record]) -> Result<BudgetLane, LogError> {
 }
 
 impl WalLease {
+    /// The disk envelope of the volume this log lives on, shared with the
+    /// other durable owners of the same volume.
+    pub fn disk_budget(&self) -> DiskBudget {
+        self.shared.disk_budget()
+    }
     /// Free bytes on the filesystem holding the shared WAL, sampled now.
     pub fn available_bytes(&self) -> Result<u64, LogError> {
         self.shared.available_bytes()

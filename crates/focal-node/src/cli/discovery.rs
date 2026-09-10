@@ -185,6 +185,7 @@ fn coverage(format: OutputFormat, output: &mut dyn Write) -> Result<()> {
                 NativeExposure::InternalTimer => "internal_timer",
                 NativeExposure::WireOnly => "wire_only",
                 NativeExposure::Activation => "activation",
+                NativeExposure::Retirement => "retirement",
             },
             result: row.result,
             reads: row.reads,

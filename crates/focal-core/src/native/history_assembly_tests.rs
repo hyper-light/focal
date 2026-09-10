@@ -159,7 +159,7 @@ fn publish(core: &mut Core<NativeState>, staged: Staged) -> (NativeOutcome, Vec<
         )
         .unwrap();
     core.publish_native(NativePrepared {
-        range,
+        fragments: range,
         outcome,
         writes: mutation::WriteSet::unrecorded(),
     })

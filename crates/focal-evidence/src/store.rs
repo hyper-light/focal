@@ -25,29 +25,46 @@ pub const MAX_TRANSFER_CONTENT_BYTES: u64 =
 
 /// Immutable local records used by the custody owner. Writing a record alone
 /// grants no readiness authority; that owner must verify its bound contents.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CustodyRecordKind {
     Checkpoint,
     Manifest,
+    /// One copy's verified receipt for one object (`custody_receipt`).
+    Receipt,
 }
 impl CustodyRecordKind {
     fn directory(self) -> &'static str {
         match self {
             Self::Checkpoint => "checkpoints",
             Self::Manifest => "custody",
+            Self::Receipt => "receipts",
+        }
+    }
+    fn tag(self) -> u8 {
+        match self {
+            Self::Checkpoint => 0,
+            Self::Manifest => 1,
+            Self::Receipt => 2,
         }
     }
     fn limit(self) -> usize {
         match self {
             Self::Checkpoint => 8 * 1024 * 1024,
             Self::Manifest => 16 * 1024,
+            Self::Receipt => crate::custody_receipt::RECEIPT_BYTES,
         }
     }
 }
 
 #[path = "transfer.rs"]
 mod transfer;
-pub use transfer::TransferManifest;
+pub use transfer::{TransferManifest, describe_encoded};
+#[path = "gc.rs"]
+mod gc;
+pub use gc::{CollectorConfig, CollectorReport, ProtectionSet, SeedReport};
+#[path = "seeds.rs"]
+mod seeds;
+pub use seeds::{SEED_CHUNK_BYTES, SeedReader, SeedStore};
 #[path = "native_artifact.rs"]
 mod native_artifact;
 pub use native_artifact::*;
@@ -213,6 +230,8 @@ pub struct ContentStore {
     terminal_uploads: usize,
     failed: bool,
     disk: DiskBudget,
+    /// The collector's pass in progress (26 §5).
+    collector: gc::CollectorState,
     _writer_lock: File,
 }
 
@@ -269,6 +288,7 @@ impl ContentStore {
         durable_directory(&root.join("objects"))?;
         durable_directory(&root.join("checkpoints"))?;
         durable_directory(&root.join("custody"))?;
+        durable_directory(&root.join("receipts"))?;
         let mut store = Self {
             root,
             limits,
@@ -278,6 +298,7 @@ impl ContentStore {
             terminal_uploads: 0,
             disk,
             failed: false,
+            collector: gc::CollectorState::new(),
             _writer_lock: lock,
         };
         store.recover_uploads()?;
@@ -294,6 +315,11 @@ impl ContentStore {
         sync_directory(&store.root.join("checkpoints"))?;
         sync_directory(&store.root.join("custody"))?;
         sync_directory(&store.root.join("staging"))?;
+        // Quarantine rounds moved into before a crash are durable by their
+        // own directory syncs; the root that lists them is re-synced here.
+        if store.root.join("quarantine").is_dir() {
+            sync_directory(&store.root.join("quarantine"))?;
+        }
         // Re-sync created ancestors left visible by a previous mkdir/sync
         // failure; filesystem root itself is not a newly created entry.
         for directory in store.root.ancestors() {
@@ -339,6 +365,57 @@ impl ContentStore {
         }
         record.commit();
         Ok(hash)
+    }
+    /// Install or replace a record under a caller-chosen name (a receipt is
+    /// named by what it is about, so it is found without a scan); the bytes
+    /// are promised their volume space first and land atomically.
+    pub fn replace_named_custody_record(
+        &mut self,
+        kind: CustodyRecordKind,
+        name: ContentHash,
+        bytes: &[u8],
+    ) -> Result<(), ContentError> {
+        self.check()?;
+        if bytes.is_empty() || bytes.len() > kind.limit() {
+            return Err(ContentError::Capacity);
+        }
+        let directory = self.root.join(kind.directory());
+        let path = directory.join(format!("{name}.record"));
+        let record = disk_reserve(
+            &self.disk,
+            &self.root,
+            DiskKind::Content,
+            BudgetLane::Completion,
+            u64::try_from(bytes.len()).map_err(|_| ContentError::Capacity)?,
+        )?;
+        let installed = durable_directory(&directory)
+            .map_err(ContentError::Io)
+            .and_then(|()| atomic_install(&path, bytes));
+        if let Err(error) = installed {
+            if matches!(error, ContentError::Io(_)) {
+                self.failed = true;
+            }
+            return Err(error);
+        }
+        record.commit();
+        Ok(())
+    }
+    /// A named record's bytes, `None` when none was installed.
+    pub fn read_named_custody_record(
+        &self,
+        kind: CustodyRecordKind,
+        name: ContentHash,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, ContentError> {
+        self.check()?;
+        let path = self
+            .root
+            .join(kind.directory())
+            .join(format!("{name}.record"));
+        if !path.is_file() {
+            return Ok(None);
+        }
+        read_bounded(&path, max_bytes.min(kind.limit())).map(Some)
     }
     /// Reading a recorded manifest never creates a trusted custody witness.
     /// A new process must repeat the snapshot/content verification protocol.

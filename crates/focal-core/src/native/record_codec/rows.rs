@@ -1,6 +1,6 @@
 //! Complete retained values; a present empty link is not a deleted key.
 use super::*;
-use bytes::{Error, Sink, write_raw as raw, write_u8, write_u64};
+use bytes::{Error, Sink, write_raw as raw, write_u8, write_u32, write_u64};
 
 pub(super) fn family(key: Key, row: &Row) -> Result<(), Error> {
     mutation::check_family(key, row).map_err(|_| Error::InvalidTag("row/key family"))
@@ -108,6 +108,18 @@ pub(super) fn value(s: &mut impl Sink, row: &Row, ledger: LedgerId) -> Result<()
         Row::RetiredCycle(v) => {
             raw(s, &v.holder.0)?;
             optional_cycle(s, v.next)
+        }
+        Row::Retired(v) => {
+            raw(s, &v.bundle.0)?;
+            write_u64(s, v.bytes)?;
+            write_u64(s, v.through.0)?;
+            types::ledger(s, v.binding.ledger)?;
+            raw(s, &v.binding.object.0)?;
+            raw(s, &v.binding.content.0)?;
+            write_u64(s, v.binding.revision.0)?;
+            lifecycle_fields::claim_status(s, v.status)?;
+            write_u64(s, v.retired_at.0)?;
+            write_u32(s, v.events)
         }
         Row::Work(v) => evidence::work(s, v),
         Row::Diagnostic(v) => evidence::diagnostic(s, v),

@@ -45,7 +45,7 @@ fn checked_pending_input_builds_from_selected_funding_after_parent_exhaustion() 
     assert!(pool.stats().used > local_before.used);
     core.state
         .rows
-        .validate_chain([&first.range, &second.range])
+        .validate_chain([&first.fragments, &second.fragments].into_iter())
         .unwrap();
     core.publish_native(first).unwrap();
     let outcome = core.publish_native(second).unwrap();

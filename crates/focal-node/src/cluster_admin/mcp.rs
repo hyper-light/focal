@@ -29,6 +29,60 @@ impl AdminBackend for ClusterAdmin {
                     })
                     .await
                 }
+                AdminAction::RetentionShow { session } => {
+                    self.retention(
+                        session
+                            .map(focal_model::SessionId)
+                            .unwrap_or(self.identity.ledger.session),
+                    )
+                    .await
+                }
+                AdminAction::GcShow => self.gc().await,
+                AdminAction::StorageShow => self.storage().await,
+                AdminAction::BackupCreate {
+                    tenant,
+                    session,
+                    output,
+                } => {
+                    self.backup_create(
+                        focal_model::LedgerId {
+                            tenant: tenant
+                                .map(focal_model::TenantId)
+                                .unwrap_or(self.identity.ledger.tenant),
+                            session: session
+                                .map(focal_model::SessionId)
+                                .unwrap_or(self.identity.ledger.session),
+                        },
+                        std::path::Path::new(&output),
+                    )
+                    .await
+                }
+                AdminAction::BackupVerify { input } => {
+                    ClusterAdmin::backup_verify(std::path::Path::new(&input))
+                }
+                AdminAction::Restore {
+                    input,
+                    new_incarnation,
+                } => {
+                    self.restore(std::path::Path::new(&input), new_incarnation)
+                        .await
+                }
+                AdminAction::GcRestore { domain, root } => {
+                    self.gc_restore(
+                        focal_model::ContentDomainId(domain),
+                        focal_model::ContentHash(root),
+                    )
+                    .await
+                }
+                AdminAction::ArchiveShow { session, claim } => {
+                    self.archive(
+                        session
+                            .map(focal_model::SessionId)
+                            .unwrap_or(self.identity.ledger.session),
+                        focal_model::ClaimId(claim),
+                    )
+                    .await
+                }
                 AdminAction::ReplicaTransfer {
                     session,
                     node,
@@ -109,6 +163,23 @@ impl AdminBackend for ClusterAdmin {
                     expected_revision,
                 } => self.revoke(id, expected_revision).await,
                 AdminAction::RenewCredential => self.renew_credential().await,
+                AdminAction::Placement => self.placement().await,
+                AdminAction::Plan => self.plan().await,
+                AdminAction::AdmitTenant { tenant } => self.admit_tenant(tenant).await,
+                AdminAction::Tenants => self.tenants().await,
+                AdminAction::CreateSession { tenant, name } => {
+                    self.create_session(tenant, &name).await
+                }
+                AdminAction::PlanSession {
+                    tenant,
+                    session,
+                    survive,
+                    max_failures,
+                    dry_run,
+                } => {
+                    self.plan_session(tenant, session, &survive, max_failures, dry_run)
+                        .await
+                }
                 AdminAction::Status => self.read(AdminRead::Membership).await,
                 AdminAction::Configuration => self.read(AdminRead::Configuration).await,
                 AdminAction::Contacts => self.read(AdminRead::Contacts).await,
@@ -131,6 +202,13 @@ impl AdminBackend for ClusterAdmin {
                     node,
                     expected_configuration_index,
                 } => self.transfer(node, expected_configuration_index).await,
+                AdminAction::NodeEligibility { node, eligible } => {
+                    self.node_eligibility(node, eligible).await
+                }
+                AdminAction::RemoveNode { node } => self.remove_node(node).await,
+                AdminAction::ReplaceNode { node, replacement } => {
+                    self.replace_node(node, replacement).await
+                }
                 AdminAction::Inspect => self.inspect(),
                 AdminAction::Retry { operation_id } => self.retry(&operation_id).await,
                 AdminAction::Reconcile { operation_id } => self.reconcile(&operation_id).await,

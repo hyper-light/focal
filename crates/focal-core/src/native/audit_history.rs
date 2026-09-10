@@ -47,7 +47,9 @@ fn entries_from<'a>(
         .tail
         .is_none()
         .then(|| view.state.rows.entries_from(key, false));
-    let pending = view.tail.map(|tail| tail.range.entries_from(key, false));
+    let pending = view
+        .tail
+        .map(|tail| tail.fragments.entries_from(key, false));
     pending
         .into_iter()
         .flatten()

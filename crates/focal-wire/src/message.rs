@@ -195,7 +195,31 @@ pub enum Operation {
     Probe {
         request: Vec<u8>,
     },
+    /// Ask the authenticated node for one range-movement fact its hosted
+    /// replica of `group` can state (its readiness, seal or progress for a
+    /// member, 25 §6). The fact travels over the node's own authenticated
+    /// connection; the session authority verifies it against its committed
+    /// state and attests it before proposing it.
+    RangeControl {
+        group: [u8; 16],
+        request: Vec<u8>,
+    },
+    /// Ask the node that leads a session's log to state the session's facts
+    /// or to apply one membership change or placement record to that log,
+    /// on behalf of the partition leader that drives the session's
+    /// placement ([24](../../../docs/archictecutre/24-placement-execution-and-fleet-control.md)
+    /// §9). The request travels over the requester's own authenticated
+    /// connection; the log applies it under its own committed rules.
+    SessionControl {
+        group: [u8; 16],
+        request: Vec<u8>,
+    },
 }
+/// One movement fact request: an operation, a member and a kind.
+pub const MAX_RANGE_CONTROL_REQUEST_BYTES: usize = 4 * 1024;
+/// One session control call: a membership change with its expected
+/// configuration, or a placement record with its placement.
+pub const MAX_SESSION_CONTROL_REQUEST_BYTES: usize = 64 * 1024;
 /// A probe with its coordinate, health and bounded piggyback.
 pub const MAX_PROBE_BYTES: usize = 8 * 1024;
 /// Read-only metadata selectors contain no variable-length collections.
@@ -239,6 +263,8 @@ impl Operation {
             Self::PlacementControl { .. } => 28,
             Self::SessionSign { .. } => 29,
             Self::Probe { .. } => 30,
+            Self::RangeControl { .. } => 31,
+            Self::SessionControl { .. } => 32,
         }
     }
     pub fn is_mutation(&self) -> bool {
@@ -466,6 +492,13 @@ pub enum CustodyRequest {
         index: u32,
         max_bytes: u32,
     },
+    /// One chunk of a seeded checkpoint (25 §5) by its content hash; a
+    /// replica installing that checkpoint pulls what it lacks from a peer
+    /// that holds it.
+    SeedChunk {
+        hash: ContentHash,
+        max_bytes: u32,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CustodyReply {
@@ -487,6 +520,10 @@ pub enum CustodyReply {
     },
     Chunk {
         index: u32,
+        bytes: Vec<u8>,
+    },
+    SeedChunk {
+        hash: ContentHash,
         bytes: Vec<u8>,
     },
 }

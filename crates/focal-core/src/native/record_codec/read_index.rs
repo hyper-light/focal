@@ -63,6 +63,7 @@ pub(super) fn phase(key: Key) -> Result<usize, NativeError> {
         | Key::Receipt(_)
         | Key::Cycle(_)
         | Key::RetiredCycleHead(_)
+        | Key::Retired(_)
         | Key::RetiredCycle(_)
         | Key::WorkSlot(..)
         | Key::ClaimResultTestament(_)
@@ -88,7 +89,8 @@ pub(super) fn phase(key: Key) -> Result<usize, NativeError> {
         | Key::ByEvaluator(..)
         | Key::ByVerdict(..)
         | Key::ByCreated(..)
-        | Key::DueTimer(..) => 0,
+        | Key::DueTimer(..)
+        | Key::ByObject(..) => 0,
         Key::Definition(_) | Key::ClaimContent(_) => 1,
         Key::Artifact(_) => 2,
         Key::Diagnostic(_) | Key::Work(_) => 3,

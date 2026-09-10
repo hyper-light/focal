@@ -163,7 +163,7 @@ fn publish(core: &mut Core<NativeState>, changes: SealedChanges) -> NativeOutcom
         )
         .unwrap();
     core.publish_native(NativePrepared {
-        range,
+        fragments: range,
         outcome,
         writes: mutation::WriteSet::unrecorded(),
     })

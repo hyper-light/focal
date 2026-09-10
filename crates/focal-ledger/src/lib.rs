@@ -18,9 +18,11 @@ mod request_streams;
 pub use request_streams::{ManagedError, RequestStreamLimits, RequestStreamReadView};
 pub mod native_checkpoint;
 pub mod native_session;
+pub use native_session::retention::{RetentionBlocker, RetentionReport};
 pub use native_session::{
-    FailureClass, NativeCommit, NativeReadBoundary, NativeSessionError, NativeSessionLimits,
-    NativeSubmission, NativeTimerInput, ReadCorrelation,
+    FailureClass, LayoutOperation, LedgerRangeVerifier, MovementRecord, NativeCommit,
+    NativeReadBoundary, NativeSessionError, NativeSessionLimits, NativeSubmission,
+    NativeTimerInput, PendingSeed, ReadCorrelation,
 };
 mod session;
 pub use focal_core::native::NativeContentProfile;

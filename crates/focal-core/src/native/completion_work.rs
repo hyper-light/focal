@@ -230,7 +230,13 @@ impl CompletionEnvelope {
             add(add(g, original_events)?, add(original_extras, 2)?)?,
             add(
                 cohort.changed_keys(),
-                add(add(4, add(moved, moved)?)?, timers)?,
+                add(
+                    add(
+                        crate::native::index_rows::report_rows(0)?,
+                        add(moved, moved)?,
+                    )?,
+                    timers,
+                )?,
             )?,
         )?;
         descriptor.inputs = crate::native::index_rows::cap_inputs(
@@ -295,13 +301,16 @@ impl CompletionEnvelope {
             )?,
         )?;
         within(changes, batch)?;
-        let ordinary_report = view.state.rows.future_write_envelope(RangeWriteLimits {
-            changed_keys: changes,
-            deleted_keys: add(moved, timers)?,
-            deleted_heap: 0,
-            incoming_heap,
-            input_capacity: changes,
-        })?;
+        let ordinary_report = view.state.rows.future_write_envelope(
+            RangeWriteLimits {
+                changed_keys: changes,
+                deleted_keys: add(moved, timers)?,
+                deleted_heap: 0,
+                incoming_heap,
+                input_capacity: changes,
+            },
+            limits.max_ranges,
+        )?;
         let reports = definition.attempt_bound();
         // A report may seal any newly terminal graph cohort. Its mixed credit
         // journal remains owned by the pending candidate, so each attempt must

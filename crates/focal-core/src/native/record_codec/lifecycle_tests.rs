@@ -167,7 +167,7 @@ fn frozen_result_testament_preserves_generated_binding_and_publications_after_po
         },
         &[],
     ));
-    let Some(Row::ResultTestament(row)) = prepared.range.get(&Key::ResultTestament(id)) else {
+    let Some(Row::ResultTestament(row)) = prepared.fragments.get(&Key::ResultTestament(id)) else {
         panic!("generated audit row");
     };
     let generated = row.get().unwrap().generated_binding();
@@ -189,7 +189,7 @@ fn frozen_result_testament_preserves_generated_binding_and_publications_after_po
         },
         &[],
     ));
-    let Some(Row::ResultTestament(row)) = prepared.range.get(&Key::ResultTestament(id)) else {
+    let Some(Row::ResultTestament(row)) = prepared.fragments.get(&Key::ResultTestament(id)) else {
         panic!("posted audit row");
     };
     let value = row.get().unwrap();

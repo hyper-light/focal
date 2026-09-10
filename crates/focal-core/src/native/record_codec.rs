@@ -5,6 +5,7 @@
 //! dormant bytes are not yet a registered WAL decoder or an activation promise.
 //! Structural inspection does not prove model validity, complete history, local
 //! evidence custody or permission to publish a recovered root.
+pub mod archive;
 mod buffer;
 pub mod checkpoint;
 pub use buffer::FundedRecord;
@@ -19,6 +20,7 @@ mod fixed;
 mod inspect;
 mod lifecycle;
 mod lifecycle_fields;
+pub mod materialize;
 mod read_audit;
 mod read_claim;
 mod read_dispatch;
@@ -62,9 +64,21 @@ use super::input_codec::{bytes, descriptors, types};
 use super::*;
 pub use bytes::Error as CodecError;
 use bytes::{
-    CountingSink, Sink, SliceSink, write_count, write_raw, write_u8, write_u16, write_u64,
+    CountingSink, Sink, SliceSink, write_count, write_raw, write_u8, write_u16, write_u32,
+    write_u64,
 };
+pub(in crate::native) use checkpoint::{ArchiveFrame, archive_frame};
 pub use fixed::RowFamily;
+pub(in crate::native) use read_history::event_object;
+/// A measuring sink for a two-pass encoding.
+pub(in crate::native) fn counting_sink(max_bytes: usize, max_visits: usize) -> CountingSink {
+    CountingSink::new(max_bytes, max_visits)
+}
+/// A writing sink over exactly the quoted bytes.
+pub(in crate::native) fn slice_sink(bytes: &mut [u8], max_visits: usize) -> SliceSink<'_> {
+    SliceSink::new(bytes, max_visits)
+}
+pub use archive::{ArchiveHeader, StructuralArchive};
 pub use inspect::{
     EncodedRow, InspectionLimits, InspectionQuote, RecordHeader, RecordRows, StructuralRecord,
 };
@@ -72,7 +86,8 @@ pub use inspect::{
 pub const MAGIC: [u8; 8] = *b"FCMUTATE";
 // Version 2 records the actual graph snapshot boundary on consequence events.
 // These dormant native bytes are separate from the frozen live V1 formats.
-pub const VERSION: u16 = 4;
+// Version 5 orders rows by the storage layout (25 §3): affinity, family, fields.
+pub const VERSION: u16 = 5;
 const HASH_DOMAIN: &str = "focal.native.record.v2";
 
 #[derive(Debug, Clone, Copy)]
@@ -187,8 +202,8 @@ fn frame(sink: &mut impl Sink, prepared: &NativePrepared) -> Result<ContentHash,
     let outcome = prepared.outcome;
     if outcome.ledger.tenant.is_zero()
         || outcome.ledger.session.is_zero()
-        || outcome.sequence.0 != prepared.range.prefix()
-        || prepared.range.base_prefix().checked_add(1) != Some(outcome.sequence.0)
+        || outcome.sequence.0 != prepared.fragments.prefix()
+        || prepared.fragments.base_prefix().checked_add(1) != Some(outcome.sequence.0)
     {
         return Err(CodecError::InvalidTag("record frame"));
     }
@@ -209,8 +224,8 @@ fn frame(sink: &mut impl Sink, prepared: &NativePrepared) -> Result<ContentHash,
         },
     )?;
     types::ledger(&mut hashed, outcome.ledger)?;
-    write_raw(&mut hashed, &prepared.range.id().0.to_le_bytes())?;
-    write_u64(&mut hashed, prepared.range.base_prefix())?;
+    write_raw(&mut hashed, &prepared.fragments.id().0.to_le_bytes())?;
+    write_u64(&mut hashed, prepared.fragments.base_prefix())?;
     fixed::outcome(&mut hashed, outcome)?;
     write_count(&mut hashed, prepared.mutation_count())?;
     let mut previous = None;
@@ -231,7 +246,7 @@ fn frame(sink: &mut impl Sink, prepared: &NativePrepared) -> Result<ContentHash,
         previous = Some(key);
         write_u8(&mut hashed, u8::from(!deleted))?;
         fixed::key(&mut hashed, key)?;
-        let value = prepared.range.get(&key);
+        let value = prepared.fragments.get(&key);
         match (deleted, value) {
             (true, None) if key != Key::Meta && key != Key::Outcome(outcome.invocation) => {
                 write_count(&mut hashed, 0)?;

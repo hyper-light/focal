@@ -15,12 +15,11 @@
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader},
-    net::UdpSocket,
     os::unix::fs::PermissionsExt,
     path::Path,
     process::{Child, Command, Output, Stdio},
     sync::mpsc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 struct Server(Child);
@@ -33,18 +32,14 @@ impl Drop for Server {
 fn private(path: &Path) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
+#[path = "support/ports.rs"]
+mod ports;
 fn address() -> String {
-    // Probe outside the ephemeral range so a concurrent test cannot take the
-    // port between the probe and the bind.
-    for port in 26_000..30_000u16 {
-        let candidate = format!("127.0.0.1:{port}");
-        if UdpSocket::bind(&candidate).is_ok() && std::net::TcpListener::bind(&candidate).is_ok() {
-            return candidate;
-        }
-    }
-    panic!("no free port")
+    ports::address()
 }
 fn start(root: &Path, advertise: &str) -> Server {
+    // Four rows per member: the balancer splits the group while the
+    // workflow runs (doc 25 §8), so every step below runs across a reshape.
     let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
         .args([
             "--data-dir",
@@ -53,6 +48,7 @@ fn start(root: &Path, advertise: &str) -> Server {
             "--advertise",
             advertise,
         ])
+        .env("FOCAL_RANGE_TARGET_ENTRIES", "4")
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -432,6 +428,31 @@ fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive
         let replayed = cli(root, None, &["request", "retry", "--operation-id", &id]);
         let (_, result) = committed(&replayed);
         assert_eq!(created(&result, "Claim").len(), 1);
+    }
+    // The balancer reshaped the group under the workflow: the map holds
+    // several members, every one with rows, at a later range epoch.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let output = run(root, None, &["cluster", "replicas", "ranges", "list"]);
+        let view: Option<Value> = output
+            .status
+            .success()
+            .then(|| serde_json::from_slice::<Value>(&output.stdout).ok())
+            .flatten()
+            .map(|value| value["result"]["ranges"].clone());
+        if let Some(view) = &view
+            && view["members"].as_array().is_some_and(|members| {
+                members.len() >= 2 && members.iter().all(|member| member["entries"] != 0)
+            })
+            && view["epoch"].as_u64().is_some_and(|epoch| epoch >= 2)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the balancer never split the group: {view:?}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
     }
     drop(server);
 }

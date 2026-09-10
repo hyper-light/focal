@@ -213,6 +213,26 @@ impl DecodedRequest<'_, '_> {
         };
         Ok(Some((input.request, artifact.into_descriptor()?)))
     }
+    /// The artifact a validation phase is begun against (an increment's
+    /// artifact or a work slot's), for custody eligibility outside the owner
+    /// (a replicated host asks the artifact's copies before the owner admits
+    /// the phase). Other frames yield `None` without being built.
+    pub fn into_evaluation_artifact(self) -> Result<Option<ArtifactId>, DecodeError> {
+        if !matches!(self.plan, Plan::Fixed { .. }) {
+            return Ok(None);
+        }
+        let input = self.build()?;
+        Ok(match input.command {
+            NativeCommand::BeginIncrement { key, .. } | NativeCommand::BeginWork { key, .. } => {
+                match key.target {
+                    EvaluationTarget::Increment { artifact }
+                    | EvaluationTarget::Work { artifact, .. } => Some(artifact),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+    }
     pub(in crate::native) fn build(self) -> Result<NativeInput, DecodeError> {
         self.check_build(self.construction_bytes(), self.construction_visits()?)?;
         match self.plan {

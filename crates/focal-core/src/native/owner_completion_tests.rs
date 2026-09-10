@@ -8,13 +8,13 @@ use super::*;
 mod claim_deadline_owner_tests;
 #[path = "deadline_owner_tests.rs"]
 mod deadline_owner_tests;
+use crate::native::fixtures::SyncCell as Cell;
 use focal_evidence::{BuiltinSchemaError, StoreLimits, error_report_schema, test_report_schema};
 use focal_model::lifecycle::{aggregation, artifact_descriptor::ResultProvenance};
 use focal_model::{
     ArtifactRef, ContentRef, Deadline, HandlerRef, TimerId, ValidationMode, ValidatorId,
     VerdictValue,
 };
-use std::cell::Cell;
 
 const DOMAIN: ContentDomainId = ContentDomainId::from_u128(1900);
 

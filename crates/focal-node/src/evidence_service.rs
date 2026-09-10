@@ -19,6 +19,48 @@ use tokio::sync::{mpsc, oneshot};
 
 const JOB_BYTES: usize = 8 * 1024 * 1024;
 
+/// The custody an object owes under a placement (doc 04 §7, R8): the copies
+/// the placement requires and those with a verified receipt at the current
+/// scope. A phase that evaluates the object begins only when the two agree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustodyObligation {
+    pub scope: CustodyScope,
+    pub required: BTreeSet<u64>,
+    pub held: BTreeSet<u64>,
+}
+impl CustodyObligation {
+    pub fn satisfied(&self) -> bool {
+        self.required.is_subset(&self.held)
+    }
+    pub fn missing(&self) -> impl Iterator<Item = u64> + '_ {
+        self.required.difference(&self.held).copied()
+    }
+}
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+        .unwrap_or(0)
+}
+/// One copy's receipt for one object under the scope, taken now.
+fn receipt_for(
+    scope: CustodyScope,
+    node: u64,
+    reference: &ContentRef,
+) -> focal_evidence::CustodyReceipt {
+    focal_evidence::CustodyReceipt::new(
+        scope.ledger,
+        reference.domain,
+        reference.root,
+        reference.length,
+        node,
+        scope.route_epoch,
+        scope.policy_revision,
+        now_millis(),
+    )
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EvidencePlacement {
     scope: CustodyScope,
@@ -161,9 +203,32 @@ enum JobKind {
     Seal(oneshot::Sender<Result<ContentRef, AccessError>>),
     Attest(oneshot::Sender<Result<EvidencedRequest, AccessError>>),
     AttestNative(oneshot::Sender<Result<NativeEvidencedRequest, AccessError>>),
+    /// The custody obligation of one object, with the request handed back.
+    Obligation(
+        ContentRef,
+        oneshot::Sender<Result<(CustodyObligation, VerifiedRequest), AccessError>>,
+    ),
+    /// Seal an archive bundle (26 §4) as content of the ledger under its
+    /// current placement, replicate it to every required copy and report
+    /// the obligation.
+    Archive {
+        bytes: Vec<u8>,
+        reply: oneshot::Sender<Result<ArchiveOutcome, AccessError>>,
+    },
+}
+/// A sealed archive bundle: the object that names it and which required
+/// copies hold a receipt for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveOutcome {
+    pub reference: ContentRef,
+    pub obligation: CustodyObligation,
 }
 struct Job {
-    request: VerifiedRequest,
+    /// The authenticated request a participant job serves; trusted node
+    /// jobs carry none.
+    request: Option<VerifiedRequest>,
+    ledger: LedgerId,
+    route: RouteEpoch,
     kind: JobKind,
     _allocation: Allocation,
 }
@@ -192,6 +257,16 @@ enum Completed {
         scope: Option<CustodyScope>,
         result: Box<Result<NativeEvidencedRequest, AccessError>>,
         reply: oneshot::Sender<Result<NativeEvidencedRequest, AccessError>>,
+    },
+    Obligation {
+        scope: Option<CustodyScope>,
+        result: Box<Result<(CustodyObligation, VerifiedRequest), AccessError>>,
+        reply: oneshot::Sender<Result<(CustodyObligation, VerifiedRequest), AccessError>>,
+    },
+    Archive {
+        scope: Option<CustodyScope>,
+        result: Box<Result<ArchiveOutcome, AccessError>>,
+        reply: oneshot::Sender<Result<ArchiveOutcome, AccessError>>,
     },
 }
 impl Completed {
@@ -234,6 +309,34 @@ impl Completed {
                 let _ = reply.send(result);
             }
             Self::AttestNative {
+                scope,
+                result,
+                reply,
+            } => {
+                let result = (*result).and_then(|value| {
+                    if current(scope) {
+                        Ok(value)
+                    } else {
+                        Err(AccessError::Unavailable)
+                    }
+                });
+                let _ = reply.send(result);
+            }
+            Self::Obligation {
+                scope,
+                result,
+                reply,
+            } => {
+                let result = (*result).and_then(|value| {
+                    if current(scope) {
+                        Ok(value)
+                    } else {
+                        Err(AccessError::Unavailable)
+                    }
+                });
+                let _ = reply.send(result);
+            }
+            Self::Archive {
                 scope,
                 result,
                 reply,
@@ -354,9 +457,13 @@ impl EvidenceCoordinator {
             .reserve(BudgetKind::Payload, BudgetLane::Ordinary, bytes)
             .map_err(|_| AccessError::Capacity)?
             .commit();
+        let ledger = request.request().ledger;
+        let route = request.request().route_epoch;
         self.sender
             .try_send(Job {
-                request,
+                request: Some(request),
+                ledger,
+                route,
                 kind,
                 _allocation: allocation,
             })
@@ -384,6 +491,54 @@ impl EvidenceCoordinator {
     ) -> Result<NativeEvidencedRequest, AccessError> {
         let (send, receive) = oneshot::channel();
         self.admit(request, JobKind::AttestNative(send))?;
+        receive.await.map_err(|_| AccessError::OutcomeUnknown)?
+    }
+    /// The custody obligation of one object under the request's placement:
+    /// every required copy with a receipt at the current scope, else asked
+    /// over its authenticated connection and recorded when it answers
+    /// `Durable`; the request is handed back for admission.
+    pub async fn obligation(
+        &self,
+        request: VerifiedRequest,
+        reference: ContentRef,
+    ) -> Result<(CustodyObligation, VerifiedRequest), AccessError> {
+        let (send, receive) = oneshot::channel();
+        self.admit(request, JobKind::Obligation(reference, send))?;
+        receive.await.map_err(|_| AccessError::OutcomeUnknown)?
+    }
+    /// Seal an archive bundle (26 §4) as content of `ledger` under its
+    /// current placement, replicate it to every required copy and report
+    /// the custody obligation; the bytes are charged here until the job is
+    /// done. A trusted node job: no participant request stands behind it.
+    pub async fn archive(
+        &self,
+        ledger: LedgerId,
+        route: RouteEpoch,
+        bytes: Vec<u8>,
+    ) -> Result<ArchiveOutcome, AccessError> {
+        let charge = bytes
+            .len()
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(JOB_BYTES))
+            .ok_or(AccessError::Capacity)?;
+        let allocation = self
+            .budget
+            .reserve(BudgetKind::Payload, BudgetLane::Ordinary, charge)
+            .map_err(|_| AccessError::Capacity)?
+            .commit();
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .try_send(Job {
+                request: None,
+                ledger,
+                route,
+                kind: JobKind::Archive { bytes, reply },
+                _allocation: allocation,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => AccessError::Capacity,
+                mpsc::error::TrySendError::Closed(_) => AccessError::Unavailable,
+            })?;
         receive.await.map_err(|_| AccessError::OutcomeUnknown)?
     }
     /// Install a verified committed placement through the existing owner. The
@@ -451,7 +606,7 @@ impl EvidenceDriver {
                 }
                 job = self.receiver.recv(), if receiving && tasks.len() < self.concurrency => {
                     if let Some(job) = job {
-                        let placement = self.snapshot(job.request.request().ledger, job.request.request().route_epoch);
+                        let placement = self.snapshot(job.ledger, job.route);
                         tasks.push(process(&content, pool, self.node, placement, job));
                     } else { receiving = false; }
                 }
@@ -539,9 +694,12 @@ async fn process(
     let scope = placement.as_ref().ok().map(|row| row.placement.scope);
     match job.kind {
         JobKind::Seal(response) => {
-            let result = match &placement {
-                Ok(row) => seal(content, pool, node, &row.placement, &job.request).await,
-                Err(error) => Err(error.clone()),
+            let result = match (&placement, &job.request) {
+                (Ok(row), Some(request)) => {
+                    seal(content, pool, node, &row.placement, request).await
+                }
+                (Err(error), _) => Err(error.clone()),
+                (Ok(_), None) => Err(AccessError::InvalidRequest),
             };
             drop(job.request);
             Completed::Seal {
@@ -552,19 +710,20 @@ async fn process(
             }
         }
         JobKind::Attest(response) => {
-            let result = match &placement {
-                Ok(row) => {
+            let result = match (&placement, job.request) {
+                (Ok(row), Some(request)) => {
                     attest(
                         content,
                         pool,
                         node,
                         &row.placement,
-                        job.request,
+                        request,
                         job._allocation,
                     )
                     .await
                 }
-                Err(error) => Err(error.clone()),
+                (Err(error), _) => Err(error.clone()),
+                (Ok(_), None) => Err(AccessError::InvalidRequest),
             };
             Completed::Attest {
                 scope,
@@ -573,9 +732,12 @@ async fn process(
             }
         }
         JobKind::AttestNative(response) => {
-            let result = match &placement {
-                Ok(row) => attest_native(content, pool, node, &row.placement, job.request).await,
-                Err(error) => Err(error.clone()),
+            let result = match (&placement, job.request) {
+                (Ok(row), Some(request)) => {
+                    attest_native(content, pool, node, &row.placement, request).await
+                }
+                (Err(error), _) => Err(error.clone()),
+                (Ok(_), None) => Err(AccessError::InvalidRequest),
             };
             drop(job._allocation);
             Completed::AttestNative {
@@ -584,7 +746,137 @@ async fn process(
                 reply: response,
             }
         }
+        JobKind::Obligation(reference, response) => {
+            let result = match (&placement, job.request) {
+                (Ok(row), Some(request)) => {
+                    obligation(content, pool, node, &row.placement, &reference)
+                        .await
+                        .map(|obligation| (obligation, request))
+                }
+                (Err(error), _) => Err(error.clone()),
+                (Ok(_), None) => Err(AccessError::InvalidRequest),
+            };
+            drop(job._allocation);
+            Completed::Obligation {
+                scope,
+                result: Box::new(result),
+                reply: response,
+            }
+        }
+        JobKind::Archive { bytes, reply } => {
+            let result = match &placement {
+                Ok(row) => archive(content, pool, node, &row.placement, bytes).await,
+                Err(error) => Err(error.clone()),
+            };
+            drop(job._allocation);
+            Completed::Archive {
+                scope,
+                result: Box::new(result),
+                reply,
+            }
+        }
     }
+}
+/// Seal an archive bundle (26 §4) as an object of the ledger's tenant
+/// domain, replicate it to every other required copy exactly as a sealed
+/// upload is, and report which required copies hold a receipt for it. The
+/// bundle names itself by its content root and length; the retirement
+/// record carries both.
+async fn archive(
+    content: &ContentHost,
+    pool: &PeerConnectionPool,
+    node: u64,
+    placement: &EvidencePlacement,
+    bytes: Vec<u8>,
+) -> Result<ArchiveOutcome, AccessError> {
+    let scope = placement.scope;
+    let (chunk_bytes, _) = content.import_chunking();
+    let domain = ContentDomainId(scope.ledger.tenant.0);
+    let reference = content
+        .seal_import_inline(domain, bytes, chunk_bytes)
+        .await?;
+    let request = RequestId(
+        reference
+            .root
+            .0
+            .get(..16)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or(AccessError::InvalidRequest)?,
+    );
+    replicate(content, pool, node, placement, request, &reference).await?;
+    let obligation = obligation(content, pool, node, placement, &reference).await?;
+    Ok(ArchiveOutcome {
+        reference,
+        obligation,
+    })
+}
+/// The obligation of one object: a receipt at the current scope counts; a
+/// copy without one is asked to verify the object now (this node through
+/// its own store) and its `Durable` answer is recorded as its receipt. A
+/// copy that cannot answer is simply not held; nothing is ever inferred
+/// from a request or an intent.
+async fn obligation(
+    content: &ContentHost,
+    pool: &PeerConnectionPool,
+    node: u64,
+    placement: &EvidencePlacement,
+    reference: &ContentRef,
+) -> Result<CustodyObligation, AccessError> {
+    let scope = placement.scope;
+    let required = placement.copies.clone();
+    let mut held = BTreeSet::new();
+    let transfer = transfer_id(
+        scope,
+        RequestId(reference.root.0[..16].try_into().unwrap_or([0; 16])),
+        reference,
+    );
+    for peer in &required {
+        if content
+            .receipt(scope, reference.root, *peer)
+            .await?
+            .is_some_and(|receipt| {
+                receipt.route_epoch == scope.route_epoch
+                    && receipt.policy_revision == scope.policy_revision
+                    && receipt.length == reference.length
+            })
+        {
+            held.insert(*peer);
+            continue;
+        }
+        let durable = if *peer == node {
+            content
+                .export_manifest(scope, reference.clone())
+                .await
+                .is_ok()
+        } else {
+            matches!(
+                remote(
+                    pool,
+                    *peer,
+                    scope,
+                    transfer,
+                    CustodyRequest::Verify {
+                        policy_revision: scope.policy_revision,
+                        content: reference.clone(),
+                    },
+                )
+                .await,
+                Ok(CustodyReply::Durable { content: found, policy_revision })
+                    if found == *reference && policy_revision == scope.policy_revision
+            )
+        };
+        if durable {
+            content
+                .record_receipt(scope, receipt_for(scope, *peer, reference))
+                .await?;
+            held.insert(*peer);
+        }
+    }
+    Ok(CustodyObligation {
+        scope,
+        required,
+        held,
+    })
 }
 /// Seal and verify an artifact-bearing native frame's inline payload, then
 /// replicate the sealed bytes to every other required copy of the current
@@ -772,6 +1064,38 @@ fn transfer_id(scope: CustodyScope, request: RequestId, reference: &ContentRef) 
     }
     id
 }
+/// Pull one seed chunk of a checkpoint (25 §5) from `peer`, verified
+/// against its hash before it is returned.
+pub(crate) async fn pull_seed(
+    pool: &PeerConnectionPool,
+    peer: u64,
+    scope: CustodyScope,
+    hash: focal_model::ContentHash,
+) -> Result<Vec<u8>, AccessError> {
+    let mut id = [0u8; 16];
+    for (target, source) in id.iter_mut().zip(hash.0.iter()) {
+        *target = *source;
+    }
+    let reply = remote(
+        pool,
+        peer,
+        scope,
+        id,
+        CustodyRequest::SeedChunk {
+            hash,
+            max_bytes: u32::try_from(focal_evidence::SEED_CHUNK_BYTES)
+                .map_err(|_| AccessError::Capacity)?,
+        },
+    )
+    .await?;
+    let CustodyReply::SeedChunk { hash: read, bytes } = reply else {
+        return Err(AccessError::InvalidRequest);
+    };
+    if read != hash || focal_model::ContentHash(*blake3::hash(&bytes).as_bytes()) != hash {
+        return Err(AccessError::InvalidRequest);
+    }
+    Ok(bytes)
+}
 fn envelope(scope: CustodyScope, id: [u8; 16], operation: CustodyRequest) -> RequestEnvelope {
     RequestEnvelope {
         protocol: PROTOCOL_VERSION,
@@ -834,6 +1158,12 @@ async fn replicate(
     let scope = placement.scope;
     let transfer = transfer_id(scope, request, reference);
     let manifest = content.export_manifest(scope, reference.clone()).await?;
+    // This node's own sealed object is its own receipt.
+    if placement.copies.contains(&node) {
+        content
+            .record_receipt(scope, receipt_for(scope, node, reference))
+            .await?;
+    }
     for peer in &placement.copies {
         if *peer == node {
             continue;
@@ -841,6 +1171,9 @@ async fn replicate(
         if matches!(remote(pool, *peer, scope, transfer, CustodyRequest::Verify { policy_revision: scope.policy_revision, content: reference.clone() }).await,
             Ok(CustodyReply::Durable { content: found, policy_revision }) if found == *reference && policy_revision == scope.policy_revision)
         {
+            content
+                .record_receipt(scope, receipt_for(scope, *peer, reference))
+                .await?;
             continue;
         }
         let opened = remote(
@@ -895,6 +1228,9 @@ async fn replicate(
         {
             return Err(AccessError::InvalidRequest);
         }
+        content
+            .record_receipt(scope, receipt_for(scope, *peer, reference))
+            .await?;
         let _ = remote(
             pool,
             *peer,
@@ -1061,6 +1397,62 @@ pub struct FleetService {
     pub content: ContentHost,
     pub evidence: EvidenceCoordinator,
 }
+enum Eligibility {
+    Refused(NativeRefusal),
+    Failed(AccessError),
+}
+impl FleetService {
+    /// A phase that evaluates an artifact begins only when every required
+    /// copy holds it (doc 04 §7, R8 instruction 1): the artifact's pointer
+    /// is read from the committed prefix and its obligation asked of the
+    /// evidence coordinator; a copy short of custody refuses the frame as a
+    /// retryable capacity condition naming the copies, and an artifact the
+    /// prefix does not hold is left for the owner to refuse.
+    async fn eligible(&self, request: VerifiedRequest) -> Result<VerifiedRequest, Eligibility> {
+        let Operation::Native { frame } = &request.request().operation else {
+            return Ok(request);
+        };
+        let ledger = request.request().ledger;
+        let limits = focal_ledger::NativeSessionLimits::standard(ContentDomainId(ledger.tenant.0));
+        let artifact = crate::native_ingress::evaluation_artifact_of_frame(&limits, frame)
+            .map_err(Eligibility::Failed)?;
+        let Some(artifact) = artifact else {
+            return Ok(request);
+        };
+        let pointer = self
+            .replica
+            .artifact_pointer(artifact)
+            .await
+            .map_err(|error| Eligibility::Failed(crate::host::access(error)))?;
+        let Some(pointer) = pointer else {
+            return Ok(request);
+        };
+        let reference = ContentRef {
+            domain: pointer.domain,
+            root: pointer.root,
+            length: pointer.length,
+            class: pointer.class,
+        };
+        let (obligation, request) = self
+            .evidence
+            .obligation(request, reference)
+            .await
+            .map_err(Eligibility::Failed)?;
+        if obligation.satisfied() {
+            return Ok(request);
+        }
+        let missing: Vec<String> = obligation.missing().map(|node| node.to_string()).collect();
+        Err(Eligibility::Refused(NativeRefusal {
+            kind: NativeRefusalKind::Capacity,
+            detail: format!(
+                "custody: {} of {} required copies hold the artifact; missing nodes {}",
+                obligation.held.len(),
+                obligation.required.len(),
+                missing.join(",")
+            ),
+        }))
+    }
+}
 impl RequestHandler for FleetService {
     fn supports_managed_requests(&self) -> bool {
         true
@@ -1107,6 +1499,21 @@ impl RequestHandler for FleetService {
                             .await
                     }
                     Err(error) => {
+                        response.result = Response::Error(error);
+                        OwnedResponse::new(response)
+                    }
+                }
+            } else if let Operation::Native { frame } = &request.request().operation
+                && inspect_native_frame(frame)
+                    .is_ok_and(|header| crate::native_ingress::evaluates_artifact(header.command))
+            {
+                match self.eligible(request).await {
+                    Ok(request) => self.replica.handle_accounted(request).await,
+                    Err(Eligibility::Refused(refusal)) => {
+                        response.result = Response::Native(NativeMutationReply::Refused(refusal));
+                        OwnedResponse::new(response)
+                    }
+                    Err(Eligibility::Failed(error)) => {
                         response.result = Response::Error(error);
                         OwnedResponse::new(response)
                     }

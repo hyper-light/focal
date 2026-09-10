@@ -78,20 +78,41 @@ fn budget() -> MemoryBudget {
     MemoryBudget::new(32 * 1024 * 1024, 16 * 1024 * 1024).unwrap()
 }
 
+/// A `Cell` that is `Sync`, since a verifier is shared with the
+/// materializer's workers.
+#[derive(Debug, Default)]
+struct SyncCell<T>(std::sync::Mutex<T>);
+impl<T: Copy> SyncCell<T> {
+    fn new(value: T) -> Self {
+        Self(std::sync::Mutex::new(value))
+    }
+    fn get(&self) -> T {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+    fn set(&self, value: T) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = value;
+    }
+}
 struct ChangingSchemas {
     schema: ContentHash,
-    maximum: std::cell::Cell<usize>,
-    present: std::cell::Cell<bool>,
-    verifications: std::cell::Cell<usize>,
+    maximum: SyncCell<usize>,
+    present: SyncCell<bool>,
+    verifications: SyncCell<usize>,
 }
 
 impl ChangingSchemas {
     fn new(maximum: usize) -> Self {
         Self {
             schema: ContentHash([87; 32]),
-            maximum: std::cell::Cell::new(maximum),
-            present: std::cell::Cell::new(true),
-            verifications: std::cell::Cell::new(0),
+            maximum: SyncCell::new(maximum),
+            present: SyncCell::new(true),
+            verifications: SyncCell::new(0),
         }
     }
 }

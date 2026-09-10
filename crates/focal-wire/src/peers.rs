@@ -264,6 +264,14 @@ impl PeerConnectionPool {
     /// Only the installed, trusted route table is enumerated. No response can
     /// add an endpoint. A strictly increasing cursor bounds changing snapshots
     /// without allocating a second route table.
+    /// The installed reachability of one peer, for a redirect hint.
+    pub fn route_endpoint(&self, node: u64) -> Result<Option<PeerEndpoint>, PeerSendError> {
+        let state = self.state.lock().map_err(|_| PeerSendError::Closed)?;
+        if state.closed {
+            return Err(PeerSendError::Closed);
+        }
+        Ok(state.routes.get(&node).cloned())
+    }
     pub fn next_route_target(&self, after: u64) -> Result<Option<u64>, PeerSendError> {
         let state = self.state.lock().map_err(|_| PeerSendError::Closed)?;
         if state.closed {
@@ -302,7 +310,10 @@ impl PeerConnectionPool {
     ) -> Result<Vec<u8>, PeerSendError> {
         if !matches!(
             request.operation,
-            Operation::PlacementControl { .. } | Operation::SessionSign { .. }
+            Operation::PlacementControl { .. }
+                | Operation::SessionSign { .. }
+                | Operation::RangeControl { .. }
+                | Operation::SessionControl { .. }
         ) {
             return Err(PeerSendError::InvalidRequest);
         }
@@ -398,6 +409,16 @@ impl PeerConnectionPool {
                 *group != [0; 16]
                     && !request.is_empty()
                     && request.len() <= MAX_SESSION_SIGN_REQUEST_BYTES
+            }
+            Operation::RangeControl { group, request } => {
+                *group != [0; 16]
+                    && !request.is_empty()
+                    && request.len() <= MAX_RANGE_CONTROL_REQUEST_BYTES
+            }
+            Operation::SessionControl { group, request } => {
+                *group != [0; 16]
+                    && !request.is_empty()
+                    && request.len() <= MAX_SESSION_CONTROL_REQUEST_BYTES
             }
             Operation::Probe { request } => !request.is_empty() && request.len() <= MAX_PROBE_BYTES,
             Operation::NodeContact { group, .. } => *group != [0; 16],

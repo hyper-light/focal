@@ -794,3 +794,111 @@ async fn abandoned_transfer_expires_without_another_network_request() {
     owner.join().unwrap();
     assert_eq!(budget.stats().used, 0);
 }
+
+#[test]
+fn seed_chunks_are_served_to_installed_peers_and_announced_pending_peers_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = ledger(1, 9);
+    let seed_root = dir.path().join("seeds");
+    let mut seeds = focal_evidence::SeedStore::open(
+        crate::custody::seed_directory(&seed_root, ledger),
+        focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default()).unwrap(),
+    )
+    .unwrap();
+    let hash = seeds.install(b"seed chunk bytes").unwrap();
+    let mut config = CustodyConfig::new(1);
+    config.seed_root = Some(seed_root);
+    let mut store = CustodyStore::new(
+        ContentStore::open(dir.path().join("content"), limits()).unwrap(),
+        config,
+        memory(),
+    )
+    .unwrap();
+    let read = |node: u64, epoch: u64, id: u128, hash: ContentHash| {
+        request(
+            ledger,
+            epoch,
+            Some(node),
+            id,
+            Operation::Custody(CustodyRequest::SeedChunk {
+                hash,
+                max_bytes: 1024,
+            }),
+        )
+    };
+    // Nothing is served for a ledger without a policy or an announcement.
+    assert!(matches!(
+        store.request(&read(2, 1, 1, hash)),
+        Err(AccessError::Unauthorized)
+    ));
+    store.install_policy(policy(ledger)).unwrap();
+    let served = store.request(&read(2, 1, 2, hash)).unwrap();
+    assert!(matches!(
+        served.value(),
+        CustodyReply::SeedChunk { hash: read_back, bytes }
+            if *read_back == hash && bytes == b"seed chunk bytes"
+    ));
+    // A node outside the installed placement, and a route nobody announced.
+    assert!(matches!(
+        store.request(&read(3, 1, 3, hash)),
+        Err(AccessError::Unauthorized)
+    ));
+    assert!(matches!(
+        store.request(&read(3, 2, 4, hash)),
+        Err(AccessError::Unavailable)
+    ));
+    // An announced pending placement admits its peers at the pending route,
+    // for seeds only; the announcement must lie beyond the installed scope.
+    let pending = CustodyScope {
+        ledger,
+        route_epoch: RouteEpoch(2),
+        policy_revision: 2,
+    };
+    assert!(matches!(
+        store.announce_pending(
+            ledger,
+            Some((
+                CustodyScope {
+                    route_epoch: RouteEpoch(1),
+                    ..pending
+                },
+                BTreeSet::from([1, 3])
+            ))
+        ),
+        Err(AccessError::InvalidRequest)
+    ));
+    let peers = BTreeSet::from([1, 2, 3]);
+    store
+        .announce_pending(ledger, Some((pending, peers.clone())))
+        .unwrap();
+    store
+        .announce_pending(ledger, Some((pending, peers)))
+        .unwrap();
+    assert!(store.request(&read(3, 2, 5, hash)).is_ok());
+    assert!(matches!(
+        store.request(&read(3, 1, 6, hash)),
+        Err(AccessError::Unauthorized)
+    ));
+    assert!(matches!(
+        store.request(&read(4, 2, 7, hash)),
+        Err(AccessError::Unauthorized)
+    ));
+    let cancel = request(
+        ledger,
+        2,
+        Some(3),
+        8,
+        Operation::Custody(CustodyRequest::Cancel { transfer: [8; 16] }),
+    );
+    assert!(matches!(
+        store.request(&cancel),
+        Err(AccessError::Unavailable)
+    ));
+    // An unknown seed is not found; a withdrawn announcement refuses again.
+    assert!(store.request(&read(3, 2, 9, ContentHash([7; 32]))).is_err());
+    store.announce_pending(ledger, None).unwrap();
+    assert!(matches!(
+        store.request(&read(3, 2, 10, hash)),
+        Err(AccessError::Unavailable)
+    ));
+}

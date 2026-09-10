@@ -26,7 +26,7 @@ pub(super) use creation_work::prepare;
 
 #[cfg(test)]
 #[path = "authored_tests.rs"]
-mod tests;
+pub(in crate::native) mod tests;
 #[cfg(test)]
 pub(super) use tests::{recovery_fixture, replay_fixture};
 

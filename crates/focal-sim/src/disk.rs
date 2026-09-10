@@ -48,6 +48,10 @@ impl Disk {
     pub fn fail_before(&mut self, operation: Option<u64>) {
         self.fail_before = operation;
     }
+    /// Operations performed so far, the coordinate `fail_before` cuts at.
+    pub fn operations(&self) -> u64 {
+        self.operation
+    }
 
     fn tick(&mut self) -> Result<(), DiskError> {
         self.operation = self.operation.checked_add(1).ok_or(DiskError::Invalid)?;

@@ -59,6 +59,9 @@ impl Fixture {
         Self::with_observe(limits, false)
     }
     fn with_observe(limits: NativeLimits, observe: bool) -> Self {
+        Self::with_shape(limits, observe, 2)
+    }
+    fn with_shape(limits: NativeLimits, observe: bool, slots: u32) -> Self {
         let core = Core::new_native(
             binding(1).ledger,
             RangeId(781),
@@ -93,10 +96,11 @@ impl Fixture {
         else {
             panic!("create")
         };
+        let policies: Vec<_> = (0..slots).map(slot_policy).collect();
         claims[0].definition.acceptance = aggregation::AcceptancePolicy::new(
             binding(1),
             ISSUER,
-            &[slot_policy(0), slot_policy(1)],
+            &policies,
             declarations,
             aggregation::Limits {
                 max_slots: 8,
@@ -839,43 +843,49 @@ fn claimant_can_observe_unattached_work_and_posted_response_after_claim_cancella
 
 #[test]
 fn output_bound_preserves_room_for_diagnostics_and_atomic_closure() {
-    // Twelve rows fit one attachment's close (its nine primary rows and the
-    // claim's two status index rows) and the pure Receipt publication (ten
-    // primary rows and the same status move). A second independently
-    // admitted output would make the cycle uncloseable. Bound the promised
-    // report payload and diagnostic set independently of the twelve-row
-    // publication limit being exercised here.
-    let mut f = Fixture::with_limits(NativeLimits {
-        range: RangeConfig {
-            max_batch_entries: 12,
-            page_bytes: 4096,
-            max_entry_bytes: 64 * 1024,
-            ..RangeConfig::default()
+    // Fourteen rows fit two attachments' close (its eleven primary rows and
+    // the claim's two status index rows), one output's submission (nine
+    // primary rows and the artifact's four index rows) and the pure Receipt
+    // publication (ten primary rows and the status move). A third
+    // independently admitted output would make the cycle uncloseable
+    // (fifteen rows). Bound the promised report payload and diagnostic set
+    // independently of the fourteen-row publication limit exercised here.
+    let mut f = Fixture::with_shape(
+        NativeLimits {
+            range: RangeConfig {
+                max_batch_entries: 14,
+                page_bytes: 4096,
+                max_entry_bytes: 64 * 1024,
+                ..RangeConfig::default()
+            },
+            plan_nodes: 4,
+            plan_edges: 64,
+            preparation_bytes: 1024 * 1024,
+            diagnostics_per_cycle: 1,
+            response_summary_bytes: 256,
+            ..NativeLimits::default()
         },
-        plan_nodes: 4,
-        plan_edges: 64,
-        preparation_bytes: 1024 * 1024,
-        diagnostics_per_cycle: 1,
-        response_summary_bytes: 256,
-        ..NativeLimits::default()
-    });
+        false,
+        3,
+    );
     let a = f.work(801, 0);
-    let artifact = f.artifact(802, WorkRole::Output { slot: 1 });
+    let b = f.work(802, 1);
+    let artifact = f.artifact(803, WorkRole::Output { slot: 2 });
     assert!(
         f.stage(
             SUBJECT,
             NativeCommand::SubmitWork {
                 claim: f.claim(),
-                slot: 1,
+                slot: 2,
                 artifact
             }
         )
         .is_err()
     );
-    let diagnostic = f.diagnostic(803);
+    let diagnostic = f.diagnostic(804);
     f.commit(
         SUBJECT,
-        f.close(900, OutcomeKind::Partial, vec![a], vec![diagnostic]),
+        f.close(900, OutcomeKind::Partial, vec![a, b], vec![diagnostic]),
     );
     assert_eq!(
         f.owner

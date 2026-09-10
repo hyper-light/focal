@@ -39,6 +39,9 @@ pub struct CustodyConfig {
     pub max_transfers: usize,
     pub max_transfer_bytes: u64,
     pub transfer_ttl: Duration,
+    /// Where this node keeps every ledger's checkpoint seeds (25 §5); unset
+    /// on a node that hosts no native session, which serves no seed.
+    pub seed_root: Option<std::path::PathBuf>,
 }
 impl CustodyConfig {
     pub fn new(node: u64) -> Self {
@@ -48,8 +51,20 @@ impl CustodyConfig {
             max_transfers: 128,
             max_transfer_bytes: 1024 * 1024 * 1024,
             transfer_ttl: Duration::from_secs(60),
+            seed_root: None,
         }
     }
+}
+/// Where a ledger's checkpoint seeds live under a node's seed root: one
+/// directory per ledger, named by the session.
+pub fn seed_directory(root: &std::path::Path, ledger: LedgerId) -> std::path::PathBuf {
+    let name: String = ledger
+        .session
+        .0
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    root.join(name)
 }
 /// Moving or transforming a result keeps its permit attached. There is no
 /// public extraction that silently drops accounting while returning its bytes.
@@ -77,6 +92,16 @@ struct Installed {
     policy: CustodyPolicy,
     _allocation: Allocation,
 }
+/// The peers of a placement the directory is preparing for a ledger this
+/// node serves. They may read the ledger's checkpoint seeds (immutable,
+/// content-addressed) before the placement activates, so a copy can seed
+/// its Session from the current owners while the route is still the old one
+/// (25 §5); nothing else is authorized by an announcement.
+struct PendingPeers {
+    scope: CustodyScope,
+    peers: BTreeSet<u64>,
+    _allocation: Allocation,
+}
 struct Transfer {
     manifest: TransferManifest,
     next_missing: usize,
@@ -89,9 +114,12 @@ pub struct CustodyStore {
     config: CustodyConfig,
     budget: MemoryBudget,
     policies: BTreeMap<LedgerId, Installed>,
+    pending: BTreeMap<LedgerId, PendingPeers>,
     transfers: BTreeMap<TransferKey, Transfer>,
     exports: BTreeMap<(CustodyScope, ContentHash), Transfer>,
     transfer_bytes: u64,
+    /// What the collector may not touch, installed per pass (26 §5).
+    protection: Option<focal_evidence::ProtectionSet>,
 }
 impl CustodyStore {
     pub fn new(
@@ -113,9 +141,11 @@ impl CustodyStore {
             config,
             budget,
             policies: BTreeMap::new(),
+            pending: BTreeMap::new(),
             transfers: BTreeMap::new(),
             exports: BTreeMap::new(),
             transfer_bytes: 0,
+            protection: None,
         })
     }
     pub fn config(&self) -> &CustodyConfig {
@@ -135,6 +165,41 @@ impl CustodyStore {
     }
     pub fn installed(&self, ledger: LedgerId) -> Option<&CustodyPolicy> {
         self.policies.get(&ledger).map(|row| &row.policy)
+    }
+    /// Every ledger with an installed custody policy: the sessions whose
+    /// content this node holds copies for.
+    pub(crate) fn installed_ledgers(&self) -> Result<Vec<LedgerId>, AccessError> {
+        let mut ledgers = Vec::new();
+        ledgers
+            .try_reserve_exact(self.policies.len())
+            .map_err(|_| AccessError::Capacity)?;
+        ledgers.extend(self.policies.keys().copied());
+        Ok(ledgers)
+    }
+    /// Install the protection set the next collector steps run under.
+    pub(crate) fn protect(&mut self, protection: focal_evidence::ProtectionSet) {
+        self.protection = Some(protection);
+    }
+    /// One bounded collector step under the installed protection set.
+    pub(crate) fn collect(
+        &mut self,
+        config: focal_evidence::CollectorConfig,
+        now_ms: u64,
+        max_items: usize,
+    ) -> Result<focal_evidence::CollectorReport, AccessError> {
+        let protection = self.protection.as_ref().ok_or(AccessError::Unavailable)?;
+        self.store
+            .collect_step(protection, config, now_ms, max_items)
+            .map_err(content_error)
+    }
+    pub(crate) fn restore_quarantined(
+        &mut self,
+        domain: ContentDomainId,
+        root: ContentHash,
+    ) -> Result<bool, AccessError> {
+        self.store
+            .restore_quarantined(domain, root)
+            .map_err(content_error)
     }
     /// The caller is the trusted control owner. Equal facts retry exactly;
     /// changed facts must move a route or policy fence forward without regression.
@@ -200,6 +265,91 @@ impl CustodyStore {
         // scope before accessing them; retirement never deletes content or
         // silently releases a transfer's retained custody.
         Ok(())
+    }
+    /// Announce (or withdraw, with `None`) the peers of a placement the
+    /// directory is preparing for `ledger`. The caller is the trusted control
+    /// owner; the announcement authorizes seed reads only and never moves the
+    /// installed policy. A pending scope must lie beyond the installed one.
+    pub fn announce_pending(
+        &mut self,
+        ledger: LedgerId,
+        pending: Option<(CustodyScope, BTreeSet<u64>)>,
+    ) -> Result<(), AccessError> {
+        let Some((scope, peers)) = pending else {
+            self.pending.remove(&ledger);
+            return Ok(());
+        };
+        if scope.ledger != ledger
+            || scope.route_epoch.0 == 0
+            || scope.policy_revision == 0
+            || peers.is_empty()
+            || peers.len() > 1024
+            || peers.contains(&0)
+            || self.installed(ledger).is_some_and(|installed| {
+                scope.route_epoch <= installed.route_epoch
+                    || scope.policy_revision <= installed.policy_revision
+            })
+        {
+            return Err(AccessError::InvalidRequest);
+        }
+        if let Some(current) = self.pending.get(&ledger) {
+            if current.scope == scope && current.peers == peers {
+                return Ok(());
+            }
+            if scope.route_epoch < current.scope.route_epoch {
+                return Err(AccessError::Unavailable);
+            }
+        } else if self.pending.len() >= self.config.max_policies {
+            return Err(AccessError::Capacity);
+        }
+        let bytes = peers
+            .len()
+            .checked_mul(128)
+            .and_then(|n| n.checked_add(4096))
+            .ok_or(AccessError::Capacity)?;
+        let allocation = self.reserve(BudgetKind::Control, BudgetLane::Completion, bytes)?;
+        self.pending.insert(
+            ledger,
+            PendingPeers {
+                scope,
+                peers,
+                _allocation: allocation,
+            },
+        );
+        Ok(())
+    }
+    /// Authorize a seed read: a node of the installed placement at its route,
+    /// or a node of an announced pending placement at that placement's route.
+    fn authorize_seed(&self, verified: &VerifiedRequest) -> Result<CustodyScope, AccessError> {
+        let request = verified.request();
+        let PeerRole::Node { node_id } = verified.peer().role() else {
+            return Err(AccessError::Unauthorized);
+        };
+        let installed = self.installed(request.ledger);
+        let pending = self.pending.get(&request.ledger);
+        if let Some(policy) = installed
+            && policy.route_epoch == request.route_epoch
+        {
+            return if policy.peers.contains(&node_id) {
+                Ok(policy.scope())
+            } else {
+                Err(AccessError::Unauthorized)
+            };
+        }
+        if let Some(pending) = pending
+            && pending.scope.route_epoch == request.route_epoch
+        {
+            return if pending.peers.contains(&node_id) {
+                Ok(pending.scope)
+            } else {
+                Err(AccessError::Unauthorized)
+            };
+        }
+        if installed.is_some() || pending.is_some() {
+            Err(AccessError::Unavailable)
+        } else {
+            Err(AccessError::Unauthorized)
+        }
     }
     pub fn check_policy(&self, scope: CustodyScope) -> Result<(), AccessError> {
         let policy = self
@@ -285,13 +435,22 @@ impl CustodyStore {
         verified: &VerifiedRequest,
     ) -> Result<Accounted<CustodyReply>, AccessError> {
         self.expire(Instant::now())?;
-        let scope = self.authorize(verified)?;
+        let seed = matches!(
+            verified.request().operation,
+            Operation::Custody(CustodyRequest::SeedChunk { .. })
+        );
+        let scope = if seed {
+            self.authorize_seed(verified)?
+        } else {
+            self.authorize(verified)?
+        };
         let PeerRole::Node { node_id } = verified.peer().role() else {
             return Err(AccessError::Unauthorized);
         };
-        if !self
-            .installed(scope.ledger)
-            .is_some_and(|p| p.peers.contains(&node_id))
+        if !seed
+            && !self
+                .installed(scope.ledger)
+                .is_some_and(|p| p.peers.contains(&node_id))
         {
             return Err(AccessError::Unauthorized);
         }
@@ -300,7 +459,8 @@ impl CustodyStore {
         };
         let output = match operation {
             CustodyRequest::Manifest { max_bytes, .. }
-            | CustodyRequest::ReadChunk { max_bytes, .. } => {
+            | CustodyRequest::ReadChunk { max_bytes, .. }
+            | CustodyRequest::SeedChunk { max_bytes, .. } => {
                 usize::try_from(*max_bytes).map_err(|_| AccessError::Capacity)?
             }
             _ => 0,
@@ -513,6 +673,29 @@ impl CustodyStore {
                 self.transfers.remove(&(scope, node_id, *transfer));
                 self.recount()?;
                 CustodyReply::Cancelled
+            }
+            CustodyRequest::SeedChunk { hash, max_bytes } => {
+                // Seeds are content-addressed and immutable; any node of the
+                // ledger's installed or announced pending placement may read
+                // one this node holds (`authorize_seed`).
+                let root = self
+                    .config
+                    .seed_root
+                    .as_ref()
+                    .ok_or(AccessError::Unavailable)?;
+                let reader = focal_evidence::SeedReader::open(seed_directory(root, scope.ledger))
+                    .map_err(|_| AccessError::Unavailable)?;
+                let limit = usize::try_from(*max_bytes).map_err(|_| AccessError::Capacity)?;
+                let _scan = self.reserve(BudgetKind::Payload, BudgetLane::Ordinary, limit)?;
+                // A peer that does not hold the seed says so definitely, so
+                // the puller moves to the next peer instead of retrying here.
+                let bytes = reader.read(*hash, limit).map_err(|error| match error {
+                    ContentError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+                        AccessError::InvalidRequest
+                    }
+                    other => content_error(other),
+                })?;
+                CustodyReply::SeedChunk { hash: *hash, bytes }
             }
         };
         Ok(Accounted {

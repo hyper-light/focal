@@ -991,7 +991,8 @@ fn native_family(object: &NativeObject) -> Option<ObjectKind> {
         | NativeObject::Event(_)
         | NativeObject::Standing(_)
         | NativeObject::Legacy(_)
-        | NativeObject::Missing(_) => return None,
+        | NativeObject::Missing(_)
+        | NativeObject::Retired(_) => return None,
     })
 }
 

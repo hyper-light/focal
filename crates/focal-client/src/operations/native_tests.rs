@@ -332,7 +332,9 @@ fn coverage_table_maps_every_frame_tag_once_and_only_exposed_rows_have_descripto
                 assert!(!row.tags.is_empty());
                 exposed.insert(row.name.unwrap());
             }
-            NativeExposure::InternalTimer | NativeExposure::Activation => {
+            NativeExposure::InternalTimer
+            | NativeExposure::Activation
+            | NativeExposure::Retirement => {
                 assert!(row.name.is_none() && row.tags.is_empty() && row.cli.is_empty());
                 assert_eq!(row.actor, NativeActor::Internal);
                 assert!(row.descriptor().is_none());

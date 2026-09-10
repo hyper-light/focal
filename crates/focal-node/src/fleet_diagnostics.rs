@@ -61,6 +61,26 @@ impl Owner {
             native_active: self.session.activation().is_native(),
             native_import_pending: self.session.pending_import().is_some(),
             native_authoritative: self.session.native_authoritative(),
+            seed_chunks_missing: self
+                .session
+                .pending_seed()
+                .map(|pending| pending.missing.len()),
+            delivery_retained: self.session.delivery_retained(),
+            log_entries_since_checkpoint: self.log_entries_since_checkpoint(),
+            retention: self.session.native_retention().ok().map(|report| {
+                focal_client::admin::AdminRetention {
+                    published: report.published.0,
+                    cursors: report.cursors.0,
+                    archived: report.archived.0,
+                    floor: report.floor.0,
+                    blocker: match report.blocker {
+                        focal_ledger::RetentionBlocker::Cursors => "cursors".to_owned(),
+                        focal_ledger::RetentionBlocker::Archive => "archive".to_owned(),
+                    },
+                    retired: report.retired,
+                    retiring: report.retiring,
+                }
+            }),
         };
         ReplicaDiagnosticsReply {
             value,

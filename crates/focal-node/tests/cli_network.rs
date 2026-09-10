@@ -19,7 +19,6 @@ use focal_node::network_join::NodeInvitation;
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader},
-    net::UdpSocket,
     os::unix::fs::PermissionsExt,
     path::Path,
     process::{Child, Command, Output, Stdio},
@@ -50,41 +49,10 @@ fn success(root: &Path, args: &[&str]) -> (Value, Output) {
     );
     (serde_json::from_slice(&output.stdout).unwrap(), output)
 }
+#[path = "support/ports.rs"]
+mod ports;
 fn address() -> String {
-    // A port above the ephemeral range is never handed to another process's
-    // unbound socket between this probe and the node's own bind, which may be
-    // seconds later on a loaded machine; the per-process registry keeps the
-    // tests of this binary apart, and both protocols are probed so a colliding
-    // TCP listener is skipped as well.
-    use std::sync::{
-        Mutex,
-        atomic::{AtomicU32, Ordering},
-    };
-    static TAKEN: Mutex<std::collections::BTreeSet<u16>> =
-        Mutex::new(std::collections::BTreeSet::new());
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    const FIRST: u32 = 24_000;
-    const COUNT: u32 = 8_000;
-    let seed = std::process::id().wrapping_mul(2_654_435_761)
-        ^ std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.subsec_nanos())
-            .unwrap_or(0);
-    let _ = NEXT.compare_exchange(0, seed.max(1), Ordering::Relaxed, Ordering::Relaxed);
-    for _ in 0..COUNT {
-        let port = (FIRST + NEXT.fetch_add(1, Ordering::Relaxed) % COUNT) as u16;
-        let mut taken = TAKEN.lock().unwrap();
-        if taken.contains(&port) {
-            continue;
-        }
-        let free = UdpSocket::bind(("127.0.0.1", port)).is_ok()
-            && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok();
-        if free {
-            taken.insert(port);
-            return format!("127.0.0.1:{port}");
-        }
-    }
-    panic!("no free loopback port for the network tests")
+    ports::address()
 }
 fn start(root: &Path, address: Option<&str>) -> (Server, Value) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));

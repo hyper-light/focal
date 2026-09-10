@@ -37,15 +37,18 @@ pub(super) fn retained(range: RangeWriteEnvelope) -> Result<usize, NativeError> 
 }
 
 impl WriteSet {
-    pub(super) fn capture(
+    /// `count` is the number of `changes`, which arrive in key order
+    /// (across a range group's members, each member's part in turn).
+    pub(super) fn capture<'a>(
         profile: NativeContentProfile,
-        changes: &[Change<Key, Row>],
+        count: usize,
+        changes: impl Iterator<Item = &'a Change<Key, Row>>,
         allowance: usize,
         funding: Allocation,
     ) -> Result<Self, NativeError> {
-        let required = bytes(changes.len())?;
+        let required = bytes(count)?;
         within(required, allowance)?;
-        if changes.is_empty() || funding.bytes() != required {
+        if count == 0 || funding.bytes() != required {
             return Err(ContractError::InvalidManifest.into());
         }
         // The complete actual charge is held before allocation. Passing this
@@ -53,7 +56,7 @@ impl WriteSet {
         #[cfg(test)]
         fail_capture()?;
         let mut keys = Vec::new();
-        keys.try_reserve_exact(changes.len())
+        keys.try_reserve_exact(count)
             .map_err(|_| MemoryError::AllocationFailed)?;
         within(bytes(keys.capacity())?, required)?;
         let mut previous = None;
@@ -75,6 +78,9 @@ impl WriteSet {
             keys.push(MutationKey { key, deleted });
             previous = Some(key);
         }
+        if keys.len() != count {
+            return Err(ContractError::InvalidManifest.into());
+        }
         Ok(Self {
             keys,
             profile,
@@ -85,7 +91,7 @@ impl WriteSet {
     /// Reconcile the exact captured plan with the constructed candidate. This
     /// touches only changed keys, including a future explicit deletion. It does
     /// not reconstruct the write set by scanning or diffing full ledger roots.
-    pub(super) fn check(&self, range: &PreparedRange<Key, Row>) -> Result<(), NativeError> {
+    pub(super) fn check(&self, range: &super::ranges::Fragments) -> Result<(), NativeError> {
         if self.keys.is_empty()
             || self.funding.as_ref().map(Allocation::bytes) != Some(bytes(self.keys.capacity())?)
         {
@@ -147,6 +153,7 @@ pub(super) fn check_family(key: Key, row: &Row) -> Result<(), NativeError> {
             | (Key::Receipt(_), Row::Receipt(_))
             | (Key::Cycle(_), Row::Cycle(_))
             | (Key::RetiredCycleHead(_), Row::RetiredCycleHead(_))
+            | (Key::Retired(_), Row::Retired(_))
             | (Key::RetiredCycle(_), Row::RetiredCycle(_))
             | (Key::Work(_), Row::Work(_))
             | (Key::WorkSlot(..), Row::WorkSlot(_))
@@ -178,7 +185,8 @@ pub(super) fn check_family(key: Key, row: &Row) -> Result<(), NativeError> {
                     | Key::ByEvaluator(..)
                     | Key::ByVerdict(..)
                     | Key::ByCreated(..)
-                    | Key::DueTimer(..),
+                    | Key::DueTimer(..)
+                    | Key::ByObject(..),
                 Row::Index
             )
     );

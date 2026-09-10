@@ -263,11 +263,14 @@ fn copied(f: &Fixture) -> Core<NativeState> {
         MemoryBudget::new(128 * 1024 * 1024, 16 * 1024 * 1024).unwrap(),
     )
     .unwrap();
-    core.state.rows = RangeStore::new(
-        RangeId(92_100),
-        source.sequence().0 - 1,
-        core.limits.range,
-        core.state.budget.clone(),
+    core.state.rows = crate::native::ranges::NativeRanges::single_from_store(
+        RangeStore::new(
+            RangeId(92_100),
+            source.sequence().0 - 1,
+            core.limits.range,
+            core.state.budget.clone(),
+        )
+        .unwrap(),
     )
     .unwrap();
     let changes = source

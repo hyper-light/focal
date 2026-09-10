@@ -4,6 +4,7 @@ mod claim_wait;
 pub(crate) mod cluster;
 pub(crate) mod command_tree;
 pub(crate) mod context;
+pub(crate) mod deployment;
 pub(crate) mod discovery;
 mod documents;
 mod download;

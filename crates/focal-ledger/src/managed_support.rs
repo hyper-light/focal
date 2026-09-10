@@ -60,9 +60,17 @@ impl Session {
         self.consensus.begin_decoder_floor(managed_format_hash())?;
         Ok(())
     }
+    /// A replica whose durable floor names the managed baseline or the native
+    /// successor takes part in the support exchange after a restart without
+    /// being asked again: a native group's membership changes are fenced by
+    /// every member's successor promise, so its authority must keep probing
+    /// the nodes it is adding or promoting.
     pub fn managed_support_demanded(&self) -> bool {
         self.managed_support.demanded
-            || self.consensus.required_decoder() == Some(managed_format_hash())
+            || matches!(
+                self.consensus.required_decoder(),
+                Some(required) if required == managed_format_hash() || required == native_format_hash()
+            )
     }
 
     /// Committed activation proves that the original voters durably promised

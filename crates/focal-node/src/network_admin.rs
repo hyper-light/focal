@@ -49,6 +49,9 @@ pub enum AdminCommand {
     Membership(Box<ControlRequest>),
     Transfer(ControlTransfer),
     Revocation(Box<ControlRequest>),
+    /// A node's eligibility grant prepared by [`AdminRead::PrepareEligibility`]
+    /// (24 §19): the only authority operation the administrator commits.
+    Authority(Box<ControlRequest>),
     InviteClient {
         name: String,
     },
@@ -56,6 +59,351 @@ pub enum AdminCommand {
     Operator(OperatorRead),
     /// Renew this node's own credential now.
     RenewCredential,
+    /// The placement view and the controller's next actions.
+    Placement,
+    /// Admit a tenant the cluster serves; founder only, exact on retry
+    /// ([24](../../../docs/archictecutre/24-placement-execution-and-fleet-control.md) §16).
+    AdmitTenant {
+        tenant: [u8; 16],
+    },
+    /// The tenants the cluster serves.
+    Tenants,
+    /// Create an application session on this node for a served tenant, or
+    /// find the one the same name already denotes.
+    CreateSession {
+        tenant: [u8; 16],
+        name: String,
+    },
+    /// Plan a session's placement under a requested durability
+    /// (`survive`: 0 node, 1 zone, 2 region).
+    PlanSession {
+        tenant: [u8; 16],
+        session: [u8; 16],
+        survive: u8,
+        max_failures: u16,
+        /// Propose and report without journaling a plan.
+        dry_run: bool,
+    },
+    /// Move one member of a session's range group to a node (25 §6).
+    MoveRange {
+        tenant: [u8; 16],
+        session: [u8; 16],
+        member: [u8; 16],
+        node: u64,
+    },
+    /// Bring a quarantined content object back (26 §5).
+    GcRestore {
+        domain: [u8; 16],
+        root: [u8; 32],
+    },
+    /// Write a backup of a hosted session at its committed prefix (26 §6).
+    BackupCreate {
+        tenant: [u8; 16],
+        session: [u8; 16],
+        output: String,
+    },
+    /// Restore a session from a verified backup onto this node (26 §6).
+    Restore {
+        input: String,
+        new_incarnation: bool,
+    },
+}
+/// The reply to [`AdminCommand::Restore`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RestoredReply {
+    pub schema: u16,
+    pub restored: focal_client::admin::AdminRestore,
+}
+pub const RESTORED_REPLY_SCHEMA: u16 = 1;
+/// The reply to [`AdminCommand::BackupCreate`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BackupCreatedReply {
+    pub schema: u16,
+    pub backup: focal_client::admin::AdminBackup,
+}
+pub const BACKUP_CREATED_REPLY_SCHEMA: u16 = 1;
+/// The reply to [`AdminCommand::GcRestore`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GcRestoreReply {
+    pub schema: u16,
+    pub restored: bool,
+}
+pub const GC_RESTORE_REPLY_SCHEMA: u16 = 1;
+/// The transfer an operator's move request denotes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RangeMovedReply {
+    pub schema: u16,
+    pub tenant: [u8; 16],
+    pub session: [u8; 16],
+    pub member: [u8; 16],
+    pub node: u64,
+    pub operation: [u8; 16],
+}
+pub const RANGE_MOVED_REPLY_SCHEMA: u16 = 1;
+/// The plan an operator's request denotes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionPlannedReply {
+    pub schema: u16,
+    pub tenant: [u8; 16],
+    pub session: [u8; 16],
+    pub operation: [u8; 16],
+    pub voters: Vec<u64>,
+    /// `planned`, `pending` or `satisfied`.
+    pub state: u8,
+    pub dry_run: bool,
+}
+pub const SESSION_PLANNED_REPLY_SCHEMA: u16 = 2;
+/// The tenants the cluster serves: the founder's own and every admitted one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TenantsReply {
+    pub schema: u16,
+    pub applied_index: u64,
+    pub revision: u64,
+    pub founder: [u8; 16],
+    pub admitted: Vec<[u8; 16]>,
+}
+pub const TENANTS_REPLY_SCHEMA: u16 = 1;
+/// An application session created on this node, or found again by name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionCreatedReply {
+    pub schema: u16,
+    pub tenant: [u8; 16],
+    pub session: [u8; 16],
+    pub group: [u8; 16],
+    pub node: u64,
+    pub existing: bool,
+}
+pub const SESSION_CREATED_REPLY_SCHEMA: u16 = 1;
+fn encode_reply<T: Serialize>(reply: &T) -> Result<Vec<u8>, AccessError> {
+    let len = postcard::experimental::serialized_size(reply).map_err(|_| AccessError::Capacity)?;
+    if len > MAX_COMMAND {
+        return Err(AccessError::Capacity);
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| AccessError::Capacity)?;
+    bytes.resize(len, 0);
+    postcard::to_slice(reply, &mut bytes).map_err(|_| AccessError::InvalidRequest)?;
+    Ok(bytes)
+}
+/// The operator's placement view ([24](../../../docs/archictecutre/24-placement-execution-and-fleet-control.md) §15).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlacementReply {
+    pub schema: u16,
+    pub placement: focal_client::admin::AdminPlacement,
+    pub actions: Vec<focal_client::admin::AdminPlannedAction>,
+}
+pub const PLACEMENT_REPLY_SCHEMA: u16 = 1;
+/// The view fits one admin frame: sessions and nodes beyond these bounds are
+/// reported as truncated.
+const MAX_REPORT_SESSIONS: usize = 48;
+const MAX_REPORT_NODES: usize = 128;
+fn hex(bytes: &[u8]) -> String {
+    let mut text = String::new();
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
+}
+/// Project the agent's last observation for the operator: committed facts
+/// only, with each session's guarantee measured against the live nodes.
+pub(crate) fn placement_reply(report: crate::placement_control::DirectoryReport) -> PlacementReply {
+    use focal_client::admin::{
+        AdminAssignmentProgress, AdminPartition, AdminPendingPlacement, AdminPlacement,
+        AdminPlacementNode, AdminPlannedAction, AdminSeal, AdminSessionPlacement,
+    };
+    let mut partitions = Vec::new();
+    let mut actions = Vec::new();
+    for (delegation, checkpoint) in report.partitions {
+        let (split_at, merge_at) = crate::placement_agent::split::thresholds(checkpoint.cluster.0);
+        let partition = hex(&delegation.partition.0);
+        let nodes: Vec<AdminPlacementNode> = checkpoint
+            .nodes
+            .values()
+            .take(MAX_REPORT_NODES)
+            .map(|record| AdminPlacementNode {
+                node: record.enrollment.node,
+                generation: record.enrollment.generation,
+                eligible: record.enrollment.eligible,
+                alive: record.is_alive(),
+                incarnation: record.liveness.map(|liveness| liveness.incarnation),
+                available_memory: record.load.map(|load| load.available_memory),
+                active_weight: record.load.map(|load| load.active_weight),
+                disk_available: record.load.map(|load| load.disk_available),
+            })
+            .collect();
+        let mut sessions = Vec::new();
+        for (ledger, descriptor) in checkpoint.sessions.iter().take(MAX_REPORT_SESSIONS) {
+            let guarantee =
+                focal_directory::effective_guarantee(descriptor, &checkpoint.nodes).ok();
+            let placement = &descriptor.active.placement;
+            sessions.push(AdminSessionPlacement {
+                tenant: ledger.tenant.to_string(),
+                session: ledger.session.to_string(),
+                route_epoch: descriptor.route_epoch.0,
+                membership_epoch: descriptor.membership_epoch,
+                placement_epoch: descriptor.placement_epoch,
+                preferred_leader: placement.preferred_leader,
+                founder: descriptor.founder,
+                range_epoch: descriptor.holders.as_ref().map(|holders| holders.epoch),
+                holders: descriptor
+                    .holders
+                    .as_ref()
+                    .map(|holders| {
+                        holders
+                            .members
+                            .iter()
+                            .map(|holder| focal_client::admin::AdminRangeHolder {
+                                member: hex(&holder.member.0.to_le_bytes()),
+                                start: holder.start.map(|start| hex(&start)),
+                                node: holder.node,
+                                generation: holder.generation,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                voters: placement.voters.keys().copied().collect(),
+                materializers: placement.materializers.keys().copied().collect(),
+                content_copies: placement.content_copies.keys().copied().collect(),
+                survive: format!("{:?}", descriptor.active.policy.durability.survive),
+                max_failures: descriptor.active.policy.durability.max_failures,
+                achieved_survive: guarantee
+                    .as_ref()
+                    .and_then(|report| report.achieved)
+                    .map(|achieved| format!("{:?}", achieved.survive)),
+                achieved_max_failures: guarantee
+                    .as_ref()
+                    .and_then(|report| report.achieved)
+                    .map(|achieved| achieved.max_failures),
+                blocked_by: guarantee
+                    .as_ref()
+                    .map(|report| {
+                        report
+                            .blocked_by
+                            .iter()
+                            .map(|blocker| match blocker.node {
+                                Some(node) => format!("{:?} on node {node}", blocker.reason),
+                                None => format!("{:?}", blocker.reason),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                phase: guarantee
+                    .as_ref()
+                    .and_then(|report| report.phase)
+                    .map(|phase| format!("{phase:?}")),
+                pending: descriptor
+                    .pending
+                    .as_ref()
+                    .map(|plan| AdminPendingPlacement {
+                        operation: hex(&plan.operation.0),
+                        phase: format!("{:?}", plan.phase),
+                        voters: plan.desired.placement.voters.keys().copied().collect(),
+                        progress: plan
+                            .progress
+                            .values()
+                            .map(|progress| AdminAssignmentProgress {
+                                node: progress.node,
+                                phase: format!("{:?}", progress.phase),
+                                attempt: progress.attempt,
+                                through: progress.through.0,
+                                refusal: progress.refusal.map(|code| format!("{code:?}")),
+                            })
+                            .collect(),
+                    }),
+                retiring: descriptor.retiring.keys().copied().collect(),
+            });
+            for action in
+                crate::placement_agent::controller::planned_actions(descriptor, &checkpoint.nodes)
+            {
+                actions.push(AdminPlannedAction {
+                    partition: partition.clone(),
+                    tenant: Some(ledger.tenant.to_string()),
+                    session: Some(ledger.session.to_string()),
+                    action,
+                });
+            }
+        }
+        match &checkpoint.sealed {
+            Some(seal) if seal.moved == checkpoint.delegation.namespace => {
+                actions.push(AdminPlannedAction {
+                    partition: partition.clone(),
+                    tenant: None,
+                    session: None,
+                    action: format!(
+                        "sealed for partition {}: merge or transfer in progress (operation {})",
+                        hex(&seal.destination.0),
+                        hex(&seal.operation.0)
+                    ),
+                });
+            }
+            Some(seal) => {
+                actions.push(AdminPlannedAction {
+                    partition: partition.clone(),
+                    tenant: None,
+                    session: None,
+                    action: format!(
+                        "split in progress toward partition {} (operation {})",
+                        hex(&seal.destination.0),
+                        hex(&seal.operation.0)
+                    ),
+                });
+            }
+            None if checkpoint.sessions.len() >= split_at => {
+                actions.push(AdminPlannedAction {
+                    partition: partition.clone(),
+                    tenant: None,
+                    session: None,
+                    action: format!(
+                        "split this partition at the median of its {} sessions (threshold {split_at})",
+                        checkpoint.sessions.len()
+                    ),
+                });
+            }
+            None if checkpoint.sessions.len() <= merge_at
+                && checkpoint.delegation.namespace.end.is_some() =>
+            {
+                actions.push(AdminPlannedAction {
+                    partition: partition.clone(),
+                    tenant: None,
+                    session: None,
+                    action: format!(
+                        "merge with the partition above when it holds at most {merge_at} sessions"
+                    ),
+                });
+            }
+            None => {}
+        }
+        partitions.push(AdminPartition {
+            partition,
+            group: hex(&delegation.log_group.0),
+            namespace_start: hex(&delegation.namespace.start.0),
+            namespace_end: delegation.namespace.end.map(|key| hex(&key.0)),
+            epoch: delegation.epoch,
+            revision: checkpoint.revision,
+            sealed: checkpoint.sealed.as_ref().map(|seal| AdminSeal {
+                operation: hex(&seal.operation.0),
+                destination: hex(&seal.destination.0),
+                moved_start: hex(&seal.moved.start.0),
+                moved_end: seal.moved.end.map(|key| hex(&key.0)),
+                next_epoch: seal.next_epoch,
+            }),
+            nodes,
+            sessions,
+            truncated: checkpoint.sessions.len() > MAX_REPORT_SESSIONS
+                || checkpoint.nodes.len() > MAX_REPORT_NODES,
+        });
+    }
+    PlacementReply {
+        schema: PLACEMENT_REPLY_SCHEMA,
+        placement: AdminPlacement {
+            observed_at: report.observed_at,
+            partitions,
+        },
+        actions,
+    }
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum AdminRead {
@@ -75,6 +423,12 @@ pub enum AdminRead {
     },
     Reconcile {
         sequence: u64,
+    },
+    /// Prepare the authority command that sets a node's placement
+    /// eligibility (24 §19); the founder is never drained.
+    PrepareEligibility {
+        node: u64,
+        eligible: bool,
     },
 }
 impl AdminCommand {
@@ -146,12 +500,98 @@ impl AdminCommand {
         match self {
             Self::Operator(read) => read.validate(),
             Self::Replica(command) => command.validate(),
-            Self::RenewCredential => Ok(()),
+            Self::RenewCredential | Self::Placement | Self::Tenants => Ok(()),
+            Self::AdmitTenant { tenant } if *tenant == [0; 16] => Err(AccessError::InvalidRequest),
+            Self::AdmitTenant { .. } => Ok(()),
+            Self::CreateSession { tenant, name } => {
+                if *tenant == [0; 16] {
+                    return Err(AccessError::InvalidRequest);
+                }
+                validate_name(name)
+            }
+            Self::PlanSession {
+                tenant,
+                session,
+                survive,
+                max_failures,
+                ..
+            } => {
+                if *tenant == [0; 16] || *session == [0; 16] || *survive > 2 || *max_failures > 255
+                {
+                    return Err(AccessError::InvalidRequest);
+                }
+                Ok(())
+            }
+            Self::MoveRange {
+                tenant,
+                session,
+                member,
+                node,
+            } => {
+                if *tenant == [0; 16] || *session == [0; 16] || *member == [0; 16] || *node == 0 {
+                    return Err(AccessError::InvalidRequest);
+                }
+                Ok(())
+            }
+            Self::GcRestore { domain, root } => {
+                if *domain == [0; 16] || *root == [0; 32] {
+                    return Err(AccessError::InvalidRequest);
+                }
+                Ok(())
+            }
+            Self::BackupCreate {
+                tenant,
+                session,
+                output,
+            } => {
+                if *tenant == [0; 16]
+                    || *session == [0; 16]
+                    || output.is_empty()
+                    || output.len() > 4096
+                    || !std::path::Path::new(output).is_absolute()
+                {
+                    return Err(AccessError::InvalidRequest);
+                }
+                Ok(())
+            }
+            Self::Restore { input, .. } => {
+                if input.is_empty()
+                    || input.len() > 4096
+                    || !std::path::Path::new(input).is_absolute()
+                {
+                    return Err(AccessError::InvalidRequest);
+                }
+                Ok(())
+            }
             Self::Invite { name } | Self::InviteClient { name } => validate_name(name),
             Self::Read(AdminRead::Invitations { limit, .. }) if *limit == 0 || *limit > 64 => {
                 Err(AccessError::InvalidRequest)
             }
             Self::Read(AdminRead::Reconcile { sequence: 0 }) => Err(AccessError::InvalidRequest),
+            Self::Read(AdminRead::PrepareEligibility { node: 0, .. }) => {
+                Err(AccessError::InvalidRequest)
+            }
+            Self::Authority(request) => {
+                let ControlCommand::Authority(command) = &request.command else {
+                    return Err(AccessError::Unauthorized);
+                };
+                let focal_directory::AuthorityOperation::GrantNode {
+                    grant,
+                    expected_generation: Some(expected),
+                } = &command.operation
+                else {
+                    return Err(AccessError::Unauthorized);
+                };
+                if request.id.sequence == 0
+                    || request.acknowledged_through >= request.id.sequence
+                    || grant.enrollment.node == 0
+                    || Some(grant.enrollment.generation) != expected.checked_add(1)
+                    || grant.enrollment.attestation != focal_model::ContentHash([0; 32])
+                {
+                    return Err(AccessError::InvalidRequest);
+                }
+                Ok(())
+            }
             Self::Read(AdminRead::Invitation { id } | AdminRead::PrepareRevocation { id })
                 if *id == [0; 16] =>
             {
@@ -287,6 +727,10 @@ pub struct LocalNetworkAdmin {
     fleet: Option<crate::fleet::FleetManager>,
     content: Option<crate::content_host::ContentHost>,
     credentials: Option<crate::credential_renewal::CredentialHandle>,
+    placement: Option<crate::placement_control::PlacementHandle>,
+    /// The collector's published state (26 §5).
+    gc: Option<crate::gc::GcHandle>,
+    archive: Option<crate::archive_agent::ArchiveHandle>,
     budget: MemoryBudget,
 }
 impl LocalNetworkAdmin {
@@ -318,6 +762,9 @@ impl LocalNetworkAdmin {
             fleet: None,
             content: None,
             credentials: None,
+            placement: None,
+            gc: None,
+            archive: None,
             budget,
         })
     }
@@ -351,6 +798,9 @@ impl LocalNetworkAdmin {
             fleet: None,
             content: None,
             credentials: None,
+            placement: None,
+            gc: None,
+            archive: None,
             budget,
         })
     }
@@ -360,6 +810,377 @@ impl LocalNetworkAdmin {
     ) -> Self {
         self.credentials = Some(credentials);
         self
+    }
+    /// Serve the placement view from the running placement agent.
+    pub fn with_placement(mut self, placement: crate::placement_control::PlacementHandle) -> Self {
+        self.placement = Some(placement);
+        self
+    }
+    /// Serve the collector's state from the running agent.
+    pub fn with_gc(mut self, gc: crate::gc::GcHandle) -> Self {
+        self.gc = Some(gc);
+        self
+    }
+    /// Serve the archive agent's state from the running agent.
+    pub fn with_archive(mut self, archive: crate::archive_agent::ArchiveHandle) -> Self {
+        self.archive = Some(archive);
+        self
+    }
+    /// Write a backup of a hosted session (26 §6): the replica exports its
+    /// durable prefix, the files are written under the operator's directory.
+    async fn backup_create(
+        &self,
+        tenant: [u8; 16],
+        session: [u8; 16],
+        output: String,
+    ) -> Result<Vec<u8>, AccessError> {
+        let fleet = self.fleet.as_ref().ok_or(AccessError::Unavailable)?;
+        let ledger = focal_model::LedgerId {
+            tenant: focal_model::TenantId(tenant),
+            session: focal_model::SessionId(session),
+        };
+        if ledger.tenant.is_zero() || ledger.session.is_zero() || output.is_empty() {
+            return Err(AccessError::InvalidRequest);
+        }
+        let backup = crate::backup::create(
+            fleet,
+            &self.directory,
+            ledger,
+            PathBuf::from(output),
+            &self.budget,
+        )
+        .await?;
+        encode_reply(&BackupCreatedReply {
+            schema: BACKUP_CREATED_REPLY_SCHEMA,
+            backup,
+        })
+    }
+    /// Restore a session from a backup (26 §6): the tenant must be served,
+    /// the incarnation decision is taken against the committed enrollment
+    /// registry, and the placement agent does the rest.
+    async fn restore(
+        &self,
+        input: String,
+        new_incarnation: bool,
+        id: RequestId,
+    ) -> Result<Vec<u8>, AccessError> {
+        let input = PathBuf::from(input);
+        let manifest =
+            crate::backup::read_manifest(&input).map_err(|_| AccessError::InvalidRequest)?;
+        let (_, registry) = self.read_registry(id).await?;
+        let tenant = manifest.prefix.ledger.tenant;
+        if tenant != self.identity.ledger.tenant && !registry.admits_tenant(tenant.0) {
+            return Err(AccessError::Unauthorized);
+        }
+        let decision = crate::backup::decide(
+            &manifest,
+            self.identity.cluster,
+            self.identity.node,
+            &registry,
+        );
+        let restored = self
+            .placement
+            .as_ref()
+            .ok_or(AccessError::Unavailable)?
+            .restore_session(crate::backup::RestoreRequest {
+                input: input.clone(),
+                new_incarnation,
+                decision,
+            })
+            .await
+            .map_err(|error| {
+                use crate::placement_agent::AgentError;
+                match error {
+                    AgentError::Capacity
+                    | AgentError::Admission(_)
+                    | AgentError::Fleet(crate::fleet::FleetError::Capacity) => {
+                        AccessError::Capacity
+                    }
+                    AgentError::Restore(_) | AgentError::Backup(_) | AgentError::Identity => {
+                        AccessError::InvalidRequest
+                    }
+                    _ => AccessError::Unavailable,
+                }
+            })?;
+        encode_reply(&RestoredReply {
+            schema: RESTORED_REPLY_SCHEMA,
+            restored: restored.admin(&input),
+        })
+    }
+    /// Bring a quarantined object back (26 §5) through the content writer.
+    async fn gc_restore(&self, domain: [u8; 16], root: [u8; 32]) -> Result<Vec<u8>, AccessError> {
+        let content = self.content.as_ref().ok_or(AccessError::Unavailable)?;
+        let restored = content
+            .restore_quarantined(
+                focal_model::ContentDomainId(domain),
+                focal_model::ContentHash(root),
+            )
+            .await?;
+        let reply = GcRestoreReply {
+            schema: GC_RESTORE_REPLY_SCHEMA,
+            restored,
+        };
+        let len =
+            postcard::experimental::serialized_size(&reply).map_err(|_| AccessError::Capacity)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(len)
+            .map_err(|_| AccessError::Capacity)?;
+        bytes.resize(len, 0);
+        postcard::to_slice(&reply, &mut bytes).map_err(|_| AccessError::InvalidRequest)?;
+        Ok(bytes)
+    }
+    async fn placement(&self) -> Result<Vec<u8>, AccessError> {
+        let handle = self.placement.as_ref().ok_or(AccessError::Unavailable)?;
+        let report = handle
+            .directory()
+            .await
+            .map_err(|_| AccessError::Unavailable)?;
+        let reply = placement_reply(report);
+        let len =
+            postcard::experimental::serialized_size(&reply).map_err(|_| AccessError::Capacity)?;
+        if len > MAX_COMMAND {
+            return Err(AccessError::Capacity);
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(len)
+            .map_err(|_| AccessError::Capacity)?;
+        bytes.resize(len, 0);
+        postcard::to_slice(&reply, &mut bytes).map_err(|_| AccessError::InvalidRequest)?;
+        Ok(bytes)
+    }
+    /// The root owner's committed enrollment registry, read as this node's
+    /// runtime principal: one bounded root checkpoint.
+    /// The enrollment registry as this node's root replica applied it.
+    async fn local_registry(&self) -> Result<focal_enrollment::EnrollmentRegistry, AccessError> {
+        let control = self.control.as_ref().ok_or(AccessError::Unavailable)?;
+        let observation = control
+            .observe_root()
+            .await
+            .map_err(|_| AccessError::Unavailable)?;
+        let focal_control::ControlBootstrap::Root { enrollment, .. } =
+            &observation.snapshot().state
+        else {
+            return Err(AccessError::Unavailable);
+        };
+        focal_enrollment::EnrollmentRegistry::restore(
+            enrollment,
+            self.identity.cluster,
+            focal_enrollment::EnrollmentLimits::default(),
+        )
+        .map_err(|_| AccessError::Unavailable)
+    }
+    async fn read_registry(
+        &self,
+        id: RequestId,
+    ) -> Result<(u64, focal_enrollment::EnrollmentRegistry), AccessError> {
+        let control = self.control.as_ref().ok_or(AccessError::Unavailable)?;
+        let principal = admin_principal(&self.identity);
+        if principal.is_zero() {
+            return Err(AccessError::Unauthorized);
+        }
+        let peer = AuthenticatedPeer::local(PeerGrant {
+            principal,
+            tenants: std::collections::BTreeSet::from([self.identity.ledger.tenant]),
+            role: PeerRole::Runtime,
+        })
+        .map_err(|_| AccessError::Unauthorized)?;
+        let result =
+            control
+                .read(peer, id, ControlRead::State)
+                .await
+                .map_err(|error| match error {
+                    ControlFailure::Capacity => AccessError::Capacity,
+                    ControlFailure::Unauthorized => AccessError::Unauthorized,
+                    _ => AccessError::Unavailable,
+                })?;
+        let focal_control::ControlReadResult::State(snapshot) = result else {
+            return Err(AccessError::Unavailable);
+        };
+        let focal_control::ControlBootstrap::Root { enrollment, .. } = &snapshot.state else {
+            return Err(AccessError::Unauthorized);
+        };
+        let registry = focal_enrollment::EnrollmentRegistry::restore(
+            enrollment.as_slice(),
+            self.identity.cluster,
+            focal_enrollment::EnrollmentLimits::default(),
+        )
+        .map_err(|_| AccessError::Unavailable)?;
+        Ok((snapshot.applied_index, registry))
+    }
+    /// The tenants the cluster serves (doc 24 §16).
+    async fn tenants(&self, id: RequestId) -> Result<Vec<u8>, AccessError> {
+        let (applied_index, registry) = self.read_registry(id).await?;
+        encode_reply(&TenantsReply {
+            schema: TENANTS_REPLY_SCHEMA,
+            applied_index,
+            revision: registry.revision(),
+            founder: self.identity.ledger.tenant.0,
+            admitted: registry.tenants().collect(),
+        })
+    }
+    /// Admit a tenant through the founder's enrollment authority, then answer
+    /// with the committed tenants; an admitted tenant is answered as done.
+    async fn admit_tenant(&self, tenant: [u8; 16], id: RequestId) -> Result<Vec<u8>, AccessError> {
+        self.enrollment
+            .as_ref()
+            .ok_or(AccessError::Unauthorized)?
+            .admit_tenant(tenant)
+            .await
+            .map_err(enrollment_error)?;
+        self.tenants(id).await
+    }
+    /// Create an application session on this node for the founder's tenant
+    /// or an admitted one; the same name is the same session.
+    async fn create_session(
+        &self,
+        tenant: [u8; 16],
+        name: String,
+        id: RequestId,
+    ) -> Result<Vec<u8>, AccessError> {
+        let tenant = focal_model::TenantId(tenant);
+        if tenant != self.identity.ledger.tenant {
+            // Admission is monotone (tenants are admitted, never removed), so
+            // a node that cannot read the root through a quorum — a host
+            // whose root replica learns — checks its own applied registry;
+            // a lagging one refuses until the admission reaches it.
+            let registry = match self.read_registry(id).await {
+                Ok((_, registry)) => registry,
+                Err(AccessError::Unavailable) => self.local_registry().await?,
+                Err(error) => return Err(error),
+            };
+            if !registry.admits_tenant(tenant.0) {
+                return Err(AccessError::Unauthorized);
+            }
+        }
+        let created = self
+            .placement
+            .as_ref()
+            .ok_or(AccessError::Unavailable)?
+            .create_session(tenant, name)
+            .await
+            .map_err(|error| {
+                use crate::placement_agent::AgentError;
+                match error {
+                    AgentError::Capacity
+                    | AgentError::Admission(_)
+                    | AgentError::Fleet(crate::fleet::FleetError::Capacity) => {
+                        AccessError::Capacity
+                    }
+                    AgentError::Identity => AccessError::InvalidRequest,
+                    _ => AccessError::Unavailable,
+                }
+            })?;
+        encode_reply(&SessionCreatedReply {
+            schema: SESSION_CREATED_REPLY_SCHEMA,
+            tenant: created.ledger.tenant.0,
+            session: created.ledger.session.0,
+            group: created.group,
+            node: created.node,
+            existing: created.existing,
+        })
+    }
+    /// Move one member of a session's range group to a node through the
+    /// agent (25 §6); the reply names the transfer the request denotes.
+    async fn move_range(
+        &self,
+        tenant: [u8; 16],
+        session: [u8; 16],
+        member: [u8; 16],
+        node: u64,
+    ) -> Result<Vec<u8>, AccessError> {
+        if node == 0 || member == [0; 16] {
+            return Err(AccessError::InvalidRequest);
+        }
+        let ledger = focal_model::LedgerId {
+            tenant: focal_model::TenantId(tenant),
+            session: focal_model::SessionId(session),
+        };
+        let operation = self
+            .placement
+            .as_ref()
+            .ok_or(AccessError::Unavailable)?
+            .move_range(
+                ledger,
+                focal_memory::RangeId(u128::from_le_bytes(member)),
+                node,
+            )
+            .await
+            .map_err(|error| {
+                use crate::placement_agent::AgentError;
+                match error {
+                    AgentError::Capacity => AccessError::Capacity,
+                    AgentError::Identity | AgentError::Registration(_) => {
+                        AccessError::InvalidRequest
+                    }
+                    AgentError::Ledger(focal_ledger::LedgerError::PlacementConflict) => {
+                        AccessError::InvalidRequest
+                    }
+                    _ => AccessError::Unavailable,
+                }
+            })?;
+        encode_reply(&RangeMovedReply {
+            schema: RANGE_MOVED_REPLY_SCHEMA,
+            tenant,
+            session,
+            member,
+            node,
+            operation: operation.0,
+        })
+    }
+    /// Plan a session's placement under a requested durability through the
+    /// agent (doc 24 §17); the reply names the plan the request denotes.
+    async fn plan_session(
+        &self,
+        tenant: [u8; 16],
+        session: [u8; 16],
+        survive: u8,
+        max_failures: u16,
+        dry_run: bool,
+    ) -> Result<Vec<u8>, AccessError> {
+        let ledger = focal_model::LedgerId {
+            tenant: focal_model::TenantId(tenant),
+            session: focal_model::SessionId(session),
+        };
+        let durability = focal_directory::DurabilityIntent {
+            survive: match survive {
+                0 => focal_directory::FailureClass::Node,
+                1 => focal_directory::FailureClass::Zone,
+                2 => focal_directory::FailureClass::Region,
+                _ => return Err(AccessError::InvalidRequest),
+            },
+            max_failures,
+        };
+        let planned = self
+            .placement
+            .as_ref()
+            .ok_or(AccessError::Unavailable)?
+            .plan_session(ledger, durability, dry_run)
+            .await
+            .map_err(|error| {
+                use crate::placement_agent::AgentError;
+                match error {
+                    AgentError::Capacity => AccessError::Capacity,
+                    AgentError::Registration(_) | AgentError::Identity => {
+                        AccessError::InvalidRequest
+                    }
+                    _ => AccessError::Unavailable,
+                }
+            })?;
+        encode_reply(&SessionPlannedReply {
+            schema: SESSION_PLANNED_REPLY_SCHEMA,
+            tenant,
+            session,
+            operation: planned.operation.0,
+            voters: planned.voters,
+            state: match planned.state {
+                crate::placement_control::PlanState::Planned => 0,
+                crate::placement_control::PlanState::Pending => 1,
+                crate::placement_control::PlanState::Satisfied => 2,
+            },
+            dry_run,
+        })
     }
     async fn renew_credential(&self) -> Result<Vec<u8>, AccessError> {
         use crate::credential_renewal::CredentialReply;
@@ -427,6 +1248,59 @@ impl LocalNetworkAdmin {
         if let AdminCommand::RenewCredential = command {
             return self.renew_credential().await;
         }
+        if let AdminCommand::Placement = command {
+            return self.placement().await;
+        }
+        if let AdminCommand::GcRestore { domain, root } = command {
+            return self.gc_restore(domain, root).await;
+        }
+        if let AdminCommand::BackupCreate {
+            tenant,
+            session,
+            output,
+        } = command
+        {
+            return self.backup_create(tenant, session, output).await;
+        }
+        if let AdminCommand::Restore {
+            input,
+            new_incarnation,
+        } = command
+        {
+            return self
+                .restore(input, new_incarnation, request.request_id)
+                .await;
+        }
+        if let AdminCommand::Tenants = command {
+            return self.tenants(request.request_id).await;
+        }
+        if let AdminCommand::AdmitTenant { tenant } = command {
+            return self.admit_tenant(tenant, request.request_id).await;
+        }
+        if let AdminCommand::CreateSession { tenant, name } = command {
+            return self.create_session(tenant, name, request.request_id).await;
+        }
+        if let AdminCommand::PlanSession {
+            tenant,
+            session,
+            survive,
+            max_failures,
+            dry_run,
+        } = command
+        {
+            return self
+                .plan_session(tenant, session, survive, max_failures, dry_run)
+                .await;
+        }
+        if let AdminCommand::MoveRange {
+            tenant,
+            session,
+            member,
+            node,
+        } = command
+        {
+            return self.move_range(tenant, session, member, node).await;
+        }
         if !matches!(
             command,
             AdminCommand::Invite { .. } | AdminCommand::InviteClient { .. }
@@ -481,6 +1355,16 @@ impl LocalNetworkAdmin {
         };
         Ok(std::mem::take(&mut *bytes))
     }
+    /// The founding node of this cluster, from the saved network state.
+    fn founder(&self) -> Result<u64, AccessError> {
+        let state = NetworkState::load_from(&self.directory, &self.identity)
+            .map_err(|_| AccessError::Unavailable)?
+            .ok_or(AccessError::Unavailable)?;
+        if state.genesis.root != self.root {
+            return Err(AccessError::Unauthorized);
+        }
+        Ok(state.genesis.founder.node)
+    }
     async fn control_command(
         &self,
         command: AdminCommand,
@@ -525,11 +1409,21 @@ impl LocalNetworkAdmin {
                                 sequence,
                             },
                         },
+                        AdminRead::PrepareEligibility { node, eligible } => {
+                            // The founder holds the enrollment authority and
+                            // the root's bootstrap identity: it is not drained.
+                            if node == self.founder()? {
+                                return Err(AccessError::InvalidRequest);
+                            }
+                            ControlRead::PrepareEligibility { node, eligible }
+                        }
                     },
                 )
                 .await
                 .map(ControlReply::Read),
-            AdminCommand::Membership(request) | AdminCommand::Revocation(request) => {
+            AdminCommand::Membership(request)
+            | AdminCommand::Revocation(request)
+            | AdminCommand::Authority(request) => {
                 if request.id.client != principal.0 {
                     return Err(AccessError::Unauthorized);
                 }
@@ -549,7 +1443,16 @@ impl LocalNetworkAdmin {
             | AdminCommand::InviteClient { .. }
             | AdminCommand::Operator(_)
             | AdminCommand::Replica(_)
-            | AdminCommand::RenewCredential => {
+            | AdminCommand::RenewCredential
+            | AdminCommand::Placement
+            | AdminCommand::AdmitTenant { .. }
+            | AdminCommand::Tenants
+            | AdminCommand::CreateSession { .. }
+            | AdminCommand::PlanSession { .. }
+            | AdminCommand::MoveRange { .. }
+            | AdminCommand::GcRestore { .. }
+            | AdminCommand::BackupCreate { .. }
+            | AdminCommand::Restore { .. } => {
                 return Err(AccessError::Unauthorized);
             }
         };

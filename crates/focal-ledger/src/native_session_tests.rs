@@ -139,6 +139,8 @@ pub(crate) fn limits() -> NativeSessionLimits {
         completion_reserve_bytes: 16 << 20,
         content_domain: ContentDomainId::from_u128(1),
         disk_headroom_bytes: 1 << 20,
+        materializer: record::materialize::MaterializerLimits::default(),
+        ranges: focal_ranges::RangeLimits::default(),
     }
 }
 fn definition(binding: Binding) -> validation::Declaration {

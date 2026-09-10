@@ -20,6 +20,71 @@ pub(crate) struct Reader<'a> {
     pub route: RouteEpoch,
 }
 
+/// Where a query's rows live (25 §6): the members a replica must hold to
+/// serve it. A compound query that walks several objects names each; one
+/// that lists across the group names the control affinity and every object
+/// it starts from.
+pub(crate) fn locations(query: &NativeReadQuery) -> Vec<focal_core::native::NativeLocation> {
+    use focal_core::native::NativeLocation as L;
+    fn of(reference: &NativeObjectRef) -> L {
+        match reference {
+            NativeObjectRef::Claim(id) => L::Claim(*id),
+            NativeObjectRef::Definition(id) => L::Definition(*id),
+            NativeObjectRef::Evaluation(key) => L::Claim(key.claim),
+            NativeObjectRef::Result(result) => L::Claim(result.evaluation.claim),
+            NativeObjectRef::Artifact(id)
+            | NativeObjectRef::Work(id)
+            | NativeObjectRef::Diagnostic(id) => L::Artifact(*id),
+            NativeObjectRef::Response(id) | NativeObjectRef::ResultTestament(id) => {
+                L::Testament(*id)
+            }
+            NativeObjectRef::Receipt(_) => L::Receipt,
+            NativeObjectRef::Monitor { id, .. } => L::Monitor(*id),
+            NativeObjectRef::Outcome(invocation) | NativeObjectRef::CreationResult(invocation) => {
+                invocation_location(invocation)
+            }
+            NativeObjectRef::Event { .. } => L::Control,
+            NativeObjectRef::LegacyTestament(id) => L::Testament(*id),
+            NativeObjectRef::LegacyEvidenceSet(_) => L::Control,
+            NativeObjectRef::LegacyDefinition(id)
+            | NativeObjectRef::LegacyRun { validation: id, .. } => L::Definition(*id),
+        }
+    }
+    fn invocation_location(invocation: &NativeInvocationRef) -> L {
+        match invocation {
+            NativeInvocationRef::Request(key) => L::Principal(key.principal),
+            NativeInvocationRef::EvaluationDeadline { evaluation, .. } => {
+                L::Claim(evaluation.claim)
+            }
+            NativeInvocationRef::ClaimDeadline { claim, .. }
+            | NativeInvocationRef::MonitorDeadline { claim, .. } => L::Claim(*claim),
+            NativeInvocationRef::Import => L::Control,
+            NativeInvocationRef::Retirement { root } => L::Claim(*root),
+        }
+    }
+    match query {
+        NativeReadQuery::Objects(references) => references.iter().map(of).collect(),
+        NativeReadQuery::Claim { id, .. } | NativeReadQuery::Responses { claim: id, .. } => {
+            vec![L::Claim(*id), L::Control]
+        }
+        NativeReadQuery::Outcome(invocation) => vec![invocation_location(invocation)],
+        NativeReadQuery::Receipt(_) => vec![L::Receipt],
+        NativeReadQuery::Monitor { id, .. } => vec![L::Monitor(*id)],
+        NativeReadQuery::Evaluations { validation, .. } => {
+            vec![L::Definition(*validation), L::Control]
+        }
+        NativeReadQuery::Results { evaluation, .. } => vec![L::Claim(evaluation.claim)],
+        NativeReadQuery::ValidationContext(context) => {
+            vec![
+                L::Claim(context.claim),
+                L::Definition(context.validation),
+                L::Control,
+            ]
+        }
+        NativeReadQuery::Events { .. } | NativeReadQuery::Standing => vec![L::Control],
+    }
+}
+
 pub(crate) fn profile(session: &Session) -> Result<NativeProfile, AccessError> {
     match session.activation() {
         LedgerActivation::Native { profile, .. } => Ok(match profile {
@@ -138,13 +203,19 @@ pub(crate) fn check_consistency(
 fn object(reader: &Reader<'_>, reference: NativeObjectRef) -> Result<NativeObject, AccessError> {
     let core = reader.core;
     let found = match reference {
-        NativeObjectRef::Claim(id) => core.native_claim(id).map(|state| {
-            NativeObject::Claim(Box::new(docs::claim(
-                core,
-                state,
-                NativeClaimExpand::default(),
-            )))
-        }),
+        NativeObjectRef::Claim(id) => core
+            .native_claim(id)
+            .map(|state| {
+                NativeObject::Claim(Box::new(docs::claim(
+                    core,
+                    state,
+                    NativeClaimExpand::default(),
+                )))
+            })
+            .or_else(|| {
+                core.native_retired(id)
+                    .map(|value| NativeObject::Retired(docs::retired(id, value)))
+            }),
         NativeObjectRef::Definition(id) => core.native_definition(id).map(|declaration| {
             NativeObject::Definition(Box::new(docs::definition(core, declaration)))
         }),
@@ -310,12 +381,12 @@ pub(crate) fn page(
                 return Err(AccessError::UnsupportedOperation);
             }
             let Some(state) = core.native_claim(*id) else {
-                return Ok(finish(
-                    reader,
-                    vec![NativeObject::Missing(NativeObjectRef::Claim(*id))],
-                    None,
-                    1,
-                ));
+                // A retired claim answers with its continuation (26 §4).
+                let object = match core.native_retired(*id) {
+                    Some(value) => NativeObject::Retired(docs::retired(*id, value)),
+                    None => NativeObject::Missing(NativeObjectRef::Claim(*id)),
+                };
+                return Ok(finish(reader, vec![object], None, 1));
             };
             let mut objects = vec![NativeObject::Claim(Box::new(docs::claim(
                 core, state, *expand,

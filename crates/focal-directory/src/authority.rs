@@ -557,8 +557,10 @@ fn validate_live_group(
         .chain(&grant.learners)
     {
         let registered = state.nodes.get(node).ok_or(DirectoryError::Missing)?;
+        // Eligibility gates new placement, never an existing vote: a drained
+        // node keeps its seat in every group it belongs to until the
+        // activation that drops it retires it (24 §19).
         if registered.enrollment.generation != *generation
-            || !registered.enrollment.eligible
             || grant.expires_at > registered.expires_at
         {
             return Err(DirectoryError::StaleNode);

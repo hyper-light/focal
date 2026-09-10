@@ -120,17 +120,25 @@ impl FoundingNetwork {
             Some(state) => state.startup_addresses(settings).await?,
             None => resolve_addresses(settings).await?,
         };
-        crate::placement::plan(
-            &[crate::placement::NodeFacts {
-                id: identity.node,
-                topology: settings.topology.clone(),
-                verified: true,
-                eligible: true,
-            }],
-            &settings.durability,
-            &settings.placement,
-        )?;
-        install_policy(directory.root(), settings)?;
+        let committed = crate::embedded::check_policy(directory.root(), settings)?;
+        // The founder pins its policy alone, so the first start must be
+        // satisfiable by this node's own facts. A committed policy is the
+        // directory's to satisfy: `deployment apply` commits stronger
+        // durability than one host provides, and a restart must not refuse
+        // what the fleet already carries.
+        if committed.is_none() {
+            crate::placement::plan(
+                &[crate::placement::NodeFacts {
+                    id: identity.node,
+                    topology: settings.topology.clone(),
+                    verified: true,
+                    eligible: true,
+                }],
+                &settings.durability,
+                &settings.placement,
+            )?;
+            install_policy(directory.root(), settings)?;
+        }
         let now = unix_time()?;
         let names = vec![format!("cluster-{}.focal.internal", hex(&identity.cluster))];
         let private = directory.root().join("cluster/network");

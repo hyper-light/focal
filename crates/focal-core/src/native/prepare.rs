@@ -24,11 +24,11 @@ impl View<'_> {
     /// borrows existing handles; it does not copy roots or reserve resources.
     pub(super) fn check_successor(&self, prepared: &NativePrepared) -> Result<(), NativeError> {
         match self.tail {
-            Some(previous) => previous.range.validate_successor(&prepared.range)?,
+            Some(previous) => previous.fragments.validate_successor(&prepared.fragments)?,
             None => self
                 .state
                 .rows
-                .validate_chain(std::iter::once(&prepared.range))?,
+                .validate_chain(std::iter::once(&prepared.fragments))?,
         }
         Ok(())
     }
@@ -104,6 +104,7 @@ pub(super) fn copy(row: &Row) -> Result<Row, MemoryError> {
         Row::Receipt(receipt) => Ok(Row::Receipt(*receipt)),
         Row::Cycle(cycle) => Ok(Row::Cycle(*cycle)),
         Row::RetiredCycleHead(row) => Ok(Row::RetiredCycleHead(*row)),
+        Row::Retired(row) => Ok(Row::Retired(*row)),
         Row::RetiredCycle(row) => Ok(Row::RetiredCycle(*row)),
         Row::WorkSlot(id) => Ok(Row::WorkSlot(*id)),
         Row::ClaimResultTestament(id) => Ok(Row::ClaimResultTestament(*id)),
@@ -537,7 +538,7 @@ impl Core<NativeState> {
         }
         self.state
             .rows
-            .validate_chain(pending.clone().map(|item| &item.range))?;
+            .validate_chain(pending.clone().map(|item| &item.fragments))?;
         let intent = intent::deadline_fingerprint(self.state.ledger, input)?;
         let view = View {
             state: &self.state,
@@ -626,7 +627,7 @@ impl Core<NativeState> {
         }
         self.state
             .rows
-            .validate_chain(pending.clone().map(|item| &item.range))?;
+            .validate_chain(pending.clone().map(|item| &item.fragments))?;
         context.principal.require_actor(request.principal)?;
         if request.principal.is_zero() || request.id.is_zero() || request.epoch.0 == 0 {
             return Err(ContractError::InvalidTarget.into());
@@ -691,7 +692,7 @@ impl Core<NativeState> {
         }
         self.state
             .rows
-            .validate_chain(pending.clone().map(|item| &item.range))?;
+            .validate_chain(pending.clone().map(|item| &item.fragments))?;
         let intent = intent::claim_deadline_fingerprint(self.state.ledger, input)?;
         let view = View {
             state: &self.state,
@@ -1301,9 +1302,8 @@ impl<'a> Fresh<'a> {
                 | NativeOperation::ReportWork
         ) {
             Some(
-                view.state
-                    .rows
-                    .future_write_envelope(focal_memory::RangeWriteLimits {
+                view.state.rows.future_write_envelope(
+                    focal_memory::RangeWriteLimits {
                         changed_keys: construction.max_changes,
                         // Status rows of every moved claim and the due
                         // timers a report can retire (doc 22 §7).
@@ -1321,7 +1321,9 @@ impl<'a> Fresh<'a> {
                             )?,
                         )?,
                         input_capacity: construction.max_changes,
-                    })?,
+                    },
+                    limits.max_ranges,
+                )?,
             )
         } else {
             None
@@ -1528,49 +1530,51 @@ impl<'a> Fresh<'a> {
             return Err(ContractError::InvalidManifest.into());
         }
         let range_plan = match view.tail {
-            Some(tail) => {
-                view.state
-                    .rows
-                    .plan_after(&tail.range, sequence.0, changes, lane, usize::MAX)?
-            }
+            Some(tail) => view.state.rows.plan_after(
+                source,
+                &tail.fragments,
+                sequence.0,
+                changes,
+                lane,
+                usize::MAX,
+            )?,
             None => view
                 .state
                 .rows
-                .plan_batch(sequence.0, changes, lane, usize::MAX)?,
+                .plan_batch(source, sequence.0, changes, lane, usize::MAX)?,
         };
         if let Some(envelope) = envelope {
-            envelope.check_plan(&range_plan)?;
+            range_plan.check_envelope(&envelope)?;
         }
         if let Some(completion) = completion
             && operation != NativeOperation::BeginWork
         {
-            completion
-                .report_storage(completion_use)?
-                .check_plan(&range_plan)?;
+            range_plan.check_envelope(&completion.report_storage(completion_use)?)?;
         }
         if let Some(envelope) = deadline_envelope {
-            envelope.check_plan(&range_plan)?;
+            range_plan.check_envelope(&envelope)?;
         }
         if let Some(respondent) = respondent {
-            respondent.storage(operation)?.check_plan(&range_plan)?;
+            range_plan.check_envelope(&respondent.storage(operation)?)?;
         }
         // The actual shape is now fixed. Charging the maximum shape here would
         // exceed a regular report's smaller retained promise (e.g. 9 vs 11 rows).
-        let mutation_bytes = super::mutation::bytes(range_plan.changes().len())?;
+        let mutation_bytes = super::mutation::bytes(range_plan.changes_len())?;
         within(mutation_bytes, construction.mutation_bytes()?)?;
         let writes = super::mutation::WriteSet::capture(
             view.state.profile,
+            range_plan.changes_len(),
             range_plan.changes(),
             construction.mutation_bytes()?,
             source
                 .reserve(BudgetKind::Pending, lane, mutation_bytes)?
                 .commit(),
         )?;
-        let range = range_plan.build_in_with(source, copy)?;
-        writes.check(&range)?;
+        let fragments = range_plan.build_in_with(source, copy)?;
+        writes.check(&fragments)?;
         BuiltNative::new(
             NativePrepared {
-                range,
+                fragments,
                 outcome,
                 writes,
             },

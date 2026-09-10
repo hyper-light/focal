@@ -37,6 +37,18 @@ impl ReadViews {
             traversal_nonce: 0,
         }
     }
+    /// Serve at a newer route: every pinned view and saved traversal carried
+    /// the old epoch in its token and is dropped; the read clock and the
+    /// list key continue, since a clock that ran backwards would stop the
+    /// session's read expiry.
+    pub(crate) fn set_route_epoch(&mut self, route_epoch: RouteEpoch) {
+        if route_epoch == self.route_epoch {
+            return;
+        }
+        self.route_epoch = route_epoch;
+        self.views.clear();
+        self.traversals.clear();
+    }
     /// The per-process key that authenticates list continuations. Minted on
     /// first use; a restart mints another, so cursors never outlive the node
     /// incarnation that issued them.

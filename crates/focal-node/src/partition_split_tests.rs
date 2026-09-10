@@ -62,7 +62,7 @@ async fn wait_partition(
     what: &str,
     condition: impl Fn(&PartitionCheckpoint) -> bool,
 ) -> PartitionCheckpoint {
-    tokio::time::timeout(Duration::from_secs(120), async {
+    let reached = tokio::time::timeout(Duration::from_secs(120), async {
         loop {
             if let Some(state) = partition_state(running, partition).await
                 && condition(&state)
@@ -72,18 +72,36 @@ async fn wait_partition(
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
-    .await
-    .unwrap_or_else(|_| panic!("partition never reached: {what}"))
+    .await;
+    match reached {
+        Ok(state) => state,
+        Err(_) => {
+            let status = running.handles.placement.status().await;
+            panic!(
+                "partition never reached: {what}; agent {:?}; state {:?}",
+                status.map(|status| (
+                    status.last_error,
+                    status.root_intents,
+                    status.partition_intents
+                )),
+                partition_state(running, partition)
+                    .await
+                    .map(|state| (state.sealed, state.delegation))
+            )
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_crowded_partition_splits_survives_a_restart_and_merges_back() {
-    // Test knobs, read at every tick: one session already crowds a partition,
-    // and nothing merges while a half holds more than nothing.
-    super::override_thresholds(1, 0);
     let directory = tempfile::tempdir().unwrap();
     let settings = settings(directory.path());
     let founder = Running::start(&settings).await;
+    // Test knobs for this cluster alone, read at every tick: one session
+    // already crowds a partition, and nothing merges while a half holds more
+    // than nothing.
+    let cluster = founder.handles.control.progress().identity.cluster.0;
+    super::override_thresholds(cluster, 1, 0);
     let ledger = founder.status.ledger;
     let founder_node = founder.status.node;
     let first = founder.handles.directory.plan().partition();
@@ -185,7 +203,7 @@ async fn a_crowded_partition_splits_survives_a_restart_and_merges_back() {
 
     // Both halves are small enough to merge once the knobs allow it: the
     // upper seals for the lower, the root merges, the lower absorbs.
-    super::override_thresholds(3, 1);
+    super::override_thresholds(cluster, 3, 1);
     let merged = wait_delegations(&founder, "one delegation", |current| current.len() == 1).await;
     let only = merged.get(&NamespaceKey::MIN).unwrap();
     assert_eq!(only.partition, first);

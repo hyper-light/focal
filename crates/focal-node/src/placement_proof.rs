@@ -161,7 +161,15 @@ pub fn prepare_session_proof(
             .eq(configuration.learners.iter().copied())
         || !configuration.learners_next.is_empty()
         || configuration.auto_leave
-        || group.voters != witness.placement().placement.voters
+        // Every voter the placement names votes under the grant at its
+        // generation; a current voter the placement drops keeps its vote
+        // until the activation retires it (24 §3, §19).
+        || !witness
+            .placement()
+            .placement
+            .voters
+            .iter()
+            .all(|(node, generation)| group.voters.get(node) == Some(generation))
     {
         return Err(PlacementProofError::Unauthorized);
     }
@@ -169,9 +177,14 @@ pub fn prepare_session_proof(
         .node(witness.node())
         .ok_or(PlacementProofError::Unauthorized)?;
     let generation = node.enrollment.generation;
-    if group.voters.get(&witness.node()) != Some(&generation)
-        && group.outgoing_voters.get(&witness.node()) != Some(&generation)
-    {
+    // A seat at or below the node's current generation is still its own
+    // (the same key re-granted, 24 §19).
+    let holds = |seats: &BTreeMap<u64, u64>| {
+        seats
+            .get(&witness.node())
+            .is_some_and(|granted| *granted <= generation)
+    };
+    if !holds(&group.voters) && !holds(&group.outgoing_voters) {
         return Err(PlacementProofError::Unauthorized);
     }
     let verifier = authority.verifier(enrollment, &[], now)?;
@@ -316,8 +329,14 @@ pub fn prepare_replica_ready_proof(
     let generation = node.enrollment.generation;
     if grant.scope != GroupScope::Session(ready.ledger)
         || ready.node_generation != generation
-        || (grant.voters.get(&ready.node) != Some(&generation)
-            && grant.outgoing_voters.get(&ready.node) != Some(&generation)
+        || (grant
+            .voters
+            .get(&ready.node)
+            .is_none_or(|granted| *granted > generation)
+            && grant
+                .outgoing_voters
+                .get(&ready.node)
+                .is_none_or(|granted| *granted > generation)
             && grant.learners.get(&ready.node) != Some(&generation))
         || grant.expires_at <= now
         || window.expires_at > grant.expires_at
@@ -418,8 +437,14 @@ pub fn prepare_membership_proof(
     if !matches!(current.scope, GroupScope::Session(_))
         || next.scope != current.scope
         || next.genesis != current.genesis
-        || (current.voters.get(&node) != Some(&generation)
-            && current.outgoing_voters.get(&node) != Some(&generation))
+        || !(current
+            .voters
+            .get(&node)
+            .is_some_and(|granted| *granted <= generation)
+            || current
+                .outgoing_voters
+                .get(&node)
+                .is_some_and(|granted| *granted <= generation))
         || current.expires_at <= now
         || window.expires_at > current.expires_at
         || next.expires_at < window.expires_at
@@ -436,10 +461,10 @@ pub fn prepare_membership_proof(
         let grant = authority
             .node(*member)
             .ok_or(PlacementProofError::Unauthorized)?;
-        if grant.enrollment.generation != *member_generation
-            || !grant.enrollment.eligible
-            || grant.expires_at < next.expires_at
-        {
+        // A drained member keeps its seat until the activation that drops
+        // it retires it (24 §19); eligibility gates placement, not the
+        // grant that follows the log.
+        if grant.enrollment.generation != *member_generation || grant.expires_at < next.expires_at {
             return Err(PlacementProofError::Unauthorized);
         }
         verifier.verify_enrollment(&grant.enrollment)?;
@@ -555,8 +580,14 @@ pub fn prepare_delegation_proof(
         GroupScope::Partition { partition, .. } if partition == expected
     );
     if !scoped
-        || (current.voters.get(&node) != Some(&generation)
-            && current.outgoing_voters.get(&node) != Some(&generation))
+        || !(current
+            .voters
+            .get(&node)
+            .is_some_and(|granted| *granted <= generation)
+            || current
+                .outgoing_voters
+                .get(&node)
+                .is_some_and(|granted| *granted <= generation))
         || current.expires_at <= now
         || window.expires_at > current.expires_at
     {

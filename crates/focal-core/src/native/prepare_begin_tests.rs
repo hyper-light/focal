@@ -148,7 +148,8 @@ fn copy_row(row: &Row) -> Result<Row, MemoryError> {
         Row::Evaluation(value) => value.copy().map(Row::Evaluation),
         Row::Outcome(value) => Ok(Row::Outcome(*value)),
         Row::Event(value) => value.copy().map(Row::Event),
-        _ => panic!("unexpected row in Begin-only fixture"),
+        // The claim's other rows share its span under the storage layout.
+        other => crate::native::prepare::copy(other),
     }
 }
 
@@ -163,11 +164,11 @@ fn altered(
 ) -> NativePrepared {
     let mut outcome = original.outcome();
     outcome.events = u32::try_from(events.len()).unwrap();
-    let Some(Row::Meta(meta)) = original.range.get(&Key::Meta) else {
+    let Some(Row::Meta(meta)) = original.fragments.get(&Key::Meta) else {
         panic!("metadata")
     };
     let mut meta = *meta;
-    let Some(Row::Meta(source_meta)) = source.range.get(&Key::Meta) else {
+    let Some(Row::Meta(source_meta)) = source.fragments.get(&Key::Meta) else {
         panic!("metadata")
     };
     meta.events = source_meta.events + events.len();
@@ -199,7 +200,8 @@ fn altered(
         .state
         .rows
         .plan_after(
-            &source.range,
+            &core.state.budget,
+            &source.fragments,
             outcome.sequence.0,
             changes,
             BudgetLane::Completion,
@@ -209,7 +211,7 @@ fn altered(
         .build_in_with(&core.state.budget, copy_row)
         .unwrap();
     NativePrepared {
-        range,
+        fragments: range,
         outcome,
         writes: crate::native::mutation::WriteSet::unrecorded(),
     }
@@ -263,7 +265,7 @@ fn collector_requires_complete_begun_history_and_exact_authorized_final_state() 
     let expected_reports = book.remaining_reports(proof.key());
     let capacity = book.funded_capacity();
     let Some(Row::Event(event)) = original
-        .range
+        .fragments
         .get(&Key::Event(original.outcome().sequence, 0))
     else {
         panic!("actual Begun event")
@@ -357,7 +359,7 @@ fn a_fake_handler_free_begun_fact_cannot_hide_behind_an_unbegun_final_row() {
     let proof = transition(&fresh);
     let original = fresh.build(&core.state.budget, None).unwrap();
     let Some(Row::Event(event)) = original
-        .range
+        .fragments
         .get(&Key::Event(original.outcome().sequence, 0))
     else {
         panic!("actual Begun event")

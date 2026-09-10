@@ -502,7 +502,7 @@ pub(super) fn take<T: V1>(bytes: &[u8]) -> Result<(T, &[u8]), LedgerError> {
 pub(super) fn encode<T: V1>(magic: &[u8], value: &T, limit: usize) -> Result<Vec<u8>, LedgerError> {
     encode_view(magic, &Frozen(value), limit)
 }
-fn encode_view<T: Serialize>(
+pub(super) fn encode_view<T: Serialize>(
     magic: &[u8],
     value: &T,
     limit: usize,

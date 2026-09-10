@@ -107,7 +107,9 @@ async fn expansion_rejects_missing_policy_before_creating_network_credentials() 
     settings.node.advertise = Some("127.0.0.1:7443".into());
     assert!(matches!(
         FoundingNetwork::open(&settings).await,
-        Err(NetworkError::Node(NodeError::Identity))
+        Err(NetworkError::Node(NodeError::Config(
+            crate::config::ConfigError::PolicyMissing
+        )))
     ));
     assert!(!directory.path().join("POLICY").exists());
     assert!(!directory.path().join("cluster/network").exists());

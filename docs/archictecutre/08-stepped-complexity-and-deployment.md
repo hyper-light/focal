@@ -76,6 +76,7 @@ must show the missing independent capacity and keep the existing guarantee uncha
 | `node.advertise` | Endpoint peers can reach and authenticate; commonly the only networking field the operator sets |
 | `node.seeds` | Optional bootstrap override for managed recovery/infrastructure; normal join persists a bounded peer set automatically |
 | `node.max_tenants` | Tenants this node hosts sessions for at most, its own included (default 8, at most 1024); a placement that needs one more is refused by this node as a capacity refusal ([24](24-placement-execution-and-fleet-control.md) §10) |
+| `node.metrics_listen` | An optional loopback endpoint for the read-only metrics text (§9); node-local, never a cluster fact |
 | `topology.zone`, `topology.region` | Infrastructure facts, validated against the configured source of topology authority |
 | `durability.survive` | Failure-domain class `node`, `zone`, or `region` |
 | `durability.max_failures` | Number of simultaneous independent failures in that class to tolerate |
@@ -97,7 +98,15 @@ cannot change committed protection or residency. It directs such changes to plan
 Configuration precedence is explicit: command-line overrides apply only to eligible
 node-local startup fields, then the supplied file, then creation defaults. A conflicting
 cluster intent does not become a last-writer-wins startup option. `explain` names each
-value's source. Identity keys, membership epochs, seeds learned from peers, placements,
+value's source. Implemented 2026-09-10 (R9.1, `crates/focal-node/src/config/`): the
+schema check names an unknown key by its full path (`node.shards`) before the typed
+parse; the store's committed policy lives in `POLICY` as `FCLPOL2` with a revision and a
+hash (the original bare pair reads as revision 1, unchanged on disk); a start whose file
+sets a policy field to another value is refused as `CommittedPolicyChange` naming the
+field and directing to plan/apply, while omitted policy fields take the committed values
+and are reported as `committed` at that revision; `deployment explain` prints `requested`
+(the file), `effective` (the committed policy) and `sources` per field
+(`command_line`, `file`, `creation_default`, `committed`). Identity keys, membership epochs, seeds learned from peers, placements,
 and measured scheduling decisions live in managed state, not generated user YAML.
 
 ## 3. Stage 1: laptop, with durable storage from the first run
@@ -379,6 +388,40 @@ data movement estimate, guarantee before/during/after, and rollback limits. `app
 rechecks prerequisites and refuses a stale plan before side effects; it never blindly
 executes a plan against another deployment. Dry-run is read-only, including no ticket
 creation, credential rotation, schema migration, membership change, or cloud allocation.
+
+Implemented 2026-09-10 (R9.2, `crates/focal-node/src/deployment/`): `deployment plan
+--config FILE` composes a plan from what the node observes — its committed policy
+revision and hash and, on a node that runs a directory, every session the placement
+view names with its route, membership and placement epochs, voters and achieved
+guarantee, plus the nodes' liveness and disk — and what the file requests (omitted
+policy fields take the committed values). Each session is asked as a dry run
+(`cluster sessions plan --dry-run`): the placement agent proposes from the committed
+directory and journals nothing, so planning creates no file, ticket or directory record.
+The plan's changes are ordered: the policy commit (revision *n* → *n*+1) when the request
+differs, then per session either the placement request it denotes (the exact operation
+identity, the voters the planner picked, the epochs it expects) or no change when the
+active placement already provides the durability. A session the planner refuses is
+listed as blocked and the guarantee after the plan stays the guarantee before it (the
+weakest achieved level across the sessions, or the committed level without sessions);
+the guarantee during the plan is the guarantee before it, because the old contract holds
+until the new placement is verified. The artifact is `FCLPLAN1` (magic, postcard body,
+BLAKE3 trailer) whose identity is derived from the facts alone, so the same observation
+and request make the same plan whenever it is computed; `--output` writes a new file and
+never overwrites one, `--dry-run` prints without writing. `deployment apply --plan-file`
+refuses a plan made for another cluster, a plan with blocked sessions (missing capacity
+leaves the contract intact), a tampered plan, and — before any side effect and without
+journaling — a stale plan whose observed policy revision or session epochs moved. It
+then journals each change under `cluster/apply/<plan>/` (`FCLAPLY1`, the plan kept
+beside it) through `Prepared → Committed → Verified → Complete`: the policy is committed
+as the next revision and read back; the placement request is sent (a reply naming
+another operation marks the plan stale), then observed under way (`pending` names the
+operation) and complete (no plan pending and the achieved guarantee covers the request);
+`--wait` bounds how long apply watches. A repeated apply resumes the journal and repeats
+nothing; `deployment status` re-checks journaled plans against the directory. A
+committed policy stronger than one host provides no longer refuses the founder's
+restart: the local solve pins only the first policy, the directory satisfies committed
+ones. Residency and home-region changes commit as policy intent; their enforcement over
+copies is the residency executor's (instruction 4).
 
 Normal text/JSON output redacts invitation secrets, credentials, private endpoints where
 the caller lacks access, and claim/artifact content. Redaction applies to errors, logs,

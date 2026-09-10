@@ -52,6 +52,7 @@ pub(crate) fn invocation_of(value: NativeInvocationRef) -> core_native::NativeIn
             })
         }
         NativeInvocationRef::Import => core_native::NativeInvocation::Import,
+        NativeInvocationRef::Retirement { root } => core_native::NativeInvocation::Retirement(root),
     }
 }
 pub(crate) fn operation(value: core_native::NativeOperation) -> NativeOperationKind {
@@ -88,6 +89,7 @@ pub(crate) fn operation(value: core_native::NativeOperation) -> NativeOperationK
         O::EvaluationDeadline => NativeOperationKind::EvaluationDeadline,
         O::ClaimDeadline => NativeOperationKind::ClaimDeadline,
         O::Import => NativeOperationKind::Import,
+        O::Retire => NativeOperationKind::Retire,
     }
 }
 pub(crate) fn outcome(value: core_native::NativeOutcome) -> NativeReceipt {
@@ -300,6 +302,19 @@ pub(crate) fn claim_content(
         policy: value.policy(),
         content_hash: value.content_hash(),
         intent: value.intent_fingerprint(),
+    }
+}
+/// The continuation of a retired claim (26 §4).
+pub(crate) fn retired(claim: ClaimId, value: &core_native::RetiredClaim) -> NativeRetiredClaim {
+    NativeRetiredClaim {
+        claim,
+        binding: binding(value.binding),
+        status: value.status,
+        bundle: value.bundle,
+        bytes: value.bytes,
+        through: value.through,
+        retired_at: value.retired_at,
+        events: value.events,
     }
 }
 pub(crate) fn claim(

@@ -110,7 +110,13 @@ impl CompletionEnvelope {
             add(add(claims, original_extras)?, add(original_events, 2)?)?,
             add(
                 cohort.changed_keys(),
-                add(add(4, add(moved, moved)?)?, timers)?,
+                add(
+                    add(
+                        crate::native::index_rows::report_rows(0)?,
+                        add(moved, moved)?,
+                    )?,
+                    timers,
+                )?,
             )?,
         )?;
         descriptor.inputs = crate::native::index_rows::cap_inputs(
@@ -166,13 +172,16 @@ impl CompletionEnvelope {
             )?,
         )?;
         within(changes, limits.range.max_batch_entries)?;
-        let failed = view.state.rows.future_write_envelope(RangeWriteLimits {
-            changed_keys: changes,
-            deleted_keys: add(moved, timers)?,
-            deleted_heap: 0,
-            incoming_heap,
-            input_capacity: changes,
-        })?;
+        let failed = view.state.rows.future_write_envelope(
+            RangeWriteLimits {
+                changed_keys: changes,
+                deleted_keys: add(moved, timers)?,
+                deleted_heap: 0,
+                incoming_heap,
+                input_capacity: changes,
+            },
+            limits.max_ranges,
+        )?;
         result.graph = Some(graph);
         result.cohort = cohort;
         result.failed_report = Some(failed);

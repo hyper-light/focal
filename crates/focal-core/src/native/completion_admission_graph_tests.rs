@@ -145,7 +145,7 @@ fn actual_dependency_failure_and_automatic_seals_fit_held_range_and_construction
         ClaimStatus::DependencyFailed
     );
     let Some(Row::Event(event)) = candidate
-        .range
+        .fragments
         .get(&Key::Event(candidate.outcome().sequence, 3))
     else {
         panic!("failure fact")

@@ -1,4 +1,4 @@
-use focal_model::{ContentHash, HandlerRef, ValidatorId, VerdictValue};
+use focal_model::{ContentHash, HandlerRef, SessionSeq, ValidatorId, VerdictValue};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -26,6 +26,17 @@ pub enum RegistryError {
     Contract,
     #[error("validator execution error: {0}")]
     Execution(String),
+    /// The version keeps its identity but runs nothing new since `at`.
+    #[error("validator version retired at session sequence {at}")]
+    Retired { at: u64 },
+}
+/// When a version entered service and, once retired, when it left it. A
+/// retired version keeps its registration (a report that cites it still
+/// resolves to the same schema and bound) but evaluates nothing new.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lifetime {
+    pub introduced_at: SessionSeq,
+    pub retired_at: Option<SessionSeq>,
 }
 
 pub trait Validator: Send + Sync {
@@ -43,8 +54,13 @@ pub struct Registration {
     pub max_evidence_bytes: usize,
 }
 
+struct Entry {
+    registration: Registration,
+    lifetime: Lifetime,
+    implementation: Box<dyn Validator>,
+}
 pub struct Registry {
-    entries: BTreeMap<(ValidatorId, ContentHash), (Registration, Box<dyn Validator>)>,
+    entries: BTreeMap<(ValidatorId, ContentHash), Entry>,
     capacity: usize,
 }
 
@@ -55,14 +71,26 @@ impl Registry {
             capacity,
         }
     }
+    /// Register a version as present from the start of history.
     pub fn register(
         &mut self,
         registration: Registration,
         implementation: Box<dyn Validator>,
     ) -> Result<(), RegistryError> {
+        self.register_at(registration, implementation, SessionSeq(0))
+    }
+    /// Register a version that entered service at `introduced_at`. A version
+    /// is immutable: the same registration again is idempotent (whatever
+    /// its lifetime), a different one under the same identity conflicts.
+    pub fn register_at(
+        &mut self,
+        registration: Registration,
+        implementation: Box<dyn Validator>,
+        introduced_at: SessionSeq,
+    ) -> Result<(), RegistryError> {
         let key = (registration.handler.id, registration.handler.version);
-        if let Some((existing, _)) = self.entries.get(&key) {
-            return if existing == &registration {
+        if let Some(existing) = self.entries.get(&key) {
+            return if existing.registration == registration {
                 Ok(())
             } else {
                 Err(RegistryError::Conflict)
@@ -71,8 +99,53 @@ impl Registry {
         if self.entries.len() >= self.capacity {
             return Err(RegistryError::Capacity);
         }
-        self.entries.insert(key, (registration, implementation));
+        self.entries.insert(
+            key,
+            Entry {
+                registration,
+                lifetime: Lifetime {
+                    introduced_at,
+                    retired_at: None,
+                },
+                implementation,
+            },
+        );
         Ok(())
+    }
+    /// Retire a version at `at`: it keeps its identity for every report that
+    /// cites it and evaluates nothing new. Retiring twice at the same
+    /// sequence is idempotent; at another sequence it conflicts, since a
+    /// retirement is a recorded fact.
+    pub fn retire(&mut self, handler: &HandlerRef, at: SessionSeq) -> Result<(), RegistryError> {
+        let entry = self
+            .entries
+            .get_mut(&(handler.id, handler.version))
+            .ok_or(RegistryError::Unavailable)?;
+        if entry.registration.handler != *handler {
+            return Err(RegistryError::Contract);
+        }
+        match entry.lifetime.retired_at {
+            Some(retired) if retired == at => Ok(()),
+            Some(_) => Err(RegistryError::Conflict),
+            None if at < entry.lifetime.introduced_at => Err(RegistryError::Conflict),
+            None => {
+                entry.lifetime.retired_at = Some(at);
+                Ok(())
+            }
+        }
+    }
+    /// The immutable registration of a version, retired or not.
+    pub fn lookup(&self, handler: &HandlerRef) -> Option<&Registration> {
+        self.entries
+            .get(&(handler.id, handler.version))
+            .map(|entry| &entry.registration)
+            .filter(|registration| registration.handler == *handler)
+    }
+    pub fn lifetime(&self, handler: &HandlerRef) -> Option<Lifetime> {
+        self.entries
+            .get(&(handler.id, handler.version))
+            .filter(|entry| entry.registration.handler == *handler)
+            .map(|entry| entry.lifetime)
     }
     pub fn execute(
         &self,
@@ -81,18 +154,21 @@ impl Registry {
         evidence: &[u8],
         quality_bar: Option<&str>,
     ) -> Result<Evaluation, RegistryError> {
-        let (registration, validator) = self
+        let entry = self
             .entries
             .get(&(handler.id, handler.version))
             .ok_or(RegistryError::Unavailable)?;
-        if registration.handler != *handler
-            || registration.evidence_schema != schema
-            || evidence.len() > registration.max_evidence_bytes
+        if entry.registration.handler != *handler
+            || entry.registration.evidence_schema != schema
+            || evidence.len() > entry.registration.max_evidence_bytes
             || (quality_bar.is_some() && !handler.agentic)
         {
             return Err(RegistryError::Contract);
         }
-        validator.evaluate(evidence, quality_bar)
+        if let Some(at) = entry.lifetime.retired_at {
+            return Err(RegistryError::Retired { at: at.0 });
+        }
+        entry.implementation.evaluate(evidence, quality_bar)
     }
 }
 

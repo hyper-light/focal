@@ -82,6 +82,27 @@ pub fn propose_placement(
     max_members: usize,
     min_disk_available: u64,
 ) -> Result<PlacementProposal, DirectoryError> {
+    propose_placement_keeping(
+        nodes,
+        policy,
+        &BTreeMap::new(),
+        max_members,
+        min_disk_available,
+    )
+}
+/// [`propose_placement`] preferring `incumbents` (the active placement's
+/// voters, by node) among equally eligible candidates, so an expansion adds
+/// hosts to the copies that exist and a heal moves only what it must
+/// ([24](../../../docs/archictecutre/24-placement-execution-and-fleet-control.md) §9, §19).
+/// Home-region preference still comes first; an incumbent that is no longer
+/// eligible, alive or reporting is not a candidate at all.
+pub fn propose_placement_keeping(
+    nodes: &BTreeMap<u64, NodeRecord>,
+    policy: &PlacementPolicy,
+    incumbents: &BTreeMap<u64, u64>,
+    max_members: usize,
+    min_disk_available: u64,
+) -> Result<PlacementProposal, DirectoryError> {
     let needed = usize::from(policy.durability.max_failures)
         .checked_mul(2)
         .and_then(|n| n.checked_add(1))
@@ -108,6 +129,7 @@ pub fn propose_placement(
         (
             !policy.home_regions.is_empty()
                 && !policy.home_regions.contains(&node.enrollment.region),
+            !incumbents.contains_key(&node.enrollment.node),
             load.active_weight,
             std::cmp::Reverse(load.available_memory),
             std::cmp::Reverse(load.disk_available),
@@ -161,7 +183,7 @@ pub fn propose_placement(
             .map(|(node, load)| (node.enrollment.node, load.report))
             .collect(),
         spec,
-        explanation: "Selected eligible nodes by ordering home, measured load, free memory, and stable ID; selected independent promised failure domains.",
+        explanation: "Selected eligible nodes by ordering home, incumbency, measured load, free memory, and stable ID; selected independent promised failure domains.",
     })
 }
 

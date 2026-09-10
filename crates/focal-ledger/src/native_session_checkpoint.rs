@@ -72,6 +72,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     pub(crate) fn begin_checkpoint(
         &mut self,
         consensus: &mut DurableNode,
+        seeds: &mut SeedStore,
     ) -> Result<(), NativeSessionError> {
         self.check()?;
         if self.delivery.is_some() || consensus.persistence_pending() {
@@ -79,7 +80,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 ConsensusError::PersistencePending,
             ));
         }
-        let (bytes, allocation) = self.encode_checkpoint(consensus)?;
+        let (bytes, allocation) = self.encode_checkpoint(consensus, seeds)?;
         consensus.begin_checkpoint_funded(self.applied_raft, bytes, allocation)?;
         Ok(())
     }
@@ -88,8 +89,18 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     /// bytes inside its own envelope; the standalone session hands them to
     /// consensus directly.
     pub(crate) fn encode_checkpoint(
+        &mut self,
+        consensus: &DurableNode,
+        seeds: &mut SeedStore,
+    ) -> Result<(Vec<u8>, Allocation), NativeSessionError> {
+        let (bytes, allocation) = self.encode_checkpoint_inner(consensus, seeds)?;
+        self.note_seeds(&bytes)?;
+        Ok((bytes, allocation))
+    }
+    fn encode_checkpoint_inner(
         &self,
         consensus: &DurableNode,
+        seeds: &mut SeedStore,
     ) -> Result<(Vec<u8>, Allocation), NativeSessionError> {
         self.check()?;
         let status = consensus.status();
@@ -121,13 +132,36 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             Some(Domain::Active(owner, _)) => owner.committed_core(),
             None => return Err(NativeSessionError::Failed),
         };
-        let plan = enclosing::EncodingPlan::prepare(
+        // The movement section: the coordinator state every replica must
+        // resume from (25 §6), under its own permit.
+        let movement = match self.movement.as_ref() {
+            Some(movement) => Some(movement.checkpoint_bytes()?),
+            None => None,
+        };
+        let _movement_permit = self.budget.reserve(
+            BudgetKind::Recovery,
+            BudgetLane::Completion,
+            array::<u8>(movement.as_ref().map_or(0, Vec::len))?,
+        )?;
+        // The retention section (26 §3): the archive's report this replica
+        // restores from its own checkpoint, carried once above zero.
+        let retention = (self.archived_through.0 > 0 || self.retired_families > 0).then_some(
+            enclosing::RetentionSection {
+                archived_through: self.archived_through,
+                retired_families: self.retired_families,
+            },
+        );
+        let plan = enclosing::EncodingPlan::prepare_with_sections(
             core,
             metadata,
             &configuration,
+            movement.as_deref(),
+            retention,
             self.limits.checkpoint,
         )?;
-        Ok(plan.encode_in(&self.budget)?.into_parts())
+        // A root beyond the inline bound is sealed as seeds first (25 §5);
+        // the bytes consensus carries then name them.
+        Ok(plan.encode_in_seeded(&self.budget, seeds)?.into_parts())
     }
 
     /// Validate and install an authoritative snapshot. Every identity, floor,
@@ -156,7 +190,45 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         configuration: &focal_consensus::MembershipConfiguration,
         consensus: &DurableNode,
     ) -> Result<(), NativeSessionError> {
-        let checkpoint = enclosing::Checkpoint::inspect(data, self.limits.checkpoint)?;
+        let assembled = match enclosing::Checkpoint::describe(data, self.limits.checkpoint)? {
+            None => None,
+            Some(manifest) => {
+                match manifest.assemble(&self.seeds, &self.budget) {
+                    Ok(core) => {
+                        // The installed seed's chunks are what this replica's
+                        // seed store keeps for peers (26 §5).
+                        self.note_seeds(data)?;
+                        Some(core)
+                    }
+                    Err(enclosing::SeedError::Missing(_)) => {
+                        // The chunks this replica lacks, for its host to pull;
+                        // the delivery is retained until they are local.
+                        let missing = manifest.missing(&self.seeds)?;
+                        self.pending_seed =
+                            Some(PendingSeed::new(index, term, missing, &self.budget)?);
+                        return Err(NativeSessionError::CustodyPending);
+                    }
+                    Err(enclosing::SeedError::Memory(error)) => {
+                        return Err(NativeSessionError::Memory(error));
+                    }
+                    Err(enclosing::SeedError::Seeds(error)) => {
+                        return Err(NativeSessionError::Native(
+                            NativeEvidenceError::from(error).into(),
+                        ));
+                    }
+                    Err(enclosing::SeedError::Invalid(_)) => {
+                        return Err(NativeSessionError::Corrupt);
+                    }
+                }
+            }
+        };
+        let checkpoint = match &assembled {
+            Some(core) => {
+                enclosing::Checkpoint::inspect_seeded(data, core.bytes(), self.limits.checkpoint)?
+            }
+            None => enclosing::Checkpoint::inspect(data, self.limits.checkpoint)?,
+        };
+        self.pending_seed = None;
         let header = checkpoint.header();
         let meta = header.metadata;
         if meta.ancillary != AncillaryProfile::NativeOnlyV1 {
@@ -191,11 +263,48 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         if restored.native_sequence() != header.prefix {
             return Err(NativeSessionError::Corrupt);
         }
+        // The movement coordinator resumes from the checkpoint's section, or
+        // starts fresh from the restored layout when the checkpoint carried
+        // none (25 §6). Built before the domain is replaced.
+        let movement = if checkpoint.movement().is_empty() {
+            let map = super::movement::map_from_layout(
+                self.ledger,
+                restored.native_layout().boundaries(),
+                self.limits.ranges,
+            )?;
+            super::movement::Movement::new(
+                meta.activation.genesis,
+                map,
+                self.limits.ranges,
+                self.budget.clone(),
+            )?
+        } else {
+            let _permit = self.budget.reserve(
+                BudgetKind::Recovery,
+                BudgetLane::Completion,
+                array::<u8>(checkpoint.movement().len().saturating_mul(4))?,
+            )?;
+            super::movement::Movement::restore(
+                meta.activation.genesis,
+                checkpoint.movement(),
+                self.limits.ranges,
+                self.budget.clone(),
+            )?
+        };
+        // The archive's report resumes from the checkpoint's section (26 §3),
+        // never regressing what this replica already recorded.
+        if let Some(section) = checkpoint.retention() {
+            self.archived_through = self.archived_through.max(section.archived_through);
+            // The count is the checkpoint's: it names the families retired
+            // through the prefix installed here (26 §4).
+            self.retired_families = section.retired_families;
+        }
         // An installed authoritative snapshot resolves every speculative candidate.
         self.resolve_suffix(super::apply::SuffixEvidence::InstalledSnapshot)?;
         self.readiness_requested = None;
         self.reconstruction_needed = true;
         self.domain = Some(Domain::Passive(restored));
+        self.movement = Some(movement);
         self.range = range;
         self.recording_range = meta.recording_range;
         self.recording_term = meta.recording_term;

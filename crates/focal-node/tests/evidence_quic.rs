@@ -893,17 +893,21 @@ async fn evidence_scenario(managed: bool) {
         download(&fleet.replicas[1].actor, &second_reference).await,
         &second_bytes,
     );
+    // Every submit retries its exact envelope: under load a replica may
+    // answer a fresh request with an unknown outcome inside its request
+    // timeout, and the identical envelope is what makes the retry exact.
     for remote in [&fleet.replicas[leader].actor, &fleet.replicas[leader].other] {
         committed(
-            &remote
-                .request(&request(
+            &eventual(
+                remote,
+                &request(
                     1,
                     Operation::OpenEpoch {
                         epoch: RequestEpoch(1),
                     },
-                ))
-                .await
-                .unwrap(),
+                ),
+            )
+            .await,
         );
     }
     for (id, command) in [
@@ -934,7 +938,7 @@ async fn evidence_scenario(managed: bool) {
         } else {
             &fleet.replicas[leader].actor
         };
-        committed(&remote.request(&submit(id, command)).await.unwrap());
+        committed(&eventual(remote, &submit(id, command)).await);
     }
     let attachment = attach(6, &reference);
     let first = eventual(&fleet.replicas[leader].actor, &attachment).await;
@@ -1022,20 +1026,20 @@ async fn evidence_scenario(managed: bool) {
         kind: ObjectKind::Artifact,
         id: ObjectId(artifact.id.0),
     };
-    let read = fleet.replicas[replacement]
-        .actor
-        .request(&request(
+    let read = eventual(
+        &fleet.replicas[replacement].actor,
+        &request(
             6000,
             Operation::Read(ReadRequest {
                 consistency: ReadConsistency::Linearizable,
                 query: ReadQuery::Objects(vec![object]),
                 max_items: 1,
             }),
-        ))
-        .await
-        .unwrap();
+        ),
+    )
+    .await;
     let Response::Read(page) = read.result else {
-        panic!("artifact graph read failed")
+        panic!("artifact graph read failed: {read:?}")
     };
     assert!(
         matches!(page.objects.as_slice(),[ReadObject::Artifact {id,..}] if *id==artifact.id),

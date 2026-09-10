@@ -122,6 +122,15 @@ fn decode_fixed(key: Key, c: &mut Cursor<'_>) -> Result<Option<Row>, CodecError>
             count: count(c)?,
             work_count: count(c)?,
         }),
+        Key::Retired(_) => Row::Retired(RetiredClaim {
+            bundle: read_fields::hash(c)?,
+            bytes: c.u64()?,
+            through: SessionSeq(c.u64()?),
+            binding: read_fields::binding(c)?,
+            status: read_fields::claim_status(c)?,
+            retired_at: SessionSeq(c.u64()?),
+            events: c.u32()?,
+        }),
         Key::RetiredCycle(_) => Row::RetiredCycle(RetiredCycle {
             holder: f::participant(c)?,
             next: optional_cycle(c)?,
@@ -144,7 +153,8 @@ fn decode_fixed(key: Key, c: &mut Cursor<'_>) -> Result<Option<Row>, CodecError>
         | Key::ByEvaluator(..)
         | Key::ByVerdict(..)
         | Key::ByCreated(..)
-        | Key::DueTimer(..) => {
+        | Key::DueTimer(..)
+        | Key::ByObject(..) => {
             if c.u8()? != 1 {
                 return Err(CodecError::InvalidTag("index row"));
             }
@@ -220,6 +230,7 @@ fn invocation(value: NativeInvocation) -> bool {
                 && key.generation != 0
         }
         NativeInvocation::Import => true,
+        NativeInvocation::Retirement(root) => !root.is_zero(),
     }
 }
 
@@ -273,6 +284,17 @@ pub(super) fn check_fixed(key: Key, row: &Row, ledger: LedgerId) -> Result<(), N
                 && chain(row.diagnostic_head.map(|id| id.0), row.diagnostic_count)
                 && optional_nonzero(row.response.map(|id| id.0))
         }
+        (Key::Retired(claim), Row::Retired(row)) => {
+            !claim.is_zero()
+                && row.binding.object.0 == claim.0
+                && row.binding.ledger == ledger
+                && row.binding.revision.0 != 0
+                && row.bundle.0 != [0; 32]
+                && row.bytes != 0
+                && row.through.0 != 0
+                && row.retired_at > row.through
+                && row.status.is_terminal()
+        }
         (Key::RetiredCycleHead(claim), Row::RetiredCycleHead(row)) => {
             !claim.is_zero()
                 && row.head.is_some() == (row.count != 0)
@@ -318,6 +340,9 @@ pub(super) fn check_fixed(key: Key, row: &Row, ledger: LedgerId) -> Result<(), N
                 }
                 NativeInvocation::Import => {
                     row.operation == NativeOperation::Import && row.sequence == SessionSeq(1)
+                }
+                NativeInvocation::Retirement(_) => {
+                    row.operation == NativeOperation::Retire && row.events == 0
                 }
             };
             key == row.invocation
@@ -371,6 +396,16 @@ pub(super) fn check_fixed(key: Key, row: &Row, ledger: LedgerId) -> Result<(), N
             focal_model::ObjectKind::from_code(family).is_some()
                 && sequence.0 != 0
                 && !object.is_zero()
+        }
+        (Key::ByObject(family, object), Row::Index) => {
+            matches!(
+                focal_model::ObjectKind::from_code(family),
+                Some(
+                    focal_model::ObjectKind::Claim
+                        | focal_model::ObjectKind::Artifact
+                        | focal_model::ObjectKind::Validation
+                )
+            ) && !object.is_zero()
         }
         (Key::DueTimer(at, target), Row::Index) => {
             at != 0

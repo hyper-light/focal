@@ -1,8 +1,8 @@
 //! Schema selection follows the action's actual new evidence. Retained reports
 //! and an exhausted receipt do not acquire a new diagnostic-verifier dependency.
 use super::*;
+use crate::native::fixtures::SyncCell as Cell;
 use focal_evidence::{BuiltinSchemaError, NativeSchemaVerifier};
-use std::cell::Cell;
 
 #[derive(Default)]
 struct NoSchemas {

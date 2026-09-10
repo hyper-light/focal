@@ -78,11 +78,11 @@ fn report_accepts_the_actual_nine_row_shape_below_its_eleven_row_ceiling() {
         // terminal transition. The smaller owner still accepts the first shape.
         assert_eq!(budget.check_counts(1, 4, 4, 0).is_ok(), batch >= 11);
         // The ceiling also funds the report's index rows: the artifact's
-        // three fixed rows and sixteen input rows, its verdict, and the
+        // four fixed rows and sixteen input rows, its verdict, and the
         // claim's status move (doc 22 §7).
         let index = crate::native::index_rows::report_rows(16).unwrap()
             + crate::native::index_rows::STATUS_ROWS;
-        assert_eq!(index, 22);
+        assert_eq!(index, 23);
         assert_eq!(budget.max_index_rows, batch.min(index));
         assert_eq!(budget.max_changes, batch.min(11 + index));
         assert_eq!(budget.scratch_bytes, 4096);
@@ -120,10 +120,10 @@ fn report_shape_limits_reject_each_independently_oversized_component() {
 
 #[test]
 fn report_retains_existing_scratch_contract_but_not_global_array_sizes() {
-    // Thirty-four changes: the eleven-change report shape, its twenty-two
+    // Thirty-five changes: the eleven-change report shape, its twenty-three
     // possible index rows and the reported evaluation's due timer.
     let small =
-        ConstructionBudget::for_operation(NativeOperation::ReportAdmission, limits(34, 1, 8192))
+        ConstructionBudget::for_operation(NativeOperation::ReportAdmission, limits(35, 1, 8192))
             .unwrap();
     let large = ConstructionBudget::for_operation(
         NativeOperation::ReportAdmission,
@@ -135,7 +135,7 @@ fn report_retains_existing_scratch_contract_but_not_global_array_sizes() {
         large.pending_bytes().unwrap()
     );
     let wider =
-        ConstructionBudget::for_operation(NativeOperation::ReportAdmission, limits(34, 1, 16384))
+        ConstructionBudget::for_operation(NativeOperation::ReportAdmission, limits(35, 1, 16384))
             .unwrap();
     assert_eq!(
         wider.pending_bytes().unwrap() - small.pending_bytes().unwrap(),

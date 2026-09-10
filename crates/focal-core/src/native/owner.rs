@@ -770,7 +770,7 @@ impl NativeOwner {
                 };
                 let checked = self
                     .book
-                    .check_slots(view.meta(), view.prefix(), prepared.range.len())
+                    .check_slots(view.meta(), view.prefix(), prepared.fragments.len())
                     .and_then(|()| self.book.check_serial(serial))
                     .and_then(|()| self.book.check_parents(&view, &prepared))
                     .and_then(|()| self.book.check_graph_growth(&view, &prepared));
@@ -938,6 +938,52 @@ impl NativeOwner {
     /// Pending rows remain isolated; this borrow prevents concurrent mutation.
     pub fn committed_core(&self) -> &Core<NativeState> {
         &self.core
+    }
+
+    /// The range layout the committed rows are held in (25 §4).
+    pub fn native_layout(&self) -> &ranges::RangeLayout {
+        self.core.native_layout()
+    }
+
+    /// Add a range boundary at affinity `at` (see
+    /// [`Core::split_native_range`]). Every pending candidate holds a
+    /// fragment per member of the layout it was prepared against, so the
+    /// layout changes only while nothing is pending and the owner is sound.
+    pub fn split_native_range(
+        &mut self,
+        at: ranges::Affinity,
+        id: RangeId,
+    ) -> Result<(), NativeOwnerError> {
+        self.check_layout_change()?;
+        Ok(self.core.split_native_range(at, id)?)
+    }
+
+    /// Remove the boundary after member `index` (see
+    /// [`Core::merge_native_range`]) under the same conditions as a split.
+    pub fn merge_native_range(&mut self, index: usize) -> Result<(), NativeOwnerError> {
+        self.check_layout_change()?;
+        Ok(self.core.merge_native_range(index)?)
+    }
+
+    /// Give range member `index` the durable identity `id` (see
+    /// [`Core::rename_native_member`]); identities are not part of any
+    /// candidate's fragments, so pending work is unaffected.
+    pub fn rename_native_member(
+        &mut self,
+        index: usize,
+        id: RangeId,
+    ) -> Result<(), NativeOwnerError> {
+        Ok(self.core.rename_native_member(index, id)?)
+    }
+
+    fn check_layout_change(&self) -> Result<(), NativeOwnerError> {
+        if !self.pending.is_empty() {
+            return Err(NativeOwnerError::PendingCandidates);
+        }
+        if self.faulted {
+            return Err(NativeError::Capacity("completion owner requires reconstruction").into());
+        }
+        Ok(())
     }
 
     /// Transfer a fully reconciled committed Core without allocating or copying

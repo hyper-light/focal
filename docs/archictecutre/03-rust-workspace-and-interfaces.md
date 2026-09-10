@@ -18,7 +18,7 @@ Create crates at the work package that first needs them. Do not scaffold empty a
 |---|---|---|---|
 | `focal-model` | Domain IDs, authored objects, lifecycle, relations, command/result types | `ids.rs`, `claim.rs`, `testament.rs`, `artifact.rs`, `validation.rs`, `command.rs`, `delta.rs`, `error.rs` | Small codec/hash primitives only |
 | `focal-core` | Pure preparation, admission, serial reducer, validation aggregation, graph oracle | `prepare.rs`, `reduce.rs`, `affordance.rs`, `lifecycle.rs`, `satisfaction.rs`, `footprint.rs` | model |
-| `focal-memory` | Generational arenas, indexes, versions, immutable views, range state, memory and disk admission envelopes | `arena.rs`, `range.rs`, `index.rs`, `snapshot.rs`, `budget.rs`, `disk.rs` | model |
+| `focal-memory` | Generational arenas, indexes, versions, immutable views, range state (stores, page-sharing split and merge, group write envelopes), the generic range map, memory and disk admission envelopes | `arena.rs`, `range.rs`, `range_split.rs`, `range_map.rs`, `index.rs`, `snapshot.rs`, `budget.rs`, `disk.rs`; optional `serde` feature for the map types | model |
 | `focal-log` | Physical segment WAL, logical log adapter, durable framing, recovery | `segment.rs`, `record.rs`, `writer.rs`, `recovery.rs`, `retention.rs` | model, filesystem adapter |
 | `focal-consensus` | Raft adapter, durable hard state, ReadIndex, membership, fencing | `session_log.rs`, `raft.rs`, `membership.rs`, `read_barrier.rs` | model, log |
 | `focal-ledger` | Composition of session sequencer, materializer, monitors, publication | `session.rs`, `sequencer.rs`, `materializer.rs`, `publication.rs`, `monitor.rs` | model, core, memory, consensus |

@@ -89,11 +89,12 @@ fn replace(core: &mut Core<NativeState>, key: Key, row: Row) {
             BudgetLane::Completion,
             |row| match row {
                 // Inserting a forged key can split an occupied one-entry leaf.
-                // Preserve the actual inline neighbor while corrupting only
-                // the explicitly selected head/link under test.
+                // Preserve every actual inline neighbor (the claim's other
+                // rows share its span under the storage layout) while
+                // corrupting only the explicitly selected head/link under test.
                 Row::IncomingHead(row) => Ok(Row::IncomingHead(*row)),
                 Row::IncomingLink(row) => Ok(Row::IncomingLink(*row)),
-                _ => panic!("unexpected non-index neighbor"),
+                other => crate::native::prepare::copy(other),
             },
         )
         .unwrap();

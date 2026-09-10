@@ -27,6 +27,23 @@ pub enum ControlRead {
     AdminReceipt {
         id: ControlRequestId,
     },
+    /// One session's route as this partition holds it (§14): where its log
+    /// leads at which epochs. Partition scope only; open to enrolled nodes.
+    Route {
+        ledger: focal_model::LedgerId,
+    },
+    /// The route changes this partition committed after a revision, for a
+    /// cache watching it. Partition scope only; open to enrolled nodes.
+    RouteChanges {
+        after_revision: u64,
+    },
+    /// Prepare the authority command that sets a node's eligibility for
+    /// placement (drain when false): the node's grant re-issued at its next
+    /// generation. Root scope, local administrator only.
+    PrepareEligibility {
+        node: u64,
+        eligible: bool,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(
@@ -64,6 +81,7 @@ impl ControlRpc {
                 | ControlRead::Invitation { .. }
                 | ControlRead::PrepareRevocation { .. }
                 | ControlRead::AdminReceipt { .. }
+                | ControlRead::PrepareEligibility { .. }
         ) {
             return Err(ControlError::Invalid);
         }
@@ -109,6 +127,8 @@ pub enum ControlReadResult {
         entries: Vec<focal_enrollment::InvitationStatus>,
         next: Option<[u8; 16]>,
     },
+    Route(Option<focal_directory::SessionRoute>),
+    RouteChanges(focal_directory::InvalidationBatch),
     PreparedRevocation {
         identity: ControlIdentity,
         applied_index: u64,
@@ -119,6 +139,16 @@ pub enum ControlReadResult {
         configuration: ControlConfiguration,
         enrollment_revision: u64,
         receipt: Option<ControlReceipt>,
+    },
+    /// The command that would set a node's eligibility; `None` when the
+    /// node's grant already states it, with the generation it has now.
+    PreparedEligibility {
+        identity: ControlIdentity,
+        applied_index: u64,
+        node: u64,
+        generation: u64,
+        eligible: bool,
+        command: Option<Box<focal_directory::AuthorityCommand>>,
     },
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -302,6 +332,13 @@ mod tests {
                         client: [1; 16],
                         sequence: 1,
                     },
+                },
+            ),
+            (
+                13,
+                ControlRead::PrepareEligibility {
+                    node: 3,
+                    eligible: false,
                 },
             ),
         ] {

@@ -684,8 +684,29 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
                 .unwrap(),
             token
         );
+        // A tenant is admitted once under the founder authority; a retry
+        // reads as done, and every certificate's grant names it from then on
+        // without a restart (doc 24 §16).
+        signer.admit_tenant([9; 16]).await.unwrap();
         let view = state(&adapter).await;
-        assert_eq!(registry(&view).revision(), 7);
+        assert_eq!(registry(&view).revision(), 8);
+        assert!(registry(&view).admits_tenant([9; 16]));
+        signer.admit_tenant([9; 16]).await.unwrap();
+        assert_eq!(registry(&state(&adapter).await).revision(), 8);
+        assert!(matches!(
+            signer.admit_tenant([0; 16]).await,
+            Err(QuorumEnrollmentError::Enrollment(EnrollmentError::Invalid))
+        ));
+        let granted = signer
+            .authorize_certificate(receipts[1].certificate.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            granted.tenants,
+            BTreeSet::from([namespace.tenant, TenantId([9; 16])])
+        );
+        let view = state(&adapter).await;
+        assert_eq!(registry(&view).revision(), 8);
         let revoke = registry(&view)
             .prepare_revoke(receipts[0].invitation, now())
             .unwrap();

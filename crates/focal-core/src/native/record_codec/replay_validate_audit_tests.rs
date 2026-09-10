@@ -35,7 +35,7 @@ impl Overlay for Source<'_> {
     }
     fn after(&self, key: Key) -> Option<&Row> {
         self.lookups.set(self.lookups.get() + 1);
-        self.candidate.range.get(&key)
+        self.candidate.fragments.get(&key)
     }
     fn changes(&self) -> impl ExactSizeIterator<Item = (Key, Option<&Row>)> {
         self.scans.set(self.scans.get() + 1);

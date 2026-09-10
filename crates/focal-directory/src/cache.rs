@@ -130,6 +130,13 @@ impl RouteCache {
     pub fn watched_partitions(&self) -> usize {
         self.watches.len()
     }
+    /// Every watched partition with the delegation epoch and revision the
+    /// cache has applied through: what to ask each partition for next.
+    pub fn watches(&self) -> impl Iterator<Item = (PartitionId, u64, u64)> + '_ {
+        self.watches
+            .iter()
+            .map(|(partition, watch)| (*partition, watch.epoch, watch.revision))
+    }
     pub fn get(
         &mut self,
         ledger: LedgerId,

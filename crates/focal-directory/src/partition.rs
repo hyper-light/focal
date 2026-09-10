@@ -2,7 +2,7 @@ use crate::*;
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::{LedgerId, RouteEpoch};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// Where a placement change stands. `Planned` is set by the plan itself;
 /// every later phase except `Cutover` is derived from committed assignment
@@ -47,10 +47,39 @@ pub struct SessionDescriptor {
     pub retiring: BTreeMap<u64, AssignmentProgress>,
     /// The newest refusals, oldest first, bounded by `PartitionConfig::max_refusals`.
     pub refusals: Vec<Refusal>,
+    /// The node that founded the session's log alone: the exact bootstrap
+    /// membership every later copy replays. `None` for sessions created
+    /// with several voters at once and for sessions recorded before schema
+    /// 6 (all founded by the cluster founder, which hosts fall back to).
+    pub founder: Option<u64>,
+    /// The session's range members and the replica each is held by, as its
+    /// controller last published them from the committed map
+    /// ([25](../../../docs/archictecutre/25-parallel-materialization-and-ranges.md)
+    /// §9); `None` until a first publication (every member held by the
+    /// voters). Schema 7.
+    pub holders: Option<RangeHolders>,
 }
-/// The current partition checkpoint layout; schema 1 and 2 checkpoints
+/// The members of a session's range map at one range epoch, in key order,
+/// each with the replica holding it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RangeHolders {
+    pub epoch: u64,
+    pub members: Vec<RangeHolder>,
+}
+/// One published member: its durable identity, the affinity it starts at
+/// (`None` for the first), and its holding replica (`None`: the voters).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RangeHolder {
+    pub member: focal_memory::RangeId,
+    pub start: Option<[u8; 16]>,
+    pub node: Option<u64>,
+    pub generation: Option<u64>,
+}
+/// The most members one publication names: a layout's bound.
+pub const MAX_PUBLISHED_HOLDERS: usize = 1024;
+/// The current partition checkpoint layout; schema 1 to 6 checkpoints
 /// convert on decode ([`PartitionCheckpoint::decode_any`]).
-pub const PARTITION_CHECKPOINT_SCHEMA: u16 = 4;
+pub const PARTITION_CHECKPOINT_SCHEMA: u16 = 7;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartitionCheckpoint {
     pub schema: u16,
@@ -62,6 +91,19 @@ pub struct PartitionCheckpoint {
     pub nodes: BTreeMap<u64, NodeRecord>,
     /// Only this delegated interval's sessions, never every fleet session.
     pub sessions: BTreeMap<LedgerId, SessionDescriptor>,
+    /// The newest route changes, oldest first: which session's route epoch
+    /// changed at which revision, so a route cache watching this partition
+    /// invalidates exactly what moved (§14). Bounded; `routes_from` is the
+    /// revision the log is complete after (older changes were evicted).
+    pub routes: VecDeque<RouteChange>,
+    pub routes_from: u64,
+}
+/// One session's route epoch changed at one partition revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteChange {
+    pub revision: u64,
+    pub ledger: LedgerId,
+    pub route_epoch: RouteEpoch,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartitionSeal {
@@ -218,6 +260,13 @@ pub enum SessionChange {
         operation: OperationId,
         node: u64,
     },
+    /// The session's controller publishes the committed range map's members
+    /// and holders at a range epoch; monotone per session, idempotent for
+    /// the same publication, and every holder a member of the active
+    /// placement at its enrolled generation.
+    Holders {
+        holders: RangeHolders,
+    },
 }
 #[derive(Debug, Clone, Copy)]
 pub struct PartitionConfig {
@@ -232,6 +281,9 @@ pub struct PartitionConfig {
     /// Sessions a merge may move in one committed `Absorb` command, which
     /// carries the sealed checkpoint; larger partitions are not merged.
     pub max_absorb_sessions: usize,
+    /// Route changes retained for cache invalidation; a cache further behind
+    /// than this clears its entries for the partition.
+    pub max_route_log: usize,
 }
 impl Default for PartitionConfig {
     fn default() -> Self {
@@ -244,6 +296,7 @@ impl Default for PartitionConfig {
             max_refusals: 16,
             min_disk_available: 64 * 1024 * 1024,
             max_absorb_sessions: 256,
+            max_route_log: 1024,
         }
     }
 }
@@ -284,6 +337,8 @@ impl DirectoryPartition {
                 sealed: None,
                 nodes: BTreeMap::new(),
                 sessions: BTreeMap::new(),
+                routes: VecDeque::new(),
+                routes_from: 0,
             },
             config,
             budget,
@@ -377,6 +432,29 @@ impl DirectoryPartition {
             activation: descriptor.authority.record_hash,
         })
     }
+    /// The route changes committed after `after`, for a cache watching this
+    /// partition. When the log no longer reaches back to `after`, the batch
+    /// starts at the revision it is complete after instead, which the cache
+    /// reads as a gap and clears its entries for this partition.
+    pub fn route_changes(&self, after: u64) -> InvalidationBatch {
+        let state = &self.root.state;
+        let after_revision = after.max(state.routes_from);
+        InvalidationBatch {
+            partition: state.delegation.partition,
+            delegation_epoch: state.delegation.epoch,
+            after_revision,
+            through_revision: state.revision,
+            changes: state
+                .routes
+                .iter()
+                .filter(|change| change.revision > after_revision)
+                .map(|change| RouteInvalidation {
+                    ledger: change.ledger,
+                    route_epoch: change.route_epoch,
+                })
+                .collect(),
+        }
+    }
     pub fn prepare(
         &self,
         command: &PartitionCommand,
@@ -431,6 +509,20 @@ impl DirectoryPartition {
             )?
             .commit();
         let mut state = self.root.state.clone();
+        // Sessions whose route may change under this command, with the route
+        // epoch they had before it: the log records exactly what changed.
+        let touched: Vec<(LedgerId, Option<RouteEpoch>)> = match &command.operation {
+            PartitionOperation::CreateSession { ledger, .. }
+            | PartitionOperation::Session { ledger, .. } => {
+                vec![(*ledger, state.sessions.get(ledger).map(|s| s.route_epoch))]
+            }
+            PartitionOperation::Absorb { moved, .. } => moved
+                .sessions
+                .keys()
+                .map(|ledger| (*ledger, None))
+                .collect(),
+            _ => Vec::new(),
+        };
         match &command.operation {
             PartitionOperation::SealForTransfer {
                 operation,
@@ -718,6 +810,13 @@ impl DirectoryPartition {
                 }
                 partition_session::validate_fence(authority, placement)?;
                 verifier.verify_session_fence(authority)?;
+                // A session a node founds alone records that node: its log's
+                // bootstrap membership, which every later copy replays. A
+                // session created with several voters at once names none.
+                let founder = match placement.placement.voters.keys().collect::<Vec<_>>()[..] {
+                    [node] => Some(*node),
+                    _ => None,
+                };
                 state.sessions.insert(
                     *ledger,
                     SessionDescriptor {
@@ -732,6 +831,8 @@ impl DirectoryPartition {
                         pending: None,
                         retiring: BTreeMap::new(),
                         refusals: Vec::new(),
+                        founder,
+                        holders: None,
                     },
                 );
             }
@@ -758,6 +859,23 @@ impl DirectoryPartition {
                     .revision
                     .checked_add(1)
                     .ok_or(DirectoryError::CounterExhausted)?;
+            }
+        }
+        for (ledger, before) in touched {
+            let after = state.sessions.get(&ledger).map(|s| s.route_epoch);
+            if let Some(route_epoch) = after
+                && after != before
+            {
+                if state.routes.len() >= self.config.max_route_log.max(1)
+                    && let Some(evicted) = state.routes.pop_front()
+                {
+                    state.routes_from = state.routes_from.max(evicted.revision);
+                }
+                state.routes.push_back(RouteChange {
+                    revision,
+                    ledger,
+                    route_epoch,
+                });
             }
         }
         state.revision = revision;
@@ -804,6 +922,10 @@ fn split_image_of(
     image
         .sessions
         .retain(|ledger, _| seal.moved.contains(*ledger));
+    // The destination's own log starts empty and complete from its first
+    // revision: a cache that watched the source re-reads through the root.
+    image.routes = VecDeque::new();
+    image.routes_from = 0;
     image.delegation = Delegation {
         namespace: seal.moved,
         partition: seal.destination,
@@ -950,8 +1072,27 @@ fn validate_partition(
     {
         return Err(DirectoryError::Invalid("partition schema or limits"));
     }
-    if state.nodes.len() > config.max_nodes || state.sessions.len() > config.max_sessions {
+    if state.nodes.len() > config.max_nodes
+        || state.sessions.len() > config.max_sessions
+        || state.routes.len() > config.max_route_log
+    {
         return Err(DirectoryError::Capacity);
+    }
+    // Entries sit above the floor in revision order; several sessions may
+    // change at one revision (an absorb moves many at once).
+    if state.routes_from > state.revision {
+        return Err(DirectoryError::Invalid("route log"));
+    }
+    let mut previous = state.routes_from;
+    for (index, change) in state.routes.iter().enumerate() {
+        if (index == 0 && change.revision <= previous)
+            || change.revision < previous
+            || change.revision > state.revision
+            || change.route_epoch.0 == 0
+        {
+            return Err(DirectoryError::Invalid("route log"));
+        }
+        previous = change.revision;
     }
     if state.sealed.as_ref().is_some_and(|seal| {
         let own = &state.delegation;
@@ -1122,6 +1263,13 @@ fn partition_charge(state: &PartitionCheckpoint) -> Result<usize, DirectoryError
         mul(
             state.sessions.len(),
             tree_row::<(LedgerId, SessionDescriptor)>(),
+        )?,
+    )?;
+    bytes = add(
+        bytes,
+        add(
+            mul(state.routes.capacity(), size_of::<RouteChange>())?,
+            ALLOCATOR_OVERHEAD,
         )?,
     )?;
     for node in state.nodes.values() {

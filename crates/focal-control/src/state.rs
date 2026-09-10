@@ -211,6 +211,17 @@ impl Machine {
             _ => None,
         }
     }
+    pub(crate) fn route_log_charge(&self) -> usize {
+        match self {
+            Self::Partition { directory, .. } => directory
+                .checkpoint()
+                .routes
+                .len()
+                .saturating_mul(size_of::<focal_directory::RouteChange>())
+                .saturating_add(4096),
+            _ => 4096,
+        }
+    }
     pub(crate) fn contact_charge(&self) -> usize {
         match self {
             Self::Root { contacts, .. } => {

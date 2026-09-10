@@ -26,6 +26,12 @@ pub(crate) struct NativeEngine<S: NativeSchemaVerifier> {
     pub(super) pending: VecDeque<Pending>,
     pub(super) domain: Option<Domain>,
     pub(super) reader: ContentReader,
+    /// Where checkpoint seeds are read from on install (25 §5); the writer
+    /// belongs to whoever owns the session's physical resources.
+    pub(super) seeds: SeedReader,
+    /// The seeded checkpoint this replica cannot install until the chunks
+    /// it names are local; the host pulls them and polls again.
+    pub(super) pending_seed: Option<PendingSeed>,
     pub(super) schemas: S,
     pub(super) budget: MemoryBudget,
     pub(super) ledger: LedgerId,
@@ -43,6 +49,24 @@ pub(crate) struct NativeEngine<S: NativeSchemaVerifier> {
     pub(super) configuration_index: u64,
     pub(super) genesis: Option<ContentHash>,
     pub(super) genesis_proposed: bool,
+    /// The layout record this authority proposed and has not seen applied;
+    /// native admission waits for it, and a term change lets it go.
+    pub(super) layout_change: Option<super::range::LayoutRecord>,
+    /// The prefix the archive reports holding every proof through (26 §3).
+    pub(super) archived_through: SessionSeq,
+    /// The retirement record this authority proposed and has not seen
+    /// applied (26 §4); native admission waits for it, and a term change
+    /// lets it go.
+    pub(super) retirement: Option<super::retirement::RetirementRecord>,
+    /// Families retired through the applied prefix, counted from genesis or
+    /// the checkpoint that seeded this replica.
+    pub(super) retired_families: u64,
+    /// The chunks of this replica's latest checkpoint seed (25 §5): what
+    /// its seed store must keep for peers that seed from it (26 §5).
+    pub(super) seed_chunks: Vec<ContentHash>,
+    /// The movement coordinator (25 §6), built once the genesis names the
+    /// origin member and restored from a checkpoint's movement section.
+    pub(super) movement: Option<super::movement::Movement>,
     pub(super) disk_sample: Option<u64>,
     pub(super) admissions_since_sample: u32,
     pub(super) ready_term: Option<u64>,
@@ -51,7 +75,16 @@ pub(crate) struct NativeEngine<S: NativeSchemaVerifier> {
     pub(super) observed_leader: bool,
     pub(super) reconstruction_needed: bool,
     pub(super) failed: bool,
+    pub(super) materializer: super::MaterializerStats,
     pub(super) _pending_allocation: Allocation,
+}
+
+/// What the engine reads from this node's disk beside the log: the content
+/// tree custody verifies against and the seed store a seeded checkpoint is
+/// assembled from (25 §5).
+pub(crate) struct NativeSources {
+    pub(crate) reader: ContentReader,
+    pub(crate) seeds: SeedReader,
 }
 
 impl<S: NativeSchemaVerifier> NativeEngine<S> {
@@ -63,9 +96,10 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         profile: NativeContentProfile,
         limits: NativeSessionLimits,
         parent: &MemoryBudget,
-        reader: ContentReader,
+        sources: NativeSources,
         schemas: S,
     ) -> Result<Self, NativeSessionError> {
+        let NativeSources { reader, seeds } = sources;
         if range.0 == 0
             || limits.content_domain.is_zero()
             || limits.recovery.native.pending == 0
@@ -107,6 +141,8 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             pending,
             domain: Some(Domain::Passive(core)),
             reader,
+            seeds,
+            pending_seed: None,
             schemas,
             budget,
             ledger,
@@ -121,6 +157,12 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             configuration_index: 0,
             genesis: None,
             genesis_proposed: false,
+            layout_change: None,
+            archived_through: SessionSeq(0),
+            retirement: None,
+            retired_families: 0,
+            seed_chunks: Vec::new(),
+            movement: None,
             disk_sample: None,
             admissions_since_sample: 0,
             ready_term: None,
@@ -129,6 +171,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             observed_leader: false,
             reconstruction_needed: true,
             failed: false,
+            materializer: super::MaterializerStats::default(),
             _pending_allocation: permit.commit(),
         })
     }
@@ -187,11 +230,306 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     pub(crate) fn sequence(&self) -> Result<SessionSeq, NativeSessionError> {
         Ok(self.committed_core()?.native_sequence())
     }
+    /// Propose one layout change as a session decision (25 §4). Only an
+    /// authority with no pending candidate and no change in flight may; the
+    /// change is checked against the committed layout before the record is
+    /// proposed, so an applicable record is what the log carries.
+    pub(crate) fn propose_layout(
+        &mut self,
+        consensus: &mut DurableNode,
+        operation: super::range::LayoutOperation,
+    ) -> Result<(), NativeSessionError> {
+        let status = consensus.status();
+        self.require_authority(&status)?;
+        if self.layout_change.is_some() {
+            return Err(NativeSessionError::LayoutChanging);
+        }
+        if self.retirement.is_some() {
+            return Err(NativeSessionError::Retiring);
+        }
+        if self
+            .movement
+            .as_ref()
+            .is_some_and(|movement| movement.pending().is_some() || movement.in_flight.is_some())
+        {
+            return Err(NativeSessionError::RangeMoving);
+        }
+        if !self.pending.is_empty() || self.delivery.is_some() {
+            return Err(NativeSessionError::Capacity);
+        }
+        let core = self.committed_core()?;
+        let layout = core.native_layout();
+        match operation {
+            super::range::LayoutOperation::Split { at, id } => {
+                layout.check_split(at, id, self.limits.recovery.native.max_ranges)?;
+            }
+            super::range::LayoutOperation::Merge { left } => {
+                layout.check_merge(left)?;
+            }
+        }
+        let record = super::range::LayoutRecord {
+            ledger: self.ledger,
+            expected_epoch: layout.epoch(),
+            operation,
+        };
+        let mut bytes = [0u8; super::range::BYTES];
+        record.write_into(&mut bytes);
+        let _permit = self.budget.reserve(
+            BudgetKind::Pending,
+            BudgetLane::Completion,
+            array::<u8>(super::range::BYTES)?,
+        )?;
+        consensus.propose_borrowed_in(&bytes, BudgetLane::Completion)?;
+        self.layout_change = Some(record);
+        Ok(())
+    }
+    pub(crate) fn archived_through(&self) -> SessionSeq {
+        self.archived_through
+    }
+    /// The archive's report is monotone: it never takes back what it holds.
+    pub(crate) fn note_archived(&mut self, through: SessionSeq) {
+        self.archived_through = self.archived_through.max(through);
+    }
+    pub(crate) fn retirement_in_flight(&self) -> Option<super::retirement::RetirementRecord> {
+        self.retirement
+    }
+    /// The owner must be reconstructed before this engine is authoritative
+    /// again: a record it did not author through its owner applied through
+    /// its committed core (a retirement, 26 §4).
+    pub(crate) fn reconstruction_needed(&self) -> bool {
+        self.reconstruction_needed
+    }
+    pub(crate) fn retired_families(&self) -> u64 {
+        self.retired_families
+    }
+    /// The chunks of the latest checkpoint seed, sorted.
+    pub(crate) fn seed_chunks(&self) -> &[ContentHash] {
+        &self.seed_chunks
+    }
+    /// Record the seed chunks a freshly encoded or installed checkpoint
+    /// names; an inline checkpoint names none.
+    pub(super) fn note_seeds(&mut self, bytes: &[u8]) -> Result<(), NativeSessionError> {
+        let mut chunks = Vec::new();
+        if let Some(manifest) =
+            crate::native_checkpoint::Checkpoint::describe(bytes, self.limits.checkpoint)?
+        {
+            for chunk in manifest.chunks() {
+                let chunk = chunk?;
+                chunks
+                    .try_reserve_exact(1)
+                    .map_err(|_| NativeSessionError::Capacity)?;
+                chunks.push(chunk.hash);
+            }
+        }
+        chunks.sort();
+        chunks.dedup();
+        self.seed_chunks = chunks;
+        Ok(())
+    }
+    /// Propose one family's retirement as a session decision (26 §4). Only
+    /// an authority with no pending candidate and nothing else in flight
+    /// may; the family is derived from the committed state and the bundle's
+    /// claim is checked against it before the record is proposed, so an
+    /// applicable record is what the log carries.
+    pub(crate) fn propose_retirement(
+        &mut self,
+        consensus: &mut DurableNode,
+        root: focal_model::ClaimId,
+        bundle: ContentHash,
+        bytes: u64,
+        through: SessionSeq,
+    ) -> Result<(), NativeSessionError> {
+        let status = consensus.status();
+        self.require_authority(&status)?;
+        if self.retirement.is_some() {
+            return Err(NativeSessionError::Retiring);
+        }
+        if self.layout_change.is_some() {
+            return Err(NativeSessionError::LayoutChanging);
+        }
+        if self
+            .movement
+            .as_ref()
+            .is_some_and(|movement| movement.pending().is_some() || movement.in_flight.is_some())
+        {
+            return Err(NativeSessionError::RangeMoving);
+        }
+        if !self.pending.is_empty() || self.delivery.is_some() {
+            return Err(NativeSessionError::Capacity);
+        }
+        let core = self.committed_core()?;
+        let family = core
+            .retirement_family(root)
+            .map_err(NativeSessionError::Retirement)?;
+        let prefix = core.native_sequence();
+        if bundle.0 == [0; 32]
+            || bytes == 0
+            || through.0 == 0
+            || through < family.through
+            || through > prefix
+        {
+            return Err(NativeError::Contract(
+                focal_model::lifecycle::ContractError::InvalidManifest,
+            )
+            .into());
+        }
+        let record = super::retirement::RetirementRecord {
+            ledger: self.ledger,
+            expected_prefix: prefix,
+            root,
+            bundle,
+            bytes,
+            through,
+        };
+        let mut encoded = [0u8; super::retirement::BYTES];
+        record.write_into(&mut encoded);
+        let _permit = self.budget.reserve(
+            BudgetKind::Pending,
+            BudgetLane::Completion,
+            array::<u8>(super::retirement::BYTES)?,
+        )?;
+        consensus.propose_borrowed_in(&encoded, BudgetLane::Completion)?;
+        self.retirement = Some(record);
+        Ok(())
+    }
+    /// Propose one movement step (25 §6). The step is prepared against the
+    /// committed coordinator state under the session verifier before the
+    /// record is proposed, so an applicable record is what the log carries;
+    /// `Cleanup` additionally waits for every read lease on the group.
+    pub(crate) fn propose_range(
+        &mut self,
+        consensus: &mut DurableNode,
+        operation: focal_ranges::RangeOperation,
+    ) -> Result<(), NativeSessionError> {
+        let status = consensus.status();
+        self.require_authority(&status)?;
+        if self.layout_change.is_some() {
+            return Err(NativeSessionError::LayoutChanging);
+        }
+        if self.retirement.is_some() {
+            return Err(NativeSessionError::Retiring);
+        }
+        if !self.pending.is_empty() || self.delivery.is_some() {
+            return Err(NativeSessionError::Capacity);
+        }
+        let sequence = self.sequence()?;
+        let pinned = self.committed_core()?.native_stats().pinned_snapshots;
+        let ledger = self.ledger;
+        let movement = self.movement.as_mut().ok_or(NativeSessionError::Corrupt)?;
+        if movement.in_flight.is_some() {
+            return Err(NativeSessionError::RangeMoving);
+        }
+        if matches!(operation, focal_ranges::RangeOperation::Cleanup { .. }) && pinned > 0 {
+            return Err(NativeSessionError::Range(focal_ranges::RangeError::Pinned));
+        }
+        let ordinal = movement
+            .coordinator
+            .checkpoint()
+            .control_ordinal
+            .checked_add(1)
+            .ok_or(NativeSessionError::Capacity)?;
+        let prepared = movement.coordinator.prepare(
+            ordinal,
+            sequence,
+            operation.clone(),
+            &movement.verifier,
+        )?;
+        let record = super::movement::MovementRecord {
+            ledger,
+            ordinal,
+            operation,
+        };
+        let _permit = self.budget.reserve(
+            BudgetKind::Pending,
+            BudgetLane::Completion,
+            array::<u8>(super::movement::MAX_RECORD_BYTES)?,
+        )?;
+        let bytes = record.encode()?;
+        consensus.propose_borrowed_in(&bytes, BudgetLane::Completion)?;
+        movement.in_flight = Some((ordinal, prepared.hash()));
+        Ok(())
+    }
+    pub(crate) fn range_map(&self) -> Result<&focal_ranges::RangeMap, NativeSessionError> {
+        self.check()?;
+        Ok(self
+            .movement
+            .as_ref()
+            .ok_or(NativeSessionError::Corrupt)?
+            .coordinator
+            .map())
+    }
+    pub(crate) fn movement_pending(
+        &self,
+    ) -> Result<Option<&focal_ranges::TransferState>, NativeSessionError> {
+        self.check()?;
+        Ok(self
+            .movement
+            .as_ref()
+            .ok_or(NativeSessionError::Corrupt)?
+            .pending())
+    }
+    pub(crate) fn movement_checkpoint(
+        &self,
+    ) -> Result<&focal_ranges::RangeCheckpoint, NativeSessionError> {
+        self.check()?;
+        Ok(self
+            .movement
+            .as_ref()
+            .ok_or(NativeSessionError::Corrupt)?
+            .coordinator
+            .checkpoint())
+    }
+    pub(crate) fn movement_refusals(&self) -> u64 {
+        self.movement
+            .as_ref()
+            .map_or(0, |movement| movement.refusals)
+    }
+    pub(crate) fn movement_in_flight(&self) -> bool {
+        self.movement
+            .as_ref()
+            .is_some_and(|movement| movement.in_flight.is_some())
+    }
+    pub(crate) fn range_verifier(
+        &self,
+    ) -> Result<super::movement::LedgerRangeVerifier, NativeSessionError> {
+        self.check()?;
+        Ok(self
+            .movement
+            .as_ref()
+            .ok_or(NativeSessionError::Corrupt)?
+            .verifier)
+    }
+    /// The `Activate` step of the pending transfer over the proofs the
+    /// state holds and the progress of the replica-held members that stay.
+    pub(crate) fn range_activation_operation(
+        &self,
+        unchanged: Vec<focal_ranges::RangeProgress>,
+    ) -> Result<focal_ranges::RangeOperation, NativeSessionError> {
+        self.check()?;
+        Ok(self
+            .movement
+            .as_ref()
+            .ok_or(NativeSessionError::Corrupt)?
+            .coordinator
+            .activation_operation(unchanged)?)
+    }
+    pub(crate) fn range_activation(
+        &self,
+        operation: focal_ranges::TransferId,
+    ) -> Option<&focal_ranges::ActivationCertificate> {
+        self.movement
+            .as_ref()
+            .and_then(|movement| movement.coordinator.activation(operation))
+    }
     pub(crate) fn applied_raft(&self) -> u64 {
         self.applied_raft
     }
     pub(crate) fn configuration_index(&self) -> u64 {
         self.configuration_index
+    }
+    /// The seeded checkpoint waiting for its chunks, if any.
+    pub(crate) fn pending_seed(&self) -> Option<&PendingSeed> {
+        self.pending_seed.as_ref()
     }
     pub(crate) fn pending_count(&self) -> usize {
         self.pending.len()
@@ -249,6 +587,12 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     ) -> Result<NativeSubmission, NativeSessionError> {
         let status = consensus.status();
         self.require_authority(&status)?;
+        if self.layout_change.is_some() {
+            return Err(NativeSessionError::LayoutChanging);
+        }
+        if self.retirement.is_some() {
+            return Err(NativeSessionError::Retiring);
+        }
         let limit = self.limits.recovery.native.pending;
         let full = self.pending.len() >= limit || self.pending.len() == self.pending.capacity();
         let headroom = self.disk_headroom_ok(consensus)?;
@@ -260,6 +604,26 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         // An exact retry never needs a fresh slot, so the owner looks it up first
         // and refuses fresh work itself when its own queue is full.
         let staged = prepare(owner, &self.schemas, domain)?;
+        // Between a transfer's barrier and its activation nothing lands on a
+        // moving member (25 §6): the fresh candidate is discarded and the
+        // caller retries after activation.
+        if let NativeStaging::Prepared { candidate, .. } = staged
+            && let Some(movement) = self.movement.as_ref()
+        {
+            let fenced = movement.fenced_members();
+            if !fenced.is_empty() {
+                let layout: Vec<RangeId> = owner.native_layout().ids().collect();
+                let touches = owner
+                    .prepared_candidate(candidate)?
+                    .touched_members()
+                    .filter_map(|position| layout.get(position).copied())
+                    .any(|member| fenced.contains(&member));
+                if touches {
+                    owner.discard_from(candidate)?;
+                    return Err(NativeSessionError::RangeMoving);
+                }
+            }
+        }
         if (full || !headroom) && matches!(staged, NativeStaging::Prepared { .. }) {
             // A full queue here is an accounting inconsistency (the owner's queue
             // is bounded by the same limit); missing disk headroom is ordinary

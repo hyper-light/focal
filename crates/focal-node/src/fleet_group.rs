@@ -75,8 +75,14 @@ fn class(work: &Work) -> WorkClass {
         | Work::ManagedSupport(..)
         | Work::ActivateNative(..)
         | Work::ImportPayloads(..)
+        | Work::Checkpoint(..)
+        | Work::ArtifactPointer(..)
+        | Work::SeedChunks(..)
+        | Work::InstallSeed(..)
+        | Work::Refence(..)
         | Work::Membership(..)
         | Work::Placement(..)
+        | Work::Range(..)
         | Work::Evidence(..) => WorkClass::Control,
         Work::Probe(request, ..) if completion_request(request) => WorkClass::Completion,
         Work::Probe(..) => WorkClass::Query,
@@ -281,6 +287,17 @@ struct GroupOwner {
     _allocation: Allocation,
     _backing: std::sync::Arc<Allocation>,
 }
+/// A session that stops on a fail-closed error says why on the node's
+/// standard error, as a standalone replica does; the other sessions of the
+/// group are unaffected.
+fn report_stop(ledger: LedgerId, error: &LedgerError) {
+    use std::io::Write as _;
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "focal: session {} stopped: {error}",
+        ledger.session
+    );
+}
 impl GroupOwner {
     fn run(mut self, receiver: mpsc::Receiver<FleetInput>) {
         let result = self.run_inner(receiver);
@@ -397,7 +414,11 @@ impl GroupOwner {
                 if let Some(owner) = self.sessions.get_mut(&ledger) {
                     match owner.progress_group() {
                         Ok(false) => self.reschedule(ledger)?,
-                        Ok(true) | Err(_) => self.stop_session(ledger),
+                        Ok(true) => self.stop_session(ledger),
+                        Err(error) => {
+                            report_stop(ledger, &error);
+                            self.stop_session(ledger);
+                        }
                     }
                 }
             }
@@ -432,7 +453,11 @@ impl GroupOwner {
                             }
                             match owner.accept(routed.work) {
                                 Ok(false) => self.reschedule(routed.ledger)?,
-                                Ok(true) | Err(_) => self.stop_session(routed.ledger),
+                                Ok(true) => self.stop_session(routed.ledger),
+                                Err(error) => {
+                                    report_stop(routed.ledger, &error);
+                                    self.stop_session(routed.ledger);
+                                }
                             }
                         }
                         runnable = true;

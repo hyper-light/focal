@@ -23,6 +23,7 @@ pub enum RowFamily {
     Receipt,
     Cycle,
     RetiredCycleHead,
+    Retired,
     RetiredCycle,
     Work,
     WorkSlot,
@@ -62,6 +63,7 @@ pub(super) fn family(value: Key) -> Result<RowFamily, Error> {
         Key::Receipt(_) => RowFamily::Receipt,
         Key::Cycle(_) => RowFamily::Cycle,
         Key::RetiredCycleHead(_) => RowFamily::RetiredCycleHead,
+        Key::Retired(_) => RowFamily::Retired,
         Key::RetiredCycle(_) => RowFamily::RetiredCycle,
         Key::Work(_) => RowFamily::Work,
         Key::WorkSlot(..) => RowFamily::WorkSlot,
@@ -92,7 +94,8 @@ pub(super) fn family(value: Key) -> Result<RowFamily, Error> {
         | Key::ByEvaluator(..)
         | Key::ByVerdict(..)
         | Key::ByCreated(..)
-        | Key::DueTimer(..) => RowFamily::Index,
+        | Key::DueTimer(..)
+        | Key::ByObject(..) => RowFamily::Index,
         Key::End => return Err(Error::InvalidTag("sentinel key")),
     })
 }
@@ -147,6 +150,8 @@ pub(super) fn key(s: &mut impl Sink, key: Key) -> Result<(), Error> {
         Key::ByVerdict(..) => 45,
         Key::ByCreated(..) => 46,
         Key::DueTimer(..) => 47,
+        Key::ByObject(..) => 48,
+        Key::Retired(_) => 49,
         Key::End => return Err(Error::InvalidTag("sentinel key")),
     };
     write_u8(s, tag)?;
@@ -156,7 +161,8 @@ pub(super) fn key(s: &mut impl Sink, key: Key) -> Result<(), Error> {
         | Key::Claim(id)
         | Key::RetiredCycleHead(id)
         | Key::ClaimResultTestament(id)
-        | Key::ClaimContent(id) => raw(s, &id.0),
+        | Key::ClaimContent(id)
+        | Key::Retired(id) => raw(s, &id.0),
         Key::IncomingLink(a, b) => {
             raw(s, &a.0)?;
             raw(s, &b.0)
@@ -238,6 +244,10 @@ pub(super) fn key(s: &mut impl Sink, key: Key) -> Result<(), Error> {
             write_u64(s, sequence.0)?;
             raw(s, &object.0)
         }
+        Key::ByObject(family, object) => {
+            write_u16(s, family)?;
+            raw(s, &object.0)
+        }
         Key::DueTimer(at, target) => {
             write_u64(s, at)?;
             match target {
@@ -297,6 +307,10 @@ pub(super) fn invocation(s: &mut impl Sink, v: NativeInvocation) -> Result<(), E
             write_u64(s, k.generation)
         }
         NativeInvocation::Import => write_u8(s, 4),
+        NativeInvocation::Retirement(root) => {
+            write_u8(s, 5)?;
+            raw(s, &root.0)
+        }
     }
 }
 pub(super) fn outcome(s: &mut impl Sink, v: NativeOutcome) -> Result<(), Error> {
@@ -356,6 +370,7 @@ fn operation(v: NativeOperation) -> u8 {
         NativeOperation::EvaluationDeadline => 28,
         NativeOperation::ClaimDeadline => 29,
         NativeOperation::Import => 30,
+        NativeOperation::Retire => 31,
     }
 }
 fn read_operation(c: &mut Cursor<'_>) -> Result<NativeOperation, Error> {
@@ -391,6 +406,7 @@ fn read_operation(c: &mut Cursor<'_>) -> Result<NativeOperation, Error> {
         28 => NativeOperation::EvaluationDeadline,
         29 => NativeOperation::ClaimDeadline,
         30 => NativeOperation::Import,
+        31 => NativeOperation::Retire,
         _ => return Err(Error::InvalidTag("operation")),
     })
 }
@@ -454,6 +470,7 @@ pub(super) fn read_invocation(c: &mut Cursor<'_>) -> Result<NativeInvocation, Er
             generation: c.u64()?,
         }),
         4 => NativeInvocation::Import,
+        5 => NativeInvocation::Retirement(ClaimId(c.fixed()?)),
         _ => return Err(Error::InvalidTag("invocation namespace")),
     })
 }
@@ -534,6 +551,8 @@ pub(super) fn read_key(c: &mut Cursor<'_>) -> Result<Key, Error> {
             };
             Key::DueTimer(at, target)
         }
+        48 => Key::ByObject(c.u16()?, focal_model::ObjectId(c.fixed()?)),
+        49 => Key::Retired(ClaimId(c.fixed()?)),
         _ => return Err(Error::InvalidTag("row family")),
     })
 }

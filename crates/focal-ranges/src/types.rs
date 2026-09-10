@@ -9,13 +9,10 @@ macro_rules! id {
         impl $name { pub const fn from_u128(value: u128) -> Self { Self(value.to_be_bytes()) } }
     )+};
 }
-id!(
-    RangeId,
-    TransferId,
-    ControllerIncarnation,
-    QueryId,
-    TransactionId
-);
+id!(TransferId, ControllerIncarnation, QueryId, TransactionId);
+/// Range identity is the memory crate's: one type names a range in the map,
+/// in every proof and in the store that holds its rows.
+pub use focal_memory::RangeId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ReplicaId {
     pub node: u64,
@@ -88,9 +85,13 @@ impl RangeLimits {
     }
 }
 /// Verified session-log authority, not a new range transaction decision.
+/// A control record is ordered by `ordinal` (one more per applied movement
+/// record) and positioned by `sequence`, the native prefix it applied at;
+/// a data batch is keyed by its sequence alone and carries ordinal zero.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitProof {
     pub ledger: LedgerId,
+    pub ordinal: u64,
     pub sequence: SessionSeq,
     pub index: RaftIndex,
     pub term: RaftTerm,
@@ -173,6 +174,7 @@ pub trait RangeVerifier {
 pub(crate) fn verify_commit(
     proof: &CommitProof,
     ledger: LedgerId,
+    ordinal: u64,
     sequence: SessionSeq,
     command: ContentHash,
     verifier: &impl RangeVerifier,
@@ -180,7 +182,7 @@ pub(crate) fn verify_commit(
     if proof.ledger != ledger {
         return Err(RangeError::WrongLedger);
     }
-    if proof.sequence != sequence || proof.command != command {
+    if proof.ordinal != ordinal || proof.sequence != sequence || proof.command != command {
         return Err(RangeError::Conflict);
     }
     if proof.index.0 == 0 || proof.term.0 == 0 || !nonzero(proof.attestation) {

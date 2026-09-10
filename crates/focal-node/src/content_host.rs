@@ -44,8 +44,34 @@ enum Command {
     Seal(CustodyScope, Box<VerifiedRequest>),
     /// Seal an inline legacy payload with the canonical import chunking.
     SealImport(focal_model::ContentDomainId, Vec<u8>, usize),
+    /// The custody policy installed for a ledger, if any.
+    Policy(focal_model::LedgerId),
+    /// The peers of a placement being prepared for a ledger (seed reads only).
+    AnnouncePending(
+        focal_model::LedgerId,
+        Option<(CustodyScope, std::collections::BTreeSet<u64>)>,
+    ),
     Verify(Box<CustodyVerification>),
     VerifyNative(Box<NativeVerification>),
+    /// Keep one copy's verified receipt for an object under a scope.
+    RecordReceipt(CustodyScope, Box<focal_evidence::CustodyReceipt>),
+    /// The receipt held for one copy of one object, if any.
+    Receipt(CustodyScope, focal_model::ContentHash, u64),
+    /// Every ledger with an installed custody policy.
+    Policies,
+    /// Install the protection set the collector runs under (26 §5).
+    Protect(Box<focal_evidence::ProtectionSet>),
+    /// One bounded collector step.
+    Collect(focal_evidence::CollectorConfig, u64, usize),
+    /// Bring a quarantined object back.
+    Restore(focal_model::ContentDomainId, focal_model::ContentHash),
+    /// Import every object a backup lists from its directory (26 §6).
+    RestoreContent(
+        std::path::PathBuf,
+        Box<focal_ledger::backup::BackupManifest>,
+    ),
+    /// The volume envelope's statistics and what the store has staged.
+    DiskStats,
     Stop,
 }
 /// One native artifact to seal and verify under the exclusive content writer.
@@ -60,9 +86,16 @@ enum Output {
     Manifest(Accounted<TransferManifest>),
     Bytes(Accounted<Vec<u8>>),
     LocalSeal(ContentRef),
+    Policy(Option<CustodyPolicy>),
     Done,
     Verification(CustodyVerificationProgress),
     NativeEvidence(Box<focal_evidence::VerifiedNativeArtifact>),
+    Receipt(Option<Box<focal_evidence::CustodyReceipt>>),
+    Policies(Vec<focal_model::LedgerId>),
+    Collected(focal_evidence::CollectorReport),
+    Restored(bool),
+    Imported(u64),
+    Disk(focal_memory::DiskStats, usize, u64),
 }
 struct Work {
     command: Command,
@@ -395,6 +428,156 @@ impl ContentHost {
             _ => Err(AccessError::Unavailable),
         }
     }
+    /// The custody policy installed for `ledger`: its scope and the peers
+    /// that hold its content and seeds.
+    pub async fn policy(
+        &self,
+        ledger: focal_model::LedgerId,
+    ) -> Result<Option<CustodyPolicy>, AccessError> {
+        match self.call(Command::Policy(ledger), 4096, true).await? {
+            Output::Policy(policy) => Ok(policy),
+            _ => Err(AccessError::Unavailable),
+        }
+    }
+    /// Trusted: announce (or withdraw with `None`) the peers of a placement
+    /// the directory is preparing for `ledger`, so they may pull the ledger's
+    /// checkpoint seeds before the placement activates (25 §5).
+    /// Keep one copy's verified receipt (doc 04 §7): written only from a
+    /// copy's `Durable` reply or this node's own sealed object.
+    pub async fn record_receipt(
+        &self,
+        scope: CustodyScope,
+        receipt: focal_evidence::CustodyReceipt,
+    ) -> Result<(), AccessError> {
+        match self
+            .call(Command::RecordReceipt(scope, Box::new(receipt)), 0, true)
+            .await?
+        {
+            Output::Done => Ok(()),
+            _ => Err(AccessError::Unavailable),
+        }
+    }
+    /// The receipt held for one copy of one object under a scope's ledger.
+    pub async fn receipt(
+        &self,
+        scope: CustodyScope,
+        root: focal_model::ContentHash,
+        node: u64,
+    ) -> Result<Option<focal_evidence::CustodyReceipt>, AccessError> {
+        match self
+            .call(Command::Receipt(scope, root, node), 0, true)
+            .await?
+        {
+            Output::Receipt(receipt) => Ok(receipt.map(|receipt| *receipt)),
+            _ => Err(AccessError::Unavailable),
+        }
+    }
+    /// Every ledger with an installed custody policy on this node.
+    pub async fn policies(&self) -> Result<Vec<focal_model::LedgerId>, AccessError> {
+        match self.call(Command::Policies, 64 * 1024, true).await? {
+            Output::Policies(ledgers) => Ok(ledgers),
+            _ => Err(AccessError::Unavailable),
+        }
+    }
+    /// Trusted: install the protection set the collector's next steps run
+    /// under (26 §5).
+    pub async fn protect(
+        &self,
+        protection: focal_evidence::ProtectionSet,
+    ) -> Result<(), AccessError> {
+        let charge = protection
+            .objects()
+            .checked_mul(64)
+            .and_then(|n| n.checked_add(4096))
+            .ok_or(AccessError::Capacity)?;
+        match self
+            .call(Command::Protect(Box::new(protection)), charge, true)
+            .await?
+        {
+            Output::Done => Ok(()),
+            _ => Err(AccessError::Unavailable),
+        }
+    }
+    /// Trusted: one bounded collector step under the installed protection
+    /// set; the report accumulates over the pass and says when it is done.
+    pub async fn collect(
+        &self,
+        config: focal_evidence::CollectorConfig,
+        now_ms: u64,
+        max_items: usize,
+    ) -> Result<focal_evidence::CollectorReport, AccessError> {
+        let charge = max_items
+            .checked_mul(256)
+            .and_then(|n| n.checked_add(4096))
+            .ok_or(AccessError::Capacity)?;
+        match self
+            .call(Command::Collect(config, now_ms, max_items), charge, true)
+            .await?
+        {
+            Output::Collected(report) => Ok(report),
+            _ => Err(AccessError::Unavailable),
+        }
+    }
+    /// Trusted: bring a quarantined object back (26 §5).
+    pub async fn restore_quarantined(
+        &self,
+        domain: focal_model::ContentDomainId,
+        root: focal_model::ContentHash,
+    ) -> Result<bool, AccessError> {
+        match self
+            .call(Command::Restore(domain, root), 64 * 1024, true)
+            .await?
+        {
+            Output::Restored(restored) => Ok(restored),
+            _ => Err(AccessError::Unavailable),
+        }
+    }
+    /// The volume envelope's statistics and the uploads staged (count and
+    /// bytes), as the content store samples them now.
+    pub async fn disk_stats(&self) -> Result<(focal_memory::DiskStats, usize, u64), AccessError> {
+        match self.call(Command::DiskStats, 4096, true).await? {
+            Output::Disk(stats, uploads, bytes) => Ok((stats, uploads, bytes)),
+            _ => Err(AccessError::Unavailable),
+        }
+    }
+    /// Trusted: import every object a backup lists into this node's store,
+    /// chunk by chunk as a custody transfer would (26 §6).
+    pub async fn restore_content(
+        &self,
+        root: std::path::PathBuf,
+        manifest: focal_ledger::backup::BackupManifest,
+    ) -> Result<u64, AccessError> {
+        match self
+            .call(
+                Command::RestoreContent(root, Box::new(manifest)),
+                4 * 1024 * 1024,
+                true,
+            )
+            .await?
+        {
+            Output::Imported(imported) => Ok(imported),
+            _ => Err(AccessError::Unavailable),
+        }
+    }
+    pub async fn announce_pending(
+        &self,
+        ledger: focal_model::LedgerId,
+        pending: Option<(CustodyScope, std::collections::BTreeSet<u64>)>,
+    ) -> Result<(), AccessError> {
+        let charge = pending
+            .as_ref()
+            .map_or(0, |(_, peers)| peers.len())
+            .checked_mul(128)
+            .and_then(|bytes| bytes.checked_add(4096))
+            .ok_or(AccessError::Capacity)?;
+        match self
+            .call(Command::AnnouncePending(ledger, pending), charge, true)
+            .await?
+        {
+            Output::Done => Ok(()),
+            _ => Err(AccessError::Unavailable),
+        }
+    }
     pub async fn stop(&self) -> Result<(), AccessError> {
         match self.call(Command::Stop, 0, true).await? {
             Output::Done => Ok(()),
@@ -453,6 +636,61 @@ fn execute(
         Command::Check(scope) => {
             owner.check_policy(scope)?;
             Ok(Output::Done)
+        }
+        Command::Policy(ledger) => Ok(Output::Policy(owner.installed(ledger).cloned())),
+        Command::Policies => Ok(Output::Policies(owner.installed_ledgers()?)),
+        Command::Protect(protection) => {
+            owner.protect(*protection);
+            Ok(Output::Done)
+        }
+        Command::Collect(config, now_ms, max_items) => {
+            Ok(Output::Collected(owner.collect(config, now_ms, max_items)?))
+        }
+        Command::Restore(domain, root) => {
+            Ok(Output::Restored(owner.restore_quarantined(domain, root)?))
+        }
+        Command::DiskStats => {
+            let (uploads, bytes) = owner.content().staged();
+            Ok(Output::Disk(owner.content().disk_stats(), uploads, bytes))
+        }
+        Command::RestoreContent(root, manifest) => {
+            let imported = focal_ledger::backup::import_content(
+                &focal_ledger::backup::FileMedium,
+                &root,
+                &manifest,
+                owner.content_mut(),
+                budget,
+            )
+            .map_err(|error| match error {
+                focal_ledger::backup::BackupError::Content(error) => content_error(error),
+                focal_ledger::backup::BackupError::Capacity
+                | focal_ledger::backup::BackupError::Memory(_) => AccessError::Capacity,
+                _ => AccessError::InvalidRequest,
+            })?;
+            Ok(Output::Imported(imported))
+        }
+        Command::AnnouncePending(ledger, pending) => {
+            owner.announce_pending(ledger, pending)?;
+            Ok(Output::Done)
+        }
+        Command::RecordReceipt(scope, receipt) => {
+            owner.check_policy(scope)?;
+            if receipt.ledger != scope.ledger {
+                return Err(AccessError::InvalidRequest);
+            }
+            owner
+                .content_mut()
+                .record_custody_receipt(&receipt)
+                .map_err(crate::custody::content_error)?;
+            Ok(Output::Done)
+        }
+        Command::Receipt(scope, root, node) => {
+            owner.check_policy(scope)?;
+            let receipt = owner
+                .content()
+                .custody_receipt(scope.ledger, root, node)
+                .map_err(crate::custody::content_error)?;
+            Ok(Output::Receipt(receipt.map(Box::new)))
         }
         Command::VerifyNative(verification) => {
             owner.check_policy(verification.scope)?;
@@ -547,13 +785,16 @@ fn handle_request(
     limits: &WireLimits,
     budget: &MemoryBudget,
 ) -> Result<Accounted<ResponseEnvelope>, AccessError> {
-    let scope = owner.authorize(verified)?;
     let request = verified.request();
     if matches!(request.operation, Operation::Custody(_)) {
+        // Custody requests authorize inside the store: a seed read admits the
+        // peers of an announced pending placement at that placement's route
+        // (25 §5); everything else binds the installed route.
         return owner
             .request(verified)
             .map(|value| value.map(|reply| request.reply(Response::Custody(reply))));
     }
+    let scope = owner.authorize(verified)?;
     if matches!(
         request.operation,
         Operation::Upload(UploadRequest::Seal { .. })

@@ -7311,3 +7311,1500 @@ pass alone and passed in the final run.
 **Limits recorded.** See [24](24-placement-execution-and-fleet-control.md) §12:
 node-local constants, flat membership, the founder never judged, the
 extension path qualified by crafted probes rather than a loaded host.
+
+## Namespace split and merge (R6.8) — 2026-09-09
+
+Instruction 4's last clause of R6 ([24](24-placement-execution-and-fleet-control.md) §13):
+"complete directory namespace split/merge and bounded delegated routing so
+the control plane itself can scale without a single unbounded metadata
+owner".
+
+- **Directory** (`focal-directory`, partition checkpoint schema 4 with
+  `PartitionCheckpointV3`/`PartitionSealV3` conversions): `PartitionSeal
+  { .., moved, source }`, `PartitionOperation::{SealForSplit, Release,
+  Install, Absorb}`, `split_image`, `split_partition_id`/`split_group_id`,
+  `RootOperation::{Split, Merge}`, shape-validated activation fences
+  (arrived / released / absorbed), `verify_delegation` scoped by
+  containment or adjacency, `PartitionConfig.max_absorb_sessions`,
+  `Delegation`/`DelegationFence` are `Copy`. Tests
+  `crates/focal-directory/tests/split_merge.rs` (a split end to end with
+  every refusal: wrong key, wrong geometry, tampered image, wrong or
+  unverified release; a merge with the tampered and over-bound absorbs
+  refused; a schema-3 checkpoint restoring with a whole-namespace seal).
+- **Hosting** (`focal-node`): `PartitionPlan` (alias `FirstDirectoryPlan`)
+  with `split_destination`, `bootstrap(image)`, `accepts`; permits and
+  grants for delegated or image plans (`authorize_first_directory`,
+  `next_first_directory_command`); `DirectoryHandle::{host_of,
+  host_of_group, hosted, request}`, `HostRequest::{Host, Retire}`, the host
+  manager in `network_directory.rs` with durable records under
+  `cluster/partitions/`, `OWNER_SLOTS = 4 + MAX_HOSTED_PARTITIONS`,
+  every hosted partition stopped at shutdown; `DataService` routes by
+  group; `ControlHost::prepare_delegation_proof` and
+  `placement_proof::prepare_delegation_proof`
+  (`AuthorityFact::DelegationSource/Destination` signed as a voter of the
+  named group).
+- **Agent**: the tick visits every root delegation with one journal per
+  partition (`Journals.partitions`), observes each partition once
+  (`Observed`), reports liveness facts from the union of node tables, keys
+  load reports by partition and skips a sealed partition's steps;
+  `partition_split.rs` (`reshape`, `continue_split`, `absorb`,
+  `delegation_proofs`, `thresholds`, `override_thresholds` under
+  `test-support`) drives split and merge one committed step per tick.
+- **Test** `crates/focal-node/src/partition_split_tests.rs::a_crowded_partition_splits_survives_a_restart_and_merges_back`
+  (threshold one: the founder's session crowds the first partition, which
+  seals at the session's key; the destination group is granted, hosted from
+  the image, the root splits under both signatures, the destination installs
+  and the source releases; both halves serve at epoch 2, the session lives
+  above and its log keeps serving; the founder restarts and reopens the
+  hosted partition from its record with the delegations untouched; with the
+  merge allowed the upper seals, the root merges at epoch 3, the lower
+  absorbs, the record is removed and the union stays under the threshold).
+  Faults the test forced: a split image must present itself as the
+  destination (the control genesis binds the bootstrap's group), the
+  partition-level install/release/absorb need the same two proofs the root
+  verified, a root permit must authorize a partition by identity rather
+  than by its initial delegation (the first partition could not refresh its
+  authority after a split), a partition whose only session sits at its start
+  key has no split key, and every hosted partition must be stopped at
+  shutdown or the owner registry never joins.
+
+**Evidence** (macOS arm64, this tree, 14:15–14:24 CDT):
+`bash scripts/cargo.sh test --workspace --offline --no-fail-fast` — **2,455 tests across 104 test binaries, 0 failures**;
+`bash scripts/cargo.sh clippy --workspace --all-targets --offline -- -D warnings` clean;
+`bash scripts/check-production.sh` clean; `cargo fmt --all --check` and the
+`--locked` check clean; `python3 scripts/check-contracts.py` clean (1,272 links, 37 hashes, 15 vocabularies).
+
+**Limits recorded.** See [24](24-placement-execution-and-fleet-control.md) §13:
+partition groups on the founder alone, absorb bounded by 256 sessions, no
+route cache, the split qualification at a threshold of one session.
+
+## The route cache and serving fences (R6.9) — 2026-09-09
+
+Instruction 4's "bounded delegated routing" and the carried limit "route
+discovery after placement change" of R6 ([24](24-placement-execution-and-fleet-control.md) §14).
+
+- **Directory** (`focal-directory`, partition checkpoint schema 5 with
+  `PartitionCheckpointV4` conversions): `PartitionCheckpoint::{routes,
+  routes_from}`, `RouteChange`, `PartitionConfig.max_route_log`,
+  `DirectoryPartition::route_changes`, route-log validation (ordered, above
+  the floor, several per revision), the log in the charge, an empty log in
+  split images; `RouteCache::watches`. Tests
+  `crates/focal-directory/tests/split_merge.rs::the_route_log_reports_exactly_what_moved_and_a_cache_too_far_behind_reads_a_gap`
+  (creation changes, a watched revision, eviction and the gap batch, a
+  cache applying it, a schema-4 checkpoint restoring with an empty log).
+- **Control** (`focal-control`): `ControlRead::{Route, RouteChanges}`,
+  `ControlReadResult::{Route, RouteChanges}`, partition-scope reads with
+  their charges, allowed through the read-only peer decoder.
+- **Wire**: `PeerConnectionPool::route_endpoint`.
+- **Node**: `route_cache_host.rs` (`RouteCacheHandle::{channel, resolve,
+  hint}`, `RouteCacheDriver::run` beside the other drivers,
+  `NetworkHandles.routes`); `ManagedService::with_routes` and `redirect`
+  (client requests only; no copy → the directory's hint; a stale epoch →
+  the current epoch at the replica's leader; a mutation on a follower → the
+  leader; current reads served here); `DataService` exposed to the crate's
+  tests through `Running.data`.
+- **Tests** `crates/focal-node/src/route_cache_tests.rs::a_node_that_does_not_serve_a_ledger_redirects_to_its_leader`
+  (the partition answers `Route` for the founder's session and `None` for
+  an unknown one, `RouteChanges` names it at epoch 1; a joined host with no
+  copy answers a `Summary` read with `RouteChanged` to the founder's
+  endpoint at epoch 1 while the founder serves it; an unknown ledger stays
+  unavailable) and, in
+  `placement_agent::tests::the_controller_expands_a_laptop_session_to_three_hosts_that_survive_one_loss`,
+  after activation at route epoch 2: a client at epoch 1 is answered with
+  epoch 2 at the founder's endpoint by the founder and by a follower, and a
+  current client is served without a redirect. The fault the expansion test
+  exposed: routing every request through the directory (a diagnostics call
+  and a cache lookup per Raft message) delayed heartbeat responses until
+  the leader stepped down after one host loss; only client requests are
+  routed now, and a current read never consults the replica's leader.
+
+**Evidence** (macOS arm64, this tree, 14:53–15:02 CDT):
+`bash scripts/cargo.sh test --workspace --offline --no-fail-fast` — **2,457 tests across 104 test binaries, 0 failures**;
+`bash scripts/cargo.sh clippy --workspace --all-targets --offline -- -D warnings` clean;
+`bash scripts/check-production.sh` clean; `cargo fmt --all --check` and the
+`--locked` check clean; `python3 scripts/check-contracts.py` clean.
+
+**Limits recorded.** See [24](24-placement-execution-and-fleet-control.md) §14.
+
+## The operator's placement view (R6.10) — 2026-09-09
+
+Instruction 5 of R6 ([24](24-placement-execution-and-fleet-control.md) §15):
+`cluster placement` and `cluster plan` on the CLI and MCP.
+
+- **Client** (`focal-client`): `AdminResult::{Placement, Plan}`,
+  `AdminPlacement`, `AdminPartition`, `AdminSeal`, `AdminPlacementNode`,
+  `AdminSessionPlacement`, `AdminPendingPlacement`,
+  `AdminAssignmentProgress`, `AdminPlannedAction`; descriptors
+  `cluster.placement` and `cluster.plan` (`ADMIN_TOOL_COUNT` 35).
+- **Node**: `AgentJob::Directory` / `PlacementHandle::directory` answer with
+  the agent's last observation (`DirectoryReport`); `AdminCommand::Placement`
+  served by `LocalNetworkAdmin::placement` (`with_placement`) through the
+  projection `placement_reply` (bounded, guarantee measured by
+  `effective_guarantee`, actions by `placement_controller::planned_actions`
+  and the partition's reshape state); `ClusterAdmin::{placement, plan}`;
+  CLI `cluster placement|plan`; MCP `AdminAction::{Placement, Plan}`.
+- **Contracts**: the cluster skill (version 4, digest re-pinned) documents
+  both tools; the manifest requires them; the MCP catalogue budget test uses
+  the production envelope (160 MiB / 80 MiB) now that the catalogue carries
+  35 administration tools; `docs/cluster-admin.md` lists both commands.
+- **Test**: `placement_agent::tests::founder_agent_registers_its_session_reports_load_and_restarts_without_repeating`
+  reads the view through the admin socket: one partition at epoch 1, the
+  founder alive and loaded, its session at the single-node guarantee with
+  nothing blocking and no pending plan, and an empty plan. The fault the
+  test exposed: the agent's tick timer was recreated after every job it
+  served, so a client polling the view every hundred milliseconds starved
+  the tick and the view never advanced; the tick is a fixed deadline now.
+  The whole-workspace run then exposed a second fault: the split test's
+  in-process threshold knob was process-global, so the founder test running
+  beside it in the same binary saw its own partition split; the knob is
+  keyed by cluster now (`override_thresholds(cluster, split, merge)`,
+  `thresholds(cluster)`).
+
+**Evidence** (macOS arm64, this tree, 15:27–15:36 CDT):
+`bash scripts/cargo.sh test --workspace --offline --no-fail-fast` — **2,457 tests across 104 test binaries, 0 failures**;
+`bash scripts/cargo.sh clippy --workspace --all-targets --offline -- -D warnings` clean;
+`bash scripts/check-production.sh` clean; `cargo fmt --all --check` and the
+`--locked` check clean; `python3 scripts/check-contracts.py` clean. The 15:15–15:24 run failed the founder
+test on the process-global knob described above and the known
+`fleet::async_tests::shared_owner_queues_covering_flush_and_serves_another_group_while_disk_waits`
+load flake, which passes alone.
+
+**Limits recorded.** See [24](24-placement-execution-and-fleet-control.md) §15.
+
+## Tenants and application sessions (R6.11) — 2026-09-09
+
+The last R6 instruction before the real-binary qualification
+([24](24-placement-execution-and-fleet-control.md) §16, decision F37): a
+cluster serves more than the founder's tenant, and an operator creates
+application sessions by name.
+
+- **Enrollment** (`focal-enrollment`): registry schema 3 with
+  `tenants: BTreeSet<[u8;16]>`, `Change::AdmitTenant`, `EnrollmentLimits.max_tenants`
+  (1,024; 64 bytes charged per tenant), `prepare_admit_tenant` (founder
+  authority; `Conflict` when admitted, `Capacity` when full),
+  `tenants()`/`admits_tenant()`, `EnrollmentCommand::admitted_tenant`; a
+  schema-2 checkpoint restores with no tenants and its own charge.
+- **Node grants**: `QuorumEnrollmentHost::admit_tenant` commits the fact
+  through the same journaled control path as an invitation and reads it
+  back before answering; `authorize` issues every certificate grant as the
+  configured tenants plus the registry's. The local Unix socket is bound
+  with a watched grant (`UnixServer::bind_watched`; each accepted connection
+  is served under the value at accept) that the network controller
+  republishes on every registry refresh (`follow_local_grant`), so admission
+  never needs a restart.
+- **Sessions**: `AdminCommand::CreateSession{tenant, name}` →
+  `PlacementHandle::create_session` → the agent derives the identity
+  (`created_session_id`, `focal.session.created.v1` over cluster, tenant,
+  length-prefixed name), answers `existing` when the fleet hosts it, admits
+  the tenant (`TenantAdmission::admit` + fleet), records the copy as
+  `created` in `cluster/placement-installs` (schema 2; schema 1 converts)
+  before opening it, and opens a single-voter log on the shared WAL at the
+  session's own group. Registration is generalised: `FirstSessionPlan::capture_hosted`
+  registers any session a node hosts alone under the node's identity at
+  that ledger, and the agent's tick runs it for the founder's session and
+  every created one whose namespace the partition holds. The partition
+  checkpoint is schema 6: `SessionDescriptor.founder` records the founding
+  node so an assigned copy replays that exact bootstrap membership
+  (schemas 1–5 convert with `None`, read as the cluster founder).
+- **Surfaces**: `AdminCommand::{AdmitTenant, Tenants, CreateSession}`
+  (`TenantsReply`, `SessionCreatedReply`), `ClusterAdmin::{admit_tenant,
+  tenants, create_session}` (the client recomputes the expected session
+  identity and refuses any other answer), `AdminResult::{Tenants,
+  SessionCreated}`, `AdminSessionPlacement.founder`; CLI `cluster tenants
+  admit|list`, `cluster sessions create`; MCP `AdminAction::{AdmitTenant,
+  Tenants, CreateSession}` and descriptors `cluster.tenants.admit|list`,
+  `cluster.sessions.create` (`ADMIN_TOOL_COUNT` 38); cluster skill version 5
+  (digest re-pinned), manifest, `docs/cluster-admin.md`.
+- **Tests**: `focal-enrollment` admission/restore/upgrade; `focal-wire`
+  `unix_watched_grant_governs_connections_accepted_after_it_changes`;
+  `focal-directory` schema-5 conversion; node `network_control` (admit once,
+  retry is done, zero refused, the grant names the tenant),
+  `session_registration` (hosted capture: distinct identities, refusals),
+  `placement_agent::tests::{created_session_identity_is_exact_per_cluster_tenant_and_name,
+  install_records_before_created_sessions_decode_as_assigned_copies,
+  operators_admit_tenants_and_create_sessions_that_register_serve_and_survive_restart}`
+  (an unserved tenant is refused on both the admin and the local socket;
+  admit, retry, list; create, exact retry, a second session under the
+  founder's tenant; both registered with `founder = node`; served through
+  the data handler and through the local socket without a restart; the
+  operator view names the founder; restart reopens both and the name still
+  finds the session). The restart half exposed one fault: a copy recorded
+  as installed was reopened before its tenant was admitted on the fresh
+  agent; `open_copy` now admits the recorded copy's tenant itself.
+
+**Evidence** (macOS arm64, this tree, 16:34–16:42 CDT):
+`bash scripts/cargo.sh test --workspace --offline --no-fail-fast` — **2,462 tests across 104 test binaries, 0 failures**;
+`bash scripts/cargo.sh clippy --workspace --all-targets --offline -- -D warnings` clean;
+`bash scripts/check-production.sh` clean; `cargo fmt --all --check` and the
+`--locked` check clean; `python3 scripts/check-contracts.py` clean. The
+16:23–16:31 run before it failed three ways on this batch: the directory's
+`CreateSession` refused a placement with several voters (the founding node is
+now recorded only for a single-voter creation), an indexed slice pair in the
+tenants reply check, and a clippy default-reassignment in the enrollment
+test; plus the known
+`fleet::async_tests::shared_owner_queues_covering_flush_and_serves_another_group_while_disk_waits`
+load flake, which passed in the clean run.
+
+**Limits recorded.** See [24](24-placement-execution-and-fleet-control.md) §16.
+
+## An operator's durability request across three real processes (R6.12) — 2026-09-09
+
+The R6 close ([24](24-placement-execution-and-fleet-control.md) §17): the
+lever an operator needs to expand a laptop session, and the real-binary
+qualification the plan names for R6.
+
+- **Request**: `AdminCommand::PlanSession{tenant, session, survive, max_failures}`
+  → `PlacementHandle::plan_session` → `AgentJob::PlanSession` queued in the
+  agent (`MAX_PLAN_REQUESTS` 64 sessions, 8 waiters each; a request under
+  another durability replaces the queued one and its waiters are told) and
+  answered by `answer_plan_request` on the next pass over the partition
+  holding the session: `pending` (the plan under way), `satisfied` (the
+  active policy carries the durability and verifies), or `planned` (a
+  `SessionChange::Plan` journaled for the partition under
+  `propose_placement` with the active policy's residency and the requested
+  durability, identity `focal.placement.request.v1` over ledger, authority
+  record and durability). `SessionPlannedReply`, `ClusterAdmin::plan_session`,
+  `AdminResult::SessionPlanned`, CLI `cluster sessions plan`, MCP
+  `cluster.sessions.plan` (`ADMIN_TOOL_COUNT` 39), skill version 6.
+- **Local socket redirects**: the Unix client transport resends at a hinted
+  epoch to the same node instead of refusing the hint; the node answers the
+  same hint again when its log leads elsewhere, which the client reports.
+  Without this a local `status` on the founder failed with `route_changed`
+  after the expansion moved its own session to epoch 2.
+- **Re-fencing after activation**: a hosted replica served clients only at
+  the route it was installed with (`serves_route`), and nothing moved that
+  fence when the directory activated a new route, so every client request
+  to an expanded session was refused `Unavailable` at every host (the
+  in-process expansion test had tolerated that answer). `ReplicaHost::refence`
+  (`Work::Refence`, control lane) moves the serving fence and the read
+  views' epoch once the session's active route is that route and no
+  cutover is pending (`ReadViews::set_route_epoch` keeps the read clock; a
+  fresh view set had run the clock backwards and stopped the owner);
+  `ReplicaProgress.route_epoch` reports the served route, and the agent's
+  `sync_custody` re-fences every copy it hosts whose served route is behind
+  the committed one. The expansion test now requires a `Summary` answer at
+  epoch 2 from the founder.
+- **Test** `crates/focal-node/tests/placement_binary.rs::a_laptop_session_expands_to_three_processes_and_converges_after_its_leader_is_killed_mid_plan`:
+  three real `focal` processes (founder with `--advertise`, two hosts
+  invited with `cluster invite`, joined with `join`, started), enrollment
+  and load observed through `cluster placement`, `cluster sessions plan`
+  for one tolerated node loss (`planned` with the three voters; the retry
+  names the same operation as `planned` or `pending`), the founder killed
+  with SIGKILL as soon as the pending plan leaves `Planned` (or activated),
+  restarted, and activation observed from the committed directory (no
+  pending plan, route epoch 2, membership epoch 3, placement epoch 2,
+  three voters, `achieved_max_failures` 1, nothing blocking, nothing
+  retiring, founder recorded, `satisfied` on the same request, an empty
+  `cluster plan`); host-b killed (a `status` quorum read still answers
+  through the founder's local socket; the directory suspects the host and
+  measures no tolerated failure), then restarted (alive, the guarantee
+  whole, no pending plan).
+
+**Evidence** (macOS arm64, this tree, 17:19–17:28 CDT):
+`bash scripts/cargo.sh test --workspace --offline --no-fail-fast` — **2,463 tests across 105 test binaries, 0 failures** (the real-binary placement qualification runs in about a minute);
+`bash scripts/cargo.sh clippy --workspace --all-targets --offline -- -D warnings` clean;
+`bash scripts/check-production.sh` clean; `cargo fmt --all --check` and the
+`--locked` check clean; `python3 scripts/check-contracts.py` clean. The
+17:08–17:18 run before it passed every test and failed clippy on two
+elidable lifetimes in the new test file, fixed for this run.
+
+**Limits recorded.** See [24](24-placement-execution-and-fleet-control.md) §17.
+
+## Deterministic parallel materialization (R7.1) — 2026-09-09
+
+The first R7 batch ([25](25-parallel-materialization-and-ranges.md) §2,
+decision F38): committed records this session did not author are
+materialized in dependency waves on bounded workers, read-traced, checked at
+a barrier and installed in order, byte-identical to serial replay.
+
+- **Core** (`focal-core`): `record_codec::replay` gains the `BaseRows` seam
+  (every base read of a replay goes through it) and splits `prepare` into
+  `stage` (decode, custody, validate against any base view → `StagedRecord`)
+  and `install` (pages against the published root); `stage_meta` decodes a
+  record's meta row alone. New `record_codec::materialize`:
+  `MaterializerLimits`, `BatchReport`, `materialize_batch` (footprints from
+  header keys, `Affinity` per key, edges by affinity and exact key with the
+  meta row excluded, pre-decoded meta rows, waves on scoped threads with a
+  fixed stack, per-task `TaskBase` view and trace, the barrier, discard and
+  serial completion, in-order install and publish, the first refusal at its
+  index). `checkpoint::rows_digest` hashes the rows under a fixed range
+  identity. `NativeSchemaVerifier` is `Sync` (shared with workers); test
+  verifiers count through `fixtures::SyncCell`.
+- **Ledger** (`focal-ledger`): `NativeSessionLimits.materializer`,
+  `MaterializerStats` (`NativeSession::materializer_stats`),
+  `NativeSession::native_state_digest`; the follower delivery loop batches a
+  run of consecutive native records up to the next membership entry
+  (`record_run`, `materialize_run`) when the session holds no candidates and
+  more than one worker is configured; the per-record path is otherwise
+  unchanged.
+- **Node**: hosted sessions run `max_workers = available_parallelism().clamp(1, 4)`.
+- **Tests**: `materialize::tests` (affinity, intersections, latest writer,
+  limits); `native_session::cluster_tests::{parallel_materialization_matches_serial_replay_on_independent_and_dependent_records,
+  a_planner_that_omits_every_edge_is_caught_by_the_barrier_and_still_matches}`
+  (digests equal across a one-worker and a four-worker follower over
+  independent creations, dependent posts and receipts, and a restart replay;
+  a no-edge planner with eight workers stages a post beside its creation,
+  the barrier reports violations and a serial fallback, rows still match).
+  Two faults the suite found: the meta row every record writes chained every
+  pair of records into serial waves until it was excluded from key edges;
+  and the checkpoint frame hash includes the store's range identity, which
+  differs per replica, so the digest hashes rows under a fixed identity.
+- **Measurement** (P10.7): `materializer_throughput_at_one_and_four_workers`
+  (`--ignored`, release) writes `target/measurements/materializer-<time>.json`;
+  eight independent records took 910 µs on the serial path and 620 µs in two
+  four-worker waves, a chained shape 928 µs against 913 µs
+  ([25](25-parallel-materialization-and-ranges.md) §2). `MaterializerStats`
+  also counts the per-record path (`serial_records`, `serial_micros`).
+
+**Evidence** (macOS arm64, this tree, 17:52–18:02 CDT):
+`bash scripts/cargo.sh test --workspace --offline --no-fail-fast` — **2,468 tests across 105 test binaries, 0 failures**;
+`bash scripts/cargo.sh clippy --workspace --all-targets --offline -- -D warnings` clean;
+`bash scripts/check-production.sh` clean; `cargo fmt --all --check` and the
+`--locked` check clean; `python3 scripts/check-contracts.py` clean.
+
+**Limits recorded.** See [25](25-parallel-materialization-and-ranges.md) §2.
+
+## The storage layout order (R7.2, first step) — 2026-09-09
+
+The first sharding step ([25](25-parallel-materialization-and-ranges.md) §3,
+decision F39): one order for every native key, affinity then family then
+fields, so an object's rows are one contiguous span.
+
+- **Core**: `native::layout` (`affinity`, `family`, the slot-sequence
+  `OrderKey`, `impl Ord for Key`); `Key` no longer derives its order.
+  `FCMUTATE` and `FCNROOTS` advance to version 5 (rows in this order; no row
+  bytes change), so the native decoder identity changes with them.
+- **Tests**: `layout::tests` (a corpus over all 48 families: the order is
+  total, agrees with equality, transitive on every triple, ends at the
+  sentinel; one claim's rows are contiguous, its cycles and evaluations
+  ordered by their fields, a status bucket holds its claims together, due
+  timers sit in time order under the control affinity). Three fixtures that
+  copied only the rows they expected beside a forged key now copy every
+  neighbour, since a claim's other rows share its span; the version
+  assertions follow the constants. One fault the suite found: an order key
+  that compared all identities before all scalars let a timer's target
+  outrank its time, so a due scan's bound stopped nothing; the order key is
+  now one slot sequence in declaration order.
+- **Identity index**: the affinity-first order scatters a family's rows
+  across claim spans, so the identity-order listings (`claims`, `artifacts`,
+  `definitions`, and unrestricted `evaluations`, which now nests each
+  claim's evaluations under its identity) walk a new unit family,
+  `ByObject(family code, object)` (tag 48; [22](22-native-record-format.md)
+  §2 and §7), written with the claim, artifact or declaration row, replayed,
+  checkpointed and imported like every other index row. Receipts stay one
+  table through their affinity. The write-set bounds count the new row:
+  `ARTIFACT_FIXED_ROWS` is four (identity, producer, kind, schema), the
+  smallest failed admission report eighteen rows, a projection-only claim's
+  index rows six; the completion, admission-graph, work and respondent
+  envelopes derive their fixed rows from `report_rows(0)`/`artifact_rows(0)`
+  instead of literals, so the promised artifact's input cap and the actual
+  batch agree. The full workspace gate (gate68) caught the omission first:
+  every node list and watch scan assumed family contiguity; the crate's own
+  suites then caught two family tables (`mutation::check_family`,
+  `read_validate`) that refused the new row as an invalid manifest, and
+  eleven exact-count tests moved with the bounds.
+
+**Evidence** (macOS arm64, this tree, 2026-09-09 19:02–19:12 CDT, gate69):
+`bash scripts/cargo.sh test --workspace --offline --no-fail-fast` ran 105
+test binaries, 2,469 passed, 1 failed: `fleet::async_tests::shared_owner_queues_covering_flush_and_serves_another_group_while_disk_waits`,
+the known timing-sensitive fleet test, which passed when rerun alone on the
+same tree (`--lib -- fleet::async_tests::shared_owner_queues_covering_flush`,
+1 passed). `clippy --workspace --all-targets --offline -- -D warnings`,
+`scripts/check-production.sh`, `cargo fmt --all --check` and
+`cargo check --workspace --all-targets --locked --offline` were clean;
+`python3 scripts/check-contracts.py` verified 1,313 links, 37 hashes and 15
+vocabularies. Earlier on this tree: `test -p focal-core -p focal-ledger
+-p focal-evidence` (839 + 103 + 41 passed) and the four node suites gate68
+had failed (`cli_native_a3`, `cli_native_lists`, `cli_native_watch`,
+`watch_client`: 1, 1, 1 and 5 passed).
+
+**Limits recorded.** See [25](25-parallel-materialization-and-ranges.md) §3.
+
+## Range groups (R7.2, second step) — 2026-09-09
+
+The second sharding step ([25](25-parallel-materialization-and-ranges.md)
+§4, decision F40): a native state's rows are a group of stores over affinity
+spans.
+
+- **Memory crate**: the generic range map (`range_map.rs`: `KeySpan<K>`,
+  `RangeDescriptor<K, M>`, `RangeMap<K, M>` with gap-free validation, routing
+  and one contiguous replacement under generation rules; an optional `serde`
+  feature; the dormant `focal-ranges` crate now builds on it with a
+  `Placement` meta and the memory crate's `RangeId`), page-sharing division
+  and joining of stores (`range_split.rs`: `split_with`, `split_where_with`
+  under a monotone predicate, `merge_with`, `new_sibling`, `is_sibling`; one
+  directory build per result, `PageDirectory::from_pages`), group write
+  envelopes (`future_write_envelope_shared`, `check_plans` over a set of
+  fragment plans, `with_group_bytes`), `project_from` on a lease and a
+  `budget()` accessor.
+- **Core**: `native::ranges` (`RangeLayout`, `NativeRanges`, `RangesPlan`,
+  `Fragments`, `RangeLeases`, `Affinity`, `MAX_LAYOUT_MEMBERS`); the native
+  state holds a group, a prepared candidate holds one fragment per member, a
+  read one lease per member; every plan, build, publication, chain check,
+  scan and projection routes by affinity; `NativeLimits.max_ranges` (64)
+  sizes every envelope; `Core::{native_layout, split_native_range,
+  merge_native_range}`. `FCNROOTS` advances to version 6 and carries the
+  layout; `StructuralCheckpoint::{members, layout}`; restoration hydrates
+  one store then divides it per the layout; the rows digest frames a
+  canonical layout; import images name one member under the import identity.
+  Replay funds the extra input vectors a divided write needs.
+- **Ledger**: `NativeSession::{native_layout, split_native_range,
+  merge_native_range}` through the owner (refused with candidates pending)
+  and the engine (refused during a delivery).
+- **Tests**: memory `range_map::tests` (4), `range::split_tests` (5: page
+  sharing, boundary pages, page-edge and past-the-end boundaries, merge
+  refusals, shared clock and envelope, bulk directory shapes at eight widths);
+  core `ranges::tests` (4: one versus five members hold identical state and
+  serve identical reads, pins across members, refusals under leases and at
+  boundaries, split and merge with rows; checkpoints carry the layout and
+  restore durable member identities under a fresh producer; records replay
+  into a differently laid-out incarnation; layout frames refuse disorder,
+  repeated identities, a bounded first member, no members and any changed
+  byte); ledger `replicas_lay_rows_out_independently_and_checkpoints_carry_the_layout`
+  (one-, three- and four-member replicas byte-identical, a split refused with
+  a candidate pending, a lagging follower adopting the leader's layout from
+  its checkpoint, a restart restoring a replica's own, a merge, further
+  records). Two faults the suites found: the first design allocated the
+  group's per-write vectors from the core budget outside the funded
+  completion envelope (every under-pressure owner test refused), so a group
+  of one now allocates nothing per write and a wider group's vectors are
+  funded by the write's source within the envelope's group bytes; and
+  replaying a record into a divided group needs a vector per touched member
+  beyond the one the record funded.
+
+**Evidence** (macOS arm64, this tree, 2026-09-09 20:07–20:17 CDT, gate71):
+`bash scripts/cargo.sh test --workspace --offline --no-fail-fast` ran 105
+test binaries, 2,484 passed, 0 failed; `clippy --workspace --all-targets
+--offline -- -D warnings`, `scripts/check-production.sh`, `cargo fmt --all
+--check` and `cargo check --workspace --all-targets --locked --offline` were
+clean; `python3 scripts/check-contracts.py` verified 1,327 links, 37 hashes
+and 15 vocabularies. The run before it (gate70, 19:55–20:05) passed the same
+2,484 tests but clippy refused four findings in the new code (a redundant
+closure, a large `Err` variant on the all-or-nothing publication, a bare
+remainder in the layout reader, a `&Vec` parameter in a test copier); they
+were fixed and the whole gate rerun.
+
+**Limits recorded.** See [25](25-parallel-materialization-and-ranges.md) §4.
+
+## Committed layout changes (R7.3, first step) — 2026-09-09
+
+The layout of a session's range group becomes a session decision
+([25](25-parallel-materialization-and-ranges.md) §4; decision F40 revised).
+
+- **Ledger**: `native_session_range.rs` (`FOCALRG1`: `LayoutRecord {ledger,
+  expected_epoch, operation}` with `LayoutOperation::{Split {at, id}, Merge
+  {left}}`, 115 fixed bytes under a digest; `origin_member(genesis)`);
+  `NativeSession::{propose_layout, native_layout, native_layout_epoch}`
+  replace the replica-local split and merge of the second step; the engine
+  keeps the record in flight (`layout_change`), refuses native admission with
+  the new retryable `NativeSessionError::LayoutChanging` while it is, refuses
+  a change while candidates are pending or another change is in flight, and
+  lets an uncommitted record go on a term change; `apply_entry` applies the
+  record between native records (inert when its epoch has passed, the same
+  split or merge on every replica otherwise, `SuffixEvidence::LayoutChanged`
+  ending any candidates an authority still holds, a refusal fail-closed);
+  `apply_genesis` names the origin member from the genesis;
+  `is_native_entry` covers the record so the hosting Session routes it and
+  the materializer's batches end at it.
+- **Core**: `RangeLayout` carries an `epoch` (one more per applied change,
+  written and read with the checkpoint layout section, so `ROW_START` in the
+  checkpoint tests is now 104), `check_split`/`check_merge` pre-check a
+  change, `rename` gives a member its durable identity, split and merge no
+  longer refuse under leases: leases of an earlier epoch expire with the
+  members they pinned and are released by member identity; `Core::{rename_native_member}`,
+  owner `rename_native_member`.
+- **Tests**: ledger `range::tests::layout_records_round_trip_and_refuse_every_forgery`
+  and `committed_layout_changes_apply_on_every_replica_and_fence_proposals`
+  (a follower cannot propose; an inapplicable merge is refused before the
+  log; a change waits for a pending candidate; a change in flight refuses a
+  second change and a native proposal; all three replicas land on one layout
+  and epoch; records flow over it; a lagging follower installs a checkpoint
+  at epoch 1 then replays the record to epoch 2 and the records after it; a
+  restart replays the records; a merge; a handover to a new authority that
+  changes the layout again); core `ranges::tests` extended for epochs and
+  for leases across a layout change.
+
+**Evidence** (macOS arm64, this tree, 2026-09-09 20:26–20:36 CDT, gate72):
+`bash scripts/cargo.sh test --workspace --offline --no-fail-fast` ran 105
+test binaries, 2,485 passed, 0 failed; `clippy --workspace --all-targets
+--offline -- -D warnings`, `scripts/check-production.sh`, `cargo fmt --all
+--check` and `cargo check --workspace --all-targets --locked --offline` were
+clean; `python3 scripts/check-contracts.py` verified 1,331 links, 37 hashes
+and 15 vocabularies.
+
+## Chunked checkpoint seeds (R7.3, second step, 2026-09-09)
+
+**Scope.** The consensus checkpoint buffer keeps its explicit limit; a native
+Core root beyond the inline bound is sealed as content-addressed 1 MiB seed
+chunks while it streams and the Raft snapshot carries only their manifest
+([25](25-parallel-materialization-and-ranges.md) §5; decision F41;
+`FCNSESS1` version 4, [22](22-native-record-format.md) §2). A replica
+retains a seeded snapshot until it holds every chunk, pulling the missing
+ones from a peer of the ledger's installed placement or of a placement the
+directory is preparing; hosted replicas checkpoint on an operator's request;
+and the real-binary expansion of a native session is qualified end to end,
+which closed three gaps in native expansion that the in-process suites had
+bypassed.
+
+- **Evidence**: `seeds.rs` (`SeedStore`/`SeedReader`, `<hash>.seed` files
+  written through a temporary, fsynced and renamed, charged to the node's
+  `DiskBudget` as checkpoint bytes, verified on install and on read;
+  `SEED_CHUNK_BYTES` = 1 MiB); `WalLease::disk_budget`,
+  `DurableNode::disk_budget`.
+- **Ledger**: the session envelope's form byte (inline / seeded chunk table;
+  `Limits {inline_bytes 4 MiB, assembled_bytes 256 MiB}`;
+  `EncodingPlan::encode_in_seeded` streams the root through one chunk
+  buffer and the inline paths refuse a seeded plan with `Error::Seeded`);
+  `Checkpoint::describe → Option<SeedManifest>` (`None` is inline),
+  `SeedManifest::{missing, assemble}`, `Checkpoint::inspect_seeded`; the
+  engine records `PendingSeed {index, term, missing}` and answers the install
+  with a retryable `CustodyPending`; the hosting `Session` keeps the missing
+  list itself when the rebuilt engine is not adopted
+  (`seed_pending`, `pending_seed`, `install_seed_chunk`, `seed_reader`,
+  `seed_waiting`: a retained delivery is not resumed until a chunk lands);
+  `Session::{delivery_retained, snapshot_index}`; a replica whose durable
+  floor names the native successor takes part in the support exchange after
+  a restart (`managed_support_demanded`).
+- **Wire, client, node**: `CustodyRequest::SeedChunk {hash, max_bytes}` /
+  `CustodyReply::SeedChunk`; `CustodyStore::{announce_pending,
+  authorize_seed}` (the placement agent announces a pending plan's scope and
+  peers to its content host, `ContentHost::announce_pending`, and withdraws
+  it; custody requests authorize inside the store); a peer without the seed
+  answers a definite refusal; `evidence_service::pull_seed`; fleet
+  `Work::{SeedChunks, InstallSeed, Checkpoint}`,
+  `ReplicaHost::{pending_seed_chunks, install_seed_chunk, checkpoint}`,
+  `ReplicaProgress.seed_pending`, `managed_support::service_seed`; the
+  authority checkpoints once an `AddLearner` it proposed has applied behind
+  a compacted log (`checkpoint_due`: Raft discards a snapshot whose
+  configuration does not name the recipient); a hosted replica answers a
+  `ManagedSupport` probe with its successor promise (`native_support`),
+  which is how a native authority admits a prospective learner; the grouped
+  worker reports a stopped session's reason on standard error; replica
+  diagnostics gain `seed_chunks_missing` and `delivery_retained`; the
+  replica admin protocol and `focal cluster replicas checkpoint` take an
+  explicit synchronous checkpoint; `FOCAL_SEED_INLINE_BYTES` moves the
+  inline bound for qualification.
+- **Tests**: evidence `seeds_are_sealed_read_back_verified_and_removed_only_on_purpose`;
+  ledger `a_root_beyond_the_inline_bound_is_seeded_and_assembled_back_exactly`
+  (plus the form byte in the forgery test), cluster
+  `a_seeded_checkpoint_installs_once_its_chunks_are_pulled` and
+  `a_checkpoint_beyond_one_seed_chunk_installs_only_when_every_chunk_is_local`
+  (a root past one chunk: every chunk but the last exactly 1 MiB, the
+  delivery retained while one is missing, byte-identical state after), and
+  the unified Session's
+  `a_lagging_replica_installs_a_seeded_ss6_checkpoint_once_its_host_pulls_the_chunks`;
+  node `seed_chunks_are_served_to_installed_peers_and_announced_pending_peers_only`
+  and the real-binary
+  `a_seeded_native_checkpoint_carries_the_founder_session_to_new_hosts`
+  (offline native activation, a 64-byte inline bound, an explicit
+  checkpoint sealing seeds, the founder killed and restored from its own
+  seeds, two hosts joined and one tolerated node loss requested: activation
+  at route epoch 2 proves each copy pulled every chunk under the pending
+  announcement and assembled the root; every host holds seeds the founder
+  sealed).
+- **Docs**: [25](25-parallel-materialization-and-ranges.md) §5,
+  [22](22-native-record-format.md) §2, [23](23-native-activation-and-import.md)
+  §3 (items 7–8), [24](24-placement-execution-and-fleet-control.md) §8,
+  [07](07-decisions-and-traceability.md) F41, [05](05-implementation-plan.md)
+  P11.5, [cluster-admin.md](../cluster-admin.md), REMAINING R7 progress.
+
+**Evidence** (macOS arm64, this tree, 2026-09-09 22:32–22:42 CDT, gate74):
+`bash scripts/cargo.sh test --workspace --offline --no-fail-fast` ran 105
+test binaries, 2,491 passed, 1 failed:
+`placed_copies_artifact_attachment_and_cold_leader_pull_use_real_quic`
+(`evidence_quic.rs`), whose first submit answered `OutcomeUnknown` under the
+full-workspace load before the test's retry loop; the binary passed three
+of three reruns alone on the same tree, and gate73 (22:18–22:28 CDT, the
+same behaviour before three clippy-only refactors) passed all 2,492.
+`clippy --workspace --all-targets --offline -- -D warnings`,
+`scripts/check-production.sh`, `cargo fmt --all --check` and `cargo check
+--workspace --all-targets --locked --offline` were clean; `python3
+scripts/check-contracts.py` verified 1,354 links, 37 hashes and 15
+vocabularies.
+
+**Follow-up (2026-09-09, after gate74).** The flake was the test's own
+contract: five submits (`OpenEpoch` on both actors, `GenerateClaim`,
+`PostClaim`, `AcquireReceipt`, `BeginEvidenceSet`) and the final
+linearizable artifact read asserted a committed reply from one send, while
+the wire allows a replica under load to answer a fresh request with
+`OutcomeUnknown` inside its request timeout — the honest reply the test's
+`eventual` helper exists to retry with the identical envelope. Those sites
+now retry exactly like every other submit in the file; no product behaviour
+changed. Evidence: `cargo test -p focal-node --test evidence_quic` passed
+six of six reruns on this tree (2 tests each), `clippy -p focal-node
+--all-targets -- -D warnings` and `cargo fmt --all --check` were clean.
+
+## Movement records in the session log (R7.3, third step, 2026-09-09)
+
+**Scope.** The durable movement state machine of [25](25-parallel-materialization-and-ranges.md)
+§6 (decision F42): each step of a range transfer — `Begin`, `Snapshot`,
+`Barrier`, `SourceSealed`, `Ready`, `Activate`, `Abort`, `Cleanup` — is a
+`FOCALRM1` record the authority proposes and every replica applies through
+the range crate's coordinator against the committed state, under a commit
+proof minted from the entry and attested from the session genesis. Members
+are held by the voters (the log itself) or by a materializer replica;
+proofs are demanded only of replica holders. The coordinator state travels
+in the session checkpoint, so a restart or a lagging replica's snapshot
+resumes a transfer from the committed step. Between barrier and activation
+the authority refuses mutations on the moving member (`RangeMoving`).
+
+- **Range crate** (no longer dormant): `Holder::{Voters, Replica}` in
+  `Placement` (`voters()`, `replica()`, `replica_owner()`); `CommitProof`
+  gains the control `ordinal` (records order by ordinal, position by native
+  prefix); `RangeCheckpoint` schema 2 with `control_ordinal`;
+  `prepare(ordinal, sequence, op)` requires the next ordinal exactly;
+  `Snapshot`/`Ready`/`SourceSealed`/`unchanged` are required of replica-held
+  ranges only; `published()` needs progress only from replica-held members;
+  `relayout` re-lays the map after a committed layout change;
+  `range_command_hash` v2 binds the ordinal.
+- **Ledger**: `native_session_movement.rs` (`MovementRecord` codec,
+  `LedgerRangeVerifier` with `attest_*` helpers, `map_from_layout`,
+  `Movement` wrapper: `apply` mints the proof and counts deterministic
+  refusals, `split`/`merge` follow layout records, `fenced_members`);
+  `NativeSessionLimits.ranges`; `NativeSessionError::{RangeMoving,
+  Range(RangeError)}`; engine `movement` built at genesis or restored from
+  the checkpoint's movement section, `propose_range` (authority, no pending
+  candidates, no layout change or step in flight, `Cleanup` waits for pins),
+  the admission fence on touched members (`NativePrepared::touched_members`),
+  a layout change refused while a transfer is pending and inert when
+  committed behind one, `in_flight` cleared on a term change;
+  `NativeSession::{propose_range, range_map, range_epoch, movement_pending,
+  movement_checkpoint, movement_refusals, movement_in_flight,
+  range_verifier, range_activation_operation, range_activation}`; FCNSESS
+  ancillary byte 0 and the movement section (`Limits.movement_bytes`,
+  `EncodingPlan::prepare_with`, `Checkpoint::movement`,
+  `SeedManifest::movement`).
+- **Tests**: cluster
+  `a_member_moves_under_one_authoritative_decision_and_faults_at_every_barrier_recover`
+  (a follower cannot propose; a step in flight fences the next; a layout
+  change waits; records commit before the barrier; a fenced mutation is
+  `RangeMoving` and `Abort` is `Sealed` after it; a lagging follower installs
+  the checkpoint carrying the pending transfer; a forged `Ready` is refused
+  before proposal and the attested one applies everywhere; activation moves
+  the map to the next epoch under the replica holder and reopens admission;
+  `Cleanup` retires the history; a move back to the voters needs no
+  readiness, a restart mid-transfer resumes, the source's seal is demanded,
+  a new authority activates; a later split re-lays the map with inherited
+  placement); `movement_records_round_trip_and_refuse_every_forgery`,
+  `genesis_attestations_bind_every_proof_field_and_the_genesis`,
+  `a_movement_section_rides_both_forms_and_every_forgery_of_it_is_refused`;
+  the range crate's suite adapted to holders and ordinals.
+- **Docs**: [25](25-parallel-materialization-and-ranges.md) §6,
+  [22](22-native-record-format.md) §2 and §6, [07](07-decisions-and-traceability.md)
+  F42, [05](05-implementation-plan.md) P11.3/P11.5, REMAINING R7 progress.
+
+**Evidence** (macOS arm64, this tree, 2026-09-09 23:24–23:35 CDT, gate75):
+`bash scripts/cargo.sh test --workspace --offline --no-fail-fast` ran 105
+test binaries, 2,496 passed, 0 failed; `clippy --workspace --all-targets
+--offline -- -D warnings`, `scripts/check-production.sh`, `cargo fmt --all
+--check` and `cargo check --workspace --all-targets --locked --offline` were
+clean; `python3 scripts/check-contracts.py` verified 1,369 links, 37 hashes
+and 15 vocabularies.
+
+## Holders that serve (R7.3, fourth step, 2026-09-09)
+
+**Scope.** [25](25-parallel-materialization-and-ranges.md) §7 (decision
+F43): a holder of a member is a Raft learner with native hosting that
+materializes the whole session (rows hydrate from their claims' retained
+policies at decode time, so a member-scoped store is not self-contained —
+the recorded reason P11.3 stays open); movement redistributes serving. A
+holder states its readiness, seal and progress facts with its member digest
+over its own authenticated connection; the authority verifies each against
+its digest of the barrier-frozen member, attests it and proposes it. The
+session leader's controller carries an operator's move through every step.
+
+- **Core**: `NativeLocation` (where an object's rows live) with
+  `location_affinity`; `RangeLayout::{route_affinity, member_id}`;
+  `NativeRanges::member_entries`; `checkpoint::member_digest` (the root
+  frame of one member's rows; an empty member digests its prefix);
+  `Core::{native_member_for, native_member_digest}`.
+- **Ledger**: `Session::{native_range_map, native_movement_pending,
+  native_movement_checkpoint, native_movement_refusals,
+  native_movement_in_flight, native_range_verifier,
+  native_range_activation_operation, native_range_activation,
+  native_propose_range, native_member_for, native_member_at,
+  native_member_digest}`.
+- **Wire**: `Operation::RangeControl {group, request}` (tag 31, node-only,
+  certificate required, `MAX_RANGE_CONTROL_REQUEST_BYTES` 4 KiB), admitted
+  by `auth.rs`, valid for the peer pool's `send_placement`, covered in the
+  client inventory as `peer.range_control`.
+- **Node**: `fleet_range.rs` (`RangeView`/`RangeMemberView`/
+  `RangePendingView`/`RangeHistoryView`, `RangeFactRequest`/`RangeFact`,
+  `RangeControlRequest`/`RangeControlReply`; `ReplicaHost::{range_view,
+  propose_range, move_range, activate_range, range_fact}`;
+  `Work::Range`; the owner builds a move's intent from the committed map
+  with a derived transfer identity, states facts under
+  `ReplicaConfig.node_generation`, and serves a native read on a learner
+  only for members it holds (`serves_member`, `serves_all_members`,
+  `native_reads::locations`); `verify_fact`/`verify_progress`);
+  `ManagedService::range_control`; `AgentJob::MoveRange` and
+  `PlacementHandle::move_range`, the agent's bounded `move_requests`
+  answered by the leader's controller; `placement_controller::drive_movement`
+  (seed, barrier, readiness and seals asked over `RangeControl` with a
+  five-second bound, progress, activation, cleanup; refusals retried next
+  pass); admin `ReplicaAdminCommand::Ranges` → `ReplicaAdminReply::Ranges`,
+  `AdminCommand::MoveRange` → `RangeMovedReply`; `ClusterAdmin::{replica_ranges,
+  move_range, tenant}`; client `AdminResult::{ReplicaRanges, RangeMoveProposed}`
+  with `AdminRangeView`/`AdminRangeMember`/`AdminRangePending`/
+  `AdminRangeHistory`; CLI `cluster replicas ranges list|move`.
+- **Tests**: in-process
+  `a_fresh_replicated_ledger_activates_admits_frames_and_serves_linearizable_reads`
+  extended with a full move through the host (same request, same transfer;
+  seed and barrier; a fenced mutation refused; a readiness fact verified
+  against the authority's digest, a forged digest and a wrong peer refused;
+  activation under the holder reopens admission; cleanup); real-binary
+  `a_seeded_native_checkpoint_carries_the_founder_session_to_new_hosts`
+  extended with an operator move to host-a carried by the founder's
+  controller over QUIC, every process reporting the same map, and the
+  founder reporting it again after a kill and restart.
+- **Fixed on the way**: the wire's reply pairing now accepts a `Control`
+  reply for `RangeControl` (a peer's fact was discarded as lost otherwise);
+  the ranges view answers from any replica (`ReplicaAdminCommand::Ranges`
+  takes an optional group); a founder restarted into a group led by another
+  voter reports `Ready` as a follower (startup waited for a leader-only
+  quorum read and never reported, [24](24-placement-execution-and-fleet-control.md)
+  §17).
+- **Docs**: [25](25-parallel-materialization-and-ranges.md) §7,
+  [24](24-placement-execution-and-fleet-control.md) §8 and §17,
+  [07](07-decisions-and-traceability.md) F43, [05](05-implementation-plan.md)
+  P11.4/P11.5, [cluster-admin.md](../cluster-admin.md), REMAINING R7 progress.
+
+**Evidence** (macOS arm64, this tree, 2026-09-10 00:12–00:22 CDT, gate76):
+`bash scripts/cargo.sh test --workspace --offline --no-fail-fast` ran 105
+test binaries, 2,496 passed, 0 failed; `clippy --workspace --all-targets
+--offline -- -D warnings`, `scripts/check-production.sh`, `cargo fmt --all
+--check` and `cargo check --workspace --all-targets --locked --offline` were
+clean; `python3 scripts/check-contracts.py` verified 1,383 links, 37 hashes
+and 15 vocabularies.
+
+## Automatic decisions (R7.4, 2026-09-10)
+
+**Scope.** [25](25-parallel-materialization-and-ranges.md) §8 (decision
+F44): the session leader's controller decides a group's shape from its
+members' row counts with hysteresis and proposes ordinary layout records;
+after a move every replica renames the core layout's member to the map's
+identity.
+
+- **Core**: `NativeRanges::{member_stats, member_split_point}` and
+  `Core::{native_member_stats, native_member_split_point}` (a member's rows
+  and pages; the affinity at or past half its rows that is not its start).
+- **Ledger**: `Session::{native_member_stats, native_member_split_point,
+  native_propose_layout}`; the engine adopts the map's member identities
+  after every applied movement (`adopt_map_identities`; a differing member
+  count is `Corrupt`).
+- **Node**: `range_balancer.rs` (`BalancerConfig` from
+  `FOCAL_RANGE_TARGET_ENTRIES`, default 250,000, split factor 2, merge
+  divisor 4, three observations; `MemberLoad`; `Decision::{Split, Merge}`;
+  `Balancer::observe` with a bounded, pruned observation table);
+  `RangeMemberView.entries`; `RangeCall::{Layout, SplitPoint}` and
+  `ReplicaHost::{propose_layout, split_point}`; the agent's `balancer`;
+  `placement_controller::drive_balance` after `drive_movement` (skipped while
+  a transfer is pending or in flight; a split names the new member from the
+  ledger, member, affinity and epoch; refusals are observed again); client
+  `AdminRangeMember.entries`; `cluster replicas ranges list` shows it.
+- **Tests**: `range_balancer::tests` (a dip resets, a split precedes a
+  merge, a full layout never splits, non-adjacent or unequal pairs never
+  merge, a departed member drops its observations); in-process
+  `a_fresh_replicated_ledger_activates_admits_frames_and_serves_linearizable_reads`
+  extended with a split at the member's middle and a merge through the host
+  after the move; real-binary `cli_native_a1` runs the complete cycle, kill
+  and restart under `FOCAL_RANGE_TARGET_ENTRIES=4` and ends with several
+  members that all hold rows at a later epoch.
+- **Fixed on the way**: a transfer's replacement carried a fresh identity in
+  the map while the core layout kept the source's, so a merge (or any
+  layout record naming the moved member) was refused as an unknown member
+  after a move; the identities are now adopted in the same apply on every
+  replica.
+- **Docs**: [25](25-parallel-materialization-and-ranges.md) §8,
+  [07](07-decisions-and-traceability.md) F44, [05](05-implementation-plan.md)
+  P11.6, [cluster-admin.md](../cluster-admin.md), REMAINING R7 progress
+  (what keeps R7 open).
+
+**Evidence** (macOS arm64, this tree, 2026-09-10 00:39–00:49 CDT, gate77):
+`bash scripts/cargo.sh test --workspace --offline --no-fail-fast` ran
+105 test binaries, 2,498 passed, 0 failed;
+`clippy --workspace --all-targets --offline -- -D warnings`,
+`scripts/check-production.sh`, `cargo fmt --all --check` and `cargo check
+--workspace --all-targets --locked --offline` were clean; `python3
+scripts/check-contracts.py` verified 1,393 links, 37 hashes and 15
+vocabularies.
+
+## Movement under faults, holders in the directory (R7.5, 2026-09-10)
+
+**Scope.** [25](25-parallel-materialization-and-ranges.md) §9 (decision
+F45): every movement step resumes from the committed map after a crash of
+its controller; a controller claims leadership of the sessions it must
+drive; the directory publishes each session's holders.
+
+- **Consensus**: a follower may ask its leader for leadership for itself
+  (`transfer_leader(self)` forwards the raft transfer request to the
+  leader it knows); any other target from a follower stays `NotLeader`.
+- **Node**: `fault.rs` gains seven movement sites (`movement-begin`,
+  `movement-seed`, `movement-barrier`, `movement-ready`, `movement-seal`,
+  `movement-activate`, `movement-cleanup`) placed in
+  `placement_controller::drive_movement` after each step's evidence and
+  before its proposal; `claim_leadership` asks for a session's leadership
+  when this voter does not lead it and the session has work (a plan, a
+  pending transfer, a queued move, a retired map, unpublished holders);
+  `publish_holders` records the settled map as `SessionChange::Holders`
+  once per range epoch.
+- **Directory**: `SessionDescriptor.holders: Option<RangeHolders>`
+  (`RangeHolder { member, start, node, generation }`,
+  `MAX_PUBLISHED_HOLDERS` 1,024), `SessionChange::Holders`, partition
+  checkpoint schema 7 with `SessionDescriptorV6`/`PartitionCheckpointV6`
+  converting on decode; a publication applies only above the held epoch
+  (idempotent at the same epoch for the same members, `CompareFailed`
+  otherwise, `StaleEpoch` below), in key order with unique identities, and
+  with every holding replica a member of the active placement at its
+  enrolled generation (`Missing`/`StaleNode`).
+- **Admin**: `AdminSessionPlacement.{range_epoch, holders}` with
+  `AdminRangeHolder`; `cluster placement` shows them.
+- **Tests**: `placement_progress::holders_publish_in_epoch_order_for_placement_members_only`
+  (every refusal, idempotence, conflict, staleness, the schema 7 round trip
+  and a schema 6 restore); real-binary
+  `movement_survives_a_cut_at_every_step_a_dead_destination_and_duplicate_requests`
+  (seven cuts with the founder restarted and claiming the session each
+  time, seven moves settling on every process; a duplicate move; a dead
+  destination holding at the barrier with a submission refused; a listing
+  continued across the move; the directory's publication).
+- **Docs**: [25](25-parallel-materialization-and-ranges.md) §9,
+  [24](24-placement-execution-and-fleet-control.md) §6, §9, §15 and its
+  limit notes, [06](06-verification-and-operations.md) §3,
+  [07](07-decisions-and-traceability.md) F45, [05](05-implementation-plan.md)
+  P11.5/P11.6, [cluster-admin.md](../cluster-admin.md), REMAINING R7
+  progress (what keeps R7 open).
+
+**Evidence** (macOS arm64, this tree, 2026-09-10 01:14–01:27 CDT, gate78):
+`bash scripts/cargo.sh test --workspace --offline --no-fail-fast` ran
+105 test binaries, 2,500 passed, 0 failed;
+`clippy --workspace --all-targets --offline -- -D warnings`,
+`scripts/check-production.sh`, `cargo fmt --all --check` and `cargo check
+--workspace --all-targets --locked --offline` were clean; `python3
+scripts/check-contracts.py` verified 1,411 links, 37 hashes and 15
+vocabularies.
+
+## Custody receipts and obligations (R8.2, 2026-09-10)
+
+**Scope.** [26](26-custody-archive-retention-and-restore.md) §1 (decision
+F46): a copy's verified custody is kept as an attested receipt and read as
+an obligation before a validation phase against an artifact is admitted.
+
+- **Evidence**: `custody_receipt.rs` (`CustodyReceipt`, `FCCRCPT1`,
+  `RECEIPT_BYTES` 160, keyed attestation, `name(ledger, root, node)`);
+  `CustodyRecordKind::Receipt` (`receipts/`);
+  `ContentStore::{replace_named_custody_record, read_named_custody_record,
+  record_custody_receipt, custody_receipt}`.
+- **Core**: `DecodedRequest::into_evaluation_artifact` (the artifact a
+  `BeginIncrement`/`BeginWork` frame evaluates; fixed plans only).
+- **Node**: `ContentHost::{record_receipt, receipt}` (`Command::{RecordReceipt,
+  Receipt}`); `evidence_service::{CustodyObligation, receipt_for,
+  obligation}`, `EvidenceCoordinator::obligation` (`JobKind::Obligation`),
+  receipts recorded in `replicate` for this node and every `Durable` copy;
+  `native_ingress::{evaluates_artifact, evaluation_artifact_of_frame}`;
+  `ReplicaHost::artifact_pointer` (`Work::ArtifactPointer`);
+  `FleetService::eligible` refuses a phase whose artifact's copies fall
+  short as a retryable capacity refusal naming the missing nodes.
+- **Tests**: `custody_receipt::tests` (round trip, every forgery, names,
+  reopen, replacement, corruption); `evidence_service::tests`
+  (`replication_records_a_receipt_per_verified_copy_and_the_obligation_reads_them`,
+  `a_phase_beginning_frame_names_its_artifact_and_other_frames_do_not`);
+  the A1 real-binary cycle runs `BeginWork` through the check.
+- **Docs**: [26](26-custody-archive-retention-and-restore.md) §1 (new
+  document, indexed), [04](04-storage-and-distribution.md) §7,
+  [07](07-decisions-and-traceability.md) F46, [05](05-implementation-plan.md)
+  P12 progress, REMAINING R8 progress.
+
+**Evidence** (macOS arm64, this tree, 2026-09-10 01:44–01:57 CDT, gate79):
+`bash scripts/cargo.sh test --workspace --offline --no-fail-fast` ran
+105 test binaries, 2,503 passed, 1 (`cli_network` `replicas::actual_cli_and_mcp_administer_installed_data_membership_with_distinct_restart_receipts`: the node's start refused a loopback UDP port another test binary's node had bound seconds after this binary probed it free — a cross-process race in the test harness's port allocation, not in the product; the test passes alone, and the harness now claims ports with an exclusive lock file shared by every real-binary test, gated next) failed;
+`clippy --workspace --all-targets --offline -- -D warnings`,
+`scripts/check-production.sh`, `cargo fmt --all --check` and `cargo check
+--workspace --all-targets --locked --offline` were clean; `python3
+scripts/check-contracts.py` verified 1,429 links, 37 hashes and 15
+vocabularies.
+
+## Registry history, checkpoint cadence and retention floors (R8.3–R8.4a, 2026-09-10)
+
+**Scope.** [26](26-custody-archive-retention-and-restore.md) §2 (decision
+F47): schema and validator identities survive upgrades. §3 (decision F48):
+every replica checkpoints by entry cadence, the retention floor and its
+blocker are computed and shown, and the archive's report rides the
+checkpoint; a sequence-based event retirement was built, failed restore
+validation against complete object histories, and was withdrawn in favour
+of per-object reclamation with the archive (§4, next).
+
+- **Evidence**: `registry_history.rs` (`SchemaRegistry` with
+  `SchemaRecord {descriptor, maximum_bytes, introduced_at, superseded_by,
+  superseded_at}`, `new`/`new_in`/`with_builtins`, `register`, `supersede`,
+  `record`, `current`, `NativeSchemaVerifier`; `MAX_SCHEMA_DESCRIPTOR_BYTES`
+  4 KiB); `validators::{Lifetime, RegistryError::Retired}`,
+  `Registry::{register_at, retire, lookup, lifetime}`, `execute` refusing a
+  retired version.
+- **Ledger**: `native_session_retention.rs` (`RetentionReport`,
+  `RetentionBlocker`); engine `archived_through` with `note_archived`;
+  `RetentionSection { archived_through }` under `FCNSESS` ancillary byte 1
+  (`EncodingPlan::prepare_with_sections`, `Checkpoint::retention`,
+  `SeedManifest::retention`); `Session::{native_retention,
+  native_note_archived}`; `NativeSession::{archived_through, note_archived}`.
+- **Node**: `ReplicaConfig::checkpoint_after_entries` (4,096) with
+  `checkpoint_by_cadence`/`try_checkpoint` in the owner's tick;
+  `log_entries_since_checkpoint` and `retention: Option<AdminRetention>`
+  in `AdminReplicaDiagnostics`.
+- **Harness**: `tests/support/ports.rs` claims each loopback port with an
+  exclusive lock file shared by every real-binary test binary (a stale lock
+  is reclaimed after half an hour) before probing it, replacing fifteen
+  per-process allocators whose ranges overlapped (the gate79 collision).
+- **Tests**: `registry_history::tests::{schemas_keep_their_identity_and_bound_across_supersession,
+  a_retired_validator_keeps_its_identity_and_runs_nothing_new}`;
+  `native_session::retention::tests`, `native_checkpoint`
+  `a_retention_section_rides_both_forms_beside_the_movement_section`,
+  `native_session::cluster_tests::the_archives_report_is_monotone_and_rides_checkpoints`;
+  the fleet native test under a four-entry cadence observes compaction and
+  the floor.
+- **Docs**: [26](26-custody-archive-retention-and-restore.md) §2–§3,
+  [07](07-decisions-and-traceability.md) F47–F48, [05](05-implementation-plan.md)
+  P12 progress, [cluster-admin.md](../cluster-admin.md), REMAINING R8
+  progress.
+
+**Evidence** (macOS arm64, this tree, 2026-09-10 02:37–02:50 CDT, gate80):
+`bash scripts/cargo.sh test --workspace --offline --no-fail-fast` ran
+105 test binaries, 2,508 passed, 1 (`fleet::async_tests::shared_owner_queues_covering_flush_and_serves_another_group_while_disk_waits`, the recorded shared-owner timing case: one of three parallel writes answered under the full gate's load with something other than a commit; it passed three of three reruns alone; the harness is made exact-retrying in the next batch rather than loosened) failed;
+`clippy --workspace --all-targets --offline -- -D warnings`,
+`scripts/check-production.sh`, `cargo fmt --all --check` and `cargo check
+--workspace --all-targets --locked --offline` were clean; `python3
+scripts/check-contracts.py` verified 1,446 links, 37 hashes and 15
+vocabularies.
+
+
+## Retirement to the archive (R8.4b, 2026-09-10)
+
+**Scope.** [26](26-custody-archive-retention-and-restore.md) §4 (decision
+F49): a terminal, released family leaves the core to a content-addressed
+bundle under custody through a committed record, behind typed
+continuations; the archive agent drives it; the operator reads the floor's
+counts and verifies a bundle.
+
+- **Core** (`crates/focal-core/src/native/retirement.rs`, `record_codec/archive.rs`):
+  `RetirementFamily {root, members, events, through}` derived by
+  `Core::retirement_family` from the committed state alone (members by
+  owner lineage; every row under a member's affinity that names it, never a
+  colliding bucket's; declarations from the acceptance policy and the
+  registration set; cycles, receipts, responses, testaments, work and
+  diagnostic chains, accepted artifacts, monitors, index rows through
+  `index_rows::{claim,definition,artifact,accepted}`, content identities,
+  the event rows describing any family key); refusals `RetirementRefusal::{Unknown,
+  NotTerminal, NotReleased, LiveParent, LiveDependent, LiveMonitor,
+  LiveReference, LiveEvaluation, TooLarge, Corrupt}`; bounds 64 members,
+  65,536 rows; `retirement_candidates` walks the terminal status buckets
+  with a resumable cursor; `archive_family_quote`/`archive_family_into`
+  write the `FCNARCHV` frame; `StructuralArchive::inspect` verifies one
+  (digest, header, members, row order and families, no accounting row,
+  nothing trailing) and counts rows by family; `retire_native_family`
+  deletes the family, decrements Meta per family, writes `Key::Retired`
+  (family 49: bundle root, length, prefix claimed, final binding and
+  status, retirement sequence, events that left) and one outcome
+  (`NativeInvocation::Retirement`, operation `Retire`, no events).
+  Validators: `read_validate` reconciles missing outcome events against
+  the continuations' counts; the authored profile's strict walk
+  (`authored_check.rs`) and the checkpoint's `objects::authored` accept a
+  creation-result entry whose identity left when its claim's continuation
+  (or, for a definition, a retired claim of the same creation) vouches for
+  it. Owner reconstruction over a retired core is tested.
+- **Ledger** (`native_session_retirement.rs`, engine, apply, checkpoint,
+  hosting): `FOCALRT1` (146 bytes) `RetirementRecord {ledger,
+  expected_prefix, root, bundle, bytes, through}`;
+  `propose_retirement` on the authority after deriving the family
+  (`NativeSessionError::{Retiring, Retirement(refusal)}`); native
+  admission, layout changes and movement steps answer `Retiring` while a
+  record is in flight; `apply_retirement` is inert on a passed prefix, a
+  pending movement or a refused family, otherwise retires through the
+  committed core (`SuffixEvidence::Retired` for pending candidates; the
+  hosted session reconstructs the authority's owner at once when it is
+  past this term's readiness barrier, as after activation); the replica
+  counts applied records and the count rides the checkpoint's retention
+  section (`RetentionSection {archived_through, retired_families}`, +8
+  bytes) and restores from it; `RetentionReport {retired, retiring}` and
+  `allows_family` (inclusive of the cursor floor).
+- **Node**: `RangeCall::{Candidates, Archive, Retire, Retired}` and
+  `ReplicaHost::{retirement_candidates, archive_family(root, min_age_ms),
+  propose_retirement, retired}` (`ArchivedFamily` charged to the replica
+  budget; only on the authority, past the floor, and settled at least the
+  grace ago on the node's logical clock); `EvidenceCoordinator::archive`
+  seals the bundle as an evidence-class object of the ledger's tenant
+  domain, replicates it to every required copy exactly as an upload and
+  reports the obligation (`ArchiveOutcome`); `archive_agent.rs`
+  (`FOCAL_RETIRE_INTERVAL_MS` 5,000; `FOCAL_RETIRE_AFTER_MS` 86,400,000;
+  1,024 index rows per replica per tick; one family per replica per tick)
+  runs in every `NetworkService`; `NativeObject::Retired(NativeRetiredClaim)`
+  on reads of a retired claim; `OperatorRead::Archive {session, claim}`
+  → `AdminArchiveBundle` (continuation, verified structure, families,
+  receipts); `AdminRetention {retired, retiring}`; CLI `cluster retention
+  show`, `cluster archive show --claim`; MCP `cluster.retention.show`,
+  `cluster.archive.show` (41 admin descriptors; cluster skill version 7,
+  manifest re-pinned).
+- **Tests**: `native::retirement_tests` (3), `record_codec::archive` through
+  them, `native_session::retirement::tests`,
+  `native_session::cluster_tests::committed_retirements_apply_on_every_replica_and_fence_proposals`,
+  `session_native_tests::a_hosted_authority_retires_a_family_and_stays_authoritative`,
+  `native_session::retention::tests` (2), `native_checkpoint` section test
+  (+16 bytes), wire/MCP/skill contract tests updated,
+  `crates/focal-node/tests/cli_retention.rs` (real binary: create, cancel,
+  release, agent-driven retirement, continuation read, retention counts,
+  verified bundle with its receipt, no archive for a live claim, exact
+  retry of the retired claim's creation, kill and restart).
+- **Docs**: [26](26-custody-archive-retention-and-restore.md) §4,
+  [22](22-native-record-format.md) (`FOCALRT1`, `FCNARCHV`, family 49 body),
+  [07](07-decisions-and-traceability.md) F49, [05](05-implementation-plan.md) P12,
+  `docs/cluster-admin.md`, `docs/REMAINING.md` R8 progress,
+  `skills/focal-cluster/SKILL.md` + `skills/manifest.json`.
+
+**Lessons.** (1) A family's rows are found by affinity, but an affinity is
+a bucket: a participant's index rows and any colliding id share it, so the
+scan keeps only rows that name the member. (2) The authored profile
+cross-links creation results, identities, contents and claims; identities
+leave with the family and the continuation vouches for the creation
+result's entries. (3) The hosted session promotes the engine at its own
+readiness barrier, never through the engine's request path, so a record
+that demotes the authority must reconstruct it there. (4) Finished claims
+must stay readable for a grace: without one, background retirement
+changed the answers of every journey that reads a released claim (the A3
+audit re-post read `not_found` instead of `conflict`).
+
+**Evidence (gate 82).** `bash scripts/cargo.sh test --workspace --offline
+--no-fail-fast` 2026-09-10 04:46:17–04:59:32 CDT, macOS arm64: 106 test
+binaries, 2,517 passed, 0 failed. `cargo clippy --workspace --all-targets
+--offline -- -D warnings`: clean. `bash scripts/check-production.sh`:
+clean. `cargo fmt --all --check`: clean. `cargo check --workspace
+--all-targets --locked --offline`: clean. `python3
+scripts/check-contracts.py`: 1,454 architecture links, 37 imported hashes,
+15 frozen vocabularies. Gate 81 (04:32–04:45) had the same test totals and
+one clippy refusal (`while_let_on_iterator` in the candidate walk),
+rewritten before gate 82.
+
+**Limits.** As [26](26-custody-archive-retention-and-restore.md) §4:
+continuations are permanent until R8.6's catalog; whole families only;
+bundle hydration is restore's; the grace and interval are node-local
+settings until R9's committed policy; a bundle whose copies never answer
+waits for R8.5's collector.
+
+## The collector (R8.5, 2026-09-10)
+
+**Scope.** [26](26-custody-archive-retention-and-restore.md) §5 (decision
+F50): every node reclaims bytes outside what the committed rows name, after
+a grace, through a dated quarantine that is reversible until its own grace
+expires; the roots come from the hosted replicas' rows and the bundles
+those rows name; domains this node cannot walk are opaque.
+
+**Delivered.**
+
+- `focal-core`: `Core::native_content_roots(cursor, max_visits)` walks
+  every row a page at a time and yields `ContentRoot::{Artifact(root),
+  Inline(stream digest), Bundle{root, bytes}}`; the archive frame
+  (`FCNARCHV`) carries the family's `content` roots and `inline` digests in
+  strictly ascending order, read back by `StructuralArchive::header()`.
+- `focal-evidence` (`store/gc.rs`): `ProtectionSet` (objects by root,
+  streams by digest, custody records in use, opaque domains),
+  `CollectorConfig` (grace one day, quarantine seven days, terminal fence
+  seven days, four records kept, 1,048,576 marks), the phased
+  `ContentStore::collect_step` (uploads → terminals → per-domain manifests
+  and chunks → custody records → receipts → quarantine rounds), rename
+  into `quarantine/<round>/…` with directory syncs, `restore_quarantined`,
+  reopen re-syncing the rounds, and `SeedStore::collect`; `CollectorReport`
+  and `SeedReport` count every action.
+- `focal-ledger`: `Session::native_content_roots`, `native_seed_chunks`
+  (the latest checkpoint's chunks and any pending seed) and
+  `native_collect_seeds`.
+- `focal-node`: the collector agent (`gc.rs`; `FOCAL_GC_INTERVAL_MS`,
+  `FOCAL_GC_GRACE_MS`, `FOCAL_GC_QUARANTINE_MS`, `FOCAL_GC_TERMINAL_MS`)
+  gathers roots through `RangeCall::ContentRoots`, reads each bundle's
+  header once, installs the protection set and drives `collect` through
+  `ContentHost::{protect, collect, restore_quarantined}`, then sweeps seeds
+  through `RangeCall::CollectSeeds`; `OperatorRead::Gc`,
+  `AdminCommand::GcRestore`, `cluster gc show`, `cluster gc restore
+  --domain --root`, MCP `cluster.gc.show` and `cluster.gc.restore` (43 admin
+  descriptors; cluster skill v8).
+
+**Evidence (macOS arm64, `--offline`).** Gate 84, 2026-09-10
+05:54:29–06:07:57 CDT, on the final tree of this section:
+
+- `bash scripts/cargo.sh test --workspace --offline --no-fail-fast`: 107
+  test binaries, 2,524 passed, 0 failed, 0 ignored failures (the run also
+  exercised the new `crates/focal-node/tests/cli_gc.rs`,
+  `focal_evidence::store::gc::tests` and the retirement bundle-header
+  tests).
+- `bash scripts/cargo.sh clippy --workspace --all-targets --offline -- -D
+  warnings`: clean (gate 83 at 05:39 had refused a `windows(2)` index in the
+  archive frame's order check; replaced by a `zip`-based
+  `strictly_ascending`).
+- `bash scripts/check-production.sh`: clean.
+- `cargo fmt --all --check`: clean.
+- `cargo check --workspace --all-targets --locked --offline`: clean.
+- `python3 scripts/check-contracts.py`: 1,464 architecture links, 37
+  imported source hashes, 15 frozen vocabularies.
+
+**Remaining in R8.** Backup at a declared prefix, restore verification and
+the recovery incarnation, the operator surface for both (R8.6); the
+compaction of continuations; the sustained-bounds loop and the corruption
+suite of the close gate.
+
+## Backups at a declared prefix (R8.6, first step, 2026-09-10)
+
+**Scope.** [26](26-custody-archive-retention-and-restore.md) §6 (decision
+F51): a coherent backup of one hosted native session — the envelope its
+replica installed durably at one applied index, the seed chunks of that
+envelope's root, the exact tree of every content object the envelope's
+rows and archive bundles name, and a hashed manifest written last — and
+its verification, which runs without a node.
+
+**Delivered.**
+
+- `focal-core`: `ContentRoot::{Artifact(pointer), Inline(pointer)}` carry
+  the recorded custody pointer (an inline payload's sealed object has the
+  same root on every replica, since every replica seals it under the
+  canonical chunking and reads it back under the record's pointer); the
+  `FCNARCHV` header's `inline` list names those roots; the collector
+  protects both by root.
+- `focal-evidence`: `ContentReader::{describe_object, read_transfer_chunk}`
+  and `describe_encoded` export an installed object's exact tree from its
+  manifest alone; `TransferManifest::chunk(index)`.
+- `focal-ledger` (`session_backup.rs`, `focal_ledger::backup`): the
+  `FCLBKUP1` manifest ([22](22-native-record-format.md) §8), the
+  `BackupMedium` install sequence (temporary, sync, rename, directory
+  sync) implemented by the filesystem and by the simulated disk, the
+  `ObjectSource`/`SeedSource` readers over a store or a backup directory,
+  `inventory` (decode the envelope, assemble a seeded root, rebuild the
+  Core through recovery, walk the roots, read each bundle's header),
+  `write` (refuses an existing manifest), `verify` (every file, then the
+  envelope rebuilt against the backup's own files and compared with the
+  manifest, problems listed), and `decoder_pair`;
+  `SeedManifest::assemble_with` reads chunks from any source.
+- `focal-node`: `backup.rs` (`create` through the replica's evidence export
+  and a blocking write; `verify` offline), `AdminCommand::BackupCreate`,
+  `cluster backup create --output DIR [--session ID]`, `cluster backup
+  verify --input DIR` (runs before any node or data directory is opened),
+  MCP `cluster.backup.create` and `cluster.backup.verify` (45 admin
+  descriptors, cluster skill v9), `AdminResult::{BackupCreated,
+  BackupVerified}` with `AdminBackup`, `AdminBackupPrefix` and
+  `AdminBackupVerification`; a session without a committed placement
+  answers `unavailable`.
+- `focal-sim`: `Disk::operations()` names the cut coordinate.
+
+**Evidence (macOS arm64, `--offline`).** Gate 86, 2026-09-10
+06:56:20–07:09:51 CDT, on the final tree of this section:
+
+- `bash scripts/cargo.sh test --workspace --offline --no-fail-fast`: 108
+  test binaries, 2,525 passed, 2 failed — both in the `focal-node` library
+  suite and both known load flakes that pass alone and passed in gate 84:
+  `fleet_tests::exact_retry_rediscovery_preserves_receipt_after_cached_owner_loses_leadership`
+  (`NotLeader` before the re-election settled) and
+  `placement_agent::tests::operators_admit_tenants_and_create_sessions_that_register_serve_and_survive_restart`
+  (the operator's placement read landed before the agent's registration
+  pass); rerun alone immediately after the gate: 2 passed. The run
+  includes the new `crates/focal-node/tests/cli_backup.rs` and the two
+  ledger backup tests (every durable cut; a seeded root).
+- Gate 85 (06:40–06:54) on the previous tree found one clippy refusal
+  (`items_after_test_module` in `transfer.rs`) and one timing race in
+  `cli_retention.rs` (the claim's status read after its release raced the
+  archive agent at a zero grace); both fixed, gate 86 is the evidence.
+- `bash scripts/cargo.sh clippy --workspace --all-targets --offline -- -D
+  warnings`: clean.
+- `bash scripts/check-production.sh`: clean.
+- `cargo fmt --all --check`: clean.
+- `cargo check --workspace --all-targets --locked --offline`: clean.
+- `python3 scripts/check-contracts.py`: 1,471 architecture links, 37
+  imported source hashes, 15 frozen vocabularies.
+
+**Remaining in R8.6.** Restore: verification before serving, the
+recovery incarnation (a new log group and genesis, the placement and
+membership sections reset, the session registered as this node's own),
+the fenced same-incarnation decision, `cluster restore`, and the
+real-binary journey through a killed node and a fresh cluster.
+
+## Restore and the recovery incarnation (R8.6, second step, 2026-09-10)
+
+**Scope.** [26](26-custody-archive-retention-and-restore.md) §6 (decision
+F52): a verified backup becomes a hosted session on this node from the
+backup's prefix, under the incarnation the committed enrollment registry
+allows; nothing is served before verification; a restore never overwrites
+history.
+
+**Delivered.**
+
+- `focal-consensus`: `RestoredLog` and `DurableNode::{restore_in,
+  restore_on_wal_in}` begin a logical group's log from an image — on an
+  empty log only: identity, decoder floor and transition, the snapshot at
+  the image's index and term under the bootstrap membership, a hard state
+  that commits it — and open the group as a restart would.
+- `focal-ledger` (`backup`): `decode_image` (shared by inventory, verify
+  and restore), `Incarnation`, `rewrite` (the envelope re-encoded under the
+  target's cluster, group and re-derived genesis, a bootstrap membership of
+  the restoring node, placement and membership sections reset, movement
+  dropped, a seeded root sealed into the target seed store), `import_content`
+  (each object installed chunk by chunk as a custody transfer does) and
+  `import_seeds`.
+- `focal-node`: `backup::{RestoreDecision, decide, recovery_group,
+  RestoreRequest, RestoredSession, read_manifest}`, the placement agent's
+  `restore_session` (verify, refuse a hosted or directory-held session,
+  admit the tenant, import through `ContentHost::restore_content`, install
+  seeds and rewrite on a blocking thread, begin the log, record the copy as
+  created here, attach it through the refactored `attach_copy`; the next
+  pass registers it), `AdminCommand::Restore`, `cluster restore --input DIR
+  [--new-incarnation]`, MCP `cluster.restore` (46 admin descriptors,
+  cluster skill v10), `AdminResult::Restored` with `AdminRestore`;
+  `cluster backup create` takes `--tenant` for a served tenant's session;
+  saved connections address another served session (`context add NAME
+  --node-data-dir DIR --tenant ID --session ID`, `context add NAME
+  --enrolled-as CONTEXT --session ID`).
+
+**Evidence (macOS arm64, `--offline`).** Gate 87, 2026-09-10
+07:35:10–07:48:50 CDT, on the final tree of this section:
+
+- `bash scripts/cargo.sh test --workspace --offline --no-fail-fast`: 109
+  test binaries, 2,529 passed, 0 failed (including the new
+  `crates/focal-node/tests/cli_restore.rs` and the ledger's in-process
+  restore round trip
+  `a_backup_restores_into_a_new_incarnation_that_holds_the_prefix_and_continues`).
+- `bash scripts/cargo.sh clippy --workspace --all-targets --offline -- -D
+  warnings`: clean.
+- `bash scripts/check-production.sh`: clean.
+- `cargo fmt --all --check`: clean.
+- `cargo check --workspace --all-targets --locked --offline`: clean.
+- `python3 scripts/check-contracts.py`: 1,477 architecture links, 37
+  imported source hashes, 15 frozen vocabularies.
+
+**Remaining in R8.** The operator view of retention policy, storage
+pressure and repair progress beyond the retention, gc and backup reads
+(instruction 9; the committed policy is R9's); the compaction of
+continuations; the sustained-bounds loop and the corruption suite of the
+close gate; the same-cluster restore of a session the directory still
+names (a placement decision, R9).
+
+## The operator's storage view and R8's close (2026-09-10)
+
+**Scope.** [26](26-custody-archive-retention-and-restore.md) §7 (decision
+F53): one local read of the node's storage pressure, agents and retention
+floors; the sustained-bounds workload and the corruption cases R8's close
+gate names.
+
+**Delivered.**
+
+- `focal-node`: `OperatorRead::Storage`, `cluster storage show`, MCP
+  `cluster.storage.show` (47 admin descriptors, cluster skill v11);
+  `ContentHost::disk_stats` (the volume envelope's statistics and what is
+  staged); the archive agent publishes `AdminArchiveAgent` (interval,
+  grace, ticks, proposed, waiting) through an `ArchiveHandle` the admin
+  serves; `AdminStorage`, `AdminDiskStats`, `AdminSessionRetention` and
+  `AdminResult::Storage` in `focal-client`.
+- Evidence added to the suites: the ledger's
+  `a_sustained_workload_stays_within_its_budgets_and_keeps_every_outcome`
+  (24 rounds of create/finish/release/archive/retire with checkpoints and
+  collector passes every fourth round, memory within its allowance and
+  plateaued, no proof quarantined, every outcome exact, every bundle
+  verified, a backup written and verified); `cli_retention.rs` sees a
+  corrupted bundle chunk turn the archive unverified and back;
+  `cli_restore.rs` sees a corrupted backup refused before any file moves;
+  `cli_backup.rs` reads the storage view.
+
+**Evidence (macOS arm64, `--offline`).** Gate 88, 2026-09-10
+07:58:55–08:12:36 CDT, on the final tree of this section:
+
+- `bash scripts/cargo.sh test --workspace --offline --no-fail-fast`: 109
+  test binaries, 2,530 passed, 0 failed.
+- `bash scripts/cargo.sh clippy --workspace --all-targets --offline -- -D
+  warnings`: clean.
+- `bash scripts/check-production.sh`: clean.
+- `cargo fmt --all --check`: clean.
+- `cargo check --workspace --all-targets --locked --offline`: clean.
+- `python3 scripts/check-contracts.py`: 1,482 architecture links, 37
+  imported source hashes, 15 frozen vocabularies.
+
+**R8 is closed** on this evidence; its stated limits (the receipt floors
+of P12.3, cold proof lookup beyond bundle verification, searchable indexes
+over bundles, pacing by work credits, the compaction of continuations, the
+committed retention policy of R9, and the same-cluster restore of a
+session the directory still names) are recorded in [26](26-custody-archive-retention-and-restore.md).
+
+## Typed configuration with ownership (R9.1, 2026-09-10)
+
+**Scope.** [08](08-stepped-complexity-and-deployment.md) §2: one versioned
+schema, two authorities. Node-local facts may be overridden at startup;
+the durability and placement intent is committed with the store and
+changes only through plan and apply; unknown keys fail by their full path;
+omitted fields keep committed values; every value names its source.
+
+**Delivered.**
+
+- `crates/focal-node/src/config/` replaces `config.rs`: `schema.rs`
+  (`check_unknown_keys` walks the embedded JSON schema and names the first
+  unknown key by its dotted path; `properties` lets a test hold the schema
+  and the typed settings to the same fields), `local.rs` (`LocalFacts`),
+  `policy.rs` (`PolicyIntent`, `PolicyRevision`, `CommittedPolicy` in the
+  `POLICY` file as `FCLPOL2` with a revision and a hash — the original bare
+  pair reads as revision 1 and is never rewritten; `read_committed`,
+  `install_or_check`, `commit`), `resolve.rs` (`CliOverrides`,
+  `FilePresence`, `ConfigSource::{CommandLine, File, CreationDefault,
+  Committed(revision)}`, `resolve`).
+- `ConfigError::{UnknownKey{path}, CommittedPolicyChange{field},
+  PolicyMissing, PolicyEncoding}`; both open paths (`EmbeddedNode::open`,
+  the founding network) check the committed policy before re-solving
+  placement, so a differing file is refused by its field and a lost policy
+  beside a store is data loss (`policy_missing`, exit 1), while an unknown
+  key or a committed change is operator input (exit 2, `committed_policy`).
+- `node.metrics_listen` (loopback only) joins the schema and the settings;
+  the schema now declares `node.max_tenants`.
+- `deployment explain` prints `requested`, `effective`, `committed_revision`
+  and `sources`.
+- Tests: `config/tests.rs` (unknown-key paths, schema/serde agreement,
+  precedence and sources, committed policy over omitted fields and refusal
+  by name, the policy file's forms and revisions, loopback metrics);
+  `cli_failures.rs::committed_policy_and_unknown_keys_are_refused_by_name`
+  on the real binary.
+
+**Evidence (macOS arm64, `--offline`).** Gate 90, 2026-09-10
+09:20:51–09:34:09 CDT, on the final tree of this section: `test
+--workspace`: 109 binaries, 2,537 passed, 0 failed; clippy, production
+lints, fmt and the locked check clean; contracts 1,486 links (gate 89 at
+08:25 had one test still expecting the old opaque error for a lost policy;
+fixed, gate 90 is the evidence).
+
+
+## Deployment plans and their application (R9.2, 2026-09-10)
+
+Instruction 2 of R9 ([REMAINING §14](../REMAINING.md); [08](08-stepped-complexity-and-deployment.md) §9):
+a plan is an immutable artifact computed from what the node observes and
+what the operator requests; applying it rechecks every observation it was
+built on and refuses a stale plan before any side effect; progress is
+journaled per change so a repeated apply resumes and repeats nothing.
+
+- Dry-run placement requests: `AdminCommand::PlanSession` carries `dry_run`
+  (`SessionPlannedReply` schema 2 echoes it); the placement agent keeps its
+  waiters as `(reply, dry_run)` pairs and journals `SessionChange::Plan`
+  only when a waiter is not a dry run — a request that is only dry runs
+  proposes from the committed directory and commits nothing; `pending` and
+  `satisfied` answers never journaled. `cluster sessions plan --dry-run`,
+  MCP `cluster.sessions.plan` v2 (`dry_run`), `AdminResult::SessionPlanned
+  { dry_run }`; cluster skill v12.
+- `crates/focal-node/src/deployment/`: `plan.rs` (`FCLPLAN1`: magic,
+  postcard `DeploymentPlan { schema, plan_id, created_ms, observed_at, body
+  }`, BLAKE3 trailer; `PlanBody { deployment {cluster, node}, observed
+  {policy_revision, policy_hash, policy, sessions[epochs, voters, desired,
+  achieved, pending, blocked_by], nodes}, requested, policy_hash, changes,
+  guarantee {before, during, after}, blocked }`; `Change::{CommitPolicy,
+  PlanSession {operation, voters, expected epochs, pending}, NoChange}`;
+  `plan_id` = `derive_key("focal.deployment.plan.v1", body)[..16]`, so
+  the same observation and request make the same plan; `compose` orders the
+  policy commit first when the request differs, one change per session in
+  observation order, blocked sessions listed with the guarantee after equal
+  to the guarantee before — the weakest achieved level across the sessions
+  (`GuaranteeLevel` ranked by tolerated failures, then domain breadth), or
+  the committed level without sessions — and the guarantee during equal to
+  the guarantee before; bounds 4 MiB and 4,096 sessions; a truncated
+  directory view is refused), `observe.rs` (the committed policy and the
+  placement view converted once, sessions deduplicated), `apply.rs`
+  (`FCLAPLY1` journal under `cluster/apply/<plan>/JOURNAL` with the plan
+  beside it; `Phase::{Prepared, Committed, Verified, Complete}` per step,
+  `Outcome::{InProgress, Complete, Stale}`; `preflight` checks every step not
+  yet committed against the current policy revision and session epochs
+  without sending anything; `apply` refuses another cluster's plan, a plan
+  with blocked sessions and a stale plan (no journal is created), commits
+  the policy as the expected next revision and reads it back, sends each
+  placement request (a reply naming another operation marks the journal
+  stale), observes it under way and complete, waits at most `--wait`;
+  `status` re-checks journaled plans), `mod.rs` (`DeploymentError` with
+  exits `stale_plan` 5, `wrong_deployment` 2, `plan_corrupt` 2,
+  `guarantee_unsatisfied` 6).
+- `cli/deployment.rs` (moved out of `main.rs`): `deployment plan --config
+  FILE (--output NEW_FILE | --dry-run)`, `apply --plan-file FILE [--wait
+  SECONDS]`, `status [--plan ID]`, and the existing `explain` (now printing
+  `requested`, `effective`, `committed_revision` and `sources` also when the
+  local inventory cannot satisfy the policy) and `schema`.
+- Configuration: `load_settings` resolves against the data directory's
+  committed policy for every command, so omitted policy fields take the
+  committed values at startup (the R9.1 rule, previously only stated) and a
+  differing file is refused by name at load; `resolve_request` serves
+  `deployment plan`/`explain`, where the file is the request. The founding
+  network node solves the single-node placement only when pinning its first
+  policy, and the service falls back to the single-node scope before its
+  session registers, so a committed policy stronger than one host provides
+  no longer refuses a restart.
+- Tests: `deployment/tests.rs` (ordering and identity, blocked sessions,
+  artifact round trip and every tamper, preflight by the fact that moved,
+  journal monotonicity, progress from the directory), `config/tests.rs`
+  (request resolution), `cli_deployment.rs` on the real binary (founder and
+  two hosts: a dry run prints the plan and journals nothing, a plan needing
+  more domains is blocked and refused by apply, the written plan equals the
+  dry run, is immutable, applies with `--wait` to activation at route epoch
+  2 and resumes complete, a plan from an older observation is refused stale
+  without a journal, a tampered plan and a laptop's plan are refused, the
+  laptop applies its own plan and restarts under it, and the founder
+  restarts under the stronger committed policy with the requesting file or
+  none while the old value is refused by name).
+
+**Evidence (macOS arm64, `--offline`).** Gate 91, 2026-09-10
+10:03:23–10:18:05 CDT, on the final tree of this section: `test
+--workspace`: 110 binaries, 2,544 passed, 0 failed; clippy, production
+lints, fmt and the locked check clean; contracts 1,487 links, 37 imported
+hashes, 15 frozen vocabularies.
+
+## Draining, replacing and removing nodes, and the session driver (R9.3, first step, 2026-09-10)
+
+Instruction 3 of R9 ([REMAINING §14](../REMAINING.md); [24](24-placement-execution-and-fleet-control.md)
+§19, §9; [08](08-stepped-complexity-and-deployment.md) §10; decisions F55,
+F56): a host leaves placement through one committed fact and is removed only
+once nothing names it; and the partition leader drives every session of its
+partition, through the session's own leader when it does not lead the log.
+
+- **Eligibility as a grant fact.** `ControlRead::PrepareEligibility { node,
+  eligible }` → `ControlReadResult::PreparedEligibility { generation,
+  command }` (root scope; excluded from peer read-only ingress) prepares the
+  node's topology grant re-issued at its next generation with the requested
+  eligibility; `AdminCommand::Authority(ControlRequest)` commits it as the
+  ordinary exact journaled request (validated to a `GrantNode` at the next
+  generation with a zero attestation); the founder is refused before the
+  root. `ClusterAdmin::{node_eligibility, remove_node, replace_node}`; CLI
+  `cluster nodes drain|undrain|remove|replace`; MCP
+  `cluster.nodes.drain|undrain|remove|replace` (51 descriptors, cluster skill
+  v13); `AdminResult::{NodeEligibility, NodeRemoved}`; errors `not_drained`
+  5, `node_holding` 5, `unknown_node` 4, `node_not_ready` 5.
+- **The partition learns every grant.** `enroll_nodes` (replacing
+  `enroll_self`): a node enrolls its own grant, and the partition leader
+  enrolls every other node's newer grant, eligible or not.
+- **Eligibility gates placement only.** Group grants may name an ineligible
+  member (`validate_group_proof`), the grant follows a log containing one
+  (`prepare_membership_proof`), and its signatures count
+  (`InstalledAuthorityVerifier`). A seat belongs to the node identity at
+  the generation of its grant: a seat at or below the node's current
+  generation is still held (signature counting, `prepare_session_proof`,
+  `prepare_membership_proof`, readiness); membership epochs and the
+  single-step rule count voting nodes, not re-grants; the grant follows a
+  member's re-grant so every seat names the generation the node signs at.
+- **Cutover with a superset.** The controller, the ledger's cutover rule
+  and the root's proof preparation ask that every desired voter votes, not
+  that nothing else does: a current voter the plan drops keeps its vote
+  until activation retires it. `propose_placement_keeping` prefers the
+  active placement's voters among equally eligible candidates, so
+  expansions add to existing copies and heals move only what they must.
+- **The session driver.** `Operation::SessionControl { group, request }`
+  (tag 32, node-only): `SessionCall::{Facts, Membership, Placement}`,
+  `SessionControlReply::{Facts, Membership, Placed, Refused}`; served by
+  `session_control::serve` on the node whose hosted replica leads the log
+  (`NotLeader { leader }` otherwise), honoured only from a voter of the
+  group owning the session's partition (`authorized_controller`).
+  `SessionDriver::{Local(ReplicaHost), Remote { leader }}` in
+  `placement_controller.rs`: facts, membership changes and placement
+  records go through it; the leader is the hosted replica's, the last
+  redirect's, the route's or the placement's preferred; the controller's
+  leadership claim is gone; range movement, balancing and holder
+  publication still run only where this node leads the log.
+- **Diagnostics.** `cluster node health` reports the placement agent
+  (`AdminPlacementAgent { root_intents, partition_intents, installed,
+  last_error, last_refusal }`); refused intents are recorded by kind and
+  failure (`IntentOutcome::Refused(failure)`).
+- Hosts admit tenants from their own applied registry when a quorum read is
+  not theirs to make (`local_registry`), so a host creates sessions for an
+  admitted tenant.
+- Tests: `session_control::tests`, `cli_nodes.rs` (four hosts: a voter
+  drained, healed around and removed; a drain without capacity refused;
+  undrain heals; replace after a fifth host joins), `cli_session_remote.rs`
+  (a session created on a host, expanded and healed by the founder through
+  the session's own leader, the leader drained and removed).

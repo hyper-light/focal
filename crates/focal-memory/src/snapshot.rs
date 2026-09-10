@@ -213,8 +213,20 @@ impl<K: Ord, V> SnapshotLease<K, V> {
         now: u64,
         project: impl FnOnce(&Entry<K, V>) -> R,
     ) -> Result<Option<R>, MemoryError> {
+        self.project_from(Some(start), exclusive, end, now, project)
+    }
+
+    /// As [`Self::project_next`]; `None` starts at the least key.
+    pub fn project_from<R>(
+        &self,
+        start: Option<&K>,
+        exclusive: bool,
+        end: &K,
+        now: u64,
+        project: impl FnOnce(&Entry<K, V>) -> R,
+    ) -> Result<Option<R>, MemoryError> {
         let state = self.checked_state(now)?;
-        let (page, offset) = state.root.seek(Some(start), exclusive);
+        let (page, offset) = state.root.seek(start, exclusive);
         Ok(state
             .root
             .from(page, offset)

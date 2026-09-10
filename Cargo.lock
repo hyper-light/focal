@@ -596,6 +596,7 @@ dependencies = [
  "focal-graph",
  "focal-memory",
  "focal-model",
+ "focal-ranges",
  "focal-sim",
  "focal-stream",
  "postcard",
@@ -640,6 +641,9 @@ dependencies = [
 [[package]]
 name = "focal-memory"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "focal-model"
@@ -690,6 +694,7 @@ dependencies = [
  "focal-model",
  "focal-native-client",
  "focal-node",
+ "focal-ranges",
  "focal-runtime",
  "focal-stream",
  "focal-wire",

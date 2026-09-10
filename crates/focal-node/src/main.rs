@@ -21,7 +21,6 @@ use focal_node::{
     network_admin::{ADMIN_SOCKET, AdminCommand, admin_wire_limits},
     network_join::{NodeInvitation, PendingJoin},
     network_state::{network_requested, resolve_addresses},
-    placement::{self, NodeFacts},
 };
 use focal_wire::*;
 use serde::Serialize;
@@ -107,10 +106,10 @@ enum Commands {
         #[arg(value_enum)]
         shell: clap_complete::Shell,
     },
-    /// Offline placement solver; planning does not activate a durability guarantee.
+    /// Explain, plan and apply deployment policy; planning never activates a guarantee.
     Deployment {
         #[command(subcommand)]
-        command: DeploymentCommand,
+        command: cli::deployment::DeploymentCommand,
     },
 }
 #[derive(Subcommand)]
@@ -118,17 +117,6 @@ enum McpCommand {
     /// Use the selected authenticated client context and durable operation store.
     Serve,
 }
-#[derive(Subcommand)]
-enum DeploymentCommand {
-    /// Check the desired guarantee against an explicit inventory of verified node facts.
-    Explain {
-        #[arg(long)]
-        inventory: Option<PathBuf>,
-    },
-    /// Emit the machine-readable deployment schema.
-    Schema,
-}
-
 fn main() {
     let mut matches = match cli::command_tree::command().try_get_matches() {
         Ok(matches) => matches,
@@ -155,7 +143,7 @@ fn execute(args: Args) -> Result<()> {
                     shape_only: false,
                 },
         } => {
-            let settings = load_settings(args.config.as_deref(), args.data_dir)?;
+            let settings = load_settings(args.config.as_deref(), args.data_dir, false)?;
             return cli::schema_validate(
                 &settings,
                 args.client_context.as_deref(),
@@ -175,7 +163,7 @@ fn execute(args: Args) -> Result<()> {
         _ => args,
     };
     if matches!(&args.command, Commands::Mcp { .. }) {
-        let settings = load_settings(args.config.as_deref(), args.data_dir)?;
+        let settings = load_settings(args.config.as_deref(), args.data_dir, false)?;
         return cli::serve(&settings, args.client_context.as_deref()).map_err(Into::into);
     }
     let service = matches!(&args.command, Commands::Start { .. });
@@ -198,19 +186,65 @@ fn execute(args: Args) -> Result<()> {
     runtime.shutdown_background();
     result
 }
-fn load_settings(config: Option<&Path>, data_dir: Option<PathBuf>) -> Result<Settings> {
-    let mut settings = match config {
-        Some(path) => Settings::from_yaml(std::str::from_utf8(&read_file(path, 64 * 1024)?)?)?,
-        None => Settings::default(),
+/// Resolve the settings for this invocation (doc 08 §2). On an initialized
+/// store the committed policy fills every policy field the file omits; a
+/// file that sets one to another value is refused by name, except for a
+/// policy request (`deployment plan`/`explain`), where the file is what the
+/// operator asks for.
+fn load_settings(
+    config: Option<&Path>,
+    data_dir: Option<PathBuf>,
+    request: bool,
+) -> Result<Settings> {
+    let file = match config {
+        Some(path) => {
+            let text = read_file(path, 64 * 1024)?;
+            let text = std::str::from_utf8(&text)?;
+            // An unknown key fails by its full path before the typed parse.
+            focal_node::config::check_unknown_keys(text)?;
+            Some((
+                Settings::from_yaml(text)?,
+                focal_node::config::resolve::FilePresence::of(text)?,
+            ))
+        }
+        None => None,
     };
-    if let Some(data_dir) = data_dir {
-        settings.node.data_dir = Some(data_dir);
-    }
-    settings.validate()?;
-    Ok(settings)
+    let overrides = focal_node::config::CliOverrides {
+        data_dir,
+        advertise: None,
+        listen: None,
+    };
+    let file = file
+        .as_ref()
+        .map(|(settings, presence)| (settings, presence));
+    // The data directory decides which committed policy applies; an
+    // unreadable one is reported by the commands that open the store.
+    let committed = focal_node::config::resolve(&overrides, file, None)?
+        .settings
+        .data_dir()
+        .ok()
+        .and_then(|root| {
+            focal_node::config::policy::read_committed(&root)
+                .ok()
+                .flatten()
+        });
+    let resolved = if request {
+        focal_node::config::resolve_request(&overrides, file, committed.as_ref())?
+    } else {
+        focal_node::config::resolve(&overrides, file, committed.as_ref())?
+    };
+    Ok(resolved.settings)
 }
 fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
-    let mut settings = load_settings(args.config.as_deref(), args.data_dir)?;
+    let data_dir_override = args.data_dir.clone();
+    let request = matches!(
+        &args.command,
+        Commands::Deployment {
+            command: cli::deployment::DeploymentCommand::Plan { .. }
+                | cli::deployment::DeploymentCommand::Explain { .. }
+        }
+    );
+    let mut settings = load_settings(args.config.as_deref(), args.data_dir, request)?;
     match args.command {
         Commands::Mcp {
             command: McpCommand::Serve,
@@ -267,40 +301,15 @@ fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
             *command,
             args.client_context.as_deref(),
         )?),
-        Commands::Deployment {
-            command: DeploymentCommand::Schema,
-        } => {
-            writeln!(
-                std::io::stdout().lock(),
-                "{}",
-                include_str!("../../../config/schema/deployment-v1.json")
-            )?;
-            Ok(())
-        }
-        Commands::Deployment {
-            command: DeploymentCommand::Explain { inventory },
-        } => {
-            let nodes: Vec<NodeFacts> = match inventory {
-                Some(path) => serde_json::from_slice(&read_file(&path, 1024 * 1024)?)?,
-                None => vec![NodeFacts {
-                    id: 1,
-                    topology: settings.topology.clone(),
-                    verified: true,
-                    eligible: true,
-                }],
-            };
-            match placement::plan(&nodes, &settings.durability, &settings.placement) {
-                Ok(plan) => print_json(
-                    &serde_json::json!({"condition":"PlanValid","activated":false,"plan":plan}),
-                ),
-                Err(error) => {
-                    print_json(
-                        &serde_json::json!({"condition":"GuaranteeUnsatisfied","activated":false,"reason":error.to_string()}),
-                    )?;
-                    Err(error.into())
-                }
-            }
-        }
+        Commands::Deployment { command } => cli::deployment::run(
+            runtime,
+            &settings,
+            cli::deployment::Inputs {
+                config: args.config.as_deref(),
+                data_dir_override,
+            },
+            command,
+        ),
     }
 }
 fn output_response(reply: ResponseEnvelope) -> Result<()> {

@@ -39,6 +39,11 @@ mod funding_tests;
 mod groups;
 #[path = "range_hydration.rs"]
 mod hydration;
+#[path = "range_split.rs"]
+mod split;
+#[cfg(test)]
+#[path = "range_split_tests.rs"]
+mod split_tests;
 pub use hydration::{
     RangeHydration, RangeHydrationLimits, RangeHydrationLookup, RangeHydrationSource,
     RangeHydrationView,
@@ -66,7 +71,13 @@ mod successor_tests;
 
 /// Process-local incarnation, distinct after restoration or ownership transfer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RangeId(pub u128);
+impl RangeId {
+    pub const fn from_u128(value: u128) -> Self {
+        Self(value)
+    }
+}
 
 /// Heap charge includes dynamic key/value capacities and their allocator
 /// overhead. Inline entry bytes are automatically added by the engine.
@@ -407,6 +418,10 @@ impl<K: Ord + Clone, V> RangeStore<K, V> {
 
     pub fn id(&self) -> RangeId {
         self.root.range
+    }
+    /// The budget every page and root of this store is charged to.
+    pub fn budget(&self) -> &MemoryBudget {
+        &self.budget
     }
     pub fn prefix(&self) -> u64 {
         self.root.prefix

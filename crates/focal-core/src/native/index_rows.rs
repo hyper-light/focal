@@ -149,9 +149,9 @@ pub fn artifact_kind_hash(kind: &str) -> ContentHash {
     ContentHash(*hash.finalize().as_bytes())
 }
 
-/// Index rows one claim without authored content adds: issuer, subject,
-/// creation, status and, with a deadline, its due timer.
-pub(super) const CLAIM_ROWS: usize = 5;
+/// Index rows one claim without authored content adds: identity, issuer,
+/// subject, creation, status and, with a deadline, its due timer.
+pub(super) const CLAIM_ROWS: usize = 6;
 /// The most due-timer rows one plan can change beyond its creations: one per
 /// new claim (its own deadline), one per changed evaluation row and one per
 /// event (every monitor disposition is one recorded event). A delivered
@@ -212,9 +212,10 @@ pub(super) const STATUS_ROWS: usize = 2;
 /// Index rows one accepted result adds beyond its artifact.
 pub(super) const ACCEPTED_ROWS: usize = 1;
 /// The smallest failed admission report: eleven primary rows, a result
-/// artifact without inputs (three rows), its verdict and the parent claim's
-/// status move.
-pub(super) const MINIMUM_FAILED_REPORT_ROWS: usize = 11 + 3 + ACCEPTED_ROWS + STATUS_ROWS;
+/// artifact without inputs (four rows: identity, producer, kind and schema),
+/// its verdict and the parent claim's status move.
+pub(super) const MINIMUM_FAILED_REPORT_ROWS: usize =
+    11 + ARTIFACT_FIXED_ROWS + ACCEPTED_ROWS + STATUS_ROWS;
 /// The most inputs one artifact admitted under `limits` can cite: the
 /// configured allowance, never above the model's fixed ceiling.
 pub(super) fn input_bound(limits: NativeLimits) -> usize {
@@ -226,10 +227,13 @@ pub(super) fn input_bound(limits: NativeLimits) -> usize {
 pub(super) fn cap_inputs(inputs: usize, fixed: usize, batch: usize) -> usize {
     inputs.min(batch.saturating_sub(fixed))
 }
-/// Index rows one artifact with `inputs` inputs adds: producer, kind, schema
-/// and one per input.
+/// Index rows every artifact adds regardless of its inputs: identity,
+/// producer, kind and schema.
+pub(super) const ARTIFACT_FIXED_ROWS: usize = 4;
+/// Index rows one artifact with `inputs` inputs adds: identity, producer,
+/// kind, schema and one per input.
 pub(super) fn artifact_rows(inputs: usize) -> Result<usize, NativeError> {
-    prepare::add(3, inputs)
+    prepare::add(ARTIFACT_FIXED_ROWS, inputs)
 }
 /// Index rows one report adds: its result artifact and the verdict row.
 pub(super) fn report_rows(inputs: usize) -> Result<usize, NativeError> {
@@ -283,6 +287,7 @@ pub(super) fn is_index(key: Key) -> bool {
             | Key::ByVerdict(..)
             | Key::ByCreated(..)
             | Key::DueTimer(..)
+            | Key::ByObject(..)
     )
 }
 
@@ -300,6 +305,10 @@ pub(super) fn claim(
 ) -> Result<(), NativeError> {
     let id = ClaimId(after.binding().object.0);
     if before.is_none() {
+        sink(IndexChange::Put(Key::ByObject(
+            ObjectKind::Claim.code(),
+            ObjectId(id.0),
+        )))?;
         sink(IndexChange::Put(Key::ByIssuer(after.issuer(), id)))?;
         sink(IndexChange::Put(Key::BySubject(after.subject(), id)))?;
         sink(IndexChange::Put(Key::ByCreated(
@@ -422,6 +431,10 @@ pub(super) fn artifact(
     sink: &mut dyn FnMut(IndexChange) -> Result<(), NativeError>,
 ) -> Result<(), NativeError> {
     let id = descriptor.id();
+    sink(IndexChange::Put(Key::ByObject(
+        ObjectKind::Artifact.code(),
+        ObjectId(id.0),
+    )))?;
     sink(IndexChange::Put(Key::ByProducer(descriptor.producer(), id)))?;
     sink(IndexChange::Put(Key::ByArtifactKind(
         artifact_kind_hash(descriptor.kind()),
@@ -443,6 +456,10 @@ pub(super) fn definition(
     sink: &mut dyn FnMut(IndexChange) -> Result<(), NativeError>,
 ) -> Result<(), NativeError> {
     let id = ValidationId(declaration.binding().object.0);
+    sink(IndexChange::Put(Key::ByObject(
+        ObjectKind::Validation.code(),
+        ObjectId(id.0),
+    )))?;
     // Every principal the declaration designates: the issuer for a delivery
     // program, the check evaluator and any quality evaluator otherwise.
     let (first, second) = match declaration.program() {
@@ -503,6 +520,12 @@ pub(super) fn primary(key: Key) -> Option<Primary> {
         Key::DueTimer(_, TimerTarget::Claim(claim))
         | Key::DueTimer(_, TimerTarget::Monitor(claim, _)) => Primary::Claim(claim),
         Key::DueTimer(_, TimerTarget::Evaluation(key)) => Primary::Evaluation(key),
+        Key::ByObject(family, object) => match ObjectKind::from_code(family)? {
+            ObjectKind::Claim => Primary::Claim(ClaimId(object.0)),
+            ObjectKind::Artifact => Primary::Artifact(ArtifactId(object.0)),
+            ObjectKind::Validation => Primary::Definition(ValidationId(object.0)),
+            ObjectKind::Testament => return None,
+        },
         _ => return None,
     })
 }

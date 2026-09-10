@@ -462,9 +462,10 @@ fn check_missing(
     let id = TestamentId(response.object.0);
     let old = crate::native::response_reads::as_response_record(source.get(Key::Response(id)))
         .ok_or(ContractError::MissingEvidence)?;
-    let final_record =
-        crate::native::response_reads::as_response_record(prepared.range.get(&Key::Response(id)))
-            .ok_or(ContractError::MissingEvidence)?;
+    let final_record = crate::native::response_reads::as_response_record(
+        prepared.fragments.get(&Key::Response(id)),
+    )
+    .ok_or(ContractError::MissingEvidence)?;
     let actual = old.response().identity();
     let mut retained = final_record.response().identity();
     retained.binding = actual.binding;
@@ -527,9 +528,10 @@ fn check_missing(
     if let Some(result) = next.last_result() {
         take(visits, 3)?;
         let key = NativeResultKey::of(result);
-        let missing =
-            crate::native::response_reads::as_missing(prepared.range.get(&Key::MissingResult(key)))
-                .ok_or(ContractError::MissingEvidence)?;
+        let missing = crate::native::response_reads::as_missing(
+            prepared.fragments.get(&Key::MissingResult(key)),
+        )
+        .ok_or(ContractError::MissingEvidence)?;
         if source.get(Key::MissingResult(key)).is_some()
             || missing.result() != result
             || missing.sequence() != prepared.outcome.sequence

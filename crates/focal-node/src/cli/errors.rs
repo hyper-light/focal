@@ -57,6 +57,23 @@ pub(crate) fn classification(error: &(dyn Error + 'static)) -> Failure {
     if let Some(error) = error.downcast_ref::<focal_node::cluster_admin::ClusterAdminError>() {
         return error.classification();
     }
+    if let Some(error) = error.downcast_ref::<focal_node::deployment::DeploymentError>() {
+        use focal_node::deployment::DeploymentError;
+        return match error {
+            DeploymentError::Config(error) => configuration(error),
+            DeploymentError::Admin(error) => error.classification(),
+            DeploymentError::Io(error) => io(error),
+            other => other.classification(),
+        };
+    }
+    if let Some(error) = error.downcast_ref::<focal_node::config::ConfigError>() {
+        return configuration(error);
+    }
+    if let Some(focal_node::embedded::NodeError::Config(error)) =
+        error.downcast_ref::<focal_node::embedded::NodeError>()
+    {
+        return configuration(error);
+    }
     if let Some(error) = error.downcast_ref::<focal_node::placement::PlacementError>() {
         use focal_node::placement::PlacementError;
         return match error {
@@ -81,6 +98,21 @@ pub(crate) fn classification(error: &(dyn Error + 'static)) -> Failure {
         };
     }
     Failure::error("operation_failed", 1)
+}
+/// Configuration errors are the operator's input (exit 2), except a lost
+/// committed policy, which is data loss and never an input to fix (exit 1).
+fn configuration(error: &focal_node::config::ConfigError) -> Failure {
+    use focal_node::config::ConfigError;
+    match error {
+        ConfigError::PolicyMissing => Failure::error("policy_missing", 1),
+        ConfigError::PolicyEncoding(_) => Failure::error("policy_corrupt", 1),
+        ConfigError::CommittedPolicyChange { .. } => Failure::error("committed_policy", 2),
+        ConfigError::UnknownKey { .. }
+        | ConfigError::Parse(_)
+        | ConfigError::Version(_)
+        | ConfigError::Invalid { .. }
+        | ConfigError::NoDataDirectory => Failure::error("invalid_input", 2),
+    }
 }
 fn io(error: &std::io::Error) -> Failure {
     io_kind(error.kind())

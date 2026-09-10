@@ -22,6 +22,8 @@ fn network_service_requires_runtime_before_starting_physical_owners() {
 pub(crate) struct Running {
     pub(crate) handles: NetworkHandles,
     pub(crate) status: NetworkServiceStatus,
+    /// The node's data handler, for requests without a transport.
+    pub(crate) data: DataService,
     stop: Option<oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<Result<(), ServiceError>>,
 }
@@ -31,6 +33,7 @@ impl Running {
     }
     async fn from_service(service: NetworkService) -> Self {
         let handles = service.handles();
+        let data = service.data.clone();
         let (stop, receive) = oneshot::channel();
         let (ready, status) = oneshot::channel();
         let mut ready = Some(ready);
@@ -57,6 +60,7 @@ impl Running {
         Self {
             handles,
             status,
+            data,
             stop: Some(stop),
             task,
         }

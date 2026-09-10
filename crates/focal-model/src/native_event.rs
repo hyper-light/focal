@@ -62,6 +62,11 @@ pub enum NativeInvocationRef {
         generation: u64,
     },
     Import,
+    /// A committed retirement that moved the family rooted at `root` to the
+    /// archive (26 §4).
+    Retirement {
+        root: ClaimId,
+    },
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

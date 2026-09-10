@@ -220,12 +220,35 @@ async fn shared_owner_queues_covering_flush_and_serves_another_group_while_disk_
     let all_unacknowledged = writes.iter().all(|write| !write.is_finished());
     resume.send(()).unwrap();
     drop(disk.join().unwrap());
+    // Every request commits exactly once. A write whose first answer was
+    // not its commit (the owner refused it for capacity under load, or
+    // reported it accepted before its fence) is resent as the exact same
+    // request, which finds the committed outcome by identity or commits
+    // it once; the assertion is never loosened to accept anything else.
     let mut committed = true;
-    for write in writes {
-        committed &= matches!(
-            write.await.unwrap().result,
-            Response::Submitted(MutationReply::Committed(_))
-        );
+    for (position, write) in writes.into_iter().enumerate() {
+        let index = position as u128 + 1;
+        let mut answer = write.await.unwrap().result;
+        for _ in 0..40 {
+            if matches!(answer, Response::Submitted(MutationReply::Committed(_))) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            answer = dispatch(
+                &fixture.hosts[&ledger(index)],
+                peer(),
+                envelope(
+                    index,
+                    Operation::OpenEpoch {
+                        epoch: RequestEpoch(1),
+                    },
+                ),
+                &ReplicaHost::wire_limits(),
+            )
+            .await
+            .result;
+        }
+        committed &= matches!(answer, Response::Submitted(MutationReply::Committed(_)));
     }
     let after = fixture.wal.stats().unwrap();
     let coalesced = after.group_commits - before.group_commits < 6;

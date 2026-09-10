@@ -275,7 +275,7 @@ impl Lab {
                 continue;
             }
             let entry = prepared
-                .range
+                .fragments
                 .entries()
                 .find(|entry| entry.key == key)
                 .unwrap_or_else(|| panic!("{step}: written {family:?} row is present"));

@@ -24,6 +24,8 @@ pub enum NativeExposure {
     WireOnly,
     /// The legacy import record; produced only by offline activation.
     Activation,
+    /// A retirement every replica applies; never a tool (26 §4).
+    Retirement,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativeCoverage {
@@ -97,7 +99,9 @@ pub const fn frame_tags(operation: NativeOperationKind) -> &'static [u8] {
         K::RegisterMonitor => &[24],
         K::RebindMonitor => &[25],
         K::CancelMonitor => &[26],
-        K::MonitorDeadline | K::EvaluationDeadline | K::ClaimDeadline | K::Import => &[],
+        K::MonitorDeadline | K::EvaluationDeadline | K::ClaimDeadline | K::Import | K::Retire => {
+            &[]
+        }
     }
 }
 pub const fn native_coverage(operation: NativeOperationKind) -> NativeCoverage {
@@ -384,10 +388,19 @@ pub const fn native_coverage(operation: NativeOperationKind) -> NativeCoverage {
             "",
             E::Activation,
         ),
+        K::Retire => row(
+            operation,
+            None,
+            A::Internal,
+            "",
+            "A family of claims retired to the archive",
+            "",
+            E::Retirement,
+        ),
     }
 }
-pub fn native_coverage_table() -> [NativeCoverage; 31] {
-    let mut rows = [native_coverage(NativeOperationKind::Import); 31];
+pub fn native_coverage_table() -> [NativeCoverage; 32] {
+    let mut rows = [native_coverage(NativeOperationKind::Import); 32];
     for (slot, kind) in rows.iter_mut().zip(NativeOperationKind::ALL) {
         *slot = native_coverage(kind);
     }

@@ -30,7 +30,8 @@ pub enum NativeEvidenceError {
 /// program execution or an acceptance verdict. Custom registries must preserve
 /// these byte/workspace bounds and pin the schema identity they implement.
 /// `maximum_bytes` must be a bounded, allocation-free lookup with no IO.
-pub trait NativeSchemaVerifier {
+/// Shared by a session and the materializer's workers, so `Sync`.
+pub trait NativeSchemaVerifier: Sync {
     fn maximum_bytes(&self, schema: ContentHash) -> Result<usize, crate::BuiltinSchemaError>;
     fn verify(&self, schema: ContentHash, bytes: &[u8]) -> Result<(), crate::BuiltinSchemaError>;
 }

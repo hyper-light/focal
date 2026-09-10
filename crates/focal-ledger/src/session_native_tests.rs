@@ -17,10 +17,15 @@ const ELECTION_TICKS: usize = 10;
 fn content_dir(dir: &Path, id: u64) -> std::path::PathBuf {
     dir.join(format!("content-{id}"))
 }
-fn hosting(dir: &Path, id: u64) -> NativeHosting {
+fn hosting_with(dir: &Path, id: u64, limits: NativeSessionLimits) -> NativeHosting {
     NativeHosting {
-        limits: native_limits(),
+        limits,
         reader: ContentReader::open(content_dir(dir, id)).unwrap(),
+        seeds: focal_evidence::SeedStore::open(
+            dir.join(format!("seeds-{id}")),
+            focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default()).unwrap(),
+        )
+        .unwrap(),
         range: RangeId(u128::from(id)),
     }
 }
@@ -29,7 +34,13 @@ fn writer(dir: &Path, id: u64) -> ContentStore {
     std::fs::create_dir_all(content_dir(dir, id)).unwrap();
     store(&content_dir(dir, id))
 }
-fn open(dir: &Path, id: u64, voters: Vec<u64>, hosted: bool) -> Session {
+fn open_with(
+    dir: &Path,
+    id: u64,
+    voters: Vec<u64>,
+    hosted: bool,
+    limits: NativeSessionLimits,
+) -> Session {
     let config = if voters.len() == 1 {
         NodeConfig::single(id, CLUSTER, ledger().session.0)
     } else {
@@ -42,7 +53,7 @@ fn open(dir: &Path, id: u64, voters: Vec<u64>, hosted: bool) -> Session {
             ledger(),
             config,
             SessionLimits::default(),
-            hosting(dir, id),
+            hosting_with(dir, id, limits),
         )
         .unwrap()
     } else {
@@ -96,6 +107,8 @@ struct Cluster {
     nodes: Vec<Option<Session>>,
     stores: Vec<ContentStore>,
     hosted: Vec<bool>,
+    /// The native hosting limits every replica opens with.
+    limits: NativeSessionLimits,
     voters: Vec<u64>,
     clock: u64,
     serial: u128,
@@ -103,21 +116,26 @@ struct Cluster {
     refusals: Vec<(u64, String)>,
     /// Replicas whose host sealed legacy payloads for a pending import.
     sealed: Vec<u64>,
-    /// Replicas whose host is not sealing yet: their import delivery stays retained.
+    /// Replicas whose host is not sealing legacy payloads or pulling seed
+    /// chunks yet: their retained delivery makes no progress.
     no_seal: Vec<u64>,
 }
 impl Cluster {
     fn new(size: u64, hosted: &[bool]) -> Self {
+        Self::with_limits(size, hosted, native_limits())
+    }
+    fn with_limits(size: u64, hosted: &[bool], limits: NativeSessionLimits) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let voters: Vec<u64> = (1..=size).collect();
         let stores: Vec<ContentStore> = (1..=size).map(|id| writer(dir.path(), id)).collect();
         let nodes = (1..=size)
             .map(|id| {
-                Some(open(
+                Some(open_with(
                     dir.path(),
                     id,
                     voters.clone(),
                     hosted[id as usize - 1],
+                    limits,
                 ))
             })
             .collect();
@@ -126,6 +144,7 @@ impl Cluster {
             nodes,
             stores,
             hosted: hosted.to_vec(),
+            limits,
             voters,
             clock: 0,
             serial: 0,
@@ -133,6 +152,9 @@ impl Cluster {
             sealed: Vec::new(),
             no_seal: Vec::new(),
         }
+    }
+    fn node_ref(&self, id: u64) -> &Session {
+        self.nodes[id as usize - 1].as_ref().unwrap()
     }
     fn node(&mut self, id: u64) -> &mut Session {
         self.nodes[id as usize - 1].as_mut().unwrap()
@@ -148,7 +170,13 @@ impl Cluster {
     fn reopen(&mut self, id: u64, hosted: bool) {
         assert!(self.nodes[id as usize - 1].is_none());
         self.hosted[id as usize - 1] = hosted;
-        let node = open(self.dir.path(), id, self.voters.clone(), hosted);
+        let node = open_with(
+            self.dir.path(),
+            id,
+            self.voters.clone(),
+            hosted,
+            self.limits,
+        );
         self.nodes[id as usize - 1] = Some(node);
     }
     fn pump(&mut self, isolated: &[u64]) {
@@ -721,6 +749,79 @@ fn a_lagging_replica_installs_the_ss6_checkpoint_with_native_state() {
     }
     let fourth = creation(cluster.next(PARTIES.issuer), 4);
     cluster.commit(3, PARTIES.issuer, fourth, &[]);
+    let sequences = cluster.native_sequences();
+    assert!(
+        sequences.iter().all(|(_, seq)| *seq == Some(SessionSeq(4))),
+        "{sequences:?}"
+    );
+}
+
+/// The unified Session's copy of the seeded path (25 §5): a lagging replica
+/// receives an SS6 snapshot whose native section is a seed manifest, keeps
+/// the delivery retained and names the chunks it lacks at the Session level
+/// (the engine it would have become is not adopted), its host pulls them from
+/// a peer's reader, and the install completes once the last one is local; the
+/// restored replica then checkpoints and restarts on its own seeds.
+#[test]
+fn a_lagging_replica_installs_a_seeded_ss6_checkpoint_once_its_host_pulls_the_chunks() {
+    let mut limits = native_limits();
+    limits.checkpoint.inline_bytes = 64;
+    let mut cluster = Cluster::with_limits(3, &[true, true, true], limits);
+    cluster.elect(1, &[]);
+    cluster.activate(1, &[]);
+    let first = creation(cluster.next(PARTIES.issuer), 1);
+    cluster.commit(1, PARTIES.issuer, first, &[]);
+    let second = creation(cluster.next(PARTIES.issuer), 2);
+    cluster.commit(1, PARTIES.issuer, second, &[3]);
+    cluster.node(1).checkpoint().unwrap();
+    let third = creation(cluster.next(PARTIES.issuer), 3);
+    cluster.commit(1, PARTIES.issuer, third, &[3]);
+    assert_eq!(cluster.node(3).native_sequence().unwrap(), SessionSeq(1));
+    // The snapshot lands; without its chunks the replica names them and waits.
+    cluster.no_seal.push(3);
+    cluster.settle(&[]);
+    let missing = cluster
+        .node(3)
+        .pending_seed()
+        .expect("the seeded snapshot is retained at the Session")
+        .missing
+        .clone();
+    assert!(!missing.is_empty());
+    assert_eq!(cluster.node(3).native_sequence().unwrap(), SessionSeq(1));
+    assert!(cluster.node(1).pending_seed().is_none());
+    // Its host pulls each chunk from a peer that holds it; a forged chunk is
+    // refused on the way in.
+    let reader = cluster.node(1).seed_reader().unwrap();
+    for hash in &missing {
+        let bytes = reader
+            .read(*hash, focal_evidence::SEED_CHUNK_BYTES)
+            .unwrap();
+        assert!(
+            cluster
+                .node(3)
+                .install_seed_chunk(*hash, b"forged")
+                .is_err()
+        );
+        cluster.node(3).install_seed_chunk(*hash, &bytes).unwrap();
+    }
+    cluster.no_seal.clear();
+    cluster.settle(&[]);
+    assert!(cluster.node(3).pending_seed().is_none());
+    let sequences = cluster.native_sequences();
+    assert!(
+        sequences.iter().all(|(_, seq)| *seq == Some(SessionSeq(3))),
+        "{sequences:?}"
+    );
+    assert_eq!(cluster.status(3, 3), Some(ClaimStatus::Generated));
+    assert!(cluster.node(3).activation().is_native());
+    // The restored replica's own seeded checkpoint restores it on restart.
+    cluster.node(3).checkpoint().unwrap();
+    cluster.stop(3);
+    cluster.reopen(3, true);
+    assert_eq!(cluster.node(3).native_sequence().unwrap(), SessionSeq(3));
+    assert!(cluster.node(3).pending_seed().is_none());
+    let fourth = creation(cluster.next(PARTIES.issuer), 4);
+    cluster.commit(1, PARTIES.issuer, fourth, &[]);
     let sequences = cluster.native_sequences();
     assert!(
         sequences.iter().all(|(_, seq)| *seq == Some(SessionSeq(4))),
@@ -1682,4 +1783,814 @@ fn native_records_stream_as_schema_two_deltas_on_the_continuous_sequence_line() 
         cluster.node(1).cursor(consumer).unwrap().token.position,
         focal_stream::Position::after_delta(ids[0])
     );
+}
+
+/// Retirement through the hosted session (26 §4): the authority applies
+/// the record it proposed through its committed core and is reconstructed
+/// at once, so linearizable reads answer with the continuation right after,
+/// the retention report counts the family, and a restart keeps all of it.
+#[test]
+fn a_hosted_authority_retires_a_family_and_stays_authoritative() {
+    use focal_core::native::NativeCommand;
+    let mut cluster = Cluster::new(1, &[true]);
+    cluster.elect(1, &[]);
+    cluster.activate(1, &[]);
+    let create = creation(cluster.next(PARTIES.issuer), 1);
+    cluster.commit(1, PARTIES.issuer, create, &[]);
+    let expected = cluster.claim(1, 1);
+    let cancel = fx::cancel(cluster.next(PARTIES.issuer), expected);
+    cluster.commit(1, PARTIES.issuer, cancel, &[]);
+    let expected = cluster.claim(1, 1);
+    let release = NativeInput {
+        request: cluster.next(PARTIES.issuer),
+        command: NativeCommand::ReleaseScope { expected },
+    };
+    cluster.commit(1, PARTIES.issuer, release, &[]);
+    assert!(cluster.node(1).native_authoritative());
+    let (bundle, length, through) = {
+        let node = cluster.node(1);
+        let limits = node.native_encoding_limits().unwrap();
+        let core = node.native_core().unwrap();
+        let family = core.retirement_family(ClaimId::from_u128(1)).unwrap();
+        let through = core.native_sequence();
+        let report = node.native_retention().unwrap();
+        assert!(report.allows_family(family.through), "{report:?}");
+        let quote = core.archive_family_quote(&family, through, limits).unwrap();
+        (quote.hash, quote.bytes as u64, through)
+    };
+    cluster
+        .node(1)
+        .native_propose_retirement(ClaimId::from_u128(1), bundle, length, through)
+        .unwrap();
+    assert!(cluster.node(1).native_retention().unwrap().retiring);
+    cluster.pump(&[]);
+    assert_eq!(cluster.status(1, 1), None);
+    let report = cluster.node(1).native_retention().unwrap();
+    assert_eq!(report.retired, 1, "{report:?}");
+    assert!(!report.retiring);
+    assert!(
+        cluster.node(1).native_authoritative(),
+        "the authority is reconstructed right after the record applies"
+    );
+    let continuation = *cluster
+        .node(1)
+        .native_core()
+        .unwrap()
+        .native_retired(ClaimId::from_u128(1))
+        .unwrap();
+    assert_eq!(continuation.bundle, bundle);
+    assert_eq!(continuation.bytes, length);
+    // A linearizable read barrier is answered.
+    let correlation = crate::ReadCorrelation([7; 16]);
+    cluster.node(1).native_read_index(correlation).unwrap();
+    let mut found = false;
+    for _ in 0..8 {
+        let events = cluster.node(1).poll().unwrap();
+        if events
+            .native_read_boundaries
+            .iter()
+            .any(|boundary| boundary.correlation == correlation)
+        {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "the read barrier after a retirement is answered");
+    // Admission continues.
+    let second = creation(cluster.next(PARTIES.issuer), 2);
+    cluster.commit(1, PARTIES.issuer, second, &[]);
+    assert_eq!(cluster.status(1, 2), Some(ClaimStatus::Generated));
+    // A restart keeps the continuation and the count.
+    cluster.stop(1);
+    cluster.reopen(1, true);
+    cluster.elect(1, &[]);
+    assert_eq!(cluster.status(1, 1), None);
+    assert_eq!(
+        cluster
+            .node(1)
+            .native_core()
+            .unwrap()
+            .native_retired(ClaimId::from_u128(1))
+            .copied(),
+        Some(continuation)
+    );
+    assert_eq!(cluster.node(1).native_retention().unwrap().retired, 1);
+}
+
+/// The simulated disk as a backup medium: every install step is one
+/// operation the qualification can cut.
+struct SimMedium(focal_sim::disk::Disk);
+impl SimMedium {
+    fn io(error: focal_sim::disk::DiskError) -> std::io::Error {
+        std::io::Error::other(error.to_string())
+    }
+}
+impl backup::BackupMedium for SimMedium {
+    fn create_dir(&mut self, _: &Path) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn create(&mut self, path: &Path) -> std::io::Result<()> {
+        self.0.create(path).map_err(Self::io)
+    }
+    fn write(&mut self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        let offset = self.0.read(path).map_err(Self::io)?.len();
+        self.0.write(path, offset, bytes).map_err(Self::io)
+    }
+    fn sync_file(&mut self, path: &Path) -> std::io::Result<()> {
+        self.0.sync_file(path).map_err(Self::io)
+    }
+    fn sync_dir(&mut self, path: &Path) -> std::io::Result<()> {
+        self.0.sync_dir(path).map_err(Self::io)
+    }
+    fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
+        self.0.rename(from, to).map_err(Self::io)
+    }
+    fn exists(&self, path: &Path) -> bool {
+        self.0.read(path).is_ok()
+    }
+    fn read(&self, path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
+        let bytes = self.0.read(path).map_err(Self::io)?;
+        if bytes.len() > limit {
+            return Err(std::io::Error::other("bound"));
+        }
+        Ok(bytes.to_vec())
+    }
+}
+
+/// A hosted session with a work artifact whose payload the node sealed,
+/// and the image of its committed prefix.
+fn backed_up_cluster() -> (Cluster, backup::BackupImage) {
+    backed_up_cluster_with(native_limits())
+}
+fn backed_up_cluster_with(limits: NativeSessionLimits) -> (Cluster, backup::BackupImage) {
+    let mut cluster = Cluster::with_limits(1, &[true], limits);
+    cluster.elect(1, &[]);
+    cluster.activate(1, &[]);
+    let create = creation(cluster.next(PARTIES.issuer), 1);
+    cluster.commit(1, PARTIES.issuer, create, &[]);
+    let expected = cluster.claim(1, 1);
+    let post = fx::post(cluster.next(PARTIES.issuer), expected);
+    cluster.commit(1, PARTIES.issuer, post, &[]);
+    let expected = cluster.claim(1, 1);
+    let receipt = fx::acquire_receipt(cluster.next(PARTIES.subject), expected, 701);
+    cluster.commit(1, PARTIES.subject, receipt, &[]);
+    let parent = focal_model::lifecycle::evidence::Parent::from_claim(
+        cluster
+            .node(1)
+            .native_core()
+            .unwrap()
+            .native_claim(ClaimId::from_u128(1))
+            .unwrap(),
+    )
+    .unwrap();
+    let (work, _slot) = fx::work_artifact(ledger(), 801, &parent, 0, fx::PROOF).unwrap();
+    let claim = cluster.claim(1, 1);
+    let submit = fx::submit_work(cluster.next(PARTIES.subject), claim, 0, work);
+    cluster.commit(1, PARTIES.subject, submit, &[]);
+    let session = cluster.node(1);
+    let encoded = session.encode_checkpoint(true).unwrap().unwrap();
+    let (checkpoint, _allocation) = encoded.retained.unwrap();
+    let status = session.status();
+    let prefix = EvidencePrefix {
+        cluster: session.cluster_id(),
+        ledger: session.ledger(),
+        group: focal_directory::LogGroupId(session.group_id()),
+        genesis: session.placement_genesis().unwrap(),
+        node: status.node_id,
+        sequence: session.sequence(),
+        index: RaftIndex(session.applied_raft),
+        term: RaftTerm(
+            session
+                .consensus
+                .published_term(session.applied_raft)
+                .unwrap(),
+        ),
+        route: RouteEpoch(1),
+        placement_epoch: 1,
+        membership_epoch: 1,
+        operation: focal_directory::OperationId([9; 16]),
+        placement_digest: ContentHash([8; 32]),
+        checkpoint: ContentHash(*blake3::hash(&checkpoint).as_bytes()),
+        checkpoint_bytes: checkpoint.len() as u64,
+        artifacts: 0,
+    };
+    let configuration = session.membership().unwrap().configuration;
+    (
+        cluster,
+        backup::BackupImage {
+            checkpoint,
+            prefix,
+            configuration,
+        },
+    )
+}
+
+#[test]
+fn a_backup_names_exactly_what_its_prefix_references_and_verifies_after_every_durable_cut() {
+    let (cluster, image) = backed_up_cluster();
+    let limits = native_limits();
+    let budget = MemoryBudget::new(256 * 1024 * 1024, 64 * 1024 * 1024).unwrap();
+    let reader = ContentReader::open(content_dir(cluster.dir.path(), 1)).unwrap();
+    let seeds = focal_evidence::SeedReader::open(cluster.dir.path().join("seeds-1")).unwrap();
+    let decoder = backup::decoder_pair();
+    let root = Path::new("/backup");
+    // The complete write.
+    let mut medium = SimMedium(focal_sim::disk::Disk::new(64 * 1024 * 1024));
+    let report = backup::write(
+        &mut medium,
+        root,
+        &image,
+        &seeds,
+        &reader,
+        decoder,
+        &limits,
+        &budget,
+        1_000,
+    )
+    .unwrap();
+    assert_eq!(report.manifest.prefix, image.prefix);
+    assert_eq!(report.manifest.content.len(), 1, "the sealed payload");
+    assert!(
+        report.manifest.seeds.is_empty(),
+        "an inline root names no seeds"
+    );
+    assert_eq!(report.bundles, 0);
+    assert_eq!(report.manifest.decoder_successor, decoder.1);
+    let verified = backup::verify(&medium, root, decoder.1, &budget).unwrap();
+    assert!(verified.complete(), "{:?}", verified.problems);
+    assert!(verified.decoder_supported);
+    assert_eq!(verified.objects_verified, 1);
+    assert_eq!(verified.chunks_verified, 1);
+    assert_eq!(verified.manifest, report.manifest);
+    // A second write into the same directory is refused.
+    assert!(matches!(
+        backup::write(
+            &mut medium,
+            root,
+            &image,
+            &seeds,
+            &reader,
+            decoder,
+            &limits,
+            &budget,
+            2_000
+        ),
+        Err(backup::BackupError::Exists)
+    ));
+    // A binary that lacks the decoder says so.
+    let other = backup::verify(&medium, root, [7; 32], &budget).unwrap();
+    assert!(!other.decoder_supported && other.complete());
+    // Every durable cut before the manifest leaves no backup; the survivors
+    // are whole files or absent.
+    let operations = {
+        let mut probe = SimMedium(focal_sim::disk::Disk::new(64 * 1024 * 1024));
+        backup::write(
+            &mut probe, root, &image, &seeds, &reader, decoder, &limits, &budget, 1_000,
+        )
+        .unwrap();
+        probe.0.operations()
+    };
+    assert!(operations > 5);
+    for cut in 1..=operations {
+        let mut medium = SimMedium(focal_sim::disk::Disk::new(64 * 1024 * 1024));
+        medium.0.fail_before(Some(cut));
+        let result = backup::write(
+            &mut medium,
+            root,
+            &image,
+            &seeds,
+            &reader,
+            decoder,
+            &limits,
+            &budget,
+            1_000,
+        );
+        medium.0.crash();
+        match result {
+            Ok(_) => {
+                assert_eq!(cut, operations + 1, "a cut inside the write cannot succeed");
+            }
+            Err(_) => {
+                let verified = backup::verify(&medium, root, decoder.1, &budget);
+                assert!(
+                    matches!(verified, Err(backup::BackupError::Missing("manifest"))),
+                    "cut {cut}: {verified:?}"
+                );
+            }
+        }
+    }
+    // A tampered chunk and a tampered envelope are named.
+    let mut medium = SimMedium(focal_sim::disk::Disk::new(64 * 1024 * 1024));
+    backup::write(
+        &mut medium,
+        root,
+        &image,
+        &seeds,
+        &reader,
+        decoder,
+        &limits,
+        &budget,
+        1_000,
+    )
+    .unwrap();
+    let chunk = report.manifest.content[0].chunks[0].hash;
+    let path = root.join("content").join(format!("{chunk}.chunk"));
+    medium.0.write(&path, 0, &[0xff]).unwrap();
+    let tampered = backup::verify(&medium, root, decoder.1, &budget).unwrap();
+    assert!(!tampered.complete());
+    assert!(
+        tampered
+            .problems
+            .iter()
+            .any(|problem| problem.contains("chunk")),
+        "{:?}",
+        tampered.problems
+    );
+    let mut medium = SimMedium(focal_sim::disk::Disk::new(64 * 1024 * 1024));
+    backup::write(
+        &mut medium,
+        root,
+        &image,
+        &seeds,
+        &reader,
+        decoder,
+        &limits,
+        &budget,
+        1_000,
+    )
+    .unwrap();
+    medium.0.write(root.join("checkpoint"), 3, &[0xff]).unwrap();
+    let tampered = backup::verify(&medium, root, decoder.1, &budget).unwrap();
+    assert!(!tampered.checkpoint_verified && !tampered.inventory_matches);
+    // The real filesystem medium writes the same backup.
+    let target = tempfile::tempdir().unwrap();
+    let mut files = backup::FileMedium;
+    let dir = target.path().join("backup");
+    let on_disk = backup::write(
+        &mut files, &dir, &image, &seeds, &reader, decoder, &limits, &budget, 1_000,
+    )
+    .unwrap();
+    assert_eq!(on_disk.manifest, report.manifest);
+    assert!(dir.join("MANIFEST").is_file());
+    let verified = backup::verify(&files, &dir, decoder.1, &budget).unwrap();
+    assert!(verified.complete(), "{:?}", verified.problems);
+    assert_eq!(verified.bytes_verified, report.manifest.content[0].length);
+}
+
+#[test]
+fn a_backup_of_a_seeded_root_carries_every_chunk_and_names_them_exactly() {
+    let mut limits = native_limits();
+    limits.checkpoint.inline_bytes = 64;
+    let (cluster, image) = backed_up_cluster_with(limits);
+    let budget = MemoryBudget::new(256 * 1024 * 1024, 64 * 1024 * 1024).unwrap();
+    let reader = ContentReader::open(content_dir(cluster.dir.path(), 1)).unwrap();
+    let seeds = focal_evidence::SeedReader::open(cluster.dir.path().join("seeds-1")).unwrap();
+    let decoder = backup::decoder_pair();
+    let root = Path::new("/backup");
+    let mut medium = SimMedium(focal_sim::disk::Disk::new(64 * 1024 * 1024));
+    let report = backup::write(
+        &mut medium,
+        root,
+        &image,
+        &seeds,
+        &reader,
+        decoder,
+        &limits,
+        &budget,
+        1_000,
+    )
+    .unwrap();
+    assert!(!report.manifest.seeds.is_empty(), "the root is seeded");
+    for chunk in &report.manifest.seeds {
+        assert!(
+            medium
+                .0
+                .read(root.join("seeds").join(format!("{}.seed", chunk.hash)))
+                .is_ok()
+        );
+    }
+    let verified = backup::verify(&medium, root, decoder.1, &budget).unwrap();
+    assert!(verified.complete(), "{:?}", verified.problems);
+    assert_eq!(verified.seeds_verified, report.manifest.seeds.len() as u64);
+    // A missing seed chunk is named and the envelope cannot be rebuilt.
+    let first = report.manifest.seeds[0].hash;
+    let path = root.join("seeds").join(format!("{first}.seed"));
+    medium.0.rename(&path, root.join("gone")).unwrap();
+    let broken = backup::verify(&medium, root, decoder.1, &budget).unwrap();
+    assert!(!broken.complete());
+    assert!(
+        broken
+            .problems
+            .iter()
+            .any(|problem| problem.contains("seed")),
+        "{:?}",
+        broken.problems
+    );
+}
+
+/// Drive a session that stands alone until it is the native authority.
+fn settle_alone(session: &mut Session) {
+    for _ in 0..64 {
+        match session.poll() {
+            Ok(_) | Err(LedgerError::Retry) => {}
+            Err(LedgerError::Consensus(ConsensusError::PersistencePending)) => {}
+            Err(error) => panic!("poll: {error:?}"),
+        }
+        if session.native_authoritative() {
+            return;
+        }
+    }
+    panic!("the restored session never became the native authority");
+}
+
+#[test]
+fn a_backup_restores_into_a_new_incarnation_that_holds_the_prefix_and_continues() {
+    use focal_consensus::{NodeConfig, RestoredLog};
+    let (cluster, image) = backed_up_cluster();
+    let limits = native_limits();
+    let budget = MemoryBudget::new(256 * 1024 * 1024, 64 * 1024 * 1024).unwrap();
+    let reader = ContentReader::open(content_dir(cluster.dir.path(), 1)).unwrap();
+    let seeds = focal_evidence::SeedReader::open(cluster.dir.path().join("seeds-1")).unwrap();
+    let decoder = backup::decoder_pair();
+    let target = tempfile::tempdir().unwrap();
+    let dir = target.path().join("backup");
+    let mut files = backup::FileMedium;
+    let report = backup::write(
+        &mut files, &dir, &image, &seeds, &reader, decoder, &limits, &budget, 1_000,
+    )
+    .unwrap();
+    let manifest = &report.manifest;
+    let claim_status = cluster
+        .node_ref(1)
+        .native_core()
+        .unwrap()
+        .native_claim(ClaimId::from_u128(1))
+        .unwrap()
+        .status();
+    let prefix_before = cluster.node_ref(1).native_sequence().unwrap();
+    drop(cluster);
+
+    // A new cluster, a new node, a new log group: the recovery incarnation.
+    let other = tempfile::tempdir().unwrap();
+    let cluster_id = [9u8; 16];
+    let group = [7u8; 16];
+    let node = 2u64;
+    let mut store = writer(other.path(), node);
+    let imported = backup::import_content(&files, &dir, manifest, &mut store, &budget).unwrap();
+    assert_eq!(imported, 1);
+    let rewritten = {
+        let mut sink = focal_evidence::SeedStore::open(
+            other.path().join(format!("seeds-{node}")),
+            focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default()).unwrap(),
+        )
+        .unwrap();
+        let installed = backup::import_seeds(&files, &dir, manifest, &mut sink).unwrap();
+        assert_eq!(installed, manifest.seeds.len() as u64);
+        let content = backup::BackupContent::new(&files, &dir);
+        let backup_seeds = backup::BackupSeeds::new(&files, &dir);
+        backup::rewrite(
+            &image.checkpoint,
+            &backup_seeds,
+            &content,
+            backup::Incarnation {
+                cluster: cluster_id,
+                group,
+                node,
+            },
+            &limits,
+            &budget,
+            &mut sink,
+        )
+        .unwrap()
+    };
+    assert_eq!(rewritten.index, image.prefix.index.0);
+    assert_eq!(rewritten.term, image.prefix.term.0);
+    assert_eq!(rewritten.native_sequence, manifest.native_sequence);
+    assert_ne!(rewritten.genesis, manifest.native_genesis);
+    assert_eq!(rewritten.configuration.voters, vec![node]);
+    let consensus = focal_consensus::DurableNode::restore_in(
+        NodeConfig::single(node, cluster_id, group),
+        other.path().join("wal"),
+        &budget,
+        RestoredLog {
+            index: rewritten.index,
+            term: rewritten.term,
+            data: rewritten.bytes.clone(),
+            floor: decoder.0,
+            transition: Some(decoder),
+        },
+    )
+    .unwrap();
+    let mut restored = Session::from_node_hosted(
+        ledger(),
+        consensus,
+        SessionLimits::default(),
+        hosting_with(other.path(), node, limits),
+    )
+    .unwrap();
+    assert!(restored.activation().is_native());
+    assert_eq!(restored.native_sequence().unwrap(), prefix_before);
+    assert_eq!(restored.status().applied_index, image.prefix.index.0);
+    assert!(
+        restored.active_fence().is_none(),
+        "a fresh registration follows"
+    );
+    assert_eq!(
+        restored
+            .native_core()
+            .unwrap()
+            .native_claim(ClaimId::from_u128(1))
+            .unwrap()
+            .status(),
+        claim_status
+    );
+    restored.campaign().unwrap();
+    settle_alone(&mut restored);
+    assert_eq!(
+        restored.membership().unwrap().configuration.voters,
+        vec![node]
+    );
+    // Work continues in the new incarnation; the prefix advances by one.
+    let request = RequestKey {
+        principal: PARTIES.issuer,
+        epoch: focal_model::RequestEpoch(1),
+        id: focal_model::RequestId::from_u128(9_001),
+    };
+    let submission = restored
+        .propose_native(
+            context(PARTIES.issuer, 5_000),
+            creation(request, 2),
+            NativeCustody::Store(&mut store),
+        )
+        .unwrap();
+    let outcome = match submission {
+        NativeSubmission::Committed(outcome) => outcome,
+        NativeSubmission::Pending { outcome, .. } => {
+            for _ in 0..64 {
+                match restored.poll() {
+                    Ok(_) | Err(LedgerError::Retry) => {}
+                    Err(LedgerError::Consensus(ConsensusError::PersistencePending)) => {}
+                    Err(error) => panic!("poll: {error:?}"),
+                }
+                if restored.native_outcome(request).unwrap() == Some(outcome) {
+                    break;
+                }
+            }
+            outcome
+        }
+    };
+    assert_eq!(restored.native_outcome(request).unwrap(), Some(outcome));
+    assert_eq!(
+        restored.native_sequence().unwrap(),
+        SessionSeq(prefix_before.0 + 1)
+    );
+    // The restored session checkpoints and reopens on its own log; a second
+    // restore into that log is refused, since history is never overwritten.
+    restored.checkpoint().unwrap();
+    drop(restored);
+    assert!(matches!(
+        focal_consensus::DurableNode::restore_in(
+            NodeConfig::single(node, cluster_id, group),
+            other.path().join("wal"),
+            &budget,
+            RestoredLog {
+                index: rewritten.index,
+                term: rewritten.term,
+                data: rewritten.bytes.clone(),
+                floor: decoder.0,
+                transition: Some(decoder),
+            },
+        ),
+        Err(ConsensusError::Configuration(_))
+    ));
+    let reopened = Session::open_hosted(
+        other.path().join("wal"),
+        ledger(),
+        NodeConfig::single(node, cluster_id, group),
+        SessionLimits::default(),
+        hosting_with(other.path(), node, limits),
+    )
+    .unwrap();
+    assert_eq!(
+        reopened.native_sequence().unwrap(),
+        SessionSeq(prefix_before.0 + 1)
+    );
+}
+
+/// A sustained workload under fixed memory and disk budgets (R8's close
+/// gate): claims are created, finished, released, archived to bundles under
+/// custody and retired; the session checkpoints; the collector runs over
+/// the store under the roots the committed rows name; and at the end the
+/// session backs up. Memory stays within its allowance and plateaus, the
+/// store holds exactly the live proof, and every outcome stays readable.
+#[test]
+fn a_sustained_workload_stays_within_its_budgets_and_keeps_every_outcome() {
+    use focal_core::native::{ContentRoot, NativeCommand};
+    use focal_evidence::{CollectorConfig, ProtectionSet};
+    let mut cluster = Cluster::new(1, &[true]);
+    cluster.elect(1, &[]);
+    cluster.activate(1, &[]);
+    let domain = native_limits().content_domain;
+    let mut outcomes = Vec::new();
+    let mut used_after_warmup = None;
+    const ROUNDS: u128 = 24;
+    for round in 1..=ROUNDS {
+        // Create, finish and release one claim; retire its family.
+        let create = creation(cluster.next(PARTIES.issuer), round);
+        let key = create.request;
+        let created = cluster.commit(1, PARTIES.issuer, create, &[]);
+        outcomes.push((key, created));
+        let expected = cluster.claim(1, round);
+        let cancel = fx::cancel(cluster.next(PARTIES.issuer), expected);
+        cluster.commit(1, PARTIES.issuer, cancel, &[]);
+        let expected = cluster.claim(1, round);
+        let release = NativeInput {
+            request: cluster.next(PARTIES.issuer),
+            command: NativeCommand::ReleaseScope { expected },
+        };
+        cluster.commit(1, PARTIES.issuer, release, &[]);
+        let bundle = {
+            let node = cluster.node(1);
+            let limits = node.native_encoding_limits().unwrap();
+            let core = node.native_core().unwrap();
+            let family = core.retirement_family(ClaimId::from_u128(round)).unwrap();
+            let through = core.native_sequence();
+            assert!(
+                node.native_retention()
+                    .unwrap()
+                    .allows_family(family.through)
+            );
+            let quote = core.archive_family_quote(&family, through, limits).unwrap();
+            let mut bytes = vec![0u8; quote.bytes];
+            core.archive_family_into(&family, through, &mut bytes, limits.visits)
+                .unwrap();
+            (bytes, through)
+        };
+        let (bytes, through) = bundle;
+        // The bundle is sealed under custody before the record names it.
+        let reference = cluster.stores[0]
+            .seal_import_inline(domain, &bytes, 1024 * 1024)
+            .unwrap();
+        cluster
+            .node(1)
+            .native_propose_retirement(
+                ClaimId::from_u128(round),
+                reference.root,
+                reference.length,
+                through,
+            )
+            .unwrap();
+        cluster.pump(&[]);
+        assert_eq!(cluster.status(1, round), None, "round {round}");
+        assert!(cluster.node(1).native_authoritative());
+        if round % 4 == 0 {
+            cluster.node(1).checkpoint().unwrap();
+            // The collector runs under the roots the committed rows name.
+            let mut protection = ProtectionSet::new();
+            let mut cursor = None;
+            loop {
+                let page = cluster.node(1).native_content_roots(cursor, 4096).unwrap();
+                for root in page.roots {
+                    match root {
+                        ContentRoot::Artifact(pointer) | ContentRoot::Inline(pointer) => {
+                            protection.protect_object(domain, pointer.root).unwrap();
+                        }
+                        ContentRoot::Bundle { root, .. } => {
+                            protection.protect_object(domain, root).unwrap();
+                        }
+                    }
+                }
+                cursor = page.next;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            protection.finish();
+            let config = CollectorConfig {
+                grace_ms: 0,
+                quarantine_ms: 0,
+                terminal_grace_ms: 0,
+                keep_records: 4,
+                max_marks: 1 << 16,
+            };
+            let now = u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            )
+            .unwrap()
+                + 60_000;
+            let mut complete = false;
+            for _ in 0..10_000 {
+                let report = cluster.stores[0]
+                    .collect_step(&protection, config, now, 64)
+                    .unwrap();
+                if report.complete {
+                    assert_eq!(report.objects_quarantined, 0, "every bundle is proof");
+                    complete = true;
+                    break;
+                }
+            }
+            assert!(complete);
+            let stats = cluster.node(1).memory_stats();
+            assert!(stats.used <= stats.limit, "{stats:?}");
+            match used_after_warmup {
+                None => used_after_warmup = Some(stats.used),
+                Some(warm) => assert!(
+                    stats.used <= warm.saturating_mul(2).max(warm + 4 * 1024 * 1024),
+                    "memory grows without bound: {warm} then {}",
+                    stats.used
+                ),
+            }
+        }
+    }
+    let report = cluster.node(1).native_retention().unwrap();
+    assert_eq!(report.retired, ROUNDS as u64, "{report:?}");
+    // Every outcome is still answered exactly, and every continuation names
+    // its bundle, which the store still holds and verifies.
+    for (key, created) in &outcomes {
+        assert_eq!(
+            cluster.node(1).native_outcome(*key).unwrap(),
+            Some(*created)
+        );
+    }
+    let core_bundles: Vec<(ContentHash, u64)> = (1..=ROUNDS)
+        .map(|round| {
+            let continuation = cluster
+                .node(1)
+                .native_core()
+                .unwrap()
+                .native_retired(ClaimId::from_u128(round))
+                .copied()
+                .unwrap();
+            (continuation.bundle, continuation.bytes)
+        })
+        .collect();
+    for (root, bytes) in &core_bundles {
+        cluster.stores[0]
+            .verify(&ContentRef {
+                domain,
+                root: *root,
+                length: *bytes,
+                class: ContentClass::Evidence,
+            })
+            .unwrap();
+    }
+    // The session backs up whole and the backup verifies.
+    let session = cluster.node(1);
+    let encoded = session.encode_checkpoint(true).unwrap().unwrap();
+    let (checkpoint, _allocation) = encoded.retained.unwrap();
+    let status = session.status();
+    let image = backup::BackupImage {
+        prefix: EvidencePrefix {
+            cluster: session.cluster_id(),
+            ledger: session.ledger(),
+            group: focal_directory::LogGroupId(session.group_id()),
+            genesis: session.placement_genesis().unwrap(),
+            node: status.node_id,
+            sequence: session.sequence(),
+            index: RaftIndex(session.applied_raft),
+            term: RaftTerm(
+                session
+                    .consensus
+                    .published_term(session.applied_raft)
+                    .unwrap(),
+            ),
+            route: RouteEpoch(1),
+            placement_epoch: 1,
+            membership_epoch: 1,
+            operation: focal_directory::OperationId([9; 16]),
+            placement_digest: ContentHash([8; 32]),
+            checkpoint: ContentHash(*blake3::hash(&checkpoint).as_bytes()),
+            checkpoint_bytes: checkpoint.len() as u64,
+            artifacts: 0,
+        },
+        configuration: session.membership().unwrap().configuration,
+        checkpoint,
+    };
+    let limits = native_limits();
+    let budget = MemoryBudget::new(256 * 1024 * 1024, 64 * 1024 * 1024).unwrap();
+    let reader = ContentReader::open(content_dir(cluster.dir.path(), 1)).unwrap();
+    let seeds = focal_evidence::SeedReader::open(cluster.dir.path().join("seeds-1")).unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let dir = target.path().join("backup");
+    let mut files = backup::FileMedium;
+    let written = backup::write(
+        &mut files,
+        &dir,
+        &image,
+        &seeds,
+        &reader,
+        backup::decoder_pair(),
+        &limits,
+        &budget,
+        1_000,
+    )
+    .unwrap();
+    assert_eq!(written.bundles, ROUNDS as u64);
+    assert_eq!(written.manifest.content.len(), ROUNDS as usize);
+    assert_eq!(written.manifest.retired_families, ROUNDS as u64);
+    let verified = backup::verify(&files, &dir, backup::decoder_pair().1, &budget).unwrap();
+    assert!(verified.complete(), "{:?}", verified.problems);
 }

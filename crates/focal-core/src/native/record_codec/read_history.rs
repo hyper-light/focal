@@ -37,6 +37,15 @@ fn lookup(read: &ValidationRead<'_, '_>) -> Result<(), NativeError> {
             .ok_or_else(invalid)?,
     )
 }
+/// The row an event belongs to (26 §4): the object it changed, a claim's
+/// registrations or child registrations, or a monitor's allocation.
+pub(in crate::native) fn event_object(event: NativeEvent) -> Key {
+    match key(event).object {
+        Object::Row(key) => key,
+        Object::Registrations(claim) | Object::ChildRegistration(claim) => Key::Claim(claim),
+        Object::Monitor(id) => Key::Monitor(id),
+    }
+}
 fn key(event: NativeEvent) -> HistoryKey {
     let (object, revision, ordinal) = match event.fact {
         NativeFact::Claim(claim) => (

@@ -93,12 +93,12 @@ fn full_chain_prices_all_retained_versions_and_only_one_parent_failure() {
                     outcomes: reports as usize,
                     sequences: u64::from(reports),
                     events: 3 * reports as usize + failure + cohort.events(),
-                    // Seven primary rows and twenty index rows per report.
-                    new_rows: 27 * reports as usize + failure + cohort.events(),
+                    // Seven primary rows and twenty-one index rows per report.
+                    new_rows: 28 * reports as usize + failure + cohort.events(),
                     ..CompletionSlots::default()
                 }
             );
-            // Nine primary writes, the report's twenty index rows and the
+            // Nine primary writes, the report's twenty-one index rows and the
             // due timers of the reported and every sealed cohort evaluation.
             let report_index = crate::native::index_rows::report_rows(16).unwrap();
             let regular_timers =
@@ -559,7 +559,7 @@ fn report_changes(
     artifact: ArtifactId,
 ) -> Vec<Change<Key, Row>> {
     let mut changes = Vec::with_capacity(11);
-    for entry in candidate.range.entries() {
+    for entry in candidate.fragments.entries() {
         let selected = match entry.key {
             Key::Meta => true,
             Key::Claim(id) => id == key(1).claim && candidate.outcome().changed != 0,
@@ -662,7 +662,7 @@ fn admitted_scope_growth_and_actual_failed_report_fit_the_original_pinned_envelo
     let changes = report_changes(&core, &candidate, ArtifactId::from_u128(900));
     assert_eq!(changes.len(), 12);
     let Some(Row::Event(event)) = candidate
-        .range
+        .fragments
         .get(&Key::Event(candidate.outcome().sequence, 4))
     else {
         panic!("actual registry seal fact")
@@ -675,17 +675,19 @@ fn admitted_scope_growth_and_actual_failed_report_fit_the_original_pinned_envelo
         .state
         .rows
         .plan_batch(
+            &core.state.budget,
             candidate.outcome().sequence.0,
             changes,
             BudgetLane::Completion,
             usize::MAX,
         )
         .unwrap();
-    envelope
-        .report_storage(CompletionUse::AdmissionFailure)
-        .unwrap()
-        .check_plan(&plan)
-        .unwrap();
+    plan.check_envelope(
+        &envelope
+            .report_storage(CompletionUse::AdmissionFailure)
+            .unwrap(),
+    )
+    .unwrap();
     drop(plan);
     core.publish_native(candidate).unwrap();
     assert_eq!(parts(&core).0.status(), ClaimStatus::PostFailed);
@@ -712,6 +714,7 @@ fn parent_cap_and_storage_envelope_reject_another_owner() {
         .state
         .rows
         .plan_batch(
+            &core.state.budget,
             other.native_sequence().0 + 1,
             vec![Change::Put(Entry::new(
                 Key::Meta,
@@ -723,10 +726,7 @@ fn parent_cap_and_storage_envelope_reject_another_owner() {
         )
         .unwrap();
     assert!(matches!(
-        envelope
-            .report_storage(CompletionUse::Regular)
-            .unwrap()
-            .check_plan(&plan),
+        plan.check_envelope(&envelope.report_storage(CompletionUse::Regular).unwrap()),
         Err(MemoryError::WrongRange)
     ));
     let mut foreign_core = super::super::report_tests::core();
@@ -1381,9 +1381,9 @@ fn required_increment_prices_nine_writes_per_attempt_without_a_claim_failure_all
     let (claim, _, _) = parts(&core);
     let declaration = core.native_definition(key(4).validation).unwrap();
     let mut limits = core.limits;
-    // Nine primary writes, the report's twenty index rows and its evaluation's
-    // due timer (doc 22 §7).
-    limits.range.max_batch_entries = 30;
+    // Nine primary writes, the report's twenty-one index rows and its
+    // evaluation's due timer (doc 22 §7).
+    limits.range.max_batch_entries = 31;
     let before = core.state.budget.stats();
     let quote = CompletionEnvelope::derive(
         &core.state.rows,
@@ -1404,18 +1404,18 @@ fn required_increment_prices_nine_writes_per_attempt_without_a_claim_failure_all
             .report_storage(CompletionUse::AdmissionFailure)
             .is_err()
     );
-    // Nine primary writes, the report's twenty index rows and the reported
-    // evaluation's due timer (doc 22 §7).
+    // Nine primary writes, the report's twenty-one index rows and the
+    // reported evaluation's due timer (doc 22 §7).
     assert_eq!(
         quote
             .report_storage(CompletionUse::Regular)
             .unwrap()
             .limits()
             .changed_keys,
-        9 + 20 + 1
+        9 + 21 + 1
     );
     assert_eq!(quote.slots().events, reports * 3);
-    assert_eq!(quote.slots().new_rows, reports * 27);
+    assert_eq!(quote.slots().new_rows, reports * 28);
     assert_eq!(
         quote.total_retained_bytes(),
         reports
@@ -1488,7 +1488,7 @@ fn remaining_slots_keep_admission_surcharge_until_used_and_zero_it_after_termina
             outcomes: 1,
             events: 4 + quote.cohort().events(),
             sequences: 1,
-            new_rows: 28 + quote.cohort().events(),
+            new_rows: 29 + quote.cohort().events(),
             ..CompletionSlots::default()
         }
     );
@@ -1501,8 +1501,8 @@ fn remaining_slots_keep_admission_surcharge_until_used_and_zero_it_after_termina
             outcomes: 1,
             events: 3,
             sequences: 1,
-            // Seven primary rows and the report's twenty index rows.
-            new_rows: 27,
+            // Seven primary rows and the report's twenty-one index rows.
+            new_rows: 28,
             ..CompletionSlots::default()
         }
     );

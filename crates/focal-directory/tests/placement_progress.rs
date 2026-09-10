@@ -1183,3 +1183,144 @@ fn the_planner_skips_nodes_without_disk_headroom_and_prefers_roomier_ones() {
     assert_ne!(digest, ContentHash([0; 32]));
     assert_eq!(checkpoint.nodes[&1].load.unwrap().disk_available, 0);
 }
+
+/// Published holders (25 §9): monotone per session, idempotent for the same
+/// publication, conflicting at the same epoch, in key order with unique
+/// identities, and every holding replica a member of the active placement
+/// at its enrolled generation.
+#[test]
+fn holders_publish_in_epoch_order_for_placement_members_only() {
+    let mut directory = partition(PartitionConfig::default());
+    nodes(&mut directory);
+    create(&mut directory);
+    let holder =
+        |member: u128, start: Option<u8>, node: Option<u64>, generation: Option<u64>| RangeHolder {
+            member: focal_memory::RangeId::from_u128(member),
+            start: start.map(|byte| [byte; 16]),
+            node,
+            generation,
+        };
+    let publish = |epoch: u64, members: Vec<RangeHolder>| SessionChange::Holders {
+        holders: RangeHolders { epoch, members },
+    };
+    assert!(session(&directory).holders.is_none());
+    // Epoch zero, no members, a first member with a start, or a later one
+    // without: refused as invalid.
+    for bad in [
+        publish(0, vec![holder(1, None, None, None)]),
+        publish(1, Vec::new()),
+        publish(1, vec![holder(1, Some(4), None, None)]),
+        publish(
+            1,
+            vec![holder(1, None, None, None), holder(2, None, None, None)],
+        ),
+        // Descending affinities, a repeated identity, a node without its
+        // generation.
+        publish(
+            1,
+            vec![
+                holder(1, None, None, None),
+                holder(2, Some(9), None, None),
+                holder(3, Some(4), None, None),
+            ],
+        ),
+        publish(
+            1,
+            vec![holder(1, None, None, None), holder(1, Some(4), None, None)],
+        ),
+        publish(1, vec![holder(1, None, Some(1), None)]),
+    ] {
+        assert_eq!(
+            attempt(&mut directory, bad),
+            Err(DirectoryError::Invalid("range holders"))
+        );
+    }
+    // A holder outside the active placement, or at another generation.
+    assert_eq!(
+        attempt(
+            &mut directory,
+            publish(1, vec![holder(1, None, Some(2), Some(1))])
+        ),
+        Err(DirectoryError::Missing)
+    );
+    assert_eq!(
+        attempt(
+            &mut directory,
+            publish(1, vec![holder(1, None, Some(1), Some(2))])
+        ),
+        Err(DirectoryError::StaleNode)
+    );
+    // The voters hold the one member at epoch one.
+    change(
+        &mut directory,
+        publish(1, vec![holder(1, None, None, None)]),
+    );
+    let published = session(&directory).holders.unwrap();
+    assert_eq!(published.epoch, 1);
+    assert_eq!(published.members, vec![holder(1, None, None, None)]);
+    // The same publication is idempotent; a different one at the same epoch
+    // conflicts; an older epoch is stale.
+    change(
+        &mut directory,
+        publish(1, vec![holder(1, None, None, None)]),
+    );
+    assert_eq!(
+        attempt(
+            &mut directory,
+            publish(1, vec![holder(1, None, Some(1), Some(1))])
+        ),
+        Err(DirectoryError::CompareFailed)
+    );
+    // Epoch three: the member moved to node one's replica and split.
+    change(
+        &mut directory,
+        publish(
+            3,
+            vec![
+                holder(1, None, Some(1), Some(1)),
+                holder(7, Some(8), Some(1), Some(1)),
+            ],
+        ),
+    );
+    assert_eq!(
+        attempt(
+            &mut directory,
+            publish(2, vec![holder(1, None, None, None)])
+        ),
+        Err(DirectoryError::StaleEpoch)
+    );
+    let published = session(&directory).holders.unwrap();
+    assert_eq!(published.epoch, 3);
+    assert_eq!(published.members.len(), 2);
+    assert_eq!(
+        published.members[1].member,
+        focal_memory::RangeId::from_u128(7)
+    );
+    // A checkpoint carries the publication; a schema 6 checkpoint restores
+    // with none.
+    let checkpoint = directory.checkpoint().clone();
+    assert_eq!(checkpoint.schema, PARTITION_CHECKPOINT_SCHEMA);
+    let bytes = postcard::to_stdvec(&checkpoint).unwrap();
+    let restored = PartitionCheckpoint::decode_any(&bytes).unwrap();
+    assert_eq!(restored.sessions[&ledger()].holders, Some(published));
+    let older = PartitionCheckpointV6 {
+        schema: 6,
+        cluster: checkpoint.cluster,
+        delegation: checkpoint.delegation,
+        revision: checkpoint.revision,
+        sealed: checkpoint.sealed.clone(),
+        nodes: checkpoint.nodes.clone(),
+        sessions: checkpoint
+            .sessions
+            .iter()
+            .map(|(ledger, session)| (*ledger, SessionDescriptorV6::from(session.clone())))
+            .collect(),
+        routes: checkpoint.routes.clone(),
+        routes_from: checkpoint.routes_from,
+    };
+    let bytes = postcard::to_stdvec(&older).unwrap();
+    let restored = PartitionCheckpoint::decode_any(&bytes).unwrap();
+    assert_eq!(restored.schema, PARTITION_CHECKPOINT_SCHEMA);
+    assert!(restored.sessions[&ledger()].holders.is_none());
+    assert_eq!(restored.sessions[&ledger()].founder, Some(1));
+}

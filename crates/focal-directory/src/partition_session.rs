@@ -35,6 +35,10 @@ pub(crate) fn change_charge(
         SessionChange::Ready { .. } => tree_row::<(u64, ReplicaReady)>(),
         SessionChange::Progress { progress, .. } => partition_progress::progress_charge(progress)?,
         SessionChange::Refuse { .. } => add(size_of::<Refusal>(), ALLOCATOR_OVERHEAD)?,
+        SessionChange::Holders { holders } => mul(
+            holders.members.len(),
+            add(size_of::<RangeHolder>(), ALLOCATOR_OVERHEAD)?,
+        )?,
         SessionChange::Activate { .. } => {
             let members = session.map_or(0, |session| session.active.placement.nodes().len());
             mul(
@@ -384,6 +388,75 @@ pub(crate) fn apply_session(
                 }
                 session.retiring.remove(node);
             }
+        }
+        SessionChange::Holders { holders } => {
+            if let Some(current) = session.holders.as_ref() {
+                if holders.epoch < current.epoch {
+                    return Err(DirectoryError::StaleEpoch);
+                }
+                if holders.epoch == current.epoch {
+                    return if holders == current {
+                        Ok(())
+                    } else {
+                        Err(DirectoryError::CompareFailed)
+                    };
+                }
+            }
+            validate_holders(session, holders)?;
+            let mut members = Vec::new();
+            members
+                .try_reserve_exact(holders.members.len())
+                .map_err(|_| DirectoryError::Memory(focal_memory::MemoryError::AllocationFailed))?;
+            members.extend(holders.members.iter().copied());
+            session.holders = Some(RangeHolders {
+                epoch: holders.epoch,
+                members,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A publication names one to `MAX_PUBLISHED_HOLDERS` members in key order
+/// (the first from the start of the space, then ascending affinities), each
+/// identity once, and every holding replica a member of the active
+/// placement at its enrolled generation.
+fn validate_holders(
+    session: &SessionDescriptor,
+    holders: &RangeHolders,
+) -> Result<(), DirectoryError> {
+    if holders.epoch == 0
+        || holders.members.is_empty()
+        || holders.members.len() > MAX_PUBLISHED_HOLDERS
+    {
+        return Err(DirectoryError::Invalid("range holders"));
+    }
+    let mut previous: Option<[u8; 16]> = None;
+    for (position, holder) in holders.members.iter().enumerate() {
+        let ordered = match (position, holder.start, previous) {
+            (0, None, _) => true,
+            (_, Some(start), Some(last)) => start > last,
+            (_, Some(_), None) => position == 1,
+            _ => false,
+        };
+        let unique = holders
+            .members
+            .iter()
+            .filter(|other| other.member == holder.member)
+            .count()
+            == 1;
+        if !ordered || !unique {
+            return Err(DirectoryError::Invalid("range holders"));
+        }
+        previous = holder.start.or(previous);
+        match (holder.node, holder.generation) {
+            (None, None) => {}
+            (Some(node), Some(generation)) => match session.active.placement.generation(node) {
+                None => return Err(DirectoryError::Missing),
+                Some(enrolled) if enrolled != generation => return Err(DirectoryError::StaleNode),
+                Some(_) => {}
+            },
+            _ => return Err(DirectoryError::Invalid("range holders")),
         }
     }
     Ok(())

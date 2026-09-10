@@ -175,9 +175,10 @@ pub enum NativeOperationKind {
     EvaluationDeadline,
     ClaimDeadline,
     Import,
+    Retire,
 }
 impl NativeOperationKind {
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 32] = [
         Self::RegisterMonitor,
         Self::RebindMonitor,
         Self::CancelMonitor,
@@ -209,6 +210,7 @@ impl NativeOperationKind {
         Self::EvaluationDeadline,
         Self::ClaimDeadline,
         Self::Import,
+        Self::Retire,
     ];
     pub const fn registered_tag(self) -> u8 {
         match self {
@@ -243,13 +245,18 @@ impl NativeOperationKind {
             Self::EvaluationDeadline => 28,
             Self::ClaimDeadline => 29,
             Self::Import => 30,
+            Self::Retire => 31,
         }
     }
     /// Trusted operations never arrive as participant frames.
     pub const fn participant_authored(self) -> bool {
         !matches!(
             self,
-            Self::MonitorDeadline | Self::EvaluationDeadline | Self::ClaimDeadline | Self::Import
+            Self::MonitorDeadline
+                | Self::EvaluationDeadline
+                | Self::ClaimDeadline
+                | Self::Import
+                | Self::Retire
         )
     }
     pub const fn name(self) -> &'static str {
@@ -285,6 +292,7 @@ impl NativeOperationKind {
             Self::EvaluationDeadline => "evaluation_deadline",
             Self::ClaimDeadline => "claim_deadline",
             Self::Import => "import",
+            Self::Retire => "retire",
         }
     }
 }
@@ -1134,6 +1142,26 @@ pub enum NativeObject {
     Legacy(NativeLegacyRow),
     /// The address is absent at this prefix; absence is never abort proof.
     Missing(NativeObjectRef),
+    /// The claim retired to the archive (26 §4): its rows left the core
+    /// behind this continuation; the bundle holds them.
+    Retired(NativeRetiredClaim),
+}
+/// The continuation of a retired claim: its final binding and status, the
+/// archive bundle holding its family's rows (an object of the ledger's
+/// tenant domain named by content root and length), the prefix the bundle
+/// claims, the sequence the retirement was published at, and how many of
+/// its events left with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeRetiredClaim {
+    pub claim: ClaimId,
+    pub binding: NativeBinding,
+    pub status: ClaimStatus,
+    pub bundle: ContentHash,
+    pub bytes: u64,
+    pub through: SessionSeq,
+    pub retired_at: SessionSeq,
+    pub events: u32,
 }
 
 /// One indexed predicate is selected by the node; the rest filter residually

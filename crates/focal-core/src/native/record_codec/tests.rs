@@ -38,7 +38,7 @@ fn graph_capture_format_has_an_explicit_version_boundary_from_dormant_native_v1(
     let mut core = fixture::core();
     let prepared = created(&core);
     let mut mutation = encode(&prepared);
-    assert_eq!(&mutation[8..10], &4u16.to_le_bytes());
+    assert_eq!(&mutation[8..10], &VERSION.to_le_bytes());
     mutation[8..10].copy_from_slice(&1u16.to_le_bytes());
     let end = mutation.len() - 32;
     let mut digest = blake3::Hasher::new_derive_key("focal.native.record.v1");
@@ -52,7 +52,7 @@ fn graph_capture_format_has_an_explicit_version_boundary_from_dormant_native_v1(
     let plan = checkpoint::EncodingPlan::prepare(&core, limits()).unwrap();
     let mut root = vec![0; plan.quote().bytes];
     plan.write_into(&mut root).unwrap();
-    assert_eq!(&root[8..10], &4u16.to_le_bytes());
+    assert_eq!(&root[8..10], &checkpoint::VERSION.to_le_bytes());
     root[8..10].copy_from_slice(&1u16.to_le_bytes());
     let end = root.len() - 32;
     let mut digest = blake3::Hasher::new_derive_key("focal.native.checkpoint.v1");
@@ -71,10 +71,10 @@ fn real_records_preserve_exact_mutations_and_do_not_serialize_unchanged_rows() {
     assert_eq!(core.native_sequence(), SessionSeq(0));
     let record = StructuralRecord::inspect(&bytes, inspection(bytes.len())).unwrap();
     assert_eq!(record.header().ledger, fixture::binding(1).ledger);
-    assert_eq!(record.header().range, prepared.range.id());
+    assert_eq!(record.header().range, prepared.fragments.id());
     assert_eq!(record.header().outcome, prepared.outcome());
     assert_eq!(record.header().base, SessionSeq(0));
-    assert_eq!(record.quote().rows, prepared.range.len());
+    assert_eq!(record.quote().rows, prepared.fragments.len());
     let rows = record
         .rows(100_000_000)
         .unwrap()
@@ -111,7 +111,7 @@ fn real_records_preserve_exact_mutations_and_do_not_serialize_unchanged_rows() {
     ));
     let bytes = encode(&posted);
     let record = StructuralRecord::inspect(&bytes, inspection(bytes.len())).unwrap();
-    assert!(record.quote().rows < posted.range.len());
+    assert!(record.quote().rows < posted.fragments.len());
     assert!(
         record
             .rows(100_000_000)
@@ -366,7 +366,7 @@ fn explicit_deletion_and_present_link_tombstone_have_distinct_records() {
     let initial = created(&core);
     let outcome = initial.outcome;
     let mut changes = initial
-        .range
+        .fragments
         .entries()
         .filter(|entry| entry.key != removed)
         .map(|entry| {
@@ -388,13 +388,14 @@ fn explicit_deletion_and_present_link_tombstone_have_distinct_records() {
         .state
         .rows
         .plan_batch(
-            initial.range.prefix(),
+            &core.state.budget,
+            initial.fragments.prefix(),
             changes,
             BudgetLane::Ordinary,
             usize::MAX,
         )
         .unwrap();
-    let count = plan.changes().len();
+    let count = plan.changes_len();
     let allowance = mutation::bytes(count).unwrap();
     let funding = core
         .state
@@ -404,13 +405,16 @@ fn explicit_deletion_and_present_link_tombstone_have_distinct_records() {
         .commit();
     let writes = mutation::WriteSet::capture(
         initial.content_profile(),
+        plan.changes_len(),
         plan.changes(),
         allowance,
         funding,
     )
     .unwrap();
     let prepared = NativePrepared {
-        range: plan.build_with(prepare::copy).unwrap(),
+        fragments: plan
+            .build_in_with(&core.state.budget, prepare::copy)
+            .unwrap(),
         outcome,
         writes,
     };

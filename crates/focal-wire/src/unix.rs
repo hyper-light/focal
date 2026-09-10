@@ -17,7 +17,10 @@ pub struct UnixServer {
     path: PathBuf,
     inode: u64,
     uid: u32,
-    grant: PeerGrant,
+    /// The grant every accepted connection is served under, read at accept:
+    /// a sender that outlives the server changes what later connections may
+    /// do without rebinding the socket.
+    grant: watch::Receiver<PeerGrant>,
     limits: WireLimits,
     shutdown: watch::Sender<bool>,
 }
@@ -27,9 +30,21 @@ impl UnixServer {
         grant: PeerGrant,
         limits: WireLimits,
     ) -> Result<Self, WireError> {
+        let (_fixed, grant) = watch::channel(grant);
+        Self::bind_watched(path, grant, limits)
+    }
+    /// Bind under a grant that follows its sender: every connection accepted
+    /// after a change is served under the new value, and a connection already
+    /// open keeps the grant it was accepted with. Each value is validated
+    /// like a fixed grant before it serves anyone.
+    pub fn bind_watched(
+        path: impl AsRef<Path>,
+        grant: watch::Receiver<PeerGrant>,
+        limits: WireLimits,
+    ) -> Result<Self, WireError> {
         limits.validate()?;
         require_runtime()?;
-        AuthenticatedPeer::local(grant.clone())?;
+        AuthenticatedPeer::local(grant.borrow().clone())?;
         let path = path.as_ref().to_path_buf();
         let parent = path.parent().ok_or(WireError::Authentication)?;
         let parent_metadata = std::fs::symlink_metadata(parent)?;
@@ -86,7 +101,7 @@ impl UnixServer {
                     let (stream,_)=accepted?;
                     if tasks.len() >= self.limits.max_connections {drop(stream);continue;}
                     if stream.peer_cred()?.uid()!=self.uid {drop(stream);continue;}
-                    let grant=self.grant.clone();let limits=self.limits.clone();let handler=handler.clone();
+                    let grant=self.grant.borrow().clone();let limits=self.limits.clone();let handler=handler.clone();
                     tasks.spawn(async move {
                         let _ = transport_exchange(async {
                             tokio::time::timeout(

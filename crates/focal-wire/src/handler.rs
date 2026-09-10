@@ -266,6 +266,8 @@ pub fn validate_response(
                     | Operation::PeerControl { .. }
                     | Operation::PlacementControl { .. }
                     | Operation::SessionSign { .. }
+                    | Operation::RangeControl { .. }
+                    | Operation::SessionControl { .. }
                     | Operation::NodeContact { .. }
                     | Operation::EnrollmentControl { .. }
             ) || response.is_empty()
@@ -726,6 +728,10 @@ pub fn validate_response(
                     },
                     CustodyReply::Chunk { index: read, bytes },
                 ) => index == read && !bytes.is_empty() && bytes.len() <= *max_bytes as usize,
+                (
+                    CustodyRequest::SeedChunk { hash, max_bytes },
+                    CustodyReply::SeedChunk { hash: read, bytes },
+                ) => hash == read && !bytes.is_empty() && bytes.len() <= *max_bytes as usize,
                 _ => false,
             };
             if !valid {

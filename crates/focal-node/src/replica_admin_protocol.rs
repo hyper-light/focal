@@ -26,6 +26,18 @@ pub enum ReplicaAdminCommand {
     /// Propose the committed activation of native history over an empty
     /// legacy prefix; every voter must already promise the successor decoder.
     ActivateNative { session: SessionId, group: [u8; 16] },
+    /// Checkpoint the replica's applied prefix now: the Session envelope is
+    /// encoded and installed synchronously, and the Raft log is compacted
+    /// behind it. A native Core root beyond the inline bound is sealed as
+    /// seeds beside the node's data (25 §5).
+    Checkpoint { session: SessionId, group: [u8; 16] },
+    /// The committed movement map of a native session (25 §6), answered by
+    /// this node's replica whether it leads or follows; `group`, when given,
+    /// must be the replica's.
+    Ranges {
+        session: SessionId,
+        group: Option<[u8; 16]>,
+    },
 }
 impl ReplicaAdminCommand {
     pub(super) fn validate(&self) -> Result<(), AccessError> {
@@ -51,7 +63,14 @@ impl ReplicaAdminCommand {
             } if !session.is_zero() && *group != [0; 16] => {
                 request.validate().map_err(|_| AccessError::InvalidRequest)
             }
-            Self::ActivateNative { session, group } if !session.is_zero() && *group != [0; 16] => {
+            Self::ActivateNative { session, group } | Self::Checkpoint { session, group }
+                if !session.is_zero() && *group != [0; 16] =>
+            {
+                Ok(())
+            }
+            Self::Ranges { session, group }
+                if !session.is_zero() && group.is_none_or(|g| g != [0; 16]) =>
+            {
                 Ok(())
             }
             _ => Err(AccessError::InvalidRequest),
@@ -88,6 +107,15 @@ pub enum ReplicaAdminReply {
     NativeActivationProposed {
         session: SessionId,
         group: [u8; 16],
+    },
+    Checkpointed {
+        session: SessionId,
+        group: [u8; 16],
+    },
+    Ranges {
+        session: SessionId,
+        group: [u8; 16],
+        view: Box<crate::fleet::RangeView>,
     },
     Rejected(ControlFailure),
 }
@@ -261,6 +289,36 @@ impl LocalNetworkAdmin {
                 .await
                 .map_err(failure)?;
                 Ok(ReplicaAdminReply::NativeActivationProposed { session, group })
+            }
+            ReplicaAdminCommand::Checkpoint { session, group } => {
+                let (actual, host) = fleet
+                    .replica_target(LedgerId {
+                        tenant: self.identity.ledger.tenant,
+                        session,
+                    })
+                    .map_err(|_| ControlFailure::Unavailable)?;
+                if group != actual {
+                    return Err(ControlFailure::WrongOwner);
+                }
+                host.checkpoint().await.map_err(failure)?;
+                Ok(ReplicaAdminReply::Checkpointed { session, group })
+            }
+            ReplicaAdminCommand::Ranges { session, group } => {
+                let (actual, host) = fleet
+                    .replica_target(LedgerId {
+                        tenant: self.identity.ledger.tenant,
+                        session,
+                    })
+                    .map_err(|_| ControlFailure::Unavailable)?;
+                if group.is_some_and(|group| group != actual) {
+                    return Err(ControlFailure::WrongOwner);
+                }
+                let view = host.range_view(false).await.map_err(failure)?;
+                Ok(ReplicaAdminReply::Ranges {
+                    session,
+                    group: actual,
+                    view: Box::new(view),
+                })
             }
         }
     }

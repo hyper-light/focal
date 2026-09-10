@@ -105,7 +105,7 @@ fn frame_refuses_repaired_identity_floor_activation_disabled_legacy_and_nested_s
     let (bytes, _, _) = encoded(false);
     // Fixed framing for a genesis native prefix with no recording range.
     for (offset, value) in [
-        (8, 4),    // Unknown enclosing schema.
+        (8, 5),    // Unknown enclosing schema.
         (10, 99),  // Cluster disagrees with retained stable genesis.
         (74, 1),   // Native content profile disagrees with root/genesis.
         (75, 99),  // Core range substitution.
@@ -136,6 +136,17 @@ fn frame_refuses_repaired_identity_floor_activation_disabled_legacy_and_nested_s
     }
     let checkpoint = Checkpoint::inspect(&bytes, Limits::default()).unwrap();
     let core_offset = checkpoint.core_bytes().as_ptr() as usize - bytes.as_ptr() as usize;
+    // The form byte precedes the Core byte count (8) and hash (32); an
+    // unknown form and a seeded form claiming an inline body are refused.
+    for form in [1u8, 2] {
+        let mut corrupt = bytes.clone();
+        corrupt[core_offset - 41] = form;
+        checksum(&mut corrupt);
+        assert!(
+            Checkpoint::inspect(&corrupt, Limits::default()).is_err(),
+            "form {form}"
+        );
+    }
     let mut corrupt = bytes.clone();
     corrupt[core_offset + 43] ^= 1; // Actual nested range; repair both checksums.
     let root_end = core_offset + checkpoint.core_bytes().len() - 32;
@@ -306,4 +317,310 @@ fn canonical_joint_membership_validation_rejects_overlap_duplicates_and_unfunded
     bad[251..255].copy_from_slice(&u32::MAX.to_le_bytes());
     checksum(&mut bad);
     assert!(Checkpoint::inspect(&bad, Limits::default()).is_err());
+}
+
+fn seed_store(directory: &std::path::Path) -> focal_evidence::SeedStore {
+    focal_evidence::SeedStore::open(
+        directory.join("seeds"),
+        focal_memory::DiskBudget::new(focal_memory::DiskBudgetConfig::default()).unwrap(),
+    )
+    .unwrap()
+}
+fn budget() -> MemoryBudget {
+    MemoryBudget::new(64 << 20, 8 << 20).unwrap()
+}
+
+#[test]
+fn a_root_beyond_the_inline_bound_is_seeded_and_assembled_back_exactly() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut seeds = seed_store(directory.path());
+    let core = core(false, 31);
+    let configuration = configuration();
+    let inline = EncodingPlan::prepare(
+        &core,
+        metadata(NativeContentProfile::ProjectionOnly),
+        &configuration,
+        Limits::default(),
+    )
+    .unwrap();
+    assert!(!inline.seeded());
+    let inline_bytes = inline.encode_in(&budget()).unwrap();
+    let limits = Limits {
+        inline_bytes: 16,
+        ..Limits::default()
+    };
+    let plan = EncodingPlan::prepare(
+        &core,
+        metadata(NativeContentProfile::ProjectionOnly),
+        &configuration,
+        limits,
+    )
+    .unwrap();
+    assert!(plan.seeded());
+    // The inline paths refuse a seeded plan; only the seed store can encode it.
+    let mut scratch = vec![0; plan.quote().bytes];
+    assert!(matches!(plan.write_into(&mut scratch), Err(Error::Seeded)));
+    assert!(matches!(plan.encode_in(&budget()), Err(Error::Seeded)));
+    assert!(matches!(
+        plan.write_with(|_| Ok::<(), ()>(())),
+        Err(WriteError::Codec(Error::Seeded))
+    ));
+    let encoded = plan.encode_in_seeded(&budget(), &mut seeds).unwrap();
+    assert_eq!(encoded.bytes().len(), plan.quote().bytes);
+    assert!(encoded.bytes().len() < inline_bytes.bytes().len());
+    // The seeded frame names one chunk holding the whole root.
+    let manifest = Checkpoint::describe(encoded.bytes(), limits)
+        .unwrap()
+        .expect("seeded form");
+    assert_eq!(manifest.len(), 1);
+    let chunk = manifest.chunks().next().unwrap().unwrap();
+    assert_eq!(u64::from(chunk.length), manifest.header().core_bytes);
+    assert!(seeds.contains(chunk.hash));
+    assert!(matches!(
+        Checkpoint::inspect(encoded.bytes(), limits),
+        Err(Error::Seeded)
+    ));
+    // Assembled from the seeds, the checkpoint is the inline one's equal.
+    assert!(manifest.missing(&seeds.reader()).unwrap().is_empty());
+    let assembled = manifest.assemble(&seeds.reader(), &budget()).unwrap();
+    let seeded = Checkpoint::inspect_seeded(encoded.bytes(), assembled.bytes(), limits).unwrap();
+    let plain = Checkpoint::inspect(inline_bytes.bytes(), Limits::default()).unwrap();
+    assert_eq!(seeded.core_bytes(), plain.core_bytes());
+    assert_eq!(seeded.header().core_hash, plain.header().core_hash);
+    assert_eq!(seeded.header().metadata, plain.header().metadata);
+    seeded.configuration_matches(&configuration).unwrap();
+    // A wrong-length assembly, an absent chunk and a corrupt one are refused.
+    assert!(matches!(
+        Checkpoint::inspect_seeded(encoded.bytes(), &assembled.bytes()[1..], limits),
+        Err(Error::Invalid("assembled core length"))
+    ));
+    let empty = tempfile::tempdir().unwrap();
+    let elsewhere = seed_store(empty.path());
+    assert_eq!(
+        manifest.missing(&elsewhere.reader()).unwrap(),
+        vec![chunk.hash]
+    );
+    assert!(matches!(
+        manifest.assemble(&elsewhere.reader(), &budget()),
+        Err(SeedError::Missing(hash)) if hash == chunk.hash
+    ));
+    std::fs::write(
+        directory
+            .path()
+            .join("seeds")
+            .join(format!("{}.seed", chunk.hash)),
+        b"not the chunk",
+    )
+    .unwrap();
+    assert!(matches!(
+        manifest.assemble(&seeds.reader(), &budget()),
+        Err(SeedError::Seeds(focal_evidence::ContentError::Corrupt))
+    ));
+    // A frame whose table disagrees with its root length is refused whole.
+    let mut forged = encoded.bytes().to_vec();
+    let table_end = forged.len() - 32;
+    forged[table_end - 4..table_end].copy_from_slice(&7u32.to_le_bytes());
+    checksum(&mut forged);
+    assert!(matches!(
+        Checkpoint::describe(&forged, limits).map(|_| ()),
+        Err(Error::Invalid("seed chunk table")) | Ok(())
+    ));
+}
+
+#[test]
+fn a_movement_section_rides_both_forms_and_every_forgery_of_it_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut seeds = seed_store(directory.path());
+    let core = core(false, 31);
+    let configuration = configuration();
+    let section = [0x5a; 300];
+    // Inline: the section is carried after the configuration and read back.
+    let plan = EncodingPlan::prepare_with(
+        &core,
+        metadata(NativeContentProfile::ProjectionOnly),
+        &configuration,
+        Some(&section),
+        Limits::default(),
+    )
+    .unwrap();
+    let plain = EncodingPlan::prepare(
+        &core,
+        metadata(NativeContentProfile::ProjectionOnly),
+        &configuration,
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(plan.quote().bytes, plain.quote().bytes + 4 + section.len());
+    let bytes = plan.encode_in(&budget()).unwrap();
+    let checkpoint = Checkpoint::inspect(bytes.bytes(), Limits::default()).unwrap();
+    assert_eq!(checkpoint.movement(), &section[..]);
+    assert_eq!(
+        checkpoint.header().metadata,
+        plan.header().unwrap().metadata
+    );
+    let plain_bytes = plain.encode_in(&budget()).unwrap();
+    let none = Checkpoint::inspect(plain_bytes.bytes(), Limits::default()).unwrap();
+    assert!(none.movement().is_empty());
+    // Seeded: the manifest carries it too.
+    let limits = Limits {
+        inline_bytes: 16,
+        ..Limits::default()
+    };
+    let seeded = EncodingPlan::prepare_with(
+        &core,
+        metadata(NativeContentProfile::ProjectionOnly),
+        &configuration,
+        Some(&section),
+        limits,
+    )
+    .unwrap();
+    let encoded = seeded.encode_in_seeded(&budget(), &mut seeds).unwrap();
+    let manifest = Checkpoint::describe(encoded.bytes(), limits)
+        .unwrap()
+        .expect("seeded form");
+    assert_eq!(manifest.movement(), &section[..]);
+    let assembled = manifest.assemble(&seeds.reader(), &budget()).unwrap();
+    let restored = Checkpoint::inspect_seeded(encoded.bytes(), assembled.bytes(), limits).unwrap();
+    assert_eq!(restored.movement(), &section[..]);
+    // An empty or oversized section is refused at the plan, an unknown
+    // ancillary byte, a zero length and a length past the frame at the reader.
+    assert!(matches!(
+        EncodingPlan::prepare_with(
+            &core,
+            metadata(NativeContentProfile::ProjectionOnly),
+            &configuration,
+            Some(&[]),
+            Limits::default()
+        ),
+        Err(Error::Invalid("movement section"))
+    ));
+    let too_big = vec![1u8; Limits::default().movement_bytes + 1];
+    assert!(matches!(
+        EncodingPlan::prepare_with(
+            &core,
+            metadata(NativeContentProfile::ProjectionOnly),
+            &configuration,
+            Some(&too_big),
+            Limits::default()
+        ),
+        Err(Error::Invalid("movement section"))
+    ));
+    let flag = 245;
+    let length_at = {
+        // The section length follows the configuration: locate it by the
+        // known layout of this fixture's bytes.
+        let section_start = bytes
+            .bytes()
+            .windows(section.len())
+            .position(|window| window == section)
+            .unwrap();
+        section_start - 4
+    };
+    for (offset, value) in [
+        (flag, 2u8),
+        (flag, 0),
+        (length_at, 0),
+        (length_at + 3, 0x7f),
+    ] {
+        let mut corrupt = bytes.bytes().to_vec();
+        corrupt[offset] = value;
+        checksum(&mut corrupt);
+        assert!(
+            Checkpoint::inspect(&corrupt, Limits::default()).is_err(),
+            "offset {offset} value {value}"
+        );
+    }
+}
+
+/// The retention section (26 §3) rides both forms beside the movement
+/// section and is absent from a frame that carries none.
+#[test]
+fn a_retention_section_rides_both_forms_beside_the_movement_section() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut seeds = seed_store(directory.path());
+    let core = core(false, 31);
+    let configuration = configuration();
+    let section = [0x5a; 40];
+    let retention = RetentionSection {
+        archived_through: SessionSeq(9),
+        retired_families: 4,
+    };
+    let plan = EncodingPlan::prepare_with_sections(
+        &core,
+        metadata(NativeContentProfile::ProjectionOnly),
+        &configuration,
+        Some(&section),
+        Some(retention),
+        Limits::default(),
+    )
+    .unwrap();
+    let with_movement = EncodingPlan::prepare_with(
+        &core,
+        metadata(NativeContentProfile::ProjectionOnly),
+        &configuration,
+        Some(&section),
+        Limits::default(),
+    )
+    .unwrap();
+    assert_eq!(plan.quote().bytes, with_movement.quote().bytes + 16);
+    let bytes = plan.encode_in(&budget()).unwrap();
+    let checkpoint = Checkpoint::inspect(bytes.bytes(), Limits::default()).unwrap();
+    assert_eq!(checkpoint.retention(), Some(retention));
+    assert_eq!(checkpoint.movement(), &section[..]);
+    let none = with_movement.encode_in(&budget()).unwrap();
+    assert_eq!(
+        Checkpoint::inspect(none.bytes(), Limits::default())
+            .unwrap()
+            .retention(),
+        None
+    );
+    // Retention without movement, inline and seeded.
+    let alone = EncodingPlan::prepare_with_sections(
+        &core,
+        metadata(NativeContentProfile::ProjectionOnly),
+        &configuration,
+        None,
+        Some(retention),
+        Limits::default(),
+    )
+    .unwrap();
+    let alone_bytes = alone.encode_in(&budget()).unwrap();
+    let inspected = Checkpoint::inspect(alone_bytes.bytes(), Limits::default()).unwrap();
+    assert_eq!(inspected.retention(), Some(retention));
+    assert!(inspected.movement().is_empty());
+    let limits = Limits {
+        inline_bytes: 16,
+        ..Limits::default()
+    };
+    let seeded = EncodingPlan::prepare_with_sections(
+        &core,
+        metadata(NativeContentProfile::ProjectionOnly),
+        &configuration,
+        None,
+        Some(retention),
+        limits,
+    )
+    .unwrap();
+    let encoded = seeded.encode_in_seeded(&budget(), &mut seeds).unwrap();
+    let manifest = Checkpoint::describe(encoded.bytes(), limits)
+        .unwrap()
+        .expect("seeded form");
+    assert_eq!(manifest.retention(), Some(retention));
+    let assembled = manifest.assemble(&seeds.reader(), &budget()).unwrap();
+    let restored = Checkpoint::inspect_seeded(encoded.bytes(), assembled.bytes(), limits).unwrap();
+    assert_eq!(restored.retention(), Some(retention));
+    // Every flip of the section or its flag byte is refused by the digest.
+    let raw = alone_bytes.bytes();
+    let flag = raw
+        .windows(6)
+        .position(|window| window == [0, 1, 0, 0, 0, 0])
+        .expect("the ancillary bytes");
+    for offset in [flag + 1, raw.len() - 33 - 8] {
+        let mut forged = raw.to_vec();
+        forged[offset] ^= 1;
+        assert!(
+            Checkpoint::inspect(&forged, Limits::default()).is_err(),
+            "offset {offset}"
+        );
+    }
 }

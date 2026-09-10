@@ -121,7 +121,22 @@ impl TryFrom<PendingPlacementV1> for PendingPlacement {
         Ok(plan)
     }
 }
-impl TryFrom<SessionDescriptorV1> for SessionDescriptor {
+/// The session descriptor of schemas 2 to 5: no founding node recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDescriptorV5 {
+    pub ledger: LedgerId,
+    pub log_group: LogGroupId,
+    pub revision: u64,
+    pub route_epoch: RouteEpoch,
+    pub membership_epoch: u64,
+    pub placement_epoch: u64,
+    pub active: PlacementSpec,
+    pub authority: SessionFence,
+    pub pending: Option<PendingPlacement>,
+    pub retiring: BTreeMap<u64, AssignmentProgress>,
+    pub refusals: Vec<Refusal>,
+}
+impl TryFrom<SessionDescriptorV1> for SessionDescriptorV5 {
     type Error = DirectoryError;
     fn try_from(value: SessionDescriptorV1) -> Result<Self, DirectoryError> {
         Ok(Self {
@@ -138,6 +153,112 @@ impl TryFrom<SessionDescriptorV1> for SessionDescriptor {
             refusals: Vec::new(),
         })
     }
+}
+/// Before schema 6 every session was founded by the cluster founder; the
+/// descriptor records no node, and hosts fall back to the genesis founder.
+impl From<SessionDescriptorV5> for SessionDescriptor {
+    fn from(value: SessionDescriptorV5) -> Self {
+        Self {
+            ledger: value.ledger,
+            log_group: value.log_group,
+            revision: value.revision,
+            route_epoch: value.route_epoch,
+            membership_epoch: value.membership_epoch,
+            placement_epoch: value.placement_epoch,
+            active: value.active,
+            authority: value.authority,
+            pending: value.pending,
+            retiring: value.retiring,
+            refusals: value.refusals,
+            founder: None,
+            holders: None,
+        }
+    }
+}
+/// The session descriptor of schema 6: a founding node, but no published
+/// range holders.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDescriptorV6 {
+    pub ledger: LedgerId,
+    pub log_group: LogGroupId,
+    pub revision: u64,
+    pub route_epoch: RouteEpoch,
+    pub membership_epoch: u64,
+    pub placement_epoch: u64,
+    pub active: PlacementSpec,
+    pub authority: SessionFence,
+    pub pending: Option<PendingPlacement>,
+    pub retiring: BTreeMap<u64, AssignmentProgress>,
+    pub refusals: Vec<Refusal>,
+    pub founder: Option<u64>,
+}
+/// Before schema 7 no session published its range holders; every member
+/// was held by the voters, which `None` still means.
+impl From<SessionDescriptorV6> for SessionDescriptor {
+    fn from(value: SessionDescriptorV6) -> Self {
+        Self {
+            ledger: value.ledger,
+            log_group: value.log_group,
+            revision: value.revision,
+            route_epoch: value.route_epoch,
+            membership_epoch: value.membership_epoch,
+            placement_epoch: value.placement_epoch,
+            active: value.active,
+            authority: value.authority,
+            pending: value.pending,
+            retiring: value.retiring,
+            refusals: value.refusals,
+            founder: value.founder,
+            holders: None,
+        }
+    }
+}
+/// The descriptor as schema 6 recorded it (the holders dropped), for
+/// encoding a checkpoint at that schema.
+impl From<SessionDescriptor> for SessionDescriptorV6 {
+    fn from(value: SessionDescriptor) -> Self {
+        Self {
+            ledger: value.ledger,
+            log_group: value.log_group,
+            revision: value.revision,
+            route_epoch: value.route_epoch,
+            membership_epoch: value.membership_epoch,
+            placement_epoch: value.placement_epoch,
+            active: value.active,
+            authority: value.authority,
+            pending: value.pending,
+            retiring: value.retiring,
+            refusals: value.refusals,
+            founder: value.founder,
+        }
+    }
+}
+/// The descriptor as schemas 2 to 5 recorded it (the founding node dropped),
+/// for encoding a checkpoint at those schemas.
+impl From<SessionDescriptor> for SessionDescriptorV5 {
+    fn from(value: SessionDescriptor) -> Self {
+        Self {
+            ledger: value.ledger,
+            log_group: value.log_group,
+            revision: value.revision,
+            route_epoch: value.route_epoch,
+            membership_epoch: value.membership_epoch,
+            placement_epoch: value.placement_epoch,
+            active: value.active,
+            authority: value.authority,
+            pending: value.pending,
+            retiring: value.retiring,
+            refusals: value.refusals,
+        }
+    }
+}
+fn current_sessions(
+    sessions: BTreeMap<LedgerId, SessionDescriptorV5>,
+) -> BTreeMap<LedgerId, SessionDescriptor> {
+    sessions
+        .into_iter()
+        .map(|(ledger, session)| (ledger, SessionDescriptor::from(session)))
+        .collect()
 }
 /// The seal of schemas 1–3: a whole-namespace transfer, so the moved range
 /// is the delegation's namespace.
@@ -175,7 +296,7 @@ pub struct PartitionCheckpointV2 {
     pub revision: u64,
     pub sealed: Option<PartitionSealV3>,
     pub nodes: BTreeMap<u64, NodeRecordV2>,
-    pub sessions: BTreeMap<LedgerId, SessionDescriptor>,
+    pub sessions: BTreeMap<LedgerId, SessionDescriptorV5>,
 }
 impl TryFrom<PartitionCheckpointV1> for PartitionCheckpointV2 {
     type Error = DirectoryError;
@@ -202,19 +323,19 @@ impl TryFrom<PartitionCheckpointV1> for PartitionCheckpointV2 {
             sessions: value
                 .sessions
                 .into_iter()
-                .map(|(ledger, session)| Ok((ledger, SessionDescriptor::try_from(session)?)))
+                .map(|(ledger, session)| Ok((ledger, SessionDescriptorV5::try_from(session)?)))
                 .collect::<Result<_, DirectoryError>>()?,
         })
     }
 }
 /// A schema 2 checkpoint knows no liveness verdict: every node restores as
 /// alive until the detector commits one.
-impl From<PartitionCheckpointV2> for PartitionCheckpoint {
+impl From<PartitionCheckpointV2> for PartitionCheckpointV4 {
     fn from(value: PartitionCheckpointV2) -> Self {
         let namespace = value.delegation.namespace;
         let source = value.delegation.partition;
         Self {
-            schema: PARTITION_CHECKPOINT_SCHEMA,
+            schema: 4,
             cluster: value.cluster,
             delegation: value.delegation,
             revision: value.revision,
@@ -239,6 +360,11 @@ impl From<PartitionCheckpointV2> for PartitionCheckpoint {
         }
     }
 }
+impl From<PartitionCheckpointV2> for PartitionCheckpoint {
+    fn from(value: PartitionCheckpointV2) -> Self {
+        PartitionCheckpointV4::from(value).into()
+    }
+}
 /// The schema 3 partition checkpoint: liveness verdicts, but a seal that
 /// can only move the whole namespace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,14 +375,14 @@ pub struct PartitionCheckpointV3 {
     pub revision: u64,
     pub sealed: Option<PartitionSealV3>,
     pub nodes: BTreeMap<u64, NodeRecord>,
-    pub sessions: BTreeMap<LedgerId, SessionDescriptor>,
+    pub sessions: BTreeMap<LedgerId, SessionDescriptorV5>,
 }
-impl From<PartitionCheckpointV3> for PartitionCheckpoint {
+impl From<PartitionCheckpointV3> for PartitionCheckpointV4 {
     fn from(value: PartitionCheckpointV3) -> Self {
         let namespace = value.delegation.namespace;
         let source = value.delegation.partition;
         Self {
-            schema: PARTITION_CHECKPOINT_SCHEMA,
+            schema: 4,
             cluster: value.cluster,
             delegation: value.delegation,
             revision: value.revision,
@@ -268,6 +394,102 @@ impl From<PartitionCheckpointV3> for PartitionCheckpoint {
         }
     }
 }
+impl From<PartitionCheckpointV3> for PartitionCheckpoint {
+    fn from(value: PartitionCheckpointV3) -> Self {
+        PartitionCheckpointV4::from(value).into()
+    }
+}
+/// The schema 4 partition checkpoint: seals that move part of a namespace,
+/// but no route-change log yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionCheckpointV4 {
+    pub schema: u16,
+    pub cluster: ClusterId,
+    pub delegation: Delegation,
+    pub revision: u64,
+    pub sealed: Option<PartitionSeal>,
+    pub nodes: BTreeMap<u64, NodeRecord>,
+    pub sessions: BTreeMap<LedgerId, SessionDescriptorV5>,
+}
+/// A schema 4 checkpoint kept no route log: a cache watching it starts at
+/// the current revision, and anything older reads as a gap.
+impl From<PartitionCheckpointV4> for PartitionCheckpoint {
+    fn from(value: PartitionCheckpointV4) -> Self {
+        Self {
+            schema: PARTITION_CHECKPOINT_SCHEMA,
+            cluster: value.cluster,
+            delegation: value.delegation,
+            revision: value.revision,
+            sealed: value.sealed,
+            nodes: value.nodes,
+            sessions: current_sessions(value.sessions),
+            routes: std::collections::VecDeque::new(),
+            routes_from: value.revision,
+        }
+    }
+}
+/// The schema 5 partition checkpoint: a route log, but no founding node per
+/// session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionCheckpointV5 {
+    pub schema: u16,
+    pub cluster: ClusterId,
+    pub delegation: Delegation,
+    pub revision: u64,
+    pub sealed: Option<PartitionSeal>,
+    pub nodes: BTreeMap<u64, NodeRecord>,
+    pub sessions: BTreeMap<LedgerId, SessionDescriptorV5>,
+    pub routes: std::collections::VecDeque<crate::partition::RouteChange>,
+    pub routes_from: u64,
+}
+impl From<PartitionCheckpointV5> for PartitionCheckpoint {
+    fn from(value: PartitionCheckpointV5) -> Self {
+        Self {
+            schema: PARTITION_CHECKPOINT_SCHEMA,
+            cluster: value.cluster,
+            delegation: value.delegation,
+            revision: value.revision,
+            sealed: value.sealed,
+            nodes: value.nodes,
+            sessions: current_sessions(value.sessions),
+            routes: value.routes,
+            routes_from: value.routes_from,
+        }
+    }
+}
+/// The schema 6 partition checkpoint: founding nodes, but no published range
+/// holders per session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionCheckpointV6 {
+    pub schema: u16,
+    pub cluster: ClusterId,
+    pub delegation: Delegation,
+    pub revision: u64,
+    pub sealed: Option<PartitionSeal>,
+    pub nodes: BTreeMap<u64, NodeRecord>,
+    pub sessions: BTreeMap<LedgerId, SessionDescriptorV6>,
+    pub routes: std::collections::VecDeque<crate::partition::RouteChange>,
+    pub routes_from: u64,
+}
+impl From<PartitionCheckpointV6> for PartitionCheckpoint {
+    fn from(value: PartitionCheckpointV6) -> Self {
+        Self {
+            schema: PARTITION_CHECKPOINT_SCHEMA,
+            cluster: value.cluster,
+            delegation: value.delegation,
+            revision: value.revision,
+            sealed: value.sealed,
+            nodes: value.nodes,
+            sessions: value
+                .sessions
+                .into_iter()
+                .map(|(ledger, session)| (ledger, SessionDescriptor::from(session)))
+                .collect(),
+            routes: value.routes,
+            routes_from: value.routes_from,
+        }
+    }
+}
 impl TryFrom<PartitionCheckpointV1> for PartitionCheckpoint {
     type Error = DirectoryError;
     fn try_from(value: PartitionCheckpointV1) -> Result<Self, DirectoryError> {
@@ -275,7 +497,7 @@ impl TryFrom<PartitionCheckpointV1> for PartitionCheckpoint {
     }
 }
 impl PartitionCheckpoint {
-    /// Decode a checkpoint at any schema. Schemas 1 to 3 convert as above; the
+    /// Decode a checkpoint at any schema. Schemas 1 to 6 convert as above; the
     /// result still passes every current validation before it is installed.
     pub fn decode_any(bytes: &[u8]) -> Result<Self, DirectoryError> {
         let (schema, _) = postcard::take_from_bytes::<u16>(bytes)
@@ -296,8 +518,23 @@ impl PartitionCheckpoint {
                     .map_err(|_| DirectoryError::Invalid("partition checkpoint v3"))?;
                 (Self::from(value), rest)
             }
-            4 => postcard::take_from_bytes::<Self>(bytes)
-                .map_err(|_| DirectoryError::Invalid("partition checkpoint v4"))?,
+            4 => {
+                let (value, rest) = postcard::take_from_bytes::<PartitionCheckpointV4>(bytes)
+                    .map_err(|_| DirectoryError::Invalid("partition checkpoint v4"))?;
+                (Self::from(value), rest)
+            }
+            5 => {
+                let (value, rest) = postcard::take_from_bytes::<PartitionCheckpointV5>(bytes)
+                    .map_err(|_| DirectoryError::Invalid("partition checkpoint v5"))?;
+                (Self::from(value), rest)
+            }
+            6 => {
+                let (value, rest) = postcard::take_from_bytes::<PartitionCheckpointV6>(bytes)
+                    .map_err(|_| DirectoryError::Invalid("partition checkpoint v6"))?;
+                (Self::from(value), rest)
+            }
+            7 => postcard::take_from_bytes::<Self>(bytes)
+                .map_err(|_| DirectoryError::Invalid("partition checkpoint v7"))?,
             _ => return Err(DirectoryError::Invalid("partition checkpoint schema")),
         };
         if !rest.is_empty() {

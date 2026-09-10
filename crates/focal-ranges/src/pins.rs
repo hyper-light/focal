@@ -159,7 +159,7 @@ impl PinRegistry {
             .try_reserve_exact(map.ranges().len())
             .map_err(|_| RangeError::Capacity)?;
         for range in map.ranges() {
-            let Some(span) = range.span.intersection(pin.span) else {
+            let Some(span) = range.span.intersection(&pin.span) else {
                 continue;
             };
             if cursor
@@ -174,7 +174,9 @@ impl PinRegistry {
                 .ok_or(RangeError::ReadTooOld)?;
             fragments.push(ReadFragment {
                 span,
-                after_exclusive: cursor.after.filter(|after| *after >= span.start),
+                after_exclusive: cursor
+                    .after
+                    .filter(|after| span.start.is_none_or(|start| *after >= start)),
                 availability: proof.clone(),
             });
         }
@@ -206,7 +208,7 @@ impl PinRegistry {
         {
             return Err(RangeError::Conflict);
         }
-        if cursor.after.is_some_and(|after| !pin.span.contains(after)) {
+        if cursor.after.is_some_and(|after| !pin.span.contains(&after)) {
             return Err(RangeError::Conflict);
         }
         Ok(pin)
@@ -226,7 +228,7 @@ fn validate_availability(
     let required = map
         .ranges()
         .iter()
-        .filter(|range| range.span.intersection(span).is_some());
+        .filter(|range| range.span.intersection(&span).is_some());
     if proofs.len() != required.clone().count() {
         return Err(RangeError::ReadTooOld);
     }
@@ -237,7 +239,7 @@ fn validate_availability(
             || proof.ledger != cursor.ledger
             || proof.epoch != map.epoch()
             || proof.range_generation != range.generation
-            || !range.accepts_reader(proof.replica)
+            || !range.meta.accepts_reader(proof.replica)
             || proof.prefix != cursor.prefix
             || proof.lease == 0
             || proof.expires_at < cursor.expires_at

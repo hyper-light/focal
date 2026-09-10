@@ -79,11 +79,19 @@ through `crates/focal-node/src/fault.rs`: built with the `focal-node`
 dev-dependency on itself), `FOCAL_FAULT=<site>:<n>` aborts the process at
 the `n`-th arrival at `before-propose` (frame received and admitted, nothing
 proposed) or `after-commit-before-reply` (owner committed and published, no
-reply written). Release binaries are built without the feature and contain
-no hook. The A4 gate (`cli_native_a4.rs`, `mcp_native_a4.rs`) uses both
-cuts: the first leaves a journaled frame that commits exactly once on retry;
-the second leaves a durable commit the restarted node re-commits in its new
-term and the exact retry finds by identity without a second effect.
+reply written), or at one of the seven movement sites of the placement
+controller (`movement-begin`, `movement-seed`, `movement-barrier`,
+`movement-ready`, `movement-seal`, `movement-activate`,
+`movement-cleanup`: each after the step's evidence is gathered and before
+its proposal, [25 §9](25-parallel-materialization-and-ranges.md)). Release
+binaries are built without the feature and contain no hook. The A4 gate
+(`cli_native_a4.rs`, `mcp_native_a4.rs`) uses the first two cuts: the
+first leaves a journaled frame that commits exactly once on retry; the
+second leaves a durable commit the restarted node re-commits in its new
+term and the exact retry finds by identity without a second effect. The
+movement cuts are used by `placement_binary.rs`, where the founder dies at
+each site in turn and the transfer completes from the committed map after
+its restart.
 
 A simulation of `fsync` is not proof that a storage device honors it. Real qualification documents OS, filesystem, mount options, device/cache behavior and failure assumptions. Laptop guarantees require intact storage that honors acknowledged flushes; independent disk loss requires another durable copy.
 

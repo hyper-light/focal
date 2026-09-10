@@ -527,6 +527,7 @@ fn process<O: Objects, C: evidence::Custody>(
         | Key::Receipt(_)
         | Key::Cycle(_)
         | Key::RetiredCycleHead(_)
+        | Key::Retired(_)
         | Key::RetiredCycle(_)
         | Key::WorkSlot(..)
         | Key::ClaimResultTestament(_)
@@ -546,7 +547,8 @@ fn process<O: Objects, C: evidence::Custody>(
         | Key::ByEvaluator(..)
         | Key::ByVerdict(..)
         | Key::ByCreated(..)
-        | Key::DueTimer(..) => {
+        | Key::DueTimer(..)
+        | Key::ByObject(..) => {
             let row = parse(body, context.parsing, |c| {
                 read_rows::read_fixed(encoded.key, c, ledger)
             })?

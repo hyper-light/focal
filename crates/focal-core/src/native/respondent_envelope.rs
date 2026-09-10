@@ -84,19 +84,23 @@ fn count(value: u32) -> Result<usize, NativeError> {
 
 fn action(
     view: &View<'_>,
+    max_ranges: usize,
     changes: usize,
     deleted: usize,
     incoming_heap: usize,
     slots: CompletionSlots,
 ) -> Result<Action, NativeError> {
     Ok(Action {
-        storage: view.state.rows.future_write_envelope(RangeWriteLimits {
-            changed_keys: changes,
-            deleted_keys: deleted,
-            deleted_heap: 0,
-            incoming_heap,
-            input_capacity: changes,
-        })?,
+        storage: view.state.rows.future_write_envelope(
+            RangeWriteLimits {
+                changed_keys: changes,
+                deleted_keys: deleted,
+                deleted_heap: 0,
+                incoming_heap,
+                input_capacity: changes,
+            },
+            max_ranges,
+        )?,
         slots,
     })
 }
@@ -200,13 +204,13 @@ impl RespondentEnvelope {
             ConstructionBudget::for_operation(NativeOperation::CloseResponse, limits)?;
         let post_construction =
             ConstructionBudget::for_operation(NativeOperation::PostResponse, limits)?;
-        // Index rows (doc 22 §7): a diagnostic artifact's producer, kind,
-        // schema and inputs; a close's and a post's claim status move. A
-        // diagnostic's eight primary rows and three fixed index rows leave the
+        // Index rows (doc 22 §7): a diagnostic artifact's identity, producer,
+        // kind, schema and inputs; a close's and a post's claim status move. A
+        // diagnostic's eight primary rows and four fixed index rows leave the
         // batch's remainder to the inputs its descriptor may cite.
         let inputs = crate::native::index_rows::cap_inputs(
             super::completion_envelope::input_bound(descriptor),
-            8 + 3,
+            add(8, crate::native::index_rows::ARTIFACT_FIXED_ROWS)?,
             limits.range.max_batch_entries,
         );
         descriptor.inputs = inputs;
@@ -303,6 +307,7 @@ impl RespondentEnvelope {
         }
         let diagnostic = action(
             view,
+            limits.max_ranges,
             add(8, diagnostic_index)?,
             0,
             add(
@@ -328,6 +333,7 @@ impl RespondentEnvelope {
         let close_events = add(work_limit, 2)?;
         let close = action(
             view,
+            limits.max_ranges,
             add(add(multiply(2, work_limit)?, 7)?, close_index)?,
             1,
             add(
@@ -345,6 +351,7 @@ impl RespondentEnvelope {
         )?;
         let post = action(
             view,
+            limits.max_ranges,
             add(6, post_index)?,
             1,
             add(add(claim_row, response_row)?, event_containers(2)?)?,

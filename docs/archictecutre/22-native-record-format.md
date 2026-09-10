@@ -34,14 +34,14 @@ The ordered envelope is:
 | Field | Encoding |
 |---|---|
 | Magic | Eight bytes, `FCMUTATE` |
-| Version | `u16`, currently 3 (version 3 adds the secondary index families of §7; the root checkpoint `FCNROOTS` advances to 3 with it) |
+| Version | `u16`, currently 5 (version 3 added the secondary index families of §7 and version 4 the trusted timer index; version 5 orders every row by the storage layout of [25 §3](25-parallel-materialization-and-ranges.md), affinity then family then fields, and the root checkpoint `FCNROOTS` advanced to 5 with it and to 6 when it began to carry the range layout of [25 §4](25-parallel-materialization-and-ranges.md); a record names the producer, never a member) |
 | Content profile | `u8`: 0 projection-only; 1 complete authored V1 descriptors |
 | Ledger | Tenant ID followed by session ID, 16 bytes each |
 | Original range incarnation | 16-byte little-endian `RangeId` |
 | Base native sequence | `u64` |
 | Exact outcome | Full outcome described below |
 | Changed-row count | `u32`, positive |
-| Changes | Exactly the declared number, in strictly increasing native key order |
+| Changes | Exactly the declared number, in strictly increasing native key order (the storage layout order of [25 §3](25-parallel-materialization-and-ranges.md) since version 5) |
 | Digest | 32-byte BLAKE3 digest of every preceding byte, derive-key context `focal.native.record.v2` |
 
 An outcome contains its ledger, namespaced invocation, native sequence, logical
@@ -81,13 +81,14 @@ grammar with mutations but has a separate envelope:
 | Field | Encoding |
 |---|---|
 | Magic | Eight bytes, `FCNROOTS` |
-| Version | `u16`, currently 2 |
+| Version | `u16`, currently 6 (version 5 orders rows by the storage layout; version 6 records the range layout of [25 §4](25-parallel-materialization-and-ranges.md)) |
 | Content profile | Same explicit profile tags as mutations |
 | Ledger | Tenant ID and session ID |
-| Original range incarnation | 16-byte little-endian `RangeId` |
+| Original range incarnation | 16-byte little-endian `RangeId`: the producer identity records carry |
 | Native prefix | `u64` |
 | Complete retained row count | `u64`, checked against decoder limits and host capacity |
-| Rows | Strictly ordered puts using the shared typed-key/body grammar |
+| Range layout | A `u32` member count (one to 1,024) and the `u64` layout epoch, then per member its 16-byte little-endian `RangeId` and one flag byte: `0` for the first member, unbounded below, `1` followed by the 16-byte affinity the member starts at for every other; starts strictly ascend and identities are distinct |
+| Rows | Strictly ordered puts using the shared typed-key/body grammar, one stream whatever the layout |
 | Digest | BLAKE3 of all preceding bytes, derive-key context `focal.native.checkpoint.v2` |
 
 Genesis has prefix zero and no rows. A nonzero prefix requires a nonempty root,
@@ -160,8 +161,9 @@ The 47 key-family tags are explicit (30–33 are the frozen legacy rows an impor
 | 38 | ByScope(kind code, key digest, claim) | 45 | ByVerdict(verdict code, result key) |
 | 39 | ByRelation(kind code, target claim, claim) | 46 | ByCreated(family code, sequence, object) |
 | 40 | ByProducer(participant, artifact) | 47 | DueTimer(logical time, target: claim, evaluation key or claim+monitor) |
+| | | 48 | ByObject(family code, object): the identity index of claims, artifacts and declarations, one contiguous listing per family under the storage layout of [25 §3](25-parallel-materialization-and-ranges.md) |
 
-Invocation namespaces are `0` request, `1`–`3` the three timers and `4` the one-time import; operation tag `30` is `Import`; claim event kind `22` is `Imported(legacy sequence)`; a claim body carries its origin byte (`0` native, `1` legacy) after `created`; the Meta row counts legacy rows after creation results. There is no encoded End sentinel. Key payloads and outcome tags are defined in
+Invocation namespaces are `0` request, `1`–`3` the three timers, `4` the one-time import and `5` a retirement (`Retirement(root claim)`, [26 §4](26-custody-archive-retention-and-restore.md)); operation tags `30` and `31` are `Import` and `Retire`; key family `49` is `Retired(claim)`, the typed continuation of a retired claim (its body: the bundle's content root and length, the prefix it claims, the claim's final binding and status, the sequence the retirement was published at, and the number of event rows that left with the claim); the archive bundle itself is an `FCNARCHV` frame (magic, version `1`, profile, ledger, the prefix it claims, the root, the members, the content roots of its artifacts held as content objects, the roots of the objects sealed for those held inline, the row count, the rows in key order as the checkpoint writes them, a trailing digest under `focal.native.archive.v1`), never restored, only read through `StructuralArchive`; claim event kind `22` is `Imported(legacy sequence)`; a claim body carries its origin byte (`0` native, `1` legacy) after `created`; the Meta row counts legacy rows after creation results. There is no encoded End sentinel. Key payloads and outcome tags are defined in
 the explicit fixed-field writer/reader above. The body implementations are
 [scalar/index and dispatch rows](../../crates/focal-core/src/native/record_codec/rows.rs),
 [claim, evaluation and audit rows](../../crates/focal-core/src/native/record_codec/lifecycle.rs),
@@ -414,6 +416,10 @@ decoder.
 
 `FCNSESS1` version 2 records `records_floor` after the recording term: the native prefix that holds no record (zero at genesis, one after an import). A recording range exists exactly when the prefix has advanced past it. Version 3 follows it with `activation_index`, the Raft index of the committed activation record (never zero, never beyond the applied index), so a restored replica reports the exact activation position rather than a bound derived from the sealed legacy prefix.
 
+Version 4 adds one **form** byte after the membership configuration, before the Core byte count and hash: `0` is the inline form (the Core root follows, as before); `1` is the seeded form, where a chunk table replaces the root — a `u32` chunk count, then per chunk a 32-byte BLAKE3 hash and a `u32` length — and the root itself lives as content-addressed seed chunks of at most 1 MiB in the node's seed store ([25 §5](25-parallel-materialization-and-ranges.md)). The table must agree with the byte count (one chunk per started MiB) and stay within the assembled-root bound; any other form byte is refused. The checksum trailer covers the manifest as it covers an inline frame, and the root's own hash is recorded in both forms, so an assembled root is verified exactly as an inline one.
+
+Ancillary byte 0 of the same version says whether a **movement section** follows the membership configuration (before the form byte): `1` means a `u32` length and that many bytes of the range coordinator's postcard-encoded `RangeCheckpoint` ([25 §6](25-parallel-materialization-and-ranges.md)), at most `Limits.movement_bytes` (1 MiB) and never empty; `0` means none, and the other five ancillary bytes stay reserved (any other value is refused). Both forms carry it, so a restored replica resumes a transfer from the committed step.
+
 ## 7. Secondary index families
 
 Bounded lists need an ordered key range per predicate; scanning a primary
@@ -429,10 +435,10 @@ charge zero. Every index row is derived from exactly one primary row:
 
 | Primary row | Index rows it implies |
 |---|---|
-| Claim (at creation) | `ByIssuer`, `BySubject`, `ByCreated(claim family)`, `ByStatus`; with authored content also `ByAction`, one `ByScope` per scope (kind code and the BLAKE3 digest of the key under `focal.native.index.scope-key.v1`) and one `ByRelation` per relation whose target is a claim or exact evidence (the target column holds that claim's or artifact's identity) |
+| Claim (at creation) | `ByObject(claim family)`, `ByIssuer`, `BySubject`, `ByCreated(claim family)`, `ByStatus`; with authored content also `ByAction`, one `ByScope` per scope (kind code and the BLAKE3 digest of the key under `focal.native.index.scope-key.v1`) and one `ByRelation` per relation whose target is a claim or exact evidence (the target column holds that claim's or artifact's identity) |
 | Claim (status change) | delete `ByStatus(old)`, put `ByStatus(new)` |
-| Artifact | `ByProducer`, `ByArtifactKind` (digest of the kind under `focal.native.index.artifact-kind.v1`), `BySchema`, one `ArtifactInput` per cited input |
-| Definition | one `ByEvaluator` per designated principal (the issuer of a delivery program, otherwise the check evaluator and any distinct quality evaluator) |
+| Artifact | `ByObject(artifact family)`, `ByProducer`, `ByArtifactKind` (digest of the kind under `focal.native.index.artifact-kind.v1`), `BySchema`, one `ArtifactInput` per cited input |
+| Definition | `ByObject(validation family)`, one `ByEvaluator` per designated principal (the issuer of a delivery program, otherwise the check evaluator and any distinct quality evaluator) |
 | Accepted result | `ByVerdict` |
 | Claim with a deadline | `DueTimer(at, Claim)` until the claim's timer has been delivered (its outcome row exists); a terminal transition leaves it, so the timer fires once on the terminal claim and retires the row |
 | Monitor (a scope of its claim row) | `DueTimer(at, Monitor)` while the scope is active and its timer has not been delivered |
@@ -531,8 +537,21 @@ record format to one Raft group through the consensus replica. Its contract:
    ledger to a group.
 3. **The native prefix is not the Raft index.** Every delivered `NativeCommit`
    carries the Raft index and term, the record hash and the outcome. Each
-   mutation advances the native sequence by one; genesis, membership and Raft
-   no-ops advance only the Raft prefix. Membership and native entries are merged
+   mutation advances the native sequence by one; genesis, layout records
+   (`FOCALRG1`, [25 §4](25-parallel-materialization-and-ranges.md): 115
+   fixed bytes naming the ledger, the layout epoch a split or merge applies
+   to, the operation and a digest under `focal.native.session.layout-record.v1`),
+   movement records (`FOCALRM1`, [25 §6](25-parallel-materialization-and-ranges.md):
+   magic, version, ledger, the control ordinal the record expects to be, a
+   `u32` length and the postcard-encoded range operation, then a digest under
+   `focal.native.session.movement-record.v1`; at most 64 KiB) and retirement
+   records (`FOCALRT1`, [26 §4](26-custody-archive-retention-and-restore.md):
+   146 fixed bytes naming the ledger, the native prefix the family was derived
+   at, the root claim, the bundle's content root and length, the prefix the
+   bundle claims and a digest under
+   `focal.native.session.retirement-record.v1`; applying one advances the
+   native sequence by one through the outcome the core publishes),
+   membership and Raft no-ops advance only the Raft prefix. Membership and native entries are merged
    by Raft index during delivery, so the configuration index never exceeds the
    applied index at a retained cursor.
 4. **Suffix disposition needs evidence.** Unresolved candidates are discarded
@@ -572,3 +591,8 @@ transit. The record bound that funds every promise is proven per row family in
 The unified Session hosts this engine after a committed activation record;
 [23](23-native-activation-and-import.md) records the field matrix, the
 activation protocol, the `FOCALSS6`/`FOCALSS7` envelopes and the import design.
+
+## 8. The backup manifest (`FCLBKUP1`)
+
+A backup directory ([26 §6](26-custody-archive-retention-and-restore.md)) is `MANIFEST`, `checkpoint` (the exact `FOCALSS7` envelope), `seeds/<hash>.seed` (the chunks of a seeded Core root, named and verified as the seed store names them) and `content/<root>.manifest` plus `content/<hash>.chunk` (each object's manifest verbatim and its chunks, named as the content store names them). `MANIFEST` is the 8-byte magic `FCLBKUP1`, a postcard body and a 32-byte BLAKE3 trailer over magic and body; the body is schema `1`, the creation time (unix ms), the evidence prefix (cluster, ledger, log group, placement genesis, node, legacy sequence, Raft index and term, route, placement and membership epochs, operation, placement digest, envelope hash and length, artifact count), the native prefix, the activation genesis, the profile byte, the content domain, the decoder pair (predecessor, successor), the membership configuration, the envelope hash and length again, the seed chunks (hash, length) in table order, the objects sorted by root (root, length, class, chunks as hash and length) and the retention section's `archived_through` and `retired_families`. A manifest is decoded only whole and validated field by field; it is written last and a directory without one is not a backup. The format is pre-release and may still change with a version of its magic.
+

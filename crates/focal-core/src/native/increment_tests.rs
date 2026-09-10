@@ -1041,9 +1041,9 @@ fn inherited_visibility_checks_exact_descriptor_heap_count_label_and_visit_bound
 
 #[test]
 fn submission_refuses_unreportable_visibility_before_custody_or_required_evaluation_creation() {
+    use crate::native::fixtures::SyncCell as Cell;
     use focal_evidence::{BuiltinSchemaError, NativeSchemaVerifier};
     use focal_model::lifecycle::artifact_descriptor::{ArtifactDescriptor, Limits};
-    use std::cell::Cell;
 
     struct Schemas {
         quotes: Cell<usize>,

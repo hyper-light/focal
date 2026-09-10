@@ -776,3 +776,186 @@ async fn native_inline_payloads_are_sealed_locally_and_replicated_to_every_requi
     pool.close();
     fixture.close().await;
 }
+
+/// Custody receipts and the obligation they answer (doc 04 §7, R8): sealing
+/// records this node's own receipt, an unreachable required copy holds
+/// none and is named missing, a placement change does not inherit older
+/// receipts, and a receipt survives the store's reopen.
+#[tokio::test]
+async fn replication_records_a_receipt_per_verified_copy_and_the_obligation_reads_them() {
+    let fixture = Fixture::new();
+    let (coordinator, driver) =
+        EvidenceCoordinator::channel(fixture.host.clone(), 1, vec![], fixture.budget.clone(), 1)
+            .unwrap();
+    let pool = pool();
+    let exercise = async {
+        let first = placement(1, &[1]);
+        coordinator
+            .replace_placement(None, first.clone())
+            .await
+            .unwrap();
+        assert!(
+            fixture
+                .host
+                .receipt(first.scope(), fixture.reference.root, 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            coordinator.seal(seal_request()).await.unwrap(),
+            fixture.reference
+        );
+        let receipt = fixture
+            .host
+            .receipt(first.scope(), fixture.reference.root, 1)
+            .await
+            .unwrap()
+            .expect("this node's own receipt");
+        assert_eq!(receipt.node, 1);
+        assert_eq!(receipt.policy_revision, 1);
+        assert_eq!(receipt.length, fixture.reference.length);
+        let (obligation, _) = coordinator
+            .obligation(seal_request(), fixture.reference.clone())
+            .await
+            .unwrap();
+        assert_eq!(obligation.required, BTreeSet::from([1]));
+        assert_eq!(obligation.held, BTreeSet::from([1]));
+        assert!(obligation.satisfied());
+        // A second required copy nobody can reach: the older receipt does
+        // not count at the new scope, this node re-verifies its own store,
+        // and the copy is named missing.
+        let next = placement(2, &[1, 2]);
+        coordinator
+            .replace_placement(Some(first.scope()), next.clone())
+            .await
+            .unwrap();
+        let (obligation, _) = coordinator
+            .obligation(seal_request(), fixture.reference.clone())
+            .await
+            .unwrap();
+        assert_eq!(obligation.required, BTreeSet::from([1, 2]));
+        assert_eq!(obligation.held, BTreeSet::from([1]));
+        assert!(!obligation.satisfied());
+        assert_eq!(obligation.missing().collect::<Vec<_>>(), vec![2]);
+        assert!(
+            fixture
+                .host
+                .receipt(next.scope(), fixture.reference.root, 2)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let renewed = fixture
+            .host
+            .receipt(next.scope(), fixture.reference.root, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(renewed.policy_revision, 2);
+    };
+    tokio::select! {
+        biased;
+        _ = exercise => {}
+        result = driver.run(&pool) => panic!("driver stopped: {result:?}"),
+    }
+    let root = fixture.reference.root;
+    fixture.host.stop().await.unwrap();
+    fixture.owner.join().unwrap();
+    assert_eq!(fixture.budget.stats().used, 0);
+    let reopened = ContentStore::open(fixture.directory.path(), store_limits()).unwrap();
+    let kept = reopened
+        .custody_receipt(ledger(), root, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.policy_revision, 2);
+    assert!(
+        reopened
+            .custody_receipt(ledger(), root, 2)
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Only a phase begun against an artifact names one for its custody check.
+#[test]
+fn a_phase_beginning_frame_names_its_artifact_and_other_frames_do_not() {
+    use focal_core::native::{EvaluationKey, EvaluationTarget, fixtures as fx, input_codec};
+    let limits = focal_ledger::NativeSessionLimits::standard(ContentDomainId(ledger().tenant.0));
+    let encode = |input: &focal_core::native::NativeInput| -> Vec<u8> {
+        let plan = input_codec::EncodingPlan::prepare(
+            input_codec::InputFrame::Request {
+                ledger: ledger(),
+                profile: focal_ledger::NativeContentProfile::AuthoredV1,
+                input,
+            },
+            input_codec::EncodingLimits {
+                bytes: 1 << 20,
+                visits: 1 << 28,
+            },
+        )
+        .unwrap();
+        let mut frame = vec![0; plan.quote().bytes];
+        plan.write_into(&mut frame).unwrap();
+        frame
+    };
+    let request = RequestKey {
+        principal: ParticipantId::from_u128(9),
+        epoch: RequestEpoch(1),
+        id: RequestId::from_u128(23),
+    };
+    let work = fx::begin_work(
+        request,
+        fx::binding(ledger(), 31),
+        EvaluationKey {
+            claim: ClaimId::from_u128(31),
+            validation: ValidationId::from_u128(61),
+            target: EvaluationTarget::Work {
+                response: TestamentId::from_u128(71),
+                slot: 0,
+                artifact: ArtifactId::from_u128(51),
+            },
+            generation: 1,
+        },
+        fx::binding(ledger(), 31),
+    );
+    assert_eq!(
+        crate::native_ingress::evaluation_artifact_of_frame(&limits, &encode(&work)).unwrap(),
+        Some(ArtifactId::from_u128(51))
+    );
+    let increment = focal_core::native::NativeInput {
+        request,
+        command: focal_core::native::NativeCommand::BeginIncrement {
+            claim: fx::binding(ledger(), 31),
+            key: EvaluationKey {
+                claim: ClaimId::from_u128(31),
+                validation: ValidationId::from_u128(61),
+                target: EvaluationTarget::Increment {
+                    artifact: ArtifactId::from_u128(52),
+                },
+                generation: 1,
+            },
+            expected: fx::binding(ledger(), 31),
+        },
+    };
+    assert_eq!(
+        crate::native_ingress::evaluation_artifact_of_frame(&limits, &encode(&increment)).unwrap(),
+        Some(ArtifactId::from_u128(52))
+    );
+    let posted = fx::post(request, fx::binding(ledger(), 31));
+    assert_eq!(
+        crate::native_ingress::evaluation_artifact_of_frame(&limits, &encode(&posted)).unwrap(),
+        None
+    );
+    let Operation::Native { frame } = native_work_frame(24, &report()).request().operation.clone()
+    else {
+        panic!("a native frame");
+    };
+    assert_eq!(
+        crate::native_ingress::evaluation_artifact_of_frame(&limits, &frame).unwrap(),
+        None
+    );
+    assert!(crate::native_ingress::evaluates_artifact(14));
+    assert!(crate::native_ingress::evaluates_artifact(18));
+    assert!(!crate::native_ingress::evaluates_artifact(6));
+}

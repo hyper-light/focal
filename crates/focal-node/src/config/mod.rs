@@ -1,3 +1,22 @@
+//! The typed, versioned deployment configuration and its ownership (doc 08
+//! §2): `node` and `topology` are local deployment facts a startup may
+//! override; `durability` and `placement` are committed policy intent that
+//! a running store changes only through plan and apply. One schema, two
+//! authorities, every value's source named.
+pub mod local;
+pub mod policy;
+pub mod resolve;
+pub mod schema;
+#[cfg(test)]
+mod ownership_tests {
+    include!("tests.rs");
+}
+pub use local::LocalFacts;
+pub use policy::{CommittedPolicy, PolicyIntent, PolicyRevision};
+pub use resolve::{
+    CliOverrides, ConfigSource, FieldSources, ResolvedSettings, resolve, resolve_request,
+};
+pub use schema::{SCHEMA, check_unknown_keys};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -41,6 +60,9 @@ pub struct NodeSettings {
     /// default 8, at most 1024. A placement that would need one more is
     /// refused by this node as `NodeCapacity`.
     pub max_tenants: Option<usize>,
+    /// An optional loopback endpoint for the read-only metrics text (doc
+    /// 08 §9); node-local, never a cluster fact.
+    pub metrics_listen: Option<SocketAddr>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +108,18 @@ pub enum ConfigError {
     },
     #[error("no OS application-data directory is available; specify --data-dir")]
     NoDataDirectory,
+    #[error("unknown configuration key `{path}`")]
+    UnknownKey { path: String },
+    #[error(
+        "configuration field {field} differs from the committed policy of this store; commit the change through `deployment plan` and `deployment apply`, or start with the committed value"
+    )]
+    CommittedPolicyChange { field: &'static str },
+    #[error(
+        "the committed policy of this store is missing or unreadable; it is not recreated beside an existing store"
+    )]
+    PolicyMissing,
+    #[error("committed policy: {0}")]
+    PolicyEncoding(String),
 }
 
 impl Settings {
@@ -151,6 +185,16 @@ impl Settings {
                 reason: "must be between 1 and 1024",
             });
         }
+        if self
+            .node
+            .metrics_listen
+            .is_some_and(|address| !address.ip().is_loopback())
+        {
+            return Err(ConfigError::Invalid {
+                field: "node.metrics_listen",
+                reason: "must be a loopback address; metrics are read-only and unauthenticated",
+            });
+        }
         for (field, value) in [
             ("topology.zone", &self.topology.zone),
             ("topology.region", &self.topology.region),
@@ -189,6 +233,20 @@ impl Settings {
         Ok(())
     }
 
+    /// The local deployment facts of this configuration.
+    pub fn local_facts(&self) -> LocalFacts {
+        LocalFacts {
+            node: self.node.clone(),
+            topology: self.topology.clone(),
+        }
+    }
+    /// The policy intent of this configuration.
+    pub fn policy_intent(&self) -> PolicyIntent {
+        PolicyIntent {
+            durability: self.durability.clone(),
+            placement: self.placement.clone(),
+        }
+    }
     pub fn data_dir(&self) -> Result<PathBuf, ConfigError> {
         if let Some(path) = &self.node.data_dir {
             return Ok(path.clone());

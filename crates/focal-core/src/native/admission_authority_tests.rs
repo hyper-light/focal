@@ -3,6 +3,7 @@ use super::report_tests::{
     report_for, request, running,
 };
 use super::*;
+use crate::native::fixtures::SyncCell as Cell;
 use focal_evidence::{
     BuiltinNativeSchemas, BuiltinSchemaError, ContentStore, NativeEvidenceError,
     NativeSchemaVerifier, StoreLimits, error_report_schema,
@@ -16,7 +17,7 @@ use focal_model::{
     ArtifactRef, ContentDomainId, ContentRef, ObjectId, ObjectKind, ObjectRef, ParticipantId,
     VerdictValue,
 };
-use std::{cell::Cell, path::PathBuf};
+use std::path::PathBuf;
 
 const DOMAIN: ContentDomainId = ContentDomainId::from_u128(901);
 

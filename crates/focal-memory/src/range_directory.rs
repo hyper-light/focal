@@ -305,6 +305,99 @@ impl<K: Ord, V> PageDirectory<K, V> {
     pub(super) fn check_shape(&self) -> bool {
         self.root.as_ref().is_none_or(|root| audit(root, true))
     }
+
+    /// The bytes [`Self::from_pages`] may issue for `count` pages: one node
+    /// per group of at most MAX handles at every level, each charged at full
+    /// width, plus the two transient handle vectors of the widest level.
+    pub(super) fn build_bound(count: usize) -> Result<usize, MemoryError> {
+        if count == 0 {
+            return Ok(0);
+        }
+        let mut nodes = 0usize;
+        let mut width = count;
+        let mut levels = 0usize;
+        loop {
+            let groups = width.div_ceil(MAX).max(1);
+            nodes = checked_add(nodes, groups)?;
+            levels = checked_add(levels, 1)?;
+            if groups == 1 {
+                break;
+            }
+            if levels > MAX_LEVELS {
+                return Err(invalid("directory height exceeds supported bound"));
+            }
+            width = groups;
+        }
+        let handles = checked_add(
+            ALLOCATOR_OVERHEAD,
+            checked_mul(count.div_ceil(MAX).max(1), size_of::<Arc<Node<K, V>>>())?,
+        )?;
+        checked_add(
+            checked_mul(nodes, node_charge::<K, V>(MAX)?)?,
+            checked_mul(2, handles)?,
+        )
+    }
+
+    /// Build a directory over `count` ordered pages in one pass: leaves of at
+    /// most MAX handles and, below the root, at least MIN, so the result has
+    /// the shape a sequence of inserts reaches with one allocation per node
+    /// instead of one path copy per page. `item(index)` yields the page at
+    /// `index`; a missing page or a disordered neighbour refuses the build.
+    pub(super) fn from_pages(
+        count: usize,
+        mut item: impl FnMut(usize) -> Option<Arc<Page<K, V>>>,
+        build: &mut DirectoryBuild<'_>,
+    ) -> Result<Self, MemoryError> {
+        if count == 0 {
+            return Ok(Self { root: None });
+        }
+        let groups = count.div_ceil(MAX);
+        let _staging = build.source.reserve(
+            BudgetKind::Roots,
+            build.lane,
+            checked_mul(
+                2,
+                checked_add(
+                    ALLOCATOR_OVERHEAD,
+                    checked_mul(groups, size_of::<Arc<Node<K, V>>>())?,
+                )?,
+            )?,
+        )?;
+        let mut level: Vec<Arc<Node<K, V>>> = bounded_vec(groups)?;
+        let mut offset = 0usize;
+        for group in 0..groups {
+            let width = group_width(count, groups, group);
+            let node = leaf(width, |index| item(checked_add(offset, index).ok()?), build)?;
+            bounded_push(&mut level, node, groups)?;
+            offset = checked_add(offset, width)?;
+        }
+        while level.len() > 1 {
+            let groups = level.len().div_ceil(MAX);
+            let mut next: Vec<Arc<Node<K, V>>> = bounded_vec(groups)?;
+            let mut offset = 0usize;
+            for group in 0..groups {
+                let width = group_width(level.len(), groups, group);
+                let node = branch(
+                    width,
+                    |index| level.get(checked_add(offset, index).ok()?).map(Arc::clone),
+                    build,
+                )?;
+                bounded_push(&mut next, node, groups)?;
+                offset = checked_add(offset, width)?;
+            }
+            level = next;
+        }
+        Ok(Self { root: level.pop() })
+    }
+}
+
+/// Divide `total` handles into `groups` nearly equal widths: every group is
+/// at least `total / groups`, so with more than one group each holds at
+/// least MIN when `total` exceeds MAX.
+fn group_width(total: usize, groups: usize, group: usize) -> usize {
+    let base = total.checked_div(groups).unwrap_or(0);
+    let extra = total.checked_rem(groups).unwrap_or(0);
+    base.saturating_add(usize::from(group < extra))
 }
 
 impl<K, V> Node<K, V> {

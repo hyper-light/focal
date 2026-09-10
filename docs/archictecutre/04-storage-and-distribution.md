@@ -286,6 +286,11 @@ staging pin until every relevant log consumer has crossed the handoff, not a sho
 Artifacts and checkpoints use cross-region placement when region-loss durability is
 promised. A cross-region Raft quorum with all artifact copies in one region is incomplete.
 
+Implemented (2026-09-10, [26](26-custody-archive-retention-and-restore.md) §1): each
+copy's verified `Durable` answer is kept as a custody receipt named by ledger, object and
+copy, and a phase that evaluates an artifact begins only when every required copy of the
+current placement holds a receipt at the current scope or answers the verification now.
+
 ## 8. Watermarks, reads, and atomic visibility
 
 Use distinct typed progress values; never overload a field called `durable`.
@@ -339,6 +344,10 @@ This minimum frontier is intentionally a per-session head-of-line constraint; ma
 sessions progress independently, but one stalled active range can stall its session.
 
 ## 9. Deterministic parallel apply
+
+Implemented for committed-record materialization on 2026-09-09
+([25](25-parallel-materialization-and-ranges.md) §2); the leader's admission
+stays serial by decision F38.
 
 The reference algorithm applies one prepared mutation at a time, in SessionSeq order.
 Validators, service handlers, clocks, randomness, network reads, and subprocesses never

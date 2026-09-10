@@ -4,7 +4,9 @@ use crate::native::report_tests as fixture;
 use focal_memory::{BudgetKind, BudgetLane, Change, Entry};
 use focal_model::ValidationMode;
 
-const ROW_START: usize = 75;
+// The version 6 header ends with the layout: a member count, the layout
+// epoch, then one member's identity and its unbounded start.
+const ROW_START: usize = 104;
 const PREFIX_AT: usize = 59;
 const COUNT_AT: usize = 67;
 
@@ -475,12 +477,15 @@ fn encoding_refuses_non_genesis_empty_roots_and_missing_meta_or_outcome() {
     ] {
         let mut core = fixture::core();
         let initial = if row.is_none() { 1 } else { 0 };
-        core.state.rows = RangeStore::new_partitioned(
-            RangeId(1712),
-            initial,
-            core.limits.range,
-            core.state.budget.clone(),
-            page_partition,
+        core.state.rows = crate::native::ranges::NativeRanges::single_from_store(
+            RangeStore::new_partitioned(
+                RangeId(1712),
+                initial,
+                core.limits.range,
+                core.state.budget.clone(),
+                page_partition,
+            )
+            .unwrap(),
         )
         .unwrap();
         if let Some(row) = row {

@@ -43,6 +43,8 @@ use managed_support_owner::SupportCall;
 mod grouped;
 #[path = "fleet_placement.rs"]
 mod placement_owner;
+#[path = "fleet_range.rs"]
+mod range_owner;
 use evidence_owner::{EvidenceCall, PendingEvidenceCall};
 pub use grouped::management::{
     FleetError, FleetIncarnation, FleetInstallFailure, FleetInstallation, FleetManager,
@@ -51,6 +53,11 @@ pub use grouped::management::{
 pub use grouped::{FleetReplica, FleetReplication, FleetTenant, ReplicaFleet, ReplicaFleetParts};
 pub use placement_owner::{CommittedPlacement, PlacementReply, SessionPlacementRequest};
 use placement_owner::{PendingPlacementCall, PlacementCall};
+pub use range_owner::{
+    ArchivedFamily, RANGE_CONTROL_SCHEMA, RangeControlReply, RangeControlRequest, RangeFact,
+    RangeFactRequest, RangeHistoryView, RangeMemberView, RangePendingView, RangeView,
+};
+pub(crate) use range_owner::{verify_fact, verify_progress};
 
 #[cfg(test)]
 #[path = "fleet_completion_tests.rs"]
@@ -87,11 +94,16 @@ pub struct ReplicaConfig {
     pub root: RootCommandId,
     pub route_epoch: RouteEpoch,
     pub policy_revision: u64,
+    /// This node's enrolled generation, the identity its range facts carry.
+    pub node_generation: u64,
     pub queue_items: usize,
     pub pending_clients: usize,
     pub replication_queue: usize,
     pub tick: Duration,
     pub request_timeout: Duration,
+    /// Checkpoint and compact the log once this many entries have applied
+    /// past the last snapshot (26 §3, the log's retirement boundary).
+    pub checkpoint_after_entries: u64,
     #[cfg(test)]
     checkpoint_observer: Option<CheckpointObserver>,
 }
@@ -112,11 +124,13 @@ impl ReplicaConfig {
             root,
             route_epoch: RouteEpoch(1),
             policy_revision: 1,
+            node_generation: 1,
             queue_items: 32,
             pending_clients: 128,
             replication_queue: 128,
             tick: Duration::from_millis(100),
             request_timeout: Duration::from_secs(5),
+            checkpoint_after_entries: 4096,
             #[cfg(test)]
             checkpoint_observer: None,
         }
@@ -142,9 +156,22 @@ pub struct ReplicaProgress {
     pub sequence: SessionSeq,
     pub dropped_replication: u64,
     pub stopped: bool,
+    /// The route epoch this replica serves clients at; a committed
+    /// activation moves the session ahead of it until the host re-fences.
+    pub route_epoch: RouteEpoch,
     /// A native import this replica cannot apply until its host seals the
     /// inline legacy payloads with the recorded chunking (23 §5.2).
     pub import_pending: Option<PendingImport>,
+    /// A seeded checkpoint this replica cannot install until its host pulls
+    /// the chunks it lacks from a peer (25 §5): the snapshot's Raft
+    /// coordinates and how many chunks are missing.
+    pub seed_pending: Option<SeedPending>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeedPending {
+    pub index: u64,
+    pub term: u64,
+    pub missing: usize,
 }
 /// The content parameters an activation proposal records for an import.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,7 +219,42 @@ enum Work {
         oneshot::Sender<Result<Option<LegacyImportPayloads>, LedgerError>>,
         Allocation,
     ),
+    /// Checkpoint the applied prefix now (an operator's explicit request).
+    Checkpoint(oneshot::Sender<Result<(), LedgerError>>, Allocation),
+    /// Where a committed artifact's bytes live, for its custody obligation.
+    ArtifactPointer(
+        focal_model::ArtifactId,
+        oneshot::Sender<
+            Result<
+                Option<focal_model::lifecycle::artifact_descriptor::ContentPointer>,
+                LedgerError,
+            >,
+        >,
+        Allocation,
+    ),
+    /// The chunks a pending seeded checkpoint still lacks.
+    SeedChunks(
+        oneshot::Sender<Result<Vec<focal_model::ContentHash>, LedgerError>>,
+        Allocation,
+    ),
+    /// One pulled chunk, verified and sealed; the delivery retries at once.
+    InstallSeed(
+        focal_model::ContentHash,
+        Vec<u8>,
+        oneshot::Sender<Result<(), LedgerError>>,
+        Allocation,
+    ),
+    /// Serve clients at an activated route: `(route, policy revision)`.
+    Refence(
+        RouteEpoch,
+        u64,
+        oneshot::Sender<Result<(), LedgerError>>,
+        Allocation,
+    ),
     Placement(Box<PlacementCall>, Allocation),
+    /// Range movement: the operator's view and move, the controller's steps,
+    /// a replica's own facts (25 §6).
+    Range(Box<range_owner::RangeCall>, Allocation),
     Evidence(Box<EvidenceCall>, Allocation),
     Stop(oneshot::Sender<Result<(), LedgerError>>),
 }
@@ -463,6 +525,9 @@ struct Owner {
     nonce: u64,
     support_cursor: u64,
     dropped: u64,
+    /// A member was added after the log was compacted: the next checkpoint
+    /// is due so the snapshot that seeds it names it in its configuration.
+    checkpoint_due: bool,
     #[cfg(test)]
     dropped_snapshots: u64,
     budget: MemoryBudget,
@@ -561,7 +626,9 @@ impl ReplicaHost {
                 sequence: session.sequence(),
                 dropped_replication: 0,
                 stopped: false,
+                route_epoch: config.route_epoch,
                 import_pending: None,
+                seed_pending: None,
             },
             _allocation: None,
         });
@@ -598,6 +665,7 @@ impl ReplicaHost {
             nonce: 0,
             support_cursor: 0,
             dropped: 0,
+            checkpoint_due: false,
             #[cfg(test)]
             dropped_snapshots: 0,
             budget: budget.clone(),
@@ -694,6 +762,32 @@ impl ReplicaHost {
             })?;
         receive.await.map_err(|_| LedgerError::OutcomeUnknown)?
     }
+    /// Serve clients at the route a committed activation moved the session
+    /// to ([24](../../../docs/archictecutre/24-placement-execution-and-fleet-control.md) §17):
+    /// the serving fence and the read views follow the session's active
+    /// route. Refused while the session is not at that route or a cutover
+    /// is still pending; a route behind the served one is a conflict.
+    pub async fn refence(
+        &self,
+        route_epoch: RouteEpoch,
+        policy_revision: u64,
+    ) -> Result<(), LedgerError> {
+        if route_epoch.0 == 0 || policy_revision == 0 {
+            return Err(LedgerError::PlacementConflict);
+        }
+        let charge = self
+            .budget
+            .reserve(BudgetKind::Control, BudgetLane::Completion, 16 * 1024)?
+            .commit();
+        let (send, receive) = oneshot::channel();
+        self.sender
+            .try_send(Work::Refence(route_epoch, policy_revision, send, charge))
+            .map_err(|error| match error {
+                HostQueueError::Full => LedgerError::Capacity,
+                HostQueueError::Disconnected => LedgerError::Failed,
+            })?;
+        receive.await.map_err(|_| LedgerError::OutcomeUnknown)?
+    }
     /// The inline legacy payloads a host must seal before this ledger's
     /// populated prefix can be imported; `None` when the prefix is empty.
     pub async fn import_payloads(&self) -> Result<Option<LegacyImportPayloads>, LedgerError> {
@@ -708,6 +802,88 @@ impl ReplicaHost {
         let (send, receive) = oneshot::channel();
         self.sender
             .try_send(Work::ImportPayloads(send, charge))
+            .map_err(|error| match error {
+                HostQueueError::Full => LedgerError::Capacity,
+                HostQueueError::Disconnected => LedgerError::Failed,
+            })?;
+        receive.await.map_err(|_| LedgerError::OutcomeUnknown)?
+    }
+    /// Checkpoint the replica's applied prefix now. The envelope is encoded
+    /// and installed on the replica's worker before this returns, so the
+    /// other sessions of that worker wait for it; refused (`Capacity`) while a
+    /// proposal or delivery is still pending, in which case the operator
+    /// retries. A native Core root beyond the inline bound is sealed as
+    /// seeds (25 §5).
+    pub async fn checkpoint(&self) -> Result<(), LedgerError> {
+        let charge = self
+            .budget
+            .reserve(BudgetKind::Control, BudgetLane::Completion, 64 * 1024)?
+            .commit();
+        let (send, receive) = oneshot::channel();
+        self.sender
+            .try_send(Work::Checkpoint(send, charge))
+            .map_err(|error| match error {
+                HostQueueError::Full => LedgerError::Capacity,
+                HostQueueError::Disconnected => LedgerError::Failed,
+            })?;
+        receive.await.map_err(|_| LedgerError::OutcomeUnknown)?
+    }
+    /// Where a committed artifact's bytes live (its domain, root and length),
+    /// `None` for an artifact this replica's committed prefix does not hold.
+    pub async fn artifact_pointer(
+        &self,
+        artifact: focal_model::ArtifactId,
+    ) -> Result<Option<focal_model::lifecycle::artifact_descriptor::ContentPointer>, LedgerError>
+    {
+        let charge = self
+            .budget
+            .reserve(BudgetKind::Control, BudgetLane::Completion, 4 * 1024)?
+            .commit();
+        let (send, receive) = oneshot::channel();
+        self.sender
+            .try_send(Work::ArtifactPointer(artifact, send, charge))
+            .map_err(|error| match error {
+                HostQueueError::Full => LedgerError::Capacity,
+                HostQueueError::Disconnected => LedgerError::Failed,
+            })?;
+        receive.await.map_err(|_| LedgerError::OutcomeUnknown)?
+    }
+    /// The chunks of a pending seeded checkpoint this replica still lacks.
+    pub async fn pending_seed_chunks(&self) -> Result<Vec<focal_model::ContentHash>, LedgerError> {
+        let charge = self
+            .budget
+            .reserve(BudgetKind::Control, BudgetLane::Completion, 64 * 1024)?
+            .commit();
+        let (send, receive) = oneshot::channel();
+        self.sender
+            .try_send(Work::SeedChunks(send, charge))
+            .map_err(|error| match error {
+                HostQueueError::Full => LedgerError::Capacity,
+                HostQueueError::Disconnected => LedgerError::Failed,
+            })?;
+        receive.await.map_err(|_| LedgerError::OutcomeUnknown)?
+    }
+    /// Hand the replica one pulled seed chunk; it is verified against its
+    /// hash, sealed, and the retained delivery retries at once.
+    pub async fn install_seed_chunk(
+        &self,
+        hash: focal_model::ContentHash,
+        bytes: Vec<u8>,
+    ) -> Result<(), LedgerError> {
+        let charge = self
+            .budget
+            .reserve(
+                BudgetKind::Control,
+                BudgetLane::Completion,
+                bytes
+                    .capacity()
+                    .checked_add(64 * 1024)
+                    .ok_or(LedgerError::Capacity)?,
+            )?
+            .commit();
+        let (send, receive) = oneshot::channel();
+        self.sender
+            .try_send(Work::InstallSeed(hash, bytes, send, charge))
             .map_err(|error| match error {
                 HostQueueError::Full => LedgerError::Capacity,
                 HostQueueError::Disconnected => LedgerError::Failed,
@@ -988,6 +1164,7 @@ impl Owner {
                             return Ok(());
                         }
                         self.progress_managed()?;
+                        self.checkpoint_if_due()?;
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
@@ -999,6 +1176,97 @@ impl Owner {
             let _ = writeln!(std::io::stderr().lock(), "focal: replica stopped: {error}");
         }
         self.close();
+    }
+    /// A member added after the log was compacted can only be seeded by a
+    /// snapshot whose configuration names it (Raft discards any other), so
+    /// the authority checkpoints once such a change has applied; a log that
+    /// is complete from its first entry needs no checkpoint. Retried while
+    /// proposals or persistence are pending; the checkpoint itself is the
+    /// synchronous one an operator's request takes.
+    /// Entries applied past the last snapshot: the log this replica keeps
+    /// beyond its checkpoint (26 §3).
+    pub(super) fn log_entries_since_checkpoint(&self) -> u64 {
+        self.session
+            .status()
+            .applied_index
+            .saturating_sub(self.session.snapshot_index())
+    }
+    /// The log's retirement boundary (26 §3): once the entries applied past
+    /// the last snapshot reach the configured bound, the replica checkpoints
+    /// its applied prefix and the log behind it is compacted; nothing is
+    /// retired before its checkpoint is durable.
+    fn checkpoint_by_cadence(&mut self) -> Result<(), LedgerError> {
+        if self.log_entries_since_checkpoint() < self.config.checkpoint_after_entries {
+            return Ok(());
+        }
+        self.try_checkpoint().map(|_| ())
+    }
+    /// Checkpoint now unless the replica cannot yet: a resource condition or
+    /// unpersisted state waits for a later tick, and nothing is a failure.
+    fn try_checkpoint(&mut self) -> Result<bool, LedgerError> {
+        if self.session.pending_count() != 0
+            || self.session.persistence_pending()
+            || self.session.checkpoint_in_flight()
+            || self.stopping.is_some()
+        {
+            return Ok(false);
+        }
+        match self.session.checkpoint() {
+            Ok(()) => Ok(true),
+            Err(
+                LedgerError::Capacity
+                | LedgerError::NotReady { .. }
+                | LedgerError::Consensus(
+                    focal_consensus::ConsensusError::PersistencePending
+                    | focal_consensus::ConsensusError::Capacity
+                    | focal_consensus::ConsensusError::CheckpointIndex,
+                ),
+            ) => Ok(false),
+            Err(LedgerError::Native(error))
+                if error.class() == focal_ledger::FailureClass::Retryable =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+    fn checkpoint_if_due(&mut self) -> Result<(), LedgerError> {
+        if !self.checkpoint_due {
+            return Ok(());
+        }
+        if self.session.snapshot_index() == 0 {
+            self.checkpoint_due = false;
+            return Ok(());
+        }
+        if self.session.pending_count() != 0
+            || self.session.persistence_pending()
+            || self.session.checkpoint_in_flight()
+            || self.stopping.is_some()
+        {
+            return Ok(());
+        }
+        match self.session.checkpoint() {
+            Ok(()) => {
+                self.checkpoint_due = false;
+                Ok(())
+            }
+            // Resource conditions and unpersisted state wait for a later tick.
+            Err(
+                LedgerError::Capacity
+                | LedgerError::NotReady { .. }
+                | LedgerError::Consensus(
+                    focal_consensus::ConsensusError::PersistencePending
+                    | focal_consensus::ConsensusError::Capacity
+                    | focal_consensus::ConsensusError::CheckpointIndex,
+                ),
+            ) => Ok(()),
+            Err(LedgerError::Native(error))
+                if error.class() == focal_ledger::FailureClass::Retryable =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
     fn tick(&mut self) -> Result<(), LedgerError> {
         self.session.tick()?;
@@ -1019,6 +1287,7 @@ impl Owner {
             .advance(&mut self.session)
             .map_err(|_| LedgerError::Failed)?;
         self.drain()?;
+        self.checkpoint_by_cadence()?;
         self.progress_managed()
     }
     /// Shared-worker progress never waits on a disk receipt. The exact Ready
@@ -1037,6 +1306,7 @@ impl Owner {
             self.poll_snapshot_feedback()?;
         }
         self.progress_managed()?;
+        self.checkpoint_if_due()?;
         if let Some((_, deadline)) = self.stopping.as_ref() {
             let expired = Instant::now() >= *deadline;
             if expired && self.session.has_ready() {
@@ -1071,7 +1341,9 @@ impl Owner {
                 .checked_add(Duration::from_millis(1))
                 .ok_or(LedgerError::Failed);
         }
-        if self.session.has_ready() {
+        // A delivery waiting for seed chunks its host has not pulled yet
+        // makes no progress on its own; it resumes when a chunk lands.
+        if self.session.has_ready() && !self.session.seed_waiting() {
             return Ok(self.next_tick.min(Instant::now()));
         }
         Ok(self.next_tick)
@@ -1155,6 +1427,28 @@ impl Owner {
                 self.drain()?;
                 let _ = response.send(result);
             }
+            Work::Refence(route, revision, response, charge) => {
+                let result = if route < self.config.route_epoch {
+                    Err(LedgerError::PlacementConflict)
+                } else if route == self.config.route_epoch {
+                    Ok(())
+                } else if self.session.active_route() != Some(route)
+                    || self
+                        .session
+                        .placement()
+                        .is_some_and(|fence| fence.kind == focal_ledger::SessionFenceKind::Cutover)
+                {
+                    Err(LedgerError::PlacementConflict)
+                } else {
+                    self.config.route_epoch = route;
+                    self.config.policy_revision = revision;
+                    self.views.set_route_epoch(route);
+                    self.publish_progress(false);
+                    Ok(())
+                };
+                drop(charge);
+                let _ = response.send(result);
+            }
             Work::ImportPayloads(response, charge) => {
                 let result = if self.session.legacy_populated() {
                     self.session
@@ -1166,12 +1460,53 @@ impl Owner {
                 drop(charge);
                 let _ = response.send(result);
             }
+            Work::ArtifactPointer(artifact, response, charge) => {
+                let result = self.session.native_core().map(|core| {
+                    core.native_artifact(artifact)
+                        .map(|artifact| artifact.custody().payload())
+                });
+                drop(charge);
+                let _ = response.send(result);
+            }
+            Work::Checkpoint(response, charge) => {
+                // Drain what Raft already owns first so the checkpoint covers
+                // the latest applied prefix; a pending proposal stays in the
+                // log and refuses the checkpoint until it commits.
+                self.drain()?;
+                let result = if self.session.pending_count() == 0 {
+                    self.session.checkpoint()
+                } else {
+                    Err(LedgerError::Capacity)
+                };
+                drop(charge);
+                self.drain()?;
+                let _ = response.send(result);
+            }
+            Work::SeedChunks(response, charge) => {
+                let result = match self.session.pending_seed() {
+                    Some(pending) => pending.missing_chunks().map_err(LedgerError::Native),
+                    None => Ok(Vec::new()),
+                };
+                drop(charge);
+                let _ = response.send(result);
+            }
+            Work::InstallSeed(hash, bytes, response, charge) => {
+                let result = self.session.install_seed_chunk(hash, &bytes);
+                drop(bytes);
+                drop(charge);
+                let _ = response.send(result);
+                self.drain()?;
+            }
             Work::Membership(call, charge) => {
                 self.accept_membership(*call, charge);
                 self.drain()?;
             }
             Work::Placement(call, charge) => {
                 self.accept_placement(*call, charge);
+                self.drain()?;
+            }
+            Work::Range(call, charge) => {
+                self.accept_range(*call, charge);
                 self.drain()?;
             }
             Work::Evidence(call, charge) => {
@@ -1271,7 +1606,13 @@ impl Owner {
                 sequence: self.session.sequence(),
                 dropped_replication: self.dropped,
                 stopped,
+                route_epoch: self.config.route_epoch,
                 import_pending: self.session.pending_import(),
+                seed_pending: self.session.pending_seed().map(|pending| SeedPending {
+                    index: pending.index,
+                    term: pending.term,
+                    missing: pending.missing.len(),
+                }),
             }
         });
     }
@@ -1328,9 +1669,24 @@ impl Owner {
                 {
                     return Err(AccessError::Unauthorized);
                 }
+                // A hosted replica answers a probe with the successor promise
+                // it can make: the authority of a native group admits a
+                // learner only once it has recorded that promise, and it
+                // learns it from this reply (the prospective learner is not
+                // yet a member and cannot push its own fact).
+                if self.session.native_hosted() {
+                    match self.session.begin_native_support() {
+                        Ok(())
+                        | Err(LedgerError::NativeUnsupported)
+                        | Err(LedgerError::Consensus(
+                            focal_consensus::ConsensusError::PersistencePending,
+                        )) => {}
+                        Err(error) => return Err(access(error)),
+                    }
+                }
                 return self
                     .session
-                    .managed_support()
+                    .native_support()
                     .map(Response::ManagedSupport)
                     .map_err(access);
             }
@@ -1878,6 +2234,14 @@ impl Owner {
                     read.validate(&self.client_limits)?;
                     let profile = crate::native_reads::profile(&self.session)?;
                     let role = crate::native_reads::role(peer)?;
+                    // A learner serves only the members it holds (25 §6);
+                    // a voter holds every member.
+                    if !crate::native_reads::locations(&read.query)
+                        .into_iter()
+                        .all(|location| self.serves_member(location))
+                    {
+                        return Err(AccessError::Unavailable);
+                    }
                     if matches!(read.consistency, ReadConsistency::Linearizable) {
                         if !self.session.is_authoritative() {
                             return Err(AccessError::Unavailable);
@@ -1930,6 +2294,9 @@ impl Owner {
                     list.validate(&self.client_limits)?;
                     let profile = crate::native_reads::profile(&self.session)?;
                     let role = crate::native_reads::role(peer)?;
+                    if !self.serves_all_members() {
+                        return Err(AccessError::Unavailable);
+                    }
                     let key = *self.views.list_key()?;
                     let core = self.session.native_core().map_err(access)?;
                     crate::native_lists::serve(
@@ -2699,6 +3066,12 @@ impl Owner {
                     if !receipt_ready {
                         self.finish_membership(pending, Err(LedgerError::MembershipConflict));
                     } else {
+                        if matches!(
+                            pending.call.request.as_ref().map(|request| &request.change),
+                            Some(focal_consensus::MembershipChange::AddLearner { .. })
+                        ) {
+                            self.checkpoint_due = true;
+                        }
                         let view = self.session.membership();
                         self.finish_membership(pending, view);
                     }

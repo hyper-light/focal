@@ -263,7 +263,8 @@ fn estimate(legacy: &LegacyState) -> Result<usize, ImportError> {
         let content = claim.content();
         let lifecycle = claim.lifecycle();
         // Claim row, receipt row and event, status events, release event,
-        // then the issuer, subject, status and creation index rows (doc 22 §7).
+        // then the identity, issuer, subject, status and creation index rows
+        // (doc 22 §7).
         rows = add(rows, 4)?;
         rows = add(rows, super::index_rows::CLAIM_ROWS)?;
         rows = add(rows, lifecycle.history.len())?;
@@ -417,6 +418,13 @@ pub fn import<S: NativeSchemaVerifier, R: NativeCustodyReader>(
         range: IMPORT_RANGE,
         prefix: IMPORT_SEQUENCE.0,
         count: rows.len(),
+        // One member under the import identity, so every replica's image
+        // is byte-identical; the producer identity is the caller's.
+        layout: &[super::ranges::RangeBoundary {
+            id: IMPORT_RANGE,
+            start: None,
+        }],
+        layout_epoch: 0,
     };
     let (image, root) =
         checkpoint::encode_rows(frame, &rows, request.encoding).map_err(ImportError::Codec)?;

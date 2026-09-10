@@ -204,8 +204,17 @@ pub fn restore<S: NativeSchemaVerifier, R: NativeCustodyReader>(
     };
     let expected_entries =
         usize::try_from(header.rows).map_err(|_| NativeError::Capacity("checkpoint row count"))?;
+    // The rows are restored into one store, validated as a whole, then laid
+    // out per the recorded layout (25 §4): members keep their durable
+    // identities while the producer identity is the caller's fresh one.
+    let layout = checkpoint.layout(limits.native.max_ranges, &budget)?;
+    let first_member = layout
+        .members()
+        .first()
+        .map(|member| member.id)
+        .ok_or(ContractError::InvalidManifest)?;
     let mut owner = RangeStore::begin_hydration_partitioned(
-        range,
+        first_member,
         limits.native.range,
         budget.clone(),
         page_partition,
@@ -258,6 +267,23 @@ pub fn restore<S: NativeSchemaVerifier, R: NativeCustodyReader>(
             .map_err(|error| shared.refuse(error))
         })
         .map_err(|error| shared.error(error))?;
+    let rows = ranges::NativeRanges::from_store(
+        range,
+        layout,
+        rows,
+        &budget,
+        BudgetLane::Completion,
+        |row| {
+            let work =
+                read_dispatch::objects::copy_work(row).map_err(|error| shared.refuse(error))?;
+            meters
+                .model
+                .charge(work)
+                .map_err(|error| shared.refuse(read_evidence::codec(error)))?;
+            prepare::copy(row)
+        },
+    )
+    .map_err(|error| shared.error(error))?;
     // All decoder/index/workspace borrows end before exposing the sole owner.
     drop(shared);
     drop(index);

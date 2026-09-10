@@ -92,13 +92,30 @@ impl<'bytes> Entries<'bytes> {
     }
 }
 
-struct Overlay<'a, 'bytes> {
-    core: &'a Core<NativeState>,
+/// The rows a replay reads beneath the record's own: the published Core, or
+/// a materializer's view of that Core plus the records staged before this
+/// one (doc 25). Every base read of a replay goes through this seam, so a
+/// materializer can answer from earlier staged rows and record what was read.
+pub(super) trait BaseRows {
+    fn base_row(&self, key: Key) -> Option<&Row>;
+    /// The prefix the record must extend.
+    fn base_prefix(&self) -> u64;
+}
+impl BaseRows for Core<NativeState> {
+    fn base_row(&self, key: Key) -> Option<&Row> {
+        self.state.rows.get(&key)
+    }
+    fn base_prefix(&self) -> u64 {
+        self.state.rows.prefix()
+    }
+}
+struct Overlay<'a, 'bytes, B> {
+    base: &'a B,
     entries: &'a Entries<'bytes>,
 }
-impl replay_validate::Overlay for Overlay<'_, '_> {
+impl<B: BaseRows> replay_validate::Overlay for Overlay<'_, '_, B> {
     fn before(&self, key: Key) -> Option<&Row> {
-        self.core.state.rows.get(&key)
+        self.base.base_row(key)
     }
     fn after(&self, key: Key) -> Option<&Row> {
         match self.entries.position(key) {
@@ -107,7 +124,7 @@ impl replay_validate::Overlay for Overlay<'_, '_> {
                 .slots
                 .get(index)
                 .and_then(|slot| slot.value.as_ref()),
-            None => self.core.state.rows.get(&key),
+            None => self.base.base_row(key),
         }
     }
     fn changes(&self) -> impl ExactSizeIterator<Item = (Key, Option<&Row>)> {
@@ -128,13 +145,13 @@ impl replay_validate::Overlay for Overlay<'_, '_> {
             .map(|slot| (slot.encoded.key, slot.value.as_ref()))
     }
 }
-struct Objects<'a, 'bytes> {
-    overlay: Overlay<'a, 'bytes>,
+struct Objects<'a, 'bytes, B> {
+    overlay: Overlay<'a, 'bytes, B>,
     header: RecordHeader,
     index: Option<&'a replay_index::Index>,
     parsing: &'a Meter,
 }
-impl read_dispatch::Objects for Objects<'_, '_> {
+impl<B: BaseRows> read_dispatch::Objects for Objects<'_, '_, B> {
     fn ledger(&self) -> LedgerId {
         self.header.ledger
     }
@@ -177,7 +194,7 @@ impl read_dispatch::Objects for Objects<'_, '_> {
                 Ok(read_dispatch::ClaimDependency::Raw(slot.encoded.body()))
             }
             None => {
-                let claim = as_claim(self.overlay.core.state.rows.get(&Key::Claim(id)))
+                let claim = as_claim(self.overlay.base.base_row(Key::Claim(id)))
                     .ok_or(ContractError::MissingEvidence)?;
                 Ok(read_dispatch::ClaimDependency::Retained(claim))
             }
@@ -197,14 +214,15 @@ impl read_dispatch::Objects for Objects<'_, '_> {
     }
 }
 
-struct Decoder<'a, S, R> {
-    core: &'a Core<NativeState>,
+struct Decoder<'a, S, R, B> {
+    base: &'a B,
+    budget: &'a MemoryBudget,
     header: RecordHeader,
     limits: read_dispatch::Limits,
     meters: &'a recovery::Meters,
     custody: recovery::Custody<'a, S, R>,
 }
-impl<S: NativeSchemaVerifier, R: NativeCustodyReader> Decoder<'_, S, R> {
+impl<S: NativeSchemaVerifier, R: NativeCustodyReader, B: BaseRows> Decoder<'_, S, R, B> {
     fn phase(
         &self,
         entries: &mut Entries<'_>,
@@ -235,7 +253,7 @@ impl<S: NativeSchemaVerifier, R: NativeCustodyReader> Decoder<'_, S, R> {
             }
             let objects = Objects {
                 overlay: Overlay {
-                    core: self.core,
+                    base: self.base,
                     entries,
                 },
                 header: self.header,
@@ -245,7 +263,7 @@ impl<S: NativeSchemaVerifier, R: NativeCustodyReader> Decoder<'_, S, R> {
             let context = read_dispatch::Context {
                 objects: &objects,
                 custody: &self.custody,
-                workspace: &self.core.state.budget,
+                workspace: self.budget,
                 workspace_lane: BudgetLane::Completion,
                 parsing: &self.meters.parsing,
                 source: &self.meters.source,
@@ -266,9 +284,7 @@ impl<S: NativeSchemaVerifier, R: NativeCustodyReader> Decoder<'_, S, R> {
                 None
             } else {
                 Some(
-                    self.core
-                        .state
-                        .budget
+                    self.budget
                         .reserve(
                             BudgetKind::Pending,
                             BudgetLane::Completion,
@@ -315,35 +331,100 @@ pub fn prepare<S: NativeSchemaVerifier, R: NativeCustodyReader>(
     core: &Core<NativeState>,
     record: &StructuralRecord<'_>,
     original: RangeId,
-    mut limits: recovery::Limits,
+    limits: recovery::Limits,
     store: &R,
     schemas: &S,
 ) -> Result<NativePrepared, NativeError> {
+    let staged = stage(
+        core,
+        &core.state.budget,
+        core.limits,
+        core.state.ledger,
+        core.state.profile,
+        record,
+        original,
+        limits,
+        store,
+        schemas,
+    )?;
+    install(core, staged)
+}
+
+/// A decoded and validated record before its pages exist: the complete
+/// change set, the captured write set and their funding. Built against any
+/// [`BaseRows`] view, so a materializer can stage records ahead of the
+/// published prefix and install them in order (doc 25).
+pub struct StagedRecord {
+    pub(super) header: RecordHeader,
+    pub(super) changes: Vec<Change<Key, Row>>,
+    pub(super) writes: mutation::WriteSet,
+    pub(super) allocation: Allocation,
+    pub(super) slots_bytes: usize,
+    pub(super) remaining: recovery::Work,
+}
+impl StagedRecord {
+    pub fn header(&self) -> &RecordHeader {
+        &self.header
+    }
+    /// The staged row for `key`: `Some(None)` for a deletion, `None` when
+    /// the record does not write the key.
+    pub(super) fn row(&self, key: Key) -> Option<Option<&Row>> {
+        let index = self
+            .changes
+            .binary_search_by(|change| change.key().cmp(&key))
+            .ok()?;
+        Some(match self.changes.get(index)? {
+            Change::Put(entry) => Some(&entry.value),
+            Change::Delete(_) => None,
+        })
+    }
+}
+
+/// Decode and validate one record against `base` without touching the
+/// Core's pages. `budget`, `native`, `ledger` and `profile` describe the
+/// Core the record will be installed into.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one bounded staging pass over borrowed inputs"
+)]
+pub(super) fn stage<S: NativeSchemaVerifier, R: NativeCustodyReader, B: BaseRows>(
+    base: &B,
+    budget: &MemoryBudget,
+    native: NativeLimits,
+    ledger: LedgerId,
+    profile: NativeContentProfile,
+    record: &StructuralRecord<'_>,
+    original: RangeId,
+    mut limits: recovery::Limits,
+    store: &R,
+    schemas: &S,
+) -> Result<StagedRecord, NativeError> {
     let header = record.header();
-    if header.ledger != core.state.ledger
-        || header.profile != core.state.profile
+    if header.ledger != ledger
+        || header.profile != profile
         || header.range != original
-        || header.base.0 != core.state.rows.prefix()
+        || header.base.0 != base.base_prefix()
         || header.base.0.checked_add(1) != Some(header.outcome.sequence.0)
     {
         return Err(ContractError::InvalidManifest.into());
     }
-    limits.native = core.limits;
+    limits.native = native;
     let meters = recovery::Meters::new(limits.work);
-    let mut entries = Entries::read(record, limits.native, &core.state.budget, &meters)?;
+    let mut entries = Entries::read(record, limits.native, budget, &meters)?;
     let decoder = Decoder {
-        core,
+        base,
+        budget,
         header,
         limits: limits.dispatch(),
         meters: &meters,
-        custody: recovery::Custody::new(store, schemas, &core.state.budget, &meters.model),
+        custody: recovery::Custody::new(store, schemas, budget, &meters.model),
     };
     let first = decoder.phase(&mut entries, None, 0)?;
     let index = replay_index::Index::build(
         &entries,
         header,
-        core.limits,
-        &core.state.budget,
+        native,
+        budget,
         &meters.parsing,
         &meters.lookup,
     )?;
@@ -357,7 +438,7 @@ pub fn prepare<S: NativeSchemaVerifier, R: NativeCustodyReader>(
         }
     }
     let overlay = Overlay {
-        core,
+        base,
         entries: &entries,
     };
     replay_validate::validate(&replay_validate::ReplayRead {
@@ -366,9 +447,9 @@ pub fn prepare<S: NativeSchemaVerifier, R: NativeCustodyReader>(
         profile: header.profile,
         base: header.base,
         outcome: header.outcome,
-        limits: core.limits,
+        limits: native,
         meter: &meters.model,
-        budget: &core.state.budget,
+        budget,
         encoded: &entries,
         index: &index,
         parsing: &meters.parsing,
@@ -381,11 +462,9 @@ pub fn prepare<S: NativeSchemaVerifier, R: NativeCustodyReader>(
     let change_bytes = prepare::array::<Change<Key, Row>>(entries.slots.len())?;
     prepare::within(
         prepare::add(entries.allocation.bytes(), change_bytes)?,
-        core.limits.preparation_bytes,
+        native.preparation_bytes,
     )?;
-    let mut changes_allocation = core
-        .state
-        .budget
+    let mut changes_allocation = budget
         .reserve(BudgetKind::Pending, BudgetLane::Completion, change_bytes)?
         .commit();
     let mut changes = Vec::new();
@@ -419,38 +498,112 @@ pub fn prepare<S: NativeSchemaVerifier, R: NativeCustodyReader>(
         changes.push(change);
     }
     entries.allocation.absorb(&mut changes_allocation)?;
+    let write_bytes = mutation::bytes(changes.len())?;
+    let writes = mutation::WriteSet::capture(
+        header.profile,
+        changes.len(),
+        changes.iter(),
+        write_bytes,
+        budget
+            .reserve(BudgetKind::Pending, BudgetLane::Completion, write_bytes)?
+            .commit(),
+    )?;
+    let slots_bytes = prepare::array::<EntrySlot<'_>>(entries.slots.capacity())?;
+    let Entries { slots, allocation } = entries;
+    drop(slots);
+    Ok(StagedRecord {
+        header,
+        changes,
+        writes,
+        allocation,
+        slots_bytes,
+        remaining: recovery::Work {
+            parsing: meters.parsing.remaining(),
+            source: meters.source.remaining(),
+            model: meters.model.remaining(),
+            lookup: meters.lookup.remaining(),
+        },
+    })
+}
+
+/// The record's meta row alone, decoded from its bytes: a fixed row that
+/// reads nothing, so a materializer can hand every stage its predecessor's
+/// meta without waiting for that predecessor (doc 25 §2).
+pub(super) fn stage_meta(
+    record: &StructuralRecord<'_>,
+    ledger: LedgerId,
+    visits: usize,
+) -> Result<Row, NativeError> {
+    let quote = record.quote();
+    for row in record.rows(quote.visits).map_err(read_evidence::codec)? {
+        let row = row.map_err(read_evidence::codec)?;
+        if row.key != Key::Meta || row.deleted() {
+            continue;
+        }
+        let body = row.body();
+        let mut cursor =
+            bytes::Cursor::new(body, body.len(), visits).map_err(read_evidence::codec)?;
+        let meta = read_rows::read_fixed(Key::Meta, &mut cursor, ledger)?
+            .ok_or(ContractError::InvalidManifest)?;
+        cursor.finish().map_err(read_evidence::codec)?;
+        return Ok(meta);
+    }
+    Err(ContractError::InvalidManifest.into())
+}
+
+/// Build the staged record's pages against the Core's published root. The
+/// record must extend the Core's current prefix; the remaining recovery work
+/// of its staging pays for the page copies.
+pub(super) fn install(
+    core: &Core<NativeState>,
+    staged: StagedRecord,
+) -> Result<NativePrepared, NativeError> {
+    let StagedRecord {
+        header,
+        changes,
+        writes,
+        mut allocation,
+        slots_bytes,
+        remaining,
+    } = staged;
+    if header.ledger != core.state.ledger
+        || header.profile != core.state.profile
+        || header.base.0 != core.state.rows.prefix()
+    {
+        return Err(ContractError::InvalidManifest.into());
+    }
+    let meters = recovery::Meters::new(remaining);
     // Prepay sorting, bounded directory descent and retained-entry sizing on
     // touched leaves. This bound scales with the mutation and configured page
     // size, never the complete ledger. Nested copies are charged individually.
-    let work = entries
-        .slots
+    let work = changes
         .len()
         .checked_add(1)
         .and_then(|n| n.checked_mul(core.limits.range.page_entries.checked_add(1)?))
         .and_then(|n| n.checked_mul(const { (usize::BITS as usize + 1) * 512 }))
         .ok_or(ContractError::Capacity)?;
     meters.lookup.charge(work).map_err(read_evidence::codec)?;
+    // Dividing the input among a group's members takes a vector per touched
+    // member beyond the one the record funded (25 §4).
+    let extra = core.state.rows.input_extra_bytes(changes.len())?;
+    if extra != 0 {
+        let mut extra_allocation = core
+            .state
+            .budget
+            .reserve(BudgetKind::Pending, BudgetLane::Completion, extra)?
+            .commit();
+        allocation.absorb(&mut extra_allocation)?;
+    }
     let plan = core.state.rows.plan_batch(
+        &core.state.budget,
         header.outcome.sequence.0,
         changes,
         BudgetLane::Completion,
         usize::MAX,
     )?;
-    let write_bytes = mutation::bytes(plan.changes().len())?;
-    let writes = mutation::WriteSet::capture(
-        header.profile,
-        plan.changes(),
-        write_bytes,
-        core.state
-            .budget
-            .reserve(BudgetKind::Pending, BudgetLane::Completion, write_bytes)?
-            .commit(),
-    )?;
     let failure = std::cell::Cell::new(None);
-    let input_bytes = plan.charges().input_pending_bytes();
-    let slots_bytes = prepare::array::<EntrySlot<'_>>(entries.slots.capacity())?;
-    let available = entries
-        .allocation
+    let input_bytes = plan.input_pending_bytes();
+    let available = allocation
         .bytes()
         .checked_sub(slots_bytes)
         .ok_or(ContractError::Capacity)?;
@@ -458,8 +611,8 @@ pub fn prepare<S: NativeSchemaVerifier, R: NativeCustodyReader>(
     // The plan takes the existing exact input permit. Its drop-ordered owner
     // retains that charge through every refusal and through destination-page
     // construction; the incoming vector/payloads are not admitted a second time.
-    let input = entries.allocation.split_off(input_bytes)?;
-    let range = plan
+    let input = allocation.split_off(input_bytes)?;
+    let fragments = plan
         .build_in_funded_with(&core.state.budget, input, |row| {
             let work = match read_dispatch::objects::copy_work(row) {
                 Ok(work) => work,
@@ -479,9 +632,9 @@ pub fn prepare<S: NativeSchemaVerifier, R: NativeCustodyReader>(
             prepare::copy(row)
         })
         .map_err(|error| failure.take().unwrap_or_else(|| error.into()))?;
-    writes.check(&range)?;
+    writes.check(&fragments)?;
     Ok(NativePrepared {
-        range,
+        fragments,
         outcome: header.outcome,
         writes,
     })

@@ -229,6 +229,22 @@ pub fn wire_coverage(operation: &Operation) -> Coverage {
             "Active enrolled certificate; signs one session fact witnessed by the node's own hosted replica.",
             "AuthorityProof",
         ),
+        Operation::RangeControl { .. } => coverage(
+            "peer.range_control",
+            Capability::Node,
+            Exposure::InternalOnly,
+            false,
+            "Active enrolled certificate; states one range-movement fact of the node's own hosted replica for the session authority to verify and attest.",
+            "RangeControlReply",
+        ),
+        Operation::SessionControl { .. } => coverage(
+            "peer.session_control",
+            Capability::Node,
+            Exposure::InternalOnly,
+            true,
+            "Active enrolled certificate of a voter in the group that owns the session's partition; the session's leader states its facts or applies one membership change or placement record under the log's own committed rules.",
+            "SessionControlReply",
+        ),
         Operation::Probe { .. } => coverage(
             "peer.probe",
             Capability::Node,
@@ -372,6 +388,7 @@ pub const fn custody_coverage(custody: &CustodyRequest) -> Coverage {
         CustodyRequest::Cancel { .. } => ("custody.cancel", true),
         CustodyRequest::Manifest { .. } => ("custody.manifest", false),
         CustodyRequest::ReadChunk { .. } => ("custody.read_chunk", false),
+        CustodyRequest::SeedChunk { .. } => ("custody.seed_chunk", false),
     };
     coverage(
         name,

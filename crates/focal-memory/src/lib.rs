@@ -38,6 +38,7 @@ mod owner;
 mod range;
 #[cfg(test)]
 mod range_elastic_tests;
+mod range_map;
 mod snapshot;
 mod traversal;
 
@@ -57,6 +58,7 @@ pub use range::{
     RangePreparationCharges, RangePreparationPlan, RangeStats, RangeStore, RangeWriteEnvelope,
     RangeWriteLimits,
 };
+pub use range_map::{KeySpan, RangeDescriptor, RangeMap, RangeMapError, RangeMapLimits};
 pub use snapshot::{ReadBudget, ReadPage, ScanContinuation, ScanQuery, SnapshotLease};
 pub use traversal::{
     TraversalContinuation, TraversalLimits, TraversalPage, TraversalQuery, TraversalStop,

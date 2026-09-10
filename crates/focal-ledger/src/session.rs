@@ -1,6 +1,6 @@
 use crate::native_session::{
     FailureClass, NativeCommit, NativeOutput, NativeReadBoundary, NativeSessionError,
-    NativeSessionLimits, NativeSubmission, NativeTimerInput, ReadCorrelation, engine,
+    NativeSessionLimits, NativeSubmission, NativeTimerInput, PendingSeed, ReadCorrelation, engine,
 };
 use crate::request_streams::{
     ManagedError, PreparedStream, RequestStreamLimits, RequestStreams, RequestStreamsCheckpoint,
@@ -249,6 +249,15 @@ pub struct Session {
     pending_activation: Option<(ActivationRecord, Allocation)>,
     native: Option<Box<engine::NativeEngine<BuiltinNativeSchemas>>>,
     hosting: Option<NativeHosting>,
+    /// A seeded native checkpoint a snapshot carried that this replica could
+    /// not assemble yet (25 §5): the engine it would have become was not
+    /// adopted, so the missing chunks are kept here for the host to pull
+    /// while the delivery is retained.
+    seed_pending: Option<PendingSeed>,
+    /// A seed chunk landed since the retained delivery last tried to
+    /// assemble the checkpoint; until one does, resuming would only repeat
+    /// the same refusal.
+    seed_progress: bool,
     retained: Option<PendingDelivery>,
 }
 
@@ -458,6 +467,8 @@ impl Session {
             pending_activation: None,
             native: None,
             hosting,
+            seed_pending: None,
+            seed_progress: false,
             retained: None,
         };
         // Recovery consumes prior committed outcomes without executing their effects.
@@ -965,7 +976,25 @@ impl Session {
         let delivery = self.begin_delivery(events)?;
         self.drive(delivery)
     }
+    /// Whether a delivery (committed entries or a snapshot) is retained
+    /// after a retryable refusal, to resume at the next poll.
+    pub fn delivery_retained(&self) -> bool {
+        self.retained.is_some()
+    }
+    /// The index of the stored checkpoint the Raft log is compacted behind,
+    /// zero while the log is complete from its first entry.
+    pub fn snapshot_index(&self) -> u64 {
+        self.consensus.snapshot_index()
+    }
+    /// A retained delivery is waiting for seed chunks no host has pulled yet.
+    pub fn seed_waiting(&self) -> bool {
+        self.retained.is_some() && self.seed_pending.is_some() && !self.seed_progress
+    }
     fn resume_delivery(&mut self) -> Result<SessionEvents, LedgerError> {
+        if self.seed_waiting() {
+            return Err(LedgerError::Retry);
+        }
+        self.seed_progress = false;
         let delivery = self.retained.take().ok_or(LedgerError::Failed)?;
         self.drive(delivery)
     }
@@ -1205,6 +1234,14 @@ impl Session {
                     }
                     return Err(error.into());
                 }
+                // A retirement record (26 §4) applies through the committed
+                // core on an authority too; past this term's readiness
+                // barrier every earlier entry is applied, so the owner is
+                // reconstructed here instead of at a later barrier.
+                if leader && self.ready_term == Some(status.term) && engine.reconstruction_needed()
+                {
+                    engine.promote(status.term, &self.consensus)?;
+                }
                 self.applied_raft = entry.index;
                 delivery.entry = next;
                 continue;
@@ -1412,6 +1449,7 @@ include!("cursor_maintenance.rs");
 include!("membership_session.rs");
 include!("placement_session.rs");
 include!("evidence_snapshot.rs");
+include!("session_backup.rs");
 
 #[cfg(test)]
 #[path = "session_native_tests.rs"]

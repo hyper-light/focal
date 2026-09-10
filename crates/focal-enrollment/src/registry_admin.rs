@@ -33,6 +33,14 @@ impl EnrollmentCommand {
             _ => None,
         }
     }
+    /// Identifies a tenant admission, which only the founder authority
+    /// prepares.
+    pub fn admitted_tenant(&self) -> Option<[u8; 16]> {
+        match self.change {
+            Change::AdmitTenant { tenant } => Some(tenant),
+            _ => None,
+        }
+    }
 }
 impl EnrollmentRegistry {
     pub fn invitation_status(&self, id: InvitationId) -> Option<InvitationStatus> {

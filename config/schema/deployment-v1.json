@@ -13,7 +13,9 @@
         "data_dir": { "type": ["string", "null"], "minLength": 1 },
         "listen": { "type": ["string", "null"] },
         "advertise": { "type": ["string", "null"], "minLength": 1 },
-        "seeds": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true }
+        "seeds": { "type": "array", "items": { "type": "string", "minLength": 1 }, "uniqueItems": true },
+        "max_tenants": { "type": ["integer", "null"], "minimum": 1, "maximum": 1024 },
+        "metrics_listen": { "type": ["string", "null"] }
       }
     },
     "topology": {

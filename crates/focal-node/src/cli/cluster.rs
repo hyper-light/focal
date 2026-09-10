@@ -25,6 +25,21 @@ pub(crate) enum ClusterCommand {
     },
     /// Quorum-read this node's root-group leader and voting membership.
     Status,
+    /// Every directory partition this node acts on: nodes, sessions, their
+    /// desired and achieved guarantee and what blocks it.
+    Placement,
+    /// The bounded next actions the placement controller would take.
+    Plan,
+    /// Admit or list the tenants the cluster serves.
+    Tenants {
+        #[command(subcommand)]
+        command: TenantCommand,
+    },
+    /// Create application sessions on this node.
+    Sessions {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
     /// Inspect committed contact announcements, not placement or credential grants.
     Nodes {
         #[command(subcommand)]
@@ -60,6 +75,105 @@ pub(crate) enum ClusterCommand {
         #[command(subcommand)]
         command: RequestCommand,
     },
+    /// A native session's retention floor and archive counts.
+    Retention {
+        #[command(subcommand)]
+        command: RetentionCommand,
+    },
+    /// A retired claim's archive bundle as this node holds and verifies it.
+    Archive {
+        #[command(subcommand)]
+        command: ArchiveCommand,
+    },
+    /// The collector that reclaims unreferenced bytes on this node.
+    Gc {
+        #[command(subcommand)]
+        command: GcCommand,
+    },
+    /// Coherent backups of a hosted session at a declared prefix.
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommand,
+    },
+    /// The storage view of this node: the volume envelope, what is staged,
+    /// the agents, and every hosted session's oldest retained prefix.
+    Storage {
+        #[command(subcommand)]
+        command: StorageCommand,
+    },
+    /// Restore a session from a verified backup onto this node. The old
+    /// incarnation continues only when its source is fenced; otherwise
+    /// `--new-incarnation` acknowledges a recovery under a new log group.
+    Restore {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        new_incarnation: bool,
+    },
+}
+#[derive(Subcommand)]
+pub(crate) enum StorageCommand {
+    /// Disk pressure by kind, staged uploads, the archive agent's and the
+    /// collector's settings and progress, and each hosted session's
+    /// retention floor; no reclamation is initiated.
+    Show,
+}
+#[derive(Subcommand)]
+pub(crate) enum BackupCommand {
+    /// Write a backup of a hosted native session into a new directory on
+    /// this node: its durable envelope, seed chunks, every object its prefix
+    /// names, and a manifest written last.
+    Create {
+        /// The session's tenant; this node's own tenant when omitted.
+        #[arg(long, requires = "session")]
+        tenant: Option<String>,
+        /// The session; this node's original session when omitted.
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Verify a backup directory without writing; needs no running node.
+    Verify {
+        #[arg(long)]
+        input: PathBuf,
+    },
+}
+#[derive(Subcommand)]
+pub(crate) enum GcCommand {
+    /// The collector's settings, whether a pass is in progress, how many
+    /// completed, and the last pass's report.
+    Show,
+    /// Bring a quarantined content object back by its domain and root, while
+    /// its quarantine round has not expired.
+    Restore {
+        #[arg(long)]
+        domain: String,
+        #[arg(long)]
+        root: String,
+    },
+}
+#[derive(Subcommand)]
+pub(crate) enum RetentionCommand {
+    /// The published prefix, what registered consumers still need, what the
+    /// archive reports holding, the floor and what holds it there, and the
+    /// families retired; no reclamation is initiated.
+    Show {
+        #[arg(long)]
+        session: Option<String>,
+    },
+}
+#[derive(Subcommand)]
+pub(crate) enum ArchiveCommand {
+    /// The continuation a retired claim left in the core and its bundle as
+    /// this node holds it: verified structurally, with the copies holding a
+    /// receipt.
+    Show {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        claim: String,
+    },
 }
 #[derive(Subcommand)]
 pub(crate) enum NodeCommand {
@@ -70,6 +184,69 @@ pub(crate) enum NodeCommand {
 #[derive(Subcommand)]
 pub(crate) enum NodesCommand {
     List,
+    /// Stop placing sessions on a node: its grant is re-issued ineligible,
+    /// the controller heals every placement that named it and retires its
+    /// copies. The founder is never drained.
+    Drain {
+        #[arg(long)]
+        node: u64,
+    },
+    /// Consider a drained node for placement again.
+    Undrain {
+        #[arg(long)]
+        node: u64,
+    },
+    /// Remove a drained node that no session names any more: its root-group
+    /// membership, then the credential its invitation issued.
+    Remove {
+        #[arg(long)]
+        node: u64,
+    },
+    /// Drain a node once its replacement is enrolled, alive, eligible and
+    /// reporting; the planner chooses among every eligible node.
+    Replace {
+        #[arg(long)]
+        node: u64,
+        #[arg(long = "with")]
+        replacement: u64,
+    },
+}
+#[derive(Subcommand)]
+pub(crate) enum TenantCommand {
+    /// Admit a tenant through the founder's enrollment authority; retrying an
+    /// admitted tenant reads as done.
+    Admit {
+        #[arg(long)]
+        tenant: String,
+    },
+    /// The founder's tenant and every admitted one.
+    List,
+}
+#[derive(Subcommand)]
+pub(crate) enum SessionCommand {
+    /// Create a session for a served tenant on this node; the same name is
+    /// the same session.
+    Create {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        name: String,
+    },
+    /// Plan a session's placement under a durability (survive node, zone or
+    /// region with up to N failures); the controller executes it unattended.
+    Plan {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long)]
+        session: String,
+        #[arg(long, default_value = "node")]
+        survive: String,
+        #[arg(long)]
+        max_failures: u16,
+        /// Report the plan the request denotes without journaling it.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 #[derive(Subcommand)]
 pub(crate) enum ClientCommand {
@@ -180,6 +357,12 @@ pub(crate) enum ReplicaCommand {
         #[arg(long)]
         session: Option<String>,
     },
+    /// Checkpoint one installed replica's applied prefix now and compact its
+    /// log; a native Core root beyond the inline bound is sealed as seeds.
+    Checkpoint {
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Observe a bounded live page of this physical node's installed application replicas.
     List {
         #[arg(long)]
@@ -198,9 +381,31 @@ pub(crate) enum ReplicaCommand {
         #[command(subcommand)]
         command: MembershipCommand,
     },
+    /// The members of a native session's range group and their holders, or
+    /// a move of one member to a node (doc 25 §6).
+    Ranges {
+        #[arg(long)]
+        session: Option<String>,
+        #[command(subcommand)]
+        command: RangesCommand,
+    },
     Request {
         #[command(subcommand)]
         command: RequestCommand,
+    },
+}
+#[derive(Subcommand)]
+pub(crate) enum RangesCommand {
+    /// Every member: identity, span, generation, holder and readers, with the
+    /// transfer in progress and the retired maps awaiting cleanup.
+    List,
+    /// Begin moving one member to a node; the controller carries the transfer
+    /// through readiness, activation and cleanup.
+    Move {
+        #[arg(long)]
+        member: String,
+        #[arg(long)]
+        node: u64,
     },
 }
 
@@ -211,6 +416,14 @@ pub(crate) fn run(
 ) -> crate::Result<()> {
     if let ClusterCommand::Invite { node, output } = command {
         return runtime.block_on(crate::invite(settings, &node, &output));
+    }
+    // Verification reads only the backup: it runs anywhere the binary does.
+    if let ClusterCommand::Backup {
+        command: BackupCommand::Verify { input },
+    } = &command
+    {
+        let result = ClusterAdmin::backup_verify(input)?;
+        return crate::print_json(&serde_json::json!({"schema_version":1,"result":result}));
     }
     // A laptop node has no admin socket: its activation runs offline against
     // the exclusive data directory and returns once the record is applied.
@@ -246,10 +459,85 @@ pub(crate) fn run(
             NodeCommand::Config => focal_node::network_admin::OperatorRead::Configuration,
         })),
         ClusterCommand::Replicas { command } => replicas(runtime, &admin, command),
+        ClusterCommand::Retention {
+            command: RetentionCommand::Show { session },
+        } => runtime.block_on(admin.retention(session_of(&admin, session)?)),
+        ClusterCommand::Archive {
+            command: ArchiveCommand::Show { session, claim },
+        } => runtime.block_on(admin.archive(
+            session_of(&admin, session)?,
+            focal_model::ClaimId(focal_client::input::parse_id(&claim)?),
+        )),
+        ClusterCommand::Gc {
+            command: GcCommand::Show,
+        } => runtime.block_on(admin.gc()),
+        ClusterCommand::Gc {
+            command: GcCommand::Restore { domain, root },
+        } => runtime.block_on(admin.gc_restore(
+            focal_model::ContentDomainId(focal_client::input::parse_id(&domain)?),
+            focal_client::input::parse_hash(&root)?,
+        )),
+        ClusterCommand::Backup {
+            command:
+                BackupCommand::Create {
+                    tenant,
+                    session,
+                    output,
+                },
+        } => {
+            let ledger = focal_model::LedgerId {
+                tenant: tenant.map_or(Ok(admin.tenant()), |tenant| {
+                    focal_client::input::parse_id(&tenant).map(focal_model::TenantId)
+                })?,
+                session: session_of(&admin, session)?,
+            };
+            runtime.block_on(admin.backup_create(ledger, &output))
+        }
+        ClusterCommand::Backup {
+            command: BackupCommand::Verify { .. },
+        } => return Err("invalid backup dispatch".into()),
+        ClusterCommand::Restore {
+            input,
+            new_incarnation,
+        } => runtime.block_on(admin.restore(&input, new_incarnation)),
+        ClusterCommand::Storage {
+            command: StorageCommand::Show,
+        } => runtime.block_on(admin.storage()),
         ClusterCommand::Status => runtime.block_on(admin.read(AdminRead::Membership)),
-        ClusterCommand::Nodes {
-            command: NodesCommand::List,
-        } => runtime.block_on(admin.read(AdminRead::Contacts)),
+        ClusterCommand::Placement => runtime.block_on(admin.placement()),
+        ClusterCommand::Plan => runtime.block_on(admin.plan()),
+        ClusterCommand::Tenants { command } => match command {
+            TenantCommand::Admit { tenant } => {
+                runtime.block_on(admin.admit_tenant(focal_client::input::parse_id(&tenant)?))
+            }
+            TenantCommand::List => runtime.block_on(admin.tenants()),
+        },
+        ClusterCommand::Sessions { command } => match command {
+            SessionCommand::Create { tenant, name } => runtime
+                .block_on(admin.create_session(focal_client::input::parse_id(&tenant)?, &name)),
+            SessionCommand::Plan {
+                tenant,
+                session,
+                survive,
+                max_failures,
+                dry_run,
+            } => runtime.block_on(admin.plan_session(
+                focal_client::input::parse_id(&tenant)?,
+                focal_client::input::parse_id(&session)?,
+                &survive,
+                max_failures,
+                dry_run,
+            )),
+        },
+        ClusterCommand::Nodes { command } => match command {
+            NodesCommand::List => runtime.block_on(admin.read(AdminRead::Contacts)),
+            NodesCommand::Drain { node } => runtime.block_on(admin.node_eligibility(node, false)),
+            NodesCommand::Undrain { node } => runtime.block_on(admin.node_eligibility(node, true)),
+            NodesCommand::Remove { node } => runtime.block_on(admin.remove_node(node)),
+            NodesCommand::Replace { node, replacement } => {
+                runtime.block_on(admin.replace_node(node, replacement))
+            }
+        },
         ClusterCommand::Client {
             command: ClientCommand::Invite { name, output },
         } => runtime.block_on(admin.invite_client(&name, &output)),
@@ -342,6 +630,20 @@ pub(crate) fn run(
     crate::print_json(&serde_json::json!({"schema_version":1,"result":result}))
 }
 
+/// The session an operator named, else the node identity's original one.
+fn session_of(
+    admin: &ClusterAdmin,
+    value: Option<String>,
+) -> Result<focal_model::SessionId, focal_node::cluster_admin::ClusterAdminError> {
+    value
+        .map(|value| {
+            focal_client::input::parse_id(&value)
+                .map(focal_model::SessionId)
+                .map_err(|_| focal_node::cluster_admin::ClusterAdminError::Invalid)
+        })
+        .transpose()
+        .map(|session| session.unwrap_or(admin.identity().ledger.session))
+}
 fn replicas(
     runtime: &tokio::runtime::Runtime,
     admin: &ClusterAdmin,
@@ -375,6 +677,9 @@ fn replicas(
         )),
         ReplicaCommand::ActivateNative { session: value } => {
             runtime.block_on(admin.replica_activate_native(session(value)?))
+        }
+        ReplicaCommand::Checkpoint { session: value } => {
+            runtime.block_on(admin.replica_checkpoint(session(value)?))
         }
         ReplicaCommand::List { after, limit } => runtime.block_on(
             admin.replica_list(
@@ -424,6 +729,24 @@ fn replicas(
                 } => (MembershipChange::LeaveJoint, expected_configuration_index),
             };
             runtime.block_on(admin.replica_change(session, change, index))
+        }
+        ReplicaCommand::Ranges {
+            session: value,
+            command,
+        } => {
+            let session = session(value)?;
+            match command {
+                RangesCommand::List => runtime.block_on(admin.replica_ranges(session)),
+                RangesCommand::Move { member, node } => runtime.block_on(
+                    admin.move_range(
+                        admin.tenant().0,
+                        session.0,
+                        focal_client::input::parse_id(&member)
+                            .map_err(|_| ClusterAdminError::Invalid)?,
+                        node,
+                    ),
+                ),
+            }
         }
         ReplicaCommand::Request { command } => match command {
             RequestCommand::Inspect => admin.replica_inspect(),

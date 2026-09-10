@@ -16,6 +16,8 @@ pub struct EnrollmentLimits {
     pub max_invitation_lifetime: u64,
     pub credential_lifetime: u64,
     pub max_checkpoint_bytes: usize,
+    /// Tenants the cluster may admit; every grant names the admitted ones.
+    pub max_tenants: usize,
 }
 impl Default for EnrollmentLimits {
     fn default() -> Self {
@@ -25,6 +27,7 @@ impl Default for EnrollmentLimits {
             max_invitation_lifetime: 86400,
             credential_lifetime: 30 * 86400,
             max_checkpoint_bytes: 8 * 1024 * 1024,
+            max_tenants: 1024,
         }
     }
 }
@@ -39,6 +42,8 @@ impl EnrollmentLimits {
             || self.credential_lifetime == 0
             || self.credential_lifetime > 365 * 86400
             || !(16 * 1024..=64 * 1024 * 1024).contains(&self.max_checkpoint_bytes)
+            || self.max_tenants == 0
+            || self.max_tenants > 65536
         {
             return Err(EnrollmentError::Capacity);
         }
@@ -104,6 +109,11 @@ enum Change {
         invitation: InvitationId,
         receipt: EnrollmentReceipt,
         retire_previous_at: i64,
+    },
+    /// A tenant the cluster serves from now on: every grant issued from a
+    /// certificate names it, and a node may create sessions under it.
+    AdmitTenant {
+        tenant: [u8; 16],
     },
 }
 /// A certificate a renewal replaced: still authorized for the grace the
@@ -383,10 +393,38 @@ pub struct EnrollmentRegistry {
     enrolled_keys: BTreeMap<Fingerprint, InvitationId>,
     /// Certificates a renewal replaced, by fingerprint, until they retire.
     retired: BTreeMap<Fingerprint, RetiredCredential>,
+    /// Tenants admitted by the founder authority, in admission order of
+    /// identity; bounded by `EnrollmentLimits::max_tenants`.
+    tenants: std::collections::BTreeSet<[u8; 16]>,
 }
-/// The registry's persisted layout; a checkpoint written at another schema
-/// is not this registry.
-const REGISTRY_SCHEMA: u16 = 2;
+/// The registry's persisted layout; schema 2 (before admitted tenants)
+/// restores with none, any other schema is not this registry.
+const REGISTRY_SCHEMA: u16 = 3;
+/// The schema 2 layout, converted on restore.
+#[derive(Deserialize)]
+struct RegistryV2 {
+    schema: u16,
+    cluster: ClusterId,
+    ca_certificate: Vec<u8>,
+    limits: LimitsV2,
+    revision: u64,
+    applied_index: u64,
+    time_floor: i64,
+    next_node: u64,
+    charged_bytes: usize,
+    records: BTreeMap<InvitationId, InviteMetadata>,
+    certificates: BTreeMap<Fingerprint, InvitationId>,
+    enrolled_keys: BTreeMap<Fingerprint, InvitationId>,
+    retired: BTreeMap<Fingerprint, RetiredCredential>,
+}
+#[derive(Deserialize)]
+struct LimitsV2 {
+    max_invitations: usize,
+    max_enrollments: usize,
+    max_invitation_lifetime: u64,
+    credential_lifetime: u64,
+    max_checkpoint_bytes: usize,
+}
 impl EnrollmentRegistry {
     pub fn new(
         cluster: ClusterId,
@@ -417,6 +455,7 @@ impl EnrollmentRegistry {
             certificates: BTreeMap::new(),
             enrolled_keys: BTreeMap::new(),
             retired: BTreeMap::new(),
+            tenants: std::collections::BTreeSet::new(),
         })
     }
     // Only the private new-genesis draft constructor can select the existing
@@ -567,6 +606,38 @@ impl EnrollmentRegistry {
             .get(&id)
             .map(|record| record.revoked)
             .ok_or(EnrollmentError::Unauthorized)
+    }
+    /// The tenants the cluster serves besides the founder's own.
+    pub fn tenants(&self) -> impl Iterator<Item = [u8; 16]> + '_ {
+        self.tenants.iter().copied()
+    }
+    pub fn admits_tenant(&self, tenant: [u8; 16]) -> bool {
+        self.tenants.contains(&tenant)
+    }
+    /// Admit a tenant under the founder authority: a conflict when it is
+    /// admitted already (an operator's retry reads that as done).
+    pub fn prepare_admit_tenant(
+        &self,
+        authority: &BootstrapAuthority,
+        tenant: [u8; 16],
+        now: i64,
+    ) -> Result<EnrollmentCommand, EnrollmentError> {
+        self.check_time(now)?;
+        self.check_authority(authority)?;
+        if tenant == [0; 16] {
+            return Err(EnrollmentError::Invalid);
+        }
+        if self.tenants.contains(&tenant) {
+            return Err(EnrollmentError::Conflict);
+        }
+        if self.tenants.len() >= self.limits.max_tenants {
+            return Err(EnrollmentError::Capacity);
+        }
+        Ok(EnrollmentCommand {
+            revision: self.revision,
+            decided_at: now,
+            change: Change::AdmitTenant { tenant },
+        })
     }
     pub fn prepare_invitation(
         &self,
@@ -972,6 +1043,20 @@ impl EnrollmentRegistry {
                     .ok_or(EnrollmentError::Unauthorized)?
                     .revoked = true
             }
+            Change::AdmitTenant { tenant } => {
+                if *tenant == [0; 16] || self.tenants.contains(tenant) {
+                    return Err(EnrollmentError::Invalid);
+                }
+                if self.tenants.len() >= self.limits.max_tenants {
+                    return Err(EnrollmentError::Capacity);
+                }
+                self.reserve(64)?;
+                self.tenants.insert(*tenant);
+                self.charged_bytes = self
+                    .charged_bytes
+                    .checked_add(64)
+                    .ok_or(EnrollmentError::Capacity)?;
+            }
             Change::Renew {
                 invitation,
                 receipt,
@@ -1115,6 +1200,50 @@ impl EnrollmentRegistry {
         bytes.truncate(length);
         Ok(bytes)
     }
+    /// The schema 2 encoding of this registry, for the upgrade test.
+    #[cfg(test)]
+    pub(crate) fn encode_as_schema_two_for_tests(&self) -> Result<Vec<u8>, EnrollmentError> {
+        #[derive(Serialize)]
+        struct Legacy<'a> {
+            schema: u16,
+            cluster: ClusterId,
+            ca_certificate: &'a [u8],
+            limits: (usize, usize, u64, u64, usize),
+            revision: u64,
+            applied_index: u64,
+            time_floor: i64,
+            next_node: u64,
+            charged_bytes: usize,
+            records: &'a BTreeMap<InvitationId, InviteMetadata>,
+            certificates: &'a BTreeMap<Fingerprint, InvitationId>,
+            enrolled_keys: &'a BTreeMap<Fingerprint, InvitationId>,
+            retired: &'a BTreeMap<Fingerprint, RetiredCredential>,
+        }
+        encode(&Legacy {
+            schema: 2,
+            cluster: self.cluster,
+            ca_certificate: &self.ca_certificate,
+            limits: (
+                self.limits.max_invitations,
+                self.limits.max_enrollments,
+                self.limits.max_invitation_lifetime,
+                self.limits.credential_lifetime,
+                self.limits.max_checkpoint_bytes,
+            ),
+            revision: self.revision,
+            applied_index: self.applied_index,
+            time_floor: self.time_floor,
+            next_node: self.next_node,
+            // A schema-2 checkpoint never charged tenants.
+            charged_bytes: self
+                .charged_bytes
+                .saturating_sub(self.tenants.len().saturating_mul(64)),
+            records: &self.records,
+            certificates: &self.certificates,
+            enrolled_keys: &self.enrolled_keys,
+            retired: &self.retired,
+        })
+    }
     pub fn restore(
         bytes: &[u8],
         expected_cluster: ClusterId,
@@ -1124,7 +1253,52 @@ impl EnrollmentRegistry {
         if bytes.len() > limits.max_checkpoint_bytes {
             return Err(EnrollmentError::Capacity);
         }
-        let (mut registry, rest): (Self, &[u8]) = postcard::take_from_bytes(bytes)?;
+        let (schema, _) = postcard::take_from_bytes::<u16>(bytes)?;
+        let (mut registry, rest): (Self, &[u8]) = if schema == 2 {
+            let (legacy, rest): (RegistryV2, &[u8]) = postcard::take_from_bytes(bytes)?;
+            if legacy.schema != 2 {
+                return Err(EnrollmentError::Corrupt);
+            }
+            let LimitsV2 {
+                max_invitations,
+                max_enrollments,
+                max_invitation_lifetime,
+                credential_lifetime,
+                max_checkpoint_bytes,
+            } = legacy.limits;
+            (
+                Self {
+                    owner: None,
+                    schema: REGISTRY_SCHEMA,
+                    cluster: legacy.cluster,
+                    ca_certificate: legacy.ca_certificate,
+                    limits: EnrollmentLimits {
+                        max_invitations,
+                        max_enrollments,
+                        max_invitation_lifetime,
+                        credential_lifetime,
+                        max_checkpoint_bytes,
+                        max_tenants: limits.max_tenants,
+                    },
+                    revision: legacy.revision,
+                    applied_index: legacy.applied_index,
+                    time_floor: legacy.time_floor,
+                    next_node: legacy.next_node,
+                    charged_bytes: legacy.charged_bytes,
+                    records: legacy.records,
+                    certificates: legacy.certificates,
+                    enrolled_keys: legacy.enrolled_keys,
+                    retired: legacy.retired,
+                    tenants: std::collections::BTreeSet::new(),
+                },
+                rest,
+            )
+        } else {
+            postcard::take_from_bytes(bytes)?
+        };
+        if registry.tenants.len() > limits.max_tenants || registry.tenants.contains(&[0; 16]) {
+            return Err(EnrollmentError::Corrupt);
+        }
         if !rest.is_empty()
             || registry.schema != REGISTRY_SCHEMA
             || registry.limits != limits
@@ -1219,6 +1393,15 @@ impl EnrollmentRegistry {
             }
             verify_issued(&retired.receipt, &registry.ca_certificate)?;
         }
+        charged_bytes = charged_bytes
+            .checked_add(
+                registry
+                    .tenants
+                    .len()
+                    .checked_mul(64)
+                    .ok_or(EnrollmentError::Capacity)?,
+            )
+            .ok_or(EnrollmentError::Capacity)?;
         if charged_bytes != registry.charged_bytes || charged_bytes > limits.max_checkpoint_bytes {
             return Err(EnrollmentError::Corrupt);
         }

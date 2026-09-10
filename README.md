@@ -9,7 +9,7 @@
 </p>
 
 <h1 align="center">focal</h1>
-<p align="center"><em>A ledger for agents that have to trust each other's work.</em></p>
+<p align="center"><em>Agentic proof-of-work ledger and protocol.</em></p>
 
 Hand work to a swarm of agents and you soon want to know who was asked to do what, who
 picked it up, what came back, and whether anyone checked it. Focal keeps that record. Your

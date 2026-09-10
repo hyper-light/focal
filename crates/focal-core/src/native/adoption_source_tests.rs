@@ -25,11 +25,14 @@ fn copy_actual_core(fixture: &Fixture) -> Core<NativeState> {
     .unwrap();
     // Test-only snapshot copy: publish the retained rows at their exact source
     // prefix. Ordinary batches still advance exactly one position.
-    core.state.rows = RangeStore::new(
-        RangeId(91_771),
-        source.sequence().0.checked_sub(1).unwrap(),
-        core.limits.range,
-        core.state.budget.clone(),
+    core.state.rows = crate::native::ranges::NativeRanges::single_from_store(
+        RangeStore::new(
+            RangeId(91_771),
+            source.sequence().0.checked_sub(1).unwrap(),
+            core.limits.range,
+            core.state.budget.clone(),
+        )
+        .unwrap(),
     )
     .unwrap();
     let changes: Vec<_> = source

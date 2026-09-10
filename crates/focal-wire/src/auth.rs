@@ -154,6 +154,8 @@ pub fn capability(operation: &Operation) -> Capability {
         | Operation::PeerControl { .. }
         | Operation::PlacementControl { .. }
         | Operation::SessionSign { .. }
+        | Operation::RangeControl { .. }
+        | Operation::SessionControl { .. }
         | Operation::Probe { .. }
         | Operation::NodeContact { .. } => Capability::Replication,
         Operation::Control { .. } => Capability::Runtime,
@@ -391,6 +393,8 @@ pub fn check_request_shape(
             | Operation::PeerControl { .. }
             | Operation::PlacementControl { .. }
             | Operation::SessionSign { .. }
+            | Operation::RangeControl { .. }
+            | Operation::SessionControl { .. }
             | Operation::Probe { .. }
             | Operation::NodeContact { .. }
             | Operation::EnrollmentControl { .. }
@@ -656,6 +660,30 @@ fn request_shape(
             }
             1
         }
+        Operation::RangeControl { group, request } => {
+            if *group == [0; 16] || request.is_empty() {
+                return Err(AccessError::InvalidRequest);
+            }
+            if request.len() > MAX_RANGE_CONTROL_REQUEST_BYTES {
+                return Err(AccessError::Capacity);
+            }
+            if peer.is_some_and(|peer| peer.certificate_fingerprint().is_none()) {
+                return Err(AccessError::Unauthorized);
+            }
+            1
+        }
+        Operation::SessionControl { group, request } => {
+            if *group == [0; 16] || request.is_empty() {
+                return Err(AccessError::InvalidRequest);
+            }
+            if request.len() > MAX_SESSION_CONTROL_REQUEST_BYTES {
+                return Err(AccessError::Capacity);
+            }
+            if peer.is_some_and(|peer| peer.certificate_fingerprint().is_none()) {
+                return Err(AccessError::Unauthorized);
+            }
+            1
+        }
         Operation::Probe { request } => {
             if request.is_empty() {
                 return Err(AccessError::InvalidRequest);
@@ -847,9 +875,15 @@ fn request_shape(
                         return Err(AccessError::InvalidRequest);
                     }
                 }
+                CustodyRequest::SeedChunk { hash, .. } => {
+                    if hash.0 == [0; 32] {
+                        return Err(AccessError::InvalidRequest);
+                    }
+                }
             }
             if let CustodyRequest::Manifest { max_bytes, .. }
-            | CustodyRequest::ReadChunk { max_bytes, .. } = custody
+            | CustodyRequest::ReadChunk { max_bytes, .. }
+            | CustodyRequest::SeedChunk { max_bytes, .. } = custody
                 && (*max_bytes == 0
                     || *max_bytes > limits.max_frame_bytes.saturating_sub(256)
                     || bytes

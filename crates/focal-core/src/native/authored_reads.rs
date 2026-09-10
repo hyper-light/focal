@@ -41,16 +41,16 @@ impl Core<NativeState> {
 }
 impl NativePrepared {
     pub fn claim_content(&self, id: ClaimId) -> Option<&ClaimDescriptor> {
-        content(self.range.get(&Key::ClaimContent(id)))
+        content(self.fragments.get(&Key::ClaimContent(id)))
     }
     pub fn validation_descriptor(&self, id: ValidationId) -> Option<&ValidationDescriptor> {
-        descriptor(self.range.get(&Key::Definition(id)))
+        descriptor(self.fragments.get(&Key::Definition(id)))
     }
     pub fn creation_result(
         &self,
         key: impl Into<NativeInvocation>,
     ) -> Option<&NativeCreationResult> {
-        result(self.range.get(&Key::CreationResult(key.into())))
+        result(self.fragments.get(&Key::CreationResult(key.into())))
     }
 }
 impl NativeView<'_> {

@@ -102,6 +102,9 @@ impl EmbeddedNode {
             return Err(NodeError::NetworkRequired);
         }
         let identity = directory.identity().clone();
+        // An initialized store's committed policy is checked before anything
+        // else: a differing file is refused by its field, never re-solved.
+        let committed = check_policy(root, settings)?;
         let facts = [NodeFacts {
             id: identity.node,
             topology: settings.topology.clone(),
@@ -110,7 +113,9 @@ impl EmbeddedNode {
         }];
         placement::plan(&facts, &settings.durability, &settings.placement)
             .map_err(|e| NodeError::Placement(e.to_string()))?;
-        install_policy(root, settings)?;
+        if committed.is_none() {
+            install_policy(root, settings)?;
+        }
         let wal = SharedWal::open(
             root.join("wal"),
             WalOptions::new(WalIdentity {
@@ -138,7 +143,7 @@ impl EmbeddedNode {
             identity.ledger,
             consensus,
             SessionLimits::default(),
-            crate::network_service::native_hosting(root, &identity)?,
+            crate::network_service::native_hosting(root, &identity, wal.disk_budget())?,
         )?;
         session.campaign()?;
         // One voter can establish the committed current-term read barrier locally.
@@ -230,36 +235,36 @@ pub(crate) fn read_bounded(path: &Path, max: usize) -> Result<Vec<u8>, NodeError
     }
     Ok(bytes)
 }
-/// Pin the configured guarantee before creating a durable store. A missing
-/// policy after initialization is data loss, not permission to select a new
-/// guarantee. Existing policy bytes keep their original serialized format.
-pub(crate) fn install_policy(root: &Path, settings: &Settings) -> Result<(), NodeError> {
-    let path = root.join("POLICY");
-    let marker = root.join("POLICY.initialized");
-    let policy = postcard::to_stdvec(&(&settings.durability, &settings.placement))?;
-    if path.exists() {
-        if read_bounded(&path, 64 * 1024)? != policy {
-            return Err(NodeError::Identity);
-        }
-    } else {
-        if [
-            "POLICY.initialized",
-            "wal",
-            "content",
-            "NETWORK",
-            "NETWORK.initialized",
-        ]
-        .iter()
-        .any(|name| root.join(name).exists())
-        {
-            return Err(NodeError::Identity);
-        }
-        atomic_file(&path, &policy)?;
+/// Pin the configured guarantee before creating a durable store, or check
+/// it against the store's committed policy (doc 08 §2): a field that
+/// differs is refused by name and directs the operator to plan and apply;
+/// a missing policy after initialization is data loss, not permission to
+/// select a new guarantee. Existing policy bytes keep their original
+/// serialized format.
+pub(crate) fn install_policy(
+    root: &Path,
+    settings: &Settings,
+) -> Result<crate::config::CommittedPolicy, NodeError> {
+    Ok(crate::config::policy::install_or_check(
+        root,
+        &settings.policy_intent(),
+        atomic_file,
+    )?)
+}
+/// The committed policy of an initialized store, checked against
+/// `settings` (a differing field is refused by name); `None` for a fresh
+/// directory that has no policy yet.
+pub(crate) fn check_policy(
+    root: &Path,
+    settings: &Settings,
+) -> Result<Option<crate::config::CommittedPolicy>, NodeError> {
+    let Some(committed) = crate::config::policy::read_committed(root)? else {
+        return Ok(None);
+    };
+    if let Some(field) = committed.intent.differing_field(&settings.policy_intent()) {
+        return Err(crate::config::ConfigError::CommittedPolicyChange { field }.into());
     }
-    if !marker.exists() {
-        atomic_file(&marker, b"deployment policy installed")?;
-    }
-    Ok(())
+    Ok(Some(committed))
 }
 pub(crate) fn durable_dir(path: &Path) -> Result<(), std::io::Error> {
     if path.is_dir() {
@@ -335,7 +340,7 @@ mod tests {
             }
             assert!(matches!(
                 EmbeddedNode::open(&settings),
-                Err(NodeError::Identity)
+                Err(NodeError::Config(crate::config::ConfigError::PolicyMissing))
             ));
             assert!(!dir.path().join("POLICY").exists());
             assert_eq!(
@@ -363,7 +368,11 @@ mod tests {
         changed.durability.max_failures = 1;
         assert!(matches!(
             install_policy(directory.root(), &changed),
-            Err(NodeError::Identity)
+            Err(NodeError::Config(
+                crate::config::ConfigError::CommittedPolicyChange {
+                    field: "durability.max_failures"
+                }
+            ))
         ));
         assert_eq!(fs::read(dir.path().join("POLICY")).unwrap(), original);
         assert!(!dir.path().join("wal").exists());
@@ -371,9 +380,20 @@ mod tests {
         drop(directory);
         assert!(matches!(
             EmbeddedNode::open(&settings),
-            Err(NodeError::Identity)
+            Err(NodeError::Config(crate::config::ConfigError::PolicyMissing))
         ));
         assert!(!dir.path().join("POLICY").exists());
         assert!(!dir.path().join("wal").exists());
+        // A fresh store pins the revisioned form, which reads back exactly.
+        let fresh = tempfile::tempdir().unwrap();
+        let mut settings = Settings::default();
+        settings.node.data_dir = Some(fresh.path().to_owned());
+        let directory = crate::node_directory::NodeDirectory::open(&settings).unwrap();
+        let committed = install_policy(directory.root(), &settings).unwrap();
+        assert_eq!(committed.revision, crate::config::PolicyRevision(1));
+        assert_eq!(
+            crate::config::policy::read_committed(directory.root()).unwrap(),
+            Some(committed)
+        );
     }
 }

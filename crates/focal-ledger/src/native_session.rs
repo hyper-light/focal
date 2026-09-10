@@ -14,7 +14,9 @@ use focal_core::native::{
     NativeOutcome, NativeOwner, NativeOwnerError, NativeStaging, NativeState, input_codec,
     record_codec::{self as record, recovery},
 };
-use focal_evidence::{ContentReader, ContentStore, NativeEvidenceError, NativeSchemaVerifier};
+use focal_evidence::{
+    ContentReader, ContentStore, NativeEvidenceError, NativeSchemaVerifier, SeedReader, SeedStore,
+};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget, MemoryError, RangeId};
 use focal_model::{ContentHash, LedgerId, SessionSeq};
 use std::{collections::VecDeque, path::Path};
@@ -30,6 +32,17 @@ mod cluster_tests;
 pub(crate) mod engine;
 #[path = "native_session_genesis.rs"]
 pub mod genesis;
+#[path = "native_session_range.rs"]
+pub mod range;
+#[path = "native_session_retention.rs"]
+pub mod retention;
+#[path = "native_session_retirement.rs"]
+pub mod retirement;
+pub use range::LayoutOperation;
+pub use retirement::RetirementRecord;
+#[path = "native_session_movement.rs"]
+pub mod movement;
+pub use movement::{LedgerRangeVerifier, MovementRecord};
 #[cfg(test)]
 #[path = "native_session_tests.rs"]
 pub(crate) mod tests;
@@ -56,6 +69,34 @@ pub struct NativeSessionLimits {
     /// fan-out, so this refuses at the door instead of after an in-memory
     /// acknowledgement. Exact retries of committed work never need headroom.
     pub disk_headroom_bytes: u64,
+    /// How committed records this session did not author are materialized
+    /// (doc 25 §2): one worker replays them one at a time; more stage a
+    /// delivery's consecutive records in dependency waves and install them
+    /// in order, byte-identical to the serial replay.
+    pub materializer: record::materialize::MaterializerLimits,
+    /// Bounds on the movement coordinator (25 §6): members, historical maps,
+    /// pins and the movement section of a checkpoint.
+    pub ranges: focal_ranges::RangeLimits,
+}
+/// What the materializer has done since this session opened.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MaterializerStats {
+    /// Deliveries whose records were materialized as one batch.
+    pub batches: u64,
+    /// Records those batches applied.
+    pub records: u64,
+    /// Batches in which at least one wave staged several records at once.
+    pub parallel_batches: u64,
+    pub waves: u64,
+    /// Reads the barrier found stale, each discarding a speculative suffix.
+    pub violations: u64,
+    pub serial_fallbacks: u64,
+    /// Wall time spent materializing batches, in microseconds: a diagnostic
+    /// for the operator and the measurement suite, never an input to state.
+    pub micros: u64,
+    /// Records replayed one at a time outside any batch, and their time.
+    pub serial_records: u64,
+    pub serial_micros: u64,
 }
 impl NativeSessionLimits {
     /// Production defaults for one hosted ledger: authored bodies up to the
@@ -175,6 +216,8 @@ impl NativeSessionLimits {
             completion_reserve_bytes: 16 << 20,
             content_domain,
             disk_headroom_bytes: 64 << 20,
+            materializer: record::materialize::MaterializerLimits::default(),
+            ranges: focal_ranges::RangeLimits::default(),
         }
     }
 }
@@ -206,6 +249,24 @@ pub enum NativeSessionError {
     Failed,
     #[error("content named by a committed fact is not local yet; poll again once custody arrives")]
     CustodyPending,
+    #[error("a committed layout change is in flight; propose again once it applies")]
+    LayoutChanging,
+    #[error("the member this mutation touches is moving; retry after activation")]
+    RangeMoving,
+    #[error("range movement: {0:?}")]
+    Range(focal_ranges::RangeError),
+    #[error("a committed retirement is in flight; propose again once it applies")]
+    Retiring,
+    #[error("retirement refused: {0:?}")]
+    Retirement(focal_core::native::retirement::RetirementRefusal),
+}
+impl From<focal_ranges::RangeError> for NativeSessionError {
+    fn from(error: focal_ranges::RangeError) -> Self {
+        match error {
+            focal_ranges::RangeError::Memory(memory) => Self::Memory(memory),
+            other => Self::Range(other),
+        }
+    }
 }
 
 /// How the session treats a failure. Corruption is never retried; a recoverable
@@ -239,7 +300,17 @@ impl NativeSessionError {
             }
         }
         match self {
-            Self::Capacity | Self::Memory(_) | Self::CustodyPending => Retryable,
+            Self::Capacity
+            | Self::Memory(_)
+            | Self::CustodyPending
+            | Self::LayoutChanging
+            | Self::Retiring
+            | Self::RangeMoving => Retryable,
+            Self::Retirement(_) => Request,
+            Self::Range(
+                focal_ranges::RangeError::Capacity | focal_ranges::RangeError::Memory(_),
+            ) => Retryable,
+            Self::Range(_) => Request,
             Self::Native(error) => native(error),
             Self::Owner(NativeOwnerError::Native(error)) => native(error),
             Self::Owner(NativeOwnerError::Input(_) | NativeOwnerError::Record(_)) => Request,
@@ -317,7 +388,49 @@ pub struct Opened<S: NativeSchemaVerifier> {
 pub struct NativeSession<S: NativeSchemaVerifier> {
     consensus: DurableNode,
     store: ContentStore,
+    seeds: SeedStore,
     engine: NativeEngine<S>,
+}
+
+/// A seeded checkpoint a replica cannot install until every chunk it names
+/// is local (25 §5): the snapshot's Raft coordinates and the chunks missing.
+#[derive(Debug)]
+pub struct PendingSeed {
+    pub index: u64,
+    pub term: u64,
+    pub missing: Vec<ContentHash>,
+    _allocation: Allocation,
+}
+impl PendingSeed {
+    pub(crate) fn new(
+        index: u64,
+        term: u64,
+        missing: Vec<ContentHash>,
+        budget: &MemoryBudget,
+    ) -> Result<Self, NativeSessionError> {
+        let allocation = budget
+            .reserve(
+                BudgetKind::Recovery,
+                BudgetLane::Completion,
+                array::<ContentHash>(missing.capacity())?,
+            )?
+            .commit();
+        Ok(Self {
+            index,
+            term,
+            missing,
+            _allocation: allocation,
+        })
+    }
+    /// A copy of the missing chunks a host can carry away.
+    pub fn missing_chunks(&self) -> Result<Vec<ContentHash>, NativeSessionError> {
+        let mut chunks = Vec::new();
+        chunks
+            .try_reserve_exact(self.missing.len())
+            .map_err(|_| NativeSessionError::Capacity)?;
+        chunks.extend_from_slice(&self.missing);
+        Ok(chunks)
+    }
 }
 
 /// The single durable capability identity: the enclosing checkpoint codec's
@@ -417,10 +530,24 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
         }
         let reader = ContentReader::open(store.root())
             .map_err(|error| NativeSessionError::Native(NativeEvidenceError::from(error).into()))?;
-        let engine = NativeEngine::new(ledger, range, profile, limits, parent, reader, schemas)?;
+        let seeds = SeedStore::open(store.root().join("seeds"), consensus.disk_budget())
+            .map_err(|error| NativeSessionError::Native(NativeEvidenceError::from(error).into()))?;
+        let engine = NativeEngine::new(
+            ledger,
+            range,
+            profile,
+            limits,
+            parent,
+            engine::NativeSources {
+                reader,
+                seeds: seeds.reader(),
+            },
+            schemas,
+        )?;
         let mut session = Self {
             consensus,
             store,
+            seeds,
             engine,
         };
         let initial = session.poll()?;
@@ -456,6 +583,139 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
     }
     pub fn recording_range(&self) -> Option<RangeId> {
         self.engine.recording_range()
+    }
+    /// What the materializer has done since this session opened.
+    pub fn materializer_stats(&self) -> MaterializerStats {
+        self.engine.materializer
+    }
+    /// A digest of the committed native rows at the current prefix: the
+    /// checkpoint encoding's content hash, so two sessions at one prefix agree
+    /// exactly when their rows are byte-identical.
+    /// The committed range layout (25 §4): each member's durable identity
+    /// and the affinity it starts at.
+    pub fn native_layout(
+        &self,
+    ) -> Result<impl Iterator<Item = (RangeId, Option<[u8; 16]>)> + '_, NativeSessionError> {
+        Ok(self.committed_core()?.native_layout().boundaries())
+    }
+    /// The epoch of the committed layout: zero at genesis, one more per
+    /// applied layout record.
+    pub fn native_layout_epoch(&self) -> Result<u64, NativeSessionError> {
+        Ok(self.committed_core()?.native_layout().epoch())
+    }
+    /// Propose one layout change as a session decision (25 §4): the
+    /// authority commits a layout record every replica applies between
+    /// native records. The change is checked against the committed layout
+    /// first; while it is in flight native proposals are refused with
+    /// `LayoutChanging`, and it is refused itself while candidates are
+    /// pending (they hold fragments of the current layout) or while another
+    /// change is in flight.
+    pub fn propose_layout(&mut self, operation: LayoutOperation) -> Result<(), NativeSessionError> {
+        self.engine.propose_layout(&mut self.consensus, operation)
+    }
+    /// The prefix the archive reports holding, the retention floor's bound
+    /// (26 §3); restored from this replica's checkpoints.
+    pub fn archived_through(&self) -> SessionSeq {
+        self.engine.archived_through()
+    }
+    /// The archive's report that it holds every proof through `through`.
+    pub fn note_archived(&mut self, through: SessionSeq) {
+        self.engine.note_archived(through);
+    }
+    /// Propose one family's retirement as a session decision (26 §4): the
+    /// family is derived from the committed state first, so an applicable
+    /// record is what the log carries. Refused while candidates are
+    /// pending, a layout change, movement step or another retirement is in
+    /// flight, or the family is ineligible.
+    pub fn propose_retirement(
+        &mut self,
+        root: focal_model::ClaimId,
+        bundle: ContentHash,
+        bytes: u64,
+        through: SessionSeq,
+    ) -> Result<(), NativeSessionError> {
+        self.engine
+            .propose_retirement(&mut self.consensus, root, bundle, bytes, through)
+    }
+    /// The retirement this authority proposed and has not seen applied.
+    pub fn retirement_in_flight(&self) -> Option<RetirementRecord> {
+        self.engine.retirement_in_flight()
+    }
+    /// Families retired through this replica's applied prefix (26 §4),
+    /// counted from genesis or the checkpoint that seeded it.
+    pub fn retired_families(&self) -> u64 {
+        self.engine.retired_families()
+    }
+    /// Propose one movement step as a session decision (25 §6): checked
+    /// against the committed coordinator state first, refused while
+    /// candidates are pending, a layout change or another step is in flight,
+    /// and — for `Cleanup` — while any read lease pins the group.
+    pub fn propose_range(
+        &mut self,
+        operation: focal_ranges::RangeOperation,
+    ) -> Result<(), NativeSessionError> {
+        self.engine.propose_range(&mut self.consensus, operation)
+    }
+    /// The committed movement map: every member's span, generation, holder
+    /// and readers under the current range epoch.
+    pub fn range_map(&self) -> Result<&focal_ranges::RangeMap, NativeSessionError> {
+        self.engine.range_map()
+    }
+    pub fn range_epoch(&self) -> Result<focal_model::RouteEpoch, NativeSessionError> {
+        Ok(self.range_map()?.epoch())
+    }
+    /// The transfer in progress, if any.
+    pub fn movement_pending(
+        &self,
+    ) -> Result<Option<&focal_ranges::TransferState>, NativeSessionError> {
+        self.engine.movement_pending()
+    }
+    /// The coordinator state as a checkpoint carries it.
+    pub fn movement_checkpoint(
+        &self,
+    ) -> Result<&focal_ranges::RangeCheckpoint, NativeSessionError> {
+        self.engine.movement_checkpoint()
+    }
+    /// Committed movement records the state refused (inert on every replica).
+    pub fn movement_refusals(&self) -> u64 {
+        self.engine.movement_refusals()
+    }
+    /// Whether this authority has a movement record proposed and not applied.
+    pub fn movement_in_flight(&self) -> bool {
+        self.engine.movement_in_flight()
+    }
+    /// The verifier this session applies movement records under; a test or
+    /// host attests proofs with it before proposing them.
+    pub fn range_verifier(&self) -> Result<LedgerRangeVerifier, NativeSessionError> {
+        self.engine.range_verifier()
+    }
+    /// The `Activate` step of the pending transfer, built over the proofs
+    /// the committed state holds.
+    pub fn range_activation_operation(
+        &self,
+        unchanged: Vec<focal_ranges::RangeProgress>,
+    ) -> Result<focal_ranges::RangeOperation, NativeSessionError> {
+        self.engine.range_activation_operation(unchanged)
+    }
+    /// The activation certificate of a completed transfer, while its map is
+    /// retained in history.
+    pub fn range_activation(
+        &self,
+        operation: focal_ranges::TransferId,
+    ) -> Option<&focal_ranges::ActivationCertificate> {
+        self.engine.range_activation(operation)
+    }
+    pub fn native_state_digest(&self) -> Result<ContentHash, NativeSessionError> {
+        let core = self.committed_core()?;
+        let limits = self.engine.limits.checkpoint;
+        Ok(record::checkpoint::rows_digest(
+            core,
+            record::EncodingLimits {
+                bytes: limits.bytes,
+                visits: limits.visits,
+                rows: limits.rows,
+            },
+        )?)
     }
     pub fn outcome(
         &self,
@@ -617,6 +877,27 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
     /// output permit and hand bytes and permit together to consensus. Completion
     /// requires the actual durable fence observed by `poll`/`try_poll`.
     pub fn begin_checkpoint(&mut self) -> Result<(), NativeSessionError> {
-        self.engine.begin_checkpoint(&mut self.consensus)
+        self.engine
+            .begin_checkpoint(&mut self.consensus, &mut self.seeds)
+    }
+    /// The seeded checkpoint this replica is waiting to install, if any.
+    pub fn pending_seed(&self) -> Option<&PendingSeed> {
+        self.engine.pending_seed()
+    }
+    /// Take one chunk of a pending seed from a peer: verified against its
+    /// hash and sealed locally; the retained delivery installs the checkpoint
+    /// at the next poll once every chunk is local.
+    pub fn install_seed_chunk(
+        &mut self,
+        hash: ContentHash,
+        bytes: &[u8],
+    ) -> Result<(), NativeSessionError> {
+        self.seeds
+            .install_as(hash, bytes)
+            .map_err(|error| NativeSessionError::Native(NativeEvidenceError::from(error).into()))
+    }
+    /// A read-only view of this replica's seeds, for serving peers.
+    pub fn seed_reader(&self) -> SeedReader {
+        self.seeds.reader()
     }
 }

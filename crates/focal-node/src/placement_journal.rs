@@ -44,7 +44,8 @@ pub enum IntentOutcome {
     /// Durably committed with this receipt; the journal advanced.
     Committed(ControlReceipt),
     /// Refused before admission (a stale compare); the sequence stays free.
-    Refused,
+    /// The failure names why, for the agent's diagnostics.
+    Refused(ControlFailure),
     /// No decision yet: not leader, not ready, capacity or an unknown outcome.
     Retry,
 }
@@ -172,15 +173,15 @@ impl IntentJournal {
             // The owner refuses before admission: the sequence stays free and
             // the caller replans from a fresh observation.
             Err(
-                ControlFailure::CompareFailed
+                failure @ (ControlFailure::CompareFailed
                 | ControlFailure::Rejected
                 | ControlFailure::Unauthorized
                 | ControlFailure::Invalid
-                | ControlFailure::WrongOwner,
+                | ControlFailure::WrongOwner),
             ) => {
                 self.saved.pending = None;
                 self.save_on(host).await?;
-                Ok(IntentOutcome::Refused)
+                Ok(IntentOutcome::Refused(failure))
             }
             Err(
                 ControlFailure::NotLeader { .. }

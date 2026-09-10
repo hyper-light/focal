@@ -345,13 +345,16 @@ impl Session {
             || !configuration.voters_outgoing.is_empty()
             || !configuration.learners_next.is_empty()
             || configuration.auto_leave
-            || !configuration.voters.iter().copied().eq(request
+            || !request
                 .placement
                 .placement
                 .voters
                 .keys()
-                .copied())
+                .all(|voter| configuration.voters.contains(voter))
         {
+            // Every voter the placement names votes in the configuration; a
+            // current voter the placement drops keeps its vote until the
+            // activation retires it (24 §4, §19).
             return Err(LedgerError::PlacementConflict);
         }
         let active = self.placement_state.active.as_ref();

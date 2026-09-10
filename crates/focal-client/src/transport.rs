@@ -82,12 +82,12 @@ impl ClientTransport for UnixTransport {
         route: Option<&'a RouteHint>,
         request: &'a RequestEnvelope,
     ) -> TransportFuture<'a> {
-        Box::pin(async move {
-            if let Some(route) = route {
-                return Err(WireError::Access(AccessError::RouteChanged(route.clone())));
-            }
-            self.remote.request(request).await
-        })
+        // The local socket reaches this node alone: a redirect is followed by
+        // resending at the hinted epoch here, and the node answers again with
+        // the same hint when its log leads elsewhere, which the client then
+        // reports as the route change it is.
+        let _ = route;
+        Box::pin(async move { self.remote.request(request).await })
     }
 }
 

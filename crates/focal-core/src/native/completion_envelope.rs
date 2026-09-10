@@ -701,7 +701,7 @@ fn descriptor_limits_with_cohort(
 impl CompletionEnvelope {
     #[allow(clippy::too_many_arguments)] // Private owner contract, not participant configuration.
     pub(super) fn derive(
-        rows: &RangeStore<Key, Row>,
+        rows: &super::ranges::NativeRanges,
         limits: NativeLimits,
         claim: &ClaimState,
         registrations: &RegistrationSet,
@@ -767,19 +767,23 @@ impl CompletionEnvelope {
         let batch = limits.range.max_batch_entries;
         // The promised result artifact cites no more inputs than leave room in
         // one batch for the report's other rows: nine primary rows, the
-        // artifact's three fixed index rows and its verdict, or for a failed
+        // artifact's four fixed index rows and its verdict, or for a failed
         // report eleven rows, the cohort's rows and every status move (22 §7).
         // The reported evaluation and every sealed cohort evaluation may
         // retire its due timer.
         let timers = crate::native::index_rows::timer_rows(0, add(1, cohort.evaluations())?, 0)?;
+        let report_fixed = crate::native::index_rows::report_rows(0)?;
         let fixed_rows = if failure_possible {
             let moved = add(1, cohort.claims())?;
             add(
-                add(add(11, cohort.changed_keys())?, add(4, add(moved, moved)?)?)?,
+                add(
+                    add(11, cohort.changed_keys())?,
+                    add(report_fixed, add(moved, moved)?)?,
+                )?,
                 timers,
             )?
         } else {
-            add(9 + 4, timers)?
+            add(add(9, report_fixed)?, timers)?
         };
         descriptor.inputs =
             crate::native::index_rows::cap_inputs(input_bound(descriptor), fixed_rows, batch);
@@ -848,32 +852,38 @@ impl CompletionEnvelope {
         // keys (doc 22 §7).
         let report_index = crate::native::index_rows::report_rows(input_bound(descriptor))?;
         let ordinary_keys = add(add(9, report_index)?, timers)?;
-        let ordinary_report = rows.future_write_envelope(RangeWriteLimits {
-            changed_keys: ordinary_keys,
-            deleted_keys: timers,
-            deleted_heap: 0,
-            incoming_heap: regular_heap,
-            input_capacity: ordinary_keys,
-        })?;
+        let ordinary_report = rows.future_write_envelope(
+            RangeWriteLimits {
+                changed_keys: ordinary_keys,
+                deleted_keys: timers,
+                deleted_heap: 0,
+                incoming_heap: regular_heap,
+                input_capacity: ordinary_keys,
+            },
+            limits.max_ranges,
+        )?;
         let failed_report = if failure_possible {
             let moved = add(1, cohort.claims())?;
             let changes = add(
                 add(11, cohort.changed_keys())?,
                 add(report_index, add(add(moved, moved)?, timers)?)?,
             )?;
-            Some(rows.future_write_envelope(RangeWriteLimits {
-                changed_keys: changes,
-                deleted_keys: add(moved, timers)?,
-                deleted_heap: 0,
-                incoming_heap: add(
-                    add(regular_heap, cohort.incoming_heap()?)?,
-                    add(
-                        add(containers(1)?, add(parent_heap, registry_heap)?)?,
-                        event_containers(1)?,
+            Some(rows.future_write_envelope(
+                RangeWriteLimits {
+                    changed_keys: changes,
+                    deleted_keys: add(moved, timers)?,
+                    deleted_heap: 0,
+                    incoming_heap: add(
+                        add(regular_heap, cohort.incoming_heap()?)?,
+                        add(
+                            add(containers(1)?, add(parent_heap, registry_heap)?)?,
+                            event_containers(1)?,
+                        )?,
                     )?,
-                )?,
-                input_capacity: changes,
-            })?)
+                    input_capacity: changes,
+                },
+                limits.max_ranges,
+            )?)
         } else {
             None
         };

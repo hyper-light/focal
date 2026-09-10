@@ -146,6 +146,7 @@ enum Action {
     Renew(RenewRequest, oneshot::Sender<Answer<EnrollmentReceipt>>),
     Revoke(InvitationId, oneshot::Sender<Answer<()>>),
     Authorize(Vec<u8>, oneshot::Sender<Answer<PeerGrant>>),
+    AdmitTenant([u8; 16], oneshot::Sender<Answer<()>>),
     Stop(oneshot::Sender<()>),
 }
 struct Work {
@@ -331,6 +332,20 @@ impl QuorumEnrollmentHost {
             .map_err(|_| QuorumEnrollmentError::Stopped)?
             .result
     }
+    /// Admit a tenant the cluster serves ([24](../../../docs/archictecutre/24-placement-execution-and-fleet-control.md)
+    /// §16): a committed enrollment fact under the founder authority. A
+    /// tenant already admitted is answered as done.
+    pub async fn admit_tenant(&self, tenant: [u8; 16]) -> Result<(), QuorumEnrollmentError> {
+        if tenant == [0; 16] {
+            return Err(EnrollmentError::Invalid.into());
+        }
+        let (send, receive) = oneshot::channel();
+        self.enqueue(Action::AdmitTenant(tenant, send), 16)?;
+        receive
+            .await
+            .map_err(|_| QuorumEnrollmentError::Stopped)?
+            .result
+    }
     pub async fn authorize_certificate(
         &self,
         certificate: Vec<u8>,
@@ -417,6 +432,13 @@ impl QuorumEnrollmentDriver {
                 }
                 Action::Authorize(cert, send) => {
                     let result = self.authorize(control, &cert).await;
+                    let _ = send.send(Answer {
+                        result,
+                        _charge: work._charge,
+                    });
+                }
+                Action::AdmitTenant(tenant, send) => {
+                    let result = self.admit_tenant(control, tenant).await;
                     let _ = send.send(Answer {
                         result,
                         _charge: work._charge,
@@ -661,6 +683,29 @@ impl QuorumEnrollmentDriver {
         }
         Ok(())
     }
+    async fn admit_tenant(
+        &mut self,
+        control: &impl EnrollmentControl,
+        tenant: [u8; 16],
+    ) -> Result<(), QuorumEnrollmentError> {
+        self.reconcile(control).await?;
+        let (registry, charge) = self.registry(control).await?;
+        if registry.admits_tenant(tenant) {
+            return Ok(());
+        }
+        let command = registry.prepare_admit_tenant(&self.authority, tenant, now()?)?;
+        drop(registry);
+        drop(charge);
+        self.commit(control, command).await?;
+        let (registry, _charge) = self.registry(control).await?;
+        if !registry.admits_tenant(tenant) {
+            return Err(EnrollmentError::NotCommitted.into());
+        }
+        Ok(())
+    }
+    /// The grant a certificate earns: the configured tenants and every tenant
+    /// the committed registry admits, so admission never needs a restart and
+    /// a credential never serves a tenant the cluster has not committed.
     async fn authorize(
         &mut self,
         control: &impl EnrollmentControl,
@@ -674,9 +719,11 @@ impl QuorumEnrollmentDriver {
             (EnrollmentRole::Client, None) => PeerRole::Actor,
             _ => return Err(QuorumEnrollmentError::Identity),
         };
+        let mut tenants = self.config.tenants.clone();
+        tenants.extend(registry.tenants().map(TenantId));
         Ok(PeerGrant {
             principal: ParticipantId(identity.principal),
-            tenants: self.config.tenants.clone(),
+            tenants,
             role,
         })
     }

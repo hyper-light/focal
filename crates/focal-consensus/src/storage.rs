@@ -66,6 +66,11 @@ impl RamLog {
             .and_then(|n| n.checked_add(self.slots.as_ref().map_or(0, Allocation::bytes)))
             .ok_or(ConsensusError::Capacity)
     }
+    /// The index of the stored snapshot the log is compacted behind; zero
+    /// while the log is complete from its first entry.
+    pub fn snapshot_index(&self) -> u64 {
+        self.snapshot.get_metadata().index
+    }
     pub fn validate(&self) -> Result<(), ConsensusError> {
         super::validate_conf_state(&self.conf_state)?;
         if self.hard_state.term == u64::MAX

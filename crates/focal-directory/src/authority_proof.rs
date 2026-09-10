@@ -5,6 +5,7 @@ use focal_enrollment::certificate_key_hash;
 use focal_enrollment::{CredentialMaterial, EnrollmentRegistry, SignedNodeStatement};
 use focal_model::{ContentHash, RaftIndex, RaftTerm};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 const MAX_STATEMENT: usize = 16 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,18 +192,28 @@ impl InstalledAuthorityVerifier<'_> {
             // same key keeps signing for the same enrollment.
             let key = certificate_key_hash(&signature.certificate)
                 .map_err(|_| DirectoryError::UnverifiedAuthority)?;
+            // A drained (ineligible) member still signs for the seats it
+            // holds; eligibility gates placement, not attestation (24 §19).
             if enrolled.principal != identity.principal
                 || enrolled.enrollment.identity != ContentHash(key)
-                || !enrolled.enrollment.eligible
                 || enrolled.expires_at < proof.statement.expires_at
             {
                 return Err(DirectoryError::UnverifiedAuthority);
             }
             crate::authority::validate_node_identity(enrolled, self.enrollment, self.now)?;
+            // A seat belongs to the node identity that was granted it, at the
+            // generation of that grant; the same key re-granted since (a
+            // drain or undrain, 24 §19) still holds the seat, so a seat at or
+            // below the node's current generation counts.
             let generation = enrolled.enrollment.generation;
-            let voter = group.voters.get(&node) == Some(&generation);
-            let old_voter = group.outgoing_voters.get(&node) == Some(&generation);
-            let learner = group.learners.get(&node) == Some(&generation);
+            let holds = |seats: &BTreeMap<u64, u64>| {
+                seats
+                    .get(&node)
+                    .is_some_and(|granted| *granted <= generation)
+            };
+            let voter = holds(&group.voters);
+            let old_voter = holds(&group.outgoing_voters);
+            let learner = holds(&group.learners);
             if !(voter || old_voter || learner) {
                 return Err(DirectoryError::StaleNode);
             }
@@ -246,15 +257,23 @@ impl InstalledAuthorityVerifier<'_> {
         else {
             return Err(DirectoryError::WrongOperation);
         };
-        // A membership epoch counts voter-set changes, matching the epoch a
-        // session fence carries; adding or removing learners keeps it.
-        let voters_changed =
-            next.voters != current.voters || next.outgoing_voters != current.outgoing_voters;
+        // A membership epoch counts voter-set changes — the nodes that vote,
+        // as the session log knows them — matching the epoch a session fence
+        // carries; adding or removing learners keeps it, and so does a member
+        // re-granted at a new generation (a drain, 24 §19), which the grant
+        // must still follow.
+        let same_nodes =
+            |left: &BTreeMap<u64, u64>, right: &BTreeMap<u64, u64>| left.keys().eq(right.keys());
+        let voters_changed = !same_nodes(&next.voters, &current.voters)
+            || !same_nodes(&next.outgoing_voters, &current.outgoing_voters);
         let expected_epoch = if voters_changed {
             current.membership_epoch.checked_add(1)
         } else {
             Some(current.membership_epoch)
         };
+        let unchanged = next.voters == current.voters
+            && next.outgoing_voters == current.outgoing_voters
+            && next.learners == current.learners;
         if index.0 == 0
             || term.0 == 0
             || !types::nonzero_hash(*record_hash)
@@ -262,7 +281,7 @@ impl InstalledAuthorityVerifier<'_> {
             || next.genesis != current.genesis
             || next.scope != current.scope
             || expected_epoch != Some(next.membership_epoch)
-            || (!voters_changed && next.learners == current.learners)
+            || unchanged
         {
             return Err(DirectoryError::StaleEpoch);
         }
@@ -281,15 +300,17 @@ impl InstalledAuthorityVerifier<'_> {
         // Direct single-step transitions may change at most one voter. Larger
         // replacements must pass through the explicit joint configuration above.
         if current.outgoing_voters.is_empty() && next.outgoing_voters.is_empty() {
+            // Counted by node: a member re-granted at a new generation (24
+            // §19) is the same voter, not a replacement.
             let changed = current
                 .voters
-                .iter()
-                .filter(|(id, generation)| next.voters.get(id) != Some(generation))
+                .keys()
+                .filter(|id| !next.voters.contains_key(id))
                 .count()
                 .saturating_add(
                     next.voters
-                        .iter()
-                        .filter(|(id, generation)| current.voters.get(id) != Some(generation))
+                        .keys()
+                        .filter(|id| !current.voters.contains_key(id))
                         .count(),
                 );
             if changed > 1 {

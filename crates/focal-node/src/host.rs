@@ -646,6 +646,8 @@ fn dispatch(
             | Operation::EnrollmentControl { .. }
             | Operation::PlacementControl { .. }
             | Operation::SessionSign { .. }
+            | Operation::RangeControl { .. }
+            | Operation::SessionControl { .. }
             | Operation::Probe { .. }
             | Operation::Custody(_) => Err(AccessError::UnsupportedOperation),
         }

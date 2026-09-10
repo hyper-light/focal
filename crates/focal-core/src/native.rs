@@ -45,6 +45,8 @@ mod index_rows;
 mod index_scan;
 pub mod input_codec;
 mod intent;
+mod layout;
+pub use layout::NativeLocation;
 #[cfg(test)]
 mod layout_tests;
 mod missing_owned;
@@ -64,6 +66,7 @@ mod projection;
 mod projection_quote;
 mod projection_visits;
 mod projection_work;
+pub mod ranges;
 mod receipt;
 #[cfg(test)]
 mod receipt_tests;
@@ -83,6 +86,10 @@ mod response_tests;
 mod responses;
 mod result_owned;
 mod retired_cycles;
+pub mod retirement;
+#[cfg(test)]
+#[path = "native/retirement_tests.rs"]
+mod retirement_tests;
 mod scope_release;
 #[cfg(test)]
 mod scope_release_tests;
@@ -110,8 +117,7 @@ pub use delivery_owned::NativeDeliveryResult;
 use delivery_owned::OwnedDeliveryResult;
 pub use event_record::delta as native_delta;
 use focal_memory::{
-    BudgetStats, MemoryBudget, MemoryError, PreparedRange, RangeConfig, RangeId, RangeStats,
-    RangeStore, SnapshotLease,
+    BudgetStats, MemoryBudget, MemoryError, RangeConfig, RangeId, RangeStats, RangeStore,
 };
 use focal_model::lifecycle::evidence::{
     self, EvidenceFailure, Response, ResponseState, WorkArtifactState,
@@ -184,6 +190,9 @@ pub struct NativeLimits {
     /// Frozen legacy rows an imported ledger may retain (23 §5.2).
     pub legacy_rows: usize,
     pub legacy_row_bytes: usize,
+    /// Members a range group may have (25 §4): every write envelope is
+    /// derived for this many, so splits never invalidate a promise.
+    pub max_ranges: usize,
 }
 impl Default for NativeLimits {
     fn default() -> Self {
@@ -211,6 +220,7 @@ impl Default for NativeLimits {
             artifact_inputs: 16,
             legacy_rows: 4_000_000,
             legacy_row_bytes: 1024 * 1024,
+            max_ranges: 64,
         }
     }
 }
@@ -218,7 +228,7 @@ impl Default for NativeLimits {
 pub struct NativeState {
     ledger: LedgerId,
     profile: NativeContentProfile,
-    rows: RangeStore<Key, Row>,
+    rows: ranges::NativeRanges,
     budget: MemoryBudget,
 }
 impl std::fmt::Debug for NativeState {
@@ -227,6 +237,7 @@ impl std::fmt::Debug for NativeState {
             .field("ledger", &self.ledger)
             .field("profile", &self.profile)
             .field("range", &self.rows.id())
+            .field("members", &self.rows.members())
             .field("prefix", &self.rows.prefix())
             .field("entries", &self.rows.len())
             .finish_non_exhaustive()
@@ -320,6 +331,10 @@ pub enum NativeInvocation {
     /// The one-time translation of a sealed legacy prefix (23 §5). Never a
     /// participant request and never a timer; it owns native sequence one.
     Import,
+    /// A committed retirement (26 §4) that moved the family rooted at the
+    /// named claim to the archive; a session decision, never a request or
+    /// a timer, owning the native sequence its publication consumed.
+    Retirement(ClaimId),
 }
 /// Custody request identity of an imported artifact (23 §5.2): derived from
 /// the ledger and artifact under a private domain, principal = producer, epoch
@@ -555,6 +570,8 @@ pub enum NativeOperation {
     EvaluationDeadline,
     ClaimDeadline,
     Import,
+    /// A family of claims retired to the archive (26 §4).
+    Retire,
 }
 /// Address of one frozen legacy row retained by import.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -937,7 +954,8 @@ impl NativeResultKey {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Ordered by the storage layout ([`layout`]): affinity, family, fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Key {
     IncomingHead(ClaimId),
     IncomingLink(ClaimId, ClaimId),
@@ -992,6 +1010,15 @@ enum Key {
     /// consumed: the claim's deadline, an evaluation's declaration deadline
     /// or a monitor's deadline (22 §7).
     DueTimer(u64, TimerTarget),
+    /// The identity index of a primary object family (22 §7): one unit row
+    /// per claim, artifact or declaration under its family's bucket, so a
+    /// listing in identity order is one contiguous scan although each
+    /// object's own rows sit under the object (25 §3).
+    ByObject(u16, focal_model::ObjectId),
+    /// The typed continuation of a claim retired to the archive (26 §4):
+    /// written where the claim's rows were, so a reference resolves to the
+    /// bundle that holds them rather than to nothing.
+    Retired(ClaimId),
     End,
 }
 
@@ -1058,7 +1085,8 @@ fn page_partition(key: &Key) -> u64 {
         | Key::ByEvaluator(..)
         | Key::ByVerdict(..)
         | Key::ByCreated(..)
-        | Key::DueTimer(..) => 6,
+        | Key::DueTimer(..)
+        | Key::ByObject(..) => 6,
         _ => 0,
     }
 }
@@ -1079,6 +1107,56 @@ struct Meta {
     creation_results: usize,
     legacy: usize,
     logical_time: u64,
+}
+/// A resumable position in the committed rows, opaque to callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeRowCursor(Key);
+/// One content object the committed rows name (26 §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentRoot {
+    /// An artifact's payload held as a content object.
+    Artifact(focal_model::lifecycle::artifact_descriptor::ContentPointer),
+    /// An artifact's payload held inline: the object every replica sealed
+    /// at admission under the canonical chunking, so its root is the same
+    /// on every node and the record names it.
+    Inline(focal_model::lifecycle::artifact_descriptor::ContentPointer),
+    /// A retired family's archive bundle, by content root and length.
+    Bundle { root: ContentHash, bytes: u64 },
+}
+impl ContentRoot {
+    /// The object's content root.
+    pub fn root(&self) -> ContentHash {
+        match self {
+            Self::Artifact(pointer) | Self::Inline(pointer) => pointer.root,
+            Self::Bundle { root, .. } => *root,
+        }
+    }
+}
+/// One page of [`Core::native_content_roots`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentRootsPage {
+    pub roots: Vec<ContentRoot>,
+    pub next: Option<NativeRowCursor>,
+    pub visited: usize,
+}
+/// The continuation left where a retired claim's rows were (26 §4): the
+/// archive bundle that holds them, the retention prefix the retirement
+/// named, the claim's final binding and status, and the native sequence
+/// the retirement was published at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetiredClaim {
+    /// The content root of the archive bundle, an object of the ledger's
+    /// tenant domain under the checkpoint class.
+    pub bundle: ContentHash,
+    /// The bundle's length: with the root, what names the object.
+    pub bytes: u64,
+    pub through: SessionSeq,
+    pub binding: Binding,
+    pub status: ClaimStatus,
+    pub retired_at: SessionSeq,
+    /// Event rows that left the core with this member; outcome rows keep
+    /// counting them, so validation reconciles the two.
+    pub events: u32,
 }
 #[derive(Debug)]
 enum Row {
@@ -1118,19 +1196,20 @@ enum Row {
     LegacyDefinition(OwnedLegacy),
     /// The unit value of every secondary index row.
     Index,
+    Retired(RetiredClaim),
 }
 
 /// All allocated candidate rows, outcomes and events have one immutable root.
 /// Dropping a candidate releases its page permits without touching live state.
 pub struct NativePrepared {
-    range: PreparedRange<Key, Row>,
+    fragments: ranges::Fragments,
     outcome: NativeOutcome,
     writes: mutation::WriteSet,
 }
 impl std::fmt::Debug for NativePrepared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NativePrepared")
-            .field("base", &self.range.base_prefix())
+            .field("base", &self.fragments.base_prefix())
             .field("outcome", &self.outcome)
             .finish_non_exhaustive()
     }
@@ -1139,6 +1218,11 @@ impl NativePrepared {
     /// Number of actual storage writes, including metadata, indices and history.
     pub fn mutation_count(&self) -> usize {
         self.writes.len()
+    }
+    /// The positions, in layout order, of the group members this mutation
+    /// writes (25 §6): what a movement fence checks before admission.
+    pub fn touched_members(&self) -> impl Iterator<Item = usize> + '_ {
+        self.fragments.touched_members()
     }
     pub fn mutation_heap_bytes(&self) -> usize {
         self.writes.heap_bytes()
@@ -1150,25 +1234,25 @@ impl NativePrepared {
         self.outcome
     }
     pub fn claim(&self, id: ClaimId) -> Option<&ClaimState> {
-        as_claim(self.range.get(&Key::Claim(id)))
+        as_claim(self.fragments.get(&Key::Claim(id)))
     }
     pub fn receipt(&self, id: ReceiptId) -> Option<NativeReceipt> {
-        as_receipt(self.range.get(&Key::Receipt(id)))
+        as_receipt(self.fragments.get(&Key::Receipt(id)))
     }
     pub fn artifact(&self, id: ArtifactId) -> Option<&NativeArtifact> {
-        as_artifact(self.range.get(&Key::Artifact(id)))
+        as_artifact(self.fragments.get(&Key::Artifact(id)))
     }
     pub fn result(&self, key: NativeResultKey) -> Option<&NativeAccepted> {
-        as_result(self.range.get(&Key::Accepted(key)))
+        as_result(self.fragments.get(&Key::Accepted(key)))
     }
     pub fn recorded(&self, key: impl Into<NativeInvocation>) -> Option<NativeOutcome> {
-        as_outcome(self.range.get(&Key::Outcome(key.into())))
+        as_outcome(self.fragments.get(&Key::Outcome(key.into())))
     }
     pub fn definition(&self, id: ValidationId) -> Option<&validation::Declaration> {
-        as_definition(self.range.get(&Key::Definition(id)))
+        as_definition(self.fragments.get(&Key::Definition(id)))
     }
     pub fn evaluation(&self, key: EvaluationKey) -> Option<&validation::EvaluationState> {
-        as_evaluation(self.range.get(&Key::Evaluation(key)))
+        as_evaluation(self.fragments.get(&Key::Evaluation(key)))
     }
 }
 #[derive(Debug)]
@@ -1210,7 +1294,7 @@ impl std::error::Error for NativePublishError {}
 /// projection call. No Clone implementation is needed on native claim rows.
 #[derive(Debug)]
 pub struct NativeRead {
-    lease: SnapshotLease<Key, Row>,
+    lease: ranges::RangeLeases,
 }
 impl NativeRead {
     pub fn sequence(&self) -> SessionSeq {
@@ -1309,6 +1393,8 @@ fn checked_native_limits(
         || limits.diagnostics_per_cycle == 0
         || limits.artifact_inputs == 0
         || limits.response_summary_bytes == 0
+        || limits.max_ranges == 0
+        || limits.max_ranges > ranges::MAX_LAYOUT_MEMBERS
         || limits.range.max_batch_entries < 4
     {
         return Err(MemoryError::InvalidConfiguration("native limits must be nonzero").into());
@@ -1371,8 +1457,7 @@ impl Core<NativeState> {
         profile: NativeContentProfile,
     ) -> Result<Self, NativeError> {
         limits = checked_native_limits(ledger, limits)?;
-        let rows =
-            RangeStore::new_partitioned(range, 0, limits.range, budget.clone(), page_partition)?;
+        let rows = ranges::NativeRanges::new(range, limits.range, &budget, page_partition)?;
         Ok(Self {
             state: NativeState {
                 ledger,
@@ -1417,6 +1502,91 @@ impl Core<NativeState> {
     pub fn native_outcome(&self, request: impl Into<NativeInvocation>) -> Option<NativeOutcome> {
         as_outcome(self.state.rows.get(&Key::Outcome(request.into())))
     }
+    /// The continuation of a claim that retired to the archive (26 §4).
+    pub fn native_retired(&self, id: ClaimId) -> Option<&RetiredClaim> {
+        match self.state.rows.get(&Key::Retired(id)) {
+            Some(Row::Retired(value)) => Some(value),
+            _ => None,
+        }
+    }
+    /// The content roots the committed rows name (26 §5): every artifact
+    /// held as a content object and every continuation's bundle, walked at
+    /// most `max_visits` rows at a time from `cursor` (exclusive) on. The
+    /// page's `next` resumes the walk; `None` once every row was visited.
+    pub fn native_content_roots(
+        &self,
+        cursor: Option<NativeRowCursor>,
+        max_visits: usize,
+    ) -> Result<ContentRootsPage, NativeError> {
+        let mut roots = Vec::new();
+        let mut visited = 0usize;
+        let mut last = None;
+        let mut truncated = false;
+        let mut push = |root: ContentRoot| -> Result<(), NativeError> {
+            roots
+                .try_reserve_exact(1)
+                .map_err(|_| NativeError::Capacity("content roots"))?;
+            roots.push(root);
+            Ok(())
+        };
+        let mut walk = |entry: &focal_memory::Entry<Key, Row>| -> Result<bool, NativeError> {
+            if visited >= max_visits {
+                return Ok(false);
+            }
+            visited = visited.saturating_add(1);
+            last = Some(entry.key);
+            match &entry.value {
+                Row::Artifact(owned) => {
+                    use focal_model::lifecycle::artifact_descriptor::PayloadSpec;
+                    if let Some(artifact) = owned.get() {
+                        match artifact.descriptor().payload() {
+                            PayloadSpec::Content(pointer) => {
+                                push(ContentRoot::Artifact(pointer))?;
+                            }
+                            PayloadSpec::Inline(_) => {
+                                // An inline payload was sealed as an object
+                                // at admission; the row's custody names it.
+                                push(ContentRoot::Inline(artifact.custody().payload()))?;
+                            }
+                        }
+                    }
+                }
+                Row::Retired(value) => push(ContentRoot::Bundle {
+                    root: value.bundle,
+                    bytes: value.bytes,
+                })?,
+                _ => {}
+            }
+            Ok(true)
+        };
+        match cursor {
+            None => {
+                for entry in self.state.rows.entries() {
+                    if !walk(entry)? {
+                        truncated = true;
+                        break;
+                    }
+                }
+            }
+            Some(cursor) => {
+                for entry in self.state.rows.entries_from(&cursor.0, true) {
+                    if !walk(entry)? {
+                        truncated = true;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(ContentRootsPage {
+            roots,
+            next: if truncated {
+                last.map(NativeRowCursor)
+            } else {
+                None
+            },
+            visited,
+        })
+    }
     pub fn native_definition(&self, id: ValidationId) -> Option<&validation::Declaration> {
         as_definition(self.state.rows.get(&Key::Definition(id)))
     }
@@ -1450,7 +1620,7 @@ impl Core<NativeState> {
         }
         self.state
             .rows
-            .validate_chain(pending.iter().map(|item| &item.range))?;
+            .validate_chain(pending.iter().map(|item| &item.fragments))?;
         Ok(())
     }
     /// The external log owner calls this only after durability. This method has
@@ -1461,17 +1631,17 @@ impl Core<NativeState> {
         prepared: NativePrepared,
     ) -> Result<NativeOutcome, NativePublishError> {
         let NativePrepared {
-            range,
+            fragments,
             outcome,
             writes,
         } = prepared;
         self.state
             .rows
-            .publish_recoverable(range)
-            .map_err(|(error, range)| NativePublishError {
+            .publish_recoverable(fragments)
+            .map_err(|(error, fragments)| NativePublishError {
                 error,
                 prepared: NativePrepared {
-                    range,
+                    fragments,
                     outcome,
                     writes,
                 },
@@ -1489,6 +1659,65 @@ impl Core<NativeState> {
     }
     pub fn advance_native_clock(&mut self, now: u64) -> Result<usize, MemoryError> {
         self.state.rows.advance_clock(now)
+    }
+    /// The range layout the rows are held in (25 §4).
+    pub fn native_layout(&self) -> &ranges::RangeLayout {
+        self.state.rows.layout()
+    }
+    /// The member (position and identity) holding an object's rows (25 §6).
+    pub fn native_member_for(&self, location: layout::NativeLocation) -> (usize, RangeId) {
+        let layout = self.state.rows.layout();
+        let index = layout.route_affinity(&layout::location_affinity(location));
+        (
+            index,
+            layout.member_id(index).unwrap_or(self.state.rows.id()),
+        )
+    }
+    /// The statistics of one member's store.
+    pub fn native_member_stats(&self, index: usize) -> Option<RangeStats> {
+        self.state.rows.member_stats(index)
+    }
+    /// An affinity dividing one member near its middle, if any (25 §8).
+    pub fn native_member_split_point(&self, index: usize) -> Option<ranges::Affinity> {
+        self.state.rows.member_split_point(index)
+    }
+    /// A digest of one member's rows at the current prefix (25 §6).
+    pub fn native_member_digest(
+        &self,
+        index: usize,
+        limits: record_codec::EncodingLimits,
+    ) -> Result<ContentHash, record_codec::CodecError> {
+        record_codec::checkpoint::member_digest(self, index, limits)
+    }
+    /// Add a range boundary at affinity `at` (a claim's affinity is its
+    /// identity's bytes), naming the member from `at` on `id`. Refused
+    /// under read leases, at an existing boundary, for a known identity or
+    /// past the configured member bound (25 §4).
+    pub fn split_native_range(
+        &mut self,
+        at: ranges::Affinity,
+        id: RangeId,
+    ) -> Result<(), NativeError> {
+        self.state.rows.split(
+            at,
+            id,
+            self.limits.max_ranges,
+            focal_memory::BudgetLane::Ordinary,
+            prepare::copy,
+        )
+    }
+    /// Give range member `index` the durable identity `id`: what a session
+    /// does once its genesis is known, so every replica names its origin
+    /// member alike.
+    pub fn rename_native_member(&mut self, index: usize, id: RangeId) -> Result<(), NativeError> {
+        self.state.rows.rename_member(index, id)
+    }
+    /// Remove the boundary after member `index`, joining it with the next
+    /// under its identity.
+    pub fn merge_native_range(&mut self, index: usize) -> Result<(), NativeError> {
+        self.state
+            .rows
+            .merge(index, focal_memory::BudgetLane::Ordinary)
     }
 }
 
@@ -1523,7 +1752,7 @@ struct View<'a> {
 impl<'a> View<'a> {
     fn get(&self, key: Key) -> Option<&'a Row> {
         match self.tail {
-            Some(tail) => tail.range.get(&key),
+            Some(tail) => tail.fragments.get(&key),
             None => self.state.rows.get(&key),
         }
     }
@@ -1552,7 +1781,7 @@ impl<'a> View<'a> {
         start: Key,
     ) -> impl Iterator<Item = &'a focal_memory::Entry<Key, Row>> + use<'a> {
         let (committed, tail) = match self.tail {
-            Some(tail) => (None, Some(tail.range.entries_from(&start, false))),
+            Some(tail) => (None, Some(tail.fragments.entries_from(&start, false))),
             None => (Some(self.state.rows.entries_from(&start, false)), None),
         };
         committed
@@ -1603,7 +1832,7 @@ impl EffectiveClaims for View<'_> {
     fn prefix(&self) -> SessionSeq {
         self.tail
             .map_or(SessionSeq(self.state.rows.prefix()), |tail| {
-                SessionSeq(tail.range.prefix())
+                SessionSeq(tail.fragments.prefix())
             })
     }
     fn claim(&self, id: ClaimId) -> Option<&ClaimState> {

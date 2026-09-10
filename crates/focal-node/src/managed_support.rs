@@ -28,6 +28,12 @@ pub(crate) async fn drive(
             // payloads are sealed locally; seal them with the recorded chunking.
             let _ = service_import(&host, content, pending).await;
         }
+        if host.progress().seed_pending.is_some() {
+            // The replica retained a seeded checkpoint until every chunk it
+            // names is local; pull the missing ones from a peer of the
+            // ledger's placement (25 §5).
+            let _ = service_seed(&host, pool, content, ledger).await;
+        }
         let Ok(charge) = budget.reserve(BudgetKind::Control, BudgetLane::Completion, 512 * 1024)
         else {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -80,6 +86,40 @@ pub(crate) async fn drive(
     }
 }
 
+/// Pull every chunk a replica's pending seeded checkpoint lacks from the
+/// peers of the ledger's custody policy, one at a time, and hand each to the
+/// replica; it installs the checkpoint once all are local.
+async fn service_seed(
+    host: &crate::fleet::ReplicaHost,
+    pool: &PeerConnectionPool,
+    content: &crate::content_host::ContentHost,
+    ledger: focal_model::LedgerId,
+) -> Result<(), LedgerError> {
+    let Some(policy) = content
+        .policy(ledger)
+        .await
+        .map_err(|_| LedgerError::Capacity)?
+    else {
+        return Ok(());
+    };
+    let scope = policy.scope();
+    let node = host.progress().node;
+    for hash in host.pending_seed_chunks().await? {
+        for peer in policy.peers.iter().filter(|peer| **peer != node) {
+            let pulled = tokio::time::timeout(
+                Duration::from_millis(2_000),
+                crate::evidence_service::pull_seed(pool, *peer, scope, hash),
+            )
+            .await;
+            let Ok(Ok(bytes)) = pulled else {
+                continue;
+            };
+            host.install_seed_chunk(hash, bytes).await?;
+            break;
+        }
+    }
+    Ok(())
+}
 /// Seal every inline legacy payload of a replica's pending import through the
 /// exclusive content writer; the replica applies the import at its next poll.
 async fn service_import(

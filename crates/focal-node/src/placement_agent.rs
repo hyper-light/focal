@@ -20,7 +20,10 @@ use crate::{
     network_service::NetworkHandles,
     network_state::NetworkState,
     placement_collect::{CollectError, Collected, remote_signature},
-    placement_control::{AgentJob, AgentStatus, CollectJob, CollectRequest, SignJob},
+    placement_control::{
+        AgentJob, AgentStatus, CollectJob, CollectRequest, CreateSessionJob, CreatedSession,
+        MoveRangeJob, PlanSessionJob, PlanState, PlannedSession, SignJob, created_session_id,
+    },
     placement_journal::{IntentError, IntentJournal},
     placement_proof::{PlacementProofError, ProofWindow},
     session_registration::{
@@ -73,6 +76,10 @@ const BACKOFF: Duration = Duration::from_secs(5);
 const REMOTE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Copies one node may host through this agent.
 const MAX_INSTALLED: usize = 1024;
+/// Operator plan requests waiting for a pass, and waiters per session.
+const MAX_PLAN_REQUESTS: usize = 64;
+const MAX_PLAN_WAITERS: usize = 8;
+type PlanReply = tokio::sync::oneshot::Sender<Result<PlannedSession, AgentError>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
@@ -106,6 +113,10 @@ pub enum AgentError {
     Fleet(#[from] FleetError),
     #[error("content hosting: {0}")]
     Content(#[from] focal_evidence::ContentError),
+    #[error("restore refused: {0}")]
+    Restore(&'static str),
+    #[error("backup: {0}")]
+    Backup(#[from] focal_ledger::backup::BackupError),
     #[error("peer transport: {0}")]
     Transport(#[from] PeerSendError),
     #[error("install journal: {0}")]
@@ -192,7 +203,8 @@ fn observed_partition(
         })
 }
 
-/// A copy this node installed for a committed plan, reopened at every start.
+/// A copy this node installed for a committed plan, or a session it created
+/// for an operator, reopened at every start.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct InstalledCopy {
     group: [u8; 16],
@@ -201,12 +213,75 @@ struct InstalledCopy {
     policy_revision: u64,
     voters: BTreeSet<u64>,
     copies: BTreeSet<u64>,
+    /// Created on this node by an operator rather than assigned by a plan:
+    /// the agent registers it with the directory as it did the founder's.
+    created: bool,
 }
 #[derive(Serialize, Deserialize)]
 struct InstallRecord {
     schema: u16,
     node: u64,
     installed: BTreeMap<LedgerId, InstalledCopy>,
+}
+const INSTALL_RECORD_SCHEMA: u16 = 2;
+/// Schema 1 (before created sessions): every recorded copy was assigned.
+#[derive(Deserialize)]
+struct InstalledCopyV1 {
+    group: [u8; 16],
+    bootstrap_voters: Vec<u64>,
+    route_epoch: RouteEpoch,
+    policy_revision: u64,
+    voters: BTreeSet<u64>,
+    copies: BTreeSet<u64>,
+}
+#[derive(Deserialize)]
+struct InstallRecordV1 {
+    schema: u16,
+    node: u64,
+    installed: BTreeMap<LedgerId, InstalledCopyV1>,
+}
+impl InstallRecord {
+    fn decode(bytes: &[u8]) -> Result<Self, AgentError> {
+        let (schema, _): (u16, _) = postcard::take_from_bytes(bytes)?;
+        match schema {
+            1 => {
+                let (legacy, rest): (InstallRecordV1, _) = postcard::take_from_bytes(bytes)?;
+                if !rest.is_empty() || legacy.schema != 1 {
+                    return Err(AgentError::Identity);
+                }
+                Ok(Self {
+                    schema: INSTALL_RECORD_SCHEMA,
+                    node: legacy.node,
+                    installed: legacy
+                        .installed
+                        .into_iter()
+                        .map(|(ledger, copy)| {
+                            (
+                                ledger,
+                                InstalledCopy {
+                                    group: copy.group,
+                                    bootstrap_voters: copy.bootstrap_voters,
+                                    route_epoch: copy.route_epoch,
+                                    policy_revision: copy.policy_revision,
+                                    voters: copy.voters,
+                                    copies: copy.copies,
+                                    created: false,
+                                },
+                            )
+                        })
+                        .collect(),
+                })
+            }
+            INSTALL_RECORD_SCHEMA => {
+                let (value, rest): (Self, _) = postcard::take_from_bytes(bytes)?;
+                if !rest.is_empty() {
+                    return Err(AgentError::Identity);
+                }
+                Ok(value)
+            }
+            _ => Err(AgentError::Identity),
+        }
+    }
 }
 struct InstallJournal {
     journal: Option<PrivateJournal>,
@@ -222,16 +297,10 @@ impl InstallJournal {
         crate::embedded::durable_dir(&root.join("cluster"))?;
         let mut journal = PrivateJournal::open(path)?;
         let record = match journal.read()? {
-            Some(bytes) => {
-                let (value, rest): (InstallRecord, _) = postcard::take_from_bytes(&bytes)?;
-                if !rest.is_empty() {
-                    return Err(AgentError::Identity);
-                }
-                value
-            }
+            Some(bytes) => InstallRecord::decode(&bytes)?,
             None => {
                 let value = InstallRecord {
-                    schema: 1,
+                    schema: INSTALL_RECORD_SCHEMA,
                     node,
                     installed: BTreeMap::new(),
                 };
@@ -239,7 +308,10 @@ impl InstallJournal {
                 value
             }
         };
-        if record.schema != 1 || record.node != node || record.installed.len() > MAX_INSTALLED {
+        if record.schema != INSTALL_RECORD_SCHEMA
+            || record.node != node
+            || record.installed.len() > MAX_INSTALLED
+        {
             return Err(AgentError::Identity);
         }
         if !marker.exists() {
@@ -306,6 +378,9 @@ pub struct PlacementAgent {
     credentials: CredentialMaterial,
     root: PathBuf,
     custody: BTreeMap<LedgerId, CustodyScope>,
+    /// The pending placement scope announced to the content host per hosted
+    /// ledger, so its peers can pull checkpoint seeds before activation.
+    pending_custody: BTreeMap<LedgerId, CustodyScope>,
     node_budget: MemoryBudget,
     admission: TenantAdmission,
     wal: SharedWal,
@@ -324,10 +399,31 @@ pub struct PlacementAgent {
     last_ready: Option<(LedgerId, OperationId, i64)>,
     /// The most recent failed tick, kept for diagnostics.
     last_error: Option<AgentError>,
+    /// The last intent the owner refused before admission, by kind and
+    /// failure, cleared by the next intent that commits (24 §7).
+    last_refusal: Option<String>,
+    /// Where each session's log was last found to lead, from a leader's
+    /// redirect, for sessions this node drives without leading (24 §9).
+    session_leaders: BTreeMap<LedgerId, u64>,
     /// Completed ticks: the progress witness a stuck host cannot advance.
     ticks: u64,
+    /// The partitions as the last tick observed them, for the operator.
+    last_observed: Vec<(Delegation, PartitionCheckpoint)>,
+    observed_at: i64,
+    /// Operator plan requests, answered by the next pass over the partition
+    /// holding each session; a request that outlives the agent is lost and
+    /// its exact retry finds the committed plan.
+    /// Waiters per session and requested durability; a waiter marked as a
+    /// dry run is answered from the same proposal without journaling it.
+    plan_requests: BTreeMap<LedgerId, (focal_directory::DurabilityIntent, Vec<(PlanReply, bool)>)>,
+    /// Operator requests to move a member (25 §6), answered by the next
+    /// controller pass over the session on the node that leads it.
+    move_requests: Vec<MoveRangeJob>,
+    /// Per-member observations behind automatic splits and merges (25 §8).
+    balancer: crate::range_balancer::Balancer,
     _allocation: Allocation,
 }
+const MAX_MOVE_REQUESTS: usize = 64;
 impl PlacementAgent {
     pub fn new(inputs: AgentInputs, budget: MemoryBudget) -> Result<Self, AgentError> {
         let AgentInputs {
@@ -365,6 +461,7 @@ impl PlacementAgent {
             credentials,
             root,
             custody,
+            pending_custody: BTreeMap::new(),
             node_budget,
             admission,
             wal,
@@ -378,7 +475,16 @@ impl PlacementAgent {
             last_load: BTreeMap::new(),
             last_ready: None,
             last_error: None,
+            last_refusal: None,
+            session_leaders: BTreeMap::new(),
             ticks: 0,
+            last_observed: Vec::new(),
+            observed_at: 0,
+            plan_requests: BTreeMap::new(),
+            move_requests: Vec::new(),
+            balancer: crate::range_balancer::Balancer::new(
+                crate::range_balancer::BalancerConfig::from_env(),
+            ),
             _allocation: allocation,
         })
     }
@@ -409,7 +515,12 @@ impl PlacementAgent {
         }
         let mut jobs = self.jobs.take().ok_or(AgentError::Identity)?;
         std::panic::AssertUnwindSafe(async {
-            let mut pause = TICK;
+            // The next tick is a deadline, not a timer restarted by every job:
+            // a steady stream of jobs (status polls, signatures) must never
+            // starve the agent's own work.
+            let mut next = tokio::time::Instant::now()
+                .checked_add(TICK)
+                .unwrap_or_else(tokio::time::Instant::now);
             loop {
                 tokio::select! {
                     biased;
@@ -432,10 +543,44 @@ impl PlacementAgent {
                             Some(AgentJob::Credentials(material)) => {
                                 self.credentials = *material;
                             }
+                            Some(AgentJob::Directory(reply)) => {
+                                let _ = reply.send(crate::placement_control::DirectoryReport {
+                                    observed_at: self.observed_at,
+                                    partitions: self.last_observed.clone(),
+                                });
+                            }
+                            Some(AgentJob::CreateSession(job)) => {
+                                let CreateSessionJob { tenant, name, reply } = *job;
+                                let result = self.create_session(handles, tenant, &name).await;
+                                let _ = reply.send(result);
+                            }
+                            Some(AgentJob::RestoreSession(job)) => {
+                                let crate::placement_control::RestoreSessionJob { request, reply } = *job;
+                                let result = self.restore_session(handles, request).await;
+                                let _ = reply.send(result);
+                            }
+                            Some(AgentJob::PlanSession(job)) => {
+                                let PlanSessionJob {
+                                    ledger,
+                                    durability,
+                                    dry_run,
+                                    reply,
+                                } = *job;
+                                self.queue_plan_request(ledger, durability, dry_run, reply);
+                            }
+                            Some(AgentJob::MoveRange(job)) => {
+                                if self.move_requests.len() >= MAX_MOVE_REQUESTS
+                                    || self.move_requests.try_reserve(1).is_err()
+                                {
+                                    let _ = job.reply.send(Err(AgentError::Capacity));
+                                } else {
+                                    self.move_requests.push(*job);
+                                }
+                            }
                         }
                     }
-                    () = tokio::time::sleep(pause) => {
-                        pause = match self.tick(handles, pool).await {
+                    () = tokio::time::sleep_until(next) => {
+                        let pause = match self.tick(handles, pool).await {
                             Ok(_) => {
                                 self.last_error = None;
                                 TICK
@@ -446,6 +591,8 @@ impl PlacementAgent {
                                 if retry { TICK } else { BACKOFF }
                             }
                         };
+                        let now = tokio::time::Instant::now();
+                        next = now.checked_add(pause).unwrap_or(now);
                     }
                 }
             }
@@ -488,12 +635,27 @@ impl PlacementAgent {
         let partition_peer = self.peer(client, namespace)?;
         {
             let journals = self.journals.as_mut().ok_or(AgentError::Identity)?;
-            if journals.root.pending().is_some() {
+            if let Some(pending) = journals.root.pending() {
+                let kind = intent_kind(&pending.command);
                 let control = &handles.control;
-                journals
-                    .root
-                    .advance(control, |request| control.submit(root_peer, request))
-                    .await?;
+                // A root intent is submitted where the root leads: here, or
+                // through the leader's placement-control ingress, which admits
+                // a node's own facts (a session group it bootstraps, 24 §16).
+                let leader = control.progress().leader;
+                let access = if leader == node || leader == 0 {
+                    PartitionAccess::Local(control.clone())
+                } else {
+                    PartitionAccess::Remote {
+                        target: leader,
+                        group: self.state.genesis.root.group,
+                    }
+                };
+                let root_namespace = self.state.genesis.root_namespace;
+                let submit = |request: ControlRequest| {
+                    submit_partition(&access, pool, root_namespace, root_peer.clone(), request)
+                };
+                let outcome = journals.root.advance(control, submit).await?;
+                self.note_intent(kind, &outcome);
                 return Ok(AgentStep::Advanced);
             }
         }
@@ -538,11 +700,13 @@ impl PlacementAgent {
                 .partitions
                 .get_mut(&delegation.partition)
                 .ok_or(AgentError::Identity)?;
-            if journal.pending().is_some() {
+            if let Some(pending) = journal.pending() {
+                let kind = intent_kind(&pending.command);
                 let submit = |request: ControlRequest| {
                     submit_partition(&access, pool, namespace, partition_peer.clone(), request)
                 };
-                journal.advance(&handles.control, submit).await?;
+                let outcome = journal.advance(&handles.control, submit).await?;
+                self.note_intent(kind, &outcome);
                 return Ok(AgentStep::Advanced);
             }
             if let Some((snapshot, installed)) = self
@@ -553,6 +717,14 @@ impl PlacementAgent {
                 observed.push((*delegation, access, snapshot, installed));
             }
         }
+        self.last_observed = observed
+            .iter()
+            .filter_map(|(delegation, _, snapshot, _)| match &snapshot.state {
+                ControlBootstrap::Partition { directory } => Some((*delegation, directory.clone())),
+                _ => None,
+            })
+            .collect();
+        self.observed_at = now;
         if observed.is_empty() {
             return Ok(AgentStep::Idle);
         }
@@ -589,15 +761,40 @@ impl PlacementAgent {
             if let Some(ledger) = &handles.ledger
                 && delegation.namespace.contains(self.identity.ledger)
                 && let Some(step) = self
-                    .register_founder(
-                        handles, access, pool, ledger, &root, snapshot, installed, now,
+                    .register_hosted(
+                        handles,
+                        ledger,
+                        self.identity.clone(),
+                        &root,
+                        snapshot,
+                        installed,
+                        now,
                     )
                     .await?
             {
                 return Ok(step);
             }
+            // Every session this node created is registered exactly as the
+            // founder's was, by the partition whose namespace holds it.
+            for ledger in self.created_ledgers() {
+                if !delegation.namespace.contains(ledger) {
+                    continue;
+                }
+                let Ok(host) = handles.fleet.current_host(ledger) else {
+                    continue;
+                };
+                let mut hosting = self.identity.clone();
+                hosting.ledger = ledger;
+                hosting.issuer = self.principal;
+                if let Some(step) = self
+                    .register_hosted(handles, &host, hosting, &root, snapshot, installed, now)
+                    .await?
+                {
+                    return Ok(step);
+                }
+            }
             if let Some(step) = self
-                .enroll_self(handles, access, pool, directory, snapshot, installed, now)
+                .enroll_nodes(handles, access, pool, directory, snapshot, installed, now)
                 .await?
             {
                 return Ok(step);
@@ -610,6 +807,12 @@ impl PlacementAgent {
             }
             for descriptor in directory.sessions.values() {
                 self.sync_custody(handles, descriptor).await?;
+                if let Some(step) = self
+                    .answer_plan_request(handles, descriptor, directory, snapshot, installed, now)
+                    .await?
+                {
+                    return Ok(step);
+                }
                 if let Some(step) = self
                     .install_assignment(handles, access, pool, descriptor, snapshot, installed, now)
                     .await?
@@ -957,13 +1160,10 @@ impl PlacementAgent {
         ledger: LedgerId,
         copy: &InstalledCopy,
     ) -> Result<ReplicaHost, AgentError> {
-        // A copy is charged to its tenant's allowance; the tenant was admitted
-        // before the copy was recorded as installed.
-        let tenant = self
-            .admission
-            .budget(ledger.tenant)
-            .ok_or(AgentError::Identity)?
-            .clone();
+        // A copy is charged to its tenant's allowance. The tenant was admitted
+        // before the copy was recorded; after a restart the record is the
+        // admission, under the same node bound and budget.
+        let tenant = self.admit_tenant(handles, ledger.tenant).await?;
         let consensus = DurableNode::open_on_wal_in(
             NodeConfig::joining(
                 self.state.node,
@@ -975,14 +1175,27 @@ impl PlacementAgent {
             self.wal.clone(),
             &tenant,
         )?;
+        self.attach_copy(handles, ledger, copy, consensus, &tenant)
+            .await
+    }
+    /// Host an opened log as one copy of `ledger` and hand it to the fleet.
+    async fn attach_copy(
+        &mut self,
+        handles: &NetworkHandles,
+        ledger: LedgerId,
+        copy: &InstalledCopy,
+        consensus: DurableNode,
+        tenant: &MemoryBudget,
+    ) -> Result<ReplicaHost, AgentError> {
         let mut identity = self.identity.clone();
         identity.ledger = ledger;
-        let hosting = crate::network_service::native_hosting(&self.root, &identity)?;
+        let hosting =
+            crate::network_service::native_hosting(&self.root, &identity, self.wal.disk_budget())?;
         let session = Session::from_node_in_hosted(
             ledger,
             consensus,
             SessionLimits::default(),
-            &tenant,
+            tenant,
             hosting,
         )?;
         // A reopened copy serves the route its log has committed; a fresh copy
@@ -1070,6 +1283,25 @@ impl PlacementAgent {
         {
             return Ok(());
         }
+        self.announce_pending(handles, descriptor).await?;
+        // A copy serves clients at the route the directory activated: once
+        // the session has applied the activation, the host re-fences the
+        // replica (its serving fence and read views) to that route.
+        if descriptor.pending.is_none()
+            && let Ok(host) = handles.fleet.current_host(descriptor.ledger)
+            && host.progress().route_epoch < descriptor.route_epoch
+            && let Err(error) = host
+                .refence(descriptor.route_epoch, descriptor.placement_epoch)
+                .await
+            && !matches!(
+                error,
+                LedgerError::PlacementConflict
+                    | LedgerError::Capacity
+                    | LedgerError::OutcomeUnknown
+            )
+        {
+            return Err(error.into());
+        }
         let scope = CustodyScope {
             ledger: descriptor.ledger,
             route_epoch: descriptor.route_epoch,
@@ -1091,34 +1323,510 @@ impl PlacementAgent {
         )
         .await
     }
+    /// Tell the content host which peers the directory is preparing for a
+    /// ledger this node serves, so a fresh copy can pull the ledger's
+    /// checkpoint seeds from this node before the placement activates
+    /// (25 §5); withdrawn once no plan is pending. Idempotent per scope.
+    async fn announce_pending(
+        &mut self,
+        handles: &NetworkHandles,
+        descriptor: &SessionDescriptor,
+    ) -> Result<(), AgentError> {
+        let ledger = descriptor.ledger;
+        let announced = self.pending_custody.get(&ledger).copied();
+        match &descriptor.pending {
+            Some(pending) => {
+                let scope = CustodyScope {
+                    ledger,
+                    route_epoch: pending.next_route,
+                    policy_revision: pending.next_placement,
+                };
+                if announced == Some(scope) {
+                    return Ok(());
+                }
+                let placement = &pending.desired.placement;
+                let peers: BTreeSet<u64> = placement
+                    .voters
+                    .keys()
+                    .chain(placement.content_copies.keys())
+                    .copied()
+                    .collect();
+                handles
+                    .content
+                    .announce_pending(ledger, Some((scope, peers)))
+                    .await?;
+                self.pending_custody.insert(ledger, scope);
+            }
+            None => {
+                if announced.is_some() {
+                    handles.content.announce_pending(ledger, None).await?;
+                    self.pending_custody.remove(&ledger);
+                }
+            }
+        }
+        Ok(())
+    }
+    /// The tenant's allowance on this node, admitting it to the node's
+    /// envelopes and the fleet first when needed; an admitted tenant is
+    /// answered with its existing allowance.
+    async fn admit_tenant(
+        &mut self,
+        handles: &NetworkHandles,
+        tenant: TenantId,
+    ) -> Result<MemoryBudget, AgentError> {
+        let required = u64::try_from(SessionLimits::default().memory_bytes)
+            .map_err(|_| AgentError::Capacity)?;
+        let admitted = self.admission.admit(tenant, required)?;
+        if !handles.fleet.is_admitted(tenant) {
+            handles.fleet.admit_tenant(admitted.clone()).await?;
+        }
+        Ok(admitted.budget)
+    }
+    /// Queue an operator's plan request for the next pass; a request under a
+    /// different durability for the same session replaces the queued one
+    /// and its waiters are told so.
+    fn queue_plan_request(
+        &mut self,
+        ledger: LedgerId,
+        durability: focal_directory::DurabilityIntent,
+        dry_run: bool,
+        reply: PlanReply,
+    ) {
+        if durability.max_failures > u16::from(u8::MAX) {
+            let _ = reply.send(Err(AgentError::Registration(
+                SessionRegistrationError::PolicyUnsatisfied,
+            )));
+            return;
+        }
+        match self.plan_requests.get_mut(&ledger) {
+            Some((requested, waiters)) if *requested == durability => {
+                if waiters.len() >= MAX_PLAN_WAITERS || waiters.try_reserve(1).is_err() {
+                    let _ = reply.send(Err(AgentError::Capacity));
+                    return;
+                }
+                waiters.push((reply, dry_run));
+            }
+            Some((requested, waiters)) => {
+                for (waiter, _) in waiters.drain(..) {
+                    let _ = waiter.send(Err(AgentError::Registration(
+                        SessionRegistrationError::Conflict,
+                    )));
+                }
+                *requested = durability;
+                waiters.push((reply, dry_run));
+            }
+            None => {
+                if self.plan_requests.len() >= MAX_PLAN_REQUESTS {
+                    let _ = reply.send(Err(AgentError::Capacity));
+                    return;
+                }
+                let mut waiters = Vec::new();
+                if waiters.try_reserve(1).is_err() {
+                    let _ = reply.send(Err(AgentError::Capacity));
+                    return;
+                }
+                waiters.push((reply, dry_run));
+                self.plan_requests.insert(ledger, (durability, waiters));
+            }
+        }
+    }
+    /// The identity of an operator's plan: exact for one session, one
+    /// authority record and one requested durability, so a retry finds the
+    /// plan it asked for.
+    fn requested_plan_id(
+        descriptor: &SessionDescriptor,
+        durability: focal_directory::DurabilityIntent,
+    ) -> OperationId {
+        let mut hasher = blake3::Hasher::new_derive_key("focal.placement.request.v1");
+        hasher.update(&descriptor.ledger.tenant.0);
+        hasher.update(&descriptor.ledger.session.0);
+        hasher.update(&descriptor.authority.record_hash.0);
+        hasher.update(&[match durability.survive {
+            focal_directory::FailureClass::Node => 0,
+            focal_directory::FailureClass::Zone => 1,
+            focal_directory::FailureClass::Region => 2,
+        }]);
+        hasher.update(&durability.max_failures.to_le_bytes());
+        let mut id = [0; 16];
+        for (target, source) in id.iter_mut().zip(hasher.finalize().as_bytes()) {
+            *target = *source;
+        }
+        OperationId(id)
+    }
+    /// Answer an operator's plan request for this session from the committed
+    /// directory: the pending plan if one exists, "satisfied" when the active
+    /// placement already provides the durability, otherwise a plan under the
+    /// active policy with the requested durability, journaled for the
+    /// partition ([24](../../../docs/archictecutre/24-placement-execution-and-fleet-control.md) §17).
+    async fn answer_plan_request(
+        &mut self,
+        handles: &NetworkHandles,
+        descriptor: &SessionDescriptor,
+        directory: &PartitionCheckpoint,
+        snapshot: &ControlSnapshot,
+        installed: &ControlAuthoritySnapshot,
+        now: i64,
+    ) -> Result<Option<AgentStep>, AgentError> {
+        let Some((durability, waiters)) = self.plan_requests.get(&descriptor.ledger) else {
+            return Ok(None);
+        };
+        let durability = *durability;
+        // A request that is only dry runs proposes without journaling: what
+        // would be planned, and nothing committed (doc 08 §9).
+        let journal = waiters.iter().any(|(_, dry_run)| !dry_run);
+        let answer = |state: PlanState, operation: OperationId, voters: Vec<u64>| PlannedSession {
+            ledger: descriptor.ledger,
+            operation,
+            voters,
+            state,
+        };
+        let config = self.partition_config();
+        let outcome: Result<(PlannedSession, Option<ControlCommand>), AgentError> =
+            if let Some(pending) = &descriptor.pending {
+                Ok((
+                    answer(
+                        PlanState::Pending,
+                        pending.operation,
+                        pending.desired.placement.voters.keys().copied().collect(),
+                    ),
+                    None,
+                ))
+            } else if descriptor.active.policy.durability == durability
+                && focal_directory::verify_placement(
+                    &descriptor.active,
+                    &directory.nodes,
+                    config.max_members,
+                )
+                .is_ok()
+            {
+                Ok((
+                    answer(
+                        PlanState::Satisfied,
+                        descriptor.authority.operation,
+                        descriptor.active.placement.voters.keys().copied().collect(),
+                    ),
+                    None,
+                ))
+            } else {
+                let policy = focal_directory::PlacementPolicy {
+                    durability,
+                    ..descriptor.active.policy.clone()
+                };
+                match focal_directory::propose_placement_keeping(
+                    &directory.nodes,
+                    &policy,
+                    &descriptor.active.placement.voters,
+                    config.max_members,
+                    config.min_disk_available,
+                ) {
+                    Ok(proposal) => {
+                        let operation = Self::requested_plan_id(descriptor, durability);
+                        let voters: Vec<u64> =
+                            proposal.spec.placement.voters.keys().copied().collect();
+                        if journal {
+                            self.session_command(
+                                descriptor,
+                                snapshot,
+                                installed,
+                                now,
+                                SessionChange::Plan {
+                                    operation,
+                                    desired: proposal.spec,
+                                    observations: proposal.observations,
+                                },
+                                None,
+                            )
+                            .map(|command| {
+                                (answer(PlanState::Planned, operation, voters), Some(command))
+                            })
+                        } else {
+                            Ok((answer(PlanState::Planned, operation, voters), None))
+                        }
+                    }
+                    Err(_) => Err(AgentError::Registration(
+                        SessionRegistrationError::PolicyUnsatisfied,
+                    )),
+                }
+            };
+        let (_, waiters) = self
+            .plan_requests
+            .remove(&descriptor.ledger)
+            .ok_or(AgentError::Identity)?;
+        match outcome {
+            Ok((planned, command)) => {
+                for (waiter, _) in waiters {
+                    let _ = waiter.send(Ok(planned.clone()));
+                }
+                match command {
+                    Some(command) => self.intend_partition(handles, command).await.map(Some),
+                    None => Ok(None),
+                }
+            }
+            Err(error) => {
+                for (waiter, _) in waiters {
+                    let _ = waiter.send(Err(AgentError::Registration(
+                        SessionRegistrationError::PolicyUnsatisfied,
+                    )));
+                }
+                Err(error)
+            }
+        }
+    }
+    /// The sessions this node created for operators, in ledger order.
+    fn created_ledgers(&self) -> Vec<LedgerId> {
+        self.installs
+            .as_ref()
+            .map(|installs| {
+                installs
+                    .record
+                    .installed
+                    .iter()
+                    .filter(|(_, copy)| copy.created)
+                    .map(|(ledger, _)| *ledger)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    /// Create an application session on this node, or find the one the same
+    /// name already denotes ([24](../../../docs/archictecutre/24-placement-execution-and-fleet-control.md)
+    /// §16). The tenant is admitted to the node's envelopes first; the copy
+    /// is recorded, then opened on the shared WAL as a single-voter group at
+    /// the session's own identity and hosted by the fleet under its custody
+    /// scope. A copy recorded but not yet opened is opened by the retry that
+    /// finds it absent from the fleet, or at the next start; one opened but
+    /// never recorded would be lost to a restart. The next tick registers the
+    /// session with the partition whose namespace holds it.
+    async fn create_session(
+        &mut self,
+        handles: &NetworkHandles,
+        tenant: TenantId,
+        name: &str,
+    ) -> Result<CreatedSession, AgentError> {
+        let node = self.state.node;
+        let session = created_session_id(self.state.genesis.founder.cluster, tenant, name)
+            .ok_or(AgentError::Identity)?;
+        let ledger = LedgerId { tenant, session };
+        if let Ok((group, _)) = handles.fleet.replica_target(ledger) {
+            return Ok(CreatedSession {
+                ledger,
+                group,
+                node,
+                existing: true,
+            });
+        }
+        let installs = self.installs.as_ref().ok_or(AgentError::Identity)?;
+        if !installs.record.installed.contains_key(&ledger)
+            && installs.record.installed.len() >= MAX_INSTALLED
+        {
+            return Err(AgentError::Capacity);
+        }
+        self.admit_tenant(handles, tenant).await?;
+        let copy = InstalledCopy {
+            group: session.0,
+            bootstrap_voters: vec![node],
+            route_epoch: RouteEpoch(1),
+            policy_revision: 1,
+            voters: BTreeSet::from([node]),
+            copies: BTreeSet::from([node]),
+            created: true,
+        };
+        let installs = self.installs.as_mut().ok_or(AgentError::Identity)?;
+        if installs.record.installed.get(&ledger) != Some(&copy) {
+            installs.record.installed.insert(ledger, copy.clone());
+            installs.save_on(&handles.control).await?;
+        }
+        self.open_copy(handles, ledger, &copy).await?;
+        Ok(CreatedSession {
+            ledger,
+            group: session.0,
+            node,
+            existing: false,
+        })
+    }
+    /// Restore a session from a verified backup onto this node (26 §6): the
+    /// objects the backup lists go into this node's content store, its seed
+    /// chunks into the session's seed store, the envelope is rewritten for
+    /// the incarnation the decision names, a fresh log begins from it, and
+    /// the copy is hosted and recorded as created here, so the next pass
+    /// registers it with the directory as a session founded on this node.
+    async fn restore_session(
+        &mut self,
+        handles: &NetworkHandles,
+        request: crate::backup::RestoreRequest,
+    ) -> Result<crate::backup::RestoredSession, AgentError> {
+        use crate::backup::RestoreDecision;
+        let node = self.state.node;
+        let cluster = self.state.genesis.founder.cluster;
+        let verification = crate::backup::verify(&request.input)?;
+        if !verification.complete {
+            return Err(AgentError::Restore(if verification.decoder_supported {
+                "the backup does not verify; run `cluster backup verify` for the problems"
+            } else {
+                "this binary does not carry the decoder the backup's log promised"
+            }));
+        }
+        let manifest = crate::backup::read_manifest(&request.input)?;
+        let ledger = manifest.prefix.ledger;
+        if handles.fleet.replica_target(ledger).is_ok() {
+            return Err(AgentError::Restore("this node already hosts the session"));
+        }
+        if self
+            .last_observed
+            .iter()
+            .any(|(_, checkpoint)| checkpoint.sessions.contains_key(&ledger))
+        {
+            return Err(AgentError::Restore(
+                "this cluster's directory already holds the session; a live descriptor is replaced by a placement plan, not a restore",
+            ));
+        }
+        let group = match &request.decision {
+            RestoreDecision::SameIncarnation { .. } => manifest.prefix.group.0,
+            RestoreDecision::RecoveryIncarnation { .. } => {
+                if !request.new_incarnation {
+                    return Err(AgentError::Restore(
+                        "the backup's source is not fenced: its cluster or a member of its membership could act again; pass --new-incarnation to restore as a recovery incarnation under a new log group",
+                    ));
+                }
+                crate::backup::recovery_group(&manifest, node)
+            }
+        };
+        let installs = self.installs.as_ref().ok_or(AgentError::Identity)?;
+        if installs.record.installed.contains_key(&ledger)
+            || installs
+                .record
+                .installed
+                .values()
+                .any(|copy| copy.group == group)
+            || installs.record.installed.len() >= MAX_INSTALLED
+        {
+            return Err(AgentError::Restore(
+                "this node already records a copy of the session or its log group",
+            ));
+        }
+        let tenant = self.admit_tenant(handles, ledger.tenant).await?;
+        let objects_imported = handles
+            .content
+            .restore_content(request.input.clone(), manifest.clone())
+            .await?;
+        let domain = focal_model::ContentDomainId(ledger.tenant.0);
+        let limits = crate::network_service::native_limits(domain)?;
+        let decoder = focal_ledger::backup::decoder_pair();
+        let seed_root = crate::custody::seed_directory(&self.root.join("seeds"), ledger);
+        let disk = self.wal.disk_budget();
+        let content_root = self.root.join("content");
+        let input = request.input.clone();
+        let manifest_for_rewrite = manifest.clone();
+        let work = tenant.clone();
+        let (rewritten, seeds_installed) = tokio::task::spawn_blocking(move || {
+            use focal_ledger::backup::{
+                BackupContent, BackupMedium as _, BackupSeeds, FileMedium, Incarnation,
+            };
+            let mut sink = focal_evidence::SeedStore::open(seed_root, disk)?;
+            let seeds_installed = focal_ledger::backup::import_seeds(
+                &FileMedium,
+                &input,
+                &manifest_for_rewrite,
+                &mut sink,
+            )?;
+            let checkpoint = FileMedium
+                .read(
+                    &input.join(focal_ledger::backup::CHECKPOINT_FILE),
+                    focal_ledger::backup::MAX_CHECKPOINT_BYTES,
+                )
+                .map_err(focal_ledger::backup::BackupError::Io)?;
+            // Recovery reads every live artifact's object: the node's own
+            // store holds them now, imported above.
+            let reader = focal_evidence::ContentReader::open(content_root)?;
+            let _ = BackupContent::new(&FileMedium, &input);
+            let rewritten = focal_ledger::backup::rewrite(
+                &checkpoint,
+                &BackupSeeds::new(&FileMedium, &input),
+                &reader,
+                Incarnation {
+                    cluster,
+                    group,
+                    node,
+                },
+                &limits,
+                &work,
+                &mut sink,
+            )?;
+            Ok::<_, AgentError>((rewritten, seeds_installed))
+        })
+        .await
+        .map_err(|_| AgentError::Runtime)??;
+        let consensus = DurableNode::restore_on_wal_in(
+            NodeConfig::single(node, cluster, group),
+            self.wal.clone(),
+            &tenant,
+            focal_consensus::RestoredLog {
+                index: rewritten.index,
+                term: rewritten.term,
+                data: rewritten.bytes,
+                floor: decoder.0,
+                transition: Some(decoder),
+            },
+        )?;
+        let copy = InstalledCopy {
+            group,
+            bootstrap_voters: vec![node],
+            route_epoch: RouteEpoch(1),
+            policy_revision: 1,
+            voters: BTreeSet::from([node]),
+            copies: BTreeSet::from([node]),
+            created: true,
+        };
+        let installs = self.installs.as_mut().ok_or(AgentError::Identity)?;
+        installs.record.installed.insert(ledger, copy.clone());
+        installs.save_on(&handles.control).await?;
+        self.attach_copy(handles, ledger, &copy, consensus, &tenant)
+            .await?;
+        Ok(crate::backup::RestoredSession {
+            ledger,
+            group,
+            node,
+            decision: request.decision,
+            manifest,
+            objects_imported,
+            seeds_installed,
+        })
+    }
+    /// Register one session this node hosts alone with the partition: the
+    /// founder's own, or one it created. `hosting` is this node's identity at
+    /// the session's ledger.
     #[allow(
         clippy::too_many_arguments,
         reason = "one bounded pass over borrowed observations; no state is retained"
     )]
-    async fn register_founder(
+    async fn register_hosted(
         &mut self,
         handles: &NetworkHandles,
-        access: &PartitionAccess,
-        pool: &PeerConnectionPool,
         ledger: &ReplicaHost,
+        hosting: NodeIdentity,
         root: &RootObservation,
         snapshot: &ControlSnapshot,
         installed: &ControlAuthoritySnapshot,
         now: i64,
     ) -> Result<Option<AgentStep>, AgentError> {
-        let _ = (access, pool);
         let facts: HostedSessionFacts = ledger.registration_facts().await?.value().clone();
         let ControlBootstrap::Partition { directory } = &snapshot.state else {
             return Err(AgentError::Identity);
         };
         // A registered session may since have moved past its creation fence;
         // its registration is complete and later placements are the plan's.
-        if directory.sessions.contains_key(&facts.ledger) || !facts.authoritative {
+        // A session other voters already share is never this node's alone
+        // to register.
+        if directory.sessions.contains_key(&facts.ledger)
+            || !facts.authoritative
+            || facts.ledger != hosting.ledger
+            || facts.membership.configuration.voters != [self.state.node]
+        {
             return Ok(None);
         }
-        let plan = FirstSessionPlan::capture_facts(
+        let plan = FirstSessionPlan::capture_hosted(
             &facts,
             &self.state.genesis,
+            &hosting,
             &self.settings,
             facts.memory_limit,
             &self.budget,
@@ -1174,7 +1882,12 @@ impl PlacementAgent {
         clippy::too_many_arguments,
         reason = "one bounded pass over borrowed observations; no state is retained"
     )]
-    async fn enroll_self(
+    /// Bring the partition's node records up to the installed authority:
+    /// this node's own grant, and — where this node leads the partition —
+    /// every other node's, so a grant the root re-issued (a drain, 24 §19)
+    /// reaches the partition whether or not its node is up. One enrollment
+    /// per tick.
+    async fn enroll_nodes(
         &mut self,
         handles: &NetworkHandles,
         access: &PartitionAccess,
@@ -1184,47 +1897,60 @@ impl PlacementAgent {
         installed: &ControlAuthoritySnapshot,
         now: i64,
     ) -> Result<Option<AgentStep>, AgentError> {
-        let _ = (access, pool);
+        let _ = pool;
         let node = self.state.node;
-        let Some(grant) = installed.authority.nodes.get(&node) else {
-            return Ok(None);
-        };
-        if !grant.enrollment.eligible || grant.expires_at <= now {
-            return Ok(None);
-        }
-        let expected_generation = match directory.nodes.get(&node) {
-            Some(existing) if existing.enrollment == grant.enrollment => return Ok(None),
-            Some(existing)
-                if existing.enrollment.generation < grant.enrollment.generation
-                    && grant.enrollment.generation
-                        == existing.enrollment.generation.saturating_add(1) =>
-            {
-                Some(existing.enrollment.generation)
+        let leads =
+            matches!(access, PartitionAccess::Local(host) if host.progress().leader == node);
+        let own = installed
+            .authority
+            .nodes
+            .get(&node)
+            .map(|grant| (node, grant));
+        let others = installed
+            .authority
+            .nodes
+            .iter()
+            .filter(|(id, _)| leads && **id != node)
+            .map(|(id, grant)| (*id, grant));
+        for (id, grant) in own.into_iter().chain(others) {
+            if grant.expires_at <= now {
+                continue;
             }
-            Some(_) => return Ok(None),
-            None if grant.enrollment.generation == 1 => None,
-            None => return Ok(None),
-        };
-        let command = ControlCommand::VerifiedPartition(VerifiedPartitionCommand {
-            command: PartitionCommand {
-                expected_revision: directory.revision,
-                delegation_epoch: directory.delegation.epoch,
-                operation: PartitionOperation::Enroll {
-                    node: grant.enrollment.clone(),
-                    expected_generation,
+            let expected_generation = match directory.nodes.get(&id) {
+                Some(existing) if existing.enrollment == grant.enrollment => continue,
+                Some(existing)
+                    if existing.enrollment.generation < grant.enrollment.generation
+                        && grant.enrollment.generation
+                            == existing.enrollment.generation.saturating_add(1) =>
+                {
+                    Some(existing.enrollment.generation)
+                }
+                Some(_) => continue,
+                None if grant.enrollment.generation == 1 => None,
+                None => continue,
+            };
+            let command = ControlCommand::VerifiedPartition(VerifiedPartitionCommand {
+                command: PartitionCommand {
+                    expected_revision: directory.revision,
+                    delegation_epoch: directory.delegation.epoch,
+                    operation: PartitionOperation::Enroll {
+                        node: grant.enrollment.clone(),
+                        expected_generation,
+                    },
                 },
-            },
-            evidence: control_evidence(
-                installed,
-                self.state.genesis.founder.cluster,
-                now,
-                &self.budget,
-            )?,
-        });
-        if snapshot.revisions.partition != directory.revision {
-            return Err(AgentError::Identity);
+                evidence: control_evidence(
+                    installed,
+                    self.state.genesis.founder.cluster,
+                    now,
+                    &self.budget,
+                )?,
+            });
+            if snapshot.revisions.partition != directory.revision {
+                return Err(AgentError::Identity);
+            }
+            return self.intend_partition(handles, command).await.map(Some);
         }
-        self.intend_partition(handles, command).await.map(Some)
+        Ok(None)
     }
     #[allow(
         clippy::too_many_arguments,
@@ -1396,9 +2122,13 @@ impl PlacementAgent {
             }
             let copy = InstalledCopy {
                 group: descriptor.log_group.0,
-                // Every session of this deployment was founded by the founder
+                // Every session of this deployment was founded by one node
                 // alone; the log replays the membership changes since.
-                bootstrap_voters: vec![self.state.genesis.founder.node],
+                bootstrap_voters: vec![
+                    descriptor
+                        .founder
+                        .unwrap_or(self.state.genesis.founder.node),
+                ],
                 route_epoch: plan.next_route,
                 policy_revision: plan.next_placement,
                 voters: plan.desired.placement.voters.keys().copied().collect(),
@@ -1409,6 +2139,7 @@ impl PlacementAgent {
                     .keys()
                     .copied()
                     .collect(),
+                created: false,
             };
             let installs = self.installs.as_mut().ok_or(AgentError::Identity)?;
             if installs.record.installed.len() >= MAX_INSTALLED {
@@ -1645,6 +2376,22 @@ impl PlacementAgent {
                 .map(|installs| installs.record.installed.keys().copied().collect())
                 .unwrap_or_default(),
             last_error: self.last_error.as_ref().map(|error| error.to_string()),
+            last_refusal: self.last_refusal.clone(),
+        }
+    }
+    /// Keep the last refused intent visible; a committed one clears it.
+    fn note_intent(
+        &mut self,
+        kind: &'static str,
+        outcome: &crate::placement_journal::IntentOutcome,
+    ) {
+        use crate::placement_journal::IntentOutcome;
+        match outcome {
+            IntentOutcome::Committed(_) => self.last_refusal = None,
+            IntentOutcome::Refused(failure) => {
+                self.last_refusal = Some(format!("{kind}: {failure}"));
+            }
+            IntentOutcome::Retry => {}
         }
     }
     pub fn node(&self) -> u64 {
@@ -1723,10 +2470,49 @@ impl crate::fleet::FleetManager {
 }
 
 #[path = "placement_controller.rs"]
-mod controller;
+pub(crate) mod controller;
 #[path = "partition_split.rs"]
 pub mod split;
 
 #[cfg(test)]
 #[path = "placement_agent_tests.rs"]
 pub(crate) mod tests;
+
+/// A bounded name for an intent's command, for diagnostics.
+fn intent_kind(command: &ControlCommand) -> &'static str {
+    match command {
+        ControlCommand::Root(_) => "root",
+        ControlCommand::Enrollment(_) => "enrollment",
+        ControlCommand::Partition(_) => "partition",
+        ControlCommand::ActivateAuthority(_) => "activate authority",
+        ControlCommand::Authority(command) => match &command.operation {
+            focal_directory::AuthorityOperation::AdvanceClock => "authority clock",
+            focal_directory::AuthorityOperation::GrantNode { .. } => "authority grant node",
+            focal_directory::AuthorityOperation::BootstrapGroup { .. } => {
+                "authority bootstrap group"
+            }
+            focal_directory::AuthorityOperation::ChangeGroup { .. } => "authority change group",
+        },
+        ControlCommand::VerifiedRoot(_) => "verified root",
+        ControlCommand::VerifiedPartition(command) => match &command.command.operation {
+            PartitionOperation::Enroll { .. } => "partition enroll",
+            PartitionOperation::ReportLoad { .. } => "partition load",
+            PartitionOperation::Liveness { .. } => "partition liveness",
+            PartitionOperation::Session { change, .. } => match change {
+                SessionChange::Plan { .. } => "session plan",
+                SessionChange::BeginPreparation { .. } => "session begin preparation",
+                SessionChange::Ready { .. } => "session ready",
+                SessionChange::Cutover { .. } => "session cutover",
+                SessionChange::Activate { .. } => "session activate",
+                SessionChange::Abort { .. } => "session abort",
+                SessionChange::Progress { .. } => "session progress",
+                SessionChange::Refuse { .. } => "session refuse",
+                SessionChange::Drain { .. } => "session drain",
+                SessionChange::Retire { .. } => "session retire",
+                SessionChange::Holders { .. } => "session holders",
+            },
+            _ => "partition change",
+        },
+        _ => "control",
+    }
+}

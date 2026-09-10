@@ -71,6 +71,16 @@ pub(super) enum SuffixEvidence {
     ConflictingCommittedPrefix,
     InstalledSnapshot,
     NewerTermBarrier,
+    /// A committed layout record precedes the candidates in the log; each
+    /// holds fragments of the layout it was prepared against, so none can
+    /// be published as prepared. A record of theirs that still commits is
+    /// replayed from its bytes, and an exact retry finds it.
+    LayoutChanged,
+    /// A committed retirement record precedes the candidates in the log;
+    /// each was prepared against rows that leave with the family, so none
+    /// can be published as prepared. A record of theirs that still commits
+    /// is replayed from its bytes, and an exact retry finds it.
+    Retired,
 }
 impl<S: NativeSchemaVerifier> NativeEngine<S> {
     pub(crate) fn poll(
@@ -261,9 +271,194 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 if self.activation_index == 0 {
                     self.activation_index = index;
                 }
+                // The origin member takes its genesis-derived identity so
+                // every replica names it alike (25 §4).
+                let origin = range::origin_member(&record.genesis)?;
+                match self.domain.as_mut() {
+                    Some(Domain::Passive(core)) => core.rename_native_member(0, origin)?,
+                    Some(Domain::Active(owner, _)) => owner.rename_native_member(0, origin)?,
+                    None => return Err(NativeSessionError::Failed),
+                }
+                // The movement map starts from the genesis layout: every
+                // member held by the voters at range epoch one (25 §6).
+                if self.movement.is_none() {
+                    let map = super::movement::map_from_layout(
+                        self.ledger,
+                        self.committed_core()?.native_layout().boundaries(),
+                        self.limits.ranges,
+                    )?;
+                    self.movement = Some(super::movement::Movement::new(
+                        record.genesis,
+                        map,
+                        self.limits.ranges,
+                        self.budget.clone(),
+                    )?);
+                }
                 Ok(())
             }
         }
+    }
+    /// Apply a committed layout record: inert when its epoch has passed,
+    /// otherwise the same split or merge on this replica's group. A refusal
+    /// here means this replica cannot hold the committed layout (its member
+    /// bound is lower than the authority's) and is fail-closed. On an
+    /// authority the record ends every pending candidate first.
+    fn apply_layout(&mut self, data: &[u8]) -> Result<(), NativeSessionError> {
+        let record = range::LayoutRecord::decode(data)?;
+        if record.ledger != self.ledger {
+            return Err(NativeSessionError::Corrupt);
+        }
+        if self.layout_change == Some(record) {
+            self.layout_change = None;
+        }
+        if self.committed_core()?.native_layout().epoch() != record.expected_epoch {
+            return Ok(());
+        }
+        // A layout change committed behind a transfer's begin is inert on
+        // every replica alike: the map and the layout never diverge (25 §6).
+        if self
+            .movement
+            .as_ref()
+            .is_some_and(|movement| movement.pending().is_some())
+        {
+            return Ok(());
+        }
+        if !self.pending.is_empty() {
+            self.resolve_suffix(SuffixEvidence::LayoutChanged)?;
+        }
+        let max = self.limits.recovery.native.max_ranges;
+        let applied = match self.domain.as_mut() {
+            Some(Domain::Passive(core)) => apply_layout_to(core, record.operation, max),
+            Some(Domain::Active(owner, _)) => match record.operation {
+                range::LayoutOperation::Split { at, id } => owner
+                    .split_native_range(at, id)
+                    .map_err(NativeSessionError::from),
+                range::LayoutOperation::Merge { left } => {
+                    let index = owner.native_layout().check_merge(left)?;
+                    owner
+                        .merge_native_range(index)
+                        .map_err(NativeSessionError::from)
+                }
+            },
+            None => return Err(NativeSessionError::Failed),
+        };
+        applied.map_err(|_| NativeSessionError::Corrupt)?;
+        if let Some(movement) = self.movement.as_mut() {
+            match record.operation {
+                range::LayoutOperation::Split { at, id } => movement.split(at, id)?,
+                range::LayoutOperation::Merge { left } => movement.merge(left)?,
+            }
+        }
+        Ok(())
+    }
+    /// Apply a committed retirement record (26 §4): inert when the prefix
+    /// it named has passed, a movement is pending, or the committed state
+    /// refuses the family; otherwise the same family leaves this replica
+    /// alike behind its continuation, and the record counts. On an
+    /// authority the record ends every pending candidate first; the owner
+    /// is reconstructed at the next readiness barrier, as after any record
+    /// it did not author.
+    fn apply_retirement(&mut self, data: &[u8]) -> Result<(), NativeSessionError> {
+        let record = retirement::RetirementRecord::decode(data)?;
+        if record.ledger != self.ledger {
+            return Err(NativeSessionError::Corrupt);
+        }
+        if self.retirement == Some(record) {
+            self.retirement = None;
+        }
+        if self.sequence()? != record.expected_prefix {
+            return Ok(());
+        }
+        if self
+            .movement
+            .as_ref()
+            .is_some_and(|movement| movement.pending().is_some())
+        {
+            return Ok(());
+        }
+        if !self.pending.is_empty() {
+            self.resolve_suffix(SuffixEvidence::Retired)?;
+        } else if matches!(self.domain, Some(Domain::Active(..))) {
+            self.passive_for_replay()?;
+        }
+        // An authority applied this through its committed core: it asks for
+        // a fresh readiness barrier and reconstructs its owner there.
+        self.readiness_requested = None;
+        self.reconstruction_needed = true;
+        let Some(Domain::Passive(core)) = self.domain.as_mut() else {
+            return Err(NativeSessionError::Failed);
+        };
+        let Ok(family) = core.retirement_family(record.root) else {
+            return Ok(());
+        };
+        if record.through < family.through {
+            return Ok(());
+        }
+        match core.retire_native_family(&family, record.bundle, record.bytes, record.through) {
+            Ok(_) => {}
+            Err(error @ (NativeError::Memory(_) | NativeError::Capacity(_))) => {
+                return Err(error.into());
+            }
+            Err(_) => return Err(NativeSessionError::Corrupt),
+        }
+        self.retired_families = self.retired_families.saturating_add(1);
+        Ok(())
+    }
+    /// Apply a committed movement record (25 §6): the coordinator's step at
+    /// the current native prefix under a proof minted from the entry; inert
+    /// when the committed state refuses it, the same on every replica.
+    fn apply_movement(
+        &mut self,
+        data: &[u8],
+        index: u64,
+        term: u64,
+    ) -> Result<(), NativeSessionError> {
+        let record = movement::MovementRecord::decode(data)?;
+        if record.ledger != self.ledger {
+            return Err(NativeSessionError::Corrupt);
+        }
+        let sequence = self.sequence()?;
+        let movement = self.movement.as_mut().ok_or(NativeSessionError::Corrupt)?;
+        if movement.apply(&record, sequence, index, term)? {
+            self.adopt_map_identities()?;
+        }
+        Ok(())
+    }
+    /// Name the layout's members as the map names them (25 §6): a
+    /// transfer's replacement carries a fresh identity once it is
+    /// activated, and the core's layout follows in the same apply, so
+    /// records, checkpoints, layout changes and the directory all name one
+    /// member alike. Members are in key order on both sides; a differing
+    /// count is a divergence no replica may serve from.
+    fn adopt_map_identities(&mut self) -> Result<(), NativeSessionError> {
+        let Some(movement) = self.movement.as_ref() else {
+            return Ok(());
+        };
+        let ranges = movement.coordinator.map().ranges();
+        let count = ranges.len();
+        for position in 0..count {
+            let wanted = ranges.get(position).map(|range| range.id);
+            let current = match self.domain.as_ref() {
+                Some(Domain::Passive(core)) => core.native_layout(),
+                Some(Domain::Active(owner, _)) => owner.native_layout(),
+                None => return Err(NativeSessionError::Failed),
+            };
+            if current.len() != count {
+                return Err(NativeSessionError::Corrupt);
+            }
+            let (Some(wanted), Some(held)) = (wanted, current.ids().nth(position)) else {
+                return Err(NativeSessionError::Corrupt);
+            };
+            if wanted == held {
+                continue;
+            }
+            match self.domain.as_mut() {
+                Some(Domain::Passive(core)) => core.rename_native_member(position, wanted)?,
+                Some(Domain::Active(owner, _)) => owner.rename_native_member(position, wanted)?,
+                None => return Err(NativeSessionError::Failed),
+            }
+        }
+        Ok(())
     }
     fn propose_genesis(&mut self, consensus: &mut DurableNode) -> Result<(), NativeSessionError> {
         let record = genesis::Genesis::derive(
@@ -292,13 +487,22 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             self.readiness_requested = None;
             self.reconstruction_needed = true;
             self.genesis_proposed = false;
+            self.layout_change = None;
+            self.retirement = None;
+            if let Some(movement) = self.movement.as_mut() {
+                movement.in_flight = None;
+            }
             self.observed_term = status.term;
             self.observed_leader = leader;
         }
     }
     /// Entries this engine applies: the committed genesis and native records.
     pub(crate) fn is_native_entry(data: &[u8]) -> bool {
-        data.starts_with(&genesis::MAGIC) || data.starts_with(&record::MAGIC)
+        data.starts_with(&genesis::MAGIC)
+            || data.starts_with(&record::MAGIC)
+            || data.starts_with(&range::MAGIC)
+            || data.starts_with(&movement::MAGIC)
+            || data.starts_with(&retirement::MAGIC)
     }
     /// Caller-issued read barriers carry this correlation namespace.
     pub(crate) fn is_correlated_read(context: &[u8]) -> bool {
@@ -344,6 +548,30 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         }
         if entry.data.starts_with(&genesis::MAGIC) {
             self.apply_genesis(&entry.data, entry.index, consensus)?;
+            self.applied_raft = entry.index;
+            return Ok(());
+        }
+        if entry.data.starts_with(&range::MAGIC) {
+            if self.genesis.is_none() {
+                return Err(NativeSessionError::Corrupt);
+            }
+            self.apply_layout(&entry.data)?;
+            self.applied_raft = entry.index;
+            return Ok(());
+        }
+        if entry.data.starts_with(&movement::MAGIC) {
+            if self.genesis.is_none() {
+                return Err(NativeSessionError::Corrupt);
+            }
+            self.apply_movement(&entry.data, entry.index, entry.term)?;
+            self.applied_raft = entry.index;
+            return Ok(());
+        }
+        if entry.data.starts_with(&retirement::MAGIC) {
+            if self.genesis.is_none() {
+                return Err(NativeSessionError::Corrupt);
+            }
+            self.apply_retirement(&entry.data)?;
             self.applied_raft = entry.index;
             return Ok(());
         }
@@ -402,6 +630,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             } else {
                 header.range
             };
+            let started = std::time::Instant::now();
             let prepared = record::replay::prepare(
                 core,
                 &record,
@@ -410,10 +639,15 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 &self.reader,
                 &self.schemas,
             )?;
-            match core.publish_native(prepared) {
+            let outcome = match core.publish_native(prepared) {
                 Ok(outcome) => outcome,
                 Err(refused) => return Err(refused.error.into()),
-            }
+            };
+            let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            self.materializer.serial_records = self.materializer.serial_records.saturating_add(1);
+            self.materializer.serial_micros =
+                self.materializer.serial_micros.saturating_add(elapsed);
+            outcome
         };
         if output.committed.len() == output.committed.capacity() {
             return Err(NativeSessionError::Capacity);
@@ -428,6 +662,163 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         self.recording_range = Some(header.range);
         self.recording_term = entry.term;
         Ok(())
+    }
+    /// How many consecutive native records from the delivery's current entry
+    /// a batch may take: none while this session has unresolved candidates
+    /// (the head may be its own), none when one worker replays serially, and
+    /// never across a membership entry.
+    fn record_run(&self, delivery: &Delivery, first_index: u64) -> usize {
+        if self.limits.materializer.max_workers <= 1 || !self.pending.is_empty() {
+            return 0;
+        }
+        let next_membership = delivery
+            .events
+            .membership
+            .get(delivery.membership)
+            .map(|membership| membership.index);
+        let mut expected = first_index;
+        delivery
+            .events
+            .committed
+            .iter()
+            .skip(delivery.entry)
+            .take(self.limits.materializer.max_batch)
+            .take_while(|entry| {
+                let native = entry.data.starts_with(&record::MAGIC)
+                    && entry.index == expected
+                    && next_membership.is_none_or(|index| entry.index < index);
+                expected = expected.saturating_add(1);
+                native
+            })
+            .count()
+    }
+    /// Materialize a run of committed records this session did not author.
+    /// Returns how many were applied (a prefix, in order) and the failure that
+    /// stopped the run, if any; the delivery resumes at the failed entry.
+    fn apply_run(
+        &mut self,
+        entries: &[focal_consensus::CommittedEntry],
+        applied_index: u64,
+        output: &mut NativeOutput,
+    ) -> (usize, Option<NativeSessionError>) {
+        match self.materialize_run(entries, applied_index, output) {
+            Ok((applied, failure)) => (applied, failure),
+            Err(error) => (0, Some(error)),
+        }
+    }
+    #[allow(
+        clippy::type_complexity,
+        reason = "the applied prefix length and the refusal that ended the run"
+    )]
+    fn materialize_run(
+        &mut self,
+        entries: &[focal_consensus::CommittedEntry],
+        applied_index: u64,
+        output: &mut NativeOutput,
+    ) -> Result<(usize, Option<NativeSessionError>), NativeSessionError> {
+        if self.genesis.is_none() || !self.pending.is_empty() {
+            return Err(NativeSessionError::Corrupt);
+        }
+        // The same header rules `apply_entry` applies to one record, walked
+        // ahead over the run so every record's producer range is known.
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(entries.len())
+            .map_err(|_| NativeSessionError::Capacity)?;
+        let mut sequence = self.sequence()?;
+        let mut recording_range = self.recording_range;
+        let mut recording_term = self.recording_term;
+        let mut expected_index = self.applied_raft;
+        for entry in entries {
+            expected_index = expected_index.saturating_add(1);
+            if entry.index <= self.applied_raft
+                || entry.index > applied_index
+                || entry.index != expected_index
+                || !entry.data.starts_with(&record::MAGIC)
+            {
+                return Err(NativeSessionError::Corrupt);
+            }
+            let record = record::StructuralRecord::inspect(&entry.data, self.limits.inspection)?;
+            let header = record.header();
+            if header.ledger != self.ledger
+                || header.profile != self.profile
+                || header.range.0 == 0
+                || header.base != sequence
+                || entry.term == 0
+                || entry.term < recording_term
+                || (entry.term == recording_term && recording_range != Some(header.range))
+                || (recording_range.is_none() && header.base != self.records_floor)
+            {
+                return Err(NativeSessionError::Corrupt);
+            }
+            let expected_range = if entry.term == recording_term {
+                recording_range.ok_or(NativeSessionError::Corrupt)?
+            } else {
+                header.range
+            };
+            records.push((record, expected_range));
+            sequence = header.outcome.sequence;
+            recording_range = Some(header.range);
+            recording_term = entry.term;
+        }
+        if matches!(self.domain, Some(Domain::Active(..))) {
+            self.passive_for_replay()?;
+        }
+        let Some(Domain::Passive(core)) = self.domain.as_mut() else {
+            return Err(NativeSessionError::Failed);
+        };
+        let started = std::time::Instant::now();
+        let batch = record::materialize::materialize_batch(
+            core,
+            &records,
+            self.limits.recovery,
+            &self.reader,
+            &self.schemas,
+            self.limits.materializer,
+        );
+        let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let stats = &mut self.materializer;
+        stats.micros = stats.micros.saturating_add(elapsed);
+        stats.batches = stats.batches.saturating_add(1);
+        stats.records = stats
+            .records
+            .saturating_add(u64::try_from(batch.report.applied).unwrap_or(u64::MAX));
+        stats.waves = stats
+            .waves
+            .saturating_add(u64::try_from(batch.report.waves).unwrap_or(u64::MAX));
+        stats.violations = stats
+            .violations
+            .saturating_add(u64::try_from(batch.report.violations).unwrap_or(u64::MAX));
+        if batch.report.max_parallel > 1 {
+            stats.parallel_batches = stats.parallel_batches.saturating_add(1);
+        }
+        if batch.report.serial_fallback {
+            stats.serial_fallbacks = stats.serial_fallbacks.saturating_add(1);
+        }
+        let mut applied = 0usize;
+        for (outcome, entry) in batch.outcomes.into_iter().zip(entries) {
+            let record = record::StructuralRecord::inspect(&entry.data, self.limits.inspection)?;
+            let header = record.header();
+            if output.committed.len() == output.committed.capacity() {
+                return Err(NativeSessionError::Capacity);
+            }
+            output.committed.push(NativeCommit {
+                raft_index: entry.index,
+                raft_term: entry.term,
+                record_hash: header.hash,
+                outcome,
+            });
+            self.applied_raft = entry.index;
+            self.recording_range = Some(header.range);
+            self.recording_term = entry.term;
+            applied = applied.saturating_add(1);
+        }
+        Ok((
+            applied,
+            batch
+                .failure
+                .map(|(_, error)| NativeSessionError::from(error)),
+        ))
     }
     /// Every entry of the delivery has been applied; the Raft prefix includes
     /// entries this engine never sees (no-ops, ancillary metadata).
@@ -550,7 +941,23 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 self.apply_membership(membership, applied_index)?;
                 delivery.membership = add(delivery.membership, 1)?;
             }
+            // Consecutive records this session did not author, up to the next
+            // membership entry, are materialized as one batch (doc 25 §2).
+            let run = self.record_run(delivery, entry.index);
             let output = delivery.output.as_mut().ok_or(NativeSessionError::Failed)?;
+            if run >= 2 {
+                let entries = delivery
+                    .events
+                    .committed
+                    .get(delivery.entry..add(delivery.entry, run)?)
+                    .ok_or(NativeSessionError::Corrupt)?;
+                let (applied, failure) = self.apply_run(entries, applied_index, output);
+                delivery.entry = add(delivery.entry, applied)?;
+                if let Some(error) = failure {
+                    return Err(error);
+                }
+                continue;
+            }
             self.apply_entry(entry, applied_index, consensus, output)?;
             delivery.entry = add(delivery.entry, 1)?;
         }
@@ -619,5 +1026,23 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             suffix.copy_from_slice(&correlation.0);
         }
         self.request_read(consensus, &context)
+    }
+}
+
+/// The same split or merge on a passive core.
+fn apply_layout_to(
+    core: &mut Core<NativeState>,
+    operation: range::LayoutOperation,
+    max: usize,
+) -> Result<(), NativeSessionError> {
+    match operation {
+        range::LayoutOperation::Split { at, id } => {
+            core.native_layout().check_split(at, id, max)?;
+            Ok(core.split_native_range(at, id)?)
+        }
+        range::LayoutOperation::Merge { left } => {
+            let index = core.native_layout().check_merge(left)?;
+            Ok(core.merge_native_range(index)?)
+        }
     }
 }

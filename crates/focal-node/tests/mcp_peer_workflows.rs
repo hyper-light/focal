@@ -17,7 +17,6 @@
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader, Write},
-    net::UdpSocket,
     os::unix::fs::PermissionsExt,
     path::Path,
     process::{Child, ChildStdin, Command, Output, Stdio},
@@ -35,14 +34,10 @@ impl Drop for Server {
 fn private(path: &Path) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
+#[path = "support/ports.rs"]
+mod ports;
 fn address() -> String {
-    for port in 26_000..30_000u16 {
-        let candidate = format!("127.0.0.1:{port}");
-        if UdpSocket::bind(&candidate).is_ok() && std::net::TcpListener::bind(&candidate).is_ok() {
-            return candidate;
-        }
-    }
-    panic!("no free port")
+    ports::address()
 }
 fn start(root: &Path, advertise: &str) -> Server {
     let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))

@@ -12,7 +12,6 @@ use focal_model::{
     ContentHash, LedgerId, RaftIndex, RaftTerm, RouteEpoch, SessionId, SessionSeq, TenantId,
 };
 use focal_ranges::*;
-use std::collections::BTreeSet;
 
 fn ledger() -> LedgerId {
     LedgerId {
@@ -26,23 +25,22 @@ fn budget() -> MemoryBudget {
 fn key(value: u8) -> StorageKey {
     StorageKey::bucket([value; 16], 0, 0)
 }
-fn descriptor(id: u128, start: StorageKey, end: Option<StorageKey>) -> RangeDescriptor {
+fn descriptor(id: u128, start: Option<StorageKey>, end: Option<StorageKey>) -> RangeDescriptor {
     RangeDescriptor {
         id: RangeId::from_u128(id),
         generation: 1,
         span: KeySpan { start, end },
-        owner: ReplicaId {
+        meta: Placement::replica(ReplicaId {
             node: 1,
             generation: 1,
-        },
-        readers: BTreeSet::new(),
+        }),
     }
 }
 fn map() -> RangeMap {
     RangeMap::new(
         ledger(),
         RouteEpoch(1),
-        vec![descriptor(1, StorageKey::MIN, None)],
+        vec![descriptor(1, None, None)],
         RangeLimits::default(),
     )
     .unwrap()
@@ -53,7 +51,7 @@ fn intent() -> RangeIntent {
         operation: TransferId::from_u128(1),
         old_epoch: RouteEpoch(1),
         sources: [RangeId::from_u128(1)].into_iter().collect(),
-        replacements: vec![descriptor(2, StorageKey::MIN, None)],
+        replacements: vec![descriptor(2, None, None)],
         seed: SessionSeq(0),
     }
 }
@@ -96,8 +94,13 @@ impl RangeVerifier for Verified {
     }
 }
 fn commit(sequence: u64, term: u64, command: ContentHash) -> CommitProof {
+    commit_at(sequence, sequence, term, command)
+}
+/// A control commit at `ordinal` applied at native prefix `sequence`.
+fn commit_at(ordinal: u64, sequence: u64, term: u64, command: ContentHash) -> CommitProof {
     CommitProof {
         ledger: ledger(),
+        ordinal,
         sequence: SessionSeq(sequence),
         index: RaftIndex(sequence),
         term: RaftTerm(term),
@@ -129,8 +132,8 @@ fn map_boundaries_split_generations_and_epoch_exhaustion_are_checked() {
         .replace(
             &[RangeId::from_u128(1)].into_iter().collect(),
             vec![
-                descriptor(2, StorageKey::MIN, Some(key(8))),
-                descriptor(3, key(8), None),
+                descriptor(2, None, Some(key(8))),
+                descriptor(3, Some(key(8)), None),
             ],
             limits,
         )
@@ -142,8 +145,8 @@ fn map_boundaries_split_generations_and_epoch_exhaustion_are_checked() {
             ledger(),
             RouteEpoch(1),
             vec![
-                descriptor(2, StorageKey::MIN, Some(key(8))),
-                descriptor(3, key(9), None)
+                descriptor(2, None, Some(key(8))),
+                descriptor(3, Some(key(9)), None)
             ],
             limits
         ),
@@ -154,8 +157,8 @@ fn map_boundaries_split_generations_and_epoch_exhaustion_are_checked() {
             ledger(),
             RouteEpoch(1),
             vec![
-                descriptor(2, StorageKey::MIN, Some(key(9))),
-                descriptor(3, key(8), None)
+                descriptor(2, None, Some(key(9))),
+                descriptor(3, Some(key(8)), None)
             ],
             limits
         ),
@@ -163,7 +166,7 @@ fn map_boundaries_split_generations_and_epoch_exhaustion_are_checked() {
     );
     let sources = [RangeId::from_u128(1)].into_iter().collect();
     assert_eq!(
-        map().replace(&sources, vec![descriptor(1, StorageKey::MIN, None)], limits),
+        map().replace(&sources, vec![descriptor(1, None, None)], limits),
         Err(RangeError::Generation)
     );
     let exhausted = RangeMap::new(
@@ -174,7 +177,7 @@ fn map_boundaries_split_generations_and_epoch_exhaustion_are_checked() {
     )
     .unwrap();
     assert_eq!(
-        exhausted.replace(&sources, vec![descriptor(2, StorageKey::MIN, None)], limits),
+        exhausted.replace(&sources, vec![descriptor(2, None, None)], limits),
         Err(RangeError::Overflow)
     );
 }
@@ -199,7 +202,7 @@ fn prepared_metadata_is_owned_fenced_and_releases_budget_on_rejection() {
     .unwrap();
     let initial = memory.stats().used;
     let prepared = owner
-        .prepare(SessionSeq(1), RangeOperation::Begin(intent()), &Verified)
+        .prepare(1, SessionSeq(1), RangeOperation::Begin(intent()), &Verified)
         .unwrap();
     assert!(memory.stats().used > initial);
     let proof = commit(1, 1, prepared.hash());
@@ -210,7 +213,7 @@ fn prepared_metadata_is_owned_fenced_and_releases_budget_on_rejection() {
     assert_eq!(memory.stats().used, initial);
     assert!(owner.pending().is_none());
     let prepared = owner
-        .prepare(SessionSeq(1), RangeOperation::Begin(intent()), &Verified)
+        .prepare(1, SessionSeq(1), RangeOperation::Begin(intent()), &Verified)
         .unwrap();
     let remaining = memory.stats().limit - memory.stats().used;
     let pressure = memory
@@ -221,7 +224,7 @@ fn prepared_metadata_is_owned_fenced_and_releases_budget_on_rejection() {
     drop(pressure);
     let published = memory.stats().used;
     let retry = owner
-        .prepare(SessionSeq(1), RangeOperation::Begin(intent()), &Verified)
+        .prepare(1, SessionSeq(1), RangeOperation::Begin(intent()), &Verified)
         .unwrap();
     owner.publish(retry, &proof, &Verified).unwrap();
     assert_eq!(memory.stats().used, published);
@@ -241,14 +244,19 @@ fn checkpoint_publication_floor_survives_new_term_and_prepared_state() {
     )
     .unwrap();
     let prepared = owner
-        .prepare(SessionSeq(11), RangeOperation::Begin(intent()), &Verified)
+        .prepare(
+            1,
+            SessionSeq(11),
+            RangeOperation::Begin(intent()),
+            &Verified,
+        )
         .unwrap();
     owner
         .observe_committed(&commit(10, 1, ContentHash([1; 32])), &Verified)
         .unwrap();
     owner.observe_progress(progress(10, 1), &Verified).unwrap();
     assert_eq!(owner.published(), Some(SessionSeq(10)));
-    let proof = commit(11, 1, prepared.hash());
+    let proof = commit_at(1, 11, 1, prepared.hash());
     owner.publish(prepared, &proof, &Verified).unwrap();
     assert_eq!(owner.checkpoint().published, SessionSeq(10));
     owner
@@ -296,7 +304,7 @@ fn staged_block_retries_checksums_and_failed_reservations_preserve_state() {
         operation: TransferId::from_u128(1),
         source_epoch: RouteEpoch(1),
         target_epoch: RouteEpoch(2),
-        destination: descriptor(2, StorageKey::MIN, None),
+        destination: descriptor(2, None, None),
         prefix: SessionSeq(0),
         blocks: vec![BlockDescriptor {
             index: 0,

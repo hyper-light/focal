@@ -300,7 +300,8 @@ mod tests {
     #[test]
     fn native_catalogue_with_administration_leaves_room_for_a_real_first_job() {
         const MIB: usize = 1024 * 1024;
-        let budget = MemoryBudget::new(128 * MIB, 80 * MIB).unwrap();
+        // The production stdio server's envelope (160 MiB, 80 MiB reserved).
+        let budget = MemoryBudget::new(160 * MIB, 80 * MIB).unwrap();
         let standing = standing(NativeProfile::AuthoredV1);
         let count = tool_count(&standing).unwrap() + crate::catalog_admin::TOOL_COUNT;
         let construction = budget

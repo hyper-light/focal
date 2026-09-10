@@ -20,6 +20,28 @@ const COMMIT_POLLS: usize = 8;
 pub(crate) const fn artifact_bearing(command: u8) -> bool {
     matches!(command, 4 | 6 | 7 | 13 | 15 | 19)
 }
+/// Command tags that begin a validation phase against an artifact
+/// (`BeginIncrement`, `BeginWork`): their target's custody obligation is
+/// read before the owner admits them (doc 04 §7, R8).
+pub(crate) const fn evaluates_artifact(command: u8) -> bool {
+    matches!(command, 14 | 18)
+}
+/// The artifact a phase-beginning frame evaluates, decoded under the
+/// session's own limits; other frames yield `None`.
+pub(crate) fn evaluation_artifact_of_frame(
+    limits: &focal_ledger::NativeSessionLimits,
+    frame: &[u8],
+) -> Result<Option<ArtifactId>, AccessError> {
+    let decode = limits
+        .decode_limits()
+        .map_err(|_| AccessError::Unavailable)?;
+    decode
+        .with_request(limits.recovery.native, frame, |decoded, _| {
+            decoded.into_evaluation_artifact()
+        })
+        .map_err(|_| AccessError::InvalidRequest)?
+        .map_err(|_| AccessError::InvalidRequest)
+}
 /// Completion-class commands ride the completion lane like their legacy
 /// counterparts; creation, posting and monitors stay ordinary.
 pub(crate) fn lane(frame: &[u8]) -> BudgetLane {

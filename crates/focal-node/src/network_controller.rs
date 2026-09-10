@@ -21,7 +21,7 @@ use focal_enrollment::{
     JoinTransportError, PrivateJournal, RenewRequest, TransportLimits,
 };
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
-use focal_model::{ParticipantId, RequestEpoch, RequestId, RouteEpoch};
+use focal_model::{ParticipantId, RequestEpoch, RequestId, RouteEpoch, TenantId};
 use focal_wire::*;
 use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
@@ -667,10 +667,33 @@ pub struct NetworkController {
     /// The committed registry holds a newer receipt of this node than the one
     /// it presents: a renewal committed that this node has not installed.
     registry_ahead: bool,
+    /// The local socket's grant and the tenants it was bound with: every
+    /// tenant the committed registry admits joins them on each refresh.
+    local_grant: Option<(tokio::sync::watch::Sender<PeerGrant>, BTreeSet<TenantId>)>,
     budget: MemoryBudget,
     _allocation: Allocation,
 }
 impl NetworkController {
+    /// Keep a local socket's grant in step with the registry's admitted
+    /// tenants ([24](../../../docs/archictecutre/24-placement-execution-and-fleet-control.md) §16).
+    pub fn follow_local_grant(&mut self, grant: tokio::sync::watch::Sender<PeerGrant>) {
+        let base = grant.borrow().tenants.clone();
+        self.local_grant = Some((grant, base));
+    }
+    fn publish_local_grant(&self, enrollment: &EnrollmentRegistry) {
+        let Some((grant, base)) = &self.local_grant else {
+            return;
+        };
+        let mut tenants = base.clone();
+        tenants.extend(enrollment.tenants().map(TenantId));
+        grant.send_if_modified(|current| {
+            if current.tenants == tenants {
+                return false;
+            }
+            current.tenants = tenants.clone();
+            true
+        });
+    }
     pub fn new(
         state: NetworkState,
         receipt: EnrollmentReceipt,
@@ -706,6 +729,7 @@ impl NetworkController {
             last_renewal_attempt: 0,
             last_renewal_error: None,
             registry_ahead: false,
+            local_grant: None,
             budget,
             _allocation: allocation,
         })
@@ -964,6 +988,7 @@ impl NetworkController {
         if enrollment.ca_certificate() != self.state.sponsor.ca_certificate {
             return Err(ControllerError::Identity);
         }
+        self.publish_local_grant(&enrollment);
         let grants = active_grants(&enrollment, &self.state, now)?;
         self.registry_ahead = enrollment
             .enrollments()

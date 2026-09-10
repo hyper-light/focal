@@ -354,8 +354,9 @@ fn assert_fence_then_seal(
     );
     let events: Vec<_> = (0..outcome.events)
         .map(|ordinal| {
-            let Some(Row::Event(event)) =
-                candidate.range.get(&Key::Event(outcome.sequence, ordinal))
+            let Some(Row::Event(event)) = candidate
+                .fragments
+                .get(&Key::Event(outcome.sequence, ordinal))
             else {
                 panic!("retained event");
             };

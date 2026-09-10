@@ -323,6 +323,7 @@ pub(super) fn validate(
     let (mut incoming, mut monitors, mut retired, mut total_events, mut last_time) =
         (0usize, 0usize, 0usize, 0usize, 0u64);
     let (mut works, mut diagnostics) = (0usize, 0usize);
+    let (mut archived_events, mut retired_events) = (0usize, 0usize);
     read.charge(sum(root.len(), 1)?)?;
     for entry in root.entries() {
         let key = entry.key;
@@ -346,13 +347,21 @@ pub(super) fn validate(
                 let count = usize::try_from(value.events).map_err(|_| ContractError::Capacity)?;
                 total_events = sum(total_events, count)?;
                 read.charge(sum(count, 1)?)?;
+                // An event whose object retired to the archive left with it
+                // (26 §4); the retired continuations account for every one.
                 for ordinal in 0..value.events {
-                    let event = read.event(value.sequence, ordinal)?;
-                    if event.invocation != value.invocation
-                        || event.sequence != value.sequence
-                        || event.ordinal != ordinal
-                    {
-                        return Err(invalid());
+                    match read.get(Key::Event(value.sequence, ordinal))? {
+                        Some(Row::Event(row)) => {
+                            let event = row.get().ok_or_else(invalid)?.expand(ledger);
+                            if event.invocation != value.invocation
+                                || event.sequence != value.sequence
+                                || event.ordinal != ordinal
+                            {
+                                return Err(invalid());
+                            }
+                        }
+                        Some(_) => return Err(invalid()),
+                        None => archived_events = sum(archived_events, 1)?,
                     }
                 }
                 if profile == NativeContentProfile::AuthoredV1
@@ -390,6 +399,20 @@ pub(super) fn validate(
             (Key::RetiredCycleHead(target), Row::RetiredCycleHead(head)) => {
                 read_rows::check_fixed(key, row, ledger)?;
                 retired = sum(retired, links::retired(target, *head, &read)?)?;
+            }
+            // A retired claim's continuation (26 §4): its rows are gone and
+            // the archive holds them; nothing here is a live claim.
+            (Key::Retired(claim), Row::Retired(value)) => {
+                read_rows::check_fixed(key, row, ledger)?;
+                read.charge(2)?;
+                if value.retired_at > read.prefix
+                    || read.root.get(&Key::Claim(claim)).is_some()
+                    || read.root.get(&Key::ClaimContent(claim)).is_some()
+                {
+                    return Err(invalid());
+                }
+                let count = usize::try_from(value.events).map_err(|_| ContractError::Capacity)?;
+                retired_events = sum(retired_events, count)?;
             }
             (Key::Cycle(key), Row::Cycle(value)) => {
                 read_rows::check_fixed(Key::Cycle(key), row, ledger)?;
@@ -472,7 +495,8 @@ pub(super) fn validate(
                 | Key::ByEvaluator(..)
                 | Key::ByVerdict(..)
                 | Key::ByCreated(..)
-                | Key::DueTimer(..),
+                | Key::DueTimer(..)
+                | Key::ByObject(..),
                 Row::Index,
             ) => super::read_validate_index::check_row(key, row, &read)?,
             _ => return Err(invalid()),
@@ -490,7 +514,8 @@ pub(super) fn validate(
         || counts.registrations != counts.meta.evaluations
         || counts.declared_definitions != counts.meta.definitions
         || counts.receipt_epochs != counts.meta.receipts
-        || total_events != counts.meta.events
+        || total_events != sum(counts.meta.events, retired_events)?
+        || archived_events != retired_events
         || last_time != expected.logical_time
     {
         return Err(invalid());

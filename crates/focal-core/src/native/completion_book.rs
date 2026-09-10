@@ -694,7 +694,7 @@ impl CompletionBook {
         ordinal: u32,
     ) -> Result<NativeEvent, NativeError> {
         match prepared
-            .range
+            .fragments
             .get(&Key::Event(prepared.outcome.sequence, ordinal))
         {
             Some(Row::Event(event)) => event
@@ -770,7 +770,7 @@ impl CompletionBook {
                 _ => continue,
             };
             let id = ClaimId(after.object.0);
-            let Some(Row::Claim(owned)) = prepared.range.get(&Key::Claim(id)) else {
+            let Some(Row::Claim(owned)) = prepared.fragments.get(&Key::Claim(id)) else {
                 return Err(ContractError::InvalidTarget.into());
             };
             let parent = prepared.claim(id).ok_or(ContractError::InvalidTarget)?;

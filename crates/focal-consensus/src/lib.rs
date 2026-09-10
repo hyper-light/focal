@@ -26,7 +26,7 @@ mod persistence;
 mod storage;
 
 use focal_log::{LogError, LogicalLogId, Record, RecordKind, WalIdentity, WalLease, WalOptions};
-use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
+use focal_memory::{Allocation, BudgetKind, BudgetLane, DiskBudget, MemoryBudget};
 use raft::{Config, RawNode, Storage};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -44,6 +44,18 @@ pub use raft::eraftpb::{
 };
 pub use raft::protocompat::{PbMessage, PbMessageExt};
 pub use raft::{SnapshotStatus, StateRole};
+
+/// The image a restored logical log begins with (26 §6): the application
+/// snapshot at one index and term, and the decoder floor (with its
+/// transition, when the log had one) the application requires.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestoredLog {
+    pub index: u64,
+    pub term: u64,
+    pub data: Vec<u8>,
+    pub floor: [u8; 32],
+    pub transition: Option<([u8; 32], [u8; 32])>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NodeConfig {
@@ -258,6 +270,123 @@ impl DurableNode {
             parent.clone(),
         )?;
         Self::open_on_wal_in(config, wal, parent)
+    }
+
+    /// `restore_on_wal_in` over a fresh physical WAL at `data_dir`.
+    pub fn restore_in(
+        config: NodeConfig,
+        data_dir: impl AsRef<Path>,
+        parent: &MemoryBudget,
+        image: RestoredLog,
+    ) -> Result<Self, ConsensusError> {
+        let options = WalOptions::new(WalIdentity {
+            cluster: config.cluster_id,
+            node: config.node_id,
+            stream: 0,
+        });
+        let wal = SharedWal::open_with_budget(
+            data_dir,
+            options,
+            focal_log::WalWriterLimits::default(),
+            parent.clone(),
+        )?;
+        Self::restore_on_wal_in(config, wal, parent, image)
+    }
+    /// Begin a logical group's log from a restored image (26 §6): on an
+    /// empty logical log, write the group identity, the decoder floor and
+    /// transition the image's log promised, the snapshot at the image's
+    /// index and term under the bootstrap membership, and a hard state that
+    /// commits it; then open the group exactly as a restart would, so the
+    /// snapshot is delivered to the application as a recovered one. A log
+    /// that already holds any record is refused: a restore never overwrites
+    /// history.
+    pub fn restore_on_wal_in(
+        config: NodeConfig,
+        shared: SharedWal,
+        parent_budget: &MemoryBudget,
+        image: RestoredLog,
+    ) -> Result<Self, ConsensusError> {
+        config.validate()?;
+        if image.index == 0
+            || image.term == 0
+            || image.data.is_empty()
+            || image.data.len() > 8 * 1024 * 1024
+            || image
+                .transition
+                .is_some_and(|(predecessor, successor)| predecessor == successor)
+            || image
+                .transition
+                .is_some_and(|(predecessor, _)| predecessor != image.floor)
+        {
+            return Err(ConsensusError::Configuration("invalid restore image"));
+        }
+        let identity = shared.identity()?;
+        if identity.cluster != config.cluster_id || identity.node != config.node_id {
+            return Err(ConsensusError::Configuration(
+                "physical WAL node/cluster mismatch",
+            ));
+        }
+        {
+            let mut wal = shared.lease(LogicalLogId(config.group_id))?;
+            let mut populated = false;
+            wal.replay(|_| {
+                populated = true;
+                Ok(())
+            })?;
+            if populated {
+                return Err(ConsensusError::Configuration(
+                    "restore into a populated log",
+                ));
+            }
+            let conf = ConfState {
+                voters: config.voters.clone(),
+                learners: config.learners.clone(),
+                ..ConfState::default()
+            };
+            validate_conf_state(&conf)?;
+            let mut snapshot = Snapshot::default();
+            snapshot.mut_metadata().index = image.index;
+            snapshot.mut_metadata().term = image.term;
+            snapshot.mut_metadata().set_conf_state(conf);
+            snapshot.data = image.data;
+            let hard = HardState {
+                term: image.term,
+                commit: image.index,
+                ..HardState::default()
+            };
+            let mut records = Vec::new();
+            records
+                .try_reserve_exact(5)
+                .map_err(|_| ConsensusError::Capacity)?;
+            records.push(identity_record(&config)?);
+            records.push(decoder::floor_record(config.group_id, image.floor)?);
+            if let Some((predecessor, successor)) = image.transition {
+                records.push(decoder::transition_record(
+                    config.group_id,
+                    decoder::DecoderPair {
+                        predecessor,
+                        successor,
+                    },
+                )?);
+            }
+            records.push(proto_record(
+                config.group_id,
+                RecordKind::Snapshot,
+                image.index,
+                image.term,
+                &snapshot,
+            )?);
+            records.push(proto_record(
+                config.group_id,
+                RecordKind::HardState,
+                image.index,
+                image.term,
+                &hard,
+            )?);
+            wal.validate_append(&records)?;
+            wal.append_in(&records, BudgetLane::Completion)?;
+        }
+        Self::open_on_wal_in(config, shared, parent_budget)
     }
 
     /// Host many logical groups on the same node-owned physical WAL. Each group
@@ -771,12 +900,27 @@ impl DurableNode {
         self.raw.propose_conf_change(Vec::new(), change)?;
         Ok(())
     }
+    /// On the leader, hand leadership to another current voter. On a
+    /// follower, only leadership for this node itself may be asked for: raft
+    /// forwards the request to the leader it knows, which times the
+    /// transferee out into a campaign; any other target is not a follower's
+    /// to request.
     fn transfer_leader_inner(&mut self, node: u64) -> Result<(), ConsensusError> {
-        self.check_leader()?;
-        if !self.raw.store().conf_state.voters.contains(&node) || node == self.config.node_id {
-            return Err(ConsensusError::Configuration(
-                "transfer target must be another current voter",
-            ));
+        self.check()?;
+        let voter = self.raw.store().conf_state.voters.contains(&node);
+        if self.raw.raft.state == StateRole::Leader {
+            if !voter || node == self.config.node_id {
+                return Err(ConsensusError::Configuration(
+                    "transfer target must be another current voter",
+                ));
+            }
+            self.raw.transfer_leader(node);
+            return Ok(());
+        }
+        if node != self.config.node_id || !voter || self.raw.raft.leader_id == 0 {
+            return Err(ConsensusError::NotLeader {
+                leader: self.raw.raft.leader_id,
+            });
         }
         self.raw.transfer_leader(node);
         Ok(())
@@ -804,6 +948,11 @@ impl DurableNode {
     pub fn disk_available_bytes(&self) -> Result<u64, ConsensusError> {
         Ok(self.wal.available_bytes()?)
     }
+    /// The volume envelope this group's WAL promises its writes from; a
+    /// session's checkpoint seeds share it (25 §5).
+    pub fn disk_budget(&self) -> DiskBudget {
+        self.wal.disk_budget()
+    }
     pub fn status(&self) -> NodeStatus {
         let conf = &self.raw.store().conf_state;
         NodeStatus {
@@ -818,6 +967,13 @@ impl DurableNode {
         }
     }
 
+    /// The index of the stored snapshot the log is compacted behind (zero
+    /// while the log is complete): a member added after it can only be
+    /// seeded by a later snapshot, since Raft discards one whose
+    /// configuration does not name the recipient.
+    pub fn snapshot_index(&self) -> u64 {
+        self.raw.store().snapshot_index()
+    }
     /// A leader cannot complete a quorum ReadIndex until it has committed an
     /// entry in its current term. Ingress uses this to defer readiness probes.
     pub fn has_committed_current_term(&self) -> bool {

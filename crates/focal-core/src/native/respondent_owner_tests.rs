@@ -510,14 +510,7 @@ fn copied(f: &Fixture, configured: NativeLimits) -> Core<NativeState> {
         MemoryBudget::new(128 * 1024 * 1024, 16 * 1024 * 1024).unwrap(),
     )
     .unwrap();
-    core.state.rows = RangeStore::new(
-        RangeId(93_100),
-        source.sequence().0 - 1,
-        core.limits.range,
-        core.state.budget.clone(),
-    )
-    .unwrap();
-    let changes = source
+    let changes: Vec<_> = source
         .source_view()
         .state
         .rows
@@ -530,17 +523,37 @@ fn copied(f: &Fixture, configured: NativeLimits) -> Core<NativeState> {
             ))
         })
         .collect();
-    let prepared = core
-        .state
-        .rows
-        .prepare_batch_with(
-            source.sequence().0,
-            changes,
-            BudgetLane::Ordinary,
-            crate::native::prepare::copy,
+    // Copy the committed rows in batches the configured limit admits, ending
+    // at the source's sequence so the copy reports the same prefix.
+    let batch = core.limits.range.max_batch_entries.max(1);
+    let batches = u64::try_from(changes.len().div_ceil(batch).max(1)).unwrap();
+    let start = source.sequence().0 - batches;
+    core.state.rows = crate::native::ranges::NativeRanges::single_from_store(
+        RangeStore::new(
+            RangeId(93_100),
+            start,
+            core.limits.range,
+            core.state.budget.clone(),
         )
-        .unwrap();
-    core.state.rows.publish(prepared).unwrap();
+        .unwrap(),
+    )
+    .unwrap();
+    let mut remaining = changes.into_iter();
+    for offset in 1..=batches {
+        let chunk: Vec<_> = remaining.by_ref().take(batch).collect();
+        let prepared = core
+            .state
+            .rows
+            .prepare_batch_with(
+                start + offset,
+                chunk,
+                BudgetLane::Ordinary,
+                crate::native::prepare::copy,
+            )
+            .unwrap();
+        core.state.rows.publish(prepared).unwrap();
+    }
+    assert_eq!(core.state.rows.prefix(), source.sequence().0);
     core
 }
 

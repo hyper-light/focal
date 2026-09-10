@@ -21,7 +21,7 @@ fn real_mutations_capture_every_write_and_leave_unchanged_content_out() {
         NativeContentProfile::ProjectionOnly
     );
     // Before creation the only row is Meta, itself updated by this command.
-    assert_eq!(initial.mutation_count(), initial.range.len());
+    assert_eq!(initial.mutation_count(), initial.fragments.len());
     assert_eq!(
         initial.mutation_heap_bytes(),
         bytes(initial.mutation_count()).unwrap()
@@ -47,15 +47,15 @@ fn real_mutations_capture_every_write_and_leave_unchanged_content_out() {
             .iter()
             .any(|item| matches!(item.key, Key::Outcome(_)))
     );
-    initial.writes.check(&initial.range).unwrap();
+    initial.writes.check(&initial.fragments).unwrap();
     core.publish_native(initial).unwrap();
     let posted = fixture::prepared(core.prepare_native(
         fixture::context(fixture::ISSUER, 2),
         fixture::post(2, fixture::binding(1)),
         &[],
     ));
-    posted.writes.check(&posted.range).unwrap();
-    assert!(posted.mutation_count() < posted.range.len());
+    posted.writes.check(&posted.fragments).unwrap();
+    assert!(posted.mutation_count() < posted.fragments.len());
     assert!(
         !posted
             .writes
@@ -85,7 +85,7 @@ fn real_mutations_capture_every_write_and_leave_unchanged_content_out() {
     let mut foreign = fixture::core();
     let refused = foreign.publish_native(posted).unwrap_err().prepared;
     assert_eq!(refused.mutation_heap_bytes(), charge);
-    refused.writes.check(&refused.range).unwrap();
+    refused.writes.check(&refused.fragments).unwrap();
     core.publish_native(refused).unwrap();
 }
 
@@ -116,7 +116,8 @@ fn malformed_or_unfunded_capture_refuses_and_returns_its_complete_debit() {
         assert!(
             WriteSet::capture(
                 NativeContentProfile::ProjectionOnly,
-                &changes,
+                changes.len(),
+                changes.iter(),
                 usize::MAX,
                 funding
             )
@@ -134,7 +135,8 @@ fn malformed_or_unfunded_capture_refuses_and_returns_its_complete_debit() {
     assert!(
         WriteSet::capture(
             NativeContentProfile::ProjectionOnly,
-            &changes,
+            changes.len(),
+            changes.iter(),
             bound - 1,
             funding
         )
@@ -147,7 +149,8 @@ fn malformed_or_unfunded_capture_refuses_and_returns_its_complete_debit() {
         .commit();
     let writes = WriteSet::capture(
         NativeContentProfile::ProjectionOnly,
-        &changes,
+        changes.len(),
+        changes.iter(),
         bound,
         funding,
     )
@@ -181,6 +184,7 @@ fn canonical_plan_capture_preserves_explicit_deletion_without_scanning_the_root(
         .state
         .rows
         .plan_batch(
+            &core.state.budget,
             2,
             vec![Change::Delete(key)],
             BudgetLane::Ordinary,
@@ -194,12 +198,15 @@ fn canonical_plan_capture_preserves_explicit_deletion_without_scanning_the_root(
         .commit();
     let writes = WriteSet::capture(
         NativeContentProfile::ProjectionOnly,
+        plan.changes_len(),
         plan.changes(),
         bytes(1).unwrap(),
         funding,
     )
     .unwrap();
-    let deleted = plan.build_with(prepare::copy).unwrap();
+    let deleted = plan
+        .build_in_with(&core.state.budget, prepare::copy)
+        .unwrap();
     assert_eq!(writes.keys, [MutationKey { key, deleted: true }]);
     writes.check(&deleted).unwrap();
     assert!(deleted.get(&key).is_none());
@@ -218,7 +225,7 @@ fn capture_allocation_failure_drops_the_candidate_and_allows_the_same_request() 
     assert_eq!(core.native_budget(), before);
     assert_eq!(core.native_sequence(), SessionSeq(0));
     let candidate = fixture::prepared(new_claim(&core));
-    candidate.writes.check(&candidate.range).unwrap();
+    candidate.writes.check(&candidate.fragments).unwrap();
     core.publish_native(candidate).unwrap();
     assert!(matches!(
         new_claim(&core).unwrap(),
@@ -270,7 +277,7 @@ fn held_reports_retain_write_sets_through_pending_and_release_them_on_rollback()
     };
     let prepared = owner.prepared_candidate(candidate).unwrap();
     assert!(prepared.mutation_heap_bytes() > 0);
-    prepared.writes.check(&prepared.range).unwrap();
+    prepared.writes.check(&prepared.fragments).unwrap();
     assert!(
         prepared
             .writes

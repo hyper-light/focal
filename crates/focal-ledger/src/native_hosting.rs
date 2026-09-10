@@ -40,6 +40,8 @@ struct SnapshotEnvelopeV7 {
 pub struct NativeHosting {
     pub limits: NativeSessionLimits,
     pub reader: ContentReader,
+    /// The one writer of this ledger's checkpoint seeds on this node (25 §5).
+    pub seeds: focal_evidence::SeedStore,
     pub range: RangeId,
 }
 
@@ -560,7 +562,10 @@ impl Session {
             record.profile,
             hosting.limits,
             &self.budget,
-            hosting.reader.clone(),
+            engine::NativeSources {
+                reader: hosting.reader.clone(),
+                seeds: hosting.seeds.reader(),
+            },
             BuiltinNativeSchemas,
         )?;
         match record.kind {
@@ -656,6 +661,56 @@ impl Session {
             other => LedgerError::Import(other),
         })
     }
+    /// The seeded checkpoint this replica is waiting to install (25 §5):
+    /// hosts pull the missing chunks from a peer that holds them and poll
+    /// again.
+    pub fn pending_seed(&self) -> Option<&crate::PendingSeed> {
+        self.seed_pending
+            .as_ref()
+            .or_else(|| self.native.as_deref().and_then(|engine| engine.pending_seed()))
+    }
+    /// The chunks of a seeded native checkpoint this replica lacks, if the
+    /// native section is seeded and incomplete.
+    fn missing_seed(
+        &self,
+        native: &[u8],
+        index: u64,
+        term: u64,
+    ) -> Result<Option<crate::PendingSeed>, LedgerError> {
+        let hosting = self.hosting.as_ref().ok_or(LedgerError::NativeUnsupported)?;
+        let Some(manifest) = crate::native_checkpoint::Checkpoint::describe(
+            native,
+            hosting.limits.checkpoint,
+        )
+        .map_err(NativeSessionError::from)?
+        else {
+            return Ok(None);
+        };
+        let missing = manifest
+            .missing(&hosting.seeds.reader())
+            .map_err(NativeSessionError::from)?;
+        if missing.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(crate::PendingSeed::new(index, term, missing, &self.budget)?))
+    }
+    /// Take one chunk of a pending seed from a peer, verified against its
+    /// hash and sealed in this ledger's seed store.
+    pub fn install_seed_chunk(&mut self, hash: ContentHash, bytes: &[u8]) -> Result<(), LedgerError> {
+        let hosting = self.hosting.as_mut().ok_or(LedgerError::NativeUnsupported)?;
+        hosting
+            .seeds
+            .install_as(hash, bytes)
+            .map_err(|error| LedgerError::Native(NativeSessionError::Native(
+                focal_evidence::NativeEvidenceError::from(error).into(),
+            )))?;
+        self.seed_progress = true;
+        Ok(())
+    }
+    /// A read-only view of this ledger's seeds, for serving peers.
+    pub fn seed_reader(&self) -> Option<focal_evidence::SeedReader> {
+        self.hosting.as_ref().map(|hosting| hosting.seeds.reader())
+    }
     /// The import this replica is waiting to apply, if a retained delivery or a
     /// pending proposal names one: hosts seal its inline payloads with these
     /// parameters and poll again.
@@ -732,7 +787,10 @@ impl Session {
             record.profile,
             hosting.limits,
             &self.budget,
-            hosting.reader.clone(),
+            engine::NativeSources {
+                reader: hosting.reader.clone(),
+                seeds: hosting.seeds.reader(),
+            },
             BuiltinNativeSchemas,
         )?;
         engine.observe(&self.consensus.status());
@@ -843,6 +901,218 @@ impl Session {
     }
     pub fn native_sequence(&self) -> Result<SessionSeq, LedgerError> {
         Ok(self.native_engine()?.sequence()?)
+    }
+    /// The committed movement map of the native group (25 §6).
+    pub fn native_range_map(&self) -> Result<&focal_ranges::RangeMap, LedgerError> {
+        Ok(self.native_engine()?.range_map()?)
+    }
+    pub fn native_movement_pending(
+        &self,
+    ) -> Result<Option<&focal_ranges::TransferState>, LedgerError> {
+        Ok(self.native_engine()?.movement_pending()?)
+    }
+    pub fn native_movement_checkpoint(
+        &self,
+    ) -> Result<&focal_ranges::RangeCheckpoint, LedgerError> {
+        Ok(self.native_engine()?.movement_checkpoint()?)
+    }
+    pub fn native_movement_refusals(&self) -> u64 {
+        self.native
+            .as_deref()
+            .map_or(0, |engine| engine.movement_refusals())
+    }
+    pub fn native_movement_in_flight(&self) -> bool {
+        self.native
+            .as_deref()
+            .is_some_and(|engine| engine.movement_in_flight())
+    }
+    pub fn native_range_verifier(&self) -> Result<crate::LedgerRangeVerifier, LedgerError> {
+        Ok(self.native_engine()?.range_verifier()?)
+    }
+    pub fn native_range_activation_operation(
+        &self,
+        unchanged: Vec<focal_ranges::RangeProgress>,
+    ) -> Result<focal_ranges::RangeOperation, LedgerError> {
+        Ok(self.native_engine()?.range_activation_operation(unchanged)?)
+    }
+    pub fn native_range_activation(
+        &self,
+        operation: focal_ranges::TransferId,
+    ) -> Option<&focal_ranges::ActivationCertificate> {
+        self.native
+            .as_deref()
+            .and_then(|engine| engine.range_activation(operation))
+    }
+    /// Propose one movement step as a session decision (25 §6).
+    pub fn native_propose_range(
+        &mut self,
+        operation: focal_ranges::RangeOperation,
+    ) -> Result<(), LedgerError> {
+        self.check()?;
+        let engine = self
+            .native
+            .as_deref_mut()
+            .ok_or(LedgerError::NativeUnsupported)?;
+        engine.propose_range(&mut self.consensus, operation)?;
+        Ok(())
+    }
+    /// The member (position and identity) holding an object's rows.
+    pub fn native_member_for(
+        &self,
+        location: focal_core::native::NativeLocation,
+    ) -> Result<(usize, RangeId), LedgerError> {
+        Ok(self.native_core()?.native_member_for(location))
+    }
+    /// The member holding `affinity`.
+    pub fn native_member_at(&self, affinity: [u8; 16]) -> Result<(usize, RangeId), LedgerError> {
+        let core = self.native_core()?;
+        let layout = core.native_layout();
+        let index = layout.route_affinity(&affinity);
+        Ok((
+            index,
+            layout.member_id(index).ok_or(LedgerError::Corrupt)?,
+        ))
+    }
+    /// The statistics of one member's store.
+    pub fn native_member_stats(
+        &self,
+        index: usize,
+    ) -> Result<Option<focal_memory::RangeStats>, LedgerError> {
+        Ok(self.native_core()?.native_member_stats(index))
+    }
+    /// An affinity dividing one member near its middle, if any (25 §8).
+    pub fn native_member_split_point(&self, index: usize) -> Result<Option<[u8; 16]>, LedgerError> {
+        Ok(self.native_core()?.native_member_split_point(index))
+    }
+    /// Propose one layout change as a session decision (25 §4).
+    pub fn native_propose_layout(
+        &mut self,
+        operation: crate::LayoutOperation,
+    ) -> Result<(), LedgerError> {
+        self.check()?;
+        let engine = self
+            .native
+            .as_deref_mut()
+            .ok_or(LedgerError::NativeUnsupported)?;
+        engine.propose_layout(&mut self.consensus, operation)?;
+        Ok(())
+    }
+    /// The session's retention floor and its inputs (26 §3).
+    pub fn native_retention(&self) -> Result<crate::RetentionReport, LedgerError> {
+        let engine = self
+            .native
+            .as_deref()
+            .ok_or(LedgerError::NativeUnsupported)?;
+        let published = self.native_sequence()?;
+        let cursors = self.cursors.retention_limit(published);
+        Ok(crate::RetentionReport::new(
+            published,
+            cursors,
+            engine.archived_through(),
+        )
+        .with_retirement(
+            engine.retired_families(),
+            engine.retirement_in_flight().is_some(),
+        ))
+    }
+    /// The record encoding limits this session hosts under: what bounds an
+    /// archive bundle (26 §4).
+    pub fn native_encoding_limits(
+        &self,
+    ) -> Result<focal_core::native::record_codec::EncodingLimits, LedgerError> {
+        let hosting = self.hosting.as_ref().ok_or(LedgerError::NativeUnsupported)?;
+        Ok(hosting.limits.encoding)
+    }
+    /// The content roots the committed rows name (26 §5), one bounded page
+    /// at a time.
+    pub fn native_content_roots(
+        &self,
+        cursor: Option<focal_core::native::NativeRowCursor>,
+        max_visits: usize,
+    ) -> Result<focal_core::native::ContentRootsPage, LedgerError> {
+        Ok(self
+            .native_core()?
+            .native_content_roots(cursor, max_visits)
+            .map_err(NativeSessionError::from)?)
+    }
+    /// The seed chunks this replica must keep (26 §5): its latest
+    /// checkpoint's and those a pending seed still lacks, sorted.
+    pub fn native_seed_chunks(&self) -> Result<Vec<ContentHash>, LedgerError> {
+        let engine = self.native_engine()?;
+        let mut chunks = Vec::new();
+        chunks
+            .try_reserve_exact(
+                engine
+                    .seed_chunks()
+                    .len()
+                    .checked_add(self.pending_seed().map_or(0, |seed| seed.missing.len()))
+                    .ok_or(LedgerError::Capacity)?,
+            )
+            .map_err(|_| LedgerError::Capacity)?;
+        chunks.extend_from_slice(engine.seed_chunks());
+        if let Some(seed) = self.pending_seed() {
+            chunks.extend_from_slice(&seed.missing);
+        }
+        chunks.sort();
+        chunks.dedup();
+        Ok(chunks)
+    }
+    /// Remove seeds nothing protects that stood past the grace (26 §5), at
+    /// most `max_items` visits; the sweep resumes across calls.
+    pub fn native_collect_seeds(
+        &mut self,
+        grace_ms: u64,
+        now_ms: u64,
+        max_items: usize,
+    ) -> Result<focal_evidence::SeedReport, LedgerError> {
+        let protected = self.native_seed_chunks()?;
+        let hosting = self.hosting.as_mut().ok_or(LedgerError::NativeUnsupported)?;
+        hosting
+            .seeds
+            .collect(&protected, grace_ms, now_ms, max_items)
+            .map_err(|error| {
+                LedgerError::Native(NativeSessionError::Native(
+                    focal_evidence::NativeEvidenceError::from(error).into(),
+                ))
+            })
+    }
+    /// Propose one family's retirement as a session decision (26 §4).
+    pub fn native_propose_retirement(
+        &mut self,
+        root: focal_model::ClaimId,
+        bundle: ContentHash,
+        bytes: u64,
+        through: SessionSeq,
+    ) -> Result<(), LedgerError> {
+        self.check()?;
+        let engine = self
+            .native
+            .as_deref_mut()
+            .ok_or(LedgerError::NativeUnsupported)?;
+        engine.propose_retirement(&mut self.consensus, root, bundle, bytes, through)?;
+        Ok(())
+    }
+    /// The archive's report that it holds every proof through `through`
+    /// (26 §3); monotone, kept in this replica's checkpoints.
+    pub fn native_note_archived(&mut self, through: SessionSeq) {
+        if let Some(engine) = self.native.as_deref_mut() {
+            engine.note_archived(through);
+        }
+    }
+    /// A digest of one member's rows at the committed prefix (25 §6).
+    pub fn native_member_digest(&self, index: usize) -> Result<ContentHash, LedgerError> {
+        let hosting = self.hosting.as_ref().ok_or(LedgerError::NativeUnsupported)?;
+        let limits = hosting.limits.checkpoint;
+        self.native_core()?
+            .native_member_digest(
+                index,
+                focal_core::native::record_codec::EncodingLimits {
+                    bytes: limits.bytes.max(limits.assembled_bytes),
+                    visits: limits.visits,
+                    rows: limits.rows,
+                },
+            )
+            .map_err(|error| LedgerError::Native(NativeSessionError::Codec(error)))
     }
     pub fn native_read_at_least(
         &self,

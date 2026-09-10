@@ -1,11 +1,11 @@
 use super::*;
+use crate::native::fixtures::SyncCell as Cell;
 use crate::native::report_tests as fixture;
 use focal_evidence::{BuiltinNativeSchemas, BuiltinSchemaError};
 use focal_model::{
     ClaimId, Deadline, HandlerRef, TimerId, ValidationKind, ValidationMode, ValidationPhase,
     ValidatorId, lifecycle::Principal,
 };
-use std::cell::Cell;
 
 fn hash(value: u8) -> ContentHash {
     ContentHash([value; 32])

@@ -85,6 +85,25 @@ byte-identically.
    activation and stops before touching state.
 7. **Membership.** After activation, adding a learner or promoting a voter
    requires that node's native promise; the managed baseline is not enough.
+   A prospective learner is not a member yet and cannot push its own fact,
+   so the authority learns the promise from the learner's **reply** to its
+   probe: a hosted replica answers `ManagedSupport` with `native_support()`
+   (its successor promise once durable, the baseline until then), beginning
+   the promise if it has not. The authority keeps probing after a restart:
+   a replica whose durable floor names the native successor takes part in
+   the exchange without being asked again (`managed_support_demanded`),
+   since every later change is fenced by the promise it must collect.
+8. **Seeding a member added behind a compacted log.** Raft discards a
+   snapshot whose configuration does not name the recipient, so a learner
+   added after the authority's last checkpoint can only be seeded by a later
+   one: the authority checkpoints once an `AddLearner` it proposed has
+   applied and its log is compacted (`checkpoint_due` in the fleet owner;
+   a log complete from its first entry needs none), and a native Core root
+   beyond the inline bound travels as seeds ([25 §5](25-parallel-materialization-and-ranges.md)).
+   The real-binary expansion of a native session
+   (`a_seeded_native_checkpoint_carries_the_founder_session_to_new_hosts`)
+   exercises all three: probe replies, probing after a restart, and the
+   checkpoint that names each learner.
 
 ## 4. Deliveries under refusal
 

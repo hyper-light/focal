@@ -12,6 +12,8 @@
 )]
 //! Node composition and user-facing deployment intent.
 pub mod admission;
+pub mod archive_agent;
+pub mod backup;
 pub mod cluster;
 pub mod cluster_admin;
 pub mod config;
@@ -21,6 +23,7 @@ pub mod credential_renewal;
 pub mod custody;
 pub mod custody_prefix;
 pub mod demo;
+pub mod deployment;
 pub mod directory_bootstrap;
 pub mod embedded;
 pub mod evidence_service;
@@ -28,6 +31,7 @@ pub mod fault;
 pub mod fleet;
 #[cfg(test)]
 mod fleet_tests;
+pub mod gc;
 pub mod host;
 pub mod liveness;
 #[cfg(test)]
@@ -50,9 +54,14 @@ pub mod placement_control;
 pub mod placement_journal;
 pub mod placement_proof;
 pub mod quorum_enrollment;
+pub mod range_balancer;
 mod reads;
 mod reconciliation;
 pub mod replication;
+pub mod route_cache_host;
+#[cfg(test)]
+mod route_cache_tests;
+pub mod session_control;
 pub mod session_registration;
 mod streams;
 #[cfg(test)]

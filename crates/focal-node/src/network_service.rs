@@ -129,9 +129,11 @@ pub struct NetworkHandles {
     pub credentials: crate::credential_renewal::CredentialHandle,
     /// The failure detector's published view and the agent's facts to it.
     pub liveness: crate::liveness::LivenessHandle,
+    /// The directory's routes as this node caches them.
+    pub routes: crate::route_cache_host::RouteCacheHandle,
 }
 #[derive(Clone)]
-struct DataService {
+pub(crate) struct DataService {
     control: ControlHost,
     root_group: [u8; 16],
     directory: DirectoryHandle,
@@ -299,7 +301,11 @@ pub struct NetworkService {
     controller: Option<NetworkController>,
     credential_requests: Option<async_mpsc::Receiver<crate::credential_renewal::CredentialRequest>>,
     agent: Option<crate::placement_agent::PlacementAgent>,
+    /// The collector agent (26 §5), taken by `run`.
+    gc_agent: Option<crate::gc::GcAgent>,
+    archive_agent: Option<crate::archive_agent::ArchiveAgent>,
     liveness: Option<crate::liveness::LivenessDriver>,
+    routes: Option<crate::route_cache_host::RouteCacheDriver>,
     directory_startup: Option<DirectoryStartup>,
     control_output: Option<async_mpsc::Receiver<ControlReplicationFrame>>,
     ledger_output: Option<FleetReplication>,
@@ -501,7 +507,7 @@ impl NetworkService {
             unix_time()?,
         )?;
         let founder_fingerprint = founder_fingerprint(&state)?;
-        let controller = NetworkController::new(
+        let mut controller = NetworkController::new(
             state.clone(),
             receipt.clone(),
             credentials.clone(),
@@ -546,27 +552,27 @@ impl NetworkService {
         let pool = PeerConnectionPool::new(connector, PeerPoolLimits::default())?;
         let socket = root.join("focal.sock");
         clean_socket(&socket, &root)?;
-        let local = UnixServer::bind(
-            &socket,
-            PeerGrant {
-                principal: if founder {
-                    identity.issuer
-                } else {
-                    ParticipantId(receipt.identity.principal)
-                },
-                tenants: if founder {
-                    BTreeSet::from([identity.ledger.tenant, directory.namespace().tenant])
-                } else {
-                    BTreeSet::from([identity.ledger.tenant])
-                },
-                role: if founder {
-                    PeerRole::Runtime
-                } else {
-                    PeerRole::Actor
-                },
+        // The local grant follows the committed registry: the controller
+        // adds every admitted tenant on each refresh (doc 24 §16).
+        let (local_grant, local_grant_watch) = tokio::sync::watch::channel(PeerGrant {
+            principal: if founder {
+                identity.issuer
+            } else {
+                ParticipantId(receipt.identity.principal)
             },
-            WireLimits::default(),
-        )?;
+            tenants: if founder {
+                BTreeSet::from([identity.ledger.tenant, directory.namespace().tenant])
+            } else {
+                BTreeSet::from([identity.ledger.tenant])
+            },
+            role: if founder {
+                PeerRole::Runtime
+            } else {
+                PeerRole::Actor
+            },
+        });
+        let local = UnixServer::bind_watched(&socket, local_grant_watch, WireLimits::default())?;
+        controller.follow_local_grant(local_grant);
         let mut admin = if let Some(handler) = admin_handler {
             let path = root.join(ADMIN_SOCKET);
             clean_socket(&path, &root)?;
@@ -610,7 +616,7 @@ impl NetworkService {
                 consensus,
                 SessionLimits::default(),
                 &tenant,
-                native_hosting(&root, &identity).map_err(NodeError::Content)?,
+                native_hosting(&root, &identity, wal.disk_budget()).map_err(NodeError::Content)?,
             )?)
         } else {
             None
@@ -651,6 +657,15 @@ impl NetworkService {
             identity.node,
             directory.namespace(),
         )?;
+        let (route_handle, route_driver) = crate::route_cache_host::RouteCacheHandle::channel(
+            &budget,
+            focal_directory::RouteCacheConfig::default(),
+            identity.node,
+            state.genesis.founder.node,
+            directory.namespace(),
+            state.genesis.founder.cluster,
+        )
+        .map_err(|_| ServiceError::Owner("route cache"))?;
         let agent = crate::placement_agent::PlacementAgent::new(
             crate::placement_agent::AgentInputs {
                 state: state.clone(),
@@ -689,8 +704,19 @@ impl NetworkService {
                     verified: true,
                     eligible: true,
                 }];
+                // Before its session registers a placement the founder runs
+                // alone: a committed durability that needs more hosts (a
+                // deployment plan applied before registration) starts at the
+                // single-node scope the first registration commits.
                 let plan =
                     crate::placement::plan(&facts, &settings.durability, &settings.placement)
+                        .or_else(|_| {
+                            crate::placement::plan(
+                                &facts,
+                                &crate::config::Durability::default(),
+                                &settings.placement,
+                            )
+                        })
                         .map_err(NetworkError::from)?;
                 Some(EvidencePlacement::verified(
                     policy.scope(),
@@ -713,9 +739,11 @@ impl NetworkService {
             advertise: state.advertise,
             assigned_ledger: founder,
         };
+        let mut custody_config = CustodyConfig::new(identity.node);
+        custody_config.seed_root = Some(root.join("seeds"));
         let (content, content_owner) = ContentHost::spawn(
             content,
-            CustodyConfig::new(identity.node),
+            custody_config,
             limits.clone(),
             budget.child(192 * 1024 * 1024, 32 * 1024 * 1024)?,
         )?;
@@ -772,6 +800,8 @@ impl NetworkService {
             budget.child(128 * 1024 * 1024, 32 * 1024 * 1024)?,
             4,
         )?;
+        let (gc_agent, gc_handle) = crate::gc::GcAgent::from_env(identity.node);
+        let (archive_agent, archive_handle) = crate::archive_agent::ArchiveAgent::from_env();
         if let Some((server, handler)) = admin.take() {
             admin = Some((
                 server,
@@ -779,7 +809,10 @@ impl NetworkService {
                     .with_control(control.clone())?
                     .with_fleet(fleet.clone())?
                     .with_content(content.clone())
-                    .with_credentials(credential_handle.clone()),
+                    .with_credentials(credential_handle.clone())
+                    .with_placement(placement_handle.clone())
+                    .with_gc(gc_handle.clone())
+                    .with_archive(archive_handle.clone()),
             ));
         }
         let data = DataService {
@@ -788,7 +821,13 @@ impl NetworkService {
             directory: directory.clone(),
             ledger: ManagedService::new(fleet.clone(), content.clone(), coordinator.clone())
                 .with_signing(control.clone(), placement_handle.clone())
-                .with_liveness(liveness_handle.clone()),
+                .with_liveness(liveness_handle.clone())
+                .with_routes(
+                    route_handle.clone(),
+                    identity.node,
+                    state.advertise,
+                    receipt.identity.server_name.clone(),
+                ),
         };
         let enrollment_service = enrollment
             .as_ref()
@@ -806,6 +845,7 @@ impl NetworkService {
                 placement: placement_handle,
                 credentials: credential_handle,
                 liveness: liveness_handle,
+                routes: route_handle,
             },
             data,
             listener,
@@ -816,7 +856,10 @@ impl NetworkService {
             controller: Some(controller),
             credential_requests: Some(credential_requests),
             agent: Some(agent),
+            gc_agent: Some(gc_agent),
+            archive_agent: Some(archive_agent),
             liveness: Some(liveness_driver),
+            routes: Some(route_driver),
             directory_startup,
             control_output: Some(control_output),
             ledger_output: Some(ledger_output),
@@ -864,6 +907,16 @@ impl NetworkService {
                 Some(host) => host.stop().await.map_err(ServiceError::from),
                 None => Ok(()),
             };
+            // Every partition a split added on this node stops with the first.
+            let mut hosted = Ok(());
+            let first = self.handles.directory.plan().partition();
+            for partition in self.handles.directory.hosted() {
+                if partition.plan.partition() != first
+                    && let Err(error) = partition.host.stop().await
+                {
+                    hosted = Err(ServiceError::from(error));
+                }
+            }
             let control = self
                 .handles
                 .control
@@ -885,6 +938,7 @@ impl NetworkService {
             joined?;
             fleet?;
             directory?;
+            hosted?;
             control?;
             content?;
             self.listener.shutdown().await;
@@ -988,10 +1042,31 @@ impl NetworkService {
                 None => std::future::pending().await,
             }
         };
+        let archive_agent = self.archive_agent.take();
+        let archive_agent = async {
+            match archive_agent {
+                Some(agent) => agent.run(&self.handles).await,
+                None => std::future::pending().await,
+            }
+        };
+        let gc_agent = self.gc_agent.take();
+        let gc_agent = async {
+            match gc_agent {
+                Some(agent) => agent.run(&self.handles).await,
+                None => std::future::pending().await,
+            }
+        };
         let liveness_driver = self.liveness.take();
         let liveness = async {
             match liveness_driver {
                 Some(driver) => driver.run(&self.pool).await,
+                None => std::future::pending().await,
+            }
+        };
+        let route_driver = self.routes.take();
+        let routes = async {
+            match route_driver {
+                Some(driver) => driver.run(&self.handles, &self.pool).await,
                 None => std::future::pending().await,
             }
         };
@@ -1015,14 +1090,19 @@ impl NetworkService {
                             .read(peer, RequestId::from_u128(1), ControlRead::Membership)
                             .await,
                         Ok(ControlReadResult::Membership(_))
-                    ) && ledger.membership().await.is_ok()
-                        && self.handles.directory.host().is_some_and(|host| {
-                            let progress = host.progress();
-                            !progress.stopped
-                                && progress.applied_index > 0
-                                && progress.leader == progress.node
-                        })
-                    {
+                    ) && {
+                        // The founder's replica is running with a known
+                        // leader: itself, or another voter of the group it
+                        // rejoined after a restart (it follows then, and its
+                        // local socket routes to the leader as any node's).
+                        let progress = ledger.progress();
+                        !progress.stopped && progress.leader != 0
+                    } && self.handles.directory.host().is_some_and(|host| {
+                        let progress = host.progress();
+                        !progress.stopped
+                            && progress.applied_index > 0
+                            && progress.leader == progress.node
+                    }) {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1041,7 +1121,10 @@ impl NetworkService {
             admin,
             controller,
             placement_agent,
+            archive_agent,
+            gc_agent,
             liveness,
+            routes,
             directory_driver,
             managed_support,
             control_driver,
@@ -1059,8 +1142,11 @@ impl NetworkService {
             result=&mut admin=>result.map_err(ServiceError::Wire).and(Err(ServiceError::Owner("admin listener ended"))),
             result=&mut controller=>result.map_err(ServiceError::Controller).and(Err(ServiceError::Owner("controller ended"))),
             result=&mut placement_agent=>result.map_err(ServiceError::Agent).and(Err(ServiceError::Owner("placement agent ended"))),
+            result=&mut archive_agent=>result.map_err(ServiceError::Access).and(Err(ServiceError::Owner("archive agent ended"))),
+            result=&mut gc_agent=>result.map_err(ServiceError::Access).and(Err(ServiceError::Owner("collector agent ended"))),
             result=&mut directory_driver=>result,
             ()=&mut liveness=>Err(ServiceError::Owner("liveness driver ended")),
+            ()=&mut routes=>Err(ServiceError::Owner("route cache driver ended")),
             _=&mut managed_support=>Err(ServiceError::Owner("managed capability driver ended")),
             result=&mut control_driver=>result.map_err(ServiceError::from).and(Err(ServiceError::Owner("control egress ended"))),
             result=&mut ledger_driver=>result.map_err(ServiceError::from).and(Err(ServiceError::Owner("ledger egress ended"))),
@@ -1116,10 +1202,15 @@ fn require_runtime() -> Result<(), ServiceError> {
 pub(crate) fn native_hosting(
     root: &Path,
     identity: &crate::embedded::NodeIdentity,
+    disk: focal_memory::DiskBudget,
 ) -> Result<focal_ledger::NativeHosting, focal_evidence::ContentError> {
     Ok(focal_ledger::NativeHosting {
         limits: native_limits(focal_model::ContentDomainId(identity.ledger.tenant.0))?,
         reader: focal_evidence::ContentReader::open(root.join("content"))?,
+        seeds: focal_evidence::SeedStore::open(
+            crate::custody::seed_directory(&root.join("seeds"), identity.ledger),
+            disk,
+        )?,
         range: focal_memory::RangeId(u128::from(identity.node)),
     })
 }
@@ -1128,6 +1219,19 @@ pub(crate) fn native_hosting(
 /// campaign raises it above the volume's free space to force `Capacity` for
 /// fresh work while exact retries of committed work still answer.
 pub(crate) const DISK_HEADROOM_ENV: &str = "FOCAL_DISK_HEADROOM_BYTES";
+/// The largest native Core root a checkpoint carries inline; a larger one
+/// travels as seeds (25 §5). Unset keeps the standard 4 MiB; a campaign
+/// lowers it so every checkpoint is seeded.
+pub(crate) const SEED_INLINE_ENV: &str = "FOCAL_SEED_INLINE_BYTES";
+pub(crate) fn seed_inline_bytes() -> Result<usize, focal_evidence::ContentError> {
+    match std::env::var_os(SEED_INLINE_ENV) {
+        Some(value) => value
+            .to_str()
+            .and_then(|text| text.trim().parse::<usize>().ok())
+            .ok_or(focal_evidence::ContentError::Invalid),
+        None => Ok(focal_ledger::native_checkpoint::Limits::default().inline_bytes),
+    }
+}
 /// The operator's disk headroom, or the standard watermark.
 pub(crate) fn disk_headroom_bytes() -> Result<u64, focal_evidence::ContentError> {
     match std::env::var_os(DISK_HEADROOM_ENV) {
@@ -1154,5 +1258,12 @@ pub(crate) fn native_limits(
 ) -> Result<focal_ledger::NativeSessionLimits, focal_evidence::ContentError> {
     let mut limits = focal_ledger::NativeSessionLimits::standard(domain);
     limits.disk_headroom_bytes = disk_headroom_bytes()?;
+    limits.checkpoint.inline_bytes = seed_inline_bytes()?;
+    // Committed records this node did not author are materialized in
+    // dependency waves on up to four workers (doc 25 §2); the result is
+    // byte-identical to the serial replay at any count.
+    limits.materializer.max_workers = std::thread::available_parallelism()
+        .map_or(1, |count| count.get())
+        .clamp(1, 4);
     Ok(limits)
 }

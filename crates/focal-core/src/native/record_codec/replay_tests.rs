@@ -69,8 +69,8 @@ fn apply(
     let recovered_prepared = replay(recovered, &bytes, original.state.rows.id(), store).unwrap();
     assert_eq!(recovered.native_sequence(), sequence);
     assert_eq!(prepared.outcome(), recovered_prepared.outcome());
-    assert_eq!(recovered_prepared.range.id(), recovered.state.rows.id());
-    assert_ne!(recovered_prepared.range.id(), prepared.range.id());
+    assert_eq!(recovered_prepared.fragments.id(), recovered.state.rows.id());
+    assert_ne!(recovered_prepared.fragments.id(), prepared.fragments.id());
     assert_eq!(
         original.publish_native(prepared).unwrap(),
         recovered.publish_native(recovered_prepared).unwrap()

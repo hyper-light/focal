@@ -620,13 +620,153 @@ fn a_schema_three_checkpoint_restores_with_a_seal_over_its_whole_namespace() {
             revision: current.revision,
         }),
         nodes: current.nodes.clone(),
-        sessions: current.sessions.clone(),
+        sessions: legacy_sessions(&current.sessions),
     };
     let encoded = postcard::to_allocvec(&legacy).unwrap();
     let converted = PartitionCheckpoint::decode_any(&encoded).unwrap();
-    assert_eq!(converted, current);
+    // A converted checkpoint knows no route history: its log is complete
+    // only from its own revision, and it records no founding node.
+    assert!(converted.routes.is_empty());
+    assert_eq!(converted.routes_from, current.revision);
+    let mut expected = current.clone();
+    expected.routes_from = current.revision;
+    for session in expected.sessions.values_mut() {
+        session.founder = None;
+    }
+    assert_eq!(converted, expected);
     assert_eq!(converted.sealed.unwrap().moved, NamespaceRange::all());
     let mut future = current.clone();
     future.schema = PARTITION_CHECKPOINT_SCHEMA + 1;
     assert!(PartitionCheckpoint::decode_any(&postcard::to_allocvec(&future).unwrap()).is_err());
+}
+
+#[test]
+fn the_route_log_reports_exactly_what_moved_and_a_cache_too_far_behind_reads_a_gap() {
+    let allowance = budget();
+    let tight = PartitionConfig {
+        max_route_log: 2,
+        ..PartitionConfig::default()
+    };
+    let mut source = DirectoryPartition::new(
+        ClusterId::from_u128(1),
+        delegation(1, NamespaceRange::all()),
+        tight,
+        allowance.clone(),
+    )
+    .unwrap();
+    nodes(&mut source);
+    // Enrollments change no route.
+    let quiet = source.route_changes(0);
+    assert!(quiet.changes.is_empty());
+    assert_eq!(quiet.after_revision, 0);
+    assert_eq!(quiet.through_revision, source.revision());
+    create(&mut source, ledger(1, 1), 1_000);
+    let first = source.revision();
+    create(&mut source, ledger(1, 2), 1_001);
+    let second = source.revision();
+    let batch = source.route_changes(0);
+    assert_eq!(batch.partition, PartitionId::from_u128(1));
+    assert_eq!(batch.delegation_epoch, 1);
+    assert_eq!(batch.after_revision, 0);
+    assert_eq!(batch.through_revision, second);
+    assert_eq!(
+        batch.changes,
+        vec![
+            RouteInvalidation {
+                ledger: ledger(1, 1),
+                route_epoch: RouteEpoch(1)
+            },
+            RouteInvalidation {
+                ledger: ledger(1, 2),
+                route_epoch: RouteEpoch(1)
+            }
+        ]
+    );
+    // Only what changed after the watched revision.
+    let later = source.route_changes(first);
+    assert_eq!(later.after_revision, first);
+    assert_eq!(later.changes.len(), 1);
+    assert_eq!(later.changes[0].ledger, ledger(1, 2));
+    // A third change evicts the oldest: a cache behind the eviction point
+    // gets a batch starting later than it asked, which it reads as a gap.
+    create(&mut source, ledger(1, 3), 1_002);
+    let state = source.checkpoint();
+    assert_eq!(state.routes.len(), 2);
+    assert_eq!(state.routes_from, first);
+    let gap = source.route_changes(0);
+    assert_eq!(gap.after_revision, first);
+    assert_eq!(gap.changes.len(), 2);
+    let exact = source.route_changes(first);
+    assert_eq!(exact.after_revision, first);
+    assert_eq!(exact.changes.len(), 2);
+    let current = source.route_changes(source.revision());
+    assert!(current.changes.is_empty());
+    // A cache applies the batches as intended: a gap clears the partition.
+    let mut cache = RouteCache::new(RouteCacheConfig::default(), allowance.clone()).unwrap();
+    cache
+        .insert(source.lookup(ledger(1, 1), 1).unwrap(), 1, 10)
+        .unwrap();
+    let watched = cache.watched_partitions();
+    assert_eq!(watched, 1);
+    let stale_batch = InvalidationBatch {
+        partition: PartitionId::from_u128(1),
+        delegation_epoch: 1,
+        after_revision: first,
+        through_revision: source.revision(),
+        changes: gap.changes.clone(),
+    };
+    // The cache's watch starts at the inserted route's source revision (the
+    // current one); an older batch is a no-op, a mismatched start a gap.
+    assert_eq!(cache.invalidate(&stale_batch).unwrap(), 0);
+    // A schema-4 checkpoint restores with an empty log complete at its
+    // revision.
+    let legacy = PartitionCheckpointV4 {
+        schema: 4,
+        cluster: state.cluster,
+        delegation: state.delegation,
+        revision: state.revision,
+        sealed: None,
+        nodes: state.nodes.clone(),
+        sessions: legacy_sessions(&state.sessions),
+    };
+    let converted =
+        PartitionCheckpoint::decode_any(&postcard::to_allocvec(&legacy).unwrap()).unwrap();
+    assert!(converted.routes.is_empty());
+    assert_eq!(converted.routes_from, state.revision);
+    // The current schema records who founded each session; a converted
+    // checkpoint does not, and a host falls back to the cluster founder.
+    assert!(state.sessions.values().all(|s| s.founder == Some(1)));
+    let mut unfounded = state.sessions.clone();
+    for session in unfounded.values_mut() {
+        session.founder = None;
+    }
+    assert_eq!(converted.sessions, unfounded);
+    // A schema-5 checkpoint keeps its route log through the conversion.
+    let five = PartitionCheckpointV5 {
+        schema: 5,
+        cluster: state.cluster,
+        delegation: state.delegation,
+        revision: state.revision,
+        sealed: None,
+        nodes: state.nodes.clone(),
+        sessions: legacy_sessions(&state.sessions),
+        routes: state.routes.clone(),
+        routes_from: state.routes_from,
+    };
+    let converted_five =
+        PartitionCheckpoint::decode_any(&postcard::to_allocvec(&five).unwrap()).unwrap();
+    assert_eq!(converted_five.routes, state.routes);
+    assert_eq!(converted_five.routes_from, state.routes_from);
+    assert_eq!(converted_five.sessions, unfounded);
+    assert_eq!(converted_five.schema, PARTITION_CHECKPOINT_SCHEMA);
+    let restored = DirectoryPartition::restore(converted, tight, allowance).unwrap();
+    assert_eq!(restored.route_changes(0).after_revision, state.revision);
+}
+fn legacy_sessions(
+    sessions: &BTreeMap<LedgerId, SessionDescriptor>,
+) -> BTreeMap<LedgerId, SessionDescriptorV5> {
+    sessions
+        .iter()
+        .map(|(ledger, session)| (*ledger, SessionDescriptorV5::from(session.clone())))
+        .collect()
 }
