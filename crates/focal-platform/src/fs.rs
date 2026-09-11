@@ -61,7 +61,14 @@ pub fn owner_at(path: &Path) -> io::Result<Owner> {
     }
     #[cfg(windows)]
     {
-        crate::windows::owner_at(path).map(|sid| Owner(OwnerRepr::Sid(sid)))
+        crate::windows::owner_at(path)
+            .map(|sid| Owner(OwnerRepr::Sid(sid)))
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("owner_at {}: {error}", path.display()),
+                )
+            })
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -176,7 +183,12 @@ pub fn open_private(path: &Path, read: bool, write: bool, create: bool) -> io::R
     }
     #[cfg(windows)]
     {
-        crate::windows::open_private(path, read, write, create)
+        crate::windows::open_private(path, read, write, create).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("open_private {}: {error}", path.display()),
+            )
+        })
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -202,7 +214,12 @@ pub fn create_private_new(path: &Path, read: bool, write: bool) -> io::Result<Fi
     }
     #[cfg(windows)]
     {
-        crate::windows::create_private_new(path, read, write)
+        crate::windows::create_private_new(path, read, write).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("create_private_new {}: {error}", path.display()),
+            )
+        })
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -222,7 +239,12 @@ pub fn create_dir_private(path: &Path) -> io::Result<()> {
     }
     #[cfg(windows)]
     {
-        crate::windows::create_dir_private(path)
+        crate::windows::create_dir_private(path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("create_dir_private {}: {error}", path.display()),
+            )
+        })
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -235,7 +257,16 @@ pub fn create_dir_private(path: &Path) -> io::Result<()> {
 pub fn atomic_replace(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
-        crate::windows::move_replace(from, to)
+        crate::windows::move_replace(from, to).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "atomic_replace {} -> {}: {error}",
+                    from.display(),
+                    to.display()
+                ),
+            )
+        })
     }
     #[cfg(not(windows))]
     {
