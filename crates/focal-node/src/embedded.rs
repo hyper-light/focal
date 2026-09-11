@@ -280,9 +280,9 @@ pub(crate) fn durable_dir(path: &Path) -> Result<(), std::io::Error> {
     }
     #[cfg(not(unix))]
     fs::create_dir(path)?;
-    File::open(path)?.sync_all()?;
+    focal_platform::sync_dir(path)?;
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        File::open(parent)?.sync_all()?;
+        focal_platform::sync_dir(parent)?;
     }
     Ok(())
 }
@@ -296,7 +296,7 @@ pub(crate) fn atomic_file(path: &Path, bytes: &[u8]) -> Result<(), std::io::Erro
     file.write_all(bytes)?;
     file.sync_all()?;
     fs::rename(temporary, path)?;
-    File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()
+    focal_platform::sync_dir(path.parent().unwrap_or_else(|| Path::new(".")))
 }
 
 #[cfg(test)]
