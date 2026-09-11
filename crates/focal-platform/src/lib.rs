@@ -68,6 +68,71 @@ pub fn available_space(_path: &std::path::Path) -> Option<u64> {
     None
 }
 
+/// A path's bytes in a form that round-trips back through [path_from_bytes] on
+/// the same platform: the operating system's own byte encoding on Unix, and
+/// UTF-16LE on Windows (where a path is a sequence of 16-bit code units).
+/// Callers journal a path the OS handed them and rebuild it verbatim later;
+/// the bytes are opaque and are never interpreted across platforms. Both
+/// directions are safe standard-library conversions — no `unsafe`, no FFI.
+pub fn path_to_bytes(path: &std::path::Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        path.as_os_str().as_encoded_bytes().to_vec()
+    }
+}
+
+/// Rebuild a path from bytes [path_to_bytes] produced on this platform.
+/// Returns `None` when the bytes cannot name a path here: they contain an
+/// interior NUL (invalid in every path), or, on Windows, they are not a whole
+/// number of 16-bit code units.
+pub fn path_from_bytes(bytes: &[u8]) -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        if bytes.contains(&0) {
+            return None;
+        }
+        use std::os::unix::ffi::OsStringExt;
+        Some(std::ffi::OsString::from_vec(bytes.to_vec()).into())
+    }
+    #[cfg(windows)]
+    {
+        if bytes.len() % 2 != 0 {
+            return None;
+        }
+        use std::os::windows::ffi::OsStringExt;
+        let wide: Vec<u16> = bytes
+            .chunks_exact(2)
+            .filter_map(|pair| <[u8; 2]>::try_from(pair).ok().map(u16::from_le_bytes))
+            .collect();
+        if wide.contains(&0) {
+            return None;
+        }
+        Some(std::ffi::OsString::from_wide(&wide).into())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        if bytes.contains(&0) {
+            return None;
+        }
+        std::str::from_utf8(bytes)
+            .ok()
+            .map(std::path::PathBuf::from)
+    }
+}
+
 pub mod fs;
 #[cfg(windows)]
 mod windows;

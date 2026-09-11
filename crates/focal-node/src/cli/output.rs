@@ -3,7 +3,7 @@ use focal_client::pending::{OperationJournal, OperationStage};
 use focal_model::*;
 use focal_wire::{ListPage, ReadObject, ReadToken, TraversalPage, TraversalStop};
 use serde::Serialize;
-use std::{io::Write, os::unix::ffi::OsStrExt};
+use std::io::Write;
 
 #[derive(Serialize)]
 struct JournalOutput<'a> {
@@ -74,7 +74,7 @@ pub(super) fn unconfirmed(
                 schema_version: 1,
                 condition,
                 operation: journal.path().to_str(),
-                operation_path_bytes: journal.path().as_os_str().as_bytes(),
+                operation_path_bytes: journal.path().as_os_str().as_encoded_bytes(),
                 request: journal
                     .next_request()?
                     .map(|request| request.request_id.to_string()),
@@ -102,7 +102,7 @@ pub(super) fn journal(journal: &OperationJournal, format: OutputFormat) -> Resul
             &JournalOutput {
                 schema_version: 1,
                 operation: journal.path().to_str(),
-                operation_path_bytes: journal.path().as_os_str().as_bytes(),
+                operation_path_bytes: journal.path().as_os_str().as_encoded_bytes(),
                 stage: journal.stage(),
                 result,
                 receipt: journal.receipt(),
@@ -568,7 +568,7 @@ mod tests {
         let inspected = JournalOutput {
             schema_version: 1,
             operation: path.to_str(),
-            operation_path_bytes: path.as_os_str().as_bytes(),
+            operation_path_bytes: path.as_os_str().as_encoded_bytes(),
             stage: OperationStage::OpenEpoch,
             result: None,
             receipt: None,
@@ -579,7 +579,7 @@ mod tests {
             schema_version: 1,
             condition: "OutcomeUnknown",
             operation: path.to_str(),
-            operation_path_bytes: path.as_os_str().as_bytes(),
+            operation_path_bytes: path.as_os_str().as_encoded_bytes(),
             request: Some(request.clone()),
             result: None,
         };
@@ -591,7 +591,7 @@ mod tests {
             assert!(value["operation"].is_null());
             let recovered: Vec<u8> =
                 serde_json::from_value(value["operation_path_bytes"].clone()).unwrap();
-            assert_eq!(recovered, path.as_os_str().as_bytes());
+            assert_eq!(recovered, path.as_os_str().as_encoded_bytes());
             assert_eq!(value[key], request);
             assert_eq!(value["schema_version"], 1);
         }
