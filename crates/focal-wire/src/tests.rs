@@ -615,6 +615,35 @@ async fn unix_uses_owner_credentials_and_same_verified_handler() {
     assert!(!socket.exists());
 }
 
+/// The same-user local transport round-trips a request on every platform: a
+/// Unix-domain socket on Unix, a named pipe on Windows. Both authenticate the
+/// peer through the operating system (`SO_PEERCRED` / pipe token SID) and
+/// carry byte-identical frames, so the dispatched response matches a direct
+/// dispatch under the same grant.
+#[tokio::test]
+async fn local_transport_round_trips_between_same_user_endpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = dir.path().join("focal.sock");
+    let handler: Arc<dyn RequestHandler> =
+        Arc::new(|verified: VerifiedRequest| async move { response(verified.request()) });
+    let server = Arc::new(UnixServer::bind(&endpoint, grant(), limits()).unwrap());
+    let running = server.clone();
+    let handling = handler.clone();
+    let task = tokio::spawn(async move { running.serve(handling).await });
+    let remote = UnixRemote::new(&endpoint, limits()).unwrap();
+    let actual = remote.request(&request(1)).await.unwrap();
+    let expected = dispatch(
+        handler.as_ref(),
+        AuthenticatedPeer::local(grant()).unwrap(),
+        request(1),
+        &limits(),
+    )
+    .await;
+    assert_eq!(actual, expected);
+    server.close();
+    task.await.unwrap().unwrap();
+}
+
 #[test]
 fn durable_cursor_scope_and_resolved_positions_survive_wire_roundtrip() {
     let peer = AuthenticatedPeer::local(grant()).unwrap();
