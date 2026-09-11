@@ -19,7 +19,15 @@ for path in sorted(DOCS.glob("*.md")):
         if not target or re.match(r"[a-z]+://", target):
             continue
         target = target.strip("<>")
-        if not (path.parent / target).exists():
+        resolved = (path.parent / target).resolve()
+        # Cross-project provenance links (the source audit cites a sibling
+        # repository) escape the repository root; they are references, not
+        # internal links, so their existence is not this repo's contract.
+        try:
+            resolved.relative_to(ROOT)
+        except ValueError:
+            continue
+        if not resolved.exists():
             errors.append(f"{path.relative_to(ROOT)}: missing {target}")
         links += 1
 
