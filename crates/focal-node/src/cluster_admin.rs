@@ -14,7 +14,7 @@ use focal_enrollment::PrivateJournal;
 use focal_wire::{AccessError, Response, UnixRemote, WireError};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
 };
@@ -1645,26 +1645,18 @@ fn initialize_named(
     directory: &str,
     marker: &str,
 ) -> Result<bool> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let metadata = fs::symlink_metadata(root)?;
-    if !metadata.is_dir() || metadata.mode() & 0o077 != 0 {
-        return Err(ClusterAdminError::Corrupt);
-    }
+    let owner = focal_platform::fs::private_dir_owner(root)?.ok_or(ClusterAdminError::Corrupt)?;
     let path = root.join(marker);
     let expected = postcard::to_allocvec(identity).map_err(|_| ClusterAdminError::Capacity)?;
     match fs::symlink_metadata(&path) {
         Ok(info) => {
-            if !info.is_file()
-                || info.uid() != metadata.uid()
-                || info.mode() & 0o077 != 0
-                || info.nlink() != 1
+            if !focal_platform::fs::check_private_file(&path, &owner, 1)?
                 || info.len() != expected.len() as u64
             {
                 return Err(ClusterAdminError::Corrupt);
             }
-            let mut file = File::open(path)?;
-            let opened = file.metadata()?;
-            if opened.dev() != info.dev() || opened.ino() != info.ino() {
+            let mut file = File::open(&path)?;
+            if !focal_platform::fs::check_open_private_file(&path, &file, &owner)? {
                 return Err(ClusterAdminError::Corrupt);
             }
             let mut actual = vec![0; expected.len()];
@@ -1673,23 +1665,25 @@ fn initialize_named(
                 return Err(ClusterAdminError::Corrupt);
             }
             file.sync_all()?;
-            File::open(root)?.sync_all()?;
+            #[cfg(unix)]
+            {
+                File::open(root)?.sync_all()?;
+            }
             return Ok(false);
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
             if root.join(directory).exists() {
                 return Err(ClusterAdminError::Corrupt);
             }
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)?;
+            let mut file = focal_platform::fs::open_private(&path, false, true, true)?;
             file.write_all(&expected)?;
             file.sync_all()?;
-            File::open(root)?.sync_all()?;
             // No request can be transmitted before the child state is synced.
             // A crash during initialization leaves explicit fail-closed evidence.
+            #[cfg(unix)]
+            {
+                File::open(root)?.sync_all()?;
+            }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(ClusterAdminError::Expired);
