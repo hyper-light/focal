@@ -728,17 +728,35 @@ impl ClusterAdmin {
         })
     }
     pub fn available(settings: &Settings) -> Result<Option<Self>> {
-        use std::os::unix::fs::{FileTypeExt, MetadataExt};
         let admin = Self::open(settings)?;
         match fs::symlink_metadata(admin.root.join(ADMIN_SOCKET)) {
             Ok(metadata) => {
-                let root = fs::symlink_metadata(&admin.root)?;
-                if !root.is_dir()
-                    || root.mode() & 0o077 != 0
-                    || !metadata.file_type().is_socket()
-                    || metadata.uid() != root.uid()
+                #[cfg(unix)]
                 {
-                    return Err(ClusterAdminError::Corrupt);
+                    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+                    let root = fs::symlink_metadata(&admin.root)?;
+                    if !root.is_dir()
+                        || root.mode() & 0o077 != 0
+                        || !metadata.file_type().is_socket()
+                        || metadata.uid() != root.uid()
+                    {
+                        return Err(ClusterAdminError::Corrupt);
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    // The admin endpoint is a named-pipe rendezvous file. The
+                    // data directory and the file must both be owned by the
+                    // current user and reachable by no one else.
+                    let _ = &metadata;
+                    let owner = focal_platform::fs::current_owner()?;
+                    let private_root = focal_platform::fs::private_dir_owner(&admin.root)?
+                        .is_some_and(|found| found == owner);
+                    if !private_root
+                        || focal_platform::fs::owner_at(&admin.root.join(ADMIN_SOCKET))? != owner
+                    {
+                        return Err(ClusterAdminError::Corrupt);
+                    }
                 }
                 Ok(Some(admin))
             }

@@ -1553,19 +1553,41 @@ impl NetworkService {
     }
 }
 fn clean_socket(path: &Path, root: &Path) -> Result<(), ServiceError> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata)
-            if metadata.file_type().is_socket()
-                && metadata.uid() == std::fs::metadata(root)?.uid() =>
-        {
-            std::fs::remove_file(path)?
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata)
+                if metadata.file_type().is_socket()
+                    && metadata.uid() == std::fs::metadata(root)?.uid() =>
+            {
+                std::fs::remove_file(path)?
+            }
+            Ok(_) => return Err(ServiceError::Owner("refusing non-owned socket path")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
-        Ok(_) => return Err(ServiceError::Owner("refusing non-owned socket path")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
+        Ok(())
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        // A named-pipe rendezvous file, not a socket: remove it only when we
+        // own it, so a stale one is cleared but another user's is refused.
+        let _ = root;
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {
+                if focal_platform::fs::owner_at(path)? != focal_platform::fs::current_owner()? {
+                    return Err(ServiceError::Owner(
+                        "refusing non-owned local endpoint path",
+                    ));
+                }
+                std::fs::remove_file(path)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
 }
 fn founder_fingerprint(state: &NetworkState) -> Result<[u8; 32], ServiceError> {
     let focal_control::ControlBootstrap::Root { enrollment, .. } = &state.genesis.bootstrap else {

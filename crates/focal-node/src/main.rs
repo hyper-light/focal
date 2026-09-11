@@ -363,11 +363,24 @@ async fn start(settings: Settings) -> Result<()> {
     // The exclusive data-directory owner may clean its socket after a crash, but
     // it must never remove an ordinary file or a symlink at that location.
     if let Ok(metadata) = std::fs::symlink_metadata(&path) {
-        use std::os::unix::fs::{FileTypeExt, MetadataExt};
-        if !metadata.file_type().is_socket()
-            || metadata.uid() != std::fs::metadata(node.root())?.uid()
+        #[cfg(unix)]
         {
-            return Err("refusing to replace a non-owned socket path".into());
+            use std::os::unix::fs::{FileTypeExt, MetadataExt};
+            if !metadata.file_type().is_socket()
+                || metadata.uid() != std::fs::metadata(node.root())?.uid()
+            {
+                return Err("refusing to replace a non-owned socket path".into());
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            // The local endpoint is a named-pipe rendezvous file, not a
+            // socket. Never remove one owned by another user; the transport
+            // fences a live server by name when it rebinds.
+            let _ = &metadata;
+            if focal_platform::fs::owner_at(&path)? != focal_platform::fs::current_owner()? {
+                return Err("refusing to replace a non-owned local endpoint path".into());
+            }
         }
         std::fs::remove_file(&path)?;
     }
