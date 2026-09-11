@@ -17,6 +17,7 @@ mod auth;
 mod frame;
 mod handler;
 mod list;
+mod local;
 mod managed;
 mod message;
 mod native;
@@ -25,23 +26,22 @@ mod peers;
 mod reconcile;
 mod transport;
 mod traversal;
-#[cfg(unix)]
-mod unix;
 mod validators;
 pub use auth::*;
 pub use frame::*;
 pub use handler::*;
 pub use list::*;
+pub use local::{LocalRemote, LocalServer};
 pub use managed::*;
 pub use message::*;
 pub use native::*;
 pub use peer_mutations::*;
 pub use peers::*;
 pub use reconcile::*;
+// Historic names kept so the ~25 call sites do not churn across the port.
+pub use local::{LocalRemote as UnixRemote, LocalServer as UnixServer};
 pub use transport::*;
 pub use traversal::*;
-#[cfg(unix)]
-pub use unix::*;
 pub use validators::*;
 #[cfg(test)]
 mod tests;

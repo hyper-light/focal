@@ -1,30 +1,24 @@
-//! Same-user local transport: identical frames and ingress verification, with
-//! kernel peer credentials replacing TLS certificate authentication.
+//! The Unix-domain-socket local transport. Kernel peer credentials
+//! (`SO_PEERCRED`) authenticate the same-user peer; the socket file is
+//! owner-only and created under an owner-only parent directory.
+use super::{request_stream, serve_stream};
 use crate::*;
 use std::{
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
 };
-use tokio::{
-    io::AsyncWriteExt,
-    net::{UnixListener, UnixStream},
-    sync::watch,
-    task::JoinSet,
-};
+use tokio::{net::UnixListener, sync::watch, task::JoinSet};
 
-pub struct UnixServer {
+pub struct LocalServer {
     listener: UnixListener,
     path: PathBuf,
     inode: u64,
     uid: u32,
-    /// The grant every accepted connection is served under, read at accept:
-    /// a sender that outlives the server changes what later connections may
-    /// do without rebinding the socket.
     grant: watch::Receiver<PeerGrant>,
     limits: WireLimits,
     shutdown: watch::Sender<bool>,
 }
-impl UnixServer {
+impl LocalServer {
     pub fn bind(
         path: impl AsRef<Path>,
         grant: PeerGrant,
@@ -33,10 +27,6 @@ impl UnixServer {
         let (_fixed, grant) = watch::channel(grant);
         Self::bind_watched(path, grant, limits)
     }
-    /// Bind under a grant that follows its sender: every connection accepted
-    /// after a change is served under the new value, and a connection already
-    /// open keeps the grant it was accepted with. Each value is validated
-    /// like a fixed grant before it serves anyone.
     pub fn bind_watched(
         path: impl AsRef<Path>,
         grant: watch::Receiver<PeerGrant>,
@@ -105,7 +95,7 @@ impl UnixServer {
                     tasks.spawn(async move {
                         let _ = transport_exchange(async {
                             tokio::time::timeout(
-                                limits.request_timeout, serve_unix(stream, grant, limits, handler),
+                                limits.request_timeout, serve_stream(stream, grant, limits, handler),
                             ).await.map_err(|_| WireError::Timeout)?
                         }).await;
                     });
@@ -117,8 +107,6 @@ impl UnixServer {
         Ok(())
     }
 }
-/// A failed IO-driver registration can unwind after the OS created its socket.
-/// Remove only that inode; another process's replacement is never unlinked.
 struct BoundPath<'a> {
     path: &'a Path,
     inode: u64,
@@ -135,7 +123,7 @@ impl Drop for BoundPath<'_> {
         }
     }
 }
-impl Drop for UnixServer {
+impl Drop for LocalServer {
     fn drop(&mut self) {
         if std::fs::symlink_metadata(&self.path)
             .is_ok_and(|m| m.ino() == self.inode && m.file_type().is_socket())
@@ -144,67 +132,13 @@ impl Drop for UnixServer {
         }
     }
 }
-async fn serve_unix<H: RequestHandler>(
-    mut stream: UnixStream,
-    grant: PeerGrant,
-    limits: WireLimits,
-    handler: H,
-) -> Result<(), WireError> {
-    let hello: Hello = read_frame(&mut stream, FrameKind::Hello, 4096).await?;
-    let negotiated = match limits.negotiate_native(
-        &hello,
-        handler.supports_managed_requests(),
-        handler.supports_participant_requests(),
-        handler.supports_native_requests(),
-    ) {
-        Ok(value) => value,
-        Err(error) => {
-            write_frame(
-                &mut stream,
-                FrameKind::HelloReply,
-                &HelloReply::Rejected(error),
-                4096,
-            )
-            .await?;
-            stream.shutdown().await?;
-            return Ok(());
-        }
-    };
-    write_frame(
-        &mut stream,
-        FrameKind::HelloReply,
-        &HelloReply::Accepted(negotiated),
-        4096,
-    )
-    .await?;
-    let request: RequestEnvelope =
-        read_frame(&mut stream, FrameKind::Request, negotiated.max_frame_bytes).await?;
-    require_end(&mut stream).await?;
-    let mut limits = limits;
-    limits.max_frame_bytes = negotiated.max_frame_bytes;
-    limits.max_items = negotiated.max_items;
-    let response = if negotiated.accepts_protocol(request.protocol) {
-        dispatch_accounted(&handler, AuthenticatedPeer::local(grant)?, request, &limits).await
-    } else {
-        OwnedResponse::new(request.reply(Response::Error(AccessError::UnsupportedProtocol)))
-    };
-    write_frame(
-        &mut stream,
-        FrameKind::Response,
-        response.envelope(),
-        negotiated.max_frame_bytes,
-    )
-    .await?;
-    stream.shutdown().await?;
-    Ok(())
-}
 
 #[derive(Clone)]
-pub struct UnixRemote {
+pub struct LocalRemote {
     path: PathBuf,
     limits: WireLimits,
 }
-impl UnixRemote {
+impl LocalRemote {
     pub fn new(path: impl AsRef<Path>, limits: WireLimits) -> Result<Self, WireError> {
         limits.validate()?;
         Ok(Self {
@@ -228,45 +162,10 @@ impl UnixRemote {
         if !metadata.file_type().is_socket() || metadata.permissions().mode() & 0o077 != 0 {
             return Err(WireError::Authentication);
         }
-        let mut stream = UnixStream::connect(&self.path).await?;
+        let stream = tokio::net::UnixStream::connect(&self.path).await?;
         if stream.peer_cred()?.uid() != metadata.uid() {
             return Err(WireError::Authentication);
         }
-        let hello = Hello {
-            versions: vec![request.protocol],
-            max_frame_bytes: self.limits.max_frame_bytes,
-            max_items: self.limits.max_items,
-        };
-        write_frame(&mut stream, FrameKind::Hello, &hello, 4096).await?;
-        let reply: HelloReply = read_frame(&mut stream, FrameKind::HelloReply, 4096).await?;
-        let negotiated = match reply {
-            HelloReply::Accepted(value) => value,
-            HelloReply::Rejected(error) => return Err(error.into()),
-        };
-        if !matches!(
-            negotiated.protocol,
-            PROTOCOL_VERSION
-                | MANAGED_PROTOCOL_VERSION
-                | PEER_PROTOCOL_VERSION
-                | crate::NATIVE_PROTOCOL_VERSION
-        ) || !negotiated.accepts_protocol(request.protocol)
-            || negotiated.max_frame_bytes > self.limits.max_frame_bytes
-            || negotiated.max_items > self.limits.max_items
-        {
-            return Err(WireError::InvalidFrame);
-        }
-        write_frame(
-            &mut stream,
-            FrameKind::Request,
-            request,
-            negotiated.max_frame_bytes,
-        )
-        .await?;
-        stream.shutdown().await?;
-        let response =
-            read_frame(&mut stream, FrameKind::Response, negotiated.max_frame_bytes).await?;
-        require_end(&mut stream).await?;
-        validate_response(request, &response, None, &self.limits)?;
-        Ok(response)
+        request_stream(stream, request, &self.limits).await
     }
 }
