@@ -313,16 +313,39 @@ fn submit(
     drive(runtime, context, &mut journal, options.output.format)
 }
 fn private_parent(path: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(path)?;
-    let metadata = std::fs::symlink_metadata(path)?;
-    if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
-        return Err(CliError::Input(
-            "client operation parent must be a private directory".into(),
-        ));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
+            return Err(CliError::Input(
+                "client operation parent must be a private directory".into(),
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if !path.try_exists()? {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
+            focal_platform::fs::create_dir_private(path)?;
+        }
+        let owner = focal_platform::fs::current_owner()?;
+        match focal_platform::fs::private_dir_owner(path)? {
+            Some(found) if found == owner => {}
+            _ => {
+                return Err(CliError::Input(
+                    "client operation parent must be a private directory".into(),
+                ));
+            }
+        }
     }
     Ok(())
 }

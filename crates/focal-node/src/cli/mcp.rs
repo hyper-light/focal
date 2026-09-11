@@ -6,7 +6,7 @@ use focal_client::{
     pending::OperationContext,
 };
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
 };
@@ -127,11 +127,8 @@ struct Bootstrap {
 }
 impl Bootstrap {
     fn open(root: &Path) -> std::result::Result<Self, BootstrapError> {
-        use std::os::unix::fs::MetadataExt;
-        let metadata = fs::symlink_metadata(root)?;
-        if !metadata.is_dir() || metadata.mode() & 0o077 != 0 {
-            return Err(BootstrapError::Permissions);
-        }
+        let owner =
+            focal_platform::fs::private_dir_owner(root)?.ok_or(BootstrapError::Permissions)?;
         let lock_path = root.join(LOCK);
         let first = !exists(&lock_path)?;
         if first {
@@ -139,21 +136,17 @@ impl Bootstrap {
                 return Err(BootstrapError::Incomplete);
             }
         } else {
-            check_file(&lock_path, metadata.uid())?;
+            check_file(&lock_path, &owner)?;
         }
-        let lock = options()
-            .read(true)
-            .write(true)
-            .create_new(first)
-            .open(&lock_path)
-            .map_err(|error| {
+        let lock =
+            focal_platform::fs::open_private(&lock_path, true, true, first).map_err(|error| {
                 if error.kind() == std::io::ErrorKind::AlreadyExists {
                     BootstrapError::Locked
                 } else {
                     error.into()
                 }
             })?;
-        check_open_file(&lock_path, &lock, metadata.uid())?;
+        check_open_file(&lock_path, &lock, &owner)?;
         focal_platform::try_lock_exclusive(&lock).map_err(|error| {
             if error.kind() == std::io::ErrorKind::WouldBlock {
                 BootstrapError::Locked
@@ -163,7 +156,10 @@ impl Bootstrap {
         })?;
         if first {
             lock.sync_all()?;
-            File::open(root)?.sync_all()?;
+            #[cfg(unix)]
+            {
+                File::open(root)?.sync_all()?;
+            }
         }
         Ok(Self {
             root: root.into(),
@@ -198,26 +194,26 @@ impl Bootstrap {
         }
     }
     fn write_marker(&self, context: &OperationContext) -> std::result::Result<(), BootstrapError> {
-        let mut file = options()
-            .write(true)
-            .create_new(true)
-            .open(self.root.join(MARKER))?;
+        let mut file =
+            focal_platform::fs::open_private(&self.root.join(MARKER), false, true, true)?;
         file.write_all(MAGIC)?;
         for field in fields(context) {
             file.write_all(field)?;
         }
         file.write_all(digest(context).as_bytes())?;
         file.sync_all()?;
-        File::open(&self.root)?.sync_all()?;
+        #[cfg(unix)]
+        {
+            File::open(&self.root)?.sync_all()?;
+        }
         Ok(())
     }
     fn read_marker(&self, context: &OperationContext) -> std::result::Result<(), BootstrapError> {
-        use std::os::unix::fs::MetadataExt;
         let path = self.root.join(MARKER);
-        let owner = fs::metadata(&self.root)?.uid();
-        check_file(&path, owner)?;
+        let owner = focal_platform::fs::owner_at(&self.root)?;
+        check_file(&path, &owner)?;
         let mut file = File::open(&path)?;
-        check_open_file(&path, &file, owner)?;
+        check_open_file(&path, &file, &owner)?;
         if file.metadata()?.len() != MARKER_BYTES {
             return Err(BootstrapError::Incomplete);
         }
@@ -244,7 +240,10 @@ impl Bootstrap {
             return Err(BootstrapError::Context);
         }
         file.sync_all()?;
-        File::open(&self.root)?.sync_all()?;
+        #[cfg(unix)]
+        {
+            File::open(&self.root)?.sync_all()?;
+        }
         Ok(())
     }
     #[cfg(test)]
@@ -273,12 +272,6 @@ fn digest(context: &OperationContext) -> blake3::Hash {
     }
     hash.finalize()
 }
-fn options() -> OpenOptions {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut options = OpenOptions::new();
-    options.mode(0o600);
-    options
-}
 fn exists(path: &Path) -> std::result::Result<bool, BootstrapError> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -286,43 +279,40 @@ fn exists(path: &Path) -> std::result::Result<bool, BootstrapError> {
         Err(error) => Err(error.into()),
     }
 }
-fn check_file(path: &Path, owner: u32) -> std::result::Result<(), BootstrapError> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            BootstrapError::Incomplete
-        } else {
-            error.into()
+fn check_file(
+    path: &Path,
+    owner: &focal_platform::fs::Owner,
+) -> std::result::Result<(), BootstrapError> {
+    match focal_platform::fs::check_private_file(path, owner, 1) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(BootstrapError::Permissions),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(BootstrapError::Incomplete)
         }
-    })?;
-    if !metadata.is_file()
-        || metadata.mode() & 0o077 != 0
-        || metadata.uid() != owner
-        || metadata.nlink() != 1
-    {
-        return Err(BootstrapError::Permissions);
+        Err(error) => Err(error.into()),
     }
-    Ok(())
 }
 fn check_open_file(
     path: &Path,
     file: &File,
-    owner: u32,
+    owner: &focal_platform::fs::Owner,
 ) -> std::result::Result<(), BootstrapError> {
-    use std::os::unix::fs::MetadataExt;
-    check_file(path, owner)?;
-    let path_metadata = fs::symlink_metadata(path)?;
-    let metadata = file.metadata()?;
-    if metadata.dev() != path_metadata.dev()
-        || metadata.ino() != path_metadata.ino()
-        || !metadata.is_file()
-        || metadata.mode() & 0o077 != 0
-        || metadata.uid() != owner
-        || metadata.nlink() != 1
-    {
-        return Err(BootstrapError::Permissions);
+    match focal_platform::fs::check_open_private_file(path, file, owner) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(BootstrapError::Permissions),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(BootstrapError::Incomplete)
+        }
+        Err(error) => Err(error.into()),
     }
-    Ok(())
+}
+
+#[cfg(test)]
+fn options() -> std::fs::OpenOptions {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    options.mode(0o600);
+    options
 }
 
 #[cfg(test)]

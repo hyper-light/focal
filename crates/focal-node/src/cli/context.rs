@@ -7,7 +7,7 @@ use focal_enrollment::PrivateJournal;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Write},
     path::Path,
     sync::{Mutex, OnceLock},
@@ -160,15 +160,15 @@ impl Store {
         }
         if !initialized {
             super::private_parent(root)?;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&marker)?;
+            let mut file = focal_platform::fs::open_private(&marker, false, true, true)?;
             file.write_all(b"FCLCTX01")?;
             file.sync_all()?;
-            File::open(root)?.sync_all()?;
+            // Unix fsyncs the directory so the new entry is durable; Windows
+            // uses write-through semantics and does not flush a directory.
+            #[cfg(unix)]
+            {
+                File::open(root)?.sync_all()?;
+            }
         }
         let mut journal = if shared {
             PrivateJournal::open_shared(&path).map_err(other)?
