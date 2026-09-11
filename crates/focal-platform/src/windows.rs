@@ -28,7 +28,8 @@ use windows_sys::Win32::{
     Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW,
         FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, GetDiskFreeSpaceExW, GetFileInformationByHandle,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetDiskFreeSpaceExW,
+        GetFileInformationByHandle,
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING,
     },
     System::{
@@ -281,14 +282,16 @@ fn open_with(path: &Path, read: bool, write: bool, disposition: u32) -> io::Resu
     }
     // SAFETY: `wide` is NUL-terminated; `attributes` (and the DACL/ACL/SID it
     // points to) live across the call in `dacl`. CreateFileW returns an owned
-    // handle or INVALID_HANDLE_VALUE. FILE_SHARE_READ|WRITE match the locking
-    // model the callers already used. CREATE_NEW fails with ERROR_FILE_EXISTS,
+    // handle or INVALID_HANDLE_VALUE. FILE_SHARE_READ|WRITE|DELETE matches std's
+    // own share mode, so a held-open file can still be renamed or deleted (the
+    // WAL, checkpoint and journal atomic-replace protocols depend on it).
+    // CREATE_NEW fails with ERROR_FILE_EXISTS,
     // which the standard library maps to io::ErrorKind::AlreadyExists.
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
             access,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             &mut attributes,
             disposition,
             FILE_ATTRIBUTE_NORMAL,
@@ -344,7 +347,7 @@ fn info_at(path: &Path) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
         CreateFileW(
             wide.as_ptr(),
             0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             ptr::null_mut(),
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS,
