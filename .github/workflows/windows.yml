@@ -1,0 +1,26 @@
+name: Windows build
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    name: windows build
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.94.1 --profile minimal --component clippy
+        shell: bash
+      - name: Install protoc
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver=29.3
+          url="https://github.com/protocolbuffers/protobuf/releases/download/v${ver}/protoc-${ver}-win64.zip"
+          curl -sSL "$url" -o protoc.zip
+          7z x protoc.zip -oprotoc-dist >/dev/null
+          echo "PROTOC=$(pwd)/protoc-dist/bin/protoc.exe" >> "$GITHUB_ENV"
+      - name: Build the workspace
+        shell: bash
+        run: cargo build --workspace --locked
