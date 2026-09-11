@@ -30,3 +30,6 @@ jobs:
       - name: Wire tests (named-pipe local transport round-trip)
         shell: bash
         run: cargo test -p focal-wire --locked
+      - name: A1 product gate on the real binary (CLI, activation, restart, retry)
+        shell: bash
+        run: cargo test -p focal-node --test cli_native_a1 --locked

@@ -1,4 +1,3 @@
-#![cfg(unix)]
 #![allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -15,7 +14,6 @@
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader},
-    os::unix::fs::PermissionsExt,
     path::Path,
     process::{Child, Command, Output, Stdio},
     sync::mpsc,
@@ -30,7 +28,15 @@ impl Drop for Server {
     }
 }
 fn private(path: &Path) {
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // A fresh directory is already owner-only on Windows (its DACL is inherited
+    // from the owner-owned temp root); on Unix, tighten it to 0700.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 #[path = "support/ports.rs"]
 mod ports;
