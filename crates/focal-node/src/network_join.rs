@@ -155,17 +155,26 @@ impl NodeInvitation {
         {
             return Err(JoinError::Invalid);
         }
-        let address = self
-            .invitation
-            .trust()
-            .endpoint
-            .parse::<SocketAddr>()
-            .map_err(|_| JoinError::Invalid)?;
+        // The sponsor's endpoint is an address or a `host:port` name (24
+        // §24); the founder's own reachability is validated by shape only.
+        let endpoint = &self.invitation.trust().endpoint;
+        let address = match endpoint.parse::<SocketAddr>() {
+            Ok(address) => address,
+            Err(_) if focal_wire::valid_endpoint_name(endpoint) => {
+                let port = endpoint
+                    .rsplit_once(':')
+                    .and_then(|(_, port)| port.parse::<u16>().ok())
+                    .ok_or(JoinError::Invalid)?;
+                SocketAddr::from(([127, 0, 0, 1], port))
+            }
+            Err(_) => return Err(JoinError::Invalid),
+        };
         NetworkState {
-            schema: 1,
+            schema: crate::network_state::NETWORK_STATE_SCHEMA,
             node: self.genesis.founder.node,
             listen: address,
             advertise: address,
+            endpoint: None,
             sponsor: self.invitation.trust().clone(),
             genesis: self.genesis.clone(),
         }
@@ -230,8 +239,12 @@ impl NodeInvitation {
         value.validate_role(role)?;
         Ok(value)
     }
+    /// Read an invitation the operator delivered: a file `cluster invite`
+    /// wrote (mode 0600), or one a packaged secret mounted (24 §24) — a
+    /// symbolic link to a regular file owned by another user, readable by
+    /// this process's group and by nobody else, writable by its owner alone.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, JoinError> {
-        Self::decode(&read_private(path.as_ref(), MAX_BUNDLE)?)
+        Self::decode(&read_invitation(path.as_ref(), MAX_BUNDLE)?)
     }
     /// Atomic install never overwrites a different file. An exact retry also
     /// resyncs the existing inode and directory before reporting success.
@@ -378,13 +391,10 @@ impl PendingJoin {
             self.verify(&receipt, now)?;
             return Ok(receipt);
         }
-        let address = self
-            .bundle
-            .invitation
-            .trust()
-            .endpoint
-            .parse()
-            .map_err(|_| JoinError::Invalid)?;
+        let address =
+            crate::network_state::resolve_endpoint(&self.bundle.invitation.trust().endpoint)
+                .await
+                .map_err(|_| JoinError::Invalid)?;
         let receipt = std::panic::AssertUnwindSafe(client.redeem(
             address,
             &self.bundle.invitation,
@@ -424,16 +434,24 @@ impl PendingJoin {
         let credentials = self.verify(&receipt, now)?;
         let mut identity = self.bundle.genesis.founder.clone();
         identity.node = receipt.identity.node_id.ok_or(JoinError::Invalid)?;
-        let state = NetworkState {
-            schema: 1,
+        let mut state = NetworkState {
+            schema: crate::network_state::NETWORK_STATE_SCHEMA,
             node: identity.node,
             listen: self.listen,
             advertise: self.advertise,
+            endpoint: None,
             sponsor: self.bundle.invitation.trust().clone(),
             genesis: self.bundle.genesis.clone(),
         };
         state.validate(&identity)?;
         let directory = self.directory.install(identity)?;
+        // Reachability adopted at a later start (24 §24) outlives the join
+        // journal's addresses.
+        if let Some(saved) = NetworkState::load(&directory)? {
+            state.listen = saved.listen;
+            state.advertise = saved.advertise;
+            state.endpoint = saved.endpoint;
+        }
         state.install(&directory)?;
         Ok(JoinedNode {
             state,
@@ -519,6 +537,12 @@ impl JoinedNode {
                 acknowledged_through: 0,
                 expected_generation: 0,
                 advertise: self.state.advertise,
+                // The network controller announces the node's topology with
+                // its running contact (24 §22); this first intent is address
+                // only.
+                region: None,
+                zone: None,
+                endpoint: self.state.endpoint.clone(),
             },
         })
     }
@@ -642,10 +666,11 @@ fn genesis_registry(genesis: &NetworkGenesis) -> Result<EnrollmentRegistry, Join
 fn validate_journal(journal: &JoinJournal) -> Result<NodeInvitation, JoinError> {
     let bundle = NodeInvitation::decode(&journal.bundle.0)?;
     NetworkState {
-        schema: 1,
+        schema: crate::network_state::NETWORK_STATE_SCHEMA,
         node: bundle.genesis.founder.node,
         listen: journal.listen,
         advertise: journal.advertise,
+        endpoint: None,
         sponsor: bundle.invitation.trust().clone(),
         genesis: bundle.genesis.clone(),
     }
@@ -662,6 +687,32 @@ fn save_journal(journal: &mut PrivateJournal, state: &JoinJournal) -> Result<(),
 }
 fn read_private(path: &Path, max: usize) -> Result<Zeroizing<Vec<u8>>, JoinError> {
     check_private(path)?;
+    read_checked(path, max)
+}
+fn read_invitation(path: &Path, max: usize) -> Result<Zeroizing<Vec<u8>>, JoinError> {
+    check_invitation(path)?;
+    read_checked(path, max)
+}
+/// An invitation file is a regular file (links followed: a mounted secret
+/// is a link into its volume) that nobody but its owner may write and
+/// nobody outside its group may read.
+fn check_invitation(path: &Path) -> Result<(), JoinError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(path)?;
+        if !metadata.is_file() || metadata.mode() & 0o027 != 0 || metadata.nlink() != 1 {
+            return Err(JoinError::Permissions);
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(JoinError::Permissions)
+    }
+}
+fn read_checked(path: &Path, max: usize) -> Result<Zeroizing<Vec<u8>>, JoinError> {
     let mut file = File::open(path)?;
     if file.metadata()?.len() > max as u64 {
         return Err(JoinError::Capacity);
@@ -700,7 +751,6 @@ fn check_private(path: &Path) -> Result<(), JoinError> {
     }
 }
 fn write_private_new(path: &Path, bytes: &[u8]) -> Result<(), JoinError> {
-    use fs2::FileExt;
     let parent = path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -723,7 +773,7 @@ fn write_private_new(path: &Path, bytes: &[u8]) -> Result<(), JoinError> {
     return Err(JoinError::Permissions);
     let lock = options.open(&lock_path)?;
     check_private(&lock_path)?;
-    lock.try_lock_exclusive()?;
+    focal_platform::try_lock_exclusive(&lock)?;
     if fs::symlink_metadata(path).is_ok() {
         recover_output_link(path, &temporary)?;
         if read_private(path, MAX_BUNDLE)?.as_slice() != bytes {

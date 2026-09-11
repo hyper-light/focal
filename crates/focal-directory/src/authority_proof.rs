@@ -329,7 +329,19 @@ impl AuthorityVerifier for InstalledAuthorityVerifier<'_> {
         if &grant.enrollment != enrollment {
             return Err(DirectoryError::UnverifiedAuthority);
         }
-        crate::authority::validate_node_identity(grant, self.enrollment, self.now)
+        // The root's attestation is the proof. A grant it committed ineligible
+        // is a withdrawal, which reaches a node whose credential is retired
+        // (runbooks/expired-credentials); every eligible grant needs the live
+        // credential as well.
+        match crate::authority::validate_node_identity(grant, self.enrollment, self.now) {
+            Ok(()) => Ok(()),
+            Err(DirectoryError::UnverifiedAuthority | DirectoryError::Expired)
+                if !enrollment.eligible =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
     fn verify_session_fence(&self, fence: &SessionFence) -> Result<(), DirectoryError> {
         let proof = self.proofs.iter().find(|proof| matches!(&proof.statement.fact, AuthorityFact::Session(value) if value == fence))

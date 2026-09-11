@@ -109,7 +109,7 @@ fn packaged_skills_pin_real_application_versions_and_complete_relative_resources
                 "focal-peers" => 1,
                 "focal-evidence" => 8,
                 "focal-validation" => 4,
-                "focal-cluster" => 13,
+                "focal-cluster" => 18,
                 _ => 2,
             }
         );

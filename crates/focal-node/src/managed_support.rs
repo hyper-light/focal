@@ -34,6 +34,12 @@ pub(crate) async fn drive(
             // ledger's placement (25 §5).
             let _ = service_seed(&host, pool, content, ledger).await;
         }
+        if host.progress().custody_pending.is_some() {
+            // The replica retained a delivery whose records or checkpoint
+            // name objects this node does not hold; pull them from a peer
+            // of the ledger's placement (24 §20).
+            let _ = service_custody(&host, pool, content, ledger).await;
+        }
         let Ok(charge) = budget.reserve(BudgetKind::Control, BudgetLane::Completion, 512 * 1024)
         else {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -117,6 +123,43 @@ async fn service_seed(
             host.install_seed_chunk(hash, bytes).await?;
             break;
         }
+    }
+    Ok(())
+}
+/// Pull every content object a replica's retained delivery lacks from the
+/// peers of the ledger's custody policy, one at a time, and tell the
+/// replica; it retries the delivery once they are local.
+async fn service_custody(
+    host: &crate::fleet::ReplicaHost,
+    pool: &PeerConnectionPool,
+    content: &crate::content_host::ContentHost,
+    ledger: focal_model::LedgerId,
+) -> Result<(), LedgerError> {
+    let Some(policy) = content
+        .policy(ledger)
+        .await
+        .map_err(|_| LedgerError::Capacity)?
+    else {
+        return Ok(());
+    };
+    let scope = policy.scope();
+    let node = host.progress().node;
+    let mut pulled = false;
+    for reference in host.pending_custody_objects().await? {
+        for peer in policy.peers.iter().filter(|peer| **peer != node) {
+            let result = tokio::time::timeout(
+                Duration::from_millis(5_000),
+                crate::evidence_service::pull_object(content, pool, node, *peer, scope, &reference),
+            )
+            .await;
+            if matches!(result, Ok(Ok(()))) {
+                pulled = true;
+                break;
+            }
+        }
+    }
+    if pulled {
+        host.custody_pulled().await?;
     }
     Ok(())
 }

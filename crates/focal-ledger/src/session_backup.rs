@@ -586,13 +586,13 @@ pub mod backup {
             let page = core.native_content_roots(cursor, PAGE)?;
             for root in page.roots {
                 match root {
-                    ContentRoot::Artifact(pointer) | ContentRoot::Inline(pointer) => {
+                    ContentRoot::Artifact { pointer, .. } | ContentRoot::Inline { pointer, .. } => {
                         if pointer.domain != domain {
                             return Err(BackupError::Corrupt("artifact domain"));
                         }
                         objects.insert(pointer.root);
                     }
-                    ContentRoot::Bundle { root, bytes } => {
+                    ContentRoot::Bundle { root, bytes, .. } => {
                         objects.insert(root);
                         bundles.try_reserve_exact(1).map_err(|_| BackupError::Capacity)?;
                         bundles.push((root, bytes));

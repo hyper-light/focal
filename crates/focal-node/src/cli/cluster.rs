@@ -1,7 +1,10 @@
 //! Local root and installed-application administration through the physical owner.
 use clap::Subcommand;
 use focal_control::MembershipChange;
-use focal_node::{cluster_admin::ClusterAdmin, network_admin::AdminRead};
+use focal_node::{
+    cluster_admin::{ClusterAdmin, ClusterAdminError},
+    network_admin::AdminRead,
+};
 use std::path::PathBuf;
 
 #[derive(Subcommand)]
@@ -110,6 +113,47 @@ pub(crate) enum ClusterCommand {
         #[arg(long)]
         new_incarnation: bool,
     },
+    /// Repair a hosted session's custody on this node: re-verify every
+    /// object its committed prefix names, recopy what is missing from
+    /// another required copy, and complete the other required copies. An
+    /// object no copy can supply is reported as unrecoverable; the session
+    /// then needs a restore.
+    Repair {
+        /// The session's tenant; this node's own tenant when omitted.
+        #[arg(long, requires = "session")]
+        tenant: Option<String>,
+        /// The session; this node's original session when omitted.
+        #[arg(long)]
+        session: Option<String>,
+        /// Resume a bounded walk after this artifact (`next_after` of the
+        /// previous report).
+        #[arg(long)]
+        after: Option<String>,
+        /// The objects one call examines at most (1–4096).
+        #[arg(long, default_value_t = 256)]
+        limit: u32,
+    },
+    /// The upgrade fence: the capability level the cluster is held to, this
+    /// binary's level and every node's reported level; raise it once every
+    /// node runs a binary at the new level.
+    Upgrade {
+        #[command(subcommand)]
+        command: UpgradeCommand,
+    },
+}
+#[derive(Subcommand)]
+pub(crate) enum UpgradeCommand {
+    /// The committed fence, this binary's level and every node's reported
+    /// capability.
+    Status,
+    /// Raise the fence to a level (founder only): refused by name
+    /// (`members_behind`) while any node reports a lower capability or
+    /// none; a fence already at the level reads as done; a fence never
+    /// lowers. Afterwards a binary announcing less refuses to start.
+    Activate {
+        #[arg(long)]
+        fence: u32,
+    },
 }
 #[derive(Subcommand)]
 pub(crate) enum StorageCommand {
@@ -180,6 +224,18 @@ pub(crate) enum NodeCommand {
     Identity,
     Health,
     Config,
+    /// The four readiness probes with the facts they derive from.
+    Readiness,
+    /// The node's metrics as Prometheus text: memory and volume envelopes,
+    /// WAL, replicas and their lags, peers, liveness, credential expiry,
+    /// placement and the upgrade fence, sampled every five seconds.
+    Metrics,
+    /// One readiness probe for a supervisor: exit 0 when it holds, 1
+    /// (`probe_failed`) otherwise.
+    Probe {
+        #[arg(long, value_parser = ["alive", "catching-up", "authoritative", "policy"])]
+        check: String,
+    },
 }
 #[derive(Subcommand)]
 pub(crate) enum NodesCommand {
@@ -293,6 +349,9 @@ pub(crate) enum CredentialCommand {
     /// Renew this node's own credential now: the same key under a fresh
     /// certificate and lifetime, presented on every path at once.
     Renew,
+    /// Rotate this node's own credential to a fresh key under the same
+    /// identity; the previous certificate authorizes through the grace.
+    Rotate,
 }
 #[derive(Subcommand)]
 pub(crate) enum MembershipCommand {
@@ -452,11 +511,31 @@ pub(crate) fn run(
         }));
     }
     let admin = ClusterAdmin::open(settings)?;
+    if let ClusterCommand::Node {
+        command: NodeCommand::Metrics,
+    } = &command
+    {
+        // Exposition text goes out as it is: a scraper reads it, not a
+        // JSON consumer.
+        let result =
+            runtime.block_on(admin.operator(focal_node::network_admin::OperatorRead::Metrics))?;
+        let focal_client::admin::AdminResult::Metrics { text } = result else {
+            return Err(ClusterAdminError::Invalid.into());
+        };
+        return crate::print_text(&text);
+    }
     let result = match command {
+        ClusterCommand::Node {
+            command: NodeCommand::Probe { check },
+        } => runtime.block_on(admin.probe(&check)),
         ClusterCommand::Node { command } => runtime.block_on(admin.operator(match command {
             NodeCommand::Identity => focal_node::network_admin::OperatorRead::Identity,
             NodeCommand::Health => focal_node::network_admin::OperatorRead::Health,
             NodeCommand::Config => focal_node::network_admin::OperatorRead::Configuration,
+            NodeCommand::Readiness => focal_node::network_admin::OperatorRead::Readiness,
+            NodeCommand::Metrics | NodeCommand::Probe { .. } => {
+                return Err(ClusterAdminError::Invalid.into());
+            }
         })),
         ClusterCommand::Replicas { command } => replicas(runtime, &admin, command),
         ClusterCommand::Retention {
@@ -500,6 +579,29 @@ pub(crate) fn run(
             input,
             new_incarnation,
         } => runtime.block_on(admin.restore(&input, new_incarnation)),
+        ClusterCommand::Repair {
+            tenant,
+            session,
+            after,
+            limit,
+        } => {
+            let ledger = focal_model::LedgerId {
+                tenant: tenant.map_or(Ok(admin.tenant()), |tenant| {
+                    focal_client::input::parse_id(&tenant).map(focal_model::TenantId)
+                })?,
+                session: session_of(&admin, session)?,
+            };
+            let after = after
+                .map(|after| focal_client::input::parse_id(&after))
+                .transpose()?;
+            runtime.block_on(admin.repair(ledger, after, limit))
+        }
+        ClusterCommand::Upgrade {
+            command: UpgradeCommand::Status,
+        } => runtime.block_on(admin.upgrade_status()),
+        ClusterCommand::Upgrade {
+            command: UpgradeCommand::Activate { fence },
+        } => runtime.block_on(admin.activate_fence(fence)),
         ClusterCommand::Storage {
             command: StorageCommand::Show,
         } => runtime.block_on(admin.storage()),
@@ -579,6 +681,7 @@ pub(crate) fn run(
                 expected_revision,
             )),
             CredentialCommand::Renew => runtime.block_on(admin.renew_credential()),
+            CredentialCommand::Rotate => runtime.block_on(admin.rotate_credential()),
         },
         ClusterCommand::Membership { command } => match command {
             MembershipCommand::Show => runtime.block_on(admin.read(AdminRead::Configuration)),

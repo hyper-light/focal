@@ -631,14 +631,25 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 header.range
             };
             let started = std::time::Instant::now();
+            let reader = RecordingReader::new(&self.reader);
             let prepared = record::replay::prepare(
                 core,
                 &record,
                 expected_range,
                 self.limits.recovery,
-                &self.reader,
+                &reader,
                 &self.schemas,
-            )?;
+            );
+            let missing = reader.take_missing();
+            self.pending_custody = if missing.is_empty() {
+                None
+            } else {
+                Some(PendingCustody::new(missing, &self.budget)?)
+            };
+            let prepared = prepared?;
+            let Some(Domain::Passive(core)) = self.domain.as_mut() else {
+                return Err(NativeSessionError::Failed);
+            };
             let outcome = match core.publish_native(prepared) {
                 Ok(outcome) => outcome,
                 Err(refused) => return Err(refused.error.into()),
@@ -768,14 +779,21 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             return Err(NativeSessionError::Failed);
         };
         let started = std::time::Instant::now();
+        let reader = RecordingReader::new(&self.reader);
         let batch = record::materialize::materialize_batch(
             core,
             &records,
             self.limits.recovery,
-            &self.reader,
+            &reader,
             &self.schemas,
             self.limits.materializer,
         );
+        let missing = reader.take_missing();
+        self.pending_custody = if missing.is_empty() {
+            None
+        } else {
+            Some(PendingCustody::new(missing, &self.budget)?)
+        };
         let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let stats = &mut self.materializer;
         stats.micros = stats.micros.saturating_add(elapsed);

@@ -207,6 +207,7 @@ fn load(node: u64) -> PartitionOperation {
             available_memory: 10,
             active_weight: 1,
             disk_available: 1 << 30,
+            capability: 0,
         },
     }
 }

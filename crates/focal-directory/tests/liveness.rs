@@ -71,6 +71,7 @@ fn load(id: u64) -> NodeLoad {
         available_memory: 1_000_000,
         active_weight: 1,
         disk_available: 1 << 30,
+        capability: 0,
     }
 }
 fn partition() -> DirectoryPartition {

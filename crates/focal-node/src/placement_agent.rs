@@ -91,6 +91,8 @@ pub enum AgentError {
     Stopped,
     #[error("placement agent runtime is unavailable")]
     Runtime,
+    #[error("residency: {0}")]
+    Residency(#[from] crate::placement_executor::ExecutorError),
     #[error("placement intent: {0}")]
     Intent(#[from] IntentError),
     #[error("metadata owner: {0}")]
@@ -378,6 +380,11 @@ pub struct PlacementAgent {
     credentials: CredentialMaterial,
     root: PathBuf,
     custody: BTreeMap<LedgerId, CustodyScope>,
+    /// The residency fence installed with each ledger's custody scope
+    /// (24 §22), re-installed when the boundary or a node's region changes.
+    fences: BTreeMap<LedgerId, crate::placement_executor::ResidencyFence>,
+    /// The region every directory-listed node reported, refreshed each pass.
+    node_regions: BTreeMap<u64, focal_directory::RegionId>,
     /// The pending placement scope announced to the content host per hosted
     /// ledger, so its peers can pull checkpoint seeds before activation.
     pending_custody: BTreeMap<LedgerId, CustodyScope>,
@@ -462,6 +469,8 @@ impl PlacementAgent {
             root,
             custody,
             pending_custody: BTreeMap::new(),
+            fences: BTreeMap::new(),
+            node_regions: BTreeMap::new(),
             node_budget,
             admission,
             wal,
@@ -619,18 +628,27 @@ impl PlacementAgent {
             self.reopen_installed(handles).await?;
             self.reopened = true;
         }
+        // The founder submits root intents to the root it leads under its
+        // local client; a host submits them through the root leader's
+        // placement-control ingress, which binds the request client to the
+        // sender's enrolled principal (24 §16).
+        let root_client = if self.state.genesis.founder.node == node {
+            client
+        } else {
+            crate::placement_control::root_intent_client(self.principal.0)
+        };
         if self.journals.is_none() {
             self.journals = Some(Journals {
                 root: IntentJournal::open(
                     &self.root,
                     "placement-root",
                     self.state.genesis.root,
-                    client,
+                    root_client,
                 )?,
                 partitions: BTreeMap::new(),
             });
         }
-        let root_peer = self.peer(client, self.state.genesis.root_namespace)?;
+        let root_peer = self.peer(root_client, self.state.genesis.root_namespace)?;
         let namespace = handles.directory.namespace();
         let partition_peer = self.peer(client, namespace)?;
         {
@@ -806,7 +824,7 @@ impl PlacementAgent {
                 return Ok(step);
             }
             for descriptor in directory.sessions.values() {
-                self.sync_custody(handles, descriptor).await?;
+                self.sync_custody(handles, descriptor, directory).await?;
                 if let Some(step) = self
                     .answer_plan_request(handles, descriptor, directory, snapshot, installed, now)
                     .await?
@@ -1201,30 +1219,44 @@ impl PlacementAgent {
         // A reopened copy serves the route its log has committed; a fresh copy
         // has none yet and takes the plan's target scope for its custody.
         let mut config = ReplicaConfig::new(self.identity.root);
-        let (scope, voters, copies) = match (session.active_fence(), session.active_placement()) {
-            (Some(fence), Some(spec)) => {
-                config.route_epoch = fence.to_route;
-                config.policy_revision = fence.placement_epoch;
-                (
-                    CustodyScope {
-                        ledger,
-                        route_epoch: fence.to_route,
-                        policy_revision: fence.placement_epoch,
-                    },
-                    spec.placement.voters.keys().copied().collect(),
-                    spec.placement.content_copies.keys().copied().collect(),
-                )
-            }
-            _ => (
-                CustodyScope {
-                    ledger,
-                    route_epoch: copy.route_epoch,
-                    policy_revision: copy.policy_revision,
-                },
-                copy.voters.clone(),
-                copy.copies.clone(),
-            ),
-        };
+        let (scope, voters, copies, residency) =
+            match (session.active_fence(), session.active_placement()) {
+                (Some(fence), Some(spec)) => {
+                    config.route_epoch = fence.to_route;
+                    config.policy_revision = fence.placement_epoch;
+                    (
+                        CustodyScope {
+                            ledger,
+                            route_epoch: fence.to_route,
+                            policy_revision: fence.placement_epoch,
+                        },
+                        spec.placement.voters.keys().copied().collect(),
+                        spec.placement.content_copies.keys().copied().collect(),
+                        spec.policy.residency.clone(),
+                    )
+                }
+                // A journaled copy's boundary is learned with the next custody
+                // sync, which re-installs the fence (24 §22). Until its log
+                // commits a fence the copy serves the session's route as it
+                // is now: the plan's target route is the current one plus one
+                // (`PendingPlacement::next_route`), and a leader probing a
+                // prospective learner speaks the current route. Serving the
+                // default route would refuse every leader past the first
+                // activation, and the session could never heal.
+                _ => {
+                    config.route_epoch = RouteEpoch(copy.route_epoch.0.saturating_sub(1).max(1));
+                    (
+                        CustodyScope {
+                            ledger,
+                            route_epoch: copy.route_epoch,
+                            policy_revision: copy.policy_revision,
+                        },
+                        copy.voters.clone(),
+                        copy.copies.clone(),
+                        BTreeSet::new(),
+                    )
+                }
+            };
         let sequence = handles
             .fleet
             .status()
@@ -1236,7 +1268,8 @@ impl PlacementAgent {
             .install(sequence, FleetReplica { session, config })
             .await
             .map_err(|failure| AgentError::Fleet(failure.error))?;
-        self.install_custody(handles, scope, voters, copies).await?;
+        self.install_custody(handles, scope, voters, copies, residency)
+            .await?;
         Ok(installed.value().host().clone())
     }
     /// Install one custody scope for a hosted ledger, replacing the previous.
@@ -1246,9 +1279,13 @@ impl PlacementAgent {
         scope: CustodyScope,
         voters: BTreeSet<u64>,
         copies: BTreeSet<u64>,
+        residency: BTreeSet<focal_directory::RegionId>,
     ) -> Result<(), AgentError> {
+        let fence =
+            crate::placement_executor::ResidencyFence::new(residency, self.node_regions.clone())
+                .map_err(|_| AgentError::Capacity)?;
         let previous = self.custody.get(&scope.ledger).copied();
-        if previous == Some(scope) {
+        if previous == Some(scope) && self.fences.get(&scope.ledger) == Some(&fence) {
             return Ok(());
         }
         handles
@@ -1264,10 +1301,11 @@ impl PlacementAgent {
             .evidence
             .replace_placement(
                 previous,
-                EvidencePlacement::committed(scope, voters, copies)?,
+                EvidencePlacement::committed(scope, voters, copies, fence.clone())?,
             )
             .await?;
         self.custody.insert(scope.ledger, scope);
+        self.fences.insert(scope.ledger, fence);
         Ok(())
     }
     /// Keep a hosted ledger's custody scope at the placement the directory
@@ -1276,6 +1314,7 @@ impl PlacementAgent {
         &mut self,
         handles: &NetworkHandles,
         descriptor: &SessionDescriptor,
+        directory: &PartitionCheckpoint,
     ) -> Result<(), AgentError> {
         let node = self.state.node;
         if !handles.fleet.hosts(descriptor.ledger)
@@ -1315,11 +1354,17 @@ impl PlacementAgent {
             return Ok(());
         }
         let placement = &descriptor.active.placement;
+        // The residency boundary and every known node's region travel with
+        // the custody scope (24 §22).
+        for (id, record) in &directory.nodes {
+            self.node_regions.insert(*id, record.enrollment.region);
+        }
         self.install_custody(
             handles,
             scope,
             placement.voters.keys().copied().collect(),
             placement.content_copies.keys().copied().collect(),
+            descriptor.active.policy.residency.clone(),
         )
         .await
     }
@@ -2002,6 +2047,7 @@ impl PlacementAgent {
             // Free bytes of the data volume that no queued durable write has
             // been promised, as the disk envelope estimates them.
             disk_available: self.wal.available_bytes().unwrap_or(0),
+            capability: crate::upgrade::announced_level(),
         };
         let command = ControlCommand::VerifiedPartition(VerifiedPartitionCommand {
             command: PartitionCommand {

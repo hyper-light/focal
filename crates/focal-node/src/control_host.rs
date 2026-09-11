@@ -1153,7 +1153,12 @@ impl<V: AuthorityVerifier> Owner<V> {
                     if !contact && matches!(request.command, ControlCommand::NodeContact(_)) {
                         return Err(ControlFailure::Unauthorized);
                     }
-                    if request.id.client != principal.0 {
+                    // A node's root intents over placement control are named
+                    // by the client derived from its principal (24 §16).
+                    let root_intent = placement
+                        && request.id.client
+                            == crate::placement_control::root_intent_client(principal.0);
+                    if request.id.client != principal.0 && !root_intent {
                         return Err(ControlFailure::Unauthorized);
                     }
                     match self

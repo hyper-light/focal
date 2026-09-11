@@ -318,9 +318,11 @@ impl CustodyStore {
         );
         Ok(())
     }
-    /// Authorize a seed read: a node of the installed placement at its route,
-    /// or a node of an announced pending placement at that placement's route.
-    fn authorize_seed(&self, verified: &VerifiedRequest) -> Result<CustodyScope, AccessError> {
+    /// Authorize a read: a node of the installed placement at its route, or
+    /// a node of an announced pending placement at that placement's route
+    /// (25 §5, 24 §20). A copy the directory is preparing reads the seeds
+    /// and objects it lacks from this node before the placement activates.
+    fn authorize_read(&self, verified: &VerifiedRequest) -> Result<CustodyScope, AccessError> {
         let request = verified.request();
         let PeerRole::Node { node_id } = verified.peer().role() else {
             return Err(AccessError::Unauthorized);
@@ -350,6 +352,28 @@ impl CustodyStore {
         } else {
             Err(AccessError::Unauthorized)
         }
+    }
+    /// A read's scope is the installed policy's or the announced pending
+    /// placement's (`authorize_read`); the object must be of the tenant.
+    fn check_read_scope(
+        &self,
+        scope: CustodyScope,
+        content: &ContentRef,
+    ) -> Result<(), AccessError> {
+        let installed = self
+            .installed(scope.ledger)
+            .is_some_and(|policy| policy.scope() == scope);
+        let pending = self
+            .pending
+            .get(&scope.ledger)
+            .is_some_and(|pending| pending.scope == scope);
+        if !installed && !pending {
+            return Err(AccessError::Unavailable);
+        }
+        if content.domain != ContentDomainId(scope.ledger.tenant.0) {
+            return Err(AccessError::Unauthorized);
+        }
+        Ok(())
     }
     pub fn check_policy(&self, scope: CustodyScope) -> Result<(), AccessError> {
         let policy = self
@@ -435,19 +459,30 @@ impl CustodyStore {
         verified: &VerifiedRequest,
     ) -> Result<Accounted<CustodyReply>, AccessError> {
         self.expire(Instant::now())?;
-        let seed = matches!(
+        // Reads — a seed, an object's manifest, the transfer that describes
+        // it, its chunks, a verification — are open to the nodes of the
+        // installed placement and of an announced pending one; writes (a
+        // chunk received, a seal) only to the installed placement's nodes.
+        let read = matches!(
             verified.request().operation,
-            Operation::Custody(CustodyRequest::SeedChunk { .. })
+            Operation::Custody(
+                CustodyRequest::SeedChunk { .. }
+                    | CustodyRequest::Manifest { .. }
+                    | CustodyRequest::Open { .. }
+                    | CustodyRequest::ReadChunk { .. }
+                    | CustodyRequest::Verify { .. }
+                    | CustodyRequest::Cancel { .. }
+            )
         );
-        let scope = if seed {
-            self.authorize_seed(verified)?
+        let scope = if read {
+            self.authorize_read(verified)?
         } else {
             self.authorize(verified)?
         };
         let PeerRole::Node { node_id } = verified.peer().role() else {
             return Err(AccessError::Unauthorized);
         };
-        if !seed
+        if !read
             && !self
                 .installed(scope.ledger)
                 .is_some_and(|p| p.peers.contains(&node_id))
@@ -481,7 +516,7 @@ impl CustodyStore {
                 content,
                 manifest,
             } => {
-                self.check_scope(
+                self.check_read_scope(
                     CustodyScope {
                         policy_revision: *policy_revision,
                         ..scope
@@ -530,6 +565,9 @@ impl CustodyStore {
                             {
                                 break;
                             }
+                            // A chunk that fails its hash is missing too: the
+                            // import installs verified bytes over it (24 §20).
+                            Err(ContentError::Corrupt) => break,
                             Err(error) => return Err(content_error(error)),
                         }
                     }
@@ -594,7 +632,7 @@ impl CustodyStore {
                 policy_revision,
                 content,
             } => {
-                self.check_scope(
+                self.check_read_scope(
                     CustodyScope {
                         policy_revision: *policy_revision,
                         ..scope
@@ -619,7 +657,7 @@ impl CustodyStore {
                 content,
                 max_bytes,
             } => {
-                self.check_scope(
+                self.check_read_scope(
                     CustodyScope {
                         policy_revision: *policy_revision,
                         ..scope

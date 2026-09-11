@@ -376,8 +376,10 @@ impl Session {
                     .fence
                     .membership_epoch
                     .checked_add(u64::from(
-                        active.record.request.placement.placement.voters
-                            != request.placement.placement.voters,
+                        request
+                            .placement
+                            .placement
+                            .adds_voter_over(&active.record.request.placement.placement),
                     ))
                     .ok_or(LedgerError::Capacity)?;
                 // A cutover may follow several committed configuration changes;
@@ -558,8 +560,12 @@ impl Session {
                         .fence
                         .membership_epoch
                         .checked_add(u64::from(
-                            active.record.request.placement.placement.voters
-                                != cutover.record.request.placement.placement.voters,
+                            cutover
+                                .record
+                                .request
+                                .placement
+                                .placement
+                                .adds_voter_over(&active.record.request.placement.placement),
                         ))
                         .ok_or(LedgerError::Corrupt)?;
                     if cutover.fence.operation == active.fence.operation

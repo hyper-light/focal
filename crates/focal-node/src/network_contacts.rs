@@ -59,10 +59,20 @@ pub(crate) fn prepare_contact(
         acknowledged_through,
         expected_generation,
         advertise,
-    } = verified.request().operation
+        region,
+        zone,
+        endpoint,
+    } = &verified.request().operation
     else {
         return Err(ControlFailure::Unauthorized);
     };
+    let (group, sequence, acknowledged_through, expected_generation, advertise) = (
+        *group,
+        *sequence,
+        *acknowledged_through,
+        *expected_generation,
+        *advertise,
+    );
     if group != replica.identity().group {
         return Err(ControlFailure::WrongOwner);
     }
@@ -94,6 +104,9 @@ pub(crate) fn prepare_contact(
             advertise,
             expected_generation,
             decided_at: now,
+            region: region.clone(),
+            zone: zone.clone(),
+            endpoint: endpoint.clone(),
         }),
     })
 }

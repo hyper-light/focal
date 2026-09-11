@@ -257,12 +257,13 @@ impl GcAgent {
                 };
                 for root in page.roots {
                     match root {
-                        ContentRoot::Artifact(pointer) | ContentRoot::Inline(pointer) => {
+                        ContentRoot::Artifact { pointer, .. }
+                        | ContentRoot::Inline { pointer, .. } => {
                             protection
                                 .protect_object(domain, pointer.root)
                                 .map_err(content)?;
                         }
-                        ContentRoot::Bundle { root, bytes } => {
+                        ContentRoot::Bundle { root, bytes, .. } => {
                             protection.protect_object(domain, root).map_err(content)?;
                             bundles
                                 .try_reserve_exact(1)

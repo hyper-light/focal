@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: focal-config
+  namespace: focal
+  labels:
+    app.kubernetes.io/name: focal
+    app.kubernetes.io/managed-by: focal-deployment-render
+data:
+  focal-founder.yaml: |
+    version: 1
+    topology:
+      region: "eu-a"
+      zone: "a"
+    durability:
+      survive: zone
+      max_failures: 1
+  focal-b.yaml: |
+    version: 1
+    topology:
+      region: "eu-a"
+      zone: "b"
+    durability:
+      survive: zone
+      max_failures: 1
+  focal-c.yaml: |
+    version: 1
+    topology:
+      region: "eu-a"
+      zone: "c"
+    durability:
+      survive: zone
+      max_failures: 1

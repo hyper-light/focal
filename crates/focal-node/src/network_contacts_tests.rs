@@ -53,6 +53,9 @@ fn packet() -> RequestEnvelope {
             acknowledged_through: 0,
             expected_generation: 0,
             advertise: "127.0.0.1:7444".parse().unwrap(),
+            region: None,
+            zone: None,
+            endpoint: None,
         },
     }
 }
@@ -306,6 +309,9 @@ async fn contact_uses_active_committed_certificate_and_exact_receipt_survives_lo
                     advertise: "127.0.0.1:7555".parse().unwrap(),
                     expected_generation: 1,
                     decided_at: now(),
+                    region: None,
+                    zone: None,
+                    endpoint: None,
                 }),
             }
         )

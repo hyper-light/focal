@@ -289,7 +289,10 @@ fn open_journal(root: &Path, plan: &DeploymentPlan, now: u64) -> Result<Journal,
     match read_file(&dir.join("JOURNAL"), MAX_JOURNAL_BYTES)? {
         Some(bytes) => {
             let journal = Journal::decode(&bytes)?;
-            if journal.plan_id != plan.plan_id || journal.plan_hash != plan.hash()? {
+            // A plan's identity is its body (facts and request); the same
+            // plan composed again at another time has other bytes and the
+            // same identity, and resumes this journal.
+            if journal.plan_id != plan.plan_id {
                 return Err(DeploymentError::Corrupt("apply journal names another plan"));
             }
             Ok(journal)

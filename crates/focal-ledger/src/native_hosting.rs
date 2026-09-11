@@ -620,7 +620,7 @@ impl Session {
     /// activation record's parameters. Retryable custody and memory refusals
     /// keep the delivery; every other refusal is typed and final.
     fn translate_legacy(
-        &self,
+        &mut self,
         record: &ActivationRecord,
     ) -> Result<focal_core::native::Imported, LedgerError> {
         let hosting = self.hosting.as_ref().ok_or(LedgerError::NativeUnsupported)?;
@@ -642,14 +642,23 @@ impl Session {
         let budget = self
             .budget
             .child(hosting.limits.memory_bytes, hosting.limits.completion_reserve_bytes)?;
-        focal_core::native::import(
+        // Objects the translation could not read are named for the host
+        // (24 §20); the delivery is retained until they are local.
+        let reader = crate::native_session::RecordingReader::new(&hosting.reader);
+        let imported = focal_core::native::import(
             self.core.snapshot(),
             request,
             budget,
-            &hosting.reader,
+            &reader,
             &BuiltinNativeSchemas,
-        )
-        .map_err(|error| match error {
+        );
+        let missing = reader.take_missing();
+        self.custody_pending = if missing.is_empty() {
+            None
+        } else {
+            Some(PendingCustody::new(missing, &self.budget)?)
+        };
+        imported.map_err(|error| match error {
             focal_core::native::ImportError::Evidence(focal_evidence::NativeEvidenceError::Content(_))
             | focal_core::native::ImportError::Content(_) => {
                 LedgerError::Native(NativeSessionError::CustodyPending)
@@ -664,6 +673,13 @@ impl Session {
     /// The seeded checkpoint this replica is waiting to install (25 §5):
     /// hosts pull the missing chunks from a peer that holds them and poll
     /// again.
+    /// The content objects a retained delivery is waiting for (24 §20):
+    /// hosts pull them from a required copy and poll again.
+    pub fn pending_custody(&self) -> Option<&crate::PendingCustody> {
+        self.custody_pending
+            .as_ref()
+            .or_else(|| self.native.as_deref().and_then(|engine| engine.pending_custody()))
+    }
     pub fn pending_seed(&self) -> Option<&crate::PendingSeed> {
         self.seed_pending
             .as_ref()
@@ -766,7 +782,7 @@ impl Session {
     /// Rebuild the native engine from the native section of an installed
     /// checkpoint. Everything is constructed before the Session adopts it.
     fn native_from_checkpoint(
-        &self,
+        &mut self,
         activation: &[u8],
         native: &[u8],
         index: u64,
@@ -794,7 +810,11 @@ impl Session {
             BuiltinNativeSchemas,
         )?;
         engine.observe(&self.consensus.status());
-        engine.restore_from(native, index, term, configuration, &self.consensus)?;
+        // A restore that found objects missing names them for the host
+        // before the engine it would have built is dropped (24 §20).
+        let restored = engine.restore_from(native, index, term, configuration, &self.consensus);
+        self.custody_pending = engine.take_pending_custody();
+        restored?;
         // The checkpoint retains the exact activation position (22 §FCNSESS);
         // it must lie between the sealed legacy prefix and the applied index.
         let activation_index = engine.activation_index();

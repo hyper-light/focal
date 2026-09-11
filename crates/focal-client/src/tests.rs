@@ -302,6 +302,75 @@ async fn lost_reply_retries_the_identical_command_and_request_identity() {
     let response = client.submit(expected.clone()).await.unwrap();
     assert_eq!(response, MutationReply::Committed(receipt(&expected)));
 }
+/// Answers `Unavailable` for the first `refusals` requests, then commits.
+struct UnavailableThen {
+    requests: Mutex<Vec<RequestEnvelope>>,
+    refusals: usize,
+}
+impl ClientTransport for UnavailableThen {
+    fn request<'a>(
+        &'a self,
+        _route: Option<&'a RouteHint>,
+        request: &'a RequestEnvelope,
+    ) -> TransportFuture<'a> {
+        Box::pin(async move {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request.clone());
+            assert_eq!(request, &super::tests::request());
+            if requests.len() <= self.refusals {
+                return Ok(request.reply(Response::Error(AccessError::Unavailable)));
+            }
+            Ok(
+                request.reply(Response::Submitted(MutationReply::Committed(receipt(
+                    request,
+                )))),
+            )
+        })
+    }
+}
+/// An availability refusal admitted nothing: the identical request is
+/// resent with backoff past the attempts kept for lost replies, and one
+/// that outlasts the clock is reported as the refusal, never as an unknown
+/// outcome or a transport failure.
+#[tokio::test]
+async fn availability_refusals_are_resent_within_the_clock_and_reported_as_refusals() {
+    let client = Client::new(
+        UnavailableThen {
+            requests: Mutex::new(vec![]),
+            refusals: 9,
+        },
+        policy(),
+        WireLimits::default(),
+        8,
+    )
+    .unwrap();
+    let expected = request();
+    let response = client.submit(expected.clone()).await.unwrap();
+    assert_eq!(response, MutationReply::Committed(receipt(&expected)));
+    assert_eq!(client.transport().requests.lock().unwrap().len(), 10);
+    let client = Client::new(
+        UnavailableThen {
+            requests: Mutex::new(vec![]),
+            refusals: usize::MAX,
+        },
+        RetryPolicy {
+            max_attempts: 3,
+            max_elapsed: Duration::from_millis(200),
+            base_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(20),
+        },
+        WireLimits::default(),
+        8,
+    )
+    .unwrap();
+    let error = client.submit(expected.clone()).await.unwrap_err();
+    assert!(
+        matches!(error, ClientError::Access(AccessError::Unavailable)),
+        "{error:?}"
+    );
+    let sent = client.transport().requests.lock().unwrap().len();
+    assert!(sent > 3 && sent <= 64, "{sent}");
+}
 #[tokio::test]
 async fn exhausted_retry_retains_exact_request_and_redacts_error_payload() {
     let client = Client::new(

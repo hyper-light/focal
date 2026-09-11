@@ -1,0 +1,13 @@
+Focal {{ .Chart.AppVersion }} in namespace {{ .Release.Namespace }}.
+
+1. Wait for focal-founder-0 to be Ready.
+2. Issue one invitation per host pod from the founder and install them as
+   the secret "{{ .Values.invitationsSecret }}" (see deploy/kubernetes/invitations.sh):
+     kubectl -n {{ .Release.Namespace }} exec focal-founder-0 -c focal -- \
+       /focal --data-dir /var/lib/focal cluster invite --node <pod> --output - > <pod>.invite
+     kubectl -n {{ .Release.Namespace }} create secret generic {{ .Values.invitationsSecret }} --from-file=<pod>.invite=<pod>.invite ...
+3. The host pods enroll at their first start and join the placement.
+
+Probes ask the node (`cluster node probe --check alive`); `authoritative` and
+`policy` are for inspection, never for restarts. Resource and volume requests
+are an unqualified bootstrap allocation (doc 08 §5).

@@ -445,6 +445,7 @@ async fn three_metadata_owners_use_mutual_tls_with_majority_retry_and_scoped_ope
         let endpoint = PeerEndpoint {
             address: server.local_addr().unwrap(),
             server_name: identity.name.clone(),
+            name: None,
         };
         routes.insert(id, endpoint.clone());
         pending.push((host, owner, channel, server, serving, pool, endpoint));

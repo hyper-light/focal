@@ -494,7 +494,7 @@ impl SharedWal {
         let directory = &self.0.directory;
         self.0
             .disk
-            .refresh_with(|| fs2::available_space(directory).ok());
+            .refresh_with(|| focal_platform::available_space(directory));
         Ok(self.0.disk.uncommitted_free())
     }
     /// The disk envelope this writer draws from, for the other durable owners
@@ -511,7 +511,7 @@ impl SharedWal {
         let directory = &self.0.directory;
         self.0
             .disk
-            .refresh_with(|| fs2::available_space(directory).ok());
+            .refresh_with(|| focal_platform::available_space(directory));
         let bytes = u64::try_from(bytes).map_err(|_| LogError::Capacity)?;
         self.0
             .disk

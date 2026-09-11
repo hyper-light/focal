@@ -254,12 +254,25 @@ fn a_session_the_founder_does_not_vote_in_expands_and_heals_through_its_own_lead
     let created = wait_created(host_a, tenant);
     let session_id = created["session"].as_str().unwrap().to_owned();
     assert_eq!(created["node"], node_a, "{created}");
-    let registered = wait_for(founder, "registration", Duration::from_secs(90), |view| {
-        session(view, &session_id).is_some_and(|session| {
-            session["pending"].is_null()
-                && session["voters"].as_array().is_some_and(|v| v.len() == 1)
-        })
-    });
+    let registered = {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            if let Some(view) = placement(founder)
+                && session(&view, &session_id).is_some_and(|session| {
+                    session["pending"].is_null()
+                        && session["voters"].as_array().is_some_and(|v| v.len() == 1)
+                })
+            {
+                break view;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "registration did not happen; host agent: {}",
+                String::from_utf8_lossy(&command(host_a, &["cluster", "node", "health"]).stdout)
+            );
+            std::thread::sleep(Duration::from_millis(150));
+        }
+    };
     let registered = session(&registered, &session_id).unwrap().clone();
     assert_eq!(registered["voters"], serde_json::json!([node_a]));
     assert_eq!(registered["founder"], node_a);
@@ -290,6 +303,47 @@ fn a_session_the_founder_does_not_vote_in_expands_and_heals_through_its_own_lead
     assert!(
         voters.contains(&node_a),
         "the incumbent keeps its copy: {active}"
+    );
+    // Readiness probes: the founder leads its own session and the root, so
+    // it is authoritative and not catching up; the policy holds once the
+    // expansion activated; host A leads the new session.
+    let readiness =
+        success(founder, &["cluster", "node", "readiness"])["result"]["readiness"].clone();
+    assert_eq!(readiness["alive"], true, "{readiness}");
+    assert_eq!(readiness["authoritative"], true);
+    assert_eq!(readiness["catching_up"], false);
+    assert_eq!(readiness["policy_satisfied"], true, "{readiness}");
+    assert!(
+        command(founder, &["cluster", "node", "probe", "--check", "alive"])
+            .status
+            .success()
+    );
+    assert!(
+        command(
+            founder,
+            &["cluster", "node", "probe", "--check", "authoritative"]
+        )
+        .status
+        .success()
+    );
+    let output = command(
+        founder,
+        &["cluster", "node", "probe", "--check", "catching-up"],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("[probe_failed]"));
+    let host_readiness =
+        success(host_a, &["cluster", "node", "readiness"])["result"]["readiness"].clone();
+    assert_eq!(host_readiness["authoritative"], true, "{host_readiness}");
+    assert!(
+        host_readiness["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| session["session"] == session_id.as_str()
+                && session["leader"] == node_a
+                && session["achieved_max_failures"] == 1),
+        "{host_readiness}"
     );
     // The founder still holds no copy: its replica list does not name the session.
     let health = success(founder, &["cluster", "node", "health"])["result"]["health"].clone();

@@ -66,6 +66,8 @@ pub struct EvidencePlacement {
     scope: CustodyScope,
     voters: BTreeSet<u64>,
     copies: BTreeSet<u64>,
+    /// The residency boundary every transfer is checked against (24 §22).
+    fence: crate::placement_executor::ResidencyFence,
 }
 impl EvidencePlacement {
     /// Only a trusted committed placement owner may install this configuration.
@@ -87,10 +89,23 @@ impl EvidencePlacement {
         if plan.voters.len() > 1024 || plan.content_copies.len() > 1024 {
             return Err(AccessError::Capacity);
         }
+        let fence = crate::placement_executor::ResidencyFence::new(
+            placement
+                .residency
+                .iter()
+                .map(|label| crate::topology::region_id(label))
+                .collect(),
+            nodes
+                .iter()
+                .map(|node| (node.id, crate::topology::ids(&node.topology).0))
+                .collect(),
+        )
+        .map_err(|_| AccessError::Capacity)?;
         Ok(Self {
             scope,
             voters: plan.voters.iter().copied().collect(),
             copies: plan.content_copies.iter().copied().collect(),
+            fence,
         })
     }
     /// A placement the directory has committed and the agent installs on this
@@ -99,6 +114,7 @@ impl EvidencePlacement {
         scope: CustodyScope,
         voters: BTreeSet<u64>,
         copies: BTreeSet<u64>,
+        fence: crate::placement_executor::ResidencyFence,
     ) -> Result<Self, AccessError> {
         if scope.ledger.tenant.is_zero()
             || scope.ledger.session.is_zero()
@@ -116,10 +132,18 @@ impl EvidencePlacement {
             scope,
             voters,
             copies,
+            fence,
         })
     }
     pub fn scope(&self) -> CustodyScope {
         self.scope
+    }
+    /// Whether a copy may move to `node` under the residency boundary
+    /// (24 §22): refused before any byte moves.
+    fn admits(&self, node: u64) -> Result<(), AccessError> {
+        self.fence
+            .check(node)
+            .map_err(|_| AccessError::Unauthorized)
     }
     pub fn custody_policy(&self) -> CustodyPolicy {
         CustodyPolicy {
@@ -135,6 +159,7 @@ impl EvidencePlacement {
             .checked_add(self.copies.len())
             .and_then(|n| n.checked_mul(128))
             .and_then(|n| n.checked_add(512))
+            .and_then(|n| n.checked_add(self.fence.bytes().ok()?))
             .ok_or(AccessError::Capacity)
     }
 }
@@ -215,6 +240,15 @@ enum JobKind {
         bytes: Vec<u8>,
         reply: oneshot::Sender<Result<ArchiveOutcome, AccessError>>,
     },
+    /// Re-verify every object the session's committed artifact projection
+    /// names on this node, recopy what is missing from another required
+    /// copy and complete the other required copies (24 §20).
+    Repair {
+        snapshot: Box<focal_ledger::DurableEvidenceSnapshot>,
+        after: Option<ArtifactId>,
+        limit: u32,
+        reply: oneshot::Sender<Result<RepairReport, AccessError>>,
+    },
 }
 /// A sealed archive bundle: the object that names it and which required
 /// copies hold a receipt for it.
@@ -223,6 +257,34 @@ pub struct ArchiveOutcome {
     pub reference: ContentRef,
     pub obligation: CustodyObligation,
 }
+/// What one repair pass over a session's committed artifact projection
+/// found and did on this node (24 §20). `next_after` names where a walk
+/// that was bounded or outlived by its snapshot resumes; `complete` says
+/// the projection was walked to its end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairReport {
+    pub sequence: SessionSeq,
+    pub index: RaftIndex,
+    pub artifacts: u64,
+    pub objects: u64,
+    pub verified: u64,
+    pub repaired: u64,
+    pub pushed: u64,
+    pub unrecoverable: Vec<UnrecoverableObject>,
+    pub unrecoverable_count: u64,
+    pub complete: bool,
+    pub next_after: Option<ArtifactId>,
+}
+/// An object no required copy could supply: the session needs a restore.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnrecoverableObject {
+    pub artifact: ArtifactId,
+    pub reference: ContentRef,
+    pub asked: u32,
+}
+/// The objects one repair call examines at most.
+pub const MAX_REPAIR_OBJECTS: u32 = 4096;
+const MAX_UNRECOVERABLE_LISTED: usize = 64;
 struct Job {
     /// The authenticated request a participant job serves; trusted node
     /// jobs carry none.
@@ -267,6 +329,11 @@ enum Completed {
         scope: Option<CustodyScope>,
         result: Box<Result<ArchiveOutcome, AccessError>>,
         reply: oneshot::Sender<Result<ArchiveOutcome, AccessError>>,
+    },
+    Repair {
+        scope: Option<CustodyScope>,
+        result: Box<Result<RepairReport, AccessError>>,
+        reply: oneshot::Sender<Result<RepairReport, AccessError>>,
     },
 }
 impl Completed {
@@ -337,6 +404,20 @@ impl Completed {
                 let _ = reply.send(result);
             }
             Self::Archive {
+                scope,
+                result,
+                reply,
+            } => {
+                let result = (*result).and_then(|value| {
+                    if current(scope) {
+                        Ok(value)
+                    } else {
+                        Err(AccessError::Unavailable)
+                    }
+                });
+                let _ = reply.send(result);
+            }
+            Self::Repair {
                 scope,
                 result,
                 reply,
@@ -541,6 +622,46 @@ impl EvidenceCoordinator {
             })?;
         receive.await.map_err(|_| AccessError::OutcomeUnknown)?
     }
+    /// Repair one session's custody on this node (24 §20): a trusted node
+    /// job under the session's current placement, walking the committed
+    /// artifact projection the snapshot holds. `after` resumes a walk and
+    /// `limit` bounds the objects one call examines.
+    pub async fn repair(
+        &self,
+        snapshot: focal_ledger::DurableEvidenceSnapshot,
+        after: Option<ArtifactId>,
+        limit: u32,
+    ) -> Result<RepairReport, AccessError> {
+        if limit == 0 || limit > MAX_REPAIR_OBJECTS {
+            return Err(AccessError::InvalidRequest);
+        }
+        let allocation = self
+            .budget
+            .reserve(BudgetKind::Payload, BudgetLane::Ordinary, JOB_BYTES)
+            .map_err(|_| AccessError::Capacity)?
+            .commit();
+        let ledger = snapshot.prefix().ledger;
+        let route = snapshot.prefix().route;
+        let (reply, receive) = oneshot::channel();
+        self.sender
+            .try_send(Job {
+                request: None,
+                ledger,
+                route,
+                kind: JobKind::Repair {
+                    snapshot: Box::new(snapshot),
+                    after,
+                    limit,
+                    reply,
+                },
+                _allocation: allocation,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => AccessError::Capacity,
+                mpsc::error::TrySendError::Closed(_) => AccessError::Unavailable,
+            })?;
+        receive.await.map_err(|_| AccessError::OutcomeUnknown)?
+    }
     /// Install a verified committed placement through the existing owner. The
     /// capacity-one completion mailbox remains available while data jobs stall.
     /// A canceled response is unknown; retry the complete target and expected
@@ -649,7 +770,13 @@ impl EvidenceDriver {
             return Err(AccessError::InvalidRequest);
         }
         if let Some(current) = self.placements.get(&next.scope.ledger) {
+            // The same scope with the same members may change only its
+            // residency fence (24 §22): the boundary or a node's region.
+            let fence_only = next.scope == current.placement.scope
+                && next.voters == current.placement.voters
+                && next.copies == current.placement.copies;
             if current.placement != *next
+                && !fence_only
                 && (expected != Some(current.placement.scope)
                     || next.scope.route_epoch < current.placement.scope.route_epoch
                     || next.scope.policy_revision < current.placement.scope.policy_revision
@@ -775,7 +902,299 @@ async fn process(
                 reply,
             }
         }
+        JobKind::Repair {
+            snapshot,
+            after,
+            limit,
+            reply,
+        } => {
+            let result = match &placement {
+                Ok(row) => {
+                    repair(content, pool, node, &row.placement, *snapshot, after, limit).await
+                }
+                Err(error) => Err(error.clone()),
+            };
+            drop(job._allocation);
+            Completed::Repair {
+                scope,
+                result: Box::new(result),
+                reply,
+            }
+        }
     }
+}
+/// Walk the session's committed artifact projection from `after`, at most
+/// `limit` objects (24 §20). An object this node holds and verifies counts
+/// as verified; one it lacks or fails to verify is pulled, chunk by
+/// verified chunk, from another required copy (the content copies first,
+/// then the voters) and counts as repaired, or as unrecoverable when no
+/// copy answers with it. Every other required copy is asked to verify the
+/// object again, receipt or not, and failing that is given it. Missing data is
+/// recopied under the same object identity, never replaced by a fresh one,
+/// and nothing is inferred from a copy that cannot answer. A walk the
+/// snapshot's lease outlives stops where it is and names where to resume.
+async fn repair(
+    content: &ContentHost,
+    pool: &PeerConnectionPool,
+    node: u64,
+    placement: &EvidencePlacement,
+    snapshot: focal_ledger::DurableEvidenceSnapshot,
+    after: Option<ArtifactId>,
+    limit: u32,
+) -> Result<RepairReport, AccessError> {
+    let scope = placement.scope;
+    let prefix = snapshot.prefix();
+    if prefix.ledger != scope.ledger
+        || prefix.route != scope.route_epoch
+        || prefix.placement_epoch != scope.policy_revision
+        || prefix.node != node
+    {
+        return Err(AccessError::Unavailable);
+    }
+    let domain = ContentDomainId(scope.ledger.tenant.0);
+    let mut report = RepairReport {
+        sequence: prefix.sequence,
+        index: prefix.index,
+        artifacts: 0,
+        objects: 0,
+        verified: 0,
+        repaired: 0,
+        pushed: 0,
+        unrecoverable: Vec::new(),
+        unrecoverable_count: 0,
+        complete: false,
+        next_after: after,
+    };
+    // Where a missing object is asked for: the content copies, then the
+    // voters, each once, never this node.
+    let mut sources: Vec<u64> = Vec::new();
+    for peer in placement.copies.iter().chain(placement.voters.iter()) {
+        if *peer != node && !sources.contains(peer) && placement.fence.admits(*peer) {
+            sources.try_reserve(1).map_err(|_| AccessError::Capacity)?;
+            sources.push(*peer);
+        }
+    }
+    let mut after = after;
+    while report.objects < u64::from(limit) {
+        let now = match snapshot.elapsed_clock() {
+            Ok(now) => now,
+            Err(error) => match crate::custody_prefix::snapshot_error(error) {
+                AccessError::SnapshotExpired => break,
+                error => return Err(error),
+            },
+        };
+        let next = match snapshot.artifact_after(after, now) {
+            Ok(next) => next,
+            Err(error) => match crate::custody_prefix::snapshot_error(error) {
+                AccessError::SnapshotExpired => break,
+                error => return Err(error),
+            },
+        };
+        let Some(artifact) = next else {
+            report.complete = true;
+            report.next_after = None;
+            break;
+        };
+        if after.is_some_and(|previous| artifact.artifact.id <= previous) {
+            return Err(AccessError::InvalidRequest);
+        }
+        after = Some(artifact.artifact.id);
+        report.next_after = after;
+        report.artifacts = report
+            .artifacts
+            .checked_add(1)
+            .ok_or(AccessError::Capacity)?;
+        let Some(reference) = artifact.content else {
+            continue;
+        };
+        if reference.domain != domain {
+            return Err(AccessError::Unauthorized);
+        }
+        report.objects = report.objects.checked_add(1).ok_or(AccessError::Capacity)?;
+        let request = RequestId(
+            reference
+                .root
+                .0
+                .get(..16)
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or(AccessError::InvalidRequest)?,
+        );
+        let transfer = transfer_id(scope, request, &reference);
+        let held = matches!(
+            local(
+                content,
+                node,
+                scope,
+                transfer,
+                CustodyRequest::Verify {
+                    policy_revision: scope.policy_revision,
+                    content: reference.clone(),
+                },
+            )
+            .await,
+            Ok(CustodyReply::Durable { content: found, policy_revision })
+                if found == reference && policy_revision == scope.policy_revision
+        );
+        if held {
+            report.verified = report
+                .verified
+                .checked_add(1)
+                .ok_or(AccessError::Capacity)?;
+        } else {
+            let mut asked = 0u32;
+            let mut recovered = false;
+            for peer in &sources {
+                asked = asked.saturating_add(1);
+                if pull(content, pool, node, *peer, scope, transfer, &reference)
+                    .await
+                    .is_ok()
+                {
+                    recovered = true;
+                    break;
+                }
+            }
+            if !recovered {
+                report.unrecoverable_count = report
+                    .unrecoverable_count
+                    .checked_add(1)
+                    .ok_or(AccessError::Capacity)?;
+                if report.unrecoverable.len() < MAX_UNRECOVERABLE_LISTED {
+                    report
+                        .unrecoverable
+                        .try_reserve(1)
+                        .map_err(|_| AccessError::Capacity)?;
+                    report.unrecoverable.push(UnrecoverableObject {
+                        artifact: artifact.artifact.id,
+                        reference: reference.clone(),
+                        asked,
+                    });
+                }
+                continue;
+            }
+            report.repaired = report
+                .repaired
+                .checked_add(1)
+                .ok_or(AccessError::Capacity)?;
+        }
+        if placement.copies.contains(&node) {
+            content
+                .record_receipt(scope, receipt_for(scope, node, &reference))
+                .await?;
+        }
+        // A repair re-asks every other required copy, receipt or not: a
+        // receipt records an answer once given, not the bytes still held. A
+        // copy outside the residency boundary is neither asked nor given.
+        for peer in placement.copies.iter().filter(|peer| **peer != node) {
+            if !placement.fence.admits(*peer) {
+                continue;
+            }
+            let verified = remote(
+                pool,
+                *peer,
+                scope,
+                transfer,
+                CustodyRequest::Verify {
+                    policy_revision: scope.policy_revision,
+                    content: reference.clone(),
+                },
+            )
+            .await;
+            if matches!(
+                verified,
+                Ok(CustodyReply::Durable { content: found, policy_revision })
+                    if found == reference && policy_revision == scope.policy_revision
+            ) {
+                content
+                    .record_receipt(scope, receipt_for(scope, *peer, &reference))
+                    .await?;
+                continue;
+            }
+            if push(content, pool, scope, transfer, *peer, &reference)
+                .await
+                .is_ok()
+            {
+                report.pushed = report.pushed.checked_add(1).ok_or(AccessError::Capacity)?;
+            }
+        }
+    }
+    Ok(report)
+}
+/// Give one required copy an object this node holds: open the transfer
+/// with this node's manifest, send the chunks the copy lacks, seal, record
+/// the copy's `Durable` answer as its receipt.
+async fn push(
+    content: &ContentHost,
+    pool: &PeerConnectionPool,
+    scope: CustodyScope,
+    transfer: [u8; 16],
+    peer: u64,
+    reference: &ContentRef,
+) -> Result<(), AccessError> {
+    let manifest = content.export_manifest(scope, reference.clone()).await?;
+    let opened = remote(
+        pool,
+        peer,
+        scope,
+        transfer,
+        CustodyRequest::Open {
+            transfer,
+            policy_revision: scope.policy_revision,
+            content: reference.clone(),
+            manifest: manifest.value().encoded().to_vec(),
+        },
+    )
+    .await?;
+    let CustodyReply::Opened {
+        chunks,
+        next_missing,
+    } = opened
+    else {
+        return Err(AccessError::InvalidRequest);
+    };
+    if chunks as usize != manifest.value().chunks() || next_missing > chunks {
+        return Err(AccessError::InvalidRequest);
+    }
+    for index in next_missing..chunks {
+        let bytes = content
+            .read_transfer_chunk(scope, reference.clone(), index as usize)
+            .await?;
+        remote(
+            pool,
+            peer,
+            scope,
+            transfer,
+            CustodyRequest::Chunk {
+                transfer,
+                index,
+                bytes: bytes.value().clone(),
+            },
+        )
+        .await?;
+    }
+    let reply = remote(
+        pool,
+        peer,
+        scope,
+        transfer,
+        CustodyRequest::Seal { transfer },
+    )
+    .await?;
+    if !matches!(reply, CustodyReply::Durable { content: found, policy_revision } if found == *reference && policy_revision == scope.policy_revision)
+    {
+        return Err(AccessError::InvalidRequest);
+    }
+    content
+        .record_receipt(scope, receipt_for(scope, peer, reference))
+        .await?;
+    let _ = remote(
+        pool,
+        peer,
+        scope,
+        transfer,
+        CustodyRequest::Cancel { transfer },
+    )
+    .await;
+    Ok(())
 }
 /// Seal an archive bundle (26 §4) as an object of the ledger's tenant
 /// domain, replicate it to every other required copy exactly as a sealed
@@ -831,6 +1250,9 @@ async fn obligation(
         reference,
     );
     for peer in &required {
+        if !placement.fence.admits(*peer) {
+            continue;
+        }
         if content
             .receipt(scope, reference.root, *peer)
             .await?
@@ -1096,6 +1518,28 @@ pub(crate) async fn pull_seed(
     }
     Ok(bytes)
 }
+/// Pull one content object this node lacks from `peer`, chunk by verified
+/// chunk under the same object identity (24 §20): what a fresh copy of a
+/// session does for the objects its retained delivery names.
+pub(crate) async fn pull_object(
+    content: &ContentHost,
+    pool: &PeerConnectionPool,
+    node: u64,
+    peer: u64,
+    scope: CustodyScope,
+    reference: &ContentRef,
+) -> Result<(), AccessError> {
+    let request = RequestId(
+        reference
+            .root
+            .0
+            .get(..16)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or(AccessError::InvalidRequest)?,
+    );
+    let transfer = transfer_id(scope, request, reference);
+    pull(content, pool, node, peer, scope, transfer, reference).await
+}
 fn envelope(scope: CustodyScope, id: [u8; 16], operation: CustodyRequest) -> RequestEnvelope {
     RequestEnvelope {
         protocol: PROTOCOL_VERSION,
@@ -1168,6 +1612,7 @@ async fn replicate(
         if *peer == node {
             continue;
         }
+        placement.admits(*peer)?;
         if matches!(remote(pool, *peer, scope, transfer, CustodyRequest::Verify { policy_revision: scope.policy_revision, content: reference.clone() }).await,
             Ok(CustodyReply::Durable { content: found, policy_revision }) if found == *reference && policy_revision == scope.policy_revision)
         {
@@ -1269,6 +1714,9 @@ async fn ensure_local(
         return Ok(());
     }
     for peer in placement.copies.iter().filter(|peer| **peer != node) {
+        if !placement.fence.admits(*peer) {
+            continue;
+        }
         let result = pull(content, pool, node, *peer, scope, transfer, reference).await;
         if result.is_ok() {
             return Ok(());

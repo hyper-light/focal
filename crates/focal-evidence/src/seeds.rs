@@ -38,7 +38,7 @@ impl SeedStore {
             .read(true)
             .write(true)
             .open(root.join("LOCK"))?;
-        lock.try_lock_exclusive().map_err(|error| {
+        focal_platform::try_lock_exclusive(&lock).map_err(|error| {
             if error.kind() == std::io::ErrorKind::WouldBlock {
                 ContentError::Locked
             } else {

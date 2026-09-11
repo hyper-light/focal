@@ -47,7 +47,16 @@ context supplies ordinary ledger operations; it does not grant node ownership.
    the restored session registers with the directory as founded here; its
    former participants' credentials belong to the old cluster, so their
    history is readable here but they cannot act until enrolled again.
-7. Use `cluster.storage.show` for this node's storage pressure (the volume
+7. Use `cluster.repair` (optionally `tenant` with `session`) to repair a
+   hosted session's custody on this node: every object its committed
+   prefix names is verified here, what is missing or fails its hash is
+   recopied from another required copy under the same identity, and other
+   required copies that lack an object are given it. Completion: `complete`
+   true with `unrecoverable_count` 0; when `complete` is false, call again
+   with `after` set to `next_after`. `restore_required` true means no
+   required copy can supply an object: use a verified backup, never a fresh
+   object.
+8. Use `cluster.storage.show` for this node's storage pressure (the volume
    envelope by kind, its headroom and completion reserve, what uploads
    have staged), the archive agent's and the collector's settings and
    progress, and every hosted session's retention floor. Completion: the
@@ -71,8 +80,11 @@ committed revocation; disconnect alone does not revoke a credential.
 same key under a fresh certificate and lifetime; a node renews itself ahead
 of expiry without being asked). Completion: the reply names the new expiry and
 fingerprint; a retry after an interruption converges on the committed
-renewal. It does not rotate the key, and the founder's identity is not
-renewed this way.
+renewal. `cluster.credentials.rotate` moves the local node's credential to a
+fresh key under the same identity: the previous certificate authorizes
+through the grace, the root re-grants the node under its new key, and the
+reply names the new `key_identity`. The founder's identity is neither
+renewed nor rotated this way.
 
 ## Inspect placement and the controller's plan
 
@@ -104,6 +116,23 @@ its log group and the node; the agent registers the session with the
 directory and places it under the deployment policy like the founder's.
 Completion: `cluster.placement` lists the session with its founding node.
 Tenants are admitted, never removed.
+
+## Read a node's readiness
+
+`cluster.node.readiness` reports the four probes a supervisor asks with the
+facts they derive from: `alive` (the node answers), `catching_up` (its root
+replica and every replica it hosts follow a known leader with nothing
+pending, but it leads none), `authoritative` (it leads the root or a hosted
+session's log at a committed prefix) and `policy_satisfied` (every session
+it hosts has its desired durability achieved in the directory with nothing
+blocking). It is a local read, never a quorum; a listening process is not
+authoritative because it listens. `cluster.node.metrics` returns the same
+node's metrics as Prometheus text (`text`), sampled every five seconds:
+memory and volume envelopes, WAL counters, each hosted replica's indices,
+apply and cursor lag, retention floor and pending seeds or objects, peer
+delivery counters, liveness members, credential expiry, placement intents
+and admission, the directory's epochs and achieved durability, and the
+upgrade fence. Read it to explain a probe; it changes nothing.
 
 ## Ask for a durability
 
@@ -162,6 +191,21 @@ use `cluster.replicas.request.inspect`, `cluster.replicas.request.retry` and
 and original physical owner. Completion: recover its receipt or report its
 specific unresolved/fenced state. A newer configuration does not prove an old
 application request never committed.
+
+## Fence an upgrade
+
+`cluster.upgrade.status` reports the committed upgrade fence (the
+capability level the cluster is held to; zero until one is activated), the
+level this node's binary implements and announces, every node the directory
+lists with the capability it last reported, and `activatable`, the highest
+fence every listed node supports. Roll binaries one node at a time; when
+`activatable` reaches the new level, the founder raises the fence with
+`cluster.upgrade.activate` and `fence` set to that level. Completion:
+`fence_level` equals the requested level. A refusal named `members_behind`
+lists the nodes still reporting less or none: upgrade or remove them, never
+retry around them. A fence never lowers; after it rises, a binary that
+announces a lower level refuses to serve (`upgrade_fenced`), so a rollback
+is a restore, not a downgrade.
 
 ## Report the achieved step
 

@@ -37,6 +37,7 @@ pub mod liveness;
 #[cfg(test)]
 mod liveness_tests;
 pub mod managed_service;
+pub mod metrics;
 pub mod network_admin;
 pub mod network_bootstrap;
 pub mod network_contacts;
@@ -51,6 +52,7 @@ pub mod placement;
 pub mod placement_agent;
 pub mod placement_collect;
 pub mod placement_control;
+pub mod placement_executor;
 pub mod placement_journal;
 pub mod placement_proof;
 pub mod quorum_enrollment;
@@ -66,6 +68,8 @@ pub mod session_registration;
 mod streams;
 #[cfg(test)]
 mod streams_tests;
+pub mod topology;
+pub mod upgrade;
 
 mod managed_support;
 

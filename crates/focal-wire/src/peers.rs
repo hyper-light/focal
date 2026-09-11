@@ -17,6 +17,9 @@ pub struct PeerEndpoint {
     pub address: SocketAddr,
     /// The committed identity's certificate name, not an unverified redirect.
     pub server_name: String,
+    /// The name the peer advertised (`host:port`, 24 §24), re-resolved when
+    /// `address` stops answering; the certificate check stays the same.
+    pub name: Option<String>,
 }
 #[derive(Debug, Clone)]
 pub struct PeerPoolLimits {
@@ -192,6 +195,10 @@ impl PeerConnectionPool {
                     || endpoint.server_name.len() > 253
                     || rustls::pki_types::ServerName::try_from(endpoint.server_name.clone())
                         .is_err()
+                    || endpoint
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| !crate::valid_endpoint_name(name))
             })
         {
             return Err(PeerSendError::Configuration);
@@ -322,6 +329,54 @@ impl PeerConnectionPool {
             Response::Error(error) => Err(PeerSendError::Rejected(error)),
             _ => Err(PeerSendError::InvalidRequest),
         }
+    }
+    /// A liveness probe to `target` at exactly `address`, on a connection
+    /// opened for it and closed after it: never the installed route, never
+    /// a re-resolved name (24 §24). The certificate check is the route's.
+    pub async fn probe_at(
+        &self,
+        target: u64,
+        address: SocketAddr,
+        request: &RequestEnvelope,
+    ) -> Result<Vec<u8>, PeerSendError> {
+        if !matches!(request.operation, Operation::Probe { .. }) || target == 0 {
+            return Err(PeerSendError::InvalidRequest);
+        }
+        let server_name = {
+            let state = self.state.lock().map_err(|_| PeerSendError::Closed)?;
+            if state.closed {
+                return Err(PeerSendError::Closed);
+            }
+            state
+                .routes
+                .get(&target)
+                .map(|endpoint| endpoint.server_name.clone())
+                .ok_or(PeerSendError::NoRoute)?
+        };
+        let _inflight = self
+            .probe_inflight
+            .try_acquire()
+            .map_err(|_| PeerSendError::Busy)?;
+        tokio::time::timeout(self.limits.timeout, async {
+            let remote = self
+                .connector
+                .connect(address, &server_name)
+                .await
+                .map_err(|_| PeerSendError::Lost)?;
+            let result = match remote.request(request).await {
+                Ok(response) => match response.result {
+                    Response::Probe(reply) => Ok(reply),
+                    Response::Error(error) => Err(PeerSendError::Rejected(error)),
+                    _ => Err(PeerSendError::Lost),
+                },
+                Err(WireError::Access(error)) => Err(PeerSendError::Rejected(error)),
+                Err(_) => Err(PeerSendError::Lost),
+            };
+            remote.close();
+            result
+        })
+        .await
+        .map_err(|_| PeerSendError::Lost)?
     }
     /// A liveness probe; the reply is the peer's opaque probe reply.
     pub async fn send_probe(
@@ -575,11 +630,21 @@ impl PeerConnectionPool {
         }
         // One connecting task per peer. At most per_peer_inflight-1 callers can
         // wait for it, and all retain global permits under the same deadline.
-        let remote = self
+        let remote = match self
             .connector
             .connect(slot.endpoint.address, &slot.endpoint.server_name)
             .await
-            .map_err(|_| PeerSendError::Lost)?;
+        {
+            Ok(remote) => remote,
+            // The announced address stopped answering: a peer that advertised
+            // a name may have moved behind it (24 §24). Resolution is bounded
+            // by the same deadline and never changes which certificate is
+            // accepted.
+            Err(_) => match &slot.endpoint.name {
+                Some(name) => self.connect_by_name(name, &slot.endpoint).await?,
+                None => return Err(PeerSendError::Lost),
+            },
+        };
         if slot.retired.load(Ordering::Acquire) {
             remote.close();
             return Err(PeerSendError::RouteChanged);
@@ -602,6 +667,26 @@ impl PeerConnectionPool {
             remote: remote.clone(),
         });
         Ok((generation, remote))
+    }
+    async fn connect_by_name(
+        &self,
+        name: &str,
+        endpoint: &PeerEndpoint,
+    ) -> Result<QuicRemote, PeerSendError> {
+        let resolved = tokio::time::timeout(self.limits.timeout, tokio::net::lookup_host(name))
+            .await
+            .map_err(|_| PeerSendError::Lost)?
+            .map_err(|_| PeerSendError::Lost)?;
+        // At most four fresh candidates, the announced address excluded.
+        for address in resolved
+            .filter(|address| *address != endpoint.address)
+            .take(4)
+        {
+            if let Ok(remote) = self.connector.connect(address, &endpoint.server_name).await {
+                return Ok(remote);
+            }
+        }
+        Err(PeerSendError::Lost)
     }
     pub fn stats(&self) -> PeerPoolStats {
         PeerPoolStats {

@@ -39,6 +39,7 @@ struct CheckpointV2<S = ControlBootstrap> {
     retries: RetryCheckpoint,
     authority: ControlAuthoritySnapshot,
 }
+/// The shape schemas 3 and 4 wrote: contacts without topology labels.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct CheckpointV3<S = ControlBootstrap> {
     schema: u16,
@@ -48,9 +49,32 @@ struct CheckpointV3<S = ControlBootstrap> {
     retries: RetryCheckpoint,
     authority: Option<ControlAuthoritySnapshot>,
     configuration_index: u64,
+    contacts: Option<crate::contacts::ContactCheckpointV1>,
+}
+/// The shape schema 5 wrote: contacts without advertised names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CheckpointV5<S = ControlBootstrap> {
+    schema: u16,
+    identity: ControlIdentity,
+    applied_index: u64,
+    state: S,
+    retries: RetryCheckpoint,
+    authority: Option<ControlAuthoritySnapshot>,
+    configuration_index: u64,
+    contacts: Option<crate::contacts::ContactCheckpointV2>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CheckpointV6<S = ControlBootstrap> {
+    schema: u16,
+    identity: ControlIdentity,
+    applied_index: u64,
+    state: S,
+    retries: RetryCheckpoint,
+    authority: Option<ControlAuthoritySnapshot>,
+    configuration_index: u64,
     contacts: Option<ContactCheckpoint>,
 }
-const CHECKPOINT_SCHEMA: u16 = 4;
+const CHECKPOINT_SCHEMA: u16 = 6;
 const COMMAND_SCHEMA: u16 = 2;
 struct Pending {
     request: ControlRequestId,
@@ -333,7 +357,7 @@ impl ControlReplica {
                         .contacts()
                         .cloned()
                         .unwrap_or(ContactCheckpoint {
-                            schema: 1,
+                            schema: crate::contacts::CONTACT_CHECKPOINT_SCHEMA,
                             cluster: self.identity.cluster.0,
                             revision: 0,
                             applied_index: 0,
@@ -706,11 +730,41 @@ impl ControlReplica {
                         },
                         newer.authority,
                         newer.configuration_index,
-                        newer.contacts,
+                        newer.contacts.map(ContactCheckpoint::from),
                     )
                 }
                 4 => {
                     let newer: CheckpointV3 = decode(&snapshot.data, limit)?;
+                    (
+                        Checkpoint {
+                            schema: CHECKPOINT_SCHEMA,
+                            identity: newer.identity,
+                            applied_index: newer.applied_index,
+                            state: newer.state,
+                            retries: newer.retries,
+                        },
+                        newer.authority,
+                        newer.configuration_index,
+                        newer.contacts.map(ContactCheckpoint::from),
+                    )
+                }
+                5 => {
+                    let newer: CheckpointV5 = decode(&snapshot.data, limit)?;
+                    (
+                        Checkpoint {
+                            schema: CHECKPOINT_SCHEMA,
+                            identity: newer.identity,
+                            applied_index: newer.applied_index,
+                            state: newer.state,
+                            retries: newer.retries,
+                        },
+                        newer.authority,
+                        newer.configuration_index,
+                        newer.contacts.map(ContactCheckpoint::from),
+                    )
+                }
+                6 => {
+                    let newer: CheckpointV6 = decode(&snapshot.data, limit)?;
                     (
                         Checkpoint {
                             schema: CHECKPOINT_SCHEMA,
@@ -974,7 +1028,7 @@ impl ControlReplica {
             .machine
             .export_authority(self.identity, self.applied_index)?;
         let bytes = encode(
-            &CheckpointV3 {
+            &CheckpointV6 {
                 schema: CHECKPOINT_SCHEMA,
                 identity: self.identity,
                 applied_index: self.applied_index,

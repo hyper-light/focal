@@ -252,14 +252,22 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             index,
             term,
         )?;
+        let reader = RecordingReader::new(&self.reader);
         let restored = recovery::restore(
             checkpoint.core(),
             range,
             self.limits.recovery,
             self.budget.clone(),
-            &self.reader,
+            &reader,
             &self.schemas,
-        )?;
+        );
+        let missing = reader.take_missing();
+        self.pending_custody = if missing.is_empty() {
+            None
+        } else {
+            Some(PendingCustody::new(missing, &self.budget)?)
+        };
+        let restored = restored?;
         if restored.native_sequence() != header.prefix {
             return Err(NativeSessionError::Corrupt);
         }

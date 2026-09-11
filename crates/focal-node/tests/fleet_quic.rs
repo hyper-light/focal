@@ -359,6 +359,7 @@ impl Fleet {
             let endpoint = PeerEndpoint {
                 address: server.local_addr().unwrap(),
                 server_name: identity.name.clone(),
+                name: None,
             };
             routes.insert(id, endpoint.clone());
             pending.push((host, owner, channel, server, server_task, pool, endpoint));

@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: focal-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: focal
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+data:
+{{- if .Values.zones }}
+{{- range $index, $zone := .Values.zones }}
+{{- if eq $index 0 }}
+  focal-founder.yaml: |
+{{ include "focal.config" (dict "root" $ "zone" $zone.name) | indent 4 }}
+{{- end }}
+{{- if gt (int $zone.hosts) 0 }}
+  focal-{{ $zone.name }}.yaml: |
+{{ include "focal.config" (dict "root" $ "zone" $zone.name) | indent 4 }}
+{{- end }}
+{{- end }}
+{{- else }}
+  focal-founder.yaml: |
+{{ include "focal.config" (dict "root" $ "zone" "") | indent 4 }}
+{{- if gt (int .Values.hosts) 0 }}
+  focal-hosts.yaml: |
+{{ include "focal.config" (dict "root" $ "zone" "") | indent 4 }}
+{{- end }}
+{{- end }}

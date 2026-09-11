@@ -298,7 +298,28 @@ impl AuthorityRegistry {
                 {
                     return Err(DirectoryError::StaleNode);
                 }
-                validate_node_identity(grant, enrollment, command.decided_at)?;
+                // A grant that only withdraws eligibility from the node as it
+                // stands (the same key and principal, marked ineligible) is a
+                // drain, and a drain must reach a node whose credential the
+                // registry no longer authorizes: that is exactly the node an
+                // operator retires (runbooks/expired-credentials). Every
+                // other grant needs the live credential.
+                let withdrawal = !grant.enrollment.eligible
+                    && old.is_some_and(|old| {
+                        old.enrollment.identity == grant.enrollment.identity
+                            && old.enrollment.region == grant.enrollment.region
+                            && old.enrollment.zone == grant.enrollment.zone
+                            && old.enrollment.endpoint == grant.enrollment.endpoint
+                            && old.enrollment.authority_epoch == grant.enrollment.authority_epoch
+                            && old.principal == grant.principal
+                            && old.expires_at == grant.expires_at
+                    });
+                match validate_node_identity(grant, enrollment, command.decided_at) {
+                    Ok(()) => {}
+                    Err(DirectoryError::UnverifiedAuthority | DirectoryError::Expired)
+                        if withdrawal => {}
+                    Err(error) => return Err(error),
+                }
                 let mut grant = grant.clone();
                 grant.enrollment.attestation = node_digest(&next.anchor, &grant)?;
                 next.nodes.insert(grant.enrollment.node, grant);
@@ -565,7 +586,16 @@ fn validate_live_group(
         {
             return Err(DirectoryError::StaleNode);
         }
-        validate_node_identity(registered, enrollment, now)?;
+        // A drained seat may belong to a retired credential (a revoked or
+        // expired node on its way out, runbooks/expired-credentials): the
+        // group change that drops it must still commit. A live seat needs
+        // the live credential.
+        match validate_node_identity(registered, enrollment, now) {
+            Ok(()) => {}
+            Err(DirectoryError::UnverifiedAuthority | DirectoryError::Expired)
+                if !registered.enrollment.eligible => {}
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }

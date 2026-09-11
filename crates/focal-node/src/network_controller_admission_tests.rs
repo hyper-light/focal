@@ -83,10 +83,15 @@ impl Fixture {
             directory,
         };
         let observation = fixture.observe().await;
-        let command =
-            next_root_command(&fixture.state, &observation, &BTreeSet::new(), fixture.now)
-                .unwrap()
-                .unwrap();
+        let command = next_root_command(
+            &fixture.state,
+            &observation,
+            &BTreeSet::new(),
+            fixture.now,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
         assert!(matches!(command, ControlCommand::ActivateAuthority(_)));
         fixture.commit(command).await;
         fixture
@@ -205,6 +210,9 @@ impl Fixture {
                     acknowledged_through: 0,
                     expected_generation: 0,
                     advertise: self.state.advertise,
+                    region: None,
+                    zone: None,
+                    endpoint: None,
                 },
             },
             &ControlHost::wire_limits(),
@@ -234,8 +242,14 @@ impl Fixture {
         let Some(ControlCommand::Authority(AuthorityCommand {
             operation: AuthorityOperation::GrantNode { grant, .. },
             ..
-        })) = next_root_command(&self.state, &observation, &BTreeSet::from([node]), self.now)
-            .unwrap()
+        })) = next_root_command(
+            &self.state,
+            &observation,
+            &BTreeSet::from([node]),
+            self.now,
+            &[],
+        )
+        .unwrap()
         else {
             panic!("first capability grant");
         };
@@ -305,6 +319,7 @@ async fn withdrawn_grant_fences_a_reopened_journal_intent_without_consuming_its_
         &observation,
         &BTreeSet::from([node]),
         fixture.now,
+        &[],
     )
     .unwrap()
     .unwrap();
@@ -427,7 +442,8 @@ async fn expired_or_mismatched_capabilities_cannot_select_a_learner() {
                 &fixture.state,
                 &observation,
                 &BTreeSet::from([node]),
-                fixture.now
+                fixture.now,
+                &[]
             )
             .unwrap(),
             Some(ControlCommand::Authority(_))
@@ -441,7 +457,8 @@ async fn expired_or_mismatched_capabilities_cannot_select_a_learner() {
             &fixture.state,
             &observation,
             &BTreeSet::from([node]),
-            grant.expires_at - 1
+            grant.expires_at - 1,
+            &[]
         )
         .unwrap(),
         Some(ControlCommand::Membership(_))
@@ -451,7 +468,8 @@ async fn expired_or_mismatched_capabilities_cannot_select_a_learner() {
             &fixture.state,
             &observation,
             &BTreeSet::from([node]),
-            grant.expires_at
+            grant.expires_at,
+            &[]
         )
         .unwrap(),
         None
@@ -463,6 +481,7 @@ async fn expired_or_mismatched_capabilities_cannot_select_a_learner() {
         &observation,
         &BTreeSet::from([node]),
         fixture.now,
+        &[],
     )
     .unwrap()
     .unwrap();
@@ -521,6 +540,7 @@ async fn full_capability_table_admits_an_existing_grant_before_an_ungranted_lowe
         &observation,
         &BTreeSet::from([lower_node, higher_node]),
         fixture.now,
+        &[],
     )
     .unwrap()
     .unwrap();

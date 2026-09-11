@@ -366,6 +366,7 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
             PeerEndpoint {
                 address: server.local_addr().unwrap(),
                 server_name: receipts[index].identity.server_name.clone(),
+                name: None,
             },
         );
         let serving_server = server.clone();
@@ -558,14 +559,19 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
         ),
         ControlReply::Rejected(ControlFailure::Unauthorized)
     );
+    // A node peer is not scoped by tenant on the wire (24 §16); the owner
+    // still refuses a request addressed outside its namespace.
     let mut wrong_scope = packet.clone();
     wrong_scope.ledger.tenant = TenantId::from_u128(999);
     assert_eq!(
-        replicas[0]
-            .pool
-            .send_enrollment_control(2, &wrong_scope)
-            .await,
-        Err(PeerSendError::Rejected(AccessError::Unauthorized))
+        control_reply(
+            &replicas[0]
+                .pool
+                .send_enrollment_control(2, &wrong_scope)
+                .await
+                .unwrap()
+        ),
+        ControlReply::Rejected(ControlFailure::Unauthorized)
     );
     assert!(
         verify_request(
@@ -756,6 +762,7 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
                 PeerEndpoint {
                     address: blackhole.local_addr().unwrap(),
                     server_name: receipts[2].identity.server_name.clone(),
+                    name: None,
                 },
             )
         })

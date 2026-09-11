@@ -1,4 +1,31 @@
 use crate::*;
+/// The longest failure-domain label a node may announce (24 §22).
+pub const MAX_TOPOLOGY_LABEL_BYTES: usize = 64;
+/// The longest advertised name (`host:port`) a contact carries (24 §24):
+/// a DNS name of at most 253 bytes, a colon and a port.
+pub const MAX_ENDPOINT_NAME_BYTES: usize = 259;
+/// An advertised name is `host:port` where the host is a DNS name (never an
+/// address literal, which needs no resolution) and the port is nonzero.
+pub fn valid_endpoint_name(name: &str) -> bool {
+    if name.len() > MAX_ENDPOINT_NAME_BYTES {
+        return false;
+    }
+    let Some((host, port)) = name.rsplit_once(':') else {
+        return false;
+    };
+    if host.is_empty()
+        || host.contains(':')
+        || host.parse::<std::net::IpAddr>().is_ok()
+        || !port.parse::<u16>().is_ok_and(|port| port != 0)
+    {
+        return false;
+    }
+    matches!(
+        rustls::pki_types::ServerName::try_from(host.to_owned()),
+        Ok(rustls::pki_types::ServerName::DnsName(_))
+    )
+}
+
 use focal_model::*;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -36,8 +63,13 @@ impl AuthenticatedPeer {
         })
     }
     /// Borrowed scope check for trusted service routers before ledger lookup.
+    /// A node peer is infrastructure: it replicates, hosts and drives the
+    /// sessions the directory assigns it across every tenant, and every
+    /// operation its role may issue is validated against committed placement
+    /// and enrollment facts, so its grant's tenants do not scope it. A
+    /// client's grant does.
     pub fn permits_tenant(&self, tenant: TenantId) -> bool {
-        self.grant.tenants.contains(&tenant)
+        matches!(self.grant.role, PeerRole::Node { .. }) || self.grant.tenants.contains(&tenant)
     }
     pub fn principal(&self) -> ParticipantId {
         self.grant.principal
@@ -290,7 +322,7 @@ pub fn verify_request(
     limits: &WireLimits,
 ) -> Result<VerifiedRequest, AccessError> {
     // Tenant authorization precedes all ledger-specific work and error disclosure.
-    if !peer.grant.tenants.contains(&request.ledger.tenant) {
+    if !peer.permits_tenant(request.ledger.tenant) {
         return Err(AccessError::Unauthorized);
     }
     let managed = matches!(
@@ -702,11 +734,25 @@ fn request_shape(
             sequence,
             acknowledged_through,
             advertise,
+            region,
+            zone,
+            endpoint,
             ..
         } => {
+            let bad_label = |label: &Option<String>| {
+                label
+                    .as_ref()
+                    .is_some_and(|label| label.is_empty() || label.len() > MAX_TOPOLOGY_LABEL_BYTES)
+            };
             if *group == [0; 16]
                 || *sequence == 0
                 || *acknowledged_through >= *sequence
+                || bad_label(region)
+                || bad_label(zone)
+                || (zone.is_some() && region.is_none())
+                || endpoint
+                    .as_deref()
+                    .is_some_and(|name| !valid_endpoint_name(name))
                 || advertise.port() == 0
                 || advertise.ip().is_unspecified()
                 || advertise.ip().is_multicast()

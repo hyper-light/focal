@@ -21,7 +21,6 @@
 //! `File::sync_all` and directory synchronization provide the OS/filesystem flush
 //! contract. This does not claim protection against a drive that lies about flushes.
 
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -187,7 +186,7 @@ impl Wal {
             .read(true)
             .write(true)
             .open(directory.join("LOCK"))?;
-        lock.try_lock_exclusive().map_err(|e| {
+        focal_platform::try_lock_exclusive(&lock).map_err(|e| {
             if e.kind() == std::io::ErrorKind::WouldBlock {
                 LogError::Locked
             } else {

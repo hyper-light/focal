@@ -6,7 +6,8 @@ use crate::{
     network_admin::{ADMIN_SOCKET, AdminCommand, AdminRead, admin_principal, admin_wire_limits},
 };
 use focal_client::admin::{
-    AdminConfiguration, AdminContact, AdminCredential, AdminInvitation, AdminResult,
+    AdminConfiguration, AdminContact, AdminCredential, AdminInvitation, AdminNodeCapability,
+    AdminResult, AdminUpgrade,
 };
 use focal_control::*;
 use focal_enrollment::PrivateJournal;
@@ -68,6 +69,22 @@ pub enum ClusterAdminError {
     UnknownNode(u64),
     #[error("node {0} is not alive, eligible and reporting; it cannot take over")]
     NotReady(u64),
+    #[error(
+        "the upgrade fence cannot rise to level {level}: nodes {behind:?} report a lower capability or none"
+    )]
+    MembersBehind { level: u32, behind: Vec<u64> },
+    #[error("the upgrade fence is at level {current} and never lowers to {requested}")]
+    FenceRegression { current: u32, requested: u32 },
+    #[error(
+        "node {node} (region {region:?}) lies outside the session's residency {residency:?}; no copy moves there"
+    )]
+    OutsideResidency {
+        node: u64,
+        region: Option<String>,
+        residency: Vec<String>,
+    },
+    #[error("probe {0} does not hold on this node")]
+    ProbeFailed(&'static str),
     #[error("bounded admin capacity or request sequence is exhausted")]
     Capacity,
 }
@@ -111,6 +128,14 @@ impl ClusterAdminError {
             Self::NodeHolding { .. } => Failure::error("node_holding", 5),
             Self::NotDrained(_) => Failure::error("not_drained", 5),
             Self::NotReady(_) => Failure::error("node_not_ready", 5),
+            Self::MembersBehind { .. } => Failure::error("members_behind", 5),
+            Self::OutsideResidency { .. } => Failure::error("outside_residency", 5),
+            Self::FenceRegression { .. } => Failure::error("invalid_input", 2),
+            Self::ProbeFailed(_) => Failure {
+                condition: "NotReady",
+                code: "probe_failed",
+                exit_code: 1,
+            },
             Self::Invalid | Self::Control(ControlFailure::Invalid | ControlFailure::RetryOrder) => {
                 Failure::error("invalid_input", 2)
             }
@@ -203,6 +228,14 @@ impl ClusterAdmin {
                 if value.node == self.identity.node =>
             {
                 Ok(AdminResult::Storage { storage: *value })
+            }
+            (OperatorRead::Readiness, OperatorReply::Readiness(value))
+                if value.node == self.identity.node && value.alive =>
+            {
+                Ok(AdminResult::Readiness { readiness: *value })
+            }
+            (OperatorRead::Metrics, OperatorReply::Metrics(text)) if text.len() <= 8 << 20 => {
+                Ok(AdminResult::Metrics { text })
             }
             (OperatorRead::Gc, OperatorReply::Gc(value))
                 if value.node == self.identity.node
@@ -311,6 +344,35 @@ impl ClusterAdmin {
             backup: reply.backup,
         })
     }
+    /// Repair a hosted session's custody on this node (24 §20).
+    pub async fn repair(
+        &self,
+        ledger: focal_model::LedgerId,
+        after: Option<[u8; 16]>,
+        limit: u32,
+    ) -> Result<AdminResult> {
+        let bytes = self
+            .exchange_bytes(AdminCommand::Repair {
+                tenant: ledger.tenant.0,
+                session: ledger.session.0,
+                after,
+                limit,
+            })
+            .await?;
+        let (reply, tail): (crate::network_admin::RepairedReply, _) =
+            postcard::take_from_bytes(&bytes).map_err(|_| ClusterAdminError::Invalid)?;
+        if !tail.is_empty()
+            || reply.schema != crate::network_admin::REPAIRED_REPLY_SCHEMA
+            || reply.repair.session != ledger.session.to_string()
+            || reply.repair.tenant != ledger.tenant.to_string()
+            || reply.repair.node != self.identity.node
+        {
+            return Err(ClusterAdminError::Invalid);
+        }
+        Ok(AdminResult::Repaired {
+            repair: reply.repair,
+        })
+    }
     /// Verify a backup directory offline (26 §6): no running node and no
     /// data directory are needed, only a binary that can read the format.
     pub fn backup_verify(input: &Path) -> Result<AdminResult> {
@@ -376,6 +438,35 @@ impl ClusterAdmin {
                     expires_at: summary.expires_at,
                     certificate_fingerprint: hex(&summary.certificate_fingerprint),
                     renewals: summary.renewals,
+                    key_identity: hex(&summary.key_identity),
+                    rotations: summary.rotations,
+                })
+            }
+            CredentialReply::Renewed(_) => Err(ClusterAdminError::Invalid),
+            CredentialReply::Failed(error) => Err(error.into()),
+        }
+    }
+    /// Rotate this node's own credential to a fresh key under the same
+    /// identity (24 §11); the founder's identity is never rotated here.
+    pub async fn rotate_credential(&self) -> Result<AdminResult> {
+        use crate::credential_renewal::CredentialReply;
+        let bytes = self.exchange_bytes(AdminCommand::RotateCredential).await?;
+        let (reply, tail): (CredentialReply, _) =
+            postcard::take_from_bytes(&bytes).map_err(|_| ClusterAdminError::Invalid)?;
+        if !tail.is_empty() {
+            return Err(ClusterAdminError::Invalid);
+        }
+        match reply {
+            CredentialReply::Renewed(summary) if summary.node == self.identity.node => {
+                Ok(AdminResult::CredentialRotated {
+                    node: summary.node,
+                    principal: hex(&summary.principal),
+                    issued_at: summary.issued_at,
+                    expires_at: summary.expires_at,
+                    certificate_fingerprint: hex(&summary.certificate_fingerprint),
+                    key_identity: hex(&summary.key_identity),
+                    renewals: summary.renewals,
+                    rotations: summary.rotations,
                 })
             }
             CredentialReply::Renewed(_) => Err(ClusterAdminError::Invalid),
@@ -460,6 +551,98 @@ impl ClusterAdmin {
             return Err(ClusterAdminError::Invalid);
         }
         Ok(Self::tenants_view(reply))
+    }
+    async fn upgrade_reply(
+        &self,
+        command: AdminCommand,
+    ) -> Result<crate::network_admin::UpgradeReply> {
+        let bytes = self.exchange_bytes(command).await?;
+        let (reply, tail): (crate::network_admin::UpgradeReply, _) =
+            postcard::take_from_bytes(&bytes).map_err(|_| ClusterAdminError::Invalid)?;
+        if !tail.is_empty()
+            || reply.schema != crate::network_admin::UPGRADE_REPLY_SCHEMA
+            || reply.announced > reply.binary
+            || reply.nodes.len() > 65536
+            || !reply
+                .nodes
+                .windows(2)
+                .all(|pair| matches!(pair, [left, right] if left.0 < right.0))
+        {
+            return Err(ClusterAdminError::Invalid);
+        }
+        Ok(reply)
+    }
+    fn upgrade_view(reply: &crate::network_admin::UpgradeReply) -> AdminUpgrade {
+        AdminUpgrade {
+            fence_level: reply.fence.level,
+            fence_activated_at: reply.fence.activated_at,
+            fence_revision: reply.fence.revision,
+            binary_level: reply.binary,
+            announced_level: reply.announced,
+            applied_index: reply.applied_index,
+            registry_revision: reply.revision,
+            nodes: reply
+                .nodes
+                .iter()
+                .map(|(node, capability)| AdminNodeCapability {
+                    node: *node,
+                    capability: *capability,
+                })
+                .collect(),
+            activatable: reply
+                .nodes
+                .iter()
+                .map(|(_, capability)| *capability)
+                .min()
+                .unwrap_or(0),
+        }
+    }
+    /// The upgrade fence and every node's reported capability (24 §21).
+    pub async fn upgrade_status(&self) -> Result<AdminResult> {
+        let reply = self.upgrade_reply(AdminCommand::UpgradeStatus).await?;
+        Ok(AdminResult::Upgrade {
+            upgrade: Self::upgrade_view(&reply),
+        })
+    }
+    /// Raise the upgrade fence to `level` (24 §21): refused by name while a
+    /// node reports a lower capability or none, never lowered; a fence
+    /// already at `level` reads as done.
+    pub async fn activate_fence(&self, level: u32) -> Result<AdminResult> {
+        if level == 0 {
+            return Err(ClusterAdminError::Invalid);
+        }
+        let status = self.upgrade_reply(AdminCommand::UpgradeStatus).await?;
+        if level < status.fence.level {
+            return Err(ClusterAdminError::FenceRegression {
+                current: status.fence.level,
+                requested: level,
+            });
+        }
+        if level == status.fence.level {
+            return Ok(AdminResult::FenceActivated {
+                upgrade: Self::upgrade_view(&status),
+                changed: false,
+            });
+        }
+        let behind: Vec<u64> = status
+            .nodes
+            .iter()
+            .filter(|(_, capability)| *capability < level)
+            .map(|(node, _)| *node)
+            .collect();
+        if status.nodes.is_empty() || !behind.is_empty() {
+            return Err(ClusterAdminError::MembersBehind { level, behind });
+        }
+        let reply = self
+            .upgrade_reply(AdminCommand::ActivateFence { level })
+            .await?;
+        if reply.fence.level < level {
+            return Err(ClusterAdminError::Invalid);
+        }
+        Ok(AdminResult::FenceActivated {
+            upgrade: Self::upgrade_view(&reply),
+            changed: reply.changed,
+        })
     }
     /// Create an application session on this node for a served tenant, or
     /// find the one the same name already denotes.
@@ -838,6 +1021,28 @@ impl ClusterAdmin {
         let (_, saved) = self.journal(false)?;
         saved_view(self.identity.node, &saved)
     }
+    /// One readiness probe (08 §9): the readiness report when `check`
+    /// holds, `probe_failed` (exit 1) otherwise, for a supervisor's probe.
+    pub async fn probe(&self, check: &str) -> Result<AdminResult> {
+        let result = self
+            .operator(crate::network_admin::OperatorRead::Readiness)
+            .await?;
+        let AdminResult::Readiness { readiness } = &result else {
+            return Err(ClusterAdminError::Invalid);
+        };
+        let (name, holds) = match check {
+            "alive" => ("alive", readiness.alive),
+            "catching-up" => ("catching-up", readiness.catching_up),
+            "authoritative" => ("authoritative", readiness.authoritative),
+            "policy" => ("policy", readiness.policy_satisfied),
+            _ => return Err(ClusterAdminError::Invalid),
+        };
+        if holds {
+            Ok(result)
+        } else {
+            Err(ClusterAdminError::ProbeFailed(name))
+        }
+    }
     /// Set a node's placement eligibility (24 §19): the root re-issues the
     /// node's grant at its next generation, after which the controller heals
     /// every placement that named the node and retires its copies (drain),
@@ -1194,6 +1399,36 @@ impl ClusterAdmin {
     ) -> Result<AdminResult> {
         if tenant == [0; 16] || session == [0; 16] || member == [0; 16] || node == 0 {
             return Err(ClusterAdminError::Invalid);
+        }
+        // The residency fence (24 §22) is checked here by name before the
+        // agent refuses it: the session's boundary against the node's
+        // announced region.
+        let view = self.placement_view().await?;
+        let session_hex = hex(&session);
+        let tenant_hex = hex(&tenant);
+        if let Some(target) = view
+            .partitions
+            .iter()
+            .flat_map(|partition| partition.sessions.iter())
+            .find(|entry| entry.session == session_hex && entry.tenant == tenant_hex)
+            && !target.residency.is_empty()
+        {
+            let region = view
+                .partitions
+                .iter()
+                .flat_map(|partition| partition.nodes.iter())
+                .find(|entry| entry.node == node)
+                .and_then(|entry| entry.region.clone());
+            if region
+                .as_ref()
+                .is_none_or(|region| !target.residency.contains(region))
+            {
+                return Err(ClusterAdminError::OutsideResidency {
+                    node,
+                    region,
+                    residency: target.residency.clone(),
+                });
+            }
         }
         let bytes = self
             .exchange_bytes(AdminCommand::MoveRange {

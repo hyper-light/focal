@@ -32,6 +32,24 @@ for entry in entries:
     if actual != entry["sha256"]:
         errors.append(f"imported source changed: {path.relative_to(ROOT)}")
 
+# The one audited unsafe file (decision 11, doc 10). The compiler denies
+# `unsafe_code` everywhere and it is allowed only in this file; this check is
+# the belt-and-suspenders that no other source relaxes the lint or writes an
+# `unsafe` block, so the boundary cannot drift without editing this script.
+UNSAFE_FILE = ROOT / "crates/focal-platform/src/windows.rs"
+UNSAFE_KEYWORD = re.compile(r"\bunsafe\s*(?:\{|fn\b|impl\b|trait\b|extern\b)")
+ALLOW_UNSAFE = re.compile(r"#!?\[\s*allow\s*\(\s*unsafe_code\s*\)")
+for source in sorted((ROOT / "crates").glob("*/src/**/*.rs")):
+    if source == UNSAFE_FILE:
+        continue
+    text = source.read_text()
+    if UNSAFE_KEYWORD.search(text):
+        errors.append(f"unsafe keyword outside the audited FFI file: {source.relative_to(ROOT)}")
+    if ALLOW_UNSAFE.search(text):
+        errors.append(f"allow(unsafe_code) outside the audited FFI file: {source.relative_to(ROOT)}")
+if not UNSAFE_FILE.exists():
+    errors.append("the audited FFI file crates/focal-platform/src/windows.rs is missing")
+
 registry = json.loads((ROOT / "config/schema/domain-registry-v1.json").read_text())
 source = (ROOT / "crates/focal-model/src/vocabulary.rs").read_text()
 for name, fields in registry["vocabularies"].items():

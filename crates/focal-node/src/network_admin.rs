@@ -22,6 +22,8 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 pub const ADMIN_SOCKET: &str = "focal-admin.sock";
 const MAGIC: &[u8] = b"FCLADMIN1";
 const MAX_COMMAND: usize = 60 * 1024;
+/// The lease a repair's export holds; a walk that outlives it resumes.
+const REPAIR_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 const WORKSPACE: usize = 2 * 1024 * 1024;
 #[path = "replica_admin_protocol.rs"]
 mod replicas;
@@ -59,6 +61,8 @@ pub enum AdminCommand {
     Operator(OperatorRead),
     /// Renew this node's own credential now.
     RenewCredential,
+    /// Rotate this node's own credential to a fresh key now (24 §11).
+    RotateCredential,
     /// The placement view and the controller's next actions.
     Placement,
     /// Admit a tenant the cluster serves; founder only, exact on retry
@@ -107,7 +111,48 @@ pub enum AdminCommand {
         input: String,
         new_incarnation: bool,
     },
+    /// Repair a hosted session's custody on this node (24 §20): re-verify
+    /// every object its committed prefix names, recopy what is missing from
+    /// another required copy, complete the other required copies.
+    Repair {
+        tenant: [u8; 16],
+        session: [u8; 16],
+        /// Resume the walk after this artifact.
+        after: Option<[u8; 16]>,
+        /// The objects one call examines at most.
+        limit: u32,
+    },
+    /// The committed upgrade fence, this binary's level and every enrolled
+    /// node's reported level (24 §21).
+    UpgradeStatus,
+    /// Raise the upgrade fence to `level`; founder only, exact on retry.
+    ActivateFence {
+        level: u32,
+    },
 }
+/// The reply to [`AdminCommand::UpgradeStatus`] and
+/// [`AdminCommand::ActivateFence`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpgradeReply {
+    pub schema: u16,
+    pub applied_index: u64,
+    pub revision: u64,
+    pub fence: focal_enrollment::UpgradeFence,
+    pub binary: u32,
+    pub announced: u32,
+    /// Every node the directory lists, with the capability it last
+    /// reported (zero: none reported).
+    pub nodes: Vec<(u64, u32)>,
+    pub changed: bool,
+}
+pub const UPGRADE_REPLY_SCHEMA: u16 = 1;
+/// The reply to [`AdminCommand::Repair`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RepairedReply {
+    pub schema: u16,
+    pub repair: focal_client::admin::AdminRepair,
+}
+pub const REPAIRED_REPLY_SCHEMA: u16 = 1;
 /// The reply to [`AdminCommand::Restore`].
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RestoredReply {
@@ -209,7 +254,41 @@ fn hex(bytes: &[u8]) -> String {
 }
 /// Project the agent's last observation for the operator: committed facts
 /// only, with each session's guarantee measured against the live nodes.
-pub(crate) fn placement_reply(report: crate::placement_control::DirectoryReport) -> PlacementReply {
+/// The labels behind the directory's identities (24 §22): every registered
+/// region's label and the topology each node announced with its contact.
+#[derive(Debug, Default)]
+pub(crate) struct TopologyLabels {
+    pub regions: std::collections::BTreeMap<focal_directory::RegionId, String>,
+    pub contacts: std::collections::BTreeMap<u64, ContactLabels>,
+    /// The nodes whose credential the enrollment registry still authorizes;
+    /// `None` when the registry could not be read.
+    pub credentialed: Option<std::collections::BTreeSet<u64>>,
+}
+/// What a node's committed contact says about it (24 §22, §24).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ContactLabels {
+    pub region: Option<String>,
+    pub zone: Option<String>,
+    pub advertise: Option<String>,
+    pub endpoint: Option<String>,
+}
+impl TopologyLabels {
+    fn region(&self, region: focal_directory::RegionId) -> Option<String> {
+        if region == focal_directory::RegionId::UNKNOWN {
+            return None;
+        }
+        Some(
+            self.regions
+                .get(&region)
+                .cloned()
+                .unwrap_or_else(|| hex(&region.0)),
+        )
+    }
+}
+pub(crate) fn placement_reply(
+    report: crate::placement_control::DirectoryReport,
+    labels: &TopologyLabels,
+) -> PlacementReply {
     use focal_client::admin::{
         AdminAssignmentProgress, AdminPartition, AdminPendingPlacement, AdminPlacement,
         AdminPlacementNode, AdminPlannedAction, AdminSeal, AdminSessionPlacement,
@@ -232,6 +311,29 @@ pub(crate) fn placement_reply(report: crate::placement_control::DirectoryReport)
                 available_memory: record.load.map(|load| load.available_memory),
                 active_weight: record.load.map(|load| load.active_weight),
                 disk_available: record.load.map(|load| load.disk_available),
+                capability: record.load.map(|load| load.capability),
+                region: labels
+                    .contacts
+                    .get(&record.enrollment.node)
+                    .and_then(|contact| contact.region.clone())
+                    .or_else(|| labels.region(record.enrollment.region)),
+                zone: labels
+                    .contacts
+                    .get(&record.enrollment.node)
+                    .and_then(|contact| contact.zone.clone()),
+                advertise: labels
+                    .contacts
+                    .get(&record.enrollment.node)
+                    .and_then(|contact| contact.advertise.clone()),
+                endpoint: labels
+                    .contacts
+                    .get(&record.enrollment.node)
+                    .and_then(|contact| contact.endpoint.clone()),
+                credential: match &labels.credentialed {
+                    Some(nodes) if nodes.contains(&record.enrollment.node) => "active".into(),
+                    Some(_) => "retired".into(),
+                    None => "unknown".into(),
+                },
             })
             .collect();
         let mut sessions = Vec::new();
@@ -269,6 +371,20 @@ pub(crate) fn placement_reply(report: crate::placement_control::DirectoryReport)
                 content_copies: placement.content_copies.keys().copied().collect(),
                 survive: format!("{:?}", descriptor.active.policy.durability.survive),
                 max_failures: descriptor.active.policy.durability.max_failures,
+                residency: descriptor
+                    .active
+                    .policy
+                    .residency
+                    .iter()
+                    .filter_map(|region| labels.region(*region))
+                    .collect(),
+                home_regions: descriptor
+                    .active
+                    .policy
+                    .home_regions
+                    .iter()
+                    .filter_map(|region| labels.region(*region))
+                    .collect(),
                 achieved_survive: guarantee
                     .as_ref()
                     .and_then(|report| report.achieved)
@@ -500,9 +616,14 @@ impl AdminCommand {
         match self {
             Self::Operator(read) => read.validate(),
             Self::Replica(command) => command.validate(),
-            Self::RenewCredential | Self::Placement | Self::Tenants => Ok(()),
+            Self::RenewCredential | Self::RotateCredential | Self::Placement | Self::Tenants => {
+                Ok(())
+            }
             Self::AdmitTenant { tenant } if *tenant == [0; 16] => Err(AccessError::InvalidRequest),
             Self::AdmitTenant { .. } => Ok(()),
+            Self::UpgradeStatus => Ok(()),
+            Self::ActivateFence { level: 0 } => Err(AccessError::InvalidRequest),
+            Self::ActivateFence { .. } => Ok(()),
             Self::CreateSession { tenant, name } => {
                 if *tenant == [0; 16] {
                     return Err(AccessError::InvalidRequest);
@@ -558,6 +679,22 @@ impl AdminCommand {
                 if input.is_empty()
                     || input.len() > 4096
                     || !std::path::Path::new(input).is_absolute()
+                {
+                    return Err(AccessError::InvalidRequest);
+                }
+                Ok(())
+            }
+            Self::Repair {
+                tenant,
+                session,
+                after,
+                limit,
+            } => {
+                if *tenant == [0; 16]
+                    || *session == [0; 16]
+                    || after.is_some_and(|after| after == [0; 16])
+                    || *limit == 0
+                    || *limit > crate::evidence_service::MAX_REPAIR_OBJECTS
                 {
                     return Err(AccessError::InvalidRequest);
                 }
@@ -721,6 +858,8 @@ pub struct LocalNetworkAdmin {
     identity: NodeIdentity,
     root: ControlIdentity,
     advertise: SocketAddr,
+    /// The name this node advertises (24 §24), when it has one.
+    endpoint: Option<String>,
     listen: SocketAddr,
     enrollment: Option<QuorumEnrollmentHost>,
     control: Option<crate::control_host::ControlHost>,
@@ -731,6 +870,10 @@ pub struct LocalNetworkAdmin {
     /// The collector's published state (26 §5).
     gc: Option<crate::gc::GcHandle>,
     archive: Option<crate::archive_agent::ArchiveHandle>,
+    /// The evidence coordinator, for repairs (24 §20).
+    evidence: Option<crate::evidence_service::EvidenceCoordinator>,
+    /// The latest metrics snapshot the service sampled (24 §23).
+    metrics: Option<tokio::sync::watch::Receiver<Option<crate::metrics::MetricsSnapshot>>>,
     budget: MemoryBudget,
 }
 impl LocalNetworkAdmin {
@@ -756,6 +899,7 @@ impl LocalNetworkAdmin {
             identity: directory.identity().clone(),
             root,
             advertise,
+            endpoint: state.endpoint.clone(),
             listen: state.listen,
             enrollment: Some(enrollment),
             control: None,
@@ -765,6 +909,8 @@ impl LocalNetworkAdmin {
             placement: None,
             gc: None,
             archive: None,
+            evidence: None,
+            metrics: None,
             budget,
         })
     }
@@ -792,6 +938,7 @@ impl LocalNetworkAdmin {
             identity: directory.identity().clone(),
             root,
             advertise,
+            endpoint: state.endpoint.clone(),
             listen: state.listen,
             enrollment,
             control: None,
@@ -801,6 +948,8 @@ impl LocalNetworkAdmin {
             placement: None,
             gc: None,
             archive: None,
+            evidence: None,
+            metrics: None,
             budget,
         })
     }
@@ -825,6 +974,83 @@ impl LocalNetworkAdmin {
     pub fn with_archive(mut self, archive: crate::archive_agent::ArchiveHandle) -> Self {
         self.archive = Some(archive);
         self
+    }
+    pub fn with_evidence(mut self, evidence: crate::evidence_service::EvidenceCoordinator) -> Self {
+        self.evidence = Some(evidence);
+        self
+    }
+    pub fn with_metrics(
+        mut self,
+        metrics: tokio::sync::watch::Receiver<Option<crate::metrics::MetricsSnapshot>>,
+    ) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+    /// Repair a hosted session's custody on this node (24 §20): the replica
+    /// exports its committed prefix and the evidence coordinator walks it.
+    async fn repair(
+        &self,
+        tenant: [u8; 16],
+        session: [u8; 16],
+        after: Option<[u8; 16]>,
+        limit: u32,
+    ) -> Result<Vec<u8>, AccessError> {
+        let fleet = self.fleet.as_ref().ok_or(AccessError::Unavailable)?;
+        let evidence = self.evidence.as_ref().ok_or(AccessError::Unavailable)?;
+        let ledger = focal_model::LedgerId {
+            tenant: focal_model::TenantId(tenant),
+            session: focal_model::SessionId(session),
+        };
+        if ledger.tenant.is_zero() || ledger.session.is_zero() {
+            return Err(AccessError::InvalidRequest);
+        }
+        let host = fleet
+            .current_host(ledger)
+            .map_err(|_| AccessError::Unavailable)?;
+        let snapshot = host
+            .checkpoint_evidence(REPAIR_TTL)
+            .await
+            .map_err(|error| match error {
+                focal_ledger::LedgerError::Capacity | focal_ledger::LedgerError::Memory(_) => {
+                    AccessError::Capacity
+                }
+                _ => AccessError::Unavailable,
+            })?;
+        let report = evidence
+            .repair(snapshot, after.map(focal_model::ArtifactId), limit)
+            .await?;
+        let mut unrecoverable = Vec::new();
+        unrecoverable
+            .try_reserve_exact(report.unrecoverable.len())
+            .map_err(|_| AccessError::Capacity)?;
+        for object in &report.unrecoverable {
+            unrecoverable.push(focal_client::admin::AdminUnrecoverableObject {
+                artifact: object.artifact.to_string(),
+                root: object.reference.root.to_string(),
+                length: object.reference.length,
+                asked: object.asked,
+            });
+        }
+        encode_reply(&RepairedReply {
+            schema: REPAIRED_REPLY_SCHEMA,
+            repair: focal_client::admin::AdminRepair {
+                tenant: ledger.tenant.to_string(),
+                session: ledger.session.to_string(),
+                node: self.identity.node,
+                sequence: report.sequence.0,
+                index: report.index.0,
+                artifacts: report.artifacts,
+                objects: report.objects,
+                verified: report.verified,
+                repaired: report.repaired,
+                pushed: report.pushed,
+                unrecoverable,
+                unrecoverable_count: report.unrecoverable_count,
+                restore_required: report.unrecoverable_count > 0,
+                complete: report.complete,
+                next_after: report.next_after.map(|artifact| artifact.to_string()),
+            },
+        })
     }
     /// Write a backup of a hosted session (26 §6): the replica exports its
     /// durable prefix, the files are written under the operator's directory.
@@ -936,7 +1162,7 @@ impl LocalNetworkAdmin {
             .directory()
             .await
             .map_err(|_| AccessError::Unavailable)?;
-        let reply = placement_reply(report);
+        let reply = placement_reply(report, &self.topology_labels().await);
         let len =
             postcard::experimental::serialized_size(&reply).map_err(|_| AccessError::Capacity)?;
         if len > MAX_COMMAND {
@@ -949,6 +1175,60 @@ impl LocalNetworkAdmin {
         bytes.resize(len, 0);
         postcard::to_slice(&reply, &mut bytes).map_err(|_| AccessError::InvalidRequest)?;
         Ok(bytes)
+    }
+    /// The region labels the root registered and the topology every node
+    /// announced (24 §22), from this node's applied root replica; empty when
+    /// the root cannot be observed, so a view degrades to identities.
+    pub(crate) async fn topology_labels(&self) -> TopologyLabels {
+        let mut labels = TopologyLabels::default();
+        let Some(control) = self.control.as_ref() else {
+            return labels;
+        };
+        let Ok(observation) = control.observe_root().await else {
+            return labels;
+        };
+        if let focal_control::ControlBootstrap::Root {
+            directory,
+            enrollment,
+            ..
+        } = &observation.snapshot().state
+        {
+            for (id, region) in &directory.regions {
+                labels.regions.insert(*id, region.label.clone());
+            }
+            // Which nodes the registry still authorizes: a revoked or
+            // expired credential shows as retired (runbooks/expired-credentials).
+            labels.credentialed = focal_enrollment::EnrollmentRegistry::restore(
+                enrollment,
+                self.identity.cluster,
+                focal_enrollment::EnrollmentLimits::default(),
+            )
+            .ok()
+            .zip(crate::network_bootstrap::unix_time().ok())
+            .map(|(registry, now)| {
+                registry
+                    .enrollments()
+                    .filter(|receipt| {
+                        registry
+                            .authorize_certificate(&receipt.certificate, now)
+                            .is_ok()
+                    })
+                    .filter_map(|receipt| receipt.identity.node_id)
+                    .collect()
+            });
+        }
+        for contact in &observation.contacts().contacts.records {
+            labels.contacts.insert(
+                contact.node,
+                ContactLabels {
+                    region: contact.region.clone(),
+                    zone: contact.zone.clone(),
+                    advertise: Some(contact.advertise.to_string()),
+                    endpoint: contact.endpoint.clone(),
+                },
+            );
+        }
+        labels
     }
     /// The root owner's committed enrollment registry, read as this node's
     /// runtime principal: one bounded root checkpoint.
@@ -1019,6 +1299,71 @@ impl LocalNetworkAdmin {
             founder: self.identity.ledger.tenant.0,
             admitted: registry.tenants().collect(),
         })
+    }
+    /// Every node the directory lists with the capability it last reported
+    /// (24 §21); a node listed by several partitions reports one level.
+    async fn node_capabilities(&self) -> Result<Vec<(u64, u32)>, AccessError> {
+        let handle = self.placement.as_ref().ok_or(AccessError::Unavailable)?;
+        let report = handle
+            .directory()
+            .await
+            .map_err(|_| AccessError::Unavailable)?;
+        let mut nodes: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
+        for (_, checkpoint) in &report.partitions {
+            for record in checkpoint.nodes.values() {
+                let level = record.load.map_or(0, |load| load.capability);
+                let entry = nodes.entry(record.enrollment.node).or_insert(0);
+                *entry = (*entry).max(level);
+            }
+        }
+        let mut listed = Vec::new();
+        listed
+            .try_reserve_exact(nodes.len())
+            .map_err(|_| AccessError::Capacity)?;
+        listed.extend(nodes);
+        Ok(listed)
+    }
+    /// The upgrade fence as the root committed it, this binary's levels and
+    /// every node's reported level (24 §21).
+    async fn upgrade_status(&self, id: RequestId, changed: bool) -> Result<Vec<u8>, AccessError> {
+        let (applied_index, registry) = match self.read_registry(id).await {
+            Ok(read) => read,
+            Err(AccessError::Unavailable) => (0, self.local_registry().await?),
+            Err(error) => return Err(error),
+        };
+        encode_reply(&UpgradeReply {
+            schema: UPGRADE_REPLY_SCHEMA,
+            applied_index,
+            revision: registry.revision(),
+            fence: registry.fence(),
+            binary: crate::upgrade::CAPABILITY_LEVEL,
+            announced: crate::upgrade::announced_level(),
+            nodes: self.node_capabilities().await?,
+            changed,
+        })
+    }
+    /// Raise the upgrade fence through the founder's enrollment authority
+    /// (24 §21), once every node the directory lists has reported at least
+    /// `level`; a fence already there is answered as done.
+    async fn activate_fence(&self, level: u32, id: RequestId) -> Result<Vec<u8>, AccessError> {
+        let enrollment = self.enrollment.as_ref().ok_or(AccessError::Unauthorized)?;
+        let (_, registry) = self.read_registry(id).await?;
+        if level < registry.fence().level {
+            return Err(AccessError::InvalidRequest);
+        }
+        if level == registry.fence().level {
+            return self.upgrade_status(id, false).await;
+        }
+        let nodes = self.node_capabilities().await?;
+        if nodes.is_empty() || nodes.iter().any(|(_, capability)| *capability < level) {
+            return Err(AccessError::Unavailable);
+        }
+        let before = registry.fence();
+        let fence = enrollment
+            .activate_fence(level)
+            .await
+            .map_err(enrollment_error)?;
+        self.upgrade_status(id, fence != before).await
     }
     /// Admit a tenant through the founder's enrollment authority, then answer
     /// with the committed tenants; an admitted tenant is answered as done.
@@ -1114,6 +1459,7 @@ impl LocalNetworkAdmin {
                     AgentError::Identity | AgentError::Registration(_) => {
                         AccessError::InvalidRequest
                     }
+                    AgentError::Residency(_) => AccessError::Unauthorized,
                     AgentError::Ledger(focal_ledger::LedgerError::PlacementConflict) => {
                         AccessError::InvalidRequest
                     }
@@ -1182,6 +1528,15 @@ impl LocalNetworkAdmin {
             dry_run,
         })
     }
+    async fn rotate_credential(&self) -> Result<Vec<u8>, AccessError> {
+        use crate::credential_renewal::CredentialReply;
+        let handle = self.credentials.as_ref().ok_or(AccessError::Unavailable)?;
+        let reply = match handle.rotate().await {
+            Ok(summary) => CredentialReply::Renewed(summary),
+            Err(error) => CredentialReply::Failed(error),
+        };
+        encode_credential_reply(&reply)
+    }
     async fn renew_credential(&self) -> Result<Vec<u8>, AccessError> {
         use crate::credential_renewal::CredentialReply;
         let handle = self.credentials.as_ref().ok_or(AccessError::Unavailable)?;
@@ -1189,6 +1544,13 @@ impl LocalNetworkAdmin {
             Ok(summary) => CredentialReply::Renewed(summary),
             Err(error) => CredentialReply::Failed(error),
         };
+        encode_credential_reply(&reply)
+    }
+}
+fn encode_credential_reply(
+    reply: &crate::credential_renewal::CredentialReply,
+) -> Result<Vec<u8>, AccessError> {
+    {
         let len =
             postcard::experimental::serialized_size(&reply).map_err(|_| AccessError::Capacity)?;
         if len > MAX_COMMAND {
@@ -1199,9 +1561,11 @@ impl LocalNetworkAdmin {
             .try_reserve_exact(len)
             .map_err(|_| AccessError::Capacity)?;
         bytes.resize(len, 0);
-        postcard::to_slice(&reply, &mut bytes).map_err(|_| AccessError::InvalidRequest)?;
+        postcard::to_slice(reply, &mut bytes).map_err(|_| AccessError::InvalidRequest)?;
         Ok(bytes)
     }
+}
+impl LocalNetworkAdmin {
     pub fn with_control(
         mut self,
         control: crate::control_host::ControlHost,
@@ -1248,6 +1612,9 @@ impl LocalNetworkAdmin {
         if let AdminCommand::RenewCredential = command {
             return self.renew_credential().await;
         }
+        if let AdminCommand::RotateCredential = command {
+            return self.rotate_credential().await;
+        }
         if let AdminCommand::Placement = command {
             return self.placement().await;
         }
@@ -1271,8 +1638,23 @@ impl LocalNetworkAdmin {
                 .restore(input, new_incarnation, request.request_id)
                 .await;
         }
+        if let AdminCommand::Repair {
+            tenant,
+            session,
+            after,
+            limit,
+        } = command
+        {
+            return self.repair(tenant, session, after, limit).await;
+        }
         if let AdminCommand::Tenants = command {
             return self.tenants(request.request_id).await;
+        }
+        if let AdminCommand::UpgradeStatus = command {
+            return self.upgrade_status(request.request_id, false).await;
+        }
+        if let AdminCommand::ActivateFence { level } = command {
+            return self.activate_fence(level, request.request_id).await;
         }
         if let AdminCommand::AdmitTenant { tenant } = command {
             return self.admit_tenant(tenant, request.request_id).await;
@@ -1334,7 +1716,11 @@ impl LocalNetworkAdmin {
             .invite(
                 id,
                 InviteIntent {
-                    endpoint: self.advertise.to_string(),
+                    // The founder as its operator named it (24 §24).
+                    endpoint: self
+                        .endpoint
+                        .clone()
+                        .unwrap_or_else(|| self.advertise.to_string()),
                     role,
                     lifetime_seconds: 3600,
                 },
@@ -1444,6 +1830,7 @@ impl LocalNetworkAdmin {
             | AdminCommand::Operator(_)
             | AdminCommand::Replica(_)
             | AdminCommand::RenewCredential
+            | AdminCommand::RotateCredential
             | AdminCommand::Placement
             | AdminCommand::AdmitTenant { .. }
             | AdminCommand::Tenants
@@ -1452,7 +1839,10 @@ impl LocalNetworkAdmin {
             | AdminCommand::MoveRange { .. }
             | AdminCommand::GcRestore { .. }
             | AdminCommand::BackupCreate { .. }
-            | AdminCommand::Restore { .. } => {
+            | AdminCommand::Restore { .. }
+            | AdminCommand::Repair { .. }
+            | AdminCommand::UpgradeStatus
+            | AdminCommand::ActivateFence { .. } => {
                 return Err(AccessError::Unauthorized);
             }
         };

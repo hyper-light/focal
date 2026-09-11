@@ -2,7 +2,6 @@ use focal_memory::{
     BudgetLane, DiskBudget, DiskBudgetConfig, DiskKind, DiskReservation, DiskStats,
 };
 use focal_model::{ContentClass, ContentDomainId, ContentHash, ContentRef};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -99,7 +98,7 @@ fn disk_reserve(
     lane: BudgetLane,
     bytes: u64,
 ) -> Result<DiskReservation, ContentError> {
-    disk.refresh_with(|| fs2::available_space(root).ok());
+    disk.refresh_with(|| focal_platform::available_space(root));
     disk.reserve(kind, lane, bytes)
         .map_err(|_| ContentError::Capacity)
 }
@@ -277,7 +276,7 @@ impl ContentStore {
             .read(true)
             .write(true)
             .open(root.join("LOCK"))?;
-        lock.try_lock_exclusive().map_err(|e| {
+        focal_platform::try_lock_exclusive(&lock).map_err(|e| {
             if e.kind() == std::io::ErrorKind::WouldBlock {
                 ContentError::Locked
             } else {
@@ -1160,6 +1159,25 @@ fn install_verified_chunk(
         if previous != bytes || ContentHash(*blake3::hash(&previous).as_bytes()) != hash {
             return Err(ContentError::Corrupt);
         }
+        return Ok(());
+    }
+    atomic_install(path, bytes)
+}
+/// Install a chunk a custody transfer received (24 §20). The bytes were
+/// verified against the chunk's hash by the caller. A file already holding
+/// them is left alone; one holding anything else is corrupt under this
+/// content-addressed name and is replaced by the verified bytes, never
+/// kept: a recopy is how a corrupt chunk is repaired.
+pub(crate) fn install_transferred_chunk(
+    path: &Path,
+    bytes: &[u8],
+    hash: ContentHash,
+) -> Result<(), ContentError> {
+    if path.exists()
+        && read_bounded(path, bytes.len()).is_ok_and(|previous| {
+            previous == bytes && ContentHash(*blake3::hash(&previous).as_bytes()) == hash
+        })
+    {
         return Ok(());
     }
     atomic_install(path, bytes)

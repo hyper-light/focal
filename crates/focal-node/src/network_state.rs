@@ -107,9 +107,72 @@ pub struct NetworkState {
     pub node: u64,
     pub listen: SocketAddr,
     pub advertise: SocketAddr,
+    /// The name this node advertises (`host:port`, 24 §24) when its operator
+    /// gave one; `advertise` is what it resolved to at the last start.
+    pub endpoint: Option<String>,
     /// The enrollment endpoint remains pinned; this is not a redirect source.
     pub sponsor: focal_enrollment::ServerTrust,
     pub genesis: NetworkGenesis,
+}
+pub const NETWORK_STATE_SCHEMA: u16 = 2;
+/// The shape schema 1 wrote: no advertised name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct NetworkStateV1 {
+    schema: u16,
+    node: u64,
+    listen: SocketAddr,
+    advertise: SocketAddr,
+    sponsor: focal_enrollment::ServerTrust,
+    genesis: NetworkGenesis,
+}
+/// The addresses a start resolved against the saved state (24 §24).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartupAddresses {
+    pub listen: SocketAddr,
+    pub advertise: SocketAddr,
+    pub endpoint: Option<String>,
+    /// The operator restated reachability that differs from the saved one:
+    /// the node adopts it and announces the change.
+    pub changed: bool,
+}
+/// The advertised name when the operator gave one rather than an address.
+pub fn advertised_name(settings: &Settings) -> Option<String> {
+    settings
+        .node
+        .advertise
+        .as_deref()
+        .filter(|advertised| advertised.parse::<SocketAddr>().is_err())
+        .map(str::to_owned)
+}
+/// Resolve an endpoint that is an address literal or a `host:port` name.
+pub async fn resolve_endpoint(endpoint: &str) -> Result<SocketAddr, NodeError> {
+    if let Ok(address) = endpoint.parse::<SocketAddr>() {
+        return Ok(address);
+    }
+    if !focal_wire::valid_endpoint_name(endpoint) {
+        return Err(NodeError::Identity);
+    }
+    let lookup = async {
+        tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(endpoint))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "endpoint resolution timed out",
+                )
+            })?
+    };
+    Ok(std::panic::AssertUnwindSafe(lookup)
+        .catch_unwind()
+        .await
+        .map_err(|_| std::io::Error::other("Tokio endpoint resolution failed"))??
+        .next()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                "endpoint resolved to no addresses",
+            )
+        })?)
 }
 impl NetworkState {
     pub fn load(directory: &NodeDirectory) -> Result<Option<Self>, NodeError> {
@@ -135,29 +198,46 @@ impl NetworkState {
         {
             return Err(NodeError::Identity);
         }
-        let (state, trailing): (Self, _) = postcard::take_from_bytes(payload)?;
-        if !trailing.is_empty() {
-            return Err(NodeError::Identity);
-        }
+        let (schema, _) = postcard::take_from_bytes::<u16>(payload)?;
+        let state = match schema {
+            1 => {
+                let (legacy, trailing): (NetworkStateV1, _) = postcard::take_from_bytes(payload)?;
+                if !trailing.is_empty() {
+                    return Err(NodeError::Identity);
+                }
+                Self {
+                    schema: NETWORK_STATE_SCHEMA,
+                    node: legacy.node,
+                    listen: legacy.listen,
+                    advertise: legacy.advertise,
+                    endpoint: None,
+                    sponsor: legacy.sponsor,
+                    genesis: legacy.genesis,
+                }
+            }
+            NETWORK_STATE_SCHEMA => {
+                let (state, trailing): (Self, _) = postcard::take_from_bytes(payload)?;
+                if !trailing.is_empty() {
+                    return Err(NodeError::Identity);
+                }
+                state
+            }
+            _ => return Err(NodeError::Identity),
+        };
         state.validate(identity)?;
         Ok(Some(state))
     }
+    /// Install this state, or adopt restated reachability over a saved one
+    /// (24 §24): the identity, sponsor and genesis never change; the
+    /// addresses and the advertised name may, and the running controller
+    /// announces the change.
     pub fn install(&self, directory: &NodeDirectory) -> Result<(), NodeError> {
         self.validate(directory.identity())?;
-        if let Some(existing) = Self::load(directory)? {
-            if existing != *self {
-                return Err(NodeError::Identity);
-            }
-        } else {
-            let length = postcard::experimental::serialized_size(self)?;
-            if length > MAX_BYTES.checked_sub(40).ok_or(NodeError::Identity)? {
-                return Err(NodeError::Identity);
-            }
-            let payload = postcard::to_stdvec(self)?;
-            let mut bytes = MAGIC.to_vec();
-            bytes.extend_from_slice(blake3::hash(&payload).as_bytes());
-            bytes.extend_from_slice(&payload);
-            atomic_file(&directory.root().join("NETWORK"), &bytes)?;
+        match Self::load(directory)? {
+            Some(existing) if existing == *self => {}
+            Some(existing) if existing.same_identity(self) => self.write(directory.root())?,
+            Some(_) => return Err(NodeError::Identity),
+            None => self.write(directory.root())?,
         }
         atomic_file(
             &directory.root().join("NETWORK.initialized"),
@@ -165,12 +245,31 @@ impl NetworkState {
         )?;
         Ok(())
     }
+    fn same_identity(&self, other: &Self) -> bool {
+        self.node == other.node && self.sponsor == other.sponsor && self.genesis == other.genesis
+    }
+    fn write(&self, root: &Path) -> Result<(), NodeError> {
+        let length = postcard::experimental::serialized_size(self)?;
+        if length > MAX_BYTES.checked_sub(40).ok_or(NodeError::Identity)? {
+            return Err(NodeError::Identity);
+        }
+        let payload = postcard::to_stdvec(self)?;
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(blake3::hash(&payload).as_bytes());
+        bytes.extend_from_slice(&payload);
+        atomic_file(&root.join("NETWORK"), &bytes)?;
+        Ok(())
+    }
     pub fn validate(&self, identity: &NodeIdentity) -> Result<(), NodeError> {
-        if self.schema != 1
+        if self.schema != NETWORK_STATE_SCHEMA
             || self.node != identity.node
             || self.node == 0
             || !valid_listen(self.listen)
             || !valid_advertise(self.advertise)
+            || self
+                .endpoint
+                .as_deref()
+                .is_some_and(|name| !focal_wire::valid_endpoint_name(name))
             || self.sponsor.ca_certificate.is_empty()
             || self.sponsor.server_fingerprint == [0; 32]
             || self.sponsor.server_name.is_empty()
@@ -179,15 +278,16 @@ impl NetworkState {
             return Err(NodeError::Identity);
         }
         self.sponsor.validate().map_err(|_| NodeError::Identity)?;
-        // Persist resolved reachability. A restart cannot silently select another
-        // DNS result and disclose an invitation to an unpinned bootstrap host.
-        let endpoint = self
-            .sponsor
-            .endpoint
-            .parse::<SocketAddr>()
-            .map_err(|_| NodeError::Identity)?;
-        if !valid_advertise(endpoint) {
-            return Err(NodeError::Identity);
+        // The sponsor's endpoint is pinned as the invitation named it: an
+        // address, or a name resolved at each use (24 §24) whose certificate
+        // pin still decides trust.
+        match self.sponsor.endpoint.parse::<SocketAddr>() {
+            Ok(endpoint) if !valid_advertise(endpoint) => return Err(NodeError::Identity),
+            Ok(_) => {}
+            Err(_) if !focal_wire::valid_endpoint_name(&self.sponsor.endpoint) => {
+                return Err(NodeError::Identity);
+            }
+            Err(_) => {}
         }
         let registry = self.genesis.validated_enrollment(identity)?;
         if registry.ca_certificate() != self.sponsor.ca_certificate {
@@ -196,20 +296,32 @@ impl NetworkState {
         Ok(())
     }
     /// A persisted network node needs no repeated addresses or seed list.
-    /// Changing an advertised identity requires a committed reachability update.
+    /// Restated reachability that differs from the saved one is adopted
+    /// (24 §24): the node's identity is its enrolled key, never its address,
+    /// and the controller announces the new contact.
     pub async fn startup_addresses(
         &self,
         settings: &Settings,
-    ) -> Result<(SocketAddr, SocketAddr), NodeError> {
+    ) -> Result<StartupAddresses, NodeError> {
         settings.validate()?;
         if settings.node.advertise.is_none() && settings.node.listen.is_none() {
-            return Ok((self.listen, self.advertise));
+            return Ok(StartupAddresses {
+                listen: self.listen,
+                advertise: self.advertise,
+                endpoint: self.endpoint.clone(),
+                changed: false,
+            });
         }
-        let addresses = resolve_addresses(settings).await?;
-        if addresses != (self.listen, self.advertise) {
-            return Err(NodeError::Identity);
-        }
-        Ok(addresses)
+        let (listen, advertise) = resolve_addresses(settings).await?;
+        let endpoint = advertised_name(settings);
+        let changed =
+            (listen, advertise, &endpoint) != (self.listen, self.advertise, &self.endpoint);
+        Ok(StartupAddresses {
+            listen,
+            advertise,
+            endpoint,
+            changed,
+        })
     }
 }
 pub fn root_group(cluster: [u8; 16]) -> [u8; 16] {

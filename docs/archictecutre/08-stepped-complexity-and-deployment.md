@@ -145,6 +145,12 @@ The qualification harness then crashes/restarts the server and reads the same re
 receipt and evidence hash. The demo itself does not shut down the running server. This
 same demo command remains the application-level acceptance probe at every later stage.
 
+Implemented 2026-09-10 (R9.6, [24 §24](24-placement-execution-and-fleet-control.md)):
+`focal deployment render systemd --config FILE --output DIR` writes the hardened unit
+and its configuration (`deploy/systemd` is that output for `deploy/config/systemd.yaml`);
+`start --invite-file` lets a supervised host enroll and start in one command; a host
+restarted at another address, or advertising a name, is adopted and announced.
+
 ## 4. Stage 2: add machines through secure membership
 
 The initial network expansion adds reachability and membership, not a replacement
@@ -246,6 +252,18 @@ Readiness distinguishes process availability, catch-up, authoritative serving, a
 policy satisfaction. A disruption budget complements Focal's membership checks; it
 does not prove that arbitrary eviction preserves quorum or artifact custody.
 
+Implemented 2026-09-10 (R9.6, [24 §24](24-placement-execution-and-fleet-control.md)):
+`focal deployment render kubernetes --config FILE --namespace NS --output DIR [--image
+--storage-class --secret --zone ... --nodes --volume --port]` writes the objects above as
+plain manifests and a kustomization, names the facts it lacks (`missing`: image, storage
+class, invitation secret, zones) and never touches a cluster; `deploy/kubernetes` is that
+output for `deploy/config/kubernetes.yaml` and `deploy/helm/focal` templates the same
+objects. Pods advertise their StatefulSet names, so a rescheduled pod is found again
+through the name its contact carries; a founder pod's invitations name the founder. Not
+yet executed: a run on a real cluster (`kind` or otherwise), the image build, and `helm
+template` (neither `helm` nor a cluster was available where this was written); the
+Kubernetes journey (DC07/DC08) stands in with local processes.
+
 ## 6. Stage 4: availability-zone survival adds domain facts and one intent
 
 ```yaml
@@ -256,7 +274,8 @@ durability:
 ```
 
 Zone identity is imported from the configured trusted infrastructure adapter or supplied
-as a node fact. Kubernetes commonly exposes `topology.kubernetes.io/zone` and
+as a node fact (`topology.region` and `topology.zone` in the node's local configuration,
+announced with its contact and granted as its failure domains; [24 §22](24-placement-execution-and-fleet-control.md)). Kubernetes commonly exposes `topology.kubernetes.io/zone` and
 `topology.kubernetes.io/region`; topology spreading operates on such labels. See
 [Kubernetes topology spread constraints](https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/).
 Names alone do not prove independence: operators own correct physical failure-domain
@@ -295,7 +314,8 @@ placement:
 ```
 
 `home_regions` selects normal authority placement eligibility. `residency` is the hard
-boundary for all scoped durable copies and derived state, not merely a leader location.
+boundary for all scoped durable copies and derived state, not merely a leader location
+(executed by the residency fence, [24 §22](24-placement-execution-and-fleet-control.md)).
 The example permits regional survival using eligible remote locations while keeping
 normal writes homed in region-a. During an authorized region outage, temporary authority
 may run in a surviving residency region under the selected failover contract; `explain`

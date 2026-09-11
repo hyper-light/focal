@@ -1,6 +1,7 @@
 use crate::native_session::{
     FailureClass, NativeCommit, NativeOutput, NativeReadBoundary, NativeSessionError,
-    NativeSessionLimits, NativeSubmission, NativeTimerInput, PendingSeed, ReadCorrelation, engine,
+    NativeSessionLimits, NativeSubmission, NativeTimerInput, PendingCustody, PendingSeed,
+    ReadCorrelation, engine,
 };
 use crate::request_streams::{
     ManagedError, PreparedStream, RequestStreamLimits, RequestStreams, RequestStreamsCheckpoint,
@@ -16,7 +17,8 @@ use focal_core::{
 };
 use focal_evidence::{BuiltinNativeSchemas, ContentReader, ContentStore, VerifiedNativeArtifact};
 use focal_graph::{
-    GraphConfig, GraphError, GraphSnapshot, GraphStore, PreparedGraph, reference_charge,
+    ArtifactEvidence, GraphConfig, GraphError, GraphSnapshot, GraphStore, PreparedGraph,
+    reference_charge,
 };
 use focal_memory::{
     Allocation, BudgetKind, BudgetLane, BudgetStats, MemoryBudget, MemoryError, RangeId,
@@ -254,6 +256,9 @@ pub struct Session {
     /// adopted, so the missing chunks are kept here for the host to pull
     /// while the delivery is retained.
     seed_pending: Option<PendingSeed>,
+    /// The objects a retained snapshot install could not read locally
+    /// (24 §20); the engine that would have held them was not adopted.
+    custody_pending: Option<PendingCustody>,
     /// A seed chunk landed since the retained delivery last tried to
     /// assemble the checkpoint; until one does, resuming would only repeat
     /// the same refusal.
@@ -469,6 +474,7 @@ impl Session {
             hosting,
             seed_pending: None,
             seed_progress: false,
+            custody_pending: None,
             retained: None,
         };
         // Recovery consumes prior committed outcomes without executing their effects.

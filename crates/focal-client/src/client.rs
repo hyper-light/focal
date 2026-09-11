@@ -13,6 +13,10 @@ pub struct RetryPolicy {
 /// Backed-off resends of one request after capacity refusals before the
 /// refusal is reported; each resend is bounded by the retry policy's clock.
 const CAPACITY_RESENDS: u32 = 3;
+/// Backed-off resends after availability refusals (a leader change, a
+/// service still opening) before the refusal is reported: at the largest
+/// backoff these span the default policy's clock, which bounds them all.
+const UNAVAILABLE_RESENDS: u32 = 64;
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
@@ -126,6 +130,10 @@ impl<T: ClientTransport> Client<T> {
     }
     pub(crate) fn retry_timeout(&self) -> Duration {
         self.policy.max_elapsed
+    }
+    #[cfg(test)]
+    pub(crate) fn transport(&self) -> &T {
+        &self.transport
     }
     /// Read bounded scalar counts after a fresh quorum barrier in this ledger.
     /// The returned token identifies the observation without retaining a snapshot.
@@ -483,14 +491,22 @@ impl<T: ClientTransport> Client<T> {
         }
         let start = tokio::time::Instant::now();
         let mut uncertain = false;
-        // A capacity refusal has no effect (nothing was admitted), so a
-        // bounded number of backed-off resends rides out a full ingress.
+        // A capacity or availability refusal has no effect (nothing was
+        // admitted), so bounded backed-off resends ride out a full ingress
+        // or a leader change without spending the attempts kept for replies
+        // that were lost; the policy's clock bounds them all, and a refusal
+        // that outlasts it is reported as the refusal it was.
         let mut capacity_refusals = 0u32;
-        for attempt in 0..self.policy.max_attempts {
+        let mut unavailable_refusals = 0u32;
+        let mut last_refusal: Option<AccessError> = None;
+        let mut attempt = 0u32;
+        let mut backoffs = 0u32;
+        while attempt < self.policy.max_attempts {
             let remaining = self.policy.max_elapsed.saturating_sub(start.elapsed());
             if remaining.is_zero() {
                 break;
             }
+            let mut refused = false;
             let response =
                 tokio::time::timeout(remaining, self.transport.request(route.as_ref(), request))
                     .await;
@@ -528,11 +544,19 @@ impl<T: ClientTransport> Client<T> {
                         Response::Submitted(MutationReply::Domain(
                             DomainOutcome::Refuse { .. } | DomainOutcome::Inform { .. },
                         )) if uncertain && request.operation.is_mutation() => break,
-                        Response::Error(AccessError::Unavailable) => {}
+                        Response::Error(AccessError::Unavailable)
+                            if unavailable_refusals < UNAVAILABLE_RESENDS =>
+                        {
+                            unavailable_refusals = unavailable_refusals.saturating_add(1);
+                            last_refusal = Some(AccessError::Unavailable);
+                            refused = true;
+                        }
                         Response::Error(AccessError::Capacity)
                             if capacity_refusals < CAPACITY_RESENDS =>
                         {
                             capacity_refusals = capacity_refusals.saturating_add(1);
+                            last_refusal = Some(AccessError::Capacity);
+                            refused = true;
                         }
                         Response::Error(error) => {
                             if uncertain && request.operation.is_mutation() {
@@ -572,20 +596,25 @@ impl<T: ClientTransport> Client<T> {
                     *write_uncertain = request.operation.is_mutation();
                 }
             }
-            if attempt.saturating_add(1) < self.policy.max_attempts {
-                let backoff = self
-                    .policy
-                    .base_backoff
-                    .saturating_mul(1u32 << attempt.min(16))
-                    .min(self.policy.max_backoff)
-                    .min(self.policy.max_elapsed.saturating_sub(start.elapsed()));
-                tokio::time::sleep(backoff).await;
+            if !refused {
+                attempt = attempt.saturating_add(1);
+                if attempt >= self.policy.max_attempts {
+                    break;
+                }
             }
+            let backoff = self
+                .policy
+                .base_backoff
+                .saturating_mul(1u32 << backoffs.min(16))
+                .min(self.policy.max_backoff)
+                .min(self.policy.max_elapsed.saturating_sub(start.elapsed()));
+            backoffs = backoffs.saturating_add(1);
+            tokio::time::sleep(backoff).await;
         }
-        if !uncertain && capacity_refusals > 0 {
+        if !uncertain && let Some(refusal) = last_refusal {
             // Every attempt was a definite refusal without effect: report
             // the refusal itself, never an unknown outcome.
-            return Err(ClientError::Access(AccessError::Capacity));
+            return Err(ClientError::Access(refusal));
         }
         if request.operation.is_mutation() {
             *write_uncertain = true;

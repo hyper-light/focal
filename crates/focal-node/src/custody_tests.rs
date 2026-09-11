@@ -847,8 +847,10 @@ fn seed_chunks_are_served_to_installed_peers_and_announced_pending_peers_only() 
         store.request(&read(3, 2, 4, hash)),
         Err(AccessError::Unavailable)
     ));
-    // An announced pending placement admits its peers at the pending route,
-    // for seeds only; the announcement must lie beyond the installed scope.
+    // An announced pending placement admits its peers at the pending route
+    // for reads (seeds, manifests, chunks, verifications and the cancel
+    // that ends a pull); the announcement must lie beyond the installed
+    // scope.
     let pending = CustodyScope {
         ledger,
         route_epoch: RouteEpoch(2),
@@ -890,8 +892,18 @@ fn seed_chunks_are_served_to_installed_peers_and_announced_pending_peers_only() 
         8,
         Operation::Custody(CustodyRequest::Cancel { transfer: [8; 16] }),
     );
+    assert!(store.request(&cancel).is_ok());
+    // A write from a pending peer at its route is refused: it holds no
+    // installed policy there.
+    let seal = request(
+        ledger,
+        2,
+        Some(3),
+        8,
+        Operation::Custody(CustodyRequest::Seal { transfer: [8; 16] }),
+    );
     assert!(matches!(
-        store.request(&cancel),
+        store.request(&seal),
         Err(AccessError::Unavailable)
     ));
     // An unknown seed is not found; a withdrawn announcement refuses again.

@@ -41,7 +41,7 @@ blake3.workspace = true
 clap.workspace = true
 clap_complete = "=4.6.6"
 getrandom.workspace = true
-fs2.workspace = true
+focal-platform = { version = "0.1.0", path = "../focal-platform" }
 postcard.workspace = true
 serde.workspace = true
 serde_json.workspace = true

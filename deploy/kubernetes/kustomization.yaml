@@ -1,0 +1,8 @@
+namespace: focal
+resources:
+  - configmap.yaml
+  - service.yaml
+  - pdb.yaml
+  - statefulset-focal-founder.yaml
+  - statefulset-focal-b.yaml
+  - statefulset-focal-c.yaml

@@ -43,7 +43,16 @@ pub struct NodeContactCommand {
     pub advertise: SocketAddr,
     pub expected_generation: u64,
     pub decided_at: i64,
+    /// The node's declared failure-domain labels (24 §22).
+    pub region: Option<String>,
+    pub zone: Option<String>,
+    /// The name the node advertises (`host:port`, 24 §24), when it has one.
+    pub endpoint: Option<String>,
 }
+/// The longest failure-domain label a contact carries (24 §22).
+pub const MAX_TOPOLOGY_LABEL_BYTES: usize = 64;
+/// The longest advertised name a contact carries (24 §24).
+pub const MAX_ENDPOINT_NAME_BYTES: usize = 259;
 impl NodeContactCommand {
     /// The owner's decision time is committed in the full envelope, but does
     /// not change client intent on retry. Existing command hashes stay intact.
@@ -58,6 +67,9 @@ impl NodeContactCommand {
                 self.certificate_fingerprint,
                 self.advertise,
                 self.expected_generation,
+                &self.region,
+                &self.zone,
+                &self.endpoint,
             ),
         )
     }
@@ -76,6 +88,13 @@ pub struct ContactRecord {
     pub generation: u64,
     pub decided_at: i64,
     pub committed_index: u64,
+    /// The node's declared failure-domain labels (24 §22); a zone needs its
+    /// region.
+    pub region: Option<String>,
+    pub zone: Option<String>,
+    /// The name the node advertises (`host:port`, 24 §24): peers re-resolve
+    /// it when `advertise` stops answering.
+    pub endpoint: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContactCheckpoint {
@@ -85,6 +104,105 @@ pub struct ContactCheckpoint {
     pub applied_index: u64,
     /// Strictly sorted by physical node. Each node has at most one current row.
     pub records: Vec<ContactRecord>,
+}
+pub const CONTACT_CHECKPOINT_SCHEMA: u16 = 3;
+/// A contact row as schema 2 wrote it, before advertised names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactRecordV2 {
+    pub node: u64,
+    pub principal: [u8; 16],
+    pub certificate_fingerprint: [u8; 32],
+    pub advertise: SocketAddr,
+    pub server_name: String,
+    pub generation: u64,
+    pub decided_at: i64,
+    pub committed_index: u64,
+    pub region: Option<String>,
+    pub zone: Option<String>,
+}
+/// The contact checkpoint as schema 2 wrote it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactCheckpointV2 {
+    pub schema: u16,
+    pub cluster: [u8; 16],
+    pub revision: u64,
+    pub applied_index: u64,
+    pub records: Vec<ContactRecordV2>,
+}
+impl From<ContactCheckpointV2> for ContactCheckpoint {
+    fn from(legacy: ContactCheckpointV2) -> Self {
+        Self {
+            schema: CONTACT_CHECKPOINT_SCHEMA,
+            cluster: legacy.cluster,
+            revision: legacy.revision,
+            applied_index: legacy.applied_index,
+            records: legacy
+                .records
+                .into_iter()
+                .map(|record| ContactRecord {
+                    node: record.node,
+                    principal: record.principal,
+                    certificate_fingerprint: record.certificate_fingerprint,
+                    advertise: record.advertise,
+                    server_name: record.server_name,
+                    generation: record.generation,
+                    decided_at: record.decided_at,
+                    committed_index: record.committed_index,
+                    region: record.region,
+                    zone: record.zone,
+                    endpoint: None,
+                })
+                .collect(),
+        }
+    }
+}
+/// A contact row as schema 1 wrote it, before topology labels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactRecordV1 {
+    pub node: u64,
+    pub principal: [u8; 16],
+    pub certificate_fingerprint: [u8; 32],
+    pub advertise: SocketAddr,
+    pub server_name: String,
+    pub generation: u64,
+    pub decided_at: i64,
+    pub committed_index: u64,
+}
+/// The contact checkpoint as schema 1 wrote it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactCheckpointV1 {
+    pub schema: u16,
+    pub cluster: [u8; 16],
+    pub revision: u64,
+    pub applied_index: u64,
+    pub records: Vec<ContactRecordV1>,
+}
+impl From<ContactCheckpointV1> for ContactCheckpoint {
+    fn from(legacy: ContactCheckpointV1) -> Self {
+        Self {
+            schema: CONTACT_CHECKPOINT_SCHEMA,
+            cluster: legacy.cluster,
+            revision: legacy.revision,
+            applied_index: legacy.applied_index,
+            records: legacy
+                .records
+                .into_iter()
+                .map(|record| ContactRecord {
+                    node: record.node,
+                    principal: record.principal,
+                    certificate_fingerprint: record.certificate_fingerprint,
+                    advertise: record.advertise,
+                    server_name: record.server_name,
+                    generation: record.generation,
+                    decided_at: record.decided_at,
+                    committed_index: record.committed_index,
+                    region: None,
+                    zone: None,
+                    endpoint: None,
+                })
+                .collect(),
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContactSnapshot {
@@ -168,7 +286,7 @@ impl NodeContacts {
     ) -> Result<Self, ControlError> {
         Self::restore(
             ContactCheckpoint {
-                schema: 1,
+                schema: CONTACT_CHECKPOINT_SCHEMA,
                 cluster,
                 revision: 0,
                 applied_index: 0,
@@ -219,6 +337,8 @@ impl NodeContacts {
         enrollment: &EnrollmentRegistry,
     ) -> Result<PreparedNodeContact, ControlError> {
         validate_contact_address(command.advertise)?;
+        validate_labels(&command.region, &command.zone)?;
+        validate_endpoint(&command.endpoint)?;
         let existing = self
             .state
             .records
@@ -274,6 +394,9 @@ impl NodeContacts {
             generation: generation.checked_add(1).ok_or(ControlError::Capacity)?,
             decided_at: command.decided_at,
             committed_index: 0,
+            region: clone_label(&command.region)?,
+            zone: clone_label(&command.zone)?,
+            endpoint: clone_label(&command.endpoint)?,
         };
         let mut records = Vec::new();
         records
@@ -296,7 +419,7 @@ impl NodeContacts {
             Err(_) => return Err(ControlError::Failed),
         }
         let state = ContactCheckpoint {
-            schema: 1,
+            schema: CONTACT_CHECKPOINT_SCHEMA,
             cluster: self.state.cluster,
             revision: self
                 .state
@@ -364,7 +487,43 @@ fn clone_record(record: &ContactRecord) -> Result<ContactRecord, ControlError> {
         generation: record.generation,
         decided_at: record.decided_at,
         committed_index: record.committed_index,
+        region: clone_label(&record.region)?,
+        zone: clone_label(&record.zone)?,
+        endpoint: clone_label(&record.endpoint)?,
     })
+}
+fn clone_label(label: &Option<String>) -> Result<Option<String>, ControlError> {
+    let Some(label) = label else {
+        return Ok(None);
+    };
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(label.len())
+        .map_err(|_| ControlError::Capacity)?;
+    owned.push_str(label);
+    Ok(Some(owned))
+}
+/// An advertised name is bounded and non-empty (24 §24).
+fn validate_endpoint(endpoint: &Option<String>) -> Result<(), ControlError> {
+    if endpoint
+        .as_ref()
+        .is_some_and(|name| name.is_empty() || name.len() > MAX_ENDPOINT_NAME_BYTES)
+    {
+        return Err(ControlError::Invalid);
+    }
+    Ok(())
+}
+/// Labels are bounded and non-empty; a zone needs its region.
+fn validate_labels(region: &Option<String>, zone: &Option<String>) -> Result<(), ControlError> {
+    let bad = |label: &Option<String>| {
+        label
+            .as_ref()
+            .is_some_and(|label| label.is_empty() || label.len() > MAX_TOPOLOGY_LABEL_BYTES)
+    };
+    if bad(region) || bad(zone) || (zone.is_some() && region.is_none()) {
+        return Err(ControlError::Invalid);
+    }
+    Ok(())
 }
 fn state_charge(state: &ContactCheckpoint, extra: usize) -> Result<usize, ControlError> {
     let rows = state
@@ -386,7 +545,7 @@ fn validate_checkpoint(
     limits: ContactLimits,
     max_index: u64,
 ) -> Result<(), ControlError> {
-    if state.schema != 1
+    if state.schema != CONTACT_CHECKPOINT_SCHEMA
         || state.cluster == [0; 16]
         || state.applied_index > max_index
         || state.records.len() > limits.max_nodes
@@ -402,6 +561,7 @@ fn validate_checkpoint(
     let mut latest_index = 0;
     for record in &state.records {
         validate_contact_address(record.advertise)?;
+        validate_labels(&record.region, &record.zone)?;
         if record.node <= prior
             || record.principal == [0; 16]
             || record.certificate_fingerprint == [0; 32]
@@ -501,6 +661,9 @@ mod tests {
             advertise: "127.0.0.1:7443".parse().unwrap(),
             expected_generation: 0,
             decided_at: NOW,
+            region: Some("region-a".into()),
+            zone: Some("zone-1".into()),
+            endpoint: Some("node-1.focal.example:7443".into()),
         };
         (disk, registry, command)
     }

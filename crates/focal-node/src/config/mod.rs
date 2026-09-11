@@ -205,16 +205,29 @@ impl Settings {
                     reason: "must not be empty",
                 });
             }
+            if value
+                .as_ref()
+                .is_some_and(|s| s.len() > crate::topology::MAX_LABEL_BYTES)
+            {
+                return Err(ConfigError::Invalid {
+                    field,
+                    reason: "must be at most 64 bytes",
+                });
+            }
         }
         for (field, regions) in [
             ("placement.home_regions", &self.placement.home_regions),
             ("placement.residency", &self.placement.residency),
         ] {
             let set: std::collections::BTreeSet<_> = regions.iter().collect();
-            if set.len() != regions.len() || regions.iter().any(|s| s.trim().is_empty()) {
+            if set.len() != regions.len()
+                || regions
+                    .iter()
+                    .any(|s| s.trim().is_empty() || s.len() > crate::topology::MAX_LABEL_BYTES)
+            {
                 return Err(ConfigError::Invalid {
                     field,
-                    reason: "must contain unique nonempty region names",
+                    reason: "must contain unique nonempty region names of at most 64 bytes",
                 });
             }
         }

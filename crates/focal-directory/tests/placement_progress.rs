@@ -73,6 +73,7 @@ fn load(id: u64, report: u64, disk: u64) -> NodeLoad {
         available_memory: 1_000_000,
         active_weight: 4 - id,
         disk_available: disk,
+        capability: 0,
     }
 }
 fn partition(config: PartitionConfig) -> DirectoryPartition {
@@ -882,14 +883,68 @@ fn refusals_fail_one_attempt_and_the_record_stays_bounded() {
     );
     change(&mut directory, SessionChange::Abort { operation: OP });
     assert!(session(&directory).pending.is_none());
+    // The aborted plan's refusals stay on record, but the active placement
+    // is whole and provides its level: they are history, not blockers.
     let guarantee =
         effective_guarantee(&session(&directory), &directory.checkpoint().nodes).unwrap();
-    assert_eq!(guarantee.blocked_by.len(), 2);
-    assert!(guarantee.blocked_by.iter().all(|blocker| blocker
-        == &Blocker {
-            node: None,
-            reason: BlockReason::Refused(RefusalCode::NoPlacement)
-        }));
+    assert_eq!(session(&directory).refusals.len(), 2);
+    assert_eq!(guarantee.achieved, Some(guarantee.desired));
+    assert!(guarantee.blocked_by.is_empty());
+    // Once a member is short (the lone node, dead in each of its three
+    // roles) the refusals explain why the controller has not healed the
+    // session.
+    apply(
+        &mut directory,
+        PartitionOperation::Liveness {
+            node: 1,
+            generation: 1,
+            alive: false,
+            incarnation: 1,
+            witness: 2,
+            decided_at: 200,
+        },
+    );
+    let guarantee =
+        effective_guarantee(&session(&directory), &directory.checkpoint().nodes).unwrap();
+    assert_eq!(
+        guarantee.blocked_by,
+        vec![
+            Blocker {
+                node: Some(1),
+                reason: BlockReason::DeadNode
+            },
+            Blocker {
+                node: Some(1),
+                reason: BlockReason::DeadNode
+            },
+            Blocker {
+                node: Some(1),
+                reason: BlockReason::DeadNode
+            },
+            Blocker {
+                node: None,
+                reason: BlockReason::Refused(RefusalCode::NoPlacement)
+            },
+            Blocker {
+                node: None,
+                reason: BlockReason::Refused(RefusalCode::NoPlacement)
+            },
+        ]
+    );
+    apply(
+        &mut directory,
+        PartitionOperation::Liveness {
+            node: 1,
+            generation: 1,
+            alive: true,
+            incarnation: 2,
+            witness: 2,
+            decided_at: 300,
+        },
+    );
+    let guarantee =
+        effective_guarantee(&session(&directory), &directory.checkpoint().nodes).unwrap();
+    assert!(guarantee.blocked_by.is_empty());
     let restored =
         DirectoryPartition::restore(directory.checkpoint().clone(), config, budget()).unwrap();
     assert_eq!(restored.checkpoint(), directory.checkpoint());

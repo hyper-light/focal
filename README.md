@@ -352,13 +352,17 @@ The founder advertises an endpoint and writes a one-use invitation; the second m
 enrolls from it and starts:
 
 ```sh
-focal --data-dir ~/focal-founder start --advertise 192.0.2.10:7443
+focal --data-dir ~/focal-founder start --advertise founder.example:7443
 focal --data-dir ~/focal-founder cluster invite --node worker-2 --output worker-2.invite
 
-# on the second host, after copying the invitation
-focal --data-dir ~/focal-node join --invite-file worker-2.invite --advertise 192.0.2.20:7443
-focal --data-dir ~/focal-node start
+# on the second host, after copying the invitation: enroll and start in one command
+focal --data-dir ~/focal-node start --invite-file worker-2.invite --advertise worker-2.example:7443
 ```
+
+An address works as well as a name; a name is announced with the node so peers find it
+again when the address behind it changes. For a supervised host or a Kubernetes
+namespace, `focal deployment render systemd|kubernetes` writes the packaging
+([deploy/](deploy/)).
 
 > [!IMPORTANT]
 > Joining lets the new node take part in the cluster; it does not yet copy your ledger onto
@@ -374,9 +378,9 @@ in [docs/network-startup.md](docs/network-startup.md) and [docs/cluster-admin.md
 | Step | What you decide | Today (2026-09-09) |
 |---|---|---|
 | Laptop | Where to keep the data | Works: durable service, restart, the full workflow through CLI and MCP |
-| VMs or bare metal | Reachable addresses, who may join, how many node failures to survive | Works: join, authenticated transport, membership, leader transfer, credential renewal. In the test suite only: a placement controller that expands a ledger to three hosts and heals a lost one. Not yet: the `cluster plan` and `deployment apply` commands that expose it |
-| Kubernetes | Storage and packaging | Planned; no manifests or images yet |
-| Several zones | Verified failure domains, what zone loss you accept | The planner and `deployment explain` (offline); zone-loss qualification remains |
+| VMs or bare metal | Reachable addresses, who may join, how many node failures to survive | Works: join (also `start --invite-file`), authenticated transport, names that outlive addresses, membership, leader transfer, credential renewal and rotation, drain/remove/replace, repair, backup/restore, the upgrade fence; `deployment plan`/`apply` commit a durability policy and the placement controller expands and heals the ledgers; `deployment render systemd` writes the unit |
+| Kubernetes | Storage and packaging | `deployment render kubernetes` writes the manifests (`deploy/kubernetes`), a Helm chart and a container recipe are checked in; not yet executed on a real cluster |
+| Several zones | Verified failure domains, what zone loss you accept | Declared zones are announced and granted, voters spread across them, residency fenced; zone-loss journeys remain to be recorded |
 | Several regions | Residency, home regions, the latency you will pay for remote durability | Architecture and schema; the geographic executor remains |
 | Global fleet | Per-tenant geography and resource policy | Target; the partitioned directory exists, scale qualification remains |
 

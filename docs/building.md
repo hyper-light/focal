@@ -22,7 +22,12 @@ bash scripts/cargo.sh build --release -p focal-node --bin focal --locked
 ```
 
 That executable supplies the same server and client commands as a downloaded
-binary. To check contributor changes:
+binary. A container image is built from the same sources with
+`docker build -f deploy/container/Dockerfile -t focal:0.1.0 .`: the release's pinned
+Rust Alpine image compiles the static musl binary, which is copied alone into an
+empty image (`FROM scratch`) with an unprivileged user; the image needs no shell, libc
+or system certificates. The build was not executed where this was written (it needs
+a container runtime and the crate registry). To check contributor changes:
 
 ```sh
 bash scripts/cargo.sh test --workspace --locked

@@ -1197,7 +1197,9 @@ fn validate_partition(
                         .ok_or(DirectoryError::CounterExhausted)?
                 || session.placement_epoch.checked_add(1) != Some(plan.next_placement)
                 || session.membership_epoch.checked_add(u64::from(
-                    plan.desired.placement.voters != session.active.placement.voters,
+                    plan.desired
+                        .placement
+                        .adds_voter_over(&session.active.placement),
                 )) != Some(plan.next_membership)
                 || plan.operation == session.authority.operation
             {

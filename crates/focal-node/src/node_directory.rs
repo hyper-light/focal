@@ -4,7 +4,6 @@ use crate::{
     config::Settings,
     embedded::{NodeError, NodeIdentity, atomic_file, decode_identity, durable_dir, new_identity},
 };
-use fs2::FileExt;
 use std::{
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
@@ -175,7 +174,7 @@ fn acquire(settings: &Settings) -> Result<(PathBuf, File), NodeError> {
         .read(true)
         .write(true)
         .open(root.join("LOCK"))?;
-    lock.try_lock_exclusive().map_err(|error| {
+    focal_platform::try_lock_exclusive(&lock).map_err(|error| {
         if error.kind() == std::io::ErrorKind::WouldBlock {
             NodeError::Locked
         } else {

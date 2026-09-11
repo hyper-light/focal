@@ -71,6 +71,11 @@ enum Commands {
         advertise: Option<String>,
         #[arg(long)]
         listen: Option<SocketAddr>,
+        /// Enroll from this invitation first when the data directory holds
+        /// no identity yet (24 §24), then start: one command for a
+        /// supervised or packaged host.
+        #[arg(long)]
+        invite_file: Option<PathBuf>,
     },
     /// Inspect and administer the selected physical node through its local socket.
     Cluster {
@@ -85,6 +90,13 @@ enum Commands {
         advertise: String,
         #[arg(long)]
         listen: Option<SocketAddr>,
+    },
+    /// Give the data directory to the node's user (24 §24): create it, set
+    /// `--owner UID:GID` and mode 0700, then exit. For an init step that
+    /// runs privileged before the node runs as that user.
+    PrepareVolume {
+        #[arg(long)]
+        owner: String,
     },
     /// Run/resume the real claim/testament/validator example with exclusive local ownership.
     Demo,
@@ -252,7 +264,11 @@ fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
         Commands::Context { command } => {
             cli::context::run(runtime, &settings, command).map_err(Into::into)
         }
-        Commands::Start { advertise, listen } => {
+        Commands::Start {
+            advertise,
+            listen,
+            invite_file,
+        } => {
             if let Some(advertise) = advertise {
                 settings.node.advertise = Some(advertise);
             }
@@ -260,8 +276,16 @@ fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
                 settings.node.listen = Some(listen);
             }
             settings.validate()?;
+            // An uninitialized directory enrolls first; an initialized one
+            // keeps its identity and ignores the invitation.
+            if let Some(invite_file) = invite_file
+                && !settings.data_dir()?.join("IDENTITY").exists()
+            {
+                runtime.block_on(join(&settings, &invite_file))?;
+            }
             runtime.block_on(start(settings))
         }
+        Commands::PrepareVolume { owner } => prepare_volume(&settings.data_dir()?, &owner),
         Commands::Cluster { command } => {
             let selected = cli::context::admin_settings(&settings, args.client_context.as_deref())?;
             cli::cluster::run(runtime, &selected, command)
@@ -406,8 +430,36 @@ async fn invite(settings: &Settings, name: &str, output: &Path) -> Result<()> {
     if bundle.name() != name || bundle.genesis().founder != identity {
         return Err("invitation response belongs to another founder or node name".into());
     }
+    // `--output -` hands the invitation to the caller's pipe: a packaged
+    // founder has no writable path an operator can read back (24 §24).
+    if output.as_os_str() == "-" {
+        let mut out = std::io::stdout().lock();
+        out.write_all(&bundle.encode()?)?;
+        return Ok(out.flush()?);
+    }
     bundle.write_new(output)?;
     print_json(&serde_json::json!({"condition":"InvitationWritten","node":name,"output":output}))
+}
+/// Create the data directory for the node's user (24 §24).
+fn prepare_volume(root: &Path, owner: &str) -> Result<()> {
+    let (uid, gid) = owner
+        .split_once(':')
+        .and_then(|(uid, gid)| Some((uid.parse::<u32>().ok()?, gid.parse::<u32>().ok()?)))
+        .ok_or("--owner must be UID:GID")?;
+    std::fs::create_dir_all(root)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::os::unix::fs::chown(root, Some(uid), Some(gid))?;
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (uid, gid);
+        return Err("prepare-volume needs a Unix filesystem".into());
+    }
+    File::open(root)?.sync_all()?;
+    print_json(&serde_json::json!({"condition":"VolumePrepared","path":root,"owner":owner}))
 }
 async fn start_network(settings: Settings) -> Result<()> {
     let service = focal_node::network_service::NetworkService::open(&settings).await?;
@@ -466,6 +518,12 @@ fn read_file(path: &Path, max: usize) -> Result<Vec<u8>> {
         return Err("input exceeds its byte budget".into());
     }
     Ok(bytes)
+}
+fn print_text(text: &str) -> Result<()> {
+    let mut out = std::io::stdout().lock();
+    out.write_all(text.as_bytes())?;
+    out.flush()?;
+    Ok(())
 }
 fn print_json(value: &impl Serialize) -> Result<()> {
     writeln!(

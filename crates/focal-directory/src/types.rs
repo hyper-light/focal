@@ -103,6 +103,10 @@ pub struct NodeLoad {
     /// watermark refuses admission. A report of zero never receives new
     /// assignments; the V1 row codec restores it as zero.
     pub disk_available: u64,
+    /// The capability level the node's binary announces (24 §21); zero is
+    /// unknown (a report from before the level was announced). The V1 row
+    /// codec restores it as zero.
+    pub capability: u32,
 }
 
 /// What the fleet's failure detector last committed about a node through the

@@ -531,6 +531,7 @@ async fn contact_announcement_reaches_alternate_after_blackholed_preferred_leade
             PeerEndpoint {
                 address: blackhole.local_addr().unwrap(),
                 server_name: network.receipt.identity.server_name.clone(),
+                name: None,
             },
         ),
         (
@@ -538,6 +539,7 @@ async fn contact_announcement_reaches_alternate_after_blackholed_preferred_leade
             PeerEndpoint {
                 address: server.local_addr().unwrap(),
                 server_name: network.receipt.identity.server_name.clone(),
+                name: None,
             },
         ),
     ]);
@@ -576,6 +578,9 @@ async fn contact_announcement_reaches_alternate_after_blackholed_preferred_leade
             acknowledged_through: 0,
             expected_generation: 0,
             advertise: network.state.advertise,
+            region: None,
+            zone: None,
+            endpoint: None,
         },
     };
     let original = postcard::to_stdvec(&request).unwrap();
@@ -618,7 +623,10 @@ async fn contact_announcement_reaches_alternate_after_blackholed_preferred_leade
         .try_recv()
         .expect("reachable alternate was never invoked");
     assert_eq!(postcard::to_stdvec(&received).unwrap(), original);
-    assert!(check_contact_reply(ControlReply::Committed(receipt), &network.receipt, 1).unwrap());
+    assert_eq!(
+        check_contact_reply(ControlReply::Committed(receipt), &network.receipt, 1).unwrap(),
+        ContactOutcome::Committed
+    );
     assert_eq!(controller.contact_cursor, 100);
     assert!(matches!(
         delivered.try_recv(),

@@ -283,7 +283,7 @@ impl CustodyVerification {
         )))
     }
 }
-fn snapshot_error(error: focal_ledger::LedgerError) -> AccessError {
+pub(crate) fn snapshot_error(error: focal_ledger::LedgerError) -> AccessError {
     match error {
         focal_ledger::LedgerError::Graph(focal_graph::GraphError::Memory(
             focal_memory::MemoryError::LeaseExpired,

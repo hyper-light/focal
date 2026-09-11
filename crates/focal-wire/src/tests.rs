@@ -888,6 +888,7 @@ async fn peer_pool_caches_connections_reconnects_identical_packets_and_fences_ro
         PeerEndpoint {
             address: server.local_addr().unwrap(),
             server_name: "localhost".into(),
+            name: None,
         },
     )]);
     pool.replace_routes(1, routes.clone()).unwrap();
@@ -920,6 +921,94 @@ async fn peer_pool_caches_connections_reconnects_identical_packets_and_fences_ro
     );
     pool.close();
     assert_eq!(pool.send(2, &packet).await, Err(PeerSendError::Closed));
+    server.close();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn peer_pool_re_resolves_a_named_endpoint_when_its_address_stops_answering() {
+    use std::collections::BTreeMap;
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(16).unwrap();
+    let mut node_grant = grant();
+    node_grant.role = PeerRole::Node { node_id: 7 };
+    registry
+        .register_certificate(&certificate, node_grant)
+        .unwrap();
+    let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| async move {
+        verified.request().reply(Response::PeerAccepted)
+    });
+    let (server, task) = server(&pki, registry, handler).await;
+    let live = server.local_addr().unwrap();
+    // A UDP socket bound and dropped: nothing answers there.
+    let stale = {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.local_addr().unwrap()
+    };
+    let pool = PeerConnectionPool::new(
+        connector(&pki, certificate, key),
+        PeerPoolLimits {
+            retry_backoff: Duration::ZERO,
+            // The stale dial runs to the connector's own deadline first.
+            timeout: Duration::from_secs(10),
+            ..PeerPoolLimits::default()
+        },
+    )
+    .unwrap();
+    // A name that is not `host:port` with a DNS host is refused with the route.
+    for name in ["localhost", "127.0.0.1:1", ":1"] {
+        assert_eq!(
+            pool.replace_routes(
+                1,
+                BTreeMap::from([(
+                    2,
+                    PeerEndpoint {
+                        address: stale,
+                        server_name: "localhost".into(),
+                        name: Some(name.into()),
+                    },
+                )]),
+            ),
+            Err(PeerSendError::Configuration),
+            "{name}"
+        );
+    }
+    pool.replace_routes(
+        1,
+        BTreeMap::from([(
+            2,
+            PeerEndpoint {
+                address: stale,
+                server_name: "localhost".into(),
+                name: Some(format!("localhost:{}", live.port())),
+            },
+        )]),
+    )
+    .unwrap();
+    let mut packet = request(82);
+    packet.operation = Operation::Raft {
+        group: [2; 16],
+        message: vec![1],
+    };
+    // The stale address fails; the name resolves to the live server.
+    pool.send(2, &packet).await.unwrap();
+    assert_eq!(pool.stats().delivered, 1);
+    // Without a name the same stale address is simply lost.
+    pool.replace_routes(
+        2,
+        BTreeMap::from([(
+            2,
+            PeerEndpoint {
+                address: stale,
+                server_name: "localhost".into(),
+                name: None,
+            },
+        )]),
+    )
+    .unwrap();
+    assert_eq!(pool.send(2, &packet).await, Err(PeerSendError::Lost));
+    pool.close();
     server.close();
     task.await.unwrap().unwrap();
 }
@@ -968,6 +1057,7 @@ async fn peer_pool_saturation_is_bounded_and_route_change_retires_active_connect
             PeerEndpoint {
                 address: server.local_addr().unwrap(),
                 server_name: "localhost".into(),
+                name: None,
             },
         )]),
     )
@@ -1063,9 +1153,16 @@ fn peer_control_discovery_is_node_only_scoped_bounded_and_read_only_on_wire() {
         response: vec![1, 2],
     });
     validate_response(&packet, &reply, None, &limits()).unwrap();
+    // A node peer is infrastructure: its grant's tenants do not scope the
+    // sessions it replicates and drives, while a client's grant still does.
     packet.ledger.tenant = TenantId::from_u128(99);
+    assert!(verify_request(node.clone(), packet.clone(), &limits()).is_ok());
+    let mut scoped = grant();
+    scoped.role = PeerRole::Actor;
+    let mut read = packet.clone();
+    read.operation = Operation::Summary;
     assert!(matches!(
-        verify_request(node.clone(), packet.clone(), &limits()),
+        verify_request(AuthenticatedPeer::local(scoped).unwrap(), read, &limits()),
         Err(AccessError::Unauthorized)
     ));
     packet.ledger = ledger();
@@ -1104,6 +1201,9 @@ fn node_contact_requires_a_certificate_and_has_no_operator_authority() {
         acknowledged_through: 0,
         expected_generation: 0,
         advertise: "127.0.0.1:7443".parse().unwrap(),
+        region: Some("region-a".into()),
+        zone: Some("zone-1".into()),
+        endpoint: Some("node-1.focal.example:7443".into()),
     };
     assert_eq!(packet.operation.registered_tag(), 12);
     assert!(packet.operation.is_mutation());
@@ -1154,6 +1254,49 @@ fn node_contact_requires_a_certificate_and_has_no_operator_authority() {
             verify_request(node.clone(), bad, &limits()),
             Err(AccessError::InvalidRequest)
         ));
+    }
+    // Labels are bounded, non-empty, and a zone needs its region.
+    for (region, zone) in [
+        (Some(String::new()), None),
+        (Some("r".repeat(65)), None),
+        (Some("region-a".into()), Some(String::new())),
+        (None, Some("zone-1".into())),
+    ] {
+        let mut bad = packet.clone();
+        if let Operation::NodeContact {
+            region: r, zone: z, ..
+        } = &mut bad.operation
+        {
+            *r = region;
+            *z = zone;
+        }
+        assert!(matches!(
+            verify_request(node.clone(), bad, &limits()),
+            Err(AccessError::InvalidRequest)
+        ));
+    }
+    // An advertised name is `host:port` with a DNS host and a nonzero port.
+    for name in [
+        "",
+        "node-1.focal.example",
+        "node-1.focal.example:0",
+        "127.0.0.1:7443",
+        "[::1]:7443",
+        ":7443",
+        "bad name:7443",
+        &format!("{}:7443", "n".repeat(254)),
+    ] {
+        let mut bad = packet.clone();
+        if let Operation::NodeContact { endpoint, .. } = &mut bad.operation {
+            *endpoint = Some(name.to_owned());
+        }
+        assert!(
+            matches!(
+                verify_request(node.clone(), bad, &limits()),
+                Err(AccessError::InvalidRequest)
+            ),
+            "{name}"
+        );
     }
     let mut denied = packet.clone();
     denied.operation = Operation::Control {

@@ -111,6 +111,7 @@ fn nodes(partition: &mut DirectoryPartition) {
                     available_memory: 1_000_000,
                     active_weight: 4 - id,
                     disk_available: 1 << 30,
+                    capability: 0,
                 },
             },
         );
@@ -279,6 +280,7 @@ fn independent_namespace_partitions_never_store_or_mutate_each_others_sessions()
                 available_memory: 100,
                 active_weight: 100,
                 disk_available: 1 << 30,
+                capability: 0,
             },
         },
     };
@@ -558,6 +560,7 @@ fn membership_and_load_reports_bind_verified_node_incarnations() {
                 available_memory: u64::MAX,
                 active_weight: 0,
                 disk_available: 1 << 30,
+                capability: 0,
             },
         },
     };
@@ -700,6 +703,7 @@ fn metadata_partition_transfer_is_sealed_cas_fenced_and_hash_checked() {
                 available_memory: 10,
                 active_weight: 1,
                 disk_available: 1 << 30,
+                capability: 0,
             },
         },
     };

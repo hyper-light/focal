@@ -32,6 +32,8 @@ pub(crate) struct NativeEngine<S: NativeSchemaVerifier> {
     /// The seeded checkpoint this replica cannot install until the chunks
     /// it names are local; the host pulls them and polls again.
     pub(super) pending_seed: Option<PendingSeed>,
+    /// The objects a retained delivery could not read locally (24 §20).
+    pub(super) pending_custody: Option<PendingCustody>,
     pub(super) schemas: S,
     pub(super) budget: MemoryBudget,
     pub(super) ledger: LedgerId,
@@ -143,6 +145,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             reader,
             seeds,
             pending_seed: None,
+            pending_custody: None,
             schemas,
             budget,
             ledger,
@@ -531,6 +534,13 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     pub(crate) fn pending_seed(&self) -> Option<&PendingSeed> {
         self.pending_seed.as_ref()
     }
+    pub(crate) fn pending_custody(&self) -> Option<&PendingCustody> {
+        self.pending_custody.as_ref()
+    }
+    pub(crate) fn take_pending_custody(&mut self) -> Option<PendingCustody> {
+        self.pending_custody.take()
+    }
+
     pub(crate) fn pending_count(&self) -> usize {
         self.pending.len()
     }

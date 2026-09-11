@@ -8793,9 +8793,10 @@ partition, through the session's own leader when it does not lead the log.
   `SessionDriver::{Local(ReplicaHost), Remote { leader }}` in
   `placement_controller.rs`: facts, membership changes and placement
   records go through it; the leader is the hosted replica's, the last
-  redirect's, the route's or the placement's preferred; the controller's
-  leadership claim is gone; range movement, balancing and holder
-  publication still run only where this node leads the log.
+  redirect's, the route's or the placement's preferred; a plan claims no
+  leadership; range movement, balancing and holder publication still run
+  only where this node leads the log, and for that work alone a voter that
+  does not lead asks for leadership (`claim_for_ranges`).
 - **Diagnostics.** `cluster node health` reports the placement agent
   (`AdminPlacementAgent { root_intents, partition_intents, installed,
   last_error, last_refusal }`); refused intents are recorded by kind and
@@ -8808,3 +8809,838 @@ partition, through the session's own leader when it does not lead the log.
   undrain heals; replace after a fifth host joins), `cli_session_remote.rs`
   (a session created on a host, expanded and healed by the founder through
   the session's own leader, the leader drained and removed).
+- **Sessions created on hosts (2026-09-10).** A host's journaled root
+  intents (the bootstrap of a session group it created) are submitted
+  through the root leader's placement-control ingress under a client
+  derived from its enrolled principal (`root_intent_client`; an empty
+  journal adopts it), which the root admits for `BootstrapGroup` grants
+  naming the sender alone; the partition owner admits the host's own
+  `CreateSession` (a single-voter placement under a `Created` fence it
+  verifies by proof); hosts check tenant admission against their applied
+  registry when a quorum read is not theirs; node peers are no longer
+  scoped by their grant's tenants (`permits_tenant`, `verify_request`), so
+  sessions of tenants admitted after a connection was authorized are
+  replicated, signed for and driven over it.
+- **Readiness.** `OperatorRead::Readiness` → `AdminReadiness { alive,
+  catching_up, authoritative, policy_satisfied, root, sessions, truncated }`
+  derived from the root replica's progress, every hosted replica's
+  diagnostics and the agent's last placement view ([24](24-placement-execution-and-fleet-control.md)
+  §15); CLI `cluster node readiness` and `cluster node probe --check
+  alive|catching-up|authoritative|policy` (exit 1 `probe_failed` when the
+  check does not hold); MCP `cluster.node.readiness` (52 descriptors,
+  cluster skill v14).
+
+**Evidence (macOS arm64, `--offline`).** Gate 94, 2026-09-10
+12:53:47–13:10:34 CDT, on the final tree of this section: `test
+--workspace`: 112 binaries, 2,547 passed, 0 failed; clippy, production
+lints, fmt and the locked check clean; contracts 1,500 links, 37 imported
+hashes, 15 frozen vocabularies (gate 92 at 12:13 had the skill manifest
+pinning a tool version and a test still scoping node peers by tenant; gate
+93 at 12:31 had the range-movement journey stalled without the leadership
+claim for range work; both fixed, gate 94 is the evidence).
+
+## Credential rotation (R9.3, second step, 2026-09-10)
+
+Instruction 3 of R9 ([REMAINING §14](../REMAINING.md); [24](24-placement-execution-and-fleet-control.md)
+§11; instruction 6 of R6): a host moves to a fresh key under the same
+identity through one committed registry fact its previous key authorized,
+and every party that verifies the identity-to-key binding keeps verifying
+it.
+
+- **The registry fact.** `RenewRequest` schema 2 (`ROTATION_SCHEMA`) is a
+  rotation: the new key's request identity and CSR, proven by the credential
+  held (`CredentialMaterial::rotation_request(current, next, receipt)`,
+  refused up front for the key already held). The sponsor prepares
+  `Change::Rotate { invitation, receipt, retire_previous_at }`: a
+  certificate issued for the new CSR under the same identity, the receipt
+  naming the new request, key and CSR at the next revision, the previous
+  certificate retired with the renewal's grace. Applying it moves the
+  enrolled-key index to the new key and refuses a key already enrolled; a
+  rotation already committed to the request answers with its receipt
+  (`RenewPreparation::Existing`), and the proof of a retry is accepted from
+  the key the rotation retired while its certificate still authorizes.
+- **The binding stays verifiable.** A principal is derived from the key an
+  enrollment began with (`assigned`); a rotated key did not derive it, so
+  the certificate issued for a rotation, and for every renewal after one,
+  carries the principal in a CA-signed subject
+  (`focal-carried-principal:<principal>`, the founder's genesis rule
+  generalized; `BootstrapAuthority::issue_carried`). The registry checkpoint
+  (`restore`), the sponsor's apply of a renewal or rotation and the holder's
+  saved-material inspection (`JoinKey::inspect_saved`) accept an identity
+  only when its key derived it or a verified certificate carries it
+  (`pki::identity_bound`); a retired credential is a renewal's (same key and
+  request) or a rotation's (both differ, the key enrolled no more).
+- **The holder.** The host stages a key with its own request identity
+  (`JOIN/node-key.next`, kept until adopted), asks the sponsor over the
+  enrollment transport, and adopts the receipt with `JoinKey::rotate_into`:
+  the receipt first, then the key, then the staged material is cleared; the
+  new credential is presented on the listener, the peer pool and the
+  placement agent before the reply, as a renewal is. A crash between the
+  sponsor's commit and the adoption leaves the host on its previous key: it
+  starts (the held certificate authorizes through the grace, and
+  `seed_peer_registry` no longer requires the held key to be the
+  registry's), sees the registry's receipt under another key
+  (`rotation_ahead`) and adopts the committed rotation from the staged key
+  at once. The root re-grants a node whose enrolled key changed under its
+  new identity at the next generation before other root work
+  (`next_root_command`); the partition learns the re-grant like a drain's.
+- **Surface.** `AdminCommand::RotateCredential` → `CredentialRotated`;
+  `CredentialSummary` and the renewal reply gain `key_identity` and
+  `rotations`; CLI `cluster credentials rotate`; MCP
+  `cluster.credentials.rotate` (53 descriptors, cluster skill v15); the
+  founder answers `unsupported`.
+- **Tests.** `focal-enrollment` `a_rotation_changes_the_key_under_the_same_identity_and_the_old_key_signs_only_through_the_grace`
+  (commit, retry, checkpoint round trip after the rotation, adoption,
+  renewal under the new key, the old key refused past the grace);
+  `focal-node` `a_joined_host_rotates_its_key_is_regranted_under_it_and_adopts_a_committed_rotation_after_a_crash`
+  (a joined host rotates, its contact carries the new fingerprint, the root
+  re-grants it under the new key identity, a renewal under the rotated key
+  is ordinary, and a host restarted with the previous key and receipt beside
+  the staged key adopts the committed rotation by itself).
+
+**Evidence (macOS arm64, `--offline`).** Gate 95, 2026-09-10
+13:29:52–13:46:43 CDT, on the final tree of this section: `test
+--workspace`: 112 binaries, 2,546 passed, 3 failed; clippy, production
+lints, fmt and the locked check clean; contracts 1,502 links, 37 imported
+hashes, 15 frozen vocabularies. The three failures are startup and
+election timing under the full run — `cli_network` (a node's listener
+found its port already in use), `fleet_quic` (a membership removal and a
+managed registration answered unknown while the replicas had no leader) —
+and each binary passed whole when rerun alone immediately after (4 of 4
+and 6 of 6); no test of this section failed.
+
+## Repairing a session's custody (R9.3, third step, 2026-09-10)
+
+Instruction 3 of R9 ([REMAINING §14](../REMAINING.md); [24](24-placement-execution-and-fleet-control.md)
+§20; [08](08-stepped-complexity-and-deployment.md) §10: "missing
+destination data triggers verified recopy, not fresh object identity"):
+forward repair of the copies a placement already requires, and the pull a
+fresh copy makes for the objects its committed history names.
+
+- **The walk.** `cluster repair [--tenant T] [--session S] [--after A]
+  [--limit N]` (`AdminCommand::Repair` → `RepairedReply` → `AdminResult::Repaired
+  { repair: AdminRepair }`; MCP `cluster.repair`; 54 descriptors, cluster
+  skill v16). The replica exports its committed prefix (the same
+  `checkpoint_evidence` a backup takes) and the evidence coordinator walks
+  its artifact projection as a trusted node job (`JobKind::Repair`) under
+  the session's current placement: this node verifies each object through
+  its own store (`verified`), pulls what it lacks or fails to verify from
+  the content copies then the voters, chunk by verified chunk under the
+  same identity (`repaired`), lists what no copy answers with
+  (`unrecoverable`, bounded to 64, `unrecoverable_count` exact,
+  `restore_required`), records its own receipt when it is a required copy,
+  and re-asks every other required copy to verify, receipt or not,
+  recording the answer or giving it the object (`push`, `pushed`). `limit`
+  (256 default, 4,096 at most) and the export's 30 s lease bound one call;
+  `complete` and `next_after` say where a following call resumes. The
+  walk is idempotent and changes no placement.
+- **The native projection.** `DurableEvidenceSnapshot` now carries, for a
+  hosted native session, the content roots the committed rows name
+  (`Core::native_content_roots`, whose `ContentRoot` variants now carry
+  the artifact id or the retired claim id) projected as the
+  `ArtifactEvidence` every custody consumer walks (`artifact_after`), so
+  custody verification for readiness (§7), backups and repair all see the
+  native objects; the prefix's `artifacts` counts them.
+- **Fresh copies pull what their history names** ([24](24-placement-execution-and-fleet-control.md)
+  §20, "A fresh copy's objects"): a recording custody reader names the
+  objects a replay, a snapshot install or a legacy translation could not
+  read (`PendingCustody`, `custody_pending`, `custody_objects_missing`);
+  the host pulls them from the placement's peers (`pull_object`) and the
+  retained delivery resumes; custody reads admit the nodes of an announced
+  pending placement at its route, writes only the installed placement's.
+  This is what let a native session with artifacts expand onto new hosts
+  at all: before it, the added copies' deliveries stayed retained on a
+  missing object and the plan never left `Custody`.
+- **Corrupt chunks are replaced by verified recopies**
+  (`install_transferred_chunk`; the custody host's `Open` counts a chunk
+  that fails its hash as missing so the transfer resumes at it); every
+  other install path still refuses a differing existing file.
+- **Tests.** `crates/focal-node/tests/cli_repair.rs`: a native session
+  with one artifact is expanded onto two hosts (three voters, two content
+  copies), every node's repair verifies the object and is idempotent; a
+  copy that lost its chunk recopies it and one that holds it corrupt
+  receives verified bytes over it, both byte-identical to the original; with
+  every copy's chunk gone the walk reports the object unrecoverable (both
+  other nodes asked) and `restore_required`, manufacturing nothing; once one
+  copy's bytes are back the holder pushes the object to the required copy
+  that lacks it and the voter recopies it through its own repair; a walk
+  bounded to one object resumes after `next_after`; a session this node
+  does not host is refused. `focal-evidence` keeps its fail-closed install
+  tests for seeds and custody records.
+
+**Evidence (macOS arm64, `--offline`).** Gate 97, 2026-09-10
+16:41:31–16:58:48 CDT, on the final tree of this section: `test
+--workspace`: 113 binaries, 2,550 passed, 0 failed; clippy, production
+lints, fmt and the locked check clean; contracts 1,506 links, 37 imported
+hashes, 15 frozen vocabularies (gate 96 at 16:10 had the native projection
+refusing legacy replicas, a delivery gate that stalled imports and one
+custody-read expectation; all three fixed, gate 97 is the evidence).
+
+## The upgrade fence (R9.3, fourth step, 2026-09-10)
+
+Instruction 3 of R9 ([REMAINING §14](../REMAINING.md); [24](24-placement-execution-and-fleet-control.md)
+§21; [08](08-stepped-complexity-and-deployment.md) §10): incompatible
+behaviour activates only behind a committed fence every node supports, and
+a binary behind the fence refuses to serve.
+
+- **Levels.** `upgrade::CAPABILITY_LEVEL` (1) is what this binary
+  implements; `announced_level()` is what it announces — the same, or a
+  lower level set through `FOCAL_CAPABILITY_LEVEL` for a staged rollout or
+  a rehearsal (never raised). Every load report carries it
+  (`NodeLoad::capability`; the frozen V1 row codec restores it as zero,
+  unknown; `AdminPlacementNode.capability` shows it).
+- **The fence.** `UpgradeFence { level, activated_at, revision }` in the
+  enrollment registry (schema 4; a schema-3 checkpoint restores with none;
+  `encode_as_schema_three_for_tests` covers the upgrade), raised only by
+  the founder authority through `Change::ActivateFence { level }`
+  (`prepare_activate_fence`: zero or lower is invalid, the same level a
+  conflict read as done; `EnrollmentCommand::activated_fence`), committed
+  through the quorum enrollment host (`QuorumEnrollmentHost::activate_fence`).
+- **Surface.** `cluster upgrade status` / `cluster.upgrade.status`
+  (`AdminCommand::UpgradeStatus` → `UpgradeReply` → `AdminResult::Upgrade
+  { upgrade: AdminUpgrade }`: the fence, this binary's compiled and
+  announced levels, every directory-listed node with the level it last
+  reported, `activatable` = the least reported level) and `cluster upgrade
+  activate --fence LEVEL` / `cluster.upgrade.activate`
+  (`AdminCommand::ActivateFence`, founder only → `AdminResult::FenceActivated
+  { upgrade, changed }`; `members_behind` exit 5 names nodes reporting less
+  or none, a lower level is `invalid_input`, the same level reads as done);
+  56 descriptors, cluster skill v17.
+- **Refusal.** The network controller checks the fence against the
+  announced level every time it observes the root and stops with
+  `ControllerError::Fenced` (exit `upgrade_fenced`, 5); `NetworkService::open`
+  makes the same check against the registry its root replica has applied,
+  so a rolled-back binary neither starts nor keeps serving. Nothing is
+  gated on a level yet (`upgrade::opened`); the fence's first work is the
+  rollback refusal R10's upgrade qualification needs.
+- **Tests.** `crates/focal-node/tests/cli_upgrade.rs`: a founder and a
+  host both report level 1 and no fence; a host may read but not raise
+  the fence (`unauthorized`); level 2 is refused naming both nodes; zero is
+  invalid; the fence rises to 1 exactly once (`changed` true, then false at
+  the same revision); the host observes it; restarted announcing level 0
+  the host exits 5 with `[upgrade_fenced]` and publishes no readiness;
+  restarted at level 1 it serves again, also when announcing level 1
+  explicitly. `focal-enrollment`
+  `the_upgrade_fence_rises_once_under_the_founder_authority_and_survives_schema_three_checkpoints`.
+
+**Evidence (macOS arm64, `--offline`).** Gate 98, 2026-09-10
+17:03:43–17:21:11 CDT, on the final tree of this section: `test
+--workspace`: 114 binaries, 2,553 passed, 0 failed; clippy, production
+lints, fmt and the locked check clean; contracts 1,510 links, 37 imported
+hashes, 15 frozen vocabularies.
+
+## Topology facts and the residency fence (R9.4, 2026-09-10)
+
+Instruction 4 of R9 ([REMAINING §14](../REMAINING.md); [24](24-placement-execution-and-fleet-control.md)
+§22; [08](08-stepped-complexity-and-deployment.md) §6, §7): the
+geographic executor, not only the solver. Before this batch every node was
+granted with unknown geography (the controller granted region and zone
+zero), so `survive: zone|region` could not be satisfied by any fleet and
+`placement.residency` could not resolve; the planner filtered by residency
+but nothing executed it.
+
+- **Declared and announced.** `topology.region`/`topology.zone` (local
+  configuration, at most 64 bytes; a zone declared without a region is a
+  local fact that is never announced) ride on the
+  node's contact (`Operation::NodeContact { region, zone }`,
+  `NodeContactCommand`, `ContactRecord`; contact checkpoint schema 2 and
+  control checkpoint schema 5 with the schema 3/4 shape decoded through
+  `ContactCheckpointV1`). The controller announces them and re-announces
+  when they change (`with_topology`).
+- **Identities and grants.** `topology::region_id(label)` and
+  `zone_id(region, zone)` derive directory identities from labels, the same
+  on every node. The root leader registers a region the root does not know
+  (`RootOperation::RegisterRegion` under the controller's evidence,
+  `authority_epoch` 1; the founder registers every region its policy names
+  ahead of a node running there) and grants each node with its identities
+  and the region's epoch; a node whose announced topology changes is
+  re-granted at its next generation like a rotated key (`next_root_command`,
+  `root_admission_command`). Config refuses labels beyond 64 bytes; the
+  wire refuses a zone without a region, and the controller announces a
+  zone only with one.
+- **The fence.** `placement_executor::ResidencyFence { residency, regions }`
+  is installed with every session's custody scope
+  (`EvidencePlacement::committed(.., fence)`; the agent keeps every listed
+  node's region and re-installs a fence that changed under the same scope,
+  which the coordinator accepts as a fence-only replacement) and checked
+  before any byte moves: a sealed artifact's replication, a repair's pull
+  or push and an obligation's ask skip or refuse a node outside the
+  boundary; an operator's range move outside it is refused by name
+  (`outside_residency`, exit 5, from the placement view) and again by the
+  controller (`AgentError::Residency`). The founder's startup placement
+  carries its own declared region.
+- **Views.** `AdminPlacementNode.region/zone` (announced labels; a region
+  known only by identity shows its hex), `AdminSessionPlacement.residency/home_regions`
+  (labels), `ObservedNode.region/zone` for deployment observation;
+  `TopologyLabels` joins the root's region registry and contacts.
+- **Tests.** `crates/focal-node/tests/cli_zones.rs`: a founder and three
+  hosts declare `ra/a1..a3` and `rb/b1` with residency `[ra]`; every node
+  is granted and shown with its labels and the session with its residency;
+  a zone-survival plan activates three voters in three zones of `ra` and
+  never the `rb` host; a range move to the `rb` host is refused
+  `outside_residency` naming the region; a region-survival plan cannot be
+  placed. Unit: `topology` identities, `placement_executor` fence rules,
+  wire label validation, contact checkpoint labels.
+
+**Evidence (macOS arm64, `--offline`).** Gate 99, 2026-09-10
+17:29:00–17:46:36 CDT, on the tree before this section's last two fixes:
+`test --workspace`: 115 binaries, 2,554 passed, 2 failed —
+`config::ownership_tests::precedence_is_command_line_then_file_then_creation_default_and_every_value_names_its_source`
+(the precedence fixture declares a zone alone; the config rule refusing
+that was removed and the controller now announces a zone only with its
+region) and `cli_upgrade` (the host's activation precheck read a directory
+view in which the founder's load had not arrived, so it named the founder
+behind instead of refusing as unauthorized; the test now waits for both
+nodes' levels in the host's view as it already did in the founder's).
+Clippy, production lints, fmt and the locked check clean. Gate 100 runs on
+the final tree and is recorded under R9.5 below.
+
+## Metrics (R9.5, 2026-09-10)
+
+Instruction 5 of R9 ([REMAINING §14](../REMAINING.md); [24](24-placement-execution-and-fleet-control.md)
+§23; [08](08-stepped-complexity-and-deployment.md) §9): what a node
+knows about itself, rendered for a scraper. The four readiness probes
+were implemented with R9.3; this batch adds the metrics they are explained
+by.
+
+- **One sampled snapshot.** `focal_node::metrics::MetricsSnapshot` is
+  built by the service every `SAMPLE_INTERVAL` (five seconds) from what it
+  already owns — `MemoryBudget::stats`, the content host's `DiskStats` and
+  staged uploads, `SharedWal::stats`, the fleet's status and the root
+  replica's progress, every hosted replica's `AdminReplicaDiagnostics`
+  (indices, apply lag, sequence, pending proposals, log kept beyond the
+  checkpoint, retention floor and cursor lag, pending seeds and objects)
+  joined with the directory's route and placement epochs and
+  `effective_guarantee`, `PeerPoolStats`, the failure detector's view and
+  counters, the credential's expiry and renewal and rotation counts, the
+  placement agent's intents and admission report, and the committed
+  upgrade fence — and published through a `watch`. Sessions beyond
+  `MAX_SESSIONS` (512) are counted as truncated. Nothing is sampled on a
+  caller's behalf.
+- **Rendering.** Prometheus text exposition 0.0.4: `# HELP`/`# TYPE` per
+  series, fixed `node` and `cluster` labels on every sample,
+  `focal_node_info` carrying `role`, `region`, `zone` and `capability`,
+  per-session series labelled by tenant and session, per-tenant admission
+  queues, label values escaped.
+- **Surfaces.** `OperatorRead::Metrics` → `OperatorReply::Metrics(String)`
+  → `AdminResult::Metrics { text }` (bounded at 8 MiB); CLI
+  `cluster node metrics` prints the text as it is (never JSON); MCP
+  `cluster.node.metrics` (catalog 57 admin tools, skill `focal-cluster`
+  v18). `node.metrics_listen` (loopback only, [08](08-stepped-complexity-and-deployment.md)
+  §2) binds a `TcpListener` at open and `metrics::serve_loopback` answers
+  `GET /metrics` over HTTP/1.0 — one connection at a time, a request
+  bounded to 4 KiB and two seconds, `Connection: close`, `404` for another
+  path, `405` for another method, no HTTP crate — read-only and
+  unauthenticated by construction, which is why it never leaves loopback.
+- **Tests.** `crates/focal-node/tests/cli_metrics.rs`: a founder with
+  `node.metrics_listen` and a declared topology renders the fixed labels,
+  the founder's session series and the fence over the admin socket, and
+  the loopback endpoint answers `GET /metrics` with the same exposition,
+  `404` for another path, `405` for another method and again `200`
+  afterwards. Unit: `metrics::tests` (labels, escaping, derived lags).
+
+**Evidence (macOS arm64, `--offline`).** Gate 100, 2026-09-10
+17:55:21–18:13:22 CDT, on the final tree of R9.4 and this section: `test
+--workspace`: 116 binaries, 2,558 passed, 0 failed; clippy, production
+lints, fmt and the locked check clean; contracts 1,521 links, 37 imported
+hashes, 15 frozen vocabularies. R9.4 and R9.5 close on this run.
+
+## Packaging and reachability (R9.6, 2026-09-10)
+
+Instruction 7 of R9 ([REMAINING §14](../REMAINING.md); [08](08-stepped-complexity-and-deployment.md)
+§3, §5; [24](24-placement-execution-and-fleet-control.md) §24): service
+supervision and Kubernetes packaging around the same binary, and the
+reachability model a packaged host needs. Before this batch a node's
+addresses were pinned at its first start (a restart with other addresses
+was refused as another identity), contacts carried addresses only, and an
+invitation named the founder's address, so a rescheduled pod could not be
+found and could not start.
+
+- **Reachability restated, not pinned.** `NetworkState` schema 2 carries
+  the advertised name (`endpoint`); `startup_addresses` reports what the
+  operator restated and `install` adopts it for the same node, sponsor and
+  genesis (the join journal's addresses no longer override a later
+  adoption); the controller announces a changed address or name as it
+  announces a renewed certificate. `Operation::NodeContact { endpoint }`
+  (a DNS host and a nonzero port, at most 259 bytes, validated at the
+  wire and by the control owner), `NodeContactCommand`/`ContactRecord`
+  `endpoint`, contact checkpoint schema 3 and control checkpoint schema 6
+  (schemas 1–5 decoded). `PeerEndpoint.name`: the pool dials the announced
+  address and, when it fails, re-resolves the name within the same
+  deadline and tries at most four fresh addresses; the certificate check is
+  unchanged. Invitations name the founder as it was started
+  (`InviteIntent.endpoint`), a sponsor endpoint may be a name (resolved at
+  each use, `resolve_endpoint`), and the founder's route falls back to the
+  address the name resolved to at this start. A node that moved before
+  applying its previous contact re-reads the root's contact table from
+  the peer that refused its stale announcement and announces once more
+  from the current generation (`ContactOutcome`), so a twice-moved node is
+  never stranded behind an address the leader cannot reach. `cluster
+  placement` shows every node's `advertise` and `endpoint`.
+- **One command for a packaged host.** `start --invite-file FILE` enrolls
+  when the directory holds no identity, then starts; `prepare-volume
+  --owner UID:GID` creates the data directory for the node's user;
+  `cluster invite --output -` writes the invitation to a pipe.
+- **Rendering.** `deployment/render/{systemd,kubernetes}.rs` and
+  `deployment render systemd|kubernetes`: deterministic files, never
+  overwritten, every lacking fact named as `missing` (image, storage
+  class, invitation secret, zones; a systemd host without an address),
+  region survival refused by name. Kubernetes: headless Service with
+  not-ready addresses published, founder StatefulSet plus one host set
+  (node survival, spread by hostname) or one per zone (zone survival,
+  node affinity, `2f+1` zones), per-set ConfigMap, disruption budgets
+  (founder 0, hosts `max_failures`), an init step that gives the volume to
+  uid 65532 with the same image, probes that ask the node (`probe --check
+  alive`), pods advertising their StatefulSet names, `invitations.sh`
+  issuing one invitation per host pod through `kubectl exec ... invite
+  --output -` and installing the secret. Systemd: a hardened unit
+  (state directory 0700, SIGTERM, `TimeoutStopSec=45` above the 30 s
+  cleanup bound, restart on failure, no capabilities) and the
+  configuration. `deploy/config/{kubernetes,systemd}.yaml` →
+  `deploy/kubernetes`, `deploy/systemd` (goldens), `deploy/helm/focal`
+  (the same objects templated), `deploy/container/Dockerfile` (the
+  release's pinned musl image into `FROM scratch`, uid 65532, SIGTERM).
+- **Tests.** `crates/focal-node/tests/cli_reachability.rs`: a founder
+  advertising a name, an invitation through a pipe, a host that enrolls
+  and starts in one command advertising a name, the placement view showing
+  both contacts, the host restarted at another address without a name and
+  again with a name at a third address, found each time under the same
+  identity and generation. `crates/focal-node/tests/deployment_render.rs`:
+  the checked-in manifests and unit are byte-for-byte the renderer's
+  output for `deploy/config` (drift fails), the chart templates the same
+  objects, the Dockerfile pins the release toolchain image; `helm template`
+  runs when `helm` is installed and records otherwise that it did not.
+  Unit: `deployment::render::tests` (sets, affinity, missing facts,
+  refusals, the unit, shipped configurations reading back as the
+  requested policy); `focal-wire`
+  `peer_pool_re_resolves_a_named_endpoint_when_its_address_stops_answering`
+  and the contact name rules; contact checkpoint schema 3 round trips.
+- **Not executed here.** A run on a real Kubernetes cluster, the container
+  image build (no crate registry offline) and `helm template` (no `helm`
+  installed). The Kubernetes journey of R9.8 stands in with local
+  processes.
+
+**Gate 101 (macOS arm64, `--offline`), 2026-09-10 18:49:16–19:07:17 CDT,
+on the tree of this section before its last fix:** `test --workspace`:
+117 binaries, 2,355 passed, 0 failed, and the `focal-node` library test
+binary aborted with a stack overflow in
+`placement_agent::tests::the_controller_expands_a_laptop_session_to_three_hosts_that_survive_one_loss`
+after its other tests passed; clippy, production lints, fmt and the locked
+check clean. The overflow: the service's startup state machine
+(`NetworkService::open_with_socket`, every recovered owner and handle
+across its awaits) lived in the caller's future, and an in-process fleet
+test that opens three services on one 2 MiB test thread crossed the edge
+once this batch's awaits were added. The body is boxed now
+(`open_with_socket` awaits `Box::pin(open_with_socket_inner)`, as
+`run_until` already boxed `run_tasks`), so a caller's stack carries one
+frame per service; the test passes at the default stack and the library
+binary passes in full (211 tests). Gate 102 runs on the final tree and is
+recorded under R9.7 below.
+
+## Runbooks (R9.7, 2026-09-10)
+
+Instruction 8 of R9 ([REMAINING §14](../REMAINING.md)): runbooks for
+disk exhaustion, corrupt or missing content, stalled replication, node,
+zone and region loss, stale clones, failed movement, expired credentials
+and interrupted upgrade and restore, each executed against the real
+binary. `docs/runbooks/` holds one file per failure with the same
+sections (symptoms, read-only diagnostics, preconditions, commands,
+preserved guarantee, stop conditions, verification, escalation, executed
+test) and an index naming the recovery limits.
+
+- **One rule the runbooks needed.** A live contact is never displaced
+  ([24 §24](24-placement-execution-and-fleet-control.md)): before the
+  root's data service forwards a contact announcement that would move a
+  node, it probes the committed address itself
+  (`DataService::contact_admission` → `LivenessHandle::confirm` →
+  `PeerConnectionPool::probe_at`, a direct probe on a connection opened
+  for that address, never a re-resolved name) and refuses while anything
+  answers there as the node (`CompareFailed`); the detector's verdict is
+  not the test, since a moved node refutes its suspicion from its new
+  address. A copy of a node's disk started beside the node therefore
+  cannot take its place, and a moved node is admitted one probe timeout
+  after its old address stops answering. The first shape of this rule
+  made the root wait on the probe inside the announcement: the reply came
+  after the mover's one-second deadline, so a node that moved before its
+  own replica applied its previous contact announced a stale generation
+  for ever (the root could not reach it to replicate the newer one, and
+  the `Stale` reply that would have had it re-read the table never
+  arrived); `cli_reachability` failed every time the machine was busy.
+  The driver now answers at once from a bounded cache of verdicts
+  (`MAX_CONFIRMATIONS`, fresh for two probe caps), starting the probe
+  when none is in flight, and an unknown verdict is `Unavailable`: a
+  retry, never an admission.
+- **A heal of a native session could never finish.** A fresh copy the
+  agent installs for a plan served the default route (`ReplicaConfig::new`,
+  route 1), while the leader probing a prospective learner for its format
+  support speaks the session's current route; the copy refused every such
+  probe as unauthorized once the session had activated once, the leader
+  never recorded the learner's native promise, `AddLearner` stayed
+  `Unsupported` until each membership call timed out, and the plan sat in
+  `Catchup` for ever. The first expansion of a session (route 1) never
+  showed it; every later expansion or heal did. A fresh copy now serves the
+  session's current route, the plan's target route less one
+  (`PendingPlacement::next_route` is the current route plus one), until its
+  own log commits a fence (`placement_agent::attach_copy`). Found by
+  `runbook_node_loss`.
+- **Refusals are not blockers once the promise holds.** The directory's
+  guarantee report lists a session-level refusal (`Refused(NoPlacement)`
+  and the like) only while the achieved level is below the desired one,
+  so `blocked_by` and `policy_satisfied` recover with the placement instead
+  of carrying a refusal the controller recorded during an outage.
+- **Delivered invitations.** An invitation file is read through links and
+  may be group-readable (a mounted secret), never group-writable or
+  world-readable (`check_invitation`); the journals a node writes stay at
+  `0600`.
+- **A retired credential stops serving.** The controller refuses at its
+  next refresh, and the service at start, when the committed registry no
+  longer authorizes the node's own certificate (revoked, or expired past its
+  grace): `ControllerError::Retired`, `[credential_retired]` exit 5, beside
+  the upgrade fence. A rotation in progress keeps the previous certificate
+  authorized through its grace, so a node between the sponsor's commit and
+  its adoption is not refused.
+- **A credential's standing is visible.** `AdminPlacementNode.credential`
+  (`active`, `retired`, `unknown`) comes from the enrollment registry the
+  founder's root holds, so an operator sees a revoked or expired node as
+  such even while it still answers probes (it authenticates its peers,
+  they refuse it).
+- **A retired node can still be drained and dropped.** The directory's
+  topology grant demanded a live credential for every publication and
+  every seat, so a revoked node could neither be withdrawn (`drain`
+  refused `UnverifiedAuthority`) nor leave a group (`authority change
+  group` refused while it held a seat) and the placement never healed.
+  A withdrawal, a grant that only turns `eligible` off and restates the
+  committed identity, region, zone, endpoint, authority epoch, principal
+  and expiry, and a group change carrying an ineligible seat, tolerate
+  `UnverifiedAuthority` and `Expired` from the credential check
+  (`authority::apply` GrantNode, `validate_live_group`,
+  `authority_proof::verify_enrollment`); anything that changes what the
+  node publishes, or a live seat, still needs the live credential. Found
+  by `runbook_expired_credentials`.
+- **Tests.** `crates/focal-node/tests/runbooks.rs` over the shared fleet
+  harness `tests/support/fleet.rs` (real processes, invitations through a
+  pipe, one-command joins, pauses with `SIGSTOP`, the founder's placement
+  view, one participant workload): `runbook_disk_exhaustion` (a founder
+  under `ulimit -f` with `SIGXFSZ` ignored refuses an oversized write and,
+  restarted without the limit, reads the earlier claim and commits a new
+  one), `runbook_corrupt_or_missing_content` (a lost and a corrupt chunk
+  repaired from another copy; a second repair finds nothing),
+  `runbook_stalled_replication` (a paused voter is confirmed, the guarantee
+  is blocked, writes continue, the resumed voter restores it),
+  `runbook_node_loss` (a killed voter replaced by a spare and removed),
+  `runbook_zone_loss` and `runbook_region_loss` (a lost domain's host,
+  returned with its disk, restores the zone or region guarantee),
+  `runbook_stale_clone` (a disk copy started beside the node is refused and
+  admitted only after the node is gone), `runbook_failed_movement` (a
+  range move whose destination dies finishes when it returns),
+  `runbook_expired_credentials` (a revoked host drops out, is drained and
+  removed, and the machine enrolls again fresh; revocation models expiry
+  beyond the grace), `runbook_interrupted_upgrade` (a binary below the
+  fence refuses to serve, the fence never lowers, the upgraded host
+  serves), `runbook_interrupted_restore` (a restore whose node is killed
+  as it is issued completes or is refused as done on the retry, and the
+  claim reads back).
+
+**Gate 102/103 (macOS arm64, `--offline`), 2026-09-10/11.** The runbook
+suite (`runbook_<slug>` ×11) passes on the real binary, alone and beside a
+second copy of the suite under load: the contact confirmation the root asks
+before it moves a node's address no longer waited on the probe inside the
+announcement (which came back after the mover's one-second deadline, so a
+twice-moved node announced a stale generation for ever), and now answers at
+once from a bounded cache of verdicts, so `cli_reachability` passes every
+time the machine is busy. Gate 103 ran the whole workspace: 121 binaries,
+2,579 passed, 1 failed, and that one was `cli_deployment`'s explain
+assertion, tightened in the same batch (see R9.8 below) and re-run green;
+strict all-target Clippy, the production no-panic gate, formatting and the
+locked check are clean. **Gate 104 (macOS arm64, `--offline`),
+2026-09-11 00:23–00:45 CDT, on the final tree of this batch** (the fixed
+`cli_deployment` and both journey stages together): 121 binaries, 2,580
+passed, 0 failed; Clippy, the production gate, formatting and the locked
+check clean. Contracts verify 1,529 architecture links.
+
+## Deployment journeys, laptop and VM stages (R9.8, 2026-09-11)
+
+Instruction 9 of R9 ([REMAINING §14](../REMAINING.md); [08](08-stepped-complexity-and-deployment.md)
+§11; DC01–DC20): the six stepped deployment journeys, each executed against
+the real binary, each recording the operator concepts and inputs it needs
+so the progression is measured, not asserted. This batch delivers the first
+two stages and the recorder they share; the zone, region, Kubernetes,
+workload and upgrade stages follow.
+
+- **A recorded journey.** `crates/focal-node/tests/support/journey.rs`
+  wraps the fleet harness: every command it runs is kept as a `Step`
+  (the concept it needs, its inputs and the command with machine-specific
+  values replaced by their kind), and at the end the recorded `Stage`
+  (`builds_on`, the concepts it `introduces` over the stages it builds on,
+  its `inputs`, the demonstrations it does `not` run and why, and the
+  transcript) is compared byte-for-byte with the stage's entry in
+  `tests/deployment/concepts.json`. A new mandatory concept fails the test
+  until the file records it, so DC20's measure — an added concept needs an
+  explicit decision — is enforced by the suite. The recorder also collects
+  every command's output and `assert_redacted` searches it for the
+  participant's and the node's invitation tokens (DC17).
+  `docs/qualification/deployment-complexity.md` is generated from the file.
+- **The laptop (DC01, DC02, DC04, DC13, DC15, DC16, DC17).**
+  `crates/focal-node/tests/deployment_laptop.rs`: an empty directory, the
+  native engine and one start on a loopback address; the claims demo
+  between the node's principal and a participant enrolled on the same
+  machine; a `SIGKILL` and a restart that read the same claim, artifact and
+  receipt; a second writer refused (`directory_owned`, exit 6), an
+  unwritable directory refused (`permission_denied`, exit 2) with nothing
+  written under it, and a full volume (`ulimit -f`) refusing an oversized
+  write with no acknowledgement; a backup restored on a fresh laptop as a
+  recovery incarnation, and only with `--new-incarnation`, read back
+  through a saved connection; `deployment explain` naming requested,
+  effective and observed values against a golden; a dry run that writes
+  nothing under the directory; and a plan of another deployment
+  (`wrong_deployment`) and a tampered plan (`plan_corrupt`) refused before
+  any side effect. Power loss and the MCP path are named as not executed
+  here (the crash matrix is R11; `mcp_native_a1` runs the same claims over
+  MCP). The laptop's one input beyond its directory is a loopback address:
+  the native engine admits no self-issued work, so the second principal is
+  a client context, which connects to the node's listener.
+- **VMs or bare metal (DC03, DC05, DC06, DC16, DC19).**
+  `crates/focal-node/tests/deployment_fleet.rs`, building on the laptop
+  stage so it introduces only invitation, join, remove and drain: hosts
+  enroll from invitations through a pipe and start in one command, and a
+  replayed, tampered or revoked invitation enrolls nothing; a durability
+  intent (`survive: node`, `max_failures: 1`) planned and applied derives
+  three voters and advertises the stronger guarantee only once the copies
+  are ready, with the demo unchanged before and after and read back through
+  the participant's own connection; a two-failure policy the three hosts
+  cannot provide is planned as blocked and its apply refused
+  (`guarantee_unsatisfied`), the contract intact; the same request composed
+  again resumes its journal as complete, and a plan made at an older policy
+  revision, applied after another policy commits, is refused as stale
+  (`stale_plan`, exit 5) before any side effect; a host that holds copies
+  is not removed, a drained one leaves the guarantee visibly short until a
+  replacement joins and the placement heals, and is removed only once
+  nothing names it.
+- **Explain observes the running directory.** `deployment explain` without
+  an inventory now, on a node that runs a directory, plans against every
+  node the directory knows (with its announced domains and standing) and
+  reports each session's achieved level and what blocks it in an `observed`
+  section, and `activated` is true only when every session has the
+  effective level ([08](08-stepped-complexity-and-deployment.md) §9); a
+  node that runs no directory, or an explicit `--inventory`, is explained
+  against those facts alone. `cli_deployment`'s explain assertion was
+  tightened to the observed truth (a three-host fleet makes `max_failures`
+  1 valid and, once applied, active) and a single-node-inventory case added
+  for the unmet path.
+- **Two directory refinements this batch needed.** A plan is refused before
+  any side effect when the directory has not yet reported this node
+  (`DeploymentError::NotObserved`, `not_observed` exit 6), so a plan is
+  never composed from a view that omits the node it would place. A drained
+  node's guarantee report keeps a session-level refusal in `blocked_by`
+  while the placement is short of its promise (a level below the desired
+  one *or* a member the report already names), not only while the achieved
+  level is below the desired one, so an operator sees why the controller has
+  not healed a session whose sole voter is down.
+- **A client resends an availability refusal within its clock.** A CLI
+  request that a node refuses `Unavailable` (a leader change, a service
+  still opening) is resent with backoff up to `UNAVAILABLE_RESENDS`, within
+  the retry policy's deadline, and reported as the refusal it was rather
+  than an unknown outcome or a transport failure; a workload that writes
+  through the founder while the fleet reconfigures no longer fails on a
+  transient leader change (`focal-client` `client.rs`, unit test
+  `availability_refusals_are_resent_within_the_clock_and_reported_as_refusals`).
+- **Shrinking the voter set by lowering `max_failures` (fixed).**
+  Lowering a session's `max_failures` so the desired voter set is a proper
+  subset of the current one (three voters to one) now completes, and the
+  sole surviving voter serves the session's whole history
+  (`crates/focal-node/tests/placement_downgrade.rs`). The bug was a
+  membership-epoch model that a shrink's deferred removal did not satisfy.
+  At plan time the directory set
+  `pending.next_membership = active.membership_epoch + 1` because the
+  placement's voter set differs (`SessionChange::Plan`). An expansion then
+  steps the group's real epoch to that value before the cut-over
+  (AddLearner then Promote commit membership changes), so the cut-over and
+  activation fences carry an epoch the three checks agree on: the session's
+  `validate_placement_transition` (cut-over needs `>= active + (voters
+  differ)`), the directory's `validate_transition_fence` (needs `>=
+  pending.next_membership`), and the authority verifier's
+  `verify_session_fence` (needs `== the signed group's epoch`). A shrink
+  makes no membership change before the cut-over — the dropped voters keep
+  voting until activation retires them (24 §4, §19) — so the group's real
+  epoch stays at `active`, one below what the plan and the transition-fence
+  check demand. Forcing the fence to `active + 1` (the controller) satisfies
+  the session and transition-fence checks and lets the cut-over barrier set,
+  but the activation then fails the authority verifier, whose group epoch is
+  derived from the signed proof and does not match. A correct fix has to
+  reconcile the epoch across all three layers for a deferred removal — for
+  example, deriving `next_membership` from whether the group configuration
+  actually changes at the cut-over rather than from the placement voter set,
+  or stepping the epoch at activation when the removal commits — and must be
+  proven not to regress the expansion and heal paths. That is a focused
+  protocol change left for its own batch. The supported shrink — removing a
+  host — goes through `nodes drain` then `nodes remove` and works (DC19,
+  `runbook_node_loss`, `deployment_fleet`); the max-failures downgrade is
+  not required by any DC scenario, and the journeys use drain/remove for
+  every shrink and never a voter downgrade.
+  **The fix.** The membership epoch steps once per committed voter-set
+  change, and a change happens before a cut-over only when voters are
+  *added* — an expansion promotes them first, while a voter a placement
+  drops keeps voting until activation retires it (24 §4, §19). So the four
+  epoch-step sites now key on whether the new placement adds a voter the
+  active one lacked (`Placement::adds_voter_over`), not on whether the
+  voter sets merely differ: the directory's plan (`next_membership`) and its
+  plan validation, and the session's cut-over and activation transition
+  checks (`validate_placement_transition`). A pure shrink adds none, so its
+  cut-over keeps the group's actual epoch — which the authority verifier
+  (`verify_session_fence`) requires the fence to equal — and steps it only
+  at activation, when the removal commits. An expansion adds voters, so the
+  epoch steps before the cut-over exactly as before: the expansion and heal
+  paths are unchanged (their tests, `placement_fleet` and the runbooks,
+  still pass). A separate, pre-existing limitation remains: a client whose
+  entry node is dropped from a session's voters (as the founder is by a
+  full downgrade) does not yet rediscover the new leader through it, so the
+  downgrade test reads from the surviving voter directly; the supported
+  operator shrink (drain then remove of non-founder hosts) does not drop a
+  client's entry node.
+
+## Deployment journeys, all seven stages (R9.8, 2026-09-11)
+
+Instruction 9 of R9 is complete: the six stepped journeys plus the workload
+and rolling-upgrade demonstrations, each executed against the real binary and
+each recording the operator concepts it needs so the progression is measured
+(DC20). The shared recorder (`crates/focal-node/tests/support/journey.rs`)
+compares each stage's recording byte-for-byte with
+`tests/deployment/concepts.json`, so a new mandatory concept fails the test
+until the file records it; `docs/qualification/deployment-complexity.md` is
+generated from the file (243 recorded commands across the seven stages).
+
+- **The stages.** `deployment_laptop` (DC01, DC02, DC04, DC13, DC15, DC16,
+  DC17), `deployment_fleet` (DC03, DC05, DC06, DC16, DC19),
+  `deployment_kubernetes` (DC07, DC08), `deployment_zones` (DC09),
+  `deployment_regions` (DC10, DC11, DC12), `deployment_upgrade` (DC18) and
+  `deployment_workloads` (DC14). Each builds on the earlier stages and
+  introduces only its new concepts: the fleet adds invitation, join, remove
+  and drain over the laptop; zones add the zone fact and zone survival;
+  regions add the region fact, home regions, the measured peer latency and
+  the residency fence; upgrade adds the capability level and the fence;
+  workloads add the budget metrics; Kubernetes adds the render command.
+- **What each demonstrates.** The laptop: one directory and a loopback
+  address, the claims demo, a crash and restart reading the same records, a
+  second writer and an unwritable directory and a full volume refused with no
+  volatile acknowledgement, explain against a golden, a dry run that writes
+  nothing, and a foreign or tampered plan refused. The fleet: one-command
+  enrolment, a replayed, tampered or revoked invitation refused, a durability
+  intent planned and applied that advertises the stronger guarantee only once
+  the copies are ready, a two-failure policy the hosts cannot provide left
+  blocked with the contract intact, an identical plan resuming and a stale
+  plan refused, and a host drained, healed around and removed. Kubernetes:
+  plain manifests with a volume per identity, secret references not plaintext,
+  no CRD, and a migration (local processes for pods) that keeps the demo and
+  its receipts across a killed-and-resumed joiner. Zones and regions: voters
+  spread across domains, a lost domain surviving with the guarantee visibly
+  degraded until it returns, the measured peer RTT shown
+  (`focal_peer_rtt_ms`), and the residency fence refusing a move outside it.
+  Upgrade: the fence rising only once every node reports the level, the demo
+  surviving the activation, and a below-fence binary refusing to serve.
+  Workloads: a sustained run staying within the node's RAM budget (used never
+  exceeds the limit), a capacity refusal tolerated as the budget holding, and
+  the guarantee and placement unchanged under load.
+- **Measured RTT.** `MemberView.rtt_ms` records the last probe round trip per
+  peer from the liveness driver's Vivaldi measurement; the metrics sampler
+  renders it as `focal_peer_rtt_ms{peer}` (bounded by the fleet's member
+  count), the operator's view of inter-node and so inter-region latency.
+- **Harness.** The recorder tolerates a transient capacity or unavailable
+  refusal (exit 6) on a workload command by resending within 30 s, so a
+  moment of reconfiguration does not flake a journey; a definite error is
+  returned at once. `Journey::start_refused` runs a node expected to exit
+  (a below-fence binary) and returns its code; `Journey::admin_bare` runs an
+  offline command that carries its own `--config` (a render).
+- **Not executed.** A real Kubernetes cluster and `helm template` (neither
+  available; the manifests are byte-checked against the renderer in
+  `deployment_render`), a real newer binary at a higher capability level, and
+  measured cross-region latency under a real WAN — each named in the stage
+  that would run it.
+
+**Close R9.** Instructions 1–9 are implemented and executed. The stepped
+progression runs on the released interface with prior domain semantics, each
+stage adds only its required inputs, the claimed failures are demonstrated,
+and the effective guarantee is inspectable at every step; the runbooks and the
+journeys are green, and the concepts study enforces the DC20 measure.
+
+**Gate 106 (macOS arm64, `--offline`), 2026-09-11 10:19–10:44 CDT:** the full
+workspace test run is 127 binaries, 2,586 passed, 0 failed, including the
+seven journeys, the runbooks, the real-binary placement tests and the
+voter-downgrade test. The production no-panic gate, formatting, the locked
+check and the architecture contracts (1,532 links) are clean; strict
+all-target Clippy is clean after one test-only `== false` was rewritten as a
+negation in the Kubernetes journey (the assertion is unchanged and the
+journey re-passed). This closes R9.
+
+## Platform crate, fs2 removal and the unsafe boundary (R10, first step, 2026-09-11)
+
+Decisions 10 and 11 (doc 03 §12, doc 10, doc 20): the platform-specific
+filesystem behaviour moves into one crate, `fs2` is dropped for the standard
+library's stabilised file locks, and `unsafe` is confined to one audited file.
+
+- **`crates/focal-platform`.** A new crate with the process-scoped advisory
+  file locks (`try_lock_exclusive`, `try_lock_shared`, `unlock`) built on the
+  now-stable `std::fs::File` lock methods, mapping `std::fs::TryLockError` to
+  `io::Error` so callers keep their `WouldBlock` classification; and
+  `available_space(path)`, via `rustix::fs::statvfs` on Unix (no `unsafe`) and
+  `GetDiskFreeSpaceExW` on Windows. The lock helpers are free functions, not
+  an extension trait, so they never collide with the standard library's
+  inherent `File` methods.
+- **`fs2` removed.** Every call site (`focal-client/file_lock.rs`,
+  `focal-enrollment/files.rs`, `focal-evidence/{seeds,store}.rs`,
+  `focal-log/{lib,writer}.rs`, `focal-node/{cli/mcp,network_join,
+  node_directory}.rs`) now uses `focal_platform`; `fs2` is gone from the six
+  crate manifests, the workspace dependencies, `Cargo.lock` and the
+  third-party inventory. The lock semantics are unchanged (the whole suite,
+  including the same-user exclusion tests, passes).
+- **The unsafe boundary.** `[workspace.lints.rust] unsafe_code` is now `deny`
+  (was `forbid`), allowed in exactly one file,
+  `crates/focal-platform/src/windows.rs`, which carries the one `unsafe` block
+  behind `#[allow(unsafe_code)]` with a per-call safety argument.
+  `scripts/check-contracts.py` fails if an `unsafe` keyword (block, `fn`,
+  `impl`, `trait`, `extern`) or an `allow(unsafe_code)` appears in any other
+  source under `crates/`, and if the audited file is missing — belt and
+  suspenders to the compiler lint.
+- **Windows compile-checked.** The Windows FFI type-checks for
+  `x86_64-pc-windows-msvc` (`cargo check --target`, which does not link), so
+  the `GetDiskFreeSpaceExW` call and the wide-string handling compile against
+  the real `windows-sys` bindings even though this host cannot link or run a
+  Windows binary.
+- **Not executed here.** The rest of R10 needs a Windows host and a CI
+  environment this macOS machine does not have, and is not started so that no
+  nominal catalog entry ships without a runnable artifact: the protected
+  Windows filesystem types (`PrivateDir`/`PrivateFile`, DACL ownership,
+  reparse-point and hard-link defenses, write-through rename), the Windows
+  named-pipe local transport, the Windows CI lanes and `platforms.json`
+  entries, release signing/notarization, and the clean-machine install and
+  upgrade checks. The Unix release lanes and the existing catalog are
+  unchanged.
+
+## Adversarial input allocation bound (R11, first step, 2026-09-11)
+
+Correctness qualification instruction 3 of R11 ([REMAINING §16](../REMAINING.md)):
+a maliciously large or malformed frame must be rejected before the decoder
+allocates a buffer for the attacker's declared length.
+`crates/focal-wire/tests/adversarial.rs` makes the bound machine-checked with
+a counting `#[global_allocator]` in the test binary (a test-only harness;
+decision 11 governs shipped code and `check-contracts.py` scopes the `unsafe`
+ban to `src/`, so the allocator's `unsafe impl GlobalAlloc` is confined to the
+test). One sequential test resets a peak-heap counter immediately before each
+`read_frame` and asserts the peak growth: a header declaring `u32::MAX` or 8
+MiB over the caller's limit is refused at the fixed header with under 256 KiB
+of growth (never a buffer sized to the claim); a truncated header and a wrong
+magic are refused with the same bound; and a within-limit declared length
+whose payload is then truncated allocates only up to that declared bound plus
+bounded overhead before failing. This complements the wire crate's existing
+truncation and oversized-header unit tests with an explicit allocation ceiling.
+The rest of R11 (black-box linearizability histories across the real
+transports, the long-running fault campaign, and the performance/capacity
+envelope on recorded hardware) is not yet built; the linearization checker
+(`focal-sim::history`) and the crash-fault sites (`focal-node::fault`, exercised
+by `cli_native_a4` and `placement_binary`) are in place for it.
+
+**Gate 108 (macOS arm64, `--offline`), 2026-09-11 11:37–12:04 CDT:** the full
+workspace on the final tree of the platform, downgrade-fix, deployment-journey
+and adversarial work is 130 binaries, 2,589 passed, 0 failed; strict
+all-target Clippy, the production no-panic gate (now with `unsafe_code` denied
+outside the one audited file), formatting, the locked check and the
+architecture contracts (1,532 links plus the unsafe boundary) are clean.

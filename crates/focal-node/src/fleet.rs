@@ -166,6 +166,14 @@ pub struct ReplicaProgress {
     /// the chunks it lacks from a peer (25 §5): the snapshot's Raft
     /// coordinates and how many chunks are missing.
     pub seed_pending: Option<SeedPending>,
+    /// A retained delivery this replica cannot apply until its host pulls
+    /// the content objects it names from a required copy (24 §20).
+    pub custody_pending: Option<CustodyPending>,
+}
+/// The objects a retained delivery still lacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CustodyPending {
+    pub missing: usize,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SeedPending {
@@ -244,6 +252,13 @@ enum Work {
         oneshot::Sender<Result<(), LedgerError>>,
         Allocation,
     ),
+    /// The content objects a retained delivery lacks (24 §20).
+    CustodyObjects(
+        oneshot::Sender<Result<Vec<focal_model::ContentRef>, LedgerError>>,
+        Allocation,
+    ),
+    /// The host pulled objects a retained delivery lacked; it retries at once.
+    CustodyPulled(oneshot::Sender<Result<(), LedgerError>>, Allocation),
     /// Serve clients at an activated route: `(route, policy revision)`.
     Refence(
         RouteEpoch,
@@ -629,6 +644,7 @@ impl ReplicaHost {
                 route_epoch: config.route_epoch,
                 import_pending: None,
                 seed_pending: None,
+                custody_pending: None,
             },
             _allocation: None,
         });
@@ -884,6 +900,40 @@ impl ReplicaHost {
         let (send, receive) = oneshot::channel();
         self.sender
             .try_send(Work::InstallSeed(hash, bytes, send, charge))
+            .map_err(|error| match error {
+                HostQueueError::Full => LedgerError::Capacity,
+                HostQueueError::Disconnected => LedgerError::Failed,
+            })?;
+        receive.await.map_err(|_| LedgerError::OutcomeUnknown)?
+    }
+    /// The content objects a retained delivery lacks (24 §20), for the host
+    /// to pull from a required copy.
+    pub async fn pending_custody_objects(
+        &self,
+    ) -> Result<Vec<focal_model::ContentRef>, LedgerError> {
+        let charge = self
+            .budget
+            .reserve(BudgetKind::Control, BudgetLane::Completion, 64 * 1024)?
+            .commit();
+        let (send, receive) = oneshot::channel();
+        self.sender
+            .try_send(Work::CustodyObjects(send, charge))
+            .map_err(|error| match error {
+                HostQueueError::Full => LedgerError::Capacity,
+                HostQueueError::Disconnected => LedgerError::Failed,
+            })?;
+        receive.await.map_err(|_| LedgerError::OutcomeUnknown)?
+    }
+    /// Tell the replica its host pulled objects a retained delivery lacked;
+    /// the delivery retries at once.
+    pub async fn custody_pulled(&self) -> Result<(), LedgerError> {
+        let charge = self
+            .budget
+            .reserve(BudgetKind::Control, BudgetLane::Completion, 4096)?
+            .commit();
+        let (send, receive) = oneshot::channel();
+        self.sender
+            .try_send(Work::CustodyPulled(send, charge))
             .map_err(|error| match error {
                 HostQueueError::Full => LedgerError::Capacity,
                 HostQueueError::Disconnected => LedgerError::Failed,
@@ -1497,6 +1547,21 @@ impl Owner {
                 let _ = response.send(result);
                 self.drain()?;
             }
+            Work::CustodyObjects(response, charge) => {
+                let result = match self.session.pending_custody() {
+                    Some(pending) => pending.missing_objects().map_err(LedgerError::Native),
+                    None => Ok(Vec::new()),
+                };
+                drop(charge);
+                let _ = response.send(result);
+            }
+            Work::CustodyPulled(response, charge) => {
+                // The retained delivery retries at every poll; this one is
+                // brought forward so the pulled objects are read at once.
+                drop(charge);
+                let _ = response.send(Ok(()));
+                self.drain()?;
+            }
             Work::Membership(call, charge) => {
                 self.accept_membership(*call, charge);
                 self.drain()?;
@@ -1613,6 +1678,12 @@ impl Owner {
                     term: pending.term,
                     missing: pending.missing.len(),
                 }),
+                custody_pending: self
+                    .session
+                    .pending_custody()
+                    .map(|pending| CustodyPending {
+                        missing: pending.missing.len(),
+                    }),
             }
         });
     }

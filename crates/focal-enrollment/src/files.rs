@@ -1,5 +1,4 @@
 use crate::*;
-use fs2::FileExt;
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -63,9 +62,9 @@ impl PrivateDirectory {
                 .open(&lock_path)?;
             check_file(&lock_path, metadata.uid())?;
             let acquired = if shared {
-                FileExt::try_lock_shared(&lock)
+                focal_platform::try_lock_shared(&lock)
             } else {
-                FileExt::try_lock_exclusive(&lock)
+                focal_platform::try_lock_exclusive(&lock)
             };
             acquired.map_err(|error| {
                 if error.kind() == std::io::ErrorKind::WouldBlock {
@@ -140,6 +139,26 @@ impl PrivateDirectory {
             return Err(EnrollmentError::Conflict);
         }
         self.install(name, payload)
+    }
+    /// Remove a file and its initialization marker: staged material that
+    /// was adopted elsewhere, so the next staging starts fresh. A missing
+    /// file is not an error.
+    pub(crate) fn remove(&self, name: &str) -> Result<(), EnrollmentError> {
+        if self.shared {
+            return Err(EnrollmentError::Locked);
+        }
+        for path in [
+            self.path.join(name),
+            self.path.join(format!("{name}.initialized")),
+        ] {
+            match fs::remove_file(&path) {
+                Ok(()) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        File::open(&self.path)?.sync_all()?;
+        Ok(())
     }
     pub(crate) fn replace(&self, name: &str, payload: &[u8]) -> Result<(), EnrollmentError> {
         if self.shared {

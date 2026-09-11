@@ -130,7 +130,7 @@ impl BootstrapAuthority {
         now: i64,
         lifetime: u64,
     ) -> Result<Vec<u8>, EnrollmentError> {
-        self.issue_identity(csr, identity, now, lifetime, false)
+        self.issue_identity(csr, identity, now, lifetime, PrincipalSubject::Derived)
     }
     pub(crate) fn issue_founder(
         &self,
@@ -139,7 +139,19 @@ impl BootstrapAuthority {
         now: i64,
         lifetime: u64,
     ) -> Result<Vec<u8>, EnrollmentError> {
-        self.issue_identity(csr, identity, now, lifetime, true)
+        self.issue_identity(csr, identity, now, lifetime, PrincipalSubject::Founding)
+    }
+    /// Issue for a key that did not derive the identity's principal: the
+    /// principal was assigned to the key this enrollment began with and is
+    /// carried to `csr`'s key by a rotation the previous key authorized.
+    pub(crate) fn issue_carried(
+        &self,
+        csr: &[u8],
+        identity: &AssignedIdentity,
+        now: i64,
+        lifetime: u64,
+    ) -> Result<Vec<u8>, EnrollmentError> {
+        self.issue_identity(csr, identity, now, lifetime, PrincipalSubject::Carried)
     }
     fn issue_identity(
         &self,
@@ -147,7 +159,7 @@ impl BootstrapAuthority {
         identity: &AssignedIdentity,
         now: i64,
         lifetime: u64,
-        founding: bool,
+        subject: PrincipalSubject,
     ) -> Result<Vec<u8>, EnrollmentError> {
         let mut request = verified_csr(csr)?;
         // A CSR proves control of a key only. Ignore every requested subject,
@@ -157,13 +169,25 @@ impl BootstrapAuthority {
             .params
             .distinguished_name
             .push(DnType::CommonName, identity.server_name.clone());
-        if founding {
-            // A CA-signed subject binds the original local principal to this
-            // one genesis identity. Ordinary CSR issuance cannot request it.
-            request.params.distinguished_name.push(
-                DnType::OrganizationalUnitName,
-                format!("focal-genesis-principal:{}", hex(&identity.principal)),
-            );
+        match subject {
+            PrincipalSubject::Derived => {}
+            PrincipalSubject::Founding => {
+                // A CA-signed subject binds the original local principal to
+                // this one genesis identity. Ordinary CSR issuance cannot
+                // request it.
+                request.params.distinguished_name.push(
+                    DnType::OrganizationalUnitName,
+                    format!("focal-genesis-principal:{}", hex(&identity.principal)),
+                );
+            }
+            PrincipalSubject::Carried => {
+                // A CA-signed subject binds a principal another key of the
+                // same enrollment derived to this rotated key.
+                request.params.distinguished_name.push(
+                    DnType::OrganizationalUnitName,
+                    format!("focal-carried-principal:{}", hex(&identity.principal)),
+                );
+            }
         }
         request.params.extended_key_usages = match identity.role {
             EnrollmentRole::Node => vec![
@@ -176,6 +200,18 @@ impl BootstrapAuthority {
             Issuer::from_ca_cert_der(&CertificateDer::from(self.bundle.ca.as_slice()), &self.key)?;
         Ok(request.signed_by(&issuer)?.der().to_vec())
     }
+}
+
+/// How a certificate's subject accounts for the principal it names.
+#[derive(Clone, Copy)]
+enum PrincipalSubject {
+    /// The principal is derived from the certificate's own key.
+    Derived,
+    /// The founder's original principal, bound at genesis.
+    Founding,
+    /// A principal derived by an earlier key of the same enrollment,
+    /// carried to this key by a rotation.
+    Carried,
 }
 
 #[derive(Clone)]
@@ -255,17 +291,13 @@ impl JoinKey {
             || receipt.public_key != csr_key_hash(&bundle.csr)?
             || receipt.issued_at > now
             || receipt.expires_at <= now
-            || receipt.identity
-                != crate::registry::assigned(
-                    cluster,
-                    receipt.identity.role,
-                    receipt.identity.node_id.unwrap_or(1),
-                    receipt.public_key,
-                )
         {
             return Err(EnrollmentError::Unauthorized);
         }
         verify_issued(&receipt, ca_certificate)?;
+        if !identity_bound(&receipt)? {
+            return Err(EnrollmentError::Unauthorized);
+        }
         Ok((receipt, *blake3::hash(&bundle.csr).as_bytes()))
     }
     /// Open existing joining material for reading beside other readers; the
@@ -373,6 +405,55 @@ impl JoinKey {
             .read("enrollment.bin")?
             .map(|bytes| decode(&bytes))
             .transpose()
+    }
+    /// Adopt a rotation (24 §11): install the receipt issued for `next` —
+    /// the same identity under the new key and request — over the receipt
+    /// and key this directory holds, then clear the staged material so a
+    /// later rotation stages a fresh key. The credential returned is the
+    /// new key's. Refused when the receipt is not `next`'s or the identity
+    /// differs from the one held.
+    pub fn rotate_into(
+        &self,
+        next: &Self,
+        receipt: &EnrollmentReceipt,
+        ca_certificate: &[u8],
+        now: i64,
+    ) -> Result<CredentialMaterial, EnrollmentError> {
+        if receipt.identity.cluster != self.bundle.cluster
+            || next.bundle.cluster != self.bundle.cluster
+        {
+            return Err(EnrollmentError::WrongCluster);
+        }
+        if receipt.request != next.bundle.request
+            || receipt.csr_hash != hash("focal.enrollment.csr.v1", next.csr())
+            || receipt.public_key != csr_key_hash(next.csr())?
+            || receipt.expires_at <= now
+        {
+            return Err(EnrollmentError::Unauthorized);
+        }
+        verify_issued(receipt, ca_certificate)?;
+        let held = self.enrollment()?.ok_or(EnrollmentError::NotCommitted)?;
+        if held.identity != receipt.identity || held.public_key == receipt.public_key {
+            return Err(EnrollmentError::Conflict);
+        }
+        // The receipt first, then the key it was issued for: a crash between
+        // the two leaves a receipt for a key this directory does not hold
+        // yet, which the next start adopts again from the staged material.
+        self._directory
+            .replace("enrollment.bin", &encode(receipt)?)?;
+        self._directory
+            .replace("join-key.bin", &Zeroizing::new(encode(&next.bundle)?))?;
+        next._directory.remove("enrollment.bin")?;
+        next._directory.remove("join-key.bin")?;
+        Ok(CredentialMaterial {
+            certificate_chain: vec![receipt.certificate.clone(), ca_certificate.to_vec()],
+            private_key: Zeroizing::new(next.bundle.key.0.clone()),
+        })
+    }
+    /// The identity of the key this directory holds, in the domain of
+    /// `EnrollmentReceipt::public_key`.
+    pub fn key_identity(&self) -> Result<Fingerprint, EnrollmentError> {
+        csr_key_hash(self.csr())
     }
     /// Install a renewed receipt of this key over the one held: the same
     /// request and CSR under a fresh certificate that expires later. A held
@@ -521,6 +602,35 @@ pub(crate) fn verify_issued(receipt: &EnrollmentReceipt, ca: &[u8]) -> Result<()
     Ok(())
 }
 
+/// Whether the receipt's identity is bound to its key: derived from the key
+/// itself, or carried to it by a CA-signed subject (the founder's genesis
+/// principal, or a principal an earlier key of the same enrollment derived
+/// and a rotation carried). Only meaningful after `verify_issued`.
+pub(crate) fn identity_bound(receipt: &EnrollmentReceipt) -> Result<bool, EnrollmentError> {
+    let derived = crate::registry::assigned(
+        receipt.identity.cluster,
+        receipt.identity.role,
+        receipt.identity.node_id.unwrap_or(1),
+        receipt.public_key,
+    );
+    Ok(receipt.identity == derived || founding_principal(receipt)? || carried_principal(receipt)?)
+}
+/// A rotated key carries the principal its enrollment's earlier key derived;
+/// the CA-signed subject names it. Only meaningful after `verify_issued`.
+pub(crate) fn carried_principal(receipt: &EnrollmentReceipt) -> Result<bool, EnrollmentError> {
+    let (_, certificate) =
+        X509Certificate::from_der(&receipt.certificate).map_err(|_| EnrollmentError::Corrupt)?;
+    let expected = format!(
+        "focal-carried-principal:{}",
+        hex(&receipt.identity.principal)
+    );
+    let mut units = certificate.subject().iter_organizational_unit();
+    Ok(receipt.identity.role == EnrollmentRole::Node
+        && units
+            .next()
+            .is_some_and(|unit| unit.as_str().is_ok_and(|value| value == expected))
+        && units.next().is_none())
+}
 /// This exception is accepted only for the first Node receipt in a new genesis;
 /// its identity and principal are bound by the already verified CA signature.
 pub(crate) fn founding_principal(receipt: &EnrollmentReceipt) -> Result<bool, EnrollmentError> {

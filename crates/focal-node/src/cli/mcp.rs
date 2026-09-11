@@ -5,7 +5,6 @@ use focal_client::{
     operation_store::{OperationStore, StoreError, StoreLimits},
     pending::OperationContext,
 };
-use fs2::FileExt;
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -155,7 +154,7 @@ impl Bootstrap {
                 }
             })?;
         check_open_file(&lock_path, &lock, metadata.uid())?;
-        lock.try_lock_exclusive().map_err(|error| {
+        focal_platform::try_lock_exclusive(&lock).map_err(|error| {
             if error.kind() == std::io::ErrorKind::WouldBlock {
                 BootstrapError::Locked
             } else {

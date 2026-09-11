@@ -46,6 +46,65 @@ pub(crate) enum DeploymentCommand {
         #[arg(long)]
         plan: Option<String>,
     },
+    /// Render packaging for the requested configuration (--config FILE):
+    /// files written under --output, facts the render lacks named in the
+    /// result. Rendering touches no cluster and no node.
+    Render {
+        #[command(subcommand)]
+        target: RenderTarget,
+    },
+}
+#[derive(Subcommand)]
+pub(crate) enum RenderTarget {
+    /// A headless Service, a founder StatefulSet and a host StatefulSet per
+    /// failure domain, disruption budgets, a ConfigMap per set and the
+    /// invitation script (08 §5).
+    Kubernetes {
+        #[arg(long)]
+        namespace: String,
+        /// The directory the files are written into (created; existing
+        /// files are never overwritten).
+        #[arg(long)]
+        output: PathBuf,
+        /// The image every pod runs.
+        #[arg(long)]
+        image: Option<String>,
+        #[arg(long)]
+        storage_class: Option<String>,
+        /// The secret holding one invitation per host pod.
+        #[arg(long)]
+        secret: Option<String>,
+        /// A zone for zone survival; repeat for each, the founder takes the first.
+        #[arg(long = "zone")]
+        zones: Vec<String>,
+        /// Nodes in total; default the fewest the durability needs.
+        #[arg(long)]
+        nodes: Option<u32>,
+        /// Each pod's volume request.
+        #[arg(long, default_value = "20Gi")]
+        volume: String,
+        /// The QUIC port every pod listens and advertises on.
+        #[arg(long, default_value_t = 7443)]
+        port: u16,
+    },
+    /// A hardened unit for one supervised host and its configuration (08 §3).
+    Systemd {
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, default_value = "/usr/local/bin/focal")]
+        binary: String,
+        #[arg(long, default_value = "focal")]
+        user: String,
+        /// The node's data directory on the host (`--data-dir` names this
+        /// process's own).
+        #[arg(long, default_value = "/var/lib/focal")]
+        state_dir: String,
+        #[arg(long, default_value = "/etc/focal/focal.yaml")]
+        config_path: String,
+        /// A host's invitation, redeemed at its first start.
+        #[arg(long)]
+        invite_file: Option<String>,
+    },
 }
 /// What the top-level arguments contributed.
 pub(crate) struct Inputs<'a> {
@@ -68,7 +127,7 @@ pub(crate) fn run(
             )?;
             Ok(())
         }
-        DeploymentCommand::Explain { inventory } => explain(settings, &inputs, inventory),
+        DeploymentCommand::Explain { inventory } => explain(runtime, settings, &inputs, inventory),
         DeploymentCommand::Plan { output, dry_run } => {
             if inputs.config.is_none() {
                 return Err(DeploymentError::NoConfig.into());
@@ -77,17 +136,155 @@ pub(crate) fn run(
         }
         DeploymentCommand::Apply { plan_file, wait } => apply(runtime, settings, &plan_file, wait),
         DeploymentCommand::Status { plan } => status(runtime, settings, plan.as_deref()),
+        DeploymentCommand::Render { target } => {
+            if inputs.config.is_none() {
+                return Err(DeploymentError::NoConfig.into());
+            }
+            render(settings, target)
+        }
     }
 }
 
+fn render(settings: &Settings, target: RenderTarget) -> crate::Result<()> {
+    use focal_node::deployment::render::{kubernetes, systemd};
+    let (kind, output, assets) = match target {
+        RenderTarget::Kubernetes {
+            namespace,
+            output,
+            image,
+            storage_class,
+            secret,
+            zones,
+            nodes,
+            volume,
+            port,
+        } => (
+            "kubernetes",
+            output,
+            kubernetes::render(
+                settings,
+                &kubernetes::KubernetesRequest {
+                    namespace,
+                    image,
+                    storage_class,
+                    secret,
+                    zones,
+                    nodes,
+                    volume,
+                    port,
+                },
+                env!("CARGO_PKG_VERSION"),
+            )?,
+        ),
+        RenderTarget::Systemd {
+            output,
+            binary,
+            user,
+            state_dir,
+            config_path,
+            invite_file,
+        } => (
+            "systemd",
+            output,
+            systemd::render(
+                settings,
+                &systemd::SystemdRequest {
+                    binary,
+                    user,
+                    data_dir: state_dir,
+                    config_path,
+                    invite_file,
+                },
+            )?,
+        ),
+    };
+    std::fs::create_dir_all(&output)?;
+    let mut written = Vec::new();
+    for file in &assets.files {
+        let path = output.join(&file.name);
+        write_new(&path, file.content.as_bytes())?;
+        written.push(path.display().to_string());
+    }
+    std::fs::File::open(&output)?.sync_all()?;
+    crate::print_json(&serde_json::json!({
+        "schema_version": 1,
+        "result": {
+            "kind": "deployment_render",
+            "target": kind,
+            "output": output.display().to_string(),
+            "files": written,
+            "missing": assets.missing,
+            "notes": assets.notes,
+        }
+    }))
+}
+
+/// What a running node's directory reports, for `explain` (08 §9): the
+/// nodes with their announced domains and standing, and every session with
+/// the level it wants, the level it has and what blocks it.
+fn observed_view(observation: &deployment::plan::Observation) -> serde_json::Value {
+    let hex = |id: &[u8; 16]| {
+        id.iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    serde_json::json!({
+        "observed_at": observation.observed_at,
+        "nodes": observation.nodes.iter().map(|node| serde_json::json!({
+            "node": node.node,
+            "alive": node.alive,
+            "eligible": node.eligible,
+            "region": node.region,
+            "zone": node.zone,
+        })).collect::<Vec<_>>(),
+        "sessions": observation.sessions.iter().map(|session| serde_json::json!({
+            "tenant": hex(&session.tenant),
+            "session": hex(&session.session),
+            "desired": deployment::plan::LevelView::of(session.desired),
+            "achieved": session.achieved.map(deployment::plan::LevelView::of),
+            "pending": session.pending.is_some(),
+            "blocked_by": session.blocked_by,
+        })).collect::<Vec<_>>(),
+    })
+}
+
 fn explain(
+    runtime: &tokio::runtime::Runtime,
     settings: &Settings,
     inputs: &Inputs<'_>,
     inventory: Option<PathBuf>,
 ) -> crate::Result<()> {
-    let nodes: Vec<NodeFacts> = match inventory {
-        Some(path) => serde_json::from_slice(&crate::read_file(&path, 1024 * 1024)?)?,
-        None => vec![NodeFacts {
+    // Without an explicit inventory, a running node that runs a directory
+    // is explained against what the directory observes: every node it
+    // knows, with its announced domains, and every session's achieved
+    // level. A node that is not running, or runs no directory, is explained
+    // against itself alone.
+    let observation = match inventory {
+        None if network(settings).unwrap_or(false) => {
+            ClusterAdmin::open(settings).ok().and_then(|admin| {
+                runtime
+                    .block_on(deployment::observe::observe(&admin, true))
+                    .ok()
+            })
+        }
+        _ => None,
+    };
+    let nodes: Vec<NodeFacts> = match (&inventory, &observation) {
+        (Some(path), _) => serde_json::from_slice(&crate::read_file(path, 1024 * 1024)?)?,
+        (None, Some(observation)) => observation
+            .nodes
+            .iter()
+            .map(|node| NodeFacts {
+                id: node.node,
+                topology: focal_node::config::Topology {
+                    region: node.region.clone(),
+                    zone: node.zone.clone(),
+                },
+                verified: true,
+                eligible: node.eligible && node.alive,
+            })
+            .collect(),
+        (None, None) => vec![NodeFacts {
             id: 1,
             topology: settings.topology.clone(),
             verified: true,
@@ -128,16 +325,29 @@ fn explain(
         .map(|policy| policy.intent.clone())
         .unwrap_or_else(|| settings.policy_intent());
     let committed_revision = committed.as_ref().map(|policy| policy.revision.0);
-    // The inventory is explicit or this node alone: a committed policy that
-    // needs more hosts than the inventory holds is reported unsatisfied
-    // against that inventory, still naming what is requested and effective.
+    // The guarantee is active when every observed session has the
+    // effective level; without an observation nothing is active.
+    let effective_level = deployment::plan::level(&effective);
+    let activated = observation.as_ref().is_some_and(|observation| {
+        !observation.sessions.is_empty()
+            && observation.sessions.iter().all(|session| {
+                session
+                    .achieved
+                    .is_some_and(|achieved| achieved.covers(effective_level))
+            })
+    });
+    let observed = observation.as_ref().map(observed_view);
+    // The inventory is explicit, observed, or this node alone: a committed
+    // policy that needs more hosts than the inventory holds is reported
+    // unsatisfied against that inventory, still naming what is requested
+    // and effective.
     match placement::plan(&nodes, &settings.durability, &settings.placement) {
         Ok(plan) => crate::print_json(
-            &serde_json::json!({"condition":"PlanValid","activated":false,"plan":plan,"requested":settings.policy_intent(),"effective":effective,"committed_revision":committed_revision,"sources":sources}),
+            &serde_json::json!({"condition":"PlanValid","activated":activated,"plan":plan,"requested":settings.policy_intent(),"effective":effective,"committed_revision":committed_revision,"sources":sources,"observed":observed}),
         ),
         Err(error) => {
             crate::print_json(
-                &serde_json::json!({"condition":"GuaranteeUnsatisfied","activated":false,"reason":error.to_string(),"requested":settings.policy_intent(),"effective":effective,"committed_revision":committed_revision,"sources":sources}),
+                &serde_json::json!({"condition":"GuaranteeUnsatisfied","activated":activated,"reason":error.to_string(),"requested":settings.policy_intent(),"effective":effective,"committed_revision":committed_revision,"sources":sources,"observed":observed}),
             )?;
             Err(error.into())
         }

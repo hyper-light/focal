@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: focal
+  namespace: focal
+  labels:
+    app.kubernetes.io/name: focal
+    app.kubernetes.io/managed-by: focal-deployment-render
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: focal
+  ports:
+    - name: peer
+      port: 7443
+      targetPort: peer
+      protocol: UDP

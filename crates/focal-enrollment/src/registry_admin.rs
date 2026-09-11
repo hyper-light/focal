@@ -26,10 +26,13 @@ impl EnrollmentCommand {
             _ => None,
         }
     }
-    /// Identifies a renewal, which only the enrollment host may commit.
+    /// Identifies a renewal or rotation, which only the enrollment host may
+    /// commit.
     pub fn renewed_invitation(&self) -> Option<InvitationId> {
         match self.change {
-            Change::Renew { invitation, .. } => Some(invitation),
+            Change::Renew { invitation, .. } | Change::Rotate { invitation, .. } => {
+                Some(invitation)
+            }
             _ => None,
         }
     }
@@ -38,6 +41,14 @@ impl EnrollmentCommand {
     pub fn admitted_tenant(&self) -> Option<[u8; 16]> {
         match self.change {
             Change::AdmitTenant { tenant } => Some(tenant),
+            _ => None,
+        }
+    }
+    /// Identifies an upgrade-fence activation, which only the founder
+    /// authority prepares (24 §21).
+    pub fn activated_fence(&self) -> Option<u32> {
+        match self.change {
+            Change::ActivateFence { level } => Some(level),
             _ => None,
         }
     }

@@ -381,6 +381,7 @@ async fn control_mailbox_replaces_policy_while_all_transfer_slots_are_blocked() 
             PeerEndpoint {
                 address: blackhole.local_addr().unwrap(),
                 server_name: "localhost".into(),
+                name: None,
             },
         )]),
     )

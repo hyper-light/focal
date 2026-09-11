@@ -612,9 +612,9 @@
     },
     {
       "name": "focal-cluster",
-      "version": 13,
+      "version": 18,
       "path": "focal-cluster/SKILL.md",
-      "blake3": "a14ffe0c86f40c0c015defb4a93574e20e659283fe1ed32a1daf66450ec2e3c8",
+      "blake3": "ecb914bc9157e8ad301d82818637abdbebe55b16a398c66a28146200e9caa854",
       "references": [
         "references/admin-workflow.md"
       ],
@@ -645,6 +645,10 @@
         },
         {
           "name": "cluster.credentials.renew",
+          "version": 1
+        },
+        {
+          "name": "cluster.credentials.rotate",
           "version": 1
         },
         {
@@ -705,6 +709,14 @@
         },
         {
           "name": "cluster.node.health",
+          "version": 1
+        },
+        {
+          "name": "cluster.node.readiness",
+          "version": 1
+        },
+        {
+          "name": "cluster.node.metrics",
           "version": 1
         },
         {
@@ -800,6 +812,10 @@
           "version": 1
         },
         {
+          "name": "cluster.repair",
+          "version": 1
+        },
+        {
           "name": "cluster.retention.show",
           "version": 1
         },
@@ -809,7 +825,7 @@
         },
         {
           "name": "cluster.sessions.plan",
-          "version": 2
+          "version": 1
         },
         {
           "name": "cluster.status",
@@ -825,6 +841,14 @@
         },
         {
           "name": "cluster.tenants.list",
+          "version": 1
+        },
+        {
+          "name": "cluster.upgrade.status",
+          "version": 1
+        },
+        {
+          "name": "cluster.upgrade.activate",
           "version": 1
         }
       ],

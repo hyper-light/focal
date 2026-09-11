@@ -1,0 +1,46 @@
+[Unit]
+Description=Focal node
+Documentation=https://github.com/hyper-light/focal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=focal
+Group=focal
+ExecStart=/usr/local/bin/focal --config /etc/focal/focal.yaml --data-dir /var/lib/focal start --invite-file /etc/focal/join.invite
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=45
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+UMask=0077
+StateDirectory=focal
+StateDirectoryMode=0700
+ConfigurationDirectory=focal
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

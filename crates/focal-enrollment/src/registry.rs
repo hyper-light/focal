@@ -68,6 +68,17 @@ pub struct AssignedIdentity {
     pub principal: [u8; 16],
     pub server_name: String,
 }
+/// The committed upgrade fence (24 §21): the capability level every node
+/// of the cluster is held to. A binary announcing less refuses to serve;
+/// features gated on a level open only once the fence reaches it. Level
+/// zero is no fence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpgradeFence {
+    pub level: u32,
+    pub activated_at: i64,
+    /// The registry revision the activation committed at.
+    pub revision: u64,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnrollmentReceipt {
     pub invitation: InvitationId,
@@ -115,6 +126,19 @@ enum Change {
     AdmitTenant {
         tenant: [u8; 16],
     },
+    /// The same identity under a new key: a certificate issued for the new
+    /// key's request, proven by the previous key; the previous certificate
+    /// keeps authorizing until `retire_previous_at` (24 §11).
+    Rotate {
+        invitation: InvitationId,
+        receipt: EnrollmentReceipt,
+        retire_previous_at: i64,
+    },
+    /// The upgrade fence raised to `level` under the founder authority
+    /// (24 §21); a fence only rises.
+    ActivateFence {
+        level: u32,
+    },
 }
 /// A certificate a renewal replaced: still authorized for the grace the
 /// authority decided, so connections and statements in flight complete.
@@ -137,7 +161,13 @@ pub struct RenewRequest {
     holds_until: i64,
     proof: SignedNodeStatement,
 }
+/// A `RenewRequest` whose CSR carries a new key: a rotation.
+pub const ROTATION_SCHEMA: u16 = 2;
 impl RenewRequest {
+    /// Whether this request rotates the key rather than renewing it.
+    pub fn is_rotation(&self) -> bool {
+        self.schema == ROTATION_SCHEMA
+    }
     pub fn invitation_id(&self) -> InvitationId {
         self.invitation
     }
@@ -169,6 +199,41 @@ impl RenewRequest {
     }
 }
 impl CredentialMaterial {
+    /// Ask for a rotation of the credential this material holds to the key
+    /// `next` (a fresh join key with its own request identity and CSR):
+    /// the request is proven by the current credential.
+    pub fn rotation_request(
+        &self,
+        current: &JoinKey,
+        next: &JoinKey,
+        receipt: &EnrollmentReceipt,
+    ) -> Result<RenewRequest, EnrollmentError> {
+        if receipt.request != current.request_id()
+            || receipt.csr_hash != hash("focal.enrollment.csr.v1", current.csr())
+            || receipt.identity.cluster != current.cluster()
+            || next.cluster() != current.cluster()
+            || next.request_id() == current.request_id()
+            || csr_key_hash(next.csr())? == receipt.public_key
+        {
+            return Err(EnrollmentError::Unauthorized);
+        }
+        let mut request = RenewRequest {
+            schema: ROTATION_SCHEMA,
+            cluster: current.cluster(),
+            invitation: receipt.invitation,
+            request: next.request_id(),
+            csr: next.csr().to_vec(),
+            holds_until: receipt.expires_at,
+            proof: SignedNodeStatement {
+                cluster: current.cluster(),
+                certificate: Vec::new(),
+                statement_hash: [0; 32],
+                signature: Vec::new(),
+            },
+        };
+        request.proof = self.sign_node_statement(current.cluster(), &request.statement()?)?;
+        Ok(request)
+    }
     /// Ask for a renewal of the credential this material holds.
     pub fn renewal_request(
         &self,
@@ -396,10 +461,30 @@ pub struct EnrollmentRegistry {
     /// Tenants admitted by the founder authority, in admission order of
     /// identity; bounded by `EnrollmentLimits::max_tenants`.
     tenants: std::collections::BTreeSet<[u8; 16]>,
+    /// The committed upgrade fence (24 §21); zero until one is activated.
+    fence: UpgradeFence,
+}
+/// The registry as schema 3 wrote it, before the upgrade fence.
+#[derive(Deserialize)]
+struct RegistryV3 {
+    schema: u16,
+    cluster: ClusterId,
+    ca_certificate: Vec<u8>,
+    limits: EnrollmentLimits,
+    revision: u64,
+    applied_index: u64,
+    time_floor: i64,
+    next_node: u64,
+    charged_bytes: usize,
+    records: BTreeMap<InvitationId, InviteMetadata>,
+    certificates: BTreeMap<Fingerprint, InvitationId>,
+    enrolled_keys: BTreeMap<Fingerprint, InvitationId>,
+    retired: BTreeMap<Fingerprint, RetiredCredential>,
+    tenants: std::collections::BTreeSet<[u8; 16]>,
 }
 /// The registry's persisted layout; schema 2 (before admitted tenants)
 /// restores with none, any other schema is not this registry.
-const REGISTRY_SCHEMA: u16 = 3;
+const REGISTRY_SCHEMA: u16 = 4;
 /// The schema 2 layout, converted on restore.
 #[derive(Deserialize)]
 struct RegistryV2 {
@@ -456,6 +541,7 @@ impl EnrollmentRegistry {
             enrolled_keys: BTreeMap::new(),
             retired: BTreeMap::new(),
             tenants: std::collections::BTreeSet::new(),
+            fence: UpgradeFence::default(),
         })
     }
     // Only the private new-genesis draft constructor can select the existing
@@ -613,6 +699,33 @@ impl EnrollmentRegistry {
     }
     pub fn admits_tenant(&self, tenant: [u8; 16]) -> bool {
         self.tenants.contains(&tenant)
+    }
+    /// The committed upgrade fence (24 §21).
+    pub fn fence(&self) -> UpgradeFence {
+        self.fence
+    }
+    /// Raise the upgrade fence to `level` under the founder authority: a
+    /// conflict when the fence is there already (an operator's retry reads
+    /// that as done), invalid when it would lower the fence.
+    pub fn prepare_activate_fence(
+        &self,
+        authority: &BootstrapAuthority,
+        level: u32,
+        now: i64,
+    ) -> Result<EnrollmentCommand, EnrollmentError> {
+        self.check_time(now)?;
+        self.check_authority(authority)?;
+        if level == 0 || level < self.fence.level {
+            return Err(EnrollmentError::Invalid);
+        }
+        if level == self.fence.level {
+            return Err(EnrollmentError::Conflict);
+        }
+        Ok(EnrollmentCommand {
+            revision: self.revision,
+            decided_at: now,
+            change: Change::ActivateFence { level },
+        })
     }
     /// Admit a tenant under the founder authority: a conflict when it is
     /// admitted already (an operator's retry reads that as done).
@@ -803,7 +916,13 @@ impl EnrollmentRegistry {
             .receipt
             .as_ref()
             .ok_or(EnrollmentError::NotCommitted)?;
-        if current.expires_at > request.holds_until {
+        let rotation = request.is_rotation();
+        let next_key = csr_key_hash(&request.csr)?;
+        // A rotation already committed to this key answers with it; a
+        // renewal that already extended past what the holder holds does too.
+        if (rotation && current.public_key == next_key && current.request == request.request)
+            || (!rotation && current.expires_at > request.holds_until)
+        {
             return Ok(RenewPreparation::Existing(current.clone()));
         }
         let lifetime =
@@ -811,7 +930,7 @@ impl EnrollmentRegistry {
         let expires_at = now.checked_add(lifetime).ok_or(EnrollmentError::Invalid)?;
         // A renewal must extend the credential; one decided within the
         // second the current certificate was issued would not.
-        if expires_at <= current.expires_at {
+        if !rotation && expires_at <= current.expires_at {
             return Err(EnrollmentError::Conflict);
         }
         let retire_previous_at = now
@@ -819,24 +938,61 @@ impl EnrollmentRegistry {
             .ok_or(EnrollmentError::Invalid)?
             .min(current.expires_at)
             .max(now);
+        // The principal was derived by the key this enrollment began with;
+        // a rotated key, and every renewal after a rotation, carries it in
+        // a CA-signed subject so the binding stays verifiable.
+        let derived = current.identity
+            == assigned(
+                self.cluster,
+                current.identity.role,
+                current.identity.node_id.unwrap_or(1),
+                if rotation {
+                    next_key
+                } else {
+                    current.public_key
+                },
+            );
+        let founding = crate::pki::founding_principal(current)?;
+        let certificate = if derived || (founding && !rotation) {
+            authority.issue(
+                &request.csr,
+                &current.identity,
+                now,
+                self.limits.credential_lifetime,
+            )?
+        } else {
+            authority.issue_carried(
+                &request.csr,
+                &current.identity,
+                now,
+                self.limits.credential_lifetime,
+            )?
+        };
         let receipt = EnrollmentReceipt {
             invitation: current.invitation,
-            request: current.request,
+            request: if rotation {
+                request.request
+            } else {
+                current.request
+            },
             identity: current.identity.clone(),
-            public_key: current.public_key,
-            csr_hash: current.csr_hash,
+            public_key: if rotation {
+                next_key
+            } else {
+                current.public_key
+            },
+            csr_hash: if rotation {
+                hash("focal.enrollment.csr.v1", &request.csr)
+            } else {
+                current.csr_hash
+            },
             issued_at: now,
             expires_at,
             revision: self
                 .revision
                 .checked_add(1)
                 .ok_or(EnrollmentError::Capacity)?,
-            certificate: authority.issue(
-                &request.csr,
-                &current.identity,
-                now,
-                self.limits.credential_lifetime,
-            )?,
+            certificate,
         };
         let retired = RetiredCredential {
             invitation: current.invitation,
@@ -844,6 +1000,17 @@ impl EnrollmentRegistry {
             retire_at: retire_previous_at,
         };
         self.reserve(retired_charge(&retired)?)?;
+        if rotation {
+            return Ok(RenewPreparation::Commit(EnrollmentCommand {
+                revision: self.revision,
+                decided_at: now,
+                change: Change::Rotate {
+                    invitation: current.invitation,
+                    receipt,
+                    retire_previous_at,
+                },
+            }));
+        }
         Ok(RenewPreparation::Commit(EnrollmentCommand {
             revision: self.revision,
             decided_at: now,
@@ -865,7 +1032,12 @@ impl EnrollmentRegistry {
             .receipt
             .as_ref()
             .ok_or(EnrollmentError::NotCommitted)?;
-        if current.expires_at > request.holds_until {
+        let committed = if request.is_rotation() {
+            current.public_key == csr_key_hash(&request.csr)? && current.request == request.request
+        } else {
+            current.expires_at > request.holds_until
+        };
+        if committed {
             Ok(current.clone())
         } else {
             Err(EnrollmentError::NotCommitted)
@@ -880,7 +1052,8 @@ impl EnrollmentRegistry {
         if request.cluster != self.cluster {
             return Err(EnrollmentError::WrongCluster);
         }
-        if request.schema != 1 || request.request == [0; 16] {
+        if !(request.schema == 1 || request.schema == ROTATION_SCHEMA) || request.request == [0; 16]
+        {
             return Err(EnrollmentError::Unauthorized);
         }
         let record = self
@@ -894,20 +1067,36 @@ impl EnrollmentRegistry {
             .receipt
             .as_ref()
             .ok_or(EnrollmentError::Unauthorized)?;
-        if receipt.request != request.request
+        if receipt.identity.role != EnrollmentRole::Node {
+            return Err(EnrollmentError::Unauthorized);
+        }
+        let csr_key = csr_key_hash(&request.csr)?;
+        if request.is_rotation() {
+            // A rotation names a new key under a new request; a rotation the
+            // registry already committed names the key it holds now.
+            let committed = receipt.request == request.request && receipt.public_key == csr_key;
+            if !committed && (receipt.request == request.request || receipt.public_key == csr_key) {
+                return Err(EnrollmentError::Unauthorized);
+            }
+        } else if receipt.request != request.request
             || receipt.csr_hash != hash("focal.enrollment.csr.v1", &request.csr)
-            || receipt.public_key != csr_key_hash(&request.csr)?
-            || receipt.identity.role != EnrollmentRole::Node
+            || receipt.public_key != csr_key
         {
             return Err(EnrollmentError::Unauthorized);
         }
         // The proof is signed by a certificate of this very enrollment: the
-        // current one, or the one a renewal just retired while it still
-        // authorizes, never a certificate of another key.
+        // current one, or the one a renewal or rotation just retired while it
+        // still authorizes, never a certificate of another enrollment. After
+        // a rotation committed, the proof carries the previous key, which the
+        // retired certificate still names.
         let signer = self.verify_node_statement(&request.proof, &request.statement()?, now)?;
-        if signer != receipt.identity
-            || certificate_key_hash(&request.proof.certificate)? != receipt.public_key
-        {
+        let signing_key = certificate_key_hash(&request.proof.certificate)?;
+        let held_key = signing_key == receipt.public_key
+            || self.retired.values().any(|retired| {
+                retired.invitation == request.invitation
+                    && retired.receipt.public_key == signing_key
+            });
+        if signer != receipt.identity || !held_key {
             return Err(EnrollmentError::Unauthorized);
         }
         Ok(record)
@@ -1043,6 +1232,16 @@ impl EnrollmentRegistry {
                     .ok_or(EnrollmentError::Unauthorized)?
                     .revoked = true
             }
+            Change::ActivateFence { level } => {
+                if *level == 0 || *level <= self.fence.level {
+                    return Err(EnrollmentError::Invalid);
+                }
+                self.fence = UpgradeFence {
+                    level: *level,
+                    activated_at: command.decided_at,
+                    revision: next_revision,
+                };
+            }
             Change::AdmitTenant { tenant } => {
                 if *tenant == [0; 16] || self.tenants.contains(tenant) {
                     return Err(EnrollmentError::Invalid);
@@ -1091,6 +1290,9 @@ impl EnrollmentRegistry {
                     return Err(EnrollmentError::Invalid);
                 }
                 verify_issued(receipt, &self.ca_certificate)?;
+                if !crate::pki::identity_bound(receipt)? {
+                    return Err(EnrollmentError::Invalid);
+                }
                 let previous = server_fingerprint(&current.certificate);
                 let retired = RetiredCredential {
                     invitation: *invitation,
@@ -1110,6 +1312,73 @@ impl EnrollmentRegistry {
                     .receipt = Some(receipt.clone());
                 self.certificates.remove(&previous);
                 self.certificates.insert(fingerprint, *invitation);
+                self.retired.insert(previous, retired);
+                self.charged_bytes = self
+                    .charged_bytes
+                    .checked_add(charge)
+                    .ok_or(EnrollmentError::Capacity)?;
+            }
+            Change::Rotate {
+                invitation,
+                receipt,
+                retire_previous_at,
+            } => {
+                let record = self
+                    .records
+                    .get(invitation)
+                    .ok_or(EnrollmentError::Unauthorized)?;
+                if record.revoked {
+                    return Err(EnrollmentError::Revoked);
+                }
+                let current = record
+                    .receipt
+                    .as_ref()
+                    .ok_or(EnrollmentError::Unauthorized)?;
+                let fingerprint = server_fingerprint(&receipt.certificate);
+                if receipt.invitation != *invitation
+                    || receipt.request == current.request
+                    || receipt.identity != current.identity
+                    || receipt.public_key == current.public_key
+                    || receipt.csr_hash == current.csr_hash
+                    || receipt.public_key != certificate_key_hash(&receipt.certificate)?
+                    || receipt.revision != next_revision
+                    || receipt.issued_at != command.decided_at
+                    || receipt.expires_at.checked_sub(receipt.issued_at)
+                        != Some(self.limits.credential_lifetime as i64)
+                    || *retire_previous_at < command.decided_at
+                    || *retire_previous_at > current.expires_at
+                    || self.certificates.contains_key(&fingerprint)
+                    || self.retired.contains_key(&fingerprint)
+                    || self.enrolled_keys.contains_key(&receipt.public_key)
+                {
+                    return Err(EnrollmentError::Invalid);
+                }
+                verify_issued(receipt, &self.ca_certificate)?;
+                if !crate::pki::identity_bound(receipt)? {
+                    return Err(EnrollmentError::Invalid);
+                }
+                let previous = server_fingerprint(&current.certificate);
+                let previous_key = current.public_key;
+                let retired = RetiredCredential {
+                    invitation: *invitation,
+                    receipt: current.clone(),
+                    retire_at: *retire_previous_at,
+                };
+                let mut updated = record.clone();
+                updated.receipt = Some(receipt.clone());
+                let charge = retired_charge(&retired)?
+                    .checked_add(record_charge(&updated)?)
+                    .and_then(|bytes| bytes.checked_sub(record_charge(record).ok()?))
+                    .ok_or(EnrollmentError::Corrupt)?;
+                self.reserve(charge)?;
+                self.records
+                    .get_mut(invitation)
+                    .ok_or(EnrollmentError::Corrupt)?
+                    .receipt = Some(receipt.clone());
+                self.certificates.remove(&previous);
+                self.certificates.insert(fingerprint, *invitation);
+                self.enrolled_keys.remove(&previous_key);
+                self.enrolled_keys.insert(receipt.public_key, *invitation);
                 self.retired.insert(previous, retired);
                 self.charged_bytes = self
                     .charged_bytes
@@ -1199,6 +1468,43 @@ impl EnrollmentRegistry {
             .len();
         bytes.truncate(length);
         Ok(bytes)
+    }
+    /// The schema 3 encoding of this registry, for the upgrade test.
+    #[cfg(test)]
+    pub(crate) fn encode_as_schema_three_for_tests(&self) -> Result<Vec<u8>, EnrollmentError> {
+        #[derive(Serialize)]
+        struct Legacy<'a> {
+            schema: u16,
+            cluster: ClusterId,
+            ca_certificate: &'a [u8],
+            limits: &'a EnrollmentLimits,
+            revision: u64,
+            applied_index: u64,
+            time_floor: i64,
+            next_node: u64,
+            charged_bytes: usize,
+            records: &'a BTreeMap<InvitationId, InviteMetadata>,
+            certificates: &'a BTreeMap<Fingerprint, InvitationId>,
+            enrolled_keys: &'a BTreeMap<Fingerprint, InvitationId>,
+            retired: &'a BTreeMap<Fingerprint, RetiredCredential>,
+            tenants: &'a std::collections::BTreeSet<[u8; 16]>,
+        }
+        encode(&Legacy {
+            schema: 3,
+            cluster: self.cluster,
+            ca_certificate: &self.ca_certificate,
+            limits: &self.limits,
+            revision: self.revision,
+            applied_index: self.applied_index,
+            time_floor: self.time_floor,
+            next_node: self.next_node,
+            charged_bytes: self.charged_bytes,
+            records: &self.records,
+            certificates: &self.certificates,
+            enrolled_keys: &self.enrolled_keys,
+            retired: &self.retired,
+            tenants: &self.tenants,
+        })
     }
     /// The schema 2 encoding of this registry, for the upgrade test.
     #[cfg(test)]
@@ -1290,6 +1596,34 @@ impl EnrollmentRegistry {
                     enrolled_keys: legacy.enrolled_keys,
                     retired: legacy.retired,
                     tenants: std::collections::BTreeSet::new(),
+                    fence: UpgradeFence::default(),
+                },
+                rest,
+            )
+        } else if schema == 3 {
+            // A schema-3 checkpoint never activated a fence.
+            let (legacy, rest): (RegistryV3, &[u8]) = postcard::take_from_bytes(bytes)?;
+            if legacy.schema != 3 {
+                return Err(EnrollmentError::Corrupt);
+            }
+            (
+                Self {
+                    owner: None,
+                    schema: REGISTRY_SCHEMA,
+                    cluster: legacy.cluster,
+                    ca_certificate: legacy.ca_certificate,
+                    limits: legacy.limits,
+                    revision: legacy.revision,
+                    applied_index: legacy.applied_index,
+                    time_floor: legacy.time_floor,
+                    next_node: legacy.next_node,
+                    charged_bytes: legacy.charged_bytes,
+                    records: legacy.records,
+                    certificates: legacy.certificates,
+                    enrolled_keys: legacy.enrolled_keys,
+                    retired: legacy.retired,
+                    tenants: legacy.tenants,
+                    fence: UpgradeFence::default(),
                 },
                 rest,
             )
@@ -1297,6 +1631,13 @@ impl EnrollmentRegistry {
             postcard::take_from_bytes(bytes)?
         };
         if registry.tenants.len() > limits.max_tenants || registry.tenants.contains(&[0; 16]) {
+            return Err(EnrollmentError::Corrupt);
+        }
+        if (registry.fence.level == 0)
+            != (registry.fence.activated_at == 0 && registry.fence.revision == 0)
+            || registry.fence.activated_at < 0
+            || registry.fence.revision > registry.revision
+        {
             return Err(EnrollmentError::Corrupt);
         }
         if !rest.is_empty()
@@ -1357,7 +1698,9 @@ impl EnrollmentRegistry {
                     receipt.identity.node_id.unwrap_or(1),
                     receipt.public_key,
                 );
-                if crate::pki::founding_principal(receipt)? {
+                if crate::pki::founding_principal(receipt)?
+                    || crate::pki::carried_principal(receipt)?
+                {
                     expected.principal = receipt.identity.principal;
                 }
                 if receipt.identity != expected {
@@ -1380,12 +1723,19 @@ impl EnrollmentRegistry {
                 .get(&retired.invitation)
                 .and_then(|record| record.receipt.as_ref())
                 .ok_or(EnrollmentError::Corrupt)?;
+            // A renewal retires a certificate of the current key and
+            // request; a rotation retires the previous key and request
+            // together, and that key is enrolled no more.
+            let renewed = retired.receipt.public_key == current.public_key
+                && retired.receipt.request == current.request;
+            let rotated = retired.receipt.public_key != current.public_key
+                && retired.receipt.request != current.request
+                && !enrolled_keys.contains_key(&retired.receipt.public_key);
             if *fingerprint != server_fingerprint(&retired.receipt.certificate)
                 || certificates.contains_key(fingerprint)
                 || retired.receipt.invitation != retired.invitation
                 || retired.receipt.identity != current.identity
-                || retired.receipt.public_key != current.public_key
-                || retired.receipt.request != current.request
+                || !(renewed || rotated)
                 || retired.retire_at > retired.receipt.expires_at
                 || retired.receipt.revision >= current.revision
             {

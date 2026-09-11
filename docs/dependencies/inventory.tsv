@@ -53,7 +53,6 @@ errno	0.3.14	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-i
 fastrand	2.5.0	Apache-2.0 OR MIT	registry+https://github.com/rust-lang/crates.io-index
 find-msvc-tools	0.1.12	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
 fixedbitset	0.4.2	MIT/Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
-fs2	0.4.3	MIT/Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
 futures-core	0.3.34	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
 futures-task	0.3.34	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
 futures-util	0.3.34	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index

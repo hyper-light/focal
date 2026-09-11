@@ -89,7 +89,16 @@ impl PlacementAgent {
         )
         .await
         .map_err(|_| AgentError::Control(ControlFailure::Unavailable))?
-        .map_err(|_| AgentError::Control(ControlFailure::Unavailable))?;
+        .map_err(|error| {
+            AgentError::Control(match error {
+                PeerSendError::Rejected(AccessError::Unauthorized) => ControlFailure::Unauthorized,
+                PeerSendError::Rejected(
+                    AccessError::InvalidRequest | AccessError::UnsupportedOperation,
+                ) => ControlFailure::Invalid,
+                PeerSendError::Rejected(AccessError::Capacity) => ControlFailure::Capacity,
+                _ => ControlFailure::Unavailable,
+            })
+        })?;
         let reply: SessionControlReply =
             postcard::from_bytes(&bytes).map_err(|_| AgentError::Identity)?;
         if let SessionControlReply::Refused(failure) = &reply {
@@ -145,6 +154,52 @@ impl PlacementAgent {
                     _ => Err(AgentError::Identity),
                 }
             }
+        }
+    }
+    /// Range movement, balancing and holder publication drive the movement
+    /// map on the log's own replica (25 §6–§9), so a voter that does not
+    /// lead a session with such work asks its leader for leadership — one
+    /// raft transfer message the leader answers by timing this voter into a
+    /// campaign; a plan needs no claim (it is driven through the leader), and
+    /// a node that is not a voter, or a session without range work, asks for
+    /// nothing.
+    async fn claim_for_ranges(&self, descriptor: &SessionDescriptor, handles: &NetworkHandles) {
+        let node = self.state.node;
+        let Ok(host) = handles.fleet.current_host(descriptor.ledger) else {
+            return;
+        };
+        if host.progress().leader == 0 {
+            return;
+        }
+        let voter = match host.registration_facts().await {
+            Ok(facts) => facts
+                .value()
+                .membership
+                .configuration
+                .voters
+                .contains(&node),
+            Err(_) => false,
+        };
+        if !voter {
+            return;
+        }
+        let queued = self
+            .move_requests
+            .iter()
+            .any(|job| job.ledger == descriptor.ledger);
+        let ranges = match host.range_view(false).await {
+            Ok(view) => {
+                view.pending.is_some()
+                    || !view.history.is_empty()
+                    || descriptor
+                        .holders
+                        .as_ref()
+                        .is_none_or(|holders| holders.epoch < view.epoch.0)
+            }
+            Err(_) => false,
+        };
+        if queued || ranges {
+            let _ = host.transfer_leader(node).await;
         }
     }
     /// Which driver reaches the session's log from here: the hosted replica
@@ -215,6 +270,9 @@ impl PlacementAgent {
             return Ok(None);
         };
         let driver = self.session_driver(handles, descriptor).await;
+        if driver.local().is_none() {
+            self.claim_for_ranges(descriptor, handles).await;
+        }
         let facts = self.session_facts(pool, &driver, descriptor).await?;
         let membership = &facts.membership;
         let configuration = &membership.configuration;
@@ -359,6 +417,24 @@ impl PlacementAgent {
                 .nodes
                 .get(&job.node)
                 .map(|grant| grant.enrollment.generation);
+            // A move outside the session's residency is refused before any
+            // byte moves (24 §22).
+            let residency = &descriptor.active.policy.residency;
+            let region = authority
+                .nodes
+                .get(&job.node)
+                .map_or(focal_directory::RegionId::UNKNOWN, |grant| {
+                    grant.enrollment.region
+                });
+            if !residency.is_empty() && !residency.contains(&region) {
+                let _ = job.reply.send(Err(AgentError::Residency(
+                    crate::placement_executor::ExecutorError::OutsideResidency {
+                        node: job.node,
+                        region,
+                    },
+                )));
+                continue;
+            }
             crate::fault::hit(crate::fault::FaultSite::MovementBegin);
             let result = match generation {
                 None => Err(AgentError::Identity),

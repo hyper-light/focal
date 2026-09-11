@@ -1307,3 +1307,198 @@ fn tenants_are_admitted_once_under_the_founder_authority_and_survive_restore_and
         Err(EnrollmentError::Capacity)
     ));
 }
+
+#[test]
+fn a_rotation_changes_the_key_under_the_same_identity_and_the_old_key_signs_only_through_the_grace()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let authority = authority(&dir, [1; 16]);
+    let mut registry = registry(&authority);
+    let (key, first, material) = enroll_node(&dir, &mut registry, &authority, "node");
+    let next = JoinKey::open_or_create(dir.path().join("node-next"), [1; 16]).unwrap();
+    assert_ne!(next.key_identity().unwrap(), key.key_identity().unwrap());
+    // A rotation request names the new key under the current credential.
+    let request = material.rotation_request(&key, &next, &first).unwrap();
+    assert!(request.is_rotation());
+    assert_eq!(request.request_id(), next.request_id());
+    // Rotating to the key already held is refused up front.
+    assert!(matches!(
+        material.rotation_request(&key, &key, &first),
+        Err(EnrollmentError::Unauthorized)
+    ));
+    let at = now() + 10;
+    let RenewPreparation::Commit(command) = registry
+        .prepare_renew(&authority, &request, at, 30)
+        .unwrap()
+    else {
+        panic!("a first rotation commits")
+    };
+    assert_eq!(command.renewed_invitation(), Some(first.invitation));
+    assert!(matches!(
+        registry.release_renewal(&request, at),
+        Err(EnrollmentError::NotCommitted)
+    ));
+    registry
+        .apply_committed(&command, registry.applied_index() + 1)
+        .unwrap();
+    let rotated = registry.release_renewal(&request, at).unwrap();
+    assert_eq!(rotated.identity, first.identity);
+    assert_eq!(rotated.request, next.request_id());
+    assert_eq!(rotated.public_key, next.key_identity().unwrap());
+    assert_ne!(rotated.public_key, first.public_key);
+    assert_eq!(
+        certificate_key_hash(&rotated.certificate).unwrap(),
+        rotated.public_key
+    );
+    assert_eq!(registry.enrollments().count(), 1);
+    assert_eq!(
+        registry.enrollments().next().unwrap().public_key,
+        rotated.public_key
+    );
+    // The checkpoint taken after a rotation restores: the retired
+    // credential names the previous key and request, the enrolled-key index
+    // names only the new key.
+    let restored = EnrollmentRegistry::restore(
+        &registry.checkpoint().unwrap(),
+        [1; 16],
+        EnrollmentLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        restored.checkpoint().unwrap(),
+        registry.checkpoint().unwrap()
+    );
+    assert!(matches!(
+        restored.prepare_renew(&authority, &request, at + 5, 30).unwrap(),
+        RenewPreparation::Existing(receipt) if receipt == rotated
+    ));
+    // Both certificates authorize during the grace; only the new after.
+    assert_eq!(
+        registry
+            .authorize_certificate(&first.certificate, at + 29)
+            .unwrap(),
+        first.identity
+    );
+    assert_eq!(
+        registry
+            .authorize_certificate(&rotated.certificate, at + 29)
+            .unwrap(),
+        first.identity
+    );
+    assert!(matches!(
+        registry.authorize_certificate(&first.certificate, at + 30),
+        Err(EnrollmentError::Expired)
+    ));
+    // The same request again finds the committed rotation (the proof still
+    // carries the previous key, retired but authorizing); after the grace it
+    // is refused.
+    assert!(matches!(
+        registry.prepare_renew(&authority, &request, at + 5, 30).unwrap(),
+        RenewPreparation::Existing(receipt) if receipt == rotated
+    ));
+    assert!(matches!(
+        registry.prepare_renew(&authority, &request, at + 31, 30),
+        Err(EnrollmentError::Expired)
+    ));
+    // A later rotation request under the previous credential, for yet
+    // another key, is refused once the grace passed (checked below).
+    let other = JoinKey::open_or_create(dir.path().join("node-other"), [1; 16]).unwrap();
+    let stale = material.rotation_request(&key, &other, &first).unwrap();
+    let next_request = next.request_id();
+    // The holder adopts the rotation: the primary directory now holds the
+    // new key and receipt, the staged material is cleared.
+    let adopted = key
+        .rotate_into(&next, &rotated, authority.ca_certificate(), at)
+        .unwrap();
+    assert_eq!(adopted.certificate_chain()[0], rotated.certificate);
+    drop(key);
+    drop(next);
+    let reopened = JoinKey::open_or_create(dir.path().join("node"), [1; 16]).unwrap();
+    assert_eq!(reopened.request_id(), next_request);
+    assert_eq!(reopened.enrollment().unwrap().unwrap(), rotated);
+    assert_eq!(reopened.key_identity().unwrap(), rotated.public_key);
+    let restaged = JoinKey::open_or_create(dir.path().join("node-next"), [1; 16]).unwrap();
+    assert_ne!(restaged.request_id(), next_request);
+    assert_ne!(restaged.key_identity().unwrap(), rotated.public_key);
+    // Under the new key a renewal is an ordinary renewal, and a second
+    // rotation under the old (retired) key is refused once the grace passed.
+    let renewal = adopted.renewal_request(&reopened, &rotated).unwrap();
+    assert!(!renewal.is_rotation());
+    assert!(matches!(
+        registry.prepare_renew(&authority, &renewal, at + 40, 30),
+        Ok(RenewPreparation::Commit(_))
+    ));
+    assert!(matches!(
+        registry.prepare_renew(&authority, &stale, at + 40, 30),
+        Err(EnrollmentError::Expired | EnrollmentError::Unauthorized)
+    ));
+}
+
+#[test]
+fn the_upgrade_fence_rises_once_under_the_founder_authority_and_survives_schema_three_checkpoints()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let founder = authority(&dir, [1; 16]);
+    let mut registry = registry(&founder);
+    assert_eq!(registry.fence(), UpgradeFence::default());
+    // A schema-3 checkpoint (no fence) restores with none.
+    let legacy = registry.encode_as_schema_three_for_tests().unwrap();
+    let upgraded =
+        EnrollmentRegistry::restore(&legacy, founder.cluster(), EnrollmentLimits::default())
+            .unwrap();
+    assert_eq!(upgraded.fence(), UpgradeFence::default());
+    assert_eq!(upgraded.revision(), registry.revision());
+    // Zero and a lower level are invalid; the fence rises through a
+    // committed command and reports its activation.
+    assert!(matches!(
+        registry.prepare_activate_fence(&founder, 0, now()),
+        Err(EnrollmentError::Invalid)
+    ));
+    let at = now() + 5;
+    let command = registry.prepare_activate_fence(&founder, 2, at).unwrap();
+    assert_eq!(command.activated_fence(), Some(2));
+    assert_eq!(command.admitted_tenant(), None);
+    let revision = registry.revision() + 1;
+    registry
+        .apply_committed(&command, registry.applied_index() + 1)
+        .unwrap();
+    assert_eq!(
+        registry.fence(),
+        UpgradeFence {
+            level: 2,
+            activated_at: at,
+            revision,
+        }
+    );
+    // The same level again is a conflict (done); a lower one is invalid;
+    // the same command cannot apply twice.
+    assert!(matches!(
+        registry.prepare_activate_fence(&founder, 2, at + 1),
+        Err(EnrollmentError::Conflict)
+    ));
+    assert!(matches!(
+        registry.prepare_activate_fence(&founder, 1, at + 1),
+        Err(EnrollmentError::Invalid)
+    ));
+    assert!(matches!(
+        registry.apply_committed(&command, registry.applied_index() + 1),
+        Err(EnrollmentError::Conflict)
+    ));
+    // Another authority cannot raise it; a restore keeps it.
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = authority(&other_dir, [1; 16]);
+    assert!(registry.prepare_activate_fence(&other, 3, at + 1).is_err());
+    let bytes = registry.checkpoint().unwrap();
+    let restored =
+        EnrollmentRegistry::restore(&bytes, founder.cluster(), EnrollmentLimits::default())
+            .unwrap();
+    assert_eq!(restored.fence().level, 2);
+    let higher = registry
+        .prepare_activate_fence(&founder, 3, at + 2)
+        .unwrap();
+    registry
+        .apply_committed(&higher, registry.applied_index() + 1)
+        .unwrap();
+    assert_eq!(registry.fence().level, 3);
+    assert_eq!(registry.fence().activated_at, at + 2);
+}

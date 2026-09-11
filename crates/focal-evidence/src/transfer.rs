@@ -186,7 +186,7 @@ impl ContentStore {
                 u64::try_from(bytes.len()).map_err(|_| ContentError::Capacity)?,
             )?;
             durable_directory(&directory)?;
-            install_verified_chunk(
+            install_transferred_chunk(
                 &directory.join(format!("{}.chunk", chunk.hash)),
                 bytes,
                 chunk.hash,

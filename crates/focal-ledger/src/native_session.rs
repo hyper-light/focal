@@ -433,6 +433,88 @@ impl PendingSeed {
     }
 }
 
+/// The content objects a retained delivery could not read locally (24 §20):
+/// the artifacts a committed record or an installed checkpoint names whose
+/// objects this replica does not hold yet. Hosts pull them from a required
+/// copy and poll again; the delivery resumes once they are local.
+#[derive(Debug)]
+pub struct PendingCustody {
+    pub missing: Vec<focal_model::ContentRef>,
+    _allocation: Allocation,
+}
+/// The objects one retained delivery reports at most.
+pub const MAX_PENDING_CUSTODY: usize = 64;
+impl PendingCustody {
+    pub(crate) fn new(
+        missing: Vec<focal_model::ContentRef>,
+        budget: &MemoryBudget,
+    ) -> Result<Self, NativeSessionError> {
+        let allocation = budget
+            .reserve(
+                BudgetKind::Recovery,
+                BudgetLane::Completion,
+                array::<focal_model::ContentRef>(missing.capacity())?,
+            )?
+            .commit();
+        Ok(Self {
+            missing,
+            _allocation: allocation,
+        })
+    }
+    /// A copy of the missing objects a host can carry away.
+    pub fn missing_objects(&self) -> Result<Vec<focal_model::ContentRef>, NativeSessionError> {
+        let mut objects = Vec::new();
+        objects
+            .try_reserve_exact(self.missing.len())
+            .map_err(|_| NativeSessionError::Capacity)?;
+        objects.extend(self.missing.iter().cloned());
+        Ok(objects)
+    }
+}
+/// A custody reader that remembers which objects the local store did not
+/// hold, so a retained delivery can name what its host must pull.
+pub(crate) struct RecordingReader<'a> {
+    inner: &'a ContentReader,
+    /// Materialization workers read through the same recorder; the lock is
+    /// held only to note a missing object.
+    missing: std::sync::Mutex<Vec<focal_model::ContentRef>>,
+}
+impl<'a> RecordingReader<'a> {
+    pub(crate) fn new(inner: &'a ContentReader) -> Self {
+        Self {
+            inner,
+            missing: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+    /// The objects the store lacked, bounded and without repeats; the
+    /// recorder is empty afterwards.
+    pub(crate) fn take_missing(&self) -> Vec<focal_model::ContentRef> {
+        match self.missing.lock() {
+            Ok(mut missing) => std::mem::take(&mut *missing),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        }
+    }
+}
+impl focal_evidence::NativeCustodyReader for RecordingReader<'_> {
+    fn read_content(
+        &self,
+        reference: &focal_model::ContentRef,
+        budget: usize,
+    ) -> Result<Vec<u8>, focal_evidence::ContentError> {
+        let result = self.inner.read_content(reference, budget);
+        if let Err(focal_evidence::ContentError::Io(error)) = &result
+            && error.kind() == std::io::ErrorKind::NotFound
+            && let Ok(mut missing) = self.missing.lock()
+            && missing.len() < MAX_PENDING_CUSTODY
+            && !missing.iter().any(|known| known == reference)
+            && missing.try_reserve(1).is_ok()
+        {
+            missing.push(reference.clone());
+        }
+        result
+    }
+}
+
 /// The single durable capability identity: the enclosing checkpoint codec's
 /// descriptor hash covers the session, input, mutation and root envelopes.
 fn decoder() -> [u8; 32] {
@@ -883,6 +965,10 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
     /// The seeded checkpoint this replica is waiting to install, if any.
     pub fn pending_seed(&self) -> Option<&PendingSeed> {
         self.engine.pending_seed()
+    }
+    /// The content objects a retained delivery is waiting for, if any.
+    pub fn pending_custody(&self) -> Option<&PendingCustody> {
+        self.engine.pending_custody()
     }
     /// Take one chunk of a pending seed from a peer: verified against its
     /// hash and sealed locally; the retained delivery installs the checkpoint

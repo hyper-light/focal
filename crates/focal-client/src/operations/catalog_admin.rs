@@ -36,6 +36,38 @@ const CLUSTER_NODE_HEALTH: OperationDescriptor = OperationDescriptor {
     input: InputKind::Literal(r#"{"type":"object","additionalProperties":false,"properties":{}}"#),
     family: None,
 };
+const CLUSTER_NODE_READINESS: OperationDescriptor = OperationDescriptor {
+    name: "cluster.node.readiness",
+    version: 1,
+    description: "The node's readiness probes with the facts they derive from (08 §9): alive whenever it answers; catching_up when every replica it hosts and its root replica follow a known leader with nothing pending but it leads none; authoritative when it leads the root or a hosted session's log at a committed prefix; policy_satisfied when every hosted session's desired durability is achieved in the directory with nothing blocking. A local read, not a quorum.",
+    capability: Capability::Node,
+    mutation: false,
+    destructive: false,
+    result_kind: ResultKind::Read,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Exact,
+    surface: Surface::Administration,
+    cli_path: Some("cluster node readiness"),
+    input: InputKind::Literal(r#"{"type":"object","additionalProperties":false,"properties":{}}"#),
+    family: None,
+};
+const CLUSTER_NODE_METRICS: OperationDescriptor = OperationDescriptor {
+    name: "cluster.node.metrics",
+    version: 1,
+    description: "The node's metrics as Prometheus text exposition (24 §23): its memory and volume envelopes, WAL counters, every hosted replica's leader, indices, apply and cursor lag, retention floor and pending seeds or objects, peer delivery counters, the failure detector's members and counters, the credential's expiry, the placement agent's intents and admission, the directory's epochs and achieved durability per session, and the upgrade fence — every series under fixed node, cluster, region and zone labels. Sampled by the service every five seconds; a local read, not a quorum. The same text is served on `node.metrics_listen` when configured.",
+    capability: Capability::Node,
+    mutation: false,
+    destructive: false,
+    result_kind: ResultKind::Read,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Exact,
+    surface: Surface::Administration,
+    cli_path: Some("cluster node metrics"),
+    input: InputKind::Literal(r#"{"type":"object","additionalProperties":false,"properties":{}}"#),
+    family: None,
+};
 const CLUSTER_NODE_CONFIG: OperationDescriptor = OperationDescriptor {
     name: "cluster.node.config",
     version: 1,
@@ -137,6 +169,24 @@ const CLUSTER_BACKUP_CREATE: OperationDescriptor = OperationDescriptor {
     cli_path: Some("cluster backup create"),
     input: InputKind::Literal(
         r#"{"type":"object","additionalProperties":false,"required":["output"],"properties":{"tenant":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"},"session":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"},"output":{"type":"string","minLength":1}}}"#,
+    ),
+    family: None,
+};
+const CLUSTER_REPAIR: OperationDescriptor = OperationDescriptor {
+    name: "cluster.repair",
+    version: 1,
+    description: "Repair a hosted session's custody on this node (24 §20): walk the session's committed artifact projection, verify every object this node holds, recopy chunk by verified chunk from another required copy what is missing or fails its hash, and complete the other required copies that lack an object. Missing data is recopied under the same object identity, never replaced; an object no required copy can supply is reported as unrecoverable and `restore_required` is true. `limit` bounds the objects one call examines and `next_after` says where to resume; the walk is idempotent.",
+    capability: Capability::Node,
+    mutation: true,
+    destructive: false,
+    result_kind: ResultKind::Read,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Exact,
+    surface: Surface::Administration,
+    cli_path: Some("cluster repair"),
+    input: InputKind::Literal(
+        r#"{"type":"object","additionalProperties":false,"properties":{"tenant":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"},"session":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"},"after":{"type":"string","pattern":"^[0-9a-fA-F]{32}$"},"limit":{"type":"integer","minimum":1,"maximum":4096,"default":256}}}"#,
     ),
     family: None,
 };
@@ -786,6 +836,24 @@ const CLUSTER_CLIENT_INVITE: OperationDescriptor = OperationDescriptor {
     ),
     family: None,
 };
+const CLUSTER_CREDENTIALS_ROTATE: OperationDescriptor = OperationDescriptor {
+    name: "cluster.credentials.rotate",
+    version: 1,
+    description: "Rotate this node's own credential to a fresh key under the same identity (24 §11): the sponsor issues for the staged key on the current credential's proof, the node adopts it and presents it on every path before the reply, the previous certificate authorizes through the grace, and the root re-grants the node under its new key. The founder's identity is not rotated. A retry after an interrupted rotation adopts the committed one.",
+    capability: Capability::Node,
+    mutation: true,
+    destructive: false,
+    result_kind: ResultKind::Mutation,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Fresh,
+    surface: Surface::Administration,
+    cli_path: Some("cluster credentials rotate"),
+    input: InputKind::Literal(
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"additionalProperties":false}"#,
+    ),
+    family: None,
+};
 const CLUSTER_CREDENTIALS_RENEW: OperationDescriptor = OperationDescriptor {
     name: "cluster.credentials.renew",
     version: 1,
@@ -837,6 +905,40 @@ const CLUSTER_PLAN: OperationDescriptor = OperationDescriptor {
     cli_path: Some("cluster plan"),
     input: InputKind::Literal(
         r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"required":[],"additionalProperties":false}"#,
+    ),
+    family: None,
+};
+const CLUSTER_UPGRADE_STATUS: OperationDescriptor = OperationDescriptor {
+    name: "cluster.upgrade.status",
+    version: 1,
+    description: "The upgrade fence (24 §21): the capability level the cluster is held to (zero until one is activated) with when and at which registry revision it rose, the level this node's binary implements and the one it announces, every node the directory lists with the capability it last reported (zero: none reported yet), and `activatable`, the highest fence every listed node supports.",
+    capability: Capability::Node,
+    mutation: false,
+    destructive: false,
+    result_kind: ResultKind::Read,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Exact,
+    surface: Surface::Administration,
+    cli_path: Some("cluster upgrade status"),
+    input: InputKind::Literal(r#"{"type":"object","additionalProperties":false,"properties":{}}"#),
+    family: None,
+};
+const CLUSTER_UPGRADE_ACTIVATE: OperationDescriptor = OperationDescriptor {
+    name: "cluster.upgrade.activate",
+    version: 1,
+    description: "Raise the upgrade fence to `fence` (24 §21) as a committed enrollment fact under the founder's authority, once every node the directory lists has reported a capability at or above it; refused by name (`members_behind`) while any node reports less or none, never lowered (`invalid_input`), and a fence already at the level reads as done (`changed` false). Afterwards a binary announcing a lower level refuses to serve (`upgrade_fenced`), and behaviour gated on the level opens.",
+    capability: Capability::FounderNode,
+    mutation: true,
+    destructive: false,
+    result_kind: ResultKind::Mutation,
+    max_input_bytes: MAX_INPUT_BYTES,
+    wire: WireProfile::V1,
+    retry: RetryIdentity::Exact,
+    surface: Surface::Administration,
+    cli_path: Some("cluster upgrade activate"),
+    input: InputKind::Literal(
+        r#"{"type":"object","additionalProperties":false,"required":["fence"],"properties":{"fence":{"type":"integer","minimum":1}}}"#,
     ),
     family: None,
 };
@@ -912,10 +1014,12 @@ const CLUSTER_SESSIONS_PLAN: OperationDescriptor = OperationDescriptor {
     ),
     family: None,
 };
-pub const ADMIN_TOOL_COUNT: usize = 51;
+pub const ADMIN_TOOL_COUNT: usize = 57;
 const ADMIN: [OperationDescriptor; ADMIN_TOOL_COUNT] = [
     CLUSTER_NODE_IDENTITY,
     CLUSTER_NODE_HEALTH,
+    CLUSTER_NODE_READINESS,
+    CLUSTER_NODE_METRICS,
     CLUSTER_NODE_CONFIG,
     CLUSTER_REPLICAS_DIAGNOSTICS,
     CLUSTER_RETENTION_SHOW,
@@ -925,6 +1029,7 @@ const ADMIN: [OperationDescriptor; ADMIN_TOOL_COUNT] = [
     CLUSTER_BACKUP_CREATE,
     CLUSTER_BACKUP_VERIFY,
     CLUSTER_RESTORE,
+    CLUSTER_REPAIR,
     CLUSTER_STORAGE_SHOW,
     CLUSTER_INVITE,
     CLUSTER_REPLICAS_TRANSFER,
@@ -958,11 +1063,14 @@ const ADMIN: [OperationDescriptor; ADMIN_TOOL_COUNT] = [
     CLUSTER_INVITATIONS_REVOKE,
     CLUSTER_CREDENTIALS_REVOKE,
     CLUSTER_CREDENTIALS_RENEW,
+    CLUSTER_CREDENTIALS_ROTATE,
     CLUSTER_CLIENT_INVITE,
     CLUSTER_PLACEMENT,
     CLUSTER_PLAN,
     CLUSTER_TENANTS_ADMIT,
     CLUSTER_TENANTS_LIST,
+    CLUSTER_UPGRADE_STATUS,
+    CLUSTER_UPGRADE_ACTIVATE,
     CLUSTER_SESSIONS_CREATE,
     CLUSTER_SESSIONS_PLAN,
 ];

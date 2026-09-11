@@ -815,6 +815,9 @@ async fn follower_root_observation_exports_one_durable_prefix_and_retains_delive
                 advertise: "127.0.0.1:7443".parse().unwrap(),
                 expected_generation: 0,
                 decided_at: now(),
+                region: None,
+                zone: None,
+                endpoint: None,
             }),
         ),
     );

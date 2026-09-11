@@ -67,6 +67,8 @@ fn observation(sessions: Vec<ObservedSession>) -> Observation {
             alive: true,
             eligible: true,
             disk_available: Some(1 << 30),
+            region: None,
+            zone: None,
         }],
     }
 }

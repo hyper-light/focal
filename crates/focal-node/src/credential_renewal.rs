@@ -41,6 +41,11 @@ pub struct CredentialSummary {
     pub certificate_fingerprint: [u8; 32],
     /// Renewals this process performed since it started.
     pub renewals: u64,
+    /// The identity of the key the credential holds (24 §11), stable across
+    /// renewals and changed by a rotation.
+    pub key_identity: [u8; 32],
+    /// Rotations this process performed since it started.
+    pub rotations: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
@@ -61,6 +66,8 @@ pub enum RenewalError {
 
 pub enum CredentialRequest {
     Renew(oneshot::Sender<Result<CredentialSummary, RenewalError>>),
+    /// Rotate to a fresh key under the same identity (24 §11).
+    Rotate(oneshot::Sender<Result<CredentialSummary, RenewalError>>),
     Current(oneshot::Sender<CredentialSummary>),
 }
 /// A bounded handle to the controller's credential state; every clone
@@ -84,6 +91,11 @@ impl CredentialHandle {
     pub async fn renew(&self) -> Result<CredentialSummary, RenewalError> {
         let (reply, receive) = oneshot::channel();
         self.send(CredentialRequest::Renew(reply))?;
+        receive.await.map_err(|_| RenewalError::Stopped)?
+    }
+    pub async fn rotate(&self) -> Result<CredentialSummary, RenewalError> {
+        let (reply, receive) = oneshot::channel();
+        self.send(CredentialRequest::Rotate(reply))?;
         receive.await.map_err(|_| RenewalError::Stopped)?
     }
     pub async fn current(&self) -> Result<CredentialSummary, RenewalError> {

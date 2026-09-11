@@ -65,6 +65,10 @@ impl Owner {
                 .session
                 .pending_seed()
                 .map(|pending| pending.missing.len()),
+            custody_objects_missing: self
+                .session
+                .pending_custody()
+                .map(|pending| pending.missing.len()),
             delivery_retained: self.session.delivery_retained(),
             log_entries_since_checkpoint: self.log_entries_since_checkpoint(),
             retention: self.session.native_retention().ok().map(|report| {

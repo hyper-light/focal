@@ -184,9 +184,25 @@ fn private_output_is_noclobber_and_recovers_both_atomic_install_crash_windows() 
     let alias = output.with_extension("symlink");
     symlink(&output, &alias).unwrap();
     assert!(matches!(
-        bundle.write_new(alias),
+        bundle.write_new(&alias),
         Err(JoinError::Permissions)
     ));
+    // A delivered invitation is read through a link and may be group-readable
+    // (a mounted secret, 24 §24), never group-writable or world-readable.
+    assert_eq!(
+        NodeInvitation::load(&alias).unwrap().encode().unwrap(),
+        bundle.encode().unwrap()
+    );
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o440)).unwrap();
+    assert!(NodeInvitation::load(&output).is_ok());
+    for mode in [0o660, 0o604, 0o444, 0o404] {
+        fs::set_permissions(&output, fs::Permissions::from_mode(mode)).unwrap();
+        assert!(
+            matches!(NodeInvitation::load(&output), Err(JoinError::Permissions)),
+            "{mode:o}"
+        );
+    }
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o600)).unwrap();
 }
 #[test]
 fn journal_precedes_network_reuses_key_and_rejects_changed_intent_or_lost_key() {
@@ -392,7 +408,7 @@ async fn pinned_enrollment_unknown_reply_restart_installs_exact_node_without_mem
     assert!(!disk.path().join("cluster").exists());
     let contact = joined.contact_request().unwrap();
     assert!(matches!(contact.operation, Operation::NodeContact {
-        group, sequence:1, acknowledged_through:0, expected_generation:0, advertise:address
+        group, sequence:1, acknowledged_through:0, expected_generation:0, advertise:address, ..
     } if group==joined.state.genesis.root.group && address==advertise));
     drop(joined);
     let joined = JoinedNode::open(&settings, now()).unwrap();

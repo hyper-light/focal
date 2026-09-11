@@ -68,18 +68,28 @@ pub async fn authorized_controller(
     let ControlBootstrap::Root { directory, .. } = &observation.snapshot().state else {
         return false;
     };
-    let Some(authority) = observation.authority() else {
-        return false;
-    };
+    // A partition the root group itself owns is judged by the root's own
+    // applied configuration, which every root replica holds; another
+    // owner group by the installed authority's grant for it.
+    let root_group = observation.snapshot().identity.group;
     directory
         .delegations
         .values()
         .filter(|delegation| delegation.namespace.contains(ledger))
         .any(|delegation| {
-            authority
-                .groups
-                .get(&delegation.log_group)
-                .is_some_and(|group| group.voters.contains_key(&requester))
+            if delegation.log_group.0 == root_group {
+                return observation
+                    .configuration()
+                    .configuration
+                    .voters
+                    .contains(&requester);
+            }
+            observation.authority().is_some_and(|authority| {
+                authority
+                    .groups
+                    .get(&delegation.log_group)
+                    .is_some_and(|group| group.voters.contains_key(&requester))
+            })
         })
 }
 

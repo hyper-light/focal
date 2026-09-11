@@ -68,6 +68,7 @@ impl From<NodeLoadV1> for NodeLoad {
             available_memory: value.available_memory,
             active_weight: value.active_weight,
             disk_available: 0,
+            capability: 0,
         }
     }
 }

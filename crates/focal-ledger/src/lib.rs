@@ -22,7 +22,7 @@ pub use native_session::retention::{RetentionBlocker, RetentionReport};
 pub use native_session::{
     FailureClass, LayoutOperation, LedgerRangeVerifier, MovementRecord, NativeCommit,
     NativeReadBoundary, NativeSessionError, NativeSessionLimits, NativeSubmission,
-    NativeTimerInput, PendingSeed, ReadCorrelation,
+    NativeTimerInput, PendingCustody, PendingSeed, ReadCorrelation,
 };
 mod session;
 pub use focal_core::native::NativeContentProfile;

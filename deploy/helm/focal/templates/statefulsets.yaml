@@ -1,0 +1,17 @@
+{{- if .Values.zones }}
+{{- range $index, $zone := .Values.zones }}
+{{- if eq $index 0 }}
+{{ include "focal.statefulset" (dict "root" $ "name" "focal-founder" "founder" true "replicas" 1 "zone" $zone.name) }}
+{{- end }}
+{{- if gt (int $zone.hosts) 0 }}
+---
+{{ include "focal.statefulset" (dict "root" $ "name" (printf "focal-%s" $zone.name) "founder" false "replicas" (int $zone.hosts) "zone" $zone.name) }}
+{{- end }}
+{{- end }}
+{{- else }}
+{{ include "focal.statefulset" (dict "root" $ "name" "focal-founder" "founder" true "replicas" 1 "zone" "") }}
+{{- if gt (int .Values.hosts) 0 }}
+---
+{{ include "focal.statefulset" (dict "root" $ "name" "focal-hosts" "founder" false "replicas" (int .Values.hosts) "zone" "") }}
+{{- end }}
+{{- end }}

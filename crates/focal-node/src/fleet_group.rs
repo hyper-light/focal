@@ -79,6 +79,8 @@ fn class(work: &Work) -> WorkClass {
         | Work::ArtifactPointer(..)
         | Work::SeedChunks(..)
         | Work::InstallSeed(..)
+        | Work::CustodyObjects(..)
+        | Work::CustodyPulled(..)
         | Work::Refence(..)
         | Work::Membership(..)
         | Work::Placement(..)

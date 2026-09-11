@@ -219,12 +219,11 @@ impl RootEnrollment {
         if self.failed {
             return Err(ClusterError::OutcomeUnknown);
         }
-        if request.is_zero()
-            || !intent
-                .endpoint
-                .parse::<std::net::SocketAddr>()
-                .is_ok_and(|address| address.port() != 0 && !address.ip().is_unspecified())
-        {
+        let reachable = match intent.endpoint.parse::<std::net::SocketAddr>() {
+            Ok(address) => address.port() != 0 && !address.ip().is_unspecified(),
+            Err(_) => focal_wire::valid_endpoint_name(&intent.endpoint),
+        };
+        if request.is_zero() || !reachable {
             return Err(ClusterError::Bootstrap);
         }
         let encoded = postcard::to_stdvec(intent).map_err(|_| ClusterError::Bootstrap)?;

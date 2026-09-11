@@ -129,6 +129,16 @@ pub enum Operation {
         acknowledged_through: u64,
         expected_generation: u64,
         advertise: std::net::SocketAddr,
+        /// The node's failure-domain labels as its operator declared them
+        /// (24 §22); a zone needs its region. Labels are at most 64 bytes.
+        region: Option<String>,
+        zone: Option<String>,
+        /// The name the node was told to advertise (`host:port`) when its
+        /// operator gave a name rather than an address (24 §24): peers
+        /// re-resolve it when the announced address stops answering, so a
+        /// node that moves keeps its identity. At most
+        /// `MAX_ENDPOINT_NAME_BYTES`.
+        endpoint: Option<String>,
     },
     /// Only the immutable genesis founder may use the enrollment owner's
     /// dedicated sequence stream. The root reauthorizes the certificate and

@@ -107,7 +107,7 @@ pub(crate) fn apply_session(
                 next_membership: session
                     .membership_epoch
                     .checked_add(u64::from(
-                        desired.placement.voters != session.active.placement.voters,
+                        desired.placement.adds_voter_over(&session.active.placement),
                     ))
                     .ok_or(DirectoryError::CounterExhausted)?,
                 next_placement: session

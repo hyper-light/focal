@@ -147,6 +147,7 @@ enum Action {
     Revoke(InvitationId, oneshot::Sender<Answer<()>>),
     Authorize(Vec<u8>, oneshot::Sender<Answer<PeerGrant>>),
     AdmitTenant([u8; 16], oneshot::Sender<Answer<()>>),
+    ActivateFence(u32, oneshot::Sender<Answer<focal_enrollment::UpgradeFence>>),
     Stop(oneshot::Sender<()>),
 }
 struct Work {
@@ -346,6 +347,23 @@ impl QuorumEnrollmentHost {
             .map_err(|_| QuorumEnrollmentError::Stopped)?
             .result
     }
+    /// Raise the upgrade fence to `level` ([24](../../../docs/archictecutre/24-placement-execution-and-fleet-control.md)
+    /// §21): a committed enrollment fact under the founder authority. A
+    /// fence at or above `level` is answered as it is.
+    pub async fn activate_fence(
+        &self,
+        level: u32,
+    ) -> Result<focal_enrollment::UpgradeFence, QuorumEnrollmentError> {
+        if level == 0 {
+            return Err(EnrollmentError::Invalid.into());
+        }
+        let (send, receive) = oneshot::channel();
+        self.enqueue(Action::ActivateFence(level, send), 16)?;
+        receive
+            .await
+            .map_err(|_| QuorumEnrollmentError::Stopped)?
+            .result
+    }
     pub async fn authorize_certificate(
         &self,
         certificate: Vec<u8>,
@@ -439,6 +457,13 @@ impl QuorumEnrollmentDriver {
                 }
                 Action::AdmitTenant(tenant, send) => {
                     let result = self.admit_tenant(control, tenant).await;
+                    let _ = send.send(Answer {
+                        result,
+                        _charge: work._charge,
+                    });
+                }
+                Action::ActivateFence(level, send) => {
+                    let result = self.activate_fence(control, level).await;
                     let _ = send.send(Answer {
                         result,
                         _charge: work._charge,
@@ -702,6 +727,26 @@ impl QuorumEnrollmentDriver {
             return Err(EnrollmentError::NotCommitted.into());
         }
         Ok(())
+    }
+    async fn activate_fence(
+        &mut self,
+        control: &impl EnrollmentControl,
+        level: u32,
+    ) -> Result<focal_enrollment::UpgradeFence, QuorumEnrollmentError> {
+        self.reconcile(control).await?;
+        let (registry, charge) = self.registry(control).await?;
+        if registry.fence().level >= level {
+            return Ok(registry.fence());
+        }
+        let command = registry.prepare_activate_fence(&self.authority, level, now()?)?;
+        drop(registry);
+        drop(charge);
+        self.commit(control, command).await?;
+        let (registry, _charge) = self.registry(control).await?;
+        if registry.fence().level < level {
+            return Err(EnrollmentError::NotCommitted.into());
+        }
+        Ok(registry.fence())
     }
     /// The grant a certificate earns: the configured tenants and every tenant
     /// the committed registry admits, so admission never needs a restart and

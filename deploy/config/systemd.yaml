@@ -1,0 +1,9 @@
+# The requested configuration the checked-in unit is rendered from
+# (deploy/systemd, doc 08 §3): one host that advertises its name.
+version: 1
+node:
+  advertise: host-1.example:7443
+  metrics_listen: 127.0.0.1:9464
+durability:
+  survive: node
+  max_failures: 0

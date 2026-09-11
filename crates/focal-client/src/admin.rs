@@ -28,6 +28,56 @@ pub struct AdminNodeHealth {
     #[serde(default)]
     pub placement: Option<AdminPlacementAgent>,
 }
+/// The node's readiness (doc 08 §9): the four probes a supervisor asks,
+/// with the facts they are derived from. `alive` holds whenever the node
+/// answers; `catching_up` when every replica it hosts and its root replica
+/// follow a known leader with nothing pending but the node leads none of
+/// them; `authoritative` when it leads the root or a hosted session's log
+/// at a committed prefix; `policy_satisfied` when every session it hosts
+/// has its desired durability achieved in the directory with nothing
+/// blocking it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminReadiness {
+    pub node: u64,
+    pub alive: bool,
+    pub catching_up: bool,
+    pub authoritative: bool,
+    pub policy_satisfied: bool,
+    pub root: AdminRootProgress,
+    pub sessions: Vec<AdminSessionReadiness>,
+    /// Sessions beyond the report bound were left out (and count as not
+    /// satisfying the policy).
+    pub truncated: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminRootProgress {
+    pub leader: u64,
+    pub term: u64,
+    pub applied_index: u64,
+    pub stopped: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminSessionReadiness {
+    pub tenant: String,
+    pub session: String,
+    pub leader: u64,
+    pub authoritative: bool,
+    pub committed_index: u64,
+    pub applied_index: u64,
+    pub seed_pending: bool,
+    pub import_pending: bool,
+    /// Objects a retained delivery names are still being pulled (24 §20).
+    pub custody_pending: bool,
+    pub stopped: bool,
+    /// The directory's desired and achieved durability for the session;
+    /// absent while the directory does not list it.
+    pub desired_max_failures: Option<u16>,
+    pub achieved_max_failures: Option<u16>,
+    pub blocked_by: Vec<String>,
+}
 /// The placement agent: the exact-retry intents it completed, the copies
 /// it installed and the last error its pass hit, cleared by the next pass
 /// that succeeds.
@@ -81,6 +131,9 @@ pub struct AdminReplicaDiagnostics {
     /// The chunks of a seeded checkpoint this replica still lacks (25 §5),
     /// `None` when no seeded snapshot is waiting.
     pub seed_chunks_missing: Option<usize>,
+    /// The content objects a retained delivery names that this replica does
+    /// not hold yet (24 §20), `None` when none is waiting.
+    pub custody_objects_missing: Option<usize>,
     /// A delivery retained after a retryable refusal, resumed at the next poll.
     pub delivery_retained: bool,
     /// Native admission is open here: activation applied, genesis committed
@@ -272,6 +325,46 @@ pub struct AdminStorage {
     pub truncated: bool,
 }
 
+/// One object a repair could not recover from any required copy (24 §20).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminUnrecoverableObject {
+    pub artifact: String,
+    pub root: String,
+    pub length: u64,
+    /// The copies asked for it.
+    pub asked: u32,
+}
+/// A repair pass over a hosted session's custody on one node (24 §20):
+/// what the walk over the committed artifact projection found and did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminRepair {
+    pub tenant: String,
+    pub session: String,
+    pub node: u64,
+    /// The committed prefix the walk covered: the session's legacy
+    /// sequence and the applied log index the checkpoint was taken at.
+    pub sequence: u64,
+    pub index: u64,
+    pub artifacts: u64,
+    pub objects: u64,
+    /// Objects this node held and verified.
+    pub verified: u64,
+    /// Objects recopied onto this node from another required copy.
+    pub repaired: u64,
+    /// Objects given to another required copy that lacked them.
+    pub pushed: u64,
+    /// The first unrecoverable objects, bounded; `unrecoverable_count` is exact.
+    pub unrecoverable: Vec<AdminUnrecoverableObject>,
+    pub unrecoverable_count: u64,
+    /// No required copy holds every object: the session needs a restore.
+    pub restore_required: bool,
+    /// The projection was walked to its end.
+    pub complete: bool,
+    /// Where a bounded or interrupted walk resumes (`--after`).
+    pub next_after: Option<String>,
+}
 /// The committed prefix a backup holds (26 §6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -520,9 +613,21 @@ pub enum AdminResult {
     Restored {
         restored: AdminRestore,
     },
+    /// A repair pass over a hosted session's custody on this node (24 §20).
+    Repaired {
+        repair: AdminRepair,
+    },
     /// The storage view of this node (26 §7).
     Storage {
         storage: AdminStorage,
+    },
+    /// The node's readiness probes with their facts (08 §9).
+    Readiness {
+        readiness: AdminReadiness,
+    },
+    /// The node's metrics as Prometheus text exposition (24 §23).
+    Metrics {
+        text: String,
     },
     ReplicaTransferInitiated {
         session: String,
@@ -647,6 +752,23 @@ pub enum AdminResult {
         expires_at: i64,
         certificate_fingerprint: String,
         renewals: u64,
+        /// The identity of the key the credential holds (24 §11).
+        #[serde(default)]
+        key_identity: String,
+        #[serde(default)]
+        rotations: u64,
+    },
+    /// This node's credential rotated to a fresh key under the same identity
+    /// (24 §11).
+    CredentialRotated {
+        node: u64,
+        principal: String,
+        issued_at: i64,
+        expires_at: i64,
+        certificate_fingerprint: String,
+        key_identity: String,
+        renewals: u64,
+        rotations: u64,
     },
     /// Every directory partition this node acts on, with each session's
     /// desired and achieved guarantee and what blocks it.
@@ -663,6 +785,16 @@ pub enum AdminResult {
         applied_index: u64,
         revision: u64,
         admitted: Vec<String>,
+    },
+    /// The upgrade fence and every node's capability (24 §21).
+    Upgrade {
+        upgrade: AdminUpgrade,
+    },
+    /// The upgrade fence after an activation; `changed` when this call
+    /// raised it.
+    FenceActivated {
+        upgrade: AdminUpgrade,
+        changed: bool,
     },
     /// An application session created on a node, or found again by its name.
     SessionCreated {
@@ -726,6 +858,47 @@ pub struct AdminPlacementNode {
     pub available_memory: Option<u64>,
     pub active_weight: Option<u64>,
     pub disk_available: Option<u64>,
+    /// The capability level the node's binary last reported (24 §21).
+    pub capability: Option<u32>,
+    /// The failure-domain labels the node announced (24 §22); a region the
+    /// directory knows only by identity is shown as its hex identity.
+    pub region: Option<String>,
+    pub zone: Option<String>,
+    /// The address the node's committed contact announces and, when its
+    /// operator gave one, the name peers re-resolve (24 §24).
+    pub advertise: Option<String>,
+    pub endpoint: Option<String>,
+    /// `active` while the enrollment registry authorizes the node's
+    /// credential, `retired` once it is revoked or expired, `unknown` when
+    /// the registry could not be read (24 §11).
+    pub credential: String,
+}
+/// The upgrade fence and the capability levels around it (24 §21).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminUpgrade {
+    /// The committed fence: zero until one is activated.
+    pub fence_level: u32,
+    pub fence_activated_at: i64,
+    pub fence_revision: u64,
+    /// The level this node's binary implements, and the one it announces
+    /// (lowered only through `FOCAL_CAPABILITY_LEVEL`).
+    pub binary_level: u32,
+    pub announced_level: u32,
+    pub applied_index: u64,
+    pub registry_revision: u64,
+    /// Every node the directory lists with the level it last reported.
+    pub nodes: Vec<AdminNodeCapability>,
+    /// The highest fence every listed node supports (zero while a node
+    /// has not reported).
+    pub activatable: u32,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminNodeCapability {
+    pub node: u64,
+    /// Zero until the node reports its load under a binary that announces.
+    pub capability: u32,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminSessionPlacement {
@@ -743,6 +916,10 @@ pub struct AdminSessionPlacement {
     pub content_copies: Vec<u64>,
     pub survive: String,
     pub max_failures: u16,
+    /// The session's residency boundary and ordering homes as region labels
+    /// (24 §22); empty is no boundary.
+    pub residency: Vec<String>,
+    pub home_regions: Vec<String>,
     pub achieved_survive: Option<String>,
     pub achieved_max_failures: Option<u16>,
     pub blocked_by: Vec<String>,

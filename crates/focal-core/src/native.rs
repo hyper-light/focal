@@ -1115,19 +1115,30 @@ pub struct NativeRowCursor(Key);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentRoot {
     /// An artifact's payload held as a content object.
-    Artifact(focal_model::lifecycle::artifact_descriptor::ContentPointer),
+    Artifact {
+        artifact: ArtifactId,
+        pointer: focal_model::lifecycle::artifact_descriptor::ContentPointer,
+    },
     /// An artifact's payload held inline: the object every replica sealed
     /// at admission under the canonical chunking, so its root is the same
     /// on every node and the record names it.
-    Inline(focal_model::lifecycle::artifact_descriptor::ContentPointer),
-    /// A retired family's archive bundle, by content root and length.
-    Bundle { root: ContentHash, bytes: u64 },
+    Inline {
+        artifact: ArtifactId,
+        pointer: focal_model::lifecycle::artifact_descriptor::ContentPointer,
+    },
+    /// A retired family's archive bundle, by the retired claim, content
+    /// root and length.
+    Bundle {
+        claim: ClaimId,
+        root: ContentHash,
+        bytes: u64,
+    },
 }
 impl ContentRoot {
     /// The object's content root.
     pub fn root(&self) -> ContentHash {
         match self {
-            Self::Artifact(pointer) | Self::Inline(pointer) => pointer.root,
+            Self::Artifact { pointer, .. } | Self::Inline { pointer, .. } => pointer.root,
             Self::Bundle { root, .. } => *root,
         }
     }
@@ -1535,23 +1546,30 @@ impl Core<NativeState> {
             }
             visited = visited.saturating_add(1);
             last = Some(entry.key);
-            match &entry.value {
-                Row::Artifact(owned) => {
+            match (&entry.key, &entry.value) {
+                (Key::Artifact(id), Row::Artifact(owned)) => {
                     use focal_model::lifecycle::artifact_descriptor::PayloadSpec;
                     if let Some(artifact) = owned.get() {
                         match artifact.descriptor().payload() {
                             PayloadSpec::Content(pointer) => {
-                                push(ContentRoot::Artifact(pointer))?;
+                                push(ContentRoot::Artifact {
+                                    artifact: *id,
+                                    pointer,
+                                })?;
                             }
                             PayloadSpec::Inline(_) => {
                                 // An inline payload was sealed as an object
                                 // at admission; the row's custody names it.
-                                push(ContentRoot::Inline(artifact.custody().payload()))?;
+                                push(ContentRoot::Inline {
+                                    artifact: *id,
+                                    pointer: artifact.custody().payload(),
+                                })?;
                             }
                         }
                     }
                 }
-                Row::Retired(value) => push(ContentRoot::Bundle {
+                (Key::Retired(claim), Row::Retired(value)) => push(ContentRoot::Bundle {
+                    claim: *claim,
                     root: value.bundle,
                     bytes: value.bytes,
                 })?,

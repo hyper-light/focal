@@ -30,6 +30,17 @@ pub struct Placement {
     pub preferred_leader: u64,
 }
 impl Placement {
+    /// Whether this placement adds a voter the `previous` one did not have.
+    /// A membership epoch steps once per committed voter-set change, and a
+    /// change happens before a cut-over only when voters are added (an
+    /// expansion promotes them first); voters this placement drops keep
+    /// voting until activation retires them (24 §4, §19), so a pure shrink
+    /// adds none and steps the epoch only at activation, not at cut-over.
+    pub fn adds_voter_over(&self, previous: &Placement) -> bool {
+        self.voters
+            .keys()
+            .any(|node| !previous.voters.contains_key(node))
+    }
     pub fn nodes(&self) -> BTreeSet<u64> {
         self.voters
             .keys()
