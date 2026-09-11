@@ -146,10 +146,17 @@ pub use tokio::net::windows::named_pipe::{NamedPipeClient, NamedPipeServer};
 #[cfg(windows)]
 pub use windows::{create_pipe_server, pipe_client_is_current_owner, pipe_server_is_current_owner};
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::fs::File;
+
+    #[test]
+    fn path_bytes_round_trip_on_this_platform() {
+        let path = std::path::Path::new("some/dir/with a space/leaf.bin");
+        let bytes = path_to_bytes(path);
+        assert_eq!(path_from_bytes(&bytes).as_deref(), Some(path));
+    }
 
     #[test]
     fn an_exclusive_lock_excludes_a_second_owner_until_released() {

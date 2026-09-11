@@ -335,29 +335,82 @@ fn open_accessible_by_others(_file: &File, path: &Path) -> io::Result<bool> {
     Ok(owner_at(path)? != current_owner()?)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn a_private_file_passes_and_a_group_readable_one_fails() {
-        use std::os::unix::fs::PermissionsExt;
+    fn a_freshly_created_private_file_is_recognised_as_private() {
         let dir = tempfile::tempdir().unwrap();
         let owner = current_owner().unwrap();
         let path = dir.path().join("f");
         let file = open_private(&path, true, true, true).unwrap();
         assert!(check_open_private_file(&path, &file, &owner).unwrap());
+        assert!(check_private_file(&path, &owner, 1).unwrap());
+        assert_eq!(path_identity(&path).unwrap(), file_identity(&file).unwrap());
+        assert_eq!(path_hard_link_count(&path).unwrap(), 1);
+    }
+
+    #[test]
+    fn create_private_new_refuses_an_existing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("once");
+        let _first = create_private_new(&path, false, true).unwrap();
+        assert_eq!(
+            create_private_new(&path, false, true).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+    }
+
+    #[test]
+    fn a_freshly_created_private_dir_is_owned_by_the_current_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = current_owner().unwrap();
+        let path = dir.path().join("d");
+        create_dir_private(&path).unwrap();
+        assert_eq!(private_dir_owner(&path).unwrap(), Some(owner));
+    }
+
+    #[test]
+    fn atomic_replace_swaps_contents_in_place() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("t");
+        let mut old = open_private(&target, false, true, true).unwrap();
+        old.write_all(b"old").unwrap();
+        old.sync_all().unwrap();
+        drop(old);
+        let temporary = dir.path().join("t.new");
+        let mut fresh = create_private_new(&temporary, false, true).unwrap();
+        fresh.write_all(b"new!").unwrap();
+        fresh.sync_all().unwrap();
+        drop(fresh);
+        atomic_replace(&temporary, &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new!");
+    }
+
+    // Mode-based negatives have no portable equivalent: a Windows private
+    // file's protection is its DACL, not a mode bit a test can flip without a
+    // second account.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_readable_file_is_not_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let owner = current_owner().unwrap();
+        let path = dir.path().join("f");
+        let _file = open_private(&path, true, true, true).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(!check_private_file(&path, &owner, 1).unwrap());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn a_private_dir_is_recognised_and_a_loose_one_is_not() {
+    fn a_loose_dir_is_not_private() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("d");
         create_dir_private(&path).unwrap();
-        assert!(private_dir_owner(&path).unwrap().is_some());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(private_dir_owner(&path).unwrap().is_none());
     }

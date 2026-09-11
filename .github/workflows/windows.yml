@@ -24,3 +24,6 @@ jobs:
       - name: Build the workspace
         shell: bash
         run: cargo build --workspace --locked
+      - name: Platform FFI tests (DACL, SID, file identity, locks, paths)
+        shell: bash
+        run: cargo test -p focal-platform --locked
