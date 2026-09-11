@@ -1712,6 +1712,42 @@ impl PlacementAgent {
         }
         let manifest = crate::backup::read_manifest(&request.input)?;
         let ledger = manifest.prefix.ledger;
+        let group = match &request.decision {
+            RestoreDecision::SameIncarnation { .. } => manifest.prefix.group.0,
+            RestoreDecision::RecoveryIncarnation { .. } => {
+                if !request.new_incarnation {
+                    return Err(AgentError::Restore(
+                        "the backup's source is not fenced: its cluster or a member of its membership could act again; pass --new-incarnation to restore as a recovery incarnation under a new log group",
+                    ));
+                }
+                crate::backup::recovery_group(&manifest, node)
+            }
+        };
+        // Resume idempotently. An interrupted restore may have durably recorded
+        // and attached this exact copy before its reply reached the operator,
+        // who then reissues the same command. The recovery group is a pure
+        // function of the backup and this node, so a copy already installed
+        // under it is this very restore, already complete: report it restored
+        // rather than refuse a re-run that would change nothing. A copy at the
+        // same ledger under a different group is a genuine conflict and still
+        // falls through to the guards below.
+        if self.installs.as_ref().is_some_and(|installs| {
+            installs
+                .record
+                .installed
+                .get(&ledger)
+                .is_some_and(|copy| copy.group == group && copy.created)
+        }) {
+            return Ok(crate::backup::RestoredSession {
+                ledger,
+                group,
+                node,
+                decision: request.decision,
+                manifest,
+                objects_imported: 0,
+                seeds_installed: 0,
+            });
+        }
         if handles.fleet.replica_target(ledger).is_ok() {
             return Err(AgentError::Restore("this node already hosts the session"));
         }
@@ -1724,17 +1760,6 @@ impl PlacementAgent {
                 "this cluster's directory already holds the session; a live descriptor is replaced by a placement plan, not a restore",
             ));
         }
-        let group = match &request.decision {
-            RestoreDecision::SameIncarnation { .. } => manifest.prefix.group.0,
-            RestoreDecision::RecoveryIncarnation { .. } => {
-                if !request.new_incarnation {
-                    return Err(AgentError::Restore(
-                        "the backup's source is not fenced: its cluster or a member of its membership could act again; pass --new-incarnation to restore as a recovery incarnation under a new log group",
-                    ));
-                }
-                crate::backup::recovery_group(&manifest, node)
-            }
-        };
         let installs = self.installs.as_ref().ok_or(AgentError::Identity)?;
         if installs.record.installed.contains_key(&ledger)
             || installs
