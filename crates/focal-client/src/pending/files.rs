@@ -1,7 +1,7 @@
 use super::{MAX_STATE_BYTES, PendingError};
 use crate::file_lock::FileLock;
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
 };
@@ -27,31 +27,19 @@ impl Directory {
         &self.path
     }
     pub(super) fn create(path: &Path) -> Result<Self, PendingError> {
-        #[cfg(not(unix))]
-        {
-            let _ = path;
-            Err(PendingError::Permissions)
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            let parent = path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(Path::new("."));
-            fs::DirBuilder::new()
-                .mode(0o700)
-                .create(path)
-                .map_err(|error| {
-                    if error.kind() == std::io::ErrorKind::AlreadyExists {
-                        PendingError::Exists
-                    } else {
-                        error.into()
-                    }
-                })?;
-            File::open(parent)?.sync_all()?;
-            Self::lock(path, true)
-        }
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        focal_platform::fs::create_dir_private(path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                PendingError::Exists
+            } else {
+                error.into()
+            }
+        })?;
+        sync_dir(parent)?;
+        Self::lock(path, true)
     }
     pub(super) fn open(path: &Path) -> Result<Self, PendingError> {
         Self::lock(path, false)
@@ -73,48 +61,37 @@ impl Directory {
         Ok(true)
     }
     fn lock(path: &Path, create: bool) -> Result<Self, PendingError> {
-        #[cfg(not(unix))]
-        {
-            let _ = (path, create);
-            Err(PendingError::Permissions)
+        let owner = focal_platform::fs::private_dir_owner(path)
+            .map_err(missing_is_corrupt)?
+            .ok_or(PendingError::Permissions)?;
+        let lock_path = path.join("LOCK");
+        if !create {
+            check_file(&lock_path, &owner)?;
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-            let directory = fs::symlink_metadata(path).map_err(missing_is_corrupt)?;
-            if !directory.is_dir() || directory.mode() & 0o077 != 0 {
-                return Err(PendingError::Permissions);
-            }
-            let lock_path = path.join("LOCK");
-            if !create {
-                check_file(&lock_path, directory.uid())?;
-            }
-            let lock = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(create)
-                .mode(0o600)
-                .open(&lock_path)
-                .map_err(missing_is_corrupt)?;
-            check_open_file(&lock_path, &lock, directory.uid())?;
-            let lock = FileLock::acquire(lock).map_err(|error| {
-                if error.kind() == std::io::ErrorKind::WouldBlock {
-                    PendingError::Locked
-                } else {
-                    error.into()
-                }
-            })?;
-            if create {
-                lock.file().sync_all()?;
-                File::open(path)?.sync_all()?;
-            }
-            Ok(Self {
-                path: path.to_path_buf(),
-                _lock: lock,
-                #[cfg(test)]
-                fault: std::cell::Cell::new(None),
-            })
+        let lock = if create {
+            focal_platform::fs::create_private_new(&lock_path, true, true)
+        } else {
+            focal_platform::fs::open_private(&lock_path, true, true, false)
         }
+        .map_err(missing_is_corrupt)?;
+        check_open_file(&lock_path, &lock, &owner)?;
+        let lock = FileLock::acquire(lock).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                PendingError::Locked
+            } else {
+                error.into()
+            }
+        })?;
+        if create {
+            lock.file().sync_all()?;
+            sync_dir(path)?;
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            _lock: lock,
+            #[cfg(test)]
+            fault: std::cell::Cell::new(None),
+        })
     }
     pub(super) fn read(&self) -> Result<Vec<u8>, PendingError> {
         let path = self.path.join(RECORD);
@@ -187,14 +164,7 @@ impl Directory {
             self.check_path(&temporary)?;
             fs::remove_file(&temporary)?;
         }
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temporary)?;
+        let mut file = focal_platform::fs::create_private_new(&temporary, false, true)?;
         let length = u32::try_from(payload.len())
             .map_err(|_| PendingError::Capacity)?
             .to_be_bytes();
@@ -212,7 +182,7 @@ impl Directory {
         fs::rename(&temporary, self.path.join(RECORD))?;
         #[cfg(test)]
         self.fail_at(Fault::Renamed)?;
-        File::open(&self.path)?.sync_all()?;
+        sync_dir(&self.path)?;
         #[cfg(test)]
         self.fail_at(Fault::DirectorySynced)?;
         self.recover_marker()
@@ -234,40 +204,20 @@ impl Directory {
             }
             file.sync_all()?;
         } else {
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(marker)?;
+            let mut file = focal_platform::fs::create_private_new(&marker, false, true)?;
             file.write_all(MAGIC)?;
             file.sync_all()?;
         }
-        File::open(&self.path)?.sync_all()?;
+        sync_dir(&self.path)?;
         Ok(())
     }
     fn check_path(&self, path: &Path) -> Result<(), PendingError> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            check_file(path, fs::metadata(&self.path)?.uid())
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = path;
-            Err(PendingError::Permissions)
-        }
+        check_file(path, &store_owner(&self.path)?)
     }
     fn checked_open(&self, path: &Path) -> Result<File, PendingError> {
         self.check_path(path)?;
         let file = File::open(path).map_err(missing_is_corrupt)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            check_open_file(path, &file, fs::metadata(&self.path)?.uid())?;
-        }
+        check_open_file(path, &file, &store_owner(&self.path)?)?;
         Ok(file)
     }
     #[cfg(test)]
@@ -299,61 +249,51 @@ fn present(path: &Path) -> Result<bool, PendingError> {
     }
 }
 fn check_unpublished_directory(path: &Path) -> Result<(), PendingError> {
+    let owner = focal_platform::fs::private_dir_owner(path)
+        .map_err(missing_is_corrupt)?
+        .ok_or(PendingError::Permissions)?;
+    // At most LOCK and the unpublished initial temporary are admissible.
+    // A marker, any existing state (even corrupt), or an unexpected name
+    // prevents initialization. This scan allocates no unbounded collection.
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name != "LOCK" && name != TEMPORARY {
+            return Err(PendingError::Corrupt);
+        }
+        check_file(&entry.path(), &owner)?;
+    }
+    Ok(())
+}
+type Owner = focal_platform::fs::Owner;
+fn store_owner(path: &Path) -> Result<Owner, PendingError> {
+    focal_platform::fs::owner_at(path).map_err(Into::into)
+}
+fn sync_dir(path: &Path) -> Result<(), PendingError> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
-        let directory = fs::symlink_metadata(path).map_err(missing_is_corrupt)?;
-        if !directory.is_dir() || directory.mode() & 0o077 != 0 {
-            return Err(PendingError::Permissions);
-        }
-        // At most LOCK and the unpublished initial temporary are admissible.
-        // A marker, any existing state (even corrupt), or an unexpected name
-        // prevents initialization. This scan allocates no unbounded collection.
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            if name != "LOCK" && name != TEMPORARY {
-                return Err(PendingError::Corrupt);
-            }
-            check_file(&entry.path(), directory.uid())?;
-        }
-        Ok(())
+        File::open(path)?.sync_all()?;
     }
     #[cfg(not(unix))]
     {
         let _ = path;
-        Err(PendingError::Permissions)
-    }
-}
-#[cfg(unix)]
-fn check_file(path: &Path, owner: u32) -> Result<(), PendingError> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = fs::symlink_metadata(path).map_err(missing_is_corrupt)?;
-    if !metadata.is_file()
-        || metadata.uid() != owner
-        || metadata.mode() & 0o077 != 0
-        || metadata.nlink() != 1
-    {
-        return Err(PendingError::Permissions);
     }
     Ok(())
 }
-#[cfg(unix)]
-fn check_open_file(path: &Path, file: &File, owner: u32) -> Result<(), PendingError> {
-    use std::os::unix::fs::MetadataExt;
+fn check_file(path: &Path, owner: &Owner) -> Result<(), PendingError> {
+    match focal_platform::fs::check_private_file(path, owner, 1) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(PendingError::Permissions),
+        Err(error) => Err(missing_is_corrupt(error)),
+    }
+}
+fn check_open_file(path: &Path, file: &File, owner: &Owner) -> Result<(), PendingError> {
     check_file(path, owner)?;
-    let path_meta = fs::symlink_metadata(path)?;
-    let metadata = file.metadata()?;
-    if path_meta.dev() != metadata.dev()
-        || path_meta.ino() != metadata.ino()
-        || !metadata.is_file()
-        || metadata.uid() != owner
-        || metadata.mode() & 0o077 != 0
-        || metadata.nlink() != 1
-    {
-        return Err(PendingError::Permissions);
+    match focal_platform::fs::check_open_private_file(path, file, owner) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(PendingError::Permissions),
+        Err(error) => Err(missing_is_corrupt(error)),
     }
-    Ok(())
 }
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -118,7 +118,19 @@ pub fn check_private_file(path: &Path, owner: &Owner, links: u64) -> io::Result<
 /// `owner`, private, singly linked. Guards against a swap between the check
 /// and the open.
 pub fn check_open_private_file(path: &Path, file: &File, owner: &Owner) -> io::Result<bool> {
-    if !check_private_file(path, owner, 1)? {
+    check_open_private_file_links(path, file, owner, 1)
+}
+
+/// As [check_open_private_file], but requiring exactly `links` hard links — the
+/// atomic link-pair publication (temp + target sharing one inode) checks for
+/// two.
+pub fn check_open_private_file_links(
+    path: &Path,
+    file: &File,
+    owner: &Owner,
+    links: u64,
+) -> io::Result<bool> {
+    if !check_private_file(path, owner, links)? {
         return Ok(false);
     }
     let path_id = file_id_at(path)?;
@@ -128,11 +140,28 @@ pub fn check_open_private_file(path: &Path, file: &File, owner: &Owner) -> io::R
         || !open.is_file()
         || !open_owner(file, owner)?
         || open_accessible_by_others(file, path)?
-        || hard_link_count_open(file)? != 1
+        || hard_link_count_open(file)? != links
     {
         return Ok(false);
     }
     Ok(true)
+}
+
+/// The volume identity of an open file (`(device, inode)` on Unix, `(volume,
+/// file index)` on Windows). Two handles or paths to the same file compare
+/// equal; a replacement compares unequal.
+pub fn file_identity(file: &File) -> io::Result<FileId> {
+    file_id(file)
+}
+/// The volume identity of the file a path names (final symlink not followed).
+pub fn path_identity(path: &Path) -> io::Result<FileId> {
+    file_id_at(path)
+}
+/// The number of hard links to the file a path names — two while an atomic
+/// link-pair publication (temp linked to target) is mid-flight.
+pub fn path_hard_link_count(path: &Path) -> io::Result<u64> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    hard_link_count(&metadata, path)
 }
 
 /// Open a file with owner-only permissions when it is created (`0600` on Unix,
@@ -152,6 +181,32 @@ pub fn open_private(path: &Path, read: bool, write: bool, create: bool) -> io::R
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (read, write, create);
+        let _ = path;
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
+/// Create a *new* owner-only file (`0600` on Unix, an owner-only DACL on
+/// Windows), failing with `io::ErrorKind::AlreadyExists` when the path exists.
+/// The no-clobber counterpart of [open_private] for atomic publications.
+pub fn create_private_new(path: &Path, read: bool, write: bool) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(read)
+            .write(write)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    }
+    #[cfg(windows)]
+    {
+        crate::windows::create_private_new(path, read, write)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (read, write);
         let _ = path;
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }

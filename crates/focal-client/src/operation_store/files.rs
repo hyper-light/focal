@@ -1,7 +1,7 @@
 use super::StoreError;
 use crate::file_lock::FileLock;
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Seek, Write},
     path::{Path, PathBuf},
 };
@@ -64,67 +64,53 @@ impl Directory {
         create: bool,
         layout: Layout,
     ) -> Result<(Self, bool), StoreError> {
-        #[cfg(not(unix))]
-        {
-            let _ = (parent, name, create);
-            Err(StoreError::Permissions)
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let metadata = fs::symlink_metadata(parent).map_err(missing_is_corrupt)?;
-            if !metadata.is_dir() || metadata.mode() & 0o077 != 0 {
-                return Err(StoreError::Permissions);
-            }
-            let suffix = if matches!(layout, Layout::Watch) {
-                "watch"
-            } else {
-                "managed"
-            };
-            let path = parent.join(format!("{name}.{suffix}-lock"));
-            match fs::symlink_metadata(&path) {
-                Ok(_) => check_file(&path, metadata.uid())?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    if parent.join(format!("{name}.{suffix}-owner")).try_exists()?
-                        || parent.join(name).try_exists()?
-                    {
-                        return Err(StoreError::Corrupt);
-                    }
+        let owner = focal_platform::fs::private_dir_owner(parent)
+            .map_err(missing_is_corrupt)?
+            .ok_or(StoreError::Permissions)?;
+        let suffix = if matches!(layout, Layout::Watch) {
+            "watch"
+        } else {
+            "managed"
+        };
+        let path = parent.join(format!("{name}.{suffix}-lock"));
+        match fs::symlink_metadata(&path) {
+            Ok(_) => check_file(&path, &owner)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if parent.join(format!("{name}.{suffix}-owner")).try_exists()?
+                    || parent.join(name).try_exists()?
+                {
+                    return Err(StoreError::Corrupt);
                 }
-                Err(error) => return Err(error.into()),
             }
-            let lock = options()
-                .read(true)
-                .write(true)
-                .create(create)
-                .open(&path)
-                .map_err(|error| {
-                    if error.kind() == std::io::ErrorKind::NotFound {
-                        StoreError::MissingOperation
-                    } else {
-                        error.into()
-                    }
-                })?;
-            check_open_file(&path, &lock, metadata.uid())?;
-            let lock = FileLock::acquire(lock).map_err(|error| {
-                if error.kind() == std::io::ErrorKind::WouldBlock {
-                    StoreError::Locked
+            Err(error) => return Err(error.into()),
+        }
+        let lock =
+            focal_platform::fs::open_private(&path, true, true, create).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    StoreError::MissingOperation
                 } else {
                     error.into()
                 }
             })?;
-            let initialized = read_marker_prefix(lock.file(), layout.marker())?;
-            lock.file().sync_all()?;
-            File::open(parent)?.sync_all()?;
-            Ok((
-                Self {
-                    path: parent.into(),
-                    _lock: lock,
-                    layout,
-                },
-                initialized,
-            ))
-        }
+        check_open_file(&path, &lock, &owner)?;
+        let lock = FileLock::acquire(lock).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                StoreError::Locked
+            } else {
+                error.into()
+            }
+        })?;
+        let initialized = read_marker_prefix(lock.file(), layout.marker())?;
+        lock.file().sync_all()?;
+        sync_dir(parent)?;
+        Ok((
+            Self {
+                path: parent.into(),
+                _lock: lock,
+                layout,
+            },
+            initialized,
+        ))
     }
     pub(crate) fn finish_coordinator(&self) -> Result<(), StoreError> {
         let mut lock = self._lock.file();
@@ -132,57 +118,47 @@ impl Directory {
         lock.write_all(self.layout.marker())?;
         lock.set_len(8)?;
         lock.sync_all()?;
-        File::open(&self.path)?.sync_all()?;
+        sync_dir(&self.path)?;
         Ok(())
     }
     /// Only a durable outer initialization intent may resume this path; no
     /// child request can have escaped before that outer intent becomes Ready.
     pub(crate) fn resume_managed_creation(path: &Path) -> Result<Self, StoreError> {
-        #[cfg(not(unix))]
-        {
-            let _ = path;
-            Err(StoreError::Permissions)
+        match focal_platform::fs::create_dir_private(path) {
+            Ok(()) => sync_dir(parent(path))?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            match fs::DirBuilder::new().mode(0o700).create(path) {
-                Ok(()) => File::open(parent(path))?.sync_all()?,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
+        let missing_lock = !path.join("LOCK").try_exists()?;
+        let mut count = 0usize;
+        for entry in fs::read_dir(path)? {
+            count = count.checked_add(1).ok_or(StoreError::Capacity)?;
+            let name = entry?.file_name();
+            if count > 4
+                || !matches!(
+                    name.to_str(),
+                    Some("LOCK" | "INITIALIZED" | "stream.bin" | "stream.pending")
+                )
+            {
+                return Err(StoreError::Corrupt);
             }
-            let missing_lock = !path.join("LOCK").try_exists()?;
-            let mut count = 0usize;
-            for entry in fs::read_dir(path)? {
-                count = count.checked_add(1).ok_or(StoreError::Capacity)?;
-                let name = entry?.file_name();
-                if count > 4
-                    || !matches!(
-                        name.to_str(),
-                        Some("LOCK" | "INITIALIZED" | "stream.bin" | "stream.pending")
-                    )
-                {
-                    return Err(StoreError::Corrupt);
-                }
-            }
-            let directory = Self::lock(path, missing_lock, Layout::Managed)?;
-            if directory.exists(MARKER)? {
-                use std::os::unix::fs::MetadataExt;
-                let marker_path = path.join(MARKER);
-                directory.check_path(&marker_path)?;
-                let mut marker = options().read(true).write(true).open(&marker_path)?;
-                check_open_file(&marker_path, &marker, fs::metadata(path)?.uid())?;
-                if !read_marker_prefix(&marker, MANAGED_INITIALIZED)? {
-                    marker.rewind()?;
-                    marker.write_all(MANAGED_INITIALIZED)?;
-                    marker.set_len(8)?;
-                }
-                marker.sync_all()?;
-            } else {
-                directory.initialize()?;
-            }
-            Ok(directory)
         }
+        let directory = Self::lock(path, missing_lock, Layout::Managed)?;
+        if directory.exists(MARKER)? {
+            let marker_path = path.join(MARKER);
+            directory.check_path(&marker_path)?;
+            let mut marker = focal_platform::fs::open_private(&marker_path, true, true, false)?;
+            check_open_file(&marker_path, &marker, &store_owner(path)?)?;
+            if !read_marker_prefix(&marker, MANAGED_INITIALIZED)? {
+                marker.rewind()?;
+                marker.write_all(MANAGED_INITIALIZED)?;
+                marker.set_len(8)?;
+            }
+            marker.sync_all()?;
+        } else {
+            directory.initialize()?;
+        }
+        Ok(directory)
     }
     pub(crate) fn create(path: &Path) -> Result<Self, StoreError> {
         Self::create_layout(path, Layout::Legacy)
@@ -194,27 +170,15 @@ impl Directory {
         Self::create_layout(path, Layout::Native)
     }
     fn create_layout(path: &Path, layout: Layout) -> Result<Self, StoreError> {
-        #[cfg(not(unix))]
-        {
-            let _ = (path, layout);
-            Err(StoreError::Permissions)
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            fs::DirBuilder::new()
-                .mode(0o700)
-                .create(path)
-                .map_err(|error| {
-                    if error.kind() == std::io::ErrorKind::AlreadyExists {
-                        StoreError::Exists
-                    } else {
-                        error.into()
-                    }
-                })?;
-            File::open(parent(path))?.sync_all()?;
-            Self::lock(path, true, layout)
-        }
+        focal_platform::fs::create_dir_private(path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                StoreError::Exists
+            } else {
+                error.into()
+            }
+        })?;
+        sync_dir(parent(path))?;
+        Self::lock(path, true, layout)
     }
     pub(crate) fn open(path: &Path) -> Result<Self, StoreError> {
         Self::open_layout(path, Layout::Legacy)
@@ -237,67 +201,55 @@ impl Directory {
             return Err(StoreError::Corrupt);
         }
         file.sync_all()?;
-        File::open(path)?.sync_all()?;
+        sync_dir(path)?;
         Ok(directory)
     }
     fn lock(path: &Path, create: bool, layout: Layout) -> Result<Self, StoreError> {
-        #[cfg(not(unix))]
-        {
-            let _ = (path, create, layout);
-            Err(StoreError::Permissions)
+        let owner = focal_platform::fs::private_dir_owner(path)
+            .map_err(missing_is_corrupt)?
+            .ok_or(StoreError::Permissions)?;
+        let lock_path = path.join("LOCK");
+        if !create {
+            check_file(&lock_path, &owner)?;
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let directory = fs::symlink_metadata(path).map_err(missing_is_corrupt)?;
-            if !directory.is_dir() || directory.mode() & 0o077 != 0 {
-                return Err(StoreError::Permissions);
-            }
-            let lock_path = path.join("LOCK");
-            if !create {
-                check_file(&lock_path, directory.uid())?;
-            }
-            let lock = options()
-                .read(true)
-                .write(true)
-                .create_new(create)
-                .open(&lock_path)
-                .map_err(missing_is_corrupt)?;
-            check_open_file(&lock_path, &lock, directory.uid())?;
-            // The native journal is shared by every process of one adapter;
-            // its critical sections are short and never span a network wait,
-            // so a contending process waits briefly instead of failing.
-            let acquired = if layout == Layout::Native {
-                FileLock::acquire_within(lock, NATIVE_LOCK_WAIT)
+        let lock = if create {
+            focal_platform::fs::create_private_new(&lock_path, true, true)
+        } else {
+            focal_platform::fs::open_private(&lock_path, true, true, false)
+        }
+        .map_err(missing_is_corrupt)?;
+        check_open_file(&lock_path, &lock, &owner)?;
+        // The native journal is shared by every process of one adapter;
+        // its critical sections are short and never span a network wait,
+        // so a contending process waits briefly instead of failing.
+        let acquired = if layout == Layout::Native {
+            FileLock::acquire_within(lock, NATIVE_LOCK_WAIT)
+        } else {
+            FileLock::acquire(lock)
+        };
+        let lock = acquired.map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                StoreError::Locked
             } else {
-                FileLock::acquire(lock)
-            };
-            let lock = acquired.map_err(|error| {
-                if error.kind() == std::io::ErrorKind::WouldBlock {
-                    StoreError::Locked
-                } else {
-                    error.into()
-                }
-            })?;
-            if create {
-                lock.file().sync_all()?;
-                File::open(path)?.sync_all()?;
+                error.into()
             }
-            Ok(Self {
-                path: path.into(),
-                _lock: lock,
-                layout,
-            })
+        })?;
+        if create {
+            lock.file().sync_all()?;
+            sync_dir(path)?;
         }
+        Ok(Self {
+            path: path.into(),
+            _lock: lock,
+            layout,
+        })
     }
     pub(crate) fn initialize(&self) -> Result<(), StoreError> {
-        let mut file = options()
-            .write(true)
-            .create_new(true)
-            .open(self.path.join(MARKER))?;
+        let mut file =
+            focal_platform::fs::create_private_new(&self.path.join(MARKER), false, true)?;
         file.write_all(self.layout.marker())?;
         file.sync_all()?;
-        File::open(&self.path)?.sync_all()?;
+        sync_dir(&self.path)?;
         Ok(())
     }
     pub(crate) fn exists(&self, relative: &str) -> Result<bool, StoreError> {
@@ -308,20 +260,9 @@ impl Directory {
         }
     }
     pub(crate) fn create_child(&self, component: &str) -> Result<(), StoreError> {
-        #[cfg(not(unix))]
-        {
-            let _ = component;
-            Err(StoreError::Permissions)
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            fs::DirBuilder::new()
-                .mode(0o700)
-                .create(self.path.join(component))?;
-            File::open(&self.path)?.sync_all()?;
-            self.check_child(component)
-        }
+        focal_platform::fs::create_dir_private(&self.path.join(component))?;
+        sync_dir(&self.path)?;
+        self.check_child(component)
     }
     /// Remove a retired child store that this owner's durable record already
     /// fences; a missing child is fine, anything but an owner-private
@@ -340,27 +281,15 @@ impl Directory {
         }
         self.check_child(component)?;
         fs::remove_dir_all(self.path.join(component))?;
-        File::open(&self.path)?.sync_all()?;
+        sync_dir(&self.path)?;
         Ok(())
     }
     pub(crate) fn check_child(&self, component: &str) -> Result<(), StoreError> {
-        #[cfg(not(unix))]
-        {
-            let _ = component;
-            Err(StoreError::Permissions)
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let metadata =
-                fs::symlink_metadata(self.path.join(component)).map_err(missing_is_corrupt)?;
-            if !metadata.is_dir()
-                || metadata.mode() & 0o077 != 0
-                || metadata.uid() != fs::metadata(&self.path)?.uid()
-            {
-                return Err(StoreError::Permissions);
-            }
-            Ok(())
+        let owner = store_owner(&self.path)?;
+        match focal_platform::fs::private_dir_owner(&self.path.join(component)) {
+            Ok(Some(found)) if found == owner => Ok(()),
+            Ok(_) => Err(StoreError::Permissions),
+            Err(error) => Err(missing_is_corrupt(error)),
         }
     }
     pub(crate) fn read(
@@ -426,13 +355,9 @@ impl Directory {
             // its checksum and both paths still name this exact private inode.
             self.check_link_pair(&path, &temporary, &file)?;
             fs::remove_file(&temporary)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                check_open_file(&path, &file, fs::metadata(&self.path)?.uid())?;
-            }
+            check_open_file(&path, &file, &store_owner(&self.path)?)?;
         }
-        File::open(parent(&path))?.sync_all()?;
+        sync_dir(parent(&path))?;
         let mut payload = Vec::new();
         payload
             .try_reserve_exact(length)
@@ -450,19 +375,13 @@ impl Directory {
         let path = self.path.join(relative);
         let temporary = path.with_extension("pending");
         match fs::symlink_metadata(&temporary) {
-            Ok(metadata) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    if metadata.nlink() == 2 {
-                        // Recover a prior no-clobber publication before stale
-                        // temporary cleanup; every other linked shape rejects.
-                        let limit = self.record_limit(relative)?;
-                        self.read(relative, magic, limit)?;
-                    }
+            Ok(_) => {
+                if focal_platform::fs::path_hard_link_count(&temporary)? == 2 {
+                    // Recover a prior no-clobber publication before stale
+                    // temporary cleanup; every other linked shape rejects.
+                    let limit = self.record_limit(relative)?;
+                    self.read(relative, magic, limit)?;
                 }
-                #[cfg(not(unix))]
-                let _ = metadata;
                 if temporary.try_exists()? {
                     self.check_path(&temporary)?;
                     fs::remove_file(&temporary)?;
@@ -477,7 +396,7 @@ impl Directory {
         let length = u32::try_from(payload.len())
             .map_err(|_| StoreError::Capacity)?
             .to_be_bytes();
-        let mut file = options().write(true).create_new(true).open(&temporary)?;
+        let mut file = focal_platform::fs::create_private_new(&temporary, false, true)?;
         let mut hash = blake3::Hasher::new();
         hash.update(magic);
         hash.update(&length);
@@ -493,7 +412,7 @@ impl Directory {
             fs::hard_link(&temporary, &path)?;
             fs::remove_file(&temporary)?;
         }
-        File::open(parent(&path))?.sync_all()?;
+        sync_dir(parent(&path))?;
         Ok(())
     }
     pub(crate) fn remove_record(&self, relative: &str) -> Result<(), StoreError> {
@@ -504,7 +423,7 @@ impl Directory {
             Err(StoreError::Corrupt) if !self.exists(relative)? => {}
             Err(error) => return Err(error),
         }
-        File::open(parent(&path))?.sync_all()?;
+        sync_dir(parent(&path))?;
         Ok(())
     }
     fn record_limit(&self, relative: &str) -> Result<usize, StoreError> {
@@ -534,24 +453,15 @@ impl Directory {
         Ok(super::PREPARED_BYTES)
     }
     fn open_link_pair(&self, path: &Path, temporary: &Path) -> Result<File, StoreError> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let owner = fs::metadata(&self.path)?.uid();
-            check_file_links(path, owner, 2)?;
-            check_file_links(temporary, owner, 2).map_err(|error| match error {
-                StoreError::Corrupt => StoreError::Permissions,
-                other => other,
-            })?;
-            let file = File::open(path).map_err(missing_is_corrupt)?;
-            self.check_link_pair(path, temporary, &file)?;
-            Ok(file)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = (path, temporary);
-            Err(StoreError::Permissions)
-        }
+        let owner = store_owner(&self.path)?;
+        check_file_links(path, &owner, 2)?;
+        check_file_links(temporary, &owner, 2).map_err(|error| match error {
+            StoreError::Corrupt => StoreError::Permissions,
+            other => other,
+        })?;
+        let file = File::open(path).map_err(missing_is_corrupt)?;
+        self.check_link_pair(path, temporary, &file)?;
+        Ok(file)
     }
     fn check_link_pair(
         &self,
@@ -559,65 +469,31 @@ impl Directory {
         temporary: &Path,
         file: &File,
     ) -> Result<(), StoreError> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let owner = fs::metadata(&self.path)?.uid();
-            check_file_links(path, owner, 2)?;
-            check_file_links(temporary, owner, 2)?;
-            let metadata = file.metadata()?;
-            if !metadata.is_file()
-                || metadata.uid() != owner
-                || metadata.mode() & 0o077 != 0
-                || metadata.nlink() != 2
-            {
+        let owner = store_owner(&self.path)?;
+        check_file_links(path, &owner, 2)?;
+        check_file_links(temporary, &owner, 2)?;
+        // The two names must be the very same file (one inode, two links) that
+        // the open handle refers to: an owner-private regular file linked twice.
+        if !focal_platform::fs::check_open_private_file_links(path, file, &owner, 2)? {
+            return Err(StoreError::Permissions);
+        }
+        let identity = focal_platform::fs::file_identity(file)?;
+        for name in [path, temporary] {
+            if focal_platform::fs::path_identity(name)? != identity {
                 return Err(StoreError::Permissions);
             }
-            for name in [path, temporary] {
-                let named = fs::symlink_metadata(name)?;
-                if named.dev() != metadata.dev() || named.ino() != metadata.ino() {
-                    return Err(StoreError::Permissions);
-                }
-            }
-            Ok(())
         }
-        #[cfg(not(unix))]
-        {
-            let _ = (path, temporary, file);
-            Err(StoreError::Permissions)
-        }
+        Ok(())
     }
     fn check_path(&self, path: &Path) -> Result<(), StoreError> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            check_file(path, fs::metadata(&self.path)?.uid())
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = path;
-            Err(StoreError::Permissions)
-        }
+        check_file(path, &store_owner(&self.path)?)
     }
     fn checked_open(&self, path: &Path) -> Result<File, StoreError> {
         self.check_path(path)?;
         let file = File::open(path).map_err(missing_is_corrupt)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            check_open_file(path, &file, fs::metadata(&self.path)?.uid())?;
-        }
+        check_open_file(path, &file, &store_owner(&self.path)?)?;
         Ok(file)
     }
-}
-fn options() -> OpenOptions {
-    let mut options = OpenOptions::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options
 }
 fn read_marker_prefix(mut file: &File, expected: &[u8; 8]) -> Result<bool, StoreError> {
     let length = usize::try_from(file.metadata()?.len()).map_err(|_| StoreError::Corrupt)?;
@@ -632,6 +508,20 @@ fn read_marker_prefix(mut file: &File, expected: &[u8; 8]) -> Result<bool, Store
     }
     Ok(length == 8)
 }
+fn sync_dir(path: &Path) -> Result<(), StoreError> {
+    // Unix makes a new or removed directory entry durable with an fsync of the
+    // directory; Windows uses write-through file writes and rename and does not
+    // flush a directory handle.
+    #[cfg(unix)]
+    {
+        File::open(path)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
 fn parent(path: &Path) -> &Path {
     path.parent()
         .filter(|value| !value.as_os_str().is_empty())
@@ -644,37 +534,25 @@ fn missing_is_corrupt(error: std::io::Error) -> StoreError {
         error.into()
     }
 }
-#[cfg(unix)]
-fn check_file(path: &Path, owner: u32) -> Result<(), StoreError> {
+type Owner = focal_platform::fs::Owner;
+fn store_owner(path: &Path) -> Result<Owner, StoreError> {
+    focal_platform::fs::owner_at(path).map_err(Into::into)
+}
+fn check_file(path: &Path, owner: &Owner) -> Result<(), StoreError> {
     check_file_links(path, owner, 1)
 }
-#[cfg(unix)]
-fn check_file_links(path: &Path, owner: u32, links: u64) -> Result<(), StoreError> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = fs::symlink_metadata(path).map_err(missing_is_corrupt)?;
-    if !metadata.is_file()
-        || metadata.uid() != owner
-        || metadata.mode() & 0o077 != 0
-        || metadata.nlink() != links
-    {
-        return Err(StoreError::Permissions);
+fn check_file_links(path: &Path, owner: &Owner, links: u64) -> Result<(), StoreError> {
+    match focal_platform::fs::check_private_file(path, owner, links) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(StoreError::Permissions),
+        Err(error) => Err(missing_is_corrupt(error)),
     }
-    Ok(())
 }
-#[cfg(unix)]
-fn check_open_file(path: &Path, file: &File, owner: u32) -> Result<(), StoreError> {
-    use std::os::unix::fs::MetadataExt;
+fn check_open_file(path: &Path, file: &File, owner: &Owner) -> Result<(), StoreError> {
     check_file(path, owner)?;
-    let path_meta = fs::symlink_metadata(path)?;
-    let metadata = file.metadata()?;
-    if path_meta.dev() != metadata.dev()
-        || path_meta.ino() != metadata.ino()
-        || !metadata.is_file()
-        || metadata.uid() != owner
-        || metadata.mode() & 0o077 != 0
-        || metadata.nlink() != 1
-    {
-        return Err(StoreError::Permissions);
+    match focal_platform::fs::check_open_private_file(path, file, owner) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(StoreError::Permissions),
+        Err(error) => Err(missing_is_corrupt(error)),
     }
-    Ok(())
 }

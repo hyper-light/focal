@@ -26,9 +26,9 @@ use windows_sys::Win32::{
         SECURITY_DESCRIPTOR, SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER, TokenUser,
     },
     Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_NORMAL,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, GetDiskFreeSpaceExW, GetFileInformationByHandle,
+        BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateDirectoryW, CreateFileW,
+        FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, GetDiskFreeSpaceExW, GetFileInformationByHandle,
         MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_ALWAYS, OPEN_EXISTING,
     },
     System::{
@@ -255,6 +255,20 @@ impl OwnerOnlyDacl {
 
 /// Open a file with an owner-only DACL when created.
 pub(crate) fn open_private(path: &Path, read: bool, write: bool, create: bool) -> io::Result<File> {
+    open_with(
+        path,
+        read,
+        write,
+        if create { OPEN_ALWAYS } else { OPEN_EXISTING },
+    )
+}
+
+/// Create a new owner-only file. Errors with `AlreadyExists` if it exists.
+pub(crate) fn create_private_new(path: &Path, read: bool, write: bool) -> io::Result<File> {
+    open_with(path, read, write, CREATE_NEW)
+}
+
+fn open_with(path: &Path, read: bool, write: bool, disposition: u32) -> io::Result<File> {
     let wide = wide(path);
     let mut dacl = OwnerOnlyDacl::new()?;
     let mut attributes = dacl.attributes();
@@ -265,11 +279,11 @@ pub(crate) fn open_private(path: &Path, read: bool, write: bool, create: bool) -
     if write {
         access |= FILE_GENERIC_WRITE;
     }
-    let disposition = if create { OPEN_ALWAYS } else { OPEN_EXISTING };
     // SAFETY: `wide` is NUL-terminated; `attributes` (and the DACL/ACL/SID it
     // points to) live across the call in `dacl`. CreateFileW returns an owned
     // handle or INVALID_HANDLE_VALUE. FILE_SHARE_READ|WRITE match the locking
-    // model the callers already used.
+    // model the callers already used. CREATE_NEW fails with ERROR_FILE_EXISTS,
+    // which the standard library maps to io::ErrorKind::AlreadyExists.
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
