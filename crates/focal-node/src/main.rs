@@ -515,7 +515,20 @@ async fn shutdown_signal() -> std::io::Result<()> {
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::select! { result=tokio::signal::ctrl_c()=>result, _=terminate.recv()=>Ok(()) }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows;
+        let mut ctrl_break = windows::ctrl_break()?;
+        let mut ctrl_close = windows::ctrl_close()?;
+        let mut ctrl_shutdown = windows::ctrl_shutdown()?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = ctrl_break.recv() => Ok(()),
+            _ = ctrl_close.recv() => Ok(()),
+            _ = ctrl_shutdown.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     tokio::signal::ctrl_c().await
 }
 fn read_file(path: &Path, max: usize) -> Result<Vec<u8>> {

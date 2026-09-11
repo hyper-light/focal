@@ -45,7 +45,7 @@ where
                 4096,
             )
             .await?;
-            stream.shutdown().await?;
+            let _ = stream.shutdown().await;
             return Ok(());
         }
     };
@@ -58,7 +58,10 @@ where
     .await?;
     let request: RequestEnvelope =
         read_frame(&mut stream, FrameKind::Request, negotiated.max_frame_bytes).await?;
-    require_end(&mut stream).await?;
+    // One length-delimited request per connection: the exchange never depends
+    // on a write-half EOF, since a named pipe has no half-close. The kernel has
+    // already authenticated a same-user peer; trailing bytes are ignored and
+    // the one-shot connection is closed after the reply.
     let mut limits = limits;
     limits.max_frame_bytes = negotiated.max_frame_bytes;
     limits.max_items = negotiated.max_items;
@@ -74,7 +77,9 @@ where
         negotiated.max_frame_bytes,
     )
     .await?;
-    stream.shutdown().await?;
+    // Best-effort close after the reply is written; a named-pipe shutdown is a
+    // no-op and the instance is closed when the connection drops.
+    let _ = stream.shutdown().await;
     Ok(())
 }
 
@@ -117,9 +122,11 @@ where
         negotiated.max_frame_bytes,
     )
     .await?;
-    stream.shutdown().await?;
+    // No write-half shutdown before the reply: a named pipe cannot half-close,
+    // and the response is one length-delimited frame. Close (best-effort) only
+    // after it is read.
     let response = read_frame(&mut stream, FrameKind::Response, negotiated.max_frame_bytes).await?;
-    require_end(&mut stream).await?;
+    let _ = stream.shutdown().await;
     validate_response(request, &response, None, limits)?;
     Ok(response)
 }
