@@ -60,11 +60,9 @@ impl<H: RequestHandler> ClientTransport for EmbeddedTransport<H> {
     }
 }
 
-#[cfg(unix)]
 pub struct UnixTransport {
     remote: UnixRemote,
 }
-#[cfg(unix)]
 impl UnixTransport {
     pub fn connect(
         path: impl AsRef<std::path::Path>,
@@ -75,7 +73,6 @@ impl UnixTransport {
         })
     }
 }
-#[cfg(unix)]
 impl ClientTransport for UnixTransport {
     fn request<'a>(
         &'a self,

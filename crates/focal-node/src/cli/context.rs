@@ -827,14 +827,29 @@ fn enroll(
     })?;
     super::super::print_json(&serde_json::json!({"condition":"Enrolled","name":selected,"principal":ParticipantId(receipt.identity.principal),"request_id":pending.request_id(),"selected":false})).map_err(CliError::Other)
 }
+/// A secret credential (a private key) must be reachable only by its owner:
+/// mode `& 0o077 == 0` on Unix; owned by the current user on Windows, where an
+/// owner-only DACL is the access control.
+fn credential_is_owner_private(path: &Path, metadata: &fs::Metadata) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = path;
+        Ok(metadata.mode() & 0o077 == 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Ok(focal_platform::fs::owner_at(path)? == focal_platform::fs::current_owner()?)
+    }
+}
 fn read_credential(path: &Path, secret: bool) -> Result<Vec<u8>> {
-    use std::os::unix::fs::MetadataExt;
     let before = fs::symlink_metadata(path)?;
     if !before.is_file()
         || before.len() > 64 * 1024
         || before.len() == 0
-        || before.nlink() != 1
-        || (secret && before.mode() & 0o077 != 0)
+        || focal_platform::fs::path_hard_link_count(path)? != 1
+        || (secret && !credential_is_owner_private(path, &before)?)
     {
         return Err(InputError::Invalid(
             "credential must be a bounded regular file; keys must be owner-private",
@@ -843,7 +858,7 @@ fn read_credential(path: &Path, secret: bool) -> Result<Vec<u8>> {
     }
     let mut file = File::open(path)?;
     let opened = file.metadata()?;
-    if before.dev() != opened.dev() || before.ino() != opened.ino() {
+    if focal_platform::fs::path_identity(path)? != focal_platform::fs::file_identity(&file)? {
         return Err(InputError::Invalid("credential changed during open").into());
     }
     let length = usize::try_from(opened.len()).map_err(|_| InputError::Capacity)?;

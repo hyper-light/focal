@@ -471,8 +471,11 @@ fn prepare_volume(root: &Path, owner: &str) -> Result<()> {
         let _ = (uid, gid);
         return Err("prepare-volume needs a Unix filesystem".into());
     }
-    File::open(root)?.sync_all()?;
-    print_json(&serde_json::json!({"condition":"VolumePrepared","path":root,"owner":owner}))
+    #[cfg(unix)]
+    {
+        File::open(root)?.sync_all()?;
+        print_json(&serde_json::json!({"condition":"VolumePrepared","path":root,"owner":owner}))
+    }
 }
 async fn start_network(settings: Settings) -> Result<()> {
     let service = focal_node::network_service::NetworkService::open(&settings).await?;
