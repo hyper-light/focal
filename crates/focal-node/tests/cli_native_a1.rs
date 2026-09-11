@@ -38,6 +38,21 @@ fn private(path: &Path) {
     #[cfg(not(unix))]
     let _ = path;
 }
+fn scratch(prefix: &str) -> tempfile::TempDir {
+    // Unix keeps the path short for the Unix-socket path limit (/tmp); Windows
+    // names its pipe by a hash of the data directory, so the default temp root
+    // is fine there.
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    #[cfg(unix)]
+    {
+        builder.tempdir_in("/tmp").unwrap()
+    }
+    #[cfg(not(unix))]
+    {
+        builder.tempdir().unwrap()
+    }
+}
 #[path = "support/ports.rs"]
 mod ports;
 fn address() -> String {
@@ -164,14 +179,8 @@ const PROOF: &str = r#"{"passed":3,"failed":0,"skipped":0}"#;
 
 #[test]
 fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive_a_kill() {
-    let founder = tempfile::Builder::new()
-        .prefix("focal-native-a1-")
-        .tempdir_in("/tmp")
-        .unwrap();
-    let client = tempfile::Builder::new()
-        .prefix("focal-native-a1-client-")
-        .tempdir_in("/tmp")
-        .unwrap();
+    let founder = scratch("focal-native-a1-");
+    let client = scratch("focal-native-a1-client-");
     private(founder.path());
     private(client.path());
     let root = founder.path();
@@ -387,9 +396,9 @@ fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive
     // A reply lost on a closed stdout leaves the exact frame journaled; the
     // recovery command replays it and finds the committed receipt.
     {
-        use std::os::{fd::OwnedFd, unix::net::UnixStream};
-        let (closed, output) = UnixStream::pair().unwrap();
-        drop(closed);
+        // A stdout whose reader is gone: writes fail, mimicking a lost reply.
+        let (reader, output) = std::io::pipe().unwrap();
+        drop(reader);
         let second = json!({
             "description": "A second request.",
             "target": alice,
@@ -407,7 +416,7 @@ fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive
                 "--format",
                 "json",
             ])
-            .stdout(Stdio::from(OwnedFd::from(output)))
+            .stdout(Stdio::from(output))
             .stderr(Stdio::piped());
         let failed = command.output().unwrap();
         assert!(!failed.status.success());
