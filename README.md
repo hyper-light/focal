@@ -72,10 +72,13 @@ focal --help
 
 > [!NOTE]
 > The release workflow builds one raw binary per platform (macOS arm64 and x64, Linux arm64
-> and x64 on glibc and static musl), smoke-tests each on its own hardware, and attaches them
-> with `SHA256SUMS`. When a release is published, download the file for your platform, check
-> its digest, `chmod +x` it and put it on your `PATH`; nothing else is needed. Windows needs
-> its own transport and filesystem port first.
+> and x64 on glibc and static musl, and Windows x64 and arm64), smoke-tests each on its own
+> hardware, and attaches them with `SHA256SUMS`. When a release is published, download the
+> file for your platform, check its digest, `chmod +x` it (or, on Windows, unblock the
+> `.exe`) and put it on your `PATH`; nothing else is needed. The native Windows build
+> compiles in CI, and its filesystem layer (owner-only DACLs, file identity) and named-pipe
+> local transport are tested there on every push; the full Windows CLI/MCP test lane and
+> signed binaries are landing.
 
 ## Quickstart
 
