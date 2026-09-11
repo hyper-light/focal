@@ -1212,7 +1212,7 @@ fn durable_directory(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 fn sync_directory(path: &Path) -> std::io::Result<()> {
-    File::open(path)?.sync_all()
+    focal_platform::sync_dir(path)
 }
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()

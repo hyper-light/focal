@@ -133,6 +133,23 @@ pub fn path_from_bytes(bytes: &[u8]) -> Option<std::path::PathBuf> {
     }
 }
 
+/// Make a directory entry (a create, rename or delete within it) durable. On
+/// Unix this opens the directory and fsyncs it. On Windows a directory handle
+/// cannot be flushed (opening one for `sync_all` fails with access-denied);
+/// durability there comes from write-through file writes and `MoveFileExW`
+/// (`atomic_replace`), so this is a no-op (decision 10, doc 20 §3).
+pub fn sync_dir(path: &std::path::Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 pub mod fs;
 #[cfg(windows)]
 mod windows;

@@ -526,7 +526,7 @@ fn segment_path(directory: &Path, generation: u64, segment: u64) -> PathBuf {
 }
 
 fn sync_dir(directory: &Path) -> Result<(), LogError> {
-    File::open(directory)?.sync_all()?;
+    focal_platform::sync_dir(directory)?;
     Ok(())
 }
 
