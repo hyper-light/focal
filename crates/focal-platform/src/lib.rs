@@ -68,6 +68,7 @@ pub fn available_space(_path: &std::path::Path) -> Option<u64> {
     None
 }
 
+pub mod fs;
 #[cfg(windows)]
 mod windows;
 
