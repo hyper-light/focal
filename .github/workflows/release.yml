@@ -86,6 +86,16 @@ jobs:
       - name: Install protobuf compiler (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
+      - name: Install protobuf compiler (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver=29.3
+          url="https://github.com/protocolbuffers/protobuf/releases/download/v${ver}/protoc-${ver}-win64.zip"
+          curl -sSL "$url" -o protoc.zip
+          7z x protoc.zip -oprotoc-dist >/dev/null
+          echo "PROTOC=$(pwd)/protoc-dist/bin/protoc.exe" >> "$GITHUB_ENV"
       - name: Build native executable
         if: ${{ !matrix.musl }}
         run: bash scripts/cargo.sh build --release --locked -p focal-node --bin focal --target "$TARGET"
@@ -104,8 +114,10 @@ jobs:
             '
           sudo chown -R "$(id -u):$(id -g)" target
       - name: Smoke the actual server, CLI, crash recovery and MCP executable
+        shell: bash
         run: python3 scripts/release/smoke.py "target/$TARGET/release/focal"
       - name: Verify target and staticness; stage raw binary and provenance
+        shell: bash
         run: python3 scripts/release/release.py stage --target "$TARGET" --output staged
       - uses: actions/upload-artifact@v4.6.2
         with:

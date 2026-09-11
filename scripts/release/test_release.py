@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -190,6 +191,52 @@ class ReleaseTests(unittest.TestCase):
     def test_existing_release_is_never_modified(self):
         calls = self.publish_fixture(exists=True)
         self.assertFalse(any(call[0] in {"POST", "upload", "PATCH"} for call in calls))
+
+
+
+class PortableExecutableTests(unittest.TestCase):
+    """The import-table parser reads DLL names from a synthetic PE32+ image."""
+
+    @staticmethod
+    def image(dll_names):
+        section_rva = 0x200
+        descriptors = section_rva
+        names_at = descriptors + 20 * (len(dll_names) + 1)
+        data = bytearray(0x400)
+        data[0:2] = b"MZ"
+        struct.pack_into("<I", data, 0x3C, 0x40)  # e_lfanew
+        pe = 0x40
+        data[pe : pe + 4] = b"PE\0\0"
+        coff = pe + 4
+        struct.pack_into("<H", data, coff, 0x8664)      # machine x86_64
+        struct.pack_into("<H", data, coff + 2, 1)        # one section
+        struct.pack_into("<H", data, coff + 16, 240)     # size of optional header
+        optional = coff + 20
+        struct.pack_into("<H", data, optional, 0x20B)    # PE32+ magic
+        struct.pack_into("<II", data, optional + 112 + 8, section_rva, 20 * (len(dll_names) + 1))
+        section = optional + 240
+        data[section : section + 8] = b".idata\0\0"
+        struct.pack_into("<IIII", data, section + 8, 0x200, section_rva, 0x200, section_rva)
+        cursor = names_at
+        for index, name in enumerate(dll_names):
+            struct.pack_into("<IIIII", data, descriptors + 20 * index, 0, 0, 0, cursor, 0)
+            encoded = name.encode() + b"\0"
+            data[cursor : cursor + len(encoded)] = encoded
+            cursor += len(encoded)
+        return bytes(data)
+
+    def test_single_import_is_read(self):
+        self.assertEqual(release.pe_imported_dlls(self.image(["KERNEL32.dll"])), {"kernel32.dll"})
+
+    def test_several_imports_are_read_and_lowercased(self):
+        self.assertEqual(
+            release.pe_imported_dlls(self.image(["KERNEL32.dll", "bcrypt.dll", "WS2_32.dll"])),
+            {"kernel32.dll", "bcrypt.dll", "ws2_32.dll"},
+        )
+
+    def test_a_non_pe_image_is_refused(self):
+        with self.assertRaises(SystemExit):
+            release.pe_imported_dlls(b"\x7fELF" + b"\0" * 60)
 
 
 if __name__ == "__main__":

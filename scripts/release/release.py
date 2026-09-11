@@ -109,9 +109,52 @@ def guard():
     print(f"Guard passed for workspace {version}, Rust {toolchain}, {len(platforms['include'])} targets")
 
 
+def pe_imported_dlls(data):
+    """The set of DLL names a PE32+ image imports, parsed without any library."""
+    require(len(data) >= 0x40 and data[:2] == b"MZ", "not a PE image")
+    lfanew = struct.unpack_from("<I", data, 0x3C)[0]
+    require(data[lfanew : lfanew + 4] == b"PE\0\0", "missing PE signature")
+    coff = lfanew + 4
+    number_of_sections = struct.unpack_from("<H", data, coff + 2)[0]
+    size_of_optional = struct.unpack_from("<H", data, coff + 16)[0]
+    optional = coff + 20
+    require(struct.unpack_from("<H", data, optional)[0] == 0x20B, "expected a PE32+ (64-bit) image")
+    # Data directory 1 is the import table (RVA, size); PE32+ directories begin
+    # at optional-header offset 112, each eight bytes.
+    import_rva = struct.unpack_from("<I", data, optional + 112 + 8)[0]
+    sections = []
+    for index in range(number_of_sections):
+        base = optional + size_of_optional + 40 * index
+        virtual_size, virtual_address, raw_size, raw_pointer = struct.unpack_from("<IIII", data, base + 8)
+        sections.append((virtual_address, max(virtual_size, raw_size), raw_pointer))
+
+    def to_offset(rva):
+        for virtual_address, span, raw_pointer in sections:
+            if virtual_address <= rva < virtual_address + span:
+                return raw_pointer + (rva - virtual_address)
+        return None
+
+    dlls = set()
+    if import_rva == 0:
+        return dlls
+    table = to_offset(import_rva)
+    require(table is not None, "import table RVA is outside every section")
+    for index in range(4096):
+        descriptor = table + 20 * index
+        fields = struct.unpack_from("<IIIII", data, descriptor)
+        if fields == (0, 0, 0, 0, 0):
+            break
+        name = to_offset(fields[3])
+        require(name is not None, "import name RVA is outside every section")
+        dlls.add(data[name : data.index(b"\0", name)].decode("ascii", "replace").lower())
+    return dlls
+
+
 def verify_native(binary, row, version):
     architecture = row["target"].split("-")[0]
-    machine = {"arm64": "aarch64", "AMD64": "x86_64"}.get(platform.machine(), platform.machine())
+    machine = {"arm64": "aarch64", "AMD64": "x86_64", "ARM64": "aarch64"}.get(
+        platform.machine(), platform.machine()
+    )
     require(machine == architecture, "cross-compiled output must be smoked on its native architecture")
     with binary.open("rb") as source:
         header = source.read(64)
@@ -133,6 +176,20 @@ def verify_native(binary, row, version):
             versions = re.findall(r"GLIBC_(\d+)\.(\d+)(?:\.(\d+))?", output("readelf", "--version-info", str(binary)))
             require(all(tuple(int(part or 0) for part in value) <= (2, 39, 0) for value in versions),
                     "GNU executable exceeds the documented glibc 2.39 baseline")
+    elif "windows" in row["target"]:
+        require(platform.system() == "Windows", "Windows binary needs a Windows smoke host")
+        require(header[:2] == b"MZ", "expected a PE image")
+        data = binary.read_bytes()
+        lfanew = struct.unpack_from("<I", data, 0x3C)[0]
+        require(struct.unpack_from("<H", data, lfanew + 4)[0] == {"x86_64": 0x8664, "aarch64": 0xAA64}[architecture],
+                "PE machine differs from asset name")
+        # Only the OS libraries Focal links: kernel, security (SID/DACL), the
+        # RNG, sockets and the API-set stubs. No bundled runtime, no OpenSSL.
+        allowed = {"kernel32.dll", "advapi32.dll", "bcrypt.dll", "ntdll.dll", "ws2_32.dll",
+                   "userenv.dll", "secur32.dll", "crypt32.dll", "rpcrt4.dll", "kernelbase.dll"}
+        unexpected = {name for name in pe_imported_dlls(data)
+                      if name not in allowed and not name.startswith("api-ms-win-")}
+        require(not unexpected, f"unpackaged Windows imports: {sorted(unexpected)}")
     else:
         require(platform.system() == "Darwin", "macOS binary needs a macOS smoke host")
         require(header[:4] == b"\xcf\xfa\xed\xfe", "expected little-endian Mach-O64")
@@ -149,7 +206,8 @@ def stage(target, destination):
     matches = [row for row in platforms["include"] if row["target"] == target]
     require(len(matches) == 1, "target is absent from the release matrix")
     row = matches[0]
-    binary = ROOT / "target" / target / "release" / "focal"
+    name = "focal.exe" if "windows" in target else "focal"
+    binary = ROOT / "target" / target / "release" / name
     require(binary.is_file() and not binary.is_symlink(), "release output is not a regular executable")
     verify_native(binary, row, version)
     destination.mkdir(parents=True, exist_ok=False)
