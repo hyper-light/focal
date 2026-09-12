@@ -623,6 +623,13 @@ impl ContentStore {
         let buffer_len = usize::try_from(upload.offset.min(self.limits.chunk_bytes as u64))
             .map_err(|_| ContentError::Capacity)?;
         let mut buffer = zeroed_buffer(buffer_len)?;
+        // The chunk count is known from the object size and chunk length;
+        // reserve once instead of growing the manifest by one per chunk.
+        let chunk_count = usize::try_from(upload.offset.div_ceil(buffer_len.max(1) as u64))
+            .map_err(|_| ContentError::Capacity)?;
+        chunks
+            .try_reserve_exact(chunk_count)
+            .map_err(|_| ContentError::Capacity)?;
         let mut remaining = upload.offset;
         while remaining > 0 {
             let count = usize::try_from(remaining.min(buffer.len() as u64))
@@ -632,7 +639,6 @@ impl ContentStore {
             hasher.update(block);
             let hash = ContentHash(*blake3::hash(block).as_bytes());
             install_verified_chunk(&directory.join(format!("{hash}.chunk")), block, hash)?;
-            chunks.try_reserve(1).map_err(|_| ContentError::Capacity)?;
             chunks.push(Chunk {
                 hash,
                 length: count as u32,
@@ -1215,7 +1221,12 @@ fn sync_directory(path: &Path) -> std::io::Result<()> {
     focal_platform::sync_dir(path)
 }
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 #[cfg(test)]

@@ -467,9 +467,8 @@ fn request_shape(
     limits: &WireLimits,
     peer: Option<&AuthenticatedPeer>,
 ) -> Result<(), AccessError> {
-    let bytes = encode_payload(request, limits.max_frame_bytes)
-        .map_err(|_| AccessError::Capacity)?
-        .len() as u64;
+    let bytes = crate::frame::payload_len(request, limits.max_frame_bytes)
+        .map_err(|_| AccessError::Capacity)? as u64;
     let items = match &request.operation {
         Operation::RequestStreamControl { cluster, command } => {
             let principal = peer.ok_or(AccessError::UnsupportedOperation)?.principal();

@@ -72,6 +72,20 @@ fn payload_buffer(length: usize) -> Result<Vec<u8>, WireError> {
     Ok(bytes)
 }
 
+/// The exact serialized length of `value`, enforcing the same frame limit as
+/// [encode_payload] but without allocating or serializing into a buffer. Use
+/// this on the per-message ingress/measure paths that only need the length.
+pub fn payload_len<T: Serialize>(value: &T, limit: u32) -> Result<usize, WireError> {
+    if u64::from(limit) > MAX_FRAME_BYTES as u64 {
+        return Err(WireError::Limit);
+    }
+    let size =
+        postcard::experimental::serialized_size(value).map_err(|_| WireError::InvalidFrame)?;
+    if size > limit as usize {
+        return Err(WireError::Limit);
+    }
+    Ok(size)
+}
 pub fn encode_payload<T: Serialize>(value: &T, limit: u32) -> Result<Vec<u8>, WireError> {
     if u64::from(limit) > MAX_FRAME_BYTES as u64 {
         return Err(WireError::Limit);

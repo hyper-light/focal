@@ -637,7 +637,7 @@ pub fn validate_response(
                 }
                 last = Some(delta.id);
             }
-            if batch.next != last || encode_payload(batch, sub.credits.bytes).is_err() {
+            if batch.next != last || payload_len(batch, sub.credits.bytes).is_err() {
                 return Err(WireError::Limit);
             }
         }
@@ -1019,7 +1019,7 @@ pub(crate) fn validate_stream_response(
         let cursor = match event {
             StreamEvent::Delta { cursor, delta } => {
                 count = count.saturating_add(1);
-                bytes = bytes.saturating_add(encode_payload(event, limits.max_frame_bytes)?.len());
+                bytes = bytes.saturating_add(payload_len(event, limits.max_frame_bytes)?);
                 if delta.id.ledger != ledger || cursor.position != Position::after_delta(delta.id) {
                     return Err(WireError::InvalidFrame);
                 }

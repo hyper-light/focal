@@ -573,17 +573,23 @@ impl PeerConnectionPool {
         if state.closed {
             return Err(PeerSendError::Closed);
         }
-        let endpoint = state
-            .routes
-            .get(&target)
-            .cloned()
-            .ok_or(PeerSendError::NoRoute)?;
+        // Validate the route without cloning the endpoint; the steady-state
+        // cache-hit path below returns without materializing it.
+        if !state.routes.contains_key(&target) {
+            return Err(PeerSendError::NoRoute);
+        }
         state.clock = state.clock.saturating_add(1);
         let clock = state.clock;
         if let Some(entry) = state.cached.get_mut(&target) {
             entry.used = clock;
             return Ok(entry.slot.clone());
         }
+        // Cache miss only: clone the endpoint the connection open needs.
+        let endpoint = state
+            .routes
+            .get(&target)
+            .cloned()
+            .ok_or(PeerSendError::NoRoute)?;
         if self.connections.available_permits() == 0 {
             let victim = state
                 .cached
