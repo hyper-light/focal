@@ -310,7 +310,7 @@ fn check_open_file(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn options() -> std::fs::OpenOptions {
     use std::os::unix::fs::OpenOptionsExt;
     let mut options = std::fs::OpenOptions::new();
@@ -329,10 +329,15 @@ enum Fault {
 mod tests {
     use super::*;
     use focal_model::{LedgerId, ParticipantId, SessionId, TenantId};
-    use std::os::unix::fs::{PermissionsExt, symlink};
     fn private_root() -> tempfile::TempDir {
         let temp = tempfile::tempdir().unwrap();
-        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        // Unix tightens the temp dir to 0700; a fresh Windows temp dir already
+        // inherits an owner-only DACL from the temp root.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
         temp
     }
     fn context() -> OperationContext {
@@ -354,14 +359,18 @@ mod tests {
         let store = open(temp.path()).unwrap();
         assert_eq!(store.root(), temp.path().join(STORE));
         assert_eq!(store.usage().unwrap().operations, 0);
-        assert_eq!(
-            fs::metadata(temp.path().join(MARKER))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(temp.path().join(MARKER))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
         let original = fs::read(temp.path().join(STORE).join("catalogue.bin")).unwrap();
         let boot = Bootstrap::open(temp.path()).unwrap();
         let mut other = context();
@@ -424,30 +433,39 @@ mod tests {
         fs::write(&marker, corrupt).unwrap();
         assert!(matches!(open(temp.path()), Err(BootstrapError::Incomplete)));
         fs::write(&marker, &original).unwrap();
-        fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(matches!(
-            open(temp.path()),
-            Err(BootstrapError::Permissions)
-        ));
-        fs::remove_file(&marker).unwrap();
-        symlink(temp.path().join("missing"), &marker).unwrap();
-        assert!(matches!(
-            open(temp.path()),
-            Err(BootstrapError::Permissions)
-        ));
-        fs::remove_file(&marker).unwrap();
-        let mut file = options()
-            .write(true)
-            .create_new(true)
-            .open(&marker)
-            .unwrap();
-        file.write_all(&original).unwrap();
-        drop(file);
-        fs::hard_link(&marker, temp.path().join("linked")).unwrap();
-        assert!(matches!(
-            open(temp.path()),
-            Err(BootstrapError::Permissions)
-        ));
+        // POSIX permission/symlink/hardlink rejection: a group/other-readable
+        // mode, a reparse-point marker and a multiply-linked marker are all
+        // refused. Windows enforces the private-file contract through DACLs,
+        // reparse-point refusal and the file link count instead (covered by the
+        // focal-platform FFI suite), so this shape is Unix-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(matches!(
+                open(temp.path()),
+                Err(BootstrapError::Permissions)
+            ));
+            fs::remove_file(&marker).unwrap();
+            symlink(temp.path().join("missing"), &marker).unwrap();
+            assert!(matches!(
+                open(temp.path()),
+                Err(BootstrapError::Permissions)
+            ));
+            fs::remove_file(&marker).unwrap();
+            let mut file = options()
+                .write(true)
+                .create_new(true)
+                .open(&marker)
+                .unwrap();
+            file.write_all(&original).unwrap();
+            drop(file);
+            fs::hard_link(&marker, temp.path().join("linked")).unwrap();
+            assert!(matches!(
+                open(temp.path()),
+                Err(BootstrapError::Permissions)
+            ));
+        }
     }
     #[test]
     fn entered_async_runtime_is_rejected_before_any_context_or_bootstrap_io() {

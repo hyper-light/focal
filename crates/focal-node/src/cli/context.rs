@@ -878,10 +878,13 @@ fn read_credential(path: &Path, secret: bool) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     fn settings() -> (tempfile::TempDir, Settings) {
         let root = tempfile::tempdir().unwrap();
-        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let mut settings = Settings::default();
         settings.node.data_dir = Some(root.path().into());
         (root, settings)
@@ -957,8 +960,15 @@ mod tests {
         let forged = br#"{"transport":"unix","node_data_dir":"/tmp","runtime":true}"#;
         assert!(parse_document::<Profile>(forged, InputFormat::Json).is_err());
     }
+    // POSIX permission/symlink/hardlink rejection: read_credential refuses a
+    // group/other-readable mode, a symlinked credential and a multiply-linked
+    // one. Windows enforces the private-credential contract through DACLs,
+    // reparse-point refusal and the link count (focal-platform FFI suite), so
+    // this shape is Unix-only.
+    #[cfg(unix)]
     #[test]
     fn credential_loading_rejects_symlinks_hardlinks_oversize_and_public_keys() {
+        use std::os::unix::fs::PermissionsExt;
         let (root, _) = settings();
         let path = root.path().join("key");
         fs::write(&path, b"key").unwrap();

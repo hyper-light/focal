@@ -554,7 +554,10 @@ pub(super) fn traversal(page: TraversalPage, format: OutputFormat) -> Result<()>
     }
 }
 
-#[cfg(test)]
+// The only output test builds a non-UTF8 path from raw bytes (OsStringExt),
+// which is a Unix-only construction; Windows paths are UTF-16 and cannot carry
+// arbitrary bytes, so the non-UTF8 output boundary is exercised on Unix.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::{ffi::OsString, os::unix::ffi::OsStringExt, path::PathBuf};
