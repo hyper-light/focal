@@ -226,8 +226,10 @@ impl Directory {
         Ok(())
     }
     pub(super) fn recover_marker(&self) -> Result<(), TransferError> {
+        // read() validates the record, which is already durable (write() fsyncs
+        // it and publishes write-through before the marker is created). A read
+        // handle needs no re-sync, and Windows rejects fsync of one.
         self.read()?;
-        self.open_file(self.layout.record(), false)?.sync_all()?;
         let marker = self.path.join(MARKER);
         if present(&marker)? {
             return self.check_marker();
