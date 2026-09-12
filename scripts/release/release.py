@@ -14,6 +14,8 @@ import subprocess
 import tempfile
 import tomllib
 
+import notices
+
 
 ROOT = Path(__file__).resolve().parents[2]
 CATALOG = Path(__file__).with_name("platforms.json")
@@ -24,6 +26,7 @@ REQUIRED_TARGETS = {
     "aarch64-apple-darwin", "x86_64-apple-darwin",
     "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl",
+    "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc",
 }
 
 
@@ -62,7 +65,7 @@ def configuration(root=ROOT, catalog=CATALOG):
     require(len(node) == 1 and node[0]["version"] == version, "Cargo.lock focal-node version mismatch")
     platforms = json.loads(catalog.read_text())
     rows = platforms["include"]
-    require({row["target"] for row in rows} == REQUIRED_TARGETS, "release matrix must contain all six required Unix targets")
+    require({row["target"] for row in rows} == REQUIRED_TARGETS, "release matrix must contain all eight required targets")
     require(len({row["target"] for row in rows}) == len(rows), "duplicate target")
     require(len({row["asset"] for row in rows}) == len(rows), "duplicate release asset")
     for row in rows:
@@ -252,7 +255,11 @@ def collect(source, destination, version, toolchain, platforms, commit):
             records.append(metadata)
         manifest = {"schema": 1, "version": version, "commit": commit, "toolchain": toolchain, "assets": records}
         (temporary / MANIFEST).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-        names = sorted([row["asset"] for row in records] + [MANIFEST])
+        # The third-party notices and the SPDX SBOM ship beside the binaries; the
+        # generator cross-checks the reviewed dependency roster against the locked
+        # graph, so drift fails the release rather than shipping stale notices.
+        extra = notices.generate(temporary, version, commit)
+        names = sorted([row["asset"] for row in records] + [MANIFEST] + extra)
         (temporary / SUMS).write_text("".join(f"{digest(temporary / name)}  {name}\n" for name in names))
         verify_collection(temporary, version, toolchain, platforms, commit)
         temporary.rename(destination)
@@ -262,14 +269,15 @@ def collect(source, destination, version, toolchain, platforms, commit):
 
 
 def verify_collection(directory, version, toolchain, platforms, commit):
-    expected = {row["asset"] for row in platforms["include"]} | {MANIFEST, SUMS}
+    expected = {row["asset"] for row in platforms["include"]} | {MANIFEST, SUMS, notices.NOTICES, notices.SBOM}
     require(regular_files(directory) == expected, "release asset set is incomplete or unexpected")
     manifest = json.loads((directory / MANIFEST).read_text())
     require((manifest.get("schema"), manifest.get("version"), manifest.get("toolchain"), manifest.get("commit"))
             == (1, version, toolchain, commit), "release manifest source mismatch")
     records = manifest["assets"]
     require(len(records) == len(platforms["include"]), "duplicate or missing manifest asset")
-    require({row["asset"] for row in records} == expected - {MANIFEST, SUMS}, "manifest asset names mismatch")
+    require({row["asset"] for row in records} == expected - {MANIFEST, SUMS, notices.NOTICES, notices.SBOM},
+            "manifest asset names mismatch")
     for row in records:
         platform_row = next(item for item in platforms["include"] if item["asset"] == row["asset"])
         require(all(row.get(name) == value for name, value in platform_row.items()), "manifest target mismatch")
@@ -339,11 +347,13 @@ def publish(directory):
             "Download the raw binary for your platform, verify it with SHA256SUMS, "
             "and make it executable. No Rust installation is needed.\n\n"
             "GNU Linux binaries require glibc 2.39 or later; musl binaries are static. "
-            "macOS binaries target macOS 15 or later. macOS signing/notarization and "
-            "Windows binaries are not provided by this release.\n\n"
+            "macOS binaries target macOS 15 or later. Windows binaries target Windows 10 "
+            "1809 / Server 2019 or later. macOS notarization and Windows Authenticode "
+            "signing are not applied by this release.\n\n"
             "Every asset passed native server startup, CLI mutation/read, acknowledged-write "
-            "crash recovery and MCP protocol/read smoke. See release-manifest.json for "
-            "target, source and digest details.\n")
+            "crash recovery and MCP protocol/read smoke. THIRD-PARTY-NOTICES.txt lists every "
+            "bundled crate and its license; sbom.spdx.json is the SPDX 2.3 bill of materials. "
+            "See release-manifest.json for target, source and digest details.\n")
     draft = api(f"{base}/releases", "POST", {"tag_name": tag, "target_commitish": commit,
                 "name": f"Focal {version}", "body": body, "draft": True,
                 "prerelease": "-" in version.split("+")[0]})

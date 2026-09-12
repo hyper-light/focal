@@ -181,9 +181,6 @@ wasm-bindgen-macro-support	0.2.128	MIT OR Apache-2.0	registry+https://github.com
 wasm-bindgen-shared	0.2.128	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
 web-time	1.1.0	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
 which	4.4.2	MIT	registry+https://github.com/rust-lang/crates.io-index
-winapi	0.3.9	MIT/Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
-winapi-i686-pc-windows-gnu	0.4.0	MIT/Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
-winapi-x86_64-pc-windows-gnu	0.4.0	MIT/Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
 windows-link	0.2.1	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
 windows-sys	0.52.0	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index
 windows-sys	0.61.2	MIT OR Apache-2.0	registry+https://github.com/rust-lang/crates.io-index

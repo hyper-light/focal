@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import notices
 import release
 
 
@@ -55,7 +56,7 @@ class ReleaseTests(unittest.TestCase):
     def test_collection_preserves_all_raw_bytes_and_checksums(self):
         self.collect()
         names = self.verify()
-        self.assertEqual(len(names), 8)
+        self.assertEqual(len(names), len(self.platforms["include"]) + 4)
         for row in self.platforms["include"]:
             name = row["asset"]
             self.assertEqual((self.source / f"binary-{name}" / name).read_bytes(), (self.destination / name).read_bytes())
@@ -235,9 +236,55 @@ class PortableExecutableTests(unittest.TestCase):
         )
 
     def test_a_non_pe_image_is_refused(self):
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(ValueError):
             release.pe_imported_dlls(b"\x7fELF" + b"\0" * 60)
 
+
+
+class NoticesTests(unittest.TestCase):
+    def test_drift_detection_rejects_a_stale_roster(self):
+        inventory = {("serde", "1.0.0"): {"name": "serde", "version": "1.0.0", "license": "MIT", "source": "reg"}}
+        packages = [
+            {"name": "serde", "version": "1.0.0", "source": "reg"},
+            {"name": "tokio", "version": "1.0.0", "source": "reg"},  # missing from roster
+            {"name": "focal-node", "version": "0.1.0", "source": None},  # workspace, not counted
+        ]
+        with self.assertRaises(SystemExit) as caught:
+            notices.check_drift(inventory, packages)
+        self.assertIn("tokio 1.0.0", str(caught.exception))
+
+    def test_drift_detection_rejects_a_removed_dependency(self):
+        inventory = {
+            ("serde", "1.0.0"): {"name": "serde", "version": "1.0.0", "license": "MIT", "source": "reg"},
+            ("gone", "0.1.0"): {"name": "gone", "version": "0.1.0", "license": "MIT", "source": "reg"},
+        }
+        packages = [{"name": "serde", "version": "1.0.0", "source": "reg"}]
+        with self.assertRaises(SystemExit) as caught:
+            notices.check_drift(inventory, packages)
+        self.assertIn("gone 0.1.0", str(caught.exception))
+
+    def test_workspace_crates_are_absent_from_notices_and_present_in_the_sbom(self):
+        packages = [
+            {"name": "serde", "version": "1.0.0", "source": "reg", "license": "MIT"},
+            {"name": "focal-node", "version": "0.1.0", "source": None, "license": "MIT"},
+        ]
+        text = notices.render_notices(packages)
+        self.assertIn("serde 1.0.0", text)
+        self.assertNotIn("focal-node", text)
+        sbom = json.loads(notices.render_sbom(packages, "1.0.0", "abc"))
+        self.assertEqual(sbom["spdxVersion"], "SPDX-2.3")
+        self.assertEqual({p["name"] for p in sbom["packages"]}, {"serde", "focal-node"})
+
+    def test_generate_is_deterministic_and_covers_the_locked_graph(self):
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            a = notices.generate(first, "9.9.9", "cafef00d")
+            b = notices.generate(second, "9.9.9", "cafef00d")
+            self.assertEqual(a, [notices.NOTICES, notices.SBOM])
+            for name in a:
+                self.assertEqual((Path(first) / name).read_bytes(), (Path(second) / name).read_bytes())
+            sbom = json.loads((Path(first) / notices.SBOM).read_text())
+            locked = notices.lock_packages()
+            self.assertEqual(len(sbom["packages"]), len(locked))
 
 if __name__ == "__main__":
     unittest.main()
