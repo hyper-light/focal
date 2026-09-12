@@ -43,7 +43,7 @@ fn append_preflight_rejects_impossible_ancestor_capacity_without_using_current_f
         .collect();
     assert!(
         shared
-            .validate_batch(LogicalLogId([1; 16]), &records)
+            .validate_batch(LogicalLogId([1; 16]), &records, None)
             .is_ok()
     );
     let before = parent.stats().used;

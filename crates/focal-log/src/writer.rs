@@ -580,7 +580,8 @@ impl SharedWal {
         checkpoint: bool,
         lane: BudgetLane,
     ) -> Result<(), LogError> {
-        let bytes = self.validate_batch(log, records)?;
+        let mut sizes = Vec::new();
+        let bytes = self.validate_batch(log, records, Some(&mut sizes))?;
         let slot = reserve(&self.0.slots, BudgetKind::Pending, lane, 1)?;
         let amount = records
             .len()
@@ -602,8 +603,7 @@ impl SharedWal {
         encoded
             .try_reserve_exact(records.len())
             .map_err(|_| LogError::Capacity)?;
-        for record in records {
-            let length = postcard::experimental::serialized_size(record)?;
+        for (record, &length) in records.iter().zip(&sizes) {
             let mut data = Vec::new();
             data.try_reserve_exact(length)
                 .map_err(|_| LogError::Capacity)?;
@@ -629,7 +629,18 @@ impl SharedWal {
             Command::Append(batch)
         })
     }
-    fn validate_batch(&self, log: LogicalLogId, records: &[Record]) -> Result<usize, LogError> {
+    fn validate_batch(
+        &self,
+        log: LogicalLogId,
+        records: &[Record],
+        mut sizes: Option<&mut Vec<usize>>,
+    ) -> Result<usize, LogError> {
+        if let Some(sizes) = sizes.as_deref_mut() {
+            sizes.clear();
+            sizes
+                .try_reserve_exact(records.len())
+                .map_err(|_| LogError::Capacity)?;
+        }
         let mut bytes = 0usize;
         for record in records {
             if record.log != log {
@@ -638,6 +649,11 @@ impl SharedWal {
             let length = postcard::experimental::serialized_size(record)?;
             if length > self.0.options.max_record_bytes {
                 return Err(LogError::Capacity);
+            }
+            // Reuse this size in the encode loop instead of a second full
+            // serialization traversal per record.
+            if let Some(sizes) = sizes.as_deref_mut() {
+                sizes.push(length);
             }
             bytes = bytes
                 .checked_add(length)
@@ -723,7 +739,7 @@ impl WalLease {
     /// Rejects a batch that cannot fit even under immutable ancestor ceilings.
     /// Current pressure can still prevent admission; this reserves no space.
     pub fn validate_append(&self, records: &[Record]) -> Result<(), LogError> {
-        let bytes = self.shared.validate_batch(self.log, records)?;
+        let bytes = self.shared.validate_batch(self.log, records, None)?;
         let metadata = std::mem::size_of::<Vec<u8>>()
             .checked_add(std::mem::size_of::<FrameLocation>())
             .and_then(|size| size.checked_mul(records.len()))
