@@ -211,7 +211,11 @@ impl DurableNode {
                 .rewrite_checkpoint_async_in(&pending.records, BudgetLane::Completion)
             {
                 Ok(receipt) => pending.receipt = Some(receipt),
-                Err(focal_log::LogError::Capacity) if !blocking => {
+                Err(focal_log::LogError::Capacity) => {
+                    // Completion-lane back-pressure is retryable in both modes;
+                    // finish_checkpoint maps Ok(false) to PersistencePending. A
+                    // blocking caller must never poison the node on a transient
+                    // shortage (the drain state machines behave the same way).
                     self.checkpoint = Some(pending);
                     return Ok(false);
                 }

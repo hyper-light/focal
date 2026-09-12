@@ -191,7 +191,13 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         consensus: &DurableNode,
     ) -> Result<(), NativeSessionError> {
         let assembled = match enclosing::Checkpoint::describe(data, self.limits.checkpoint)? {
-            None => None,
+            None => {
+                // An inline snapshot has no seed chunks; clear any retained from a
+                // prior seeded checkpoint so native_collect_seeds does not protect
+                // stale chunks from reclamation (note_seeds yields empty here).
+                self.note_seeds(data)?;
+                None
+            }
             Some(manifest) => {
                 match manifest.assemble(&self.seeds, &self.budget) {
                     Ok(core) => {

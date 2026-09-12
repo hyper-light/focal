@@ -433,14 +433,24 @@ impl JoinKey {
         }
         verify_issued(receipt, ca_certificate)?;
         let held = self.enrollment()?.ok_or(EnrollmentError::NotCommitted)?;
-        if held.identity != receipt.identity || held.public_key == receipt.public_key {
+        if held.identity != receipt.identity {
             return Err(EnrollmentError::Conflict);
         }
-        // The receipt first, then the key it was issued for: a crash between
-        // the two leaves a receipt for a key this directory does not hold
-        // yet, which the next start adopts again from the staged material.
-        self._directory
-            .replace("enrollment.bin", &encode(receipt)?)?;
+        // The receipt is installed first, then the key it was issued for. A crash
+        // between the two leaves this directory holding the new receipt but the
+        // previous key; the next start re-adopts and must FINISH by installing the
+        // key. So resume idempotently: install the receipt only if it is not
+        // already held, and always (re)install the key. A genuine duplicate - the
+        // receipt AND its key already installed - is still refused.
+        let key_installed = self.key_identity()? == receipt.public_key;
+        if held.public_key == receipt.public_key {
+            if key_installed {
+                return Err(EnrollmentError::Conflict);
+            }
+        } else {
+            self._directory
+                .replace("enrollment.bin", &encode(receipt)?)?;
+        }
         self._directory
             .replace("join-key.bin", &Zeroizing::new(encode(&next.bundle)?))?;
         next._directory.remove("enrollment.bin")?;

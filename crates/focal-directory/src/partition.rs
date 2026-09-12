@@ -870,6 +870,18 @@ impl DirectoryPartition {
                     && let Some(evicted) = state.routes.pop_front()
                 {
                     state.routes_from = state.routes_from.max(evicted.revision);
+                    // An absorb writes several route changes at one revision, so
+                    // the log can hold a contiguous same-revision block. Evict the
+                    // whole block, not one entry: a revision must never be both the
+                    // log floor (routes_from) and still present at the front, which
+                    // would wedge validate_partition on the next route change.
+                    while state
+                        .routes
+                        .front()
+                        .is_some_and(|front| front.revision == evicted.revision)
+                    {
+                        state.routes.pop_front();
+                    }
                 }
                 state.routes.push_back(RouteChange {
                     revision,

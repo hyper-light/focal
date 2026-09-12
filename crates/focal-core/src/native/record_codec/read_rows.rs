@@ -328,6 +328,7 @@ pub(super) fn check_fixed(key: Key, row: &Row, ledger: LedgerId) -> Result<(), N
                         | NativeOperation::ClaimDeadline
                         | NativeOperation::MonitorDeadline
                         | NativeOperation::Import
+                        | NativeOperation::Retire
                 ),
                 NativeInvocation::EvaluationDeadline(_) => {
                     row.operation == NativeOperation::EvaluationDeadline

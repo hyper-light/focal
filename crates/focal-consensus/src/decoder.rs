@@ -48,6 +48,7 @@ impl DurableNode {
             return Err(ConsensusError::DecoderMismatch);
         }
         self.confirmed_decoder = Some(hash);
+        self.rebuild_recovered_membership()?;
         Ok(())
     }
     /// Trusted application composition registers exactly one compiled ordered
@@ -83,6 +84,24 @@ impl DurableNode {
         }
         self.compiled_decoders = Some(pair);
         self.confirmed_decoder = Some(predecessor);
+        self.rebuild_recovered_membership()?;
+        Ok(())
+    }
+    /// Run the committed conf-change replay that a decoder-gated recovery had to
+    /// defer past open (its unconfirmed decoder made `check` — and therefore
+    /// `drain` — refuse). Called the instant confirmation completes, before any
+    /// caller can step or campaign, so elections never see the stale
+    /// snapshot-only voter set. The rebuilt events are retained for the caller's
+    /// first drain, exactly as the non-gated constructor path retains them. Idempotent:
+    /// once the flag is cleared, and while the decoder is not yet fully confirmed,
+    /// it is a no-op.
+    fn rebuild_recovered_membership(&mut self) -> Result<(), ConsensusError> {
+        if !self.membership_rebuild_pending || !self.decoder_confirmed() {
+            return Ok(());
+        }
+        let events = self.drain()?;
+        self.recovered_events = Some(events);
+        self.membership_rebuild_pending = false;
         Ok(())
     }
     /// Effective minimum decoder. This does not discard the original baseline

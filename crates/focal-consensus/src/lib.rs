@@ -232,6 +232,11 @@ pub struct DurableNode {
     compiled_decoders: Option<decoder::DecoderPair>,
     decoder_transition: Option<decoder::DecoderPair>,
     decoder_write: Option<decoder::PendingDecoderFloor>,
+    // A decoder-gated recovery cannot drain at open (the unconfirmed decoder
+    // makes `check` refuse), so the committed conf-change replay that rebuilds
+    // membership is deferred until the decoder is confirmed. While it is pending,
+    // no election or network step may observe the stale snapshot-only voter set.
+    membership_rebuild_pending: bool,
     // Drop after any pending Ready/output payloads, including owner cancellation.
     active_allocation: Option<Allocation>,
 }
@@ -547,6 +552,10 @@ impl DurableNode {
             compiled_decoders: None,
             decoder_transition,
             decoder_write: None,
+            // The complement of the constructor rebuild below: a gated recovery
+            // (required_decoder set) cannot drain yet, so its rebuild is deferred
+            // to decoder confirmation and fenced until then.
+            membership_rebuild_pending: required_decoder.is_some(),
         };
         // Rebuild committed membership before elections or network messages can
         // run. Application replay is retained for the caller's first drain.
@@ -1067,6 +1076,14 @@ impl DurableNode {
         operation: impl FnOnce(&mut Self) -> Result<T, ConsensusError>,
     ) -> Result<T, ConsensusError> {
         self.check()?;
+        // Fence every Raft-participating operation (propose, step, campaign,
+        // tick, conf change, transfer, reports) until the deferred committed
+        // membership rebuild has run. `poll_drain` bypasses `guarded_in`, so the
+        // rebuild that clears this flag is never blocked by it. `confirm_decoder`
+        // clears it eagerly, so this is a retryable safety net, not the norm.
+        if self.membership_rebuild_pending {
+            return Err(ConsensusError::PersistencePending);
+        }
         if self.persistence_pending() {
             return Err(ConsensusError::PersistencePending);
         }

@@ -988,13 +988,21 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             if barrier.index > self.applied_raft {
                 return Err(NativeSessionError::Corrupt);
             }
-            if barrier.context == readiness(status.term) {
-                if leader {
+            // Classify the barrier by its 8-byte magic, not by full equality with
+            // the current term: READINESS and CORRELATION share their first seven
+            // bytes, so a readiness barrier confirmed in a prior term and drained
+            // after a term bump would otherwise be misread as a correlated read
+            // and fail closed. A readiness barrier for the current term promotes;
+            // a stale-term one is a benign internal barrier and is ignored.
+            if barrier.context.starts_with(READINESS.as_slice()) {
+                if leader && barrier.context == readiness(status.term) {
                     self.promote(status.term, consensus)?;
                 }
-            } else {
+            } else if Self::is_correlated_read(&barrier.context) {
                 let output = delivery.output.as_mut().ok_or(NativeSessionError::Failed)?;
                 self.apply_correlated_read(barrier, output)?;
+            } else {
+                return Err(NativeSessionError::Corrupt);
             }
             delivery.read = add(delivery.read, 1)?;
         }
