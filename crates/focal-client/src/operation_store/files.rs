@@ -406,8 +406,11 @@ impl Directory {
         file.write_all(payload)?;
         file.write_all(hash.finalize().as_bytes())?;
         file.sync_all()?;
+        // Close before renaming/linking: Windows refuses to rename a file with
+        // an open handle, and the link-pair recovery reopens by path.
+        drop(file);
         if replace {
-            fs::rename(&temporary, &path)?;
+            focal_platform::fs::atomic_replace(&temporary, &path)?;
         } else {
             fs::hard_link(&temporary, &path)?;
             fs::remove_file(&temporary)?;

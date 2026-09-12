@@ -201,11 +201,13 @@ impl Directory {
         file.write_all(payload)?;
         file.write_all(hash.finalize().as_bytes())?;
         file.sync_all()?;
+        // Close before rename: Windows refuses to rename a file with an open handle.
+        drop(file);
         #[cfg(test)]
         self.fail_at(Fault::FileSynced)?;
         // The private exclusive lock protects both initial and replacement
         // publication; rename avoids a two-link crash window entirely.
-        fs::rename(&temporary, &state)?;
+        focal_platform::fs::atomic_replace(&temporary, &state)?;
         #[cfg(test)]
         self.fail_at(Fault::Renamed)?;
         sync_dir(&self.path)?;

@@ -86,7 +86,7 @@ pub(super) fn install(path: &Path, id: UploadId) -> Result<(), ContentError> {
     file.write_all(&bytes)?;
     file.sync_all()?;
     fault(Cut::FileSynced)?;
-    fs::rename(&temp, path)?;
+    focal_platform::fs::atomic_replace(&temp, path)?;
     fault(Cut::Renamed)?;
     sync_directory(path.parent().ok_or(ContentError::Invalid)?)?;
     Ok(())

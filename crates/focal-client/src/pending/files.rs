@@ -177,9 +177,11 @@ impl Directory {
         file.write_all(payload)?;
         file.write_all(digest.finalize().as_bytes())?;
         file.sync_all()?;
+        // Close before rename: Windows refuses to rename a file with an open handle.
+        drop(file);
         #[cfg(test)]
         self.fail_at(Fault::FileSynced)?;
-        fs::rename(&temporary, self.path.join(RECORD))?;
+        focal_platform::fs::atomic_replace(&temporary, &self.path.join(RECORD))?;
         #[cfg(test)]
         self.fail_at(Fault::Renamed)?;
         sync_dir(&self.path)?;

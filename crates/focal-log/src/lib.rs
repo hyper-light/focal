@@ -609,7 +609,7 @@ fn install_fence(
     file.write_all(&data)?;
     file.write_all(&crc32fast::hash(&data).to_le_bytes())?;
     file.sync_all()?;
-    fs::rename(temp, directory.join("CURRENT"))?;
+    focal_platform::fs::atomic_replace(&temp, &directory.join("CURRENT"))?;
     sync_dir(directory)
 }
 

@@ -283,7 +283,7 @@ impl ContentStore {
         let target = self
             .round_dir(now_ms, relative)?
             .join(source.file_name().ok_or(ContentError::Invalid)?);
-        fs::rename(source, &target)?;
+        focal_platform::fs::atomic_replace(source, &target)?;
         sync_directory(target.parent().ok_or(ContentError::Invalid)?)?;
         Ok(())
     }
@@ -950,9 +950,12 @@ impl ContentStore {
             else {
                 return Err(ContentError::Corrupt);
             };
-            fs::rename(holder.join(&relative).join(&name), target.join(&name))?;
+            focal_platform::fs::atomic_replace(
+                &holder.join(&relative).join(&name),
+                &target.join(&name),
+            )?;
         }
-        fs::rename(&source, target.join(&manifest))?;
+        focal_platform::fs::atomic_replace(&source, &target.join(&manifest))?;
         sync_directory(&target)?;
         Ok(true)
     }

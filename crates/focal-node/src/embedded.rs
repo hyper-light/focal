@@ -295,7 +295,9 @@ pub(crate) fn atomic_file(path: &Path, bytes: &[u8]) -> Result<(), std::io::Erro
         .open(&temporary)?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    fs::rename(temporary, path)?;
+    // Close before rename: Windows refuses to rename a file with an open handle.
+    drop(file);
+    focal_platform::fs::atomic_replace(&temporary, path)?;
     focal_platform::sync_dir(path.parent().unwrap_or_else(|| Path::new(".")))
 }
 

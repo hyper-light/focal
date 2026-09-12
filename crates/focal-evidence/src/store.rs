@@ -1192,7 +1192,7 @@ fn atomic_install(path: &Path, bytes: &[u8]) -> Result<(), ContentError> {
         .open(&temp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    fs::rename(&temp, path)?;
+    focal_platform::fs::atomic_replace(&temp, path)?;
     sync_directory(path.parent().ok_or(ContentError::Invalid)?)?;
     Ok(())
 }

@@ -169,9 +169,12 @@ impl PrivateDirectory {
         bytes.extend_from_slice(checksum.as_bytes());
         file.write_all(&bytes)?;
         file.sync_all()?;
-        // Same-directory rename is atomic; held exclusive writer lock excludes
-        // another initializer. The directory sync is the acknowledgment fence.
-        fs::rename(&temporary, &path)?;
+        // Close the handle before the rename: Windows refuses to rename a file
+        // that still has an open handle. Same-directory rename is atomic; the
+        // held exclusive writer lock excludes another initializer, and the
+        // directory sync is the acknowledgment fence.
+        drop(file);
+        focal_platform::fs::atomic_replace(&temporary, &path)?;
         sync_dir(&self.path)?;
         self.ensure_marker(name)?;
         Ok(())

@@ -596,6 +596,7 @@ dependencies = [
  "focal-graph",
  "focal-memory",
  "focal-model",
+ "focal-platform",
  "focal-ranges",
  "focal-sim",
  "focal-stream",

@@ -256,9 +256,9 @@ pub mod backup {
             }
             #[cfg(not(unix))]
             std::fs::create_dir(path)?;
-            std::fs::File::open(path)?.sync_all()?;
+            focal_platform::sync_dir(path)?;
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                std::fs::File::open(parent)?.sync_all()?;
+                focal_platform::sync_dir(parent)?;
             }
             Ok(())
         }
@@ -279,10 +279,10 @@ pub mod backup {
             std::fs::File::open(path)?.sync_all()
         }
         fn sync_dir(&mut self, path: &Path) -> std::io::Result<()> {
-            std::fs::File::open(path)?.sync_all()
+            focal_platform::sync_dir(path)
         }
         fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
-            std::fs::rename(from, to)
+            focal_platform::fs::atomic_replace(from, to)
         }
         fn exists(&self, path: &Path) -> bool {
             path.exists()
