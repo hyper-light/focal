@@ -204,7 +204,8 @@ impl Directory {
             if bytes != *MAGIC {
                 return Err(PendingError::Corrupt);
             }
-            file.sync_all()?;
+            // The marker is already durable from its creation below; a read
+            // handle needs no re-sync (Windows rejects fsync of a read handle).
         } else {
             let mut file = focal_platform::fs::create_private_new(&marker, false, true)?;
             file.write_all(MAGIC)?;

@@ -200,7 +200,9 @@ impl Directory {
         if marker != *layout.marker() {
             return Err(StoreError::Corrupt);
         }
-        file.sync_all()?;
+        // The marker was written durably at initialization; a read handle needs
+        // no re-sync (FlushFileBuffers rejects a read-only handle on Windows).
+        // The directory fence below re-establishes a prior ambiguous sync_dir.
         sync_dir(path)?;
         Ok(directory)
     }
@@ -348,8 +350,9 @@ impl Directory {
             return Err(StoreError::Corrupt);
         }
         // A previous caller may have received an ambiguous directory-fsync
-        // failure. Re-establish durability before adopting its visible record.
-        file.sync_all()?;
+        // failure. The record's bytes are already durable (written and synced
+        // before publication); only the directory entry needs re-fencing, done
+        // by sync_dir below. A read handle cannot be fsync'd on Windows anyway.
         if let Some(temporary) = linked_temporary {
             // No name is removed until the bounded complete frame has passed
             // its checksum and both paths still name this exact private inode.
