@@ -471,15 +471,18 @@ impl Wal {
                 .checked_add(1)
                 .ok_or(LogError::Capacity)?;
             let len = u32::try_from(data.len()).map_err(|_| LogError::Capacity)?;
-            let mut header = Vec::with_capacity(FRAME_HEADER);
-            header.extend_from_slice(&len.to_le_bytes());
-            header.extend_from_slice(&sequence.to_le_bytes());
-            header.extend_from_slice(&self.position.checksum.to_le_bytes());
+            // A fixed-size stack header (len u32, sequence u64, previous CRC u32,
+            // then this frame's CRC u32) avoids a per-record heap allocation; the
+            // byte layout is identical to the frozen frame format.
+            let mut header = [0u8; FRAME_HEADER];
+            header[0..4].copy_from_slice(&len.to_le_bytes());
+            header[4..12].copy_from_slice(&sequence.to_le_bytes());
+            header[12..16].copy_from_slice(&self.position.checksum.to_le_bytes());
             let mut hash = crc32fast::Hasher::new();
-            hash.update(&header);
+            hash.update(&header[..16]);
             hash.update(data);
             let checksum = hash.finalize();
-            header.extend_from_slice(&checksum.to_le_bytes());
+            header[16..20].copy_from_slice(&checksum.to_le_bytes());
             let location = FrameLocation {
                 generation: self.position.generation,
                 segment: self.position.segment,

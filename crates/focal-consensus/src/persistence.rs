@@ -160,6 +160,11 @@ impl DurableNode {
                     }
                     let ready = self.raw.ready();
                     let mut records = Vec::new();
+                    // The record count is known: entries plus an optional snapshot
+                    // and hard state. Reserve once so the ready cycle never grows.
+                    records
+                        .try_reserve_exact(ready.entries().len().saturating_add(2))
+                        .map_err(|_| ConsensusError::Capacity)?;
                     if !ready.snapshot().is_empty() {
                         records.push(proto_record(
                             self.config.group_id,

@@ -316,11 +316,13 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         if let Some(manifest) =
             crate::native_checkpoint::Checkpoint::describe(bytes, self.limits.checkpoint)?
         {
+            // Reserve the manifest's chunk count once instead of growing by one
+            // per chunk (which was O(n^2) in reallocations).
+            chunks
+                .try_reserve_exact(manifest.len())
+                .map_err(|_| NativeSessionError::Capacity)?;
             for chunk in manifest.chunks() {
                 let chunk = chunk?;
-                chunks
-                    .try_reserve_exact(1)
-                    .map_err(|_| NativeSessionError::Capacity)?;
                 chunks.push(chunk.hash);
             }
         }

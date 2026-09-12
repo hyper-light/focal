@@ -307,16 +307,20 @@ impl Storage for RamLog {
         }
         let limit = max_size.into().unwrap_or(u64::MAX);
         let mut size = 0u64;
+        let want = usize::try_from(high.checked_sub(low).ok_or(StorageError::Unavailable)?)
+            .map_err(|_| raft::Error::Store(StorageError::Unavailable))?;
         let mut result = Vec::new();
+        // The upper bound (high - low) is known; reserve it so replication and
+        // read fetches never reallocate the entry spine (max_size only trims).
+        result
+            .try_reserve_exact(want)
+            .map_err(|_| raft::Error::Store(StorageError::Unavailable))?;
         let offset = usize::try_from(
             low.checked_sub(self.first_index()?)
                 .ok_or(StorageError::Unavailable)?,
         )
         .map_err(|_| raft::Error::Store(StorageError::Unavailable))?;
-        for entry in self.entries.iter().skip(offset).take(
-            usize::try_from(high.checked_sub(low).ok_or(StorageError::Unavailable)?)
-                .map_err(|_| StorageError::Unavailable)?,
-        ) {
+        for entry in self.entries.iter().skip(offset).take(want) {
             let bytes = entry.compute_size() as u64;
             if !result.is_empty() && size.saturating_add(bytes) > limit {
                 break;
