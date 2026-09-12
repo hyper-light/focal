@@ -712,35 +712,57 @@ impl NetworkService {
         } else {
             None
         };
-        // The content store draws on the WAL's volume envelope: one
-        // watermark guards every durable owner of the data directory.
-        let content = ContentStore::open_with_disk(
-            root.join("content"),
-            StoreLimits {
-                max_content_bytes: 64 * 1024 * 1024,
-                max_staging_bytes: 128 * 1024 * 1024,
-                max_uploads: 16,
-                chunk_bytes: 1024 * 1024,
-                max_manifest_bytes: 1024 * 1024,
-            },
-            wal.disk_budget(),
-        )?;
         let tenant = budget.child(512 * 1024 * 1024, 128 * 1024 * 1024)?;
-        let session = if founder {
-            let consensus = DurableNode::open_on_wal_in(
-                NodeConfig::single(identity.node, identity.cluster, identity.ledger.session.0),
-                wal.clone(),
-                &tenant,
-            )?;
-            Some(Session::from_node_in_hosted(
-                identity.ledger,
-                consensus,
-                SessionLimits::default(),
-                &tenant,
-                native_hosting(&root, &identity, wal.disk_budget()).map_err(NodeError::Content)?,
-            )?)
-        } else {
-            None
+        // The content store and the founder's durable application session both
+        // recover by replaying the WAL - unbounded CPU- and IO-blocking work
+        // that must not run on the async executor (it would stall the runtime
+        // and, in debug builds, materialize its un-optimized poll frames on the
+        // executor's shallow 1 MiB Windows main-thread stack). Recover them on a
+        // blocking thread, exactly as the founder bootstrap does. The content
+        // store draws on the WAL's volume envelope: one watermark guards every
+        // durable owner of the data directory.
+        let (content, session) = {
+            let root = root.clone();
+            let wal = wal.clone();
+            let identity = identity.clone();
+            let tenant = tenant.clone();
+            tokio::task::spawn_blocking(move || -> Result<_, ServiceError> {
+                let content = ContentStore::open_with_disk(
+                    root.join("content"),
+                    StoreLimits {
+                        max_content_bytes: 64 * 1024 * 1024,
+                        max_staging_bytes: 128 * 1024 * 1024,
+                        max_uploads: 16,
+                        chunk_bytes: 1024 * 1024,
+                        max_manifest_bytes: 1024 * 1024,
+                    },
+                    wal.disk_budget(),
+                )?;
+                let session = if founder {
+                    let consensus = DurableNode::open_on_wal_in(
+                        NodeConfig::single(
+                            identity.node,
+                            identity.cluster,
+                            identity.ledger.session.0,
+                        ),
+                        wal.clone(),
+                        &tenant,
+                    )?;
+                    Some(Session::from_node_in_hosted(
+                        identity.ledger,
+                        consensus,
+                        SessionLimits::default(),
+                        &tenant,
+                        native_hosting(&root, &identity, wal.disk_budget())
+                            .map_err(NodeError::Content)?,
+                    )?)
+                } else {
+                    None
+                };
+                Ok((content, session))
+            })
+            .await
+            .map_err(|_| ServiceError::Owner("store recovery task failed to join"))??
         };
         // The founder's custody and serving scope follow the placement its
         // session has committed; a fresh session starts at the single-node
