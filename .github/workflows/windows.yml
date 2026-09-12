@@ -30,6 +30,14 @@ jobs:
       - name: Wire tests (named-pipe local transport round-trip)
         shell: bash
         run: cargo test -p focal-wire --locked
+      - name: Enrollment tests (private credential persistence, PKI, invitations)
+        shell: bash
+        # The founder's credential bootstrap persists through this crate's
+        # PrivateDirectory. Its own suite exercises BootstrapAuthority/JoinKey
+        # open_or_create and install/read round-trips - the exact Windows path
+        # the A1 binary drives - and runs in seconds, so a durability regression
+        # is caught here before the multi-minute release A1 build.
+        run: cargo test -p focal-enrollment --locked
       - name: A1 product gate on the real binary (CLI, activation, restart, retry)
         shell: bash
         # The integration test drives the shipped artifact, so it runs the

@@ -58,7 +58,8 @@ impl PrivateDirectory {
             }
         })?;
         if !shared {
-            lock.sync_all()?;
+            lock.sync_all()
+                .map_err(|e| io_ctx("lock sync_all", &lock_path, e))?;
             sync_dir(path)?;
         }
         Ok(Self {
@@ -77,7 +78,7 @@ impl PrivateDirectory {
             };
         }
         check_file(&path, &store_owner(&self.path)?)?;
-        let mut file = File::open(path)?;
+        let mut file = File::open(&path).map_err(|e| io_ctx("read open", &path, e))?;
         if file.metadata()?.len() > 64 * 1024 {
             return Err(EnrollmentError::Capacity);
         }
@@ -103,7 +104,8 @@ impl PrivateDirectory {
         }
         // Recover the narrow crash window after the complete file was installed
         // but before its initialization marker was synced.
-        file.sync_all()?;
+        file.sync_all()
+            .map_err(|e| io_ctx("read sync_all", &path, e))?;
         self.ensure_marker(name)?;
         Ok(Some(Zeroizing::new(
             payload.get(8..).ok_or(EnrollmentError::Corrupt)?.to_vec(),
@@ -167,8 +169,10 @@ impl PrivateDirectory {
         bytes.extend_from_slice(payload);
         let checksum = blake3::hash(&bytes);
         bytes.extend_from_slice(checksum.as_bytes());
-        file.write_all(&bytes)?;
-        file.sync_all()?;
+        file.write_all(&bytes)
+            .map_err(|e| io_ctx("credential write_all", &temporary, e))?;
+        file.sync_all()
+            .map_err(|e| io_ctx("credential sync_all", &temporary, e))?;
         // Close the handle before the rename: Windows refuses to rename a file
         // that still has an open handle. Same-directory rename is atomic; the
         // held exclusive writer lock excludes another initializer, and the
@@ -185,7 +189,9 @@ impl PrivateDirectory {
             check_file(&marker, &store_owner(&self.path)?)?;
             return Ok(());
         }
-        focal_platform::fs::create_private_new(&marker, false, true)?.sync_all()?;
+        focal_platform::fs::create_private_new(&marker, false, true)?
+            .sync_all()
+            .map_err(|e| io_ctx("marker sync_all", &marker, e))?;
         sync_dir(&self.path)?;
         Ok(())
     }
@@ -211,4 +217,13 @@ fn check_file(path: &Path, owner: &Owner) -> Result<(), EnrollmentError> {
         Ok(false) => Err(EnrollmentError::Permissions),
         Err(error) => Err(error.into()),
     }
+}
+/// Attach the failing operation and path to a raw I/O error. A bare
+/// "Access is denied" from a `sync_all`/`write_all`/`open` is undiagnosable
+/// across platforms; every persistence step names itself instead.
+fn io_ctx(op: &str, path: &Path, error: std::io::Error) -> EnrollmentError {
+    EnrollmentError::Io(std::io::Error::new(
+        error.kind(),
+        format!("{op} {}: {error}", path.display()),
+    ))
 }
