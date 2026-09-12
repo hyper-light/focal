@@ -70,6 +70,22 @@ Implement these in dependency order:
    seals and client journals. Surface unsupported durability as an error. Test
    acknowledged writes across process kill and reopen, interrupted publication,
    locked destinations, disk-full conditions and stale temporary files.
+
+   *Implemented mechanism.* Every durable install writes a temporary file,
+   `sync_all`s it, **closes the handle**, then publishes through
+   `focal_platform::fs::atomic_replace`. On Unix that is `std::fs::rename`
+   paired with a following `focal_platform::sync_dir` (the directory `fsync`
+   that makes the rename durable). On Windows it is
+   `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`, whose
+   write-through flag is the durability fence, so `sync_dir` is a no-op there
+   (Windows offers no directory `fsync`). Closing the source handle first is
+   mandatory: Windows refuses to rename a file that still has an open handle.
+   `std::fs::rename` must not be used for a durability-critical publish, because
+   it carries no write-through guarantee on Windows and would leave the metadata
+   update unflushed with no directory `fsync` to follow. This covers the WAL
+   `CURRENT` fence, the node identity/policy files, enrollment credential stores,
+   the client operation/pending/artifact-transfer journals, evidence content
+   installs, GC round promotions, upload terminals and the backup `FileMedium`.
 3. **Authenticated local transport.** Implement bounded same-user named pipes or
    an equivalently authenticated native local transport for data and admin
    operations. Reuse framed typed requests, deadlines, backpressure and owned
