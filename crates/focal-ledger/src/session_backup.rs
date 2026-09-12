@@ -276,7 +276,14 @@ pub mod backup {
             file.write_all(bytes)
         }
         fn sync_file(&mut self, path: &Path) -> std::io::Result<()> {
-            std::fs::File::open(path)?.sync_all()
+            // Open with write access: FlushFileBuffers rejects a read-only handle
+            // on Windows. write(true) without truncate reopens the existing file
+            // in place; fsync/FlushFileBuffers then makes its bytes durable.
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)?
+                .sync_all()
         }
         fn sync_dir(&mut self, path: &Path) -> std::io::Result<()> {
             focal_platform::sync_dir(path)

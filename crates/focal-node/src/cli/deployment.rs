@@ -205,7 +205,7 @@ fn render(settings: &Settings, target: RenderTarget) -> crate::Result<()> {
         write_new(&path, file.content.as_bytes())?;
         written.push(path.display().to_string());
     }
-    std::fs::File::open(&output)?.sync_all()?;
+    focal_platform::sync_dir(&output)?;
     crate::print_json(&serde_json::json!({
         "schema_version": 1,
         "result": {

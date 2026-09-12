@@ -1664,7 +1664,11 @@ fn initialize_named(
             if actual != expected || !root.join(directory).is_dir() {
                 return Err(ClusterAdminError::Corrupt);
             }
-            file.sync_all()?;
+            // The file was written and synced by its installer before this
+            // marker was ever readable; a read handle needs no re-sync (and
+            // FlushFileBuffers rejects a read-only handle on Windows). The
+            // directory entry is fenced below.
+            drop(file);
             #[cfg(unix)]
             {
                 File::open(root)?.sync_all()?;

@@ -102,10 +102,13 @@ impl PrivateDirectory {
         if blake3::hash(payload).as_bytes() != checksum {
             return Err(EnrollmentError::Corrupt);
         }
-        // Recover the narrow crash window after the complete file was installed
-        // but before its initialization marker was synced.
-        file.sync_all()
-            .map_err(|e| io_ctx("read sync_all", &path, e))?;
+        // The file was installed durably (write-through atomic_replace fsyncs the
+        // bytes before the rename), so it is already on disk before any marker
+        // claims it - there is no read-time re-sync to do, and none is portable:
+        // FlushFileBuffers refuses a read-only handle on Windows, and fsync of a
+        // read handle buys nothing on Unix. Only the initialization marker's own
+        // crash window remains to complete.
+        drop(file);
         self.ensure_marker(name)?;
         Ok(Some(Zeroizing::new(
             payload.get(8..).ok_or(EnrollmentError::Corrupt)?.to_vec(),

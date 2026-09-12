@@ -239,7 +239,10 @@ impl Bootstrap {
         if mismatch {
             return Err(BootstrapError::Context);
         }
-        file.sync_all()?;
+        // The marker was written and synced by its installer before it could be
+        // read back; a read handle needs no re-sync (FlushFileBuffers rejects a
+        // read-only handle on Windows). The directory entry is fenced below.
+        drop(file);
         #[cfg(unix)]
         {
             File::open(&self.root)?.sync_all()?;
