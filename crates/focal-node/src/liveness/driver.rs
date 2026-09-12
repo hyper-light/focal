@@ -111,7 +111,10 @@ impl LivenessConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LocalFacts {
     pub generation: u64,
-    pub members: BTreeMap<u64, u64>,
+    /// Shared so an unchanged membership re-reports each tick (its witness must
+    /// advance) as a cheap refcount bump instead of rebuilding and cloning the
+    /// whole map.
+    pub members: std::sync::Arc<BTreeMap<u64, u64>>,
     pub witness: u64,
     pub overloaded: bool,
 }
@@ -600,6 +603,8 @@ impl LivenessDriver {
         let mut next = started.checked_add(period).unwrap_or(started);
         loop {
             let now_ms = elapsed_ms(started);
+            let counters = self.state.counters;
+            let mut refresh = false;
             tokio::select! {
                 biased;
                 inbound = self.inbox.recv() => {
@@ -625,6 +630,7 @@ impl LivenessDriver {
                     }
                 }
                 () = tokio::time::sleep_until(next) => {
+                    refresh = true;
                     let at = Instant::now();
                     let late = at.saturating_duration_since(next);
                     if late > period.checked_div(2).unwrap_or(period) {
@@ -638,7 +644,13 @@ impl LivenessDriver {
                     }
                 }
             }
-            self.publish();
+            // Rebuild and publish the view only when a settled verdict changed or
+            // on the periodic tick (which refreshes RTT/coordinate-derived view
+            // fields). A stale or duplicate message and a no-op probe ack no
+            // longer rebuild the whole view every event.
+            if refresh || self.state.counters != counters {
+                self.publish();
+            }
         }
     }
     fn publish(&mut self) {

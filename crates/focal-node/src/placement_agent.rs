@@ -417,6 +417,14 @@ pub struct PlacementAgent {
     /// The partitions as the last tick observed them, for the operator.
     last_observed: Vec<(Delegation, PartitionCheckpoint)>,
     observed_at: i64,
+    /// The liveness member set derived from the last observation, shared so an
+    /// unchanged membership re-reports each tick without rebuilding the map.
+    member_facts: std::sync::Arc<BTreeMap<u64, u64>>,
+    member_generation: u64,
+    /// Per session, the (descriptor authority, directory revision) last seen to
+    /// verify: the self-heal placement check is a pure function of those two, so
+    /// an unchanged pair skips re-verifying against the whole node set each tick.
+    verified_active: BTreeMap<LedgerId, (ContentHash, u64)>,
     /// Operator plan requests, answered by the next pass over the partition
     /// holding each session; a request that outlives the agent is lost and
     /// its exact retry finds the committed plan.
@@ -489,6 +497,9 @@ impl PlacementAgent {
             ticks: 0,
             last_observed: Vec::new(),
             observed_at: 0,
+            member_facts: std::sync::Arc::new(BTreeMap::new()),
+            member_generation: 0,
+            verified_active: BTreeMap::new(),
             plan_requests: BTreeMap::new(),
             move_requests: Vec::new(),
             balancer: crate::range_balancer::Balancer::new(
@@ -808,18 +819,37 @@ impl PlacementAgent {
                 observed.push((*delegation, access, snapshot, installed));
             }
         }
-        self.last_observed = observed
-            .iter()
-            .filter_map(|(delegation, _, snapshot, _)| match &snapshot.state {
-                ControlBootstrap::Partition { directory } => Some((*delegation, directory.clone())),
-                _ => None,
-            })
-            .collect();
+        // The last-observed snapshot only feeds the operator's on-demand
+        // placement view, so rebuild it (a deep clone of every partition
+        // directory) only when a partition's revision actually moved. In steady
+        // state — the common case at fleet scale — this tick clones nothing.
+        let unchanged = observed.len() == self.last_observed.len()
+            && observed.iter().zip(&self.last_observed).all(
+                |((delegation, _, snapshot, _), (previous, checkpoint))| {
+                    delegation.partition == previous.partition
+                        && matches!(
+                            &snapshot.state,
+                            ControlBootstrap::Partition { directory }
+                                if directory.revision == checkpoint.revision
+                        )
+                },
+            );
+        if !unchanged {
+            let mut next = Vec::new();
+            next.try_reserve(observed.len())
+                .map_err(|_| AgentError::Capacity)?;
+            for (delegation, _, snapshot, _) in &observed {
+                if let ControlBootstrap::Partition { directory } = &snapshot.state {
+                    next.push((*delegation, directory.clone()));
+                }
+            }
+            self.last_observed = next;
+        }
         self.observed_at = now;
         if observed.is_empty() {
             return Ok(AgentStep::Idle);
         }
-        self.report_liveness_facts(handles, &observed);
+        self.report_liveness_facts(handles, &observed, unchanged);
         let root_leader = handles.control.progress().leader == node;
         for (delegation, access, snapshot, installed) in &observed {
             let ControlBootstrap::Partition { directory } = &snapshot.state else {
@@ -995,25 +1025,38 @@ impl PlacementAgent {
     /// enrolled node of every observed partition, at its highest generation),
     /// how far this node has progressed, and whether admission is refusing
     /// capacity.
-    fn report_liveness_facts(&mut self, handles: &NetworkHandles, observed: &[Observed]) {
+    fn report_liveness_facts(
+        &mut self,
+        handles: &NetworkHandles,
+        observed: &[Observed],
+        unchanged: bool,
+    ) {
         self.ticks = self.ticks.saturating_add(1);
-        let node = self.state.node;
-        let mut generation = 0;
-        let mut members: BTreeMap<u64, u64> = BTreeMap::new();
-        for (_, _, snapshot, _) in observed {
-            let ControlBootstrap::Partition { directory } = &snapshot.state else {
-                continue;
-            };
-            if let Some(record) = directory.nodes.get(&node) {
-                generation = generation.max(record.enrollment.generation);
-            }
-            for (id, record) in &directory.nodes {
-                if *id == node || !record.enrollment.eligible {
+        // The member set and generation derive only from the observed partition
+        // directories, so recompute them only when a directory actually moved;
+        // otherwise re-report the cached Arc (a refcount bump) with the advancing
+        // witness. Only `overloaded` and `witness` change every tick.
+        if !unchanged {
+            let node = self.state.node;
+            let mut generation = 0;
+            let mut members: BTreeMap<u64, u64> = BTreeMap::new();
+            for (_, _, snapshot, _) in observed {
+                let ControlBootstrap::Partition { directory } = &snapshot.state else {
                     continue;
+                };
+                if let Some(record) = directory.nodes.get(&node) {
+                    generation = generation.max(record.enrollment.generation);
                 }
-                let known = members.entry(*id).or_insert(0);
-                *known = (*known).max(record.enrollment.generation);
+                for (id, record) in &directory.nodes {
+                    if *id == node || !record.enrollment.eligible {
+                        continue;
+                    }
+                    let known = members.entry(*id).or_insert(0);
+                    *known = (*known).max(record.enrollment.generation);
+                }
             }
+            self.member_generation = generation;
+            self.member_facts = std::sync::Arc::new(members);
         }
         let report = self
             .admission
@@ -1024,8 +1067,8 @@ impl PlacementAgent {
                 .disk_free
                 .is_some_and(|free| free < report.disk_headroom);
         handles.liveness.report(crate::liveness::LocalFacts {
-            generation,
-            members,
+            generation: self.member_generation,
+            members: std::sync::Arc::clone(&self.member_facts),
             witness: self.ticks,
             overloaded,
         });

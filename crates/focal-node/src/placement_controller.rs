@@ -1158,8 +1158,14 @@ impl PlacementAgent {
             }
         }
         // Self-healing: the active placement must still verify against the
-        // live registry; otherwise plan again under the same policy.
+        // live registry; otherwise plan again under the same policy. The check
+        // is a pure function of the descriptor's active placement and the node
+        // set, so skip it while neither has moved since it last passed.
         let config = self.partition_config();
+        let fingerprint = (descriptor.authority.record_hash, directory.revision);
+        if self.verified_active.get(&descriptor.ledger) == Some(&fingerprint) {
+            return Ok(None);
+        }
         if focal_directory::verify_placement(
             &descriptor.active,
             &directory.nodes,
@@ -1167,8 +1173,10 @@ impl PlacementAgent {
         )
         .is_ok()
         {
+            self.verified_active.insert(descriptor.ledger, fingerprint);
             return Ok(None);
         }
+        self.verified_active.remove(&descriptor.ledger);
         let operation = OperationId({
             let mut hasher = blake3::Hasher::new_derive_key("focal.placement.heal.v1");
             hasher.update(&descriptor.ledger.tenant.0);
