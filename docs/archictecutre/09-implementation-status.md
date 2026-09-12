@@ -9705,3 +9705,19 @@ dependency roster (which caught and dropped three stale `winapi` entries), and
 both join the collected/verified/published release asset set; the release matrix
 guard was corrected to require all eight targets (it still demanded only the six
 Unix ones after Windows was added to the catalog).
+
+**R10 Windows node library tests green (run 34675753864, 2026-09-12):**
+`cargo test -p focal-node --lib` now compiles and passes on Windows (210 tests,
+0 failures) and is a permanent Windows CI step. The full Windows lane is build +
+platform FFI + named-pipe wire + enrollment + node lib + the CLI and MCP A1
+product gates. Making the lib suites portable added a cfg(test) `set_test_mode`
+helper (POSIX chmod on Unix, a no-op on Windows where a fresh temp directory
+already carries an owner-only DACL) for the library test modules; the bin-only
+`cli` module tree — whose cfg(test) code cannot reach a library helper across the
+crate boundary — uses inline cfg(unix) setup instead. POSIX-only assertions
+(mode, symlink and hard-link rejection; non-UTF8 `OsString` paths) are cfg(unix)
+or cfg(all(test, unix)), their Windows equivalents (DACLs, reparse-point refusal,
+link count) covered by the platform FFI suite. ci.yml was also aligned to the
+release workflow's `--test-threads=4`, so the heavy in-process fleet and runbook
+suites no longer oversubscribe memory (where the node correctly refuses at
+capacity and an otherwise-sound test cannot outlast the transient refusal).
