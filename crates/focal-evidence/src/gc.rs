@@ -509,9 +509,19 @@ impl ContentStore {
             }
         }
         for id in stale {
-            self.finish_inner(id)?;
-            self.collector.report.uploads_expired =
-                self.collector.report.uploads_expired.saturating_add(1);
+            match self.finish_inner(id) {
+                Ok(()) => {
+                    self.collector.report.uploads_expired =
+                        self.collector.report.uploads_expired.saturating_add(1);
+                }
+                // At the terminal-uploads cap (or a transient shortage) finishing
+                // an upload is deferred, not fatal: returning lets the pass reach
+                // the Terminals phase, which releases terminal records and lowers
+                // the count so a later pass finishes these. Aborting instead would
+                // reset the phase to Idle and wedge, never reaching that release.
+                Err(ContentError::Capacity) => break,
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }
@@ -620,12 +630,24 @@ impl ContentStore {
                 continue;
             };
             let metadata = entry.metadata()?;
-            let bytes = read_bounded(&entry.path(), MAX_TRANSFER_MANIFEST_BYTES)?;
-            let manifest = decode_manifest(
-                bytes
-                    .get(MANIFEST_MAGIC.len()..)
-                    .ok_or(ContentError::Corrupt)?,
-            )?;
+            // A single unreadable/oversized/corrupt manifest must not abort the
+            // whole GC pass — an aborted pass resets to Idle and restarts,
+            // re-hitting the poison file and never reaching quarantine deletion.
+            // I/O errors stay fatal (the store's failure model); a poison manifest
+            // is skipped, exactly as sweep_receipts skips an undecodable receipt.
+            // Leaving its chunks unmarked is correct: an object whose manifest is
+            // unreadable is already unrecoverable.
+            let bytes = match read_bounded(&entry.path(), MAX_TRANSFER_MANIFEST_BYTES) {
+                Ok(bytes) => bytes,
+                Err(ContentError::Io(error)) => return Err(ContentError::Io(error)),
+                Err(_) => continue,
+            };
+            let Some(payload) = bytes.get(MANIFEST_MAGIC.len()..) else {
+                continue;
+            };
+            let Ok(manifest) = decode_manifest(payload) else {
+                continue;
+            };
             let keep = protection.protects_object(domain, root)
                 || protection.protects_stream(domain, manifest.stream_digest)
                 || age_ms(&metadata, now_ms)? < config.grace_ms;
@@ -1025,8 +1047,15 @@ impl SeedStore {
                 continue;
             }
             if let Err(error) = fs::remove_file(entry.path()) {
-                self.failed = true;
-                return Err(ContentError::Io(error));
+                // Removal is idempotent (matching SeedStore::remove): the writer
+                // may have removed this seed between the resumable ReadDir yielding
+                // it and this step, so an already-absent file is complete, not a
+                // failure that takes down seed serving until reopen.
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    self.failed = true;
+                    return Err(ContentError::Io(error));
+                }
+                continue;
             }
             changed = true;
             report.removed = report.removed.saturating_add(1);

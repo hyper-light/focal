@@ -118,6 +118,7 @@ impl DurableNode {
     pub fn decoder_floor_ready(&self, hash: [u8; 32]) -> bool {
         !self.failed
             && self.decoder_confirmed()
+            && !self.membership_rebuild_pending
             && self.decoder_write.is_none()
             && (self.required_decoder == Some(hash)
                 || self

@@ -5,7 +5,7 @@ use focal_enrollment::certificate_key_hash;
 use focal_enrollment::{CredentialMaterial, EnrollmentRegistry, SignedNodeStatement};
 use focal_model::{ContentHash, RaftIndex, RaftTerm};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_STATEMENT: usize = 16 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +166,13 @@ impl InstalledAuthorityVerifier<'_> {
         let mut incoming = 0_usize;
         let mut outgoing = 0_usize;
         let mut sole = false;
+        // Quorum must count distinct voter nodes, not certificates. A node in a
+        // renewal grace window holds two simultaneously-valid certificates of the
+        // same enrolled key (registry keeps the old one authorizable until its
+        // retirement), each with different bytes, so the per-certificate dedup
+        // below cannot catch them. Without this, one node signing with both certs
+        // would count twice and forge a majority.
+        let mut counted: BTreeSet<u64> = BTreeSet::new();
         for (ordinal, signature) in proof.signatures.iter().enumerate() {
             // No heap set is needed. Work is bounded by max_members (<=127).
             if proof
@@ -219,6 +226,13 @@ impl InstalledAuthorityVerifier<'_> {
             }
             if only.is_some_and(|expected| expected != node) {
                 return Err(DirectoryError::UnverifiedAuthority);
+            }
+            // One signature per node: a node's single vote already counts toward
+            // both incoming and outgoing quorums in joint consensus below, so a
+            // second signature from the same node (e.g. its other grace-window
+            // certificate) is a duplicate, never additional quorum weight.
+            if !counted.insert(node) {
+                return Err(DirectoryError::Duplicate);
             }
             incoming = incoming.saturating_add(usize::from(voter));
             outgoing = outgoing.saturating_add(usize::from(old_voter));

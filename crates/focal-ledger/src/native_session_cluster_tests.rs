@@ -825,6 +825,16 @@ fn commit_isolated(
 /// Commit `inputs` on the leader while `isolated` cannot hear; it stays cut
 /// off, so later commits join the same delivery when it reconnects.
 fn commit_apart(cluster: &mut Cluster, isolated: u64, inputs: Vec<(ParticipantId, NativeInput)>) {
+    commit_apart_on(cluster, 1, isolated, inputs);
+}
+/// As `commit_apart`, but proposing to an explicit `leader` — used to commit a
+/// second batch under a new term after a leadership handover.
+fn commit_apart_on(
+    cluster: &mut Cluster,
+    leader: u64,
+    isolated: u64,
+    inputs: Vec<(ParticipantId, NativeInput)>,
+) {
     let mut outcomes = Vec::new();
     for (position, (actor, input)) in inputs.into_iter().enumerate() {
         // Every pending candidate holds its funded report and record buffer
@@ -834,23 +844,58 @@ fn commit_apart(cluster: &mut Cluster, isolated: u64, inputs: Vec<(ParticipantId
             cluster.pump(&[isolated]);
         }
         let request = input.request;
-        match cluster.propose(1, actor, input) {
+        match cluster.propose(leader, actor, input) {
             NativeSubmission::Committed(outcome) => outcomes.push((request, outcome)),
             NativeSubmission::Pending { outcome, .. } => outcomes.push((request, outcome)),
         }
     }
     for _ in 0..8 {
         cluster.pump(&[isolated]);
-        if outcomes
-            .iter()
-            .all(|(request, outcome)| cluster.node(1).outcome(*request).unwrap() == Some(*outcome))
-        {
+        if outcomes.iter().all(|(request, outcome)| {
+            cluster.node(leader).outcome(*request).unwrap() == Some(*outcome)
+        }) {
             break;
         }
     }
     for (request, outcome) in &outcomes {
-        assert_eq!(cluster.node(1).outcome(*request).unwrap(), Some(*outcome));
+        assert_eq!(
+            cluster.node(leader).outcome(*request).unwrap(),
+            Some(*outcome)
+        );
     }
+}
+
+#[test]
+fn a_parallel_batch_after_a_leadership_change_crosses_the_term_start_gap() {
+    // Node 3 has four workers and receives records from two terms in one
+    // catch-up delivery. The new leader's term-start no-op is an empty entry
+    // dropped from the committed stream, so the first record of the second term
+    // sits at applied_raft + 2, not + 1. The parallel batch path must anchor on
+    // the run's own first index (as the single-entry path already does) or it
+    // fails closed on this routine leader change and the follower dies on a
+    // valid log.
+    let mut cluster =
+        Cluster::with_limits(|id| materializer_limits(if id == 3 { 4 } else { 1 }, false));
+    cluster.elect(1, &[]);
+    let first: Vec<_> = (1..=4u128)
+        .map(|claim| (PARTIES.issuer, cluster.creation(claim)))
+        .collect();
+    commit_apart_on(&mut cluster, 1, 3, first);
+    // Hand leadership to node 2 (a new term, hence a term-start no-op) while
+    // node 3 is still cut off, then commit a second batch under the new term.
+    cluster.elect(2, &[3]);
+    let second: Vec<_> = (5..=8u128)
+        .map(|claim| (PARTIES.issuer, cluster.creation(claim)))
+        .collect();
+    commit_apart_on(&mut cluster, 2, 3, second);
+    // Reconnect node 3: it replays both terms in one delivery, crossing the gap.
+    cluster.settle(&[]);
+    cluster.pump(&[]);
+    let claims: Vec<u128> = (1..=8).collect();
+    assert_same_digest(&mut cluster, &claims);
+    let stats = cluster.node(3).materializer_stats();
+    assert_eq!(stats.violations, 0, "{stats:?}");
+    assert!(stats.parallel_batches >= 1, "{stats:?}");
 }
 
 #[test]

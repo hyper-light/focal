@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 const MANIFEST_MAGIC: &[u8] = b"focal.evidence.manifest\0\x01\0";
 const UPLOAD_SCHEMA: u16 = 1;
@@ -1165,9 +1166,23 @@ fn install_verified_chunk(
         if previous != bytes || ContentHash(*blake3::hash(&previous).as_bytes()) != hash {
             return Err(ContentError::Corrupt);
         }
+        refresh_mtime(path)?;
         return Ok(());
     }
     atomic_install(path, bytes)
+}
+/// Mark a content-addressed file as freshly referenced. Dedup keeps an existing
+/// file rather than rewriting it, so without this a chunk shared with a newly
+/// sealed object would keep its old mtime; a collector pass that scanned the
+/// object domain before the seal could then reclaim a live chunk (its grace
+/// window already elapsed). Refreshing the mtime keeps a re-referenced chunk
+/// inside its grace window. It is a hint, not a durability fence, so no fsync.
+fn refresh_mtime(path: &Path) -> Result<(), ContentError> {
+    OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .set_modified(SystemTime::now())?;
+    Ok(())
 }
 /// Install a chunk a custody transfer received (24 §20). The bytes were
 /// verified against the chunk's hash by the caller. A file already holding
@@ -1184,6 +1199,7 @@ pub(crate) fn install_transferred_chunk(
             previous == bytes && ContentHash(*blake3::hash(&previous).as_bytes()) == hash
         })
     {
+        refresh_mtime(path)?;
         return Ok(());
     }
     atomic_install(path, bytes)

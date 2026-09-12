@@ -988,6 +988,7 @@ impl DurableNode {
     pub fn has_committed_current_term(&self) -> bool {
         !self.failed
             && self.decoder_confirmed()
+            && !self.membership_rebuild_pending
             && !self.persistence_pending()
             && self
                 .raw
