@@ -197,6 +197,39 @@ enum Phase {
         dir: Option<ReadDir>,
     },
 }
+impl Phase {
+    /// The phase to resume from when a step errors: re-derivable directory and
+    /// mark state is dropped and rebuilt on re-entry, and only scalar progress
+    /// (the domain or round index) is preserved. Resuming a Manifests/Chunks
+    /// phase re-enters its domain so the mark set is recomputed from scratch,
+    /// which is correct because marking is idempotent over the surviving files.
+    fn resume_point(&self) -> Phase {
+        match self {
+            Phase::Idle => Phase::Idle,
+            Phase::Uploads => Phase::Uploads,
+            Phase::Terminals(_) => Phase::Terminals(None),
+            Phase::Domains { domains, index }
+            | Phase::Manifests { domains, index, .. }
+            | Phase::Chunks { domains, index, .. } => Phase::Domains {
+                domains: domains.clone(),
+                index: *index,
+            },
+            Phase::Records { kinds } => Phase::Records { kinds: *kinds },
+            Phase::Receipts(_) => Phase::Receipts(None),
+            Phase::Quarantine { rounds, index, .. } => Phase::Quarantine {
+                rounds: rounds.clone(),
+                index: *index,
+                dir: None,
+            },
+        }
+    }
+}
+/// One collector phase transition: advance to the next phase, or the pass is
+/// complete.
+enum Step {
+    Advance(Phase),
+    Done,
+}
 
 pub(super) struct CollectorState {
     phase: Phase,
@@ -319,106 +352,102 @@ impl ContentStore {
                 return Ok(self.collector.report);
             }
             let phase = std::mem::replace(&mut self.collector.phase, Phase::Idle);
-            let next = match phase {
-                Phase::Idle => {
-                    self.collector.report = CollectorReport::default();
+            // If a step errors, resume this phase next call rather than restarting
+            // the whole pass from Idle. One bounded or transient error (a memory
+            // shortage, say) must never wedge reclamation by forever looping back
+            // over earlier phases; re-derivable directory/mark state is rebuilt on
+            // re-entry, only scalar progress is preserved.
+            let resume = phase.resume_point();
+            match self.advance_phase(phase, protection, config, now_ms, &mut budget) {
+                Ok(Step::Advance(next)) => self.collector.phase = next,
+                Ok(Step::Done) => {
+                    self.collector.report.complete = true;
+                    let report = self.collector.report;
+                    self.collector.phase = Phase::Idle;
                     self.collector.round = None;
-                    Phase::Uploads
+                    return Ok(report);
                 }
-                Phase::Uploads => {
-                    self.expire_uploads(config, now_ms, &mut budget)?;
-                    Phase::Terminals(None)
+                Err(error) => {
+                    self.collector.phase = resume;
+                    return Err(error);
                 }
-                Phase::Terminals(dir) => {
-                    match self.release_terminals(dir, config, now_ms, &mut budget)? {
-                        Some(dir) => Phase::Terminals(Some(dir)),
-                        None => {
-                            let domains = self.domains()?;
-                            Phase::Domains { domains, index: 0 }
-                        }
+            }
+        }
+    }
+    fn advance_phase(
+        &mut self,
+        phase: Phase,
+        protection: &ProtectionSet,
+        config: CollectorConfig,
+        now_ms: u64,
+        budget: &mut usize,
+    ) -> Result<Step, ContentError> {
+        Ok(match phase {
+            Phase::Idle => {
+                self.collector.report = CollectorReport::default();
+                self.collector.round = None;
+                Step::Advance(Phase::Uploads)
+            }
+            Phase::Uploads => {
+                self.expire_uploads(config, now_ms, budget)?;
+                Step::Advance(Phase::Terminals(None))
+            }
+            Phase::Terminals(dir) => match self.release_terminals(dir, config, now_ms, budget)? {
+                Some(dir) => Step::Advance(Phase::Terminals(Some(dir))),
+                None => {
+                    let domains = self.domains()?;
+                    Step::Advance(Phase::Domains { domains, index: 0 })
+                }
+            },
+            Phase::Domains { domains, index } => Step::Advance(match domains.get(index).copied() {
+                None => Phase::Records { kinds: 0 },
+                Some(domain) if protection.is_opaque(domain) => {
+                    self.collector.report.opaque_domains =
+                        self.collector.report.opaque_domains.saturating_add(1);
+                    Phase::Domains {
+                        domains,
+                        index: index.saturating_add(1),
                     }
                 }
-                Phase::Domains { domains, index } => match domains.get(index).copied() {
-                    None => Phase::Records { kinds: 0 },
-                    Some(domain) if protection.is_opaque(domain) => {
-                        self.collector.report.opaque_domains =
-                            self.collector.report.opaque_domains.saturating_add(1);
+                Some(domain) => {
+                    let dir = fs::read_dir(self.root.join("objects").join(hex(&domain.0)))?;
+                    Phase::Manifests {
+                        domains,
+                        index,
+                        dir,
+                        marks: BTreeSet::new(),
+                        overflow: false,
+                    }
+                }
+            }),
+            Phase::Manifests {
+                domains,
+                index,
+                mut dir,
+                mut marks,
+                mut overflow,
+            } => {
+                let domain = *domains.get(index).ok_or(ContentError::Invalid)?;
+                let exhausted = self.sweep_manifests(
+                    domain,
+                    &mut dir,
+                    &mut marks,
+                    &mut overflow,
+                    protection,
+                    config,
+                    now_ms,
+                    budget,
+                )?;
+                Step::Advance(if exhausted {
+                    if overflow {
+                        self.collector.report.chunks_deferred =
+                            self.collector.report.chunks_deferred.saturating_add(1);
                         Phase::Domains {
                             domains,
                             index: index.saturating_add(1),
                         }
-                    }
-                    Some(domain) => {
+                    } else {
                         let dir = fs::read_dir(self.root.join("objects").join(hex(&domain.0)))?;
-                        Phase::Manifests {
-                            domains,
-                            index,
-                            dir,
-                            marks: BTreeSet::new(),
-                            overflow: false,
-                        }
-                    }
-                },
-                Phase::Manifests {
-                    domains,
-                    index,
-                    mut dir,
-                    mut marks,
-                    mut overflow,
-                } => {
-                    let domain = *domains.get(index).ok_or(ContentError::Invalid)?;
-                    let exhausted = self.sweep_manifests(
-                        domain,
-                        &mut dir,
-                        &mut marks,
-                        &mut overflow,
-                        protection,
-                        config,
-                        now_ms,
-                        &mut budget,
-                    )?;
-                    if exhausted {
-                        if overflow {
-                            self.collector.report.chunks_deferred =
-                                self.collector.report.chunks_deferred.saturating_add(1);
-                            Phase::Domains {
-                                domains,
-                                index: index.saturating_add(1),
-                            }
-                        } else {
-                            let dir = fs::read_dir(self.root.join("objects").join(hex(&domain.0)))?;
-                            Phase::Chunks {
-                                domains,
-                                index,
-                                dir,
-                                marks,
-                            }
-                        }
-                    } else {
-                        Phase::Manifests {
-                            domains,
-                            index,
-                            dir,
-                            marks,
-                            overflow,
-                        }
-                    }
-                }
-                Phase::Chunks {
-                    domains,
-                    index,
-                    mut dir,
-                    marks,
-                } => {
-                    let domain = *domains.get(index).ok_or(ContentError::Invalid)?;
-                    let exhausted =
-                        self.sweep_chunks(domain, &mut dir, &marks, config, now_ms, &mut budget)?;
-                    if exhausted {
-                        Phase::Domains {
-                            domains,
-                            index: index.saturating_add(1),
-                        }
-                    } else {
                         Phase::Chunks {
                             domains,
                             index,
@@ -426,60 +455,82 @@ impl ContentStore {
                             marks,
                         }
                     }
-                }
-                Phase::Records { kinds } => {
-                    const KINDS: [CustodyRecordKind; 2] =
-                        [CustodyRecordKind::Checkpoint, CustodyRecordKind::Manifest];
-                    match KINDS.get(kinds) {
-                        Some(kind) => {
-                            self.sweep_records(*kind, protection, config, now_ms, &mut budget)?;
-                            Phase::Records {
-                                kinds: kinds.saturating_add(1),
-                            }
-                        }
-                        None => Phase::Receipts(None),
+                } else {
+                    Phase::Manifests {
+                        domains,
+                        index,
+                        dir,
+                        marks,
+                        overflow,
                     }
-                }
-                Phase::Receipts(dir) => {
-                    match self.sweep_receipts(dir, config, now_ms, &mut budget)? {
-                        Some(dir) => Phase::Receipts(Some(dir)),
-                        None => {
-                            let rounds = self.expired_rounds(config, now_ms)?;
-                            Phase::Quarantine {
-                                rounds,
-                                index: 0,
-                                dir: None,
-                            }
-                        }
+                })
+            }
+            Phase::Chunks {
+                domains,
+                index,
+                mut dir,
+                marks,
+            } => {
+                let domain = *domains.get(index).ok_or(ContentError::Invalid)?;
+                let exhausted =
+                    self.sweep_chunks(domain, &mut dir, &marks, config, now_ms, budget)?;
+                Step::Advance(if exhausted {
+                    Phase::Domains {
+                        domains,
+                        index: index.saturating_add(1),
                     }
-                }
-                Phase::Quarantine { rounds, index, dir } => match rounds.get(index).copied() {
-                    None => {
-                        self.collector.report.complete = true;
-                        let report = self.collector.report;
-                        self.collector.phase = Phase::Idle;
-                        self.collector.round = None;
-                        return Ok(report);
+                } else {
+                    Phase::Chunks {
+                        domains,
+                        index,
+                        dir,
+                        marks,
                     }
-                    Some(round) => {
-                        let done = self.delete_round(round, dir, &mut budget)?;
-                        match done {
-                            None => Phase::Quarantine {
-                                rounds,
-                                index: index.saturating_add(1),
-                                dir: None,
-                            },
-                            Some(dir) => Phase::Quarantine {
-                                rounds,
-                                index,
-                                dir: Some(dir),
-                            },
+                })
+            }
+            Phase::Records { kinds } => {
+                const KINDS: [CustodyRecordKind; 2] =
+                    [CustodyRecordKind::Checkpoint, CustodyRecordKind::Manifest];
+                Step::Advance(match KINDS.get(kinds) {
+                    Some(kind) => {
+                        self.sweep_records(*kind, protection, config, now_ms, budget)?;
+                        Phase::Records {
+                            kinds: kinds.saturating_add(1),
                         }
                     }
-                },
-            };
-            self.collector.phase = next;
-        }
+                    None => Phase::Receipts(None),
+                })
+            }
+            Phase::Receipts(dir) => match self.sweep_receipts(dir, config, now_ms, budget)? {
+                Some(dir) => Step::Advance(Phase::Receipts(Some(dir))),
+                None => {
+                    let rounds = self.expired_rounds(config, now_ms)?;
+                    Step::Advance(Phase::Quarantine {
+                        rounds,
+                        index: 0,
+                        dir: None,
+                    })
+                }
+            },
+            Phase::Quarantine { rounds, index, dir } => match rounds.get(index).copied() {
+                None => Step::Done,
+                Some(round) => {
+                    let done = self.delete_round(round, dir, budget)?;
+                    Step::Advance(match done {
+                        None => Phase::Quarantine {
+                            rounds,
+                            index: index.saturating_add(1),
+                            dir: None,
+                        },
+                        Some(dir) => Phase::Quarantine {
+                            rounds,
+                            index,
+                            dir: Some(dir),
+                        },
+                    })
+                }
+            },
+        })
     }
     fn visit(&mut self, budget: &mut usize) {
         *budget = budget.saturating_sub(1);
