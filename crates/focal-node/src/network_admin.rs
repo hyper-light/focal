@@ -1853,10 +1853,10 @@ impl LocalNetworkAdmin {
     }
 }
 impl RequestHandler for LocalNetworkAdmin {
-    fn handle(&self, request: VerifiedRequest) -> HandlerFuture<'_> {
+    fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
         Box::pin(async move { self.handle_accounted(request).await.into_envelope() })
     }
-    fn handle_accounted(&self, request: VerifiedRequest) -> OwnedHandlerFuture<'_> {
+    fn handle_accounted<'a>(&'a self, request: &'a VerifiedRequest) -> OwnedHandlerFuture<'a> {
         Box::pin(async move {
             let mut reply = request
                 .request()
@@ -1868,11 +1868,10 @@ impl RequestHandler for LocalNetworkAdmin {
                 return OwnedResponse::new(reply);
             };
             let mut allocation = reservation.commit();
-            reply.result = match self.invite(&request).await {
+            reply.result = match self.invite(request).await {
                 Ok(response) => Response::Control { response },
                 Err(error) => Response::Error(error),
             };
-            drop(request);
             let bytes = postcard::experimental::serialized_size(&reply)
                 .ok()
                 .and_then(|bytes| bytes.checked_mul(4))
@@ -1986,7 +1985,7 @@ mod tests {
         let local = AuthenticatedPeer::local(grant(ParticipantId(wrong))).unwrap();
         assert_eq!(
             admin
-                .handle(verify_request(local, request.clone(), &admin_wire_limits()).unwrap())
+                .handle(&verify_request(local, request.clone(), &admin_wire_limits()).unwrap())
                 .await
                 .result,
             Response::Error(AccessError::Unauthorized)
@@ -1999,7 +1998,7 @@ mod tests {
         let remote = peers.authenticate(fingerprint).unwrap();
         assert_eq!(
             admin
-                .handle(verify_request(remote, request.clone(), &admin_wire_limits()).unwrap())
+                .handle(&verify_request(remote, request.clone(), &admin_wire_limits()).unwrap())
                 .await
                 .result,
             Response::Error(AccessError::Unauthorized)
@@ -2010,7 +2009,7 @@ mod tests {
         }
         let local = AuthenticatedPeer::local(grant(network.directory.identity().issuer)).unwrap();
         let response = admin
-            .handle_accounted(verify_request(local, wrong_command, &admin_wire_limits()).unwrap())
+            .handle_accounted(&verify_request(local, wrong_command, &admin_wire_limits()).unwrap())
             .await;
         assert!(budget.stats().used > 0);
         assert!(budget.stats().used < WORKSPACE);

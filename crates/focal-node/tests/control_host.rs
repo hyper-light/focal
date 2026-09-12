@@ -196,7 +196,7 @@ impl Rig {
                         &ControlHost::wire_limits(),
                     )
                     .unwrap();
-                    let _ = target.handle(verified).await;
+                    let _ = target.handle(&verified).await;
                     drop(frame);
                 }
             }));
@@ -617,7 +617,7 @@ async fn partition_owner_replication_and_authorization_are_independent_of_root()
         };
         let verified =
             verify_request(peer(PeerRole::Runtime), wire, &ControlHost::wire_limits()).unwrap();
-        let result = rig.hosts[leader].handle(verified).await;
+        let result = rig.hosts[leader].handle(&verified).await;
         let Response::Control { response } = result.result else {
             panic!("control response expected")
         };
@@ -652,7 +652,7 @@ async fn partition_owner_replication_and_authorization_are_independent_of_root()
     )
     .unwrap();
     assert_eq!(
-        rig.hosts[leader].handle(verified).await.result,
+        rig.hosts[leader].handle(&verified).await.result,
         Response::Error(AccessError::Unauthorized)
     );
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -739,7 +739,7 @@ async fn owned_control_response_retains_input_and_export_budgets_until_delivery_
         &ControlHost::wire_limits(),
     )
     .unwrap();
-    let response = host.handle_accounted(verified).await;
+    let response = host.handle_accounted(&verified).await;
     assert!(matches!(
         response.envelope().result,
         Response::Control { .. }

@@ -100,10 +100,10 @@ struct AccountedDownload {
     budget: MemoryBudget,
 }
 impl RequestHandler for AccountedDownload {
-    fn handle(&self, _request: VerifiedRequest) -> HandlerFuture<'_> {
+    fn handle<'a>(&'a self, _request: &'a VerifiedRequest) -> HandlerFuture<'a> {
         panic!("network dispatch must preserve the accounted handler override")
     }
-    fn handle_accounted(&self, request: VerifiedRequest) -> OwnedHandlerFuture<'_> {
+    fn handle_accounted<'a>(&'a self, request: &'a VerifiedRequest) -> OwnedHandlerFuture<'a> {
         Box::pin(async move {
             let Operation::Download {
                 content,

@@ -171,10 +171,10 @@ enum TestService {
     Managed(ManagedService),
 }
 impl RequestHandler for TestService {
-    fn handle(&self, request: VerifiedRequest) -> HandlerFuture<'_> {
+    fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
         Box::pin(async move { self.handle_accounted(request).await.into_envelope() })
     }
-    fn handle_accounted(&self, request: VerifiedRequest) -> OwnedHandlerFuture<'_> {
+    fn handle_accounted<'a>(&'a self, request: &'a VerifiedRequest) -> OwnedHandlerFuture<'a> {
         match self {
             Self::Single(service) => service.handle_accounted(request),
             Self::Managed(service) => service.handle_accounted(request),

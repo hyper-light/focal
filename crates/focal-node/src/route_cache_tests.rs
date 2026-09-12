@@ -37,7 +37,7 @@ pub(crate) async fn ask(running: &Running, request: RequestEnvelope) -> Response
     let verified = verify_request(peer, request, &WireLimits::default()).unwrap();
     running
         .data
-        .handle_accounted(verified)
+        .handle_accounted(&verified)
         .await
         .into_envelope()
         .result

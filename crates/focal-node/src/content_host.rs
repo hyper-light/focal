@@ -586,13 +586,17 @@ impl ContentHost {
     }
 }
 impl RequestHandler for ContentHost {
-    fn handle(
-        &self,
-        request: VerifiedRequest,
-    ) -> Pin<Box<dyn Future<Output = ResponseEnvelope> + Send + '_>> {
+    fn handle<'a>(
+        &'a self,
+        request: &'a VerifiedRequest,
+    ) -> Pin<Box<dyn Future<Output = ResponseEnvelope> + Send + 'a>> {
         Box::pin(async move { self.handle_accounted(request).await.into_envelope() })
     }
-    fn handle_accounted(&self, request: VerifiedRequest) -> OwnedHandlerFuture<'_> {
+    fn handle_accounted<'a>(&'a self, request: &'a VerifiedRequest) -> OwnedHandlerFuture<'a> {
+        // `request` is queued into the content command channel and outlives this
+        // call, so clone once here (the transport no longer clones every
+        // request).
+        let request = request.clone();
         Box::pin(async move {
             let fallback = request
                 .request()

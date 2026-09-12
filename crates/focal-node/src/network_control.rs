@@ -256,7 +256,7 @@ impl<'a> NetworkEnrollmentControl<'a> {
                 &ControlHost::wire_limits(),
             )
             .map_err(peer_access)?;
-            let response = self.local.handle_accounted(verified).await;
+            let response = self.local.handle_accounted(&verified).await;
             let result = match &response.envelope().result {
                 Response::Control { response } => decode_reply(response),
                 Response::Error(error) => Err(peer_access(error.clone())),

@@ -1010,14 +1010,21 @@ impl RequestHandler for ReplicaHost {
     fn supports_native_requests(&self) -> bool {
         true
     }
-    fn handle(
-        &self,
-        request: VerifiedRequest,
-    ) -> Pin<Box<dyn Future<Output = ResponseEnvelope> + Send + '_>> {
-        Box::pin(async move { self.submit_inner(request, None, None).await.into_envelope() })
+    fn handle<'a>(
+        &'a self,
+        request: &'a VerifiedRequest,
+    ) -> Pin<Box<dyn Future<Output = ResponseEnvelope> + Send + 'a>> {
+        // The request is queued into `Work` and outlives this call, so it is
+        // owned from here; clone once at the queue boundary (the transport no
+        // longer clones every request).
+        Box::pin(async move {
+            self.submit_inner(request.clone(), None, None)
+                .await
+                .into_envelope()
+        })
     }
-    fn handle_accounted(&self, request: VerifiedRequest) -> OwnedHandlerFuture<'_> {
-        Box::pin(self.submit_inner(request, None, None))
+    fn handle_accounted<'a>(&'a self, request: &'a VerifiedRequest) -> OwnedHandlerFuture<'a> {
+        Box::pin(self.submit_inner(request.clone(), None, None))
     }
 }
 impl ReplicaHost {
@@ -2436,7 +2443,7 @@ impl Owner {
                 &self.client_limits,
             );
         }
-        let input = verified.clone().into_authenticated(AuthorityContext {
+        let input = verified.to_authenticated(AuthorityContext {
             runtime: false,
             cause: Cause::Root(self.config.root),
             policy_revision: self.config.policy_revision,

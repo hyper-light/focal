@@ -834,7 +834,7 @@ impl RequestHandler for NativeEcho {
     fn supports_native_requests(&self) -> bool {
         self.native
     }
-    fn handle(&self, request: VerifiedRequest) -> HandlerFuture<'_> {
+    fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
         Box::pin(async move {
             let envelope = request.request();
             let result = match &envelope.operation {

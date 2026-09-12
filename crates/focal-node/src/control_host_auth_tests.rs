@@ -120,7 +120,7 @@ async fn cached_enrolled_peer_cannot_dispatch_root_raft_or_read_after_committed_
     )
     .unwrap();
     assert_eq!(
-        host.handle(request(peer.clone(), namespace, 3, raft_operation))
+        host.handle(&request(peer.clone(), namespace, 3, raft_operation))
             .await
             .result,
         Response::PeerAccepted
@@ -145,10 +145,10 @@ async fn cached_enrolled_peer_cannot_dispatch_root_raft_or_read_after_committed_
             .is_ok()
     );
     assert_eq!(
-        host.handle(stale_raft).await.result,
+        host.handle(&stale_raft).await.result,
         Response::Error(AccessError::Unauthorized)
     );
-    assert_read_denied(host.handle(stale_read).await);
+    assert_read_denied(host.handle(&stale_read).await);
     host.stop().await.unwrap();
     owner.join().unwrap();
 }

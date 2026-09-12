@@ -150,7 +150,7 @@ impl Rig {
                         &ControlHost::wire_limits(),
                     )
                     .unwrap();
-                    let _ = target.handle(verified).await;
+                    let _ = target.handle(&verified).await;
                     drop(frame);
                 }
             }));

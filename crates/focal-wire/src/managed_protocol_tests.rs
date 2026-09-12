@@ -9,7 +9,7 @@ impl RequestHandler for Capable {
     fn supports_managed_requests(&self) -> bool {
         self.managed
     }
-    fn handle(&self, request: VerifiedRequest) -> HandlerFuture<'_> {
+    fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
         Box::pin(async move {
             self.calls
                 .send_modify(|count| *count = count.saturating_add(1));

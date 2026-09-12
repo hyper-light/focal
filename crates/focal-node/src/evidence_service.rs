@@ -1911,13 +1911,18 @@ impl RequestHandler for FleetService {
     fn supports_native_requests(&self) -> bool {
         true
     }
-    fn handle(
-        &self,
-        request: VerifiedRequest,
-    ) -> Pin<Box<dyn Future<Output = ResponseEnvelope> + Send + '_>> {
+    fn handle<'a>(
+        &'a self,
+        request: &'a VerifiedRequest,
+    ) -> Pin<Box<dyn Future<Output = ResponseEnvelope> + Send + 'a>> {
         Box::pin(async move { self.handle_accounted(request).await.into_envelope() })
     }
-    fn handle_accounted(&self, request: VerifiedRequest) -> OwnedHandlerFuture<'_> {
+    fn handle_accounted<'a>(&'a self, request: &'a VerifiedRequest) -> OwnedHandlerFuture<'a> {
+        // This service threads ownership of the request through seal / attest /
+        // eligibility / probe pipelines, so it needs an owned value; clone once
+        // here (the transport no longer clones every request). Forwarding
+        // branches (content, replica) pass a borrow.
+        let request = request.clone();
         Box::pin(async move {
             let mut response = request
                 .request()
@@ -1935,7 +1940,7 @@ impl RequestHandler for FleetService {
                 request.request().operation,
                 Operation::Custody(_) | Operation::Upload(_) | Operation::Download { .. }
             ) {
-                self.content.handle_accounted(request).await
+                self.content.handle_accounted(&request).await
             } else if let Operation::Native { frame } = &request.request().operation
                 && inspect_native_frame(frame)
                     .is_ok_and(|header| crate::native_ingress::artifact_bearing(header.command))
@@ -1956,7 +1961,7 @@ impl RequestHandler for FleetService {
                     .is_ok_and(|header| crate::native_ingress::evaluates_artifact(header.command))
             {
                 match self.eligible(request).await {
-                    Ok(request) => self.replica.handle_accounted(request).await,
+                    Ok(request) => self.replica.handle_accounted(&request).await,
                     Err(Eligibility::Refused(refusal)) => {
                         response.result = Response::Native(NativeMutationReply::Refused(refusal));
                         OwnedResponse::new(response)
@@ -1998,7 +2003,7 @@ impl RequestHandler for FleetService {
                     }
                 }
             } else {
-                self.replica.handle_accounted(request).await
+                self.replica.handle_accounted(&request).await
             }
         })
     }

@@ -65,8 +65,8 @@ pub trait RequestHandler: Send + Sync + 'static {
     fn supports_native_requests(&self) -> bool {
         false
     }
-    fn handle(&self, request: VerifiedRequest) -> HandlerFuture<'_>;
-    fn handle_accounted(&self, request: VerifiedRequest) -> OwnedHandlerFuture<'_> {
+    fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a>;
+    fn handle_accounted<'a>(&'a self, request: &'a VerifiedRequest) -> OwnedHandlerFuture<'a> {
         Box::pin(async move { OwnedResponse::new(self.handle(request).await) })
     }
 }
@@ -75,8 +75,12 @@ where
     F: Fn(VerifiedRequest) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ResponseEnvelope> + Send + 'static,
 {
-    fn handle(&self, request: VerifiedRequest) -> HandlerFuture<'_> {
-        Box::pin(self(request))
+    // Closure handlers (test scaffolding and compatibility callers) take an owned
+    // `VerifiedRequest`, so this bridge clones it. Production handlers implement
+    // the trait directly on `&VerifiedRequest` and never clone here — the hot
+    // dispatch path is clone-free.
+    fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
+        Box::pin(self(request.clone()))
     }
 }
 
@@ -92,10 +96,10 @@ impl RequestHandler for std::sync::Arc<dyn RequestHandler> {
     fn supports_native_requests(&self) -> bool {
         self.as_ref().supports_native_requests()
     }
-    fn handle(&self, request: VerifiedRequest) -> HandlerFuture<'_> {
+    fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
         self.as_ref().handle(request)
     }
-    fn handle_accounted(&self, request: VerifiedRequest) -> OwnedHandlerFuture<'_> {
+    fn handle_accounted<'a>(&'a self, request: &'a VerifiedRequest) -> OwnedHandlerFuture<'a> {
         self.as_ref().handle_accounted(request)
     }
 }
@@ -126,39 +130,59 @@ pub async fn dispatch_accounted(
     if require_runtime().is_err() {
         return OwnedResponse::new(request.reply(Response::Error(AccessError::Unavailable)));
     }
-    let verified = match verify_request(peer.clone(), request.clone(), limits) {
+    // `verify_request` consumes `peer` and `request` into `VerifiedRequest`; the
+    // whole envelope and peer are no longer cloned per request. Capture the Copy
+    // reply identity first so a verification failure can still answer under the
+    // request's identity without retaining the moved envelope.
+    let (protocol, ledger, route_epoch, request_epoch, request_id) = (
+        request.protocol,
+        request.ledger,
+        request.route_epoch,
+        request.request_epoch,
+        request.request_id,
+    );
+    let verified = match verify_request(peer, request, limits) {
         Ok(value) => value,
-        Err(error) => return OwnedResponse::new(request.reply(Response::Error(error))),
+        Err(error) => {
+            return OwnedResponse::new(ResponseEnvelope {
+                protocol,
+                ledger,
+                route_epoch,
+                request_epoch,
+                request_id,
+                result: Response::Error(error),
+            });
+        }
     };
-    if (request.protocol == PEER_PROTOCOL_VERSION
+    if (verified.request().protocol == PEER_PROTOCOL_VERSION
         && (!handler.supports_managed_requests() || !handler.supports_participant_requests()))
-        || (request.protocol == crate::NATIVE_PROTOCOL_VERSION
+        || (verified.request().protocol == crate::NATIVE_PROTOCOL_VERSION
             && (!handler.supports_managed_requests()
                 || !handler.supports_participant_requests()
                 || !handler.supports_native_requests()))
     {
         return OwnedResponse::new(
-            request.reply(Response::Error(AccessError::UnsupportedProtocol)),
+            verified
+                .request()
+                .reply(Response::Error(AccessError::UnsupportedProtocol)),
         );
     }
-    let response = match tokio::time::timeout(
-        limits.request_timeout,
-        handler.handle_accounted(verified),
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(_) => {
-            return OwnedResponse::new(request.reply(Response::Error(
-                if request.operation.is_mutation() {
-                    AccessError::OutcomeUnknown
-                } else {
-                    AccessError::Unavailable
-                },
-            )));
-        }
-    };
-    let delivery = match (&request.operation, &response.envelope().result) {
+    let response =
+        match tokio::time::timeout(limits.request_timeout, handler.handle_accounted(&verified))
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => {
+                return OwnedResponse::new(verified.request().reply(Response::Error(
+                    if verified.request().operation.is_mutation() {
+                        AccessError::OutcomeUnknown
+                    } else {
+                        AccessError::Unavailable
+                    },
+                )));
+            }
+        };
+    let delivery = match (&verified.request().operation, &response.envelope().result) {
         (Operation::Stream(stream), Response::Stream(reply)) => Some((stream, reply)),
         (
             Operation::Managed {
@@ -173,20 +197,25 @@ pub async fn dispatch_accounted(
         _ => None,
     };
     if let Some((stream, reply)) = delivery
-        && stream_scope(&peer, request.ledger, stream.filter()).ok() != Some(reply.cursor.scope)
+        && stream_scope(verified.peer(), verified.request().ledger, stream.filter()).ok()
+            != Some(reply.cursor.scope)
     {
-        return OwnedResponse::new(request.reply(Response::Error(AccessError::OutcomeUnknown)));
+        return OwnedResponse::new(
+            verified
+                .request()
+                .reply(Response::Error(AccessError::OutcomeUnknown)),
+        );
     }
     if validate_response(
-        &request,
+        verified.request(),
         response.envelope(),
-        Some(peer.principal()),
+        Some(verified.peer().principal()),
         limits,
     )
     .is_err()
     {
-        return OwnedResponse::new(request.reply(Response::Error(
-            if request.operation.is_mutation() {
+        return OwnedResponse::new(verified.request().reply(Response::Error(
+            if verified.request().operation.is_mutation() {
                 AccessError::OutcomeUnknown
             } else {
                 AccessError::InvalidRequest
@@ -197,8 +226,8 @@ pub async fn dispatch_accounted(
         .ok()
         .is_none_or(|n| n > limits.max_frame_bytes as usize)
     {
-        return OwnedResponse::new(request.reply(Response::Error(
-            if request.operation.is_mutation() {
+        return OwnedResponse::new(verified.request().reply(Response::Error(
+            if verified.request().operation.is_mutation() {
                 AccessError::OutcomeUnknown
             } else {
                 AccessError::Capacity

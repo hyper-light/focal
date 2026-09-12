@@ -141,7 +141,7 @@ fn missing_time_driver_and_panicking_transport_do_not_unwind_or_replace_write_id
 async fn embedded_transport_checks_managed_syntax_capability_before_dispatch() {
     struct Legacy;
     impl RequestHandler for Legacy {
-        fn handle(&self, request: VerifiedRequest) -> HandlerFuture<'_> {
+        fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
             assert_eq!(request.request().protocol, PROTOCOL_VERSION);
             Box::pin(async move {
                 request

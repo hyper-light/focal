@@ -640,7 +640,7 @@ impl ControlHost {
             },
         };
         let verified = verify_request(peer, request, &self.limits).map_err(access_failure)?;
-        let response = self.handle(verified).await;
+        let response = self.handle(&verified).await;
         match response.result {
             Response::Control { response } => {
                 ControlReply::decode(&response, self.limits.max_frame_bytes as usize)
@@ -652,10 +652,10 @@ impl ControlHost {
     }
 }
 impl RequestHandler for ControlHost {
-    fn handle(&self, request: VerifiedRequest) -> HandlerFuture<'_> {
+    fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
         Box::pin(async move { self.handle_accounted(request).await.into_envelope() })
     }
-    fn handle_accounted(&self, request: VerifiedRequest) -> OwnedHandlerFuture<'_> {
+    fn handle_accounted<'a>(&'a self, request: &'a VerifiedRequest) -> OwnedHandlerFuture<'a> {
         Box::pin(async move {
             let unknown = request
                 .request()
@@ -687,7 +687,11 @@ impl RequestHandler for ControlHost {
             };
             let (send, receive) = oneshot::channel();
             let queue = if peer { &self.peers } else { &self.sender };
-            match queue.try_send(Work::Request(Box::new(request), send, charge.commit())) {
+            match queue.try_send(Work::Request(
+                Box::new(request.clone()),
+                send,
+                charge.commit(),
+            )) {
                 Ok(()) => receive
                     .await
                     .map(Completed::into_owned)

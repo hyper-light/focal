@@ -314,6 +314,84 @@ impl VerifiedRequest {
             command,
         })
     }
+    /// Borrowed twin of `into_authenticated` for handlers that receive
+    /// `&VerifiedRequest`: clones only the command, never the whole envelope or
+    /// peer. Semantics are otherwise identical (server authority still enters
+    /// here, never through decoded client input).
+    pub fn to_authenticated(
+        &self,
+        mut authority: AuthorityContext,
+    ) -> Result<AuthenticatedInput, AccessError> {
+        let (expected_revision, command, epoch_allocation) = match &self.request.operation {
+            Operation::Submit {
+                expected_revision,
+                command,
+            } => (*expected_revision, command.clone(), false),
+            Operation::OpenEpoch { epoch } => {
+                (None, Command::NegotiateEpoch { epoch: *epoch }, true)
+            }
+            _ => return Err(AccessError::InvalidRequest),
+        };
+        authority.runtime = matches!(self.peer.role(), PeerRole::Runtime) || epoch_allocation;
+        verify_authored_claims(
+            &command,
+            self.request.ledger,
+            self.peer.principal(),
+            &authority,
+        )?;
+        Ok(AuthenticatedInput {
+            ledger: self.request.ledger,
+            principal: self.peer.principal(),
+            request_epoch: self.request.request_epoch,
+            request_id: self.request.request_id,
+            expected_revision,
+            authority,
+            command,
+        })
+    }
+    /// Borrowed twin of `into_managed`; clones only the command.
+    pub fn to_managed(
+        &self,
+        mut authority: AuthorityContext,
+    ) -> Result<ManagedAuthenticatedInput, AccessError> {
+        let Operation::Managed {
+            key,
+            operation:
+                ManagedOperation::Submit {
+                    expected_revision,
+                    command,
+                },
+        } = &self.request.operation
+        else {
+            return Err(AccessError::InvalidRequest);
+        };
+        authority.runtime = matches!(self.peer.role(), PeerRole::Runtime);
+        verify_authored_claims(
+            command,
+            self.request.ledger,
+            self.peer.principal(),
+            &authority,
+        )?;
+        Ok(ManagedAuthenticatedInput {
+            key: *key,
+            expected_revision: *expected_revision,
+            authority,
+            command: command.clone(),
+        })
+    }
+    /// Borrowed twin of `into_request_stream_control`; clones only the command.
+    pub fn to_request_stream_control(&self) -> Result<RequestStreamControlInput, AccessError> {
+        let Operation::RequestStreamControl { cluster, command } = &self.request.operation else {
+            return Err(AccessError::InvalidRequest);
+        };
+        Ok(RequestStreamControlInput {
+            cluster: *cluster,
+            ledger: self.request.ledger,
+            principal: self.peer.principal(),
+            id: self.request.request_id,
+            command: command.clone(),
+        })
+    }
 }
 
 pub fn verify_request(
