@@ -391,6 +391,10 @@ struct Pending {
     sequence: u64,
     indirect_outstanding: usize,
     acknowledged: bool,
+    /// When this probe round began (its direct probe send). Direct proof of life
+    /// received at or after this time refutes the round, so an indirect failure
+    /// never suspects a member that answered us meanwhile.
+    started_ms: u64,
 }
 struct Member {
     generation: u64,
@@ -406,6 +410,10 @@ struct Member {
     /// The last measured round-trip time to this member (24 §22): a probe's
     /// answer minus its send. `None` until the first answer.
     last_rtt_ms: Option<u64>,
+    /// When direct evidence of this member's life last arrived (a message from
+    /// it, its direct probe reply, or a relay's acknowledgement). Gossip does
+    /// not update it. Used to refute an in-flight probe round (SWIM Lifeguard).
+    last_alive_ms: u64,
 }
 impl Member {
     fn new(generation: u64, now_ms: u64, config: &LivenessConfig) -> Self {
@@ -421,6 +429,7 @@ impl Member {
             grace_until_ms: 0,
             probe: None,
             last_rtt_ms: None,
+            last_alive_ms: 0,
         }
     }
     fn view(&self, timeout_ms: u64) -> MemberView {
@@ -873,6 +882,7 @@ impl LivenessDriver {
             sequence,
             indirect_outstanding: 0,
             acknowledged: false,
+            started_ms: now_ms,
         });
         self.state.counters.probes_sent = self.state.counters.probes_sent.saturating_add(1);
         self.state.inflight = self.state.inflight.saturating_add(1);
@@ -1026,7 +1036,7 @@ impl LivenessDriver {
             .get(&request.sender)
             .is_some_and(|member| member.generation == request.generation);
         if known {
-            self.learn_alive(request.sender, request.incarnation, now_ms);
+            self.learn_alive(request.sender, request.incarnation, now_ms, true);
             if let Some(member) = self.state.members.get_mut(&request.sender) {
                 member.coordinate = Some(request.coordinate);
             }
@@ -1184,7 +1194,7 @@ impl LivenessDriver {
                             target: relayed,
                             acknowledged: Some(incarnation),
                         } if relayed == target => {
-                            self.learn_alive(target, incarnation, now_ms);
+                            self.learn_alive(target, incarnation, now_ms, true);
                             true
                         }
                         _ => false,
@@ -1280,7 +1290,7 @@ impl LivenessDriver {
                     member.coordinate = Some(reply.coordinate);
                     member.last_rtt_ms = Some(elapsed);
                 }
-                self.learn_alive(from, reply.incarnation, now_ms);
+                self.learn_alive(from, reply.incarnation, now_ms, true);
                 for update in &reply.updates {
                     self.on_update(*update, now_ms);
                 }
@@ -1302,11 +1312,18 @@ impl LivenessDriver {
         let Some(member) = self.state.members.get_mut(&target) else {
             return;
         };
+        let round_started = member.probe.as_ref().map(|pending| pending.started_ms);
         member.probe = None;
+        // Direct proof of life received at or after this round began refutes it:
+        // a member that answered us (or a relay) during the probe window must not
+        // be suspected just because the indirect probes over a degraded path
+        // failed (SWIM Lifeguard).
+        let refuted = round_started.is_some_and(|started| member.last_alive_ms >= started);
         if !member.confirmed
             || member.status == MemberStatus::Dead
             || member.suspicion.is_some()
             || now_ms < member.grace_until_ms
+            || refuted
         {
             return;
         }
@@ -1339,12 +1356,19 @@ impl LivenessDriver {
         });
     }
     /// Direct evidence that `node` answers at `incarnation`.
-    fn learn_alive(&mut self, node: u64, incarnation: u64, now_ms: u64) {
+    fn learn_alive(&mut self, node: u64, incarnation: u64, now_ms: u64, direct: bool) {
         let config = self.config;
         let me = self.node;
         let Some(member) = self.state.members.get_mut(&node) else {
             return;
         };
+        // Direct evidence (a message from the member, its probe reply, or a
+        // relay's acknowledgement) records the time even for a stale incarnation,
+        // since it still proves the member is alive now; gossip (hearsay) does
+        // not, so it can never refute an in-flight probe round.
+        if direct {
+            member.last_alive_ms = now_ms;
+        }
         if incarnation < member.incarnation {
             return;
         }
@@ -1397,7 +1421,7 @@ impl LivenessDriver {
         match update.status {
             MemberStatus::Alive => {
                 if update.incarnation > member.incarnation {
-                    self.learn_alive(update.node, update.incarnation, now_ms);
+                    self.learn_alive(update.node, update.incarnation, now_ms, false);
                 }
             }
             MemberStatus::Suspect => {

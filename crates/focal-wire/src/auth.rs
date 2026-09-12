@@ -423,7 +423,8 @@ pub fn verify_request(
     {
         return Err(AccessError::UnsupportedProtocol);
     }
-    if request.ledger.session.is_zero()
+    if request.ledger.tenant.is_zero()
+        || request.ledger.session.is_zero()
         || request.request_id.is_zero()
         || request.request_epoch.0 == 0
     {

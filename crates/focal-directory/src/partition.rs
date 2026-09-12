@@ -713,12 +713,15 @@ impl DirectoryPartition {
                 if previous != *expected_generation {
                     return Err(DirectoryError::CompareFailed);
                 }
-                if node.generation
-                    != previous
-                        .unwrap_or(0)
-                        .checked_add(1)
-                        .ok_or(DirectoryError::CounterExhausted)?
-                {
+                // Any forward generation move is accepted, not only +1: the root
+                // advances a node's generation once per drain/undrain and the
+                // authority snapshot that feeds enrollment holds only the latest
+                // grant, so an intermediate generation may never reach this
+                // partition. The grant is self-contained and authenticated by
+                // verify_enrollment below, and the compare-and-set above pins the
+                // record this decision was made against, so skipping a generation
+                // is safe. Requiring exactly +1 wedged the enrollment permanently.
+                if node.generation <= previous.unwrap_or(0) {
                     return Err(DirectoryError::StaleNode);
                 }
                 if let Some(old) = state.nodes.get(&node.node)

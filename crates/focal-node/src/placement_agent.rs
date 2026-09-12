@@ -1988,16 +1988,19 @@ impl PlacementAgent {
             }
             let expected_generation = match directory.nodes.get(&id) {
                 Some(existing) if existing.enrollment == grant.enrollment => continue,
-                Some(existing)
-                    if existing.enrollment.generation < grant.enrollment.generation
-                        && grant.enrollment.generation
-                            == existing.enrollment.generation.saturating_add(1) =>
-                {
+                // Accept any forward move, not only +1. The root advances a node's
+                // generation once per drain/undrain, and this partition's authority
+                // snapshot holds only the latest grant per node, so an intermediate
+                // generation (e.g. a drain immediately undrained) is never presented
+                // here. Requiring exactly +1 would freeze the enrollment forever and
+                // keep serving a since-drained node. The grant is self-contained and
+                // verified at apply, and the compare-and-set on expected_generation
+                // guards against a lost concurrent update.
+                Some(existing) if existing.enrollment.generation < grant.enrollment.generation => {
                     Some(existing.enrollment.generation)
                 }
                 Some(_) => continue,
-                None if grant.enrollment.generation == 1 => None,
-                None => continue,
+                None => None,
             };
             let command = ControlCommand::VerifiedPartition(VerifiedPartitionCommand {
                 command: PartitionCommand {
