@@ -32,4 +32,9 @@ jobs:
         run: cargo test -p focal-wire --locked
       - name: A1 product gate on the real binary (CLI, activation, restart, retry)
         shell: bash
-        run: cargo test -p focal-node --test cli_native_a1 --locked
+        # The integration test drives the shipped artifact, so it runs the
+        # release binary — the optimized build users get, which needs ~700 KiB
+        # of stack (well within a Windows process's 1 MiB main thread). A debug
+        # build's un-optimized async poll frames need ~2 MiB, a rustc codegen
+        # characteristic, not a product cost.
+        run: cargo test -p focal-node --test cli_native_a1 --release --locked
