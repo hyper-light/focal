@@ -76,6 +76,17 @@ impl Collected {
     }
 }
 
+/// Serialize the signature request body once. Every voter in a collection round
+/// signs the identical (fact, window), so the caller builds this once and hands
+/// each `remote_signature` the shared bytes instead of re-serializing per voter.
+pub fn sign_request_body(fact: &SessionFact, window: ProofWindow) -> Option<Vec<u8>> {
+    postcard::to_stdvec(&SessionSignRequest {
+        schema: 1,
+        fact: fact.clone(),
+        window,
+    })
+    .ok()
+}
 /// Ask one voter for its signature. An unreachable or refusing voter yields
 /// None; the majority decides, never one node.
 pub async fn remote_signature(
@@ -83,16 +94,11 @@ pub async fn remote_signature(
     voter: u64,
     ledger: LedgerId,
     group: [u8; 16],
-    fact: &SessionFact,
-    window: ProofWindow,
+    body: &[u8],
     request_id: RequestId,
 ) -> Option<AuthorityProof> {
-    let body = postcard::to_stdvec(&SessionSignRequest {
-        schema: 1,
-        fact: fact.clone(),
-        window,
-    })
-    .ok()?;
+    // The signed body (fact + window) is identical for every voter, so the
+    // caller serializes it once; each voter's envelope only copies those bytes.
     let envelope = RequestEnvelope {
         protocol: PROTOCOL_VERSION,
         ledger,
@@ -101,7 +107,7 @@ pub async fn remote_signature(
         request_id,
         operation: Operation::SessionSign {
             group,
-            request: body,
+            request: body.to_vec(),
         },
     };
     let bytes = tokio::time::timeout(REMOTE_TIMEOUT, pool.send_placement(voter, &envelope))

@@ -2536,10 +2536,11 @@ impl PlacementAgent {
                 return collected.finish();
             }
         }
+        let body = crate::placement_collect::sign_request_body(&fact, window)
+            .ok_or(CollectError::Capacity)?;
         for voter in voters.iter().copied().filter(|voter| *voter != node) {
             let id = self.next_request_id().map_err(|_| CollectError::Capacity)?;
-            let Some(proof) = remote_signature(pool, voter, ledger, group, &fact, window, id).await
-            else {
+            let Some(proof) = remote_signature(pool, voter, ledger, group, &body, id).await else {
                 continue;
             };
             if collected.merge(proof)? {
