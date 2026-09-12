@@ -1049,18 +1049,30 @@ fn read_verified_at(
     let manifest = manifest_at(root, reference)?;
     let dir = root.join("objects").join(hex(&reference.domain.0));
     let mut whole = blake3::Hasher::new();
-    for chunk in manifest.chunks {
-        let bytes = read_bounded(
-            &dir.join(format!("{}.chunk", chunk.hash)),
-            MAX_TRANSFER_CHUNK_BYTES,
-        )?;
-        if bytes.len() != chunk.length as usize
-            || ContentHash(*blake3::hash(&bytes).as_bytes()) != chunk.hash
-        {
+    // One scratch buffer sized to the largest chunk, reused for every chunk,
+    // instead of allocating a fresh buffer (up to a full chunk) per chunk.
+    let scratch_len = manifest
+        .chunks
+        .iter()
+        .map(|chunk| chunk.length as usize)
+        .max()
+        .unwrap_or(0);
+    let mut scratch = zeroed_buffer(scratch_len)?;
+    for chunk in &manifest.chunks {
+        let len = chunk.length as usize;
+        let block = scratch.get_mut(..len).ok_or(ContentError::Corrupt)?;
+        let mut file = File::open(dir.join(format!("{}.chunk", chunk.hash)))?;
+        file.read_exact(block)?;
+        // The chunk file must be exactly `len`: a trailing byte is corruption.
+        let mut extra = [0u8; 1];
+        if file.read(&mut extra)? != 0 {
             return Err(ContentError::Corrupt);
         }
-        whole.update(&bytes);
-        sink.write_all(&bytes)?;
+        if ContentHash(*blake3::hash(block).as_bytes()) != chunk.hash {
+            return Err(ContentError::Corrupt);
+        }
+        whole.update(block);
+        sink.write_all(block)?;
     }
     if ContentHash(*whole.finalize().as_bytes()) != manifest.stream_digest {
         return Err(ContentError::Corrupt);
