@@ -46,3 +46,10 @@ jobs:
         # build's un-optimized async poll frames need ~2 MiB, a rustc codegen
         # characteristic, not a product cost.
         run: cargo test -p focal-node --test cli_native_a1 --release --locked
+      - name: A1 product gate through the MCP adapter (stdio tools, restart, retry)
+        shell: bash
+        # The MCP counterpart of the A1 gate: two participants each behind their
+        # own `focal mcp serve`, complete claim cycle through native tools, kill
+        # and restart, identical reads, exact retry. Release for the same stack
+        # reason as the CLI gate (both drive the founder start path).
+        run: cargo test -p focal-node --test mcp_native_a1 --release --locked

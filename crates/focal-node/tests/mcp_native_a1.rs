@@ -1,4 +1,3 @@
-#![cfg(unix)]
 #![allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -16,7 +15,6 @@
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader, Write},
-    os::unix::fs::PermissionsExt,
     path::Path,
     process::{Child, ChildStdin, Command, Output, Stdio},
     sync::mpsc,
@@ -31,7 +29,30 @@ impl Drop for Server {
     }
 }
 fn private(path: &Path) {
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // A fresh directory is already owner-only on Windows (its DACL is inherited
+    // from the owner-owned temp root); on Unix, tighten it to 0700.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+fn scratch(prefix: &str) -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    // Unix keeps the path short for the Unix-socket path limit (/tmp); Windows
+    // names its pipe by a hash of the data directory, so the default temp root
+    // is fine there.
+    #[cfg(unix)]
+    {
+        builder.tempdir_in("/tmp").unwrap()
+    }
+    #[cfg(not(unix))]
+    {
+        builder.tempdir().unwrap()
+    }
 }
 #[path = "support/ports.rs"]
 mod ports;
@@ -228,14 +249,8 @@ const PROOF: &str = r#"{"passed":3,"failed":0,"skipped":0}"#;
 
 #[test]
 fn two_participants_complete_a_native_claim_cycle_through_mcp_and_survive_a_kill() {
-    let founder = tempfile::Builder::new()
-        .prefix("focal-native-mcp-a1-")
-        .tempdir_in("/tmp")
-        .unwrap();
-    let client = tempfile::Builder::new()
-        .prefix("focal-native-mcp-a1-client-")
-        .tempdir_in("/tmp")
-        .unwrap();
+    let founder = scratch("focal-native-mcp-a1-");
+    let client = scratch("focal-native-mcp-a1-client-");
     private(founder.path());
     private(client.path());
     let root = founder.path();
