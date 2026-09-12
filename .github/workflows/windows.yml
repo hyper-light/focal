@@ -38,6 +38,13 @@ jobs:
         # the A1 binary drives - and runs in seconds, so a durability regression
         # is caught here before the multi-minute release A1 build.
         run: cargo test -p focal-enrollment --locked
+      - name: Join tests (invitation output, credential save, atomic no-clobber publish)
+        shell: bash
+        # write_private_new is the invitation/credential publisher the A1 invite
+        # and enroll steps drive; its Windows path (owner-only DACL, MoveFileExW
+        # write-through no-clobber) round-trips here in the debug lib tests before
+        # the multi-minute release A1 build.
+        run: cargo test -p focal-node --lib network_join --locked
       - name: A1 product gate on the real binary (CLI, activation, restart, retry)
         shell: bash
         # The integration test drives the shipped artifact, so it runs the

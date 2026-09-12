@@ -338,6 +338,22 @@ pub(crate) fn move_replace(from: &Path, to: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Atomically move `from` to `to`, write-through, failing if `to` already
+/// exists. Without `MOVEFILE_REPLACE_EXISTING`, `MoveFileExW` returns
+/// `ERROR_ALREADY_EXISTS` when the destination exists - the no-clobber
+/// publication guarantee - which the standard library maps to
+/// `io::ErrorKind::AlreadyExists`.
+pub(crate) fn move_create_new(from: &Path, to: &Path) -> io::Result<()> {
+    let from = wide(from);
+    let to = wide(to);
+    // SAFETY: both buffers are NUL-terminated and outlive the call.
+    let ok = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_WRITE_THROUGH) };
+    if ok == 0 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
 fn info_at(path: &Path) -> io::Result<BY_HANDLE_FILE_INFORMATION> {
     let wide = wide(path);
     // SAFETY: `wide` is NUL-terminated. Open a query-only handle (no access

@@ -274,6 +274,38 @@ pub fn atomic_replace(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
+/// Atomically publish `from` to a *new* `to` on the same volume, failing with
+/// `io::ErrorKind::AlreadyExists` if `to` already exists (the no-clobber
+/// publication guarantee). Durable: on Windows the move is write-through; on
+/// Unix the caller fsyncs the parent directory afterwards. On Unix this links
+/// then unlinks `from`; a crash between the two leaves `from` as a second link
+/// to the same inode, which the caller's crash-recovery removes.
+pub fn atomic_create_new(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        crate::windows::move_create_new(from, to).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "atomic_create_new {} -> {}: {error}",
+                    from.display(),
+                    to.display()
+                ),
+            )
+        })
+    }
+    #[cfg(unix)]
+    {
+        std::fs::hard_link(from, to)?;
+        std::fs::remove_file(from)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (from, to);
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
 // ---- Unix-native helpers ---------------------------------------------------
 
 #[cfg(unix)]

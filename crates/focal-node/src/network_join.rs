@@ -708,8 +708,14 @@ fn check_invitation(path: &Path) -> Result<(), JoinError> {
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
-        Err(JoinError::Permissions)
+        // Windows has no group/other split; a delivered invitation must be a
+        // regular file owned by the current user under an owner-only DACL.
+        let owner = focal_platform::fs::current_owner()?;
+        match focal_platform::fs::check_private_file(path, &owner, 1) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(JoinError::Permissions),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 fn read_checked(path: &Path, max: usize) -> Result<Zeroizing<Vec<u8>>, JoinError> {
@@ -746,10 +752,17 @@ fn check_private(path: &Path) -> Result<(), JoinError> {
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
-        Err(JoinError::Permissions)
+        // The owner-only DACL is the Windows analogue of 0600; a singly-linked
+        // regular file owned by the current user with no other access.
+        let owner = focal_platform::fs::current_owner()?;
+        match focal_platform::fs::check_private_file(path, &owner, 1) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(JoinError::Permissions),
+            Err(error) => Err(error.into()),
+        }
     }
 }
+#[cfg(unix)]
 fn write_private_new(path: &Path, bytes: &[u8]) -> Result<(), JoinError> {
     let parent = path
         .parent()
@@ -769,8 +782,6 @@ fn write_private_new(path: &Path, bytes: &[u8]) -> Result<(), JoinError> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    #[cfg(not(unix))]
-    return Err(JoinError::Permissions);
     let lock = options.open(&lock_path)?;
     check_private(&lock_path)?;
     focal_platform::try_lock_exclusive(&lock)?;
@@ -822,6 +833,71 @@ fn write_private_new(path: &Path, bytes: &[u8]) -> Result<(), JoinError> {
         }
         Err(error) => {
             let _ = cleanup;
+            Err(error.into())
+        }
+    }
+}
+#[cfg(not(unix))]
+fn write_private_new(path: &Path, bytes: &[u8]) -> Result<(), JoinError> {
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().ok_or(JoinError::Invalid)?;
+    let digest = blake3::hash(name.as_encoded_bytes()).to_hex();
+    let temporary = parent.join(format!(".focal-invitation-{digest}.pending"));
+    let lock_path = parent.join(format!(".focal-invitation-{digest}.lock"));
+    if fs::symlink_metadata(&lock_path).is_ok() {
+        check_private(&lock_path)?;
+    }
+    // Serialize concurrent publications of this exact output path.
+    let lock = focal_platform::fs::open_private(&lock_path, true, true, true)?;
+    check_private(&lock_path)?;
+    focal_platform::try_lock_exclusive(&lock)?;
+    // Republishing the identical bytes is success; different bytes at the same
+    // path is a genuine conflict. The installed file is already durable, so no
+    // read-time re-sync (FlushFileBuffers would reject a read-only handle).
+    if fs::symlink_metadata(path).is_ok() {
+        check_private(path)?;
+        if read_private(path, MAX_BUNDLE)?.as_slice() != bytes {
+            return Err(JoinError::Conflict);
+        }
+        return Ok(());
+    }
+    // A private interrupted temporary is unacknowledged; the held exclusive lock
+    // makes its removal unambiguous.
+    if fs::symlink_metadata(&temporary).is_ok() {
+        check_private(&temporary)?;
+        fs::remove_file(&temporary)?;
+    }
+    let mut file = focal_platform::fs::create_private_new(&temporary, false, true)?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok::<_, std::io::Error>(())
+    })();
+    drop(file);
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    // Atomic, no-clobber, write-through publish. MoveFileExW without
+    // REPLACE_EXISTING fails AlreadyExists if a racing publisher installed the
+    // destination first (detected as a conflict below); WRITE_THROUGH is the
+    // durability fence Windows offers in place of a directory fsync. The closed
+    // temp handle lets Windows move it.
+    match focal_platform::fs::atomic_create_new(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&temporary);
+            check_private(path)?;
+            if read_private(path, MAX_BUNDLE)?.as_slice() != bytes {
+                return Err(JoinError::Conflict);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
             Err(error.into())
         }
     }
