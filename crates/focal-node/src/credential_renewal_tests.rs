@@ -265,7 +265,7 @@ async fn a_joined_host_rotates_its_key_is_regranted_under_it_and_adopts_a_commit
     peer.stop().await;
     let staged = peer_dir.path().join("JOIN").join("node-key.next");
     std::fs::create_dir_all(&staged).unwrap();
-    std::fs::set_permissions(&staged, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    crate::set_test_mode(&staged, 0o700);
     for name in ["join-key.bin", "join-key.bin.initialized"] {
         let source = key_dir.join(name);
         if source.exists() {

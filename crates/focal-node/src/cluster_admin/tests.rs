@@ -4,8 +4,7 @@ use std::collections::BTreeSet;
 #[test]
 fn journal_reopens_exact_pending_and_rejects_loss_of_child_or_state() {
     let disk = tempfile::tempdir().unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(disk.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    crate::set_test_mode(disk.path(), 0o700);
     let mut settings = Settings::default();
     settings.node.data_dir = Some(disk.path().into());
     let node = crate::embedded::EmbeddedNode::open(&settings).unwrap();
@@ -67,9 +66,8 @@ fn journal_reopens_exact_pending_and_rejects_loss_of_child_or_state() {
 
 #[tokio::test]
 async fn reconciliation_proves_supersession_and_recovers_lost_receipt_without_reusing_reference() {
-    use std::os::unix::fs::PermissionsExt;
     let disk = tempfile::tempdir().unwrap();
-    fs::set_permissions(disk.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    crate::set_test_mode(disk.path(), 0o700);
     let mut settings = Settings::default();
     settings.node.data_dir = Some(disk.path().into());
     settings.node.advertise = Some("127.0.0.1:7443".into());

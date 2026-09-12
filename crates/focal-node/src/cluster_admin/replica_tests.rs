@@ -1,12 +1,11 @@
 use super::*;
 use focal_consensus::NodeConfig;
 use focal_ledger::{Session, SessionLimits};
-use std::os::unix::fs::PermissionsExt;
 
 #[test]
 fn actual_receipt_recovery_and_later_fence_preserve_distinct_unknown_outcomes() {
     let disk = tempfile::tempdir().unwrap();
-    fs::set_permissions(disk.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    crate::set_test_mode(disk.path(), 0o700);
     let mut settings = Settings::default();
     settings.node.data_dir = Some(disk.path().into());
     drop(crate::embedded::EmbeddedNode::open(&settings).unwrap());

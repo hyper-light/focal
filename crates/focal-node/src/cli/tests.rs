@@ -330,17 +330,22 @@ fn joined_markers_reject_manual_context_before_journaling_or_transmission() {
         );
         std::fs::remove_file(path).unwrap();
     }
-    // Even an incomplete dangling marker is evidence of joined ownership.
-    std::os::unix::fs::symlink(
-        directory.path().join("absent"),
-        directory.path().join("JOIN"),
-    )
-    .unwrap();
-    assert!(matches!(
-        Context::open(&settings, None),
-        Err(CliError::Input(_))
-    ));
-    assert!(!directory.path().join("client").exists());
+    // Even an incomplete dangling marker is evidence of joined ownership. A
+    // symlink marker is a Unix-only shape (creating one needs privilege on
+    // Windows); the private-file checks reject a reparse point there anyway.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(
+            directory.path().join("absent"),
+            directory.path().join("JOIN"),
+        )
+        .unwrap();
+        assert!(matches!(
+            Context::open(&settings, None),
+            Err(CliError::Input(_))
+        ));
+        assert!(!directory.path().join("client").exists());
+    }
 }
 
 #[test]

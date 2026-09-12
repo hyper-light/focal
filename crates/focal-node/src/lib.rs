@@ -89,3 +89,19 @@ mod native_ingress;
 mod native_lists;
 mod native_reads;
 mod native_timers;
+
+/// Test-only: tighten a fresh temp path to owner-only. On Unix this sets the
+/// POSIX mode the private-directory checks require; on Windows a fresh temp
+/// directory already inherits an owner-only DACL from the temp root, so it is a
+/// no-op (mirrors the cli_native_a1 harness). Confined to `cfg(test)`, so no
+/// production build sees it.
+#[cfg(test)]
+pub(crate) fn set_test_mode(path: &std::path::Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+}
