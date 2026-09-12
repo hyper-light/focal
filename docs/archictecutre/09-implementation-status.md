@@ -9685,3 +9685,23 @@ names its failing operation and path. Still open for R10: the arm64 Windows lane
 folding Windows into the main CI matrix, cross-platform focal-node lib tests
 (un-gating ~49 Unix-only `#[cfg(test)]` sites), and the release/signing/notices/
 install-check lanes.
+
+**R10 Windows CLI + MCP product gates both green (Windows Server 2022 CI, run
+34672668845, commit 727278c):** the MCP A1 gate now runs beside the CLI gate —
+two participants each behind their own `focal mcp serve`, the full native claim
+cycle through MCP tools over stdio, a killed and restarted node, identical reads
+and exact retries — and both pass on the shipped release binary. This closes the
+plan's R10 criterion "the Windows CI lane runs platform, transport, CLI, MCP and
+restart tests". `mcp_native_a1` was un-gated from `#![cfg(unix)]` the same way
+`cli_native_a1` was (a no-op `private()` on Windows, a default-temp `scratch()`).
+The last Windows durability defect it surfaced was one more read-only-handle
+`sync_all` (the artifact-transfer store's `recover_marker`), removed; a
+helper-aware sweep that follows `sync_all` receivers through read-only opener
+helpers (`checked_open`, `open_file`, `open_link_pair`, `open_private` write=false)
+confirms none remain in `src/`. Release qualification also advanced: a new
+`scripts/release/notices.py` renders `THIRD-PARTY-NOTICES.txt` and an SPDX 2.3
+`sbom.spdx.json` from `Cargo.lock` offline, cross-checked against the reviewed
+dependency roster (which caught and dropped three stale `winapi` entries), and
+both join the collected/verified/published release asset set; the release matrix
+guard was corrected to require all eight targets (it still demanded only the six
+Unix ones after Windows was added to the catalog).

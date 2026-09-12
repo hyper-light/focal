@@ -54,7 +54,7 @@ Claim: d4cc83c48c5ad2bafaa1802bb87c3e07
 > Focal has no release yet. The local service, the whole claim and evidence workflow through
 > the CLI and MCP, restart recovery, durable retries, and joining nodes into a cluster all
 > work today. Automatic placement across hosts, range movement, archival and restore,
-> Kubernetes packaging, multi-region operation and Windows are still being built.
+> Kubernetes packaging, multi-region operation, native Windows arm64 and binary signing are still being built.
 > [docs/REMAINING.md](docs/REMAINING.md) lists each piece and what closes it.
 
 ## Install
@@ -75,10 +75,12 @@ focal --help
 > and x64 on glibc and static musl, and Windows x64 and arm64), smoke-tests each on its own
 > hardware, and attaches them with `SHA256SUMS`. When a release is published, download the
 > file for your platform, check its digest, `chmod +x` it (or, on Windows, unblock the
-> `.exe`) and put it on your `PATH`; nothing else is needed. The native Windows build
-> compiles in CI, and its filesystem layer (owner-only DACLs, file identity) and named-pipe
-> local transport are tested there on every push; the full Windows CLI/MCP test lane and
-> signed binaries are landing.
+> `.exe`) and put it on your `PATH`; nothing else is needed. The native Windows x64 build is
+> tested in CI on every push: its filesystem layer (owner-only DACLs, file identity,
+> write-through publication), named-pipe local transport, credential enrollment, and the
+> first product gate through both the CLI and the MCP adapter — including a killed and
+> restarted node with exact retries. Windows arm64 is built but not yet exercised on native
+> hardware, and the binaries are not yet signed.
 
 ## Quickstart
 
