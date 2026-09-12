@@ -179,24 +179,34 @@ fn execute(args: Args) -> Result<()> {
         return cli::serve(&settings, args.client_context.as_deref()).map_err(Into::into);
     }
     let service = matches!(&args.command, Commands::Start { .. });
-    // Tokio's fallible builder can still unwind when an OS worker cannot be
-    // started. Contain that dependency boundary before acquiring node state.
-    let runtime = std::panic::catch_unwind(|| {
-        // A manual invocation owns one sequential network conversation. Avoid
-        // starting a worker pool for every get/list/submit process.
-        let mut builder = if service {
-            tokio::runtime::Builder::new_multi_thread()
-        } else {
-            tokio::runtime::Builder::new_current_thread()
-        };
-        builder.enable_all().build()
-    })
-    .map_err(|_| "async runtime initialization failed")??;
-    let result = run(&runtime, args);
-    // A timed-out blocking owner must not make Runtime::drop wait forever.
-    // Normal service shutdown has already joined its owner before returning.
-    runtime.shutdown_background();
-    result
+    // The node startup future is deep, and a Windows process's main thread has
+    // only a 1 MiB stack (Unix gives 8 MiB), so build and drive the runtime on
+    // a thread with a generous stack. `block_on` runs the future on its own
+    // (calling) thread, which is this one.
+    std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || -> Result<()> {
+            // Tokio's fallible builder can still unwind when an OS worker cannot
+            // be started. Contain that dependency boundary before acquiring node
+            // state. A manual invocation owns one sequential network
+            // conversation, so it avoids a worker pool for every get/list/submit.
+            let runtime = std::panic::catch_unwind(|| {
+                let mut builder = if service {
+                    tokio::runtime::Builder::new_multi_thread()
+                } else {
+                    tokio::runtime::Builder::new_current_thread()
+                };
+                builder.enable_all().build()
+            })
+            .map_err(|_| "async runtime initialization failed")??;
+            let result = run(&runtime, args);
+            // A timed-out blocking owner must not make Runtime::drop wait
+            // forever. Normal service shutdown joins its owner before returning.
+            runtime.shutdown_background();
+            result
+        })?
+        .join()
+        .map_err(|_| "runtime owner thread panicked")?
 }
 /// Resolve the settings for this invocation (doc 08 §2). On an initialized
 /// store the committed policy fills every policy field the file omits; a
