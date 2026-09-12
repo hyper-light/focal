@@ -118,15 +118,17 @@ impl PlacementAgent {
         pool: &PeerConnectionPool,
         driver: &SessionDriver,
         descriptor: &SessionDescriptor,
-    ) -> Result<HostedSessionFacts, AgentError> {
+    ) -> Result<std::sync::Arc<HostedSessionFacts>, AgentError> {
         match driver {
-            SessionDriver::Local(host) => Ok(host.registration_facts().await?.value().clone()),
+            // A locally hosted session shares its facts without a deep copy; only
+            // the remote path, which decodes them off the wire, must own them.
+            SessionDriver::Local(host) => Ok(host.registration_facts().await?.value_arc()),
             SessionDriver::Remote { leader } => {
                 match self
                     .session_call(pool, *leader, descriptor, SessionCall::Facts)
                     .await?
                 {
-                    SessionControlReply::Facts(facts) => Ok(*facts),
+                    SessionControlReply::Facts(facts) => Ok(std::sync::Arc::new(*facts)),
                     _ => Err(AgentError::Identity),
                 }
             }
@@ -376,14 +378,30 @@ impl PlacementAgent {
         match &descriptor.pending {
             Some(plan) => {
                 self.drive_plan(
-                    handles, pool, descriptor, plan, snapshot, installed, grant, &facts, &driver,
+                    handles,
+                    pool,
+                    descriptor,
+                    plan,
+                    snapshot,
+                    installed,
+                    grant,
+                    facts.as_ref(),
+                    &driver,
                     now,
                 )
                 .await
             }
             None => {
                 self.retire_and_heal(
-                    handles, pool, descriptor, directory, snapshot, installed, &facts, &driver, now,
+                    handles,
+                    pool,
+                    descriptor,
+                    directory,
+                    snapshot,
+                    installed,
+                    facts.as_ref(),
+                    &driver,
+                    now,
                 )
                 .await
             }
