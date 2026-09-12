@@ -40,6 +40,10 @@ jobs:
       - name: Production panic policy
         run: bash scripts/check-production.sh
       - name: Tests
-        run: bash scripts/cargo.sh test --workspace --locked
+        # Bound test parallelism to match the release workflow: the multi-node
+        # fleet and runbook tests each spawn several node processes, so running
+        # every test binary at once oversubscribes memory and the node correctly
+        # refuses admission at capacity, failing a test that is otherwise sound.
+        run: bash scripts/cargo.sh test --workspace --locked -- --test-threads=4
       - name: Release build
         run: bash scripts/cargo.sh build --release --workspace --locked
