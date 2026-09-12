@@ -94,16 +94,6 @@ impl FoundingNetwork {
         tokio::runtime::Handle::try_current().map_err(|_| NetworkError::RuntimeRequired)?;
         let directory = NodeDirectory::open(settings)?;
         let identity = directory.identity();
-        let budget = MemoryBudget::new(1024 * 1024 * 1024, 256 * 1024 * 1024)?;
-        // Covers bounded manifest decode, founding PKI/draft buffers and duplicate
-        // serialized bootstrap inputs during recovery. Shrunk before publication.
-        let mut bootstrap_allocation = budget
-            .reserve(
-                BudgetKind::Recovery,
-                BudgetLane::Completion,
-                4 * 1024 * 1024,
-            )?
-            .commit();
         let saved = NetworkState::load(&directory)?;
         if saved
             .as_ref()
@@ -133,6 +123,46 @@ impl FoundingNetwork {
                 )
             }
         };
+        // The founder bootstrap - PKI generation, WAL and consensus recovery,
+        // enrollment - is unbounded CPU- and IO-blocking work. Run it on a
+        // blocking thread so it neither stalls the async runtime nor executes on
+        // the executor's shallow poll stack (a Windows main thread is 1 MiB).
+        let settings = settings.clone();
+        tokio::task::spawn_blocking(move || {
+            Self::bootstrap_blocking(
+                &settings,
+                directory,
+                saved,
+                listen,
+                advertise,
+                endpoint,
+                local_readiness,
+            )
+        })
+        .await
+        .map_err(|_| NetworkError::RuntimeRequired)?
+    }
+    /// The synchronous founder bootstrap, run off the executor by [open_inner].
+    fn bootstrap_blocking(
+        settings: &Settings,
+        directory: NodeDirectory,
+        saved: Option<NetworkState>,
+        listen: std::net::SocketAddr,
+        advertise: std::net::SocketAddr,
+        endpoint: Option<String>,
+        local_readiness: bool,
+    ) -> NetworkResult<Self> {
+        let identity = directory.identity();
+        let budget = MemoryBudget::new(1024 * 1024 * 1024, 256 * 1024 * 1024)?;
+        // Covers bounded manifest decode, founding PKI/draft buffers and duplicate
+        // serialized bootstrap inputs during recovery. Shrunk before publication.
+        let mut bootstrap_allocation = budget
+            .reserve(
+                BudgetKind::Recovery,
+                BudgetLane::Completion,
+                4 * 1024 * 1024,
+            )?
+            .commit();
         let committed = crate::embedded::check_policy(directory.root(), settings)?;
         // The founder pins its policy alone, so the first start must be
         // satisfiable by this node's own facts. A committed policy is the
