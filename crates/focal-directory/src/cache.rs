@@ -2,7 +2,7 @@ use crate::*;
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::{ContentHash, LedgerId, RouteEpoch, SessionSeq};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A routing hint with provenance, never a serving-authority grant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +102,12 @@ struct Watch {
 pub struct RouteCache {
     entries: BTreeMap<LedgerId, CacheEntry>,
     watches: BTreeMap<PartitionId, Watch>,
+    /// Least-recently-used ordering (access counter, ledger) for O(log n)
+    /// eviction instead of a full-map scan; kept in sync with `entries`.
+    recency: BTreeMap<(u64, LedgerId), ()>,
+    /// The ledgers cached for each partition, so an invalidation and the watch
+    /// prune touch only the affected ledgers, not the whole map.
+    by_partition: BTreeMap<PartitionId, BTreeSet<LedgerId>>,
     config: RouteCacheConfig,
     budget: MemoryBudget,
     clock: u64,
@@ -115,6 +121,8 @@ impl RouteCache {
         Ok(Self {
             entries: BTreeMap::new(),
             watches: BTreeMap::new(),
+            recency: BTreeMap::new(),
+            by_partition: BTreeMap::new(),
             config,
             budget,
             clock: 0,
@@ -126,6 +134,38 @@ impl RouteCache {
     }
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+    /// Insert an entry and its recency/partition index rows together, dropping
+    /// any prior entry for the ledger first so both indexes stay exact.
+    fn put_entry(&mut self, ledger: LedgerId, entry: CacheEntry) {
+        self.drop_entry(ledger);
+        self.recency.insert((entry.used, ledger), ());
+        self.by_partition
+            .entry(entry.route.partition)
+            .or_default()
+            .insert(ledger);
+        self.entries.insert(ledger, entry);
+    }
+    /// Remove an entry and its index rows together.
+    fn drop_entry(&mut self, ledger: LedgerId) -> Option<CacheEntry> {
+        let entry = self.entries.remove(&ledger)?;
+        self.recency.remove(&(entry.used, ledger));
+        if let Some(set) = self.by_partition.get_mut(&entry.route.partition) {
+            set.remove(&ledger);
+            if set.is_empty() {
+                self.by_partition.remove(&entry.route.partition);
+            }
+        }
+        Some(entry)
+    }
+    /// Move an entry to most-recently-used, keeping the recency index in sync.
+    fn retouch(&mut self, ledger: LedgerId, used: u64) {
+        if let Some(entry) = self.entries.get_mut(&ledger) {
+            let previous = entry.used;
+            entry.used = used;
+            self.recency.remove(&(previous, ledger));
+            self.recency.insert((used, ledger), ());
+        }
     }
     pub fn watched_partitions(&self) -> usize {
         self.watches.len()
@@ -157,7 +197,7 @@ impl RouteCache {
             .get(&ledger)
             .is_some_and(|entry| entry.expires_at <= now)
         {
-            self.entries.remove(&ledger);
+            self.drop_entry(ledger);
             return Ok(None);
         }
         let access = self
@@ -165,9 +205,7 @@ impl RouteCache {
             .checked_add(1)
             .ok_or(DirectoryError::CounterExhausted)?;
         self.access = access;
-        if let Some(entry) = self.entries.get_mut(&ledger) {
-            entry.used = access;
-        }
+        self.retouch(ledger, access);
         Ok(self.entries.get(&ledger).map(|entry| &entry.route))
     }
     pub fn insert(
@@ -216,7 +254,11 @@ impl RouteCache {
             .reserve(
                 BudgetKind::Index,
                 BudgetLane::Ordinary,
-                tree_row::<(LedgerId, CacheEntry)>(),
+                // The entry plus its recency and per-partition index rows, all
+                // added and dropped together with this entry.
+                tree_row::<(LedgerId, CacheEntry)>()
+                    .saturating_add(tree_row::<((u64, LedgerId), ())>())
+                    .saturating_add(tree_row::<(LedgerId, ())>()),
             )?
             .commit();
         let new_watch = if !self.watches.contains_key(&route.partition) {
@@ -239,12 +281,12 @@ impl RouteCache {
             && !self.entries.contains_key(&route.ledger)
         {
             let victim = self
-                .entries
-                .iter()
-                .min_by_key(|(key, entry)| (entry.used, **key))
-                .map(|(key, _)| *key)
+                .recency
+                .keys()
+                .next()
+                .map(|(_, ledger)| *ledger)
                 .ok_or(DirectoryError::Missing)?;
-            self.entries.remove(&victim);
+            self.drop_entry(victim);
         }
         if let Some(allocation) = new_watch {
             self.watches.insert(
@@ -257,8 +299,9 @@ impl RouteCache {
             );
         }
         // A point lookup must not move an existing watch past unseen updates.
-        self.entries.insert(
-            route.ledger,
+        let ledger = route.ledger;
+        self.put_entry(
+            ledger,
             CacheEntry {
                 route,
                 expires_at,
@@ -276,25 +319,37 @@ impl RouteCache {
         {
             return Err(DirectoryError::Invalid("invalidation bounds"));
         }
-        let watch = self
-            .watches
-            .get_mut(&batch.partition)
-            .ok_or(DirectoryError::Missing)?;
-        if batch.delegation_epoch < watch.epoch
-            || (batch.delegation_epoch == watch.epoch && batch.through_revision <= watch.revision)
+        let (watch_epoch, watch_revision) = {
+            let watch = self
+                .watches
+                .get(&batch.partition)
+                .ok_or(DirectoryError::Missing)?;
+            (watch.epoch, watch.revision)
+        };
+        if batch.delegation_epoch < watch_epoch
+            || (batch.delegation_epoch == watch_epoch && batch.through_revision <= watch_revision)
         {
             return Ok(0);
         }
         let before = self.entries.len();
-        if batch.delegation_epoch != watch.epoch || batch.after_revision != watch.revision {
-            let expected = watch.revision;
-            self.entries
-                .retain(|_, entry| entry.route.partition != batch.partition);
-            watch.epoch = batch.delegation_epoch;
-            watch.revision = batch.through_revision;
+        if batch.delegation_epoch != watch_epoch || batch.after_revision != watch_revision {
+            // A gap: drop only the ledgers cached for this partition (via the
+            // by-partition index, not a full-map scan) and resync the watch.
+            let affected: Vec<LedgerId> = self
+                .by_partition
+                .get(&batch.partition)
+                .map(|ledgers| ledgers.iter().copied().collect())
+                .unwrap_or_default();
+            for ledger in affected {
+                self.drop_entry(ledger);
+            }
+            if let Some(watch) = self.watches.get_mut(&batch.partition) {
+                watch.epoch = batch.delegation_epoch;
+                watch.revision = batch.through_revision;
+            }
             self.prune_watches();
             return Err(DirectoryError::WatchGap {
-                expected,
+                expected: watch_revision,
                 actual: batch.after_revision,
             });
         }
@@ -303,10 +358,12 @@ impl RouteCache {
                 entry.route.partition == batch.partition
                     && entry.route.route_epoch < change.route_epoch
             }) {
-                self.entries.remove(&change.ledger);
+                self.drop_entry(change.ledger);
             }
         }
-        watch.revision = batch.through_revision;
+        if let Some(watch) = self.watches.get_mut(&batch.partition) {
+            watch.revision = batch.through_revision;
+        }
         self.prune_watches();
         Ok(before.saturating_sub(self.entries.len()))
     }
@@ -316,15 +373,24 @@ impl RouteCache {
             return Err(DirectoryError::ClockRegression);
         }
         self.clock = now;
-        self.entries.retain(|_, entry| entry.expires_at > now);
+        // The intended bulk TTL sweep (get() keeps the hot path O(log n)); route
+        // the removals through drop_entry so both indexes stay in sync.
+        let expired: Vec<LedgerId> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.expires_at <= now)
+            .map(|(ledger, _)| *ledger)
+            .collect();
+        for ledger in expired {
+            self.drop_entry(ledger);
+        }
         self.prune_watches();
         Ok(())
     }
     fn prune_watches(&mut self) {
-        self.watches.retain(|partition, _| {
-            self.entries
-                .values()
-                .any(|entry| entry.route.partition == *partition)
-        });
+        // A partition is still cached iff it has a by-partition index entry, so
+        // this is O(watches log) rather than O(watches x entries).
+        self.watches
+            .retain(|partition, _| self.by_partition.contains_key(partition));
     }
 }
