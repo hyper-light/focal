@@ -203,6 +203,14 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8], limit: usize) -> Result<
     }
     Ok(value)
 }
+/// Keyed hash of already-serialized bytes. Equivalent to `hash(domain, value)`
+/// when `bytes` is `encode(value)`, so a caller that already encoded a value can
+/// hash it without serializing it a second time.
+fn hash_bytes(domain: &'static str, bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(domain);
+    hasher.update(bytes);
+    *hasher.finalize().as_bytes()
+}
 fn hash<T: Serialize>(domain: &'static str, value: &T) -> Result<[u8; 32], ControlError> {
     struct Sink(blake3::Hasher);
     impl postcard::ser_flavors::Flavor for Sink {

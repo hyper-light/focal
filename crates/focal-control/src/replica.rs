@@ -596,10 +596,11 @@ impl ControlReplica {
             owner_term: status.term,
             request,
         };
-        let encoded_len = postcard::experimental::serialized_size(&envelope)?;
-        if encoded_len > self.options.limits.max_command_bytes {
-            return Err(ControlError::Capacity);
-        }
+        // Serialize the envelope once: its bytes give the length (for admission
+        // and the machine's charge), its hash, and the committed command, instead
+        // of serializing it for each of those in turn.
+        let encoded = encode(&envelope, self.options.limits.max_command_bytes)?;
+        let encoded_len = encoded.len();
         let allocation = self
             .budget
             .reserve(
@@ -622,8 +623,7 @@ impl ControlReplica {
             self.identity,
             &self.options,
         )?;
-        let envelope_hash = hash("focal.control.envelope.v1", &envelope)?;
-        let encoded = encode(&envelope, self.options.limits.max_command_bytes)?;
+        let envelope_hash = hash_bytes("focal.control.envelope.v1", &encoded);
         let membership = if let ControlCommand::Membership(change) = &envelope.request.command {
             Some(PreparedConfiguration {
                 index: change.expected_configuration_index,
