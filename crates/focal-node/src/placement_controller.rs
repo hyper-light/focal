@@ -620,6 +620,9 @@ impl PlacementAgent {
         }
         // Progress of every replica-held member that stays, then activation.
         let mut unchanged = Vec::new();
+        unchanged
+            .try_reserve_exact(digests.members.len())
+            .map_err(|_| AgentError::Capacity)?;
         for member in digests
             .members
             .iter()
