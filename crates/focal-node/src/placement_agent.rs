@@ -610,6 +610,76 @@ impl PlacementAgent {
         .await
         .unwrap_or(Err(AgentError::Runtime))
     }
+    fn pending_retires_path(&self) -> PathBuf {
+        self.root.join("cluster").join("pending-retires")
+    }
+    /// Partition ids whose host must be retired after a committed merge. A merge
+    /// commits the Absorb durably (in the intent journal) and then deletes the
+    /// source's host record; a crash between the two would re-host the sealed,
+    /// now-absorbed source on restart forever. Recording the id durably before
+    /// the delete, and replaying it each tick, closes that window.
+    fn load_pending_retires(&self) -> Vec<PartitionId> {
+        // Best effort: a missing or unreadable list means nothing is pending; the
+        // record is only a retry hint, and the retire it drives is idempotent.
+        let Ok(bytes) = std::fs::read(self.pending_retires_path()) else {
+            return Vec::new();
+        };
+        bytes
+            .chunks_exact(16)
+            .filter_map(|chunk| <[u8; 16]>::try_from(chunk).ok().map(PartitionId))
+            .collect()
+    }
+    fn store_pending_retires(&self, ids: &[PartitionId]) -> Result<(), AgentError> {
+        let path = self.pending_retires_path();
+        if ids.is_empty() {
+            return match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(_) => Err(AgentError::Capacity),
+            };
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(ids.len().saturating_mul(16))
+            .map_err(|_| AgentError::Capacity)?;
+        for id in ids {
+            bytes.extend_from_slice(&id.0);
+        }
+        if let Some(parent) = path.parent() {
+            crate::embedded::durable_dir(parent).map_err(|_| AgentError::Capacity)?;
+        }
+        atomic_file(&path, &bytes).map_err(|_| AgentError::Capacity)
+    }
+    /// Record a source for retirement durably, before its host record is deleted.
+    fn record_pending_retire(&self, source: PartitionId) -> Result<(), AgentError> {
+        let mut ids = self.load_pending_retires();
+        if ids.iter().any(|id| id.0 == source.0) {
+            return Ok(());
+        }
+        ids.try_reserve(1).map_err(|_| AgentError::Capacity)?;
+        ids.push(source);
+        self.store_pending_retires(&ids)
+    }
+    /// Retire every recorded source (idempotent), then drop those the directory
+    /// no longer hosts. Runs each tick so a merge whose retire was lost to a
+    /// crash still converges.
+    fn drain_pending_retires(&self, handles: &NetworkHandles) -> Result<(), AgentError> {
+        let ids = self.load_pending_retires();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut remaining = Vec::new();
+        for id in ids {
+            handles
+                .directory
+                .request(crate::network_service::HostRequest::Retire { partition: id })?;
+            if handles.directory.is_hosted(id) {
+                remaining.try_reserve(1).map_err(|_| AgentError::Capacity)?;
+                remaining.push(id);
+            }
+        }
+        self.store_pending_retires(&remaining)
+    }
     /// One bounded pass; public for the service tests. Every partition the
     /// root delegates is visited in namespace order: hosted partitions this
     /// node leads locally, the rest through the founder; a sealed partition
@@ -628,6 +698,9 @@ impl PlacementAgent {
             self.reopen_installed(handles).await?;
             self.reopened = true;
         }
+        // Retire any source whose merge committed but whose host-record delete was
+        // lost to a crash; idempotent and self-clearing once the host is gone.
+        self.drain_pending_retires(handles)?;
         // The founder submits root intents to the root it leads under its
         // local client; a host submits them through the root leader's
         // placement-control ingress, which binds the request client to the
