@@ -142,7 +142,24 @@ impl RouteCache {
         ledger: LedgerId,
         now: u64,
     ) -> Result<Option<&SessionRoute>, DirectoryError> {
-        self.advance(now)?;
+        // Route resolution is per-request: it must be O(log n), not a full-cache
+        // TTL sweep plus watch prune (O(entries) + O(watches x entries)). Advance
+        // the clock, then lazily treat only the looked-up entry as expired; the
+        // bulk sweep and watch pruning run on the cheaper insert/invalidate paths
+        // (advance), which also bounds how long a stale entry or orphan watch can
+        // linger (both are capped by max_entries/max_partitions).
+        if now < self.clock {
+            return Err(DirectoryError::ClockRegression);
+        }
+        self.clock = now;
+        if self
+            .entries
+            .get(&ledger)
+            .is_some_and(|entry| entry.expires_at <= now)
+        {
+            self.entries.remove(&ledger);
+            return Ok(None);
+        }
         let access = self
             .access
             .checked_add(1)
