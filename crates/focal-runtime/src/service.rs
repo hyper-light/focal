@@ -26,6 +26,10 @@ pub struct DriveReport {
     pub committed: usize,
     pub stale: usize,
     pub indeterminate: usize,
+    /// Runs that could not be dispatched this pass because their historical
+    /// increment manifest was not retrievable within the read budget. Parked,
+    /// not failed: a per-run data-availability limit never wedges the owner.
+    pub parked: usize,
     pub active: usize,
     pub pending: Option<RequestKey>,
 }
@@ -818,7 +822,14 @@ impl Runtime {
             }) {
                 continue;
             }
-            let evidence = exact_manifest(state, run, self.config.max_scan_items)?;
+            let Some(evidence) = exact_manifest(state, run, self.config.max_scan_items)? else {
+                // This run's historical increment manifest is not retrievable
+                // within the read budget: park this one run and keep driving the
+                // rest, never fail the whole owner on a single run's data-
+                // availability limit.
+                report.parked = report.parked.saturating_add(1);
+                continue;
+            };
             if evidence.len() > self.config.max_evidence_artifacts {
                 return Err(RuntimeError::Capacity);
             }
@@ -1208,9 +1219,9 @@ fn exact_manifest<'a>(
     state: &'a State,
     run: &ValidationRun,
     max_visits: usize,
-) -> Result<&'a [ArtifactRef], RuntimeError> {
+) -> Result<Option<&'a [ArtifactRef]>, RuntimeError> {
     if run.manifest == manifest_hash(&[])? {
-        return Ok(&[]);
+        return Ok(Some(&[]));
     }
     if run.id.phase == ValidationPhase::WholeWork
         && let Some(object) = state
@@ -1220,7 +1231,7 @@ fn exact_manifest<'a>(
         && testament.content().claim == run.claim
         && manifest_hash(&testament.content().artifacts)? == run.manifest
     {
-        return Ok(&testament.content().artifacts);
+        return Ok(Some(&testament.content().artifacts));
     }
     if let Some(claim) = state.claims.get(&run.claim)
         && let Some(set) = claim
@@ -1229,7 +1240,7 @@ fn exact_manifest<'a>(
             .and_then(|id| state.evidence_sets.get(&id))
         && manifest_hash(&set.artifacts)? == run.manifest
     {
-        return Ok(&set.artifacts);
+        return Ok(Some(&set.artifacts));
     }
     // Historical increment manifests need the future durable manifest index.
     // This bounded fallback never substitutes a newer mutable evidence set.
@@ -1245,12 +1256,14 @@ fn exact_manifest<'a>(
         );
     for (claim, references) in candidates.take(max_visits) {
         if claim == run.claim && manifest_hash(references)? == run.manifest {
-            return Ok(references);
+            return Ok(Some(references));
         }
     }
-    Err(RuntimeError::Configuration(
-        "exact historical increment manifest is unavailable within the read budget",
-    ))
+    // Not found within the bounded scan: a per-run data-availability limit, never
+    // an owner-wide fault. The caller parks this one run and keeps driving the
+    // rest; retaining the referenced evidence set (the durable manifest index)
+    // removes the case entirely.
+    Ok(None)
 }
 fn phase_finished(state: &State, claim: ClaimId, phase: ValidationPhase) -> bool {
     state

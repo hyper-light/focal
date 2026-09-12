@@ -180,10 +180,26 @@ impl<T: ClientTransport> Backend<T> {
                     return Err(InputError::Invalid("unsupported recovery argument").into());
                 }
                 if remote {
-                    let page = focal_native_client::outcome(
-                        id.key(&self.context),
-                        &mut self.native_reads(runtime, cancel),
-                    )?;
+                    let key = id.key(&self.context);
+                    let page =
+                        focal_native_client::outcome(key, &mut self.native_reads(runtime, cancel))?;
+                    // The wire layer validates the read reply's own envelope
+                    // identity, but not that the outcome it carries is for the
+                    // invocation we asked about. Bind it here, mirroring the
+                    // receipt-identity check the V1 and managed inspect paths
+                    // apply: a returned outcome for a different request is a
+                    // ReceiptMismatch, never shown as this operation's outcome.
+                    let expected = NativeInvocationRef::Request(key);
+                    for object in &page.objects {
+                        if let NativeObject::Outcome(receipt) = object
+                            && receipt.invocation != expected
+                        {
+                            return Err(
+                                focal_client::native_store::NativeStoreError::ReceiptMismatch
+                                    .into(),
+                            );
+                        }
+                    }
                     return Ok((
                         "Observed",
                         OperationOutput::NativeRead {

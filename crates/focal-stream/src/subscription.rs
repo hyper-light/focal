@@ -175,6 +175,17 @@ impl Subscription {
         {
             return Err(StreamError::Invalid("transport limits must be nonzero"));
         }
+        // The credit window must be able to admit any entry the queue admits, or
+        // a queued item larger than the maximum grantable credit could never be
+        // delivered (the delivery gate would refuse it forever while grant caps
+        // credit at the smaller window) — a permanent head-of-line deadlock.
+        if config.max_credit_items < config.max_queue_items
+            || config.max_credit_bytes < config.max_queue_bytes
+        {
+            return Err(StreamError::Invalid(
+                "credit window must be at least the queue capacity",
+            ));
+        }
         let charge = add(
             add(size_of::<Self>(), ALLOCATOR_OVERHEAD)?,
             add(
@@ -463,7 +474,13 @@ impl Subscription {
             return Ok(None);
         }
         if let Some(front) = self.queue.front() {
-            if self.item_credit == 0 || self.byte_credit < front.wire_bytes {
+            // A fully granted window that still cannot fit the head must deliver
+            // it anyway, so a maximal entry can never wedge the queue. `resume`
+            // guarantees max_credit >= max_queue >= any admitted entry, so this
+            // only relaxes the gate at the window ceiling; below it the normal
+            // credit rule applies.
+            let window_full = self.byte_credit >= self.config.max_credit_bytes;
+            if self.item_credit == 0 || (self.byte_credit < front.wire_bytes && !window_full) {
                 return Ok(None);
             }
             let delivery = self

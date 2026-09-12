@@ -300,6 +300,22 @@ impl RecoveryIndex {
             .try_reserve(count)
             .map_err(|_| LogError::Capacity)
     }
+    /// Total on-disk bytes across every indexed group. A checkpoint rewrite
+    /// copies all of these forward into a new generation while the old one is
+    /// still live, so this is the additional disk a checkpoint must be promised.
+    fn total_bytes(&self) -> Result<u64, LogError> {
+        let mut total = 0u64;
+        for group in self.groups.values() {
+            for chunk in &group.chunks {
+                for frame in &chunk.frames {
+                    total = total
+                        .checked_add(frame.length as u64)
+                        .ok_or(LogError::Capacity)?;
+                }
+            }
+        }
+        Ok(total)
+    }
     fn prepare(
         &mut self,
         log: LogicalLogId,
@@ -341,6 +357,7 @@ struct Writer {
     lease_generation: u64,
     limits: WalWriterLimits,
     budget: MemoryBudget,
+    disk: DiskBudget,
     stats: WalWriterStats,
 }
 fn reserve(
@@ -463,6 +480,7 @@ impl SharedWal {
             lease_generation: 0,
             limits,
             budget: budget.clone(),
+            disk: disk.clone(),
             stats,
         };
         let (sender, receiver) = mpsc::sync_channel(capacity);
@@ -1021,7 +1039,12 @@ impl Writer {
             match result {
                 Ok(chunk) => prepared.push((batch, chunk)),
                 Err(error) => {
-                    self.wal.failed = true;
+                    // Pre-write, per-batch errors (a bounded slot-reservation
+                    // shortage, a locked logical group) are batch-local: nothing
+                    // has touched disk yet, so the physical writer and every other
+                    // logical group stay healthy. Fail only this batch and keep
+                    // the rest; the writer is poisoned only by post-write failures
+                    // below, never by a recoverable prepare-phase condition.
                     batch.reply.finish(Err(error));
                 }
             }
@@ -1107,6 +1130,21 @@ impl Writer {
     fn checkpoint(&mut self, batch: Batch) {
         let result = (|| {
             self.valid(batch.log, batch.generation)?;
+            // The rewrite copies every logical group forward into a new
+            // generation while the old one is still on disk, so its peak is the
+            // whole current log, not just the retained batch reserved at
+            // admission. Reserve that peak as transient headroom held across the
+            // rewrite (released when this scope ends, since cleanup frees the old
+            // generation): a full volume is refused cleanly here instead of
+            // hitting ENOSPC mid-copy and poisoning the physical writer.
+            let _forward = self
+                .disk
+                .reserve(
+                    DiskKind::Checkpoint,
+                    BudgetLane::Completion,
+                    self.index.total_bytes()?,
+                )
+                .map_err(|_| LogError::Capacity)?;
             let _scratch = reserve(
                 &self.budget,
                 BudgetKind::Recovery,
