@@ -902,6 +902,7 @@ fn write_private_new(path: &Path, bytes: &[u8]) -> Result<(), JoinError> {
         }
     }
 }
+#[cfg(unix)]
 fn recover_output_link(path: &Path, temporary: &Path) -> Result<(), JoinError> {
     #[cfg(unix)]
     {

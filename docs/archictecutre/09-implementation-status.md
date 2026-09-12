@@ -9644,3 +9644,44 @@ and adversarial work is 130 binaries, 2,589 passed, 0 failed; strict
 all-target Clippy, the production no-panic gate (now with `unsafe_code` denied
 outside the one audited file), formatting, the locked check and the
 architecture contracts (1,532 links plus the unsafe boundary) are clean.
+
+**R10 native Windows — first product gate green (Windows Server 2022 CI,
+2026-09-11):** the dedicated Windows workflow (`.github/workflows/windows.yml`,
+`windows-2022`, pinned Rust 1.94.1) builds the whole workspace and runs, all
+green: the platform FFI suite (DACL/SID ownership, handle identity, locks,
+paths — 7), the named-pipe local transport round-trip (`focal-wire` — 59), the
+enrollment credential suite (`BootstrapAuthority`/`JoinKey` persistence, PKI,
+invitations — 22), and the A1 product gate on the shipped **release** binary
+(`cli_native_a1`: two participants complete a native claim cycle through the
+real `focal.exe` — submit/post, receipt, work artifact, testament, validation,
+derived acceptance — then survive a SIGKILL restart and exact retry — 1 passed).
+Getting there fixed several genuine cross-platform durability defects at the
+root, each also correct (and unchanged) on Unix:
+
+- `sync_all()` on a **read-only** handle returns `ERROR_ACCESS_DENIED` on
+  Windows (`FlushFileBuffers` requires a writable handle); Unix silently
+  tolerates it. Every durability-critical read-path re-sync was redundant (the
+  writer fsyncs before the file is visible; the directory fence recovers a prior
+  ambiguous `sync_dir`) and was removed across the enrollment `PrivateDirectory`,
+  the client operation/pending stores, the cluster-admin and MCP verify paths,
+  and the backup medium. An exhaustive sweep confirms none remain in `src/`.
+- Durable installs now publish through `focal_platform::fs::atomic_replace`
+  (`std::fs::rename` + directory fsync on Unix; `MoveFileExW(REPLACE_EXISTING |
+  WRITE_THROUGH)` on Windows, where there is no directory fsync), always closing
+  the temp handle first (Windows refuses to rename an open file).
+- The invitation/credential publisher (`network_join::write_private_new`) was a
+  Unix-only stub; its Windows path now uses a new
+  `focal_platform::fs::atomic_create_new` (`MoveFileExW(WRITE_THROUGH)` without
+  `REPLACE_EXISTING` — atomic, durable, no-clobber). The Unix hard-link/nlink
+  crash-recovery path is kept verbatim (the `renameat2`/`renamex_np` no-clobber
+  rename would need libc FFI, which the unsafe policy confines to `windows.rs`).
+- The network host recovers the content store and the founder's durable session
+  on a `spawn_blocking` thread (like the founder bootstrap), off the async
+  executor's shallow 1 MiB Windows main-thread stack.
+
+A fast `cargo test -p focal-enrollment` Windows step runs before the multi-minute
+release A1 build so a credential-persistence regression is caught in seconds and
+names its failing operation and path. Still open for R10: the arm64 Windows lane,
+folding Windows into the main CI matrix, cross-platform focal-node lib tests
+(un-gating ~49 Unix-only `#[cfg(test)]` sites), and the release/signing/notices/
+install-check lanes.
