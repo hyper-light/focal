@@ -334,4 +334,141 @@ mod tests {
             Err(HistoryError::StaleRead)
         );
     }
+
+    // The checker is the foundation of black-box history verification, so each
+    // violation class it defines has a test proving it is actually caught — a
+    // checker that silently accepted a bad history would give false confidence.
+
+    fn read(call: u64, consistency: Consistency) -> Event {
+        Event::Invoke {
+            call,
+            request: Request::Read {
+                ledger: initial().ledger,
+                consistency,
+            },
+        }
+    }
+
+    #[test]
+    fn a_history_over_its_event_budget_is_capacity() {
+        assert_eq!(
+            check(&[initial()], &[invocation(1)], 0),
+            Err(HistoryError::Capacity)
+        );
+    }
+
+    #[test]
+    fn a_reused_call_id_is_identity() {
+        assert_eq!(
+            check(&[initial()], &[invocation(1), invocation(1)], 20),
+            Err(HistoryError::Identity)
+        );
+    }
+
+    #[test]
+    fn completing_a_call_that_never_invoked_is_identity() {
+        let events = vec![Event::Complete {
+            call: 7,
+            outcome: Outcome::Refused,
+        }];
+        assert_eq!(check(&[initial()], &events, 20), Err(HistoryError::Identity));
+    }
+
+    #[test]
+    fn an_invocation_on_an_unknown_ledger_is_identity() {
+        let other = LedgerId {
+            tenant: TenantId::from_u128(9),
+            session: SessionId::from_u128(9),
+        };
+        let events = vec![Event::Invoke {
+            call: 1,
+            request: Request::Read {
+                ledger: other,
+                consistency: Consistency::Linearizable,
+            },
+        }];
+        assert_eq!(check(&[initial()], &events, 20), Err(HistoryError::Identity));
+    }
+
+    #[test]
+    fn a_publication_that_skips_a_sequence_is_prefix() {
+        let mut skipped = receipt();
+        skipped.sequence = SessionSeq(2); // expected 1 after the initial prefix 0
+        let events = vec![Event::Publish {
+            receipt: skipped,
+            state_hash: ContentHash([2; 32]),
+        }];
+        assert_eq!(check(&[initial()], &events, 20), Err(HistoryError::Prefix));
+    }
+
+    #[test]
+    fn two_publications_of_one_request_are_a_duplicate_commit() {
+        let first = receipt(); // key K at sequence 1
+        let mut second = receipt(); // the same key, a later contiguous sequence
+        second.sequence = SessionSeq(2);
+        let events = vec![
+            Event::Publish {
+                receipt: first,
+                state_hash: ContentHash([2; 32]),
+            },
+            Event::Publish {
+                receipt: second,
+                state_hash: ContentHash([3; 32]),
+            },
+        ];
+        assert_eq!(
+            check(&[initial()], &events, 20),
+            Err(HistoryError::DuplicateCommit)
+        );
+    }
+
+    #[test]
+    fn a_receipt_that_contradicts_its_request_is_a_response_mismatch() {
+        let mut wrong = receipt();
+        wrong.command_hash = ContentHash([9; 32]); // the request pinned [1; 32]
+        let events = vec![
+            invocation(1),
+            Event::Complete {
+                call: 1,
+                outcome: Outcome::Committed(wrong),
+            },
+        ];
+        assert_eq!(
+            check(&[initial()], &events, 20),
+            Err(HistoryError::ResponseMismatch)
+        );
+    }
+
+    #[test]
+    fn a_committed_outcome_for_a_read_is_a_response_mismatch() {
+        let events = vec![
+            read(1, Consistency::Linearizable),
+            Event::Complete {
+                call: 1,
+                outcome: Outcome::Committed(receipt()),
+            },
+        ];
+        assert_eq!(
+            check(&[initial()], &events, 20),
+            Err(HistoryError::ResponseMismatch)
+        );
+    }
+
+    #[test]
+    fn a_read_whose_hash_does_not_match_its_prefix_is_a_state_mismatch() {
+        let events = vec![
+            read(1, Consistency::Exact(SessionSeq(0))),
+            Event::Complete {
+                call: 1,
+                outcome: Outcome::Read {
+                    sequence: SessionSeq(0),
+                    state_hash: ContentHash([42; 32]), // the initial prefix hashes to [0; 32]
+                },
+            },
+        ];
+        assert_eq!(
+            check(&[initial()], &events, 20),
+            Err(HistoryError::StateMismatch)
+        );
+    }
 }
