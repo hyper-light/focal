@@ -91,8 +91,22 @@ impl ClientTransport for UnixTransport {
 pub struct QuicTransport {
     connector: QuicConnector,
     initial: RouteHint,
-    connections: Mutex<BTreeMap<(String, String), QuicRemote>>,
+    connections: Mutex<Connections>,
     max_connections: usize,
+}
+
+/// A cached QUIC connection with the logical clock value of its last use, so the
+/// cache evicts the least-recently-used connection under pressure rather than
+/// the lexicographically smallest key.
+struct Cached {
+    remote: QuicRemote,
+    used: u64,
+}
+
+#[derive(Default)]
+struct Connections {
+    entries: BTreeMap<(String, String), Cached>,
+    clock: u64,
 }
 impl QuicTransport {
     pub fn new(
@@ -110,32 +124,49 @@ impl QuicTransport {
         Ok(Self {
             connector,
             initial,
-            connections: Mutex::new(BTreeMap::new()),
+            connections: Mutex::new(Connections::default()),
             max_connections,
         })
     }
     async fn connection(&self, route: &RouteHint) -> Result<QuicRemote, WireError> {
         tokio::runtime::Handle::try_current().map_err(|_| WireError::Connection)?;
         let key = (route.endpoint.clone(), route.server_name.clone());
-        if let Some(connection) = self
-            .connections
-            .lock()
-            .map_err(|_| WireError::Connection)?
-            .get(&key)
-            .cloned()
         {
-            return Ok(connection);
+            let mut guard = self.connections.lock().map_err(|_| WireError::Connection)?;
+            guard.clock = guard.clock.saturating_add(1);
+            let clock = guard.clock;
+            if let Some(entry) = guard.entries.get_mut(&key) {
+                entry.used = clock;
+                return Ok(entry.remote.clone());
+            }
         }
         let mut addresses = tokio::net::lookup_host(route.endpoint.as_str())
             .await
             .map_err(|_| WireError::Connection)?;
         let address = addresses.next().ok_or(WireError::Connection)?;
         let connection = self.connector.connect(address, &route.server_name).await?;
-        let mut connections = self.connections.lock().map_err(|_| WireError::Connection)?;
-        if connections.len() >= self.max_connections {
-            connections.pop_first();
+        let mut guard = self.connections.lock().map_err(|_| WireError::Connection)?;
+        guard.clock = guard.clock.saturating_add(1);
+        let clock = guard.clock;
+        // Evict the least-recently-used connection only when admitting a new key
+        // at capacity; a re-inserted key just refreshes its clock.
+        if !guard.entries.contains_key(&key)
+            && guard.entries.len() >= self.max_connections
+            && let Some(evict) = guard
+                .entries
+                .iter()
+                .min_by_key(|(_, cached)| cached.used)
+                .map(|(evict_key, _)| evict_key.clone())
+        {
+            guard.entries.remove(&evict);
         }
-        connections.insert(key, connection.clone());
+        guard.entries.insert(
+            key,
+            Cached {
+                remote: connection.clone(),
+                used: clock,
+            },
+        );
         Ok(connection)
     }
 }
@@ -153,6 +184,7 @@ impl ClientTransport for QuicTransport {
                 self.connections
                     .lock()
                     .map_err(|_| WireError::Connection)?
+                    .entries
                     .remove(&(route.endpoint.clone(), route.server_name.clone()));
             }
             result
