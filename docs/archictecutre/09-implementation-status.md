@@ -9830,3 +9830,16 @@ map per call): prepare is a few µs; production `apply` grows with session size 
 the one-session reduce ceiling (roughly linear per-op, quadratic total) that R7
 ranges/materialization address, measured rather than hidden. Results in
 `docs/qualification/performance/2026-09-12-macos-arm64.md`.
+
+## Capacity envelope (R11, 2026-09-12)
+
+`docs/qualification/capacity-envelope.md` synthesizes the four leaf-crate benches
+into a capacity envelope with every row labelled measured / extrapolated /
+simulated. It states the per-operation floors (~8 ns admission, ~40 ns codec,
+~4–8 µs prepare) and the durability shape (fsync-dominated, batching-set), and
+separates the **measured one-session reduce ceiling** (apply roughly linear
+per-op, quadratic per session — sharded via R7 ranges above the low thousands of
+live claims) from fleet scaling (orthogonal: independent sessions own separate
+budgets/owners), with global scale given only as an envelope, not a demonstrated
+result. Fleet/global rows stay simulated until the R9 journeys and the R11
+workload generator and fault campaign produce real runs.
