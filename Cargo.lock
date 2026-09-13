@@ -698,6 +698,7 @@ dependencies = [
  "focal-platform",
  "focal-ranges",
  "focal-runtime",
+ "focal-sim",
  "focal-stream",
  "focal-wire",
  "futures-util",
