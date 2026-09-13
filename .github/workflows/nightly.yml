@@ -1,0 +1,58 @@
+name: Nightly qualification
+
+on:
+  schedule:
+    # 06:00 UTC daily.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      seed_start:
+        description: "First campaign seed"
+        default: "0"
+      seed_count:
+        description: "Number of campaign seeds"
+        default: "16"
+      campaign_claims:
+        description: "Native creations per campaign seed"
+        default: "500"
+
+permissions:
+  contents: read
+
+jobs:
+  qualification:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.94.1 --profile minimal --component clippy
+      - name: Install native protobuf compiler (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install native protobuf compiler (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+      # Black-box linearizability: client traces (embedded + the real binary)
+      # checked against the offline-recovered committed prefix, plus lost-reply
+      # exactly-once.
+      - name: Black-box histories
+        run: bash scripts/cargo.sh test -p focal-node --test history_black_box --test cli_history_black_box --locked -- --test-threads=4
+      # Bounded-allocation decoding of malformed / oversized inputs.
+      - name: Adversarial inputs
+        run: |
+          bash scripts/cargo.sh test -p focal-node --test adversarial_inputs --locked -- --test-threads=4
+          bash scripts/cargo.sh test -p focal-wire --test adversarial --locked
+      # Crash cuts: fault sites on the mutation and movement paths.
+      - name: Crash-cut matrix
+        run: bash scripts/cargo.sh test -p focal-node --test cli_native_a4 --test placement_binary --locked -- --test-threads=4
+      # Seeded end-to-end campaign: every workload run commits without loss.
+      - name: Workload campaign
+        env:
+          FOCAL_SEED_START: ${{ github.event.inputs.seed_start || '0' }}
+          FOCAL_SEED_COUNT: ${{ github.event.inputs.seed_count || '16' }}
+          FOCAL_CAMPAIGN_CLAIMS: ${{ github.event.inputs.campaign_claims || '500' }}
+        run: bash scripts/cargo.sh test -p focal-load --test campaign --locked -- --ignored --nocapture
