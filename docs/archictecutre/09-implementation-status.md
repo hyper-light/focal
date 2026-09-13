@@ -9785,3 +9785,16 @@ attacker-sized `with_capacity` would trip the bound. `cargo test -p focal-node
 --test adversarial_inputs` passes; the test is `#![cfg(unix)]` and its
 test-only counting allocator uses `unsafe` under the same tests-scoped exception
 as the wire suite.
+
+## Allocation-admission performance bench (R11, 2026-09-12)
+
+`crates/focal-memory/benches/budget.rs` (a dependency-free `harness = false`
+binary — no criterion, so `deny.toml`'s unmaintained/license bans are untouched)
+measures the `MemoryBudget` admission path every operation charges through. First
+`docs/qualification/performance/` record (2026-09-12, macOS arm64): an
+uncontended reserve/commit/release is ~8 ns; a per-session child budget ~27 ns;
+workers sharing one envelope contend on its atomic counters at ~131 ns/op (2
+threads) flattening toward ~270 ns/op (8), the bounded cost of the deliberately
+lock-free shared envelope. Run with `cargo bench -p focal-memory --bench budget`
+(`FOCAL_BENCH_ITERS` overrides the count). A measurement tool and regression
+signal, not a pass/fail gate.
