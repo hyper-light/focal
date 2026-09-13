@@ -23,8 +23,8 @@
 //! `recovered_prefix_is_a_linearizable_publication_history`.)
 
 use focal_client::{
-    Client, EmbeddedTransport, RetryPolicy, TraceEntry, TraceOutcome, TraceSink,
-    pending::OperationContext,
+    Client, ClientError, ClientTransport, EmbeddedTransport, RetryPolicy, TraceEntry, TraceOutcome,
+    TraceSink, TransportFuture, pending::OperationContext,
 };
 use focal_core::native::{NativeCommand, NativeInput, input_codec};
 use focal_ledger::NativeContentProfile;
@@ -37,6 +37,7 @@ use focal_node::{config::Settings, embedded::EmbeddedNode, host::LocalHost};
 use focal_sim::history::{self, Consistency, Event, Initial, Outcome, Request};
 use focal_wire::*;
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Collects every traced exchange a client completes.
@@ -471,6 +472,171 @@ fn concurrent_traced_clients_produce_a_linearizable_native_history() {
 
     drop(client_a);
     drop(client_b);
+    drop(host);
+    owner.join().unwrap();
+}
+
+/// A transport that forwards to the owner but drops the reply until `deliver`
+/// is set, modelling a lost response. The owner still processes each forwarded
+/// request (committing the first time it sees the identity, exact-retrying
+/// afterwards), so dropping replies never double-commits.
+struct DropReplies<T> {
+    inner: T,
+    deliver: Arc<AtomicBool>,
+}
+impl<T: ClientTransport> ClientTransport for DropReplies<T> {
+    fn request<'a>(
+        &'a self,
+        route: Option<&'a RouteHint>,
+        request: &'a RequestEnvelope,
+    ) -> TransportFuture<'a> {
+        Box::pin(async move {
+            let reply = self.inner.request(route, request).await;
+            if self.deliver.load(Ordering::SeqCst) {
+                reply
+            } else {
+                // The owner processed the request; drop its response.
+                let _ = reply;
+                Err(WireError::Timeout)
+            }
+        })
+    }
+}
+
+#[test]
+fn lost_reply_then_exact_retry_commits_exactly_once() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut settings = Settings::default();
+    settings.node.data_dir = Some(root.path().into());
+    focal_node::native_activation::activate_local(&settings, NativeContentProfile::ProjectionOnly)
+        .unwrap();
+
+    let node = EmbeddedNode::open(&settings).unwrap();
+    let ledger = node.identity.ledger;
+    let issuer = node.identity.issuer;
+    let worker = node.identity.worker;
+    let cluster = node.identity.cluster;
+    let limits = WireLimits::default();
+    let (host, owner) = LocalHost::spawn(node, limits.clone()).unwrap();
+    let _ = OperationContext {
+        cluster,
+        ledger,
+        principal: issuer,
+    };
+
+    let deliver = Arc::new(AtomicBool::new(false));
+    let peer = AuthenticatedPeer::local(PeerGrant {
+        principal: issuer,
+        tenants: BTreeSet::from([ledger.tenant]),
+        role: PeerRole::Runtime,
+    })
+    .unwrap();
+    let sink = Arc::new(RecordingSink::default());
+    // A short policy so the first request exhausts its window quickly and the
+    // application observes an unknown outcome.
+    let policy = RetryPolicy {
+        max_attempts: 3,
+        max_elapsed: std::time::Duration::from_secs(5),
+        base_backoff: std::time::Duration::from_millis(1),
+        max_backoff: std::time::Duration::from_millis(5),
+    };
+    let client = Client::new(
+        DropReplies {
+            inner: EmbeddedTransport::new(peer, host.clone(), limits.clone()).unwrap(),
+            deliver: Arc::clone(&deliver),
+        },
+        policy,
+        limits.clone(),
+        1,
+    )
+    .unwrap()
+    .with_trace(Box::new(SinkHandle(Arc::clone(&sink))));
+
+    // First attempt: replies are dropped, so the client exhausts its window and
+    // reports an unknown outcome — though the owner committed the request.
+    let first = runtime.block_on(client.request(create_envelope(ledger, issuer, worker, 1, 100)));
+    assert!(
+        matches!(first, Err(ClientError::OutcomeUnknown { .. })),
+        "a lost reply on a mutation is an unknown outcome, got {first:?}"
+    );
+
+    // The application retries the identical request; the reply now arrives and
+    // the owner returns the same committed receipt (exact retry, no re-commit).
+    deliver.store(true, Ordering::SeqCst);
+    let retry_receipt = match runtime
+        .block_on(client.request(create_envelope(ledger, issuer, worker, 1, 100)))
+        .unwrap()
+        .result
+    {
+        Response::Native(NativeMutationReply::Committed(receipt)) => receipt,
+        other => panic!("exact retry: {other:?}"),
+    };
+    assert_eq!(retry_receipt.sequence, SessionSeq(1), "exactly one commit");
+
+    // A second, cleanly-delivered create.
+    let second_receipt = match runtime
+        .block_on(client.request(create_envelope(ledger, issuer, worker, 2, 101)))
+        .unwrap()
+        .result
+    {
+        Response::Native(NativeMutationReply::Committed(receipt)) => receipt,
+        other => panic!("second create: {other:?}"),
+    };
+    assert_eq!(second_receipt.sequence, SessionSeq(2));
+
+    let key1 = RequestKey {
+        principal: issuer,
+        epoch: RequestEpoch(1),
+        id: RequestId::from_u128(1),
+    };
+    let key2 = RequestKey {
+        principal: issuer,
+        epoch: RequestEpoch(1),
+        id: RequestId::from_u128(2),
+    };
+    let publications = vec![
+        receipt(ledger, key1, retry_receipt.sequence, retry_receipt.intent),
+        receipt(ledger, key2, second_receipt.sequence, second_receipt.intent),
+    ];
+
+    let entries = sink.drain();
+    // Three exchanges: unknown, then the committed retry, then the second create.
+    assert_eq!(entries.len(), 3);
+    assert!(matches!(entries[0].outcome, TraceOutcome::Unknown));
+    assert_eq!(entries[0].request_id, RequestId::from_u128(1));
+    assert!(matches!(entries[1].outcome, TraceOutcome::Committed { .. }));
+    assert_eq!(entries[1].request_id, RequestId::from_u128(1));
+
+    let traces = vec![(issuer, entries)];
+    let initial = [Initial {
+        ledger,
+        sequence: SessionSeq(0),
+        state_hash: ContentHash([0; 32]),
+    }];
+    let events = build_history(&traces, &publications);
+    let report = history::check(&initial, &events, 256).unwrap();
+    assert_eq!(report.publications, 2, "the retried request committed once");
+    assert_eq!(report.unknown, 1, "the lost-reply attempt is unknown");
+    assert_eq!(report.pending, 0);
+
+    // If the owner had double-committed the retried key, the checker would catch
+    // it: a second publication of key one at the next contiguous sequence keeps
+    // the prefix whole, so the key collision is what trips the checker.
+    let mut doubled = events.clone();
+    doubled.push(Event::Publish {
+        receipt: receipt(ledger, key1, SessionSeq(3), retry_receipt.intent),
+        state_hash: state_marker(SessionSeq(3)),
+    });
+    assert_eq!(
+        history::check(&initial, &doubled, 256),
+        Err(history::HistoryError::DuplicateCommit)
+    );
+
+    drop(client);
     drop(host);
     owner.join().unwrap();
 }
