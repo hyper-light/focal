@@ -404,3 +404,27 @@ fn unknown_reply_and_eof_leave_exact_epoch_request_recoverable() {
 mod native;
 #[path = "traversal_backend_tests.rs"]
 mod traversal;
+
+#[test]
+fn a_withheld_tool_invoked_directly_is_refused_and_never_dispatched() {
+    // The authorization boundary (protocol.rs): a tools/call is accepted only
+    // when the tool is in this connection's catalogue, which stdio assembles
+    // from the backend's capabilities. The default backend has no admin
+    // capability, so admin tools are absent from tools/list; invoking one
+    // directly must be refused at the protocol layer and never reach the owner —
+    // listing is not the security boundary, dispatch membership is.
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("operations");
+    let mut runner = Running::start(&path, false);
+    let response = runner.tool_response(1, "cluster.status", json!({}));
+    assert_eq!(response["error"]["code"], -32602, "{response}");
+    assert_eq!(response["error"]["message"], "Unknown tool", "{response}");
+    assert!(
+        runner
+            .requests
+            .recv_timeout(Duration::from_millis(200))
+            .is_err(),
+        "a withheld tool must not dispatch a request to the owner"
+    );
+    runner.stop();
+}
