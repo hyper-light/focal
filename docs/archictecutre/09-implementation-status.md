@@ -9818,3 +9818,13 @@ reason the shared WAL batches concurrent appends into one durable write. Results
 in `docs/qualification/performance/2026-09-12-macos-arm64.md`. Completes the
 memory/wire/log leaf-crate benches; the focal-core reduce bench and the workload
 generator remain.
+
+## Domain-reduce performance bench (R11, 2026-09-12)
+
+`crates/focal-core/benches/reduce.rs` (dependency-free `harness = false`)
+completes the memory/wire/log/core leaf-crate bench set. It measures the serial
+oracle (`Core::prepare` + `apply_serial`, F05): prepare is ~8.5 µs; apply grows
+with session size — ~172 µs/op for the first 1000 claims, ~548 µs/op for the next
+1000 — surfacing the one-session reduce ceiling (roughly linear per-op, quadratic
+total) that R7 ranges/materialization address, measured rather than hidden.
+Results in `docs/qualification/performance/2026-09-12-macos-arm64.md`.

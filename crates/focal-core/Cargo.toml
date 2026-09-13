@@ -15,6 +15,7 @@ thiserror.workspace = true
 postcard.workspace = true
 
 [dev-dependencies]
+focal-model = { version = "0.1.0", path = "../focal-model" }
 serde_json.workspace = true
 tempfile.workspace = true
 
@@ -25,3 +26,7 @@ workspace = true
 # Public, fallible workflow fixtures for integration tests in other crates.
 # Never enabled by production binaries.
 test-support = []
+
+[[bench]]
+name = "reduce"
+harness = false
