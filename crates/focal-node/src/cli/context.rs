@@ -659,8 +659,13 @@ pub(super) fn connect(profile: Profile, history: PathBuf) -> Result<Context> {
                 initialized: Mutex::new(()),
                 transport: OnceLock::new(),
             }));
+            let client = Client::new(transport, RetryPolicy::default(), limits, 1)?;
+            let client = match super::trace::sink() {
+                Some(sink) => client.with_trace(sink),
+                None => client,
+            };
             Ok(Context {
-                client: Client::new(transport, RetryPolicy::default(), limits, 1)?,
+                client,
                 build,
                 operation,
                 root: history,
@@ -720,8 +725,13 @@ pub(super) fn connect(profile: Profile, history: PathBuf) -> Result<Context> {
                 initialized: Mutex::new(()),
                 transport: OnceLock::new(),
             }));
+            let client = Client::new(transport, RetryPolicy::default(), limits, 1)?;
+            let client = match super::trace::sink() {
+                Some(sink) => client.with_trace(sink),
+                None => client,
+            };
             Ok(Context {
-                client: Client::new(transport, RetryPolicy::default(), limits, 1)?,
+                client,
                 build,
                 operation,
                 root: history,

@@ -50,6 +50,10 @@ struct Args {
     /// Use a named ledger connection; cluster administration requires a Unix context.
     #[arg(long, global = true)]
     client_context: Option<String>,
+    /// Append each client request/response exchange as JSON lines to this file
+    /// (black-box history capture; diagnostic).
+    #[arg(long, global = true, hide = true)]
+    trace_file: Option<PathBuf>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -140,6 +144,7 @@ fn main() {
         Err(error) => error.exit(),
     };
     drop(matches);
+    cli::trace::configure(args.trace_file.clone());
     if let Err(error) = execute(args) {
         let _ = cli::errors::report(error.as_ref(), format, &mut std::io::stderr().lock());
         std::process::exit(cli::errors::classification(error.as_ref()).exit_code);

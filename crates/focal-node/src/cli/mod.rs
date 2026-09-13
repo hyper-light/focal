@@ -22,6 +22,7 @@ mod reconcile;
 mod request_files;
 #[cfg(test)]
 mod tests;
+pub(crate) mod trace;
 mod upload;
 mod upload_control;
 mod validators;
@@ -141,13 +142,18 @@ impl Context {
         let limits = WireLimits::default();
         let transport = UnixTransport::connect(root.join("focal.sock"), limits.clone())
             .map_err(|e| CliError::Other(Box::new(e)))?;
+        let client = Client::new(
+            context::Transport::Unix(transport),
+            RetryPolicy::default(),
+            limits,
+            1,
+        )?;
+        let client = match trace::sink() {
+            Some(sink) => client.with_trace(sink),
+            None => client,
+        };
         Ok(Self {
-            client: Client::new(
-                context::Transport::Unix(transport),
-                RetryPolicy::default(),
-                limits,
-                1,
-            )?,
+            client,
             build: BuildContext {
                 ledger: identity.ledger,
                 actor,
