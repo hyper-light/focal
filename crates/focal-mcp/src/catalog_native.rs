@@ -173,6 +173,61 @@ mod tests {
         }
     }
 
+    /// Every `family.action` tool name shown in docs/mcp.md whose family is a
+    /// real tool namespace exists in the catalogue, so the MCP manual cannot
+    /// present a tool the server does not expose. Dotted tokens outside any tool
+    /// family (e.g. `params._meta`) are ignored.
+    #[test]
+    fn documented_mcp_tools_exist_in_the_catalogue() {
+        // The union of every tool the server can expose across backends: the V1
+        // application catalogue, the native catalogue, and the admin, transfer
+        // and watch surfaces appended per backend capability.
+        let mut all = crate::catalog::catalog().unwrap();
+        crate::catalog_admin::append(&mut all).unwrap();
+        crate::catalog_transfer::append(&mut all).unwrap();
+        crate::catalog_watch::append(&mut all).unwrap();
+        all.extend(catalog(&standing(NativeProfile::AuthoredV1)).unwrap());
+        let mut names = std::collections::BTreeSet::new();
+        for tool in all {
+            names.insert(tool.name);
+        }
+        let families: std::collections::BTreeSet<&str> = names
+            .iter()
+            .filter_map(|name| name.split_once('.').map(|(family, _)| family))
+            .collect();
+
+        let manual = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/mcp.md");
+        let text = std::fs::read_to_string(&manual)
+            .unwrap_or_else(|error| panic!("read {}: {error}", manual.display()));
+
+        // Documented tool names not (yet) in the catalogue; empty today.
+        const PLANNED: &[&str] = &[];
+        let mut checked = 0usize;
+        for token in text.split('`').skip(1).step_by(2) {
+            let Some((family, action)) = token.split_once('.') else {
+                continue;
+            };
+            let dotted =
+                |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c == '_');
+            if !dotted(family) || !dotted(action) || action.contains('.') {
+                continue;
+            }
+            if !families.contains(family) {
+                continue;
+            }
+            if PLANNED.contains(&token) {
+                checked += 1;
+                continue;
+            }
+            assert!(
+                names.contains(token),
+                "docs/mcp.md documents `{token}` but the catalogue has no such tool"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 20, "only {checked} documented MCP tools checked");
+    }
+
     #[test]
     fn native_catalogue_is_exact_versioned_and_withholds_creation_on_projection_only_ledgers() {
         let full = focal_client::operations::descriptors()[0]
