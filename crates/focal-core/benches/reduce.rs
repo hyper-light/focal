@@ -10,11 +10,14 @@
     clippy::arithmetic_side_effects
 )]
 //! Performance bench for the domain reduce path — `Core::prepare` +
-//! `Core::apply_serial`, the serial oracle every mutation passes through (F05;
-//! P-gate, R11 §5). After negotiating a request epoch (as any session does), it
-//! admits and applies native claim creations. The fixture mirrors the in-crate
-//! `new_claim` builder; if it were malformed, `prepare` would refuse it and this
-//! bench would panic rather than report a misleading number.
+//! `Core::apply`, the production reduce every mutation passes through (F05;
+//! P-gate, R11 §5). It deliberately uses `apply` (owned row overlays), not
+//! `apply_serial` (the differential-verification oracle, which clones the whole
+//! state map per call and so is O(state) by construction — not the shipped
+//! path). After negotiating a request epoch (as any session does), it admits and
+//! applies native claim creations. The fixture mirrors the in-crate `new_claim`
+//! builder; if it were malformed, `prepare` would refuse it and this bench would
+//! panic rather than report a misleading number.
 use focal_core::Core;
 use focal_model::{
     ActionType, AuthenticatedInput, AuthorityContext, Cause, ClaimContent, ClaimId, Command,
@@ -119,7 +122,7 @@ fn apply_one(core: &mut Core, n: u128, principal: ParticipantId, command: Comman
         .prepare(&input(n, principal, command))
         .unwrap_or_else(|outcome| panic!("prepare refused (request {n}): {outcome:?}"));
     let seq = SessionSeq(core.sequence().0 + 1);
-    core.apply_serial(seq, prepared).unwrap();
+    core.apply(seq, prepared).unwrap();
 }
 
 /// A core with request epoch 1 negotiated for each participant, ready to admit
@@ -179,7 +182,7 @@ fn main() {
         );
     }
 
-    // apply_serial: the reduce onto committed state, which grows as claims
+    // apply: the production reduce onto committed state, which grows as claims
     // accumulate. Timed (apply only, excluding prepare) over the first and
     // second half of the run so the one-session scaling is visible: if the
     // second half is dearer per op, apply cost rises with session size — the
@@ -194,7 +197,7 @@ fn main() {
                 let prepared = core.prepare(&input(id, ISSUER, command)).unwrap();
                 let seq = SessionSeq(core.sequence().0 + 1);
                 let start = Instant::now();
-                let result = core.apply_serial(seq, prepared).unwrap();
+                let result = core.apply(seq, prepared).unwrap();
                 total += start.elapsed();
                 std::hint::black_box(&result);
             }
