@@ -95,8 +95,29 @@ pub fn run_bare(node: &Node, args: &[&str]) -> Output {
     command.args(["--data-dir", node.root().to_str().unwrap()]);
     command.args(args).output().unwrap()
 }
+/// Run a command, riding out the retryable exit-6 (`unavailable` or `capacity`)
+/// that a cluster reconfiguration (a range move, a voter change, a leader
+/// election) briefly returns while the authoritative service settles. The CLI's
+/// own retry rides out most of it; this harness resends a few more times so no
+/// test is flaked by a moment of reconfiguration. A definite error (bad input,
+/// not found) is returned at once. Both operator (`admin`) and client (`cli`)
+/// commands share this: an operator command issued mid-reconfiguration (e.g. a
+/// `move` during a prior transfer) is as subject to the transient as a workload.
+fn run_riding_out(node: &Node, context: Option<&str>, args: &[&str]) -> Output {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let output = run(node, context, args);
+        if output.status.success()
+            || output.status.code() != Some(6)
+            || std::time::Instant::now() >= deadline
+        {
+            break output;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
 pub fn admin(node: &Node, args: &[&str]) -> Value {
-    let output = run(node, None, args);
+    let output = run_riding_out(node, None, args);
     assert!(
         output.status.success(),
         "{args:?}: {}\n{}",
@@ -113,23 +134,7 @@ pub fn admin(node: &Node, args: &[&str]) -> Value {
 pub fn cli(node: &Node, context: Option<&str>, args: &[&str]) -> Value {
     let mut args = args.to_vec();
     args.extend(["--format", "json"]);
-    // A workload command run while the cluster is reconfiguring (a range
-    // move, a voter change, a leader election) can briefly see the
-    // authoritative service unavailable or at capacity (exit 6); the CLI's
-    // own retry rides out most of it, and this harness resends a few more
-    // times so a test workload is not flaked by a moment of reconfiguration.
-    // A definite error (bad input, not found) is returned at once.
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    let output = loop {
-        let output = run(node, context, &args);
-        if output.status.success() || output.status.code() != Some(6) {
-            break output;
-        }
-        if std::time::Instant::now() >= deadline {
-            break output;
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    };
+    let output = run_riding_out(node, context, &args);
     assert!(
         output.status.success(),
         "{args:?}: {}\n{}",

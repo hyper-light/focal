@@ -517,13 +517,29 @@ fn runbook_failed_movement() {
     assert_eq!(moved["result"]["kind"], "range_move_proposed", "{moved}");
     // The destination dies before the transfer completes.
     drop(std::mem::replace(&mut server_a, start_placeholder()));
-    let during = workload.write(&founder, "while the move is stalled");
+    // The move stalls, its phase unable to advance. Per the runbook's
+    // documented symptom (docs/runbooks/failed-movement.md), admission of
+    // writes to the moving range now answers retryable `range_moving`: the
+    // founder commits the transfer barrier from its own range view within a
+    // tick or two of the proposal, fencing the member until an activation the
+    // dead destination cannot give. A workload write to that member is
+    // therefore refused-retryable during the stall, never lost, and resumes
+    // once the transfer finishes (asserted after recovery, below) — so this
+    // test does not race a write against the barrier here.
+    // The transfer is underway but cannot complete: `in_flight` while the
+    // pending placement is recorded, or already cut its route toward the new
+    // holder — any of these is the stalled symptom (the earlier assertion,
+    // which ran only after a workload write had delayed it, missed the initial
+    // `in_flight` state now that the write is deferred to after recovery).
     let listing = ranges(&founder, &ledger).unwrap();
     assert!(
-        listing["pending"].is_object() || listing["members"][0]["holder"] == node_a,
+        listing["in_flight"] == true
+            || listing["pending"].is_object()
+            || listing["members"][0]["holder"] == node_a,
         "{listing}"
     );
-    // The destination returns with its disk: the transfer finishes.
+    // The destination returns with its disk: the transfer finishes and the
+    // moving range's fence lifts.
     server_a = start(&host_a, &[]);
     let deadline = Instant::now() + Duration::from_secs(240);
     loop {
@@ -547,11 +563,16 @@ fn runbook_failed_movement() {
         );
         std::thread::sleep(Duration::from_millis(500));
     }
+    // The workload resumes once the transfer completes: a write that would
+    // have been fenced during the stall now commits, and the claim from before
+    // the move survived the transfer intact.
+    let during = workload.write(&founder, "after the move recovers");
     for claim in [&before, &during] {
         assert_eq!(claim_id(&read_claim(&founder, claim)), *claim);
     }
     let after = workload.write(&founder, "after the move");
     assert_ne!(after, before);
+    assert_ne!(after, during);
     drop(server_a);
 }
 
