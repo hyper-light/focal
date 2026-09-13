@@ -9721,3 +9721,45 @@ link count) covered by the platform FFI suite. ci.yml was also aligned to the
 release workflow's `--test-threads=4`, so the heavy in-process fleet and runbook
 suites no longer oversubscribe memory (where the node correctly refuses at
 capacity and an otherwise-sound test cannot outlast the transient refusal).
+
+## Directory copy-on-write and the failed-movement runbook (2026-09-12)
+
+The directory root and partition state machines staged every command by cloning
+the whole checkpoint, mutating it, and publishing the clone on commit — deep
+copying every table on every command though a command mutates at most one.
+`RootCheckpoint.{regions,delegations}` and `PartitionCheckpoint.{nodes,sessions,
+routes}` are now serde-transparent `Arc<…>`: the stage clone is O(1) reference
+bumps and `Arc::make_mut` copies only the one table a command touches, leaving
+the rest shared between the live checkpoint and the staged one for the single
+control owner that holds both. Reads deref transparently. Under serde's `rc`
+feature `Arc<T>` serializes byte-identically to `T`, so frozen checkpoint bytes,
+digests and `PartitionCheckpoint::decode_any` schema conversions are unchanged —
+covered by `focal-directory`'s `durable_v1_tests`, `control_state`, `split_merge`
+and `placement_progress` round-trip and digest assertions. Recorded as a
+single-owner copy-on-write case in [doc 10](10-ownership-and-failure-policy.md),
+distinct from the cross-thread sharing that document otherwise restricts `Arc`
+to. This is an allocation optimization, not shared state.
+
+`runbook_failed_movement` was a residual flake the `--test-threads=4` alignment
+above did not cover: its race is intra-binary. The founder's placement controller
+commits a transfer's `Barrier` from its own range view within a tick or two of
+the operator's `move`, independent of the (killed) destination, fencing the
+moving member; admission of writes to that member then answers retryable
+`range_moving` until an activation the dead destination cannot yet give — exactly
+as [docs/runbooks/failed-movement.md](../runbooks/failed-movement.md) documents.
+The test wrote a claim to the single moving range mid-stall and asserted it
+committed, racing the barrier: it won in isolation and lost under load. It now
+asserts the documented behavior — the move stalls (observed via the transfer's
+`in_flight` state), the destination recovers from disk, the transfer finishes,
+and only then does the workload write commit, with the pre-move claim intact. The
+harness `admin()` helper also gained the same retryable-exit-6 ride-out `cli()`
+already had (shared `run_riding_out`), since an operator command issued during a
+reconfiguration is as subject to the transient as a workload command.
+
+Validation (macOS arm64): `bash scripts/cargo.sh test --workspace --locked --
+--test-threads=4` — 129 test binaries, 0 failures; `bash scripts/cargo.sh clippy
+--workspace --all-targets --locked -- -D warnings` clean; `cargo fmt --all
+--check` clean; `python3 scripts/check-contracts.py` — 1,452 architecture links,
+37 imported source hashes, 15 frozen domain vocabularies. `runbook_failed_movement`
+passed 8/8 under 8× concurrency (~50% failure before) and in the clean 11-test
+runbooks suite.
