@@ -9763,3 +9763,25 @@ Validation (macOS arm64): `bash scripts/cargo.sh test --workspace --locked --
 37 imported source hashes, 15 frozen domain vocabularies. `runbook_failed_movement`
 passed 8/8 under 8× concurrency (~50% failure before) and in the clean 11-test
 runbooks suite.
+
+## Node on-disk adversarial input allocation bound (R11, 2026-09-12)
+
+The wire frame decoder's bounded-allocation guard (above) now has a node-side
+peer: `crates/focal-node/tests/adversarial_inputs.rs`. A counting global
+allocator in that test binary asserts that the two decoders that read
+attacker-influenced bytes off the node's own disk — `CommittedPolicy::decode`
+(the `POLICY` file) and `decode_identity` (the `IDENTITY` file) — reject a
+malformed or maliciously length-inflated file without peak heap growth past a
+fixed 4 MiB budget, orders of magnitude below the gigabyte a leading varint
+could claim and far above honest decode overhead. The corpus covers empty,
+all-ones (maximal varints), unterminated varints, truncations and pseudo-random
+runs across and past each decoder's size cap (`POLICY` 64 KiB, `IDENTITY`
+4 KiB), through both POLICY framings (the `FCLPOL2\0` magic prefix and the legacy
+magic-less pair). The property holds structurally today — `NodeIdentity` is
+fixed-size, and postcard 1.1.3 with serde's cautious capacity reads collections
+bounded by the input, itself size-capped by `read_bounded` — so this is a
+regression guard: a future variable-length field that decoded with an
+attacker-sized `with_capacity` would trip the bound. `cargo test -p focal-node
+--test adversarial_inputs` passes; the test is `#![cfg(unix)]` and its
+test-only counting allocator uses `unsafe` under the same tests-scoped exception
+as the wire suite.
