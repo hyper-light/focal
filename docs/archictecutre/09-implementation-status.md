@@ -9913,3 +9913,47 @@ checks every `family.action` tool name in `docs/mcp.md` against the union of eve
 tool the server can expose (application, native, admin, transfer, watch). Both
 carry an empty PLANNED allowlist today — the manuals document only executable
 commands and tools.
+
+## R10 Windows local validation + R11 residual resolution (2026-09-13)
+
+Concrete status of the items previously described as "remaining", each
+investigated and resolved:
+
+**R10 native Windows — built and locally validated; only CI execution remains.**
+The Focal-authored Windows surface is complete: `crates/focal-platform`
+(`windows.rs` audited FFI) **cross-compile-checks clean** for
+`x86_64-pc-windows-msvc` (`cargo check --target x86_64-pc-windows-msvc -p
+focal-platform`); `scripts/release/platforms.json` defines both Windows targets
+(x64-msvc, arm64-msvc) with runners and assets; `.github/workflows/windows.yml`
+runs the platform FFI and named-pipe wire tests on `windows-2022` with a pinned
+protoc; `scripts/release/release.py` verifies PE images (MZ / `PE\0\0` / COFF
+machine, native-arch guard) and `smoke.py` drives Windows binaries
+(`CREATE_NEW_PROCESS_GROUP`, `CTRL_BREAK_EVENT`, `.exe`). A full-workspace
+Windows `cargo check` on macOS is blocked only at the C-crypto build scripts
+(`ring`, `blake3` need a Windows C toolchain) — the concrete reason the Windows
+CI lane exists; it is not a Focal-code gap. Remaining: the windows.yml lane's
+execution on real Windows runners.
+
+**Multi-node linearizability — covered; a separate quorum-reopen reader is
+redundant.** `crates/focal-ledger/src/native_session_cluster_tests.rs` is a
+deterministic in-process three-voter harness (pump / elect / stop / reopen /
+transfer_leader, no real network, no timing flakiness) that already asserts the
+multi-node properties directly: committed-head matching on the leader, passive
+follower replay equality, leader loss with unresolved candidates (barrier and
+conflict proofs), crash-after-commit handover, correlated read barriers, a
+refused evidence record retained until custody then applied once, and corrupted
+record / genesis bytes stopping only the receiving replica fail-closed. With the
+crash-cut matrix (`placement_binary`, `cli_native_a4`), failover exactly-once is
+covered. A black-box checker run over a stopped multi-voter cluster would need a
+quorum reopen (restarting the cluster) purely to re-derive an order these tests
+already assert, or owner-sourced publications (as the single-node black-box
+tests use) — no new coverage, so the reader is not built.
+
+**MCP dispatch — audited sound; the authorization test was added.** `Protocol::call`
+rejects any `tools/call` outside the connection's capability-filtered catalogue
+(a withheld tool called directly returns "Unknown tool" and dispatches nothing —
+now regression-tested); JSON-RPC framing reuses the bounded focal-wire
+`FrameDecoder`; the remote `request.inspect` binds the outcome key to the
+caller's own context and rejects a mismatched invocation (`ReceiptMismatch`); and
+the committed / pending / refused outcome mapping is a total 1:1. No defects
+beyond the already-fixed items.
