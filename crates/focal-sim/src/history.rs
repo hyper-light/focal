@@ -371,7 +371,10 @@ mod tests {
             call: 7,
             outcome: Outcome::Refused,
         }];
-        assert_eq!(check(&[initial()], &events, 20), Err(HistoryError::Identity));
+        assert_eq!(
+            check(&[initial()], &events, 20),
+            Err(HistoryError::Identity)
+        );
     }
 
     #[test]
@@ -387,7 +390,10 @@ mod tests {
                 consistency: Consistency::Linearizable,
             },
         }];
-        assert_eq!(check(&[initial()], &events, 20), Err(HistoryError::Identity));
+        assert_eq!(
+            check(&[initial()], &events, 20),
+            Err(HistoryError::Identity)
+        );
     }
 
     #[test]
