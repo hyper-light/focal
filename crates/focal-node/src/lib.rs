@@ -32,6 +32,7 @@ pub mod fleet;
 #[cfg(test)]
 mod fleet_tests;
 pub mod gc;
+pub mod history;
 pub mod host;
 pub mod liveness;
 #[cfg(test)]

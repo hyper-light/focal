@@ -591,6 +591,18 @@ impl Session {
     pub fn sequence(&self) -> SessionSeq {
         self.core.sequence()
     }
+    /// The committed native prefix as ordered outcomes — one per committed
+    /// record, in native-sequence order (offline publications reader, R11 §1).
+    /// Empty when this ledger has no native engine. Survives a checkpoint (the
+    /// outcomes are recovered state, not a delivery delta).
+    pub fn native_committed_outcomes(
+        &self,
+    ) -> Result<Vec<focal_core::native::NativeOutcome>, LedgerError> {
+        match self.native.as_deref() {
+            Some(engine) => Ok(engine.committed_core()?.native_outcomes()),
+            None => Ok(Vec::new()),
+        }
+    }
     pub fn ledger(&self) -> LedgerId {
         self.ledger
     }

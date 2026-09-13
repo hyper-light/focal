@@ -1513,6 +1513,24 @@ impl Core<NativeState> {
     pub fn native_outcome(&self, request: impl Into<NativeInvocation>) -> Option<NativeOutcome> {
         as_outcome(self.state.rows.get(&Key::Outcome(request.into())))
     }
+    /// Every committed native outcome (the retry-dedup records that survive a
+    /// checkpoint) in native-sequence order — one per committed record. The
+    /// offline publications reader projects these to the linearizability
+    /// checker's receipts; each carries its `invocation`, `sequence` and
+    /// `intent`.
+    pub fn native_outcomes(&self) -> Vec<NativeOutcome> {
+        let mut outcomes: Vec<NativeOutcome> = self
+            .state
+            .rows
+            .entries()
+            .filter_map(|entry| match &entry.value {
+                Row::Outcome(outcome) => Some(*outcome),
+                _ => None,
+            })
+            .collect();
+        outcomes.sort_by_key(|outcome| outcome.sequence.0);
+        outcomes
+    }
     /// The continuation of a claim that retired to the archive (26 §4).
     pub fn native_retired(&self, id: ClaimId) -> Option<&RetiredClaim> {
         match self.state.rows.get(&Key::Retired(id)) {

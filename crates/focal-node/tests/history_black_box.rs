@@ -640,3 +640,100 @@ fn lost_reply_then_exact_retry_commits_exactly_once() {
     drop(host);
     owner.join().unwrap();
 }
+
+/// Project one recovered native outcome to the generic receipt the checker
+/// compares (participant requests only for this workload).
+fn outcome_to_receipt(outcome: &focal_core::native::NativeOutcome) -> MutationReceipt {
+    let key = match outcome.invocation {
+        focal_core::native::NativeInvocation::Request(key) => key,
+        other => panic!("workload issues only participant requests: {other:?}"),
+    };
+    receipt(outcome.ledger, key, outcome.sequence, outcome.intent)
+}
+
+#[test]
+fn offline_reader_is_an_independent_publication_source() {
+    // The strongest black-box form: publications come not from the client's
+    // replies but from reopening the stopped node's durable log independently
+    // (focal_node::history), then the client's traced observations are checked
+    // against that independent order. A node that acked without committing would
+    // be caught here.
+    let root = tempfile::tempdir().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut settings = Settings::default();
+    settings.node.data_dir = Some(root.path().into());
+    focal_node::native_activation::activate_local(&settings, NativeContentProfile::ProjectionOnly)
+        .unwrap();
+
+    let node = EmbeddedNode::open(&settings).unwrap();
+    let identity = node.identity.clone();
+    let ledger = identity.ledger;
+    let issuer = identity.issuer;
+    let worker = identity.worker;
+    let limits = WireLimits::default();
+    let (host, owner) = LocalHost::spawn(node, limits.clone()).unwrap();
+
+    let peer = AuthenticatedPeer::local(PeerGrant {
+        principal: issuer,
+        tenants: BTreeSet::from([ledger.tenant]),
+        role: PeerRole::Runtime,
+    })
+    .unwrap();
+    let sink = Arc::new(RecordingSink::default());
+    let client = Client::new(
+        EmbeddedTransport::new(peer, host.clone(), limits.clone()).unwrap(),
+        RetryPolicy::default(),
+        limits.clone(),
+        1,
+    )
+    .unwrap()
+    .with_trace(Box::new(SinkHandle(Arc::clone(&sink))));
+
+    let mut owner_receipts = Vec::new();
+    for (request, claim) in [(1u128, 100u128), (2, 101), (3, 102)] {
+        match runtime
+            .block_on(client.request(create_envelope(ledger, issuer, worker, request, claim)))
+            .unwrap()
+            .result
+        {
+            Response::Native(NativeMutationReply::Committed(reply)) => {
+                owner_receipts.push((reply.sequence, reply.intent))
+            }
+            other => panic!("create: {other:?}"),
+        }
+    }
+    let entries = sink.drain();
+
+    // Stop the node so its durable log can be reopened offline.
+    drop(client);
+    drop(host);
+    owner.join().unwrap();
+
+    // Independent recovery of the committed prefix (no live server).
+    let outcomes = focal_node::history::offline_native_publications(root.path(), &identity)
+        .expect("offline reopen of the stopped node");
+    let recovered: Vec<(SessionSeq, ContentHash)> = outcomes
+        .iter()
+        .map(|outcome| (outcome.sequence, outcome.intent))
+        .collect();
+    assert_eq!(
+        recovered, owner_receipts,
+        "the independently recovered prefix agrees with the owner's replies"
+    );
+
+    let publications: Vec<MutationReceipt> = outcomes.iter().map(outcome_to_receipt).collect();
+    let traces = vec![(issuer, entries)];
+    let initial = [Initial {
+        ledger,
+        sequence: SessionSeq(publications[0].sequence.0 - 1),
+        state_hash: ContentHash([0; 32]),
+    }];
+    let events = build_history(&traces, &publications);
+    let report = history::check(&initial, &events, 256).unwrap();
+    assert_eq!(report.publications, 3);
+    assert_eq!(report.unknown, 0);
+    assert_eq!(report.pending, 0);
+}
