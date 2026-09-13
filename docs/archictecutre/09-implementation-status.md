@@ -9798,3 +9798,12 @@ threads) flattening toward ~270 ns/op (8), the bounded cost of the deliberately
 lock-free shared envelope. Run with `cargo bench -p focal-memory --bench budget`
 (`FOCAL_BENCH_ITERS` overrides the count). A measurement tool and regression
 signal, not a pass/fail gate.
+
+## Request codec performance bench (R11, 2026-09-12)
+
+`crates/focal-wire/benches/codec.rs` (dependency-free `harness = false`, using
+the public `encode_payload`/`decode_payload`) extends the performance record with
+the request codec: ~40 ns per-request fixed overhead each way; encode stays
+CPU-bound (tens of GiB/s at large frames) while decode is copy-bound at ~2 GiB/s,
+which is why large payloads move by reference and are encoded once. Results in
+`docs/qualification/performance/2026-09-12-macos-arm64.md`.
