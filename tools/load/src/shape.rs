@@ -13,6 +13,10 @@ pub struct WorkloadShape {
     /// reproducible and two runs never collide.
     #[serde(default = "default_seed")]
     pub seed: u64,
+    /// Claim reads to issue after the creations, cycling through the committed
+    /// claims. Zero (the default) measures the write path only.
+    #[serde(default)]
+    pub reads: u64,
 }
 
 fn default_seed() -> u64 {
@@ -26,6 +30,9 @@ impl WorkloadShape {
         }
         if self.claims > 1_000_000 {
             return Err("claims must not exceed 1_000_000".to_string());
+        }
+        if self.reads > 10_000_000 {
+            return Err("reads must not exceed 10_000_000".to_string());
         }
         Ok(())
     }

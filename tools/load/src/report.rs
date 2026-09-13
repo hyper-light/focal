@@ -12,6 +12,12 @@ pub struct Report {
     pub wall_ms: u128,
     pub throughput_ops_per_s: f64,
     pub latency_ns: Latency,
+    /// Claim reads issued after the creations (0 when the shape asks for none).
+    pub reads: u64,
+    /// Reads that returned the claim (a miss would indicate lost committed state).
+    pub read_hits: u64,
+    pub read_throughput_ops_per_s: f64,
+    pub read_latency_ns: Latency,
 }
 
 #[derive(Debug, Serialize)]
