@@ -1,6 +1,6 @@
 use crate::*;
 use focal_model::*;
-use focal_wire::{WireError, encode_payload, validate_response};
+use focal_wire::{WireError, validate_response};
 use std::{collections::BTreeMap, sync::Mutex, time::Duration};
 
 #[derive(Debug, Clone)]
@@ -157,7 +157,19 @@ fn trace_outcome(result: &Result<ResponseEnvelope, ClientError>) -> crate::Trace
                 sequence: receipt.sequence,
                 command_hash: receipt.intent,
             },
+            // A duplicate is the idempotent-resend reply: a full receipt proving
+            // this exact request already committed. Classify it as the commit it
+            // is, not Unknown, so a retried write is not lost to the checker.
+            Response::Submitted(MutationReply::Domain(DomainOutcome::Duplicate(receipt))) => {
+                TraceOutcome::Committed {
+                    sequence: receipt.sequence,
+                    command_hash: receipt.command_hash,
+                }
+            }
             Response::Read(page) => TraceOutcome::Read {
+                sequence: page.token.sequence,
+            },
+            Response::NativeRead(page) => TraceOutcome::Read {
                 sequence: page.token.sequence,
             },
             Response::Error(_) | Response::Native(NativeMutationReply::Refused(_)) => {
@@ -559,7 +571,10 @@ impl<T: ClientTransport> Client<T> {
         if tokio::runtime::Handle::try_current().is_err() {
             return Err(ClientError::Transport);
         }
-        encode_payload(&request, self.limits.max_frame_bytes)
+        // Reject an oversized request before the retry loop. `payload_len`
+        // enforces the same limit as encoding without allocating or serializing
+        // into a throwaway buffer (the transport serializes once itself).
+        focal_wire::payload_len(&request, self.limits.max_frame_bytes)
             .map_err(|_| ClientError::Access(AccessError::Capacity))?;
         let mut route = self
             .routes

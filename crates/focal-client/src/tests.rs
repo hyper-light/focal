@@ -678,3 +678,47 @@ async fn untraced_client_needs_no_sink() {
         Response::Submitted(MutationReply::Committed(_))
     ));
 }
+
+// Finding 2 (audit 2026-09-13): a Duplicate domain reply is a committed-on-retry
+// proof; it must trace as Committed, not Unknown.
+#[tokio::test]
+async fn a_duplicate_domain_reply_traces_as_committed() {
+    struct DuplicateReply;
+    impl ClientTransport for DuplicateReply {
+        fn request<'a>(
+            &'a self,
+            _: Option<&'a RouteHint>,
+            request: &'a RequestEnvelope,
+        ) -> TransportFuture<'a> {
+            Box::pin(async move {
+                Ok(request.reply(Response::Submitted(MutationReply::Domain(
+                    DomainOutcome::Duplicate(Box::new(receipt(request))),
+                ))))
+            })
+        }
+    }
+    struct Shared(std::sync::Arc<RecordingSink>);
+    impl TraceSink for Shared {
+        fn record(&self, entry: TraceEntry) {
+            self.0.record(entry);
+        }
+    }
+    let sink = std::sync::Arc::new(RecordingSink::default());
+    let client = Client::new(DuplicateReply, policy(), WireLimits::default(), 1)
+        .unwrap()
+        .with_trace(Box::new(Shared(std::sync::Arc::clone(&sink))));
+    let reply = client.submit(request()).await.unwrap();
+    assert!(matches!(
+        reply,
+        MutationReply::Domain(DomainOutcome::Duplicate(_))
+    ));
+    let entries = sink.entries.lock().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].outcome,
+        TraceOutcome::Committed {
+            sequence: SessionSeq(12),
+            command_hash: ContentHash([9; 32]),
+        }
+    );
+}
