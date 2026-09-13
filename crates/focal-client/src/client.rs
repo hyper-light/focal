@@ -123,6 +123,51 @@ pub struct Client<T: ClientTransport> {
     policy: RetryPolicy,
     limits: WireLimits,
     routes: Mutex<Routes>,
+    /// Optional offline-history trace (R11 §1). Absent by default; when absent,
+    /// `request` does no per-call trace work.
+    trace: Option<Box<dyn crate::TraceSink>>,
+    /// Per-client call counter, stamped onto each traced exchange to order and
+    /// pair concurrent invocations. Untouched when `trace` is `None`.
+    calls: std::sync::atomic::AtomicU64,
+}
+
+/// Single-host wall-clock nanoseconds for trace timestamps; a clock that runs
+/// before the epoch (never, in practice) records zero rather than panicking.
+fn trace_now_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+/// Classify a completed exchange for the history trace. Only explicit authority
+/// answers are reported as definite (`Committed`/`Read`/`Refused`); anything the
+/// client cannot pin — a still-pending mutation, a lost reply, a reply kind this
+/// trace does not model — is `Unknown`, so the checker never sees a false "no
+/// effect".
+fn trace_outcome(result: &Result<ResponseEnvelope, ClientError>) -> crate::TraceOutcome {
+    use crate::TraceOutcome;
+    match result {
+        Ok(env) => match &env.result {
+            Response::Submitted(MutationReply::Committed(receipt)) => TraceOutcome::Committed {
+                sequence: receipt.sequence,
+                command_hash: receipt.command_hash,
+            },
+            Response::Native(NativeMutationReply::Committed(receipt)) => TraceOutcome::Committed {
+                sequence: receipt.sequence,
+                command_hash: receipt.intent,
+            },
+            Response::Read(page) => TraceOutcome::Read {
+                sequence: page.token.sequence,
+            },
+            Response::Error(_) | Response::Native(NativeMutationReply::Refused(_)) => {
+                TraceOutcome::Refused
+            }
+            _ => TraceOutcome::Unknown,
+        },
+        Err(ClientError::Access(_)) => TraceOutcome::Refused,
+        Err(_) => TraceOutcome::Unknown,
+    }
 }
 impl<T: ClientTransport> Client<T> {
     pub(crate) fn wire_limits(&self) -> &WireLimits {
@@ -176,7 +221,18 @@ impl<T: ClientTransport> Client<T> {
                 clock: 0,
                 capacity: route_capacity,
             }),
+            trace: None,
+            calls: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Attach a trace sink so every subsequent `request` records one
+    /// [`TraceEntry`](crate::TraceEntry) (R11 §1 offline history checking).
+    /// Tracing is off by default; a client without a sink pays nothing.
+    #[must_use]
+    pub fn with_trace(mut self, sink: Box<dyn crate::TraceSink>) -> Self {
+        self.trace = Some(sink);
+        self
     }
     pub async fn submit(&self, request: RequestEnvelope) -> Result<MutationReply, ClientError> {
         if !matches!(
@@ -441,6 +497,19 @@ impl<T: ClientTransport> Client<T> {
             task::Poll,
         };
         let mutation = request.operation.is_mutation();
+        // Trace identity captured before the exchange (which may consume
+        // `request`); every field is `Copy`, and the `map` is skipped entirely
+        // when no sink is attached, so an untraced client does no extra work.
+        let trace_start = self.trace.as_ref().map(|_| {
+            (
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                request.ledger,
+                request.request_epoch,
+                request.request_id,
+                trace_now_nanos(),
+            )
+        });
         let mut write_uncertain = false;
         // A missing Tokio driver or a transport dependency failure must not
         // unwind through an SDK caller. After entering a mutation exchange,
@@ -456,7 +525,7 @@ impl<T: ClientTransport> Client<T> {
             )
             .await
         };
-        match result {
+        let outcome = match result {
             Ok(Err(_)) if write_uncertain => Err(ClientError::OutcomeUnknown {
                 request: Box::new(request),
             }),
@@ -465,7 +534,22 @@ impl<T: ClientTransport> Client<T> {
                 request: Box::new(request),
             }),
             Err(()) => Err(ClientError::Transport),
+        };
+        if let (Some(sink), Some((call, ledger, request_epoch, request_id, invoked_nanos))) =
+            (self.trace.as_ref(), trace_start)
+        {
+            sink.record(crate::TraceEntry {
+                call,
+                invoked_nanos,
+                completed_nanos: trace_now_nanos(),
+                ledger,
+                request_epoch,
+                request_id,
+                mutation,
+                outcome: trace_outcome(&outcome),
+            });
         }
+        outcome
     }
     async fn request_inner(
         &self,
