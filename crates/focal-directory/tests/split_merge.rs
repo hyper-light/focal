@@ -383,7 +383,7 @@ fn a_partition_splits_at_a_key_and_both_halves_route_every_session_exactly_once(
         Err(DirectoryError::OutsideNamespace)
     ));
     let mut tampered = image.clone();
-    tampered.sessions.remove(&ledger(3, 1));
+    std::sync::Arc::make_mut(&mut tampered.sessions).remove(&ledger(3, 1));
     assert!(matches!(
         DirectoryPartition::install_transferred(
             tampered,
@@ -525,7 +525,7 @@ fn two_adjacent_partitions_merge_back_under_a_bounded_absorb() {
     assert_eq!(merged.activation.as_ref(), Some(&fence));
     // The left partition absorbs the hash-verified sealed checkpoint.
     let mut tampered = moved.clone();
-    tampered.sessions.remove(&ledger(3, 1));
+    std::sync::Arc::make_mut(&mut tampered.sessions).remove(&ledger(3, 1));
     assert!(matches!(
         refused(
             &left,
@@ -620,7 +620,7 @@ fn a_schema_three_checkpoint_restores_with_a_seal_over_its_whole_namespace() {
             next_epoch: 2,
             revision: current.revision,
         }),
-        nodes: current.nodes.clone(),
+        nodes: current.nodes.as_ref().clone(),
         sessions: legacy_sessions(&current.sessions),
     };
     let encoded = postcard::to_allocvec(&legacy).unwrap();
@@ -631,7 +631,7 @@ fn a_schema_three_checkpoint_restores_with_a_seal_over_its_whole_namespace() {
     assert_eq!(converted.routes_from, current.revision);
     let mut expected = current.clone();
     expected.routes_from = current.revision;
-    for session in expected.sessions.values_mut() {
+    for session in std::sync::Arc::make_mut(&mut expected.sessions).values_mut() {
         session.founder = None;
     }
     assert_eq!(converted, expected);
@@ -727,7 +727,7 @@ fn the_route_log_reports_exactly_what_moved_and_a_cache_too_far_behind_reads_a_g
         delegation: state.delegation,
         revision: state.revision,
         sealed: None,
-        nodes: state.nodes.clone(),
+        nodes: state.nodes.as_ref().clone(),
         sessions: legacy_sessions(&state.sessions),
     };
     let converted =
@@ -737,11 +737,11 @@ fn the_route_log_reports_exactly_what_moved_and_a_cache_too_far_behind_reads_a_g
     // The current schema records who founded each session; a converted
     // checkpoint does not, and a host falls back to the cluster founder.
     assert!(state.sessions.values().all(|s| s.founder == Some(1)));
-    let mut unfounded = state.sessions.clone();
+    let mut unfounded = state.sessions.as_ref().clone();
     for session in unfounded.values_mut() {
         session.founder = None;
     }
-    assert_eq!(converted.sessions, unfounded);
+    assert_eq!(converted.sessions.as_ref(), &unfounded);
     // A schema-5 checkpoint keeps its route log through the conversion.
     let five = PartitionCheckpointV5 {
         schema: 5,
@@ -749,16 +749,16 @@ fn the_route_log_reports_exactly_what_moved_and_a_cache_too_far_behind_reads_a_g
         delegation: state.delegation,
         revision: state.revision,
         sealed: None,
-        nodes: state.nodes.clone(),
+        nodes: state.nodes.as_ref().clone(),
         sessions: legacy_sessions(&state.sessions),
-        routes: state.routes.clone(),
+        routes: state.routes.as_ref().clone(),
         routes_from: state.routes_from,
     };
     let converted_five =
         PartitionCheckpoint::decode_any(&postcard::to_allocvec(&five).unwrap()).unwrap();
     assert_eq!(converted_five.routes, state.routes);
     assert_eq!(converted_five.routes_from, state.routes_from);
-    assert_eq!(converted_five.sessions, unfounded);
+    assert_eq!(converted_five.sessions.as_ref(), &unfounded);
     assert_eq!(converted_five.schema, PARTITION_CHECKPOINT_SCHEMA);
     let restored = DirectoryPartition::restore(converted, tight, allowance).unwrap();
     assert_eq!(restored.route_changes(0).after_revision, state.revision);

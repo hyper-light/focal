@@ -577,15 +577,15 @@ fn policy_labels_require_one_actual_registered_nonzero_region() {
         schema: 1,
         cluster: ClusterId([1; 16]),
         revision: 1,
-        regions: BTreeMap::new(),
-        delegations: BTreeMap::new(),
+        regions: std::sync::Arc::new(BTreeMap::new()),
+        delegations: std::sync::Arc::new(BTreeMap::new()),
     };
     let labels = vec!["west".into()];
     assert!(matches!(
         resolve_regions(&labels, &root),
         Err(SessionRegistrationError::NotReady)
     ));
-    root.regions.insert(
+    std::sync::Arc::make_mut(&mut root.regions).insert(
         RegionId::from_u128(2),
         RegionRecord {
             id: RegionId::from_u128(2),
@@ -597,7 +597,7 @@ fn policy_labels_require_one_actual_registered_nonzero_region() {
         resolve_regions(&labels, &root).unwrap(),
         BTreeSet::from([RegionId::from_u128(2)])
     );
-    root.regions.insert(
+    std::sync::Arc::make_mut(&mut root.regions).insert(
         RegionId::from_u128(3),
         RegionRecord {
             id: RegionId::from_u128(3),
@@ -609,8 +609,8 @@ fn policy_labels_require_one_actual_registered_nonzero_region() {
         resolve_regions(&labels, &root),
         Err(SessionRegistrationError::PolicyUnsatisfied)
     ));
-    root.regions.clear();
-    root.regions.insert(
+    std::sync::Arc::make_mut(&mut root.regions).clear();
+    std::sync::Arc::make_mut(&mut root.regions).insert(
         RegionId::UNKNOWN,
         RegionRecord {
             id: RegionId::UNKNOWN,

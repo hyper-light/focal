@@ -15,7 +15,7 @@ async fn delegations(running: &Running) -> BTreeMap<NamespaceKey, focal_director
     let ControlBootstrap::Root { directory, .. } = &root.snapshot().state else {
         panic!("root state");
     };
-    directory.delegations.clone()
+    directory.delegations.as_ref().clone()
 }
 async fn wait_delegations(
     running: &Running,

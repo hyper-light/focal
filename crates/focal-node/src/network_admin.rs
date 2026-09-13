@@ -1193,7 +1193,7 @@ impl LocalNetworkAdmin {
             ..
         } = &observation.snapshot().state
         {
-            for (id, region) in &directory.regions {
+            for (id, region) in directory.regions.iter() {
                 labels.regions.insert(*id, region.label.clone());
             }
             // Which nodes the registry still authorizes: a revoked or

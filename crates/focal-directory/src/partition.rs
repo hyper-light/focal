@@ -3,6 +3,7 @@ use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::{LedgerId, RouteEpoch};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 
 /// Where a placement change stands. `Planned` is set by the plan itself;
 /// every later phase except `Cutover` is derived from committed assignment
@@ -88,14 +89,17 @@ pub struct PartitionCheckpoint {
     pub revision: u64,
     pub sealed: Option<PartitionSeal>,
     /// Only relevant enrolled nodes, bounded independently of total fleet size.
-    pub nodes: BTreeMap<u64, NodeRecord>,
+    /// Serde-transparent `Arc`: a mutation clones the whole checkpoint to stage
+    /// its change, so table-level sharing copies only the tables the command
+    /// actually touches (`Arc::make_mut`) and leaves the rest shared.
+    pub nodes: Arc<BTreeMap<u64, NodeRecord>>,
     /// Only this delegated interval's sessions, never every fleet session.
-    pub sessions: BTreeMap<LedgerId, SessionDescriptor>,
+    pub sessions: Arc<BTreeMap<LedgerId, SessionDescriptor>>,
     /// The newest route changes, oldest first: which session's route epoch
     /// changed at which revision, so a route cache watching this partition
     /// invalidates exactly what moved (§14). Bounded; `routes_from` is the
     /// revision the log is complete after (older changes were evicted).
-    pub routes: VecDeque<RouteChange>,
+    pub routes: Arc<VecDeque<RouteChange>>,
     pub routes_from: u64,
 }
 /// One session's route epoch changed at one partition revision.
@@ -335,9 +339,9 @@ impl DirectoryPartition {
                 delegation,
                 revision: 0,
                 sealed: None,
-                nodes: BTreeMap::new(),
-                sessions: BTreeMap::new(),
-                routes: VecDeque::new(),
+                nodes: Arc::new(BTreeMap::new()),
+                sessions: Arc::new(BTreeMap::new()),
+                routes: Arc::new(VecDeque::new()),
                 routes_from: 0,
             },
             config,
@@ -615,8 +619,7 @@ impl DirectoryPartition {
                 {
                     return Err(DirectoryError::CompareFailed);
                 }
-                state
-                    .sessions
+                Arc::make_mut(&mut state.sessions)
                     .retain(|ledger, _| !seal.moved.contains(*ledger));
                 state.delegation = *delegation;
                 state.sealed = None;
@@ -681,22 +684,22 @@ impl DirectoryPartition {
                     .values()
                     .map(|session| session.log_group)
                     .collect();
-                for (ledger, session) in &moved.sessions {
+                for (ledger, session) in moved.sessions.iter() {
                     if state.sessions.contains_key(ledger) || groups.contains(&session.log_group) {
                         return Err(DirectoryError::Duplicate);
                     }
                 }
-                for (ledger, session) in &moved.sessions {
-                    state.sessions.insert(*ledger, session.clone());
+                for (ledger, session) in moved.sessions.iter() {
+                    Arc::make_mut(&mut state.sessions).insert(*ledger, session.clone());
                 }
                 // A node known to both keeps the record at the higher
                 // generation; equal generations keep the destination's.
-                for (id, record) in &moved.nodes {
+                for (id, record) in moved.nodes.iter() {
                     let replace = state.nodes.get(id).is_none_or(|mine| {
                         mine.enrollment.generation < record.enrollment.generation
                     });
                     if replace {
-                        state.nodes.insert(*id, record.clone());
+                        Arc::make_mut(&mut state.nodes).insert(*id, record.clone());
                     }
                 }
                 state.delegation = *delegation;
@@ -730,7 +733,7 @@ impl DirectoryPartition {
                     return Err(DirectoryError::UnverifiedAuthority);
                 }
                 verifier.verify_enrollment(node)?;
-                state.nodes.insert(
+                Arc::make_mut(&mut state.nodes).insert(
                     node.node,
                     NodeRecord {
                         enrollment: node.clone(),
@@ -740,8 +743,7 @@ impl DirectoryPartition {
                 );
             }
             PartitionOperation::ReportLoad { load } => {
-                let node = state
-                    .nodes
+                let node = Arc::make_mut(&mut state.nodes)
                     .get_mut(&load.node)
                     .ok_or(DirectoryError::Missing)?;
                 if node.enrollment.generation != load.generation
@@ -760,7 +762,9 @@ impl DirectoryPartition {
                 witness,
                 decided_at,
             } => {
-                let record = state.nodes.get_mut(node).ok_or(DirectoryError::Missing)?;
+                let record = Arc::make_mut(&mut state.nodes)
+                    .get_mut(node)
+                    .ok_or(DirectoryError::Missing)?;
                 if record.enrollment.generation != *generation {
                     return Err(DirectoryError::StaleNode);
                 }
@@ -820,7 +824,7 @@ impl DirectoryPartition {
                     [node] => Some(*node),
                     _ => None,
                 };
-                state.sessions.insert(
+                Arc::make_mut(&mut state.sessions).insert(
                     *ledger,
                     SessionDescriptor {
                         ledger: *ledger,
@@ -844,8 +848,7 @@ impl DirectoryPartition {
                 expected_revision,
                 change,
             } => {
-                let session = state
-                    .sessions
+                let session = Arc::make_mut(&mut state.sessions)
                     .get_mut(ledger)
                     .ok_or(DirectoryError::Missing)?;
                 if session.revision != *expected_revision {
@@ -869,8 +872,9 @@ impl DirectoryPartition {
             if let Some(route_epoch) = after
                 && after != before
             {
-                if state.routes.len() >= self.config.max_route_log.max(1)
-                    && let Some(evicted) = state.routes.pop_front()
+                let routes = Arc::make_mut(&mut state.routes);
+                if routes.len() >= self.config.max_route_log.max(1)
+                    && let Some(evicted) = routes.pop_front()
                 {
                     state.routes_from = state.routes_from.max(evicted.revision);
                     // An absorb writes several route changes at one revision, so
@@ -878,15 +882,14 @@ impl DirectoryPartition {
                     // whole block, not one entry: a revision must never be both the
                     // log floor (routes_from) and still present at the front, which
                     // would wedge validate_partition on the next route change.
-                    while state
-                        .routes
+                    while routes
                         .front()
                         .is_some_and(|front| front.revision == evicted.revision)
                     {
-                        state.routes.pop_front();
+                        routes.pop_front();
                     }
                 }
-                state.routes.push_back(RouteChange {
+                routes.push_back(RouteChange {
                     revision,
                     ledger,
                     route_epoch,
@@ -934,12 +937,10 @@ fn split_image_of(
         return Err(DirectoryError::WrongOperation);
     }
     let mut image = state.clone();
-    image
-        .sessions
-        .retain(|ledger, _| seal.moved.contains(*ledger));
+    Arc::make_mut(&mut image.sessions).retain(|ledger, _| seal.moved.contains(*ledger));
     // The destination's own log starts empty and complete from its first
     // revision: a cache that watched the source re-reads through the root.
-    image.routes = VecDeque::new();
+    image.routes = Arc::new(VecDeque::new());
     image.routes_from = 0;
     image.delegation = Delegation {
         namespace: seal.moved,
@@ -1127,7 +1128,7 @@ fn validate_partition(
     }) {
         return Err(DirectoryError::StaleEpoch);
     }
-    for (id, node) in &state.nodes {
+    for (id, node) in state.nodes.iter() {
         if *id != node.enrollment.node {
             return Err(DirectoryError::Invalid("node key"));
         }
@@ -1145,7 +1146,7 @@ fn validate_partition(
         }
     }
     let mut groups = BTreeSet::new();
-    for (ledger, session) in &state.sessions {
+    for (ledger, session) in state.sessions.iter() {
         if *ledger != session.ledger || !state.delegation.namespace.contains(*ledger) {
             return Err(DirectoryError::OutsideNamespace);
         }

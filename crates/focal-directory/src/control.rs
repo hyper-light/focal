@@ -3,6 +3,7 @@ use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::LedgerId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegionRecord {
@@ -26,8 +27,11 @@ pub struct RootCheckpoint {
     pub schema: u16,
     pub cluster: ClusterId,
     pub revision: u64,
-    pub regions: BTreeMap<RegionId, RegionRecord>,
-    pub delegations: BTreeMap<NamespaceKey, Delegation>,
+    // Serde-transparent `Arc`: a mutation clones the whole `RootCheckpoint` to
+    // stage its change, so table-level sharing copies only the one table the
+    // command touches (`Arc::make_mut`) and leaves the other shared.
+    pub regions: Arc<BTreeMap<RegionId, RegionRecord>>,
+    pub delegations: Arc<BTreeMap<NamespaceKey, Delegation>>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RootCommand {
@@ -121,8 +125,8 @@ impl RootDirectory {
                 schema: 1,
                 cluster,
                 revision: 0,
-                regions: BTreeMap::new(),
-                delegations: BTreeMap::new(),
+                regions: Arc::new(BTreeMap::new()),
+                delegations: Arc::new(BTreeMap::new()),
             },
             config,
             budget,
@@ -224,7 +228,7 @@ impl RootDirectory {
                 {
                     return Err(DirectoryError::Duplicate);
                 }
-                state.regions.insert(region.id, region.clone());
+                Arc::make_mut(&mut state.regions).insert(region.id, region.clone());
             }
             RootOperation::Delegate { delegation } => {
                 if delegation.epoch != 1 || delegation.activation.is_some() {
@@ -237,8 +241,7 @@ impl RootDirectory {
                 }) {
                     return Err(DirectoryError::Duplicate);
                 }
-                state
-                    .delegations
+                Arc::make_mut(&mut state.delegations)
                     .insert(delegation.namespace.start, *delegation);
             }
             RootOperation::Transfer {
@@ -285,7 +288,7 @@ impl RootDirectory {
                 authority.verify_delegation(fence)?;
                 let mut destination = *destination;
                 destination.activation = Some(*fence);
-                state.delegations.insert(*start, destination);
+                Arc::make_mut(&mut state.delegations).insert(*start, destination);
             }
             RootOperation::Split {
                 start,
@@ -348,8 +351,8 @@ impl RootDirectory {
                 kept_delegation.activation = Some(*fence);
                 let mut destination = *destination;
                 destination.activation = Some(*fence);
-                state.delegations.insert(*start, kept_delegation);
-                state.delegations.insert(*at, destination);
+                Arc::make_mut(&mut state.delegations).insert(*start, kept_delegation);
+                Arc::make_mut(&mut state.delegations).insert(*at, destination);
             }
             RootOperation::Merge {
                 start,
@@ -395,8 +398,8 @@ impl RootDirectory {
                 };
                 merged.epoch = next_epoch;
                 merged.activation = Some(*fence);
-                state.delegations.remove(right);
-                state.delegations.insert(*start, merged);
+                Arc::make_mut(&mut state.delegations).remove(right);
+                Arc::make_mut(&mut state.delegations).insert(*start, merged);
             }
         }
         state.revision = revision;
@@ -427,7 +430,7 @@ fn validate_root(state: &RootCheckpoint, config: RootConfig) -> Result<(), Direc
     {
         return Err(DirectoryError::Capacity);
     }
-    for (id, region) in &state.regions {
+    for (id, region) in state.regions.iter() {
         if *id != region.id
             || *id == RegionId::UNKNOWN
             || region.authority_epoch == 0
@@ -445,7 +448,7 @@ fn validate_root(state: &RootCheckpoint, config: RootConfig) -> Result<(), Direc
         }
     }
     let mut previous: Option<&Delegation> = None;
-    for (start, delegation) in &state.delegations {
+    for (start, delegation) in state.delegations.iter() {
         delegation.namespace.validate()?;
         if *start != delegation.namespace.start
             || delegation.epoch == 0

@@ -6,6 +6,7 @@ use crate::*;
 use focal_model::{LedgerId, RouteEpoch};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeLoadV1 {
@@ -422,9 +423,9 @@ impl From<PartitionCheckpointV4> for PartitionCheckpoint {
             delegation: value.delegation,
             revision: value.revision,
             sealed: value.sealed,
-            nodes: value.nodes,
-            sessions: current_sessions(value.sessions),
-            routes: std::collections::VecDeque::new(),
+            nodes: Arc::new(value.nodes),
+            sessions: Arc::new(current_sessions(value.sessions)),
+            routes: Arc::new(std::collections::VecDeque::new()),
             routes_from: value.revision,
         }
     }
@@ -451,9 +452,9 @@ impl From<PartitionCheckpointV5> for PartitionCheckpoint {
             delegation: value.delegation,
             revision: value.revision,
             sealed: value.sealed,
-            nodes: value.nodes,
-            sessions: current_sessions(value.sessions),
-            routes: value.routes,
+            nodes: Arc::new(value.nodes),
+            sessions: Arc::new(current_sessions(value.sessions)),
+            routes: Arc::new(value.routes),
             routes_from: value.routes_from,
         }
     }
@@ -480,13 +481,15 @@ impl From<PartitionCheckpointV6> for PartitionCheckpoint {
             delegation: value.delegation,
             revision: value.revision,
             sealed: value.sealed,
-            nodes: value.nodes,
-            sessions: value
-                .sessions
-                .into_iter()
-                .map(|(ledger, session)| (ledger, SessionDescriptor::from(session)))
-                .collect(),
-            routes: value.routes,
+            nodes: Arc::new(value.nodes),
+            sessions: Arc::new(
+                value
+                    .sessions
+                    .into_iter()
+                    .map(|(ledger, session)| (ledger, SessionDescriptor::from(session)))
+                    .collect(),
+            ),
+            routes: Arc::new(value.routes),
             routes_from: value.routes_from,
         }
     }

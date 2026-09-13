@@ -990,7 +990,7 @@ fn the_measured_guarantee_never_exceeds_what_live_nodes_provide() {
             authority: fence(&desired, SessionFenceKind::Activated, 2, 6, 2),
         },
     );
-    let nodes = directory.checkpoint().nodes.clone();
+    let nodes = directory.checkpoint().nodes.as_ref().clone();
     let active = session(&directory);
     assert_eq!(
         effective_guarantee(&active, &nodes).unwrap().achieved,
@@ -1364,13 +1364,13 @@ fn holders_publish_in_epoch_order_for_placement_members_only() {
         delegation: checkpoint.delegation,
         revision: checkpoint.revision,
         sealed: checkpoint.sealed.clone(),
-        nodes: checkpoint.nodes.clone(),
+        nodes: checkpoint.nodes.as_ref().clone(),
         sessions: checkpoint
             .sessions
             .iter()
             .map(|(ledger, session)| (*ledger, SessionDescriptorV6::from(session.clone())))
             .collect(),
-        routes: checkpoint.routes.clone(),
+        routes: checkpoint.routes.as_ref().clone(),
         routes_from: checkpoint.routes_from,
     };
     let bytes = postcard::to_stdvec(&older).unwrap();

@@ -9,7 +9,7 @@ license.workspace = true
 focal-model = { version = "0.1.0", path = "../focal-model" }
 focal-enrollment = { version = "0.1.0", path = "../focal-enrollment" }
 focal-memory = { version = "0.1.0", path = "../focal-memory", features = ["serde"] }
-serde.workspace = true
+serde = { workspace = true, features = ["rc"] }
 postcard.workspace = true
 blake3.workspace = true
 

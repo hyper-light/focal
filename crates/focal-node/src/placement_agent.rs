@@ -1047,7 +1047,7 @@ impl PlacementAgent {
                 if let Some(record) = directory.nodes.get(&node) {
                     generation = generation.max(record.enrollment.generation);
                 }
-                for (id, record) in &directory.nodes {
+                for (id, record) in directory.nodes.iter() {
                     if *id == node || !record.enrollment.eligible {
                         continue;
                     }
@@ -1472,7 +1472,7 @@ impl PlacementAgent {
         let placement = &descriptor.active.placement;
         // The residency boundary and every known node's region travel with
         // the custody scope (24 §22).
-        for (id, record) in &directory.nodes {
+        for (id, record) in directory.nodes.iter() {
             self.node_regions.insert(*id, record.enrollment.region);
         }
         self.install_custody(
