@@ -15,6 +15,9 @@ on:
       campaign_claims:
         description: "Native creations per campaign seed"
         default: "500"
+      campaign_reads:
+        description: "Claim reads per campaign seed"
+        default: "2000"
 
 permissions:
   contents: read
@@ -55,4 +58,5 @@ jobs:
           FOCAL_SEED_START: ${{ github.event.inputs.seed_start || '0' }}
           FOCAL_SEED_COUNT: ${{ github.event.inputs.seed_count || '16' }}
           FOCAL_CAMPAIGN_CLAIMS: ${{ github.event.inputs.campaign_claims || '500' }}
+          FOCAL_CAMPAIGN_READS: ${{ github.event.inputs.campaign_reads || '2000' }}
         run: bash scripts/cargo.sh test -p focal-load --test campaign --locked -- --ignored --nocapture

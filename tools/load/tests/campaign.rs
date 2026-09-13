@@ -31,12 +31,17 @@ fn seeded_workloads_commit_without_loss() {
     let start = env_u64("FOCAL_SEED_START", 0);
     let count = env_u64("FOCAL_SEED_COUNT", 4).max(1);
     let claims = env_u64("FOCAL_CAMPAIGN_CLAIMS", 100).max(1);
+    let reads = env_u64("FOCAL_CAMPAIGN_READS", 0);
 
     for seed in start..start.saturating_add(count) {
         let dir = tempfile::tempdir().unwrap();
         let shape_path = dir.path().join("shape.yaml");
         let report_path = dir.path().join("report.json");
-        std::fs::write(&shape_path, format!("claims: {claims}\nseed: {seed}\n")).unwrap();
+        std::fs::write(
+            &shape_path,
+            format!("claims: {claims}\nseed: {seed}\nreads: {reads}\n"),
+        )
+        .unwrap();
 
         let status = Command::new(env!("CARGO_BIN_EXE_focal-load"))
             .args([
