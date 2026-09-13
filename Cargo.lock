@@ -607,6 +607,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "focal-load"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "focal-client",
+ "focal-core",
+ "focal-ledger",
+ "focal-model",
+ "focal-node",
+ "focal-wire",
+ "getrandom 0.3.4",
+ "serde",
+ "serde-saphyr",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "focal-log"
 version = "0.1.0"
 dependencies = [
