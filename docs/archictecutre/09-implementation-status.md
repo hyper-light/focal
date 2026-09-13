@@ -9807,3 +9807,14 @@ the request codec: ~40 ns per-request fixed overhead each way; encode stays
 CPU-bound (tens of GiB/s at large frames) while decode is copy-bound at ~2 GiB/s,
 which is why large payloads move by reference and are encoded once. Results in
 `docs/qualification/performance/2026-09-12-macos-arm64.md`.
+
+## Durable-append performance bench (R11, 2026-09-12)
+
+`crates/focal-log/benches/append.rs` (dependency-free `harness = false`) records
+the durable WAL append path: on macOS APFS a true `F_FULLFSYNC` is ~12–15 ms and
+nearly flat across batch/payload, so per-record throughput is set by batching —
+~80 rec/s at one record per fsync, ~17 K rec/s at 256 (~200×), the quantified
+reason the shared WAL batches concurrent appends into one durable write. Results
+in `docs/qualification/performance/2026-09-12-macos-arm64.md`. Completes the
+memory/wire/log leaf-crate benches; the focal-core reduce bench and the workload
+generator remain.

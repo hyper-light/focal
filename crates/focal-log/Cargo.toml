@@ -22,3 +22,7 @@ tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "append"
+harness = false
