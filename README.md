@@ -393,7 +393,10 @@ in [docs/network-startup.md](docs/network-startup.md) and [docs/cluster-admin.md
 > Small-cluster tests are not evidence of global throughput. Per-operation and single-node
 > microbenchmarks and a capacity envelope are published — the admission, request-codec,
 > durable-append and domain-reduce floors, and the measured one-session reduce ceiling — but
-> fleet and global throughput remain unmeasured, stated only as an envelope. See the
+> fleet and global throughput remain unmeasured, stated only as an envelope. An end-to-end
+> workload generator ([`tools/load`](tools/load/README.md)) and a nightly seeded campaign now
+> measure the full client→commit path and assert loss-free, exactly-once operation under load;
+> their runs will replace the envelope's simulated rows. See the
 > [capacity envelope](docs/qualification/capacity-envelope.md). The contract for each step is
 > [08](docs/archictecutre/08-stepped-complexity-and-deployment.md); the placement design is
 > [24](docs/archictecutre/24-placement-execution-and-fleet-control.md).
