@@ -9843,3 +9843,73 @@ live claims) from fleet scaling (orthogonal: independent sessions own separate
 budgets/owners), with global scale given only as an envelope, not a demonstrated
 result. Fleet/global rows stay simulated until the R9 journeys and the R11
 workload generator and fault campaign produce real runs.
+
+## Black-box linearizability histories (R11, 2026-09-13)
+
+The R11 §1 black-box history harness is complete for the single-node case. A
+production client trace sink (`focal_client::TraceSink`, hooked once in
+`Client::request` so it covers every operation, zero overhead when unattached)
+records each request/response exchange as a serde `TraceEntry`
+{call, invoked/completed nanos, ledger, request_epoch, request_id, mutation,
+outcome}; only explicit authority answers are definite (Committed/Read/Refused),
+a lost or pending mutation is Unknown, so the checker never sees a false "no
+effect". Publications come from the owner, not the client's belief:
+
+- **Embedded** (`crates/focal-node/tests/history_black_box.rs`): real traced
+  `Client`s over `EmbeddedTransport` submit concurrent native creates; their
+  traces merge with the owner's committed receipts and pass
+  `focal_sim::history::check`. A lost-reply test drops replies until the client
+  reports `OutcomeUnknown`, then the application resends and the owner
+  exact-retries the same sequence — three exchanges, two publications:
+  exactly-once under retry, with a fabricated second publication caught as
+  `DuplicateCommit`.
+- **Independent offline reader** (`focal_node::history::offline_native_publications`,
+  built on new `Core::native_outcomes()` and `Session::native_committed_outcomes()`):
+  reopens a stopped node's durable directory through the unified `Session`
+  (which confirms the managed+native decoder pair — a bare native session
+  refuses with `DecoderMismatch`), replays its committed log, and reads the
+  committed prefix from recovered state (it survives a checkpoint, which folds
+  the prefix into state rather than re-delivering it). The recovered order
+  agrees with the owner's replies and the client trace checks linearizable
+  against it.
+- **CLI, the real binary** (`crates/focal-node/tests/cli_history_black_box.rs`):
+  a hidden global `--trace-file` writes each exchange as JSON lines; native
+  creates through the `focal` binary are killed, the durable log reopened
+  offline, and the trace checked against the recovered order — a separate
+  process, a real Unix transport, and a durable-log-sourced publication order.
+
+Multi-node failover exactly-once is covered by the crash-cut matrix
+(`cli_native_a4`, `placement_binary`) with the single-node lost-reply test; a
+fully-independent offline reader over a stopped multi-voter cluster (quorum
+reopen) is a later refinement.
+
+## Workload generator and nightly campaign (R11 §4/§5, 2026-09-13)
+
+`tools/load` (crate `focal-load`, not shipped; the workspace now includes
+`tools/*`) drives a `WorkloadShape` (`claims`, `seed`) end to end against an
+in-process node over the real client path and writes a JSON report
+(committed/refused/unknown, wall time, end-to-end committed throughput, latency
+p50/p95/p99/max). A first run of 200 native creations commits 200/200 at
+~33 ops/s, p50 ~30 ms — the `F_FULLFSYNC` per-commit latency, consistent with
+`benches/append`; it is the source the capacity envelope's fleet rows and the
+nightly campaign refresh from.
+
+`.github/workflows/nightly.yml` (scheduled 06:00 UTC and manual, ubuntu-24.04
+and macos-15) runs the black-box histories (embedded and the binary), the
+adversarial bounded-allocation suites (node and wire), the crash-cut matrix, and
+`tools/load/tests/campaign.rs` — a `#[ignore]`d seeded sweep
+(`FOCAL_SEED_START`/`COUNT`, `FOCAL_CAMPAIGN_CLAIMS`) asserting every run commits
+its whole workload with nothing refused or unknown (loss-free, bounded,
+exactly-once under repeated reproducible load).
+
+## Documentation contracts (R11 §6, 2026-09-13)
+
+Two in-process contract tests hold the manuals to the real surfaces, so neither
+can document a verb or tool that does not exist:
+`command_tree_tests::documented_cli_commands_resolve_in_the_command_tree` walks
+every `focal …` example in fenced code blocks of `docs/manual-cli.md` against the
+real clap tree; `catalog_native::tests::documented_mcp_tools_exist_in_the_catalogue`
+checks every `family.action` tool name in `docs/mcp.md` against the union of every
+tool the server can expose (application, native, admin, transfer, watch). Both
+carry an empty PLANNED allowlist today — the manuals document only executable
+commands and tools.
