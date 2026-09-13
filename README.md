@@ -390,8 +390,11 @@ in [docs/network-startup.md](docs/network-startup.md) and [docs/cluster-admin.md
 | Global fleet | Per-tenant geography and resource policy | Target; the partitioned directory exists, scale qualification remains |
 
 > [!NOTE]
-> Small-cluster tests are not evidence of global throughput, and Focal has no published
-> benchmark yet. The contract for each step is
+> Small-cluster tests are not evidence of global throughput. Per-operation and single-node
+> microbenchmarks and a capacity envelope are published — the admission, request-codec,
+> durable-append and domain-reduce floors, and the measured one-session reduce ceiling — but
+> fleet and global throughput remain unmeasured, stated only as an envelope. See the
+> [capacity envelope](docs/qualification/capacity-envelope.md). The contract for each step is
 > [08](docs/archictecutre/08-stepped-complexity-and-deployment.md); the placement design is
 > [24](docs/archictecutre/24-placement-execution-and-fleet-control.md).
 
@@ -405,6 +408,7 @@ in [docs/network-startup.md](docs/network-startup.md) and [docs/cluster-admin.md
 | [Monitors](docs/monitors.md) | Durable wait predicates under a claim |
 | [Building](docs/building.md) | Toolchain, checks, the release lane |
 | [Architecture](docs/archictecutre/README.md) | Design documents 00–24 |
+| [Performance & capacity](docs/qualification/capacity-envelope.md) | Measured per-operation and durability floors, the one-session reduce ceiling, and the capacity envelope |
 | [Remaining work](docs/REMAINING.md) · [Implementation status](docs/archictecutre/09-implementation-status.md) | What is left, and the dated evidence for what is done |
 
 ## Contributing / development
