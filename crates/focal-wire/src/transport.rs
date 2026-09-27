@@ -390,76 +390,119 @@ impl QuicConnector {
         *self.tls.write().map_err(|_| WireError::Connection)? = tls;
         Ok(())
     }
+    /// A clonable handle that opens connections with the identity presented
+    /// now; a peer pool's detached dial holds one so a caller giving up under
+    /// its own deadline neither abandons the dial nor keeps the connector.
+    pub fn dialer(&self) -> Result<QuicDialer, WireError> {
+        Ok(QuicDialer {
+            endpoint: self.endpoint.clone(),
+            limits: self.limits.clone(),
+            tls: self.tls.read().map_err(|_| WireError::Connection)?.clone(),
+        })
+    }
     pub async fn connect(
         &self,
         address: SocketAddr,
         server_name: &str,
     ) -> Result<QuicRemote, WireError> {
-        transport_exchange(self.connect_inner(address, server_name)).await
+        let tls = self.tls.read().map_err(|_| WireError::Connection)?.clone();
+        transport_exchange(open_remote(
+            &self.endpoint,
+            tls,
+            &self.limits,
+            address,
+            server_name,
+        ))
+        .await
     }
-    async fn connect_inner(
+}
+/// The identity and limits a [`QuicConnector`] presented when the handle was
+/// taken; connections it opens are the connector's own (same endpoint, same
+/// certificate check by `server_name`).
+#[derive(Clone)]
+pub struct QuicDialer {
+    endpoint: Endpoint,
+    limits: WireLimits,
+    tls: quinn::ClientConfig,
+}
+impl QuicDialer {
+    pub async fn connect(
         &self,
         address: SocketAddr,
         server_name: &str,
     ) -> Result<QuicRemote, WireError> {
-        let tls = self.tls.read().map_err(|_| WireError::Connection)?.clone();
-        let connecting = self
-            .endpoint
-            .connect_with(tls, address, server_name)
-            .map_err(|_| WireError::Connection)?;
-        let connection = tokio::time::timeout(self.limits.request_timeout, connecting)
-            .await
-            .map_err(|_| WireError::Timeout)?
-            .map_err(|_| WireError::Authentication)?;
-        let handshake = async {
-            let (mut send, mut recv) = connection
-                .open_bi()
-                .await
-                .map_err(|_| WireError::Connection)?;
-            let hello = Hello {
-                versions: vec![
-                    crate::NATIVE_PROTOCOL_VERSION,
-                    PEER_PROTOCOL_VERSION,
-                    MANAGED_PROTOCOL_VERSION,
-                    PROTOCOL_VERSION,
-                ],
-                max_frame_bytes: self.limits.max_frame_bytes,
-                max_items: self.limits.max_items,
-            };
-            write_frame(&mut send, FrameKind::Hello, &hello, 4096).await?;
-            send.finish().map_err(|_| WireError::Connection)?;
-            let reply: HelloReply = read_frame(&mut recv, FrameKind::HelloReply, 4096).await?;
-            require_end(&mut recv).await?;
-            match reply {
-                HelloReply::Accepted(value) => Ok(value),
-                HelloReply::Rejected(error) => Err(WireError::Access(error)),
-            }
-        };
-        let negotiated = tokio::time::timeout(self.limits.request_timeout, handshake)
-            .await
-            .map_err(|_| WireError::Timeout)??;
-        if !matches!(
-            negotiated.protocol,
-            PROTOCOL_VERSION
-                | MANAGED_PROTOCOL_VERSION
-                | PEER_PROTOCOL_VERSION
-                | crate::NATIVE_PROTOCOL_VERSION
-        ) || negotiated.max_frame_bytes > self.limits.max_frame_bytes
-            || negotiated.max_items > self.limits.max_items
-        {
-            return Err(WireError::InvalidFrame);
-        }
-        Ok(QuicRemote {
-            connection,
-            negotiated,
-            limits: self.limits.clone(),
-            _endpoint: self.endpoint.clone(),
-            capacity: Arc::new(RemoteCapacity {
-                data: Semaphore::new(self.limits.streams_per_connection as usize),
-                control: Semaphore::new(2),
-            }),
-        })
+        transport_exchange(open_remote(
+            &self.endpoint,
+            self.tls.clone(),
+            &self.limits,
+            address,
+            server_name,
+        ))
+        .await
     }
+}
+async fn open_remote(
+    endpoint: &Endpoint,
+    tls: quinn::ClientConfig,
+    limits: &WireLimits,
+    address: SocketAddr,
+    server_name: &str,
+) -> Result<QuicRemote, WireError> {
+    let connecting = endpoint
+        .connect_with(tls, address, server_name)
+        .map_err(|_| WireError::Connection)?;
+    let connection = tokio::time::timeout(limits.request_timeout, connecting)
+        .await
+        .map_err(|_| WireError::Timeout)?
+        .map_err(|_| WireError::Authentication)?;
+    let handshake = async {
+        let (mut send, mut recv) = connection
+            .open_bi()
+            .await
+            .map_err(|_| WireError::Connection)?;
+        let hello = Hello {
+            versions: vec![
+                crate::NATIVE_PROTOCOL_VERSION,
+                PEER_PROTOCOL_VERSION,
+                MANAGED_PROTOCOL_VERSION,
+                PROTOCOL_VERSION,
+            ],
+            max_frame_bytes: limits.max_frame_bytes,
+            max_items: limits.max_items,
+        };
+        write_frame(&mut send, FrameKind::Hello, &hello, 4096).await?;
+        send.finish().map_err(|_| WireError::Connection)?;
+        let reply: HelloReply = read_frame(&mut recv, FrameKind::HelloReply, 4096).await?;
+        require_end(&mut recv).await?;
+        match reply {
+            HelloReply::Accepted(value) => Ok(value),
+            HelloReply::Rejected(error) => Err(WireError::Access(error)),
+        }
+    };
+    let negotiated = tokio::time::timeout(limits.request_timeout, handshake)
+        .await
+        .map_err(|_| WireError::Timeout)??;
+    if !matches!(
+        negotiated.protocol,
+        PROTOCOL_VERSION
+            | MANAGED_PROTOCOL_VERSION
+            | PEER_PROTOCOL_VERSION
+            | crate::NATIVE_PROTOCOL_VERSION
+    ) || negotiated.max_frame_bytes > limits.max_frame_bytes
+        || negotiated.max_items > limits.max_items
+    {
+        return Err(WireError::InvalidFrame);
+    }
+    Ok(QuicRemote {
+        connection,
+        negotiated,
+        limits: limits.clone(),
+        _endpoint: endpoint.clone(),
+        capacity: Arc::new(RemoteCapacity {
+            data: Semaphore::new(limits.streams_per_connection as usize),
+            control: Semaphore::new(2),
+        }),
+    })
 }
 #[derive(Clone)]
 pub struct QuicRemote {

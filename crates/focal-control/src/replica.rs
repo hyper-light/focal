@@ -72,9 +72,21 @@ struct CheckpointV6<S = ControlBootstrap> {
     retries: RetryCheckpoint,
     authority: Option<ControlAuthoritySnapshot>,
     configuration_index: u64,
+    contacts: Option<crate::contacts::ContactCheckpointV3>,
+}
+/// Schema 7: contacts carry retirement counters (24 §19).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CheckpointV7<S = ControlBootstrap> {
+    schema: u16,
+    identity: ControlIdentity,
+    applied_index: u64,
+    state: S,
+    retries: RetryCheckpoint,
+    authority: Option<ControlAuthoritySnapshot>,
+    configuration_index: u64,
     contacts: Option<ContactCheckpoint>,
 }
-const CHECKPOINT_SCHEMA: u16 = 6;
+const CHECKPOINT_SCHEMA: u16 = 7;
 const COMMAND_SCHEMA: u16 = 2;
 struct Pending {
     request: ControlRequestId,
@@ -184,8 +196,25 @@ impl ControlReplica {
     pub fn status(&self) -> NodeStatus {
         self.node.status()
     }
+    pub fn peer_progress(&self) -> Vec<focal_consensus::PeerProgress> {
+        self.node.peer_progress()
+    }
     pub fn applied_index(&self) -> u64 {
         self.applied_index
+    }
+    /// The compaction floor: the index of the most recent installed snapshot,
+    /// or zero if the log has never been compacted.
+    pub fn snapshot_index(&self) -> u64 {
+        self.node.snapshot_index()
+    }
+    /// The Raft index of the most recent committed membership change. A stored
+    /// snapshot older than this carries a configuration that excludes members
+    /// added since, so it cannot catch such a member up.
+    pub fn configuration_index(&self) -> u64 {
+        self.configuration_index
+    }
+    pub fn membership_configuration(&self) -> MembershipConfiguration {
+        self.node.membership_configuration()
     }
     pub fn has_pending(&self) -> bool {
         self.pending.is_some()
@@ -362,6 +391,8 @@ impl ControlReplica {
                             revision: 0,
                             applied_index: 0,
                             records: Vec::new(),
+                            retired_mutations: 0,
+                            last_retirement_index: 0,
                         }),
                 }))
             }
@@ -775,6 +806,21 @@ impl ControlReplica {
                         },
                         newer.authority,
                         newer.configuration_index,
+                        newer.contacts.map(ContactCheckpoint::from),
+                    )
+                }
+                7 => {
+                    let newer: CheckpointV7 = decode(&snapshot.data, limit)?;
+                    (
+                        Checkpoint {
+                            schema: CHECKPOINT_SCHEMA,
+                            identity: newer.identity,
+                            applied_index: newer.applied_index,
+                            state: newer.state,
+                            retries: newer.retries,
+                        },
+                        newer.authority,
+                        newer.configuration_index,
                         newer.contacts,
                     )
                 }
@@ -1028,7 +1074,7 @@ impl ControlReplica {
             .machine
             .export_authority(self.identity, self.applied_index)?;
         let bytes = encode(
-            &CheckpointV6 {
+            &CheckpointV7 {
                 schema: CHECKPOINT_SCHEMA,
                 identity: self.identity,
                 applied_index: self.applied_index,
@@ -1042,9 +1088,35 @@ impl ControlReplica {
         )?;
         let result = self.node.checkpoint(self.applied_index, bytes);
         if result.is_err() {
-            self.failed = true;
+            // A checkpoint the log had no room to admit stays unadmitted:
+            // withdraw it so the node is mutable again and a later attempt
+            // starts afresh. Nothing was written.
+            self.node.cancel_unadmitted_checkpoint();
+            // Only a node that actually stopped stops this replica. A refusal
+            // that changed nothing (Raft has work outstanding, persistence is
+            // in flight, memory or log pressure) is retried by the caller;
+            // treating it as fatal ended the root leader under ordinary load.
+            if self.node.failed() {
+                self.failed = true;
+            }
         }
         result.map_err(ControlError::from)
+    }
+    /// Whether a checkpoint error is a refusal that changed nothing and may
+    /// be retried later, rather than a failure of this replica.
+    pub fn checkpoint_retryable(&self, error: &ControlError) -> bool {
+        !self.failed
+            && matches!(
+                error,
+                ControlError::NotReady
+                    | ControlError::Busy
+                    | ControlError::Memory(_)
+                    | ControlError::Consensus(
+                        focal_consensus::ConsensusError::PersistencePending
+                            | focal_consensus::ConsensusError::CheckpointIndex
+                            | focal_consensus::ConsensusError::Capacity
+                    )
+            )
     }
     fn validate_state_scope(&self, state: &ControlBootstrap) -> Result<(), ControlError> {
         match (self.identity.scope, state) {

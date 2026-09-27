@@ -15,6 +15,7 @@ pub use local::LocalFacts;
 pub use policy::{CommittedPolicy, PolicyIntent, PolicyRevision};
 pub use resolve::{
     CliOverrides, ConfigSource, FieldSources, ResolvedSettings, resolve, resolve_request,
+    resolve_start,
 };
 pub use schema::{SCHEMA, check_unknown_keys};
 use serde::{Deserialize, Serialize};

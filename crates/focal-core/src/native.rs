@@ -184,6 +184,15 @@ pub struct NativeLimits {
     pub work_artifacts_per_cycle: usize,
     pub diagnostics_per_cycle: usize,
     pub response_summary_bytes: usize,
+    /// The guaranteed inline size of a completion/respondent report or
+    /// diagnostic artifact descriptor the owner pre-reserves per outstanding
+    /// receipt (doc 18 §6.7). This decouples the per-respondent completion
+    /// promise from `preparation_bytes`: inline payloads up to this bound are
+    /// guaranteed, and larger artifact content rides the separately bounded
+    /// content store as a `Payload::Content` pointer rather than pinning owner
+    /// RAM. Keeping it small is what lets one node hold many concurrent
+    /// respondents (the per-node concurrency envelope that sizes the ledger).
+    pub report_descriptor_bytes: usize,
     /// Inputs one artifact may cite, and so the `ArtifactInput` index rows its
     /// admission writes (22 §7); never above the model's fixed ceiling.
     pub artifact_inputs: usize,
@@ -217,6 +226,7 @@ impl Default for NativeLimits {
             work_artifacts_per_cycle: 256,
             diagnostics_per_cycle: 64,
             response_summary_bytes: 64 * 1024,
+            report_descriptor_bytes: 128 * 1024,
             artifact_inputs: 16,
             legacy_rows: 4_000_000,
             legacy_row_bytes: 1024 * 1024,

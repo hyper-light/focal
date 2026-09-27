@@ -422,3 +422,40 @@ async fn pinned_enrollment_unknown_reply_restart_installs_exact_node_without_mem
     server.close();
     task.await.unwrap();
 }
+
+/// An operator who advertises a `host:port` name has that name carried into
+/// the join and committed with the first contact (24 §24): peers re-resolve
+/// it when the address behind it stops answering, which is how a rescheduled
+/// host stays reachable. Before this, the join dropped the name and every
+/// host's committed contact was address-only, so a host that moved was
+/// unreachable until declared dead. The name comes from the operator's
+/// configuration on open and on resume alike; an address literal names
+/// nothing to re-resolve and leaves it unset.
+#[test]
+fn a_join_carries_the_advertised_name_so_peers_can_re_resolve_a_moved_host() {
+    let mut fixture = Fixture::new();
+    let (listen, advertise) = addresses();
+    let disk = tempfile::tempdir().unwrap();
+    let mut named = settings(disk.path());
+    named.node.listen = Some(listen);
+    named.node.advertise = Some("host-b.example:7444".into());
+    let pending = PendingJoin::open(&named, fixture.bundle(), listen, advertise).unwrap();
+    assert_eq!(pending.endpoint.as_deref(), Some("host-b.example:7444"));
+    drop(pending);
+    let resumed = PendingJoin::resume(&named).unwrap();
+    assert_eq!(
+        resumed.endpoint.as_deref(),
+        Some("host-b.example:7444"),
+        "a resumed join derives the name from the same configuration"
+    );
+    drop(resumed);
+    let disk = tempfile::tempdir().unwrap();
+    let mut addressed = settings(disk.path());
+    addressed.node.listen = Some(listen);
+    addressed.node.advertise = Some(advertise.to_string());
+    let pending = PendingJoin::open(&addressed, fixture.bundle(), listen, advertise).unwrap();
+    assert!(
+        pending.endpoint.is_none(),
+        "an address literal names nothing to re-resolve"
+    );
+}

@@ -63,6 +63,10 @@ impl OperatorRead {
 }
 /// Sessions the storage view lists before it reports truncation.
 const MAX_STORAGE_SESSIONS: usize = 256;
+/// The whole readiness report's wait budget (08 §9): well under a
+/// supervisor's exec-probe timeout, so a root or session leader that is
+/// unreachable makes the report incomplete, never late.
+const READINESS_BUDGET: std::time::Duration = std::time::Duration::from_millis(400);
 #[derive(Serialize, Deserialize)]
 pub(crate) enum OperatorReply {
     Identity(AdminNodeIdentity),
@@ -352,10 +356,19 @@ impl LocalNetworkAdmin {
         let control = self.control.as_ref().ok_or(AccessError::Unavailable)?;
         let fleet = self.fleet.as_ref().ok_or(AccessError::Unavailable)?;
         let root = control.progress();
+        // The report is bounded as a whole: the placement view and each
+        // session's diagnostics can wait on the root or a session leader that
+        // is currently unreachable, and a supervisor's probe must not hang
+        // with them. What the budget does not cover is reported as absent
+        // (`truncated`, no directory view), which never satisfies the policy
+        // — honest, and bounded.
+        let deadline = tokio::time::Instant::now()
+            .checked_add(READINESS_BUDGET)
+            .ok_or(AccessError::Capacity)?;
         let placement = match &self.placement {
-            Some(handle) => match handle.directory().await {
-                Ok(report) => Some(placement_reply(report, &self.topology_labels().await)),
-                Err(_) => None,
+            Some(handle) => match tokio::time::timeout_at(deadline, handle.directory()).await {
+                Ok(Ok(report)) => Some(placement_reply(report, &self.topology_labels().await)),
+                Ok(Err(_)) | Err(_) => None,
             },
             None => None,
         };
@@ -379,8 +392,9 @@ impl LocalNetworkAdmin {
                 break;
             }
             let progress = host.progress();
-            let Ok(reply) = host.diagnostics().await else {
-                continue;
+            let Ok(Ok(reply)) = tokio::time::timeout_at(deadline, host.diagnostics()).await else {
+                truncated = true;
+                break;
             };
             let diagnostics = reply.value();
             let directory = listed(ledger);

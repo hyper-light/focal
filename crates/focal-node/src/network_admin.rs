@@ -129,6 +129,9 @@ pub enum AdminCommand {
     ActivateFence {
         level: u32,
     },
+    /// Retire a removed node's committed contact record (24 §19); the
+    /// journaled `a1:` request, exact like a membership change.
+    RetireContact(Box<ControlRequest>),
 }
 /// The reply to [`AdminCommand::UpgradeStatus`] and
 /// [`AdminCommand::ActivateFence`].
@@ -740,6 +743,18 @@ impl AdminCommand {
                     return Err(AccessError::Unauthorized);
                 };
                 if command.revoked_invitation().is_none()
+                    || request.id.sequence == 0
+                    || request.acknowledged_through >= request.id.sequence
+                {
+                    return Err(AccessError::InvalidRequest);
+                }
+                Ok(())
+            }
+            Self::RetireContact(request) => {
+                let ControlCommand::RetireContact(command) = &request.command else {
+                    return Err(AccessError::Unauthorized);
+                };
+                if command.node == 0
                     || request.id.sequence == 0
                     || request.acknowledged_through >= request.id.sequence
                 {
@@ -1809,7 +1824,8 @@ impl LocalNetworkAdmin {
                 .map(ControlReply::Read),
             AdminCommand::Membership(request)
             | AdminCommand::Revocation(request)
-            | AdminCommand::Authority(request) => {
+            | AdminCommand::Authority(request)
+            | AdminCommand::RetireContact(request) => {
                 if request.id.client != principal.0 {
                     return Err(AccessError::Unauthorized);
                 }

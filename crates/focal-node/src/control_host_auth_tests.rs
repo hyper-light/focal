@@ -176,6 +176,9 @@ async fn root_read_rechecks_enrollment_when_its_quorum_barrier_completes() {
             revisions: network.control.revisions(),
             dropped_replication: 0,
             stopped: false,
+            snapshot_index: 0,
+            peers: Vec::new(),
+            failure: None,
         },
         _allocation: None,
     });
@@ -194,6 +197,7 @@ async fn root_read_rechecks_enrollment_when_its_quorum_barrier_completes() {
         progress,
         nonce: 0,
         dropped: 0,
+        failure: None,
     };
     let charge = owner
         .budget

@@ -706,6 +706,24 @@ fn next_root_command(
         else {
             continue;
         };
+        // A removed node is never re-granted: its invitation is revoked and
+        // its contact retired (24 §19), and a grant proposed for it would be
+        // refused by the authority.
+        if matches!(enrollment.invitation_revoked(receipt.invitation), Ok(true)) {
+            continue;
+        }
+        // Only what a node announces changes its grant. A node with no
+        // committed contact has announced nothing, which is not a move to
+        // the unknown region.
+        if !observation
+            .contacts()
+            .contacts
+            .records
+            .iter()
+            .any(|contact| contact.node == *node)
+        {
+            continue;
+        }
         let identity = focal_model::ContentHash(receipt.public_key);
         let (region, zone, label) = contact_topology(observation, *node);
         if grant.enrollment.identity == identity
@@ -1009,6 +1027,7 @@ impl NetworkController {
         let mut eligible = BTreeSet::new();
         let mut next_transition = i64::MAX;
         let mut previous_time = None;
+        let mut last_bootstrap_announce: Option<std::time::Instant> = None;
         loop {
             let progress = host.progress();
             if progress.stopped {
@@ -1026,6 +1045,27 @@ impl NetworkController {
                 let next = match observe_projection(host, registry).await? {
                     Some(value) => value,
                     None => {
+                        // The root is unobservable from here — typically a
+                        // host whose leader no longer reaches it because this
+                        // node's committed address is stale (a rescheduled
+                        // pod, a new lease). Observing the root needs the
+                        // leader, and the leader needs this node's new
+                        // address: break the cycle by announcing through the
+                        // immutable, authenticated sponsor route, at most once
+                        // a second.
+                        if last_bootstrap_announce
+                            .is_none_or(|at| at.elapsed() >= Duration::from_secs(1))
+                        {
+                            last_bootstrap_announce = Some(std::time::Instant::now());
+                            if let Ok(result) = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                self.announce_unobserved(pool),
+                            )
+                            .await
+                            {
+                                result?;
+                            }
+                        }
                         tokio::time::sleep(Duration::from_millis(100)).await;
                         continue;
                     }
@@ -1402,6 +1442,18 @@ impl NetworkController {
                 );
             }
         }
+        // The founder's committed contact supersedes the sponsor route but
+        // keeps the sponsor's name when it carries none of its own: the name
+        // outlives the address behind it (24 §24), and a founder that moved
+        // is otherwise reachable only once its new contact has replicated —
+        // through the very leader this node cannot reach.
+        let sponsor_name = {
+            let sponsor = &self.state.sponsor.endpoint;
+            sponsor
+                .parse::<std::net::SocketAddr>()
+                .is_err()
+                .then(|| sponsor.clone())
+        };
         let mut eligible = BTreeSet::new();
         for contact in &observed.contacts().contacts.records {
             if !grants.contains_key(&contact.certificate_fingerprint) {
@@ -1420,12 +1472,17 @@ impl NetworkController {
             }
             eligible.insert(contact.node);
             if contact.node != self.state.node {
+                let name = contact.endpoint.clone().or_else(|| {
+                    (contact.node == self.state.genesis.founder.node)
+                        .then(|| sponsor_name.clone())
+                        .flatten()
+                });
                 routes.insert(
                     contact.node,
                     PeerEndpoint {
                         address: contact.advertise,
                         server_name: contact.server_name.clone(),
-                        name: contact.endpoint.clone(),
+                        name,
                     },
                 );
             }
@@ -1442,6 +1499,21 @@ impl NetworkController {
         }
         Ok((eligible, next_transition))
     }
+    /// Whether a committed contact record already states what this node
+    /// would announce: the certificate it holds and its reachability and
+    /// failure-domain labels (24 §22, §24).
+    fn contact_current(&self, contact: &ContactRecord) -> bool {
+        contact.certificate_fingerprint == certificate_fingerprint(&self.receipt.certificate)
+            && contact.advertise == self.state.advertise
+            && contact.endpoint == self.state.endpoint
+            && contact.region == self.topology.region
+            && contact.zone
+                == self
+                    .topology
+                    .region
+                    .as_ref()
+                    .and_then(|_| self.topology.zone.clone())
+    }
     async fn announce(
         &mut self,
         observed: &RootObservation,
@@ -1457,20 +1529,7 @@ impl NetworkController {
             .iter()
             .find(|contact| contact.node == self.state.node)
         {
-            Some(contact)
-                if contact.certificate_fingerprint == fingerprint
-                    && contact.advertise == self.state.advertise
-                    && contact.endpoint == self.state.endpoint
-                    && contact.region == self.topology.region
-                    && contact.zone
-                        == self
-                            .topology
-                            .region
-                            .as_ref()
-                            .and_then(|_| self.topology.zone.clone()) =>
-            {
-                return Ok(());
-            }
+            Some(contact) if self.contact_current(contact) => return Ok(()),
             // A committed renewal this node has not installed yet is announced
             // by the renewal, never regressed to the receipt still held.
             Some(contact)
@@ -1523,6 +1582,87 @@ impl NetworkController {
         }
         Ok(())
     }
+    /// Announce this node's contact while the root cannot be observed from
+    /// here: install the genesis sponsor as a route and announce through it,
+    /// learning the committed generation from the root's refusal exactly as
+    /// [`Self::announce`] does for a node that moved before it applied its
+    /// previous contact. The founder never needs this, and a sponsor named
+    /// by a name that did not resolve at this start has nothing to dial.
+    async fn announce_unobserved(
+        &mut self,
+        pool: &PeerConnectionPool,
+    ) -> Result<(), ControllerError> {
+        let founder_node = self.state.genesis.founder.node;
+        if self.state.node == founder_node {
+            return Ok(());
+        }
+        let sponsor = &self.state.sponsor.endpoint;
+        let dial = match sponsor.parse::<std::net::SocketAddr>() {
+            Ok(address) => Some((address, None)),
+            Err(_) => self
+                .sponsor_address
+                .map(|address| (address, Some(sponsor.clone()))),
+        };
+        let Some((address, name)) = dial else {
+            return Ok(());
+        };
+        if !self.routes.contains_key(&founder_node) {
+            let initial = genesis_enrollment(&self.state)?;
+            let founder = initial
+                .enrollments()
+                .next()
+                .ok_or(ControllerError::Identity)?;
+            let mut routes = self.routes.clone();
+            routes.insert(
+                founder_node,
+                PeerEndpoint {
+                    address,
+                    server_name: founder.identity.server_name.clone(),
+                    name,
+                },
+            );
+            let revision = self
+                .route_revision
+                .checked_add(1)
+                .ok_or(ControllerError::Capacity)?;
+            pool.replace_routes(revision, routes.clone())?;
+            self.routes = routes;
+            self.route_revision = revision;
+        }
+        // The root's committed record for this node is read first: nothing
+        // is announced while it already says what this node would say (the
+        // move committed; this node's own replica is still catching up), and
+        // otherwise the announcement expects the generation the root holds.
+        // Only a root that cannot be read is announced to blind, from the
+        // first generation; its refusal names the generation to repeat from.
+        let (sequence, expected_generation) = match self.remote_contact(pool, founder_node).await {
+            Some(contact) if contact.principal != self.receipt.identity.principal => {
+                return Err(ControllerError::Identity);
+            }
+            Some(contact) if self.contact_current(&contact) => return Ok(()),
+            Some(contact) => (
+                contact
+                    .generation
+                    .checked_add(1)
+                    .ok_or(ControllerError::Capacity)?,
+                contact.generation,
+            ),
+            None => (1, 0),
+        };
+        let request = self.contact_envelope(sequence, expected_generation);
+        if let Some(target) = self
+            .announce_remote(pool, &request, founder_node, sequence)
+            .await?
+            && let Some(generation) = self.remote_contact_generation(pool, target).await
+            && generation > expected_generation
+        {
+            let sequence = generation.checked_add(1).ok_or(ControllerError::Capacity)?;
+            let request = self.contact_envelope(sequence, generation);
+            self.announce_remote(pool, &request, target, sequence)
+                .await?;
+        }
+        Ok(())
+    }
     /// This node's contact announcement at `sequence`, expecting the root to
     /// hold `expected_generation` for it.
     fn contact_envelope(&self, sequence: u64, expected_generation: u64) -> RequestEnvelope {
@@ -1549,14 +1689,27 @@ impl NetworkController {
             },
         }
     }
-    /// The generation the root at `target` holds for this node's contact, read
-    /// over the node's own certificate; `None` when the read fails or the
-    /// node has no contact there.
+    /// The generation the root at `target` holds for this node's contact
+    /// under the principal this node holds; `None` when the read fails or
+    /// the node has no such contact there.
     async fn remote_contact_generation(
         &self,
         pool: &PeerConnectionPool,
         target: u64,
     ) -> Option<u64> {
+        self.remote_contact(pool, target)
+            .await
+            .filter(|contact| contact.principal == self.receipt.identity.principal)
+            .map(|contact| contact.generation)
+    }
+    /// The contact record the root at `target` holds for this node, read
+    /// over the node's own certificate; `None` when the read fails or the
+    /// node has no contact there.
+    async fn remote_contact(
+        &self,
+        pool: &PeerConnectionPool,
+        target: u64,
+    ) -> Option<ContactRecord> {
         let request = RequestEnvelope {
             protocol: PROTOCOL_VERSION,
             ledger: self.state.genesis.root_namespace,
@@ -1588,12 +1741,8 @@ impl NetworkController {
         snapshot
             .contacts
             .records
-            .iter()
-            .find(|contact| {
-                contact.node == self.state.node
-                    && contact.principal == self.receipt.identity.principal
-            })
-            .map(|contact| contact.generation)
+            .into_iter()
+            .find(|contact| contact.node == self.state.node)
     }
     /// Announce to the leader, then around the installed routes. Returns the
     /// peer that refused the announcement as stale (its root holds a newer
@@ -1703,10 +1852,15 @@ fn check_contact_reply(
         // request the root retained under this sequence: a conflict means an
         // earlier attempt already committed, and the next observation of the
         // contact table settles it. A generation the observation had not yet
-        // caught up with is re-derived from the next observation the same way.
-        ControlReply::Rejected(ControlFailure::RetryConflict | ControlFailure::CompareFailed) => {
-            Ok(ContactOutcome::Stale)
-        }
+        // caught up with is re-derived from the next observation the same way,
+        // and so is a sequence the root's retry window has already moved past
+        // (a later announcement from this node committed while this one was
+        // derived from an older view, or announced blind).
+        ControlReply::Rejected(
+            ControlFailure::RetryConflict
+            | ControlFailure::CompareFailed
+            | ControlFailure::RetryExpired,
+        ) => Ok(ContactOutcome::Stale),
         ControlReply::Rejected(error) => Err(error.into()),
         _ => Err(ControllerError::Identity),
     }

@@ -327,6 +327,15 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     assert_eq!(result["changed"], true);
     assert_eq!(result["generation"], 2);
     assert!(result["operation_id"].as_str().unwrap().starts_with("a1:"));
+    // A remove that follows the drain at once is refused for the copies the
+    // host still holds — never as "not drained": the committed grant is
+    // ineligible even while the partition is still observing it.
+    let (code, report) = failure(
+        founder,
+        &["cluster", "nodes", "remove", "--node", &drained_text],
+    );
+    assert_eq!(code, 5, "{report}");
+    assert!(report.contains("[node_holding]"), "{report}");
     let again = success(
         founder,
         &["cluster", "nodes", "drain", "--node", &drained_text],
@@ -365,7 +374,19 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     assert_eq!(removed["node"], drained);
     assert_eq!(removed["membership_removed"], true, "{removed}");
     assert_eq!(removed["revoked"], true, "{removed}");
+    assert_eq!(removed["contact_retired"], true, "{removed}");
     let invitation = removed["invitation"].as_str().unwrap().to_owned();
+    // The removed node's committed contact is gone: the bounded contact
+    // table keeps no slot for a node that no longer exists.
+    let listed = success(founder, &["cluster", "nodes", "list"]);
+    assert!(
+        !listed["result"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|contact| contact["node"] == drained),
+        "{listed}"
+    );
     let repeated = success(
         founder,
         &["cluster", "nodes", "remove", "--node", &drained_text],
@@ -373,6 +394,7 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
         .clone();
     assert_eq!(repeated["membership_removed"], false, "{repeated}");
     assert_eq!(repeated["revoked"], false);
+    assert_eq!(repeated["contact_retired"], false, "{repeated}");
     assert_eq!(repeated["invitation"], invitation);
     let inspected = success(founder, &["cluster", "invitations", "get", &invitation]);
     assert_eq!(

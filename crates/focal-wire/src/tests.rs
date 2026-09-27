@@ -1042,6 +1042,169 @@ async fn peer_pool_re_resolves_a_named_endpoint_when_its_address_stops_answering
     task.await.unwrap().unwrap();
 }
 
+/// A peer that moved behind its name while every caller gives up long before
+/// the dead address's deadline (a liveness probe, a bounded control read):
+/// the dial runs on its own and the name's fresh address wins, so a later
+/// caller finds the connection instead of restarting from the dead address
+/// forever (24 §24; the 2026-09-13 all-pods-moved wedge).
+#[tokio::test]
+async fn peer_pool_reaches_a_peer_that_moved_behind_its_name_while_every_caller_gives_up_early() {
+    use std::collections::BTreeMap;
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(16).unwrap();
+    let mut node_grant = grant();
+    node_grant.role = PeerRole::Node { node_id: 7 };
+    registry
+        .register_certificate(&certificate, node_grant)
+        .unwrap();
+    let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| async move {
+        verified.request().reply(Response::PeerAccepted)
+    });
+    let (server, task) = server(&pki, registry, handler).await;
+    let live = server.local_addr().unwrap();
+    // A UDP socket bound and dropped: nothing answers there, and a dial to it
+    // only fails at the connector's deadline.
+    let stale = {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.local_addr().unwrap()
+    };
+    let pool = PeerConnectionPool::new(
+        connector(&pki, certificate, key),
+        PeerPoolLimits {
+            attempts: 1,
+            retry_backoff: Duration::ZERO,
+            timeout: Duration::from_secs(10),
+            ..PeerPoolLimits::default()
+        },
+    )
+    .unwrap();
+    pool.replace_routes(
+        1,
+        BTreeMap::from([(
+            2,
+            PeerEndpoint {
+                address: stale,
+                server_name: "localhost".into(),
+                name: Some(format!("localhost:{}", live.port())),
+            },
+        )]),
+    )
+    .unwrap();
+    let mut packet = request(84);
+    packet.operation = Operation::Raft {
+        group: [2; 16],
+        message: vec![1],
+    };
+    // Every caller allows far less than the dead address's deadline.
+    let started = std::time::Instant::now();
+    let mut delivered = false;
+    while started.elapsed() < Duration::from_secs(5) {
+        match tokio::time::timeout(Duration::from_millis(200), pool.send(2, &packet)).await {
+            Ok(Ok(_)) => {
+                delivered = true;
+                break;
+            }
+            Ok(Err(error)) => panic!("the send failed rather than timing out: {error}"),
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    }
+    assert!(delivered, "no caller ever reached the moved peer");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the moved peer was reached only after {:?}",
+        started.elapsed()
+    );
+    let stats = pool.stats();
+    assert_eq!(stats.dials, 1, "one dial served every caller");
+    assert_eq!(stats.connections_opened, 1);
+    assert_eq!(stats.delivered, 1);
+    pool.close();
+    server.close();
+    task.await.unwrap().unwrap();
+}
+
+/// Callers that give up before a dial to a dead address decides neither
+/// abandon it nor repeat it: one dial serves them all, and its outcome still
+/// marks the peer unreachable so the next send fails at once.
+#[tokio::test]
+async fn peer_pool_callers_that_give_up_share_one_dial_whose_outcome_is_still_recorded() {
+    use std::collections::BTreeMap;
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let stale = {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.local_addr().unwrap()
+    };
+    let cooldown = Duration::from_secs(5);
+    let pool = PeerConnectionPool::new(
+        connector(&pki, certificate, key),
+        PeerPoolLimits {
+            attempts: 1,
+            retry_backoff: Duration::ZERO,
+            timeout: Duration::from_secs(10),
+            unreachable_cooldown: cooldown,
+            ..PeerPoolLimits::default()
+        },
+    )
+    .unwrap();
+    pool.replace_routes(
+        1,
+        BTreeMap::from([(
+            2,
+            PeerEndpoint {
+                address: stale,
+                server_name: "localhost".into(),
+                name: None,
+            },
+        )]),
+    )
+    .unwrap();
+    let mut packet = request(85);
+    packet.operation = Operation::Raft {
+        group: [2; 16],
+        message: vec![1],
+    };
+    let mut callers = tokio::task::JoinSet::new();
+    let pool = Arc::new(pool);
+    for _ in 0..6 {
+        let pool = pool.clone();
+        let packet = packet.clone();
+        callers.spawn(async move {
+            tokio::time::timeout(Duration::from_millis(100), pool.send(2, &packet)).await
+        });
+    }
+    while let Some(outcome) = callers.join_next().await {
+        // A caller either ran out its own deadline waiting on the dial or was
+        // refused at once by the per-peer bound; none was answered by the dial.
+        match outcome.unwrap() {
+            Err(_) | Ok(Err(PeerSendError::Busy)) => {}
+            other => panic!("a caller was answered by the dial: {other:?}"),
+        }
+    }
+    assert_eq!(pool.stats().dials, 1, "the callers shared one dial");
+    // The dial decides on its own after the callers left; wait for it.
+    let deadline = std::time::Instant::now() + limits().request_timeout + Duration::from_secs(2);
+    loop {
+        let started = std::time::Instant::now();
+        let result = pool.send(2, &packet).await;
+        assert_eq!(result, Err(PeerSendError::Lost));
+        if started.elapsed() < Duration::from_millis(50) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the abandoned dial never marked the peer unreachable"
+        );
+    }
+    assert_eq!(
+        pool.stats().dials,
+        1,
+        "the recorded outcome spared every later caller a dial"
+    );
+    pool.close();
+}
+
 #[tokio::test]
 async fn peer_pool_saturation_is_bounded_and_route_change_retires_active_connections() {
     use std::collections::BTreeMap;
@@ -1741,4 +1904,74 @@ fn placement_control_and_session_sign_are_node_only_certificate_bound_and_bounde
         verify_request(node, sign, &limits()),
         Err(AccessError::InvalidRequest)
     ));
+}
+
+/// An unreachable peer is dialed once per cooldown, not once per send: a
+/// send within the cooldown fails at once as `Lost` without a dial, so the
+/// peer holds no send capacity for a second dial deadline, and the peer is
+/// dialed again once the cooldown passes. Without this every send to a dead
+/// peer ran its own dial to the deadline, and enough dead peers at once
+/// filled the replication driver's send slots, queuing live followers'
+/// appends behind them.
+#[tokio::test]
+async fn peer_pool_dials_an_unreachable_peer_once_per_cooldown_and_fails_the_rest_fast() {
+    use std::collections::BTreeMap;
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    // A UDP socket bound and dropped: nothing answers there.
+    let stale = {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.local_addr().unwrap()
+    };
+    let cooldown = Duration::from_millis(600);
+    let pool = PeerConnectionPool::new(
+        connector(&pki, certificate, key),
+        PeerPoolLimits {
+            attempts: 1,
+            retry_backoff: Duration::ZERO,
+            timeout: Duration::from_secs(10),
+            unreachable_cooldown: cooldown,
+            ..PeerPoolLimits::default()
+        },
+    )
+    .unwrap();
+    pool.replace_routes(
+        1,
+        BTreeMap::from([(
+            2,
+            PeerEndpoint {
+                address: stale,
+                server_name: "localhost".into(),
+                name: None,
+            },
+        )]),
+    )
+    .unwrap();
+    let mut packet = request(83);
+    packet.operation = Operation::Raft {
+        group: [2; 16],
+        message: vec![1],
+    };
+    assert_eq!(pool.send(2, &packet).await, Err(PeerSendError::Lost));
+    assert_eq!(pool.stats().dials, 1, "the first send dialed");
+    let started = std::time::Instant::now();
+    assert_eq!(pool.send(2, &packet).await, Err(PeerSendError::Lost));
+    assert_eq!(
+        pool.stats().dials,
+        1,
+        "a send within the cooldown does not dial"
+    );
+    assert!(
+        started.elapsed() < cooldown,
+        "the send failed at once, not after a dial deadline"
+    );
+    tokio::time::sleep(cooldown).await;
+    assert_eq!(pool.send(2, &packet).await, Err(PeerSendError::Lost));
+    assert_eq!(
+        pool.stats().dials,
+        2,
+        "the peer is dialed again after the cooldown"
+    );
+    assert_eq!(pool.stats().connections_opened, 0);
+    pool.close();
 }

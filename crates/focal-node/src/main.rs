@@ -160,7 +160,8 @@ fn execute(args: Args) -> Result<()> {
                     shape_only: false,
                 },
         } => {
-            let settings = load_settings(args.config.as_deref(), args.data_dir, false)?;
+            let settings =
+                load_settings(args.config.as_deref(), args.data_dir, Resolution::Command)?;
             return cli::schema_validate(
                 &settings,
                 args.client_context.as_deref(),
@@ -180,7 +181,7 @@ fn execute(args: Args) -> Result<()> {
         _ => args,
     };
     if matches!(&args.command, Commands::Mcp { .. }) {
-        let settings = load_settings(args.config.as_deref(), args.data_dir, false)?;
+        let settings = load_settings(args.config.as_deref(), args.data_dir, Resolution::Command)?;
         return cli::serve(&settings, args.client_context.as_deref()).map_err(Into::into);
     }
     let service = matches!(&args.command, Commands::Start { .. });
@@ -208,10 +209,20 @@ fn execute(args: Args) -> Result<()> {
 /// file that sets one to another value is refused by name, except for a
 /// policy request (`deployment plan`/`explain`), where the file is what the
 /// operator asks for.
+/// How the invoked command resolves a policy the committed store already
+/// holds: the pod's own `start` yields to the committed policy, a policy
+/// request keeps the file's values, and every other command is refused if
+/// the file diverges (directing to plan/apply).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Resolution {
+    Start,
+    Request,
+    Command,
+}
 fn load_settings(
     config: Option<&Path>,
     data_dir: Option<PathBuf>,
-    request: bool,
+    resolution: Resolution,
 ) -> Result<Settings> {
     let file = match config {
         Some(path) => {
@@ -245,23 +256,33 @@ fn load_settings(
                 .ok()
                 .flatten()
         });
-    let resolved = if request {
-        focal_node::config::resolve_request(&overrides, file, committed.as_ref())?
-    } else {
-        focal_node::config::resolve(&overrides, file, committed.as_ref())?
+    let resolved = match resolution {
+        Resolution::Start => {
+            focal_node::config::resolve_start(&overrides, file, committed.as_ref())?
+        }
+        Resolution::Request => {
+            focal_node::config::resolve_request(&overrides, file, committed.as_ref())?
+        }
+        Resolution::Command => focal_node::config::resolve(&overrides, file, committed.as_ref())?,
     };
     Ok(resolved.settings)
 }
 fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
     let data_dir_override = args.data_dir.clone();
-    let request = matches!(
+    let resolution = if matches!(
         &args.command,
         Commands::Deployment {
             command: cli::deployment::DeploymentCommand::Plan { .. }
                 | cli::deployment::DeploymentCommand::Explain { .. }
         }
-    );
-    let mut settings = load_settings(args.config.as_deref(), args.data_dir, request)?;
+    ) {
+        Resolution::Request
+    } else if matches!(&args.command, Commands::Start { .. }) {
+        Resolution::Start
+    } else {
+        Resolution::Command
+    };
+    let mut settings = load_settings(args.config.as_deref(), args.data_dir, resolution)?;
     match args.command {
         Commands::Mcp {
             command: McpCommand::Serve,
@@ -495,7 +516,6 @@ async fn start_network(settings: Settings) -> Result<()> {
 async fn join(settings: &Settings, invite_file: &Path) -> Result<()> {
     let bundle = NodeInvitation::load(invite_file)?;
     let (listen, advertise) = resolve_addresses(settings).await?;
-    let pending = PendingJoin::open(settings, bundle, listen, advertise)?;
     let bind = if advertise.is_ipv4() {
         "0.0.0.0:0"
     } else {
@@ -506,6 +526,42 @@ async fn join(settings: &Settings, invite_file: &Path) -> Result<()> {
         bind,
         focal_enrollment::TransportLimits::default(),
     )?;
+    let pending = match PendingJoin::open(settings, bundle, listen, advertise) {
+        Ok(pending) => pending,
+        // A different invitation than the one journaled here, and no identity
+        // yet: the journaled join is settled with the founder first (24 §24).
+        // A receipt means this node is already enrolled under it and the new
+        // invitation is not needed; a terminal refusal (revoked, expired,
+        // redeemed by another, wrong cluster, unauthorized) retires it and the
+        // new invitation is joined; an unknown outcome keeps the journal.
+        Err(focal_node::network_join::JoinError::Conflict)
+            if !settings.data_dir()?.join("IDENTITY").exists() =>
+        {
+            let previous = PendingJoin::resume(settings)?;
+            let now = focal_node::network_bootstrap::unix_time()?;
+            match previous.redeem(&client, now).await {
+                Ok(receipt) => {
+                    client.close();
+                    let joined =
+                        previous.install(receipt, focal_node::network_bootstrap::unix_time()?)?;
+                    return print_json(joined.directory.identity());
+                }
+                Err(error) if focal_node::network_join::terminal_rejection(&error) => {
+                    previous.retire()?;
+                    let bundle = NodeInvitation::load(invite_file)?;
+                    PendingJoin::open(settings, bundle, listen, advertise)?
+                }
+                Err(error) => {
+                    client.close();
+                    return Err(error.into());
+                }
+            }
+        }
+        Err(error) => {
+            client.close();
+            return Err(error.into());
+        }
+    };
     let receipt = pending
         .redeem(&client, focal_node::network_bootstrap::unix_time()?)
         .await;

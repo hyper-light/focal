@@ -67,14 +67,28 @@ fn node_survival_renders_a_founder_and_a_host_set_and_names_what_is_missing() {
     assert!(file(&assets, "service.yaml").contains("clusterIP: None"));
     assert!(file(&assets, "service.yaml").contains("protocol: UDP"));
     assert!(file(&assets, "invitations.sh").contains("--output - > \"$host.invite\""));
-    // The configuration a set ships is the requested policy and reads back.
+    // Each set ships its first-start seed (single-node durability, the only
+    // first start a lone node can satisfy), and the requested policy is
+    // rendered once as `target.yaml` for `deployment plan`.
     let map = file(&assets, "configmap.yaml");
-    assert!(map.contains("  focal-hosts.yaml: |\n    version: 1\n    topology:\n      region: \"eu-a\"\n    durability:\n      survive: node\n      max_failures: 1\n"));
-    let shipped = Settings::from_yaml(
+    assert!(map.contains("  focal-hosts.yaml: |\n    version: 1\n    topology:\n      region: \"eu-a\"\n    durability:\n      survive: node\n      max_failures: 0\n"));
+    let seed = Settings::from_yaml(
+        "version: 1\ntopology:\n  region: \"eu-a\"\ndurability:\n  survive: node\n  max_failures: 0\n",
+    )
+    .unwrap();
+    assert_eq!(
+        seed.durability.max_failures, 0,
+        "the seed is single-node satisfiable"
+    );
+    assert!(map.contains("  target.yaml: |\n    version: 1\n    topology:\n      region: \"eu-a\"\n    durability:\n      survive: node\n      max_failures: 1\n"));
+    let target = Settings::from_yaml(
         "version: 1\ntopology:\n  region: \"eu-a\"\ndurability:\n  survive: node\n  max_failures: 1\n",
     )
     .unwrap();
-    assert_eq!(shipped.policy_intent(), settings.policy_intent());
+    assert_eq!(target.policy_intent(), settings.policy_intent());
+    // Every set mounts the target policy read-only for the operator's apply.
+    assert!(hosts.contains("mountPath: /etc/focal-target/target.yaml"));
+    assert!(founder.contains("mountPath: /etc/focal-target/target.yaml"));
     // The same inputs render the same bytes.
     let again = kubernetes::render(&settings, &KubernetesRequest::default(), "0.1.0").unwrap();
     assert_eq!(again, assets);

@@ -19,7 +19,7 @@ pub(crate) enum ClusterCommand {
         #[command(subcommand)]
         command: ReplicaCommand,
     },
-    /// Write a private one-node invitation; retrying the same name is exact.
+    /// Write a private one-node invitation; retrying the same name is exact while its invitation is live, and a revoked or expired one is superseded by a fresh invitation under the same name.
     Invite {
         #[arg(long)]
         node: String,

@@ -7,6 +7,15 @@ Focal {{ .Chart.AppVersion }} in namespace {{ .Release.Namespace }}.
        /focal --data-dir /var/lib/focal cluster invite --node <pod> --output - > <pod>.invite
      kubectl -n {{ .Release.Namespace }} create secret generic {{ .Values.invitationsSecret }} --from-file=<pod>.invite=<pod>.invite ...
 3. The host pods enroll at their first start and join the placement.
+4. Every pod starts at single-node durability (survive: node, max_failures: 0),
+   the only first start a lone node can satisfy. Once every host pod is Ready,
+   commit the requested policy ({{ .Values.survive }} survival, max_failures
+   {{ .Values.maxFailures }}, mounted as /etc/focal-target/target.yaml) from the founder:
+     kubectl -n {{ .Release.Namespace }} exec focal-founder-0 -c focal -- \
+       /focal --data-dir /var/lib/focal deployment plan --config /etc/focal-target/target.yaml --output /var/lib/focal/target.plan
+     kubectl -n {{ .Release.Namespace }} exec focal-founder-0 -c focal -- \
+       /focal --data-dir /var/lib/focal deployment apply --plan-file /var/lib/focal/target.plan
+   The committed policy then carries every restart; the configmap never has to follow it.
 
 Probes ask the node (`cluster node probe --check alive`); `authoritative` and
 `policy` are for inspection, never for restarts. Resource and volume requests

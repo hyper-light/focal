@@ -738,3 +738,44 @@ fn total_budget_exhaustion_never_publishes_and_reopen_allows_exact_retry() {
         ControlSubmission::Existing(receipt)
     );
 }
+
+/// A checkpoint refused because Raft has work outstanding changes nothing and
+/// must leave the replica serving: compaction runs on a timer beside ordinary
+/// traffic, and a refusal that stopped the replica ended the root leader.
+#[test]
+fn a_checkpoint_refused_while_raft_has_work_outstanding_leaves_the_replica_serving() {
+    let mut cluster = Cluster::new();
+    cluster.nodes[0].campaign().unwrap();
+    cluster.pump(None);
+    cluster.nodes[0]
+        .submit(request(1, 1, 0, region(0, 1)), &Evidence)
+        .unwrap();
+    cluster.pump(None);
+    assert_eq!(cluster.nodes[0].root().unwrap().revision(), 1);
+    // Heartbeats are queued and not yet drained: Raft has Ready outstanding.
+    let mut refused = None;
+    for _ in 0..64 {
+        cluster.nodes[0].tick().unwrap();
+        match cluster.nodes[0].checkpoint() {
+            Ok(()) => {}
+            Err(error) => {
+                refused = Some(error);
+                break;
+            }
+        }
+    }
+    let refused = refused.expect("a checkpoint beside undrained work is refused");
+    assert!(
+        cluster.nodes[0].checkpoint_retryable(&refused),
+        "the refusal is retryable: {refused}"
+    );
+    // The replica still replicates, commits and compacts.
+    cluster.pump(None);
+    cluster.nodes[0]
+        .submit(request(1, 2, 1, region(1, 2)), &Evidence)
+        .unwrap();
+    cluster.pump(None);
+    assert_eq!(cluster.nodes[0].root().unwrap().revision(), 2);
+    assert_eq!(cluster.nodes[2].root().unwrap().revision(), 2);
+    cluster.nodes[0].checkpoint().unwrap();
+}

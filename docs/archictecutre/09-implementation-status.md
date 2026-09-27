@@ -9957,3 +9957,557 @@ now regression-tested); JSON-RPC framing reuses the bounded focal-wire
 caller's own context and rejects a mismatched invocation (`ReceiptMismatch`); and
 the committed / pending / refused outcome mapping is a total 1:1. No defects
 beyond the already-fixed items.
+
+## 2026-09-13 — Completion reservation decoupled from `preparation_bytes` (per-node concurrent-respondent envelope)
+
+**Defect (live multi-agent exercise, macOS arm64).** On a long-lived QUIC node,
+completion-class native writes from enrolled participants (`receipt acquire`,
+`artifact submit`, `testament submit`) began failing `Owner(Native(Memory(
+Capacity { requested, available })))` — surfaced to the client as
+`RequestUnconfirmed` / capacity — while the founder's Unix-socket creations kept
+succeeding. Root cause: the native owner pre-reserves a respondent's entire
+future cycle at receipt-acquire time (the honest completion promise,
+doc 18 §6.7). Each grant reserved ~47.5 MiB against the 128 MiB owner budget, so
+a node held only ~2 concurrent outstanding respondents; the third was refused,
+and the condition persisted across restart because outstanding receipts
+reconstruct their grants. Founder creations survived only because they ride the
+Ordinary lane with small reservations. Measured breakdown of one grant:
+`credit(diag=4, close=4, post=4)` (from the claim's `max_responses`, schema
+default 4) × per-action `retained + future_record_bytes`, the diagnostic
+descriptor sized to `preparation_bytes` (1 MiB) and expanded ×4 by the record
+codec.
+
+**Fix (focal-core only, +21/-5 lines).** (1) Added
+`NativeLimits::report_descriptor_bytes` (default 128 KiB) and clamped the
+reserved report/diagnostic descriptor to it in
+`completion_envelope::descriptor_limits_with_cohort`, decoupling the per-receipt
+promise from `preparation_bytes`; artifact content larger than the inline bound
+rides the content store as `Payload::Content` (the frozen record format already
+carries the pointer variant). (2) Directed-work claims set `max_responses = 1`
+(a claim to a single target accepts one response; the default 4 quadruples the
+per-receipt credit). Together these raise a 128 MiB node from ~2 to 14 concurrent
+outstanding respondents (7×).
+
+**Evidence.** `cargo check --workspace --all-targets` clean; `focal-core` 846
+tests, `focal-ledger` 126 tests, `cli_native_a1`/`cli_native_a2` product gates,
+`cargo fmt --all --check`, `clippy -D warnings`, `check-production.sh`, and
+`check-contracts.py` (1454 links / 37 hashes / 15 vocabularies) all pass. Live
+against `target/release/focal`: the previously-refused aged-node acquire now
+commits, the full two-party cycle + SIGKILL restart + exact retry passes, and a
+40-worker concurrency probe holds 14 simultaneous outstanding respondents.
+
+**Remaining scale levers (partitioning / ledger-sizing design, not shipped
+here).** `max_ranges = 64` (per-write directory ∝ group members; over-provisioned
+for a single range), `page_bytes = 64 KiB` (worst-case COW page charged per
+changed key), the `max_responses`-scaled per-receipt credit (a receipt reserves
+the claim's whole remaining response capacity — quadratic for broadcast claims),
+and the deeper option of a shared completion lane charged at submit time instead
+of per-receipt pre-reservation. These set the per-node concurrency envelope and
+therefore the ledger Helm chart and partition sizing.
+
+## 2026-09-13 — Founder restart address reconciliation; SWIM/Raft safety tests to the slates benchmark
+
+**Defect (KIND, desktop cluster, focal:0.1.0).** A founder that had grown (two
+hosts joined as learners) crash-looped on every restart with "node identity or
+stored policy is corrupt or incompatible". `FoundingNetwork::bootstrap_blocking`
+compared the saved `NetworkState` for exact equality, including the transient
+resolved `advertise`/`listen` addresses, so any restart that resolved a new
+address — every rescheduled pod, a fresh lease, a moved VM — was refused as an
+identity change. The joined-node path already reconciled addresses through
+`NetworkState::install` (`same_identity`: node, sponsor trust, genesis); the
+founder path did not.
+
+**Fix (`network_bootstrap.rs`, +9/−3).** On restart a differing saved state is
+reconciled through `install`, which rewrites only the transport addresses and
+still refuses a real identity change. Regression:
+`network_service::tests::a_founder_restarted_on_a_new_listen_address_behind_its_advertised_endpoint_recovers`
+(grown founder restarted on a different listen address behind an unchanged
+advertised endpoint recovers the same node identity and adopts the new
+address). Verified live on focal:0.1.1: the founder pod deleted and recreated
+came back `1/1`, 0 restarts, at a new pod IP, with both learners intact,
+Raft term 1→2 and applied index 18→20.
+
+**Bootstrap finding.** A founder's first start must be satisfiable by its own
+facts (`bootstrap_blocking`: `placement::plan` over the founder alone); the
+stronger guarantee is committed later by `deployment apply` and realised by the
+placement controller promoting learners. The shipped `deploy/kubernetes`
+configmap hands the founder `survive: zone, max_failures: 1` as its first-start
+config, which cannot cold-start (three zones required, one present). The KIND
+run bootstraps with `max_failures: 0` and upgrades through `deployment apply`;
+manual `cluster membership promote` is not the path.
+
+**SWIM/Raft tests measured against `../slates/crates/cluster/tests` (the
+benchmark: ~3,800 lines / 11 dedicated files).** Mechanisms were present
+(Raft on tikv raft-rs with membership/checkpoint/recovery; SWIM with Lifeguard
+local health, suspicion extensions, gossip and Vivaldi coordinates) but the
+named-property tests were thin. Added:
+- `focal-consensus/src/raft_safety_tests.rs` (4): exactly one leader and never
+  two in a term over randomized rounds; a replicated entry commits and reaches
+  every follower; a behind candidate cannot win (election restriction with
+  pre-vote); a partitioned stale leader steps down by CheckQuorum, the
+  survivors lead a strictly higher term, and the committed entry survives the
+  change (Leader Completeness).
+- `focal-node/src/liveness/swim_tests.rs` (6): an acknowledgement counts only
+  when it answers *this* probe — a stale sequence, a foreign node, a stale
+  enrollment generation, a refusal, a lost/closed lane and an undecodable
+  answer each decide nothing (no confirmation, no coordinate move, gossip not
+  folded), and the identical answer at the right sequence is learned in full.
+  This is slates' stale-acknowledgement regression class.
+Live over-the-transport Raft election/replication/leader-loss is already
+covered by `tests/fleet_quic.rs`. Still open against the benchmark: slates'
+commit-level late-work extension (`extend.rs`: extended past deadline, stalled
+commit expires uncertain, straggler session reuse) is a mechanism focal's
+Raft-proposal commits do not have (AD-26 design decision), and there is no
+focal-native supervisor for self-restart (`focal start` exits on fail-stop and
+relies on the orchestrator).
+
+**Evidence.** `cargo fmt --all --check` clean; `clippy -p focal-consensus -p
+focal-node --all-targets -- -D warnings` clean; `check-production.sh` clean;
+`check-contracts.py` 1454 links / 37 hashes / 15 vocabularies; `focal-consensus`
+47 passed; `focal-node --lib` 218 passed (211 prior + 6 SWIM + 1 regression).
+
+## 2026-09-13 — Distributed root learner catch-up on KIND: contact heal validated, per-peer Raft diagnostics, and a stuck-catch-up robustness finding
+
+Ran the fresh 3-node deployment on KIND (founder + two zone hosts, scratch/musl image, cross-node
+pods) and drove the rescheduled-host and zone-loss recovery scenarios. Results and fixes:
+
+**Contact heal for a rescheduled host — VALIDATED LIVE (fix batch A1/A2/A3 + SWIM B, `focal-node`).**
+Deleting `focal-b-0` (new pod IP) and `focal-c-0` (a session voter) each committed the moved contact
+to the founder's root table within one round and the host rejoined and caught its root replica up to
+the leader's index. `network_controller.rs`: `announce_unobserved` announces through the immutable
+sponsor route while the root is unobservable, reads the root's committed record first
+(`remote_contact`), no-ops when `contact_current`, and treats `RetryExpired` as `Stale` (an earlier
+announce already committed) rather than fatal — the earlier bug crashed the service on the second
+announce after the retry floor moved. Regressions:
+`network_service_tests::a_host_restarted_on_a_new_address_reannounces_and_regains_its_leader`,
+`network_join_tests::a_join_carries_the_advertised_name_...`.
+
+**Zone-survival guarantee — ACHIEVED and survives a zone kill.** After the learners caught up,
+`deployment plan --config target.yaml` was unblocked and `deployment apply` converged the application
+session to `voters=[founder, b, c]` across zones a/b/c with `achieved_survive: Zone, max_failures: 1,
+blocked_by: []`. Killing zone c kept session quorum (the founder stayed available and applied) and c
+rejoined on a new IP and caught up. The root control group stays 1 voter + 2 learners by design (the
+session placement, not the root group, carries the durability guarantee).
+
+**Per-peer Raft progress diagnostics (new).** `focal-consensus::DurableNode::peer_progress()` exposes
+each peer's `matched/next_index/state/recent_active/pending_snapshot` (leader only, in-memory,
+diagnostic); threaded through `ControlProgress` and rendered as `focal_root_peer_*` metrics. This is
+what localized the stuck-catch-up below and matches the consensus introspection the slates benchmark
+carries.
+
+**Peer-pool dead-peer dial cooldown (`focal-wire::peers`).** A peer whose dial fails is left alone for
+`unreachable_cooldown` (default 2s) instead of each send running a dial to its deadline; adds
+`PeerPoolStats.dials`/`focal_peer_dials_total` and the replication drivers size their in-flight cap
+from `max_inflight`. Prevents a batch of unreachable peers from starving live followers' appends (the
+slates "broadcast waits out a dead voter" class). Test
+`peer_pool_dials_an_unreachable_peer_once_per_cooldown_and_fails_the_rest_fast`.
+
+**Raft safety tests (`focal-consensus::raft_safety_tests`, 6).** Election safety, commit reach,
+election restriction, CheckQuorum step-down, PreVote rejoin, joint consensus — to the slates benchmark.
+
+**OPEN robustness finding — stuck initial root-learner catch-up (no self-heal without restart).** On
+the first deployment the two root learners sat at `applied_index = 0` for ~18 minutes while the founder
+grew its root log ~4/s and churned QUIC connections. Packet capture proved connectivity and MTU were
+fine (1200–1452-byte QUIC packets flowed both ways with responses); the learners simply never applied a
+single entry, and `focal_root_applied_index` stayed 0 with `wal_appended = 0`. A rolling restart of all
+three pods cleared it instantly: both learners reached `matched = leader.applied`, `state = Replicate`,
+and the founder's root log stopped growing. The two symptoms share one root — learners stuck behind:
+they could not answer SWIM probes (no partition view at applied 0), so the founder's verdict/placement
+reconciliation re-proposed at the controller cadence (~4/s), and that log growth plus connection churn
+never let the wedged replication recover. Normal kill/rejoin catch-up (validated above) does **not**
+reproduce it; it needs the initial join-while-log-grows sequence. Left as a tracked robustness bug: the
+proper fix (self-heal without restart) needs a deterministic in-process reproduction; the new
+`focal_root_peer_*` metrics detect it in the field, and a rolling restart is the current workaround.
+
+## 2026-09-13 — RESOLVED: stuck root-learner catch-up was a stale-configuration snapshot; configuration-aware checkpoint refresh
+
+The earlier "stuck initial root-learner catch-up (no self-heal)" finding is root-caused and fixed,
+with a deterministic small-scale reproduction and a live end-to-end validation.
+
+**Root cause (confirmed with new `focal_root_peer_*` / `focal_root_snapshot_index` metrics).** On a
+fresh deploy the founder's control (root) log is compacted at the genesis prefix (snapshot floor at
+index 8, retained log 9..20). That snapshot carries the committed *configuration at index 8* —
+`voters=[founder]`, no learners, because the learners join later (indices > 8). When a learner's
+`next_index` falls to the compaction floor, Raft must catch it up with that snapshot, but a snapshot
+whose configuration excludes the recipient cannot install it (it would seat a membership that omits the
+node). The leader can neither append below the floor nor install the stale snapshot, so its per-peer
+state oscillated Probe(next=9)↔Snapshot(next=1) with `matched=0` forever — the learner sat at
+`applied_index=0`, `wal_appended=0` indefinitely. tcpdump/conntrack proved connectivity and MTU were
+fine; `messages_lost` climbed because the learner returned non-`PeerAccepted` (install refused) each
+round. The 2026-09-13 "unbounded root log ~4/s" symptom was the same cause under a blocked-promotion
+retry; a rolling restart "fixed" it only because the post-restart snapshot happened to be taken *after*
+the learners joined (its configuration included them).
+
+**Fix (`crates/focal-node/src/control_host.rs`, `crates/focal-control/src/replica.rs`).** The control
+owner now refreshes its checkpoint when the stored snapshot's configuration is stale — i.e. a membership
+change committed above the snapshot floor (`snapshot_index < configuration_index`) — in addition to the
+steady-state size trigger (`applied - snapshot_index >= checkpoint_interval`, default 1024). Refreshing
+at the current applied index mints a snapshot whose configuration includes the newly-joined member,
+which then installs and catches up. It fires at most once per membership change (afterward the floor is
+at or above `configuration_index`), never per entry, so it cannot storm. New accessors
+`ControlReplica::{snapshot_index, configuration_index}` and `DurableNode::peer_progress()`; new
+diagnostics `focal_root_snapshot_index` and `focal_root_peer_{matched,next_index,state,recent_active,pending_snapshot}`.
+This is also the first periodic control-log compaction (previously the root log only compacted at
+`PrepareReplicaReady`, so a steady-state cluster grew it without bound — that is fixed too).
+
+**Live validation (KIND, fresh deploy, focal:0.1.7, no restart).** Both learners reach
+`matched = leader.applied` within ~5s (was stuck at 0 for 18+ min); `snapshot_index` tracks `applied`
+and stays stable for 180s (no storm, log bounded); `deployment apply` then converges the application
+session to `voters` across zones a/b/c with `achieved_survive: Zone, blocked_by: []` in ~20s — the full
+laptop→zone-survival journey from a clean deploy with no manual intervention.
+
+Gates green: `cargo fmt --all --check`; `clippy --workspace --all-targets -D warnings`;
+`check-production.sh`; `check-contracts.py` (1454 links); `focal-consensus` 49 + `raft_safety_tests` 6;
+`focal-control` 8+5+9+1; `focal-node --lib` 222.
+
+## 2026-09-13 — Leader-loss recovery on KIND found two availability bugs: a founder that could not restart after `deployment apply`, and a liveness probe that killed healthy hosts when the root leader was down
+
+Killing the founder pod (the only root voter, so the root leader, and a session voter) on the
+healthy 3-node KIND deployment exposed two bugs in how a node behaves when its control plane is
+gone or its committed policy has moved past its file.
+
+**Bug 1 — a founder crash-looped on restart after a sanctioned `deployment apply`.** The pod's
+static configmap seeds single-node durability (`survive: node, max_failures: 0`, the only first
+start a lone founder can satisfy); `deployment apply` then committed `survive: zone,
+max_failures: 1`. On restart `config::resolve` (and `embedded::check_policy`) refused the
+differing file value as `CommittedPolicyChange` and the founder exited with
+`[committed_policy] configuration field durability.survive differs from the committed policy` —
+five restarts into `CrashLoopBackOff`, the control plane down for as long as the pod was
+rescheduled. `REMAINING.md` already stated the intended contract ("a stronger committed policy
+no longer refuses the founder's **restart**") and `network_bootstrap.rs` documented "a restart must
+not refuse what the fleet already carries"; the code had drifted, refusing every command. Fix
+(`crates/focal-node/src/config/resolve.rs`, `embedded.rs`, `main.rs`): config resolution now has
+three modes. The pod's own `start` (`resolve_start`, and `embedded::check_policy`) treats the
+committed policy as authoritative — a file value that differs yields to it and is recorded as
+`ConfigSource::Committed(revision)`, exactly as an omitted field always was, so a restart is
+never refused for carrying what the fleet already carries; the file only seeds the first start.
+An **operator command** (identity, cluster, deployment apply, …; `resolve`, the default) still
+refuses a file that sets a policy field to a value other than the committed one, by name,
+directing to plan/apply — so an operator who edits the file learns their edit does not take
+effect that way (the divergence is also visible through `deployment explain`). A policy
+**request** (`deployment plan`/`explain`, `resolve_request`) keeps the file's values as the
+request. `policy::install_or_check` still refuses to overwrite a committed policy on a
+first-start install. Doc 08 §2 revised. This start/operator split matches REMAINING.md's narrow
+"restart" wording and keeps `cli_deployment`'s operator-refusal assertion.
+
+Final-tree gate for this batch (2026-09-13, macOS arm64, quiescent machine): `cargo fmt --all
+--check` clean; `python3 scripts/check-contracts.py` verified 1454 architecture links, 37
+imported source hashes and 15 frozen vocabularies; `bash scripts/check-production.sh` clean;
+`bash scripts/cargo.sh clippy --workspace --all-targets --locked -- -D warnings` clean; `bash
+scripts/cargo.sh test --workspace --locked` passed with no failures (the two tests that flaked
+earlier under a concurrent Docker build, `receipt_reads_require_live_quorum…` and
+`credential_renewal::a_joined_host_renews…`, passed quiescent).
+
+### 2026-09-13 — every pod moved at once: the peer pool never reached the name
+
+Rolling focal:0.1.9 onto the KIND fleet updated all three StatefulSets at once, so
+the founder and both hosts came back on new pod IPs within seconds of each other. The
+fleet then stayed wedged: the founder's `focal_peer_connections_opened_total` stayed 0
+while `focal_peer_dials_total` climbed past 500, both root learners sat at
+`matched = 0`, liveness reported both hosts dead, and each host reported `root_leader 0`
+with the same zero-opened, climbing-dials signature. Restarting one host (a fresh
+sponsor resolution at start) changed nothing; its contact generation on the founder
+stayed at 1. The committed contacts were not the cause: the root log on the founder's
+volume carries all three advertised names (`focal-*.focal.focal.svc.cluster.local:7443`),
+and the in-process test `peer_pool_re_resolves_a_named_endpoint_when_its_address_stops_answering`
+passes — because its one caller waits out the whole dial. Root cause
+(`crates/focal-wire/src/peers.rs`): the pool dialed the announced address inline in the
+caller's future, to the connector's deadline (3–5 s), and only then re-resolved the
+name; every real caller — a liveness probe (300 ms–2 s), the controller's
+`remote_contact` read (1 s), Raft delivery — cancelled that future first, dropping the
+dial and marking nothing, so the next caller started over from the dead address and
+the name was never tried. With the founder moved, no host could announce (its route
+to the founder was the founder's stale committed address), and with the hosts moved,
+the founder could not reach them: a symmetric, permanent wedge that no single-move
+scenario had exercised (a host moving finds a stationary founder at its pinned address;
+a founder moving alone had been read as recovered from the founder's own metrics).
+Fix: a slot's dial is a task of its own (`PeerConnectionPool::dial`, `Dial`,
+`DialState` over a `watch` channel) that callers join under their own deadlines; it
+dials the announced address and, after a 100 ms head start, up to four fresh addresses
+the name resolves to, concurrently (`dial_candidates`, `first_connection`,
+`QuicDialer` — a clonable handle on the connector's endpoint, limits and current
+identity), the first connection wins, and the outcome (cached connection or unreachable
+cooldown) is recorded whether or not any caller still waits. The controller keeps the
+sponsor's name on a founder route whose committed contact carries none. Regressions:
+`peer_pool_reaches_a_peer_that_moved_behind_its_name_while_every_caller_gives_up_early`
+(200 ms callers against a dead announced address; reached within 2 s, one dial, one
+connection) and
+`peer_pool_callers_that_give_up_share_one_dial_whose_outcome_is_still_recorded`
+(six 100 ms callers share one dial; its failure still arms the cooldown). The scale
+probe now checks the learner and liveness view rather than the committed placement
+alone, which had hidden the wedge. Doc 24 §24 and doc 10 revised.
+
+Live-validated on focal:0.1.10 (KIND, 2026-09-13): the same roll — all three
+StatefulSets updated at once, every pod on a new IP — healed before the first probe
+ran (under 20 s after the roll finished). Founder: 4 dials, 4 connections opened, both
+learners `matched = applied = 34` in Replicate, liveness 2 alive / 0 dead / 0 probe
+timeouts; hosts re-announced at generation 2 with their new addresses (committed at
+indexes 33 and 34); host b-0: leader known, applied 34, no placement error, liveness 2
+alive. Gates on the change: fmt, clippy `-D warnings` (focal-wire, focal-node),
+check-production, check-contracts (1454 links), focal-wire 69 lib tests, focal-node
+network_service/join/controller/liveness tests (26).
+
+### 2026-09-13 — dozens of nodes on KIND (focal:0.1.10)
+
+Scale-out from 3 to 25 pods (founder + 12 hosts in each of zones b and c; 22
+invitations issued from the founder with `cluster invite` and merged into the
+invitation secret, then `kubectl scale`): all 25 Ready in 108 s under `OrderedReady`
+(two sets in parallel, one pod at a time each), 0 restarts. Founder view after the
+join storm: root applied 144, snapshot 144 (one refresh per membership change, no
+storm — counters identical 40 s later), 24 learners all `matched = applied` in
+Replicate, 26 dials / 26 connections opened (no failed dial), liveness 24 alive / 0
+suspect / 0 dead / 0 probe timeouts. Sampled hosts (b-5, b-11, c-11): leader known,
+applied 144, no placement error, 24 connections each, 24 alive. Pods respected zone
+affinity (4 per zone-b/zone-c worker, founder alone in zone a). `deployment explain`
+against the mounted target: `PlanValid`, effective `zone / 1`, activated, committed
+revision 2. Bounds relevant at this scale (unchanged): peer pool and listener 128
+connections, enrollment listener 32 concurrent joins, partition `max_nodes` 1024,
+per-group `max_members` 31 (session placement, not the fleet).
+
+Zone loss at scale: deleting all 12 zone-c pods at once (one of them the session
+voter 100) kept the guarantee (`achieved Zone`, voters 099/100/101, nothing blocked,
+root leader stable) throughout; zone c was fully Ready again at 74 s, all 24
+learners caught up (applied 156, the 12 re-announcements at generation 3), snapshot
+index unchanged (no membership change, no refresh), liveness back to 24 alive / 0
+dead with 15 probe timeouts accrued during the outage; 85 dials across the outage
+for 12 moved peers (no dial storm).
+
+Worker drain at scale (`kubectl drain desktop-worker4`, four zone-b pods): the
+`focal-hosts` PodDisruptionBudget (`maxUnavailable: 1`) evicted one pod and held the
+other three until it was Ready again, and it never was — KIND's local-path volumes
+carry `kubernetes.io/hostname` node affinity, so the evicted pod could not schedule on
+any other node (`FailedScheduling: 2 node(s) didn't match PersistentVolume's node
+affinity`) and the drain timed out after 180 s. That is the storage class, not focal:
+with network-attached volumes the pod moves. After the uncordon the pod returned on
+its own worker with a new address, re-announced (applied 157), and the fleet was whole
+again (25 Ready, 24 alive, all learners caught up). The founder's PDB
+(`maxUnavailable: 0`) means a drain of the founder's worker never evicts it, by
+design (single root voter); moving the founder is a pod delete.
+
+Founder loss at scale with a concurrent scale-out: six invitations issued, then the
+founder pod deleted and both host sets scaled 12 → 15 two seconds later. At t = 7 s
+the 24 existing hosts were all Ready (alive is local; the two not-Ready pods were the
+first new ones starting), the founder returned on a new address, and all 31 pods were
+Ready at t = 33 s with 0 container restarts — the new pods' joins succeeded on their
+first attempt once the founder was back. Settled fleet: root applied 189, snapshot
+189, 30 learners all `matched = applied`, 30 dials / 30 connections, liveness 30
+alive / 0 dead / 0 probe timeouts, guarantee `Zone` with voters 099/100/101.
+
+Scale-down and node removal at scale: both host sets scaled 15 → 12 (six pods
+departed); the founder's liveness went 3 suspect → 6 dead within about 35 s while
+root membership still listed 30 learners. `cluster nodes remove` before any drain was
+refused `[not_drained]`; `cluster nodes drain` committed each node ineligible
+(`node_eligibility`, generation 2, indexes 190–195), and a `remove` issued in the same
+second was still refused `[not_drained]` — the drained grant reaches the placement
+partition's node view asynchronously — while the same `remove` about 40 s later
+succeeded for all six (`node_removed`, `membership_removed: true`, `revoked: true`).
+Afterwards: 24 learners, 24 peer progress series, six invitations revoked of 31, root
+applied 207 = snapshot 207 (a refresh per membership change), liveness 24 alive / 0
+dead, guarantee unchanged.
+
+Writes during zone loss at scale: a client principal invited from the founder
+(`cluster client invite`, `context enroll` in the founder pod) submitted a baseline
+claim, then all 12 zone-c pods (voter 100 among them) were deleted and a second claim
+was submitted 6 s into the outage: `Committed` at t = 7 s, readable during the outage
+(`get claim`), and both claims readable after zone c returned at t = 73 s; fleet
+whole afterwards (25 Ready, 24 alive, learners at applied 221). The session kept
+quorum with two of three zone voters, which is what `survive: zone, max_failures: 1`
+promises.
+
+Full workspace test on this tree, run while the 31-pod fleet and its fault
+scenarios were executing on the same machine: 1 failure,
+`credential_renewal::tests::a_joined_host_rotates_its_key_is_regranted_under_it_and_adopts_a_committed_rotation_after_a_crash`
+("the renewed certificate was never announced to the root" within its fixed 30 s
+wall-clock deadline); it passed twice in isolation (7.5 s, 16.9 s). Same class as
+the earlier load flakes (fixed wall-clock deadlines rather than per-progress
+deadlines); not a regression of the dial change, which in-process tests do not reach
+(they advertise address literals, so no name candidates or head start).
+
+Remove-after-drain made exact (`crates/focal-node/src/cluster_admin.rs`): `cluster
+nodes remove` read only the placement partition's node view, so a remove issued right
+after its drain was refused `[not_drained]` ("drain it first") although the drain had
+committed. It now consults the committed grant (the same eligibility prepare read the
+drain uses; no command means the grant already says ineligible): a never-drained node
+is still `[not_drained]`, a drained node whose ineligibility the partition has not yet
+observed is waited for (20 polls of 500 ms) and then, if still unobserved, refused
+`[drain_pending]` with a retry hint; a drained node still holding copies remains
+`[node_holding]`. `cli_nodes` asserts that a remove immediately after a voter's drain
+reads `[node_holding]`, never `[not_drained]`.
+
+Whole-fleet roll at scale (focal:0.1.11, 25 pods, all three StatefulSets updated at
+once so every pod moved): the fleet was whole when the roll's own probe ran — 24/24
+learners `matched = applied` in Replicate, 0 restarts — and settled at 58 connections
+opened over 80 dials, liveness 24 alive / 0 dead / 3 probe timeouts, and every sampled
+host's committed contact equal to its new pod IP (7 of 7), i.e. each moved host
+re-announced. The same roll shape wedged the 3-pod fleet permanently before the dial
+fix.
+
+Removed nodes whose volumes survive (scaling a set back up after `cluster nodes
+remove`, without deleting the departed pods' PersistentVolumeClaims): the two pods
+restarted with their revoked identities. The fleet fenced them exactly — root
+membership stayed at 24 learners, liveness at 24 alive, the founder never admitted
+them — but each node ran on as a fenced process: Ready to Kubernetes (the alive
+probe is local by design), `authoritative: false`, `catching_up: false`, placement
+`last_error: replication delivery was lost`, dialing the founder forever. The node
+cannot tell revocation from unreachability: the founder refuses a revoked certificate
+during the TLS handshake, before any `Hello`, so no reason reaches it, and its own
+replica cannot replicate the revocation it is fenced from. Documented limitation:
+delete a removed node's volume with the node (the renderer's StatefulSets keep
+`volumeClaimTemplates` claims by design); a fenced node is visible as
+`root_leader 0` with no progress. Not changed: completing TLS for unknown
+certificates to deliver a reason would widen the unauthenticated surface. Open item:
+`cluster nodes list` still showed the contact records of removed nodes (31 records
+for 25 live nodes); they route nowhere (no grant, no route) but the table is bounded
+by `max_nodes` (1024) and refuses new announcements when full, so a fleet that scales up
+and down would eventually wedge new nodes — fixed below (contact retirement).
+
+A fresh data directory with an already-redeemed (and revoked) invitation file
+crash-loops at join, as it must: invitations are one-use.
+
+Re-inviting a removed name was impossible (`crates/focal-node/src/quorum_enrollment.rs`,
+`crates/focal-enrollment/src/journal.rs`): `cluster invite --node focal-b-12` after that
+ordinal had been drained, removed and its invitation revoked was refused
+`[invalid_input]` — the name's private slot still held the first invitation, whose
+committed record is now revoked, so `PendingInvitation::release` refused it for good,
+and the slot memory was set-once. With stable StatefulSet ordinals that meant a removed
+ordinal could never rejoin, contradicting "enroll it again from a fresh invitation". Fix:
+a finished invitation (revoked, or expired before redemption; `finished`,
+`EnrollmentRegistry::invitation_status`) retires its slot under a marker
+(`retired_marker`), a fresh invitation is prepared under the same name, and the
+memory is replaced (`PrivateJournal::replace_invitation`) — a remembered id that
+differs from the slot's is accepted only as a retired predecessor, and a remembered id
+whose slot is absent only when its marker exists, so a crash between the steps reads
+as a retirement, never as corruption; a live invitation is still returned exactly and
+a redeemed one still denotes its enrolled node. Regression:
+`actual_cli_invitation_inspection_revocation_and_retry_never_disclose_token` now
+re-invites the revoked name (a new id), retries it exactly, and joins a peer with it.
+The peer side had the mirror-image trap (`crates/focal-node/src/network_join.rs`,
+`main.rs::join`): a data directory that had journaled a join under the revoked
+invitation (the crash-looping pod) refused a different invitation as
+`[operation_failed] invitation or join identity conflicts with durable state` — the
+journal pins the invitation for exact retry and recorded no outcome. Now a differing
+invitation with no identity present first settles the journaled join with the founder:
+a receipt installs that enrollment (the node was already enrolled; the new invitation
+goes unused), a terminal refusal (`terminal_rejection`: revoked, expired, used, wrong
+cluster, unauthorized) retires the journal and key under `JOIN.retired-<invitation>`
+(`PendingJoin::retire`) and the new invitation is joined, and an unknown outcome keeps
+the journal. The extended `cli_network` test joins the fresh invitation from the very
+peer directory whose join the revoked one had failed. Live: the same
+scale-down/scale-up of a StatefulSet ordinal (below).
+
+Contact retirement (`crates/focal-control/src/{contacts.rs,state.rs,lib.rs}`,
+`crates/focal-node/src/{cluster_admin.rs,network_admin.rs,control_host.rs}`):
+`cluster nodes remove` now ends by retiring the node's committed contact record —
+`ControlCommand::RetireContact { node, expected_generation }` (appended, append-only
+log discriminants), prepared by `NodeContacts::prepare_retire`, which compares the
+generation the operator read and refuses (`Unauthorized`) while any committed
+enrollment receipt for the node under the record's principal is unrevoked, so the
+step is admissible only after the revocation that precedes it; the control host
+admits it only from the local operator path (`PeerRole::Runtime`), never from a peer.
+Publication of a retirement writes no committed index (no record). The admin journals
+it as the ordinary exact `a1:` request; `reconcile` reads the contact table before the
+receipt so an absent receipt with the record gone or moved is absence for good.
+`NodeRemoved.contact_retired` reports it (`false` on the exact repeat). Tests:
+`contacts::a_contact_is_retired_only_once_nothing_enrolls_its_node` (a live node's
+record refused; a removed node's retired once at its generation; checkpoint restores)
+and `cli_nodes` (removal reports `contact_retired: true`, `cluster nodes list` no
+longer names the node, the repeat reports `false`). Doc 24 §19 and the manual revised.
+Regressions: `config::tests` (committed value + `Committed(3)` source for a differing file
+field) and `network_service_tests::a_founder_restarts_from_its_stale_seed_file_after_a_stronger_policy_was_applied`
+(bootstrap at `node/0`, `policy::commit` `zone/1` as apply does, restart from the same file →
+starts and carries revision 2).
+
+**Bug 2 — the liveness probe hung on the control plane and the kubelet killed healthy hosts.**
+While the founder was down, `cluster node probe --check alive` on both hosts timed out at the
+manifests' 1 s exec limit (`Liveness probe failed: command timed out`, ×6) and the kubelet
+restarted them (four times each). `alive` was read off the full readiness report, which
+awaits the placement directory view (an observation that needs the root leader) and every
+session's diagnostics before it ever reaches its hard-coded `alive: true`. Doc 24 §15 already
+specified "`alive` whenever it answers". Fix (`crates/focal-node/src/cluster_admin.rs`,
+`operator_admin.rs`): `probe alive` is answered by the identity read — the process answering on
+its own socket, touching no root, session or placement state — and the readiness report as a
+whole is bounded by a 400 ms budget (`READINESS_BUDGET`): what it cannot observe in time is
+reported as absent (`truncated`, no directory view), which never satisfies the policy, so the
+other probes are incomplete rather than late. Regression
+`network_service_tests::a_host_stays_alive_and_its_readiness_stays_bounded_while_the_root_leader_is_down`
+(founder stopped: `alive` holds at once; `catching-up` returns `ProbeFailed` within the budget).
+
+**Bug 3 (deployment) — the renderer pinned the guarantee in every pod's static configmap.**
+`deployment render kubernetes` wrote the requested `survive: zone, max_failures: 1` into each
+pod's mounted config. That config cannot bootstrap a lone founder (first-start placement needs
+three zones) and, after the operator's apply, is exactly the file/committed mismatch Bug 1
+crash-looped on. Fix (`deployment/render/kubernetes.rs`, Helm chart, doc 08 §5): every pod's
+configmap ships the first-start *seed* (`survive: node, max_failures: 0`, its zone), and the
+requested policy is rendered once as `target.yaml` in the same configmap, mounted read-only at
+`/etc/focal-target/target.yaml`; the notes and NOTES.txt tell the operator to
+`deployment plan --config /etc/focal-target/target.yaml` then `apply` once the hosts are Ready.
+The committed policy then carries every restart. Goldens regenerated; render golden and unit
+tests updated. systemd already seeds `node/0` and needs no split.
+
+**Live validation (KIND, focal:0.1.8).** Rolling 0.1.8 onto the cluster whose committed policy
+is `zone/1` while its configmap seeds `node/0`: the founder started with 0 restarts (the exact
+state that crash-looped before), zone survival intact (`voters` across a/b/c, `blocked_by: []`).
+Then killing the founder (root leader): both hosts answered `probe --check alive` continuously
+throughout the outage (Bug 2 — before, the 1 s exec probe timed out and the kubelet killed
+them), the founder restarted with no crash-loop (Bug 1), and the root control plane recovered
+(applied advanced). The full laptop→zone-survival→leader-loss recovery journey now runs on the
+real image with no manual intervention and no degradation.
+
+### 2026-09-27 — the root leader stopped on a refused checkpoint; failures made visible
+
+The live removal that ended `[outcome_unknown]` on 2026-09-13 was the founder process
+exiting: its control owner thread had ended, the request it was waiting on was answered
+"outcome unknown", and the pod restarted. The exit message, "root request: metadata
+owner is unavailable", was the cleanup's failure to join an owner that had already
+stopped, not the cause. Three defects:
+
+- **A refused checkpoint stopped the replica for good**
+  (`crates/focal-control/src/replica.rs`). `ControlReplica::checkpoint` set its
+  `failed` flag on any error from the consensus node, including refusals that change
+  nothing: Raft has work outstanding (`CheckpointIndex`), persistence is in flight,
+  memory or log pressure. Until 2026-09-13 a checkpoint ran only when a replica became
+  ready; the periodic compaction added that day runs beside ordinary traffic, and with
+  two dozen peers Raft almost always has work outstanding. Now the replica stops only
+  when the node itself stopped (`DurableNode::failed`), a checkpoint the log had no room
+  to admit is withdrawn (`cancel_unadmitted_checkpoint`) so the node is mutable again,
+  and the owner treats a refusal that changed nothing as "later"
+  (`checkpoint_retryable`, `maybe_checkpoint`). Regression:
+  `durable_control::a_checkpoint_refused_while_raft_has_work_outstanding_leaves_the_replica_serving`.
+- **The owner discarded its own exit error** (`crates/focal-node/src/control_host.rs`).
+  `Owner::run` now records why it ended in `ControlProgress.failure`, and the service
+  reports it (`ServiceError::ControlOwner`).
+- **Cleanup errors replaced the cause** (`network_service.rs`). What ended the service
+  is returned; a failure while cleaning up after it no longer masks it.
+
+Contact retirement was completed: the contact checkpoint is schema 4 with
+`retired_mutations` and `last_retirement_index`, so its counters stay exact after rows
+are gone (revision equals the surviving rows' generations plus the retired mutations;
+the table's index is the latest of the rows' commits and the last retirement). The
+control checkpoint is schema 7; schema 6 and earlier decode. An emptied table restores
+and is distinct from a fresh one.
+
+CI's standing macOS failure,
+`runtime_host::threaded_owners_recover_execution_after_leader_loss_and_restart`, read
+the isolated former leader's cancellation count the instant the majority finished. The
+former leader cancels when its own quorum check decides, on its own clock. The test now
+waits for the cancellation and still requires exactly one.
+
+Priority elections are wired (`DurableNode::set_priority`, doc
+[27](27-consensus-roadmap-and-slates-port.md) §5). The library unwinds when a node at
+term zero rejects a pre-vote, which a rejection on priority makes reachable, so a node
+keeps the neutral priority until it has a term. Four tests in `raft_safety_tests`.
+
+Contact retirement exposed a dependent: the founder's controller re-grants any granted
+node whose announced topology differs from its grant, read the retired contact as the
+unknown region, proposed a grant for the removed node, was refused by the authority and
+exited, taking the founder with it (`deployment_fleet` caught it: the claim after the
+shrink ended `outcome_unknown`). The re-grant loop now skips a node whose invitation is
+revoked and a node with no committed contact: only what a node announces changes its
+grant (`network_controller.rs`).
+
+The timing law is ported (`focal-consensus::timing`, doc
+[27](27-consensus-roadmap-and-slates-port.md) §3.1 P2): `PathRtt`, the RFC 9002
+estimator per voter path, and `TickPace::derive`, which stretches the owner's tick
+period until the election timeout is at least ten round-trip tails of the slowest voter.
+A loopback or LAN group keeps its configured period. Eight tests, including regional
+(80 ms ± 20 ms one way) and geographic (500 ms ± 100 ms) profiles.

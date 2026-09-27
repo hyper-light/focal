@@ -282,10 +282,19 @@ fn missing_runtime_drivers_fail_before_ingress_and_release_started_owners() {
         stop.send(()).unwrap();
         // The initial runtime probe already succeeded. Moving the suspended
         // future makes the cleanup timer fail after the task boundary returns.
-        assert!(matches!(
-            no_time.block_on(running),
-            Err(ServiceError::Runtime)
-        ));
+        let ended = no_time.block_on(running);
+        // Whichever driver meets the missing timer first names the failure:
+        // the service's own boundary, or the controller's.
+        assert!(
+            matches!(
+                ended,
+                Err(ServiceError::Runtime
+                    | ServiceError::Controller(
+                        crate::network_controller::ControllerError::Runtime
+                    ))
+            ),
+            "{ended:?}"
+        );
     }
     runtime.block_on(wait_unlocked(&settings));
 }
@@ -724,4 +733,268 @@ async fn joined_service_receives_committed_root_learner_and_restarts_without_led
     drop(peer_settings);
     drop(std::net::UdpSocket::bind(founder_address).unwrap());
     drop(std::net::UdpSocket::bind(peer_address).unwrap());
+}
+
+/// A founder that has grown (a host joined) and is restarted on a different
+/// listen address behind the *same* advertised endpoint recovers: only the
+/// transient transport addresses changed, not its identity, sponsor trust or
+/// genesis. (A founder advertised by name behaves the same when the name
+/// resolves elsewhere; the listen change here drives the identical path.) Before `FoundingNetwork::bootstrap_blocking` reconciled addresses
+/// through `NetworkState::install`, it compared the saved state for exact
+/// equality, so every restart that resolved a new address — a rescheduled
+/// pod, a fresh lease, a moved VM — failed as "corrupt or incompatible".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_founder_restarted_on_a_new_listen_address_behind_its_advertised_endpoint_recovers() {
+    let founder_dir = tempfile::tempdir().unwrap();
+    let peer_dir = tempfile::tempdir().unwrap();
+    // The advertised endpoint stays fixed across both starts; only the
+    // listen address behind it changes.
+    let first_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let first_listen = first_socket.local_addr().unwrap();
+    let port = first_listen.port();
+    let name = first_listen.to_string();
+    let mut value = Settings::default();
+    value.node.data_dir = Some(founder_dir.path().to_path_buf());
+    value.node.listen = Some(first_listen);
+    value.node.advertise = Some(name.clone());
+    let first = TestSettings {
+        value,
+        socket: first_socket,
+    };
+    let founder = Running::start(&first).await;
+    let founder_node = founder.status.node;
+    assert_eq!(founder.status.listen, first_listen);
+    // Grow the founder so its root group is no longer a pristine one voter.
+    let peer_settings = settings(peer_dir.path());
+    let (peer, node_a) = crate::placement_agent::tests::join_peer(
+        &founder,
+        founder_dir.path(),
+        "host-a",
+        &peer_settings,
+    )
+    .await;
+    assert_ne!(node_a, founder_node);
+    peer.stop().await;
+    founder.stop().await;
+    drop(first);
+    // Restart on the wildcard interface at the same port: the listen address
+    // differs from the saved one while the advertised endpoint is unchanged.
+    let second_socket = std::net::UdpSocket::bind(("0.0.0.0", port)).unwrap();
+    let second_listen = second_socket.local_addr().unwrap();
+    assert_ne!(second_listen, first_listen);
+    let mut value = Settings::default();
+    value.node.data_dir = Some(founder_dir.path().to_path_buf());
+    value.node.listen = Some(second_listen);
+    value.node.advertise = Some(name);
+    let second = TestSettings {
+        value,
+        socket: second_socket,
+    };
+    let restarted = Running::start(&second).await;
+    assert_eq!(
+        restarted.status.node, founder_node,
+        "the same node identity recovered"
+    );
+    assert_eq!(
+        restarted.status.listen, second_listen,
+        "the new listen address was adopted, not refused"
+    );
+    assert_eq!(restarted.status.advertise.port(), port);
+    restarted.stop().await;
+}
+
+/// The KIND incident, as a regression: a joined host restarted on a new
+/// address heals the mesh by itself. Its leader keeps sending to the old,
+/// committed address, so the host cannot observe the root; observing the
+/// root is what the controller needed before it would announce — a cycle
+/// that left every rescheduled host leaderless and every placement on it
+/// stalled, while the detector kept reporting it alive. Now the controller
+/// announces the new contact through the immutable sponsor route while the
+/// root is unobservable: the root asks the old address, finds it silent,
+/// commits the move, and the leader reaches the host again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_restarted_on_a_new_address_reannounces_and_regains_its_leader() {
+    let founder_dir = tempfile::tempdir().unwrap();
+    let host_dir = tempfile::tempdir().unwrap();
+    let founder_settings = settings(founder_dir.path());
+    let founder = Running::start(&founder_settings).await;
+    let founder_node = founder.status.node;
+    let first = settings(host_dir.path());
+    let first_advertise = first.socket.local_addr().unwrap();
+    let (host, host_node) =
+        crate::placement_agent::tests::join_peer(&founder, founder_dir.path(), "host-a", &first)
+            .await;
+    // The root committed the host at its first address.
+    let committed = |observation: &crate::control_host::RootObservation| {
+        observation
+            .contacts()
+            .contacts
+            .records
+            .iter()
+            .find(|record| record.node == host_node)
+            .map(|record| record.advertise)
+    };
+    // The announce is asynchronous: the host commits its first contact
+    // once its controller observes the root.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let observation = founder.handles.control.observe_root().await.unwrap();
+        if committed(&observation) == Some(first_advertise) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the joined host never committed its first contact"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    host.stop().await;
+    drop(first);
+    // The host returns on a different address; the root still holds the
+    // old one, so nothing reaches the host until it announces the move.
+    let second_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let second_advertise = second_socket.local_addr().unwrap();
+    assert_ne!(second_advertise, first_advertise);
+    let mut value = Settings::default();
+    value.node.data_dir = Some(host_dir.path().to_path_buf());
+    value.node.listen = Some(second_advertise);
+    value.node.advertise = Some(second_advertise.to_string());
+    let second = TestSettings {
+        value,
+        socket: second_socket,
+    };
+    let host = Running::start(&second).await;
+    assert_eq!(
+        host.status.node, host_node,
+        "the same node identity recovered"
+    );
+    assert_eq!(host.status.advertise, second_advertise);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        let moved = founder
+            .handles
+            .control
+            .observe_root()
+            .await
+            .ok()
+            .and_then(|observation| committed(&observation))
+            == Some(second_advertise);
+        let led = host.handles.control.progress().leader == founder_node;
+        if moved && led {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the moved host never healed: contact moved={moved}, leader regained={led}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    host.stop().await;
+    founder.stop().await;
+}
+
+/// A store bootstrapped at one durability and raised by `deployment apply`
+/// restarts from the same static file it was bootstrapped with (a
+/// Kubernetes configmap does not follow the committed policy). The committed
+/// policy is what the fleet already carries, so the restart must carry it
+/// rather than refuse the stale seed: before this, every founder restart
+/// after a sanctioned apply crash-looped on `CommittedPolicyChange`, taking
+/// the control plane down with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_founder_restarts_from_its_stale_seed_file_after_a_stronger_policy_was_applied() {
+    use crate::config::policy::{PolicyRevision, commit, read_committed};
+    let dir = tempfile::tempdir().unwrap();
+    // The file's seed: single-node durability, the only first-start a lone
+    // founder can satisfy.
+    let settings = settings(dir.path());
+    assert_eq!(
+        settings.durability.survive,
+        crate::config::FailureDomain::Node
+    );
+    let founder = Running::start(&settings).await;
+    founder.stop().await;
+    let root = settings.node.data_dir.clone().unwrap();
+    let seeded = read_committed(&root)
+        .unwrap()
+        .expect("first start committed the seed");
+    assert_eq!(seeded.revision, PolicyRevision(1));
+    // `deployment apply` commits stronger durability than the seed.
+    let mut stronger = seeded.intent.clone();
+    stronger.durability.survive = crate::config::FailureDomain::Zone;
+    stronger.durability.max_failures = 1;
+    let applied = commit(
+        &root,
+        &stronger,
+        PolicyRevision(1),
+        crate::embedded::atomic_file,
+    )
+    .unwrap();
+    assert_eq!(applied.revision, PolicyRevision(2));
+    // The same stale file starts the founder again: it carries the committed
+    // policy instead of refusing it.
+    let founder = Running::start(&settings).await;
+    let carried = read_committed(&root)
+        .unwrap()
+        .expect("the committed policy survives the restart");
+    assert_eq!(
+        carried, applied,
+        "the restart neither refused nor regressed the applied policy"
+    );
+    founder.stop().await;
+}
+
+/// A host's liveness is its own process answering on its socket, never the
+/// control plane's reachability: with the founder (the only root voter, so
+/// the root leader) gone, `probe alive` still holds at once, and the full
+/// readiness report — which does wait on the root and the session leaders —
+/// returns within its budget rather than hanging. Before this the liveness
+/// probe waited on that report and timed out whenever the root leader was
+/// down, and the supervisor killed every healthy host (24 §15).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_stays_alive_and_its_readiness_stays_bounded_while_the_root_leader_is_down() {
+    use crate::cluster_admin::{ClusterAdmin, ClusterAdminError};
+    let founder_dir = tempfile::tempdir().unwrap();
+    let host_dir = tempfile::tempdir().unwrap();
+    let founder_settings = settings(founder_dir.path());
+    let founder = Running::start(&founder_settings).await;
+    let host_settings = settings(host_dir.path());
+    let (host, _node) = crate::placement_agent::tests::join_peer(
+        &founder,
+        founder_dir.path(),
+        "host-a",
+        &host_settings,
+    )
+    .await;
+    let admin = ClusterAdmin::open(&host_settings).unwrap();
+    // Alive while the root leader is reachable.
+    tokio::time::timeout(Duration::from_millis(800), admin.probe("alive"))
+        .await
+        .expect("alive answers at once")
+        .expect("the host is alive");
+    // The root leader goes away: the host's own process is untouched.
+    founder.stop().await;
+    let started = tokio::time::Instant::now();
+    tokio::time::timeout(Duration::from_millis(800), admin.probe("alive"))
+        .await
+        .expect("alive answers at once with the root leader down")
+        .expect("the host is still alive");
+    assert!(
+        started.elapsed() < Duration::from_millis(800),
+        "liveness never waits on the control plane"
+    );
+    // The readiness report waits on what is unreachable only up to its
+    // budget, then reports what it could not see as absent: bounded, and it
+    // does not claim the node is ready.
+    let started = tokio::time::Instant::now();
+    let readiness = tokio::time::timeout(Duration::from_secs(3), admin.probe("catching-up")).await;
+    assert!(
+        readiness.is_ok(),
+        "the readiness report returns within its budget with the root leader down"
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(
+        matches!(readiness, Ok(Err(ClusterAdminError::ProbeFailed(_)))),
+        "a host without a root leader is not catching up: {readiness:?}"
+    );
+    host.stop().await;
 }

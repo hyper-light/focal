@@ -1150,15 +1150,37 @@ copies the node held are drained, removed from the session logs and retired
 or undrains. The root group's membership is untouched by a drain.
 
 **Removal.** `cluster nodes remove --node N` (`cluster.nodes.remove`) is
-refused while the node's grant is eligible (`not_drained`, exit 5) or while
-any session in the placement view still names it as a voter, materializer,
-content copy, retiring copy or pending assignment (`node_holding`, exit 5),
-and for a node the directory does not know (`unknown_node`, exit 4). It then
+refused while the node's committed grant is eligible (`not_drained`, exit 5)
+or while any session in the placement view still names it as a voter,
+materializer, content copy, retiring copy or pending assignment
+(`node_holding`, exit 5), and for a node the directory does not know
+(`unknown_node`, exit 4). The drain commits the grant; the placement
+partition observes it a controller round later, so a remove that follows
+its drain at once consults the committed grant (the eligibility prepare
+read, which yields no command when the grant already says ineligible) and,
+finding it drained, waits up to ten seconds (20 polls of 500 ms) for the
+partition's node view to agree before the holding check; only a drain the
+partition still has not observed after that is refused (`drain_pending`,
+exit 5, retry). A never-drained node is never waited for. It then
 removes the node from the root group when the configuration contains it
 (`MembershipChange::Remove`, the ordinary journaled `a1:` request) and
 revokes the invitation that enrolled it (found by the credential's node id
 across the invitation pages; the ordinary revocation request, which also
-revokes the certificate a renewal replaced). Each step is exact, so a
+revokes the certificate a renewal replaced), and last retires its committed
+contact record (`ControlCommand::RetireContact { node, expected_generation }`,
+the journaled `a1:` request at the generation the operator read; result
+`contact_retired`). The root admits a retirement only from the local
+operator path, never from a peer, and only once no committed enrollment
+still authorizes the node under the record's principal — so a live node's
+reachability can never be retired by mistake, and only after the revocation
+above. Without retirement every node that ever joined would hold one of the
+`max_nodes` (1024) contact slots forever and a fleet that scales up and down
+would eventually have new nodes' announcements refused for capacity
+(revised 2026-09-13; found by repeated scale-up/down on KIND). A retirement
+whose outcome is unknown reconciles like a membership change: the contact
+table is read first and the receipt after, so an absent receipt at the later
+prefix with the record gone or moved is absence for good (node ids are never
+reused; generations only rise). Each step is exact, so a
 repeated command after a crash resumes: an already removed member and an
 already revoked invitation read as done. The revoked node can no longer
 present its credential on any path; its data directory is the operator's to
@@ -1412,12 +1434,25 @@ a moment later. An operator who
 gives a name (`host:port`, a DNS host and a nonzero port, at most 259
 bytes) rather than an address has it carried with the contact
 (`Operation::NodeContact { endpoint }`, `ContactRecord.endpoint`, contact
-checkpoint schema 3, control checkpoint schema 6 with every earlier shape
+checkpoint schema 4 — retirement counters, 2026-09-13 — and control checkpoint schema 7 with every earlier shape
 decoded) and shown by `cluster placement` (`advertise`, `endpoint` per
-node). The peer pool dials the announced address and, when it stops
-answering, re-resolves the name once within the same deadline and tries
-at most four fresh addresses (`PeerEndpoint.name`, `connect_by_name`);
-the certificate it accepts never changes with the address. The founder's
+node). The peer pool's dial for a route is a task of its own
+(`PeerConnectionPool::dial`, one per slot at a time): it dials the
+announced address and, after a 100 ms head start, every fresh address the
+name resolves to (at most four, resolved afresh on every dial), and the
+first connection wins while the rest are abandoned (`dial_candidates`,
+`QuicDialer`); the certificate it accepts never changes with the address.
+Callers join the dial in flight under their own deadlines, so a liveness
+probe or a bounded control read that gives up neither abandons the dial
+nor makes the next caller start over from the dead address, and the
+dial's outcome — the cached connection, or the unreachable cooldown when
+every candidate failed — is recorded whether or not anyone still waits.
+(Revised 2026-09-13: the first shape awaited the announced address inline
+to the connector's deadline before trying the name; every caller's shorter
+deadline cancelled it, so a fleet whose pods all moved at once never
+reached anything.) A route to the founder whose committed contact carries
+no name keeps the sponsor's name, since the founder's new contact can only
+replicate through the founder itself. The founder's
 invitations name the founder as its operator did, so an invitation
 outlives the founder's address; the sponsor's pinned endpoint is resolved
 at each use and its certificate pin still decides trust. A fleet speaks
@@ -1434,7 +1469,27 @@ host and a pod alike, with no init step that would need a shell.
 node's user and exits: the privileged step a packaged volume needs,
 performed by the same image and nothing else. `cluster invite --output -`
 writes the invitation to the caller's pipe, so a founder that has no
-readable path can still issue one through `kubectl exec`. An invitation
+readable path can still issue one through `kubectl exec`. A name denotes
+one invitation at a time — retrying `cluster invite --node NAME` returns
+the live invitation exactly, and a redeemed one still denotes its
+enrolled node — but not forever: an invitation that is finished (revoked,
+as `cluster nodes remove` does, or expired before anyone redeemed it) is
+superseded by a fresh invitation under the same name, so a removed
+StatefulSet ordinal comes back under its stable pod name (revised
+2026-09-13: the first shape refused the name for good once its
+invitation was revoked). The founder keeps the finished invitation's
+private slot under a retirement marker until the successor is
+remembered, so a crash between the two steps reads as a retirement,
+never as corruption. On the joining side, a data directory that journaled
+a join under one invitation and is now offered a different one (a pod
+that crash-looped on a revoked invitation until its operator issued a
+fresh one) settles the journaled join with the founder first: a receipt
+means the node is already enrolled under it and the new invitation is
+not needed; a terminal refusal — revoked, expired, redeemed under another
+key, wrong cluster, unauthorized — retires the journal and its
+never-enrolled key under a marker (`JOIN.retired-<invitation>`) and the
+new invitation is joined; an unknown outcome keeps the journal and the
+exact retry (`PendingJoin::retire`, `terminal_rejection`). An invitation
 file is read through links (a mounted secret is a link into its volume)
 and must be a regular file nobody but its owner may write and nobody
 outside its group may read (mode `0600` as `cluster invite` writes it, or

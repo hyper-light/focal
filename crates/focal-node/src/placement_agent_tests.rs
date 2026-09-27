@@ -565,14 +565,26 @@ async fn operators_admit_tenants_and_create_sessions_that_register_serve_and_sur
     .await
     .expect("local grant never followed the registry");
     assert!(!matches!(served, Response::Error(_)), "{served:?}");
-    let AdminResult::Placement { placement } = admin.placement().await.unwrap() else {
-        panic!("placement");
-    };
-    let view = placement.partitions[0]
-        .sessions
-        .iter()
-        .find(|session| session.session == created)
-        .expect("created session in the operator view");
+    // The session serves as soon as its local grant follows the registry;
+    // the operator's view reads the partition, which commits the session's
+    // registration a controller round later.
+    let view = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let AdminResult::Placement { placement } = admin.placement().await.unwrap() else {
+                panic!("placement");
+            };
+            if let Some(view) = placement.partitions[0]
+                .sessions
+                .iter()
+                .find(|session| session.session == created)
+            {
+                return view.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("created session in the operator view");
     assert_eq!(view.founder, Some(node));
     assert_eq!(view.tenant, tenant.to_string());
     founder.stop().await;

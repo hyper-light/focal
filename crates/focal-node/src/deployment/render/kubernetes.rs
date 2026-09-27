@@ -56,6 +56,9 @@ struct SetPlan {
 const USER: u32 = 65532;
 const DATA_DIR: &str = "/var/lib/focal";
 const CONFIG_MAP: &str = "focal-config";
+/// Where every pod mounts the requested policy for `deployment plan`.
+const TARGET_DIR: &str = "/etc/focal-target";
+const TARGET_FILE: &str = "target.yaml";
 const SERVICE: &str = "focal";
 const DEFAULT_SECRET: &str = "focal-invitations";
 /// The node's shutdown bound is 30 s; the pod waits longer before SIGKILL.
@@ -254,14 +257,23 @@ pub fn render(
             script: "invitations.sh".into(),
         });
     }
-    // The configuration per set: the requested policy, the set's zone.
+    // The configuration per set is the first-start seed: the set's zone and
+    // single-node durability, the only first start a lone node can satisfy
+    // (a founder alone cannot promise zone survival, and a host's first
+    // start pins its own policy the same way). The requested policy ships
+    // beside it as `target.yaml` for `deployment plan --config` once the
+    // hosts have joined; from then on the committed policy carries every
+    // restart (08 §2), so the static file never has to follow it.
+    let mut seed = settings.clone();
+    seed.durability.survive = FailureDomain::Node;
+    seed.durability.max_failures = 0;
     let mut config_map = format!(
         "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {CONFIG_MAP}\n  namespace: {}\n  labels:\n    app.kubernetes.io/name: focal\n    app.kubernetes.io/managed-by: focal-deployment-render\ndata:\n",
         request.namespace
     );
     for set in &sets {
         let config = config_yaml(
-            settings,
+            &seed,
             &ConfigNode {
                 listen: None,
                 advertise: None,
@@ -274,6 +286,20 @@ pub fn render(
         for line in config.lines() {
             let _ = writeln!(config_map, "    {line}");
         }
+    }
+    let target = config_yaml(
+        settings,
+        &ConfigNode {
+            listen: None,
+            advertise: None,
+            metrics_listen: None,
+            region: settings.topology.region.as_deref(),
+            zone: None,
+        },
+    );
+    let _ = writeln!(config_map, "  {TARGET_FILE}: |");
+    for line in target.lines() {
+        let _ = writeln!(config_map, "    {line}");
     }
     assets.push("configmap.yaml", config_map);
     assets.push("service.yaml", service(&request.namespace, request.port));
@@ -307,6 +333,12 @@ pub fn render(
     assets.notes.push(
         "Probes ask the node: startup, liveness and readiness are `cluster node probe --check alive`; `catching-up`, `authoritative` and `policy` are for inspection (`kubectl exec`) and never gate restarts, so a healthy node is not restarted for a missing quorum.".into(),
     );
+    assets.notes.push(format!(
+        "Every pod starts at single-node durability (survive: node, max_failures: 0), the only first start a lone node can satisfy; the requested policy ({} survival, max_failures {}) is mounted as {TARGET_DIR}/{TARGET_FILE}. Once every host pod is Ready, commit it from the founder: `kubectl -n {ns} exec focal-founder-0 -c focal -- /focal --data-dir {DATA_DIR} deployment plan --config {TARGET_DIR}/{TARGET_FILE} --output {DATA_DIR}/target.plan` then `... deployment apply --plan-file {DATA_DIR}/target.plan`. The committed policy then carries every restart; the configmap never has to follow it (08 §2).",
+        crate::deployment::survive_name(settings.durability.survive),
+        settings.durability.max_failures,
+        ns = request.namespace,
+    ));
     Ok(assets)
 }
 fn service(namespace: &str, port: u16) -> String {
@@ -377,9 +409,12 @@ fn stateful_set(
     if !set.founder {
         out.push_str("            - name: invitations\n              mountPath: /etc/focal/invitations\n              readOnly: true\n");
     }
+    out.push_str(&format!(
+        "            - name: target\n              mountPath: {TARGET_DIR}/{TARGET_FILE}\n              subPath: {TARGET_FILE}\n              readOnly: true\n"
+    ));
     let _ = write!(
         out,
-        "      volumes:\n        - name: config\n          configMap:\n            name: {CONFIG_MAP}\n            items:\n              - key: {name}.yaml\n                path: focal.yaml\n",
+        "      volumes:\n        - name: config\n          configMap:\n            name: {CONFIG_MAP}\n            items:\n              - key: {name}.yaml\n                path: focal.yaml\n        - name: target\n          configMap:\n            name: {CONFIG_MAP}\n            items:\n              - key: {TARGET_FILE}\n                path: {TARGET_FILE}\n",
         name = set.name
     );
     if !set.founder {

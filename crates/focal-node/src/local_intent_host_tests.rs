@@ -25,6 +25,9 @@ fn queued_host(budget: MemoryBudget) -> (ControlHost, mpsc::Receiver<Work>) {
             revisions: ControlRevisions::default(),
             dropped_replication: 0,
             stopped: false,
+            snapshot_index: 0,
+            peers: Vec::new(),
+            failure: None,
         },
         _allocation: None,
     });

@@ -143,6 +143,7 @@ pub enum ControlCommand {
     VerifiedPartition(VerifiedPartitionCommand),
     Membership(ControlMembershipCommand),
     NodeContact(NodeContactCommand),
+    RetireContact(RetireContactCommand),
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequest {

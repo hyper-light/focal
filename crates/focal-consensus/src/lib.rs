@@ -24,6 +24,7 @@ mod checkpoint;
 mod decoder;
 mod persistence;
 mod storage;
+pub mod timing;
 
 use focal_log::{LogError, LogicalLogId, Record, RecordKind, WalIdentity, WalLease, WalOptions};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, DiskBudget, MemoryBudget};
@@ -38,6 +39,7 @@ use storage::RamLog;
 use thiserror::Error;
 
 pub use focal_log::{FaultPoint, SharedWal};
+use raft::ProgressState;
 pub use raft::eraftpb::{
     ConfChange, ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState,
     Entry, EntryType, HardState, Message, MessageType, Snapshot,
@@ -202,6 +204,19 @@ impl NodeEvents {
     }
 }
 
+/// One peer's replication progress as this leader tracks it (§ diagnostics).
+/// Meaningful only while this node leads; empty otherwise. `state` is 0=probe,
+/// 1=replicate, 2=snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerProgress {
+    pub node: u64,
+    pub matched: u64,
+    pub next_index: u64,
+    pub state: u8,
+    pub recent_active: bool,
+    pub paused: bool,
+    pub pending_snapshot: u64,
+}
 #[derive(Clone, Debug)]
 pub struct NodeStatus {
     pub node_id: u64,
@@ -237,6 +252,8 @@ pub struct DurableNode {
     // membership is deferred until the decoder is confirmed. While it is pending,
     // no election or network step may observe the stale snapshot-only voter set.
     membership_rebuild_pending: bool,
+    /// The election priority the owner configured; see `set_priority`.
+    priority: i64,
     // Drop after any pending Ready/output payloads, including owner cancellation.
     active_allocation: Option<Allocation>,
 }
@@ -556,6 +573,7 @@ impl DurableNode {
             // (required_decoder set) cannot drain yet, so its rebuild is deferred
             // to decoder confirmation and fenced until then.
             membership_rebuild_pending: required_decoder.is_some(),
+            priority: 0,
         };
         // Rebuild committed membership before elections or network messages can
         // run. Application replay is retained for the caller's first drain.
@@ -653,6 +671,50 @@ impl DurableNode {
             BudgetLane::Completion,
             |replica| replica.propose_conf_change_inner(change),
         )
+    }
+    /// This node's election priority (27 §5). A voter refuses its vote, and
+    /// its pre-vote, to a candidate of lower priority unless that candidate's
+    /// log is strictly longer than the voter's, so among equally current
+    /// members the one of highest priority wins and a lower one that times
+    /// out first does not take the group. Priority never outranks the log:
+    /// the election restriction is unchanged, and a group whose highest
+    /// priority member is gone still elects among the rest. It is policy the
+    /// owner sets from committed placement, not part of the node's durable
+    /// identity.
+    ///
+    /// It takes effect once this node has a term. A node still at term zero
+    /// keeps the neutral priority: the library asserts that a pre-vote
+    /// rejection carries a term, and a rejection on priority from term zero
+    /// would unwind and stop the replica. A group's first election is
+    /// therefore decided by timeouts alone.
+    pub fn set_priority(&mut self, priority: i64) -> Result<(), ConsensusError> {
+        self.check()?;
+        if priority < 0 {
+            return Err(ConsensusError::Configuration(
+                "election priority must not be negative",
+            ));
+        }
+        self.priority = priority;
+        self.apply_priority();
+        Ok(())
+    }
+    /// The priority this node was given; in force once it has a term.
+    pub fn priority(&self) -> i64 {
+        self.priority
+    }
+    /// The priority votes are judged by now.
+    pub fn effective_priority(&self) -> i64 {
+        self.raw.raft.priority
+    }
+    fn apply_priority(&mut self) {
+        let effective = if self.raw.raft.term == 0 {
+            0
+        } else {
+            self.priority
+        };
+        if self.raw.raft.priority != effective {
+            self.raw.set_priority(effective);
+        }
     }
     pub fn transfer_leader(&mut self, node: u64) -> Result<(), ConsensusError> {
         self.guarded(|replica| replica.transfer_leader_inner(node))
@@ -975,6 +1037,34 @@ impl DurableNode {
             learners: conf.learners.clone(),
         }
     }
+    /// Per-peer replication progress this node tracks as leader (empty when not
+    /// leading). Diagnostic only; it reflects in-memory Raft progress and is
+    /// never persisted or replicated.
+    pub fn peer_progress(&self) -> Vec<PeerProgress> {
+        if self.raw.raft.state != StateRole::Leader {
+            return Vec::new();
+        }
+        let self_id = self.config.node_id;
+        self.raw
+            .raft
+            .prs()
+            .iter()
+            .filter(|(node, _)| **node != self_id)
+            .map(|(node, progress)| PeerProgress {
+                node: *node,
+                matched: progress.matched,
+                next_index: progress.next_idx,
+                state: match progress.state {
+                    ProgressState::Probe => 0,
+                    ProgressState::Replicate => 1,
+                    ProgressState::Snapshot => 2,
+                },
+                recent_active: progress.recent_active,
+                paused: progress.paused,
+                pending_snapshot: progress.pending_snapshot,
+            })
+            .collect()
+    }
 
     /// The index of the stored snapshot the log is compacted behind (zero
     /// while the log is complete): a member added after it can only be
@@ -1095,7 +1185,15 @@ impl DurableNode {
             lane,
             bytes,
         )?);
-        let result = catch_unwind(AssertUnwindSafe(|| operation(self)));
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            // A term gained since the last operation (a vote, a leader's
+            // message) puts the configured priority in force before the next
+            // message is judged.
+            self.apply_priority();
+            let result = operation(self);
+            self.apply_priority();
+            result
+        }));
         match result {
             Ok(result) => {
                 let retained = match memory::raw_bytes(&self.raw) {
@@ -1133,6 +1231,12 @@ impl DurableNode {
         } else {
             Ok(())
         }
+    }
+    /// Whether this node stopped on a dependency or persistence failure and
+    /// must be reopened. A refusal that changed nothing leaves it false, so a
+    /// caller can tell "try again" from "this replica is gone".
+    pub fn failed(&self) -> bool {
+        self.failed
     }
     fn check_state(&self) -> Result<(), ConsensusError> {
         if self.failed {
@@ -1343,6 +1447,8 @@ fn decode_proto<T: PbMessage + Default>(bytes: &[u8]) -> Result<T, ConsensusErro
 
 #[cfg(test)]
 mod borrowed_proposal_tests;
+#[cfg(test)]
+mod raft_safety_tests;
 #[cfg(test)]
 mod tests;
 

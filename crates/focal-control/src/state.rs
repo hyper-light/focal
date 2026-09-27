@@ -386,6 +386,21 @@ impl Machine {
             }
             (
                 Self::Root {
+                    enrollment,
+                    contacts,
+                    ..
+                },
+                ControlCommand::RetireContact(command),
+            ) => {
+                // No table yet means no record to retire.
+                let rows = contacts
+                    .as_ref()
+                    .ok_or(focal_directory::DirectoryError::CompareFailed)?;
+                let update = rows.prepare_retire(command, enrollment)?;
+                Ok(PreparedMachine::Contact { new: None, update })
+            }
+            (
+                Self::Root {
                     directory,
                     authority: None,
                     ..

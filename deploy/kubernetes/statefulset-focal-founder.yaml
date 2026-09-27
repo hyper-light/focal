@@ -118,6 +118,10 @@ spec:
               mountPath: /etc/focal/focal.yaml
               subPath: focal.yaml
               readOnly: true
+            - name: target
+              mountPath: /etc/focal-target/target.yaml
+              subPath: target.yaml
+              readOnly: true
       volumes:
         - name: config
           configMap:
@@ -125,6 +129,12 @@ spec:
             items:
               - key: focal-founder.yaml
                 path: focal.yaml
+        - name: target
+          configMap:
+            name: focal-config
+            items:
+              - key: target.yaml
+                path: target.yaml
   volumeClaimTemplates:
     - metadata:
         name: data

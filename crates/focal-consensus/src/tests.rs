@@ -98,7 +98,7 @@ fn deeply_nested_unknown_protobuf_groups_fail_without_stack_overflow() {
     // Also exercise nested configuration data independently of the peer envelope.
     assert!(decode_proto::<ConfChangeV2>(&malicious).is_err());
 }
-fn config(id: u64) -> NodeConfig {
+pub(crate) fn config(id: u64) -> NodeConfig {
     NodeConfig::single(id, [1; 16], [2; 16])
 }
 #[test]
@@ -201,14 +201,14 @@ fn delayed_snapshot_feedback_cannot_release_another_term_peer_or_prefix() {
         raft::ProgressState::Probe
     );
 }
-struct Cluster {
+pub(crate) struct Cluster {
     dirs: Vec<tempfile::TempDir>,
-    nodes: Vec<DurableNode>,
-    applied: Vec<Vec<Vec<u8>>>,
+    pub(crate) nodes: Vec<DurableNode>,
+    pub(crate) applied: Vec<Vec<Vec<u8>>>,
     snapshots: Vec<Vec<AppliedSnapshot>>,
 }
 impl Cluster {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
         let nodes = dirs
             .iter()
@@ -226,7 +226,7 @@ impl Cluster {
             snapshots: vec![Vec::new(); 3],
         }
     }
-    fn pump(&mut self, isolated: Option<u64>) {
+    pub(crate) fn pump(&mut self, isolated: Option<u64>) {
         for _ in 0..100 {
             let mut messages = Vec::new();
             for (i, node) in self.nodes.iter_mut().enumerate() {

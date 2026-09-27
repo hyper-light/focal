@@ -10,15 +10,19 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
+use tokio::{
+    sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, watch},
+    task::JoinSet,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerEndpoint {
     pub address: SocketAddr,
     /// The committed identity's certificate name, not an unverified redirect.
     pub server_name: String,
-    /// The name the peer advertised (`host:port`, 24 §24), re-resolved when
-    /// `address` stops answering; the certificate check stays the same.
+    /// The name the peer advertised (`host:port`, 24 §24), resolved afresh on
+    /// every dial and raced against `address`; the certificate check stays
+    /// the same for every candidate.
     pub name: Option<String>,
 }
 #[derive(Debug, Clone)]
@@ -34,6 +38,12 @@ pub struct PeerPoolLimits {
     pub attempts: u8,
     pub timeout: Duration,
     pub retry_backoff: Duration,
+    /// How long a peer whose dial failed is left alone before a send dials
+    /// it again. Sends within the cooldown fail at once as `Lost` instead of
+    /// each running a dial to its deadline, so an unreachable peer holds at
+    /// most one dial's worth of send capacity per cooldown and never the
+    /// capacity live peers need; zero disables it.
+    pub unreachable_cooldown: Duration,
 }
 impl Default for PeerPoolLimits {
     fn default() -> Self {
@@ -46,6 +56,7 @@ impl Default for PeerPoolLimits {
             attempts: 2,
             timeout: Duration::from_secs(5),
             retry_backoff: Duration::from_millis(10),
+            unreachable_cooldown: Duration::from_secs(2),
         }
     }
 }
@@ -63,6 +74,7 @@ impl PeerPoolLimits {
             || self.timeout.is_zero()
             || self.timeout > Duration::from_secs(120)
             || self.retry_backoff > self.timeout
+            || self.unreachable_cooldown > Duration::from_secs(60)
         {
             return Err(PeerSendError::Configuration);
         }
@@ -95,6 +107,8 @@ pub struct PeerPoolStats {
     pub delivered: u64,
     pub lost: u64,
     pub busy: u64,
+    /// Dials attempted, successful or not.
+    pub dials: u64,
     pub connections_opened: u64,
     pub cached_connections: usize,
     pub inflight: usize,
@@ -104,12 +118,34 @@ struct Counters {
     delivered: AtomicU64,
     lost: AtomicU64,
     busy: AtomicU64,
+    dials: AtomicU64,
     opened: AtomicU64,
 }
 struct Connected {
     generation: u64,
     remote: QuicRemote,
 }
+/// What a slot's detached dial has decided so far; every caller waiting on
+/// the slot observes the same decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DialState {
+    Pending,
+    Connected,
+    Failed,
+}
+/// A dial in flight for a slot: it runs on its own task so a caller giving
+/// up under its own deadline neither abandons it nor makes the next caller
+/// start over from the announced address (24 §24).
+struct Dial {
+    state: watch::Receiver<DialState>,
+    task: tokio::task::JoinHandle<()>,
+}
+/// Fresh addresses a name resolves to start this long after the announced
+/// address, so an unchanged peer still answers on the address it announced
+/// and a moved one is reached without waiting out the dead address.
+const NAME_HEAD_START: Duration = Duration::from_millis(100);
+/// At most this many fresh candidates from one resolution.
+const MAX_NAME_CANDIDATES: usize = 4;
 struct Slot {
     endpoint: PeerEndpoint,
     retired: AtomicBool,
@@ -117,12 +153,35 @@ struct Slot {
     /// The probe lane: one liveness probe to this peer at a time.
     probes: Semaphore,
     connection: AsyncMutex<Option<Connected>>,
+    dial: Mutex<Option<Dial>>,
     generation: AtomicU64,
+    /// Until when a failed dial keeps this peer from being dialed again.
+    unreachable_until: Mutex<Option<std::time::Instant>>,
     _reservation: OwnedSemaphorePermit,
 }
 impl Slot {
+    fn unreachable(&self) -> bool {
+        self.unreachable_until
+            .lock()
+            .ok()
+            .and_then(|until| *until)
+            .is_some_and(|until| std::time::Instant::now() < until)
+    }
+    fn mark_unreachable(&self, cooldown: Duration) {
+        if cooldown.is_zero() {
+            return;
+        }
+        if let Ok(mut until) = self.unreachable_until.lock() {
+            *until = std::time::Instant::now().checked_add(cooldown);
+        }
+    }
     fn retire(&self) {
         self.retired.store(true, Ordering::Release);
+        if let Ok(mut dial) = self.dial.lock()
+            && let Some(dial) = dial.take()
+        {
+            dial.task.abort();
+        }
         if let Ok(mut connection) = self.connection.try_lock()
             && let Some(connection) = connection.take()
         {
@@ -132,6 +191,9 @@ impl Slot {
 }
 impl Drop for Slot {
     fn drop(&mut self) {
+        if let Some(dial) = self.dial.get_mut().ok().and_then(|dial| dial.take()) {
+            dial.task.abort();
+        }
         if let Some(connection) = self.connection.get_mut().take() {
             connection.remote.close();
         }
@@ -159,9 +221,15 @@ pub struct PeerConnectionPool {
     probe_inflight: Semaphore,
     // OwnedSemaphorePermit lives in slots that can outlive cache membership.
     connections: Arc<Semaphore>,
-    counters: Counters,
+    // A slot's detached dial records its outcome after every caller may have
+    // given up; the counters outlive any one caller for the same reason the
+    // connection permits do.
+    counters: Arc<Counters>,
 }
 impl PeerConnectionPool {
+    pub fn limits(&self) -> &PeerPoolLimits {
+        &self.limits
+    }
     pub fn new(connector: QuicConnector, limits: PeerPoolLimits) -> Result<Self, PeerSendError> {
         limits.validate()?;
         Ok(Self {
@@ -177,7 +245,7 @@ impl PeerConnectionPool {
                 clock: 0,
                 closed: false,
             }),
-            counters: Counters::default(),
+            counters: Arc::new(Counters::default()),
         })
     }
     /// Atomically install a complete control-owner reachability snapshot. This
@@ -614,7 +682,9 @@ impl PeerConnectionPool {
             inflight: Semaphore::new(self.limits.per_peer_inflight),
             probes: Semaphore::new(1),
             connection: AsyncMutex::new(None),
+            dial: Mutex::new(None),
             generation: AtomicU64::new(0),
+            unreachable_until: Mutex::new(None),
             _reservation: reservation,
         });
         state.cached.insert(
@@ -626,79 +696,112 @@ impl PeerConnectionPool {
         );
         Ok(slot)
     }
-    async fn connection(&self, slot: &Slot) -> Result<(u64, QuicRemote), PeerSendError> {
-        let mut cached = slot.connection.lock().await;
-        if slot.retired.load(Ordering::Acquire) {
-            return Err(PeerSendError::RouteChanged);
+    async fn connection(&self, slot: &Arc<Slot>) -> Result<(u64, QuicRemote), PeerSendError> {
+        // A peer whose dial just failed is not dialed again until its cooldown
+        // passes: the send fails at once rather than holding its permits for
+        // another dial deadline, so unreachable peers never consume the
+        // capacity reachable ones need.
+        if slot.unreachable() {
+            return Err(PeerSendError::Lost);
         }
-        if let Some(connection) = &*cached {
-            return Ok((connection.generation, connection.remote.clone()));
-        }
-        // One connecting task per peer. At most per_peer_inflight-1 callers can
-        // wait for it, and all retain global permits under the same deadline.
-        let remote = match self
-            .connector
-            .connect(slot.endpoint.address, &slot.endpoint.server_name)
-            .await
         {
-            Ok(remote) => remote,
-            // The announced address stopped answering: a peer that advertised
-            // a name may have moved behind it (24 §24). Resolution is bounded
-            // by the same deadline and never changes which certificate is
-            // accepted.
-            Err(_) => match &slot.endpoint.name {
-                Some(name) => self.connect_by_name(name, &slot.endpoint).await?,
-                None => return Err(PeerSendError::Lost),
-            },
-        };
-        if slot.retired.load(Ordering::Acquire) {
-            remote.close();
-            return Err(PeerSendError::RouteChanged);
-        }
-        let generation =
-            match slot
-                .generation
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                    value.checked_add(1)
-                }) {
-                Ok(generation) => generation,
-                Err(_) => {
-                    remote.close();
-                    return Err(PeerSendError::Closed);
-                }
-            };
-        increment(&self.counters.opened);
-        *cached = Some(Connected {
-            generation,
-            remote: remote.clone(),
-        });
-        Ok((generation, remote))
-    }
-    async fn connect_by_name(
-        &self,
-        name: &str,
-        endpoint: &PeerEndpoint,
-    ) -> Result<QuicRemote, PeerSendError> {
-        let resolved = tokio::time::timeout(self.limits.timeout, tokio::net::lookup_host(name))
-            .await
-            .map_err(|_| PeerSendError::Lost)?
-            .map_err(|_| PeerSendError::Lost)?;
-        // At most four fresh candidates, the announced address excluded.
-        for address in resolved
-            .filter(|address| *address != endpoint.address)
-            .take(4)
-        {
-            if let Ok(remote) = self.connector.connect(address, &endpoint.server_name).await {
-                return Ok(remote);
+            let cached = slot.connection.lock().await;
+            if slot.retired.load(Ordering::Acquire) {
+                return Err(PeerSendError::RouteChanged);
+            }
+            if let Some(connection) = &*cached {
+                return Ok((connection.generation, connection.remote.clone()));
             }
         }
-        Err(PeerSendError::Lost)
+        // No connection: join the slot's dial in flight, or start one. The
+        // dial is a task of its own, so this caller giving up under its own
+        // deadline (a liveness probe, a bounded control read) neither
+        // abandons it nor makes the next caller start over from the
+        // announced address; whichever caller is still waiting when the dial
+        // decides sees the same outcome.
+        let mut dial = self.dial(slot)?;
+        loop {
+            let state = *dial.borrow_and_update();
+            match state {
+                DialState::Pending => dial.changed().await.map_err(|_| PeerSendError::Lost)?,
+                DialState::Failed => return Err(PeerSendError::Lost),
+                DialState::Connected => break,
+            }
+        }
+        let cached = slot.connection.lock().await;
+        if slot.retired.load(Ordering::Acquire) {
+            return Err(PeerSendError::RouteChanged);
+        }
+        match &*cached {
+            Some(connection) => Ok((connection.generation, connection.remote.clone())),
+            None => Err(PeerSendError::Lost),
+        }
+    }
+    /// The slot's dial in flight, or a new one: one dial per slot at a time,
+    /// counted once however many callers wait on it.
+    fn dial(&self, slot: &Arc<Slot>) -> Result<watch::Receiver<DialState>, PeerSendError> {
+        let mut current = slot.dial.lock().map_err(|_| PeerSendError::Closed)?;
+        if let Some(dial) = current.as_ref()
+            && *dial.state.borrow() == DialState::Pending
+        {
+            return Ok(dial.state.clone());
+        }
+        if slot.retired.load(Ordering::Acquire) {
+            return Err(PeerSendError::RouteChanged);
+        }
+        let dialer = self.connector.dialer().map_err(|_| PeerSendError::Closed)?;
+        let (sender, receiver) = watch::channel(DialState::Pending);
+        increment(&self.counters.dials);
+        let task_slot = slot.clone();
+        let counters = self.counters.clone();
+        let timeout = self.limits.timeout;
+        let cooldown = self.limits.unreachable_cooldown;
+        let task = tokio::spawn(async move {
+            let endpoint = task_slot.endpoint.clone();
+            let state = match dial_candidates(dialer, endpoint, timeout).await {
+                Ok(remote) if task_slot.retired.load(Ordering::Acquire) => {
+                    remote.close();
+                    DialState::Failed
+                }
+                Ok(remote) => {
+                    match task_slot.generation.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |value| value.checked_add(1),
+                    ) {
+                        Ok(generation) => {
+                            let mut cached = task_slot.connection.lock().await;
+                            *cached = Some(Connected { generation, remote });
+                            increment(&counters.opened);
+                            DialState::Connected
+                        }
+                        Err(_) => {
+                            remote.close();
+                            DialState::Failed
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Every candidate failed: the announced address and each
+                    // fresh one the name resolved to.
+                    task_slot.mark_unreachable(cooldown);
+                    DialState::Failed
+                }
+            };
+            sender.send_replace(state);
+        });
+        *current = Some(Dial {
+            state: receiver.clone(),
+            task,
+        });
+        Ok(receiver)
     }
     pub fn stats(&self) -> PeerPoolStats {
         PeerPoolStats {
             delivered: self.counters.delivered.load(Ordering::Relaxed),
             lost: self.counters.lost.load(Ordering::Relaxed),
             busy: self.counters.busy.load(Ordering::Relaxed),
+            dials: self.counters.dials.load(Ordering::Relaxed),
             connections_opened: self.counters.opened.load(Ordering::Relaxed),
             cached_connections: self
                 .state
@@ -728,6 +831,75 @@ impl Drop for PeerConnectionPool {
     }
 }
 
+/// Dial the announced address and, after a short head start, every fresh
+/// address the advertised name resolves to (24 §24); the first connection
+/// wins and the rest are abandoned. A peer that moved behind its name is
+/// reached in one handshake instead of after the dead address's deadline,
+/// and every candidate is checked against the same certificate name.
+async fn dial_candidates(
+    dialer: QuicDialer,
+    endpoint: PeerEndpoint,
+    timeout: Duration,
+) -> Result<QuicRemote, PeerSendError> {
+    let mut candidates: JoinSet<Result<QuicRemote, PeerSendError>> = JoinSet::new();
+    {
+        let dialer = dialer.clone();
+        let address = endpoint.address;
+        let server_name = endpoint.server_name.clone();
+        candidates.spawn(async move {
+            dialer
+                .connect(address, &server_name)
+                .await
+                .map_err(|_| PeerSendError::Lost)
+        });
+    }
+    if let Some(name) = endpoint.name.clone() {
+        let announced = endpoint.address;
+        let server_name = endpoint.server_name.clone();
+        candidates.spawn(async move {
+            tokio::time::sleep(NAME_HEAD_START).await;
+            let resolved = tokio::net::lookup_host(name.as_str())
+                .await
+                .map_err(|_| PeerSendError::Lost)?;
+            let mut fresh: JoinSet<Result<QuicRemote, PeerSendError>> = JoinSet::new();
+            for address in resolved
+                .filter(|address| *address != announced)
+                .take(MAX_NAME_CANDIDATES)
+            {
+                let dialer = dialer.clone();
+                let server_name = server_name.clone();
+                fresh.spawn(async move {
+                    dialer
+                        .connect(address, &server_name)
+                        .await
+                        .map_err(|_| PeerSendError::Lost)
+                });
+            }
+            first_connection(fresh).await
+        });
+    }
+    tokio::time::timeout(timeout, first_connection(candidates))
+        .await
+        .map_err(|_| PeerSendError::Lost)?
+}
+/// The first candidate that connected; the others are abandoned, and one
+/// that also connected meanwhile is closed rather than left to idle out.
+async fn first_connection(
+    mut candidates: JoinSet<Result<QuicRemote, PeerSendError>>,
+) -> Result<QuicRemote, PeerSendError> {
+    while let Some(joined) = candidates.join_next().await {
+        if let Ok(Ok(remote)) = joined {
+            candidates.abort_all();
+            while let Some(other) = candidates.join_next().await {
+                if let Ok(Ok(extra)) = other {
+                    extra.close();
+                }
+            }
+            return Ok(remote);
+        }
+    }
+    Err(PeerSendError::Lost)
+}
 fn increment(counter: &AtomicU64) {
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         Some(value.saturating_add(1))

@@ -16,6 +16,10 @@ use super::{
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget, MemoryError};
 use focal_model::{LedgerId, RequestEpoch, RequestId, RouteEpoch};
 use focal_wire::{Operation, PROTOCOL_VERSION, PeerConnectionPool, PeerSendError, RequestEnvelope};
+
+#[cfg(test)]
+#[path = "swim_tests.rs"]
+mod swim_tests;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -62,6 +66,13 @@ pub struct LivenessConfig {
     pub extension_min_grant_ms: u64,
     /// The local health score at which a suspected host asks for time.
     pub extension_score: u8,
+    /// Failed probe rounds an as-yet-unconfirmed member is allowed before it
+    /// is suspected like any other. Never reaching a member is treated first
+    /// as this node's own fault (Lifeguard's self-blame already stretches the
+    /// timeouts), but only for this many rounds: a member that never answers
+    /// at its committed address must become visible to the detector, not stay
+    /// "alive" forever.
+    pub unconfirmed_patience: u32,
     pub vivaldi: VivaldiConfig,
 }
 impl Default for LivenessConfig {
@@ -76,6 +87,7 @@ impl Default for LivenessConfig {
             suspicion_spread: 6.0,
             extension_min_grant_ms: 1_000,
             extension_score: 2,
+            unconfirmed_patience: 3,
             vivaldi: VivaldiConfig::default(),
         }
     }
@@ -93,7 +105,8 @@ impl LivenessConfig {
             && self.suspicion_factor >= 1.0
             && self.suspicion_spread.is_finite()
             && self.suspicion_spread >= 1.0
-            && self.extension_min_grant_ms > 0;
+            && self.extension_min_grant_ms > 0
+            && self.unconfirmed_patience >= 1;
         if ok {
             Ok(())
         } else {
@@ -417,6 +430,9 @@ struct Member {
     /// it, its direct probe reply, or a relay's acknowledgement). Gossip does
     /// not update it. Used to refute an in-flight probe round (SWIM Lifeguard).
     last_alive_ms: u64,
+    /// Consecutive failed probe rounds while still unconfirmed; any direct
+    /// proof of life clears it.
+    unconfirmed_rounds: u32,
 }
 impl Member {
     fn new(generation: u64, now_ms: u64, config: &LivenessConfig) -> Self {
@@ -433,6 +449,7 @@ impl Member {
             probe: None,
             last_rtt_ms: None,
             last_alive_ms: 0,
+            unconfirmed_rounds: 0,
         }
     }
     fn view(&self, timeout_ms: u64) -> MemberView {
@@ -1331,8 +1348,18 @@ impl LivenessDriver {
         // be suspected just because the indirect probes over a degraded path
         // failed (SWIM Lifeguard).
         let refuted = round_started.is_some_and(|started| member.last_alive_ms >= started);
-        if !member.confirmed
-            || member.status == MemberStatus::Dead
+        // A member this node has never reached is first given the benefit of
+        // the doubt (the fault may be ours), but only for a bounded number of
+        // rounds; past that it is suspected exactly like a confirmed member,
+        // so a node that never answers at its committed address is never
+        // invisible to the detector.
+        if !member.confirmed {
+            member.unconfirmed_rounds = member.unconfirmed_rounds.saturating_add(1);
+            if member.unconfirmed_rounds < config.unconfirmed_patience {
+                return;
+            }
+        }
+        if member.status == MemberStatus::Dead
             || member.suspicion.is_some()
             || now_ms < member.grace_until_ms
             || refuted
@@ -1380,6 +1407,7 @@ impl LivenessDriver {
         // not, so it can never refute an in-flight probe round.
         if direct {
             member.last_alive_ms = now_ms;
+            member.unconfirmed_rounds = 0;
         }
         if incarnation < member.incarnation {
             return;

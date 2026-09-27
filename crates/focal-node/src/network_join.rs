@@ -11,7 +11,8 @@ use focal_control::{
 };
 use focal_enrollment::{
     CredentialMaterial, EnrollmentClient, EnrollmentError, EnrollmentLimits, EnrollmentReceipt,
-    EnrollmentRegistry, EnrollmentRole, Invitation, JoinKey, JoinTransportError, PrivateJournal,
+    EnrollmentRegistry, EnrollmentRole, Invitation, JoinFailure, JoinKey, JoinTransportError,
+    PrivateJournal,
 };
 use focal_model::{RequestEpoch, RequestId, RouteEpoch};
 use focal_wire::{
@@ -270,6 +271,11 @@ pub struct PendingJoin {
     bundle: NodeInvitation,
     listen: SocketAddr,
     advertise: SocketAddr,
+    /// The `host:port` name this node advertises when its operator gave one
+    /// (24 §24). It is committed with the first contact so peers can
+    /// re-resolve it when `advertise` stops answering; an address-only
+    /// operator leaves it unset.
+    endpoint: Option<String>,
     key: JoinKey,
     _journal: PrivateJournal,
     directory: JoinDirectory,
@@ -365,6 +371,7 @@ impl PendingJoin {
             bundle,
             listen: state.listen,
             advertise: state.advertise,
+            endpoint: crate::network_state::advertised_name(settings),
             key,
             _journal: journal,
             directory,
@@ -430,6 +437,29 @@ impl PendingJoin {
             .key
             .complete(receipt, &self.bundle.invitation.trust().ca_certificate, now)?)
     }
+    /// Retire this pending join (24 §24): its journal and never-enrolled key
+    /// move under a marker named by the invitation they were for, so a
+    /// different invitation can be joined from this data directory. Only for
+    /// a join the founder has refused terminally; a join whose outcome is
+    /// unknown keeps its journal and is retried exactly.
+    pub fn retire(self) -> Result<(), JoinError> {
+        let invitation = self.bundle.invitation.id();
+        let root = self.directory.root().to_path_buf();
+        // Release the journal and key leases before moving their directory.
+        drop(self);
+        let join = root.join("JOIN");
+        let mut retired = join.as_os_str().to_owned();
+        retired.push(".retired-");
+        for byte in invitation {
+            retired.push(format!("{byte:02x}"));
+        }
+        std::fs::rename(&join, std::path::PathBuf::from(retired))?;
+        let marker = root.join("JOIN.initialized");
+        if marker.exists() {
+            std::fs::remove_file(&marker)?;
+        }
+        Ok(())
+    }
     pub fn install(self, receipt: EnrollmentReceipt, now: i64) -> Result<JoinedNode, JoinError> {
         let credentials = self.verify(&receipt, now)?;
         let mut identity = self.bundle.genesis.founder.clone();
@@ -439,7 +469,7 @@ impl PendingJoin {
             node: identity.node,
             listen: self.listen,
             advertise: self.advertise,
-            endpoint: None,
+            endpoint: self.endpoint.clone(),
             sponsor: self.bundle.invitation.trust().clone(),
             genesis: self.bundle.genesis.clone(),
         };
@@ -585,12 +615,11 @@ impl JoinedNode {
             let limits = crate::control_host::ControlHost::wire_limits();
             let registry = genesis_registry(&self.state.genesis)?;
             let founder = registry.enrollments().next().ok_or(JoinError::Invalid)?;
-            let address: SocketAddr = self
-                .state
-                .sponsor
-                .endpoint
-                .parse()
-                .map_err(|_| JoinError::Invalid)?;
+            // The sponsor is an address or a `host:port` name (24 §24); a
+            // name is resolved at each use, so a founder that moved behind it
+            // is still reached.
+            let address: SocketAddr =
+                crate::network_state::resolve_endpoint(&self.state.sponsor.endpoint).await?;
             let bind = if address.is_ipv4() {
                 "0.0.0.0:0"
             } else {
@@ -662,6 +691,22 @@ fn genesis_registry(genesis: &NetworkGenesis) -> Result<EnrollmentRegistry, Join
         genesis.founder.cluster,
         EnrollmentLimits::default(),
     )?)
+}
+/// Whether the founder refused a join for good: the invitation is revoked,
+/// expired, redeemed under another key, for another cluster, or not
+/// authorized. Capacity, unavailability and an unknown outcome are not
+/// terminal — the same join is retried exactly.
+pub fn terminal_rejection(error: &JoinError) -> bool {
+    matches!(
+        error,
+        JoinError::Transport(JoinTransportError::Rejected(
+            JoinFailure::Revoked
+                | JoinFailure::Expired
+                | JoinFailure::Used
+                | JoinFailure::WrongCluster
+                | JoinFailure::Unauthorized
+        ))
+    )
 }
 fn validate_journal(journal: &JoinJournal) -> Result<NodeInvitation, JoinError> {
     let bundle = NodeInvitation::decode(&journal.bundle.0)?;

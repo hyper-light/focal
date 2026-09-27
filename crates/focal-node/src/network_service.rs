@@ -67,6 +67,8 @@ pub enum ServiceError {
     Control(#[from] focal_control::ControlError),
     #[error("directory startup: {0}")]
     Directory(#[from] crate::directory_bootstrap::DirectoryBootstrapError),
+    #[error("control owner stopped: {0}")]
+    ControlOwner(String),
     #[error("root request: {0}")]
     ControlRequest(#[from] focal_control::ControlFailure),
     #[error("ledger: {0}")]
@@ -1257,6 +1259,8 @@ impl NetworkService {
                 term: root.term,
                 applied_index: root.applied_index,
                 stopped: root.stopped,
+                snapshot_index: root.snapshot_index,
+                peers: root.peers.clone(),
             },
             peers: self.pool.stats(),
             peer_rtts,
@@ -1342,15 +1346,19 @@ impl NetworkService {
         };
         // A future may be moved to another runtime between polls. Contain the
         // timer dependency here too, after the earlier run boundary has ended.
-        std::panic::AssertUnwindSafe(async {
+        let cleaned = std::panic::AssertUnwindSafe(async {
             tokio::time::timeout(Duration::from_secs(30), cleanup)
                 .await
                 .map_err(|_| ServiceError::ShutdownTimeout)?
         })
         .catch_unwind()
         .await
-        .map_err(|_| ServiceError::Runtime)??;
-        running
+        .map_err(|_| ServiceError::Runtime)
+        .and_then(|cleaned| cleaned);
+        // What ended the service is the cause; a failure while cleaning up
+        // after it (an owner that had already stopped cannot be joined
+        // cleanly) must not replace it.
+        running.and(cleaned)
     }
     async fn run_tasks<F, R>(&mut self, shutdown: F, mut on_status: R) -> Result<(), ServiceError>
     where
@@ -1365,7 +1373,13 @@ impl NetworkService {
             .control_output
             .take()
             .ok_or(ServiceError::Owner("egress already consumed"))?;
-        let control_driver = drive_control_replication(output, &self.pool, 16);
+        // Concurrent sends are bounded by the pool's own admission: a peer
+        // that stopped answering holds at most `per_peer_inflight` of them
+        // for one dial and then fails fast, so the driver's cap only has to
+        // exceed what the unreachable peers of a moment can hold at once,
+        // never leaving live followers' appends queued behind dead ones.
+        let inflight = self.pool.limits().max_inflight.min(1024);
+        let control_driver = drive_control_replication(output, &self.pool, inflight);
         let directory_startup = self.directory_startup.take();
         let owners = self
             .owners
@@ -1381,7 +1395,7 @@ impl NetworkService {
         let metrics_listener = self.metrics_listener.take();
         let ledger_driver = async {
             match ledger_output {
-                Some(output) => drive_fleet_replication(output, &self.pool, 16)
+                Some(output) => drive_fleet_replication(output, &self.pool, inflight)
                     .await
                     .map(|_| ()),
                 None => std::future::pending().await,
@@ -1570,7 +1584,10 @@ impl NetworkService {
             _=&mut signer_driver=>Err(ServiceError::Owner("enrollment driver ended")),
             ()=&mut metrics_sampler=>Err(ServiceError::Owner("metrics sampler ended")),
             result=&mut metrics_endpoint=>result.map_err(ServiceError::Io).and(Err(ServiceError::Owner("metrics endpoint ended"))),
-            _=self.handles.control.closed()=>Err(ServiceError::Owner("control owner ended")),
+            _=self.handles.control.closed()=>Err(match self.handles.control.progress().failure {
+                Some(failure) => ServiceError::ControlOwner(failure),
+                None => ServiceError::Owner("control owner ended"),
+            }),
         }
     }
 }

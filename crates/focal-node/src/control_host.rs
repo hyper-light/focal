@@ -25,6 +25,11 @@ pub struct ControlHostConfig {
     pub replication_queue: usize,
     pub tick: Duration,
     pub request_timeout: Duration,
+    /// Compact the metadata log once this many entries have been applied past
+    /// the last snapshot. Bounds the log in steady state and lets a lagging
+    /// follower catch up from a trusted snapshot instead of replaying every
+    /// authority fact (24 §16). Never zero.
+    pub checkpoint_interval: u64,
     /// Trusted immutable-genesis pin; absent means remote enrollment is denied.
     pub enrollment_authority: Option<crate::network_control::FounderControlAuthority>,
 }
@@ -38,6 +43,7 @@ impl ControlHostConfig {
             replication_queue: 128,
             tick: Duration::from_millis(100),
             request_timeout: Duration::from_secs(5),
+            checkpoint_interval: 1024,
             enrollment_authority: None,
         }
     }
@@ -47,6 +53,7 @@ impl ControlHostConfig {
             || self.route_epoch.0 == 0
             || !(1..=1024).contains(&self.queue_items)
             || !(1..=1024).contains(&self.pending_requests)
+            || self.checkpoint_interval == 0
             || !(1..=1024).contains(&self.replication_queue)
             || !(Duration::from_millis(10)..=Duration::from_secs(1)).contains(&self.tick)
             || self.request_timeout.is_zero()
@@ -67,6 +74,16 @@ pub struct ControlProgress {
     pub revisions: ControlRevisions,
     pub dropped_replication: u64,
     pub stopped: bool,
+    /// The compaction floor: index of the most recent metadata snapshot, or
+    /// zero before the first compaction. `applied_index - snapshot_index` is
+    /// the retained log length.
+    pub snapshot_index: u64,
+    /// Per-peer replication progress while this node leads (diagnostic).
+    pub peers: Vec<focal_consensus::PeerProgress>,
+    /// Why the owner stopped, when it stopped on a failure rather than on
+    /// request: the error its loop ended with, or that it unwound. Without
+    /// this a stopped control plane reads as an unexplained shutdown.
+    pub failure: Option<String>,
 }
 struct ControlProgressState {
     value: ControlProgress,
@@ -267,6 +284,7 @@ struct Owner<V> {
     progress: watch::Sender<ControlProgressState>,
     nonce: u64,
     dropped: u64,
+    failure: Option<String>,
 }
 impl ControlHost {
     /// Validate a durable session-owner witness against this control owner's
@@ -513,6 +531,9 @@ impl ControlHost {
                 revisions: replica.revisions(),
                 dropped_replication: 0,
                 stopped: false,
+                snapshot_index: 0,
+                peers: Vec::new(),
+                failure: None,
             },
             _allocation: None,
         });
@@ -531,6 +552,7 @@ impl ControlHost {
             progress,
             nonce: 0,
             dropped: 0,
+            failure: None,
         };
         let thread = std::thread::Builder::new()
             .name(format!("focal-control-{}", status.node_id))
@@ -704,7 +726,7 @@ impl RequestHandler for ControlHost {
 }
 impl<V: AuthorityVerifier> Owner<V> {
     fn run(mut self, receiver: mpsc::Receiver<Work>, peers: mpsc::Receiver<Work>) {
-        let _result = catch_unwind(AssertUnwindSafe(|| -> Result<(), ControlError> {
+        let result = catch_unwind(AssertUnwindSafe(|| -> Result<(), ControlError> {
             self.drain()?;
             let mut next_tick = Instant::now()
                 .checked_add(self.config.tick)
@@ -721,6 +743,7 @@ impl<V: AuthorityVerifier> Owner<V> {
                 if Instant::now() >= next_tick {
                     self.replica.tick()?;
                     self.drain()?;
+                    self.maybe_checkpoint()?;
                     next_tick = Instant::now()
                         .checked_add(self.config.tick)
                         .ok_or(ControlError::Capacity)?;
@@ -741,6 +764,11 @@ impl<V: AuthorityVerifier> Owner<V> {
                 }
             }
         }));
+        self.failure = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(_) => Some("control owner unwound".to_owned()),
+        };
         self.stop_waiters();
         self.publish_progress(true);
     }
@@ -1157,6 +1185,13 @@ impl<V: AuthorityVerifier> Owner<V> {
                     if !contact && matches!(request.command, ControlCommand::NodeContact(_)) {
                         return Err(ControlFailure::Unauthorized);
                     }
+                    // Retiring a contact is the operator's (24 §19): only the
+                    // local admin path, never a peer over the network.
+                    if matches!(request.command, ControlCommand::RetireContact(_))
+                        && !matches!(verified.peer().role(), PeerRole::Runtime)
+                    {
+                        return Err(ControlFailure::Unauthorized);
+                    }
                     // A node's root intents over placement control are named
                     // by the client derived from its principal (24 §16).
                     let root_intent = placement
@@ -1521,6 +1556,61 @@ impl<V: AuthorityVerifier> Owner<V> {
             _output: output,
         });
     }
+    /// Refresh the log snapshot when either the log has grown
+    /// `checkpoint_interval` entries past the last snapshot (steady-state
+    /// bounding) or a membership change has committed above the snapshot floor
+    /// so the stored snapshot's configuration is stale.
+    ///
+    /// The second trigger is essential for correctness, not just bounding: a
+    /// snapshot carries the committed configuration at its index, and a
+    /// follower cannot be caught up by a snapshot whose configuration predates
+    /// the follower's own admission (it would install a membership that does
+    /// not contain it). The genesis snapshot excludes every later-joined node,
+    /// so without this a freshly joined learner whose `next_index` reaches the
+    /// compaction floor wedges: the leader can neither append below the floor
+    /// nor install its stale snapshot, and it oscillates Probe/Snapshot
+    /// forever. Re-checkpointing at the current applied index mints a snapshot
+    /// whose configuration includes the follower, which then installs and
+    /// catches up. It fires at most once per membership change (afterward the
+    /// floor is at or above `configuration_index`), never per entry.
+    ///
+    /// Compaction is skipped, not forced, when a proposal, directory bootstrap,
+    /// enrollment refresh or caller read is in flight so no in-flight fence is
+    /// invalidated; the next tick retries. `NotReady`/`Busy` is transient and
+    /// never fails the owner.
+    fn maybe_checkpoint(&mut self) -> Result<(), ControlError> {
+        let applied = self.replica.applied_index();
+        if applied == 0
+            || self.replica.has_pending()
+            || self.directory.is_some()
+            || self.authority_refresh.is_some()
+            || !self.pending.is_empty()
+        {
+            return Ok(());
+        }
+        let floor = self.replica.snapshot_index();
+        if applied <= floor {
+            return Ok(());
+        }
+        let interval_reached = applied.saturating_sub(floor) >= self.config.checkpoint_interval;
+        // The stored snapshot carries the configuration at its index. Once a
+        // membership change commits above the floor, that snapshot excludes the
+        // member(s) it added and can no longer catch them up, so refresh it to
+        // the current committed configuration. This fires at most once per
+        // membership change (afterward the floor is at or above the change),
+        // never per entry, so it cannot storm.
+        let stale_configuration = floor < self.replica.configuration_index();
+        if !interval_reached && !stale_configuration {
+            return Ok(());
+        }
+        match self.replica.checkpoint() {
+            Ok(()) => Ok(()),
+            // Compaction is opportunistic: a refusal that changed nothing is
+            // tried again on a later tick and never ends the owner.
+            Err(error) if self.replica.checkpoint_retryable(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
     fn publish_progress(&self, stopped: bool) {
         let status = self.replica.status();
         self.progress.send_modify(|state| {
@@ -1533,6 +1623,9 @@ impl<V: AuthorityVerifier> Owner<V> {
                 revisions: self.replica.revisions(),
                 dropped_replication: self.dropped,
                 stopped,
+                snapshot_index: self.replica.snapshot_index(),
+                peers: self.replica.peer_progress(),
+                failure: self.failure.clone(),
             }
         });
     }

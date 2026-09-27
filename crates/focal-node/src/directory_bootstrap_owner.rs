@@ -77,6 +77,9 @@ impl ControlHost {
                 revisions: ControlRevisions::default(),
                 dropped_replication: 0,
                 stopped: false,
+                snapshot_index: 0,
+                peers: Vec::new(),
+                failure: None,
             },
             _allocation: Some(allocation),
         });
@@ -110,6 +113,7 @@ impl ControlHost {
                             progress: progress.clone(),
                             nonce: 0,
                             dropped: 0,
+                            failure: None,
                         };
                         owner.run(receiver, incoming);
                         Ok(())

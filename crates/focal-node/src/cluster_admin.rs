@@ -27,6 +27,11 @@ mod replicas;
 #[cfg(test)]
 mod tests;
 
+/// A remove that follows its drain waits this long, in this many polls, for the
+/// placement partition to observe the committed ineligibility.
+const REMOVE_DRAIN_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+const REMOVE_DRAIN_POLLS: u32 = 20;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ClusterAdminError {
     #[error(transparent)]
@@ -65,6 +70,8 @@ pub enum ClusterAdminError {
     NodeHolding { node: u64, sessions: usize },
     #[error("node {0} is still eligible for placement; drain it first")]
     NotDrained(u64),
+    #[error("node {0} is drained, but the placement controller has not observed it yet; retry")]
+    DrainPending(u64),
     #[error("node {0} is not enrolled in the directory")]
     UnknownNode(u64),
     #[error("node {0} is not alive, eligible and reporting; it cannot take over")]
@@ -127,6 +134,7 @@ impl ClusterAdminError {
             },
             Self::NodeHolding { .. } => Failure::error("node_holding", 5),
             Self::NotDrained(_) => Failure::error("not_drained", 5),
+            Self::DrainPending(_) => Failure::error("drain_pending", 5),
             Self::NotReady(_) => Failure::error("node_not_ready", 5),
             Self::MembersBehind { .. } => Failure::error("members_behind", 5),
             Self::OutsideResidency { .. } => Failure::error("outside_residency", 5),
@@ -1042,6 +1050,18 @@ impl ClusterAdmin {
     /// One readiness probe (08 §9): the readiness report when `check`
     /// holds, `probe_failed` (exit 1) otherwise, for a supervisor's probe.
     pub async fn probe(&self, check: &str) -> Result<AdminResult> {
+        // Liveness is the process answering on its own socket, nothing more:
+        // it is answered by the identity read, which touches no root, session
+        // or placement state, so a node whose control plane is unreachable
+        // still reports alive. A liveness probe that waited on the readiness
+        // report timed out whenever the root leader was down and had the
+        // supervisor kill healthy hosts (24 §15).
+        if check == "alive" {
+            return self
+                .operator(crate::network_admin::OperatorRead::Identity)
+                .await
+                .map_err(|_| ClusterAdminError::ProbeFailed("alive"));
+        }
         let result = self
             .operator(crate::network_admin::OperatorRead::Readiness)
             .await?;
@@ -1049,7 +1069,6 @@ impl ClusterAdmin {
             return Err(ClusterAdminError::Invalid);
         };
         let (name, holds) = match check {
-            "alive" => ("alive", readiness.alive),
             "catching-up" => ("catching-up", readiness.catching_up),
             "authoritative" => ("authoritative", readiness.authoritative),
             "policy" => ("policy", readiness.policy_satisfied),
@@ -1066,6 +1085,30 @@ impl ClusterAdmin {
     /// every placement that named the node and retires its copies (drain),
     /// or considers it again (undrain). Exact on retry; a node already in the
     /// requested state commits nothing.
+    /// Whether the committed grant for `node` is already ineligible: the
+    /// eligibility prepare read yields no command when the grant already
+    /// states what is asked.
+    async fn grant_ineligible(&self, node: u64) -> Result<bool> {
+        let reply = self
+            .exchange(AdminCommand::Read(AdminRead::PrepareEligibility {
+                node,
+                eligible: false,
+            }))
+            .await;
+        match reply {
+            Ok(ControlReply::Read(ControlReadResult::PreparedEligibility {
+                node: prepared,
+                eligible: false,
+                command,
+                ..
+            })) if prepared == node => Ok(command.is_none()),
+            Ok(_) => Err(ClusterAdminError::Invalid),
+            Err(ClusterAdminError::Control(ControlFailure::Invalid)) => {
+                Err(ClusterAdminError::UnknownNode(node))
+            }
+            Err(error) => Err(error),
+        }
+    }
     pub async fn node_eligibility(&self, node: u64, eligible: bool) -> Result<AdminResult> {
         if node == 0 {
             return Err(ClusterAdminError::Invalid);
@@ -1179,7 +1222,29 @@ impl ClusterAdmin {
         if node == 0 || node == self.identity.node {
             return Err(ClusterAdminError::Invalid);
         }
-        let placement = self.placement_view().await?;
+        // The drain commits the grant ineligible; the placement partition
+        // observes that a controller round later. A remove that follows its
+        // drain at once must not read as "never drained": when the committed
+        // grant is already ineligible, wait — bounded — for the partition to
+        // say so, and name the pending drain if it still has not.
+        let mut placement = self.placement_view().await?;
+        let mut waited = 0u32;
+        while placement
+            .partitions
+            .iter()
+            .flat_map(|partition| partition.nodes.iter())
+            .any(|entry| entry.node == node && entry.eligible)
+        {
+            if waited == 0 && !self.grant_ineligible(node).await? {
+                return Err(ClusterAdminError::NotDrained(node));
+            }
+            if waited >= REMOVE_DRAIN_POLLS {
+                return Err(ClusterAdminError::DrainPending(node));
+            }
+            waited = waited.saturating_add(1);
+            tokio::time::sleep(REMOVE_DRAIN_POLL).await;
+            placement = self.placement_view().await?;
+        }
         let mut record = None;
         let mut holding = 0usize;
         for partition in &placement.partitions {
@@ -1269,12 +1334,64 @@ impl ClusterAdmin {
             }
             None => (None, false),
         };
+        // Last, once nothing enrolls the node: its contact record, so the
+        // bounded contact table does not keep a slot for every node that
+        // ever joined (24 §19). Exact: an absent record reads as done.
+        let contact_retired = self.retire_contact(node).await?;
         Ok(AdminResult::NodeRemoved {
             node,
             membership_removed,
             invitation,
             revoked,
+            contact_retired,
         })
+    }
+    /// Retire a removed node's committed contact record as a journaled
+    /// request at the generation the operator read; `false` when no record
+    /// remains. The root refuses it while any enrollment still authorizes the
+    /// node, so an operator cannot retire a live node's reachability.
+    async fn retire_contact(&self, node: u64) -> Result<bool> {
+        let AdminResult::Contacts { nodes, .. } = self.read(AdminRead::Contacts).await? else {
+            return Err(ClusterAdminError::Invalid);
+        };
+        let Some(record) = nodes.iter().find(|contact| contact.node == node) else {
+            return Ok(false);
+        };
+        let (mut journal, mut saved) = self.journal(true)?;
+        if saved
+            .latest
+            .as_ref()
+            .is_some_and(|latest| latest.receipt.is_none() && !latest.superseded)
+        {
+            return Err(ClusterAdminError::Pending);
+        }
+        let sequence = saved.next_control;
+        let operation = saved.next;
+        let next = operation
+            .checked_add(1)
+            .ok_or(ClusterAdminError::Capacity)?;
+        sequence.checked_add(1).ok_or(ClusterAdminError::Capacity)?;
+        let request = ControlRequest {
+            id: ControlRequestId {
+                client: admin_principal(&self.identity).0,
+                sequence,
+            },
+            acknowledged_through: sequence.checked_sub(1).ok_or(ClusterAdminError::Corrupt)?,
+            command: ControlCommand::RetireContact(focal_control::RetireContactCommand {
+                node,
+                expected_generation: record.generation,
+            }),
+        };
+        saved.next = next;
+        saved.latest = Some(Latest {
+            operation,
+            request,
+            receipt: None,
+            superseded: false,
+        });
+        save(&mut journal, &saved)?;
+        self.drive(&mut journal, &mut saved).await?;
+        Ok(true)
     }
     /// Replace a node (24 §19): drain `node` once `replacement` is enrolled,
     /// alive, eligible and reporting, so the healed placements have a host
@@ -1353,6 +1470,23 @@ impl ClusterAdmin {
         if latest.receipt.is_some() || latest.superseded {
             return saved_view(self.identity.node, &saved);
         }
+        // A contact retirement can never commit once its record is gone or
+        // has moved past the generation it named (node ids are never reused;
+        // generations only rise). Read the table before the receipt, so an
+        // absent receipt at the later prefix is absence for good.
+        let contact_superseded = match &latest.request.command {
+            ControlCommand::RetireContact(command) => {
+                let AdminResult::Contacts { nodes, .. } = self.read(AdminRead::Contacts).await?
+                else {
+                    return Err(ClusterAdminError::Invalid);
+                };
+                Some(!nodes.iter().any(|contact| {
+                    contact.node == command.node
+                        && contact.generation == command.expected_generation
+                }))
+            }
+            _ => None,
+        };
         let reply = self
             .exchange(AdminCommand::Read(AdminRead::Reconcile {
                 sequence: latest.request.id.sequence,
@@ -1373,6 +1507,9 @@ impl ClusterAdmin {
             }
             ControlCommand::Enrollment(command) if command.revoked_invitation().is_some() => {
                 enrollment_revision > command.expected_revision()
+            }
+            ControlCommand::RetireContact(_) => {
+                contact_superseded.ok_or(ClusterAdminError::Corrupt)?
             }
             _ => return Err(ClusterAdminError::Corrupt),
         };
@@ -1774,6 +1911,7 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 fn mutation_command(request: ControlRequest) -> Result<AdminCommand> {
     match &request.command {
         ControlCommand::Membership(_) => Ok(AdminCommand::Membership(Box::new(request))),
+        ControlCommand::RetireContact(_) => Ok(AdminCommand::RetireContact(Box::new(request))),
         ControlCommand::Authority(focal_directory::AuthorityCommand {
             operation: focal_directory::AuthorityOperation::GrantNode { .. },
             ..

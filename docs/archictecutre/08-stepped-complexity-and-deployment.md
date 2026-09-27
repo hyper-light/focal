@@ -101,10 +101,16 @@ cluster intent does not become a last-writer-wins startup option. `explain` name
 value's source. Implemented 2026-09-10 (R9.1, `crates/focal-node/src/config/`): the
 schema check names an unknown key by its full path (`node.shards`) before the typed
 parse; the store's committed policy lives in `POLICY` as `FCLPOL2` with a revision and a
-hash (the original bare pair reads as revision 1, unchanged on disk); a start whose file
-sets a policy field to another value is refused as `CommittedPolicyChange` naming the
-field and directing to plan/apply, while omitted policy fields take the committed values
-and are reported as `committed` at that revision; `deployment explain` prints `requested`
+hash (the original bare pair reads as revision 1, unchanged on disk); config resolution has
+three modes on an initialized store. The pod's own `start` treats the committed policy as
+authoritative: omitted policy fields take the committed values, and a file value that differs
+also yields to it (both reported as `committed` at that revision) — the file only seeds the
+first start, and `deployment apply` may have committed stronger durability than that seed, so a
+restart is never refused for carrying what the fleet already carries (revised 2026-09-13: the
+earlier blanket `CommittedPolicyChange` refusal crash-looped every founder restart after an
+apply from a static configmap). An operator command still refuses a file that sets a policy
+field to another value, naming the field and directing to plan/apply; a policy request
+(plan/explain) keeps the file's values as the request. `deployment explain` prints `requested`
 (the file), `effective` (the committed policy) and `sources` per field
 (`command_line`, `file`, `creation_default`, `committed`). Identity keys, membership epochs, seeds learned from peers, placements,
 and measured scheduling decisions live in managed state, not generated user YAML.
@@ -236,7 +242,19 @@ retention/resource allocation. A new unmeasured deployment uses a documented bou
 bootstrap allocation and labels it unqualified; it cannot claim a measured envelope.
 
 The operator reviews and applies generated assets with its existing Kubernetes tooling.
-Rendering and dry-run do not alter a cluster. Enrollment uses bounded bootstrap tickets
+Rendering and dry-run do not alter a cluster. Every rendered pod's mounted
+configuration is its *first-start seed* — the pod's zone and single-node
+durability (`survive: node, max_failures: 0`), the only first start a lone node
+can satisfy (a founder alone cannot promise zone survival). The *requested*
+policy is rendered beside it in the same ConfigMap as `target.yaml` and mounted
+read-only at `/etc/focal-target/target.yaml`. Once every host pod is Ready, the
+operator commits it once from the founder — `deployment plan --config
+/etc/focal-target/target.yaml --output <plan>` then `deployment apply
+--plan-file <plan>` — and from then on the committed policy carries every
+restart (§2), so the static ConfigMap never has to follow it. This is why a
+pod's ConfigMap holds the seed, not the guarantee: a StatefulSet ConfigMap is
+static, and pinning the guarantee would make the first start unsatisfiable and,
+after an apply, crash-loop every restart on a policy mismatch. Enrollment uses bounded bootstrap tickets
 delivered through the configured secret mechanism; rendered public manifests contain
 secret references, not invitation or private-key values. The renderer emits a separate
 restricted credential-installation action when no secret reference has been supplied.

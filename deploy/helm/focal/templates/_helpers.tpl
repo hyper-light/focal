@@ -1,5 +1,8 @@
 {{/*
-The node configuration a set ships: the requested policy and the set's zone.
+The node configuration a set ships: its first-start seed — the set's zone and
+single-node durability, the only first start a lone node can satisfy. The
+requested policy is "focal.target" (mounted as /etc/focal-target/target.yaml
+for `deployment plan`); the committed policy carries every restart (08 §2).
 */}}
 {{- define "focal.config" -}}
 version: 1
@@ -13,8 +16,23 @@ topology:
 {{- end }}
 {{- end }}
 durability:
-  survive: {{ .root.Values.survive }}
-  max_failures: {{ .root.Values.maxFailures }}
+  survive: node
+  max_failures: 0
+{{- end }}
+
+{{/*
+The requested policy, committed with `deployment plan/apply` once the hosts
+have joined.
+*/}}
+{{- define "focal.target" -}}
+version: 1
+{{- if .Values.region }}
+topology:
+  region: {{ .Values.region | quote }}
+{{- end }}
+durability:
+  survive: {{ .Values.survive }}
+  max_failures: {{ .Values.maxFailures }}
 {{- end }}
 
 {{/*
@@ -157,6 +175,10 @@ spec:
               mountPath: /etc/focal/invitations
               readOnly: true
 {{- end }}
+            - name: target
+              mountPath: /etc/focal-target/target.yaml
+              subPath: target.yaml
+              readOnly: true
       volumes:
         - name: config
           configMap:
@@ -164,6 +186,12 @@ spec:
             items:
               - key: {{ .name }}.yaml
                 path: focal.yaml
+        - name: target
+          configMap:
+            name: focal-config
+            items:
+              - key: target.yaml
+                path: target.yaml
 {{- if not .founder }}
         - name: invitations
           secret:

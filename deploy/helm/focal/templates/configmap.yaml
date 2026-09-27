@@ -26,3 +26,5 @@ data:
 {{ include "focal.config" (dict "root" $ "zone" "") | indent 4 }}
 {{- end }}
 {{- end }}
+  target.yaml: |
+{{ include "focal.target" . | indent 4 }}

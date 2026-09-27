@@ -724,6 +724,9 @@ pub enum AdminResult {
         membership_removed: bool,
         invitation: Option<String>,
         revoked: bool,
+        /// Its committed contact record was retired (24 §19), freeing the
+        /// bounded contact table's slot; false when none remained.
+        contact_retired: bool,
     },
     TransferInitiated {
         target: u64,

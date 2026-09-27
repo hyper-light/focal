@@ -96,6 +96,9 @@ impl Fixture {
                 revisions: replica.revisions(),
                 dropped_replication: 0,
                 stopped: false,
+                snapshot_index: 0,
+                peers: Vec::new(),
+                failure: None,
             },
             _allocation: None,
         });
@@ -117,6 +120,7 @@ impl Fixture {
             progress,
             nonce: 0,
             dropped: 0,
+            failure: None,
         };
         drop(root);
         Self {
@@ -275,4 +279,58 @@ fn control_snapshot_old_term_completion_cannot_release_current_flight_and_frame_
     assert!(budget.stats().used > 0);
     drop(current);
     assert_eq!(budget.stats().used, 0);
+}
+
+/// A stored snapshot carries the configuration at its index; a member admitted
+/// after that snapshot cannot be caught up by it. When a membership change
+/// commits above the snapshot floor the owner must refresh the snapshot to the
+/// current configuration, otherwise a later-joined learner whose `next_index`
+/// reaches the floor wedges (the leader can neither append below the floor nor
+/// install a snapshot whose configuration omits the learner). This proves the
+/// refresh fires on the stale-configuration trigger and lands at or above the
+/// membership change, so the fresh snapshot includes the new member.
+#[test]
+fn maybe_checkpoint_refreshes_a_snapshot_whose_configuration_predates_a_member() {
+    use focal_consensus::MembershipChange;
+    let mut fixture = Fixture::new();
+    // The fixture checkpointed at bootstrap, so a snapshot floor already exists
+    // whose configuration is voters=[1], learners=[2].
+    let floor_before = fixture.owner.replica.snapshot_index();
+    assert!(floor_before > 0, "the bootstrap snapshot exists");
+    // Admit a third node as a learner: the membership change commits above the
+    // floor, so the stored snapshot's configuration can no longer contain every
+    // member.
+    fixture
+        .owner
+        .replica
+        .submit(
+            ControlRequest {
+                id: ControlRequestId {
+                    client: [214; 16],
+                    sequence: 1,
+                },
+                acknowledged_through: 0,
+                command: ControlCommand::Membership(ControlMembershipCommand {
+                    expected_configuration_index: fixture.owner.replica.configuration_index(),
+                    expected: fixture.owner.replica.membership_configuration(),
+                    change: MembershipChange::AddLearner { node: 3 },
+                }),
+            },
+            &NoDirectoryAuthority,
+        )
+        .unwrap();
+    fixture.owner.replica.drain(&NoDirectoryAuthority).unwrap();
+    let configuration_index = fixture.owner.replica.configuration_index();
+    assert!(
+        configuration_index > fixture.owner.replica.snapshot_index(),
+        "the membership change is above the snapshot floor: the snapshot is now stale"
+    );
+    // The owner refreshes the snapshot to the current committed configuration.
+    fixture.owner.maybe_checkpoint().unwrap();
+    assert!(
+        fixture.owner.replica.snapshot_index() >= configuration_index,
+        "maybe_checkpoint refreshed the snapshot to include the membership change \
+         (was {floor_before}, now {})",
+        fixture.owner.replica.snapshot_index()
+    );
 }

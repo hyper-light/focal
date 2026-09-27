@@ -208,6 +208,9 @@ fn owner(
             revisions: replica.revisions(),
             dropped_replication: 0,
             stopped: false,
+            snapshot_index: 0,
+            peers: Vec::new(),
+            failure: None,
         },
         _allocation: None,
     });
@@ -226,6 +229,7 @@ fn owner(
         progress,
         nonce: 0,
         dropped: 0,
+        failure: None,
     }
 }
 

@@ -123,6 +123,10 @@ spec:
             - name: invitations
               mountPath: /etc/focal/invitations
               readOnly: true
+            - name: target
+              mountPath: /etc/focal-target/target.yaml
+              subPath: target.yaml
+              readOnly: true
       volumes:
         - name: config
           configMap:
@@ -130,6 +134,12 @@ spec:
             items:
               - key: focal-b.yaml
                 path: focal.yaml
+        - name: target
+          configMap:
+            name: focal-config
+            items:
+              - key: target.yaml
+                path: target.yaml
         - name: invitations
           secret:
             secretName: focal-invitations

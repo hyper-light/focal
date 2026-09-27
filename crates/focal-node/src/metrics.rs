@@ -36,6 +36,11 @@ pub struct RootMetrics {
     pub term: u64,
     pub applied_index: u64,
     pub stopped: bool,
+    /// The metadata compaction floor; `applied_index - snapshot_index` is the
+    /// retained root log length.
+    pub snapshot_index: u64,
+    /// Per-peer replication progress this node tracks as the root leader.
+    pub peers: Vec<focal_consensus::PeerProgress>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PeerRtt {
@@ -310,10 +315,77 @@ impl MetricsSnapshot {
             self.root.applied_index,
         );
         text.gauge(
+            "focal_root_snapshot_index",
+            "The root log compaction floor; applied minus this is the retained log length.",
+            self.root.snapshot_index,
+        );
+        text.gauge(
             "focal_root_stopped",
             "Whether the root replica stopped.",
             u8::from(self.root.stopped),
         );
+        if !self.root.peers.is_empty() {
+            text.header(
+                "focal_root_peer_matched",
+                "gauge",
+                "Highest log index the root leader knows this peer has stored.",
+            );
+            for peer in &self.root.peers {
+                text.labeled(
+                    "focal_root_peer_matched",
+                    &[("peer", &peer.node.to_string())],
+                    peer.matched,
+                );
+            }
+            text.header(
+                "focal_root_peer_next_index",
+                "gauge",
+                "The next log index the root leader will send this peer.",
+            );
+            for peer in &self.root.peers {
+                text.labeled(
+                    "focal_root_peer_next_index",
+                    &[("peer", &peer.node.to_string())],
+                    peer.next_index,
+                );
+            }
+            text.header(
+                "focal_root_peer_state",
+                "gauge",
+                "Replication state for this peer (0 probe, 1 replicate, 2 snapshot).",
+            );
+            for peer in &self.root.peers {
+                text.labeled(
+                    "focal_root_peer_state",
+                    &[("peer", &peer.node.to_string())],
+                    u64::from(peer.state),
+                );
+            }
+            text.header(
+                "focal_root_peer_recent_active",
+                "gauge",
+                "Whether the root leader has heard from this peer within the last check.",
+            );
+            for peer in &self.root.peers {
+                text.labeled(
+                    "focal_root_peer_recent_active",
+                    &[("peer", &peer.node.to_string())],
+                    u64::from(peer.recent_active),
+                );
+            }
+            text.header(
+                "focal_root_peer_pending_snapshot",
+                "gauge",
+                "Snapshot index in flight to this peer, or zero.",
+            );
+            for peer in &self.root.peers {
+                text.labeled(
+                    "focal_root_peer_pending_snapshot",
+                    &[("peer", &peer.node.to_string())],
+                    peer.pending_snapshot,
+                );
+            }
+        }
         text.counter(
             "focal_peer_messages_delivered_total",
             "Peer requests answered.",
@@ -328,6 +400,11 @@ impl MetricsSnapshot {
             "focal_peer_messages_busy_total",
             "Peer requests refused at the pool's bound.",
             self.peers.busy,
+        );
+        text.counter(
+            "focal_peer_dials_total",
+            "Peer dials attempted; those beyond connections opened failed, and a peer in its unreachable cooldown is not dialed.",
+            self.peers.dials,
         );
         text.counter(
             "focal_peer_connections_opened_total",
@@ -739,6 +816,7 @@ mod tests {
                 delivered: 4,
                 lost: 0,
                 busy: 0,
+                dials: 1,
                 connections_opened: 1,
                 cached_connections: 1,
                 inflight: 0,

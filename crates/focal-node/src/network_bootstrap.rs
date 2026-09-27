@@ -250,8 +250,15 @@ impl FoundingNetwork {
                 bootstrap: bootstrap.clone(),
             },
         };
+        // A restart may resolve a new listen/advertise address (a rescheduled
+        // pod, a fresh DHCP lease, a moved VM): peers reach the founder by its
+        // pinned endpoint name, not this transient snapshot. `install` accepts a
+        // saved state whose identity (node, sponsor trust, genesis) is unchanged
+        // and rewrites only the transport addresses; a real identity change is
+        // still refused. A strict equality here would corrupt-fail every
+        // restart that resolved a new address.
         if saved.as_ref().is_some_and(|saved| saved != &state) {
-            return Err(NodeError::Identity.into());
+            state.install(&directory)?;
         }
         state.validate(identity)?;
         let wal = SharedWal::open_with_budgets(

@@ -637,11 +637,17 @@ fn descriptor_limits_with_cohort(
     ] {
         within(required, entry)?;
     }
-    let available = available.min(
-        entry
-            .checked_sub(OwnedArtifact::container_charge())
-            .ok_or(NativeError::Capacity("artifact entry charge"))?,
-    );
+    let available = available
+        .min(
+            entry
+                .checked_sub(OwnedArtifact::container_charge())
+                .ok_or(NativeError::Capacity("artifact entry charge"))?,
+        )
+        // Decouple the per-respondent completion promise from preparation_bytes:
+        // the owner guarantees only a bounded inline report/diagnostic here, so
+        // one node holds many concurrent respondents. Larger artifact content
+        // rides the content store as a Payload::Content pointer (doc 18 §6.7).
+        .min(limits.report_descriptor_bytes);
     // Binary search is bounded by usize width and allocates no buffer. Checking
     // overflow is equivalent to refusing an unrepresentable candidate charge.
     let mut low = 0usize;

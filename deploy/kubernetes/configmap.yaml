@@ -13,21 +13,28 @@ data:
       region: "eu-a"
       zone: "a"
     durability:
-      survive: zone
-      max_failures: 1
+      survive: node
+      max_failures: 0
   focal-b.yaml: |
     version: 1
     topology:
       region: "eu-a"
       zone: "b"
     durability:
-      survive: zone
-      max_failures: 1
+      survive: node
+      max_failures: 0
   focal-c.yaml: |
     version: 1
     topology:
       region: "eu-a"
       zone: "c"
+    durability:
+      survive: node
+      max_failures: 0
+  target.yaml: |
+    version: 1
+    topology:
+      region: "eu-a"
     durability:
       survive: zone
       max_failures: 1
