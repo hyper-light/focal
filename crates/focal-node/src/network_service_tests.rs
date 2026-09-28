@@ -998,3 +998,54 @@ async fn a_host_stays_alive_and_its_readiness_stays_bounded_while_the_root_leade
     );
     host.stop().await;
 }
+
+/// A joined host measures its path to the root's voter and derives its tick
+/// period from it (27 §3.1 P2): on a loopback the measurement is recorded
+/// and the period stays the configured one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joined_host_measures_its_voter_path_and_keeps_the_configured_period_on_a_loopback() {
+    let founder_dir = tempfile::tempdir().unwrap();
+    let host_dir = tempfile::tempdir().unwrap();
+    let founder_settings = settings(founder_dir.path());
+    let founder = Running::start(&founder_settings).await;
+    let founder_node = founder.status.node;
+    let host_settings = settings(host_dir.path());
+    let (host, _) = crate::placement_agent::tests::join_peer(
+        &founder,
+        founder_dir.path(),
+        "host-a",
+        &host_settings,
+    )
+    .await;
+    let configured = host.handles.control.tick_period();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let pace = loop {
+        let pace = host.handles.control.current_pace();
+        if pace.samples > 0 {
+            break pace;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the host never measured its path to the root voter"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert!(pace.broadcast_tail_ns > 0);
+    // The period in force is the derivation of what was measured: ten tails
+    // per election timeout of ten ticks is one tail per tick, never under
+    // the configured period nor over the ceiling. On a quiet loopback that
+    // is the configured period itself.
+    let ceiling = Duration::from_secs(2);
+    assert_eq!(
+        pace.period,
+        Duration::from_nanos(pace.broadcast_tail_ns).clamp(configured, ceiling),
+        "{pace:?}"
+    );
+    assert_eq!(host.handles.control.progress().leader, founder_node);
+    // The founder is the root's only voter: it has no voter path to measure.
+    let own = founder.handles.control.current_pace();
+    assert_eq!(own.samples, 0);
+    assert_eq!(own.period, configured);
+    host.stop().await;
+    founder.stop().await;
+}

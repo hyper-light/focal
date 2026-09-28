@@ -21,6 +21,19 @@
 //! own thread is starved ticks late and waits longer instead of campaigning
 //! on its own slowness.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::panic,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::disallowed_macros
+    )
+)]
+
 use std::time::Duration;
 
 /// Raft's order-of-magnitude ratio of election timeout to broadcast time.

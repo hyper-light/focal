@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 focal-log = { version = "0.1.0", path = "../focal-log" }
 focal-memory = { version = "0.1.0", path = "../focal-memory" }
+focal-timing = { version = "0.1.0", path = "../focal-timing" }
 postcard.workspace = true
 raft.workspace = true
 serde.workspace = true

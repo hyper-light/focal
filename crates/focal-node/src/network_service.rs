@@ -1106,6 +1106,7 @@ impl NetworkService {
             Err(_) => (None, 0, 0),
         };
         let root = self.handles.control.progress();
+        let pace = self.handles.control.current_pace();
         let view = self.handles.liveness.view();
         let mut liveness = LivenessMetrics {
             health_score: view.health.score,
@@ -1260,6 +1261,9 @@ impl NetworkService {
                 applied_index: root.applied_index,
                 stopped: root.stopped,
                 snapshot_index: root.snapshot_index,
+                tick_period_ms: u64::try_from(pace.period.as_millis()).unwrap_or(u64::MAX),
+                broadcast_tail_us: pace.broadcast_tail_ns / 1_000,
+                pace_samples: pace.samples,
                 peers: root.peers.clone(),
             },
             peers: self.pool.stats(),
@@ -1497,6 +1501,28 @@ impl NetworkService {
                 tokio::time::sleep(crate::metrics::SAMPLE_INTERVAL).await;
             }
         };
+        // The root group's tick period follows the round trips this node
+        // measures to the group's other voters (27 §3.1 P2). A group inside
+        // one period keeps the configured period; a far one is stretched so
+        // its election timeout stays ten round-trip tails of its slowest
+        // voter. While the root cannot be observed the last pace stands.
+        let pacer = async {
+            loop {
+                if let Ok(observation) = self.handles.control.observe_root().await {
+                    let local = self.status.node;
+                    let paths: Vec<focal_timing::PathRtt> = observation
+                        .configuration()
+                        .configuration
+                        .voters
+                        .iter()
+                        .filter(|voter| **voter != local)
+                        .filter_map(|voter| self.pool.path(*voter))
+                        .collect();
+                    self.handles.control.pace(paths.iter());
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        };
         let metrics_view = self.metrics.subscribe();
         let metrics_endpoint = async {
             match metrics_listener {
@@ -1562,7 +1588,8 @@ impl NetworkService {
             ready,
             shutdown,
             metrics_sampler,
-            metrics_endpoint
+            metrics_endpoint,
+            pacer
         );
         tokio::select! {
             result=&mut shutdown=>result.map_err(ServiceError::Io),
@@ -1583,6 +1610,7 @@ impl NetworkService {
             _=&mut evidence_driver=>Err(ServiceError::Owner("evidence driver ended")),
             _=&mut signer_driver=>Err(ServiceError::Owner("enrollment driver ended")),
             ()=&mut metrics_sampler=>Err(ServiceError::Owner("metrics sampler ended")),
+            ()=&mut pacer=>Err(ServiceError::Owner("pace driver ended")),
             result=&mut metrics_endpoint=>result.map_err(ServiceError::Io).and(Err(ServiceError::Owner("metrics endpoint ended"))),
             _=self.handles.control.closed()=>Err(match self.handles.control.progress().failure {
                 Some(failure) => ServiceError::ControlOwner(failure),

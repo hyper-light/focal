@@ -10511,3 +10511,33 @@ estimator per voter path, and `TickPace::derive`, which stretches the owner's ti
 period until the election timeout is at least ten round-trip tails of the slowest voter.
 A loopback or LAN group keeps its configured period. Eight tests, including regional
 (80 ms ± 20 ms one way) and geographic (500 ms ± 100 ms) profiles.
+
+### 2026-09-27 — CI on `03524ee`, the dependency audit, and the root group's pace
+
+CI run 36358522629 on commit `03524ee`: `check (ubuntu-24.04)`, `check (macos-15)`
+and the Windows build passed, the macOS job including the test that had failed on
+every earlier run. The `dependencies` job failed on RUSTSEC-2026-0285 against rustls
+0.23.43 (TLS 1.3 handshake messages accepted across encryption levels), published
+after the previous run. rustls is 0.23.45 in `Cargo.lock` and in
+`docs/dependencies/inventory.tsv`; `cargo deny check advisories bans licenses sources`
+passes locally.
+
+The root group's owner now ticks at a derived pace (doc
+[27](27-consensus-roadmap-and-slates-port.md) §3.1 P2). `focal-timing` holds the
+estimator and the derivation; the peer pool keeps one `PathRtt` per routed peer, fed
+only by replication messages and probes the peer answered on an open connection (a
+control request waits on a quorum commit, which is the group's latency and not the
+path's); the service derives the period each second from the paths to the root's other
+voters (`ControlHost::pace`), and the owner clamps it between its configured period
+and `tick_ceiling` (2 s). Metrics `focal_root_tick_period_milliseconds`,
+`focal_root_broadcast_tail_microseconds`, `focal_root_pace_samples`. Session groups do
+not use the derived pace yet.
+
+Local gates on this tree (macOS arm64): audit, fmt, contracts (1457 links), production
+lints and clippy `-D warnings` passed, and the release build finished. The workspace
+test, run with `--no-fail-fast` while another project's test suite was running on the
+same machine, had one failure:
+`fleet_quic::managed::managed_mtls_support_domain_cursor_retirement_quorum_and_disk_recovery`
+at the assertion that a retired mutation is refused as `ManagedRetired`. It then passed
+8 times in isolation and 37 times under 12 and 40 CPU-bound processes. The cause is
+not established; the assertion now prints the response it received.

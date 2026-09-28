@@ -39,6 +39,7 @@ fn queued_host(budget: MemoryBudget) -> (ControlHost, mpsc::Receiver<Work>) {
             config: ControlHostConfig::new(namespace),
             limits: ControlHost::wire_limits(),
             budget,
+            pace: Default::default(),
         },
         receiver,
     )

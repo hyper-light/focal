@@ -83,6 +83,8 @@ impl ControlHost {
             },
             _allocation: Some(allocation),
         });
+        let pace = crate::control_host::TickPeriod::default();
+        let owner_pace = pace.clone();
         let host = Self {
             sender,
             peers,
@@ -90,6 +92,7 @@ impl ControlHost {
             config: config.clone(),
             limits: limits.clone(),
             budget: budget.clone(),
+            pace,
         };
         let thread = std::thread::Builder::new()
             .name(format!("focal-directory-{}", plan.founder_node()))
@@ -114,6 +117,7 @@ impl ControlHost {
                             nonce: 0,
                             dropped: 0,
                             failure: None,
+                            pace: owner_pace,
                         };
                         owner.run(receiver, incoming);
                         Ok(())

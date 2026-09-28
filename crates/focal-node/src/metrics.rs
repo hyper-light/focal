@@ -41,6 +41,12 @@ pub struct RootMetrics {
     pub snapshot_index: u64,
     /// Per-peer replication progress this node tracks as the root leader.
     pub peers: Vec<focal_consensus::PeerProgress>,
+    /// The root owner's tick period in force, in milliseconds (27 §3.1 P2).
+    pub tick_period_ms: u64,
+    /// The slowest measured voter path's round-trip tail, in microseconds.
+    pub broadcast_tail_us: u64,
+    /// Round trips that fed the pace; zero means the configured period.
+    pub pace_samples: u64,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PeerRtt {
@@ -318,6 +324,21 @@ impl MetricsSnapshot {
             "focal_root_snapshot_index",
             "The root log compaction floor; applied minus this is the retained log length.",
             self.root.snapshot_index,
+        );
+        text.gauge(
+            "focal_root_tick_period_milliseconds",
+            "The root owner's tick period in force; stretched for a far group.",
+            self.root.tick_period_ms,
+        );
+        text.gauge(
+            "focal_root_broadcast_tail_microseconds",
+            "The slowest measured root voter path's round-trip tail.",
+            self.root.broadcast_tail_us,
+        );
+        text.gauge(
+            "focal_root_pace_samples",
+            "Round trips that fed the root pace; zero means the configured period.",
+            self.root.pace_samples,
         );
         text.gauge(
             "focal_root_stopped",

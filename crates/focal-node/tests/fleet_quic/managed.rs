@@ -299,10 +299,14 @@ async fn managed_mtls_support_domain_cursor_retirement_quorum_and_disk_recovery(
     let Response::RequestStreamControlled(acknowledged) = exchange(&fleet, next, &ack).await else {
         panic!("acknowledgment")
     };
-    assert!(matches!(
-        exchange(&fleet, next, &mutation).await,
-        Response::Error(AccessError::ManagedRetired { through: 2 })
-    ));
+    let retired = exchange(&fleet, next, &mutation).await;
+    assert!(
+        matches!(
+            retired,
+            Response::Error(AccessError::ManagedRetired { through: 2 })
+        ),
+        "{retired:?}"
+    );
     let Response::RequestStreamRead(retired) = exchange(&fleet, next, &lookup).await else {
         panic!("retiredread")
     };

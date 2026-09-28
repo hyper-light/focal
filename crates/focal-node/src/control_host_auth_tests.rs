@@ -198,6 +198,7 @@ async fn root_read_rechecks_enrollment_when_its_quorum_barrier_completes() {
         nonce: 0,
         dropped: 0,
         failure: None,
+        pace: Default::default(),
     };
     let charge = owner
         .budget

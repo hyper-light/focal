@@ -210,6 +210,10 @@ impl ControlReplica {
     /// The Raft index of the most recent committed membership change. A stored
     /// snapshot older than this carries a configuration that excludes members
     /// added since, so it cannot catch such a member up.
+    /// Ticks without leader contact before this replica campaigns.
+    pub fn election_tick(&self) -> usize {
+        self.node.election_tick()
+    }
     pub fn configuration_index(&self) -> u64 {
         self.configuration_index
     }

@@ -926,8 +926,20 @@ async fn peer_pool_caches_connections_reconnects_identical_packets_and_fences_ro
         group: [2; 16],
         message: vec![7, 8, 9],
     };
+    assert_eq!(pool.path(3), None, "an unrouted peer has no path");
+    assert_eq!(
+        pool.path(2).unwrap().samples(),
+        0,
+        "a routed peer that answered nothing has no sample"
+    );
     pool.send(2, &packet).await.unwrap();
     pool.send(2, &packet).await.unwrap();
+    // Each answered exchange is one sample; the refused first attempt and
+    // the dial are not.
+    let path = pool.path(2).unwrap();
+    assert_eq!(path.samples(), 2);
+    assert!(path.tail_ns().unwrap() >= path.smoothed_ns());
+    assert!(path.smoothed_ns() > 0 && path.smoothed_ns() < 1_000_000_000);
     {
         let recorded = seen.lock().unwrap();
         assert_eq!(recorded.len(), 3);

@@ -24,6 +24,10 @@ pub struct ControlHostConfig {
     pub pending_requests: usize,
     pub replication_queue: usize,
     pub tick: Duration,
+    /// The longest the tick period is stretched for a far group (27 §3.1
+    /// P2). It bounds how long a dead leader goes unnoticed: the election
+    /// timeout is at most the election ticks times this.
+    pub tick_ceiling: Duration,
     pub request_timeout: Duration,
     /// Compact the metadata log once this many entries have been applied past
     /// the last snapshot. Bounds the log in steady state and lets a lagging
@@ -42,6 +46,7 @@ impl ControlHostConfig {
             pending_requests: 64,
             replication_queue: 128,
             tick: Duration::from_millis(100),
+            tick_ceiling: Duration::from_secs(2),
             request_timeout: Duration::from_secs(5),
             checkpoint_interval: 1024,
             enrollment_authority: None,
@@ -56,6 +61,8 @@ impl ControlHostConfig {
             || self.checkpoint_interval == 0
             || !(1..=1024).contains(&self.replication_queue)
             || !(Duration::from_millis(10)..=Duration::from_secs(1)).contains(&self.tick)
+            || self.tick_ceiling < self.tick
+            || self.tick_ceiling > Duration::from_secs(10)
             || self.request_timeout.is_zero()
             || self.request_timeout > Duration::from_secs(60)
         {
@@ -209,8 +216,48 @@ pub struct ControlHost {
     config: ControlHostConfig,
     limits: WireLimits,
     budget: MemoryBudget,
+    pub(crate) pace: TickPeriod,
 }
 pub struct ControlOwner(JoinHandle<()>);
+
+/// The owner's tick period, shared between the owner thread and whoever
+/// derives it from measured round trips (27 §3.1 P2). Zero means "as
+/// configured". The owner reads it once per tick and clamps it between its
+/// configured period and its ceiling, so no value written here can make it
+/// tick faster than configured or slower than its ceiling.
+#[derive(Clone, Default)]
+pub(crate) struct TickPeriod(std::sync::Arc<TickShared>);
+#[derive(Default)]
+struct TickShared {
+    period_ns: std::sync::atomic::AtomicU64,
+    election_tick: std::sync::atomic::AtomicUsize,
+    /// The last derivation as one value, for observers.
+    derived: std::sync::Mutex<Option<focal_timing::TickPace>>,
+}
+impl TickPeriod {
+    fn set(&self, period: Duration) {
+        self.0.period_ns.store(
+            u64::try_from(period.as_nanos()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    fn get(&self, config: &ControlHostConfig) -> Duration {
+        Duration::from_nanos(self.0.period_ns.load(std::sync::atomic::Ordering::Relaxed))
+            .clamp(config.tick, config.tick_ceiling.max(config.tick))
+    }
+    /// The owner states its replica's election ticks once it has opened it.
+    fn announce(&self, election_tick: usize) {
+        self.0
+            .election_tick
+            .store(election_tick, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// Zero until the owner has opened its replica.
+    fn election_tick(&self) -> usize {
+        self.0
+            .election_tick
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
 
 /// One durable local prefix for transport reconstruction. This observation
 /// grants neither a current quorum read nor permission to change membership.
@@ -285,6 +332,7 @@ struct Owner<V> {
     nonce: u64,
     dropped: u64,
     failure: Option<String>,
+    pub(crate) pace: TickPeriod,
 }
 impl ControlHost {
     /// Validate a durable session-owner witness against this control owner's
@@ -521,6 +569,7 @@ impl ControlHost {
         let (peers, incoming) = mpsc::sync_channel(config.replication_queue);
         let (outbound, outgoing) = async_mpsc::channel(config.replication_queue);
         let status = replica.status();
+        let pace = TickPeriod::default();
         let (progress, changes) = watch::channel(ControlProgressState {
             value: ControlProgress {
                 identity: replica.identity(),
@@ -553,6 +602,7 @@ impl ControlHost {
             nonce: 0,
             dropped: 0,
             failure: None,
+            pace: pace.clone(),
         };
         let thread = std::thread::Builder::new()
             .name(format!("focal-control-{}", status.node_id))
@@ -563,6 +613,7 @@ impl ControlHost {
                 sender,
                 peers,
                 progress: changes,
+                pace,
                 config,
                 limits,
                 budget,
@@ -570,6 +621,43 @@ impl ControlHost {
             ControlOwner(thread),
             outgoing,
         ))
+    }
+    /// Derive this owner's tick period from the measured paths to the
+    /// group's other voters (27 §3.1 P2) and put it in force from the next
+    /// tick. A group whose paths all sit inside the configured period keeps
+    /// the configured period.
+    pub fn pace<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a focal_timing::PathRtt>,
+    ) -> focal_timing::TickPace {
+        let pace = focal_timing::TickPace::derive(
+            self.config.tick,
+            self.config.tick_ceiling,
+            // Before the owner has opened its replica the count is unknown;
+            // one tick is the conservative reading (the longest period).
+            self.pace.election_tick().max(1),
+            paths,
+        );
+        self.pace.set(pace.period);
+        if let Ok(mut derived) = self.pace.0.derived.lock() {
+            *derived = Some(pace);
+        }
+        pace
+    }
+    /// The tick period in force.
+    pub fn tick_period(&self) -> Duration {
+        self.pace.get(&self.config)
+    }
+    /// The pace in force: the last derivation, or the configured period
+    /// with no samples before any.
+    pub fn current_pace(&self) -> focal_timing::TickPace {
+        self.pace
+            .0
+            .derived
+            .lock()
+            .ok()
+            .and_then(|derived| *derived)
+            .unwrap_or_else(|| focal_timing::TickPace::floor(self.config.tick))
     }
     pub fn progress(&self) -> ControlProgress {
         self.progress.borrow().value.clone()
@@ -726,10 +814,11 @@ impl RequestHandler for ControlHost {
 }
 impl<V: AuthorityVerifier> Owner<V> {
     fn run(mut self, receiver: mpsc::Receiver<Work>, peers: mpsc::Receiver<Work>) {
+        self.pace.announce(self.replica.election_tick());
         let result = catch_unwind(AssertUnwindSafe(|| -> Result<(), ControlError> {
             self.drain()?;
             let mut next_tick = Instant::now()
-                .checked_add(self.config.tick)
+                .checked_add(self.pace.get(&self.config))
                 .ok_or(ControlError::Capacity)?;
             loop {
                 for _ in 0..8 {
@@ -745,7 +834,7 @@ impl<V: AuthorityVerifier> Owner<V> {
                     self.drain()?;
                     self.maybe_checkpoint()?;
                     next_tick = Instant::now()
-                        .checked_add(self.config.tick)
+                        .checked_add(self.pace.get(&self.config))
                         .ok_or(ControlError::Capacity)?;
                 }
                 // Peer ingress has its own reserved queue. The short idle wait

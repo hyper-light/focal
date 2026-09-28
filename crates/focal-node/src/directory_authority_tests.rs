@@ -230,6 +230,7 @@ fn owner(
         nonce: 0,
         dropped: 0,
         failure: None,
+        pace: Default::default(),
     }
 }
 

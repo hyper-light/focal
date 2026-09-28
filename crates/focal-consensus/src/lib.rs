@@ -24,7 +24,8 @@ mod checkpoint;
 mod decoder;
 mod persistence;
 mod storage;
-pub mod timing;
+/// A group's timing, derived from the round trips it measures (27 §3.1 P2).
+pub use focal_timing as timing;
 
 use focal_log::{LogError, LogicalLogId, Record, RecordKind, WalIdentity, WalLease, WalOptions};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, DiskBudget, MemoryBudget};
@@ -697,6 +698,10 @@ impl DurableNode {
         self.priority = priority;
         self.apply_priority();
         Ok(())
+    }
+    /// Ticks without leader contact before this node campaigns.
+    pub fn election_tick(&self) -> usize {
+        self.config.election_tick
     }
     /// The priority this node was given; in force once it has a term.
     pub fn priority(&self) -> i64 {

@@ -121,6 +121,7 @@ impl Fixture {
             nonce: 0,
             dropped: 0,
             failure: None,
+            pace: Default::default(),
         };
         drop(root);
         Self {
@@ -333,4 +334,35 @@ fn maybe_checkpoint_refreshes_a_snapshot_whose_configuration_predates_a_member()
          (was {floor_before}, now {})",
         fixture.owner.replica.snapshot_index()
     );
+}
+
+/// The owner's tick period is never shorter than configured nor longer than
+/// its ceiling, whatever is derived for it (27 §3.1 P2).
+#[test]
+fn the_tick_period_is_clamped_between_the_configured_period_and_its_ceiling() {
+    let config = ControlHostConfig::new(LedgerId {
+        tenant: focal_model::TenantId([1; 16]),
+        session: focal_model::SessionId([2; 16]),
+    });
+    let pace = TickPeriod::default();
+    assert_eq!(pace.get(&config), config.tick, "unset is as configured");
+    assert_eq!(pace.election_tick(), 0, "unknown until the owner opens");
+    pace.announce(10);
+    assert_eq!(pace.election_tick(), 10);
+    pace.set(Duration::from_millis(1));
+    assert_eq!(pace.get(&config), config.tick);
+    pace.set(Duration::from_millis(750));
+    assert_eq!(pace.get(&config), Duration::from_millis(750));
+    pace.set(Duration::from_secs(3600));
+    assert_eq!(pace.get(&config), config.tick_ceiling);
+    // A shared handle sees what the other wrote.
+    let shared = pace.clone();
+    shared.set(Duration::from_millis(300));
+    assert_eq!(pace.get(&config), Duration::from_millis(300));
+    // A ceiling under the period, or past ten seconds, is not a configuration.
+    let mut bad = config.clone();
+    bad.tick_ceiling = Duration::from_millis(50);
+    assert!(bad.validate().is_err());
+    bad.tick_ceiling = Duration::from_secs(11);
+    assert!(bad.validate().is_err());
 }

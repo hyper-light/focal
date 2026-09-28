@@ -24,6 +24,7 @@ Create crates at the work package that first needs them. Do not scaffold empty a
 | `focal-ledger` | Composition of session sequencer, materializer, monitors, publication | `session.rs`, `sequencer.rs`, `materializer.rs`, `publication.rs`, `monitor.rs` | model, core, memory, consensus |
 | `focal-evidence` | Chunk ingest, content verification, custody, validator contracts and optional participant-side evaluation helpers | `chunks.rs`, `manifest.rs`, `registry.rs`, `dispatch.rs`, `verdict.rs` | model; ledger client seam only |
 | `focal-stream` | Subscription cursor, projection seed, credits, bounded replay/fanout | `cursor.rs`, `subscription.rs`, `seed.rs`, `fanout.rs` | model, ledger read seam |
+| `focal-timing` | Round-trip estimation per path (RFC 9002) and the tick pace a group derives from it; pure, no dependencies | `lib.rs` | none |
 | `focal-wire` | Canonical domain codec and bounded network envelopes | `canonical.rs`, `frame.rs`, `version.rs`, `message.rs` | model |
 | `focal-client` | In-process/network adapters, typed authored operations, human DTO conversion, routing, durable retry and query token propagation | `client.rs`, `operations/`, `input/`, `pending/`, `query/`, transport adapters | model, wire |
 | `focal-native-client` | Native document-to-frame compiler, ledger-binding resolution, `FCNINPUT` frame encoder and owner-side intent fingerprint for the CLI and MCP hosts (decision F17); the `n1:` operation journal itself lives in `focal-client` | `compile.rs`, `resolve.rs`, `frame.rs` | model, memory, core, evidence, wire, client |

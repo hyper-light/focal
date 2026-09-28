@@ -209,6 +209,9 @@ struct State {
     revision: u64,
     routes: BTreeMap<u64, PeerEndpoint>,
     cached: BTreeMap<u64, CacheEntry>,
+    /// The measured path to each routed peer (27 §3.1 P2): one estimator per
+    /// peer, kept across reconnects and dropped with the peer's route.
+    paths: BTreeMap<u64, focal_timing::PathRtt>,
     clock: u64,
     closed: bool,
 }
@@ -242,6 +245,7 @@ impl PeerConnectionPool {
                 revision: 0,
                 routes: BTreeMap::new(),
                 cached: BTreeMap::new(),
+                paths: BTreeMap::new(),
                 clock: 0,
                 closed: false,
             }),
@@ -289,9 +293,34 @@ impl PeerConnectionPool {
                 false
             }
         });
+        state.paths.retain(|id, _| routes.contains_key(id));
         state.revision = revision;
         state.routes = routes;
         Ok(())
+    }
+    /// The measured path to `target`: round trips of exchanges it answered
+    /// on an open connection. `None` for a peer with no route; a routed peer
+    /// that has answered nothing yet has a path with no sample.
+    pub fn path(&self, target: u64) -> Option<focal_timing::PathRtt> {
+        let state = self.state.lock().ok()?;
+        state
+            .routes
+            .contains_key(&target)
+            .then(|| state.paths.get(&target).copied().unwrap_or_default())
+    }
+    /// Karn's rule: only an exchange the peer answered is a sample, timed on
+    /// a connection already open, so neither a dial nor a lost request
+    /// enters the estimate.
+    fn observe(&self, target: u64, round_trip: Duration) {
+        if let Ok(mut state) = self.state.lock()
+            && state.routes.contains_key(&target)
+        {
+            state
+                .paths
+                .entry(target)
+                .or_default()
+                .on_sample(u64::try_from(round_trip.as_nanos()).unwrap_or(u64::MAX));
+        }
     }
     /// Present a renewed credential on every connection opened from now on.
     /// Cached connections under the previous certificate are retired, so the
@@ -597,6 +626,7 @@ impl PeerConnectionPool {
                         continue;
                     }
                 };
+                let sent = std::time::Instant::now();
                 match remote.request(request).await {
                     Ok(response) => match response.result {
                         value @ (Response::PeerAccepted
@@ -606,6 +636,16 @@ impl PeerConnectionPool {
                         | Response::Probe(_)) => {
                             if slot.retired.load(Ordering::Acquire) {
                                 return Err(PeerSendError::RouteChanged);
+                            }
+                            // Broadcast time is a replication message
+                            // or a probe answered by the peer alone. A
+                            // control request waits on a quorum commit,
+                            // which is the group's latency, not the path's.
+                            if matches!(
+                                request.operation,
+                                Operation::Raft { .. } | Operation::Probe { .. }
+                            ) {
+                                self.observe(target, sent.elapsed());
                             }
                             return Ok(value);
                         }
