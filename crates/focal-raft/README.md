@@ -11,6 +11,11 @@ ReadIndex and snapshots. It keeps the log and speaks the messages of `raft-rs` 0
 (`raft-proto`), which focal's groups ran on before. What it decides differently, and
 why, is in [27 §4.5](../../docs/archictecutre/27-consensus-roadmap-and-slates-port.md).
 
+A group may have the fast track (`Config::fast`, `fast.rs`, `track.rs`; 27 §4.6): a
+member that does not lead proposes to every voter at once (`RawNode::propose_fast`),
+and its entry is committed when three quarters of the voters hold it, or a majority
+holds it from the leader, whichever is first.
+
 ## Rules
 
 - Nothing unwinds. `Error` says whether an operation was refused and changed nothing,
@@ -26,6 +31,8 @@ why, is in [27 §4.5](../../docs/archictecutre/27-consensus-roadmap-and-slates-p
 | `src/**` | the log, quorums, configurations, progress, reads; what the core refuses and the bounds it keeps |
 | `tests/differential.rs` | this core and `raft-rs` on one schedule, compared after every step |
 | `tests/group.rs` | groups of this core, and of both cores together, under schedules: safe whatever the schedule, and settled once the network is whole; the decisions of 27 §4.5 |
+| `tests/fast.rs` | the fast track: committed by the fast quorum, taken again by the leader that follows, and groups that propose by it under schedules |
+| `docs/models/FastTrack.tla` | the fast track's model, checked by `scripts/check-model.sh` |
 | `benches/replicate.rs` | what replication costs with either core |
 
 `FOCAL_RAFT_SEEDS`, `FOCAL_RAFT_STEPS` and `FOCAL_RAFT_SEED` set how many schedules

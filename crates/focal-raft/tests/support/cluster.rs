@@ -16,9 +16,15 @@ const NETWORK: usize = 2048;
 
 #[derive(Clone, Debug)]
 pub enum Op {
-    Deliver { at: usize, keep: bool, lose: bool },
+    Deliver {
+        at: usize,
+        keep: bool,
+        lose: bool,
+    },
     Tick(u64),
     Propose(u64, Vec<u8>),
+    /// By the fast track.
+    Fast(u64, Vec<u8>),
     Change(u64, ConfChangeV2),
     Transfer(u64, u64),
     Read(u64, Vec<u8>),
@@ -51,6 +57,8 @@ pub struct Mix {
     pub compaction: bool,
     pub partitions: bool,
     pub priorities: bool,
+    /// Of a hundred proposals, how many go by the fast track.
+    pub fast: u64,
     pub lose: u64,
     pub repeat: u64,
 }
@@ -63,6 +71,7 @@ impl Mix {
             compaction: true,
             partitions: true,
             priorities: true,
+            fast: 0,
             lose: 8,
             repeat: 5,
         }
@@ -161,11 +170,17 @@ impl<R: Replica> Cluster<R> {
         let output = node.drain();
         let view = node.view();
         for committed in &output.committed {
+            // What an entry states, and not the term it bears: by the fast
+            // track the leader that took an entry and the leader that took
+            // it again at its election each gave it its own.
+            let stated = |said: &Said| (said.0, said.2, said.3.clone());
             match self.chosen.get(&committed.0) {
                 Some(chosen) => assert_eq!(
-                    chosen, committed,
+                    stated(chosen),
+                    stated(committed),
                     "seed {}: member {member} committed another entry at {}",
-                    self.seed, committed.0
+                    self.seed,
+                    committed.0
                 ),
                 None => {
                     self.chosen.insert(committed.0, committed.clone());
@@ -233,6 +248,12 @@ impl<R: Replica> Cluster<R> {
             }
             Op::Propose(id, data) => {
                 let accepted = self.node(*id).map(|node| node.propose(data.clone()));
+                reports.push(self.report(*id, accepted));
+            }
+            Op::Fast(id, data) => {
+                let accepted = self
+                    .node(*id)
+                    .map(|node| node.propose_fast(data.clone()).is_some());
                 reports.push(self.report(*id, accepted));
             }
             Op::Change(id, change) => {
@@ -390,6 +411,11 @@ impl<R: Replica> Cluster<R> {
                 75..=84 if !up.is_empty() => {
                     let size = 1 + rng.below(48) as usize;
                     let data = (0..size).map(|_| rng.next() as u8).collect();
+                    if rng.chance(mix.fast) {
+                        // From any member: the fast track is for those
+                        // that do not lead.
+                        return Op::Fast(any(rng), data);
+                    }
                     return Op::Propose(leader(rng), data);
                 }
                 85..=87 if mix.changes && !up.is_empty() => {

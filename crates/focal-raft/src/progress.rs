@@ -373,6 +373,15 @@ impl Tracker {
                 .map(|(_, vote)| *vote)
         })
     }
+    /// Whether `members`, in order, are a fast quorum of the voters. Of a
+    /// joint configuration there is none: the fast track is closed while
+    /// the group changes.
+    pub fn has_fast_quorum(&self, members: &[NodeId]) -> bool {
+        !self.configuration.is_joint()
+            && quorum::tally(self.configuration.voters(), Quorum::Fast, |member| {
+                members.binary_search(&member).ok().map(|_| true)
+            }) == Tally::Won
+    }
     /// Whether `members`, in order, hold the quorum of both halves.
     pub fn has_quorum(&self, members: &[NodeId]) -> bool {
         self.decided(|member| members.binary_search(&member).ok().map(|_| true)) == Tally::Won
@@ -443,33 +452,21 @@ impl Tracker {
         self.configuration = configuration;
         Ok(())
     }
+    /// What is held for the members, by their number and their windows.
+    /// The votes of an election and the room a quorum is counted in are
+    /// an identity or an index a member at most; they are counted for
+    /// every member whether they are held or not, so that what a member
+    /// holds when it rests does not depend on what it did before.
     pub fn resident_bytes(&self) -> usize {
-        let members = self
-            .progress
-            .capacity()
-            .saturating_mul(std::mem::size_of::<(NodeId, Progress)>());
+        let members = self.progress.len();
         let windows = self.progress.iter().fold(0usize, |bytes, (_, progress)| {
             bytes.saturating_add(progress.inflights.resident_bytes())
         });
-        let votes = self
-            .votes
-            .capacity()
-            .saturating_mul(std::mem::size_of::<(NodeId, bool)>());
-        let configuration = self
-            .configuration
-            .members()
-            .count()
-            .saturating_mul(4)
-            .saturating_mul(std::mem::size_of::<NodeId>());
-        members
-            .saturating_add(windows)
-            .saturating_add(votes)
-            .saturating_add(configuration)
-            .saturating_add(
-                self.scratch
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<u64>()),
-            )
+        let each = std::mem::size_of::<(NodeId, Progress)>()
+            .saturating_add(std::mem::size_of::<(NodeId, bool)>())
+            .saturating_add(std::mem::size_of::<u64>())
+            .saturating_add(std::mem::size_of::<NodeId>().saturating_mul(4));
+        members.saturating_mul(each).saturating_add(windows)
     }
 }
 

@@ -159,10 +159,12 @@ configuration so every member agrees on the quorum rule in force.
 - A self-approved entry is durable before its vote is sent.
 - Configuration entries never take the fast track.
 
-These are checked three ways: a TLA+ model (slates keeps models beside its code and
-focal has none for consensus), property tests over the sans-io core with a
-deterministic scheduler and P7's network model, and the existing black-box history
-checker on real processes.
+These are checked three ways: a TLA+ model (`docs/models/FastTrack.tla`, checked by
+`scripts/check-model.sh` in CI, with the rule the core does not follow beside it, which
+the checker must refuse), tests over the sans-io core under seeded schedules
+(`crates/focal-raft/tests/fast.rs`) and over durable nodes and P7's network model
+(`fast_track_tests`, `sim_fast_tests`), and the existing black-box history checker on
+real processes, for an owner that takes the fast track (section 4.6).
 
 ### 4.5 The core as built: the classic track
 
@@ -202,6 +204,70 @@ included.
 adds again is known anew, and a member added by a change is first probed one entry
 before the log's end. Both are raft-rs's, harmless, and kept so that the comparison
 needs no exception for them.
+
+### 4.6 The fast track as built
+
+`focal_raft::fast` and `track` in the core, `DurableNode::propose_fast` in the shell. A
+group has the fast track or has none from the day it is made (`NodeConfig::fast`), and
+says so in a record of its own in its log (`RecordKind::FastTrack`), which a binary
+that knows no fast track refuses. The identity record's bytes are as they were.
+
+**What a member approved by itself is held beside its log, never in it.** The log holds
+what a leader approved and nothing else, so it is the classic log, elections compare
+it as they always did, and the fast track changes no byte of an entry. What is held is
+bounded (`Limits::proposals`, `proposal_bytes`, `fast_window`), is on disk before the
+member says that it holds it (`RecordKind::Proposal`, in the same write as the rest of
+the `Ready`), is given back when the member opens, and is carried by a checkpoint.
+
+**A leader stamps what it takes with its own term.** The term a proposer gave says
+nothing of an entry: two proposers of one term propose different entries for one
+index, and an index and a term name one entry of a log only while one member writes
+each term. Fast Raft as published keeps the proposer's term; two entries of one index
+and one term, approved by two leaders, would then pass each other's check of the point
+an append follows.
+
+**The leader takes what it hears of first.** For the next index of its log a leader
+takes the first entry it hears of, from the proposer or from a voter that holds it, and
+sends it to its members as it sends any entry. The index is committed by whichever
+quorum comes first: the fast quorum that holds the entry, or the classic quorum that
+holds it from the leader. Fast Raft as published waits for the votes of a classic
+quorum before the leader takes an entry, and pays a round when the fast quorum does
+not come, which is why its authors measured it slower than classic Raft above 5%
+loss. Taking at once costs no more than the classic track does at any loss
+(section 09, 2026-09-28).
+
+It is safe for the reason the classic track is. Only a leader commits. What a leader
+committed by the classic quorum every later leader holds in its log. What a leader
+committed by the fast quorum R every later leader takes at its election: of the
+members that elected it, more hold that entry by themselves than are outside R, so it
+is the entry most held among them; and a member that holds it from the leader votes
+for no one whose log lacks it. An entry of an index no voter holds anything at was
+committed by no one, and one that is elected writes an entry there that states
+nothing.
+
+**A member does not compare terms at or below its commit.** An entry committed by the
+fast quorum bears the term of the leader that took it; the leader after it, which
+took it again at its election, gave it its own. Both state the same. A member
+therefore takes what is committed at it to be what the leader holds there
+(`Log::append_after`), which a leader's log is by what makes it a leader. It follows
+that **an owner of a group with the fast track derives nothing from the term of an
+entry**: it is not the same at every member.
+
+**The fast quorum commits only under a configuration that is applied and not joint**,
+so that the quorum a leader counts is of the configuration a later leader counts by.
+Configuration changes never take the fast track.
+
+**What the fast track asks of an owner**, and which owners can give it:
+
+| | Needs | Session groups | Control groups |
+|---|---|---|---|
+| An entry states a request, which every member evaluates when it applies it | yes | no: an entry is the outcome of the leader's admission, which is the sequencer | yes: the machine prepares and publishes each command at every member (`ControlReplica`) |
+| Nothing is derived from an entry's term | yes | no: `NativeCommit::raft_term` | no: an envelope binds `owner_term` to the entry's term, and a receipt states it |
+| A proposer that is told its entry lost its index proposes it again, and the owner knows the request it has already applied | yes | yes: exact retry | yes: `retries` |
+
+No owner takes the fast track today. Giving it to the control groups is a change of
+two checks and of what a receipt states, which is a durable format; it is a decision
+and not made here.
 
 ## 5. The other features
 
@@ -270,6 +336,7 @@ quorum and never vote, tested as slates tests it.
 | D | `focal-raft` core: classic track at parity with raft-rs for focal's use | differential test against raft-rs over random schedules |
 | | *State 2026-09-28:* built and in service under `DurableNode` (section 4.5). Five campaigns of schedules compare the two cores step for step; a run of 15,000 schedules compared 80.8 million steps and found them equal ([09](09-implementation-status.md)). Groups of both cores together, and of this core alone under schedules that also remove the leader, are safe and settle. Replication costs what it cost (`benches/replicate.rs`). | |
 | E | Fast track in `focal-raft`; TLA+ model | section 4.4 invariants; latency measured against classic under 0 to 10% loss |
+| | *State 2026-09-28:* built in the core and the shell (section 4.6), modelled and checked, and measured: a member that does not lead waits three quarters of what the classic track takes with nothing lost, and less of it as more is lost ([09](09-implementation-status.md)). No owner takes it yet; what it asks of one is in section 4.6. | |
 | F | MLRaft leader balancer | leader spread converges; no transfer storms |
 | G | P10 congestion measurement; decide | bake-off numbers recorded |
 

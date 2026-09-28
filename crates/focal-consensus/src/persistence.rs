@@ -163,7 +163,13 @@ impl DurableNode {
                     // The record count is known: entries plus an optional snapshot
                     // and hard state. Reserve once so the ready cycle never grows.
                     records
-                        .try_reserve_exact(ready.entries().len().saturating_add(2))
+                        .try_reserve_exact(
+                            ready
+                                .entries()
+                                .len()
+                                .saturating_add(ready.proposals().len())
+                                .saturating_add(2),
+                        )
                         .map_err(|_| ConsensusError::Capacity)?;
                     if let Some(snapshot) = ready.snapshot() {
                         records.push(proto_record(
@@ -183,6 +189,17 @@ impl DurableNode {
                             entry,
                         )?);
                     }
+                    // What the member approved by itself is durable before it
+                    // says that it holds it (27 §4.4).
+                    for proposal in ready.proposals() {
+                        records.push(proto_record(
+                            self.config.group_id,
+                            RecordKind::Proposal,
+                            proposal.index,
+                            proposal.term,
+                            proposal,
+                        )?);
+                    }
                     if let Some(hs) = ready.hard_state() {
                         records.push(proto_record(
                             self.config.group_id,
@@ -193,10 +210,11 @@ impl DurableNode {
                         )?);
                     }
                     self.wal.validate_append(&records)?;
-                    let prepared = self
-                        .raw
-                        .store_mut()
-                        .prepare(ready.entries(), ready.snapshot())?;
+                    let prepared = self.raw.store_mut().prepare_with(
+                        ready.entries(),
+                        ready.snapshot(),
+                        ready.proposals(),
+                    )?;
                     pending.phase = Phase::Ready(Box::new(ReadyPhase {
                         ready,
                         prepared,
@@ -260,6 +278,19 @@ impl DurableNode {
                         let hs = hs.clone();
                         self.raw.store_mut().hard_state = hs;
                     }
+                    pending
+                        .events
+                        .displaced
+                        .extend(
+                            ready
+                                .take_displaced()
+                                .into_iter()
+                                .map(|entry| CommittedEntry {
+                                    index: entry.index,
+                                    term: entry.term,
+                                    data: entry.data,
+                                }),
+                        );
                     pending.events.messages.extend(ready.take_messages());
                     pending
                         .events

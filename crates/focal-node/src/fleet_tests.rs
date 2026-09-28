@@ -218,8 +218,15 @@ impl Fleet {
             tokio::time::sleep(TICK).await;
         }
     }
-    async fn retry_exact(
+    async fn retry_exact(&self, candidate: usize, request: &RequestEnvelope) -> ResponseEnvelope {
+        self.retry_exact_as(actor(), candidate, request).await
+    }
+    /// As `retry_exact`, asked by `peer`. A read that was answered gives no
+    /// lease on the leader that answered it: the next one, whoever asks it,
+    /// may find no quorum in time and is asked again.
+    async fn retry_exact_as(
         &self,
+        peer: AuthenticatedPeer,
         mut candidate: usize,
         request: &RequestEnvelope,
     ) -> ResponseEnvelope {
@@ -228,7 +235,7 @@ impl Fleet {
             loop {
                 let reply = dispatch(
                     &self.hosts[candidate],
-                    actor(),
+                    peer.clone(),
                     request.clone(),
                     &ReplicaHost::wire_limits(),
                 )

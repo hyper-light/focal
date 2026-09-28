@@ -75,6 +75,15 @@ pub struct NodeConfig {
     pub max_entry_bytes: usize,
     pub max_uncommitted_bytes: u64,
     pub max_inflight_messages: usize,
+    /// Whether the group has the fast track (27 §4): a proposal from a
+    /// member that does not lead goes to every voter at once, and is
+    /// committed when a fast quorum holds it. It is part of what the group
+    /// is, the same at every member and for as long as the group lives. It
+    /// is no part of the identity record, whose bytes are as they were: a
+    /// group that has it says so in a record of its own, which a binary
+    /// that knows no fast track refuses.
+    #[serde(skip)]
+    pub fast: bool,
 }
 
 impl NodeConfig {
@@ -102,6 +111,7 @@ impl NodeConfig {
             max_entry_bytes: 4 * 1024 * 1024,
             max_uncommitted_bytes: 32 * 1024 * 1024,
             max_inflight_messages: 128,
+            fast: false,
         }
     }
 
@@ -203,6 +213,9 @@ pub struct NodeEvents {
     pub committed: Vec<CommittedEntry>,
     pub membership: Vec<AppliedMembership>,
     pub read_states: Vec<ReadBarrier>,
+    /// What was proposed here by the fast track and another entry took the
+    /// index of: it is not in the log, and its proposer proposes it again.
+    pub displaced: Vec<CommittedEntry>,
     pub snapshot: Option<AppliedSnapshot>,
     /// Includes Raft-internal entries; this is never a SessionSeq.
     pub applied_index: u64,
@@ -389,9 +402,12 @@ impl DurableNode {
             };
             let mut records = Vec::new();
             records
-                .try_reserve_exact(5)
+                .try_reserve_exact(6)
                 .map_err(|_| ConsensusError::Capacity)?;
             records.push(identity_record(&config)?);
+            if config.fast {
+                records.push(fast_track_record(&config));
+            }
             records.push(decoder::floor_record(config.group_id, image.floor)?);
             if let Some((predecessor, successor)) = image.transition {
                 records.push(decoder::transition_record(
@@ -456,6 +472,7 @@ impl DurableNode {
         let mut wal = shared.lease(LogicalLogId(config.group_id))?;
         let mut storage = RamLog::new(&config, budget.clone())?;
         let mut persisted_config = None;
+        let mut persisted_fast = false;
         let mut required_decoder = None;
         let mut decoder_transition = None;
         let mut replay_error = None;
@@ -477,6 +494,7 @@ impl DurableNode {
                         replay_record(
                             &mut storage,
                             &mut persisted_config,
+                            &mut persisted_fast,
                             &mut required_decoder,
                             &mut decoder_transition,
                             record,
@@ -498,6 +516,7 @@ impl DurableNode {
                 || persisted.group_id != config.group_id
                 || persisted.voters != config.voters
                 || persisted.learners != config.learners
+                || persisted_fast != config.fast
             {
                 return Err(ConsensusError::Configuration(
                     "persisted identity/bootstrap configuration mismatch",
@@ -510,7 +529,18 @@ impl DurableNode {
             {
                 return Err(ConsensusError::Corruption("missing group identity"));
             }
-            wal.append_in(&[identity_record(&config)?], BudgetLane::Completion)?;
+            if persisted_fast {
+                return Err(ConsensusError::Corruption("missing group identity"));
+            }
+            let mut records = Vec::new();
+            records
+                .try_reserve_exact(2)
+                .map_err(|_| ConsensusError::Capacity)?;
+            records.push(identity_record(&config)?);
+            if config.fast {
+                records.push(fast_track_record(&config));
+            }
+            wal.append_in(&records, BudgetLane::Completion)?;
         }
         storage.validate()?;
         let applied = proto::snapshot_index(&storage.snapshot);
@@ -536,6 +566,7 @@ impl DurableNode {
             max_committed_size_per_ready: 16 * 1024 * 1024,
             check_quorum: true,
             pre_vote: true,
+            fast: config.fast,
             seed: election_seed(&config),
             limits: Limits {
                 // Reads are admitted against the window (`read_index_inner`);
@@ -606,6 +637,42 @@ impl DurableNode {
     }
     pub fn propose(&mut self, data: Vec<u8>) -> Result<(), ConsensusError> {
         self.propose_in(data, BudgetLane::Ordinary)
+    }
+    /// Proposes by the fast track (27 §4), from a member that does not
+    /// lead: the entry goes to every voter, for the index after what this
+    /// member holds, and is committed when a fast quorum holds it or the
+    /// leader's classic quorum does, whichever is first. The index it was
+    /// proposed for. Success is admission, as of `propose`: the entry is
+    /// committed when `drain` gives it, and is given in
+    /// `NodeEvents::displaced` when another took its index.
+    ///
+    /// A leader proposes as it always did.
+    pub fn propose_fast(&mut self, data: Vec<u8>) -> Result<u64, ConsensusError> {
+        self.propose_fast_in(data, BudgetLane::Ordinary)
+    }
+    pub fn propose_fast_in(
+        &mut self,
+        data: Vec<u8>,
+        lane: BudgetLane,
+    ) -> Result<u64, ConsensusError> {
+        self.check()?;
+        if !self.config.fast {
+            return Err(ConsensusError::Configuration("the group has no fast track"));
+        }
+        if data.is_empty() || data.len() > self.config.max_entry_bytes {
+            return Err(ConsensusError::Capacity);
+        }
+        self.guarded_in(data.capacity(), 0, lane, |replica| {
+            Ok(replica.raw.propose_fast(Vec::new(), data)?)
+        })
+    }
+    /// Whether the group has the fast track.
+    pub fn fast(&self) -> bool {
+        self.config.fast
+    }
+    /// What the fast track did at this member since it opened.
+    pub fn fast_stats(&self) -> focal_raft::FastStats {
+        self.raw.raft.fast_stats()
     }
     pub fn propose_in(&mut self, data: Vec<u8>, lane: BudgetLane) -> Result<(), ConsensusError> {
         self.guarded_in(data.capacity(), 0, lane, |replica| {
@@ -843,6 +910,11 @@ impl DurableNode {
         {
             return Err(ConsensusError::Capacity);
         }
+        if message.msg_type == focal_raft::fast::FAST_PROPOSE
+            || message.msg_type == focal_raft::fast::FAST_VOTE
+        {
+            return self.step_fast(message);
+        }
         let Some(kind) = MessageType::from_i32(message.msg_type) else {
             return Err(ConsensusError::MalformedMessage("unknown message type"));
         };
@@ -894,6 +966,41 @@ impl DurableNode {
             // does not know, is no entry a peer may send.
             proto::Plan::of_entry(entry)
                 .map_err(|_| ConsensusError::MalformedMessage("an entry that cannot be read"))?;
+        }
+        self.raw.step(message)?;
+        Ok(())
+    }
+
+    /// A proposal by the fast track, or what a voter holds of one.
+    fn step_fast(&mut self, message: Message) -> Result<(), ConsensusError> {
+        if !self.config.fast {
+            return Err(ConsensusError::MalformedMessage(
+                "the fast track in a group that has none",
+            ));
+        }
+        if message.term == u64::MAX || message.commit == u64::MAX {
+            return Err(ConsensusError::Capacity);
+        }
+        if message.entries.is_empty() || message.entries.len() > 256 {
+            return Err(ConsensusError::MalformedMessage(
+                "a proposal that states nothing, or too much",
+            ));
+        }
+        for entry in &message.entries {
+            if entry.entry_type != EntryType::EntryNormal as i32
+                || entry.data.is_empty()
+                || entry.index == 0
+            {
+                return Err(ConsensusError::MalformedMessage(
+                    "what may not go by the fast track",
+                ));
+            }
+            if entry.data.len() > self.config.max_entry_bytes
+                || entry.index == u64::MAX
+                || entry.term == u64::MAX
+            {
+                return Err(ConsensusError::Capacity);
+            }
         }
         self.raw.step(message)?;
         Ok(())
@@ -1344,9 +1451,20 @@ fn snapshot_event(snapshot: &Snapshot) -> AppliedSnapshot {
     }
 }
 
+/// Says that the group has the fast track.
+fn fast_track_record(config: &NodeConfig) -> Record {
+    Record {
+        log: LogicalLogId(config.group_id),
+        kind: RecordKind::FastTrack,
+        index: 0,
+        term: 0,
+        payload: b"FOCALFT1".to_vec(),
+    }
+}
 fn replay_record(
     storage: &mut RamLog,
     config: &mut Option<NodeConfig>,
+    fast: &mut bool,
     required_decoder: &mut Option<[u8; 32]>,
     decoder_transition: &mut Option<decoder::DecoderPair>,
     record: Record,
@@ -1357,6 +1475,33 @@ fn replay_record(
                 return Err(ConsensusError::Corruption("duplicate group identity"));
             }
             *config = Some(postcard::from_bytes(&record.payload)?);
+        }
+        RecordKind::FastTrack => {
+            if config.is_none() || *fast || record.payload != b"FOCALFT1" {
+                return Err(ConsensusError::Corruption(
+                    "duplicate, unbound or unknown fast track record",
+                ));
+            }
+            *fast = true;
+        }
+        RecordKind::Proposal => {
+            if !*fast {
+                return Err(ConsensusError::Corruption(
+                    "a proposal in a group that has no fast track",
+                ));
+            }
+            let entry = decode_proto::<Entry>(&record.payload)?;
+            if entry.index != record.index
+                || entry.term != record.term
+                || entry.entry_type != EntryType::EntryNormal as i32
+                || entry.data.is_empty()
+            {
+                return Err(ConsensusError::Corruption("proposal envelope mismatch"));
+            }
+            // What the log has reached since is set aside.
+            if entry.index > storage.last_index()? {
+                storage.hold_proposal(entry)?;
+            }
         }
         RecordKind::DecoderFloor => {
             if config.is_none() || required_decoder.is_some() {
@@ -1500,9 +1645,13 @@ fn decode_proto<T: PbMessage + Default>(bytes: &[u8]) -> Result<T, ConsensusErro
 #[cfg(test)]
 mod borrowed_proposal_tests;
 #[cfg(test)]
+mod fast_track_tests;
+#[cfg(test)]
 mod raft_safety_tests;
 #[cfg(test)]
 mod sim_election_tests;
+#[cfg(test)]
+mod sim_fast_tests;
 #[cfg(test)]
 mod tests;
 

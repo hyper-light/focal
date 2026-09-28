@@ -10898,3 +10898,97 @@ With that, the suites of `focal-raft` and `focal-consensus` were run again and p
 congestion measurement (G). The sequential fan-out sites of stage C and the run under
 injected load of stage A are as [27](27-consensus-roadmap-and-slates-port.md) §6 states
 them.
+
+### 2026-09-28 — CI on `b92492c`: two answers given before their owner had let go; the fast track (27 stage E)
+
+CI on `b92492c`: ubuntu-24.04 and the dependency job passed; macos-15 and Windows
+failed, each on one test. Neither was of the new core: both fail on `e9f6247` as well
+when the machine is busy, and the core's different timing met them on CI.
+
+1. **`owned_control_response_retains_input_and_export_budgets_until_delivery_drop`**
+   (macOS). The test reads the budget, asks, drops the answer and reads the budget
+   again; it found 1,214 bytes more. The control owner answered inside its drain, while
+   it still held the events it had drained and their permit, and released them when
+   the drain returned. Under sixteen runs at once the old core failed 1 of 256 and the
+   new one 10 of 512. The owner now answers once the events and their permit are
+   released (`Owner::drain`, `drain_events`): 0 of 512. With it, what the core holds
+   when it rests no longer depends on what it did before: its queues are given up when
+   they empty and not kept for the next use.
+2. **`receipt_reads_require_live_quorum_preserve_privacy_and_recover_after_leader_restart`**
+   (Windows). Every read of the test is asked again when the group has no quorum in
+   time, as `retry_exact` says a read must be, but the stranger's, which was asked
+   once. Old core 2 of 192, new core 3 of 192; asked like the others
+   (`retry_exact_as`), 0 of 288.
+
+**The fast track.** Built in the core (`focal_raft::fast`, `track`) and the shell
+(`DurableNode::propose_fast`, `NodeConfig::fast`, `RecordKind::FastTrack` and
+`Proposal`); what it is and why it differs from Fast Raft as published is in
+[27](27-consensus-roadmap-and-slates-port.md) §4.6.
+
+*Schedules.* `tests/fast.rs` runs groups of five voters that propose six times in ten
+by the fast track, under the schedules of stage D, the leader's removal among them.
+2,000 schedules of 6,000 steps (release, macOS arm64, 7 s): no two members committed
+entries stating different things at one index, no term had two leaders, and every
+group settled. Members proposed 331,509 entries by the fast track and held 284,247;
+leaders took 7,973 as they arrived and 86,941 at their election from what their
+voters held; 1,913 indexes were committed by the fast quorum; 73,142 proposals lost
+their index and were said to their proposers. The schedules are hostile to the fast
+track, which is the point of them: most of what is proposed is proposed by a member
+whose log is behind.
+
+The first run of them found what the design had missed. A leader committed an entry
+by the fast quorum and stopped; the leader after it took the same entry at its
+election and gave it its own term; the first leader, back as a follower, held the
+entry committed under another term than the log it was sent, and refused it as a
+change of what is committed. Hence the rule that a member does not compare terms at
+or below its commit (27 §4.6), and that an owner derives nothing from an entry's term.
+
+*Model.* `docs/models/FastTrack.tla`, checked with TLC 1.7.4 (`scripts/check-model.sh`,
+a job of CI). Three voters, three terms, one index: 8,278,749 states generated,
+1,219,562 distinct, depth 26, no property violated, 9 s. With five voters and the rule
+that one that is elected takes the entry its voters hold least, the checker finds a
+leader that lacks what was committed (`LeaderHolds`, depth 17, 26,212,234 states,
+4 min 54 s); CI requires that it does. Five voters under the rule the core follows
+run nightly.
+
+*Latency.* `sim_fast_tests`: durable nodes over `focal_sim::path`, a member that does
+not lead proposes 120 entries one after another and waits for each to be applied at
+itself; by the classic track it sends its proposal to the leader. Virtual time, tick
+100 ms (release, macOS arm64):
+
+| Path | Members | Loss | Classic mean / p50 / p99 ms | Fast mean / p50 / p99 ms | Fast of classic | By the fast quorum |
+|---|---|---|---|---|---|---|
+| regional | 3 | 0% | 320.9 / 320.8 / 360.2 | 243.4 / 243.8 / 279.3 | 0.76 | 120 |
+| regional | 3 | 1% | 323.2 / 321.2 / 366.1 | 245.3 / 242.1 / 411.2 | 0.76 | 116 |
+| regional | 3 | 2% | 353.8 / 325.8 / 1,098.9 | 257.2 / 249.6 / 439.4 | 0.73 | 113 |
+| regional | 3 | 5% | 378.9 / 329.2 / 1,137.6 | 268.1 / 247.7 / 498.0 | 0.71 | 104 |
+| regional | 3 | 10% | 419.3 / 332.6 / 1,489.3 | 314.4 / 268.9 / 667.6 | 0.75 | 88 |
+| regional | 5 | 0% | 322.4 / 323.6 / 353.7 | 241.1 / 242.9 / 280.4 | 0.75 | 120 |
+| regional | 5 | 1% | 328.9 / 325.4 / 497.1 | 247.8 / 244.0 / 398.9 | 0.75 | 120 |
+| regional | 5 | 2% | 334.1 / 328.7 / 482.1 | 250.9 / 243.4 / 460.5 | 0.75 | 120 |
+| regional | 5 | 5% | 372.9 / 335.6 / 1,159.7 | 261.9 / 251.4 / 404.7 | 0.70 | 117 |
+| regional | 5 | 10% | 499.6 / 349.0 / 1,926.7 | 283.9 / 256.8 / 562.6 | 0.57 | 110 |
+| lan | 3 | 0% | 0.8 / 0.8 / 1.1 | 0.6 / 0.6 / 0.8 | 0.77 | 118 |
+| lan | 3 | 5% | 14.6 / 0.8 / 301.0 | 17.9 / 0.6 / 200.1 | 1.22 | 97 |
+| lan | 3 | 10% | 54.5 / 0.9 / 397.6 | 19.4 / 0.7 / 300.4 | 0.36 | 79 |
+| lan | 5 | 0% | 0.8 / 0.8 / 1.0 | 0.6 / 0.6 / 0.8 | 0.73 | 120 |
+| lan | 5 | 5% | 30.3 / 0.8 / 591.5 | 14.3 / 0.6 / 300.7 | 0.47 | 119 |
+| lan | 5 | 10% | 84.4 / 0.9 / 600.9 | 43.5 / 0.7 / 400.5 | 0.52 | 118 |
+
+With nothing lost the fast track takes three of the classic track's four trips. With
+messages lost it does not fall behind, as Fast Raft as published does above 5%: the
+leader sends what it took to its members whether or not the fast quorum comes, so the
+entry has two ways to its commit and the proposal more than one way to the leader. On
+the LAN a lost message waits for a heartbeat, 200 ms against a round trip of 0.4 ms,
+and the mean of a run is the mean of the few entries that waited; the entry in the
+middle takes three quarters by the fast track at every loss. The gate runs five of
+the cases with 32 entries; the nightly all of them.
+
+**No owner takes the fast track.** What it asks of one, and why neither session nor
+control groups give it as they are, is in 27 §4.6. Giving it to the control groups
+changes what a receipt states and is a decision.
+
+Local gates on this tree (macOS arm64): format, contracts (1,465 links), clippy
+`-D warnings`, production lints and the dependency audit passed;
+`cargo test --workspace --locked --no-fail-fast -- --test-threads=4` ran 143 suites and
+none failed.

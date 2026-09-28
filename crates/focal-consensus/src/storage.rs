@@ -14,6 +14,9 @@ pub(super) struct RamLog {
     pub conf_state: ConfState,
     pub entries: VecDeque<Entry>,
     pub snapshot: Snapshot,
+    /// What this member approved by itself (27 §4), above its log, each
+    /// with its charge. At most what the core holds (`Limits::proposals`).
+    pub proposals: Vec<(Entry, Allocation)>,
     charges: VecDeque<Allocation>,
     entry_bytes: usize,
     snapshot_charge: Option<Allocation>,
@@ -29,6 +32,7 @@ pub(super) struct PreparedSnapshot {
 pub(super) struct PreparedUpdate {
     snapshot: Option<PreparedSnapshot>,
     entries: Vec<(Entry, Allocation)>,
+    proposals: Vec<(Entry, Allocation)>,
 }
 impl RamLog {
     pub fn new(config: &NodeConfig, budget: MemoryBudget) -> Result<Self, ConsensusError> {
@@ -49,6 +53,7 @@ impl RamLog {
             },
             entries: VecDeque::new(),
             snapshot: Snapshot::default(),
+            proposals: Vec::new(),
             charges: VecDeque::new(),
             entry_bytes: 0,
             snapshot_charge: None,
@@ -58,9 +63,12 @@ impl RamLog {
         })
     }
     pub fn resident_bytes(&self) -> Result<usize, ConsensusError> {
-        self.metadata
-            .bytes()
-            .checked_add(self.entry_bytes)
+        self.proposals
+            .iter()
+            .try_fold(self.metadata.bytes(), |bytes, (_, charge)| {
+                bytes.checked_add(charge.bytes())
+            })
+            .and_then(|n| n.checked_add(self.entry_bytes))
             .and_then(|n| n.checked_add(self.snapshot_charge.as_ref().map_or(0, Allocation::bytes)))
             .and_then(|n| n.checked_add(self.slots.as_ref().map_or(0, Allocation::bytes)))
             .ok_or(ConsensusError::Capacity)
@@ -164,6 +172,30 @@ impl RamLog {
         entries: &[Entry],
         snapshot: Option<&Snapshot>,
     ) -> Result<PreparedUpdate, ConsensusError> {
+        self.prepare_with(entries, snapshot, &[])
+    }
+    /// As `prepare`, with what the member approved by itself.
+    pub fn prepare_with(
+        &mut self,
+        entries: &[Entry],
+        snapshot: Option<&Snapshot>,
+        proposals: &[Entry],
+    ) -> Result<PreparedUpdate, ConsensusError> {
+        let mut held = Vec::new();
+        held.try_reserve_exact(proposals.len())
+            .map_err(|_| ConsensusError::Capacity)?;
+        for proposal in proposals {
+            let allocation = reserve(
+                &self.budget,
+                BudgetKind::Payload,
+                BudgetLane::Completion,
+                entry_bytes(proposal)?,
+            )?;
+            held.push((proposal.clone(), allocation));
+        }
+        self.proposals
+            .try_reserve(held.len())
+            .map_err(|_| ConsensusError::Capacity)?;
         let snapshot = snapshot
             .map(|value| self.prepare_snapshot(value))
             .transpose()?;
@@ -218,6 +250,7 @@ impl RamLog {
         Ok(PreparedUpdate {
             snapshot,
             entries: prepared,
+            proposals: held,
         })
     }
     pub fn publish(&mut self, update: PreparedUpdate) -> Result<(), ConsensusError> {
@@ -256,7 +289,28 @@ impl RamLog {
             self.entries.push_back(entry);
             self.charges.push_back(allocation);
         }
+        for held in update.proposals {
+            // One entry an index: what storage holds there it keeps.
+            if !self
+                .proposals
+                .iter()
+                .any(|(entry, _)| entry.index == held.0.index)
+            {
+                self.proposals.push(held);
+            }
+        }
+        self.release_proposals()
+    }
+    /// What the log has reached is held beside it no more.
+    fn release_proposals(&mut self) -> Result<(), ConsensusError> {
+        let last = self.last_index()?;
+        self.proposals.retain(|(entry, _)| entry.index > last);
         Ok(())
+    }
+    /// A proposal as the log of writes states it, at opening.
+    pub fn hold_proposal(&mut self, entry: Entry) -> Result<(), ConsensusError> {
+        let update = self.prepare_with(&[], None, std::slice::from_ref(&entry))?;
+        self.publish(update)
     }
     pub fn append(&mut self, entries: &[Entry]) -> Result<(), ConsensusError> {
         let update = self.prepare(entries, None)?;
@@ -289,7 +343,7 @@ impl RamLog {
         self.snapshot = prepared.snapshot;
         self.snapshot_charge = Some(prepared.allocation);
         self.conf_state = prepared.conf;
-        Ok(())
+        self.release_proposals()
     }
 }
 impl Storage for RamLog {
@@ -297,6 +351,11 @@ impl Storage for RamLog {
         Ok(InitialState {
             hard_state: self.hard_state.clone(),
             configuration: self.conf_state.clone(),
+            proposals: self
+                .proposals
+                .iter()
+                .map(|(entry, _)| entry.clone())
+                .collect(),
         })
     }
     fn entries(

@@ -96,6 +96,8 @@ impl DurableNode {
                 .filter(|entry| entry.index > index)
                 .count()
                 .checked_add(3)
+                .and_then(|count| count.checked_add(self.raw.store().proposals.len()))
+                .and_then(|count| count.checked_add(usize::from(self.config.fast)))
                 .and_then(|count| count.checked_add(usize::from(self.required_decoder.is_some())))
                 .and_then(|count| count.checked_add(usize::from(self.decoder_transition.is_some())))
                 .ok_or(ConsensusError::Capacity)?;
@@ -103,6 +105,9 @@ impl DurableNode {
                 .try_reserve_exact(count)
                 .map_err(|_| ConsensusError::Capacity)?;
             records.push(identity_record(&self.config)?);
+            if self.config.fast {
+                records.push(fast_track_record(&self.config));
+            }
             if let Some(hash) = self.required_decoder {
                 records.push(decoder::floor_record(self.config.group_id, hash)?);
             }
@@ -129,6 +134,21 @@ impl DurableNode {
                     entry.index,
                     entry.term,
                     entry,
+                )?);
+            }
+            for (proposal, _) in self
+                .raw
+                .store()
+                .proposals
+                .iter()
+                .filter(|(proposal, _)| proposal.index > index)
+            {
+                records.push(proto_record(
+                    self.config.group_id,
+                    RecordKind::Proposal,
+                    proposal.index,
+                    proposal.term,
+                    proposal,
                 )?);
             }
             let hard = &self.raw.store().hard_state;

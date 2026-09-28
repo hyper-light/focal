@@ -82,6 +82,8 @@ pub struct Ready {
     hard_state: Option<HardState>,
     read_states: Vec<ReadState>,
     entries: Vec<Entry>,
+    proposals: Vec<Entry>,
+    displaced: Vec<Entry>,
     snapshot: Option<Snapshot>,
     after_persisting: bool,
     light: LightReady,
@@ -111,6 +113,22 @@ impl Ready {
     }
     pub fn take_entries(&mut self) -> Vec<Entry> {
         std::mem::take(&mut self.entries)
+    }
+    /// To persist beside the log: what this member approved by itself
+    /// ([`crate::fast`]). What it holds it says only once this is durable,
+    /// and storage gives it back when the member opens
+    /// ([`crate::InitialState::proposals`]) until the log reaches its
+    /// index.
+    pub fn proposals(&self) -> &[Entry] {
+        &self.proposals
+    }
+    /// What was proposed here by the fast track and another entry took the
+    /// index of: its proposer proposes it again.
+    pub fn displaced(&self) -> &[Entry] {
+        &self.displaced
+    }
+    pub fn take_displaced(&mut self) -> Vec<Entry> {
+        std::mem::take(&mut self.displaced)
     }
     /// To persist before the entries: the log begins again after it.
     pub fn snapshot(&self) -> Option<&Snapshot> {
@@ -238,6 +256,11 @@ impl<S: Storage> RawNode<S> {
             raft.step(message)
         })
     }
+    /// Proposes by the fast track ([`crate::fast`]); the index proposed
+    /// for.
+    pub fn propose_fast(&mut self, context: Vec<u8>, data: Vec<u8>) -> Result<u64> {
+        self.operate(|raft| raft.propose_fast(context, data))
+    }
     pub fn propose_conf_change(&mut self, context: Vec<u8>, change: &ConfChangeV2) -> Result<()> {
         // What could not be read when it is applied is not proposed.
         Plan::of(change)?;
@@ -285,6 +308,11 @@ impl<S: Storage> RawNode<S> {
     }
     /// A message from the network.
     pub fn step(&mut self, message: Message) -> Result<()> {
+        if message.msg_type == crate::fast::FAST_PROPOSE
+            || message.msg_type == crate::fast::FAST_VOTE
+        {
+            return self.operate(|raft| raft.step(message));
+        }
         let kind = proto::message_type(&message).ok_or(Error::Violation("a message of no kind"))?;
         if is_local(kind) {
             return Err(Error::StepLocalMessage);
@@ -369,6 +397,8 @@ impl<S: Storage> RawNode<S> {
             || raft.soft_state() != self.previous_soft
             || raft.hard_state() != self.previous_hard
             || !raft.read_states.is_empty()
+            || !raft.displaced.is_empty()
+            || raft.held.has_unstable()
             || !raft.log().unstable().entries().is_empty()
             || raft
                 .snapshot()
@@ -416,10 +446,8 @@ impl<S: Storage> RawNode<S> {
             ready.must_sync = true;
         }
         crate::log::copy_entries(self.raft.log().unstable().entries(), &mut ready.entries)?;
-        ready
-            .read_states
-            .try_reserve_exact(self.raft.read_states.len())
-            .map_err(|_| Error::Memory)?;
+        self.raft.unstable_proposals(&mut ready.proposals)?;
+
         if let Some(index) = given.snapshot {
             self.commit_since = index;
         }
@@ -436,7 +464,13 @@ impl<S: Storage> RawNode<S> {
             }
             ready.hard_state = Some(hard);
         }
-        ready.read_states.append(&mut self.raft.read_states);
+        // Taken, and not emptied: what the member holds when it rests is
+        // what it held before.
+        ready.read_states = std::mem::take(&mut self.raft.read_states);
+        ready.displaced = self.raft.take_displaced();
+        if !ready.proposals.is_empty() {
+            ready.must_sync = true;
+        }
         if let Some(last) = ready.entries.last() {
             ready.must_sync = true;
             given.last_entry = Some((last.index, last.term));
@@ -471,6 +505,7 @@ impl<S: Storage> RawNode<S> {
         if let Some((index, term)) = given.last_entry {
             self.raft.on_persist_entries(index, term)?;
         }
+        self.raft.on_persist_proposals(&ready.proposals)?;
         self.raft.settle_priority();
         // What is to send now is sent after what `ready` persisted, whoever
         // sends it: a leader that a change it applied made a follower has

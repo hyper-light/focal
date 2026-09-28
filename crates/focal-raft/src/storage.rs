@@ -9,6 +9,10 @@ use crate::{
 pub struct InitialState {
     pub hard_state: HardState,
     pub configuration: ConfState,
+    /// What this member approved by itself and storage holds
+    /// ([`crate::fast`]), in any order. What the log has reached since is
+    /// set aside.
+    pub proposals: Vec<Entry>,
 }
 
 pub trait Storage {

@@ -15,6 +15,19 @@ jobs:
         run: cargo install cargo-deny --version 0.20.2 --locked
       - name: Audit dependencies
         run: cargo deny check advisories bans licenses sources
+  model:
+    # The fast track's model (docs/models/FastTrack.tla): every state of the
+    # model a change is checked with, and the rule the core does not follow,
+    # which the checker must refuse.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Java
+        run: java -version
+      - name: Check the model
+        run: bash scripts/check-model.sh
+      - name: The checker refuses the wrong rule
+        run: bash scripts/check-model.sh wrong
   check:
     strategy:
       fail-fast: false

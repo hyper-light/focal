@@ -103,6 +103,16 @@ pub(super) fn events_bytes(events: &NodeEvents) -> Result<usize, ConsensusError>
     for read in &events.read_states {
         bytes = add(bytes, read.context.capacity())?;
     }
+    bytes = add(
+        bytes,
+        mul(
+            events.displaced.capacity(),
+            std::mem::size_of::<crate::CommittedEntry>(),
+        )?,
+    )?;
+    for entry in &events.displaced {
+        bytes = add(bytes, entry.data.capacity())?;
+    }
     if let Some(snapshot) = &events.snapshot {
         bytes = add(bytes, snapshot.data.capacity())?;
         bytes = add(bytes, snapshot.configuration.charged_bytes()?)?;

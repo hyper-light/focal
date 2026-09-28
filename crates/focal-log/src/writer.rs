@@ -693,6 +693,7 @@ fn default_lane(records: &[Record]) -> Result<BudgetLane, LogError> {
                 | RecordKind::Identity
                 | RecordKind::DecoderFloor
                 | RecordKind::DecoderTransition
+                | RecordKind::FastTrack
         )
     }) {
         return Ok(BudgetLane::Ordinary);

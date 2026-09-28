@@ -773,6 +773,12 @@ impl RequestHandler for ControlHost {
         })
     }
 }
+/// A request, its answer, and what the answer's export is charged to.
+type Finished = (
+    Pending,
+    Result<ControlReply, ControlFailure>,
+    Option<Allocation>,
+);
 impl<V: AuthorityVerifier> Owner<V> {
     fn run(mut self, receiver: mpsc::Receiver<Work>, peers: mpsc::Receiver<Work>) {
         self.pace.announce(self.replica.election_tick());
@@ -1353,7 +1359,22 @@ impl<V: AuthorityVerifier> Owner<V> {
             self.send(header, response, result, charge, None);
         }
     }
+    /// A reply is given once what it was made from is released: the one that
+    /// asked may look at the budget the moment it is answered, and finds
+    /// there what its answer holds and nothing of the owner's.
     fn drain(&mut self) -> Result<(), ControlError> {
+        let mut finished = Vec::new();
+        let drained = self.drain_events(&mut finished);
+        for (pending, result, output) in finished {
+            self.finish_charged(pending, result, output);
+        }
+        drained
+    }
+    fn drain_events(&mut self, finished: &mut Vec<Finished>) -> Result<(), ControlError> {
+        // Every request that waits may be answered by this drain.
+        finished
+            .try_reserve_exact(self.pending.len())
+            .map_err(|_| ControlError::Capacity)?;
         // Declare the source permit first so remaining event buffers drop
         // before it on every exit. Frames/replies below allocate new encoded
         // buffers under their own permits, retained through transport send.
@@ -1476,7 +1497,7 @@ impl<V: AuthorityVerifier> Owner<V> {
                 } else {
                     result
                 };
-                self.finish_charged(pending, result, read_charge.take());
+                finished.push((pending, result, read_charge.take()));
             } else if pending.response.is_closed() {
                 drop(pending);
             } else if pending.term != status.term
@@ -1487,7 +1508,7 @@ impl<V: AuthorityVerifier> Owner<V> {
                     Waiting::Write(_) => ControlFailure::OutcomeUnknown,
                     _ => ControlFailure::Unavailable,
                 };
-                self.finish(pending, Err(failure));
+                finished.push((pending, Err(failure), None));
             } else {
                 self.pending.push_back(pending);
             }

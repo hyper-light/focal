@@ -17,6 +17,7 @@
 use crate::{
     Configuration, NodeId, Tally,
     error::{Error, Result, StorageError},
+    fast::{self, Decided, Proposals, Votes},
     log::Log,
     progress::{Progress, ProgressState, Tracker},
     proto::{
@@ -42,6 +43,15 @@ pub struct Limits {
     /// may be held not yet durable, so that a member can always take a
     /// leader's message whole.
     pub entries_per_message: usize,
+    /// Entries a member holds approved by itself ([`crate::fast`]). A vote
+    /// for one that asks to lead carries them all, so their bytes are
+    /// what one message may be.
+    pub proposals: usize,
+    pub proposal_bytes: usize,
+    /// How far above what is committed an entry may be proposed.
+    pub fast_window: u64,
+    /// The bytes of what a leader was told the voters hold.
+    pub vote_bytes: usize,
 }
 impl Default for Limits {
     fn default() -> Self {
@@ -50,6 +60,10 @@ impl Default for Limits {
             pending_reads: 4_096,
             unstable_entries: 65_536,
             entries_per_message: 16_384,
+            proposals: 256,
+            proposal_bytes: 8 * 1024 * 1024 - 64 * 1024,
+            fast_window: 256,
+            vote_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -97,6 +111,9 @@ pub struct Config {
     pub pre_vote: bool,
     pub priority: i64,
     pub precedence: Precedence,
+    /// Whether the group has the fast track ([`crate::fast`]). It is part
+    /// of what the group is: every member is opened with the same.
+    pub fast: bool,
     /// A commit alone is not sent; it goes with the next message.
     pub skip_bcast_commit: bool,
     /// What the election timeouts are drawn from.
@@ -118,6 +135,7 @@ impl Config {
             pre_vote: false,
             priority: 0,
             precedence: Precedence::Log,
+            fast: false,
             skip_bcast_commit: false,
             seed: id,
             limits: Limits::default(),
@@ -152,6 +170,10 @@ impl Config {
             || self.limits.pending_reads == 0
             || self.limits.unstable_entries == 0
             || self.limits.entries_per_message == 0
+            || self.limits.proposals == 0
+            || self.limits.proposal_bytes == 0
+            || self.limits.fast_window == 0
+            || self.limits.vote_bytes == 0
         {
             return Err(Error::Settings("a bound that admits nothing"));
         }
@@ -162,6 +184,23 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// What the fast track did at a member since it opened.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FastStats {
+    /// Entries proposed here by the fast track.
+    pub proposed: u64,
+    /// Of those, the ones another entry took the index of.
+    pub displaced: u64,
+    /// Entries held here approved by this member.
+    pub held: u64,
+    /// Entries this member took as leader from the fast track.
+    pub taken: u64,
+    /// Indexes this member committed as leader by the fast quorum.
+    pub committed: u64,
+    /// Entries this member took at its election from what the voters held.
+    pub recovered: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -204,12 +243,25 @@ pub struct Raft<S> {
     pub(crate) election_elapsed: usize,
     heartbeat_elapsed: usize,
     randomized_election_timeout: usize,
+    /// What this member approved by itself.
+    pub(crate) held: Proposals,
+    /// What the voters hold above this member's log, as it was told.
+    pub(crate) votes: Votes,
+    /// Who holds what this leader took from the fast track.
+    pub(crate) decided: Decided,
+    /// What was proposed here and another entry took the index of.
+    pub(crate) displaced: Vec<Entry>,
+    /// The leader, and its term, that was told what this member holds.
+    pub(crate) voted_to: (u64, NodeId),
+    /// What the fast track did here since the member opened.
+    pub(crate) fast_stats: FastStats,
+    pub(crate) holders: Vec<NodeId>,
     /// The priority the owner gave.
     priority: i64,
     /// The priority votes are judged by: the one given, once the member
     /// has a term.
     priority_in_force: i64,
-    promotable: bool,
+    pub(crate) promotable: bool,
     /// The leader told this member to campaign, and it could not yet: a
     /// change it has committed is not applied. It campaigns once it is,
     /// unless it has heard of a leader or a term since.
@@ -224,7 +276,7 @@ pub struct Raft<S> {
     /// below are no proposals of its own.
     leader_tail: u64,
     random: u64,
-    config: Config,
+    pub(crate) config: Config,
 }
 
 /// What sends for a leader while it walks its members.
@@ -247,6 +299,21 @@ fn push(
 ) -> Result<()> {
     if message.from == 0 {
         message.from = id;
+    }
+    if message.msg_type == fast::FAST_PROPOSE || message.msg_type == fast::FAST_VOTE {
+        if message.term != 0 {
+            return Err(Error::Invariant(
+                "a term given to a message that takes the member's",
+            ));
+        }
+        // A proposal is its proposer's and bears no term; what a member
+        // holds it says as of its term.
+        if message.msg_type == fast::FAST_VOTE {
+            message.term = term;
+        }
+        msgs.try_reserve(1).map_err(|_| Error::Memory)?;
+        msgs.push(message);
+        return Ok(());
     }
     let kind = proto::message_type(&message).ok_or(Error::Invariant("a message of no kind"))?;
     match kind {
@@ -430,6 +497,16 @@ impl<S: Storage> Raft<S> {
             election_elapsed: 0,
             heartbeat_elapsed: 0,
             randomized_election_timeout: config.election_tick,
+            held: Proposals::new(config.limits.proposals, config.limits.proposal_bytes),
+            votes: Votes::new(
+                usize::try_from(config.limits.fast_window).unwrap_or(usize::MAX),
+                config.limits.vote_bytes,
+            ),
+            decided: Decided::default(),
+            displaced: Vec::new(),
+            voted_to: (0, 0),
+            fast_stats: FastStats::default(),
+            holders: Vec::new(),
             priority: config.priority,
             priority_in_force: 0,
             promotable: false,
@@ -451,6 +528,12 @@ impl<S: Storage> Raft<S> {
         if config.applied > 0 {
             // What was applied may be ahead of the commit that was durable.
             raft.log.applied_to_unchecked(config.applied);
+        }
+        let last = raft.log.last_index()?;
+        for held in initial.proposals {
+            if held.index > last {
+                raft.held.hold(held, true, false)?;
+            }
         }
         let term = raft.term;
         raft.become_follower(term, 0)?;
@@ -615,11 +698,26 @@ impl<S: Storage> Raft<S> {
             .saturating_add(messages)
             .saturating_add(reads)
             .saturating_add(self.read_only.resident_bytes())
+            .saturating_add(self.held.resident_bytes())
+            .saturating_add(self.votes.resident_bytes())
+            .saturating_add(self.decided.resident_bytes())
+            .saturating_add(
+                self.displaced.iter().fold(
+                    self.displaced
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<Entry>()),
+                    |bytes, entry| {
+                        bytes
+                            .saturating_add(entry.data.capacity())
+                            .saturating_add(entry.context.capacity())
+                    },
+                ),
+            )
             .saturating_add(self.tracker.resident_bytes())
             .saturating_add(self.log.unstable().resident_bytes())
     }
 
-    fn send(&mut self, message: Message) -> Result<()> {
+    pub(crate) fn send(&mut self, message: Message) -> Result<()> {
         push(
             &mut self.msgs,
             self.id,
@@ -704,10 +802,15 @@ impl<S: Storage> Raft<S> {
     /// Commits what the quorum holds, if it is of this term.
     pub fn maybe_commit(&mut self) -> Result<bool> {
         let index = self.tracker.quorum_index();
-        if !self.log.maybe_commit(index, self.term)? {
+        let classic = self.log.maybe_commit(index, self.term)?;
+        // What the classic quorum committed may open the next index to the
+        // fast one.
+        let fast = self.fast_commit()?;
+        if !classic && !fast {
             return Ok(false);
         }
         let committed = self.log.committed();
+        self.decided.release(committed);
         if let Some(progress) = self.tracker.get_mut(self.id) {
             progress.update_committed(committed);
         }
@@ -744,6 +847,10 @@ impl<S: Storage> Raft<S> {
             }
             self.pending_conf_index = self.log.last_index()?;
         }
+        // A change that is applied may open the fast track.
+        if self.config.fast && self.state == StateRole::Leader && self.maybe_commit()? {
+            self.bcast_append()?;
+        }
         Ok(())
     }
     fn reset(&mut self, term: u64) -> Result<()> {
@@ -757,6 +864,8 @@ impl<S: Storage> Raft<S> {
         self.heartbeat_elapsed = 0;
         self.lead_transferee = None;
         self.told_to_campaign = false;
+        self.votes.clear();
+        self.decided.clear();
         self.tracker.reset_votes();
         self.pending_conf_index = 0;
         self.read_only.clear();
@@ -807,13 +916,30 @@ impl<S: Storage> Raft<S> {
     }
     /// A leader's own entries, at the end of its log. False when they
     /// would hold more uncommitted than the leader may.
-    fn append_entry(&mut self, mut entries: Vec<Entry>) -> Result<bool> {
+    pub(crate) fn append_entry(&mut self, entries: Vec<Entry>) -> Result<bool> {
+        self.append_entries(entries, false)
+    }
+    /// `recovered` entries are what a leader finds the voters hold when it
+    /// is elected: it takes them whatever it may hold uncommitted, for it
+    /// may not lead without them.
+    pub(crate) fn append_entries(
+        &mut self,
+        mut entries: Vec<Entry>,
+        recovered: bool,
+    ) -> Result<bool> {
         let last = self.log.last_index()?;
         let count = u64::try_from(entries.len()).unwrap_or(u64::MAX);
         if last.checked_add(count).is_none_or(|end| end == u64::MAX) {
             return Err(Error::Capacity("the log's indexes"));
         }
-        if !self.admit_uncommitted(&entries) {
+        if recovered {
+            let bytes = entries.iter().fold(0usize, |bytes, entry| {
+                bytes.saturating_add(entry.data.len())
+            });
+            if self.config.max_uncommitted_size != u64::MAX {
+                self.uncommitted_bytes = self.uncommitted_bytes.saturating_add(bytes);
+            }
+        } else if !self.admit_uncommitted(&entries) {
             return Ok(false);
         }
         let mut index = last;
@@ -949,6 +1075,14 @@ impl<S: Storage> Raft<S> {
             return Err(Error::Invariant("a follower that leads"));
         }
         let term = self.term;
+        // What the voters said they hold outlives the asking.
+        let reports = std::mem::replace(
+            &mut self.votes,
+            Votes::new(
+                usize::try_from(self.config.limits.fast_window).unwrap_or(usize::MAX),
+                self.config.limits.vote_bytes,
+            ),
+        );
         self.reset(term)?;
         self.leader_id = self.id;
         self.state = StateRole::Leader;
@@ -966,10 +1100,14 @@ impl<S: Storage> Raft<S> {
         // There may be a change in the log that is not applied: none is
         // proposed until all of the log is.
         self.pending_conf_index = last;
-        if !self.append_entry(vec![Entry::default()])? {
+        let mut first = self.recover(reports, last)?;
+        first.try_reserve(1).map_err(|_| Error::Memory)?;
+        first.push(Entry::default());
+        if !self.append_entries(first, true)? {
             return Err(Error::Invariant("a leader's first entry was refused"));
         }
-        Ok(())
+        let last = self.log.last_index()?;
+        self.release_proposals(last)
     }
 
     fn campaign(&mut self, campaign: Campaign) -> Result<()> {
@@ -1076,10 +1214,16 @@ impl<S: Storage> Raft<S> {
 
     /// What arrived, or what the member asks of itself.
     pub fn step(&mut self, message: Message) -> Result<()> {
-        let kind = proto::message_type(&message).ok_or(Error::Violation("a message of no kind"))?;
         if self.msgs.len() >= self.config.limits.pending_messages {
             return Err(Error::Capacity("messages that wait to be taken"));
         }
+        if message.msg_type == fast::FAST_PROPOSE {
+            return self.hear_proposal(message);
+        }
+        if message.msg_type == fast::FAST_VOTE {
+            return self.step_fast_vote(message);
+        }
+        let kind = proto::message_type(&message).ok_or(Error::Violation("a message of no kind"))?;
         if [
             message.term,
             message.index,
@@ -1195,6 +1339,12 @@ impl<S: Storage> Raft<S> {
             // is behind.
             let mut answer = proto::message(message.from, answer_kind);
             answer.term = message.term;
+            if kind == MessageType::MsgRequestVote && self.config.fast {
+                // With the vote, what this member approved by itself: one
+                // that is elected decides by it what the group holds
+                // above its log.
+                crate::log::copy_entries_of(self.held.iter(), &mut answer.entries)?;
+            }
             self.send(answer)?;
             if kind == MessageType::MsgRequestVote {
                 self.election_elapsed = 0;
@@ -1526,6 +1676,9 @@ impl<S: Storage> Raft<S> {
                 if kind != asked {
                     return Ok(());
                 }
+                if !message.reject && kind == MessageType::MsgRequestVoteResponse {
+                    self.hear_report(&message)?;
+                }
                 self.poll(message.from, !message.reject)?;
                 self.maybe_commit_by_vote(&message)
             }
@@ -1548,19 +1701,22 @@ impl<S: Storage> Raft<S> {
                 self.election_elapsed = 0;
                 self.leader_id = message.from;
                 self.told_to_campaign = false;
-                self.handle_append_entries(&message)
+                self.handle_append_entries(&message)?;
+                self.heard_leader()
             }
             MessageType::MsgHeartbeat => {
                 self.election_elapsed = 0;
                 self.leader_id = message.from;
                 self.told_to_campaign = false;
-                self.handle_heartbeat(message)
+                self.handle_heartbeat(message)?;
+                self.heard_leader()
             }
             MessageType::MsgSnapshot => {
                 self.election_elapsed = 0;
                 self.leader_id = message.from;
                 self.told_to_campaign = false;
-                self.handle_snapshot(message)
+                self.handle_snapshot(message)?;
+                self.heard_leader()
             }
             MessageType::MsgTransferLeader | MessageType::MsgReadIndex => {
                 if self.leader_id == 0 {
@@ -1643,11 +1799,18 @@ impl<S: Storage> Raft<S> {
             .entries
             .get(..self.config.limits.unstable_entries)
             .unwrap_or(&message.entries);
-        match self
-            .log
-            .maybe_append(message.index, message.log_term, message.commit, taken)?
-        {
-            Some((_, last)) => answer.index = last,
+        match self.log.append_after(
+            message.index,
+            message.log_term,
+            message.commit,
+            taken,
+            self.config.fast,
+        )? {
+            Some((_, last)) => {
+                answer.index = last;
+                let held = self.log.last_index()?;
+                self.release_proposals(held)?;
+            }
             None => {
                 // The leader's log before its index has terms at most the
                 // one it names: the last index here of such a term is
@@ -1716,6 +1879,7 @@ impl<S: Storage> Raft<S> {
         }
         self.log.restore(snapshot)?;
         let last = self.log.last_index()?;
+        self.release_proposals(last)?;
         self.tracker = Tracker::new(configuration, last, self.config.max_inflight_msgs)?;
         self.post_conf_change()?;
         if let Some(progress) = self.tracker.get_mut(self.id) {

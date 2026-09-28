@@ -108,11 +108,18 @@ impl ReadOnly {
     }
     /// The read `context` is confirmed, and so is every read asked before
     /// it: they leave in the order asked.
-    pub fn advance(&mut self, context: &[u8]) -> impl Iterator<Item = PendingRead> + '_ {
+    pub fn advance(&mut self, context: &[u8]) -> impl Iterator<Item = PendingRead> + use<> {
         let count = self
             .position(context)
             .map_or(0, |position| position.saturating_add(1));
-        self.queue.drain(..count)
+        if count == self.queue.len() {
+            // All of them: the queue is given up with them, so that a
+            // member that rests holds what it held before it was asked.
+            return std::mem::take(&mut self.queue).into_iter().take(count);
+        }
+        let mut rest = self.queue.split_off(count);
+        std::mem::swap(&mut rest, &mut self.queue);
+        rest.into_iter().take(count)
     }
     /// What the last read asked is called: a heartbeat that carries it
     /// confirms every read before it too.

@@ -70,6 +70,8 @@ pub struct Disk {
     pub boot: ConfState,
     pub snapshot: Snapshot,
     pub entries: Vec<Entry>,
+    /// What the member approved by itself.
+    pub proposals: Vec<Entry>,
 }
 impl Disk {
     pub fn snapshot_index(&self) -> u64 {
@@ -108,6 +110,8 @@ impl Disk {
                 .truncate((entry.index - self.first_index()) as usize);
             self.entries.push(entry.clone());
         }
+        let last = self.last_index();
+        self.proposals.retain(|held| held.index > last);
     }
     pub fn install(&mut self, snapshot: &Snapshot) {
         let metadata = snapshot.metadata.clone().unwrap_or_default();
@@ -115,6 +119,7 @@ impl Disk {
         self.hard_state.commit = self.hard_state.commit.max(metadata.index);
         self.entries.clear();
         self.snapshot = snapshot.clone();
+        self.proposals.retain(|held| held.index > metadata.index);
     }
     /// Everything through `index` becomes the snapshot.
     pub fn compact(&mut self, index: u64, data: Vec<u8>) {
@@ -226,6 +231,7 @@ impl focal_raft::Storage for Store {
         Ok(focal_raft::InitialState {
             hard_state: disk.hard_state.clone(),
             configuration: disk.conf.clone(),
+            proposals: disk.proposals.clone(),
         })
     }
     fn entries(
@@ -330,6 +336,8 @@ pub struct Output {
     pub committed: Vec<Said>,
     pub reads: Vec<(u64, Vec<u8>)>,
     pub confs: Vec<ConfState>,
+    /// What was proposed here by the fast track and lost its index.
+    pub displaced: Vec<Said>,
     /// A change that could not be applied, by the index of its entry.
     pub refused: Vec<u64>,
     /// A leader applied a change that leaves it no voter. The two cores
@@ -373,6 +381,8 @@ pub struct Settings {
     pub pre_vote: bool,
     /// Whether priority yields to a longer log alone, as in `raft-rs`.
     pub by_length: bool,
+    /// Whether the group has the fast track.
+    pub fast: bool,
 }
 impl Settings {
     /// As focal's shell sets a group.
@@ -387,6 +397,7 @@ impl Settings {
             check_quorum: true,
             pre_vote: true,
             by_length: true,
+            fast: false,
         }
     }
     /// As focal runs this core.
@@ -394,6 +405,13 @@ impl Settings {
         Self {
             by_length: false,
             ..Self::shell()
+        }
+    }
+    /// A group with the fast track.
+    pub fn fast() -> Self {
+        Self {
+            fast: true,
+            ..Self::focal()
         }
     }
 }
@@ -405,6 +423,10 @@ pub trait Replica: Sized {
     fn tick(&mut self) -> bool;
     fn step(&mut self, message: Message) -> bool;
     fn propose(&mut self, data: Vec<u8>) -> bool;
+    /// By the fast track; the index proposed for.
+    fn propose_fast(&mut self, _data: Vec<u8>) -> Option<u64> {
+        None
+    }
     fn propose_change(&mut self, change: &ConfChangeV2) -> bool;
     fn campaign(&mut self) -> bool;
     fn ping(&mut self);
@@ -754,6 +776,19 @@ fn heard<T>(outcome: focal_raft::Result<T>) -> Option<T> {
         }
     }
 }
+impl New {
+    pub fn fast_stats(&self) -> focal_raft::FastStats {
+        self.raw.raft.fast_stats()
+    }
+    /// What the member holds approved by itself.
+    pub fn held(&self) -> Vec<(u64, Vec<u8>)> {
+        self.raw
+            .raft
+            .proposals()
+            .map(|held| (held.index, held.data.clone()))
+            .collect()
+    }
+}
 impl Replica for New {
     fn open(id: u64, store: Store, settings: &Settings, seed: u64) -> Self {
         store.0.borrow_mut().reopen();
@@ -778,6 +813,7 @@ impl Replica for New {
             } else {
                 focal_raft::Precedence::Log
             },
+            fast: settings.fast,
             seed,
             ..focal_raft::Config::new(id)
         };
@@ -798,6 +834,9 @@ impl Replica for New {
     }
     fn propose(&mut self, data: Vec<u8>) -> bool {
         heard(self.raw.propose(Vec::new(), data)).is_some()
+    }
+    fn propose_fast(&mut self, data: Vec<u8>) -> Option<u64> {
+        heard(self.raw.propose_fast(Vec::new(), data))
     }
     fn propose_change(&mut self, change: &ConfChangeV2) -> bool {
         heard(self.raw.propose_conf_change(Vec::new(), change)).is_some()
@@ -846,7 +885,12 @@ impl Replica for New {
                 self.store.0.borrow_mut().install(snapshot);
             }
             output.persisted.extend(ready.entries().iter().map(said));
-            self.store.0.borrow_mut().append(ready.entries());
+            {
+                let mut disk = self.store.0.borrow_mut();
+                disk.proposals.extend(ready.proposals().iter().cloned());
+                disk.append(ready.entries());
+            }
+            output.displaced.extend(ready.displaced().iter().map(said));
             if let Some(hard) = ready.hard_state() {
                 output.hard_states.push((hard.term, hard.vote, hard.commit));
                 self.store.0.borrow_mut().hard_state = hard.clone();
@@ -934,8 +978,8 @@ impl Replica for New {
 /// A group of both cores: the odd members run `raft-rs` and the even ones
 /// this crate, as a group does while its nodes are replaced one by one.
 pub enum Either {
-    Old(Old),
-    New(New),
+    Old(Box<Old>),
+    New(Box<New>),
 }
 macro_rules! either {
     ($self:ident, $node:ident => $call:expr) => {
@@ -953,9 +997,9 @@ impl Replica for Either {
             // seed.
             let span = settings.election_tick as u64;
             old.set_timeout(settings.election_tick + Seeded(seed).below(span) as usize);
-            Self::Old(old)
+            Self::Old(Box::new(old))
         } else {
-            Self::New(New::open(id, store, settings, seed))
+            Self::New(Box::new(New::open(id, store, settings, seed)))
         }
     }
     fn id(&self) -> u64 {
@@ -972,6 +1016,9 @@ impl Replica for Either {
     }
     fn propose(&mut self, data: Vec<u8>) -> bool {
         either!(self, node => node.propose(data))
+    }
+    fn propose_fast(&mut self, data: Vec<u8>) -> Option<u64> {
+        either!(self, node => node.propose_fast(data))
     }
     fn propose_change(&mut self, change: &ConfChangeV2) -> bool {
         either!(self, node => node.propose_change(change))

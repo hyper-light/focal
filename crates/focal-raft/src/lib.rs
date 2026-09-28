@@ -28,6 +28,7 @@
 
 pub mod configuration;
 pub mod error;
+pub mod fast;
 pub mod log;
 pub mod node;
 pub mod progress;
@@ -36,12 +37,13 @@ pub mod quorum;
 pub mod raft;
 pub mod read;
 pub mod storage;
+mod track;
 
 pub use configuration::{Change, Changed, Configuration, ConfigurationError};
 pub use error::{Error, Result, StorageError};
 pub use node::{LightReady, RawNode, Ready, SnapshotStatus};
 pub use quorum::{Quorum, Tally};
-pub use raft::{Config, Limits, Precedence, Raft, SoftState, StateRole};
+pub use raft::{Config, FastStats, Limits, Precedence, Raft, SoftState, StateRole};
 pub use read::ReadState;
 pub use storage::{InitialState, Storage};
 

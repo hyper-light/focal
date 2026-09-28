@@ -44,6 +44,16 @@ pub(crate) fn copy_entry(entry: &Entry) -> Result<Entry> {
         sync_log: entry.sync_log,
     })
 }
+pub(crate) fn copy_entries_of<'a>(
+    entries: impl Iterator<Item = &'a Entry>,
+    into: &mut Vec<Entry>,
+) -> Result<()> {
+    for entry in entries {
+        into.try_reserve(1).map_err(|_| Error::Memory)?;
+        into.push(copy_entry(entry)?);
+    }
+    Ok(())
+}
 pub(crate) fn copy_entries(entries: &[Entry], into: &mut Vec<Entry>) -> Result<()> {
     into.try_reserve(entries.len()).map_err(|_| Error::Memory)?;
     for entry in entries {
@@ -142,7 +152,7 @@ impl Unstable {
             .ok_or(Error::Invariant("a range outside what is not yet durable"))
     }
     fn restore(&mut self, snapshot: Snapshot) {
-        self.entries.clear();
+        self.entries = Vec::new();
         self.bytes = 0;
         self.offset = proto::snapshot_index(&snapshot).saturating_add(1);
         self.snapshot = Some(snapshot);
@@ -287,9 +297,36 @@ impl<S: Storage> Log<S> {
         committed: u64,
         entries: &[Entry],
     ) -> Result<Option<(u64, u64)>> {
-        if !self.match_term(index, term) {
+        self.append_after(index, term, committed, entries, false)
+    }
+    /// As [`Log::maybe_append`]. With `committed_agrees`, what is committed
+    /// here is taken to be what the leader holds there, whatever term it
+    /// bears: the point the entries follow matches when it is committed,
+    /// and an entry at a committed index is set aside.
+    ///
+    /// A leader holds every committed entry, so this takes nothing on
+    /// trust that the terms would not show. It is for the fast track
+    /// ([`crate::fast`]), where an entry committed by the fast quorum bears
+    /// the term of the leader that took it, and the leader after it, which
+    /// took it again at its election, gave it its own.
+    pub fn append_after(
+        &mut self,
+        index: u64,
+        term: u64,
+        committed: u64,
+        entries: &[Entry],
+        committed_agrees: bool,
+    ) -> Result<Option<(u64, u64)>> {
+        let agreed = if committed_agrees { self.committed } else { 0 };
+        if (index > agreed || !committed_agrees) && !self.match_term(index, term) {
             return Ok(None);
         }
+        let skipped = entries
+            .iter()
+            .take_while(|entry| entry.index <= agreed)
+            .count();
+        let entries = entries.get(skipped..).unwrap_or(&[]);
+        let index = index.saturating_add(u64::try_from(skipped).unwrap_or(u64::MAX));
         let last_new = index
             .checked_add(u64::try_from(entries.len()).unwrap_or(u64::MAX))
             .ok_or(Error::Violation("an index beyond what can be counted"))?;
@@ -352,7 +389,9 @@ impl<S: Storage> Log<S> {
             ));
         }
         self.unstable.offset = index.saturating_add(1);
-        self.unstable.entries.clear();
+        // Given up, and not emptied: a member that rests holds what it
+        // held before it was written to.
+        self.unstable.entries = Vec::new();
         self.unstable.bytes = 0;
         Ok(())
     }
@@ -559,6 +598,8 @@ pub(crate) mod tests {
         pub configuration: ConfState,
         pub snapshot: Snapshot,
         pub entries: Vec<Entry>,
+        /// What the member approved by itself.
+        pub proposals: Vec<Entry>,
     }
     impl Memory {
         pub fn with_voters(voters: &[u64]) -> Self {
@@ -610,6 +651,7 @@ pub(crate) mod tests {
             Ok(InitialState {
                 hard_state: self.hard_state.clone(),
                 configuration: self.configuration.clone(),
+                proposals: self.proposals.clone(),
             })
         }
         fn entries(

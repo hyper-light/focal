@@ -60,3 +60,23 @@ jobs:
           FOCAL_CAMPAIGN_CLAIMS: ${{ github.event.inputs.campaign_claims || '500' }}
           FOCAL_CAMPAIGN_READS: ${{ github.event.inputs.campaign_reads || '2000' }}
         run: bash scripts/cargo.sh test -p focal-load --test campaign --locked -- --ignored --nocapture
+      # The consensus core against raft-rs, and groups under schedules, with
+      # more schedules and longer ones than a change is checked with.
+      - name: Consensus schedules
+        env:
+          FOCAL_RAFT_SEEDS: "2000"
+          FOCAL_RAFT_STEPS: "6000"
+        run: bash scripts/cargo.sh test -p focal-raft --release --locked -- --nocapture
+      # What the fast track takes against the classic one, every case.
+      - name: Fast track latency
+        env:
+          FOCAL_FAST_FULL: "1"
+        run: bash scripts/cargo.sh test -p focal-consensus --release --locked sim_fast -- --nocapture
+  model:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v7.0.1
+      # Five voters: every state.
+      - name: The fast track's model, five voters
+        run: bash scripts/check-model.sh five
