@@ -135,6 +135,7 @@ pub struct QuicServer {
     endpoint: Endpoint,
     registry: PeerRegistry,
     limits: WireLimits,
+    admission: crate::Admission,
 }
 impl QuicServer {
     pub fn bind(
@@ -143,13 +144,30 @@ impl QuicServer {
         registry: PeerRegistry,
         limits: WireLimits,
     ) -> Result<Self, WireError> {
+        let admission = crate::AdmissionLimits::for_connections(limits.max_connections);
+        Self::bind_admitting(address, tls, registry, limits, admission)
+    }
+    /// [`Self::bind`] with the admission bounds stated.
+    pub fn bind_admitting(
+        address: SocketAddr,
+        tls: quinn::ServerConfig,
+        registry: PeerRegistry,
+        limits: WireLimits,
+        admission: crate::AdmissionLimits,
+    ) -> Result<Self, WireError> {
         limits.validate()?;
+        let admission = crate::Admission::new(admission).map_err(|_| WireError::Limit)?;
         let endpoint = transport_setup(|| Ok(Endpoint::server(tls, address)?))?;
         Ok(Self {
             endpoint,
             registry,
             limits,
+            admission,
         })
+    }
+    /// Who holds this server's connections, and what it refused.
+    pub fn admission(&self) -> crate::AdmissionStats {
+        self.admission.stats()
     }
     pub fn local_addr(&self) -> Result<SocketAddr, WireError> {
         Ok(self.endpoint.local_addr()?)
@@ -159,26 +177,29 @@ impl QuicServer {
     }
     pub async fn serve<H: RequestHandler + Clone>(&self, handler: H) -> Result<(), WireError> {
         require_runtime()?;
-        let mut tasks = JoinSet::new();
+        // The connections borrow this server and its admission; each
+        // serves its streams on tasks of its own.
+        let mut connections = futures_util::stream::FuturesUnordered::new();
         loop {
             tokio::select! {
-                Some(_)=tasks.join_next(),if !tasks.is_empty()=>{},
+                Some(())=futures_util::StreamExt::next(&mut connections),if !connections.is_empty()=>{},
                 incoming=self.endpoint.accept()=>{
-                    let Some(incoming)=incoming else{break}; if tasks.len() >= self.limits.max_connections {incoming.refuse();continue;}
+                    let Some(incoming)=incoming else{break};
+                    if connections.len() >= self.limits.max_connections {incoming.refuse();continue;}
+                    let Ok(pending)=self.admission.begin() else {incoming.refuse();continue;};
                     let registry=self.registry.clone();let limits=self.limits.clone();let handler=handler.clone();
-                    tasks.spawn(async move {
+                    connections.push(async move {
                         let _ = transport_exchange(async {
                             let connection = tokio::time::timeout(limits.request_timeout, incoming)
                                 .await.map_err(|_| WireError::Timeout)?
                                 .map_err(|_| WireError::Connection)?;
-                            serve_authenticated_connection(connection, registry, limits, handler).await
+                            serve_admitted_connection(connection, registry, limits, handler, pending).await
                         }).await;
                     });
                 }
             }
         }
-        tasks.abort_all();
-        while tasks.join_next().await.is_some() {}
+        drop(connections);
         Ok(())
     }
 }
@@ -192,7 +213,26 @@ pub async fn serve_authenticated_connection<H: RequestHandler + Clone>(
     handler: H,
 ) -> Result<(), WireError> {
     transport_exchange(serve_authenticated_connection_inner(
-        connection, registry, limits, handler,
+        connection, registry, limits, handler, None,
+    ))
+    .await
+}
+/// [`serve_authenticated_connection`] for a listener that admits by identity
+/// (27 §3.1 P5): `pending` is the place the handshake held, exchanged for a
+/// charge to the identity the certificate authenticates as.
+pub async fn serve_admitted_connection<H: RequestHandler + Clone>(
+    connection: Connection,
+    registry: PeerRegistry,
+    limits: WireLimits,
+    handler: H,
+    pending: crate::Pending<'_>,
+) -> Result<(), WireError> {
+    transport_exchange(serve_authenticated_connection_inner(
+        connection,
+        registry,
+        limits,
+        handler,
+        Some(pending),
     ))
     .await
 }
@@ -201,6 +241,7 @@ async fn serve_authenticated_connection_inner<H: RequestHandler + Clone>(
     registry: PeerRegistry,
     limits: WireLimits,
     handler: H,
+    pending: Option<crate::Pending<'_>>,
 ) -> Result<(), WireError> {
     limits.validate()?;
     let authenticated = (|| {
@@ -219,16 +260,27 @@ async fn serve_authenticated_connection_inner<H: RequestHandler + Clone>(
             .map_err(|_| WireError::Authentication)?;
         let fingerprint =
             certificate_fingerprint(identity.first().ok_or(WireError::Authentication)?.as_ref());
-        registry
+        let peer = registry
             .authenticate(fingerprint)
             .map_err(|_| WireError::Authentication)?;
-        Ok(fingerprint)
+        Ok((fingerprint, peer))
     })();
-    let fingerprint = match authenticated {
-        Ok(fingerprint) => fingerprint,
+    let (fingerprint, peer) = match authenticated {
+        Ok(authenticated) => authenticated,
         Err(error) => {
             connection.close(1u8.into(), b"unauthorized");
             return Err(error);
+        }
+    };
+    // Charged to the identity from here until this connection is served.
+    let _admitted = match pending
+        .map(|pending| pending.authenticated(peer.principal(), peer.role(), &connection))
+        .transpose()
+    {
+        Ok(admitted) => admitted,
+        Err(_) => {
+            connection.close(4u8.into(), b"capacity");
+            return Err(WireError::Access(AccessError::Capacity));
         }
     };
     let handshake = async {

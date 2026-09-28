@@ -1268,6 +1268,7 @@ impl NetworkService {
                 peers: root.peers.clone(),
             },
             peers: self.pool.stats(),
+            listener: self.listener.admission(),
             peer_rtts,
             liveness,
             credential,

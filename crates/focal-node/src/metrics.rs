@@ -120,6 +120,9 @@ pub struct MetricsSnapshot {
     pub fleet: FleetStatus,
     pub root: RootMetrics,
     pub peers: PeerPoolStats,
+    /// Who holds the listener's connections and what it refused (27 §3.1
+    /// P5).
+    pub listener: focal_wire::AdmissionStats,
     /// The last measured round-trip time to each peer, bounded by the
     /// fleet's member count (24 §22): the operator's view of inter-node,
     /// and so inter-region, latency.
@@ -450,6 +453,46 @@ impl MetricsSnapshot {
             "Peer requests in flight.",
             self.peers.inflight,
         );
+        text.gauge(
+            "focal_listener_handshakes_pending",
+            "Inbound handshakes in progress.",
+            self.listener.pending,
+        );
+        text.gauge(
+            "focal_listener_identities",
+            "Identities holding an inbound connection.",
+            self.listener.identities,
+        );
+        text.gauge(
+            "focal_listener_connections",
+            "Authenticated inbound connections.",
+            self.listener.connections,
+        );
+        text.counter(
+            "focal_listener_admitted_total",
+            "Inbound connections admitted to an identity.",
+            self.listener.admitted,
+        );
+        text.counter(
+            "focal_listener_replaced_total",
+            "Oldest connections of a node closed for its newest.",
+            self.listener.replaced,
+        );
+        text.header(
+            "focal_listener_refused_total",
+            "counter",
+            "Inbound connections refused, by the bound that refused them.",
+        );
+        for (bound, refused) in [
+            ("handshakes", self.listener.refused_pending),
+            ("identities", self.listener.refused_identities),
+            (
+                "identity_connections",
+                self.listener.refused_identity_connections,
+            ),
+        ] {
+            text.labeled("focal_listener_refused_total", &[("bound", bound)], refused);
+        }
         if !self.peer_rtts.is_empty() {
             text.header(
                 "focal_peer_rtt_ms",
@@ -850,6 +893,7 @@ mod tests {
                 cached_connections: 1,
                 inflight: 0,
             },
+            listener: focal_wire::AdmissionStats::default(),
             peer_rtts: vec![PeerRtt {
                 peer: 9,
                 rtt_ms: 42,

@@ -142,6 +142,10 @@ pub struct NetworkListener {
     limits: WireLimits,
     join_limits: TransportLimits,
     enrollment_slots: tokio::sync::Semaphore,
+    /// Who holds this listener's connections (27 §3.1 P5): handshakes in
+    /// progress apart from authenticated connections, which are charged to
+    /// the identity they authenticated as.
+    admission: focal_wire::Admission,
     budget: MemoryBudget,
     ca: Vec<u8>,
     enrollment: Option<CredentialMaterial>,
@@ -212,12 +216,17 @@ impl NetworkListener {
             )
         }))
         .map_err(|_| WireError::Connection)??;
+        let admission = focal_wire::Admission::new(focal_wire::AdmissionLimits::for_connections(
+            limits.max_connections,
+        ))
+        .map_err(|_| WireError::Limit)?;
         Ok(Self {
             endpoint: Some(endpoint),
             released: Some(completion),
             registry,
             limits,
             enrollment_slots: tokio::sync::Semaphore::new(join_limits.max_connections),
+            admission,
             join_limits,
             budget,
             ca: ca.to_vec(),
@@ -230,6 +239,10 @@ impl NetworkListener {
             .ok_or(WireError::Connection)?
             .local_addr()
             .map_err(Into::into)
+    }
+    /// Who holds this listener's connections, and what it refused.
+    pub fn admission(&self) -> focal_wire::AdmissionStats {
+        self.admission.stats()
     }
     pub fn close(&self) {
         if let Some(endpoint) = &self.endpoint {
@@ -279,6 +292,9 @@ impl NetworkListener {
                 incoming = endpoint.accept() => {
                     let Some(incoming) = incoming else { break; };
                     if connections.len() >= self.limits.max_connections { incoming.refuse(); continue; }
+                    // A handshake takes a pending place, which no
+                    // authenticated connection uses.
+                    let Ok(pending) = self.admission.begin() else { incoming.refuse(); continue; };
                     let Ok(charge) = self.budget.reserve(BudgetKind::Control, BudgetLane::Ordinary, 64 * 1024) else { incoming.refuse(); continue; };
                     let data = data.clone();
                     let enrollment = enrollment.clone();
@@ -288,8 +304,11 @@ impl NetworkListener {
                         let protocol = connection.handshake_data().and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
                             .and_then(|data| data.protocol);
                         if protocol.as_deref() == Some(ALPN) {
-                            let _ = focal_wire::serve_authenticated_connection(connection, self.registry.clone(), self.limits.clone(), data).await;
+                            let _ = focal_wire::serve_admitted_connection(connection, self.registry.clone(), self.limits.clone(), data, pending).await;
                         } else if protocol.as_deref() == Some(ENROLLMENT_ALPN) {
+                            // A joiner has no identity yet: its own bound is
+                            // the enrollment slots.
+                            drop(pending);
                             if let (Some(handler), Ok(_slot)) = (enrollment, self.enrollment_slots.try_acquire()) {
                                 let _ = focal_enrollment::serve_enrollment_connection(connection, handler, self.join_limits.timeout).await;
                             } else { connection.close(1u8.into(), b"enrollment unavailable"); }

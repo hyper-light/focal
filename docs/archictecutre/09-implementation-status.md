@@ -10637,3 +10637,41 @@ raft-rs draws its election timeouts from its own generator, so a run does not re
 from the seed alone; the suite is repeated instead: 30 runs of the six tests, 30 passed
 (macOS arm64, with another project building on the same machine).
 
+### 2026-09-28 — CI on `8462329`; admission by identity; a retirement that always closes
+
+CI on `8462329` (runs 36393047505, 36393047486). macOS failed in
+`network_control::tests::founder_enrollment_follows_remote_quorum_leaders_…`: the
+test required one call to reach the known leader without asking another route, and a
+call whose leader is slow to answer goes on to the routes, which is what the transport
+is for. The test now requires that a call does so while the dead route is still
+installed, charged to the replicas' periods. On `45076ef` macOS had failed in
+`quorum_enrollment`, whose router asked one host wherever the group led; it follows
+the group now, as `NetworkEnrollmentControl` does, except in the scenario that places
+the signer with a minority. Both are the class the Windows failure was: leadership or
+promptness observed once and assumed to hold.
+
+**Admission by identity (27 §3.1 P5).** The listener counted handshakes and
+authenticated connections in one bound, and no identity had a bound of its own.
+`focal_wire::Admission`: a bounded number of pending places that authenticated
+connections never use; a charge per identity (the grant's principal, which a renewed
+certificate keeps); a bound on identities. A node past its bound of 4 replaces its
+oldest connection; any other identity past its bound of 16 is refused. Metrics
+`focal_listener_{handshakes_pending,identities,connections,admitted_total,
+replaced_total,refused_total{bound}}`. Five tests over real QUIC connections.
+
+**A retirement always closes (27 §3.1 P6).** `Slot::retire` closed the slot's
+connection only when a `try_lock` succeeded, and a dial could store a connection after
+the retirement had looked. The connection lock is never held across an await, so it is
+a synchronous lock: a retirement takes it and closes what it finds, and a dial stores
+under it only while the slot is not retired. Tests:
+`a_request_in_flight_ends_when_its_route_is_retired_and_not_at_its_deadline` (the
+peer never answers and the pool's deadline is a minute; the request ends at the
+retirement) and `a_route_retired_during_its_dial_leaves_no_connection_behind`.
+
+**Not resolved.** `network_control.rs`, the listener and the service probe for a
+runtime without a timer by calling tokio's timer inside `catch_unwind`: tokio offers no
+other way to ask, and it panics when the timer is absent. The panic is contained and
+the call answers `Unavailable`, but it is a panic on a production path and it prints.
+Removing it means never calling tokio's timer on a runtime focal did not build, or a
+timer of focal's own. Not decided.
+

@@ -1218,6 +1218,148 @@ async fn peer_pool_callers_that_give_up_share_one_dial_whose_outcome_is_still_re
 }
 
 #[tokio::test]
+async fn a_request_in_flight_ends_when_its_route_is_retired_and_not_at_its_deadline() {
+    use std::collections::BTreeMap;
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(16).unwrap();
+    let mut node_grant = grant();
+    node_grant.role = PeerRole::Node { node_id: 7 };
+    registry
+        .register_certificate(&certificate, node_grant)
+        .unwrap();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let gated = started.clone();
+    // The peer never answers: only the retirement can end the request.
+    let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| {
+        let gated = gated.clone();
+        async move {
+            gated.notify_one();
+            std::future::pending::<()>().await;
+            verified.request().reply(Response::PeerAccepted)
+        }
+    });
+    let (server, task) = server(&pki, registry, handler).await;
+    let deadline = Duration::from_secs(60);
+    let pool = Arc::new(
+        PeerConnectionPool::new(
+            connector(&pki, certificate, key),
+            PeerPoolLimits {
+                timeout: deadline,
+                attempts: 2,
+                ..PeerPoolLimits::default()
+            },
+        )
+        .unwrap(),
+    );
+    let endpoint = PeerEndpoint {
+        address: server.local_addr().unwrap(),
+        server_name: "localhost".into(),
+        name: None,
+    };
+    for round in 0..8u64 {
+        let revision = round * 2 + 1;
+        pool.replace_routes(revision, BTreeMap::from([(2, endpoint.clone())]))
+            .unwrap();
+        let mut packet = request(200 + round as u128);
+        packet.operation = Operation::Raft {
+            group: [2; 16],
+            message: vec![7, 8, 9],
+        };
+        let sending = pool.clone();
+        let pending = tokio::spawn(async move { sending.send(2, &packet).await });
+        tokio::time::timeout(Duration::from_secs(10), started.notified())
+            .await
+            .unwrap();
+        let asked = std::time::Instant::now();
+        pool.replace_routes(revision + 1, BTreeMap::new()).unwrap();
+        let ended = tokio::time::timeout(deadline / 2, pending)
+            .await
+            .expect("the request waited out its deadline")
+            .unwrap();
+        assert!(
+            matches!(
+                ended,
+                Err(PeerSendError::NoRoute | PeerSendError::RouteChanged)
+            ),
+            "{ended:?}"
+        );
+        assert!(asked.elapsed() < deadline / 2);
+        assert_eq!(pool.stats().inflight, 0);
+        assert_eq!(pool.stats().cached_connections, 0);
+    }
+    pool.close();
+    server.close();
+    task.await.unwrap().unwrap();
+}
+
+/// A route retired while its connection is still being made never leaves a
+/// connection behind: whatever the order of the handshake and the
+/// retirement, the pool holds none afterwards and the next route works.
+#[tokio::test]
+async fn a_route_retired_during_its_dial_leaves_no_connection_behind() {
+    use std::collections::BTreeMap;
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(16).unwrap();
+    let mut node_grant = grant();
+    node_grant.role = PeerRole::Node { node_id: 7 };
+    registry
+        .register_certificate(&certificate, node_grant)
+        .unwrap();
+    let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| async move {
+        verified.request().reply(Response::PeerAccepted)
+    });
+    let (server, task) = server(&pki, registry, handler).await;
+    let pool = Arc::new(
+        PeerConnectionPool::new(connector(&pki, certificate, key), PeerPoolLimits::default())
+            .unwrap(),
+    );
+    let endpoint = PeerEndpoint {
+        address: server.local_addr().unwrap(),
+        server_name: "localhost".into(),
+        name: None,
+    };
+    let mut packet = request(300);
+    packet.operation = Operation::Raft {
+        group: [2; 16],
+        message: vec![1],
+    };
+    let mut retired_in_flight = 0;
+    for round in 0..64u64 {
+        let revision = round * 2 + 1;
+        pool.replace_routes(revision, BTreeMap::from([(2, endpoint.clone())]))
+            .unwrap();
+        let sending = pool.clone();
+        let sent = packet.clone();
+        let pending = tokio::spawn(async move { sending.send(2, &sent).await });
+        // Yield a varying number of times so the retirement lands at
+        // different points of the dial.
+        for _ in 0..round % 8 {
+            tokio::task::yield_now().await;
+        }
+        pool.replace_routes(revision + 1, BTreeMap::new()).unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(30), pending)
+            .await
+            .expect("a send outlived its retired route")
+            .unwrap();
+        if ended.is_err() {
+            retired_in_flight += 1;
+        }
+        assert_eq!(pool.stats().inflight, 0, "round {round}");
+        assert_eq!(pool.stats().cached_connections, 0, "round {round}");
+    }
+    assert!(retired_in_flight > 0, "no retirement met a send in flight");
+    // The pool is whole: a route installed now serves.
+    pool.replace_routes(1_000, BTreeMap::from([(2, endpoint)]))
+        .unwrap();
+    assert_eq!(pool.send(2, &packet).await, Ok(()));
+    pool.close();
+    server.close();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn peer_pool_saturation_is_bounded_and_route_change_retires_active_connections() {
     use std::collections::BTreeMap;
     let pki = Pki::new();
@@ -1986,4 +2128,248 @@ async fn peer_pool_dials_an_unreachable_peer_once_per_cooldown_and_fails_the_res
     );
     assert_eq!(pool.stats().connections_opened, 0);
     pool.close();
+}
+
+mod admission {
+    //! Admission by identity (27 §3.1 P5), over real connections.
+    use super::*;
+
+    async fn admitting(
+        pki: &Pki,
+        registry: PeerRegistry,
+        admission: AdmissionLimits,
+    ) -> (
+        Arc<QuicServer>,
+        tokio::task::JoinHandle<Result<(), WireError>>,
+    ) {
+        let (certificate, key) = pki.issue(true);
+        let tls = server_tls(
+            TlsIdentity::from_pkcs8(vec![certificate], key),
+            vec![pki.ca.der().to_vec()],
+            &limits(),
+        )
+        .unwrap();
+        let server = Arc::new(
+            QuicServer::bind_admitting(
+                "127.0.0.1:0".parse().unwrap(),
+                tls,
+                registry,
+                limits(),
+                admission,
+            )
+            .unwrap(),
+        );
+        let running = server.clone();
+        let handler: Arc<dyn RequestHandler> =
+            Arc::new(|verified: VerifiedRequest| async move { response(verified.request()) });
+        let task = tokio::spawn(async move { running.serve(handler).await });
+        (server, task)
+    }
+    fn bounds() -> AdmissionLimits {
+        AdmissionLimits {
+            pending: 8,
+            identities: 8,
+            per_node: 4,
+            per_participant: 2,
+        }
+    }
+    /// What the server holds, once it says so: a connection's end reaches
+    /// the server a moment after the client's close.
+    async fn held(server: &QuicServer, connections: usize) -> AdmissionStats {
+        // Charged to what the listener does: it ends when the listener has
+        // changed nothing for the frozen window.
+        let mut wait = focal_timing::ProgressDeadline::begin(
+            &[server.admission().changes],
+            u64::MAX,
+            Duration::from_secs(30),
+        );
+        loop {
+            let stats = server.admission();
+            if stats.connections == connections && stats.pending == 0 {
+                return stats;
+            }
+            if let Err(spent) = wait.check(&[stats.changes]) {
+                panic!("the server never held {connections}: {spent}: {stats:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    async fn serves(remote: &QuicRemote, id: u128) -> bool {
+        remote.request(&request(id)).await.is_ok()
+    }
+
+    #[test]
+    fn pending_places_are_bounded_and_given_back() {
+        assert_eq!(
+            Admission::new(AdmissionLimits {
+                pending: 0,
+                ..bounds()
+            })
+            .err(),
+            Some(AdmissionRefusal::InvalidLimits)
+        );
+        let admission = Admission::new(AdmissionLimits {
+            pending: 2,
+            ..bounds()
+        })
+        .unwrap();
+        let first = admission.begin().unwrap();
+        let second = admission.begin().unwrap();
+        assert_eq!(admission.begin().err(), Some(AdmissionRefusal::Pending));
+        assert_eq!(admission.stats().pending, 2);
+        assert_eq!(admission.stats().refused_pending, 1);
+        drop(first);
+        let third = admission.begin().unwrap();
+        assert_eq!(admission.begin().err(), Some(AdmissionRefusal::Pending));
+        drop((second, third));
+        assert_eq!(admission.stats().pending, 0);
+        assert_eq!(admission.stats().connections, 0);
+        assert_eq!(
+            AdmissionLimits::for_connections(128),
+            AdmissionLimits {
+                pending: 32,
+                identities: 128,
+                per_node: 4,
+                per_participant: 16,
+            }
+        );
+        assert_eq!(AdmissionLimits::for_connections(1).pending, 1);
+    }
+
+    #[tokio::test]
+    async fn a_node_past_its_bound_replaces_its_oldest_connection() {
+        let pki = Pki::new();
+        let (certificate, key) = pki.issue(false);
+        let registry = PeerRegistry::new(16).unwrap();
+        let mut node = grant();
+        node.role = PeerRole::Node { node_id: 7 };
+        registry.register_certificate(&certificate, node).unwrap();
+        let (server, task) = admitting(&pki, registry, bounds()).await;
+        let address = server.local_addr().unwrap();
+        let connector = connector(&pki, certificate, key);
+        let mut remotes = Vec::new();
+        for _ in 0..4 {
+            remotes.push(connector.connect(address, "localhost").await.unwrap());
+        }
+        let stats = held(&server, 4).await;
+        assert_eq!((stats.identities, stats.replaced), (1, 0));
+        for (index, remote) in remotes.iter().enumerate() {
+            assert!(serves(remote, 400 + index as u128).await);
+        }
+        // The node dials again: it is served, and its oldest connection is
+        // the one that ends.
+        let fifth = connector.connect(address, "localhost").await.unwrap();
+        assert!(serves(&fifth, 410).await);
+        let stats = held(&server, 4).await;
+        assert_eq!(
+            (stats.identities, stats.replaced, stats.admitted),
+            (1, 1, 5)
+        );
+        assert!(!serves(&remotes[0], 411).await, "the oldest still serves");
+        for (index, remote) in remotes.iter().enumerate().skip(1) {
+            assert!(serves(remote, 420 + index as u128).await, "{index} ended");
+        }
+        // Closed connections give their charge back.
+        for remote in remotes.iter().skip(1) {
+            remote.close();
+        }
+        fifth.close();
+        let stats = held(&server, 0).await;
+        assert_eq!(stats.identities, 0);
+        server.close();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_participant_at_its_bound_is_refused_and_nothing_of_theirs_is_closed() {
+        let pki = Pki::new();
+        let (certificate, key) = pki.issue(false);
+        let registry = PeerRegistry::new(16).unwrap();
+        registry
+            .register_certificate(&certificate, grant())
+            .unwrap();
+        let (server, task) = admitting(&pki, registry, bounds()).await;
+        let address = server.local_addr().unwrap();
+        let connector = connector(&pki, certificate, key);
+        let first = connector.connect(address, "localhost").await.unwrap();
+        let second = connector.connect(address, "localhost").await.unwrap();
+        held(&server, 2).await;
+        assert!(connector.connect(address, "localhost").await.is_err());
+        let stats = held(&server, 2).await;
+        assert_eq!((stats.refused_identity_connections, stats.replaced), (1, 0));
+        assert!(serves(&first, 500).await && serves(&second, 501).await);
+        // One of theirs ends: the next is admitted.
+        first.close();
+        held(&server, 1).await;
+        let third = connector.connect(address, "localhost").await.unwrap();
+        assert!(serves(&third, 502).await && serves(&second, 503).await);
+        held(&server, 2).await;
+        server.close();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn identities_are_bounded_and_one_identity_cannot_take_anothers_place() {
+        let pki = Pki::new();
+        let registry = PeerRegistry::new(16).unwrap();
+        let mut connectors = Vec::new();
+        for principal in 1..=3u128 {
+            let (certificate, key) = pki.issue(false);
+            let mut grant = grant();
+            grant.principal = ParticipantId::from_u128(principal);
+            registry.register_certificate(&certificate, grant).unwrap();
+            connectors.push(connector(&pki, certificate, key));
+        }
+        let (server, task) = admitting(
+            &pki,
+            registry,
+            AdmissionLimits {
+                identities: 2,
+                ..bounds()
+            },
+        )
+        .await;
+        let address = server.local_addr().unwrap();
+        // The first identity takes all it may hold; the second still has
+        // its place.
+        let a = connectors[0].connect(address, "localhost").await.unwrap();
+        let b = connectors[0].connect(address, "localhost").await.unwrap();
+        assert!(connectors[0].connect(address, "localhost").await.is_err());
+        let c = connectors[1].connect(address, "localhost").await.unwrap();
+        let stats = held(&server, 3).await;
+        assert_eq!(stats.identities, 2);
+        // A third identity finds no place, and takes none from the others.
+        assert!(connectors[2].connect(address, "localhost").await.is_err());
+        let stats = held(&server, 3).await;
+        assert_eq!(
+            (stats.refused_identities, stats.refused_identity_connections),
+            (1, 1)
+        );
+        assert!(serves(&a, 600).await && serves(&b, 601).await && serves(&c, 602).await);
+        // An identity that leaves frees its place.
+        c.close();
+        held(&server, 2).await;
+        let d = connectors[2].connect(address, "localhost").await.unwrap();
+        assert!(serves(&d, 603).await);
+        server.close();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_certificate_that_does_not_authenticate_is_charged_to_no_identity() {
+        let pki = Pki::new();
+        let (certificate, key) = pki.issue(false);
+        // Signed by the authority, registered to nobody.
+        let registry = PeerRegistry::new(16).unwrap();
+        let (server, task) = admitting(&pki, registry, bounds()).await;
+        let address = server.local_addr().unwrap();
+        let connector = connector(&pki, certificate, key);
+        for _ in 0..16 {
+            assert!(connector.connect(address, "localhost").await.is_err());
+        }
+        let stats = held(&server, 0).await;
+        assert_eq!((stats.identities, stats.admitted), (0, 0));
+        server.close();
+        task.await.unwrap().unwrap();
+    }
 }

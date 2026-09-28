@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, watch},
+    sync::{OwnedSemaphorePermit, Semaphore, watch},
     task::JoinSet,
 };
 
@@ -152,7 +152,10 @@ struct Slot {
     inflight: Semaphore,
     /// The probe lane: one liveness probe to this peer at a time.
     probes: Semaphore,
-    connection: AsyncMutex<Option<Connected>>,
+    /// Never held across an await: a retirement takes it and closes what it
+    /// finds, and whoever stores a connection checks for a retirement under
+    /// it, so no connection outlives its slot's retirement.
+    connection: Mutex<Option<Connected>>,
     dial: Mutex<Option<Dial>>,
     generation: AtomicU64,
     /// Until when a failed dial keeps this peer from being dialed again.
@@ -182,9 +185,12 @@ impl Slot {
         {
             dial.task.abort();
         }
-        if let Ok(mut connection) = self.connection.try_lock()
-            && let Some(connection) = connection.take()
-        {
+        // A poisoned lock still guards the connection to close.
+        let connection = match self.connection.lock() {
+            Ok(mut connection) => connection.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(connection) = connection {
             connection.remote.close();
         }
     }
@@ -194,7 +200,11 @@ impl Drop for Slot {
         if let Some(dial) = self.dial.get_mut().ok().and_then(|dial| dial.take()) {
             dial.task.abort();
         }
-        if let Some(connection) = self.connection.get_mut().take() {
+        let connection = match self.connection.get_mut() {
+            Ok(connection) => connection.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(connection) = connection {
             connection.remote.close();
         }
     }
@@ -659,14 +669,13 @@ impl PeerConnectionPool {
                     Err(_) => (),
                 }
                 remote.close();
-                let mut cached = slot.connection.lock().await;
-                if cached
-                    .as_ref()
-                    .is_some_and(|entry| entry.generation == generation)
+                if let Ok(mut cached) = slot.connection.lock()
+                    && cached
+                        .as_ref()
+                        .is_some_and(|entry| entry.generation == generation)
                 {
                     *cached = None;
                 }
-                drop(cached);
                 if attempt.saturating_add(1) < self.limits.attempts {
                     tokio::time::sleep(self.limits.retry_backoff).await;
                 }
@@ -721,7 +730,7 @@ impl PeerConnectionPool {
             retired: AtomicBool::new(false),
             inflight: Semaphore::new(self.limits.per_peer_inflight),
             probes: Semaphore::new(1),
-            connection: AsyncMutex::new(None),
+            connection: Mutex::new(None),
             dial: Mutex::new(None),
             generation: AtomicU64::new(0),
             unreachable_until: Mutex::new(None),
@@ -745,7 +754,7 @@ impl PeerConnectionPool {
             return Err(PeerSendError::Lost);
         }
         {
-            let cached = slot.connection.lock().await;
+            let cached = slot.connection.lock().map_err(|_| PeerSendError::Closed)?;
             if slot.retired.load(Ordering::Acquire) {
                 return Err(PeerSendError::RouteChanged);
             }
@@ -768,7 +777,7 @@ impl PeerConnectionPool {
                 DialState::Connected => break,
             }
         }
-        let cached = slot.connection.lock().await;
+        let cached = slot.connection.lock().map_err(|_| PeerSendError::Closed)?;
         if slot.retired.load(Ordering::Acquire) {
             return Err(PeerSendError::RouteChanged);
         }
@@ -809,12 +818,21 @@ impl PeerConnectionPool {
                         Ordering::Relaxed,
                         |value| value.checked_add(1),
                     ) {
-                        Ok(generation) => {
-                            let mut cached = task_slot.connection.lock().await;
-                            *cached = Some(Connected { generation, remote });
-                            increment(&counters.opened);
-                            DialState::Connected
-                        }
+                        // Stored under the lock a retirement takes, and
+                        // only while the slot is not retired: a connection
+                        // that finished its handshake as its route was
+                        // replaced is closed here and never used.
+                        Ok(generation) => match task_slot.connection.lock() {
+                            Ok(mut cached) if !task_slot.retired.load(Ordering::Acquire) => {
+                                *cached = Some(Connected { generation, remote });
+                                increment(&counters.opened);
+                                DialState::Connected
+                            }
+                            _ => {
+                                remote.close();
+                                DialState::Failed
+                            }
+                        },
                         Err(_) => {
                             remote.close();
                             DialState::Failed

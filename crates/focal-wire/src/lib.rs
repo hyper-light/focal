@@ -13,6 +13,7 @@
 //! Bounded authenticated protocol shared by embedded and QUIC adapters.
 //! Async transport entry points require a Tokio runtime with IO and time drivers.
 //! Missing runtime context returns a typed transport error before dispatch.
+mod admission;
 mod auth;
 mod frame;
 mod handler;
@@ -27,6 +28,7 @@ mod reconcile;
 mod transport;
 mod traversal;
 mod validators;
+pub use admission::*;
 pub use auth::*;
 pub use frame::*;
 pub use handler::*;
