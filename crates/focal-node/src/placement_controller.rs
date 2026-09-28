@@ -1267,6 +1267,15 @@ impl PlacementAgent {
                 .await;
         }
         self.verified_active.remove(&descriptor.ledger);
+        // A death that has not stood for one election window of the group
+        // that would lose the voter moves nothing yet (27 §3.1 P4): a
+        // member that is back within it keeps its seat, and the group has
+        // not been without it for longer than it takes to elect.
+        let hold = self.retirement_hold(handles, driver);
+        if !focal_directory::deaths_held(&descriptor.active.placement, &directory.nodes, now, hold)
+        {
+            return Ok(None);
+        }
         let operation = OperationId({
             let mut hasher = blake3::Hasher::new_derive_key("focal.placement.heal.v1");
             hasher.update(&descriptor.ledger.tenant.0);
@@ -1279,10 +1288,10 @@ impl PlacementAgent {
             id
         });
         let leading = self.take_leading(directory);
-        let proposal = focal_directory::propose_placement_leading(
+        let proposal = focal_directory::heal_placement(
             &directory.nodes,
             &descriptor.active.policy,
-            &descriptor.active.placement.voters,
+            &descriptor.active.placement,
             focal_directory::Leading {
                 counts: &leading.counts,
                 current: Some(descriptor.active.placement.preferred_leader),
@@ -1363,7 +1372,13 @@ impl PlacementAgent {
             now,
         );
         let Some(desired) = desired.filter(|_| due && !moving) else {
-            return Ok(None);
+            // Where the session is led where it should be, a seat of it
+            // may still be away from home.
+            return self
+                .balance_home(
+                    handles, descriptor, directory, snapshot, installed, moving, now,
+                )
+                .await;
         };
         let target = desired.placement.preferred_leader;
         // What the move was decided on: the report of the node it goes to.
@@ -1403,12 +1418,105 @@ impl PlacementAgent {
         self.leader_balancer.moved();
         Ok(Some(step))
     }
+    /// Give one seat of a session whose policy names home regions to a
+    /// node that is there, where the directory has said so for long enough
+    /// and no other session of the partition is being balanced
+    /// (`focal_directory::home_move`, 27 §3.1 P4). A plan like any other.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one bounded pass over borrowed observations; no state is retained"
+    )]
+    async fn balance_home(
+        &mut self,
+        handles: &NetworkHandles,
+        descriptor: &SessionDescriptor,
+        directory: &PartitionCheckpoint,
+        snapshot: &ControlSnapshot,
+        installed: &ControlAuthoritySnapshot,
+        moving: bool,
+        now: i64,
+    ) -> Result<Option<AgentStep>, AgentError> {
+        let config = self.partition_config();
+        let proposal = if self.home_balancer.config().enabled {
+            focal_directory::home_move(
+                descriptor,
+                &directory.nodes,
+                config.max_members,
+                config.min_disk_available,
+            )
+        } else {
+            None
+        };
+        let newcomer = proposal
+            .as_ref()
+            .and_then(|proposal| proposal.observations.keys().next().copied());
+        let due = self.home_balancer.observe(descriptor.ledger, newcomer, now);
+        let (Some(proposal), Some(newcomer)) = (proposal.filter(|_| due && !moving), newcomer)
+        else {
+            return Ok(None);
+        };
+        let operation = OperationId({
+            let mut hasher = blake3::Hasher::new_derive_key("focal.placement.home.v1");
+            hasher.update(&descriptor.ledger.tenant.0);
+            hasher.update(&descriptor.ledger.session.0);
+            hasher.update(&descriptor.authority.record_hash.0);
+            hasher.update(&newcomer.to_le_bytes());
+            let mut id = [0; 16];
+            for (target, source) in id.iter_mut().zip(hasher.finalize().as_bytes()) {
+                *target = *source;
+            }
+            id
+        });
+        let command = self.session_command(
+            descriptor,
+            snapshot,
+            installed,
+            now,
+            SessionChange::Plan {
+                operation,
+                desired: proposal.spec,
+                observations: proposal.observations,
+            },
+            None,
+        )?;
+        let step = self.intend_partition(handles, command).await?;
+        self.home_balancer.moved();
+        self.leader_balancer.moved();
+        Ok(Some(step))
+    }
+    /// How long a death stands before it moves a seat, in seconds: one
+    /// election window of the session's group where this node hosts a copy
+    /// of it, and of the partition's own group otherwise, at the pace the
+    /// group runs at. Twice its election timeout, which is the longest a
+    /// member waits before it campaigns; a second at least, which is what
+    /// the controller's clock counts.
+    fn retirement_hold(&self, handles: &NetworkHandles, driver: &SessionDriver) -> i64 {
+        let (period, elections) = match driver.local() {
+            Some(host) => (host.tick_period(), host.election_periods()),
+            None => (
+                handles.control.tick_period(),
+                handles.control.election_periods(),
+            ),
+        };
+        retirement_hold(period, elections)
+    }
     /// The bounds the partition applies to every placement it accepts.
     pub(super) fn partition_config(&self) -> focal_directory::PartitionConfig {
         focal_directory::PartitionConfig::default()
     }
 }
 
+/// One election window in the seconds the controller's clock counts,
+/// rounded up.
+pub(crate) fn retirement_hold(period: Duration, election_periods: u64) -> i64 {
+    let window = period
+        .as_millis()
+        .saturating_mul(u128::from(election_periods.max(1)))
+        .saturating_mul(2);
+    i64::try_from(window.div_ceil(1_000))
+        .unwrap_or(i64::MAX)
+        .max(1)
+}
 /// What the controller would do next for one session, from the committed
 /// directory alone: the operator's `cluster plan`. Never executes anything.
 pub(crate) fn planned_actions(

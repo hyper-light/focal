@@ -56,7 +56,7 @@ are not driven in production.
 | P1 | Progress-aware fan-out: `broadcast`, `DispatchWait`, `CommitBudget`, `Stragglers` | A round stops when every peer has reported or when no reply arrives within a stall window, and extends while a quorum is still filling. Late replies are folded into the operation they belong to. focal's drivers bound sends per peer but still decide by fixed deadlines. | `focal_timing::{RoundBudget, RoundWait}`, `focal_wire::gather`. Two differences from slates, both from what focal's transport is. The budget is derived from what exchanges with the round's peers were measured to take, the peer's work included, because a focal request waits on a commit at its peer and not on the path alone. And an exchange outstanding when its round ends is dropped, not kept to fold later: a Raft reply in focal is an inbound message of its own, and a signature past the majority has no use. The pool counts a dropped exchange as given up on and doubles what that peer is expected to take until it answers one (RFC 9002 §6.2), so an estimate that ended a round too early corrects itself |
 | P2 | Derived timing: `PathRtt` (RFC 9002 smoothing), `ElectionTiming::derive`, `round_budget` | focal's election and heartbeat ticks are constants. A WAN group whose round trip exceeds the fixed budget never elects. slates derives the election base from the slowest voter's tail. | `focal_timing::{PathRtt, TickPace}`; the pool measures each path by the liveness probes the peer answers, as the median of the latest sixteen and their median absolute deviation, so that an answer that came late does not set a group's election timeout; both owners tick at the derived period, and a leader beats at the configured cadence whatever its period. As in slates, what stretches is the election timeout and never the heartbeat |
 | P3 | Period-counted timers | A starved node waits longer instead of campaigning. | The control and the replica owner tick once when their period has passed and begin the next from then: a period that was missed is not made up for, and the core counts ticks, so an owner that was starved for ten periods has waited eleven |
-| P4 | Voter reconciliation rules: retire only a death held continuously for one election window; sitting live voters keep their seats | focal's placement controller heals on liveness; the hold window and seat stability are not stated rules. | placement controller |
+| P4 | Voter reconciliation rules: retire only a death held continuously for one election window; sitting live voters keep their seats | focal's placement controller healed on the first verdict, and one ordering decided both who keeps a seat and who is nearest home. | `focal_directory::{heal_placement, home_move, deaths_held}` and the controller (section 5, seats) |
 | P5 | Admission by certificate: a pending-handshake reservation separate from authenticated slots, two slots per identity, replace on redial | focal bounds connections in total. One identity can take them. | `focal_wire::Admission`, in the node's listener. focal's identities are principals, and a participant may run several clients: a node holds 4 connections and any other identity 16. A connection past the bound replaces the one of that identity that was idle longest. Refusing the newcomer, which was the first rule here, made a participant whose clients exit without closing wait out the idle timeout of what they left behind |
 | P6 | Link validity inside a wait | A pending request should end when its peer's identity is replaced or retired, not at its deadline. | `focal-wire` pool: a retired route closes its connection under the lock a dial stores it under, so no order of the two leaves one open |
 | P7 | Simulated network: bottleneck with drop-tail queue, Gilbert-Elliott loss, MTU, NAT rebinding | focal-sim's network delivered at delays the test chose, with partitions and no path model. Election, fast-track and transfer claims need one. | `focal_sim::path` (`Fabric`, `Path`, `Loss`, `Link`, `Nat`), every table bounded (`FabricLimits`) |
@@ -86,7 +86,7 @@ are not driven in production.
 | Voter set never shrinks | Fixed: drain, remove, contact retirement |
 | Hard consensus budget under load | Fixed for what a group decides by (P1, `focal_wire::gather`); the transfers of section 6 stage C are still asked one peer after another |
 | Round expires inside the WAN round trip | Fixed: P2, the derived pace and the derived round budget |
-| Council retires a suspected voter | Open: P4 |
+| Council retires a suspected voter | Fixed: a death moves a seat once it has stood for one election window of the group, and a heal moves nothing else (section 5, seats) |
 | Wall-clock test deadlines | Converted: the fleet, placement, service, split, route, credential and liveness suites of `focal-node`, and every binary suite (`tests/support/deadline.rs`, `tests/support/fleet.rs`) |
 | A leader removes itself and keeps leading | Fixed: refused by the shell (`LeaderLeaving`), removal and demotion alike; the controller and `cluster nodes remove` transfer first; and a leader that applies its own leaving all the same, proposed by the one that led before it, hands the group over and follows (section 4.5) |
 | A new copy refuses a leader outside its genesis configuration | Fixed: copies admit the members the committed directory names (`ReplicaHost::admit_members`) |
@@ -327,6 +327,33 @@ replica says how often it asked and how often that did not hold
 `focal_session_leader_returns_total`, `focal_session_leader_returns_failed_total`,
 `focal_session_preferred_leader` in the node's metrics).
 
+**Seats.** Who keeps a seat when a placement is planned again was one ordering, home
+region first and then incumbency, and it was wrong at both ends: the death of one
+voter moved every voter that was not at home, and nothing moved a voter toward home
+unless something died. They are two decisions (`focal_directory::seats`).
+
+*A heal* fills the seats that were vacated and moves nothing else. A voter that sits,
+is enrolled at the generation it sits at, is eligible, alive and inside the residency
+keeps its seat, wherever it is and whatever has joined since. What admits a node to a
+seat it does not have (a load report, memory, disk) is no condition of keeping one. The
+one seat a heal takes from a voter that could keep it is the one the policy cannot do
+without: a session with home regions is led at home, and where no voter that sits is
+there, a node that is takes the seat given last. A death moves a seat once it has
+stood for one election window of the group that would lose the voter, twice its
+election timeout at the pace the group runs at (`retirement_hold`): two seconds on one
+network, forty across the planet at the ceiling of the pace. A member that is back
+within it keeps its seat. What an operator asks for is not held.
+
+*A move toward home* gives one seat of a voter that is not at home to a node that is,
+the most loaded voter's first. It is decided as a move of a preferred leader is: for a
+state that has lasted `FOCAL_HOME_BALANCE_HOLD_SECS` (30), one session of a partition
+at a time, leaders and seats together, and not at all with `FOCAL_HOME_BALANCE=off`.
+Every move leaves one voter fewer away from home and none more, so the moves end.
+
+On one node neither decides anything. Five real processes: a session placed while its
+home region had one node keeps its two voters elsewhere until two nodes join at home,
+and then moves one seat, and then the other, and rests (`tests/home_balance.rs`).
+
 **A node's own socket reaches a log only where that node leads it** (24 §14, a limit
 stated there). With leadership placed by priority and moved by transfer, that limit is
 met in ordinary operation and no longer only after a failure: a client on the local
@@ -477,3 +504,60 @@ Credit that rides acknowledgements, bounded probe copies and its path MTU search
 parts of its own transport; quinn has delayed acknowledgements, MTU discovery,
 segmentation offload, key update and migration, which slates lacks. Its consensus core
 has not changed since what focal took from it.
+
+## 8. Where the plan stands, and slates examined again (2026-09-28)
+
+### 8.1 What was planned, and the evidence for each
+
+| Planned | State | Where | Evidence |
+|---|---|---|---|
+| Fast Raft | Built in the core and the shell; no owner takes it yet (section 4.6) | `focal_raft::{fast, track}`, `DurableNode::propose_fast` | `tests/fast.rs` under schedules; `docs/models/FastTrack.tla` checked in CI; latency against the classic track, 0 to 10% loss |
+| Pre-vote | In service | `focal_raft::raft`, `Config::pre_vote` | compared with raft-rs step for step; `sim_election_tests` over three path profiles |
+| Priority elections | In service, three ranks | `fleet::{PREFERRED_LEADER_PRIORITY, ZONE_PRIORITY, VOTER_PRIORITY}` | `raft_safety_tests`; `fleet_leader_return_tests` |
+| Parallel vote replication and processing | In service for what a group decides by | `focal_wire::gather`, `focal_timing::RoundBudget` | round tests; dead-voter and straggler tests. The transfers of section 6 stage C are still asked one after another |
+| Learners | In service | `focal_raft::configuration`, `progress` | differential campaigns with changes; the placement suites |
+| Multi-log synchronization | In service | `leader_return`, `focal_directory::leading`, `leader_balancer`, `seats` | `tests/leader_balance.rs` and `tests/home_balance.rs`, real processes |
+| Leader transfer | In service | `focal_raft::raft`, `ReplicaHost::transfer_leader` | differential campaigns; `drain_leader`; a transfer that reaches a member asking for votes (section 4.5) |
+
+### 8.2 slates, by what it has
+
+Examined in its code, its records of defects and its measurements, three times over:
+its transport, its consensus and fleet, and three questions asked of its code.
+
+| slates has | focal | Why |
+|---|---|---|
+| Copa | Taken | Section 7 |
+| Classes of traffic, strict priority | Taken | Section 7 |
+| A collector that reads what is queued before it expires | Had it | `gather` reads a reply in hand before it judges the wait |
+| Test ports held from claim to use | Had it | `tests/support/ports.rs` claims across processes, outside the ephemeral range |
+| A council seated by incumbency and liveness | Taken, and split | Section 5, seats |
+| A death held for one election window | Taken | Section 5, seats |
+| Progress-aware fan-out, derived timing, period-counted timers, admission by certificate, link validity inside a wait, a modelled network, waits charged to progress | Taken before | Section 3.1, P1 to P8 |
+| Its own transport: packet and frame format, handshake, loss recovery, pacing, credit that rides acknowledgements, path MTU search | Not taken | quinn has each of them, and delayed acknowledgements, segmentation offload, key update and migration, which slates lacks |
+| Its executor: shards, io_uring, timer wheel, wake estimate | Not taken | tokio. The gains slates measured there (loopback p90 from 1,311 to 30 µs) repaired defects of its own |
+| Its consensus core | Not taken | Unchanged since what focal took; configuration only, without transfer, priority or a fast track |
+
+### 8.3 What slates lacks at the scale both must reach
+
+Found in its code, and stated here because the two projects are held to one bar. None
+of it was changed.
+
+| Finding | At one host | Across the planet |
+|---|---|---|
+| An object is one exchange on one stream, handed on when its last byte has arrived | Nothing to see | One lost datagram stalls the object |
+| The credit of a connection is one number for every class, asked for before a class is chosen | Nothing to see | A hole in a transfer that has filled the window stops consensus and probes on that session until it is filled |
+| The receive window's ceiling is about 135 KB whatever the memory, since a floor on the number of peers decides it | Far above what loopback needs | 3.6% of what 100 Mbit/s at 300 ms holds in flight: a session carries 3.6 Mbit/s |
+| Its measurements set the window to eight times the path | | What they report is not what a daemon reaches |
+| An object is owned where it was created, until that host dies; then by a survivor chosen by hash | The only host | Every write from elsewhere crosses the long path; nothing moves an owner to its writers or spreads owners |
+| No migration, no path validation, no keep-alive, no key update | Nothing to see | A laptop that changes networks, or a NAT that forgets, ends the session |
+| Copa carries 0.795 of 100 Mbit/s at 100 ms and 0.496 at 300 ms | | focal measured the same law at 69% of 10 Mbit/s at 300 ms: the law under-uses long paths in both |
+
+### 8.4 What is open in focal
+
+| Open | Why it matters |
+|---|---|
+| Transfers by as many streams as the path holds in flight; custody replication asked of all copies at once | One stream carries a megabyte in a round trip (section 7) |
+| The control suite's single asks inside a request deadline of 350 ms | They fail under six copies of the suite at once, as before |
+| A voter that dies and returns within the hold, end to end | The hold is tested by itself and by the dead-voter test |
+| The run under injected load (stage A) | Not recorded |
+| The fast track for an owner | A receipt states its entry's term: a durable format, and a decision |

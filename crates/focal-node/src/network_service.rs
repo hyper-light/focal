@@ -1231,6 +1231,7 @@ impl NetworkService {
                 tick_period_ms: u64::try_from(host.tick_period().as_millis()).unwrap_or(u64::MAX),
                 broadcast_tail_us: host.current_pace().broadcast_tail_ns / 1_000,
                 pace_samples: host.current_pace().samples,
+                refused_periods: host.refused_periods(),
             });
         }
         let fence_level = self
@@ -1271,6 +1272,7 @@ impl NetworkService {
                 broadcast_tail_us: pace.broadcast_tail_ns / 1_000,
                 pace_samples: pace.samples,
                 periods: self.handles.control.periods(),
+                refused_periods: self.handles.control.refused_periods(),
                 peers: root.peers.clone(),
             },
             peers: self.pool.stats(),

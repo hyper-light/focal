@@ -25,6 +25,9 @@ pub const BALANCE_ENV: &str = "FOCAL_LEADER_BALANCE";
 /// The operator's hold, in seconds; a campaign lowers it so a small fleet
 /// spreads while it is watched.
 pub const HOLD_ENV: &str = "FOCAL_LEADER_BALANCE_HOLD_SECS";
+/// The same for the balancer that moves seats toward the home regions.
+pub const HOME_BALANCE_ENV: &str = "FOCAL_HOME_BALANCE";
+pub const HOME_HOLD_ENV: &str = "FOCAL_HOME_BALANCE_HOLD_SECS";
 /// The most sessions observed at once.
 const MAX_OBSERVED: usize = 4096;
 
@@ -53,13 +56,18 @@ impl LeaderBalancerConfig {
     }
     /// The standard configuration under the operator's hold, if set.
     pub fn from_env() -> Self {
+        Self::from_env_of(BALANCE_ENV, HOLD_ENV)
+    }
+    /// As [`Self::from_env`], by the switch and the hold of another
+    /// balancer that decides as this one does.
+    pub fn from_env_of(balance: &str, hold: &str) -> Self {
         let mut config = Self::standard();
-        if std::env::var_os(BALANCE_ENV)
+        if std::env::var_os(balance)
             .is_some_and(|value| value.to_str().is_some_and(|text| text.trim() == "off"))
         {
             config.enabled = false;
         }
-        if let Some(value) = std::env::var_os(HOLD_ENV)
+        if let Some(value) = std::env::var_os(hold)
             && let Some(hold) = value
                 .to_str()
                 .and_then(|text| text.trim().parse::<i64>().ok())

@@ -1515,3 +1515,19 @@ async fn a_dead_voter_is_drained_and_replaced_without_waiting_it_out() {
     peer_c.stop().await;
     founder.stop().await;
 }
+
+#[test]
+fn a_death_stands_for_one_election_window_of_the_group() {
+    use crate::placement_agent::controller::retirement_hold;
+    let ms = Duration::from_millis;
+    // A group on one machine or one network: ten periods of 100 ms, twice.
+    assert_eq!(retirement_hold(ms(100), 10), 2);
+    // A group across the planet at the ceiling of its pace.
+    assert_eq!(retirement_hold(ms(2_000), 10), 40);
+    // Rounded up, a second at least, and one period where none is known.
+    assert_eq!(retirement_hold(ms(101), 10), 3);
+    assert_eq!(retirement_hold(ms(1), 1), 1);
+    assert_eq!(retirement_hold(Duration::ZERO, 0), 1);
+    assert_eq!(retirement_hold(ms(100), 0), 1);
+    assert_eq!(retirement_hold(Duration::MAX, u64::MAX), i64::MAX);
+}

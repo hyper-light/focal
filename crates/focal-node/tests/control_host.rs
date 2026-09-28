@@ -87,6 +87,10 @@ fn exhaust(memory: &MemoryBudget) -> Vec<focal_memory::Allocation> {
     }
     panic!("the control budget never reached exhaustion")
 }
+/// How long an owner may run no period before a wait calls it wedged.
+const FROZEN: Duration = Duration::from_secs(60);
+/// The tick of the owners of a rig.
+const RIG_TICK: Duration = Duration::from_millis(25);
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -170,7 +174,7 @@ impl Rig {
             )
             .unwrap();
             let mut config = ControlHostConfig::new(namespace());
-            config.tick = Duration::from_millis(25);
+            config.tick = RIG_TICK;
             config.request_timeout = Duration::from_millis(350);
             let (host, owner, channel) =
                 ControlHost::spawn(replica, RejectUnverifiedEvidence, config, allowance).unwrap();
@@ -202,30 +206,46 @@ impl Rig {
             }));
         }
     }
+    fn periods(&self) -> Vec<u64> {
+        self.hosts.iter().map(ControlHost::periods).collect()
+    }
+    /// A wait charged to the owners' own periods (27 §3.1 P8): what ten
+    /// seconds hold at the tick they are configured with, however long
+    /// that takes on the machine the test runs on.
+    fn deadline(&self) -> focal_timing::ProgressDeadline {
+        focal_timing::ProgressDeadline::begin(
+            &self.periods(),
+            focal_timing::ProgressDeadline::periods(Duration::from_secs(10), RIG_TICK),
+            FROZEN,
+        )
+    }
     async fn leader(&self, exclude: u64) -> usize {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                for (index, host) in self.hosts.iter().enumerate() {
-                    let status = host.progress();
-                    if status.node != exclude
-                        && status.leader == status.node
-                        && host
-                            .read(
-                                peer(PeerRole::Runtime),
-                                RequestId::from_u128(900),
-                                ControlRead::State,
-                            )
-                            .await
-                            .is_ok()
-                    {
-                        return index;
-                    }
+        let mut wait = self.deadline();
+        loop {
+            for (index, host) in self.hosts.iter().enumerate() {
+                let status = host.progress();
+                if status.node != exclude
+                    && status.leader == status.node
+                    && host
+                        .read(
+                            peer(PeerRole::Runtime),
+                            RequestId::from_u128(900),
+                            ControlRead::State,
+                        )
+                        .await
+                        .is_ok()
+                {
+                    return index;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        })
-        .await
-        .unwrap()
+            if let Err(spent) = wait.check(&self.periods()) {
+                panic!(
+                    "no leader that answers: {spent}; {:?}",
+                    self.hosts.iter().map(|h| h.progress()).collect::<Vec<_>>()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
     async fn state(&self, index: usize) -> ControlSnapshot {
         self.state_on_leader(index).await.1
@@ -239,56 +259,56 @@ impl Rig {
         // A successful setup read is not a lease on the leader. Preserve the
         // exact command and request ID across short host deadlines or elections;
         // the tests below still exercise minority/refusal boundaries directly.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match self.hosts[index]
-                    .submit(peer(PeerRole::Runtime), request.clone())
-                    .await
-                {
-                    Ok(receipt) => {
-                        assert_eq!(receipt.request, request.id);
-                        return (index, receipt);
-                    }
-                    Err(
-                        ControlFailure::OutcomeUnknown
-                        | ControlFailure::Unavailable
-                        | ControlFailure::NotLeader { .. }
-                        | ControlFailure::NotReady,
-                    ) => index = self.leader(excluded).await,
-                    Err(error) => panic!("unexpected setup mutation failure: {error:?}"),
+        let mut wait = self.deadline();
+        loop {
+            match self.hosts[index]
+                .submit(peer(PeerRole::Runtime), request.clone())
+                .await
+            {
+                Ok(receipt) => {
+                    assert_eq!(receipt.request, request.id);
+                    return (index, receipt);
                 }
+                Err(
+                    ControlFailure::OutcomeUnknown
+                    | ControlFailure::Unavailable
+                    | ControlFailure::NotLeader { .. }
+                    | ControlFailure::NotReady,
+                ) => index = self.leader(excluded).await,
+                Err(error) => panic!("unexpected setup mutation failure: {error:?}"),
             }
-        })
-        .await
-        .expect("exact setup mutation did not commit within five seconds")
+            if let Err(spent) = wait.check(&self.periods()) {
+                panic!("exact setup mutation did not commit: {spent}");
+            }
+        }
     }
     async fn state_on_leader(&self, mut index: usize) -> (usize, ControlSnapshot) {
         // A completed ReadIndex is not an owner lease. These eventual-state
         // assertions rediscover on transient leadership loss, while direct
         // minority reads elsewhere in the tests must still fail immediately.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match self.hosts[index]
-                    .read(
-                        peer(PeerRole::Runtime),
-                        RequestId::from_u128(901),
-                        ControlRead::State,
-                    )
-                    .await
-                {
-                    Ok(ControlReadResult::State(snapshot)) => return (index, snapshot),
-                    Ok(_) => panic!("state expected"),
-                    Err(
-                        ControlFailure::Unavailable
-                        | ControlFailure::NotLeader { .. }
-                        | ControlFailure::NotReady,
-                    ) => index = self.leader(0).await,
-                    Err(error) => panic!("unexpected state read failure: {error:?}"),
-                }
+        let mut wait = self.deadline();
+        loop {
+            match self.hosts[index]
+                .read(
+                    peer(PeerRole::Runtime),
+                    RequestId::from_u128(901),
+                    ControlRead::State,
+                )
+                .await
+            {
+                Ok(ControlReadResult::State(snapshot)) => return (index, snapshot),
+                Ok(_) => panic!("state expected"),
+                Err(
+                    ControlFailure::Unavailable
+                    | ControlFailure::NotLeader { .. }
+                    | ControlFailure::NotReady,
+                ) => index = self.leader(0).await,
+                Err(error) => panic!("unexpected state read failure: {error:?}"),
             }
-        })
-        .await
-        .expect("no quorum-ready state owner within five seconds")
+            if let Err(spent) = wait.check(&self.periods()) {
+                panic!("no quorum-ready state owner: {spent}");
+            }
+        }
     }
     async fn stop(&mut self) {
         for host in &self.hosts {
@@ -703,24 +723,21 @@ async fn owned_control_response_retains_input_and_export_budgets_until_delivery_
     )
     .unwrap();
     host.campaign().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if host
-                .read(
-                    peer(PeerRole::Runtime),
-                    RequestId::from_u128(1),
-                    ControlRead::State,
-                )
-                .await
-                .is_ok()
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+    let mut wait = focal_timing::ProgressDeadline::begin(&[host.periods()], 100, FROZEN);
+    while host
+        .read(
+            peer(PeerRole::Runtime),
+            RequestId::from_u128(1),
+            ControlRead::State,
+        )
+        .await
+        .is_err()
+    {
+        if let Err(spent) = wait.check(&[host.periods()]) {
+            panic!("the owner never led: {spent}; {:?}", host.progress());
         }
-    })
-    .await
-    .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let before = memory.stats();
     let request = RequestEnvelope {
         protocol: PROTOCOL_VERSION,
@@ -843,13 +860,18 @@ async fn follower_root_observation_exports_one_durable_prefix_and_retains_delive
     config.tick = Duration::from_secs(1);
     let (host, owner, outgoing) =
         ControlHost::spawn(replica, RejectUnverifiedEvidence, config, memory.clone()).unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while host.progress().applied_index != membership.committed_index {
-            tokio::time::sleep(Duration::from_millis(1)).await;
+    // What was durable is applied when the owner opens, before its first
+    // period: the wait is for the owner's thread to have run at all.
+    let mut wait = focal_timing::ProgressDeadline::begin(&[host.periods()], 30, FROZEN);
+    while host.progress().applied_index != membership.committed_index {
+        if let Err(spent) = wait.check(&[host.periods()]) {
+            panic!(
+                "what was durable was never applied: {spent}; {:?}",
+                host.progress()
+            );
         }
-    })
-    .await
-    .unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
     assert_eq!(host.progress().leader, 0);
     assert!(matches!(
         host.read(
@@ -861,12 +883,29 @@ async fn follower_root_observation_exports_one_durable_prefix_and_retains_delive
         Err(ControlFailure::NotLeader { .. })
     ));
     let before = memory.stats();
-    let exhausted = exhaust(&memory);
-    assert!(matches!(
-        host.observe_root().await,
-        Err(ControlFailure::Capacity)
-    ));
-    drop(exhausted);
+    // The owner shares the budget: what it reserves for a tick it gives
+    // back when the tick is over, and room given back after the budget was
+    // filled admits an observation. An observation that was admitted is
+    // delivered and dropped, and the budget is filled again, until one is
+    // asked with no room: that one is refused.
+    let mut refused = false;
+    for _ in 0..64 {
+        let exhausted = exhaust(&memory);
+        let observed = host.observe_root().await;
+        drop(exhausted);
+        match observed {
+            Err(ControlFailure::Capacity) => {
+                refused = true;
+                break;
+            }
+            Ok(observation) => drop(observation),
+            Err(error) => panic!(
+                "an observation failed for no room of its own: {error:?}; the owner: {:?}",
+                host.progress().failure
+            ),
+        }
+    }
+    assert!(refused, "an observation was never refused for room");
     assert_eq!(
         memory.stats().by_kind[focal_memory::BudgetKind::Control as usize],
         before.by_kind[focal_memory::BudgetKind::Control as usize]
@@ -1087,12 +1126,33 @@ async fn membership_requires_runtime_and_returns_only_committed_configuration_re
             .await,
         Err(ControlFailure::Unauthorized)
     ));
-    rig.hosts[leader]
-        .transfer(peer(PeerRole::Runtime), RequestId::from_u128(914), transfer)
-        .await
-        .unwrap();
-    let next = rig.leader(rig.hosts[leader].progress().node).await;
-    assert_eq!(rig.hosts[next].progress().node, target);
+    // A transfer asks the target to campaign; on a machine that starves
+    // its owners another voter may have campaigned first. Leadership is
+    // handed on from whoever leads until the target leads.
+    let mut leads = leader;
+    let mut led = false;
+    for attempt in 0..16u128 {
+        let asked = rig.hosts[leads]
+            .transfer(
+                peer(PeerRole::Runtime),
+                RequestId::from_u128(914 + attempt),
+                transfer.clone(),
+            )
+            .await;
+        assert!(
+            matches!(
+                asked,
+                Ok(_) | Err(ControlFailure::NotLeader { .. } | ControlFailure::Unavailable)
+            ),
+            "{asked:?}"
+        );
+        leads = rig.leader(rig.hosts[leads].progress().node).await;
+        if rig.hosts[leads].progress().node == target {
+            led = true;
+            break;
+        }
+    }
+    assert!(led, "the target of a transfer never led");
     rig.stop().await;
 }
 
@@ -1147,10 +1207,20 @@ async fn recovered_control_events_are_forwarded_once_and_keep_frames_charged_aft
     let mut frames = Vec::new();
     let mut actual = Vec::new();
     for _ in 0..expected.len() {
-        let frame = tokio::time::timeout(Duration::from_secs(3), outgoing.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        // The owner frames what was recovered when it starts, before its
+        // first period.
+        let mut wait = focal_timing::ProgressDeadline::begin(&[host.periods()], 30, FROZEN);
+        let frame = loop {
+            match outgoing.try_recv() {
+                Ok(frame) => break frame,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                Err(error) => panic!("the owner closed what it sends on: {error}"),
+            }
+            if let Err(spent) = wait.check(&[host.periods()]) {
+                panic!("what was recovered was never framed: {spent}");
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
         let Operation::Raft { group, message } = &frame.request.operation else {
             panic!("replication frame");
         };
@@ -1172,4 +1242,89 @@ async fn recovered_control_events_are_forwarded_once_and_keep_frames_charged_aft
     assert!(memory.stats().by_kind[focal_memory::BudgetKind::Control as usize] > 0);
     drop(frames);
     assert_eq!(memory.stats().used, 0);
+}
+
+/// An owner that is refused the room is not ticked and drains nothing, and
+/// goes on: the periods pass, it says how many of them passed without a
+/// tick, and it leads and answers once the room is back. Before, it stopped for
+/// the refusal of one tick or of one drain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_owner_refused_the_room_waits_and_goes_on() {
+    let data = tempfile::tempdir().unwrap();
+    let authority = BootstrapAuthority::open_or_create(
+        data.path().join("ca"),
+        CLUSTER,
+        vec!["localhost".into()],
+        now(),
+    )
+    .unwrap();
+    let memory = budget();
+    let replica = ControlReplica::open(
+        ControlOptions::new(NodeConfig::single(1, CLUSTER, GROUP)),
+        root_bootstrap(&authority),
+        memory.clone(),
+        data.path().join("log"),
+    )
+    .unwrap();
+    let mut config = ControlHostConfig::new(namespace());
+    config.tick = Duration::from_millis(10);
+    let (host, owner, _outgoing) =
+        ControlHost::spawn(replica, RejectUnverifiedEvidence, config, memory.clone()).unwrap();
+    let answers = async || {
+        host.read(
+            peer(PeerRole::Runtime),
+            RequestId::from_u128(1),
+            ControlRead::State,
+        )
+        .await
+    };
+    host.campaign().await.unwrap();
+    let mut wait = focal_timing::ProgressDeadline::begin(&[host.periods()], 500, FROZEN);
+    while answers().await.is_err() {
+        if let Err(spent) = wait.check(&[host.periods()]) {
+            panic!("the owner never led: {spent}; {:?}", host.progress());
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // No room, for fifty periods of the owner. What it frees is taken
+    // again, so that it is refused whatever it gives back.
+    let (began, refused) = (host.periods(), host.refused_periods());
+    let mut held = Vec::new();
+    let mut wait = focal_timing::ProgressDeadline::begin(&[began], 5_000, FROZEN);
+    while host.periods() < began + 50 {
+        held.extend(exhaust(&memory));
+        if let Err(spent) = wait.check(&[host.periods()]) {
+            panic!(
+                "the owner stopped its periods: {spent}; {:?}",
+                host.progress()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let progress = host.progress();
+    assert!(!progress.stopped, "{progress:?}");
+    assert_eq!(progress.failure, None);
+    assert!(
+        host.refused_periods() > refused,
+        "fifty periods without room, and none of them refused"
+    );
+    // The room is back: it leads, or is elected again, and answers.
+    drop(held);
+    let mut wait = focal_timing::ProgressDeadline::begin(&[host.periods()], 2_000, FROZEN);
+    let mut asked = false;
+    while answers().await.is_err() {
+        if !asked && host.progress().leader == 0 {
+            asked = host.campaign().await.is_ok();
+        }
+        if let Err(spent) = wait.check(&[host.periods()]) {
+            panic!(
+                "the owner never answered again: {spent}; {:?}",
+                host.progress()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(host.progress().failure, None);
+    host.stop().await.unwrap();
+    owner.join().unwrap();
 }

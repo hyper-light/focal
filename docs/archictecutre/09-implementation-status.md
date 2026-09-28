@@ -11219,3 +11219,59 @@ Windows, with the model and the dependency jobs.
 many streams as the path holds in flight, which custody replication does not do yet,
 and it asks its copies one after another. A death re-plans a placement on its first
 verdict. A heal and a move toward the home regions are one ordering.
+
+### 2026-09-28 — CI on `d88cde3`; an owner that a full budget stopped; a session that could not seed a copy; seats
+
+CI on `d88cde3`: macos-15, Windows, the model and the dependency jobs passed;
+ubuntu-24.04 failed on one test,
+`follower_root_observation_exports_one_durable_prefix_and_retains_delivery_budget_after_stop`.
+
+**The test, and what it stood on.** It fills the budget and expects an observation to
+be refused for room. The owner shares the budget: what it reserves for a tick it gives
+back when the tick is over, and room given back after the budget was filled admitted
+the observation. With the owner ticking every 10 ms the test failed 1 of 96 here. It
+now fills the budget again until an observation is asked with no room.
+
+**An owner that a full budget stopped.** The same runs ended twice with the owner gone:
+`metadata consensus: entry, read context, or pending proposal capacity exceeded`. A
+tick and a drain reserve their room before they take anything from the core, and the
+consensus layer says of a refusal that it "leaves the replica exactly as it was, so the
+caller retries once memory returns instead of losing the node to a transient shortage".
+Both shells lost the node: `ControlReplica::drain` and `Session::poll` marked
+themselves failed for it, and both owners ended their loop on a tick that was refused.
+A node short of memory for one period lost its root owner or a session's replica until
+it was restarted.
+
+A tick or a drain that was refused before it took anything, for the room or for what
+is still persisted, is a period that passed without it (27 §3.1 P3): the owner counts
+it (`focal_root_periods_refused_total`, `focal_session_periods_refused_total`) and
+goes on. `an_owner_refused_the_room_waits_and_goes_on` holds the budget full for fifty
+periods of an owner that leads, and the owner answers when the room is back. The
+budget test at a 10 ms tick, sixteen at once: 512 of 512. The suite's waits are
+charged to its owners' periods now, as the other suites' are; twelve runs of two at
+once, four threads each: 24 of 24. Under six copies at once the tests that ask a host
+once and expect its answer inside its request deadline of 350 ms still fail, as they
+did before: they are not converted yet.
+
+**A session that could not seed a copy.** A placement is committed while every voter
+it names votes, and a voter it drops keeps its vote until the activation retires it
+(24 §4, §19). The validator of a snapshot held the record's configuration to equality
+with the placement's voters. So a session that had replaced a voter once refused every
+snapshot of itself, and a copy seeded from one stopped with `persisted ledger identity,
+format or prefix mismatch`. Found by the second of two moves toward home, whose
+newcomer was seeded after the first. The validator holds the record to what it was
+admitted under (`a_snapshot_of_a_session_that_replaced_a_voter_is_accepted`).
+
+**Seats** (27 §5). `focal_directory::seats`, eight tests; `retirement_hold`;
+`tests/home_balance.rs`, five real processes, 78 s. The hand-over counters no longer
+count leadership that came by another placement as a hand-over undone.
+
+A test of the control crate held the old rule: that a replica refused the room is a
+failed one until it is opened again. It states the new one
+(`a_drain_refused_the_room_publishes_nothing_and_commits_once_the_room_is_back`).
+
+**Gates** on the final tree (macOS arm64, from a clean build): `cargo fmt --all
+--check`, `check-contracts.py`, clippy with `-D warnings`, `check-production.sh`,
+`cargo deny`, and the workspace's tests with four threads: 148 suites, 2,856 tests,
+none failed, 3 ignored. The model was not checked here, for want of a Java runtime on
+this machine; it has not changed since `d88cde3`, whose model job passed.

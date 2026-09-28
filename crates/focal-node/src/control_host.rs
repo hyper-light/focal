@@ -609,6 +609,16 @@ impl ControlHost {
     pub fn periods(&self) -> u64 {
         self.pace.periods()
     }
+    /// Periods in one election timeout of this replica; none before its
+    /// owner has opened it.
+    pub fn election_periods(&self) -> u64 {
+        u64::try_from(self.pace.election_tick()).unwrap_or(u64::MAX)
+    }
+    /// The periods in which the replica was not ticked: refused the room,
+    /// or still persisting.
+    pub fn refused_periods(&self) -> u64 {
+        self.pace.refused()
+    }
     /// The tick period in force.
     pub fn tick_period(&self) -> Duration {
         self.pace.get(self.config.tick, self.config.tick_ceiling)
@@ -802,7 +812,19 @@ impl<V: AuthorityVerifier> Owner<V> {
                 }
                 if Instant::now() >= next_tick {
                     self.pace.advance();
-                    self.replica.tick()?;
+                    // A tick that was refused the room, or that came while
+                    // the one before it is still persisted, changed
+                    // nothing: the period has passed without it. A member
+                    // that is not ticked waits longer before it campaigns,
+                    // and a leader sends its heartbeats a period later
+                    // (27 §3.1 P3). It is no reason for the owner to end.
+                    match self.replica.tick() {
+                        Ok(()) => {}
+                        Err(error) if self.replica.checkpoint_retryable(&error) => {
+                            self.pace.refuse();
+                        }
+                        Err(error) => return Err(error),
+                    }
                     self.drain()?;
                     self.maybe_checkpoint()?;
                     next_tick = Instant::now()
@@ -1381,7 +1403,16 @@ impl<V: AuthorityVerifier> Owner<V> {
         let _source_allocation;
         let mut events = match self.initial.take() {
             Some(events) => events,
-            None => self.replica.drain(&self.verifier)?,
+            None => match self.replica.drain(&self.verifier) {
+                Ok(events) => events,
+                // Refused before anything was taken: what waits to be
+                // drained waits for the next drain.
+                Err(error) if self.replica.checkpoint_retryable(&error) => {
+                    self.pace.refuse();
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            },
         };
         _source_allocation = events.take_allocation();
         let status = self.replica.status();

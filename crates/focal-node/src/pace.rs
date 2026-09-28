@@ -22,6 +22,9 @@ struct TickShared {
     /// The periods the owner has run: its progress, which a wait is
     /// charged in (27 §3.1 P8).
     periods: AtomicU64,
+    /// The periods in which the replica was not ticked, because it was
+    /// refused the room or still persisted what the tick before had left.
+    refused: AtomicU64,
     /// The last derivation as one value, for observers.
     derived: Mutex<Option<focal_timing::TickPace>>,
 }
@@ -57,6 +60,13 @@ impl TickPeriod {
     /// The owner ran one period.
     pub(crate) fn advance(&self) {
         self.0.periods.fetch_add(1, Ordering::Relaxed);
+    }
+    /// The period passed without a tick.
+    pub(crate) fn refuse(&self) {
+        self.0.refused.fetch_add(1, Ordering::Relaxed);
+    }
+    pub(crate) fn refused(&self) -> u64 {
+        self.0.refused.load(Ordering::Relaxed)
     }
     pub(crate) fn periods(&self) -> u64 {
         self.0.periods.load(Ordering::Relaxed)

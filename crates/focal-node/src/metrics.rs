@@ -43,6 +43,9 @@ pub struct RootMetrics {
     pub peers: Vec<focal_consensus::PeerProgress>,
     /// The root owner's tick period in force, in milliseconds (27 §3.1 P2).
     pub tick_period_ms: u64,
+    /// Periods in which the owner's replica was not ticked: it was
+    /// refused the room or still persisted.
+    pub refused_periods: u64,
     /// The slowest measured voter path's round-trip tail, in microseconds.
     pub broadcast_tail_us: u64,
     /// Round trips that fed the pace; zero means the configured period.
@@ -105,6 +108,9 @@ pub struct SessionMetrics {
     /// measured tail it was derived from, in microseconds, and how many
     /// round trips fed it (27 §3.1 P2).
     pub tick_period_ms: u64,
+    /// Periods in which the owner's replica was not ticked: it was
+    /// refused the room or still persisted.
+    pub refused_periods: u64,
     pub broadcast_tail_us: u64,
     pub pace_samples: u64,
 }
@@ -360,6 +366,11 @@ impl MetricsSnapshot {
             "focal_root_periods_total",
             "Periods the root owner has run since it started; a node that is slow still advances this, a wedged one does not.",
             self.root.periods,
+        );
+        text.counter(
+            "focal_root_periods_refused_total",
+            "Periods in which the root replica was not ticked: it was refused the room, or still persisted what the tick before had left.",
+            self.root.refused_periods,
         );
         text.gauge(
             "focal_root_stopped",
@@ -668,7 +679,12 @@ impl MetricsSnapshot {
             "Whether sessions beyond the bound were left out.",
             u8::from(self.sessions_truncated),
         );
-        let series: [(&str, &str, &str); 25] = [
+        let series: [(&str, &str, &str); 26] = [
+            (
+                "focal_session_periods_refused_total",
+                "counter",
+                "Periods in which the session's replica was not ticked: it was refused the room, or still persisted.",
+            ),
             (
                 "focal_session_leader",
                 "gauge",
@@ -799,6 +815,7 @@ impl MetricsSnapshot {
                     ("session", session.session.as_str()),
                 ];
                 let value: Option<u64> = match name {
+                    "focal_session_periods_refused_total" => Some(session.refused_periods),
                     "focal_session_leader" => Some(session.leader),
                     "focal_session_preferred_leader" => session.preferred_leader,
                     "focal_session_leader_returns_total" => Some(session.leader_returns),

@@ -704,12 +704,24 @@ impl ControlReplica {
     /// Persist Raft state before releasing messages; publish all committed
     /// metadata before emitting completion or fulfilled ReadIndex barriers.
     /// Any persistence/replay/publication failure fail-stops this owner.
+    /// A drain the node refused before it took anything, for the room or
+    /// for what it still persists, is none: the node is as it was, and the
+    /// drain is asked again (`checkpoint_retryable`).
     pub fn drain(
         &mut self,
         verifier: &impl AuthorityVerifier,
     ) -> Result<ControlEvents, ControlError> {
         self.check()?;
-        let result = self.drain_inner(verifier);
+        let events = match self.node.drain() {
+            Ok(events) => events,
+            Err(error) if !self.node.failed() => return Err(error.into()),
+            Err(error) => {
+                self.failed = true;
+                self.pending = None;
+                return Err(error.into());
+            }
+        };
+        let result = self.drain_inner(events, verifier);
         if result.is_err() {
             self.failed = true;
             self.pending = None;
@@ -718,9 +730,9 @@ impl ControlReplica {
     }
     fn drain_inner(
         &mut self,
+        mut events: focal_consensus::NodeEvents,
         verifier: &impl AuthorityVerifier,
     ) -> Result<ControlEvents, ControlError> {
-        let mut events = self.node.drain()?;
         let mut output = ControlEvents {
             allocation: events.take_allocation(),
             ..Default::default()

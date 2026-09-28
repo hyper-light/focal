@@ -806,6 +806,11 @@ impl ReplicaHost {
     }
     /// The periods this replica's owner has run; what a wait on it is
     /// charged in (27 §3.1 P8).
+    /// The periods in which the replica was not ticked: refused the room,
+    /// or still persisting.
+    pub fn refused_periods(&self) -> u64 {
+        self.pace.refused()
+    }
     /// Periods in one election timeout of this replica.
     pub fn election_periods(&self) -> u64 {
         u64::try_from(self.pace.election_tick()).unwrap_or(u64::MAX)
@@ -1530,7 +1535,20 @@ impl Owner {
         if self.session.priority() != priority {
             self.session.set_priority(priority)?;
         }
-        self.session.tick()?;
+        // A tick that was refused the room, or that came while the one
+        // before it is still persisted, changed nothing: the period has
+        // passed without it (27 §3.1 P3), and the replica goes on.
+        match self.session.tick() {
+            Ok(()) => {}
+            Err(
+                LedgerError::Capacity
+                | LedgerError::Consensus(
+                    focal_consensus::ConsensusError::Capacity
+                    | focal_consensus::ConsensusError::PersistencePending,
+                ),
+            ) => self.pace.refuse(),
+            Err(error) => return Err(error),
+        }
         self.return_leadership()?;
         if self.session.status().role == StateRole::Leader {
             let now = wall_ms()?.max(self.session.cursor_clock());

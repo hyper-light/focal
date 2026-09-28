@@ -26,6 +26,7 @@ mod partition_session;
 mod partition_v1;
 mod placement;
 mod scheduler;
+mod seats;
 mod types;
 
 pub use authority::*;
@@ -38,6 +39,7 @@ pub use partition_progress::*;
 pub use partition_v1::*;
 pub use placement::*;
 pub use scheduler::*;
+pub use seats::*;
 pub use types::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

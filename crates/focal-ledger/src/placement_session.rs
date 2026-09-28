@@ -508,13 +508,19 @@ impl Session {
                 return Err(LedgerError::Corrupt);
             }
             record.configuration.validate()?;
-            if !record.configuration.voters.iter().copied().eq(record
+            // As the record was admitted (`validate_placement_transition`):
+            // every voter the placement names voted in the configuration it
+            // was committed under, and a voter the placement dropped kept
+            // its vote until the activation retired it. Held to equality, a
+            // session that had replaced a voter once could not seed another
+            // copy: every snapshot of it was refused.
+            if !record
                 .request
                 .placement
                 .placement
                 .voters
                 .keys()
-                .copied())
+                .all(|voter| record.configuration.voters.contains(voter))
                 || !record.configuration.voters_outgoing.is_empty()
                 || !record.configuration.learners_next.is_empty()
                 || record.configuration.auto_leave

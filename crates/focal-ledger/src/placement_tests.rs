@@ -302,3 +302,67 @@ fn placement_unknown_outcome_loses_local_reservation_and_retries_after_real_lead
         assert!(s.placement_witness(&request).unwrap().is_some());
     }
 }
+
+/// A voter the placement dropped keeps its vote until the activation
+/// retires it (24 §4, §19), so the record of a placement that replaced a
+/// voter was committed under a configuration of one voter more than it
+/// names. A snapshot that carries such a record seeds a copy as any other;
+/// one whose placement names a voter its configuration did not have does
+/// not.
+#[test]
+fn a_snapshot_of_a_session_that_replaced_a_voter_is_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session =
+        Session::open(dir.path(), identity(), config(), SessionLimits::default()).unwrap();
+    elect(&mut session);
+    let request = placement_request(&session, SessionFenceKind::Created, 1);
+    session.propose_placement(&request).unwrap();
+    session.poll().unwrap();
+    let validate = |session: &Session, state: &PlacementState| {
+        session.validate_placement_snapshot(
+            state,
+            session.applied_raft,
+            session.status().term,
+            session.sequence(),
+        )
+    };
+    let committed = PlacementState {
+        active: session.placement_state.active.clone(),
+        cutover: None,
+    };
+    validate(&session, &committed).unwrap();
+    let under = |change: fn(&mut PlacementRecord)| {
+        let mut state = PlacementState {
+            active: committed.active.clone(),
+            cutover: None,
+        };
+        let stored = state.active.as_mut().unwrap();
+        change(&mut stored.record);
+        let encoded = encode_placement(&stored.record).unwrap();
+        stored.fence = stored
+            .record
+            .fence(stored.fence.index.0, stored.fence.term.0, &encoded)
+            .unwrap();
+        state
+    };
+    // Committed while the voter it dropped still voted.
+    let replaced = under(|record| record.configuration.voters.push(99));
+    validate(&session, &replaced).unwrap();
+    // A voter the configuration never had.
+    let invented = under(|record| {
+        record
+            .request
+            .placement
+            .placement
+            .voters
+            .insert(98, 1);
+    });
+    assert!(matches!(
+        validate(&session, &invented),
+        Err(LedgerError::Corrupt)
+    ));
+    // A configuration in the middle of a change is none a placement is
+    // committed under.
+    let joint = under(|record| record.configuration.voters_outgoing.push(1));
+    assert!(validate(&session, &joint).is_err());
+}

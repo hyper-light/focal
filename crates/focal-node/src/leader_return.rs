@@ -94,8 +94,9 @@ pub struct LeaderReturn {
     since: u32,
     /// An ask is out and this member still leads.
     asked: bool,
-    /// Leadership left this member after it asked.
-    handed: bool,
+    /// Whom leadership was handed to when it left this member after it
+    /// asked.
+    handed: Option<u64>,
     /// This member led on the last tick.
     led: bool,
     stats: Stats,
@@ -112,7 +113,7 @@ impl LeaderReturn {
             doubled: 0,
             since: u32::MAX,
             asked: false,
-            handed: false,
+            handed: None,
             led: false,
             stats: Stats::default(),
         }
@@ -160,17 +161,23 @@ impl LeaderReturn {
             self.silent = 0;
             if self.asked {
                 self.asked = false;
-                self.handed = true;
+                self.handed = Some(self.target);
             }
             return Verdict::Hold;
         }
         if !led {
-            if self.handed && self.since <= self.memory() {
+            // Leadership is back. It did not hold where it was handed to
+            // if that member is still the one to lead; where the placement
+            // prefers another since, this member perhaps, nothing failed.
+            let undone = self
+                .handed
+                .take()
+                .is_some_and(|to| seen.preferred == Some(to) && self.since <= self.memory());
+            if undone {
                 self.fail();
             } else {
                 self.doubled = 0;
             }
-            self.handed = false;
         }
         if self.asked {
             if seen.transferring {
@@ -446,6 +453,50 @@ mod tests {
         }
         waits.push(until_ask(&mut policy, fit(), 100_000));
         assert_eq!(waits, vec![Some(641), Some(20), Some(81)]);
+    }
+    #[test]
+    fn leadership_that_comes_by_another_placement_undoes_nothing() {
+        let follower = Seen {
+            leads: false,
+            ..fit()
+        };
+        // Handed to the preferred leader; the placement then prefers this
+        // member, which is handed leadership in its turn.
+        let mut policy = LeaderReturn::new(ELECTION);
+        assert_eq!(until_ask(&mut policy, fit(), 1_000), Some(20));
+        for _ in 0..30 {
+            assert_eq!(policy.observe(follower), Verdict::Hold);
+        }
+        let preferred = Seen {
+            preferred: None,
+            ..fit()
+        };
+        assert_eq!(until_ask(&mut policy, preferred, 1_000), None);
+        assert_eq!(
+            policy.stats(),
+            Stats {
+                asked: 1,
+                failed: 0
+            }
+        );
+        // And where it prefers a third: asked after the plain rest.
+        let mut policy = LeaderReturn::new(ELECTION);
+        assert_eq!(until_ask(&mut policy, fit(), 1_000), Some(20));
+        for _ in 0..30 {
+            assert_eq!(policy.observe(follower), Verdict::Hold);
+        }
+        let third = Seen {
+            preferred: Some(3),
+            ..fit()
+        };
+        assert_eq!(until_ask(&mut policy, third, 1_000), Some(20));
+        assert_eq!(
+            policy.stats(),
+            Stats {
+                asked: 2,
+                failed: 0
+            }
+        );
     }
     #[test]
     fn a_refusal_where_it_was_asked_is_a_failure() {

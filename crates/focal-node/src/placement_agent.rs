@@ -438,6 +438,9 @@ pub struct PlacementAgent {
     balancer: crate::range_balancer::Balancer,
     /// Per-session observations behind moves of a preferred leader (27 §5).
     pub(super) leader_balancer: crate::leader_balancer::LeaderBalancer,
+    /// Per-session observations behind moves of a seat toward the home
+    /// regions (27 §3.1 P4).
+    pub(super) home_balancer: crate::leader_balancer::LeaderBalancer,
     /// Where sessions are led, as one revision of one partition's
     /// directory commits it: counted once for every session of a pass.
     pub(super) leading: Option<Leading>,
@@ -475,7 +478,9 @@ pub(super) struct Leading {
     revision: u64,
     /// Sessions that prefer each node as their leader.
     pub(super) counts: BTreeMap<u64, u64>,
-    /// A session is moving its preferred leader among the members it has.
+    /// A session is being balanced: it moves its preferred leader among
+    /// the members it has, or one seat to another node, under the policy
+    /// it has.
     pub(super) moving: bool,
 }
 const MAX_MOVE_REQUESTS: usize = 64;
@@ -547,6 +552,12 @@ impl PlacementAgent {
             ),
             leader_balancer: crate::leader_balancer::LeaderBalancer::new(
                 crate::leader_balancer::LeaderBalancerConfig::from_env(),
+            ),
+            home_balancer: crate::leader_balancer::LeaderBalancer::new(
+                crate::leader_balancer::LeaderBalancerConfig::from_env_of(
+                    crate::leader_balancer::HOME_BALANCE_ENV,
+                    crate::leader_balancer::HOME_HOLD_ENV,
+                ),
             ),
             leading: None,
             _allocation: allocation,
@@ -1719,6 +1730,9 @@ impl PlacementAgent {
                 self.leader_balancer.retain(|ledger| {
                     !namespace.contains(*ledger) || directory.sessions.contains_key(ledger)
                 });
+                self.home_balancer.retain(|ledger| {
+                    !namespace.contains(*ledger) || directory.sessions.contains_key(ledger)
+                });
                 Leading {
                     partition,
                     revision: directory.revision,
@@ -1730,10 +1744,16 @@ impl PlacementAgent {
                     },
                     moving: directory.sessions.values().any(|session| {
                         session.pending.as_ref().is_some_and(|plan| {
+                            let (now, next) = (&session.active.placement, &plan.desired.placement);
+                            let left = now
+                                .voters
+                                .keys()
+                                .filter(|voter| !next.voters.contains_key(voter))
+                                .count();
                             plan.desired.policy == session.active.policy
-                                && plan.desired.placement.voters == session.active.placement.voters
-                                && plan.desired.placement.preferred_leader
-                                    != session.active.placement.preferred_leader
+                                && now.voters.len() == next.voters.len()
+                                && left <= 1
+                                && (left == 1 || now.preferred_leader != next.preferred_leader)
                         })
                     }),
                 }
@@ -1799,10 +1819,10 @@ impl PlacementAgent {
                     ..descriptor.active.policy.clone()
                 };
                 let leading = self.take_leading(directory);
-                let proposal = focal_directory::propose_placement_leading(
+                let proposal = focal_directory::heal_placement(
                     &directory.nodes,
                     &policy,
-                    &descriptor.active.placement.voters,
+                    &descriptor.active.placement,
                     focal_directory::Leading {
                         counts: &leading.counts,
                         current: Some(descriptor.active.placement.preferred_leader),

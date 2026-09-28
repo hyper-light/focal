@@ -967,7 +967,7 @@ impl Session {
         if self.consensus.checkpoint_pending() {
             self.consensus.finish_checkpoint()?;
         }
-        let acquired = self.consensus.drain().map_err(LedgerError::from);
+        let acquired = self.consensus.drain().map_err(|error| self.refused(error));
         let result = acquired.and_then(|events| self.apply_events(events));
         self.finish_poll(result)
     }
@@ -994,7 +994,23 @@ impl Session {
                 let result = self.apply_events(events);
                 self.finish_poll(result).map(Some)
             }
-            Err(error) => self.finish_poll(Err(error.into())).map(Some),
+            Err(error) => {
+                let error = self.refused(error);
+                self.finish_poll(Err(error)).map(Some)
+            }
+        }
+    }
+    /// What a drain failed with. One the node refused before it took
+    /// anything, for the room or for what it still persists, left the node
+    /// as it was: it is asked again, and the session goes on.
+    fn refused(&self, error: ConsensusError) -> LedgerError {
+        if self.consensus.failed() {
+            error.into()
+        } else {
+            match error {
+                ConsensusError::Capacity | ConsensusError::PersistencePending => LedgerError::Retry,
+                error => error.into(),
+            }
         }
     }
     fn finish_poll(
