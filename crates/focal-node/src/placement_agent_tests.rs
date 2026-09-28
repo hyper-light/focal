@@ -1328,3 +1328,190 @@ async fn a_drained_session_leader_hands_leadership_on_and_the_session_heals() {
     peer_c.stop().await;
     founder.stop().await;
 }
+
+/// A voter that stopped is drained and replaced (27 §3.1 P1): the rounds
+/// that collect signatures and change the membership ask the voters at
+/// once and end at a majority, so the one that answers nothing delays none
+/// of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_voter_is_drained_and_replaced_without_waiting_it_out() {
+    let founder_dir = tempfile::tempdir().unwrap();
+    let dirs = [
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    ];
+    let founder_settings = settings(founder_dir.path());
+    let peer_settings = [
+        settings(dirs[0].path()),
+        settings(dirs[1].path()),
+        settings(dirs[2].path()),
+    ];
+    let founder = Running::start(&founder_settings).await;
+    let (peer_a, node_a) =
+        join_peer(&founder, founder_dir.path(), "host-a", &peer_settings[0]).await;
+    let (peer_b, node_b) =
+        join_peer(&founder, founder_dir.path(), "host-b", &peer_settings[1]).await;
+    let ledger = founder.status.ledger;
+    let founder_node = founder.status.node;
+    let host = partition_host(&founder).await;
+    let observed = [&founder, &peer_a, &peer_b];
+    let enrolled = wait_among(
+        &observed,
+        Duration::from_secs(60),
+        &host,
+        "three hosts enrolled with load",
+        |state| {
+            state.sessions.contains_key(&ledger)
+                && [founder_node, node_a, node_b].iter().all(|node| {
+                    state
+                        .nodes
+                        .get(node)
+                        .is_some_and(|record| record.load.is_some())
+                })
+        },
+    );
+    let (checkpoint, _, installed) = enrolled.await.unwrap().unwrap();
+    let descriptor = checkpoint.sessions[&ledger].clone();
+    let policy = focal_directory::PlacementPolicy {
+        durability: focal_directory::DurabilityIntent {
+            survive: focal_directory::FailureClass::Node,
+            max_failures: 1,
+        },
+        ..descriptor.active.policy.clone()
+    };
+    let proposal = focal_directory::propose_placement(&checkpoint.nodes, &policy, 31, 1).unwrap();
+    submit(
+        &founder,
+        &host,
+        1,
+        &checkpoint,
+        &installed,
+        PartitionOperation::Session {
+            ledger,
+            expected_revision: descriptor.revision,
+            change: SessionChange::Plan {
+                operation: OperationId::from_u128(2),
+                desired: proposal.spec.clone(),
+                observations: proposal.observations.clone(),
+            },
+        },
+    )
+    .await;
+    let activated = wait_among(
+        &observed,
+        Duration::from_secs(120),
+        &host,
+        "placement activated",
+        |state| {
+            state.sessions[&ledger].pending.is_none()
+                && state.sessions[&ledger].route_epoch == RouteEpoch(2)
+        },
+    );
+    activated.await.unwrap().unwrap();
+
+    // A replacement joins; then a voter stops, and is drained.
+    let (peer_c, node_c) =
+        join_peer(&founder, founder_dir.path(), "host-c", &peer_settings[2]).await;
+    wait_among(
+        &[&founder, &peer_a, &peer_b, &peer_c],
+        Duration::from_secs(60),
+        &host,
+        "the replacement enrolled with load",
+        |state| {
+            state
+                .nodes
+                .get(&node_c)
+                .is_some_and(|record| record.load.is_some())
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    peer_b.stop().await;
+    use crate::cluster_admin::ClusterAdmin;
+    use focal_client::admin::AdminResult;
+    crate::set_test_mode(founder_dir.path(), 0o700);
+    let admin = ClusterAdmin::open(&founder_settings).unwrap();
+    let AdminResult::NodeEligibility { eligible, .. } =
+        admin.node_eligibility(node_b, false).await.unwrap()
+    else {
+        panic!("drain");
+    };
+    assert!(!eligible);
+    // Every signature round and every membership change from here has a
+    // voter that answers nothing (27 §3.1 P1): the two that stay are a
+    // majority, and the plan completes on them.
+    let healed = BTreeSet::from([founder_node, node_a, node_c]);
+    let living = [&founder, &peer_a, &peer_c];
+    let settled = wait_among(
+        &living,
+        Duration::from_secs(300),
+        &host,
+        "the session healed without the dead voter",
+        |state| {
+            let session = &state.sessions[&ledger];
+            session.pending.is_none()
+                && session.retiring.is_empty()
+                && session
+                    .active
+                    .placement
+                    .voters
+                    .keys()
+                    .copied()
+                    .collect::<BTreeSet<_>>()
+                    == healed
+        },
+    )
+    .await;
+    if !matches!(settled, Ok(Some(_))) {
+        let mut seen = Vec::new();
+        for (name, running) in [("founder", &founder), ("a", &peer_a), ("c", &peer_c)] {
+            seen.push(format!(
+                "{name}: replica {:?}; agent {:?}",
+                running
+                    .handles
+                    .fleet
+                    .current_host(ledger)
+                    .map(|replica| replica.progress()),
+                running
+                    .handles
+                    .placement
+                    .status()
+                    .await
+                    .map(|status| (status.last_error, status.last_refusal))
+            ));
+        }
+        panic!(
+            "the session never healed: {:?}: {seen:#?}; session {:#?}",
+            settled.map(|_| "the service ended"),
+            observe(&founder, &host, 998)
+                .await
+                .map(|(state, _, _)| state.sessions[&ledger].clone())
+        );
+    }
+    let staying = [
+        founder.handles.ledger.clone().unwrap(),
+        peer_a.handles.fleet.current_host(ledger).unwrap(),
+        peer_c.handles.fleet.current_host(ledger).unwrap(),
+    ];
+    until(
+        "the hosts that stay agree on a leader and a configuration",
+        &living,
+        Duration::from_secs(60),
+        async || {
+            let leader = staying.first()?.progress().leader;
+            (healed.contains(&leader)
+                && staying.iter().all(|replica| {
+                    let progress = replica.progress();
+                    progress.leader == leader
+                        && progress.voters.iter().copied().collect::<BTreeSet<_>>() == healed
+                }))
+            .then_some(())
+        },
+    )
+    .await;
+    peer_a.stop().await;
+    peer_c.stop().await;
+    founder.stop().await;
+}

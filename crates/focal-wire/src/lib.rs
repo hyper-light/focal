@@ -25,6 +25,7 @@ mod native;
 mod peer_mutations;
 mod peers;
 mod reconcile;
+mod round;
 mod transport;
 mod traversal;
 mod validators;
@@ -40,6 +41,7 @@ pub use native::*;
 pub use peer_mutations::*;
 pub use peers::*;
 pub use reconcile::*;
+pub use round::*;
 // Historic names kept so the ~25 call sites do not churn across the port.
 pub use local::{LocalRemote as UnixRemote, LocalServer as UnixServer};
 pub use transport::*;

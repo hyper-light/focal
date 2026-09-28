@@ -19,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::mpsc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 struct Server(Child);
@@ -29,6 +29,8 @@ impl Drop for Server {
         let _ = self.0.wait();
     }
 }
+#[path = "support/deadline.rs"]
+mod deadline;
 #[path = "support/ports.rs"]
 mod ports;
 fn address() -> String {
@@ -93,6 +95,7 @@ fn failure(node: &Node, args: &[&str]) -> (i32, String) {
     )
 }
 fn start(node: &Node, address: Option<&str>) -> (Server, Value) {
+    deadline::observe(node.root());
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
     command.args(["--config", node.config.to_str().unwrap()]);
     command.args(["--data-dir", node.root().to_str().unwrap(), "start"]);
@@ -182,9 +185,9 @@ fn wait_for(
     timeout: Duration,
     condition: impl Fn(&Value) -> bool,
 ) -> Value {
-    let deadline = Instant::now() + timeout;
+    let mut deadline = deadline::Deadline::after(timeout);
     let mut last = None;
-    while Instant::now() < deadline {
+    while deadline.open() {
         if let Some(view) = placement(node) {
             if condition(&view) {
                 return view;

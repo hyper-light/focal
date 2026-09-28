@@ -20,7 +20,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::mpsc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 const FAR: u64 = 4_102_444_800_000;
@@ -33,6 +33,8 @@ impl Drop for Server {
         let _ = self.0.wait();
     }
 }
+#[path = "support/deadline.rs"]
+mod deadline;
 #[path = "support/ports.rs"]
 mod ports;
 fn address() -> String {
@@ -87,6 +89,7 @@ fn admin(root: &Path, args: &[&str]) -> Value {
     })
 }
 fn start(root: &Path, address: Option<&str>) -> (Server, Value) {
+    deadline::observe(root);
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
     command.args(["--data-dir", root.to_str().unwrap(), "start"]);
     if let Some(address) = address {
@@ -176,9 +179,9 @@ fn wait_for(
     timeout: Duration,
     condition: impl Fn(&Value) -> bool,
 ) -> Value {
-    let deadline = Instant::now() + timeout;
+    let mut deadline = deadline::Deadline::after(timeout);
     let mut last = None;
-    while Instant::now() < deadline {
+    while deadline.open() {
         if let Some(view) = placement(root) {
             if condition(&view) {
                 return view;
@@ -515,9 +518,9 @@ fn wait_for_report(
     ledger: &str,
     condition: impl Fn(&Value) -> bool,
 ) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
     let mut last = None;
-    while Instant::now() < deadline {
+    while deadline.open() {
         let output = run(
             root,
             None,

@@ -1225,6 +1225,9 @@ impl NetworkService {
                 desired_max_failures: listed.map(|listed| listed.2),
                 achieved_max_failures: listed.and_then(|listed| listed.3),
                 blocked: listed.and_then(|listed| listed.4),
+                tick_period_ms: u64::try_from(host.tick_period().as_millis()).unwrap_or(u64::MAX),
+                broadcast_tail_us: host.current_pace().broadcast_tail_ns / 1_000,
+                pace_samples: host.current_pace().samples,
             });
         }
         let fence_level = self

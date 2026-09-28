@@ -718,14 +718,69 @@ fn kill(server: &mut Server) {
     let _ = server.0.wait();
 }
 /// The process reached its configured cut and aborted.
-fn wait_cut(server: &mut Server, what: &str) {
+/// `again` asks once more for what leads to the cut. A founder that has
+/// just restarted may not lead its session yet, and answers a request it
+/// cannot serve as unavailable (exit 6), which says to ask again; a request
+/// that was taken is never asked twice.
+fn wait_cut(
+    server: &mut Server,
+    what: &str,
+    roots: &[&Path],
+    mut attempted: Output,
+    mut again: impl FnMut() -> Output,
+) {
     let mut deadline = Deadline::after(Duration::from_secs(90));
+    let mut asked = std::time::Instant::now();
     loop {
         if let Some(status) = server.0.try_wait().unwrap() {
             assert!(!status.success(), "{what}: exited normally");
             return;
         }
-        assert!(deadline.open(), "{what}: the cut was never reached");
+        if attempted.status.code() == Some(6) && asked.elapsed() >= Duration::from_millis(500) {
+            attempted = again();
+            asked = std::time::Instant::now();
+        }
+        if !deadline.open() {
+            // What every host says of itself, its session and its ranges.
+            let seen: Vec<String> = roots
+                .iter()
+                .map(|root| {
+                    let text = |args: &[&str]| {
+                        String::from_utf8_lossy(&command(root, args).stdout).into_owned()
+                    };
+                    let metrics = text(&["cluster", "node", "metrics"]);
+                    let session: Vec<&str> = metrics
+                        .lines()
+                        .filter(|line| {
+                            [
+                                "focal_session_leader",
+                                "focal_session_term",
+                                "focal_session_tick_period",
+                                "focal_session_broadcast_tail",
+                                "focal_root_leader",
+                                "focal_root_tick_period",
+                                "focal_root_broadcast_tail",
+                                "focal_peer_rtt_ms",
+                            ]
+                            .iter()
+                            .any(|name| line.starts_with(name))
+                        })
+                        .collect();
+                    format!(
+                        "{}: {session:?}; health {}; ranges {:?}",
+                        root.display(),
+                        text(&["cluster", "node", "health"]),
+                        ranges(root)
+                    )
+                })
+                .collect();
+            panic!(
+                "{what}: the cut was never reached; the move answered {} {} {}; {seen:#?}",
+                attempted.status,
+                String::from_utf8_lossy(&attempted.stdout),
+                String::from_utf8_lossy(&attempted.stderr)
+            );
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -950,13 +1005,16 @@ fn movement_survives_a_cut_at_every_step_a_dead_destination_and_duplicate_reques
         founder_server = start_with(founder, None, &[("FOCAL_FAULT", fault.as_str())]).0;
         let member = member_of(founder);
         let attempted = run_move(founder, &member, target);
-        wait_cut(&mut founder_server, site);
+        let refused_before_it_began = !attempted.status.success();
+        wait_cut(&mut founder_server, site, &roots, attempted, || {
+            run_move(founder, &member, target)
+        });
         founder_server = start(founder, None).0;
         if *site == "movement-begin" {
             // The founder died before it began: the operator's command
             // failed, nothing moved, and the same request begins the move
             // once the restarted controller claims the session again.
-            assert!(!attempted.status.success(), "{site}: the move was begun");
+            assert!(refused_before_it_began, "{site}: the move was begun");
             let mut deadline = Deadline::after(Duration::from_secs(90));
             loop {
                 if run_move(founder, &member, target).status.success() {

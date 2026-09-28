@@ -36,6 +36,8 @@
 
 mod progress;
 pub use progress::{ProgressDeadline, Spent};
+mod round;
+pub use round::{DeadlineExtender, ProgressWitness, RoundBudget, RoundWait, Verdict};
 
 use std::time::Duration;
 
@@ -47,18 +49,125 @@ const SMOOTHED_SHIFT: u32 = 3;
 const VARIATION_SHIFT: u32 = 2;
 const TAIL_VARIATION_MULTIPLIER: u64 = 4;
 
-/// The measured path to one peer: smoothed round trip and mean deviation
-/// over every completed exchange timed to it. Karn's rule is the caller's:
-/// only a completed exchange is a sample, a timed-out one is not. A path with
-/// no sample contributes nothing to a derivation.
+/// How many of a path's latest round trips its estimate is taken over.
+pub const PATH_WINDOW: usize = 16;
+
+/// The measured path to one peer: the median of its latest round trips and
+/// their median absolute deviation.
+///
+/// A path's estimate sets a group's election timeout, so it has to say what
+/// the path is and not what one answer took. A peer that is starting, or
+/// stalled on its disk, answers a probe seconds late; an estimator that
+/// smooths (RFC 9002's, [`ExchangeRtt`]) is built to react to exactly that,
+/// and one such answer puts its tail at seconds for as long as it takes the
+/// smoothing to forget. The median and the median absolute deviation do not
+/// move until half of the window says so: fewer than half of the latest
+/// [`PATH_WINDOW`] answers, however late, leave the estimate where the path
+/// is, and a path that has become slow is followed once most of the window
+/// has seen it.
+///
+/// Karn's rule is the caller's: only an answered probe is a sample. A path
+/// with no sample contributes nothing to a derivation.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PathRtt {
+    window: [u64; PATH_WINDOW],
+    /// Where the next sample goes.
+    next: usize,
+    samples: u64,
+}
+impl PathRtt {
+    pub const fn new() -> Self {
+        Self {
+            window: [0; PATH_WINDOW],
+            next: 0,
+            samples: 0,
+        }
+    }
+    /// Fold one answered round trip in, in place of the oldest of the
+    /// window.
+    pub fn on_sample(&mut self, round_trip_ns: u64) {
+        if let Some(slot) = self.window.get_mut(self.next) {
+            *slot = round_trip_ns;
+        }
+        self.next = self
+            .next
+            .saturating_add(1)
+            .checked_rem(PATH_WINDOW)
+            .unwrap_or(0);
+        self.samples = self.samples.saturating_add(1);
+    }
+    pub const fn samples(&self) -> u64 {
+        self.samples
+    }
+    /// The samples in the window, sorted, and how many there are.
+    fn sorted(&self) -> ([u64; PATH_WINDOW], usize) {
+        let held = usize::try_from(self.samples)
+            .unwrap_or(PATH_WINDOW)
+            .min(PATH_WINDOW);
+        let mut sorted = [u64::MAX; PATH_WINDOW];
+        for (slot, sample) in sorted.iter_mut().zip(self.window.iter().take(held)) {
+            *slot = *sample;
+        }
+        // The samples held are the first `held` slots of the ring until it
+        // is full, and all of it afterwards; the rest sort last.
+        sorted.sort_unstable();
+        (sorted, held)
+    }
+    /// The middle of `held` sorted values, the upper one of two.
+    fn middle(sorted: &[u64; PATH_WINDOW], held: usize) -> u64 {
+        sorted
+            .get(held.checked_div(2).unwrap_or(0))
+            .copied()
+            .unwrap_or(0)
+    }
+    /// The median round trip; zero before a sample.
+    pub fn smoothed_ns(&self) -> u64 {
+        let (sorted, held) = self.sorted();
+        if held == 0 {
+            return 0;
+        }
+        Self::middle(&sorted, held)
+    }
+    /// The median absolute deviation from the median; zero before a sample.
+    pub fn variation_ns(&self) -> u64 {
+        let (sorted, held) = self.sorted();
+        if held == 0 {
+            return 0;
+        }
+        let median = Self::middle(&sorted, held);
+        let mut deviations = [u64::MAX; PATH_WINDOW];
+        for (slot, sample) in deviations.iter_mut().zip(sorted.iter().take(held)) {
+            *slot = sample.abs_diff(median);
+        }
+        deviations.sort_unstable();
+        Self::middle(&deviations, held)
+    }
+    /// The bound on this path's round-trip tail,
+    /// `median + max(4 · deviation, granularity)`, or `None` before a
+    /// sample.
+    pub fn tail_ns(&self) -> Option<u64> {
+        (self.samples > 0).then(|| {
+            self.smoothed_ns().saturating_add(
+                TAIL_VARIATION_MULTIPLIER
+                    .saturating_mul(self.variation_ns())
+                    .max(GRANULARITY_NS),
+            )
+        })
+    }
+}
+
+/// What an exchange with one peer takes, the peer's work included: smoothed
+/// round trip and mean deviation over every exchange it answered (RFC 9002
+/// §5.3). It follows a peer that has become slow at once, which is what a
+/// deadline for the next exchange with that peer wants.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExchangeRtt {
     smoothed_ns: u64,
     variation_ns: u64,
     samples: u64,
 }
 
-impl PathRtt {
+impl ExchangeRtt {
     pub const fn new() -> Self {
         Self {
             smoothed_ns: 0,
@@ -192,8 +301,76 @@ mod tests {
     }
 
     #[test]
-    fn the_estimator_follows_rfc_9002() {
+    fn a_path_is_the_median_of_its_latest_answers_and_their_deviation() {
         let mut path = PathRtt::new();
+        assert_eq!(path.tail_ns(), None, "no sample, no tail");
+        assert_eq!((path.smoothed_ns(), path.variation_ns()), (0, 0));
+        path.on_sample(80 * MS);
+        assert_eq!(path.smoothed_ns(), 80 * MS);
+        assert_eq!(path.variation_ns(), 0);
+        assert_eq!(path.tail_ns(), Some(81 * MS), "the granularity at least");
+        for sample in [100, 60, 90, 70] {
+            path.on_sample(sample * MS);
+        }
+        // 60 70 80 90 100: the median 80, the deviations 0 10 10 20 20.
+        assert_eq!(path.smoothed_ns(), 80 * MS);
+        assert_eq!(path.variation_ns(), 10 * MS);
+        assert_eq!(path.tail_ns(), Some(120 * MS));
+        assert_eq!(path.samples(), 5);
+    }
+
+    #[test]
+    fn answers_that_came_late_do_not_move_a_path() {
+        // A peer that was starting answered three probes seconds late.
+        let mut path = PathRtt::new();
+        for _ in 0..PATH_WINDOW {
+            path.on_sample(5 * MS);
+        }
+        let before = path.tail_ns().unwrap();
+        assert_eq!(before, 6 * MS);
+        for late in [2_900, 1_400, 800] {
+            path.on_sample(late * MS);
+            assert_eq!(path.tail_ns(), Some(before));
+        }
+        // The smoothing estimator, given the same, is at seconds.
+        let mut exchange = ExchangeRtt::new();
+        for _ in 0..PATH_WINDOW {
+            exchange.on_sample(5 * MS);
+        }
+        exchange.on_sample(2_900 * MS);
+        assert!(exchange.tail_ns().unwrap() > 3_000 * MS);
+        // Fewer than half of the window, however late, are outvoted.
+        let mut path = PathRtt::new();
+        for _ in 0..PATH_WINDOW {
+            path.on_sample(5 * MS);
+        }
+        for _ in 0..PATH_WINDOW / 2 - 1 {
+            path.on_sample(10_000 * MS);
+        }
+        assert_eq!(path.smoothed_ns(), 5 * MS);
+    }
+
+    #[test]
+    fn a_path_that_became_slow_is_followed_within_its_window() {
+        let mut path = PathRtt::new();
+        for _ in 0..PATH_WINDOW {
+            path.on_sample(5 * MS);
+        }
+        let mut followed = None;
+        for sample in 1..=PATH_WINDOW {
+            path.on_sample(160 * MS);
+            if followed.is_none() && path.smoothed_ns() == 160 * MS {
+                followed = Some(sample);
+            }
+        }
+        assert_eq!(followed, Some(PATH_WINDOW / 2), "at half of the window");
+        assert_eq!(path.tail_ns(), Some(161 * MS));
+        assert_eq!(path.samples(), 2 * PATH_WINDOW as u64);
+    }
+
+    #[test]
+    fn the_exchange_estimator_follows_rfc_9002() {
+        let mut path = ExchangeRtt::new();
         assert_eq!(path.tail_ns(), None, "no sample, no tail");
         path.on_sample(80 * MS);
         assert_eq!(path.smoothed_ns(), 80 * MS, "the first sample seeds it");

@@ -9,17 +9,19 @@
 //! authenticated it is charged to its **identity** (the principal its grant
 //! names, which a renewed certificate keeps):
 //!
-//! - a node holds at most [`AdmissionLimits::per_node`] connections. A node
-//!   opens one connection per peer and another only when it thinks the first
-//!   is gone, so a connection past the bound replaces the oldest, which is
-//!   closed: a peer that restarted or moved is served at once instead of
-//!   waiting out the idle timeout of what it left behind;
-//! - any other identity holds at most [`AdmissionLimits::per_participant`].
-//!   A participant may run several clients at once, so nothing of theirs is
-//!   closed for a newcomer: the newcomer is refused and may try again.
+//! - a node holds at most [`AdmissionLimits::per_node`] connections, any
+//!   other identity at most [`AdmissionLimits::per_participant`];
+//! - a connection past the bound replaces the one of that identity that has
+//!   been idle longest, which is closed. A client that exited, a node that
+//!   restarted or moved, leaves a connection behind that the listener holds
+//!   until its idle timeout: refusing the newcomer would make an identity
+//!   wait out what it left behind, and the connection it uses least is the
+//!   one most likely to be that. A live client whose idle connection is
+//!   closed dials again at its next request.
 //!
-//! The number of identities is bounded too. Every refusal is typed and
-//! counted.
+//! One identity never takes another's place: the number of identities is
+//! bounded, and an identity past its own bound displaces only itself. Every
+//! refusal is typed and counted.
 use crate::PeerRole;
 use focal_model::ParticipantId;
 use quinn::Connection;
@@ -60,8 +62,6 @@ pub enum AdmissionRefusal {
     Pending,
     #[error("too many identities hold connections")]
     Identities,
-    #[error("this identity holds its bound of connections")]
-    IdentityConnections,
     #[error("the listener is closed")]
     Closed,
 }
@@ -74,13 +74,12 @@ pub struct AdmissionStats {
     pub replaced: u64,
     pub refused_pending: u64,
     pub refused_identities: u64,
-    pub refused_identity_connections: u64,
     /// Every admission, refusal and release so far: what a wait on this
     /// listener is charged in.
     pub changes: u64,
 }
 struct Held {
-    /// Oldest first.
+    /// Least recently used first.
     connections: VecDeque<(u64, Connection)>,
 }
 #[derive(Default)]
@@ -93,7 +92,6 @@ struct State {
     replaced: u64,
     refused_pending: u64,
     refused_identities: u64,
-    refused_identity_connections: u64,
     changes: u64,
 }
 pub struct Admission {
@@ -128,7 +126,6 @@ impl Admission {
             replaced: state.replaced,
             refused_pending: state.refused_pending,
             refused_identities: state.refused_identities,
-            refused_identity_connections: state.refused_identity_connections,
             changes: state.changes,
         }
     }
@@ -151,8 +148,7 @@ impl Admission {
     ) -> Result<(u64, Option<Connection>), AdmissionRefusal> {
         let mut state = self.state.lock().map_err(|_| AdmissionRefusal::Closed)?;
         bump(&mut state.changes);
-        let node = matches!(role, PeerRole::Node { .. });
-        let bound = if node {
+        let bound = if matches!(role, PeerRole::Node { .. }) {
             self.limits.per_node
         } else {
             self.limits.per_participant
@@ -164,10 +160,6 @@ impl Admission {
         if held == 0 && state.identities.len() >= self.limits.identities {
             bump(&mut state.refused_identities);
             return Err(AdmissionRefusal::Identities);
-        }
-        if held >= bound && !node {
-            bump(&mut state.refused_identity_connections);
-            return Err(AdmissionRefusal::IdentityConnections);
         }
         let id = state.next;
         state.next = state.next.checked_add(1).ok_or(AdmissionRefusal::Closed)?;
@@ -187,6 +179,24 @@ impl Admission {
         }
         bump(&mut state.admitted);
         Ok((id, replaced))
+    }
+    /// The connection served a request: it is this identity's most
+    /// recently used.
+    fn used(&self, identity: ParticipantId, id: u64) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let Some(held) = state.identities.get_mut(&identity) else {
+            return;
+        };
+        if held.connections.back().is_some_and(|(last, _)| *last == id) {
+            return;
+        }
+        if let Some(position) = held.connections.iter().position(|(held, _)| *held == id)
+            && let Some(entry) = held.connections.remove(position)
+        {
+            held.connections.push_back(entry);
+        }
     }
     fn release(&self, identity: ParticipantId, id: u64) {
         let Ok(mut state) = self.state.lock() else {
@@ -244,6 +254,12 @@ pub struct Admitted<'a> {
     admission: &'a Admission,
     identity: ParticipantId,
     id: u64,
+}
+impl Admitted<'_> {
+    /// The connection served a request.
+    pub fn used(&self) {
+        self.admission.used(self.identity, self.id);
+    }
 }
 impl Drop for Admitted<'_> {
     fn drop(&mut self) {

@@ -23,6 +23,7 @@ use std::time::Duration;
 
 #[path = "support/fleet.rs"]
 mod fleet;
+use fleet::deadline;
 #[path = "support/journey.rs"]
 mod journey;
 use fleet::*;
@@ -40,7 +41,7 @@ fn regional(view: &Value, id: u64, region: &str) -> bool {
 }
 /// The founder's metrics text once a measured peer RTT is present.
 fn wait_for_peer_rtt(founder: &Node) -> String {
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
     loop {
         let output = fleet::run(founder, None, &["cluster", "node", "metrics"]);
         if output.status.success() {
@@ -49,10 +50,7 @@ fn wait_for_peer_rtt(founder: &Node) -> String {
                 return text;
             }
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no peer RTT metric within 60 s"
-        );
+        assert!(deadline.open(), "no peer RTT metric within 60 s");
         std::thread::sleep(Duration::from_millis(500));
     }
 }

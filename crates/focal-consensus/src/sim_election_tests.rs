@@ -19,6 +19,7 @@ struct Replica {
     _dir: tempfile::TempDir,
     period: u64,
     next_tick: u64,
+    next_beat: u64,
     applied: Vec<Vec<u8>>,
     down: bool,
 }
@@ -28,6 +29,9 @@ struct Sim {
     /// Every `(term, leader)` any replica reported, in order of appearance.
     leaders: Vec<(u64, u64)>,
     derive: bool,
+    /// Whether a leader whose period is stretched sends its heartbeats at
+    /// the configured cadence, as the owners do.
+    beats: bool,
 }
 impl Sim {
     fn new(seed: u64, path: Path, derive: bool) -> Self {
@@ -72,6 +76,7 @@ impl Sim {
                     period,
                     // Replicas do not start in step.
                     next_tick: period / 3 * id,
+                    next_beat: 0,
                     applied: Vec::new(),
                     down: false,
                 }
@@ -82,6 +87,7 @@ impl Sim {
             replicas,
             leaders: Vec::new(),
             derive,
+            beats: true,
         }
     }
     fn election_timeout(&self) -> u64 {
@@ -123,7 +129,20 @@ impl Sim {
                 .filter(|replica| !replica.down)
                 .map(|replica| replica.next_tick)
                 .min();
-            let next = [tick, self.fabric.next_arrival()]
+            let beats = self.beats;
+            let configured = CONFIGURED.as_nanos() as u64;
+            let beat = self
+                .replicas
+                .iter()
+                .filter(|replica| {
+                    beats
+                        && !replica.down
+                        && replica.period > configured
+                        && replica.node.status().role == StateRole::Leader
+                })
+                .map(|replica| replica.next_beat)
+                .min();
+            let next = [tick, beat, self.fabric.next_arrival()]
                 .into_iter()
                 .flatten()
                 .min()
@@ -147,6 +166,17 @@ impl Sim {
                 if !self.replicas[index].down && self.replicas[index].next_tick <= now {
                     self.replicas[index].node.tick().unwrap();
                     self.replicas[index].next_tick = now + self.replicas[index].period;
+                    self.flush(index);
+                }
+                let replica = &mut self.replicas[index];
+                if beats
+                    && !replica.down
+                    && replica.period > configured
+                    && replica.node.status().role == StateRole::Leader
+                    && replica.next_beat <= now
+                {
+                    replica.node.beat().unwrap();
+                    replica.next_beat = now + configured * replica.node.heartbeat_tick() as u64;
                     self.flush(index);
                 }
             }
@@ -291,6 +321,53 @@ fn a_group_whose_round_trip_exceeds_the_configured_timeout_elects_only_at_the_de
         derived.run(settled + 50 * timeout, |_| false);
         assert_eq!(derived.leader(), first, "{:?}", derived.leaders);
         assert_eq!(derived.terms(), 1, "{:?}", derived.leaders);
+    }
+}
+
+/// Each node stretches its period by what it measured itself, so the
+/// periods of a group differ. A leader whose period is stretched sends its
+/// heartbeats at the configured cadence all the same, and keeps its group;
+/// one that beat at its own stretched period is presumed dead by followers
+/// that measured less, and deposed.
+#[test]
+fn a_leader_whose_period_is_stretched_more_than_its_followers_keeps_its_group() {
+    let configured = CONFIGURED.as_nanos() as u64;
+    let stretched = CEILING.as_nanos() as u64;
+    let run = |seed: u64, beats: bool| {
+        let mut sim = Sim::new(seed, Path::LAN, true);
+        sim.beats = beats;
+        let follower_timeout = configured * sim.replicas[0].node.election_tick() as u64;
+        assert!(sim.run(8 * follower_timeout, |sim| sim.leader().is_some()));
+        let leader = sim.leader().unwrap();
+        // The leader measured a slow tail; its followers did not.
+        let index = (leader - 1) as usize;
+        sim.replicas[index].period = stretched;
+        sim.replicas[index].next_tick = sim.fabric.now() + stretched;
+        sim.replicas[index].next_beat = sim.fabric.now();
+        let terms = sim.terms();
+        let settled = sim.fabric.now();
+        sim.run(settled + 200 * follower_timeout, |_| false);
+        (leader, sim.leader(), sim.terms() - terms, sim)
+    };
+    for seed in 1..=4 {
+        let (leader, kept, spent, mut sim) = run(seed, true);
+        assert_eq!(kept, Some(leader), "seed {seed}: {:?}", sim.leaders);
+        assert_eq!(spent, 0, "seed {seed}: {:?}", sim.leaders);
+        // And it still commits.
+        let index = (leader - 1) as usize;
+        sim.replicas[index].node.propose(b"entry".to_vec()).unwrap();
+        sim.flush(index);
+        let proposed = sim.fabric.now();
+        assert!(sim.run(proposed + 4 * stretched, |sim| {
+            sim.replicas
+                .iter()
+                .all(|replica| replica.applied.iter().any(|entry| entry == b"entry"))
+        }));
+        // The control: beating at its own period, the same leader is
+        // deposed by followers that heard nothing inside their timeout.
+        let (leader, kept, spent, sim) = run(seed, false);
+        assert!(spent >= 1, "seed {seed}: {:?}", sim.leaders);
+        assert_ne!(kept, Some(leader), "seed {seed}: {:?}", sim.leaders);
     }
 }
 

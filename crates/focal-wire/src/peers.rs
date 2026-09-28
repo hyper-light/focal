@@ -209,6 +209,59 @@ impl Drop for Slot {
         }
     }
 }
+#[derive(Clone, Copy, Default)]
+struct Exchange {
+    taken: focal_timing::ExchangeRtt,
+    /// Exchanges given up on since the last one answered. Each doubles what
+    /// the peer is expected to take (RFC 9002 §6.2's backoff): an estimate
+    /// that made a round give up too early is not fed by the exchange it
+    /// gave up on, and would otherwise never grow.
+    abandoned: u32,
+}
+/// The most doublings an estimate takes.
+const MAX_BACKOFF: u32 = 6;
+/// One exchange in progress: given up on unless it says it was answered.
+struct Asked<'a> {
+    pool: &'a PeerConnectionPool,
+    target: u64,
+    /// Whether this operation's exchanges are measured at all.
+    measured: bool,
+    answered: bool,
+}
+impl Asked<'_> {
+    fn answered(&mut self, taken: Duration) {
+        self.answered = true;
+        if !self.measured {
+            return;
+        }
+        if let Ok(mut state) = self.pool.state.lock()
+            && state.routes.contains_key(&self.target)
+        {
+            let exchange = state.exchanges.entry(self.target).or_default();
+            exchange
+                .taken
+                .on_sample(u64::try_from(taken.as_nanos()).unwrap_or(u64::MAX));
+            exchange.abandoned = 0;
+        }
+    }
+    /// The peer refused: it was reached and decided, which is no sample of
+    /// what an answer takes and no reason to expect it slower.
+    fn refused(&mut self) {
+        self.answered = true;
+    }
+}
+impl Drop for Asked<'_> {
+    fn drop(&mut self) {
+        if self.answered || !self.measured {
+            return;
+        }
+        if let Ok(mut state) = self.pool.state.lock()
+            && let Some(exchange) = state.exchanges.get_mut(&self.target)
+        {
+            exchange.abandoned = exchange.abandoned.saturating_add(1).min(MAX_BACKOFF);
+        }
+    }
+}
 struct CacheEntry {
     // The cache and concurrent send tasks retain one physical connection slot;
     // removal retires it while outstanding sends keep its capacity reservation.
@@ -222,6 +275,11 @@ struct State {
     /// The measured path to each routed peer (27 §3.1 P2): one estimator per
     /// peer, kept across reconnects and dropped with the peer's route.
     paths: BTreeMap<u64, focal_timing::PathRtt>,
+    /// What an exchange with each routed peer takes, the peer's work
+    /// included (27 §3.1 P1): one estimator per peer over the exchanges it
+    /// answered, and how many in a row were given up on. Dropped with the
+    /// peer's route.
+    exchanges: BTreeMap<u64, Exchange>,
     clock: u64,
     closed: bool,
 }
@@ -256,6 +314,7 @@ impl PeerConnectionPool {
                 routes: BTreeMap::new(),
                 cached: BTreeMap::new(),
                 paths: BTreeMap::new(),
+                exchanges: BTreeMap::new(),
                 clock: 0,
                 closed: false,
             }),
@@ -304,12 +363,13 @@ impl PeerConnectionPool {
             }
         });
         state.paths.retain(|id, _| routes.contains_key(id));
+        state.exchanges.retain(|id, _| routes.contains_key(id));
         state.revision = revision;
         state.routes = routes;
         Ok(())
     }
-    /// The measured path to `target`: round trips of exchanges it answered
-    /// on an open connection. `None` for a peer with no route; a routed peer
+    /// The measured path to `target`: round trips of the liveness probes it
+    /// answered on an open connection. `None` for a peer with no route; a routed peer
     /// that has answered nothing yet has a path with no sample.
     pub fn path(&self, target: u64) -> Option<focal_timing::PathRtt> {
         let state = self.state.lock().ok()?;
@@ -317,6 +377,33 @@ impl PeerConnectionPool {
             .routes
             .contains_key(&target)
             .then(|| state.paths.get(&target).copied().unwrap_or_default())
+    }
+    /// What an exchange with `target` is expected to take, its work
+    /// included: the tail of the exchanges it answered, doubled for each
+    /// one given up on since. `None` while it has answered none.
+    pub fn exchange_tail(&self, target: u64) -> Option<Duration> {
+        let state = self.state.lock().ok()?;
+        let exchange = state.exchanges.get(&target)?;
+        let tail = exchange.taken.tail_ns()?;
+        let factor = 1u64.checked_shl(exchange.abandoned.min(MAX_BACKOFF))?;
+        Some(Duration::from_nanos(tail.saturating_mul(factor)))
+    }
+    /// The budget of a round that asks `targets` (27 §3.1 P1): derived from
+    /// the slowest of them, and the pool's own deadline where one of them
+    /// has answered nothing yet. Never longer than that deadline.
+    pub fn round_budget(
+        &self,
+        targets: impl IntoIterator<Item = u64>,
+        period: Duration,
+    ) -> focal_timing::RoundBudget {
+        let mut slowest = Some(Duration::ZERO);
+        for target in targets {
+            slowest = match (slowest, self.exchange_tail(target)) {
+                (Some(slowest), Some(tail)) => Some(slowest.max(tail)),
+                _ => None,
+            };
+        }
+        focal_timing::RoundBudget::derive(period, slowest, self.limits.timeout)
     }
     /// Karn's rule: only an exchange the peer answered is a sample, timed on
     /// a connection already open, so neither a dial nor a lost request
@@ -613,6 +700,14 @@ impl PeerConnectionPool {
             return Err(PeerSendError::InvalidRequest);
         }
         let probe = matches!(request.operation, Operation::Probe { .. });
+        // Replication and probes measure the path; every other exchange
+        // measures what the peer takes to answer it.
+        let mut asked = Asked {
+            pool: self,
+            target,
+            measured: !probe && !matches!(request.operation, Operation::Raft { .. }),
+            answered: false,
+        };
         let _inflight = if probe {
             &self.probe_inflight
         } else {
@@ -645,23 +740,28 @@ impl PeerConnectionPool {
                         | Response::ManagedSupport(_)
                         | Response::Probe(_)) => {
                             if slot.retired.load(Ordering::Acquire) {
+                                asked.refused();
                                 return Err(PeerSendError::RouteChanged);
                             }
-                            // Broadcast time is a replication message
-                            // or a probe answered by the peer alone. A
-                            // control request waits on a quorum commit,
-                            // which is the group's latency, not the path's.
-                            if matches!(
-                                request.operation,
-                                Operation::Raft { .. } | Operation::Probe { .. }
-                            ) {
+                            asked.answered(sent.elapsed());
+                            // The path is measured by probes alone: the
+                            // peer's liveness driver answers one without
+                            // its replicas' owners. A replication message
+                            // is answered once the peer has persisted it,
+                            // and a peer that has just restarted answers
+                            // its first one seconds late; a control request
+                            // waits on a quorum commit. Neither is the path.
+                            if matches!(request.operation, Operation::Probe { .. }) {
                                 self.observe(target, sent.elapsed());
                             }
                             return Ok(value);
                         }
                         Response::Error(AccessError::Unavailable | AccessError::OutcomeUnknown) => {
                         }
-                        Response::Error(error) => return Err(PeerSendError::Rejected(error)),
+                        Response::Error(error) => {
+                            asked.refused();
+                            return Err(PeerSendError::Rejected(error));
+                        }
                         _ => return Err(PeerSendError::Lost),
                     },
                     Err(WireError::Limit) => return Err(PeerSendError::Busy),

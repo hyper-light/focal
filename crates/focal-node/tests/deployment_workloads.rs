@@ -18,6 +18,7 @@ use std::time::Duration;
 
 #[path = "support/fleet.rs"]
 mod fleet;
+use fleet::deadline;
 #[path = "support/journey.rs"]
 mod journey;
 use fleet::*;
@@ -40,7 +41,7 @@ fn gauge(text: &str, name: &str) -> Option<u64> {
     })
 }
 fn metrics(node: &Node) -> String {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(30));
     loop {
         let output = fleet::run(node, None, &["cluster", "node", "metrics"]);
         if output.status.success() {
@@ -49,7 +50,7 @@ fn metrics(node: &Node) -> String {
                 return text;
             }
         }
-        assert!(std::time::Instant::now() < deadline, "no metrics snapshot");
+        assert!(deadline.open(), "no metrics snapshot");
         std::thread::sleep(Duration::from_millis(250));
     }
 }

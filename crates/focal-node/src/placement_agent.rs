@@ -2575,14 +2575,36 @@ impl PlacementAgent {
         }
         let body = crate::placement_collect::sign_request_body(&fact, window)
             .ok_or(CollectError::Capacity)?;
+        // Every other voter is asked at once (27 §3.1 P1): the round ends at
+        // the first majority, so a voter that is gone costs nothing the
+        // majority does not need, and its budget is derived from what these
+        // voters were measured to take.
+        let mut asks = Vec::new();
+        asks.try_reserve_exact(voters.len())
+            .map_err(|_| CollectError::Capacity)?;
         for voter in voters.iter().copied().filter(|voter| *voter != node) {
             let id = self.next_request_id().map_err(|_| CollectError::Capacity)?;
-            let Some(proof) = remote_signature(pool, voter, ledger, group, &body, id).await else {
-                continue;
-            };
-            if collected.merge(proof)? {
-                return collected.finish();
+            asks.push((
+                voter,
+                remote_signature(pool, voter, ledger, group, &body, id),
+            ));
+        }
+        let budget = pool.round_budget(
+            asks.iter().map(|(voter, _)| *voter),
+            handles.control.tick_period(),
+        );
+        let mut refused = None;
+        focal_wire::gather(asks, budget, |_, proof| match collected.merge(proof) {
+            Ok(complete) => complete,
+            Err(error) => {
+                refused = Some(error);
+                true
             }
+        })
+        .await
+        .map_err(|_| CollectError::Capacity)?;
+        if let Some(error) = refused {
+            return Err(error);
         }
         collected.finish()
     }

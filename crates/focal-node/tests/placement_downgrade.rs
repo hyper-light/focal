@@ -19,6 +19,7 @@
 use std::time::Duration;
 #[path = "support/fleet.rs"]
 mod fleet;
+use fleet::deadline;
 use fleet::*;
 
 #[test]
@@ -76,7 +77,7 @@ fn lowering_max_failures_shrinks_the_voter_set_and_keeps_the_history() {
     let sole = shrunk[0];
     let voter: &Node = if sole == node_a { &host_a } else { &host_b };
     let read_from_voter = |claim: &str| -> String {
-        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        let mut deadline = deadline::Deadline::after(Duration::from_secs(120));
         loop {
             let output = fleet::run(voter, None, &["get", "claim", claim, "--format", "json"]);
             if output.status.success()
@@ -86,7 +87,7 @@ fn lowering_max_failures_shrinks_the_voter_set_and_keeps_the_history() {
                 return claim_id(&objects(&page)[0]);
             }
             assert!(
-                std::time::Instant::now() < deadline,
+                deadline.open(),
                 "the sole voter never served: {}",
                 String::from_utf8_lossy(&output.stderr)
             );

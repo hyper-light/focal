@@ -23,6 +23,7 @@ use std::{os::unix::fs::PermissionsExt, time::Duration};
 
 #[path = "support/fleet.rs"]
 mod fleet;
+use fleet::deadline;
 #[path = "support/journey.rs"]
 mod journey;
 use fleet::*;
@@ -347,7 +348,7 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
     wait_for(&founder, "the heal", Duration::from_secs(240), |view| {
         settled(view, &ledger, &healed, 1)
     });
-    let deadline = std::time::Instant::now() + Duration::from_secs(180);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(180));
     let removed = loop {
         let output = fleet::run(
             &founder,
@@ -358,7 +359,7 @@ fn the_vm_stage_adds_addresses_invitations_and_a_durability_intent() {
             break serde_json::from_slice::<Value>(&output.stdout).unwrap()["result"].clone();
         }
         assert!(
-            std::time::Instant::now() < deadline,
+            deadline.open(),
             "removal never succeeded: {}",
             String::from_utf8_lossy(&output.stderr)
         );

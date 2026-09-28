@@ -19,7 +19,7 @@ use std::{
     path::Path,
     process::{Child, Command, Output, Stdio},
     sync::mpsc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 struct Server(Child);
@@ -29,6 +29,8 @@ impl Drop for Server {
         let _ = self.0.wait();
     }
 }
+#[path = "support/deadline.rs"]
+mod deadline;
 #[path = "support/ports.rs"]
 mod ports;
 fn address() -> String {
@@ -107,6 +109,7 @@ fn spawn(
     (child, receive)
 }
 fn start(root: &Path, address: Option<&str>) -> (Server, Value) {
+    deadline::observe(root);
     let (child, receive) = spawn(root, address, None);
     let server = Server(child);
     let status = receive
@@ -149,9 +152,9 @@ fn upgrade(root: &Path) -> Value {
     status["result"]["upgrade"].clone()
 }
 fn wait_for_upgrade(root: &Path, what: &str, condition: impl Fn(&Value) -> bool) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(90));
     let mut last = None;
-    while Instant::now() < deadline {
+    while deadline.open() {
         let output = run(root, &["cluster", "upgrade", "status"]);
         if output.status.success()
             && let Ok(value) = serde_json::from_slice::<Value>(&output.stdout)
@@ -296,12 +299,12 @@ trait WaitTimeout {
 }
 impl WaitTimeout for Child {
     fn wait_timeout_or_kill(&mut self, timeout: Duration) -> std::process::ExitStatus {
-        let deadline = Instant::now() + timeout;
+        let mut deadline = deadline::Deadline::after(timeout);
         loop {
             if let Some(status) = self.try_wait().unwrap() {
                 return status;
             }
-            if Instant::now() >= deadline {
+            if !deadline.open() {
                 let _ = self.kill();
                 return self.wait().unwrap();
             }

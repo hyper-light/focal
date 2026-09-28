@@ -46,6 +46,10 @@ impl TickPeriod {
     pub(crate) fn derived(&self) -> Option<focal_timing::TickPace> {
         self.0.derived.lock().ok().and_then(|derived| *derived)
     }
+    /// Whether the period in force is longer than the configured one.
+    pub(crate) fn stretched(&self, configured: Duration, ceiling: Duration) -> bool {
+        self.get(configured, ceiling) > configured
+    }
     pub(crate) fn get(&self, configured: Duration, ceiling: Duration) -> Duration {
         Duration::from_nanos(self.0.period_ns.load(Ordering::Relaxed))
             .clamp(configured, ceiling.max(configured))

@@ -583,6 +583,8 @@ struct Owner {
     nonblocking: bool,
     stopping: Option<(oneshot::Sender<Result<(), LedgerError>>, Instant)>,
     next_tick: Instant,
+    /// When a leader whose period is stretched sends its next heartbeats.
+    next_beat: Instant,
     wake_at: Instant,
 }
 impl ReplicaHost {
@@ -733,6 +735,7 @@ impl ReplicaHost {
             nonblocking: false,
             stopping: None,
             next_tick: Instant::now(),
+            next_beat: Instant::now(),
             wake_at: Instant::now(),
         };
         Ok((
@@ -1307,6 +1310,41 @@ impl Owner {
             let _ = observer.0.try_send(self.session.ledger());
         }
     }
+    /// The interval of a leader's heartbeats at the configured period.
+    fn beat_interval(&self) -> Duration {
+        self.config
+            .tick
+            .saturating_mul(u32::try_from(self.session.heartbeat_tick().max(1)).unwrap_or(u32::MAX))
+    }
+    /// Whether this owner beats apart from its ticks: it leads, and its
+    /// period is stretched. A stretched period stretches the election
+    /// timeout, which is what it is for; the heartbeats of a leader keep
+    /// the cadence its followers were configured to expect. Each node
+    /// stretches by what it measured itself, and a leader that beat at its
+    /// own stretched period would be presumed dead by a follower that
+    /// measured less (27 §3.1 P2).
+    fn beats(&self) -> bool {
+        self.pace
+            .stretched(self.config.tick, self.config.tick_ceiling)
+            && self.session.status().role == StateRole::Leader
+    }
+    fn beat_if_due(&mut self) -> Result<(), LedgerError> {
+        if !self.beats() || Instant::now() < self.next_beat {
+            return Ok(());
+        }
+        match self.session.beat() {
+            Ok(())
+            | Err(LedgerError::Consensus(
+                focal_consensus::ConsensusError::PersistencePending
+                | focal_consensus::ConsensusError::Capacity,
+            )) => {}
+            Err(error) => return Err(error),
+        }
+        self.next_beat = Instant::now()
+            .checked_add(self.beat_interval())
+            .ok_or(LedgerError::Failed)?;
+        Ok(())
+    }
     fn run(mut self, receiver: mpsc::Receiver<Work>) {
         let mut next_tick = Instant::now();
         let result = (|| -> Result<(), LedgerError> {
@@ -1318,7 +1356,16 @@ impl Owner {
                         .checked_add(self.pace.get(self.config.tick, self.config.tick_ceiling))
                         .ok_or(LedgerError::Failed)?;
                 }
-                match receiver.recv_timeout(next_tick.saturating_duration_since(Instant::now())) {
+                self.beat_if_due()?;
+                if self.session.has_ready() {
+                    self.drain()?;
+                }
+                let wake = if self.beats() {
+                    next_tick.min(self.next_beat)
+                } else {
+                    next_tick
+                };
+                match receiver.recv_timeout(wake.saturating_duration_since(Instant::now())) {
                     Ok(work) => {
                         if self.accept(work)? {
                             return Ok(());
@@ -1507,6 +1554,9 @@ impl Owner {
                 .checked_add(self.pace.get(self.config.tick, self.config.tick_ceiling))
                 .ok_or(LedgerError::Failed)?;
         }
+        if !self.session.persistence_pending() {
+            self.beat_if_due()?;
+        }
         Ok(false)
     }
     fn group_deadline(&self) -> Result<Instant, LedgerError> {
@@ -1520,6 +1570,9 @@ impl Owner {
         // makes no progress on its own; it resumes when a chunk lands.
         if self.session.has_ready() && !self.session.seed_waiting() {
             return Ok(self.next_tick.min(Instant::now()));
+        }
+        if self.beats() {
+            return Ok(self.next_tick.min(self.next_beat));
         }
         Ok(self.next_tick)
     }

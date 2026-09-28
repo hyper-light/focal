@@ -30,6 +30,8 @@ pub use focal_timing as timing;
 use focal_log::{LogError, LogicalLogId, Record, RecordKind, WalIdentity, WalLease, WalOptions};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, DiskBudget, MemoryBudget};
 use raft::{Config, RawNode, Storage};
+/// The context raft-rs gives the vote request of a transferred campaign.
+const CAMPAIGN_TRANSFER: &[u8] = b"CampaignTransfer";
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
@@ -702,6 +704,21 @@ impl DurableNode {
         Ok(())
     }
     /// Ticks without leader contact before this node campaigns.
+    /// Ticks between a leader's heartbeats.
+    pub fn heartbeat_tick(&self) -> usize {
+        self.config.heartbeat_tick
+    }
+    /// A leader sends its heartbeats now; any other role does nothing. For
+    /// an owner whose tick period is stretched (27 §3.1 P2): the election
+    /// timeout follows the period, and the heartbeats keep the cadence the
+    /// followers were configured to expect.
+    pub fn beat(&mut self) -> Result<(), ConsensusError> {
+        self.guarded(|replica| {
+            replica.check()?;
+            replica.raw.ping();
+            Ok(())
+        })
+    }
     pub fn election_tick(&self) -> usize {
         self.config.election_tick
     }
@@ -885,6 +902,17 @@ impl DurableNode {
                 }
                 EntryType::EntryNormal => {}
             }
+        }
+        // Priority orders elections; it never vetoes a transfer (27 §5). A
+        // transfer is the leader's own decision, or its operator's, that a
+        // member shall lead: the vote it asks for is judged by the log
+        // alone. The priority in force returns with the end of this
+        // operation (`guarded_in`).
+        if message.get_msg_type() == MessageType::MsgRequestVote
+            && message.context.as_slice() == CAMPAIGN_TRANSFER
+            && self.raw.raft.priority != 0
+        {
+            self.raw.set_priority(0);
         }
         self.raw.step(message)?;
         Ok(())

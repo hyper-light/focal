@@ -18,7 +18,7 @@ use std::{
     path::Path,
     process::{Child, Command, Output, Stdio},
     sync::mpsc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 struct Server(Child);
@@ -28,6 +28,8 @@ impl Drop for Server {
         let _ = self.0.wait();
     }
 }
+#[path = "support/deadline.rs"]
+mod deadline;
 #[path = "support/ports.rs"]
 mod ports;
 fn run(root: &Path, config: &Path, args: &[&str]) -> Output {
@@ -39,6 +41,7 @@ fn run(root: &Path, config: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 fn start(root: &Path, config: &Path, advertise: &str) -> Server {
+    deadline::observe(root);
     let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
         .args(["--config", config.to_str().unwrap()])
         .args(["--data-dir", root.to_str().unwrap(), "start"])
@@ -111,7 +114,7 @@ fn metrics_render_the_sampled_snapshot_over_the_admin_socket_and_the_loopback_en
         .to_owned();
     // The admin socket renders the latest snapshot as text, with the fixed
     // labels and the founder's session, once the sampler has run.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(30));
     let text = loop {
         let output = run(root, &config, &["cluster", "node", "metrics"]);
         assert!(
@@ -123,7 +126,7 @@ fn metrics_render_the_sampled_snapshot_over_the_admin_socket_and_the_loopback_en
         if text.contains("focal_session_applied_index{") && text.contains("focal_node_info{") {
             break text;
         }
-        assert!(Instant::now() < deadline, "no snapshot within 30 s: {text}");
+        assert!(deadline.open(), "no snapshot within 30 s: {text}");
         std::thread::sleep(Duration::from_millis(250));
     };
     assert!(

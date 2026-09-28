@@ -587,6 +587,15 @@ impl Session {
     pub fn priority(&self) -> i64 {
         self.consensus.priority()
     }
+    /// Ticks between a leader's heartbeats.
+    pub fn heartbeat_tick(&self) -> usize {
+        self.consensus.heartbeat_tick()
+    }
+    /// A leader sends its heartbeats now; see `DurableNode::beat`.
+    pub fn beat(&mut self) -> Result<(), LedgerError> {
+        self.check()?;
+        Ok(self.consensus.beat()?)
+    }
     /// Ticks without leader contact before this replica campaigns.
     pub fn election_tick(&self) -> usize {
         self.consensus.election_tick()

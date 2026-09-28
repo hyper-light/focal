@@ -781,6 +781,10 @@ impl<V: AuthorityVerifier> Owner<V> {
             let mut next_tick = Instant::now()
                 .checked_add(self.pace.get(self.config.tick, self.config.tick_ceiling))
                 .ok_or(ControlError::Capacity)?;
+            let beat = self.config.tick.saturating_mul(
+                u32::try_from(self.replica.heartbeat_tick().max(1)).unwrap_or(u32::MAX),
+            );
+            let mut next_beat = Instant::now();
             loop {
                 for _ in 0..8 {
                     match peers.try_recv() {
@@ -797,6 +801,27 @@ impl<V: AuthorityVerifier> Owner<V> {
                     self.maybe_checkpoint()?;
                     next_tick = Instant::now()
                         .checked_add(self.pace.get(self.config.tick, self.config.tick_ceiling))
+                        .ok_or(ControlError::Capacity)?;
+                }
+                // A stretched period stretches the election timeout, which
+                // is what it is for. The heartbeats of a leader keep the
+                // cadence its followers were configured to expect: each
+                // node stretches by what it measured itself, and a leader
+                // that beat at its own stretched period would be presumed
+                // dead by a follower that measured less (27 §3.1 P2).
+                if self.replica.leads()
+                    && self
+                        .pace
+                        .stretched(self.config.tick, self.config.tick_ceiling)
+                    && Instant::now() >= next_beat
+                {
+                    match self.replica.beat() {
+                        Ok(()) => self.drain()?,
+                        Err(error) if self.replica.checkpoint_retryable(&error) => {}
+                        Err(error) => return Err(error),
+                    }
+                    next_beat = Instant::now()
+                        .checked_add(beat)
                         .ok_or(ControlError::Capacity)?;
                 }
                 // Peer ingress has its own reserved queue. The short idle wait

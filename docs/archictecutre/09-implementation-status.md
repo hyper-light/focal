@@ -10654,10 +10654,18 @@ promptness observed once and assumed to hold.
 authenticated connections in one bound, and no identity had a bound of its own.
 `focal_wire::Admission`: a bounded number of pending places that authenticated
 connections never use; a charge per identity (the grant's principal, which a renewed
-certificate keeps); a bound on identities. A node past its bound of 4 replaces its
-oldest connection; any other identity past its bound of 16 is refused. Metrics
-`focal_listener_{handshakes_pending,identities,connections,admitted_total,
-replaced_total,refused_total{bound}}`. Five tests over real QUIC connections.
+certificate keeps); a bound on identities. A node holds 4 connections and any other
+identity 16; a connection past the bound replaces the one of that identity that was
+idle longest. Metrics `focal_listener_{handshakes_pending,identities,connections,
+admitted_total,replaced_total,refused_total{bound}}`. Five tests over real QUIC
+connections.
+
+The first rule refused a participant past its bound, and it was wrong. A client
+process that exits leaves its connection with the listener until the idle timeout, so a
+participant that ran one short client after another was refused for what it had left
+behind. CI on `6fe3828` showed it as an MCP call that waited out its thirty seconds.
+`an_identity_past_its_bound_loses_the_connection_it_used_least` runs forty clients
+that leave without closing; every one is served.
 
 **A retirement always closes (27 §3.1 P6).** `Slot::retire` closed the slot's
 connection only when a `try_lock` succeeded, and a dial could store a connection after
@@ -10674,4 +10682,119 @@ other way to ask, and it panics when the timer is absent. The panic is contained
 the call answers `Unavailable`, but it is a panic on a production path and it prints.
 Removing it means never calling tokio's timer on a runtime focal did not build, or a
 timer of focal's own. Not decided.
+
+### 2026-09-28 — rounds that end on what they observe (27 §3.1 P1)
+
+`focal_timing::round`: `RoundBudget` (a deadline, the lookahead at which it is judged,
+an extension and how many, a stall window), `ProgressWitness`, `DeadlineExtender`,
+`RoundWait`. Pure: the caller says what time it is. `RoundBudget::derive(period, tail,
+ceiling)` opens a round for a period or the measured tail, whichever is longer, judges
+it at three quarters, extends it a period at a time while answers arrive, and never
+passes the ceiling; with nothing measured it is the ceiling, hard. 7 tests.
+
+`focal_wire::gather` asks every peer at once and ends when the caller has what it
+needs, when every peer has reported, or when the wait ends it. 9 tests under a paused
+clock, with exact times: a dead peer costs nothing (20 ms), no answer ends the round at
+its lookahead (75 ms), answers that keep arriving extend it past its deadline (600 ms),
+a stall ends it (225 ms), an answer that arrives with the judgement is read first.
+
+`PeerConnectionPool` measures what an exchange with each peer takes
+(`exchange_tail`), apart from the path it measures with replication and probes, and
+doubles the expectation for each exchange given up on, at most six times, until the
+peer answers one. `round_budget(targets, period)` derives a round's budget from the
+slowest target, with the pool's own deadline as the ceiling. Test over a real
+connection: `an_exchange_given_up_on_lengthens_what_its_peer_is_expected_to_take`.
+
+Session-fact signatures (`PlacementAgent::collect`) were asked of one voter after
+another with five seconds each; they are one round now.
+`a_dead_voter_is_drained_and_replaced_without_waiting_it_out`: four services, a voter
+stopped and then drained, the session healed on the three that answer.
+
+### 2026-09-28 — CI on `6fe3828`; a transfer that priority vetoed; the binary suites' deadlines
+
+CI on `6fe3828` (runs 36397864563, 36397864572): Windows and the dependency audit
+passed; Ubuntu failed in `mcp_native_a4` and macOS in `cli_gc`.
+
+- `mcp_native_a4`: one call waited out its thirty seconds. The admission rule of that
+  commit refused an identity past its bound; see the entry above for the rule that
+  replaced it.
+- `cli_gc`: the test waited for a pass of the collector that reported one object
+  quarantined. The pass that takes the object reports it and the passes after it
+  report none, so a poll that lands after a later pass never sees the count. The test
+  waits for the fact that lasts: the object is gone from the store.
+
+**Priority vetoed a leader transfer.** raft-rs applies the priority rule to every vote
+request, the one of a transferred campaign included. A voter of higher priority
+refused a member the leader had handed leadership to, and where that vote completed
+the majority the transfer failed and the old leader was elected again. This came with
+the priority wiring of the same day. `DurableNode` judges the vote a transfer asks for
+by the log alone. Test: `a_transfer_to_a_member_of_lower_priority_is_not_vetoed_by_priority`
+(two live members, the leader of higher priority, the transfer completes on its vote;
+an election afterwards is still ordered by priority).
+
+**Deadlines in the binary suites (27 §3.1 P8).** `tests/support/deadline.rs`: a test
+names the data directories it starts processes on, and a `Deadline` is charged to the
+periods those processes run, read from `focal_root_periods_total`. In use in every
+binary suite that had a wall-clock deadline: `cli_backup`, `cli_deployment`, `cli_gc`,
+`cli_metrics`, `cli_native_a1`, `cli_native_a4`, `cli_nodes`, `cli_reachability`,
+`cli_repair`, `cli_restore`, `cli_retention`, `cli_session_remote`, `cli_upgrade`,
+`cli_zones`, `mcp_native_a4`, `mcp_stdio`, `placement_binary`, and through the fleet
+harness `deployment_*`, `placement_downgrade` and `runbooks`. `runtime_host` keeps its
+one: it is the length of a simulated execution and waits for nothing.
+
+### 2026-09-28 — the derived pace, corrected
+
+`placement_binary`'s movement test failed in about half of its runs after session
+groups took the derived pace, and in none of six on `45076ef` or of six with session
+pacing switched off. With every host's session leader, term, period and tail traced
+once a second, the run that failed showed, in the second after the founder was killed
+and restarted: host a at a period of 735 ms and host b at 2,000 ms, the ceiling, against
+100 ms configured; fifteen seconds later 291 ms and 916 ms; term 26 by the seventh
+step. Four faults in the pacing as it was first built:
+
+1. **A replication round trip is not the path.** The pool took its path samples from
+   replication messages as well as probes. A replication message is answered once the
+   peer has persisted it, and a peer that has just restarted answers its first one
+   seconds late. One such sample put the tail at two seconds. The path is measured by
+   liveness probes alone now; the peer's liveness driver answers one without its
+   replicas' owners.
+2. **The stretch fed itself.** Samples came at the rate of the heartbeats, and the
+   heartbeats at the rate of the stretched tick, so a stretched period was corrected
+   at the pace it had slowed everything to. Probes have their own cadence.
+3. **Each node stretches by what it measured.** raft-rs counts heartbeats and election
+   timeouts in the same ticks, so a leader whose period was stretched beat less often
+   than a follower that had measured less expected. A leader whose period is stretched
+   sends its heartbeats at the configured cadence (`DurableNode::beat`, by both
+   owners); the stretched period stretches the election timeout, which is what it is
+   for.
+
+4. **The estimator answered for one late reply.** With the path measured by probes
+   alone, the same trace still showed tails of 1.4 s and 2.9 s: a probe sent to a
+   process that is starting is answered seconds late, and RFC 9002's estimator, which
+   is built to react to that, carried it for many seconds. The liveness layer's own
+   figure for the same peers stayed at 0 to 1 ms throughout. A path is now the median
+   of its latest sixteen answers and their median absolute deviation
+   (`focal_timing::PathRtt`), which fewer than half of the window cannot move; the
+   smoothing estimator stays for what an exchange takes (`ExchangeRtt`), where
+   following a peer that became slow at once is what is wanted.
+
+Tests: `a_leader_whose_period_is_stretched_more_than_its_followers_keeps_its_group`
+(the leader at the ceiling, its followers at the configured period: no term is spent in
+two hundred of the followers' election timeouts, and entries commit; without the
+beats the same leader is deposed). The pool's test states that a replication message
+is no sample and a probe is one. Metrics `focal_session_tick_period_milliseconds`,
+`focal_session_broadcast_tail_microseconds`, `focal_session_pace_samples`.
+
+With the four corrected, the movement test passed six runs of six with its moves asked
+once each, and no host's period left the configured 100 ms in any of them (macOS
+arm64).
+
+The movement test also asked for each move once. A founder that has just restarted
+may not lead its session yet and answers `unavailable`, which says to ask again; the
+test does, as an operator's script would.
+
+Local gates on this tree (macOS arm64, nothing else of focal's running): format,
+contracts (1458 links), clippy `-D warnings`, production lints and the dependency audit
+passed; `cargo test --workspace --locked --no-fail-fast -- --test-threads=4` ran 137
+suites and none failed.
 

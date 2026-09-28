@@ -893,10 +893,15 @@ async fn peer_pool_caches_connections_reconnects_identical_packets_and_fences_ro
     let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| {
         assert_eq!(verified.peer().role(), PeerRole::Node { node_id: 7 });
         let mut records = records.lock().unwrap();
-        records.push(verified.request().clone());
-        let lose_first = records.len() == 1;
+        let probe = matches!(verified.request().operation, Operation::Probe { .. });
+        if !probe {
+            records.push(verified.request().clone());
+        }
+        let lose_first = !probe && records.len() == 1;
         async move {
-            verified.request().reply(if lose_first {
+            verified.request().reply(if probe {
+                Response::Probe(vec![1])
+            } else if lose_first {
                 Response::Error(AccessError::Unavailable)
             } else {
                 Response::PeerAccepted
@@ -934,8 +939,17 @@ async fn peer_pool_caches_connections_reconnects_identical_packets_and_fences_ro
     );
     pool.send(2, &packet).await.unwrap();
     pool.send(2, &packet).await.unwrap();
-    // Each answered exchange is one sample; the refused first attempt and
-    // the dial are not.
+    // A replication message is answered once the peer has persisted it:
+    // what it takes is the peer's work, and no sample of the path.
+    assert_eq!(pool.path(2).unwrap().samples(), 0);
+    // Each probe the peer answers is one sample, timed on the connection
+    // already open.
+    let mut probe = request(84);
+    probe.operation = Operation::Probe {
+        request: vec![1, 2, 3],
+    };
+    assert_eq!(pool.send_probe(2, &probe).await, Ok(vec![1]));
+    assert_eq!(pool.send_probe(2, &probe).await, Ok(vec![1]));
     let path = pool.path(2).unwrap();
     assert_eq!(path.samples(), 2);
     assert!(path.tail_ns().unwrap() >= path.smoothed_ns());
@@ -947,7 +961,8 @@ async fn peer_pool_caches_connections_reconnects_identical_packets_and_fences_ro
     }
     assert_eq!(pool.stats().connections_opened, 2);
     assert_eq!(pool.stats().cached_connections, 1);
-    assert_eq!(pool.stats().delivered, 2);
+    // Two replication messages and two probes.
+    assert_eq!(pool.stats().delivered, 4);
     pool.replace_routes(1, routes.clone()).unwrap();
     assert_eq!(
         pool.replace_routes(1, BTreeMap::new()),
@@ -2130,6 +2145,128 @@ async fn peer_pool_dials_an_unreachable_peer_once_per_cooldown_and_fails_the_res
     pool.close();
 }
 
+/// What an exchange with a peer is expected to take (27 §3.1 P1): measured
+/// over the exchanges it answered, doubled for each one given up on, and
+/// what a round's budget is derived from.
+#[tokio::test]
+async fn an_exchange_given_up_on_lengthens_what_its_peer_is_expected_to_take() {
+    use std::collections::BTreeMap;
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(16).unwrap();
+    let mut node_grant = grant();
+    node_grant.role = PeerRole::Node { node_id: 7 };
+    registry
+        .register_certificate(&certificate, node_grant)
+        .unwrap();
+    let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let holding = held.clone();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let gated = started.clone();
+    let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| {
+        let holding = holding.clone();
+        let gated = gated.clone();
+        async move {
+            if holding.load(Ordering::SeqCst) {
+                gated.notify_one();
+                std::future::pending::<()>().await;
+            }
+            verified
+                .request()
+                .reply(Response::Control { response: vec![1] })
+        }
+    });
+    let (server, task) = server(&pki, registry, handler).await;
+    let ceiling = Duration::from_secs(30);
+    let pool = Arc::new(
+        PeerConnectionPool::new(
+            connector(&pki, certificate, key),
+            PeerPoolLimits {
+                timeout: ceiling,
+                ..PeerPoolLimits::default()
+            },
+        )
+        .unwrap(),
+    );
+    pool.replace_routes(
+        1,
+        BTreeMap::from([(
+            2,
+            PeerEndpoint {
+                address: server.local_addr().unwrap(),
+                server_name: "localhost".into(),
+                name: None,
+            },
+        )]),
+    )
+    .unwrap();
+    let ask = |id: u128| {
+        let mut packet = request(id);
+        packet.operation = Operation::SessionSign {
+            group: [2; 16],
+            request: vec![1, 2, 3],
+        };
+        packet
+    };
+    let period = Duration::from_millis(100);
+    // Nothing measured: a round with this peer has the pool's own deadline.
+    assert_eq!(pool.exchange_tail(2), None);
+    assert_eq!(
+        pool.round_budget([2], period),
+        focal_timing::RoundBudget::hard(ceiling)
+    );
+    // No peers: a round of one period.
+    assert_eq!(
+        pool.round_budget([], period).deadline_ns,
+        period.as_nanos() as u64
+    );
+    for id in 0..8 {
+        pool.send_placement(2, &ask(700 + id)).await.unwrap();
+    }
+    let measured = pool.exchange_tail(2).unwrap();
+    assert!(
+        measured > Duration::ZERO && measured < ceiling,
+        "{measured:?}"
+    );
+    let budget = pool.round_budget([2], period);
+    assert_eq!(budget.deadline_ns, period.max(measured).as_nanos() as u64);
+    assert!(budget.max_deadline_ns() <= ceiling.as_nanos() as u64);
+    // A replication message measures the path, not what an answer takes.
+    let mut replication = request(720);
+    replication.operation = Operation::Raft {
+        group: [2; 16],
+        message: vec![7],
+    };
+    held.store(true, Ordering::SeqCst);
+    // Three exchanges given up on, as a round that ended would: each
+    // doubles the expectation.
+    let mut expected = measured;
+    for id in 0..3 {
+        let sending = pool.clone();
+        let packet = ask(730 + id);
+        let pending = tokio::spawn(async move { sending.send_placement(2, &packet).await });
+        tokio::time::timeout(Duration::from_secs(10), started.notified())
+            .await
+            .unwrap();
+        pending.abort();
+        let _ = pending.await;
+        expected *= 2;
+        assert_eq!(pool.exchange_tail(2), Some(expected));
+    }
+    // An exchange it answers is a sample again, and ends the doubling.
+    held.store(false, Ordering::SeqCst);
+    pool.send_placement(2, &ask(740)).await.unwrap();
+    let recovered = pool.exchange_tail(2).unwrap();
+    assert!(recovered < expected, "{recovered:?} {expected:?}");
+    // A route that leaves takes its measurements with it.
+    pool.replace_routes(2, BTreeMap::new()).unwrap();
+    assert_eq!(pool.exchange_tail(2), None);
+    let _ = replication;
+    pool.close();
+    server.close();
+    task.await.unwrap().unwrap();
+}
+
 mod admission {
     //! Admission by identity (27 §3.1 P5), over real connections.
     use super::*;
@@ -2265,6 +2402,7 @@ mod admission {
             (stats.identities, stats.replaced, stats.admitted),
             (1, 1, 5)
         );
+        // The four were used in order, so the first is the one used least.
         assert!(!serves(&remotes[0], 411).await, "the oldest still serves");
         for (index, remote) in remotes.iter().enumerate().skip(1) {
             assert!(serves(remote, 420 + index as u128).await, "{index} ended");
@@ -2281,7 +2419,7 @@ mod admission {
     }
 
     #[tokio::test]
-    async fn a_participant_at_its_bound_is_refused_and_nothing_of_theirs_is_closed() {
+    async fn an_identity_past_its_bound_loses_the_connection_it_used_least() {
         let pki = Pki::new();
         let (certificate, key) = pki.issue(false);
         let registry = PeerRegistry::new(16).unwrap();
@@ -2294,16 +2432,33 @@ mod admission {
         let first = connector.connect(address, "localhost").await.unwrap();
         let second = connector.connect(address, "localhost").await.unwrap();
         held(&server, 2).await;
-        assert!(connector.connect(address, "localhost").await.is_err());
-        let stats = held(&server, 2).await;
-        assert_eq!((stats.refused_identity_connections, stats.replaced), (1, 0));
-        assert!(serves(&first, 500).await && serves(&second, 501).await);
-        // One of theirs ends: the next is admitted.
-        first.close();
-        held(&server, 1).await;
+        // The first is used after the second was opened: the second is now
+        // the one used least, and it is the one a third replaces.
+        assert!(serves(&first, 500).await);
         let third = connector.connect(address, "localhost").await.unwrap();
-        assert!(serves(&third, 502).await && serves(&second, 503).await);
-        held(&server, 2).await;
+        assert!(serves(&third, 501).await);
+        let stats = held(&server, 2).await;
+        assert_eq!((stats.replaced, stats.identities), (1, 1));
+        assert!(
+            serves(&first, 502).await,
+            "the connection in use was closed"
+        );
+        assert!(
+            !serves(&second, 503).await,
+            "the idle connection still serves"
+        );
+        // Clients that leave without closing: a participant that runs one
+        // short-lived client after another is always served.
+        for round in 0..40u128 {
+            let client = connector.connect(address, "localhost").await.unwrap();
+            assert!(serves(&client, 510 + round).await, "round {round}");
+            // Dropped without a close: the listener holds it until it is
+            // replaced or idles out.
+            std::mem::forget(client);
+        }
+        let stats = held(&server, 2).await;
+        assert_eq!(stats.identities, 1);
+        assert!(stats.replaced >= 40, "{stats:?}");
         server.close();
         task.await.unwrap().unwrap();
     }
@@ -2330,22 +2485,20 @@ mod admission {
         )
         .await;
         let address = server.local_addr().unwrap();
-        // The first identity takes all it may hold; the second still has
-        // its place.
-        let a = connectors[0].connect(address, "localhost").await.unwrap();
-        let b = connectors[0].connect(address, "localhost").await.unwrap();
-        assert!(connectors[0].connect(address, "localhost").await.is_err());
+        // The first identity dials past its bound: it displaces its own
+        // connections, and the second identity still has its place.
+        let mut firsts = Vec::new();
+        for _ in 0..5 {
+            firsts.push(connectors[0].connect(address, "localhost").await.unwrap());
+        }
         let c = connectors[1].connect(address, "localhost").await.unwrap();
         let stats = held(&server, 3).await;
-        assert_eq!(stats.identities, 2);
+        assert_eq!((stats.identities, stats.replaced), (2, 3));
         // A third identity finds no place, and takes none from the others.
         assert!(connectors[2].connect(address, "localhost").await.is_err());
         let stats = held(&server, 3).await;
-        assert_eq!(
-            (stats.refused_identities, stats.refused_identity_connections),
-            (1, 1)
-        );
-        assert!(serves(&a, 600).await && serves(&b, 601).await && serves(&c, 602).await);
+        assert_eq!(stats.refused_identities, 1);
+        assert!(serves(&firsts[4], 600).await && serves(&c, 602).await);
         // An identity that leaves frees its place.
         c.close();
         held(&server, 2).await;

@@ -20,7 +20,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::mpsc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 struct Server(Child);
@@ -30,6 +30,8 @@ impl Drop for Server {
         let _ = self.0.wait();
     }
 }
+#[path = "support/deadline.rs"]
+mod deadline;
 #[path = "support/ports.rs"]
 mod ports;
 struct Node {
@@ -68,6 +70,7 @@ fn admin(node: &Node, args: &[&str]) -> Value {
 /// Start and wait for the readiness record; a `--invite-file` start prints
 /// the joined identity first.
 fn start(node: &Node, args: &[&str]) -> Server {
+    deadline::observe(node.root());
     let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
         .args(["--data-dir", node.root().to_str().unwrap(), "start"])
         .args(args)
@@ -120,9 +123,9 @@ fn node_row(founder: &Node, id: u64) -> Option<Value> {
 /// The announced address is whichever loopback family `localhost` resolved
 /// to, at the expected port; the name is exactly what was given.
 fn wait_for_contact(founder: &Node, id: u64, port: &str, endpoint: Option<&str>) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
     let mut last = None;
-    while Instant::now() < deadline {
+    while deadline.open() {
         if let Some(row) = node_row(founder, id) {
             let expected = endpoint.map_or(Value::Null, |name| Value::String(name.into()));
             let announced = row["advertise"].as_str().unwrap_or_default();

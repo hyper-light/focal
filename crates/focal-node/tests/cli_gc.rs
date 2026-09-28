@@ -22,8 +22,12 @@ use std::{
     path::Path,
     process::{Child, Command, Output, Stdio},
     sync::mpsc,
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+#[path = "support/deadline.rs"]
+mod deadline;
+use deadline::Deadline;
 
 struct Server(Child);
 impl Drop for Server {
@@ -41,6 +45,7 @@ fn address() -> String {
     ports::address()
 }
 fn start(root: &Path, advertise: &str) -> Server {
+    deadline::observe(root);
     let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
         .args([
             "--data-dir",
@@ -156,7 +161,7 @@ fn gc_status(root: &Path) -> Value {
 }
 /// Poll the collector until a completed pass satisfies `condition`.
 fn pass_where(root: &Path, condition: impl Fn(&Value) -> bool) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut deadline = Deadline::after(Duration::from_secs(60));
     loop {
         let status = gc_status(root);
         if status["passes"].as_u64().unwrap() > 0
@@ -165,7 +170,7 @@ fn pass_where(root: &Path, condition: impl Fn(&Value) -> bool) -> Value {
         {
             return status;
         }
-        assert!(Instant::now() < deadline, "no pass satisfied: {status}");
+        assert!(deadline.open(), "no pass satisfied: {status}");
         std::thread::sleep(Duration::from_millis(250));
     }
 }
@@ -307,9 +312,11 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
         .unwrap();
     // Past the grace the orphan leaves through quarantine; the bound
     // payload stays, protected by the claim's row.
-    let status = pass_where(root, |last| {
-        last["content"]["objects_quarantined"].as_u64().unwrap() >= 1
-    });
+    // The fact waited for is the one that lasts: the orphan is gone from
+    // the store. The pass that took it reports one object quarantined, and
+    // the passes after it report none, so a poll that lands after a later
+    // pass never sees that count.
+    let status = pass_where(root, |_| manifests(root, &tenant) == bound);
     let last = &status["last"];
     assert_eq!(last["opaque_domains"], 0, "{status}");
     assert!(last["protected_objects"].as_u64().unwrap() >= 1, "{status}");
@@ -348,7 +355,7 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
     // still verifies after the collector ran over it.
     committed(&cli(root, None, &["claim", "cancel", &claim]));
     committed(&cli(root, None, &["claim", "release-scope", &claim]));
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut deadline = Deadline::after(Duration::from_secs(60));
     loop {
         let output = run(root, None, &["get", "claim", &claim, "--format", "json"]);
         if output.status.success()
@@ -357,7 +364,7 @@ fn unreferenced_objects_leave_through_quarantine_while_proof_stays() {
         {
             break;
         }
-        assert!(Instant::now() < deadline, "the claim never retired");
+        assert!(deadline.open(), "the claim never retired");
         std::thread::sleep(Duration::from_millis(200));
     }
     let after = gc_status(root)["passes"].as_u64().unwrap();

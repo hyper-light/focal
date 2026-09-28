@@ -273,7 +273,7 @@ async fn serve_authenticated_connection_inner<H: RequestHandler + Clone>(
         }
     };
     // Charged to the identity from here until this connection is served.
-    let _admitted = match pending
+    let admitted = match pending
         .map(|pending| pending.authenticated(peer.principal(), peer.role(), &connection))
         .transpose()
     {
@@ -335,7 +335,9 @@ async fn serve_authenticated_connection_inner<H: RequestHandler + Clone>(
         tokio::select! {
             Some(_)=tasks.join_next(),if !tasks.is_empty()=>{},
             streams=connection.accept_bi()=>{
-                let Ok((mut send,mut recv))=streams else{break}; if tasks.len() >= task_limit {let _=send.reset(2u8.into());let _=recv.stop(2u8.into());continue;}
+                let Ok((mut send,mut recv))=streams else{break};
+                if let Some(admitted) = &admitted { admitted.used(); }
+                if tasks.len() >= task_limit {let _=send.reset(2u8.into());let _=recv.stop(2u8.into());continue;}
                 let registry=registry.clone();let limits=limits.clone();let handler=handler.clone();
                 tasks.spawn(async move {
                     let work=async {

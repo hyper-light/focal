@@ -97,6 +97,12 @@ pub struct SessionMetrics {
     pub desired_max_failures: Option<u16>,
     pub achieved_max_failures: Option<u16>,
     pub blocked: Option<u64>,
+    /// The replica owner's tick period in force, in milliseconds, the
+    /// measured tail it was derived from, in microseconds, and how many
+    /// round trips fed it (27 §3.1 P2).
+    pub tick_period_ms: u64,
+    pub broadcast_tail_us: u64,
+    pub pace_samples: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentMetrics {
@@ -475,7 +481,7 @@ impl MetricsSnapshot {
         );
         text.counter(
             "focal_listener_replaced_total",
-            "Oldest connections of a node closed for its newest.",
+            "Connections closed for a newer one of the same identity: the one idle longest.",
             self.listener.replaced,
         );
         text.header(
@@ -486,10 +492,6 @@ impl MetricsSnapshot {
         for (bound, refused) in [
             ("handshakes", self.listener.refused_pending),
             ("identities", self.listener.refused_identities),
-            (
-                "identity_connections",
-                self.listener.refused_identity_connections,
-            ),
         ] {
             text.labeled("focal_listener_refused_total", &[("bound", bound)], refused);
         }
@@ -662,13 +664,28 @@ impl MetricsSnapshot {
             "Whether sessions beyond the bound were left out.",
             u8::from(self.sessions_truncated),
         );
-        let series: [(&str, &str, &str); 19] = [
+        let series: [(&str, &str, &str); 22] = [
             (
                 "focal_session_leader",
                 "gauge",
                 "The session log's leader as this replica knows it.",
             ),
             ("focal_session_term", "gauge", "The replica's term."),
+            (
+                "focal_session_tick_period_milliseconds",
+                "gauge",
+                "The replica owner's tick period in force; stretched for a far or slow group.",
+            ),
+            (
+                "focal_session_broadcast_tail_microseconds",
+                "gauge",
+                "The slowest measured voter path's round-trip tail of this session.",
+            ),
+            (
+                "focal_session_pace_samples",
+                "gauge",
+                "Round trips that fed the session's pace; zero means the configured period.",
+            ),
             (
                 "focal_session_committed_index",
                 "gauge",
@@ -765,6 +782,9 @@ impl MetricsSnapshot {
                 let value: Option<u64> = match name {
                     "focal_session_leader" => Some(session.leader),
                     "focal_session_term" => Some(session.term),
+                    "focal_session_tick_period_milliseconds" => Some(session.tick_period_ms),
+                    "focal_session_broadcast_tail_microseconds" => Some(session.broadcast_tail_us),
+                    "focal_session_pace_samples" => Some(session.pace_samples),
                     "focal_session_committed_index" => Some(session.committed_index),
                     "focal_session_applied_index" => Some(session.applied_index),
                     "focal_session_apply_lag" => Some(

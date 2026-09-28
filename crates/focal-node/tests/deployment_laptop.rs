@@ -29,6 +29,7 @@ use std::{collections::BTreeSet, os::unix::fs::PermissionsExt, path::Path};
 
 #[path = "support/fleet.rs"]
 mod fleet;
+use fleet::deadline;
 #[path = "support/journey.rs"]
 mod journey;
 use fleet::*;
@@ -394,7 +395,7 @@ fn the_laptop_stage_needs_a_directory_an_address_and_one_command() {
         "{}",
         String::from_utf8_lossy(&added.stderr)
     );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut deadline = deadline::Deadline::after(std::time::Duration::from_secs(60));
     let restored_claim = loop {
         let output = fleet::run(
             &reader,
@@ -408,7 +409,7 @@ fn the_laptop_stage_needs_a_directory_an_address_and_one_command() {
             break objects(&page)[0].clone();
         }
         assert!(
-            std::time::Instant::now() < deadline,
+            deadline.open(),
             "the restored session never answered: {}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)

@@ -35,12 +35,15 @@ impl Drop for Server {
 fn private(path: &Path) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
+#[path = "support/deadline.rs"]
+mod deadline;
 #[path = "support/ports.rs"]
 mod ports;
 fn address() -> String {
     ports::address()
 }
 fn start(root: &Path, advertise: &str) -> Server {
+    deadline::observe(root);
     let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
         .args([
             "--data-dir",
@@ -216,6 +219,7 @@ fn hex_hash(value: &Value) -> String {
 const FAR: u64 = 4_102_444_800_000;
 
 fn start_with(root: &Path, advertise: &str, env: &[(&str, &str)]) -> Server {
+    deadline::observe(root);
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
     command
         .args([
@@ -497,11 +501,12 @@ fn concurrent_adapters_cancelled_calls_lost_replies_and_exhausted_capacity_recon
     let server = start(root, &advertise);
     // The restarted node re-commits its durable tail in its new term; the
     // acknowledged commit is there, never lost.
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(15));
     while sequence(root) < before + 1 {
         assert!(
-            std::time::Instant::now() < deadline,
-            "the commit did not survive the cut"
+            deadline.open(),
+            "the commit did not survive the cut: {}",
+            admin(root, None, &["status"])
         );
         std::thread::sleep(Duration::from_millis(50));
     }

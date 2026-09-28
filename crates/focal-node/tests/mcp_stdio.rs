@@ -29,6 +29,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "support/deadline.rs"]
+mod deadline;
+
 struct Process(Child);
 impl Drop for Process {
     fn drop(&mut self) {
@@ -37,6 +40,7 @@ impl Drop for Process {
     }
 }
 fn start(root: &Path) -> Process {
+    deadline::observe(root);
     let mut process = Process(
         Command::new(env!("CARGO_BIN_EXE_focal"))
             .arg("--data-dir")
@@ -508,7 +512,7 @@ fn lost_first_response_and_both_process_restarts_preserve_generated_ids() {
     mcp.send(json!({"jsonrpc":"2.0","id":100,"method":"tools/call","params":{"name":"claim.submit","arguments":authored}}));
     // Deliberately never consume the mutation's MCP response. Observe its
     // committed object independently and then lose both processes.
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(5));
     let observed = loop {
         let output = Command::new(env!("CARGO_BIN_EXE_focal"))
             .arg("--data-dir")
@@ -519,7 +523,7 @@ fn lost_first_response_and_both_process_restarts_preserve_generated_ids() {
         if output.status.success() {
             break serde_json::from_slice::<Value>(&output.stdout).unwrap();
         }
-        assert!(Instant::now() < deadline, "mutation never reached ledger");
+        assert!(deadline.open(), "mutation never reached ledger");
         std::thread::sleep(Duration::from_millis(10));
     };
     drop(mcp);
@@ -689,7 +693,7 @@ fn lost_managed_mutation_response_recovers_through_human_cli_without_reexecution
     let mut authored = claim();
     authored["operation_id"] = json!(operation);
     mcp.send(json!({"jsonrpc":"2.0","id":100,"method":"tools/call","params":{"name":"claim.submit","arguments":authored}}));
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(5));
     loop {
         let output = Command::new(env!("CARGO_BIN_EXE_focal"))
             .arg("--data-dir")
@@ -700,7 +704,7 @@ fn lost_managed_mutation_response_recovers_through_human_cli_without_reexecution
         if output.status.success() {
             break;
         }
-        assert!(Instant::now() < deadline, "mutation never reached ledger");
+        assert!(deadline.open(), "mutation never reached ledger");
         std::thread::sleep(Duration::from_millis(10));
     }
     // Drop the unread response and both processes after independently observing

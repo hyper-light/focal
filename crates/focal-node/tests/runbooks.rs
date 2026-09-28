@@ -12,13 +12,11 @@
 //! test walks one runbook's commands through the failure it names and
 //! verifies what the runbook says holds and what it says recovers.
 use serde_json::Value;
-use std::{
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::{path::Path, time::Duration};
 
 #[path = "support/fleet.rs"]
 mod fleet;
+use fleet::deadline;
 use fleet::*;
 
 /// A founder with a client that writes claims: the workload every runbook
@@ -44,8 +42,8 @@ fn founder_with(yaml: &str) -> Node {
     Node::with_config("founder", yaml)
 }
 fn wait_until(what: &str, timeout: Duration, mut condition: impl FnMut() -> bool) {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
+    let mut deadline = deadline::Deadline::after(timeout);
+    while deadline.open() {
         if condition() {
             return;
         }
@@ -333,7 +331,7 @@ fn start_placeholder() -> Server {
     Server(std::process::Command::new("true").spawn().unwrap())
 }
 fn wait_removed(founder: &Node, node: u64) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(180);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(180));
     loop {
         let output = run(
             founder,
@@ -345,7 +343,7 @@ fn wait_removed(founder: &Node, node: u64) -> Value {
             return value["result"].clone();
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.open(),
             "removal never succeeded: {}",
             String::from_utf8_lossy(&output.stderr)
         );
@@ -541,7 +539,7 @@ fn runbook_failed_movement() {
     // The destination returns with its disk: the transfer finishes and the
     // moving range's fence lifts.
     server_a = start(&host_a, &[]);
-    let deadline = Instant::now() + Duration::from_secs(240);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(240));
     loop {
         let views: Vec<Option<Value>> = [&founder, &host_a, &host_b]
             .iter()
@@ -557,10 +555,7 @@ fn runbook_failed_movement() {
         if done {
             break;
         }
-        assert!(
-            Instant::now() < deadline,
-            "the move never finished: {views:#?}"
-        );
+        assert!(deadline.open(), "the move never finished: {views:#?}");
         std::thread::sleep(Duration::from_millis(500));
     }
     // The workload resumes once the transfer completes: a write that would
@@ -612,8 +607,8 @@ fn runbook_expired_credentials() {
     let (mut child, receive) = spawn(&hosts[1], &[], &[]);
     let restarted = receive.recv_timeout(Duration::from_secs(45)).ok();
     let mut cut_off = false;
-    let deadline = Instant::now() + Duration::from_secs(90);
-    while Instant::now() < deadline {
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(90));
+    while deadline.open() {
         if let Some(status) = child.try_wait().unwrap() {
             assert_eq!(status.code(), Some(5), "{status:?}");
             cut_off = true;
@@ -704,12 +699,12 @@ fn runbook_interrupted_upgrade() {
     // A binary below the fence refuses to serve; the fence never lowers.
     drop(server);
     let (mut child, receive) = spawn(&host, &[], &[("FOCAL_CAPABILITY_LEVEL", "0")]);
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
         }
-        assert!(Instant::now() < deadline, "a fenced binary kept running");
+        assert!(deadline.open(), "a fenced binary kept running");
         std::thread::sleep(Duration::from_millis(200));
     };
     assert_eq!(status.code(), Some(5), "{status:?}");
@@ -858,7 +853,7 @@ fn runbook_interrupted_restore() {
         "{}",
         String::from_utf8_lossy(&added.stderr)
     );
-    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(90));
     let after = loop {
         let output = run(
             &client,
@@ -872,7 +867,7 @@ fn runbook_interrupted_restore() {
             break objects(&page)[0].clone();
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.open(),
             "the restored session never answered: {}",
             String::from_utf8_lossy(&output.stderr)
         );

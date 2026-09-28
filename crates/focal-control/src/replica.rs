@@ -541,6 +541,19 @@ impl ControlReplica {
         self.node.tick()?;
         Ok(())
     }
+    /// Ticks between a leader's heartbeats.
+    pub fn heartbeat_tick(&self) -> usize {
+        self.node.heartbeat_tick()
+    }
+    /// A leader sends its heartbeats now; see `DurableNode::beat`.
+    pub fn beat(&mut self) -> Result<(), ControlError> {
+        self.check()?;
+        self.node.beat()?;
+        Ok(())
+    }
+    pub fn leads(&self) -> bool {
+        self.node.status().role == focal_consensus::StateRole::Leader
+    }
     /// Trusted in-process transport/testing seam. Production ingress must bind
     /// cluster/group and sender identity before delivering the message.
     pub fn step(&mut self, message: Message) -> Result<(), ControlError> {

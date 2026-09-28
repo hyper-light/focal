@@ -17,7 +17,7 @@ use std::{
     path::Path,
     process::{Child, Command, Output, Stdio},
     sync::mpsc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 struct Server(Child);
@@ -53,12 +53,15 @@ fn scratch(prefix: &str) -> tempfile::TempDir {
         builder.tempdir().unwrap()
     }
 }
+#[path = "support/deadline.rs"]
+mod deadline;
 #[path = "support/ports.rs"]
 mod ports;
 fn address() -> String {
     ports::address()
 }
 fn start(root: &Path, advertise: &str) -> Server {
+    deadline::observe(root);
     // Four rows per member: the balancer splits the group while the
     // workflow runs (doc 25 §8), so every step below runs across a reshape.
     let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
@@ -446,7 +449,7 @@ fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive
     }
     // The balancer reshaped the group under the workflow: the map holds
     // several members, every one with rows, at a later range epoch.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
     loop {
         let output = run(root, None, &["cluster", "replicas", "ranges", "list"]);
         let view: Option<Value> = output
@@ -464,7 +467,7 @@ fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive
             break;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.open(),
             "the balancer never split the group: {view:?}"
         );
         std::thread::sleep(Duration::from_millis(250));

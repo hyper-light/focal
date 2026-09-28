@@ -547,3 +547,39 @@ fn a_leader_refuses_its_own_removal_and_leaves_after_a_transfer() {
         assert!(applied.iter().any(|entry| entry == b"after"));
     }
 }
+
+/// Priority orders elections and never vetoes a transfer (27 §5): a leader
+/// of higher priority hands leadership to a member of lower priority, and
+/// its own vote is the one that completes the majority.
+#[test]
+fn a_transfer_to_a_member_of_lower_priority_is_not_vetoed_by_priority() {
+    let mut cluster = Cluster::new();
+    elect(&mut cluster, 0);
+    prioritize(&mut cluster, [2, 1, 1]);
+    cluster.nodes[0].propose(b"before".to_vec()).unwrap();
+    cluster.pump(None);
+    // Node 3 is gone: node 2 can only be elected with node 1's vote.
+    cluster.nodes[0].transfer_leader(2).unwrap();
+    let moved = run_until(
+        &mut cluster,
+        3,
+        [10, 10, 10],
+        |cluster| leads(cluster, 2, 3),
+        |_| {},
+    );
+    assert!(moved, "the transfer was vetoed: {:?}", leaders(&cluster));
+    cluster.nodes[1].propose(b"after".to_vec()).unwrap();
+    cluster.pump(Some(3));
+    assert!(cluster.applied[0].iter().any(|entry| entry == b"after"));
+    // An election is still ordered by priority: with node 2 gone, node 1
+    // leads again, and node 3 does not although it may time out first.
+    cluster.pump(None);
+    let won = run_until(
+        &mut cluster,
+        2,
+        [19, 10, 10],
+        |cluster| leads(cluster, 1, 2),
+        |cluster| assert!(!leads(cluster, 3, 2), "a lower priority member led"),
+    );
+    assert!(won, "the member of higher priority never led again");
+}

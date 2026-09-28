@@ -25,7 +25,7 @@ use std::{
     path::Path,
     process::{Child, Command, Output, Stdio},
     sync::mpsc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 struct Server(Child);
@@ -63,12 +63,15 @@ fn failure(root: &Path, config: Option<&Path>, args: &[&str]) -> (i32, String) {
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
 }
+#[path = "support/deadline.rs"]
+mod deadline;
 #[path = "support/ports.rs"]
 mod ports;
 fn address() -> String {
     ports::address()
 }
 fn start(root: &Path, config: Option<&Path>, address: Option<&str>) -> (Server, Value) {
+    deadline::observe(root);
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
     command.args(["--data-dir", root.to_str().unwrap()]);
     if let Some(config) = config {
@@ -148,9 +151,9 @@ fn wait_for(
     timeout: Duration,
     condition: impl Fn(&Value) -> bool,
 ) -> Value {
-    let deadline = Instant::now() + timeout;
+    let mut deadline = deadline::Deadline::after(timeout);
     let mut last = None;
-    while Instant::now() < deadline {
+    while deadline.open() {
         if let Some(view) = placement(root) {
             if condition(&view) {
                 return view;

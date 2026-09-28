@@ -20,6 +20,7 @@ use std::time::Duration;
 
 #[path = "support/fleet.rs"]
 mod fleet;
+use fleet::deadline;
 #[path = "support/journey.rs"]
 mod journey;
 use fleet::*;
@@ -29,7 +30,7 @@ fn upgrade(node: &Node) -> Value {
     admin(node, &["cluster", "upgrade", "status"])["result"]["upgrade"].clone()
 }
 fn wait_upgrade(node: &Node, what: &str, cond: impl Fn(&Value) -> bool) -> Value {
-    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(90));
     loop {
         let output = fleet::run(node, None, &["cluster", "upgrade", "status"]);
         if output.status.success()
@@ -40,10 +41,7 @@ fn wait_upgrade(node: &Node, what: &str, cond: impl Fn(&Value) -> bool) -> Value
                 return view;
             }
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "{what} did not happen"
-        );
+        assert!(deadline.open(), "{what} did not happen");
         std::thread::sleep(Duration::from_millis(200));
     }
 }

@@ -22,7 +22,7 @@ use std::{
     path::Path,
     process::{Child, Command, Output, Stdio},
     sync::mpsc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 struct Server(Child);
@@ -35,12 +35,15 @@ impl Drop for Server {
 fn private(path: &Path) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
+#[path = "support/deadline.rs"]
+mod deadline;
 #[path = "support/ports.rs"]
 mod ports;
 fn address() -> String {
     ports::address()
 }
 fn start(root: &Path, advertise: &str) -> Server {
+    deadline::observe(root);
     let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
         .args([
             "--data-dir",
@@ -168,7 +171,7 @@ fn first_object(root: &Path, claim: &str) -> Value {
 /// record applies, the authority rebuilds its owner at a fresh readiness
 /// barrier and a read may be refused for a tick; that is waited out too.
 fn retired(root: &Path, claim: &str) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
     loop {
         let output = run(root, None, &["get", "claim", claim, "--format", "json"]);
         let last = if output.status.success()
@@ -182,10 +185,7 @@ fn retired(root: &Path, claim: &str) -> Value {
         } else {
             json!({"stderr": String::from_utf8_lossy(&output.stderr), "stdout": String::from_utf8_lossy(&output.stdout)})
         };
-        assert!(
-            Instant::now() < deadline,
-            "claim {claim} never retired: {last}"
-        );
+        assert!(deadline.open(), "claim {claim} never retired: {last}");
         std::thread::sleep(Duration::from_millis(200));
     }
 }

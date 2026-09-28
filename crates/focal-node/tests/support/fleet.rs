@@ -113,8 +113,9 @@ fn run_riding_out(node: &Node, context: Option<&str>, args: &[&str]) -> Output {
         std::thread::sleep(Duration::from_millis(500));
     }
 }
-#[path = "progress.rs"]
-pub mod progress;
+#[path = "deadline.rs"]
+pub mod deadline;
+pub use deadline::progress;
 /// The periods a node's root owner has run since it started, from its
 /// metrics; none while the node does not answer.
 pub fn periods(node: &Node) -> Option<u64> {
@@ -187,6 +188,7 @@ pub fn failure(node: &Node, context: Option<&str>, args: &[&str]) -> (i32, Strin
 /// Spawn `start` with extra arguments and environment; the receiver yields
 /// every JSON record the process prints that carries a `condition`.
 pub fn spawn(node: &Node, args: &[&str], envs: &[(&str, &str)]) -> (Child, mpsc::Receiver<Value>) {
+    deadline::observe(node.root());
     let mut command = base(node, None);
     command.arg("start").args(args);
     command.envs(envs.iter().copied());
@@ -519,6 +521,7 @@ pub fn readiness(node: &Node) -> Value {
 /// `SIGXFSZ` ignored, so an oversized write returns `EFBIG` instead of
 /// killing the process: a full volume modelled as a write failure.
 pub fn start_limited(node: &Node, args: &[&str], blocks: u64) -> Server {
+    deadline::observe(node.root());
     let mut command = Command::new("/bin/sh");
     command.args([
         "-c",

@@ -20,7 +20,7 @@ use std::{
     path::Path,
     process::{Child, Command, Output, Stdio},
     sync::mpsc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 struct Server(Child);
@@ -33,12 +33,15 @@ impl Drop for Server {
 fn private(path: &Path) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
+#[path = "support/deadline.rs"]
+mod deadline;
 #[path = "support/ports.rs"]
 mod ports;
 fn address() -> String {
     ports::address()
 }
 fn start(root: &Path, advertise: &str) -> Server {
+    deadline::observe(root);
     let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
         .args([
             "--data-dir",
@@ -192,7 +195,7 @@ fn enroll(root: &Path, client: &Path, name: &str) -> String {
     hex_hash(&objects(&standing)[0]["Standing"]["principal"])
 }
 fn wait_registered(root: &Path, session: &str) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(90));
     loop {
         let placement = admin(root, &["cluster", "placement"]);
         let found = placement["result"]["placement"]["partitions"]
@@ -205,10 +208,7 @@ fn wait_registered(root: &Path, session: &str) -> Value {
         if let Some(entry) = found {
             return entry;
         }
-        assert!(
-            Instant::now() < deadline,
-            "the session never registered: {placement}"
-        );
+        assert!(deadline.open(), "the session never registered: {placement}");
         std::thread::sleep(Duration::from_millis(250));
     }
 }
@@ -397,7 +397,7 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
         .status
         .success()
     );
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
     let claim_after = loop {
         let output = run(
             client_b.path(),
@@ -411,7 +411,7 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
             break objects(&page)[0].clone();
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.open(),
             "the restored session never answered: {}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
@@ -485,7 +485,7 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
     // A restart reopens the restored session from the install record.
     drop(server_b);
     let _server_b = start(root_b, &advertise_b);
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
     loop {
         let output = run(
             client_b.path(),
@@ -502,10 +502,7 @@ fn a_backup_restores_onto_a_fresh_cluster_as_a_recovery_incarnation() {
             );
             break;
         }
-        assert!(
-            Instant::now() < deadline,
-            "the restored session never reopened"
-        );
+        assert!(deadline.open(), "the restored session never reopened");
         std::thread::sleep(Duration::from_millis(250));
     }
 }

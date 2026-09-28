@@ -22,7 +22,7 @@ use std::{
     path::Path,
     process::{Child, Command, Output, Stdio},
     sync::mpsc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 struct Server(Child);
@@ -49,12 +49,15 @@ fn success(root: &Path, args: &[&str]) -> Value {
     serde_json::from_slice(&output.stdout)
         .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&output.stdout)))
 }
+#[path = "support/deadline.rs"]
+mod deadline;
 #[path = "support/ports.rs"]
 mod ports;
 fn address() -> String {
     ports::address()
 }
 fn start(root: &Path, address: Option<&str>) -> (Server, Value) {
+    deadline::observe(root);
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
     command.args(["--data-dir", root.to_str().unwrap(), "start"]);
     if let Some(address) = address {
@@ -151,9 +154,9 @@ fn wait_for(
     timeout: Duration,
     condition: impl Fn(&Value) -> bool,
 ) -> Value {
-    let deadline = Instant::now() + timeout;
+    let mut deadline = deadline::Deadline::after(timeout);
     let mut last = None;
-    while Instant::now() < deadline {
+    while deadline.open() {
         if let Some(view) = placement(root) {
             if condition(&view) {
                 return view;
@@ -255,7 +258,7 @@ fn a_session_the_founder_does_not_vote_in_expands_and_heals_through_its_own_lead
     let session_id = created["session"].as_str().unwrap().to_owned();
     assert_eq!(created["node"], node_a, "{created}");
     let registered = {
-        let deadline = Instant::now() + Duration::from_secs(90);
+        let mut deadline = deadline::Deadline::after(Duration::from_secs(90));
         loop {
             if let Some(view) = placement(founder)
                 && session(&view, &session_id).is_some_and(|session| {
@@ -266,7 +269,7 @@ fn a_session_the_founder_does_not_vote_in_expands_and_heals_through_its_own_lead
                 break view;
             }
             assert!(
-                Instant::now() < deadline,
+                deadline.open(),
                 "registration did not happen; host agent: {}",
                 String::from_utf8_lossy(&command(host_a, &["cluster", "node", "health"]).stdout)
             );
@@ -378,7 +381,7 @@ fn a_session_the_founder_does_not_vote_in_expands_and_heals_through_its_own_lead
     assert_eq!(healed_voters.len(), 3, "{healed}");
     assert!(!healed_voters.contains(&node_a));
     // The drained host leaves the cluster.
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(120));
     let removed = loop {
         let output = command(
             founder,
@@ -394,10 +397,7 @@ fn a_session_the_founder_does_not_vote_in_expands_and_heals_through_its_own_lead
                 || stderr.contains("[unavailable]"),
             "{stderr}"
         );
-        assert!(
-            Instant::now() < deadline,
-            "removal stayed refused: {stderr}"
-        );
+        assert!(deadline.open(), "removal stayed refused: {stderr}");
         std::thread::sleep(Duration::from_millis(500));
     };
     assert_eq!(removed["kind"], "node_removed", "{removed}");
@@ -407,7 +407,7 @@ fn a_session_the_founder_does_not_vote_in_expands_and_heals_through_its_own_lead
 }
 /// Session creation on a host waits for the host's directory view.
 fn wait_created(host: &Path, tenant: &str) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
     loop {
         let output = command(
             host,
@@ -419,7 +419,7 @@ fn wait_created(host: &Path, tenant: &str) -> Value {
             return serde_json::from_slice::<Value>(&output.stdout).unwrap()["result"].clone();
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.open(),
             "session creation stayed refused: {}",
             String::from_utf8_lossy(&output.stderr)
         );
