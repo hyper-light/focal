@@ -26,6 +26,9 @@ pub enum SessionCall {
     Membership(SessionMembershipRequest),
     /// Propose one placement record (a cutover or an activation).
     Placement(SessionPlacementRequest),
+    /// Begin moving leadership to `target`, a voter. The log leads
+    /// elsewhere only once an election says so.
+    Transfer { target: u64 },
 }
 /// The body of `Operation::SessionControl`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +44,8 @@ pub enum SessionControlReply {
     Placed,
     /// `NotLeader { leader }` names where the log leads, when known.
     Refused(ControlFailure),
+    /// A transfer began.
+    Transferring,
 }
 
 fn refusal(error: LedgerError) -> ControlFailure {
@@ -48,6 +53,10 @@ fn refusal(error: LedgerError) -> ControlFailure {
         LedgerError::Capacity => ControlFailure::Capacity,
         LedgerError::NotReady { leader } => ControlFailure::NotLeader { leader },
         LedgerError::OutcomeUnknown => ControlFailure::OutcomeUnknown,
+        LedgerError::Consensus(
+            focal_consensus::ConsensusError::LearnerBehind
+            | focal_consensus::ConsensusError::LeaderLeaving,
+        ) => ControlFailure::NotReady,
         LedgerError::MembershipConflict | LedgerError::PlacementConflict => {
             ControlFailure::CompareFailed
         }
@@ -121,6 +130,10 @@ pub async fn serve(
         },
         SessionCall::Placement(request) => match host.propose_placement(request).await {
             Ok(_) => SessionControlReply::Placed,
+            Err(error) => SessionControlReply::Refused(refusal(error)),
+        },
+        SessionCall::Transfer { target } => match host.transfer_leader(target).await {
+            Ok(()) => SessionControlReply::Transferring,
             Err(error) => SessionControlReply::Refused(refusal(error)),
         },
     }

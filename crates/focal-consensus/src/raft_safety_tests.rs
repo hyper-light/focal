@@ -477,3 +477,73 @@ fn a_longer_log_wins_the_vote_over_a_higher_priority() {
     assert!(cluster.nodes[2].status().committed_index >= ahead);
     assert!(cluster.applied[2].iter().any(|entry| entry == b"ahead"));
 }
+
+/// A leader does not remove itself (27 §5): it refuses, hands leadership to
+/// a voter that stays, and that leader removes it. The group never follows
+/// a node outside its configuration, and committed entries survive.
+#[test]
+fn a_leader_refuses_its_own_removal_and_leaves_after_a_transfer() {
+    use crate::{ConsensusError, MembershipChange};
+    let mut cluster = Cluster::new();
+    elect(&mut cluster, 0);
+    cluster.nodes[0].propose(b"before".to_vec()).unwrap();
+    cluster.pump(None);
+    let expected = cluster.nodes[0].membership_configuration();
+    assert!(matches!(
+        cluster.nodes[0].propose_membership(
+            &expected,
+            MembershipChange::Remove { node: 1 },
+            b"leave".to_vec()
+        ),
+        Err(ConsensusError::LeaderLeaving)
+    ));
+    // The refusal proposed nothing: the group is as it was and still serves.
+    cluster.pump(None);
+    assert_eq!(cluster.nodes[0].membership_configuration(), expected);
+    assert_eq!(cluster.nodes[0].status().role, StateRole::Leader);
+    // A follower is removed by the leader as before.
+    cluster.nodes[0].transfer_leader(2).unwrap();
+    let moved = run_until(
+        &mut cluster,
+        0,
+        [10, 10, 10],
+        |cluster| leads(cluster, 2, 0),
+        |cluster| {
+            for node in &cluster.nodes {
+                let status = node.status();
+                assert!(
+                    status.role != StateRole::Leader || status.voters.contains(&status.node_id),
+                    "node {} leads a group it is not in",
+                    status.node_id
+                );
+            }
+        },
+    );
+    assert!(moved, "leadership never moved");
+    let expected = cluster.nodes[1].membership_configuration();
+    cluster.nodes[1]
+        .propose_membership(
+            &expected,
+            MembershipChange::Remove { node: 1 },
+            b"leave".to_vec(),
+        )
+        .unwrap();
+    // The departed node is cut off from here: the harness delivers every
+    // message, and one from a node the leader no longer tracks is refused.
+    for _ in 0..8 {
+        cluster.pump(Some(1));
+        cluster.nodes[1].tick().unwrap();
+    }
+    let mut voters = cluster.nodes[1].status().voters;
+    voters.sort_unstable();
+    assert_eq!(voters, vec![2, 3]);
+    assert_eq!(cluster.nodes[1].status().role, StateRole::Leader);
+    assert_ne!(cluster.nodes[0].status().role, StateRole::Leader);
+    // The two that stay commit without the one that left.
+    cluster.nodes[1].propose(b"after".to_vec()).unwrap();
+    cluster.pump(Some(1));
+    for applied in [&cluster.applied[1], &cluster.applied[2]] {
+        assert!(applied.iter().any(|entry| entry == b"before"));
+        assert!(applied.iter().any(|entry| entry == b"after"));
+    }
+}

@@ -220,44 +220,7 @@ pub struct ControlHost {
 }
 pub struct ControlOwner(JoinHandle<()>);
 
-/// The owner's tick period, shared between the owner thread and whoever
-/// derives it from measured round trips (27 §3.1 P2). Zero means "as
-/// configured". The owner reads it once per tick and clamps it between its
-/// configured period and its ceiling, so no value written here can make it
-/// tick faster than configured or slower than its ceiling.
-#[derive(Clone, Default)]
-pub(crate) struct TickPeriod(std::sync::Arc<TickShared>);
-#[derive(Default)]
-struct TickShared {
-    period_ns: std::sync::atomic::AtomicU64,
-    election_tick: std::sync::atomic::AtomicUsize,
-    /// The last derivation as one value, for observers.
-    derived: std::sync::Mutex<Option<focal_timing::TickPace>>,
-}
-impl TickPeriod {
-    fn set(&self, period: Duration) {
-        self.0.period_ns.store(
-            u64::try_from(period.as_nanos()).unwrap_or(u64::MAX),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-    fn get(&self, config: &ControlHostConfig) -> Duration {
-        Duration::from_nanos(self.0.period_ns.load(std::sync::atomic::Ordering::Relaxed))
-            .clamp(config.tick, config.tick_ceiling.max(config.tick))
-    }
-    /// The owner states its replica's election ticks once it has opened it.
-    fn announce(&self, election_tick: usize) {
-        self.0
-            .election_tick
-            .store(election_tick, std::sync::atomic::Ordering::Relaxed);
-    }
-    /// Zero until the owner has opened its replica.
-    fn election_tick(&self) -> usize {
-        self.0
-            .election_tick
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-}
+pub(crate) use crate::pace::TickPeriod;
 
 /// One durable local prefix for transport reconstruction. This observation
 /// grants neither a current quorum read nor permission to change membership.
@@ -638,25 +601,23 @@ impl ControlHost {
             self.pace.election_tick().max(1),
             paths,
         );
-        self.pace.set(pace.period);
-        if let Ok(mut derived) = self.pace.0.derived.lock() {
-            *derived = Some(pace);
-        }
+        self.pace.publish(pace);
         pace
+    }
+    /// The periods the owner has run; what a wait on it is charged in
+    /// (27 §3.1 P8).
+    pub fn periods(&self) -> u64 {
+        self.pace.periods()
     }
     /// The tick period in force.
     pub fn tick_period(&self) -> Duration {
-        self.pace.get(&self.config)
+        self.pace.get(self.config.tick, self.config.tick_ceiling)
     }
     /// The pace in force: the last derivation, or the configured period
     /// with no samples before any.
     pub fn current_pace(&self) -> focal_timing::TickPace {
         self.pace
-            .0
-            .derived
-            .lock()
-            .ok()
-            .and_then(|derived| *derived)
+            .derived()
             .unwrap_or_else(|| focal_timing::TickPace::floor(self.config.tick))
     }
     pub fn progress(&self) -> ControlProgress {
@@ -818,7 +779,7 @@ impl<V: AuthorityVerifier> Owner<V> {
         let result = catch_unwind(AssertUnwindSafe(|| -> Result<(), ControlError> {
             self.drain()?;
             let mut next_tick = Instant::now()
-                .checked_add(self.pace.get(&self.config))
+                .checked_add(self.pace.get(self.config.tick, self.config.tick_ceiling))
                 .ok_or(ControlError::Capacity)?;
             loop {
                 for _ in 0..8 {
@@ -830,11 +791,12 @@ impl<V: AuthorityVerifier> Owner<V> {
                     }
                 }
                 if Instant::now() >= next_tick {
+                    self.pace.advance();
                     self.replica.tick()?;
                     self.drain()?;
                     self.maybe_checkpoint()?;
                     next_tick = Instant::now()
-                        .checked_add(self.pace.get(&self.config))
+                        .checked_add(self.pace.get(self.config.tick, self.config.tick_ceiling))
                         .ok_or(ControlError::Capacity)?;
                 }
                 // Peer ingress has its own reserved queue. The short idle wait

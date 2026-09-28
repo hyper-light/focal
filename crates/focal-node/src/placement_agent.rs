@@ -927,6 +927,7 @@ impl PlacementAgent {
                 return Ok(step);
             }
             for descriptor in directory.sessions.values() {
+                Self::sync_members(handles, descriptor).await?;
                 self.sync_custody(handles, descriptor, directory).await?;
                 if let Some(step) = self
                     .answer_plan_request(handles, descriptor, directory, snapshot, installed, now)
@@ -1423,6 +1424,42 @@ impl PlacementAgent {
         self.custody.insert(scope.ledger, scope);
         self.fences.insert(scope.ledger, fence);
         Ok(())
+    }
+    /// Tell a hosted copy which members the committed directory names for
+    /// its session: the active voters, the voters of a pending plan and the
+    /// copies being retired. The copy admits their replication before it
+    /// has applied a configuration that names them (a new copy begins at
+    /// the configuration its log began with, and the log may lead anywhere).
+    async fn sync_members(
+        handles: &NetworkHandles,
+        descriptor: &SessionDescriptor,
+    ) -> Result<(), AgentError> {
+        let Ok(host) = handles.fleet.current_host(descriptor.ledger) else {
+            return Ok(());
+        };
+        let members: BTreeSet<u64> = descriptor
+            .active
+            .placement
+            .voters
+            .keys()
+            .chain(
+                descriptor
+                    .pending
+                    .iter()
+                    .flat_map(|plan| plan.desired.placement.voters.keys()),
+            )
+            .chain(descriptor.retiring.keys())
+            .copied()
+            .collect();
+        if host.progress().admitted.iter().eq(members.iter()) {
+            return Ok(());
+        }
+        match host.admit_members(members.into_iter().collect()).await {
+            // Refused for room or lost with its owner: asked again on the
+            // next pass, from what the directory says then.
+            Ok(()) | Err(LedgerError::Capacity | LedgerError::OutcomeUnknown) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
     /// Keep a hosted ledger's custody scope at the placement the directory
     /// has activated; a pending plan changes nothing until it activates.

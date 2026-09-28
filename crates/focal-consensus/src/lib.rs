@@ -164,6 +164,8 @@ pub enum ConsensusError {
     LearnerBehind,
     #[error("invalid peer message: {0}")]
     MalformedMessage(&'static str),
+    #[error("a leader does not remove itself; transfer leadership first")]
+    LeaderLeaving,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -961,6 +963,16 @@ impl DurableNode {
             if update.node_id == 0 {
                 return Err(ConsensusError::Configuration("zero member ID"));
             }
+            // A leader that applies its own removal keeps leading a group
+            // it no longer belongs to (raft-rs leaves the step-down undone):
+            // the group follows a non-member until check-quorum or an
+            // election ends it. Leadership moves first; the next leader
+            // removes this node (27 §5).
+            if update.get_change_type() == ConfChangeType::RemoveNode
+                && update.node_id == self.raw.raft.id
+            {
+                return Err(ConsensusError::LeaderLeaving);
+            }
             if update.get_change_type() == ConfChangeType::AddNode {
                 let progress = self
                     .raw
@@ -1454,6 +1466,8 @@ fn decode_proto<T: PbMessage + Default>(bytes: &[u8]) -> Result<T, ConsensusErro
 mod borrowed_proposal_tests;
 #[cfg(test)]
 mod raft_safety_tests;
+#[cfg(test)]
+mod sim_election_tests;
 #[cfg(test)]
 mod tests;
 

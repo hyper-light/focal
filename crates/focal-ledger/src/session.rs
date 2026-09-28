@@ -579,6 +579,18 @@ impl Session {
         }
         self.step(message)
     }
+    /// This replica's election priority (27 §5); see
+    /// `DurableNode::set_priority`.
+    pub fn set_priority(&mut self, priority: i64) -> Result<(), LedgerError> {
+        Ok(self.consensus.set_priority(priority)?)
+    }
+    pub fn priority(&self) -> i64 {
+        self.consensus.priority()
+    }
+    /// Ticks without leader contact before this replica campaigns.
+    pub fn election_tick(&self) -> usize {
+        self.consensus.election_tick()
+    }
     pub fn status(&self) -> NodeStatus {
         self.consensus.status()
     }

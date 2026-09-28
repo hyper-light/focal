@@ -1264,6 +1264,7 @@ impl NetworkService {
                 tick_period_ms: u64::try_from(pace.period.as_millis()).unwrap_or(u64::MAX),
                 broadcast_tail_us: pace.broadcast_tail_ns / 1_000,
                 pace_samples: pace.samples,
+                periods: self.handles.control.periods(),
                 peers: root.peers.clone(),
             },
             peers: self.pool.stats(),
@@ -1519,6 +1520,29 @@ impl NetworkService {
                         .filter_map(|voter| self.pool.path(*voter))
                         .collect();
                     self.handles.control.pace(paths.iter());
+                }
+                // Every hosted session paces itself by its own voters: a
+                // session whose voters are near keeps the configured period
+                // beside one whose voters are far.
+                let local = self.status.node;
+                let pace_session = |host: &ReplicaHost| {
+                    let paths: Vec<focal_timing::PathRtt> = host
+                        .progress()
+                        .voters
+                        .iter()
+                        .filter(|voter| **voter != local)
+                        .filter_map(|voter| self.pool.path(*voter))
+                        .collect();
+                    host.pace(paths.iter());
+                };
+                if let Some(host) = &self.handles.ledger {
+                    pace_session(host);
+                }
+                let mut after = None;
+                while let Some((ledger, host)) = self.handles.fleet.next_host(after) {
+                    pace_session(&host);
+                    after = Some(ledger);
+                    tokio::task::yield_now().await;
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }

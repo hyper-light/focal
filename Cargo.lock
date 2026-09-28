@@ -479,6 +479,7 @@ version = "0.1.0"
 dependencies = [
  "focal-log",
  "focal-memory",
+ "focal-sim",
  "focal-timing",
  "postcard",
  "raft",

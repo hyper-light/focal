@@ -30,6 +30,7 @@ pub struct Network<M> {
     max_messages: usize,
     queue: BTreeMap<(u64, u64), (usize, Delivery<M>)>,
     blocked: BTreeSet<(u64, u64)>,
+    dropped: u64,
 }
 
 impl<M> Network<M> {
@@ -42,6 +43,7 @@ impl<M> Network<M> {
             max_messages,
             queue: BTreeMap::new(),
             blocked: BTreeSet::new(),
+            dropped: 0,
         }
     }
 
@@ -98,10 +100,22 @@ impl<M> Network<M> {
             if !self.blocked.contains(&(delivery.from, delivery.to)) {
                 return Some(delivery);
             }
+            self.dropped = self.dropped.saturating_add(1);
         }
         None
     }
 
+    pub fn now(&self) -> u64 {
+        self.now
+    }
+    /// When the earliest message in flight is due.
+    pub fn next_due(&self) -> Option<u64> {
+        self.queue.first_key_value().map(|(key, _)| key.0)
+    }
+    /// Messages a partition cut at their delivery.
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
     pub fn pending(&self) -> (usize, usize) {
         (self.queue.len(), self.bytes)
     }

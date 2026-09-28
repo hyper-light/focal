@@ -345,20 +345,33 @@ fn the_tick_period_is_clamped_between_the_configured_period_and_its_ceiling() {
         session: focal_model::SessionId([2; 16]),
     });
     let pace = TickPeriod::default();
-    assert_eq!(pace.get(&config), config.tick, "unset is as configured");
+    assert_eq!(
+        pace.get(config.tick, config.tick_ceiling),
+        config.tick,
+        "unset is as configured"
+    );
     assert_eq!(pace.election_tick(), 0, "unknown until the owner opens");
     pace.announce(10);
     assert_eq!(pace.election_tick(), 10);
     pace.set(Duration::from_millis(1));
-    assert_eq!(pace.get(&config), config.tick);
+    assert_eq!(pace.get(config.tick, config.tick_ceiling), config.tick);
     pace.set(Duration::from_millis(750));
-    assert_eq!(pace.get(&config), Duration::from_millis(750));
+    assert_eq!(
+        pace.get(config.tick, config.tick_ceiling),
+        Duration::from_millis(750)
+    );
     pace.set(Duration::from_secs(3600));
-    assert_eq!(pace.get(&config), config.tick_ceiling);
+    assert_eq!(
+        pace.get(config.tick, config.tick_ceiling),
+        config.tick_ceiling
+    );
     // A shared handle sees what the other wrote.
     let shared = pace.clone();
     shared.set(Duration::from_millis(300));
-    assert_eq!(pace.get(&config), Duration::from_millis(300));
+    assert_eq!(
+        pace.get(config.tick, config.tick_ceiling),
+        Duration::from_millis(300)
+    );
     // A ceiling under the period, or past ten seconds, is not a configuration.
     let mut bad = config.clone();
     bad.tick_ceiling = Duration::from_millis(50);

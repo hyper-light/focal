@@ -21,7 +21,7 @@ use std::{
     path::Path,
     process::{Child, Command, Output, Stdio},
     sync::mpsc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 struct Server(Child);
@@ -50,6 +50,40 @@ fn success(root: &Path, args: &[&str]) -> Value {
 }
 #[path = "support/ports.rs"]
 mod ports;
+#[path = "support/progress.rs"]
+mod progress;
+
+thread_local! {
+    /// The data directories of the processes this test started: what its
+    /// waits are charged to.
+    static STARTED: std::cell::RefCell<Vec<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+fn periods(root: &Path) -> Option<u64> {
+    let output = command(root, &["cluster", "node", "metrics"]);
+    if !output.status.success() {
+        return None;
+    }
+    progress::periods_in(&String::from_utf8_lossy(&output.stdout))
+}
+/// A deadline charged to the periods the started processes run (27 §3.1
+/// P8): `allowance` is what the wait takes at most on an idle machine.
+struct Deadline(progress::Progress<'static>);
+impl Deadline {
+    fn after(allowance: Duration) -> Self {
+        let roots = STARTED.with(|started| started.borrow().clone());
+        Self(progress::Progress::begin(
+            roots
+                .into_iter()
+                .map(|root| Box::new(move || periods(&root)) as progress::Counter<'static>)
+                .collect(),
+            allowance,
+        ))
+    }
+    fn open(&mut self) -> bool {
+        self.0.open()
+    }
+}
 fn address() -> String {
     ports::address()
 }
@@ -58,6 +92,12 @@ fn start(root: &Path, address: Option<&str>) -> (Server, Value) {
 }
 /// Start a server with extra environment for the process.
 fn start_with(root: &Path, address: Option<&str>, envs: &[(&str, &str)]) -> (Server, Value) {
+    STARTED.with(|started| {
+        let mut started = started.borrow_mut();
+        if !started.iter().any(|known| known == root) {
+            started.push(root.to_path_buf());
+        }
+    });
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
     command.args(["--data-dir", root.to_str().unwrap(), "start"]);
     command.envs(envs.iter().copied());
@@ -158,9 +198,9 @@ fn wait_for(
     timeout: Duration,
     condition: impl Fn(&Value) -> bool,
 ) -> Value {
-    let deadline = Instant::now() + timeout;
+    let mut deadline = Deadline::after(timeout);
     let mut last = None;
-    while Instant::now() < deadline {
+    while deadline.open() {
         if let Some(view) = placement(root) {
             if condition(&view) {
                 return view;
@@ -347,7 +387,7 @@ fn a_laptop_session_expands_to_three_processes_and_converges_after_its_leader_is
     // Losing one host keeps a quorum: the founder still answers a quorum read
     // of its session, and the directory measures the weaker guarantee.
     drop(server_b);
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut deadline = Deadline::after(Duration::from_secs(30));
     loop {
         let output = command(founder, &["status"]);
         if output.status.success() {
@@ -359,7 +399,7 @@ fn a_laptop_session_expands_to_three_processes_and_converges_after_its_leader_is
             break;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.open(),
             "the session lost its quorum after one host loss: {}; founder replicas {}; host-a replicas {}; founder view {:#?}",
             String::from_utf8_lossy(&output.stderr),
             String::from_utf8_lossy(
@@ -428,7 +468,7 @@ fn a_seeded_native_checkpoint_carries_the_founder_session_to_new_hosts() {
     // still in flight) seals the Core root as seeds beside the founder's
     // data, since it exceeds 64 inline bytes; the log is compacted behind
     // it, so a later copy can only catch up through the seeded snapshot.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut deadline = Deadline::after(Duration::from_secs(60));
     loop {
         let output = command(founder, &["cluster", "replicas", "checkpoint"]);
         if output.status.success() {
@@ -437,7 +477,7 @@ fn a_seeded_native_checkpoint_carries_the_founder_session_to_new_hosts() {
             break;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.open(),
             "the founder never checkpointed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
@@ -494,7 +534,7 @@ fn a_seeded_native_checkpoint_carries_the_founder_session_to_new_hosts() {
     assert_eq!(planned["kind"], "session_planned");
     // The copies can only catch up through the seeded snapshot: activation
     // proves every chunk was pulled and the Core root assembled on each.
-    let deadline = Instant::now() + Duration::from_secs(240);
+    let mut deadline = Deadline::after(Duration::from_secs(240));
     let activated = loop {
         let view = placement(founder);
         if let Some(view) = &view
@@ -506,7 +546,7 @@ fn a_seeded_native_checkpoint_carries_the_founder_session_to_new_hosts() {
         {
             break view.clone();
         }
-        if Instant::now() >= deadline {
+        if !deadline.open() {
             let diagnostics: Vec<String> = dirs
                 .iter()
                 .map(|dir| {
@@ -598,7 +638,7 @@ fn a_seeded_native_checkpoint_carries_the_founder_session_to_new_hosts() {
         ],
     );
     assert_eq!(moved["result"]["kind"], "range_move_proposed", "{moved}");
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut deadline = Deadline::after(Duration::from_secs(120));
     loop {
         let views: Vec<Option<Value>> = dirs.iter().map(|dir| ranges(dir.path())).collect();
         let done = views.iter().all(|view| {
@@ -613,7 +653,7 @@ fn a_seeded_native_checkpoint_carries_the_founder_session_to_new_hosts() {
             break;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.open(),
             "the member did not move within 120s: {views:#?}"
         );
         std::thread::sleep(Duration::from_millis(250));
@@ -623,7 +663,7 @@ fn a_seeded_native_checkpoint_carries_the_founder_session_to_new_hosts() {
     founder_server.0.kill().unwrap();
     founder_server.0.wait().unwrap();
     let (founder_server, _) = start_with(founder, None, SEEDED);
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut deadline = Deadline::after(Duration::from_secs(60));
     loop {
         if let Some(view) = ranges(founder)
             && view["epoch"] == 2
@@ -631,10 +671,7 @@ fn a_seeded_native_checkpoint_carries_the_founder_session_to_new_hosts() {
         {
             break;
         }
-        assert!(
-            Instant::now() < deadline,
-            "the restarted founder lost the map"
-        );
+        assert!(deadline.open(), "the restarted founder lost the map");
         std::thread::sleep(Duration::from_millis(250));
     }
     drop(founder_server);
@@ -652,7 +689,7 @@ fn ranges(root: &Path) -> Option<Value> {
 /// Every process reports the same settled map at `epoch` with its one
 /// member held by `holder`.
 fn converged(dirs: &[&Path], epoch: u64, holder: u64, what: &str) {
-    let deadline = Instant::now() + Duration::from_secs(150);
+    let mut deadline = Deadline::after(Duration::from_secs(150));
     loop {
         let views: Vec<Option<Value>> = dirs.iter().map(|dir| ranges(dir)).collect();
         let done = views.iter().all(|view| {
@@ -670,7 +707,7 @@ fn converged(dirs: &[&Path], epoch: u64, holder: u64, what: &str) {
             return;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.open(),
             "{what}: the map did not settle at epoch {epoch} under node {holder}: {views:#?}"
         );
         std::thread::sleep(Duration::from_millis(250));
@@ -682,16 +719,13 @@ fn kill(server: &mut Server) {
 }
 /// The process reached its configured cut and aborted.
 fn wait_cut(server: &mut Server, what: &str) {
-    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut deadline = Deadline::after(Duration::from_secs(90));
     loop {
         if let Some(status) = server.0.try_wait().unwrap() {
             assert!(!status.success(), "{what}: exited normally");
             return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "{what}: the cut was never reached"
-        );
+        assert!(deadline.open(), "{what}: the cut was never reached");
         std::thread::sleep(Duration::from_millis(100));
     }
 }
@@ -923,12 +957,12 @@ fn movement_survives_a_cut_at_every_step_a_dead_destination_and_duplicate_reques
             // failed, nothing moved, and the same request begins the move
             // once the restarted controller claims the session again.
             assert!(!attempted.status.success(), "{site}: the move was begun");
-            let deadline = Instant::now() + Duration::from_secs(90);
+            let mut deadline = Deadline::after(Duration::from_secs(90));
             loop {
                 if run_move(founder, &member, target).status.success() {
                     break;
                 }
-                assert!(Instant::now() < deadline, "{site}: the move never began");
+                assert!(deadline.open(), "{site}: the move never began");
                 std::thread::sleep(Duration::from_millis(500));
             }
         }
@@ -974,14 +1008,14 @@ fn movement_survives_a_cut_at_every_step_a_dead_destination_and_duplicate_reques
         "{}",
         String::from_utf8_lossy(&begun.stderr)
     );
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut deadline = Deadline::after(Duration::from_secs(60));
     loop {
         if let Some(view) = ranges(founder)
             && view["pending"]["barrier"].is_number()
         {
             break;
         }
-        assert!(Instant::now() < deadline, "the barrier was never proposed");
+        assert!(deadline.open(), "the barrier was never proposed");
         std::thread::sleep(Duration::from_millis(250));
     }
     std::thread::sleep(Duration::from_secs(6));

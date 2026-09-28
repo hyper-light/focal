@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
     sync::mpsc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[path = "ports.rs"]
@@ -104,16 +104,44 @@ pub fn run_bare(node: &Node, args: &[&str]) -> Output {
 /// commands share this: an operator command issued mid-reconfiguration (e.g. a
 /// `move` during a prior transfer) is as subject to the transient as a workload.
 fn run_riding_out(node: &Node, context: Option<&str>, args: &[&str]) -> Output {
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut wait = Progress::begin(&[node], Duration::from_secs(60));
     loop {
         let output = run(node, context, args);
-        if output.status.success()
-            || output.status.code() != Some(6)
-            || std::time::Instant::now() >= deadline
-        {
+        if output.status.success() || output.status.code() != Some(6) || wait.spent().is_some() {
             break output;
         }
         std::thread::sleep(Duration::from_millis(500));
+    }
+}
+#[path = "progress.rs"]
+pub mod progress;
+/// The periods a node's root owner has run since it started, from its
+/// metrics; none while the node does not answer.
+pub fn periods(node: &Node) -> Option<u64> {
+    let output = run(node, None, &["cluster", "node", "metrics"]);
+    if !output.status.success() {
+        return None;
+    }
+    progress::periods_in(&String::from_utf8_lossy(&output.stdout))
+}
+/// A wait charged to the periods the observed nodes run (27 §3.1 P8).
+pub struct Progress<'a>(progress::Progress<'a>);
+impl<'a> Progress<'a> {
+    pub fn begin(nodes: &[&'a Node], allowance: Duration) -> Self {
+        Self(progress::Progress::begin(
+            nodes
+                .iter()
+                .map(|node| {
+                    let node: &'a Node = node;
+                    Box::new(move || periods(node)) as progress::Counter<'a>
+                })
+                .collect(),
+            allowance,
+        ))
+    }
+    /// Why the wait is over, once it is.
+    pub fn spent(&mut self) -> Option<focal_timing::Spent> {
+        self.0.spent()
     }
 }
 pub fn admin(node: &Node, args: &[&str]) -> Value {
@@ -291,20 +319,23 @@ pub fn wait_for(
     timeout: Duration,
     condition: impl Fn(&Value) -> bool,
 ) -> Value {
-    let deadline = Instant::now() + timeout;
+    let mut wait = Progress::begin(&[node], timeout);
     let mut last = None;
-    while Instant::now() < deadline {
+    let spent = loop {
         if let Some(view) = placement(node) {
             if condition(&view) {
                 return view;
             }
             last = Some(view);
         }
+        if let Some(spent) = wait.spent() {
+            break spent;
+        }
         std::thread::sleep(Duration::from_millis(200));
-    }
+    };
     let health = run(node, None, &["cluster", "node", "health"]);
     panic!(
-        "{what} did not happen within {timeout:?}; health: {}; last view: {last:#?}",
+        "{what} did not happen ({spent}; allowance {timeout:?}); health: {}; last view: {last:#?}",
         String::from_utf8_lossy(&health.stdout)
     );
 }

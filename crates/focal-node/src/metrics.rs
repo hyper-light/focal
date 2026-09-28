@@ -47,6 +47,9 @@ pub struct RootMetrics {
     pub broadcast_tail_us: u64,
     /// Round trips that fed the pace; zero means the configured period.
     pub pace_samples: u64,
+    /// Periods the root owner has run since it started: its progress, which
+    /// a wait on this node is charged in (27 §3.1 P8).
+    pub periods: u64,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PeerRtt {
@@ -339,6 +342,11 @@ impl MetricsSnapshot {
             "focal_root_pace_samples",
             "Round trips that fed the root pace; zero means the configured period.",
             self.root.pace_samples,
+        );
+        text.counter(
+            "focal_root_periods_total",
+            "Periods the root owner has run since it started; a node that is slow still advances this, a wedged one does not.",
+            self.root.periods,
         );
         text.gauge(
             "focal_root_stopped",

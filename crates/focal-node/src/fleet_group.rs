@@ -82,6 +82,7 @@ fn class(work: &Work) -> WorkClass {
         | Work::CustodyObjects(..)
         | Work::CustodyPulled(..)
         | Work::Refence(..)
+        | Work::Admit(..)
         | Work::Membership(..)
         | Work::Placement(..)
         | Work::Range(..)

@@ -34,6 +34,9 @@
     )
 )]
 
+mod progress;
+pub use progress::{ProgressDeadline, Spent};
+
 use std::time::Duration;
 
 /// Raft's order-of-magnitude ratio of election timeout to broadcast time.

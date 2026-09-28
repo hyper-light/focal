@@ -22,8 +22,8 @@ fences and the unwind boundary. raft-rs owns elections and the log.
 | Check-quorum | yes | on, tested |
 | Learners | yes | root learners and session learners in production |
 | Joint consensus | yes | tested |
-| Leader transfer | yes | `transfer_leader`, `cluster leader transfer` |
-| Priority elections | yes (`Config::priority`, `set_priority`) | not wired |
+| Leader transfer | yes | `transfer_leader`, `cluster leader transfer`; before a leading voter is removed (section 5) |
+| Priority elections | yes (`Config::priority`, `set_priority`) | session groups: from the committed placement's preferred leader |
 | Pipelining, inflight window | yes | `max_inflight_messages` 128 |
 | Parallel vote and append fan-out | driver concern | per-peer sends through the pool; not progress-aware |
 | Multi-group | driver concern | root, partition and session groups share one WAL and one pool; no leader balancing |
@@ -56,8 +56,8 @@ are not driven in production.
 | P4 | Voter reconciliation rules: retire only a death held continuously for one election window; sitting live voters keep their seats | focal's placement controller heals on liveness; the hold window and seat stability are not stated rules. | placement controller |
 | P5 | Admission by certificate: a pending-handshake reservation separate from authenticated slots, two slots per identity, replace on redial | focal bounds connections in total. One identity can take them. | `focal-wire` listener |
 | P6 | Link validity inside a wait | A pending request should end when its peer's identity is replaced or retired, not at its deadline. | `focal-wire` pool |
-| P7 | Simulated network: bottleneck with drop-tail queue, Gilbert-Elliott loss, MTU, NAT rebinding | focal-sim has disk faults and no network model. Election, fast-track and transfer claims need one. | `focal-sim` |
-| P8 | Per-progress test deadlines (`poll_until` charged to the slowest node's progress counter) | focal's fleet tests use wall-clock deadlines and fail under load; this recurred three times in this work. | test support |
+| P7 | Simulated network: bottleneck with drop-tail queue, Gilbert-Elliott loss, MTU, NAT rebinding | focal-sim's network delivered at delays the test chose, with partitions and no path model. Election, fast-track and transfer claims need one. | `focal_sim::path` (`Fabric`, `Path`, `Loss`, `Link`, `Nat`), every table bounded (`FabricLimits`) |
+| P8 | Per-progress test deadlines (`poll_until` charged to the slowest node's progress counter) | focal's fleet tests use wall-clock deadlines and fail under load; this recurred four times in this work. | `focal_timing::ProgressDeadline`; owners count their periods (`periods()`, `focal_root_periods_total`) |
 | P9 | The bug corpus as regression cases (section 3.3) | Each is a class, not an instance. | tests |
 | P10 | Copa congestion control, as a candidate | slates measured ping p99 104 ms under bulk load on a 100 ms path, against 185 to 199 ms for NewReno, CUBIC and BBR. One simulated result. quinn accepts a custom controller. | `focal-wire`, behind a measurement |
 
@@ -82,7 +82,9 @@ are not driven in production.
 | Hard consensus budget under load | Open: P1 |
 | Round expires inside the WAN round trip | Open: P2 |
 | Council retires a suspected voter | Open: P4 |
-| Wall-clock test deadlines | Open: P8 |
+| Wall-clock test deadlines | Converted: the fleet, placement, service, split, route, credential and liveness suites of `focal-node`, the binary fleet harness (`tests/support/fleet.rs`) and `tests/placement_binary.rs`. Open: the other binary suites that carry their own deadlines |
+| A leader removes itself and keeps leading | Fixed: refused in the core (`LeaderLeaving`); the controller and `cluster nodes remove` transfer first |
+| A new copy refuses a leader outside its genesis configuration | Fixed: copies admit the members the committed directory names (`ReplicaHost::admit_members`) |
 
 ## 4. Fast Raft
 
@@ -160,13 +162,35 @@ checker on real processes.
 **Priority elections.** A voter refuses its vote and its pre-vote to a candidate of
 lower priority unless the candidate's log is strictly longer than its own. Priority
 never outranks the log, and a group whose highest priority member is gone elects among
-the rest (`DurableNode::set_priority`, three tests in `raft_safety_tests`). focal
-sets the priority per group member from the committed placement: the intended leader
-highest, then members in the leader's zone, then the rest. Priorities are configuration,
-never liveness.
+the rest (`DurableNode::set_priority`, four tests in `raft_safety_tests`). A session's
+owner sets its replica's priority each period from the placement the session has
+committed: the preferred leader 2, every other voter 1 (`fleet::PREFERRED_LEADER_PRIORITY`,
+`VOTER_PRIORITY`). Priorities are configuration, never liveness. A third rank, voters
+in the preferred leader's zone above the rest, needs the members' zones in the
+session's own committed state, which holds node identities only; it is part of stage F,
+where the balancer chooses by zone.
 
-**Leader transfer.** Already present. Added: transfer on drain before a voter leaves,
-and transfer as the balancer's action.
+A node that has no term yet keeps the neutral priority: raft-rs 0.7 panics when a
+term-0 node rejects a pre-vote (`term should be set when sending
+MsgRequestPreVoteResponse`), and a node with no term has no log to defend.
+
+**Leader transfer.** Already present. A leader does not remove itself: raft-rs 0.7
+leaves a leader that applies its own removal in place (`post_conf_change`, the
+step-down is a TODO there), so the group follows a node outside its configuration
+until check-quorum or an election ends it. `DurableNode` refuses the proposal
+(`ConsensusError::LeaderLeaving`) on every path a configuration change takes. The
+placement controller moves a session's leadership to a voter that stays (the
+preferred leader where it votes) before it removes a draining voter
+(`SessionCall::Transfer` reaches a leader on another node), and `cluster nodes remove`
+does the same for a root voter. Transfer as the balancer's action is stage F.
+
+**A node's own socket reaches a log only where that node leads it** (24 §14, a limit
+stated there). With leadership placed by priority and moved by transfer, that limit is
+met in ordinary operation and no longer only after a failure: a client on the local
+socket of a node that follows is refused until leadership returns. A client over QUIC
+is sent on to the leader. Serving a local client through the leader needs the node to
+speak for that client to another node, which is a change to who a leader trusts; it is
+an open decision and not made here.
 
 **Multi-log synchronization.** MLRaft splits one log into n logs, each with its own
 leader, and spreads the leaders with priority election and dynamic transfer. focal
@@ -186,7 +210,9 @@ quorum and never vote, tested as slates tests it.
 | Stage | Content | Exit evidence |
 |---|---|---|
 | A | P8 per-progress deadlines; P7 network model in `focal-sim` | fleet suites pass under injected CPU load |
+| | *State 2026-09-27:* P7 in place with 32 tests. P8 in place for the suites named in section 3.3; the run under injected load is not recorded yet. | |
 | B | Priority elections wired; transfer on drain; P2 derived timing | election tests under LAN, regional and geographic profiles |
+| | *State 2026-09-28:* wired for session groups, with `drain_leader` on real processes. Elections run over `focal_sim::path` at the three profiles (`sim_election_tests`): real replicas on real logs in virtual time, at the derived pace. | |
 | C | P1 progress-aware fan-out; P5, P6 | dead-voter and straggler tests; no round waits out a dead peer |
 | D | `focal-raft` core: classic track at parity with raft-rs for focal's use | differential test against raft-rs over random schedules |
 | E | Fast track in `focal-raft`; TLA+ model | section 4.4 invariants; latency measured against classic under 0 to 10% loss |

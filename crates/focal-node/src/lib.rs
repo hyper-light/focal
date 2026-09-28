@@ -49,6 +49,7 @@ pub mod network_listener;
 pub mod network_service;
 pub mod network_state;
 pub mod node_directory;
+mod pace;
 pub mod placement;
 pub mod placement_agent;
 pub mod placement_collect;

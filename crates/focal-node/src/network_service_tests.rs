@@ -82,6 +82,64 @@ impl Running {
             .unwrap();
     }
 }
+/// How long the slowest observed owner may run no period at all before a
+/// wait calls it wedged: the only wall-clock bound a wait has (27 §3.1 P8).
+pub(crate) const FROZEN: Duration = Duration::from_secs(60);
+impl Running {
+    /// The periods of the owners this service has run since it started: the
+    /// root group's, and its own session's where it founded one.
+    pub(crate) fn periods(&self) -> Vec<u64> {
+        let mut periods = vec![self.handles.control.periods()];
+        periods.extend(self.handles.ledger.as_ref().map(ReplicaHost::periods));
+        periods
+    }
+}
+fn periods_of(services: &[&Running]) -> Vec<u64> {
+    services
+        .iter()
+        .flat_map(|service| service.periods())
+        .collect()
+}
+/// Poll until `poll` yields, charged to the periods the services' owners
+/// run and not to the wall clock: `allowance` is what the wait would take
+/// at most on an idle machine, and it stretches with the machine. Pass
+/// every service whose state the poll reads.
+pub(crate) async fn until<T>(
+    what: &str,
+    services: &[&Running],
+    allowance: Duration,
+    poll: impl AsyncFnMut() -> Option<T>,
+) -> T {
+    match try_until(services, allowance, poll).await {
+        Ok(value) => value,
+        Err(spent) => panic!("never reached: {what}: {spent}"),
+    }
+}
+/// [`until`], for a caller that reports what it observed when the wait is
+/// spent.
+pub(crate) async fn try_until<T>(
+    services: &[&Running],
+    allowance: Duration,
+    mut poll: impl AsyncFnMut() -> Option<T>,
+) -> Result<T, focal_timing::Spent> {
+    let period = services
+        .iter()
+        .map(|service| service.handles.control.tick_period())
+        .max()
+        .unwrap_or(Duration::from_millis(100));
+    let mut wait = focal_timing::ProgressDeadline::begin(
+        &periods_of(services),
+        focal_timing::ProgressDeadline::periods(allowance, period),
+        FROZEN,
+    );
+    loop {
+        if let Some(value) = poll().await {
+            return Ok(value);
+        }
+        wait.check(&periods_of(services))?;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
 impl Drop for Running {
     fn drop(&mut self) {
         if let Some(stop) = self.stop.take() {
@@ -627,26 +685,25 @@ async fn joined_service_receives_committed_root_learner_and_restarts_without_led
         )
     );
     assert!(!peer_dir.path().join("POLICY").exists());
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
+    until(
+        "the joined root applies its committed learner configuration",
+        &[&founder, &peer],
+        Duration::from_secs(15),
+        async || {
             let a = founder.handles.control.observe_root().await.unwrap();
             let b = peer.handles.control.observe_root().await.unwrap();
-            if a.configuration()
+            (a.configuration()
                 .configuration
                 .learners
                 .contains(&peer_node)
                 && b.configuration()
                     .configuration
                     .learners
-                    .contains(&peer_node)
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("joined root never applied its committed learner configuration");
+                    .contains(&peer_node))
+            .then_some(())
+        },
+    )
+    .await;
     peer.stop().await;
     founder.stop().await;
     let founder = Running::start(&founder_settings).await;
@@ -705,22 +762,25 @@ async fn joined_service_receives_committed_root_learner_and_restarts_without_led
         peer.handles.directory.host().is_none(),
         "joining does not assign the founder directory"
     );
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
+    until(
+        "the placement agent registers the founder's session group",
+        &[&founder],
+        Duration::from_secs(15),
+        async || {
             let observed = founder.handles.control.observe_root().await.unwrap();
-            if observed.authority().is_some_and(|authority| {
-                authority.groups.values().any(|grant| {
-                    grant.scope == focal_directory::GroupScope::Session(identity.ledger)
-                        && grant.voters == std::collections::BTreeMap::from([(identity.node, 1)])
+            observed
+                .authority()
+                .is_some_and(|authority| {
+                    authority.groups.values().any(|grant| {
+                        grant.scope == focal_directory::GroupScope::Session(identity.ledger)
+                            && grant.voters
+                                == std::collections::BTreeMap::from([(identity.node, 1)])
+                    })
                 })
-            }) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("the placement agent never registered the founder's session group");
+                .then_some(())
+        },
+    )
+    .await;
     assert!(!peer_dir.path().join("POLICY").exists());
     peer.stop().await;
     founder.stop().await;
@@ -836,18 +896,16 @@ async fn a_host_restarted_on_a_new_address_reannounces_and_regains_its_leader() 
     };
     // The announce is asynchronous: the host commits its first contact
     // once its controller observes the root.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let observation = founder.handles.control.observe_root().await.unwrap();
-        if committed(&observation) == Some(first_advertise) {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the joined host never committed its first contact"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    until(
+        "the joined host commits its first contact",
+        &[&founder, &host],
+        Duration::from_secs(30),
+        async || {
+            let observation = founder.handles.control.observe_root().await.unwrap();
+            (committed(&observation) == Some(first_advertise)).then_some(())
+        },
+    )
+    .await;
     host.stop().await;
     drop(first);
     // The host returns on a different address; the root still holds the
@@ -869,8 +927,8 @@ async fn a_host_restarted_on_a_new_address_reannounces_and_regains_its_leader() 
         "the same node identity recovered"
     );
     assert_eq!(host.status.advertise, second_advertise);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
-    loop {
+    let mut seen = (false, false);
+    let healed = try_until(&[&founder, &host], Duration::from_secs(90), async || {
         let moved = founder
             .handles
             .control
@@ -880,14 +938,15 @@ async fn a_host_restarted_on_a_new_address_reannounces_and_regains_its_leader() 
             .and_then(|observation| committed(&observation))
             == Some(second_advertise);
         let led = host.handles.control.progress().leader == founder_node;
-        if moved && led {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the moved host never healed: contact moved={moved}, leader regained={led}"
+        seen = (moved, led);
+        (moved && led).then_some(())
+    })
+    .await;
+    if let Err(spent) = healed {
+        panic!(
+            "the moved host never healed: {spent}: contact moved={}, leader regained={}",
+            seen.0, seen.1
         );
-        tokio::time::sleep(Duration::from_millis(200)).await;
     }
     host.stop().await;
     founder.stop().await;
@@ -1018,18 +1077,16 @@ async fn a_joined_host_measures_its_voter_path_and_keeps_the_configured_period_o
     )
     .await;
     let configured = host.handles.control.tick_period();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    let pace = loop {
-        let pace = host.handles.control.current_pace();
-        if pace.samples > 0 {
-            break pace;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the host never measured its path to the root voter"
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    };
+    let pace = until(
+        "the host measures its path to the root voter",
+        &[&founder, &host],
+        Duration::from_secs(60),
+        async || {
+            let pace = host.handles.control.current_pace();
+            (pace.samples > 0).then_some(pace)
+        },
+    )
+    .await;
     assert!(pace.broadcast_tail_ns > 0);
     // The period in force is the derivation of what was measured: ten tails
     // per election timeout of ten ticks is one tail per tick, never under

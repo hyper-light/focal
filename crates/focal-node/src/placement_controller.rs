@@ -42,10 +42,31 @@ const CHANGE_ADD_LEARNER: u8 = 1;
 const CHANGE_PROMOTE: u8 = 2;
 const CHANGE_REMOVE: u8 = 3;
 const SESSION_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Leader hints the controller keeps, one per session it could not reach
+/// at the leader it first asked.
+const SESSION_LEADER_HINTS: usize = 4096;
 
 /// How the controller reaches a session's log: its own replica when this
 /// node leads the log, otherwise the node that does, over the authenticated
 /// peer connection (`Operation::SessionControl`, 24 §9).
+/// Who leads after `leaving`: the placement's preferred leader where it
+/// votes, otherwise the first voter that stays. None when no other voter
+/// exists, which a removal refuses by itself.
+fn successor(
+    descriptor: &SessionDescriptor,
+    configuration: &focal_consensus::MembershipConfiguration,
+    leaving: u64,
+) -> Option<u64> {
+    let preferred = descriptor.active.placement.preferred_leader;
+    if preferred != leaving && configuration.voters.contains(&preferred) {
+        return Some(preferred);
+    }
+    configuration
+        .voters
+        .iter()
+        .copied()
+        .find(|voter| *voter != leaving)
+}
 pub(super) enum SessionDriver {
     Local(ReplicaHost),
     Remote { leader: u64 },
@@ -105,7 +126,13 @@ impl PlacementAgent {
             if let ControlFailure::NotLeader { leader } = failure
                 && *leader != 0
             {
-                // Follow the log to where it leads on the next pass.
+                // Follow the log to where it leads on the next pass. The
+                // hints are a cache: full, it is emptied and learned again.
+                if self.session_leaders.len() >= SESSION_LEADER_HINTS
+                    && !self.session_leaders.contains_key(&descriptor.ledger)
+                {
+                    self.session_leaders.clear();
+                }
                 let _ = self.session_leaders.insert(descriptor.ledger, *leader);
             }
             return Err(AgentError::Control(*failure));
@@ -796,6 +823,39 @@ impl PlacementAgent {
         .map_err(|_| AgentError::Identity)?
         .revision())
     }
+    /// The node `driver` reaches the log at.
+    fn leads(&self, driver: &SessionDriver) -> u64 {
+        match driver {
+            SessionDriver::Local(_) => self.state.node,
+            SessionDriver::Remote { leader } => *leader,
+        }
+    }
+    /// Begin moving the log's leadership to `target`, through `driver`. A
+    /// transfer that does not complete is begun again on a later pass.
+    async fn transfer_leadership(
+        &mut self,
+        pool: &PeerConnectionPool,
+        driver: &SessionDriver,
+        descriptor: &SessionDescriptor,
+        target: u64,
+    ) -> Result<Option<AgentStep>, AgentError> {
+        match driver {
+            SessionDriver::Local(host) => host.transfer_leader(target).await?,
+            SessionDriver::Remote { leader } => {
+                match self
+                    .session_call(pool, *leader, descriptor, SessionCall::Transfer { target })
+                    .await?
+                {
+                    SessionControlReply::Transferring => {}
+                    _ => return Err(AgentError::Identity),
+                }
+            }
+        }
+        // The log leads elsewhere from the next election: forget where it
+        // led, and follow it from what its replicas say.
+        let _ = self.session_leaders.remove(&descriptor.ledger);
+        Ok(Some(AgentStep::Advanced))
+    }
     /// Apply one session-log configuration change exactly once, through
     /// `driver`.
     async fn change_membership(
@@ -1142,6 +1202,17 @@ impl PlacementAgent {
                     return self.intend_partition(handles, command).await.map(Some);
                 }
                 AssignmentPhase::Draining => {
+                    // A leader does not remove itself (27 §5): leadership
+                    // moves to a voter that stays, and that leader removes
+                    // this node on a later pass.
+                    if configuration.voters.contains(node)
+                        && self.leads(driver) == *node
+                        && let Some(target) = successor(descriptor, configuration, *node)
+                    {
+                        return self
+                            .transfer_leadership(pool, driver, descriptor, target)
+                            .await;
+                    }
                     if configuration.contains(*node) {
                         return self
                             .change_membership(

@@ -2,7 +2,7 @@
 //! the client at the leader, a stale client learns the current epoch, and
 //! the partition answers route and route-change reads.
 use crate::{
-    network_service::tests::{Running, settings},
+    network_service::tests::{Running, settings, until},
     placement_agent::tests::{controller_peer, join_peer, partition_host},
 };
 use focal_control::{ControlRead, ControlReadResult};
@@ -46,16 +46,16 @@ pub(crate) async fn redirect_from(
     running: &Running,
     request: RequestEnvelope,
 ) -> focal_wire::RouteHint {
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            match ask(running, request.clone()).await {
-                Response::Error(AccessError::RouteChanged(hint)) => return hint,
-                _ => tokio::time::sleep(Duration::from_millis(100)).await,
-            }
-        }
-    })
+    until(
+        "the node redirects",
+        &[running],
+        Duration::from_secs(30),
+        async || match ask(running, request.clone()).await {
+            Response::Error(AccessError::RouteChanged(hint)) => Some(hint),
+            _ => None,
+        },
+    )
     .await
-    .expect("never redirected")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -73,23 +73,23 @@ async fn a_node_that_does_not_serve_a_ledger_redirects_to_its_leader_and_a_stale
 
     // The partition answers route reads once the founder's session is
     // registered: the founder leads at epoch 1, and the route log names it.
-    let route = tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            if let Ok(ControlReadResult::Route(Some(route))) = host
-                .read(
-                    controller_peer(&founder),
-                    RequestId::from_u128(501),
-                    ControlRead::Route { ledger },
-                )
-                .await
-            {
-                return route;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .expect("route never known");
+    let route = until(
+        "the route is known",
+        &[&founder],
+        Duration::from_secs(60),
+        async || match host
+            .read(
+                controller_peer(&founder),
+                RequestId::from_u128(501),
+                ControlRead::Route { ledger },
+            )
+            .await
+        {
+            Ok(ControlReadResult::Route(Some(route))) => Some(route),
+            _ => None,
+        },
+    )
+    .await;
     assert_eq!(route.ledger, ledger);
     assert_eq!(route.leader, founder_node);
     assert_eq!(route.route_epoch, RouteEpoch(1));
@@ -138,21 +138,19 @@ async fn a_node_that_does_not_serve_a_ledger_redirects_to_its_leader_and_a_stale
     assert_eq!(hint.endpoint, founder.status.advertise.to_string());
     assert!(!hint.server_name.is_empty());
     // The founder serves the same request itself.
-    let served = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            match ask(&founder, envelope(ledger, 1, 2)).await {
-                Response::Error(AccessError::RouteChanged(hint)) => {
-                    panic!("the leader redirected to {hint:?}")
-                }
-                Response::Error(AccessError::Unavailable) => {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                other => return other,
+    let served = until(
+        "the founder serves",
+        &[&founder],
+        Duration::from_secs(30),
+        async || match ask(&founder, envelope(ledger, 1, 2)).await {
+            Response::Error(AccessError::RouteChanged(hint)) => {
+                panic!("the leader redirected to {hint:?}")
             }
-        }
-    })
-    .await
-    .expect("founder never served");
+            Response::Error(AccessError::Unavailable) => None,
+            other => Some(other),
+        },
+    )
+    .await;
     assert!(!matches!(served, Response::Error(_)), "{served:?}");
     // An unknown ledger stays unavailable everywhere: no route, no hint.
     let unknown = focal_model::LedgerId {

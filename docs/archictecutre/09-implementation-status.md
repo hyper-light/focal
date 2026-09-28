@@ -10541,3 +10541,99 @@ same machine, had one failure:
 at the assertion that a retired mutation is refused as `ManagedRetired`. It then passed
 8 times in isolation and 37 times under 12 and 40 CPU-bound processes. The cause is
 not established; the assertion now prints the response it received.
+
+### 2026-09-27 — leadership that is not the founder's: priority, transfer before removal, and what it exposed
+
+CI on `45076ef`: the Windows build failed in
+`fleet_tests::exact_retry_rediscovery_preserves_receipt_after_cached_owner_loses_leadership`
+(`NotLeader { leader: 0 }` from a transfer asked of a leader observed one call
+earlier, on 20 ms ticks). Leadership observed is not leadership held. The harness now
+follows the group (`Fleet::depose`) and charges its waits to the owners' periods.
+
+**Per-progress deadlines (27 §3.1 P8).** Both owners count the periods they run
+(`ReplicaHost::periods`, `ControlHost::periods`, metric `focal_root_periods_total`).
+`focal_timing::ProgressDeadline` charges a wait at the least advance of the owners it
+observes and ends it when every owner ran its budget or the slowest ran nothing for
+the frozen window (8 tests). In use: `fleet_tests`, `placement_agent_tests`,
+`network_service_tests`, `partition_split_tests`, `route_cache_tests`,
+`credential_renewal_tests`, `liveness_tests`, `tests/support/fleet.rs` (through each
+node's metrics) and `tests/placement_binary.rs`. A process that does not answer is left
+out of the charge while another answers.
+
+**Session pace and priority.** Session groups take the derived pace the root group
+took (`ReplicaHost::pace`, fed each second from the paths to the session's other
+voters). A session's owner sets its election priority from the placement the session
+committed: the preferred leader 2, other voters 1.
+
+**A leader does not remove itself.** raft-rs leaves a leader that applies its own
+removal leading. The core refuses the proposal (`LeaderLeaving`); the controller
+transfers a session's leadership before it removes a draining voter; `cluster nodes
+remove` does so for a root voter (`leader_leaving` when the transfer has not completed
+within its bound). Tests: `a_leader_refuses_its_own_removal_and_leaves_after_a_transfer`
+(core), `a_drained_session_leader_hands_leadership_on_and_the_session_heals` (four
+services in one process), `tests/drain_leader.rs` (five real processes: leadership moved
+to a host, a participant's QUIC client sent on to it, the host drained, the session
+healed on the three that stay, the host removed).
+
+Those tests were the first to run a session led by a node other than its founder
+through a placement change. Three defects, each older than this work:
+
+1. **A new copy refused its leader.** A replica admitted replication from the members
+   of its own applied configuration. A copy that has applied nothing knows the
+   configuration its log began with, which names the founder alone, so under any other
+   leader it refused every message and never caught up; the plan stayed in `Catchup`.
+   A copy now also admits the members the committed directory names for its session
+   (active voters, a pending plan's voters, retiring copies), which its agent announces
+   (`ReplicaHost::admit_members`, at most 2048).
+2. **`cluster nodes drain` lost to a concurrent grant and left the journal pending.**
+   The grant is compared at the authority revision it was prepared from; a grant the
+   controller committed in between refused it, and `reconcile` had no rule for a grant,
+   so every later admin command answered `outcome_unknown`. `reconcile` proves a grant
+   superseded by the authority revision; the command prepares again, at most four times.
+3. **`placement_binary` under load.** One failure of
+   `movement_survives_a_cut_at_every_step…` (`movement-cleanup: the cut was never
+   reached`, a 90 s wall-clock wait) in a workspace run during which other suites were
+   started by hand on the same machine; it passed alone (3 of 3, 214 s). Its waits are
+   charged to progress now. The cause of that one failure is not established beyond
+   that.
+
+**The network model (27 §3.1 P7).** `focal_sim::path`: propagation with jitter, in
+order or reordering; Gilbert–Elliott loss per flow; a bottleneck with a drop-tail queue
+whose backlog is exact across a change of rate; a path MTU; a NAT whose mapping
+expires; partitions at send and in flight. 32 tests, including that every message sent
+is delivered or counted in exactly one drop cause, and that a scenario replays from its
+seed. Every table is bounded (`FabricLimits`).
+
+**Rules recorded.** `CLAUDE.md`: no panics in production code, nothing grows without a
+bound, root causes only, the gates. Against them in this batch: the simulator's
+per-flow tables and link queue were unbounded and its bounded draw looped until it
+succeeded; both have bounds now. The controller's leader hints had no bound (4096,
+emptied when full).
+
+**Open.** A client on the local socket of a node that follows a session is refused
+until that node leads (24 §14); see 27 §5. The binary suites other than the two named
+still carry wall-clock deadlines. Stages C to G of 27 §6 are not started.
+
+### 2026-09-28 — elections over the modelled network
+
+`focal-consensus::sim_election_tests` runs three real replicas on real logs, their
+messages carried by `focal_sim::path` in virtual time, each ticking at the period
+derived from the round trips it measured (27 §3.1 P2, §6 stage B).
+
+| Test | Path | What holds |
+|---|---|---|
+| `a_lan_group_…`, `a_regional_group_…`, `a_geographic_group_elects_keeps_and_replaces_its_leader` | 0.2 ms, 80 ms and 500 ms one way | a leader within eight election timeouts; the same leader and no new term for a hundred more; an entry applied on every replica; a successor within eight timeouts of the leader's loss; never two leaders in a term. Four seeds each. |
+| `a_group_whose_round_trip_exceeds_the_configured_timeout_elects_only_at_the_derived_pace` | 1.2 s one way | at the configured 100 ms period no leader in two hundred election timeouts; at the derived pace a leader that is kept, in one term |
+| `a_regional_group_under_bursty_loss_stays_safe_and_commits` | 80 ms, loss in bursts, about nine in a hundred | twenty entries, each proposed again until applied, reach every replica in order; never two leaders in a term |
+| `the_preferred_member_leads_after_a_loss_over_a_regional_path` | 80 ms | with the leader lost, the member of higher priority leads and the other never does. Six seeds. |
+
+Two assertions first written here were wrong and were corrected, not loosened. A
+geographic group at the configured period does keep a leader once it has one: a round
+trip as long as the election timeout costs it terms, and only a round trip longer than
+the timeout denies it a leader, which is the case the fourth test states. And an entry
+a leader admitted is not committed: under loss a leader may be replaced before it
+replicates, so the test proposes as a client does, again until the entry is applied.
+raft-rs draws its election timeouts from its own generator, so a run does not replay
+from the seed alone; the suite is repeated instead: 30 runs of the six tests, 30 passed
+(macOS arm64, with another project building on the same machine).
+

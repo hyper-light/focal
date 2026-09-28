@@ -29,6 +29,9 @@ mod tests;
 
 /// A remove that follows its drain waits this long, in this many polls, for the
 /// placement partition to observe the committed ineligibility.
+/// How often a grant change that lost to a concurrent re-grant is prepared
+/// again.
+const ELIGIBILITY_ATTEMPTS: u32 = 4;
 const REMOVE_DRAIN_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 const REMOVE_DRAIN_POLLS: u32 = 20;
 
@@ -72,6 +75,8 @@ pub enum ClusterAdminError {
     NotDrained(u64),
     #[error("node {0} is drained, but the placement controller has not observed it yet; retry")]
     DrainPending(u64),
+    #[error("node {0} still leads the root group; its leadership is being transferred; retry")]
+    LeaderLeaving(u64),
     #[error("node {0} is not enrolled in the directory")]
     UnknownNode(u64),
     #[error("node {0} is not alive, eligible and reporting; it cannot take over")]
@@ -135,6 +140,7 @@ impl ClusterAdminError {
             Self::NodeHolding { .. } => Failure::error("node_holding", 5),
             Self::NotDrained(_) => Failure::error("not_drained", 5),
             Self::DrainPending(_) => Failure::error("drain_pending", 5),
+            Self::LeaderLeaving(_) => Failure::error("leader_leaving", 5),
             Self::NotReady(_) => Failure::error("node_not_ready", 5),
             Self::MembersBehind { .. } => Failure::error("members_behind", 5),
             Self::OutsideResidency { .. } => Failure::error("outside_residency", 5),
@@ -1109,7 +1115,61 @@ impl ClusterAdmin {
             Err(error) => Err(error),
         }
     }
+    /// The authority revision a grant for `node` would be compared at now,
+    /// read through the same preparation a change is built from. The
+    /// preparation of the state the grant already has carries no command,
+    /// so the opposite one is asked.
+    async fn authority_revision(&self, node: u64, eligible: bool) -> Result<u64> {
+        for eligible in [eligible, !eligible] {
+            match self
+                .exchange(AdminCommand::Read(AdminRead::PrepareEligibility {
+                    node,
+                    eligible,
+                }))
+                .await?
+            {
+                ControlReply::Read(ControlReadResult::PreparedEligibility {
+                    node: prepared,
+                    command,
+                    ..
+                }) if prepared == node => {
+                    if let Some(command) = command {
+                        return Ok(command.expected_revision);
+                    }
+                }
+                _ => return Err(ClusterAdminError::Invalid),
+            }
+        }
+        Err(ClusterAdminError::Invalid)
+    }
+    /// Make `node` eligible or not. The grant is compared at the authority
+    /// revision it was prepared from, and the controller commits grants of
+    /// its own whenever a node announces itself: a change that lost that
+    /// race is proven superseded and prepared again from the revision that
+    /// won, a bounded number of times.
     pub async fn node_eligibility(&self, node: u64, eligible: bool) -> Result<AdminResult> {
+        let mut attempts = 0u32;
+        loop {
+            match self.node_eligibility_once(node, eligible).await {
+                Err(ClusterAdminError::Control(ControlFailure::CompareFailed))
+                    if attempts < ELIGIBILITY_ATTEMPTS =>
+                {
+                    attempts = attempts.saturating_add(1);
+                    let (_, saved) = self.journal(false)?;
+                    let Some(latest) = saved.latest.as_ref() else {
+                        return Err(ControlFailure::CompareFailed.into());
+                    };
+                    if latest.receipt.is_none() && !latest.superseded {
+                        let reference = operation_id(self.identity.node, latest.operation);
+                        drop(saved);
+                        self.reconcile(&reference).await?;
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+    async fn node_eligibility_once(&self, node: u64, eligible: bool) -> Result<AdminResult> {
         if node == 0 {
             return Err(ClusterAdminError::Invalid);
         }
@@ -1282,6 +1342,9 @@ impl ClusterAdmin {
             });
         }
         let current = self.configuration().await?;
+        if current.configuration.voters.contains(&node) {
+            self.lead_elsewhere(node, &current.configuration).await?;
+        }
         let membership_removed = if current.configuration.contains(node) {
             self.membership(MembershipChange::Remove { node }, None)
                 .await?;
@@ -1414,6 +1477,45 @@ impl ClusterAdmin {
         }
         self.node_eligibility(node, false).await
     }
+    /// A leader does not remove itself (27 §5): while `leaving` leads the
+    /// root group, move its leadership to a voter that stays (this node
+    /// where it votes) and wait, bounded, for the group to follow.
+    async fn lead_elsewhere(
+        &self,
+        leaving: u64,
+        configuration: &focal_consensus::MembershipConfiguration,
+    ) -> Result<()> {
+        let target = if configuration.voters.contains(&self.identity.node) {
+            Some(self.identity.node)
+        } else {
+            configuration
+                .voters
+                .iter()
+                .copied()
+                .find(|voter| *voter != leaving)
+        };
+        for _ in 0..=REMOVE_DRAIN_POLLS {
+            let AdminResult::Membership { leader, .. } = self.read(AdminRead::Membership).await?
+            else {
+                return Err(ClusterAdminError::Invalid);
+            };
+            if leader != 0 && leader != leaving {
+                return Ok(());
+            }
+            if leader == leaving
+                && let Some(target) = target
+            {
+                // Refused while an earlier transfer or an election is in
+                // progress; the next read says where the group leads.
+                match self.transfer(target, None).await {
+                    Ok(_) | Err(ClusterAdminError::Control(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            tokio::time::sleep(REMOVE_DRAIN_POLL).await;
+        }
+        Err(ClusterAdminError::LeaderLeaving(leaving))
+    }
     pub async fn transfer(&self, target: u64, expected_index: Option<u64>) -> Result<AdminResult> {
         let current = self.configuration().await?;
         if expected_index.is_some_and(|index| index != current.configuration_index) {
@@ -1487,6 +1589,19 @@ impl ClusterAdmin {
             }
             _ => None,
         };
+        // A grant compared at an authority revision can never commit once
+        // the authority has moved past it (revisions only rise).
+        let grant_superseded = match &latest.request.command {
+            ControlCommand::Authority(command) => match &command.operation {
+                focal_directory::AuthorityOperation::GrantNode { grant, .. } => Some(
+                    self.authority_revision(grant.enrollment.node, grant.enrollment.eligible)
+                        .await?
+                        > command.expected_revision,
+                ),
+                _ => None,
+            },
+            _ => None,
+        };
         let reply = self
             .exchange(AdminCommand::Read(AdminRead::Reconcile {
                 sequence: latest.request.id.sequence,
@@ -1511,6 +1626,7 @@ impl ClusterAdmin {
             ControlCommand::RetireContact(_) => {
                 contact_superseded.ok_or(ClusterAdminError::Corrupt)?
             }
+            ControlCommand::Authority(_) => grant_superseded.ok_or(ClusterAdminError::Corrupt)?,
             _ => return Err(ClusterAdminError::Corrupt),
         };
         if let Some(receipt) = receipt {
