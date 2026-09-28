@@ -10992,3 +10992,64 @@ Local gates on this tree (macOS arm64): format, contracts (1,465 links), clippy
 `-D warnings`, production lints and the dependency audit passed;
 `cargo test --workspace --locked --no-fail-fast -- --test-threads=4` ran 143 suites and
 none failed.
+
+### 2026-09-28 — CI on `f929ea0`; where many logs are led (27 stage F)
+
+CI on `f929ea0` passed on ubuntu-24.04, macos-15 and Windows, with the model and the
+dependency jobs.
+
+**Leadership returns** (`leader_return`, 27 §5). The replica that leads in place of
+the preferred leader hands leadership to it once it has stayed current for two
+election timeouts, and rests between two hand-overs; the rest doubles when a hand-over
+is abandoned or leadership comes back. Ten tests of the rule by itself. Three
+replicas on real logs (`fleet_leader_return_tests`): leadership ends at the preferred
+leader after the placement is committed, after it is moved away by hand, and after the
+preferred leader was cut off and came back; nothing is asked of a member that is away
+or while no election is held; no replica asks more often than its rest allows. Twelve
+runs at once, six times: 72 of 72.
+
+The first runs of them found a hand-over that the core lost. A member whose election
+timeout had passed on a starved machine was asking whether it could be elected when
+its leader told it to campaign; raft-rs ignores that, and so did this core. The others
+refused what it asked, since they heard their leader, and the leader waited an
+election timeout for a campaign that never came, taking no proposal meanwhile. The
+member now campaigns (27 §4.5). The comparison with raft-rs loses that message for
+both cores and goes on: 96 schedules of each campaign reach it 0 to 10 times.
+
+**The zone.** A voter the directory places in the preferred leader's zone ranks above
+the other voters (`fleet::Near`, `ZONE_PRIORITY`): it is elected before them, and
+handed leadership by one of them that was elected, while the preferred leader is away.
+
+**Preferred leaders are spread** (`focal_directory::leading`, `leader_move`,
+`propose_placement_leading`; `leader_balancer`). Five tests of the directory's rule.
+Sessions led by the lowest of their nodes, moved one at a time by what is committed
+when each moves:
+
+| Nodes | Voters | Sessions | Moves | Led, by node |
+|---|---|---|---|---|
+| 3 | 3 | 64 | 42 | 22, 21, 21 |
+| 5 | 3 | 200 | 112 | 40 each |
+| 7 | 5 | 333 | 236 | 48, 48, 48, 48, 47, 47, 47 |
+| 4 | 1 | 9 | 0 | 2, 3, 2, 2 |
+
+Every move lowered the sum of squares of what the nodes lead by two at least.
+
+**Three real processes** (`tests/leader_balance.rs`). A founder and two hosts run with
+`FOCAL_LEADER_BALANCE=off`; three sessions are created on the founder and each is
+planned for one tolerated node loss: three voters each, all preferring the founder.
+The processes are restarted one at a time with balancing on and a hold of two
+seconds. The controller moves two sessions, one after the other, each by a placement
+of its own (its placement epoch one higher, its voters the same); every node then
+says of every session that it is led by the leader its placement prefers; nothing is
+planned and nothing moves over the next eighty periods of the founder. 105 s on macOS
+arm64.
+
+**Gates** on the final tree (macOS arm64): `cargo fmt --all --check`,
+`check-contracts.py`, clippy with `-D warnings`, `check-production.sh`, `cargo deny`,
+and the workspace's tests with four threads: 145 suites, 2,827 tests, none failed,
+3 ignored. `check-model.sh`: 8,278,749 states generated, 1,219,562 distinct, no
+property violated.
+
+**Open.** A move of a preferred leader is a whole placement plan, with a cut-over of
+the session; a lighter record that changes the preferred leader alone would be a new
+durable format and is a decision, not made here.

@@ -600,6 +600,18 @@ impl Session {
     pub fn election_tick(&self) -> usize {
         self.consensus.election_tick()
     }
+    /// What this leader tracks of one member's replication.
+    pub fn peer(&self, node: u64) -> Option<focal_consensus::PeerProgress> {
+        self.consensus.peer(node)
+    }
+    /// The member this leader is handing leadership to, while it is.
+    pub fn transferring(&self) -> Option<u64> {
+        self.consensus.transferring()
+    }
+    /// A configuration change is in the log and not applied yet.
+    pub fn configuration_pending(&self) -> bool {
+        self.consensus.configuration_pending()
+    }
     pub fn status(&self) -> NodeStatus {
         self.consensus.status()
     }

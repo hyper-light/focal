@@ -34,6 +34,8 @@ mod fleet_tests;
 pub mod gc;
 pub mod history;
 pub mod host;
+pub mod leader_balancer;
+pub mod leader_return;
 pub mod liveness;
 #[cfg(test)]
 mod liveness_tests;

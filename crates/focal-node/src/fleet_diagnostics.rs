@@ -50,6 +50,13 @@ impl Owner {
             sequence: self.session.sequence().0,
             pending: self.session.pending_count(),
             authoritative: self.session.is_authoritative(),
+            priority: self.session.priority(),
+            preferred_leader: self
+                .session
+                .active_placement()
+                .map(|spec| spec.placement.preferred_leader),
+            leader_returns: self.leader_return.stats().asked,
+            leader_returns_failed: self.leader_return.stats().failed,
             persistence_pending: self.session.persistence_pending(),
             checkpoint_pending: self.session.checkpoint_in_flight(),
             compiled_managed_decoder: hex(&Session::managed_decoder_hash()),

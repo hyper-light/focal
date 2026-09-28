@@ -168,6 +168,11 @@ pub struct ReplicaProgress {
     pub admitted: Vec<u64>,
     /// This replica's election priority, from its committed placement.
     pub priority: i64,
+    /// The voters the directory places in the preferred leader's zone.
+    pub near: Near,
+    /// How often this replica asked leadership to return to the preferred
+    /// leader, and how often that did not hold (27 §5).
+    pub returns: crate::leader_return::Stats,
     /// The route epoch this replica serves clients at; a committed
     /// activation moves the session ahead of it until the host re-fences.
     pub route_epoch: RouteEpoch,
@@ -271,9 +276,11 @@ enum Work {
     ),
     /// The host pulled objects a retained delivery lacked; it retries at once.
     CustodyPulled(oneshot::Sender<Result<(), LedgerError>>, Allocation),
-    /// The members the committed directory names for this session.
+    /// The members the committed directory names for this session, and
+    /// those of them in its preferred leader's zone.
     Admit(
         Vec<u64>,
+        Near,
         oneshot::Sender<Result<(), LedgerError>>,
         Allocation,
     ),
@@ -434,10 +441,21 @@ pub struct ReplicaHost {
 /// The most members a replica admits by the directory's word: the largest
 /// configuration, entering and leaving.
 const MAX_ADMITTED: usize = 2048;
-/// The election priority of a session's preferred leader and of its other
-/// voters (27 §5).
-pub const PREFERRED_LEADER_PRIORITY: i64 = 2;
+/// The election priority of a session's preferred leader, of the voters in
+/// its zone, and of its other voters (27 §5).
+pub const PREFERRED_LEADER_PRIORITY: i64 = 3;
+pub const ZONE_PRIORITY: i64 = 2;
 pub const VOTER_PRIORITY: i64 = 1;
+/// The voters the committed directory places in the zone of a session's
+/// preferred leader: who leads in its place where it cannot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Near {
+    /// The preferred leader they are near to. They rank by it only while
+    /// the session's own committed placement prefers the same.
+    pub leader: u64,
+    /// Sorted, without the leader.
+    pub voters: Vec<u64>,
+}
 struct ProgressState {
     value: ReplicaProgress,
     // The existing watch owns the allocation across owner, cloned handles and
@@ -562,6 +580,8 @@ struct Owner {
     /// own applied configuration. A copy that has applied nothing yet knows
     /// only the configuration its log began with.
     admitted: Vec<u64>,
+    /// The voters in the preferred leader's zone, by the directory's word.
+    near: Near,
     deferred_managed: VecDeque<managed_support_owner::DeferredManaged>,
     deferred_backing: Option<Allocation>,
     snapshot_feedback: crate::snapshot_feedback::SnapshotFeedback,
@@ -580,6 +600,8 @@ struct Owner {
     dropped_snapshots: u64,
     budget: MemoryBudget,
     pace: crate::pace::TickPeriod,
+    /// When leadership goes back to the placement's preferred leader.
+    leader_return: crate::leader_return::LeaderReturn,
     nonblocking: bool,
     stopping: Option<(oneshot::Sender<Result<(), LedgerError>>, Instant)>,
     next_tick: Instant,
@@ -682,6 +704,8 @@ impl ReplicaHost {
                 voters: status.voters.clone(),
                 admitted: Vec::new(),
                 priority: session.priority(),
+                near: Near::default(),
+                returns: crate::leader_return::Stats::default(),
                 route_epoch: config.route_epoch,
                 import_pending: None,
                 seed_pending: None,
@@ -706,6 +730,7 @@ impl ReplicaHost {
         let pace = crate::pace::TickPeriod::default();
         pace.announce(session.election_tick());
         let owner = Owner {
+            leader_return: crate::leader_return::LeaderReturn::new(session.election_tick()),
             pace: pace.clone(),
             session,
             config,
@@ -717,6 +742,7 @@ impl ReplicaHost {
             pending: VecDeque::new(),
             memberships: VecDeque::new(),
             admitted: Vec::new(),
+            near: Near::default(),
             deferred_managed: VecDeque::new(),
             deferred_backing: None,
             snapshot_feedback: crate::snapshot_feedback::SnapshotFeedback::default(),
@@ -780,6 +806,10 @@ impl ReplicaHost {
     }
     /// The periods this replica's owner has run; what a wait on it is
     /// charged in (27 §3.1 P8).
+    /// Periods in one election timeout of this replica.
+    pub fn election_periods(&self) -> u64 {
+        u64::try_from(self.pace.election_tick()).unwrap_or(u64::MAX)
+    }
     pub fn periods(&self) -> u64 {
         self.pace.periods()
     }
@@ -865,10 +895,24 @@ impl ReplicaHost {
     /// names its peers once it has applied it; a copy that has applied
     /// nothing knows only the configuration its log began with, and would
     /// refuse a leader outside it. Replaces what was admitted before.
-    pub async fn admit_members(&self, mut members: Vec<u64>) -> Result<(), LedgerError> {
+    pub async fn admit_members(&self, members: Vec<u64>) -> Result<(), LedgerError> {
+        self.admit(members, Near::default()).await
+    }
+    /// [`Self::admit_members`], with the voters the directory places in the
+    /// zone of the session's preferred leader: they outrank the other
+    /// voters in an election and lead in the preferred leader's place
+    /// (27 §5). Replaces what was said before.
+    pub async fn admit(&self, mut members: Vec<u64>, mut near: Near) -> Result<(), LedgerError> {
         members.sort_unstable();
         members.dedup();
-        if members.len() > MAX_ADMITTED || members.first() == Some(&0) {
+        near.voters.sort_unstable();
+        near.voters.dedup();
+        if members.len() > MAX_ADMITTED
+            || members.first() == Some(&0)
+            || near.voters.len() > MAX_ADMITTED
+            || near.voters.first() == Some(&0)
+            || near.voters.binary_search(&near.leader).is_ok()
+        {
             return Err(LedgerError::Capacity);
         }
         let charge = self
@@ -877,7 +921,7 @@ impl ReplicaHost {
             .commit();
         let (send, receive) = oneshot::channel();
         self.sender
-            .try_send(Work::Admit(members, send, charge))
+            .try_send(Work::Admit(members, near, send, charge))
             .map_err(|error| match error {
                 HostQueueError::Full => LedgerError::Capacity,
                 HostQueueError::Disconnected => LedgerError::Failed,
@@ -1482,16 +1526,12 @@ impl Owner {
         // current logs, so leadership returns to where placement put it and
         // a voter that merely timed out first does not take it. Policy from
         // committed state, applied by the owner; never from liveness.
-        let priority = match self.session.active_placement() {
-            Some(spec) if spec.placement.preferred_leader == self.session.status().node_id => {
-                PREFERRED_LEADER_PRIORITY
-            }
-            _ => VOTER_PRIORITY,
-        };
+        let priority = self.rank(self.session.status().node_id);
         if self.session.priority() != priority {
             self.session.set_priority(priority)?;
         }
         self.session.tick()?;
+        self.return_leadership()?;
         if self.session.status().role == StateRole::Leader {
             let now = wall_ms()?.max(self.session.cursor_clock());
             match self.session.propose_cursor_clock(now) {
@@ -1511,6 +1551,100 @@ impl Owner {
         self.drain()?;
         self.checkpoint_by_cadence()?;
         self.progress_managed()
+    }
+    /// The election priority of `node` by the session's committed
+    /// placement: its preferred leader first, then the voters the
+    /// directory places in that leader's zone, then the rest.
+    fn rank(&self, node: u64) -> i64 {
+        match self.session.active_placement() {
+            Some(spec) if spec.placement.preferred_leader == node => PREFERRED_LEADER_PRIORITY,
+            Some(spec)
+                if spec.placement.preferred_leader == self.near.leader
+                    && spec.placement.voters.contains_key(&node)
+                    && self.near.voters.binary_search(&node).is_ok() =>
+            {
+                ZONE_PRIORITY
+            }
+            _ => VOTER_PRIORITY,
+        }
+    }
+    /// Hands leadership to a voter the placement ranks above this replica
+    /// when this replica leads in its place and that member has stayed
+    /// current (`leader_return`, 27 §5): to the preferred leader, and while
+    /// that one is not there to take it, to a voter in its zone. A refusal
+    /// is counted and rested on; only a failure of the session itself is
+    /// an error.
+    fn return_leadership(&mut self) -> Result<(), LedgerError> {
+        let status = self.session.status();
+        let leads = self.session.is_authoritative();
+        let own = self.rank(status.node_id);
+        let votes = |node: u64| {
+            node != status.node_id
+                && status.voters.contains(&node)
+                && self
+                    .session
+                    .active_placement()
+                    .is_some_and(|spec| spec.placement.voters.contains_key(&node))
+        };
+        let fit = |node: u64| {
+            self.session.peer(node).is_some_and(|peer| {
+                peer.state == 1 && peer.matched >= status.committed_index && peer.recent_active
+            })
+        };
+        let preferred = self
+            .session
+            .active_placement()
+            .map(|spec| spec.placement.preferred_leader)
+            .filter(|node| votes(*node));
+        // The preferred leader, unless it is not there to take it and a
+        // voter of its zone is. Counted for the preferred leader where no
+        // one is, so that it is asked once it has come back and stayed.
+        let target = if !leads {
+            preferred
+        } else {
+            match preferred {
+                Some(node) if fit(node) => Some(node),
+                _ if own < ZONE_PRIORITY => self
+                    .near
+                    .voters
+                    .iter()
+                    .copied()
+                    .find(|node| votes(*node) && self.rank(*node) > own && fit(*node))
+                    .or(preferred),
+                preferred => preferred,
+            }
+        };
+        let peer = match (leads, target) {
+            (true, Some(node)) => self.session.peer(node),
+            _ => None,
+        };
+        let seen = crate::leader_return::Seen {
+            leads,
+            preferred: target,
+            current: peer
+                .is_some_and(|peer| peer.state == 1 && peer.matched >= status.committed_index),
+            heard: peer.is_some_and(|peer| peer.recent_active),
+            transferring: self.session.transferring().is_some(),
+            settled: self.stopping.is_none()
+                && self.memberships.is_empty()
+                && self.placement.is_none()
+                && !self.session.configuration_pending(),
+            quiet: self.session.pending_count() == 0,
+        };
+        let crate::leader_return::Verdict::Ask(target) = self.leader_return.observe(seen) else {
+            return Ok(());
+        };
+        match self.session.transfer_leader(target) {
+            Ok(()) => Ok(()),
+            Err(
+                error @ (LedgerError::Failed
+                | LedgerError::Consensus(focal_consensus::ConsensusError::Failed)),
+            ) => Err(error),
+            Err(_) => {
+                self.leader_return.refused();
+                Ok(())
+            }
+        }
     }
     /// Shared-worker progress never waits on a disk receipt. The exact Ready
     /// remains inside Session until its WAL owner reports a completed fence.
@@ -1655,8 +1789,9 @@ impl Owner {
                 self.drain()?;
                 let _ = response.send(result);
             }
-            Work::Admit(members, response, charge) => {
+            Work::Admit(members, near, response, charge) => {
                 self.admitted = members;
+                self.near = near;
                 self.publish_progress(false);
                 drop(charge);
                 let _ = response.send(Ok(()));
@@ -1858,6 +1993,8 @@ impl Owner {
                 voters: status.voters.clone(),
                 admitted: self.admitted.clone(),
                 priority: self.session.priority(),
+                near: self.near.clone(),
+                returns: self.leader_return.stats(),
                 route_epoch: self.config.route_epoch,
                 import_pending: self.session.pending_import(),
                 seed_pending: self.session.pending_seed().map(|pending| SeedPending {

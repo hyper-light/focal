@@ -1252,18 +1252,19 @@ impl PlacementAgent {
         // set, so skip it while neither has moved since it last passed.
         let config = self.partition_config();
         let fingerprint = (descriptor.authority.record_hash, directory.revision);
-        if self.verified_active.get(&descriptor.ledger) == Some(&fingerprint) {
-            return Ok(None);
-        }
-        if focal_directory::verify_placement(
-            &descriptor.active,
-            &directory.nodes,
-            config.max_members,
-        )
-        .is_ok()
-        {
+        let verified = self.verified_active.get(&descriptor.ledger) == Some(&fingerprint)
+            || focal_directory::verify_placement(
+                &descriptor.active,
+                &directory.nodes,
+                config.max_members,
+            )
+            .is_ok();
+        if verified {
             self.verified_active.insert(descriptor.ledger, fingerprint);
-            return Ok(None);
+            // A placement that holds may still be led where too many are.
+            return self
+                .balance_leader(handles, descriptor, directory, snapshot, installed, now)
+                .await;
         }
         self.verified_active.remove(&descriptor.ledger);
         let operation = OperationId({
@@ -1277,13 +1278,20 @@ impl PlacementAgent {
             }
             id
         });
-        match focal_directory::propose_placement_keeping(
+        let leading = self.take_leading(directory);
+        let proposal = focal_directory::propose_placement_leading(
             &directory.nodes,
             &descriptor.active.policy,
             &descriptor.active.placement.voters,
+            focal_directory::Leading {
+                counts: &leading.counts,
+                current: Some(descriptor.active.placement.preferred_leader),
+            },
             config.max_members,
             config.min_disk_available,
-        ) {
+        );
+        self.leading = Some(leading);
+        match proposal {
             Ok(proposal) => {
                 let command = self.session_command(
                     descriptor,
@@ -1321,6 +1329,79 @@ impl PlacementAgent {
                 self.intend_partition(handles, command).await.map(Some)
             }
         }
+    }
+    /// Move a session's preferred leader to another of its voters where
+    /// that one leads two sessions fewer, the directory has said so for
+    /// long enough, and no other session of the partition is moving its
+    /// own (`leader_balancer`, 27 §5). The move is a plan over the members
+    /// the session has: it is prepared, cut over and activated as any
+    /// other, and leadership follows the placement once it is active.
+    async fn balance_leader(
+        &mut self,
+        handles: &NetworkHandles,
+        descriptor: &SessionDescriptor,
+        directory: &PartitionCheckpoint,
+        snapshot: &ControlSnapshot,
+        installed: &ControlAuthoritySnapshot,
+        now: i64,
+    ) -> Result<Option<AgentStep>, AgentError> {
+        let config = self.partition_config();
+        let leading = self.take_leading(directory);
+        let desired = focal_directory::leader_move(
+            descriptor,
+            &directory.nodes,
+            &leading.counts,
+            config.max_members,
+        );
+        let moving = leading.moving;
+        self.leading = Some(leading);
+        let due = self.leader_balancer.observe(
+            descriptor.ledger,
+            desired
+                .as_ref()
+                .map(|desired| desired.placement.preferred_leader),
+            now,
+        );
+        let Some(desired) = desired.filter(|_| due && !moving) else {
+            return Ok(None);
+        };
+        let target = desired.placement.preferred_leader;
+        // What the move was decided on: the report of the node it goes to.
+        let Some(report) = directory
+            .nodes
+            .get(&target)
+            .and_then(|node| node.load)
+            .map(|load| load.report)
+        else {
+            return Ok(None);
+        };
+        let operation = OperationId({
+            let mut hasher = blake3::Hasher::new_derive_key("focal.placement.lead.v1");
+            hasher.update(&descriptor.ledger.tenant.0);
+            hasher.update(&descriptor.ledger.session.0);
+            hasher.update(&descriptor.authority.record_hash.0);
+            hasher.update(&target.to_le_bytes());
+            let mut id = [0; 16];
+            for (target, source) in id.iter_mut().zip(hasher.finalize().as_bytes()) {
+                *target = *source;
+            }
+            id
+        });
+        let command = self.session_command(
+            descriptor,
+            snapshot,
+            installed,
+            now,
+            SessionChange::Plan {
+                operation,
+                desired,
+                observations: BTreeMap::from([(target, report)]),
+            },
+            None,
+        )?;
+        let step = self.intend_partition(handles, command).await?;
+        self.leader_balancer.moved();
+        Ok(Some(step))
     }
     /// The bounds the partition applies to every placement it accepts.
     pub(super) fn partition_config(&self) -> focal_directory::PartitionConfig {

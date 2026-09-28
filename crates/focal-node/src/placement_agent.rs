@@ -436,7 +436,47 @@ pub struct PlacementAgent {
     move_requests: Vec<MoveRangeJob>,
     /// Per-member observations behind automatic splits and merges (25 §8).
     balancer: crate::range_balancer::Balancer,
+    /// Per-session observations behind moves of a preferred leader (27 §5).
+    pub(super) leader_balancer: crate::leader_balancer::LeaderBalancer,
+    /// Where sessions are led, as one revision of one partition's
+    /// directory commits it: counted once for every session of a pass.
+    pub(super) leading: Option<Leading>,
     _allocation: Allocation,
+}
+/// The voters of `descriptor`'s active placement that the directory places
+/// in the zone of its preferred leader; none while that zone is not known.
+pub(super) fn near(
+    descriptor: &SessionDescriptor,
+    directory: &PartitionCheckpoint,
+) -> crate::fleet::Near {
+    let placement = &descriptor.active.placement;
+    let leader = placement.preferred_leader;
+    let zone = |node: &u64| {
+        directory
+            .nodes
+            .get(node)
+            .map(|record| (record.enrollment.region, record.enrollment.zone))
+            .filter(|(region, zone)| region.0 != [0; 16] && zone.0 != [0; 16])
+    };
+    let voters = match zone(&leader) {
+        Some(home) => placement
+            .voters
+            .keys()
+            .filter(|voter| **voter != leader && zone(voter) == Some(home))
+            .copied()
+            .collect(),
+        None => Vec::new(),
+    };
+    crate::fleet::Near { leader, voters }
+}
+/// Where the sessions of a partition are led at one revision of it.
+pub(super) struct Leading {
+    partition: focal_directory::PartitionId,
+    revision: u64,
+    /// Sessions that prefer each node as their leader.
+    pub(super) counts: BTreeMap<u64, u64>,
+    /// A session is moving its preferred leader among the members it has.
+    pub(super) moving: bool,
 }
 const MAX_MOVE_REQUESTS: usize = 64;
 impl PlacementAgent {
@@ -505,6 +545,10 @@ impl PlacementAgent {
             balancer: crate::range_balancer::Balancer::new(
                 crate::range_balancer::BalancerConfig::from_env(),
             ),
+            leader_balancer: crate::leader_balancer::LeaderBalancer::new(
+                crate::leader_balancer::LeaderBalancerConfig::from_env(),
+            ),
+            leading: None,
             _allocation: allocation,
         })
     }
@@ -927,7 +971,7 @@ impl PlacementAgent {
                 return Ok(step);
             }
             for descriptor in directory.sessions.values() {
-                Self::sync_members(handles, descriptor).await?;
+                Self::sync_members(handles, descriptor, directory).await?;
                 self.sync_custody(handles, descriptor, directory).await?;
                 if let Some(step) = self
                     .answer_plan_request(handles, descriptor, directory, snapshot, installed, now)
@@ -1430,9 +1474,12 @@ impl PlacementAgent {
     /// copies being retired. The copy admits their replication before it
     /// has applied a configuration that names them (a new copy begins at
     /// the configuration its log began with, and the log may lead anywhere).
+    /// With them, the voters the directory places in the zone of the
+    /// session's preferred leader: they outrank the other voters (27 §5).
     async fn sync_members(
         handles: &NetworkHandles,
         descriptor: &SessionDescriptor,
+        directory: &PartitionCheckpoint,
     ) -> Result<(), AgentError> {
         let Ok(host) = handles.fleet.current_host(descriptor.ledger) else {
             return Ok(());
@@ -1451,10 +1498,12 @@ impl PlacementAgent {
             .chain(descriptor.retiring.keys())
             .copied()
             .collect();
-        if host.progress().admitted.iter().eq(members.iter()) {
+        let near = near(descriptor, directory);
+        let progress = host.progress();
+        if progress.admitted.iter().eq(members.iter()) && progress.near == near {
             return Ok(());
         }
-        match host.admit_members(members.into_iter().collect()).await {
+        match host.admit(members.into_iter().collect(), near).await {
             // Refused for room or lost with its owner: asked again on the
             // next pass, from what the directory says then.
             Ok(()) | Err(LedgerError::Capacity | LedgerError::OutcomeUnknown) => Ok(()),
@@ -1652,6 +1701,45 @@ impl PlacementAgent {
         OperationId(id)
     }
     /// Answer an operator's plan request for this session from the committed
+    /// Where the sessions of `directory` are led, counted when its revision
+    /// was first seen. Taken out of the agent while it is read, and put
+    /// back by the caller.
+    pub(super) fn take_leading(&mut self, directory: &PartitionCheckpoint) -> Leading {
+        let partition = directory.delegation.partition;
+        match self.leading.take() {
+            Some(leading)
+                if leading.partition == partition && leading.revision == directory.revision =>
+            {
+                leading
+            }
+            _ => {
+                // Sessions that left the partition take their
+                // observations with them.
+                let namespace = directory.delegation.namespace;
+                self.leader_balancer.retain(|ledger| {
+                    !namespace.contains(*ledger) || directory.sessions.contains_key(ledger)
+                });
+                Leading {
+                    partition,
+                    revision: directory.revision,
+                    // Counted as nothing, every leader is kept where it is.
+                    counts: if self.leader_balancer.config().enabled {
+                        focal_directory::leading(&directory.sessions)
+                    } else {
+                        BTreeMap::new()
+                    },
+                    moving: directory.sessions.values().any(|session| {
+                        session.pending.as_ref().is_some_and(|plan| {
+                            plan.desired.policy == session.active.policy
+                                && plan.desired.placement.voters == session.active.placement.voters
+                                && plan.desired.placement.preferred_leader
+                                    != session.active.placement.preferred_leader
+                        })
+                    }),
+                }
+            }
+        }
+    }
     /// directory: the pending plan if one exists, "satisfied" when the active
     /// placement already provides the durability, otherwise a plan under the
     /// active policy with the requested durability, journaled for the
@@ -1710,13 +1798,20 @@ impl PlacementAgent {
                     durability,
                     ..descriptor.active.policy.clone()
                 };
-                match focal_directory::propose_placement_keeping(
+                let leading = self.take_leading(directory);
+                let proposal = focal_directory::propose_placement_leading(
                     &directory.nodes,
                     &policy,
                     &descriptor.active.placement.voters,
+                    focal_directory::Leading {
+                        counts: &leading.counts,
+                        current: Some(descriptor.active.placement.preferred_leader),
+                    },
                     config.max_members,
                     config.min_disk_available,
-                ) {
+                );
+                self.leading = Some(leading);
+                match proposal {
                     Ok(proposal) => {
                         let operation = Self::requested_plan_id(descriptor, durability);
                         let voters: Vec<u64> =

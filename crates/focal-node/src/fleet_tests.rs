@@ -282,6 +282,9 @@ impl Drop for Fleet {
     }
 }
 
+#[path = "fleet_leader_return_tests.rs"]
+mod leader_return_tests;
+
 #[path = "fleet_summary_tests.rs"]
 mod summary_tests;
 

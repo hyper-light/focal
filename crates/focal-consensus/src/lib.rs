@@ -1202,6 +1202,37 @@ impl DurableNode {
             .collect()
     }
 
+    /// What this leader tracks of one member's replication; nothing when
+    /// it does not lead or tracks no such member. Allocates nothing, so an
+    /// owner may ask on every tick.
+    pub fn peer(&self, node: u64) -> Option<PeerProgress> {
+        if self.raw.raft.state() != StateRole::Leader || node == self.config.node_id {
+            return None;
+        }
+        let progress = self.raw.raft.tracker().get(node)?;
+        Some(PeerProgress {
+            node,
+            matched: progress.matched,
+            next_index: progress.next_index,
+            state: match progress.state {
+                ProgressState::Probe => 0,
+                ProgressState::Replicate => 1,
+                ProgressState::Snapshot => 2,
+            },
+            recent_active: progress.recent_active,
+            paused: progress.paused,
+            pending_snapshot: progress.pending_snapshot,
+        })
+    }
+    /// The member this leader is handing leadership to, while it is.
+    pub fn transferring(&self) -> Option<u64> {
+        self.raw.raft.lead_transferee()
+    }
+    /// A configuration change is in the log and not applied yet.
+    pub fn configuration_pending(&self) -> bool {
+        self.raw.raft.pending_conf_index() > self.delivered_index
+    }
+
     /// The index of the stored snapshot the log is compacted behind (zero
     /// while the log is complete): a member added after it can only be
     /// seeded by a later snapshot, since Raft discards one whose

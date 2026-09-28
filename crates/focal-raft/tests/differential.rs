@@ -5,10 +5,14 @@
 //! member knows of the others; all of it is equal, or the run fails naming
 //! its seed and its step.
 //!
-//! The two differ by decision in one place a schedule reaches: a leader
+//! The two differ by decision in two places a schedule reaches. A leader
 //! that applies a change which leaves it no voter steps down here and
-//! leads on there. A run that comes to it ends there, and what this core
-//! does from there on is tested by itself (`group.rs`).
+//! leads on there: a run that comes to it ends there, and what this core
+//! does from there on is tested by itself (`group.rs`). A member told by
+//! its leader to campaign while it asks whether it could be elected
+//! campaigns here and ignores it there, where the leader then waits an
+//! election timeout for nothing: the schedule loses that message for both,
+//! and the run goes on.
 #![allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -35,6 +39,8 @@ fn count(name: &str, default: u64) -> u64 {
 /// What the schedules came to: a comparison proves what it reached.
 #[derive(Debug, Default)]
 struct Reached {
+    /// Members told to campaign while they asked whether they could.
+    told_while_asking: u64,
     terms: u64,
     committed: u64,
     changes: u64,
@@ -89,6 +95,24 @@ enum End {
     Ran,
     /// The run came to the place the two differ by decision.
     LeaderLeft(u64),
+}
+
+/// Whether `op` tells a member to campaign that asks whether it could.
+fn tells_one_that_asks(group: &Cluster<New>, op: &Op) -> bool {
+    let Op::Deliver {
+        at, lose: false, ..
+    } = op
+    else {
+        return false;
+    };
+    let Some(message) = group.net.get(*at) else {
+        return false;
+    };
+    message.msg_type == MessageType::MsgTimeoutNow as i32
+        && group.peek(message.to).is_some_and(|member| {
+            let view = member.view();
+            view.role == 3 && view.term == message.term
+        })
 }
 
 fn brief(message: &focal_raft::proto::Message) -> String {
@@ -237,6 +261,17 @@ fn run(seed: u64, steps: u64, settings: Settings, mix: Mix, reached: &mut Reache
         if trace.len() > 24 {
             trace.pop_front();
         }
+        let op = match op {
+            Op::Deliver { at, keep, .. } if tells_one_that_asks(&new, &op) => {
+                reached.told_while_asking += 1;
+                Op::Deliver {
+                    at,
+                    keep,
+                    lose: true,
+                }
+            }
+            op => op,
+        };
         let mut said_old = old.act(&op);
         let mut said_new = new.act(&op);
         timeless(&mut said_old);

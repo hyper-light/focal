@@ -1682,6 +1682,18 @@ impl<S: Storage> Raft<S> {
                 self.poll(message.from, !message.reject)?;
                 self.maybe_commit_by_vote(&message)
             }
+            MessageType::MsgTimeoutNow => {
+                // The leader of this term hands over to one that was
+                // asking whether it could be elected: it need not ask, and
+                // the lease that refuses what it asked refuses no
+                // hand-over. Ignored, the leader would wait an election
+                // timeout for it and take no proposal meanwhile. One that
+                // asks for votes has a later term than whoever told it.
+                if self.state == StateRole::PreCandidate && self.promotable {
+                    self.hup(true)?;
+                }
+                Ok(())
+            }
             _ => Ok(()),
         }
     }

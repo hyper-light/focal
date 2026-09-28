@@ -114,6 +114,31 @@ pub fn propose_placement_keeping(
     max_members: usize,
     min_disk_available: u64,
 ) -> Result<PlacementProposal, DirectoryError> {
+    propose_placement_leading(
+        nodes,
+        policy,
+        incumbents,
+        Leading {
+            counts: &BTreeMap::new(),
+            current: None,
+        },
+        max_members,
+        min_disk_available,
+    )
+}
+/// [`propose_placement_keeping`] choosing the preferred leader by where
+/// sessions are led already (27 §5): the session's current one where it is
+/// still a candidate and moving would not help, otherwise the candidate
+/// that the fewest sessions prefer, and among those the first by the order
+/// the members were selected in.
+pub fn propose_placement_leading(
+    nodes: &BTreeMap<u64, NodeRecord>,
+    policy: &PlacementPolicy,
+    incumbents: &BTreeMap<u64, u64>,
+    leading: Leading<'_>,
+    max_members: usize,
+    min_disk_available: u64,
+) -> Result<PlacementProposal, DirectoryError> {
     let needed = usize::from(policy.durability.max_failures)
         .checked_mul(2)
         .and_then(|n| n.checked_add(1))
@@ -160,15 +185,17 @@ pub fn propose_placement_keeping(
     if selected.len() != needed {
         return Err(DirectoryError::NoPlacement);
     }
-    let leader = selected
-        .iter()
-        .find(|(node, _)| {
-            policy.home_regions.is_empty() || policy.home_regions.contains(&node.enrollment.region)
-        })
-        .ok_or(DirectoryError::Residency)?
-        .0
-        .enrollment
-        .node;
+    let leader = leading
+        .choose(
+            selected
+                .iter()
+                .filter(|(node, _)| {
+                    policy.home_regions.is_empty()
+                        || policy.home_regions.contains(&node.enrollment.region)
+                })
+                .map(|(node, _)| node.enrollment.node),
+        )
+        .ok_or(DirectoryError::Residency)?;
     let voters: BTreeMap<_, _> = selected
         .iter()
         .map(|(node, _)| (node.enrollment.node, node.enrollment.generation))
@@ -194,7 +221,7 @@ pub fn propose_placement_keeping(
             .map(|(node, load)| (node.enrollment.node, load.report))
             .collect(),
         spec,
-        explanation: "Selected eligible nodes by ordering home, incumbency, measured load, free memory, and stable ID; selected independent promised failure domains.",
+        explanation: "Selected eligible nodes by ordering home, incumbency, measured load, free memory, and stable ID; selected independent promised failure domains; kept the preferred leader unless another home voter leads two sessions fewer.",
     })
 }
 

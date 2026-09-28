@@ -586,6 +586,58 @@ fn storage_that_fails_stops_no_one_and_is_said() {
 }
 
 #[test]
+fn one_told_to_campaign_while_it_asks_whether_it_could_does() {
+    let mut node = follower();
+    let mut ticks = 0;
+    while node.raft.state() != StateRole::PreCandidate {
+        node.tick().unwrap();
+        ticks += 1;
+        assert!(ticks < 100, "it never asked");
+    }
+    assert_eq!(node.raft.term(), 1);
+    let asked = drain(&mut node);
+    assert!(asked.iter().all(
+        |message| message.msg_type == MessageType::MsgRequestPreVote as i32
+            && message.context.is_empty()
+    ));
+    // The others hear their leader and refuse; the leader hands over.
+    node.step(answer(MessageType::MsgTimeoutNow, 1, 2, 1))
+        .unwrap();
+    assert_eq!(node.raft.state(), StateRole::Candidate);
+    assert_eq!(node.raft.term(), 2);
+    let asked = drain(&mut node);
+    assert_eq!(asked.len(), 2);
+    for message in &asked {
+        assert_eq!(message.msg_type, MessageType::MsgRequestVote as i32);
+        assert_eq!(message.term, 2);
+        assert_eq!(message.context, proto::CAMPAIGN_TRANSFER);
+    }
+    // What was answered to the asking before counts for nothing now.
+    node.step(answer(MessageType::MsgRequestPreVoteResponse, 3, 2, 2))
+        .unwrap();
+    assert_eq!(node.raft.state(), StateRole::Candidate);
+    node.step(answer(MessageType::MsgRequestVoteResponse, 3, 2, 2))
+        .unwrap();
+    assert_eq!(node.raft.state(), StateRole::Leader);
+    // One that asks for votes is past the term of whoever tells it.
+    let mut node = follower();
+    node.step(answer(MessageType::MsgTimeoutNow, 1, 2, 1))
+        .unwrap();
+    assert_eq!(
+        (node.raft.state(), node.raft.term()),
+        (StateRole::Candidate, 2)
+    );
+    drain(&mut node);
+    node.step(answer(MessageType::MsgTimeoutNow, 1, 2, 1))
+        .unwrap();
+    assert_eq!(
+        (node.raft.state(), node.raft.term()),
+        (StateRole::Candidate, 2)
+    );
+    assert!(drain(&mut node).is_empty());
+}
+
+#[test]
 fn one_told_to_campaign_before_it_applied_a_change_campaigns_once_it_has() {
     use crate::proto::{ConfChangeType, protocompat::PbMessageExt};
     let change = ConfChangeV2 {

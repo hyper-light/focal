@@ -118,6 +118,16 @@ pub struct AdminReplicaDiagnostics {
     pub sequence: u64,
     pub pending: usize,
     pub authoritative: bool,
+    /// This replica's election priority, from its committed placement
+    /// (27 §5): the preferred leader outranks the other voters.
+    pub priority: i64,
+    /// The leader the committed placement prefers; absent before one is
+    /// committed.
+    pub preferred_leader: Option<u64>,
+    /// How often this replica handed leadership to the preferred leader
+    /// while it led in its place, and how often that did not hold.
+    pub leader_returns: u64,
+    pub leader_returns_failed: u64,
     pub persistence_pending: bool,
     pub checkpoint_pending: bool,
     pub compiled_managed_decoder: String,

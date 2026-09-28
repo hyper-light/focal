@@ -86,6 +86,10 @@ pub struct SessionMetrics {
     pub sequence: u64,
     pub pending: u64,
     pub authoritative: bool,
+    /// The leader the committed placement prefers (27 §5).
+    pub preferred_leader: Option<u64>,
+    pub leader_returns: u64,
+    pub leader_returns_failed: u64,
     pub native_authoritative: bool,
     pub log_entries_since_checkpoint: u64,
     pub retention: Option<AdminRetention>,
@@ -664,11 +668,26 @@ impl MetricsSnapshot {
             "Whether sessions beyond the bound were left out.",
             u8::from(self.sessions_truncated),
         );
-        let series: [(&str, &str, &str); 22] = [
+        let series: [(&str, &str, &str); 25] = [
             (
                 "focal_session_leader",
                 "gauge",
                 "The session log's leader as this replica knows it.",
+            ),
+            (
+                "focal_session_preferred_leader",
+                "gauge",
+                "The leader the session's committed placement prefers.",
+            ),
+            (
+                "focal_session_leader_returns_total",
+                "counter",
+                "Hand-overs of leadership to the preferred leader this replica asked for.",
+            ),
+            (
+                "focal_session_leader_returns_failed_total",
+                "counter",
+                "Hand-overs to the preferred leader that were abandoned or did not hold.",
             ),
             ("focal_session_term", "gauge", "The replica's term."),
             (
@@ -781,6 +800,11 @@ impl MetricsSnapshot {
                 ];
                 let value: Option<u64> = match name {
                     "focal_session_leader" => Some(session.leader),
+                    "focal_session_preferred_leader" => session.preferred_leader,
+                    "focal_session_leader_returns_total" => Some(session.leader_returns),
+                    "focal_session_leader_returns_failed_total" => {
+                        Some(session.leader_returns_failed)
+                    }
                     "focal_session_term" => Some(session.term),
                     "focal_session_tick_period_milliseconds" => Some(session.tick_period_ms),
                     "focal_session_broadcast_tail_microseconds" => Some(session.broadcast_tail_us),

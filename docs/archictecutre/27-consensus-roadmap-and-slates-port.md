@@ -193,6 +193,7 @@ included.
 | Its generated accessors unwind on an enumeration value they do not know, which a peer chooses | Reads them as options (`focal_raft::proto`); the accessors are forbidden by lint in production (`clippy.toml`) |
 | A leader that applies a change which leaves it no voter leads on, and unwinds when it next commits | It tells the voter that holds the whole log to campaign, and follows |
 | One told to campaign while a change it committed is not applied forgets that it was told | It campaigns once the change is applied, unless it heard of a leader since |
+| One told to campaign while it asks whether it could be elected ignores it; the leader waits an election timeout for it and takes no proposal meanwhile | It campaigns: the leader of its term asks, and the lease that refuses what it asked refuses no hand-over. The comparison loses that message for both cores and goes on |
 | A voter refuses a candidate of lower priority unless the candidate has more entries | Unless the candidate's log is more current, by its last term and then its length (`Precedence::Log`). By length alone, two voters whose logs are equally long and end in different terms refuse each other, one for priority and one for the log, and with the third away the group elects no one. The rule of raft-rs is kept (`Precedence::Length`) to compare the cores under one rule |
 | Priority judges the vote a transfer asks for; a member without a term that refuses for priority unwinds | Priority never judges a transfer and is not in force without a term. The shell did both for raft-rs; they are the core's now |
 | One that is no voter may campaign, and unwinds when it wins | Refused (`NotPromotable`) |
@@ -282,11 +283,14 @@ term, or the same and more entries (section 4.5). Priority
 never outranks the log, and a group whose highest priority member is gone elects among
 the rest (`DurableNode::set_priority`, four tests in `raft_safety_tests`). A session's
 owner sets its replica's priority each period from the placement the session has
-committed: the preferred leader 2, every other voter 1 (`fleet::PREFERRED_LEADER_PRIORITY`,
-`VOTER_PRIORITY`). Priorities are configuration, never liveness. A third rank, voters
-in the preferred leader's zone above the rest, needs the members' zones in the
-session's own committed state, which holds node identities only; it is part of stage F,
-where the balancer chooses by zone.
+committed: the preferred leader 3, the voters in its zone 2, every other voter 1
+(`fleet::PREFERRED_LEADER_PRIORITY`, `ZONE_PRIORITY`, `VOTER_PRIORITY`). Priorities are
+configuration, never liveness. The session's committed state holds node identities
+only, so who is in the preferred leader's zone is said by the directory, which has
+committed every node's region and zone: the node's agent tells each copy it hosts
+(`ReplicaHost::admit`, `fleet::Near`), with the members it admits. What it says names
+the preferred leader it is said of, and ranks a voter only while the session's own
+placement prefers that same leader; a zone that is not known is near to nothing.
 
 A node that has no term yet keeps the neutral priority: a node with no term has no log
 to defend, and its refusal would bear no term a candidate could hear (raft-rs 0.7
@@ -300,7 +304,28 @@ its own leaving all the same hands the group over and follows (section 4.5). The
 placement controller moves a session's leadership to a voter that stays (the
 preferred leader where it votes) before it removes a draining voter
 (`SessionCall::Transfer` reaches a leader on another node), and `cluster nodes remove`
-does the same for a root voter. Transfer as the balancer's action is stage F.
+does the same for a root voter.
+
+**Leadership returns.** Priority decides an election and starts none: after the
+preferred leader was away and came back, another voter leads, and would until it
+fails. The voter that leads hands leadership on (`leader_return`, run by the owner
+each period): to the preferred leader, and while that one is not there to take it, to
+a voter of its zone where the one that leads is of neither. What it decides on is what
+the leader observes of the member on its own periods, and everything it counts has a
+bound:
+
+| Rule | Value | Why |
+|---|---|---|
+| Fit | 2 election timeouts | The member replicates without probing, holds everything committed and has answered since the leader last checked its quorum, every period of them. One that has just returned is not asked to lead while it may leave again |
+| Quiet | until nothing proposed is undecided, 8 election timeouts at most | A leader takes no proposal while it hands over. Load that never pauses delays the hand-over and cannot prevent it |
+| Rest | 4 election timeouts, doubled by each failure up to 6 times | A hand-over that was abandoned, or after which leadership came back to the same replica within the longest rest, is a failure. A preferred leader that cannot keep leadership costs the group one election per rest, never a storm of them |
+| Held | while a change of configuration or of placement is in progress, a hand-over is under way, or the replica is stopping | The decision of whoever changes the group comes first |
+
+A refusal where the hand-over is asked is counted as a failure and rested on. The
+replica says how often it asked and how often that did not hold
+(`leader_returns`, `leader_returns_failed` in `cluster replicas diagnostics`;
+`focal_session_leader_returns_total`, `focal_session_leader_returns_failed_total`,
+`focal_session_preferred_leader` in the node's metrics).
 
 **A node's own socket reaches a log only where that node leads it** (24 §14, a limit
 stated there). With leadership placed by priority and moved by transfer, that limit is
@@ -312,9 +337,41 @@ an open decision and not made here.
 
 **Multi-log synchronization.** MLRaft splits one log into n logs, each with its own
 leader, and spreads the leaders with priority election and dynamic transfer. focal
-already runs many groups per node. What it lacks is MLRaft's two balancing mechanisms:
-initial spread through priorities, and a balancer that moves leaders when the spread
-drifts. Cross-log order is not needed: focal's sessions are independent ledgers.
+already runs many groups per node, and has both of MLRaft's balancing mechanisms: the
+spread through priorities when a session is placed, and a balancer that moves leaders
+when the spread drifts. Cross-log order is not needed: focal's sessions are
+independent ledgers.
+
+A session's preferred leader is part of its committed placement, so how many sessions
+prefer each node is a fact of the directory (`focal_directory::leading`; a session
+that is moving counts where it is going). Nothing is decided by who happens to lead.
+
+*When a session is placed or placed again* (`propose_placement_leading`) its preferred
+leader is kept where it is still a candidate and moving would not help, and is
+otherwise the candidate at home that the fewest sessions prefer. Moving a session from
+a node preferred by `a` to one preferred by `b` leaves them at `a - 1` and `b + 1`,
+which is no better unless `b + 2 <= a`. Every move by that rule lowers the sum of the
+squares of what the nodes lead by two at least, so moves end and leadership comes to
+rest however the sessions share their nodes.
+
+*When the spread drifts* (`focal_directory::leader_move`, `leader_balancer`) the
+controller moves the preferred leader of a session that holds its placement to another
+of its voters by the same rule: one that is alive, eligible, reporting, of the enrolled
+generation and at home; of the least led, one in the zone the session is led in; of
+those, the least loaded. The move is a placement plan over the members the session
+has. Every copy verifies its custody under the new route and the session is cut over,
+as for any plan, so it is made for an imbalance that lasts:
+
+| Rule | Value |
+|---|---|
+| Observed | the same move on 3 passes of the controller in a row, over `FOCAL_LEADER_BALANCE_HOLD_SECS` at least (30, a load report's interval) |
+| One at a time | no move while another session of the partition moves its leader among the members it has |
+| After a move | every count begins again: two moves are a hold apart, and each is decided on what the one before it left |
+| Bound | 4096 sessions observed at once; one past it is not observed until another lapses, and is counted |
+| Off | `FOCAL_LEADER_BALANCE=off`: the planner keeps every preferred leader and the controller moves none |
+
+Leadership follows the placement once it is active: the replicas take their ranks
+from it, and the one that leads hands over.
 
 **Parallel vote replication and processing.** Votes and appends go to all peers at
 once through P1's fan-out, and inbound replies are stepped as they arrive instead of
@@ -338,6 +395,7 @@ quorum and never vote, tested as slates tests it.
 | E | Fast track in `focal-raft`; TLA+ model | section 4.4 invariants; latency measured against classic under 0 to 10% loss |
 | | *State 2026-09-28:* built in the core and the shell (section 4.6), modelled and checked, and measured: a member that does not lead waits three quarters of what the classic track takes with nothing lost, and less of it as more is lost ([09](09-implementation-status.md)). No owner takes it yet; what it asks of one is in section 4.6. | |
 | F | MLRaft leader balancer | leader spread converges; no transfer storms |
+| | *State 2026-09-28:* built (section 5): leadership returns to the preferred leader and to its zone, preferred leaders are spread when sessions are placed and moved when the spread drifts. Three real processes whose sessions were all led by their founder spread them one each and every log is led where its placement prefers ([09](09-implementation-status.md)). | |
 | G | P10 congestion measurement; decide | bake-off numbers recorded |
 
 Each stage closes on the workspace gates and on CI for Linux, macOS and Windows.
