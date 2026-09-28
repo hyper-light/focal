@@ -42,7 +42,26 @@ fn roots(certificates: Vec<Vec<u8>>) -> Result<rustls::RootCertStore, WireError>
 // tasks; these Arc types are required by those libraries' public APIs.
 /// Longest silence before a QUIC connection is considered dead.
 const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// The most a stream is given to send ahead of what its reader has taken.
+///
+/// quinn keeps what arrives out of order as the spans it arrived in, and
+/// closes a connection whose stream holds more than 1,024 of them once it
+/// has merged what it merges (`too many gaps in stream buffer`): spans next
+/// to each other of less than a 1,024th of what is held. A megabyte holds
+/// no more than 1,024 spans that are not merged, however it arrived. With
+/// the 10 MiB of a frame as its window, a sender that overshot a fast and
+/// long path in its first round trips, as every law does that probes for
+/// the rate, lost every second datagram to the bottleneck's queue and its
+/// connection with them (`tests/congestion.rs`). A frame longer than the
+/// window is read as it arrives, so the window bounds what is in flight
+/// and not what is sent.
+pub const STREAM_WINDOW_CEILING: u32 = 1024 * 1024;
+
 fn transport(limits: &WireLimits) -> Result<Arc<quinn::TransportConfig>, WireError> {
+    quic_transport(limits).map(Arc::new)
+}
+/// What focal's connections are set to, for a caller that measures them.
+pub fn quic_transport(limits: &WireLimits) -> Result<quinn::TransportConfig, WireError> {
     limits.validate()?;
     let streams = limits
         .streams_per_connection
@@ -51,7 +70,8 @@ fn transport(limits: &WireLimits) -> Result<Arc<quinn::TransportConfig>, WireErr
     let frame = limits
         .max_frame_bytes
         .checked_add(HEADER_BYTES as u32)
-        .ok_or(WireError::Limit)?;
+        .ok_or(WireError::Limit)?
+        .min(STREAM_WINDOW_CEILING);
     let window = u64::from(frame)
         .checked_mul(u64::from(streams))
         .ok_or(WireError::Limit)?;
@@ -68,7 +88,12 @@ fn transport(limits: &WireLimits) -> Result<Arc<quinn::TransportConfig>, WireErr
     let idle = limits.request_timeout.min(IDLE_TIMEOUT);
     transport.max_idle_timeout(Some(idle.try_into().map_err(|_| WireError::Limit)?));
     transport.keep_alive_interval(Some(idle.checked_div(4).ok_or(WireError::Limit)?));
-    Ok(Arc::new(transport))
+    // Chosen by measurement against the laws quinn brings
+    // (`tests/congestion.rs`, 27 §3.1 P10): the one that stalled on no path
+    // and kept what is asked beside a transfer from waiting for a full
+    // queue.
+    transport.congestion_controller_factory(Arc::new(crate::congestion::CopaConfig::default()));
+    Ok(transport)
 }
 
 pub fn server_tls(
@@ -345,7 +370,7 @@ async fn serve_authenticated_connection_inner<H: RequestHandler + Clone>(
                         // to already established authenticated connections.
                         let peer=registry.authenticate(fingerprint)?;
                         let request:RequestEnvelope=read_frame(&mut recv,FrameKind::Request,limits.max_frame_bytes).await?;require_end(&mut recv).await?;
-                        if matches!(request.operation,Operation::Raft{..}){send.set_priority(10).map_err(|_|WireError::Connection)?;}
+                        send.set_priority(request.operation.class().priority()).map_err(|_|WireError::Connection)?;
                         let response = if negotiated.accepts_protocol(request.protocol) {
                             dispatch_accounted(&handler,peer,request,&limits).await
                         } else {
@@ -604,9 +629,8 @@ impl QuicRemote {
             .open_bi()
             .await
             .map_err(|_| WireError::Connection)?;
-        if matches!(request.operation, Operation::Raft { .. }) {
-            send.set_priority(10).map_err(|_| WireError::Connection)?;
-        }
+        send.set_priority(request.operation.class().priority())
+            .map_err(|_| WireError::Connection)?;
         write_frame(
             &mut send,
             FrameKind::Request,

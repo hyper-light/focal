@@ -72,6 +72,12 @@ jobs:
         env:
           FOCAL_FAST_FULL: "1"
         run: bash scripts/cargo.sh test -p focal-consensus --release --locked sim_fast -- --nocapture
+      # The congestion laws against each other over the modelled paths: the
+      # grid the choice of focal's law is recorded from.
+      - name: Congestion laws
+        env:
+          FOCAL_CONGESTION_FULL: "1"
+        run: bash scripts/cargo.sh test -p focal-wire --release --locked --test congestion -- --nocapture
   model:
     runs-on: ubuntu-24.04
     timeout-minutes: 350

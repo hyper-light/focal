@@ -15,6 +15,7 @@
 //! Missing runtime context returns a typed transport error before dispatch.
 mod admission;
 mod auth;
+pub mod congestion;
 mod frame;
 mod handler;
 mod list;

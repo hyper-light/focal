@@ -11053,3 +11053,169 @@ property violated.
 **Open.** A move of a preferred leader is a whole placement plan, with a cut-over of
 the session; a lighter record that changes the preferred leader alone would be a new
 durable format and is a decision, not made here.
+
+### 2026-09-28 — the transport, measured: a connection that one lost datagram closed, Copa, classes (27 stage G)
+
+What was measured, how, and the rule the choice was made by are in
+[27](27-consensus-roadmap-and-slates-port.md) §7. `crates/focal-wire/tests/congestion.rs`,
+release, macOS arm64, 30 s for the whole grid; every run is its seed.
+
+**Found.** quinn closed connections under every law at 100 Mbit/s, the first after
+1.0 s, with `too many gaps in stream buffer`. quinn-proto 0.11.17 did not merge spans
+that fill their datagram, so one missing datagram and 2,048 behind it closed a
+connection; 0.11.18 merges them (`Cargo.lock`, `docs/dependencies/inventory.tsv`). With
+that, laws that overshoot still lost their connection at 100 Mbit/s and 100 to 300 ms,
+CUBIC, quinn's default, among them: more than 1,024 holes in one window of 10 MiB.
+A stream's window is a megabyte now (`focal_wire::STREAM_WINDOW_CEILING`), and no
+connection closes anywhere in the grid
+(`a_loss_on_a_fast_long_path_does_not_close_the_connection`).
+
+**The grid**, with focal's own settings (`focal_wire::quic_transport`) and each law:
+
+| 1M 20ms 0% | NewReno | 62.6 | 80.5 | 117.0 | 450/450 | 90.1% | 140 | 0 |
+| 1M 20ms 0% | Cubic | 64.4 | 78.2 | 78.4 | 449/450 | 93.6% | 133 | 0 |
+| 1M 20ms 0% | Bbr | 60.9 | 77.9 | 106.4 | 449/450 | 93.0% | 1496 | 0 |
+| 1M 20ms 0% | Copa | 65.5 | 131.0 | 134.7 | 449/450 | 93.5% | 547 | 0 |
+| 1M 20ms 0.1% | NewReno | 63.4 | 83.9 | 86.5 | 449/450 | 89.8% | 143 | 1 |
+| 1M 20ms 0.1% | Cubic | 64.2 | 78.2 | 78.4 | 450/450 | 93.5% | 133 | 1 |
+| 1M 20ms 0.1% | Bbr | 61.0 | 77.9 | 106.4 | 449/450 | 93.0% | 1496 | 1 |
+| 1M 20ms 0.1% | Copa | 66.1 | 131.6 | 190.6 | 449/450 | 93.6% | 531 | 1 |
+| 1M 20ms 1% | NewReno | 62.5 | 122.3 | 174.0 | 449/450 | 88.5% | 128 | 29 |
+| 1M 20ms 1% | Cubic | 63.7 | 78.4 | 154.3 | 449/450 | 92.5% | 126 | 29 |
+| 1M 20ms 1% | Bbr | 63.3 | 138.1 | 202.0 | 446/450 | 92.6% | 1581 | 29 |
+| 1M 20ms 1% | Copa | 66.5 | 154.2 | 190.8 | 449/450 | 93.2% | 531 | 29 |
+| 1M 100ms 0% | NewReno | 169.4 | 222.7 | 352.7 | 447/450 | 91.4% | 41 | 0 |
+| 1M 100ms 0% | Cubic | 182.6 | 211.9 | 442.3 | 446/450 | 94.0% | 37 | 0 |
+| 1M 100ms 0% | Bbr | 208.0 | 428.0 | 859.1 | 446/450 | 92.6% | 1331 | 0 |
+| 1M 100ms 0% | Copa | 151.6 | 194.5 | 202.1 | 448/450 | 93.2% | 93 | 0 |
+| 1M 100ms 0.1% | NewReno | 169.7 | 217.2 | 234.6 | 448/450 | 90.0% | 42 | 1 |
+| 1M 100ms 0.1% | Cubic | 183.0 | 211.0 | 442.3 | 447/450 | 93.9% | 36 | 1 |
+| 1M 100ms 0.1% | Bbr | 208.3 | 424.2 | 627.1 | 446/450 | 93.5% | 1337 | 1 |
+| 1M 100ms 0.1% | Copa | 152.0 | 203.8 | 212.2 | 447/450 | 93.2% | 94 | 1 |
+| 1M 100ms 1% | NewReno | 148.8 | 359.1 | 461.8 | 448/450 | 79.1% | 26 | 25 |
+| 1M 100ms 1% | Cubic | 161.9 | 329.2 | 440.0 | 447/450 | 91.3% | 27 | 29 |
+| 1M 100ms 1% | Bbr | 207.9 | 860.5 | 1684.5 | 446/450 | 93.3% | 1906 | 30 |
+| 1M 100ms 1% | Copa | 154.1 | 342.5 | 422.8 | 448/450 | 92.8% | 105 | 29 |
+| 1M 300ms 0% | NewReno | 482.5 | 613.5 | 628.3 | 440/450 | 93.8% | 69 | 0 |
+| 1M 300ms 0% | Cubic | 547.1 | 614.3 | 616.9 | 439/450 | 93.9% | 132 | 0 |
+| 1M 300ms 0% | Bbr | 607.5 | 2425.4 | 3685.4 | 432/450 | 88.3% | 3475 | 0 |
+| 1M 300ms 0% | Copa | 356.4 | 451.8 | 465.4 | 443/450 | 93.9% | 0 | 0 |
+| 1M 300ms 0.1% | NewReno | 482.5 | 613.9 | 1075.9 | 440/450 | 93.8% | 69 | 1 |
+| 1M 300ms 0.1% | Cubic | 539.5 | 614.3 | 941.2 | 438/450 | 92.8% | 137 | 1 |
+| 1M 300ms 0.1% | Bbr | 607.1 | 1836.0 | 2436.0 | 437/450 | 83.3% | 3478 | 2 |
+| 1M 300ms 0.1% | Copa | 356.8 | 451.8 | 465.4 | 443/450 | 93.8% | 0 | 1 |
+| 1M 300ms 1% | NewReno | 375.7 | 881.0 | 1057.1 | 443/450 | 46.8% | 68 | 16 |
+| 1M 300ms 1% | Cubic | 354.1 | 767.0 | 896.9 | 444/450 | 57.1% | 111 | 19 |
+| 1M 300ms 1% | Bbr | 607.5 | 3030.7 | 6597.2 | 437/450 | 90.1% | 3002 | 31 |
+| 1M 300ms 1% | Copa | 355.5 | 706.3 | 745.5 | 443/450 | 93.0% | 0 | 29 |
+| 10M 20ms 0% | NewReno | 32.6 | 41.4 | 42.9 | 450/450 | 96.1% | 108 | 0 |
+| 10M 20ms 0% | Cubic | 35.7 | 41.2 | 41.4 | 450/450 | 97.0% | 92 | 0 |
+| 10M 20ms 0% | Bbr | 40.7 | 41.4 | 81.5 | 450/450 | 96.7% | 9554 | 0 |
+| 10M 20ms 0% | Copa | 24.4 | 31.5 | 40.3 | 450/450 | 96.3% | 5 | 0 |
+| 10M 20ms 0.1% | NewReno | 30.1 | 41.3 | 55.4 | 450/450 | 93.3% | 87 | 38 |
+| 10M 20ms 0.1% | Cubic | 31.4 | 41.0 | 41.3 | 450/450 | 95.9% | 73 | 38 |
+| 10M 20ms 0.1% | Bbr | 40.6 | 41.4 | 83.0 | 450/450 | 96.5% | 9427 | 40 |
+| 10M 20ms 0.1% | Copa | 24.7 | 36.3 | 40.0 | 450/450 | 96.2% | 7 | 38 |
+| 10M 20ms 1% | NewReno | 25.0 | 62.6 | 81.8 | 450/450 | 50.0% | 46 | 230 |
+| 10M 20ms 1% | Cubic | 24.3 | 55.6 | 65.1 | 450/450 | 53.5% | 63 | 246 |
+| 10M 20ms 1% | Bbr | 40.5 | 82.2 | 95.2 | 450/450 | 95.8% | 10375 | 470 |
+| 10M 20ms 1% | Copa | 25.0 | 58.2 | 68.4 | 450/450 | 95.2% | 2 | 459 |
+| 10M 100ms 0% | NewReno | 163.2 | 200.6 | 201.4 | 447/450 | 96.8% | 216 | 0 |
+| 10M 100ms 0% | Cubic | 173.8 | 201.3 | 201.7 | 447/450 | 96.9% | 324 | 0 |
+| 10M 100ms 0% | Bbr | 200.9 | 603.6 | 807.3 | 446/450 | 96.9% | 8072 | 0 |
+| 10M 100ms 0% | Copa | 106.4 | 114.0 | 115.4 | 448/450 | 96.9% | 0 | 0 |
+| 10M 100ms 0.1% | NewReno | 104.7 | 149.5 | 246.9 | 448/450 | 44.9% | 214 | 15 |
+| 10M 100ms 0.1% | Cubic | 104.0 | 137.6 | 156.0 | 448/450 | 49.6% | 310 | 16 |
+| 10M 100ms 0.1% | Bbr | 201.0 | 605.7 | 807.9 | 446/450 | 96.8% | 8099 | 39 |
+| 10M 100ms 0.1% | Copa | 106.4 | 113.6 | 114.7 | 448/450 | 96.5% | 0 | 38 |
+| 10M 100ms 1% | NewReno | 115.6 | 199.0 | 294.8 | 448/450 | 12.6% | 0 | 44 |
+| 10M 100ms 1% | Cubic | 117.4 | 216.2 | 274.1 | 448/450 | 13.4% | 0 | 52 |
+| 10M 100ms 1% | Bbr | 200.8 | 603.5 | 605.3 | 446/450 | 95.7% | 8566 | 469 |
+| 10M 100ms 1% | Copa | 106.1 | 214.4 | 228.6 | 448/450 | 96.1% | 0 | 447 |
+| 10M 300ms 0% | NewReno | 500.9 | 522.0 | 522.4 | 440/450 | 96.9% | 235 | 0 |
+| 10M 300ms 0% | Cubic | 522.1 | 601.9 | 602.1 | 441/450 | 95.8% | 446 | 0 |
+| 10M 300ms 0% | Bbr | 542.8 | 1198.4 | 1202.5 | 444/450 | 80.6% | 3854 | 0 |
+| 10M 300ms 0% | Copa | 446.1 | 596.5 | 597.0 | 444/450 | 69.2% | 79 | 0 |
+| 10M 300ms 0.1% | NewReno | 308.5 | 437.9 | 487.9 | 444/450 | 18.0% | 235 | 8 |
+| 10M 300ms 0.1% | Cubic | 306.1 | 378.7 | 438.0 | 444/450 | 36.1% | 393 | 12 |
+| 10M 300ms 0.1% | Bbr | 468.5 | 1026.7 | 1582.6 | 439/450 | 83.6% | 3834 | 34 |
+| 10M 300ms 0.1% | Copa | 464.1 | 595.5 | 596.7 | 443/450 | 85.6% | 80 | 33 |
+| 10M 300ms 1% | NewReno | 350.6 | 549.7 | 897.1 | 444/450 | 3.3% | 0 | 17 |
+| 10M 300ms 1% | Cubic | 339.7 | 742.4 | 1163.5 | 443/450 | 5.3% | 0 | 25 |
+| 10M 300ms 1% | Bbr | 400.5 | 965.0 | 1041.5 | 439/450 | 78.1% | 4764 | 368 |
+| 10M 300ms 1% | Copa | 434.5 | 896.5 | 1110.3 | 443/450 | 90.5% | 88 | 415 |
+| 100M 20ms 0% | NewReno | 31.3 | 40.0 | 40.1 | 450/450 | 97.1% | 427 | 0 |
+| 100M 20ms 0% | Cubic | 35.2 | 40.1 | 40.1 | 450/450 | 97.2% | 591 | 0 |
+| 100M 20ms 0% | Bbr | 38.2 | 40.1 | 80.2 | 450/450 | 84.7% | 3776 | 0 |
+| 100M 20ms 0% | Copa | 20.5 | 20.9 | 21.0 | 450/450 | 97.2% | 0 | 0 |
+| 100M 20ms 0.1% | NewReno | 21.6 | 30.1 | 38.6 | 450/450 | 18.9% | 418 | 90 |
+| 100M 20ms 0.1% | Cubic | 21.7 | 29.1 | 50.4 | 450/450 | 18.7% | 586 | 87 |
+| 100M 20ms 0.1% | Bbr | 39.0 | 80.0 | 113.5 | 450/450 | 84.7% | 20827 | 404 |
+| 100M 20ms 0.1% | Copa | 20.6 | 35.9 | 36.6 | 450/450 | 92.1% | 0 | 398 |
+| 100M 20ms 1% | NewReno | 25.8 | 52.2 | 92.7 | 450/450 | 5.5% | 0 | 253 |
+| 100M 20ms 1% | Cubic | 24.8 | 43.8 | 77.7 | 450/450 | 5.7% | 0 | 271 |
+| 100M 20ms 1% | Bbr | 37.3 | 80.2 | 120.3 | 450/450 | 83.9% | 33561 | 4162 |
+| 100M 20ms 1% | Copa | 20.6 | 41.4 | 42.7 | 450/450 | 96.2% | 0 | 4494 |
+| 100M 100ms 0% | NewReno | 103.3 | 110.7 | 110.9 | 448/450 | 73.5% | 0 | 0 |
+| 100M 100ms 0% | Cubic | 103.3 | 110.7 | 110.9 | 448/450 | 73.5% | 0 | 0 |
+| 100M 100ms 0% | Bbr | 103.6 | 110.7 | 110.8 | 448/450 | 73.4% | 0 | 0 |
+| 100M 100ms 0% | Copa | 103.9 | 108.8 | 108.9 | 448/450 | 73.4% | 0 | 0 |
+| 100M 100ms 0.1% | NewReno | 104.1 | 156.1 | 183.4 | 448/450 | 3.4% | 0 | 34 |
+| 100M 100ms 0.1% | Cubic | 104.6 | 121.9 | 153.5 | 448/450 | 3.9% | 0 | 38 |
+| 100M 100ms 0.1% | Bbr | 100.9 | 169.9 | 177.3 | 448/450 | 53.8% | 0 | 247 |
+| 100M 100ms 0.1% | Copa | 101.3 | 153.4 | 234.1 | 448/450 | 53.8% | 0 | 241 |
+| 100M 100ms 1% | NewReno | 120.9 | 235.5 | 290.4 | 448/450 | 1.2% | 0 | 43 |
+| 100M 100ms 1% | Cubic | 110.0 | 249.4 | 266.9 | 448/450 | 1.3% | 0 | 59 |
+| 100M 100ms 1% | Bbr | 100.0 | 207.4 | 215.3 | 447/450 | 39.0% | 0 | 1907 |
+| 100M 100ms 1% | Copa | 100.0 | 245.6 | 325.1 | 448/450 | 39.8% | 0 | 1908 |
+| 100M 300ms 0% | NewReno | 300.0 | 308.8 | 309.9 | 444/450 | 24.5% | 0 | 0 |
+| 100M 300ms 0% | Cubic | 300.0 | 308.8 | 309.9 | 444/450 | 24.5% | 0 | 0 |
+| 100M 300ms 0% | Bbr | 300.0 | 310.4 | 310.7 | 444/450 | 24.5% | 0 | 0 |
+| 100M 300ms 0% | Copa | 300.0 | 310.4 | 310.8 | 444/450 | 24.6% | 0 | 0 |
+| 100M 300ms 0.1% | NewReno | 305.9 | 448.6 | 503.0 | 444/450 | 2.3% | 0 | 15 |
+| 100M 300ms 0.1% | Cubic | 302.1 | 374.1 | 409.2 | 444/450 | 6.2% | 0 | 34 |
+| 100M 300ms 0.1% | Bbr | 300.0 | 339.9 | 650.1 | 444/450 | 18.9% | 0 | 83 |
+| 100M 300ms 0.1% | Copa | 300.0 | 374.1 | 603.9 | 444/450 | 19.6% | 0 | 79 |
+| 100M 300ms 1% | NewReno | 330.3 | 763.4 | 848.7 | 443/450 | 0.6% | 0 | 34 |
+| 100M 300ms 1% | Cubic | 321.9 | 698.4 | 824.9 | 443/450 | 0.7% | 0 | 49 |
+| 100M 300ms 1% | Bbr | 300.0 | 621.1 | 652.9 | 444/450 | 13.6% | 0 | 672 |
+| 100M 300ms 1% | Copa | 300.0 | 627.4 | 657.7 | 444/450 | 13.8% | 0 | 653 |
+| 10M 100ms 0% queue x4 | NewReno | 470.7 | 492.0 | 492.8 | 441/450 | 96.9% | 337 | 0 |
+| 10M 100ms 0% queue x4 | Cubic | 432.2 | 501.1 | 501.3 | 442/450 | 96.9% | 468 | 0 |
+| 10M 100ms 0% queue x4 | Bbr | 245.0 | 358.2 | 358.9 | 446/450 | 96.2% | 36 | 0 |
+| 10M 100ms 0% queue x4 | Copa | 106.4 | 114.0 | 115.4 | 448/450 | 96.9% | 0 | 0 |
+| 10M 100ms 1% bursts | NewReno | 118.1 | 458.2 | 990.5 | 448/450 | 15.6% | 0 | 103 |
+| 10M 100ms 1% bursts | Cubic | 112.2 | 254.6 | 263.6 | 448/450 | 20.2% | 0 | 132 |
+| 10M 100ms 1% bursts | Bbr | 200.9 | 604.0 | 605.9 | 447/450 | 94.6% | 10167 | 472 |
+| 10M 100ms 1% bursts | Copa | 106.1 | 214.7 | 234.1 | 448/450 | 95.5% | 0 | 498 |
+| 100M 1ms 0% | NewReno | 1.7 | 2.4 | 3.4 | 450/450 | 94.6% | 2842 | 0 |
+| 100M 1ms 0% | Cubic | 1.8 | 2.1 | 2.1 | 450/450 | 97.3% | 1163 | 0 |
+| 100M 1ms 0% | Bbr | 2.1 | 4.1 | 4.1 | 450/450 | 96.9% | 119849 | 0 |
+| 100M 1ms 0% | Copa | 1.6 | 2.1 | 3.7 | 450/450 | 96.5% | 1555 | 0 |
+
+| Law | p99 of the best (geomean) | Carried of the best (geomean) | Stalled in |
+|---|---|---|---|
+| NewReno | 1.276 | 0.402 | 10M 300ms 1%; 100M 20ms 1%; 100M 100ms 0.1%; 100M 100ms 1%; 100M 300ms 1% |
+| Cubic | 1.193 | 0.455 | the same five |
+| Bbr | 1.998 | 0.965 | nowhere |
+| Copa | 1.130 | 0.987 | nowhere |
+
+Copa is the law of focal's connections (`focal_wire::congestion`, nine tests of the law
+by itself). Classes of traffic are in 27 §7 with their numbers.
+
+**slates, examined again** (its transport, its consensus and fleet, its records of the
+last ten days): what is taken is Copa and the classes; what focal already has is a
+collector that reads a reply in hand before it judges the wait (`gather`), and test
+ports claimed across processes; what is open is in 27 §3.1 P4, where slates seats a
+council by incumbency and liveness and focal retires a voter on the first verdict.
+
+**Gates** on the final tree (macOS arm64): `cargo fmt --all --check`,
+`check-contracts.py`, clippy with `-D warnings`, `check-production.sh`, `cargo deny`,
+`check-model.sh`, and the workspace's tests with four threads: 146 suites, 2,843
+tests, none failed, 3 ignored. CI on `bd5e54b` passed on ubuntu-24.04, macos-15 and
+Windows, with the model and the dependency jobs.
+
+**Open, and next.** One stream carries a megabyte in a round trip: transfers go by as
+many streams as the path holds in flight, which custody replication does not do yet,
+and it asks its copies one after another. A death re-plans a placement on its first
+verdict. A heal and a move toward the home regions are one ordering.

@@ -2526,3 +2526,18 @@ mod admission {
         task.await.unwrap().unwrap();
     }
 }
+
+#[test]
+fn every_operation_has_its_class_and_control_goes_first() {
+    assert!(TrafficClass::Control.priority() > TrafficClass::Exchange.priority());
+    assert!(TrafficClass::Exchange.priority() > TrafficClass::Bulk.priority());
+    assert!(TrafficClass::Control > TrafficClass::Exchange);
+    assert!(TrafficClass::Exchange > TrafficClass::Bulk);
+    let raft = Operation::Raft {
+        group: [1; 16],
+        message: vec![1],
+    };
+    assert_eq!(raft.class(), TrafficClass::Control);
+    assert_eq!(Operation::Summary.class(), TrafficClass::Exchange);
+    assert_eq!(download_request(1).operation.class(), TrafficClass::Bulk);
+}

@@ -55,14 +55,14 @@ are not driven in production.
 |---|---|---|---|
 | P1 | Progress-aware fan-out: `broadcast`, `DispatchWait`, `CommitBudget`, `Stragglers` | A round stops when every peer has reported or when no reply arrives within a stall window, and extends while a quorum is still filling. Late replies are folded into the operation they belong to. focal's drivers bound sends per peer but still decide by fixed deadlines. | `focal_timing::{RoundBudget, RoundWait}`, `focal_wire::gather`. Two differences from slates, both from what focal's transport is. The budget is derived from what exchanges with the round's peers were measured to take, the peer's work included, because a focal request waits on a commit at its peer and not on the path alone. And an exchange outstanding when its round ends is dropped, not kept to fold later: a Raft reply in focal is an inbound message of its own, and a signature past the majority has no use. The pool counts a dropped exchange as given up on and doubles what that peer is expected to take until it answers one (RFC 9002 §6.2), so an estimate that ended a round too early corrects itself |
 | P2 | Derived timing: `PathRtt` (RFC 9002 smoothing), `ElectionTiming::derive`, `round_budget` | focal's election and heartbeat ticks are constants. A WAN group whose round trip exceeds the fixed budget never elects. slates derives the election base from the slowest voter's tail. | `focal_timing::{PathRtt, TickPace}`; the pool measures each path by the liveness probes the peer answers, as the median of the latest sixteen and their median absolute deviation, so that an answer that came late does not set a group's election timeout; both owners tick at the derived period, and a leader beats at the configured cadence whatever its period. As in slates, what stretches is the election timeout and never the heartbeat |
-| P3 | Period-counted timers | A starved node waits longer instead of campaigning. focal's owner ticks on wall time. | control and replica owners |
+| P3 | Period-counted timers | A starved node waits longer instead of campaigning. | The control and the replica owner tick once when their period has passed and begin the next from then: a period that was missed is not made up for, and the core counts ticks, so an owner that was starved for ten periods has waited eleven |
 | P4 | Voter reconciliation rules: retire only a death held continuously for one election window; sitting live voters keep their seats | focal's placement controller heals on liveness; the hold window and seat stability are not stated rules. | placement controller |
 | P5 | Admission by certificate: a pending-handshake reservation separate from authenticated slots, two slots per identity, replace on redial | focal bounds connections in total. One identity can take them. | `focal_wire::Admission`, in the node's listener. focal's identities are principals, and a participant may run several clients: a node holds 4 connections and any other identity 16. A connection past the bound replaces the one of that identity that was idle longest. Refusing the newcomer, which was the first rule here, made a participant whose clients exit without closing wait out the idle timeout of what they left behind |
 | P6 | Link validity inside a wait | A pending request should end when its peer's identity is replaced or retired, not at its deadline. | `focal-wire` pool: a retired route closes its connection under the lock a dial stores it under, so no order of the two leaves one open |
 | P7 | Simulated network: bottleneck with drop-tail queue, Gilbert-Elliott loss, MTU, NAT rebinding | focal-sim's network delivered at delays the test chose, with partitions and no path model. Election, fast-track and transfer claims need one. | `focal_sim::path` (`Fabric`, `Path`, `Loss`, `Link`, `Nat`), every table bounded (`FabricLimits`) |
 | P8 | Per-progress test deadlines (`poll_until` charged to the slowest node's progress counter) | focal's fleet tests use wall-clock deadlines and fail under load; this recurred four times in this work. | `focal_timing::ProgressDeadline`; owners count their periods (`periods()`, `focal_root_periods_total`) |
 | P9 | The bug corpus as regression cases (section 3.3) | Each is a class, not an instance. | tests |
-| P10 | Copa congestion control, as a candidate | slates measured ping p99 104 ms under bulk load on a 100 ms path, against 185 to 199 ms for NewReno, CUBIC and BBR. One simulated result. quinn accepts a custom controller. | `focal-wire`, behind a measurement |
+| P10 | Copa congestion control, as a candidate | slates measured ping p99 104 ms under bulk load on a 100 ms path, against 185 to 199 ms for NewReno, CUBIC and BBR. One simulated result. quinn accepts a custom controller. | `focal_wire::congestion`, chosen by measurement (section 7); with it slates' classes of traffic (`focal_wire::TrafficClass`) |
 
 ### 3.2 Leave
 
@@ -84,8 +84,8 @@ are not driven in production.
 | Fixed probe deadline kills a starved peer | Fixed: RTT-bounded probe timeout, unconfirmed patience |
 | Abandoned request poisons the next | Not applicable: quinn streams |
 | Voter set never shrinks | Fixed: drain, remove, contact retirement |
-| Hard consensus budget under load | Open: P1 |
-| Round expires inside the WAN round trip | Open: P2 |
+| Hard consensus budget under load | Fixed for what a group decides by (P1, `focal_wire::gather`); the transfers of section 6 stage C are still asked one peer after another |
+| Round expires inside the WAN round trip | Fixed: P2, the derived pace and the derived round budget |
 | Council retires a suspected voter | Open: P4 |
 | Wall-clock test deadlines | Converted: the fleet, placement, service, split, route, credential and liveness suites of `focal-node`, and every binary suite (`tests/support/deadline.rs`, `tests/support/fleet.rs`) |
 | A leader removes itself and keeps leading | Fixed: refused by the shell (`LeaderLeaving`), removal and demotion alike; the controller and `cluster nodes remove` transfer first; and a leader that applies its own leaving all the same, proposed by the one that led before it, hands the group over and follows (section 4.5) |
@@ -397,5 +397,83 @@ quorum and never vote, tested as slates tests it.
 | F | MLRaft leader balancer | leader spread converges; no transfer storms |
 | | *State 2026-09-28:* built (section 5): leadership returns to the preferred leader and to its zone, preferred leaders are spread when sessions are placed and moved when the spread drifts. Three real processes whose sessions were all led by their founder spread them one each and every log is led where its placement prefers ([09](09-implementation-status.md)). | |
 | G | P10 congestion measurement; decide | bake-off numbers recorded |
+| | *State 2026-09-28:* measured and decided (section 7): Copa is the law of focal's connections, a stream is given a megabyte ahead of its reader, and what a group needs goes before what is asked, and that before content. | |
 
 Each stage closes on the workspace gates and on CI for Linux, macOS and Windows.
+
+## 7. The transport as measured (stage G)
+
+focal's connections are quinn's. What is set on them is decided by measurement
+(`crates/focal-wire/tests/congestion.rs`): two real endpoints, TLS and loss recovery
+and pacing included, exchange over `focal_sim::path` in virtual time, through a
+bottleneck of a stated rate with a drop-tail queue of one bandwidth-delay product in
+each direction. One connection carries a transfer that sends as fast as it may and,
+every 50 ms, an exchange of 200 bytes each way. A run is its seed.
+
+**The rule, fixed before any run.** A law stalls in a scenario where its transfer
+carries less than a tenth of what the best law carries there, where fewer than nine in
+ten of its exchanges are answered, or where its connection closes. A law that stalls
+anywhere is not chosen. Of the others the one whose exchanges' 99th percentile, as a
+multiple of the best law's in each scenario, has the least geometric mean is preferred.
+quinn's default is replaced only by a law preferred by a tenth at least whose transfer
+carries nine tenths at least of what the default's carries, or where the default stalls.
+
+**A connection that one lost datagram closed.** The first grid closed connections
+under every law at 100 Mbit/s. quinn keeps what arrives out of order as the spans it
+arrived in, and closes a connection whose stream holds more than 1,024 of them once it
+has merged what it merges (`too many gaps in stream buffer`). Two causes, both closed:
+
+| Cause | Where | Closed by |
+|---|---|---|
+| quinn-proto 0.11.17 never merged a span that filled its datagram, which is every span of a transfer. 2,048 of them behind one missing datagram closed the connection: any path that carries 2.4 MB in the time a loss takes to repair | quinn | quinn-proto 0.11.18, which merges them |
+| A sender that overshoots in its first round trips loses every second datagram to the bottleneck's queue. With the 10 MiB of a frame as a stream's window there were more than 1,024 holes in one window, which no merging removes | focal's windows | `STREAM_WINDOW_CEILING`: a stream is given a megabyte ahead of what its reader has taken. A megabyte holds no more than 1,024 spans that are not merged, however it arrived |
+
+A frame longer than the window is read as it arrives, so the window bounds what is in
+flight and not what is sent. What it costs is stated by the grid: one stream carries a
+megabyte in a round trip at most, 73% of 100 Mbit/s at 100 ms and 25% at 300 ms.
+Transfers that need more go by several streams, which the connection's window of
+eighteen megabytes allows; custody replication does not yet (section 6, stage C).
+
+**The laws.** Twenty-seven paths of rate, round trip and loss, and three more (a deep
+queue, bursts of loss, a link within a building), thirty virtual seconds each:
+
+| Law | p99 of the best (geometric mean) | Carried of the best (geometric mean) | Stalled |
+|---|---|---|---|
+| NewReno | 1.276 | 0.402 | on 5 paths |
+| CUBIC, quinn's default | 1.193 | 0.455 | on 5 paths |
+| BBR | 1.998 | 0.965 | nowhere |
+| Copa (δ = 1/2) | 1.130 | 0.987 | nowhere |
+
+NewReno and CUBIC take a loss for congestion. With one datagram in a thousand lost
+they carry 93 to 96% of 10 Mbit/s at 20 ms, 45 to 50% at 100 ms, and 2 to 6% of
+100 Mbit/s at 300 ms; with one in a hundred, 50 to 54% at best and under 1% at worst.
+BBR carries nearly what Copa carries and fills the queue to do it: at 10 Mbit/s and
+100 ms its exchanges take 604 ms at the 99th percentile, six round trips, where
+Copa's take 114. Copa is chosen. It
+is slates' law (`crates/transport/src/congestion/copa.rs`) behind quinn's interface;
+what quinn does not let a law decide is the pacing, which stays quinn's. Where Copa is
+the worse: on a path of 1 Mbit/s and 20 ms its exchanges take 131 ms at the 99th
+percentile where CUBIC's take 78, since it keeps about two datagrams queued, each 10 ms
+at that rate; and at 10 Mbit/s and 300 ms without loss it carries 69%.
+
+**Classes** (`focal_wire::TrafficClass`, `Operation::class`). A stream of a higher
+priority sends all it has before one of a lower sends anything. Consensus, probes and
+the fleet's control go first, then what participants ask, then content. Before, a
+consensus message went before everything else and everything else took turns:
+
+| Path | Beside one transfer, p99 | Beside eight, in turn | Beside eight, by class |
+|---|---|---|---|
+| 1 Mbit/s, 100 ms | 190.5 ms | 260.3 ms | 170.9 ms |
+| 10 Mbit/s, 20 ms | 27.7 ms | 33.7 ms | 26.5 ms |
+| 100 Mbit/s, 1 ms | 2.1 ms | 2.7 ms | 1.9 ms |
+
+A class orders what a sender has not sent; what is on the path already is kept short
+by the law.
+
+**What slates has beyond this, and why it is not taken.** Its measured gains of the
+last week (loopback p90 from 1,311 to 30 µs, a directory listing from 782 to 6.5 ms)
+were defects of its own executor and transport, which tokio and quinn do not have.
+Credit that rides acknowledgements, bounded probe copies and its path MTU search are
+parts of its own transport; quinn has delayed acknowledgements, MTU discovery,
+segmentation offload, key update and migration, which slates lacks. Its consensus core
+has not changed since what focal took from it.
