@@ -157,7 +157,8 @@ impl Cluster {
         Ok(())
     }
     fn corrupt(&self, message: &mut Message) {
-        if self.corrupt_to != Some(message.to) || message.get_msg_type() != MessageType::MsgAppend {
+        if self.corrupt_to != Some(message.to) || message.msg_type != MessageType::MsgAppend as i32
+        {
             return;
         }
         for entry in message.mut_entries().iter_mut() {
@@ -217,7 +218,7 @@ impl Cluster {
                     continue;
                 }
                 self.corrupt(&mut message);
-                let snapshot = message.get_msg_type() == MessageType::MsgSnapshot;
+                let snapshot = message.msg_type == MessageType::MsgSnapshot as i32;
                 let retry_ok = self.retry_ok.contains(&to);
                 match self.node(to).step(message) {
                     Ok(()) => {}

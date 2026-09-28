@@ -1,10 +1,9 @@
 use super::{ConsensusError, NodeConfig};
-use crate::PbMessageExt;
 use crate::memory::{entry_bytes, reserve, snapshot_bytes};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
-use raft::{
-    GetEntriesContext, RaftState, Storage, StorageError,
-    eraftpb::{ConfState, Entry, HardState, Snapshot},
+use focal_raft::{
+    InitialState, Storage, StorageError,
+    proto::{self, ConfState, Entry, HardState, Snapshot},
 };
 use std::collections::VecDeque;
 
@@ -69,18 +68,18 @@ impl RamLog {
     /// The index of the stored snapshot the log is compacted behind; zero
     /// while the log is complete from its first entry.
     pub fn snapshot_index(&self) -> u64 {
-        self.snapshot.get_metadata().index
+        proto::snapshot_index(&self.snapshot)
     }
     pub fn validate(&self) -> Result<(), ConsensusError> {
         super::validate_conf_state(&self.conf_state)?;
         if self.hard_state.term == u64::MAX
             || self.last_index()? == u64::MAX
-            || self.snapshot.get_metadata().term == u64::MAX
+            || proto::snapshot_term(&self.snapshot) == u64::MAX
         {
             return Err(ConsensusError::Corruption("exhausted Raft term or index"));
         }
         if self.hard_state.commit > self.last_index()?
-            || self.hard_state.commit < self.snapshot.get_metadata().index
+            || self.hard_state.commit < proto::snapshot_index(&self.snapshot)
         {
             return Err(ConsensusError::Corruption(
                 "commit outside retained snapshot/log",
@@ -136,10 +135,18 @@ impl RamLog {
         &self,
         snapshot: &Snapshot,
     ) -> Result<PreparedSnapshot, ConsensusError> {
-        super::validate_conf_state(snapshot.get_metadata().get_conf_state())?;
-        if snapshot.get_metadata().index < self.snapshot.get_metadata().index {
+        let conf = snapshot
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.conf_state.as_ref())
+            .ok_or(ConsensusError::Corruption(
+                "snapshot without its configuration",
+            ))?;
+        super::validate_conf_state(conf)?;
+        if proto::snapshot_index(snapshot) < proto::snapshot_index(&self.snapshot) {
             return Err(ConsensusError::Corruption("snapshot regression"));
         }
+        let conf = conf.clone();
         let allocation = reserve(
             &self.budget,
             BudgetKind::Payload,
@@ -148,7 +155,7 @@ impl RamLog {
         )?;
         Ok(PreparedSnapshot {
             snapshot: snapshot.clone(),
-            conf: snapshot.get_metadata().get_conf_state().clone(),
+            conf,
             allocation,
         })
     }
@@ -162,8 +169,8 @@ impl RamLog {
             .transpose()?;
         let snapshot_index = snapshot
             .as_ref()
-            .map_or(self.snapshot.get_metadata().index, |s| {
-                s.snapshot.get_metadata().index
+            .map_or(proto::snapshot_index(&self.snapshot), |s| {
+                proto::snapshot_index(&s.snapshot)
             });
         let mut last = if snapshot.is_some() {
             snapshot_index
@@ -222,7 +229,7 @@ impl RamLog {
             self.hard_state.commit = self
                 .hard_state
                 .commit
-                .max(snapshot.snapshot.get_metadata().index);
+                .max(proto::snapshot_index(&snapshot.snapshot));
             self.snapshot = snapshot.snapshot;
             self.snapshot_charge = Some(snapshot.allocation);
         }
@@ -260,8 +267,8 @@ impl RamLog {
         self.publish(update)
     }
     pub fn compact_prepared(&mut self, prepared: PreparedSnapshot) -> Result<(), ConsensusError> {
-        let index = prepared.snapshot.get_metadata().index;
-        if self.term(index)? != prepared.snapshot.get_metadata().term {
+        let index = proto::snapshot_index(&prepared.snapshot);
+        if self.term(index)? != proto::snapshot_term(&prepared.snapshot) {
             return Err(ConsensusError::Corruption("checkpoint term mismatch"));
         }
         while self
@@ -286,87 +293,89 @@ impl RamLog {
     }
 }
 impl Storage for RamLog {
-    fn initial_state(&self) -> raft::Result<RaftState> {
-        Ok(RaftState {
+    fn initial_state(&self) -> Result<InitialState, StorageError> {
+        Ok(InitialState {
             hard_state: self.hard_state.clone(),
-            conf_state: self.conf_state.clone(),
+            configuration: self.conf_state.clone(),
         })
     }
     fn entries(
         &self,
         low: u64,
         high: u64,
-        max_size: impl Into<Option<u64>>,
-        _context: GetEntriesContext,
-    ) -> raft::Result<Vec<Entry>> {
+        max_bytes: u64,
+        into: &mut Vec<Entry>,
+    ) -> Result<(), StorageError> {
         if low < self.first_index()? {
-            return Err(StorageError::Compacted.into());
+            return Err(StorageError::Compacted);
         }
         if low > high || high > self.last_index()?.saturating_add(1) {
-            return Err(StorageError::Unavailable.into());
+            return Err(StorageError::Unavailable);
         }
-        let limit = max_size.into().unwrap_or(u64::MAX);
         let mut size = 0u64;
         let want = usize::try_from(high.checked_sub(low).ok_or(StorageError::Unavailable)?)
-            .map_err(|_| raft::Error::Store(StorageError::Unavailable))?;
-        let mut result = Vec::new();
+            .map_err(|_| StorageError::Unavailable)?;
         // The upper bound (high - low) is known; reserve it so replication and
-        // read fetches never reallocate the entry spine (max_size only trims).
-        result
-            .try_reserve_exact(want)
-            .map_err(|_| raft::Error::Store(StorageError::Unavailable))?;
+        // read fetches never reallocate the entry spine (max_bytes only trims).
+        into.try_reserve_exact(want)
+            .map_err(|_| StorageError::Unavailable)?;
         let offset = usize::try_from(
             low.checked_sub(self.first_index()?)
                 .ok_or(StorageError::Unavailable)?,
         )
-        .map_err(|_| raft::Error::Store(StorageError::Unavailable))?;
+        .map_err(|_| StorageError::Unavailable)?;
+        let mut taken = 0usize;
         for entry in self.entries.iter().skip(offset).take(want) {
-            let bytes = entry.compute_size() as u64;
-            if !result.is_empty() && size.saturating_add(bytes) > limit {
+            let bytes = proto::encoded_bytes(entry);
+            if taken > 0 && size.saturating_add(bytes) > max_bytes {
                 break;
             }
             size = size.saturating_add(bytes);
-            result.push(entry.clone());
+            into.push(entry.clone());
+            taken = taken.saturating_add(1);
         }
-        Ok(result)
+        Ok(())
     }
-    fn term(&self, index: u64) -> raft::Result<u64> {
-        let snapshot = self.snapshot.get_metadata();
-        if index == snapshot.index {
-            return Ok(snapshot.term);
+    fn term(&self, index: u64) -> Result<u64, StorageError> {
+        let (snapshot_index, snapshot_term) = (
+            proto::snapshot_index(&self.snapshot),
+            proto::snapshot_term(&self.snapshot),
+        );
+        if index == snapshot_index {
+            return Ok(snapshot_term);
         }
-        if index < snapshot.index {
-            return Err(StorageError::Compacted.into());
+        if index < snapshot_index {
+            return Err(StorageError::Compacted);
         }
         let offset = usize::try_from(
             index
-                .checked_sub(snapshot.index)
+                .checked_sub(snapshot_index)
                 .and_then(|value| value.checked_sub(1))
                 .ok_or(StorageError::Unavailable)?,
         )
-        .map_err(|_| raft::Error::Store(StorageError::Unavailable))?;
+        .map_err(|_| StorageError::Unavailable)?;
         self.entries
             .get(offset)
             .filter(|entry| entry.index == index)
             .map(|entry| entry.term)
-            .ok_or(StorageError::Unavailable.into())
+            .ok_or(StorageError::Unavailable)
     }
-    fn first_index(&self) -> raft::Result<u64> {
-        self.snapshot
-            .get_metadata()
-            .index
+    fn first_index(&self) -> Result<u64, StorageError> {
+        proto::snapshot_index(&self.snapshot)
             .checked_add(1)
-            .ok_or(StorageError::Unavailable.into())
+            .ok_or(StorageError::Unavailable)
     }
-    fn last_index(&self) -> raft::Result<u64> {
+    fn last_index(&self) -> Result<u64, StorageError> {
         Ok(self
             .entries
             .back()
-            .map_or(self.snapshot.get_metadata().index, |entry| entry.index))
+            .map_or(proto::snapshot_index(&self.snapshot), |entry| entry.index))
     }
-    fn snapshot(&self, request_index: u64, _to: u64) -> raft::Result<Snapshot> {
-        if self.snapshot.is_empty() || self.snapshot.get_metadata().index < request_index {
-            return Err(StorageError::SnapshotTemporarilyUnavailable.into());
+    fn snapshot(&self, request_index: u64, _to: u64) -> Result<Snapshot, StorageError> {
+        if proto::snapshot_is_empty(&self.snapshot)
+            || proto::snapshot_index(&self.snapshot) < request_index
+        {
+            return Err(StorageError::SnapshotTemporarilyUnavailable);
         }
         Ok(self.snapshot.clone())
     }

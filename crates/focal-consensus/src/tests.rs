@@ -41,7 +41,7 @@ fn original_protobuf_bytes_decode_and_reencode_through_prost() {
     let message = decode_message(PROTOBUF_MESSAGE).unwrap();
     assert_eq!(message.to, 2);
     assert_eq!(message.from, 1);
-    assert_eq!(message.get_msg_type(), MessageType::MsgAppend);
+    assert_eq!(message.msg_type, MessageType::MsgAppend as i32);
     assert_eq!(message.entries, vec![entry]);
     assert_eq!(
         decode_message(&message.write_to_bytes().unwrap()).unwrap(),
@@ -179,10 +179,13 @@ fn delayed_snapshot_feedback_cannot_release_another_term_peer_or_prefix() {
     let snapshot = events
         .messages
         .iter()
-        .find(|m| m.get_msg_type() == MessageType::MsgSnapshot)
+        .find(|m| m.msg_type == MessageType::MsgSnapshot as i32)
         .unwrap();
     assert_eq!(snapshot.get_snapshot().get_metadata().index, index);
-    assert_eq!(node.raw.raft.prs().get(2).unwrap().pending_snapshot, index);
+    assert_eq!(
+        node.raw.raft.tracker().get(2).unwrap().pending_snapshot,
+        index
+    );
     for (peer, expected_term, expected_index) in [
         (3, term, index),
         (2, term + 1, index),
@@ -191,14 +194,17 @@ fn delayed_snapshot_feedback_cannot_release_another_term_peer_or_prefix() {
     ] {
         node.report_snapshot_at(peer, expected_term, expected_index, SnapshotStatus::Failure)
             .unwrap();
-        assert_eq!(node.raw.raft.prs().get(2).unwrap().pending_snapshot, index);
+        assert_eq!(
+            node.raw.raft.tracker().get(2).unwrap().pending_snapshot,
+            index
+        );
     }
     node.report_snapshot_at(2, term, index, SnapshotStatus::Failure)
         .unwrap();
-    assert_eq!(node.raw.raft.prs().get(2).unwrap().pending_snapshot, 0);
+    assert_eq!(node.raw.raft.tracker().get(2).unwrap().pending_snapshot, 0);
     assert_eq!(
-        node.raw.raft.prs().get(2).unwrap().state,
-        raft::ProgressState::Probe
+        node.raw.raft.tracker().get(2).unwrap().state,
+        focal_raft::progress::ProgressState::Probe
     );
 }
 pub(crate) struct Cluster {
@@ -240,7 +246,7 @@ impl Cluster {
             }
             for message in messages {
                 if isolated != Some(message.from) && isolated != Some(message.to) {
-                    let snapshot = message.get_msg_type() == MessageType::MsgSnapshot;
+                    let snapshot = message.msg_type == MessageType::MsgSnapshot as i32;
                     let from = message.from;
                     let to = message.to;
                     self.nodes[(to - 1) as usize].step(message).unwrap();
@@ -272,7 +278,10 @@ fn three_voters_partition_leader_change_and_restart() {
     assert_eq!(cluster.applied[0].len(), 1);
     for _ in 0..30 {
         for (i, node) in cluster.nodes.iter_mut().enumerate() {
-            node.raw.raft.set_randomized_election_timeout(10 + i * 3);
+            node.raw
+                .raft
+                .set_randomized_election_timeout(10 + i * 3)
+                .unwrap();
             node.tick().unwrap();
         }
         cluster.pump(Some(1));
@@ -556,6 +565,47 @@ fn isolated_leader_cannot_complete_a_quorum_read_barrier() {
 }
 
 #[test]
+fn a_failure_of_the_core_stops_only_this_replica_until_disk_recovery() {
+    for unwinds in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = DurableNode::open(config(1), dir.path()).unwrap();
+        node.campaign().unwrap();
+        node.drain().unwrap();
+        node.propose(b"durable-before-the-failure".to_vec())
+            .unwrap();
+        let committed = node.drain().unwrap().committed;
+        let result = node.guarded(|replica| {
+            if unwinds {
+                // Nothing the core does unwinds; what it depends on is
+                // fenced all the same.
+                std::panic::resume_unwind(Box::new("a dependency unwound"));
+            }
+            // The core says its state no longer adds up: what is applied
+            // cannot pass what is committed.
+            replica.raw.advance_apply_to(u64::MAX)?;
+            Ok(())
+        });
+        if unwinds {
+            assert!(matches!(result, Err(ConsensusError::DependencyFailure)));
+        } else {
+            assert!(matches!(
+                result,
+                Err(ConsensusError::Raft(focal_raft::Error::Invariant(_)))
+            ));
+        }
+        assert!(node.failed());
+        assert!(matches!(
+            node.propose(b"must-not-append".to_vec()),
+            Err(ConsensusError::Failed)
+        ));
+        assert!(matches!(node.drain(), Err(ConsensusError::Failed)));
+        drop(node);
+        let mut recovered = DurableNode::open(config(1), dir.path()).unwrap();
+        assert_eq!(recovered.drain().unwrap().committed, committed);
+    }
+}
+
+#[test]
 fn upstream_invariant_failure_stops_only_this_replica_until_disk_recovery() {
     let dir = tempfile::tempdir().unwrap();
     let mut node = DurableNode::open(config(1), dir.path()).unwrap();
@@ -564,10 +614,8 @@ fn upstream_invariant_failure_stops_only_this_replica_until_disk_recovery() {
     node.propose(b"durable-before-dependency-failure".to_vec())
         .unwrap();
     let committed = node.drain().unwrap().committed;
-    let result = node.guarded(|replica| {
-        // Invoke a real upstream invariant failure: commit cannot pass last_index.
-        replica.raw.raft.raft_log.commit_to(u64::MAX);
-        Ok(())
+    let result = node.guarded(|_| -> Result<(), ConsensusError> {
+        std::panic::resume_unwind(Box::new("a dependency unwound"))
     });
     assert!(matches!(result, Err(ConsensusError::DependencyFailure)));
     assert!(matches!(

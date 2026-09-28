@@ -2,7 +2,7 @@
 //! forbids mutation before advance; other groups remain independently runnable.
 use super::*;
 use focal_log::WalAppend;
-use raft::{LightReady, Ready};
+use focal_raft::{LightReady, Ready, proto};
 use storage::PreparedUpdate;
 
 pub(super) struct PendingDrain {
@@ -75,13 +75,13 @@ impl DurableNode {
             let membership_pending = self
                 .raw
                 .raft
-                .raft_log
-                .unstable
-                .entries
+                .log()
+                .unstable()
+                .entries()
                 .iter()
                 .rev()
                 .take_while(|entry| entry.index > self.delivered_index)
-                .any(|entry| entry.get_entry_type() != EntryType::EntryNormal)
+                .any(proto::changes_configuration)
                 || self
                     .raw
                     .store()
@@ -89,7 +89,7 @@ impl DurableNode {
                     .iter()
                     .rev()
                     .take_while(|entry| entry.index > self.delivered_index)
-                    .any(|entry| entry.get_entry_type() != EntryType::EntryNormal);
+                    .any(proto::changes_configuration);
             let bytes = memory::staging_bytes(
                 &self.raw,
                 &self.config,
@@ -158,20 +158,20 @@ impl DurableNode {
                         self.delivered_index = pending.delivered;
                         return Ok(Some(pending.events));
                     }
-                    let ready = self.raw.ready();
+                    let ready = self.raw.ready()?;
                     let mut records = Vec::new();
                     // The record count is known: entries plus an optional snapshot
                     // and hard state. Reserve once so the ready cycle never grows.
                     records
                         .try_reserve_exact(ready.entries().len().saturating_add(2))
                         .map_err(|_| ConsensusError::Capacity)?;
-                    if !ready.snapshot().is_empty() {
+                    if let Some(snapshot) = ready.snapshot() {
                         records.push(proto_record(
                             self.config.group_id,
                             RecordKind::Snapshot,
-                            ready.snapshot().get_metadata().index,
-                            ready.snapshot().get_metadata().term,
-                            ready.snapshot(),
+                            proto::snapshot_index(snapshot),
+                            proto::snapshot_term(snapshot),
+                            snapshot,
                         )?);
                     }
                     for entry in ready.entries() {
@@ -183,7 +183,7 @@ impl DurableNode {
                             entry,
                         )?);
                     }
-                    if let Some(hs) = ready.hs() {
+                    if let Some(hs) = ready.hard_state() {
                         records.push(proto_record(
                             self.config.group_id,
                             RecordKind::HardState,
@@ -192,9 +192,11 @@ impl DurableNode {
                             hs,
                         )?);
                     }
-                    let snapshot = (!ready.snapshot().is_empty()).then_some(ready.snapshot());
                     self.wal.validate_append(&records)?;
-                    let prepared = self.raw.mut_store().prepare(ready.entries(), snapshot)?;
+                    let prepared = self
+                        .raw
+                        .store_mut()
+                        .prepare(ready.entries(), ready.snapshot())?;
                     pending.phase = Phase::Ready(Box::new(ReadyPhase {
                         ready,
                         prepared,
@@ -247,15 +249,16 @@ impl DurableNode {
                         prepared,
                         ..
                     } = *work;
-                    self.raw.mut_store().publish(prepared)?;
-                    if !ready.snapshot().is_empty() {
-                        pending.delivered = ready.snapshot().get_metadata().index;
+                    self.raw.store_mut().publish(prepared)?;
+                    if let Some(snapshot) = ready.snapshot() {
+                        pending.delivered = proto::snapshot_index(snapshot);
                         pending.events.committed.clear();
                         pending.events.membership.clear();
-                        pending.events.snapshot = Some(snapshot_event(ready.snapshot()));
+                        pending.events.snapshot = Some(snapshot_event(snapshot));
                     }
-                    if let Some(hs) = ready.hs() {
-                        self.raw.mut_store().hard_state = hs.clone();
+                    if let Some(hs) = ready.hard_state() {
+                        let hs = hs.clone();
+                        self.raw.store_mut().hard_state = hs;
                     }
                     pending.events.messages.extend(ready.take_messages());
                     pending
@@ -271,7 +274,7 @@ impl DurableNode {
                                 .into_iter()
                                 .map(|read| ReadBarrier {
                                     index: read.index,
-                                    context: read.request_ctx.to_vec(),
+                                    context: read.request_ctx,
                                 }),
                         );
                     self.apply_entries(
@@ -279,7 +282,7 @@ impl DurableNode {
                         &mut pending.events,
                         &mut pending.delivered,
                     )?;
-                    let light = self.raw.advance_append(ready);
+                    let light = self.raw.advance_append(ready)?;
                     if let Some(commit) = light.commit_index() {
                         let mut hard_state = self.raw.store().hard_state.clone();
                         hard_state.commit = commit;
@@ -341,7 +344,7 @@ impl DurableNode {
                             result?;
                         }
                     }
-                    self.raw.mut_store().hard_state = work.hard_state;
+                    self.raw.store_mut().hard_state = work.hard_state;
                     self.finish_light(work.light, &mut pending.events, &mut pending.delivered)?;
                     pending.phase = Phase::Start;
                 }
@@ -356,7 +359,7 @@ impl DurableNode {
     ) -> Result<(), ConsensusError> {
         events.messages.extend(light.take_messages());
         self.apply_entries(light.take_committed_entries(), events, delivered)?;
-        self.raw.advance_apply_to(*delivered);
+        self.raw.advance_apply_to(*delivered)?;
         Ok(())
     }
 }

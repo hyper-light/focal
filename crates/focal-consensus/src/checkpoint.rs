@@ -241,7 +241,7 @@ impl DurableNode {
         } = *pending;
         drop(records);
         drop(receipt);
-        self.raw.mut_store().compact_prepared(prepared)?;
+        self.raw.store_mut().compact_prepared(prepared)?;
         _allocation
             .shrink_to(memory::raw_bytes(&self.raw)?)
             .map_err(|_| ConsensusError::Capacity)?;

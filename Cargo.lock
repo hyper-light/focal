@@ -479,12 +479,12 @@ version = "0.1.0"
 dependencies = [
  "focal-log",
  "focal-memory",
+ "focal-raft",
  "focal-sim",
  "focal-timing",
+ "getrandom 0.3.4",
  "postcard",
- "raft",
  "serde",
- "slog",
  "tempfile",
  "thiserror 2.0.20",
 ]
@@ -746,6 +746,16 @@ dependencies = [
  "tempfile",
  "tokio",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "focal-raft"
+version = "0.1.0"
+dependencies = [
+ "raft",
+ "raft-proto",
+ "slog",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

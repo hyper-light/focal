@@ -18,6 +18,9 @@ postcard = { version = "1.1", features = ["alloc", "use-std"] }
 # Upstream PR #578: native Prost compatibility + maintained rustc-hash.
 # Exact commit provenance and validation: docs/dependencies/raft-upstream.md.
 raft = { version = "0.7.0", git = "https://github.com/tikv/raft-rs", rev = "8e4cef172421bf77b2ae1c26628a9531b0be41f0", default-features = false, features = ["prost-codec"] }
+# The message and entry types alone, for focal's own core (27 §4.2): the same
+# revision as `raft`, so both speak one wire and one log format.
+raft-proto = { version = "0.7.0", git = "https://github.com/tikv/raft-rs", rev = "8e4cef172421bf77b2ae1c26628a9531b0be41f0", default-features = false, features = ["prost-codec"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_saphyr = { package = "serde-saphyr", version = "1.2", default-features = false, features = ["deserialize"] }
@@ -44,6 +47,7 @@ unreachable = "deny"
 indexing_slicing = "deny"
 arithmetic_side_effects = "deny"
 disallowed_macros = "deny"
+disallowed_methods = "deny"
 
 [profile.release]
 lto = "thin"

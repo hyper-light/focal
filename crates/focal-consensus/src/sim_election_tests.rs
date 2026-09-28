@@ -2,13 +2,13 @@
 //! logs, their messages carried by `focal_sim::path` at LAN, regional and
 //! geographic profiles, in virtual time. The tick period is the one derived
 //! from the round trips each replica measured (27 §3.1 P2).
+use crate::Message;
 use crate::{
     DurableNode, StateRole,
     tests::config,
     timing::{PathRtt, TickPace},
 };
 use focal_sim::path::{Fabric, Fate, Loss, Path};
-use raft::prelude::Message;
 use std::time::Duration;
 
 const CONFIGURED: Duration = Duration::from_millis(100);
@@ -104,7 +104,7 @@ impl Sim {
             .applied
             .extend(events.committed.into_iter().map(|entry| entry.data));
         for message in events.messages {
-            use raft::protocompat::PbMessageExt as _;
+            use crate::PbMessageExt as _;
             let bytes = message.compute_size() as usize;
             let (from, to) = (message.from, message.to);
             let _: Fate = self.fabric.send(from, to, message, bytes);

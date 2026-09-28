@@ -330,7 +330,7 @@ fn snapshot_owner_retries_admission_drop_cancellation_and_unprepared_learner() {
             };
             let mut decoded = focal_consensus::Message::default();
             decoded.merge_from_bytes(message).unwrap();
-            if decoded.get_msg_type() == focal_consensus::MessageType::MsgSnapshot {
+            if decoded.msg_type == focal_consensus::MessageType::MsgSnapshot as i32 {
                 snapshots += 1;
                 if !canceled {
                     canceled = true;
@@ -340,7 +340,7 @@ fn snapshot_owner_retries_admission_drop_cancellation_and_unprepared_learner() {
                     continue;
                 }
             }
-            let was_snapshot = decoded.get_msg_type() == focal_consensus::MessageType::MsgSnapshot;
+            let was_snapshot = decoded.msg_type == focal_consensus::MessageType::MsgSnapshot as i32;
             let accepted = deliver_frame(&mut learner, frame, false);
             if was_snapshot && !accepted {
                 floor_rejected = true;
@@ -352,9 +352,9 @@ fn snapshot_owner_retries_admission_drop_cancellation_and_unprepared_learner() {
             };
             let mut decoded = focal_consensus::Message::default();
             decoded.merge_from_bytes(message).unwrap();
-            let retry_hint = decoded.get_msg_type()
-                == focal_consensus::MessageType::MsgHeartbeatResponse
-                || decoded.get_msg_type() == focal_consensus::MessageType::MsgAppendResponse
+            let retry_hint = decoded.msg_type
+                == focal_consensus::MessageType::MsgHeartbeatResponse as i32
+                || decoded.msg_type == focal_consensus::MessageType::MsgAppendResponse as i32
                     && decoded.reject;
             let force_admission = retry_hint && !admission_failed;
             let dropped = leader.dropped_snapshots;

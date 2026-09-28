@@ -185,7 +185,7 @@ impl DurableNode {
             return Err(ConsensusError::PersistencePending);
         }
         if !self.has_committed_current_term()
-            || self.delivered_index < self.raw.raft.raft_log.committed
+            || self.delivered_index < self.raw.raft.log().committed()
         {
             return Err(ConsensusError::Configuration(
                 "current-term committed configuration is not published",

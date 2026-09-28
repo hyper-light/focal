@@ -151,10 +151,8 @@ impl Fixture {
                 let Operation::Raft { message, .. } = &frame.request.operation else {
                     panic!("not Raft")
                 };
-                if focal_consensus::decode_message(message)
-                    .unwrap()
-                    .get_msg_type()
-                    == MessageType::MsgSnapshot
+                if focal_consensus::decode_message(message).unwrap().msg_type
+                    == MessageType::MsgSnapshot as i32
                 {
                     return frame;
                 }
@@ -267,10 +265,8 @@ fn control_snapshot_old_term_completion_cannot_release_current_flight_and_frame_
                 panic!("not Raft")
             };
             assert_ne!(
-                focal_consensus::decode_message(message)
-                    .unwrap()
-                    .get_msg_type(),
-                MessageType::MsgSnapshot
+                focal_consensus::decode_message(message).unwrap().msg_type,
+                MessageType::MsgSnapshot as i32
             );
             fixture.deliver(frame);
         }

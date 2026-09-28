@@ -2,7 +2,7 @@
 //! each mutation first reserves clone/fanout headroom before entering Raft.
 use crate::{ConsensusError, Entry, Message, NodeConfig, NodeEvents, Snapshot, storage::RamLog};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
-use raft::RawNode;
+use focal_raft::RawNode;
 
 fn add(a: usize, b: usize) -> Result<usize, ConsensusError> {
     a.checked_add(b).ok_or(ConsensusError::Capacity)
@@ -55,37 +55,12 @@ pub(super) fn message_bytes(message: &Message) -> Result<usize, ConsensusError> 
     Ok(bytes)
 }
 pub(super) fn raw_bytes(raw: &RawNode<RamLog>) -> Result<usize, ConsensusError> {
-    let members = raw.raft.prs().iter().len();
-    // Includes progress-map/configuration storage and scalar RawNode state.
-    let mut bytes = add(4096, mul(members, 2048)?)?;
-    bytes = add(bytes, raw.raft.inflight_buffers_size())?;
-    bytes = add(
-        bytes,
-        mul(raw.raft.msgs.capacity(), std::mem::size_of::<Message>())?,
-    )?;
-    for message in &raw.raft.msgs {
-        bytes = add(bytes, message_bytes(message)?)?;
-    }
-    let unstable = &raw.raft.raft_log.unstable;
-    bytes = add(
-        bytes,
-        mul(unstable.entries.capacity(), std::mem::size_of::<Entry>())?,
-    )?;
-    for entry in &unstable.entries {
-        bytes = add(bytes, entry_bytes(entry)?)?;
-    }
-    if let Some(snapshot) = &unstable.snapshot {
-        bytes = add(bytes, snapshot_bytes(snapshot)?)?;
-    }
-    // ReadOnly's map/ack set is private upstream. Every admitted context is <=1KiB;
-    // account its bounded map and peer-ack overhead, in addition to visible output.
-    let reads = add(raw.raft.pending_read_count(), raw.raft.ready_read_count())?;
-    bytes = add(bytes, mul(reads, add(4096, mul(members, 64)?)?)?)?;
-    bytes = add(bytes, mul(raw.raft.read_states.capacity(), 64)?)?;
-    for read in &raw.raft.read_states {
-        bytes = add(bytes, read.request_ctx.capacity())?;
-    }
-    Ok(bytes)
+    let members = raw.raft.tracker().len();
+    // What the core says it holds, by capacity: its queue of messages, what
+    // is not yet durable, the reads that wait and what it knows of each
+    // member. The allowance above it covers the node's own scalar state and
+    // what an allocator keeps for each of those buffers.
+    add(add(4096, mul(members, 512)?)?, raw.raft.resident_bytes())
 }
 pub(super) fn events_bytes(events: &NodeEvents) -> Result<usize, ConsensusError> {
     let mut bytes = 1024usize;
@@ -146,7 +121,7 @@ pub(super) fn staging_bytes(
     incoming: usize,
     new_members: usize,
 ) -> Result<usize, ConsensusError> {
-    let members = add(raw.raft.prs().iter().len(), new_members)?.max(1);
+    let members = add(raw.raft.tracker().len(), new_members)?.max(1);
     // A transition can copy retained entries to one outbound batch per peer,
     // Ready, encoded WAL records, prepared storage, and committed application output.
     // No history-sized temporary allocation escapes this guard.

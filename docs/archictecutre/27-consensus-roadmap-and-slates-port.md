@@ -13,8 +13,11 @@ transfer.
 ## 1. Where focal stands
 
 focal's consensus is `focal-consensus::DurableNode`, a durable, memory-accounted shell
-around tikv raft-rs 0.7 `RawNode`. The shell owns persistence, checkpoints, decoder
-fences and the unwind boundary. raft-rs owns elections and the log.
+around a core that owns elections and the log. The shell owns persistence, checkpoints,
+decoder fences and the unwind boundary. Until 2026-09-28 the core was tikv raft-rs 0.7
+`RawNode`; since then it is `focal-raft` (section 4.5), which keeps raft-rs's log and
+speaks its messages. The table states what raft-rs gave and what focal ran when this
+plan was made.
 
 | Planned feature | raft-rs 0.7 | focal today |
 |---|---|---|
@@ -67,7 +70,9 @@ are not driven in production.
   idle timeout, close, reset, migration or key update, and copies each packet several
   times. quinn covers all of these.
 - The Raft core as a replacement for raft-rs in the classic path. raft-rs is more
-  complete (transfer, pipelining, conflict hints) and more exercised.
+  complete (transfer, pipelining, conflict hints) and more exercised. focal's own core
+  (section 4.5) takes slates' shape, a state machine with no clock, disk or network,
+  and raft-rs's behaviour, which it is compared with step for step.
 - Fixes for stream-id reuse, handshake tails and flight size, which quinn handles.
 
 ### 3.3 Bug classes already checked against focal
@@ -83,7 +88,7 @@ are not driven in production.
 | Round expires inside the WAN round trip | Open: P2 |
 | Council retires a suspected voter | Open: P4 |
 | Wall-clock test deadlines | Converted: the fleet, placement, service, split, route, credential and liveness suites of `focal-node`, and every binary suite (`tests/support/deadline.rs`, `tests/support/fleet.rs`) |
-| A leader removes itself and keeps leading | Fixed: refused in the core (`LeaderLeaving`); the controller and `cluster nodes remove` transfer first |
+| A leader removes itself and keeps leading | Fixed: refused by the shell (`LeaderLeaving`), removal and demotion alike; the controller and `cluster nodes remove` transfer first; and a leader that applies its own leaving all the same, proposed by the one that led before it, hands the group over and follows (section 4.5) |
 | A new copy refuses a leader outside its genesis configuration | Fixed: copies admit the members the committed directory names (`ReplicaHost::admit_members`) |
 
 ## 4. Fast Raft
@@ -127,7 +132,9 @@ be made safe: the fast decision and the leader's no-op contend for the same inde
 So Fast Raft needs a core focal owns. The decision is to build `focal-raft`, a sans-io
 core in the shape of slates' (pure state machine, messages in and out, no clock, no
 I/O), and to run it under the existing `DurableNode` shell, which keeps persistence,
-memory accounting, checkpoints and decoder fences unchanged.
+memory accounting, checkpoints and decoder fences unchanged. The classic track of that
+core is built and in service (section 4.5). Its log is the classic one; the entries a
+member approves by itself are kept beside it and not in it, which is stage E.
 
 ### 4.3 Where the fast track pays
 
@@ -157,6 +164,45 @@ focal has none for consensus), property tests over the sans-io core with a
 deterministic scheduler and P7's network model, and the existing black-box history
 checker on real processes.
 
+### 4.5 The core as built: the classic track
+
+`focal-raft` is Raft as Ongaro's thesis states it with pre-vote, check-quorum, election
+priority, learners, joint consensus, leader transfer, an inflight window with conflict
+hints, ReadIndex and snapshots. It uses raft-rs's wire and log types (`raft-proto`, the
+same pinned revision), so the bytes on the wire and in the WAL did not change, and a
+group whose nodes are replaced one by one is one group throughout.
+
+**Compared with raft-rs step for step.** `tests/differential.rs` runs both cores on one
+schedule: five members, three of them voters at first; messages delivered, lost,
+repeated and held back; members stopped and reopened from what was durable; logs
+compacted; membership changed by simple and joint changes; leadership transferred;
+reads asked; priorities set. After every step both say what they persisted, sent,
+committed and answered and what each knows of every member, and all of it is equal.
+raft-rs draws its election timeouts from the thread; the harness gives it the ones this
+core drew from its seed. It is driven as focal's shell drove it, its priority rules
+included.
+
+**Where the two differ, by decision.** Each is tested by itself (`tests/group.rs`,
+`src/tests.rs`, `raft_safety_tests`).
+
+| raft-rs 0.7 | `focal-raft` |
+|---|---|
+| Asserts; the shell contains the unwind and stops the replica | Returns an error of one of three kinds: a refusal that changed nothing, a peer's message that contradicts what the member holds, or a state that no longer adds up, which alone stops the replica |
+| Its generated accessors unwind on an enumeration value they do not know, which a peer chooses | Reads them as options (`focal_raft::proto`); the accessors are forbidden by lint in production (`clippy.toml`) |
+| A leader that applies a change which leaves it no voter leads on, and unwinds when it next commits | It tells the voter that holds the whole log to campaign, and follows |
+| One told to campaign while a change it committed is not applied forgets that it was told | It campaigns once the change is applied, unless it heard of a leader since |
+| A voter refuses a candidate of lower priority unless the candidate has more entries | Unless the candidate's log is more current, by its last term and then its length (`Precedence::Log`). By length alone, two voters whose logs are equally long and end in different terms refuse each other, one for priority and one for the log, and with the third away the group elects no one. The rule of raft-rs is kept (`Precedence::Length`) to compare the cores under one rule |
+| Priority judges the vote a transfer asks for; a member without a term that refuses for priority unwinds | Priority never judges a transfer and is not in force without a term. The shell did both for raft-rs; they are the core's now |
+| One that is no voter may campaign, and unwinds when it wins | Refused (`NotPromotable`) |
+| A change refused for the size of what is uncommitted leaves the leader believing one is pending | It does not |
+| Election timeouts from the thread's generator | From a seed the owner gives: a run is reproducible |
+| Queues without a bound of their own | `Limits`: messages and reads that wait, entries not yet durable, entries in one message. A member takes of a message what it may hold and answers with the last entry taken |
+
+**What is kept although it could be otherwise.** A member that a change removes and
+adds again is known anew, and a member added by a change is first probed one entry
+before the log's end. Both are raft-rs's, harmless, and kept so that the comparison
+needs no exception for them.
+
 ## 5. The other features
 
 **Priority and transfer.** Priority orders elections and never vetoes a transfer: the
@@ -165,7 +211,8 @@ decision that a member shall lead, the leader's or its operator's or the control
 and the priority of the voters is no part of it.
 
 **Priority elections.** A voter refuses its vote and its pre-vote to a candidate of
-lower priority unless the candidate's log is strictly longer than its own. Priority
+lower priority unless the candidate's log is more current than its own: a later last
+term, or the same and more entries (section 4.5). Priority
 never outranks the log, and a group whose highest priority member is gone elects among
 the rest (`DurableNode::set_priority`, four tests in `raft_safety_tests`). A session's
 owner sets its replica's priority each period from the placement the session has
@@ -175,15 +222,15 @@ in the preferred leader's zone above the rest, needs the members' zones in the
 session's own committed state, which holds node identities only; it is part of stage F,
 where the balancer chooses by zone.
 
-A node that has no term yet keeps the neutral priority: raft-rs 0.7 panics when a
-term-0 node rejects a pre-vote (`term should be set when sending
-MsgRequestPreVoteResponse`), and a node with no term has no log to defend.
+A node that has no term yet keeps the neutral priority: a node with no term has no log
+to defend, and its refusal would bear no term a candidate could hear (raft-rs 0.7
+unwinds there: `term should be set when sending MsgRequestPreVoteResponse`).
 
-**Leader transfer.** Already present. A leader does not remove itself: raft-rs 0.7
-leaves a leader that applies its own removal in place (`post_conf_change`, the
-step-down is a TODO there), so the group follows a node outside its configuration
-until check-quorum or an election ends it. `DurableNode` refuses the proposal
-(`ConsensusError::LeaderLeaving`) on every path a configuration change takes. The
+**Leader transfer.** Already present. A leader does not propose its own leaving,
+neither its removal nor its becoming a learner: `DurableNode` refuses the proposal
+(`ConsensusError::LeaderLeaving`) on every path a configuration change takes, so that
+leadership moves by the decision of whoever removes the node. A leader that applies
+its own leaving all the same hands the group over and follows (section 4.5). The
 placement controller moves a session's leadership to a voter that stays (the
 preferred leader where it votes) before it removes a draining voter
 (`SessionCall::Transfer` reaches a leader on another node), and `cluster nodes remove`
@@ -221,6 +268,7 @@ quorum and never vote, tested as slates tests it.
 | C | P1 progress-aware fan-out; P5, P6 | dead-voter and straggler tests; no round waits out a dead peer |
 | | *State 2026-09-28:* P5 and P6 in place (`focal_wire::Admission`; a retirement always closes its connection). P1: the round is in place (`focal_timing::RoundBudget`, `RoundWait`; `focal_wire::gather`; `PeerConnectionPool::exchange_tail`, `round_budget`) and session-fact signatures are collected by it. Still asked one peer after another on fixed deadlines: custody replication and the custody and seed pulls (`evidence_service`, `managed_support`), and the fallback of enrollment control and of the contact announcement to the installed routes (`network_control`, `network_controller`). | |
 | D | `focal-raft` core: classic track at parity with raft-rs for focal's use | differential test against raft-rs over random schedules |
+| | *State 2026-09-28:* built and in service under `DurableNode` (section 4.5). Five campaigns of schedules compare the two cores step for step; a run of 15,000 schedules compared 80.8 million steps and found them equal ([09](09-implementation-status.md)). Groups of both cores together, and of this core alone under schedules that also remove the leader, are safe and settle. Replication costs what it cost (`benches/replicate.rs`). | |
 | E | Fast track in `focal-raft`; TLA+ model | section 4.4 invariants; latency measured against classic under 0 to 10% loss |
 | F | MLRaft leader balancer | leader spread converges; no transfer storms |
 | G | P10 congestion measurement; decide | bake-off numbers recorded |

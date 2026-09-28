@@ -1499,7 +1499,7 @@ impl<V: AuthorityVerifier> Owner<V> {
             let snapshot = match self.snapshot_feedback.begin(&message, &self.budget) {
                 Ok(snapshot) => snapshot,
                 Err(_) => {
-                    if message.get_msg_type() == focal_consensus::MessageType::MsgSnapshot {
+                    if message.msg_type == focal_consensus::MessageType::MsgSnapshot as i32 {
                         self.replica.report_snapshot_at(
                             message.to,
                             message.term,

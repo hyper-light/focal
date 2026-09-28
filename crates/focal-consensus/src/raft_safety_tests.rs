@@ -26,7 +26,10 @@ fn leaders(cluster: &Cluster) -> Vec<(u64, u64)> {
 /// One randomized election-timer tick on every node, then deliver.
 fn randomize_and_tick(cluster: &mut Cluster, isolated: Option<u64>) {
     for (i, node) in cluster.nodes.iter_mut().enumerate() {
-        node.raw.raft.set_randomized_election_timeout(10 + i * 3);
+        node.raw
+            .raft
+            .set_randomized_election_timeout(10 + i * 3)
+            .unwrap();
         node.tick().unwrap();
     }
     cluster.pump(isolated);
@@ -351,7 +354,10 @@ fn run_until(
             if i as u64 + 1 == isolated {
                 continue;
             }
-            node.raw.raft.set_randomized_election_timeout(timeouts[i]);
+            node.raw
+                .raft
+                .set_randomized_election_timeout(timeouts[i])
+                .unwrap();
             node.tick().unwrap();
         }
         cluster.pump(Some(isolated));
@@ -582,4 +588,233 @@ fn a_transfer_to_a_member_of_lower_priority_is_not_vetoed_by_priority() {
         |cluster| assert!(!leads(cluster, 3, 2), "a lower priority member led"),
     );
     assert!(won, "the member of higher priority never led again");
+}
+
+/// Drains every node and delivers what `carried` admits, until nothing more
+/// is sent.
+fn route(cluster: &mut Cluster, carried: impl Fn(&crate::Message) -> bool) {
+    for _ in 0..100 {
+        let mut messages = Vec::new();
+        for (i, node) in cluster.nodes.iter_mut().enumerate() {
+            let events = node.drain().unwrap();
+            cluster.applied[i].extend(events.committed.into_iter().map(|entry| entry.data));
+            messages.extend(events.messages);
+        }
+        if messages.is_empty() {
+            return;
+        }
+        for message in messages {
+            if carried(&message) {
+                let to = message.to;
+                // One that left is answered by no one.
+                let _ = cluster.nodes[(to - 1) as usize].step(message);
+            }
+        }
+    }
+    panic!("message delivery failed to quiesce");
+}
+
+/// A leader does not propose its own leaving, and a change that removes a
+/// member can still come to be applied by that member as leader: proposed by
+/// the one that led before it. It then hands the group to a voter that holds
+/// the whole log and follows (27 §5). The core focal ran on before left it
+/// leading a group it was no member of.
+#[test]
+fn a_leader_that_applies_its_own_removal_hands_the_group_over_and_follows() {
+    use crate::{ConfChangeSingle, ConfChangeType, ConfChangeV2, ConsensusError, MembershipChange};
+    let mut cluster = Cluster::new();
+    elect(&mut cluster, 0);
+    cluster.nodes[0].propose(b"before".to_vec()).unwrap();
+    cluster.pump(None);
+    // Neither by removal nor by becoming a learner.
+    for kind in [ConfChangeType::RemoveNode, ConfChangeType::AddLearnerNode] {
+        let leaving = ConfChangeV2 {
+            changes: vec![ConfChangeSingle {
+                change_type: kind as i32,
+                node_id: 1,
+            }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            cluster.nodes[0].propose_conf_change(leaving),
+            Err(ConsensusError::LeaderLeaving)
+        ));
+    }
+    // Node 1 proposes that node 2 leaves. Node 2 holds the entry, and its
+    // answer is lost with node 1.
+    let expected = cluster.nodes[0].membership_configuration();
+    let committed = cluster.nodes[0].status().committed_index;
+    cluster.nodes[0]
+        .propose_membership(
+            &expected,
+            MembershipChange::Remove { node: 2 },
+            b"leave".to_vec(),
+        )
+        .unwrap();
+    route(&mut cluster, |message| message.from == 1 && message.to == 2);
+    assert_eq!(cluster.nodes[0].status().committed_index, committed);
+    // Node 2 is elected by node 3: its log is the longer.
+    let elected = {
+        let mut elected = false;
+        for _ in 0..ROUNDS {
+            for (node, timeout) in [(1usize, 10usize), (2, 19)] {
+                cluster.nodes[node]
+                    .raw
+                    .raft
+                    .set_randomized_election_timeout(timeout)
+                    .unwrap();
+                cluster.nodes[node].tick().unwrap();
+            }
+            route(&mut cluster, |message| message.from != 1 && message.to != 1);
+            let status = cluster.nodes[1].status();
+            // It led, committed its own removal with node 3, applied it and
+            // follows: no tick passed in between.
+            if status.term > 1 && !status.voters.contains(&2) {
+                elected = true;
+                break;
+            }
+            assert_ne!(
+                (status.role, status.voters.contains(&2)),
+                (StateRole::Leader, false),
+                "node 2 leads a group it is not in"
+            );
+        }
+        elected
+    };
+    assert!(elected, "node 2 never led");
+    let status = cluster.nodes[1].status();
+    assert_eq!(status.role, StateRole::Follower);
+    assert_eq!(status.voters, vec![1, 3]);
+    assert!(!cluster.nodes[1].failed());
+    // Node 3 was told to campaign and needs node 1, which is back.
+    let term = cluster.nodes[2].status().term;
+    assert!(term > status.term, "node 3 was not told to campaign");
+    let led = run_until(
+        &mut cluster,
+        0,
+        [10, 10, 10],
+        |cluster| leads(cluster, 3, 0),
+        |cluster| {
+            for node in &cluster.nodes {
+                let status = node.status();
+                assert!(
+                    status.role != StateRole::Leader || status.voters.contains(&status.node_id),
+                    "node {} leads a group it is not in",
+                    status.node_id
+                );
+            }
+        },
+    );
+    assert!(led, "the group has no leader: {:?}", leaders(&cluster));
+    cluster.nodes[2].propose(b"after".to_vec()).unwrap();
+    route(&mut cluster, |_| true);
+    for applied in [&cluster.applied[0], &cluster.applied[2]] {
+        assert!(applied.iter().any(|entry| entry == b"before"));
+        assert!(applied.iter().any(|entry| entry == b"after"));
+    }
+    assert!(!cluster.applied[1].iter().any(|entry| entry == b"after"));
+}
+
+/// A peer chooses the numbers in its messages. One that names a kind of
+/// message, entry or change this member does not know is refused before the
+/// core sees it, and the member goes on: the accessors the wire types
+/// generate unwind on such a number.
+#[test]
+fn what_a_peer_names_that_is_not_known_is_refused_and_stops_no_one() {
+    use crate::{
+        ConfChangeSingle, ConfChangeV2, ConsensusError, Entry, EntryType, Message, MessageType,
+        PbMessageExt,
+    };
+    let mut cluster = Cluster::new();
+    elect(&mut cluster, 0);
+    let term = cluster.nodes[0].status().term;
+    let last = cluster.nodes[1].status().committed_index;
+    let append = |entry: Entry| Message {
+        msg_type: MessageType::MsgAppend as i32,
+        from: 1,
+        to: 2,
+        term,
+        index: last,
+        log_term: term,
+        entries: vec![entry],
+        ..Message::default()
+    };
+    let unknown_change = |change: ConfChangeV2| Entry {
+        entry_type: EntryType::EntryConfChangeV2 as i32,
+        index: last + 1,
+        term,
+        data: change.write_to_bytes().unwrap(),
+        ..Entry::default()
+    };
+    let refused = [
+        Message {
+            msg_type: 77,
+            from: 1,
+            to: 2,
+            term,
+            ..Message::default()
+        },
+        append(Entry {
+            entry_type: 9,
+            index: last + 1,
+            term,
+            ..Entry::default()
+        }),
+        append(unknown_change(ConfChangeV2 {
+            transition: 9,
+            ..Default::default()
+        })),
+        append(unknown_change(ConfChangeV2 {
+            changes: vec![ConfChangeSingle {
+                change_type: 9,
+                node_id: 3,
+            }],
+            ..Default::default()
+        })),
+        append(Entry {
+            entry_type: EntryType::EntryConfChange as i32,
+            index: last + 1,
+            term,
+            data: vec![0xff; 3],
+            ..Entry::default()
+        }),
+    ];
+    for message in refused {
+        let encoded = message.write_to_bytes().unwrap();
+        for stepped in [
+            cluster.nodes[1].step(message.clone()),
+            cluster.nodes[1].step_authenticated(1, &encoded),
+        ] {
+            assert!(
+                matches!(stepped, Err(ConsensusError::MalformedMessage(_))),
+                "{stepped:?}"
+            );
+        }
+        assert!(!cluster.nodes[1].failed());
+    }
+    for change in [
+        ConfChangeV2 {
+            transition: 9,
+            ..Default::default()
+        },
+        ConfChangeV2 {
+            changes: vec![ConfChangeSingle {
+                change_type: 9,
+                node_id: 3,
+            }],
+            ..Default::default()
+        },
+    ] {
+        assert!(matches!(
+            cluster.nodes[0].propose_conf_change(change),
+            Err(ConsensusError::Configuration(_))
+        ));
+        assert!(!cluster.nodes[0].failed());
+    }
+    // The group is as it was.
+    cluster.nodes[0].propose(b"after".to_vec()).unwrap();
+    cluster.pump(None);
+    for applied in &cluster.applied {
+        assert!(applied.iter().any(|entry| entry == b"after"));
+    }
 }

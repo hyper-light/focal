@@ -10798,3 +10798,103 @@ contracts (1458 links), clippy `-D warnings`, production lints and the dependenc
 passed; `cargo test --workspace --locked --no-fail-fast -- --test-threads=4` ran 137
 suites and none failed.
 
+
+### 2026-09-28 — CI on `e9f6247`; focal's own consensus core, in service (27 stage D)
+
+CI on `e9f6247`: `Rust contracts` passed on ubuntu-24.04 (38m44s) and macos-15
+(41m43s) with the dependency job, and `Windows build` passed (24m12s). It is the first
+commit of this work that passed on all three.
+
+**The core.** `crates/focal-raft` is elections and the log as a state machine with no
+clock, disk or network ([27](27-consensus-roadmap-and-slates-port.md) §4.5): about 4,900
+lines of source and 3,500 of tests. It uses the wire and log types of `raft-proto` at
+the revision focal pinned, so no byte on the wire or in the WAL changed.
+`DurableNode` runs on it; `raft` is a test dependency of `focal-raft` and in no binary,
+and `slog`, `getset`, `rand` 0.8 and `rustc-hash` left the shipped graph with it.
+
+**Compared with raft-rs.** `tests/differential.rs` runs both cores on one schedule and
+compares, after every step, what each persisted, sent, committed and answered, and what
+each knows of every member. Five campaigns: as the shell sets a group; without pre-vote
+and check-quorum; with a window of two and a message of one entry; with a bound on what
+a leader holds uncommitted; on a network that loses nothing. A release run of 3,000
+schedules of 6,000 steps for each campaign (macOS arm64, 77 s):
+
+| Campaign | Steps compared | Ran to their end | Terms led | Entries committed | Changes applied | Snapshots installed | Reads answered | Appends refused | Votes refused | Restarts |
+|---|---|---|---|---|---|---|---|---|---|---|
+| shell | 14,843,338 | 2,007 | 222,434 | 3,737,789 | 259,147 | 13,339 | 90,166 | 496,231 | 108,036 | 148,926 |
+| plain | 14,510,498 | 1,916 | 229,007 | 3,614,499 | 243,295 | 14,435 | 58,122 | 445,914 | 162,731 | 145,530 |
+| narrow | 17,406,983 | 2,833 | 85,104 | 828,564 | 47,831 | 9,765 | 57,459 | 564,942 | 107,777 | 174,858 |
+| uncommitted | 18,000,000 | 3,000 | 202,592 | 2,347,829 | none proposed | 13,756 | 184,754 | 697,708 | 88,399 | 185,853 |
+| whole | 16,086,468 | 2,477 | 179,819 | 2,858,956 | 150,782 | 12,551 | 208,934 | 627,962 | 88,410 | none |
+
+80,847,287 steps, and the cores said the same at every one. A schedule that does not
+run to its end came to the one place a schedule reaches where the cores differ by
+decision, a leader applying a change that leaves it no voter, and is compared up to
+there. The gate runs 96 schedules of 4,000 steps for each campaign.
+
+The comparison found one difference that was not a decision: raft-rs forgets what it
+knew of a member that one change removes and adds again, and this core kept it. It
+forgets too now; nothing depends on either.
+
+**Found in the path focal ran on.**
+
+1. The accessors `raft-proto` generates for enumerations (`get_msg_type`,
+   `get_entry_type`, `get_change_type`, `get_transition`) unwind on a value they do not
+   know. `DurableNode::step` called `get_entry_type` on a peer's entries to size its
+   reservation, before its own check of the entry's kind and outside the unwind
+   boundary: an authenticated peer's message with an unknown kind of entry unwound the
+   owner's thread. A change whose kind or transition was unknown passed the shell's
+   check, which only decoded it, and unwound in raft-rs where it was applied, which
+   stopped the replica. Both are refused as malformed before the core now, and the
+   accessors are forbidden in production by lint (`clippy.toml`,
+   `disallowed-methods`; `scripts/check-production.sh`). Test:
+   `what_a_peer_names_that_is_not_known_is_refused_and_stops_no_one`.
+2. raft-rs's priority rule lets a candidate of lower priority pass only with more
+   entries. Two voters whose logs are equally long and end in different terms refuse
+   each other, one for priority and one for the log, and with the third voter away the
+   group has no leader until it returns. `priority_yields_to_a_log_that_is_more_current`
+   shows it on raft-rs and on this core under raft-rs's rule, and shows this core's
+   rule electing.
+3. A leader that applied a change leaving it no voter led on in raft-rs, and unwound
+   at its next commit (`maybe_commit` unwraps its own progress). The shell refuses to
+   propose such a change; one proposed by the leader before it could still be applied.
+   Tests: `a_leader_that_applies_its_own_removal_hands_the_group_over_and_follows`
+   (shell), `a_leader_a_change_leaves_no_voter_hands_the_group_over_and_follows` and
+   `a_leader_leaves_a_joint_configuration_it_is_no_part_of_after` (core).
+
+**Groups.** `tests/group.rs`: groups of this core under schedules that also remove the
+member that leads, and groups of both cores together (the odd members raft-rs, the
+even ones this core), hold that no two members commit different entries at one index
+and that no term has two leaders, and settle once the network is whole: they elect,
+and a proposal is applied by every member. In 1,000 schedules of each, no member on
+this core ever led a group it was no voter of. Members on raft-rs did 199 times; such
+a member unwinds at its next commit, and the harness stops it and opens it again, as
+the shell's fence did.
+
+**Cost.** `benches/replicate.rs`, nanoseconds for each entry committed by every member,
+storage in memory, the better of three runs (macOS arm64):
+
+| Group | raft-rs | focal-raft | Ratio |
+|---|---|---|---|
+| 3 members, 1 at a time, 64 B | 3,333 | 3,323 | 1.00 |
+| 3 members, 16 at a time, 64 B | 1,738 | 1,721 | 0.99 |
+| 3 members, 1 at a time, 4 KiB | 16,841 | 16,026 | 0.95 |
+| 3 members, 16 at a time, 4 KiB | 15,186 | 15,004 | 0.99 |
+| 5 members, 1 at a time, 64 B | 6,608 | 6,626 | 1.00 |
+| 5 members, 16 at a time, 1 KiB | 8,612 | 8,510 | 0.99 |
+| 3 members, 1 at a time, 256 KiB | 906,984 | 864,550 | 0.95 |
+
+The harness's own copies are in both columns, so the cores differ by more than the
+ratio says and by less than would matter: replication costs what it cost.
+
+**Gates** on this tree (macOS arm64): format, contracts (1,463 links), clippy
+`-D warnings`, production lints and the dependency audit passed.
+`cargo test --workspace --locked --no-fail-fast -- --test-threads=4` ran 142 suites; 141
+passed, and the one that failed was the group of both cores, at a schedule where a
+member on raft-rs led a group it had left, before the harness stopped such members.
+With that, the suites of `focal-raft` and `focal-consensus` were run again and passed.
+
+**Not done in this stage.** The fast track (stage E), the leader balancer (F) and the
+congestion measurement (G). The sequential fan-out sites of stage C and the run under
+injected load of stage A are as [27](27-consensus-roadmap-and-slates-port.md) §6 states
+them.

@@ -12,6 +12,7 @@ bash scripts/cargo.sh clippy --workspace --lib --bins --locked -- \
   -D clippy::indexing_slicing \
   -D clippy::arithmetic_side_effects \
   -D clippy::disallowed_macros \
+  -D clippy::disallowed_methods \
   -D clippy::todo \
   -D clippy::unimplemented \
   -D clippy::dbg_macro

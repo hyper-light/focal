@@ -240,7 +240,7 @@ impl Cluster {
                 if !self.live().contains(&to) {
                     continue;
                 }
-                let snapshot = message.get_msg_type() == MessageType::MsgSnapshot;
+                let snapshot = message.msg_type == MessageType::MsgSnapshot as i32;
                 match self.node(to).step(message) {
                     Ok(()) => {}
                     Err(LedgerError::NativeUnsupported) => {

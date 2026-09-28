@@ -119,7 +119,7 @@ impl Cluster {
                 if !self.nodes[(to - 1) as usize].accepts_peer(from) {
                     continue;
                 }
-                let snapshot = message.get_msg_type() == MessageType::MsgSnapshot;
+                let snapshot = message.msg_type == MessageType::MsgSnapshot as i32;
                 self.nodes[(to - 1) as usize]
                     .step_authenticated(from, &message.write_to_bytes().unwrap())
                     .unwrap();
