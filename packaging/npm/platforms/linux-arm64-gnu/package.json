@@ -1,0 +1,30 @@
+{
+  "name": "@hyper-light/focal-linux-arm64-gnu",
+  "version": "0.0.0",
+  "description": "The focal executable for linux-arm64-gnu; installed by @hyper-light/focal",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hyper-light/focal.git"
+  },
+  "license": "MIT",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "files": [
+    "focal",
+    "LICENSE",
+    "THIRD-PARTY-NOTICES.txt"
+  ],
+  "engines": {
+    "node": ">= 18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -14,7 +14,9 @@ import notices
 import release
 
 
-class ReleaseTests(unittest.TestCase):
+class CollectionFixture:
+    """A synthetic complete artifact set, collected on demand."""
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="focal-release-tests-")
         self.addCleanup(self.temporary.cleanup)
@@ -45,6 +47,8 @@ class ReleaseTests(unittest.TestCase):
         row = self.platforms["include"][0]
         return self.source / f"binary-{row['asset']}" / f"{row['asset']}.json"
 
+
+class ReleaseTests(CollectionFixture, unittest.TestCase):
     def test_tag_must_match_and_manual_tag_dispatch_never_publishes(self):
         self.assertEqual(release.release_tag(self.version, "push", f"refs/tags/v{self.version}"), f"v{self.version}")
         self.assertIsNone(release.release_tag(self.version, "workflow_dispatch", f"refs/tags/v{self.version}"))
@@ -328,3 +332,129 @@ class NoticesTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+import packages  # noqa: E402  (the packaging tests below build on ReleaseTests' collection)
+
+
+class PackagesTests(CollectionFixture, unittest.TestCase):
+    """The PyPI wheels and npm archives built from a verified collection."""
+
+    def setUp(self):
+        super().setUp()
+        self.collect()
+        self.packages = self.root / "packages"
+        self.stamp = 1_700_000_000
+        self.patcher = patch.object(packages, "commit_time", return_value=self.stamp)
+        self.patcher.start()
+        self.addCleanup(self.patcher.stop)
+
+    def build(self):
+        return packages.build(self.destination, self.packages, self.version, self.toolchain, self.platforms, self.commit)
+
+    def verify_packages(self):
+        return packages.verify(self.packages, self.destination, self.version, self.toolchain, self.platforms, self.commit)
+
+    def test_sources_agree_with_the_catalog(self):
+        packages.check_sources(self.platforms)
+        wrong = copy.deepcopy(self.platforms)
+        wrong["include"][0]["target"] = "riscv64gc-unknown-linux-gnu"
+        with self.assertRaises(ValueError):
+            packages.check_sources(wrong)
+
+    def test_semantic_versions_have_one_pypi_form(self):
+        self.assertEqual(packages.pep440("0.1.0"), "0.1.0")
+        self.assertEqual(packages.pep440("0.2.0-rc.1"), "0.2.0rc1")
+        self.assertEqual(packages.pep440("1.0.0-alpha.2"), "1.0.0a2")
+        self.assertEqual(packages.pep440("1.0.0-beta.3"), "1.0.0b3")
+        for version in ("0.1.0-dev.1", "0.1.0+build", "1.0"):
+            with self.assertRaises(ValueError):
+                packages.pep440(version)
+
+    def test_every_target_gets_a_wheel_and_a_platform_package_carrying_its_bytes(self):
+        names = self.build()
+        self.assertEqual(len(names), 2 * len(self.platforms["include"]) + 1)
+        self.assertEqual(self.verify_packages(), names)
+        wheels = sorted((self.packages / "wheels").iterdir())
+        self.assertEqual({path.name for path in wheels}, {
+            f"focal_node-{self.version}-py3-none-{'.'.join(tags)}.whl" for _, tags in packages.PLATFORMS.values()})
+        for row in self.platforms["include"]:
+            platform, tags = packages.PLATFORMS[row["target"]]
+            wheel = self.packages / "wheels" / f"focal_node-{self.version}-py3-none-{'.'.join(tags)}.whl"
+            members, modes = packages.read_wheel(wheel)
+            binary = "focal.exe" if "windows" in row["target"] else "focal"
+            script = f"focal_node-{self.version}.data/scripts/{binary}"
+            self.assertEqual(members[script], (self.destination / row["asset"]).read_bytes())
+            self.assertEqual(modes[script], 0o755)
+            metadata = members[f"focal_node-{self.version}.dist-info/METADATA"].decode()
+            self.assertIn("License-File: THIRD-PARTY-NOTICES.txt\n", metadata)
+            self.assertIn("Requires-Python: >=3.8\n", metadata)
+            tarball = self.packages / "npm" / packages.tarball_name(packages.platform_package(platform), self.version)
+            members, modes = packages.read_tarball(tarball)
+            self.assertEqual(members[binary], (self.destination / row["asset"]).read_bytes())
+            self.assertEqual(modes[binary], 0o755)
+            package = json.loads(members["package.json"])
+            self.assertEqual((package["name"], package["version"]), (packages.platform_package(platform), self.version))
+            self.assertNotIn("0.0.0", members["package.json"].decode())
+        wrapper = self.packages / "npm" / packages.tarball_name(packages.NPM_WRAPPER, self.version)
+        members, _ = packages.read_tarball(wrapper)
+        package = json.loads(members["package.json"])
+        self.assertEqual(set(package["optionalDependencies"].values()), {self.version})
+        self.assertEqual(len(package["optionalDependencies"]), len(self.platforms["include"]))
+
+    def test_archives_are_deterministic(self):
+        self.build()
+        first = {path.name: path.read_bytes() for path in self.packages.rglob("*") if path.is_file()}
+        shutil.rmtree(self.packages)
+        self.build()
+        second = {path.name: path.read_bytes() for path in self.packages.rglob("*") if path.is_file()}
+        self.assertEqual(first, second)
+
+    def test_an_altered_archive_or_a_foreign_executable_is_refused(self):
+        self.build()
+        wheel = next((self.packages / "wheels").glob("*macosx_15_0_arm64.whl"))
+        original = wheel.read_bytes()
+        wheel.write_bytes(original + b"\0")
+        with self.assertRaises(ValueError):
+            self.verify_packages()
+        wheel.write_bytes(original)
+        self.verify_packages()
+        row = self.platforms["include"][0]
+        (self.destination / row["asset"]).write_bytes(b"another build")
+        with self.assertRaises(ValueError):
+            self.verify_packages()
+
+    def test_a_missing_or_extra_archive_is_refused(self):
+        self.build()
+        extra = self.packages / "npm" / "stray.tgz"
+        extra.write_bytes(b"")
+        with self.assertRaises(ValueError):
+            self.verify_packages()
+        extra.unlink()
+        next((self.packages / "wheels").glob("*.whl")).unlink()
+        with self.assertRaises(ValueError):
+            self.verify_packages()
+
+    def test_npm_publishes_platform_packages_before_the_wrapper_and_skips_what_is_live(self):
+        self.build()
+        published = []
+        live = {packages.platform_package("darwin-arm64")}
+
+        def output(*arguments):
+            self.assertEqual(arguments[:2], ("npm", "view"))
+            name, version = arguments[2].rsplit("@", 1)
+            if name in live:
+                return version
+            raise release.subprocess.CalledProcessError(1, arguments)
+
+        def run(*arguments, **kwargs):
+            self.assertEqual(arguments[:2], ("npm", "publish"))
+            self.assertIn("--access", arguments)
+            members, _ = packages.read_tarball(Path(arguments[2]))
+            published.append(json.loads(members["package.json"])["name"])
+
+        with patch.object(release, "output", side_effect=output), patch.object(release, "run", side_effect=run):
+            packages.publish_npm(self.packages, self.version, self.toolchain, self.platforms, self.commit, self.destination)
+        self.assertEqual(published[-1], packages.NPM_WRAPPER)
+        self.assertNotIn(packages.platform_package("darwin-arm64"), published)
+        self.assertEqual(len(published), len(self.platforms["include"]))

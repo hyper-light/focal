@@ -101,6 +101,13 @@ def guard():
     version, toolchain, platforms = configuration()
     release_tag(version, os.environ.get("GITHUB_EVENT_NAME", ""), os.environ.get("GITHUB_REF", ""))
     source_commit()
+    # The PyPI and npm packaging sources (`packaging/`) name one package per
+    # release target at the placeholder version the build stamps; a catalog
+    # and a packaging map that disagree stop the release here, before a lane
+    # is built. (`packages` imports this module; the import is local to keep
+    # the two from importing each other at load.)
+    import packages
+    packages.check_sources(platforms)
     values = {
         "matrix": json.dumps({"include": platforms["include"]}, separators=(",", ":")),
         "toolchain": toolchain,
@@ -338,6 +345,8 @@ def require_release_absent(base, tag):
 
 
 def publish(directory):
+    import packages
+
     version, toolchain, platforms = configuration()
     tag = release_tag(version, os.environ.get("GITHUB_EVENT_NAME", ""), os.environ.get("GITHUB_REF", ""))
     require(tag is not None, "manual builds cannot publish")
@@ -359,7 +368,11 @@ def publish(directory):
             "Every asset passed native server startup, CLI mutation/read, acknowledged-write "
             "crash recovery and MCP protocol/read smoke. THIRD-PARTY-NOTICES.txt lists every "
             "bundled crate and its license; sbom.spdx.json is the SPDX 2.3 bill of materials. "
-            "See release-manifest.json for target, source and digest details.\n")
+            "See release-manifest.json for target, source and digest details.\n\n"
+            f"The same executables are packaged for PyPI as `{packages.PYPI_NAME}` "
+            f"(`pip install {packages.PYPI_NAME}`) and for npm as `{packages.NPM_WRAPPER}` "
+            f"(`npm install -g {packages.NPM_WRAPPER}`); the release workflow publishes both "
+            "from this release's verified collection, byte for byte.\n")
     draft = api(f"{base}/releases", "POST", {"tag_name": tag, "target_commitish": commit,
                 "name": f"Focal {version}", "body": body, "draft": True,
                 "prerelease": "-" in version.split("+")[0]})

@@ -1,0 +1,27 @@
+{
+  "name": "@hyper-light/focal-darwin-x64",
+  "version": "0.0.0",
+  "description": "The focal executable for darwin-x64; installed by @hyper-light/focal",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hyper-light/focal.git"
+  },
+  "license": "MIT",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "focal",
+    "LICENSE",
+    "THIRD-PARTY-NOTICES.txt"
+  ],
+  "engines": {
+    "node": ">= 18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -12,10 +12,10 @@ ELF interpreter/dependency checks reject dynamically linked musl output. macOS
 dependency checks reject non-system libraries. These are release qualification
 lanes; they are not a claim that all six have already passed in GitHub Actions.
 
-Windows is an outstanding port, not a successful skipped lane. Current Unix
-socket/peer credentials, private-file checks and directory durability operations
-must be implemented and tested on Windows before its binaries enter this matrix.
-macOS binaries are not yet signed or notarized.
+The two Windows lanes (x64 on Windows Server 2022, arm64 on Windows 11) build
+with the static C runtime and pass the same smoke; their import tables are
+verified against an allow-list of system DLLs. macOS binaries are not yet
+signed or notarized, and Windows binaries carry no Authenticode signature.
 
 ## Run and publish
 
@@ -77,3 +77,59 @@ also recorded in `platforms.json`; update that digest with the pinned Rust versi
 Artifact
 actions use the published [upload v4.6.2](https://github.com/actions/upload-artifact/releases/tag/v4.6.2)
 and [download v4.3.0](https://github.com/actions/download-artifact/releases/tag/v4.3.0).
+
+## Registries: PyPI and npm
+
+The same executables reach PyPI (`focal-node`) and npm (`@hyper-light/focal`
+with one platform package `@hyper-light/focal-<os>-<arch>[-<libc>]` per
+target). [`packages.py`](packages.py) builds them from the verified collection
+— never from a second compilation — as one PEP 427 wheel per target
+(`focal_node-<version>-py3-none-<platform tag>.whl`, the executable as its only
+script, the license and third-party notices beside it, no Python code) and one
+npm archive per package (`hyper-light-focal[-<platform>]-<version>.tgz`, laid
+out as `npm pack` lays out a package). Every archive is deterministic (the
+source commit's time on every member, fixed ownership), recorded in
+`packages-manifest.json` with its digest, and re-read against the collection
+before it is smoke-installed (the `package` job: the GNU x86_64 wheel through
+`pip`, the matching npm pair through `npm`, with and without install scripts)
+and again before it is published. The manifests under [`packaging/`](../../packaging)
+carry the placeholder version `0.0.0`; the build stamps the workspace version,
+and the guard refuses a manifest that drifted from the platform catalog.
+
+Wheel platform tags state what each binary needs: `macosx_15_0_{arm64,x86_64}`,
+`manylinux_2_39_{x86_64,aarch64}` for the GNU binaries (glibc 2.39, the
+runner's), `manylinux_2_17_<arch>.musllinux_1_2_<arch>` for the static musl
+binaries (no C library needed, so `pip` installs them on any older glibc and on
+musl), `win_amd64` and `win_arm64`.
+
+Publication runs after the GitHub release is published, on the tag push only,
+with **trusted publishing** on both registries — the repository holds no
+registry token:
+
+- PyPI: on <https://pypi.org/manage/account/publishing/> add a *pending*
+  publisher for project `focal-node`: owner `hyper-light`, repository `focal`,
+  workflow `release.yml`, environment empty. The first publication creates the
+  project. `publish-pypi` uploads with `skip-existing`, so a rerun after a
+  partial publication completes it.
+- npm: a trusted publisher can only be attached to an existing package
+  (npm/cli#8544), so a maintainer runs [`npm-bootstrap.sh`](npm-bootstrap.sh)
+  once, logged in with publish rights on `@hyper-light`: it publishes and at
+  once deprecates a `0.0.0` placeholder for each of the nine names. Then, for
+  each package on npmjs.com: Settings → Trusted publisher → GitHub Actions,
+  organization `hyper-light`, repository `focal`, workflow `release.yml`,
+  environment empty. `publish-npm` publishes the platform packages, then the
+  wrapper, and leaves a version the registry already serves untouched.
+
+Local checks, without publishing:
+
+```sh
+python3 -m unittest discover -s scripts/release -p 'test_*.py'   # includes the packaging tests
+python3 scripts/release/packages.py check                          # sources against the catalog
+python3 scripts/release/packages.py build --collection release-assets --output packages
+python3 scripts/release/packages.py verify --collection release-assets --input packages
+```
+
+`release-assets` is a downloaded `complete-release-assets` artifact (or a
+local collection); `packages/` then holds every wheel and npm archive, which
+`pip install <wheel>` and `npm install <wrapper.tgz> <platform.tgz>` install
+like the published ones.

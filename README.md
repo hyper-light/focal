@@ -59,9 +59,25 @@ Claim: d4cc83c48c5ad2bafaa1802bb87c3e07
 
 ## Install
 
-Until the first tagged release, build from source. You need Rust 1.94.1 (pinned in the
-toolchain file, so `rustup` picks it up) and a protobuf compiler (`brew install protobuf`
-or `apt-get install protobuf-compiler`):
+One executable, `focal`, is the server, the human CLI and the stdio MCP server. Every
+release publishes the same binary three ways — the bytes are identical, verified by the
+release workflow before either registry sees them:
+
+```sh
+# Python (PyPI: focal-node; the wheel carries the native executable, no Python code)
+pip install focal-node          # or: uv tool install focal-node
+# Node (npm: @hyper-light/focal; installs the platform package for this machine)
+npm install -g @hyper-light/focal
+focal --version
+```
+
+Or take the raw binary from the [latest release](https://github.com/hyper-light/focal/releases):
+download the file for your platform, check its digest against `SHA256SUMS`, `chmod +x` it
+(on Windows, unblock the `.exe`) and put it on your `PATH`; nothing else is needed.
+
+To build from source you need Rust 1.94.1 (pinned in the toolchain file, so `rustup`
+picks it up) and a protobuf compiler (`brew install protobuf` or
+`apt-get install protobuf-compiler`):
 
 ```sh
 git clone https://github.com/hyper-light/focal && cd focal
@@ -73,9 +89,8 @@ focal --help
 > [!NOTE]
 > The release workflow builds one raw binary per platform (macOS arm64 and x64, Linux arm64
 > and x64 on glibc and static musl, and Windows x64 and arm64), smoke-tests each on its own
-> hardware, and attaches them with `SHA256SUMS`. When a release is published, download the
-> file for your platform, check its digest, `chmod +x` it (or, on Windows, unblock the
-> `.exe`) and put it on your `PATH`; nothing else is needed. The native Windows x64 build is
+> hardware, attaches them with `SHA256SUMS`, and packages the same files as one wheel and
+> one npm platform package per target. The native Windows x64 build is
 > tested in CI on every push: its filesystem layer (owner-only DACLs, file identity,
 > write-through publication), named-pipe local transport, credential enrollment, and the
 > first product gate through both the CLI and the MCP adapter — including a killed and
@@ -225,6 +240,9 @@ point your client at it:
 **Claude Code**
 ```sh
 claude mcp add focal -- /usr/local/bin/focal --data-dir /absolute/path/to/ledger mcp serve
+# or without installing, from a registry:
+claude mcp add focal -- npx -y @hyper-light/focal --data-dir /absolute/path/to/ledger mcp serve
+claude mcp add focal -- uvx --from focal-node focal --data-dir /absolute/path/to/ledger mcp serve
 ```
 
 **Claude Desktop, Cursor and other `mcpServers` clients**

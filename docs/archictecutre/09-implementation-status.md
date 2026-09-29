@@ -11523,3 +11523,58 @@ archives (run 36550010518; `publish` skipped, as a dispatch must). The third dis
 already passed all eight lanes (its test job failing only on the harness bound above). The
 branch's CI is green on every commit of this batch on all three platforms.
 
+**On `main`.** The batch was merged as `e5f991a` (2026-09-29 14:27 UTC). Its Windows run
+(36582854663) passed whole in 32 minutes — the workspace build in 3 m 19 s, the platform,
+wire, enrollment and node-library suites, the A1 gate on the real binary (16 m 36 s) and
+through the MCP adapter — the envelope every earlier Windows run has kept (27 to 32
+minutes); its Rust-contracts run (36582854560) passed `dependencies`, `model` (21 minutes),
+`check (ubuntu-24.04)` (44 minutes) and `check (macos-15)` (52 minutes). A run read while
+its A1 gate was in progress looked stuck; it was not: no run of this batch was queued for
+longer than a minute or ran longer than the ones before it.
+
+### 2026-09-29 — the release reaches the registries: `focal-node` on PyPI, `@hyper-light/focal` on npm
+
+The release workflow published nothing because nothing had asked it to: it
+publishes on an intentional `v<version>` tag push ([20](20-binary-distribution.md) §2),
+and no tag has been pushed. And it reached no registry at all: focal had no Python
+or Node package. Both are added, in the shape vorpal distributes its CLI in — the
+native executable itself, packaged, not bindings.
+
+`scripts/release/packages.py` builds, from the complete verified collection and
+never from a second compilation, one PEP 427 wheel per target (`focal_node-<v>-py3-none-<tag>.whl`:
+the executable as the wheel's only script under `.data/scripts/`, the license and
+the third-party notices as its license files, no Python code) and one npm archive
+per package (`@hyper-light/focal`, a wrapper whose optional dependencies are the
+eight platform packages `@hyper-light/focal-<os>-<arch>[-<libc>]`; on Unix its
+postinstall puts the executable in the shim's place so the command on `PATH` is the
+binary, on Windows the shim spawns `focal.exe`; without install scripts the shim
+spawns it everywhere). The wheel's tags say what each binary needs: macOS 15, glibc
+2.39 for the GNU binaries, and for the static musl binaries `manylinux_2_17` and
+`musllinux_1_2` at once — no C library is needed, so `pip` installs them on any
+older glibc and on musl, while a glibc 2.39 host takes the GNU wheel. Archives are
+deterministic (the source commit's time on every member, fixed ownership), listed
+with their digests in `packages-manifest.json`, re-read against the collection
+before they are kept and again before they are published, and installed on the
+runner as a user installs them (`pip`, `npm` with and without scripts), on manual
+dispatches too. The manifests under `packaging/` carry the placeholder `0.0.0`;
+the build stamps the workspace version and the guard refuses a packaging map that
+disagrees with the platform catalog. Publication runs after the GitHub release is
+published, under each registry's trusted publishing (OIDC): the repository holds no
+token, a rerun skips what is live, and a refusing registry leaves the release as
+it is. The one-time registry setup (PyPI pending publisher; npm's name registration
+by `npm-bootstrap.sh`, then a trusted publisher per package) is in
+`scripts/release/README.md`. Names: `focal` and `focal-cli` belong to other
+projects on PyPI, `focal` to another on npm; `focal-node` is the crate that builds
+the executable, and the npm names sit under the organization's scope.
+
+Verified locally on this tree: the orchestration suite (27 tests, seven of them
+packaging: every target's wheel and archive carry the collection's bytes, the
+archives are deterministic, an altered archive, a foreign executable, a missing or
+a stray archive is refused, npm publication orders the platform packages before the
+wrapper and skips what is live); a collection with the real macOS arm64 executable
+built into all seventeen archives, the wheel installed by `pip` into a venv
+(`focal 0.1.0`; the first build lost the executable bit — pip keeps it only for a
+zip member marked a regular file, `S_IFREG`, which the builder now sets), run by
+`uvx --from <wheel> focal`, all eight wheels passing `twine check`, and the npm
+pair installed with and without install scripts (`focal 0.1.0` both ways, the
+command on `PATH` a Mach-O executable after postinstall and the Node shim without).
