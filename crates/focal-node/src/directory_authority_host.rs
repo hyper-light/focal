@@ -98,12 +98,7 @@ impl<V: AuthorityVerifier> Owner<V> {
             if self.replica.status().role != StateRole::Leader {
                 return Err(DirectoryBootstrapError::Unavailable);
             }
-            self.pace
-                .periods()
-                .checked_add(focal_timing::ProgressDeadline::periods(
-                    self.config.request_timeout,
-                    self.config.tick,
-                ))
+            self.request_deadline()
                 .ok_or(DirectoryBootstrapError::Capacity)
         })();
         match result {

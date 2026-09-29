@@ -11,8 +11,10 @@ naming `unauthorized`; `focal_credential_expires_at_seconds` in its metrics is p
 peers close its connections and admit no new ones, so it learns nothing more: `cluster
 node readiness` on it shows `catching_up: false` and `authoritative: false`, and a node
 whose own copy of the registry applied the revocation before it was cut off refuses to
-serve or start (`[credential_retired]`, exit 5). It may still answer probes for a while, so
-`alive` can lag: the credential field, not liveness, is the symptom.
+serve or start (`[credential_retired]`, exit 5). A node that has just renewed or rotated
+its credential is not retired by a copy of the registry that has not yet applied that
+change: it is ahead of what it observes and converges on the commit. It may still answer
+probes for a while, so `alive` can lag: the credential field, not liveness, is the symptom.
 
 **Read-only diagnostics.**
 

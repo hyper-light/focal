@@ -91,6 +91,19 @@ impl Running {
     pub(crate) fn periods(&self) -> Vec<u64> {
         let mut periods = vec![self.handles.control.periods()];
         periods.extend(self.handles.ledger.as_ref().map(ReplicaHost::periods));
+        // Every session copy this node hosts, by the one that has run the
+        // fewest periods: what a wait reads is theirs as often as the
+        // root's, and each runs at a pace of its own. A copy installed
+        // during the wait counts from its start, which is what is waited
+        // on (27 §3.1 P8).
+        let mut after = None;
+        let mut fewest: Option<u64> = None;
+        while let Some((ledger, host)) = self.handles.fleet.next_host(after) {
+            after = Some(ledger);
+            let ran = host.periods();
+            fewest = Some(fewest.map_or(ran, |least| least.min(ran)));
+        }
+        periods.extend(fewest);
         periods
     }
 }

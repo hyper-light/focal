@@ -437,7 +437,9 @@ impl PeerConnectionPool {
     /// take where that is more ([`Self::exchange_tail`]); the pool's own
     /// deadline at most. A peer across the planet is waited for as long
     /// as it takes to answer, one that stopped answering twice as long
-    /// each time, and one that never answered its share.
+    /// each time, and one nothing is measured of yet its share: a directed
+    /// search hands its request on, and a peer given the whole round would
+    /// leave the others unasked.
     pub fn exchange_wait(&self, target: u64, round: Duration, asked: usize) -> Duration {
         let share = round
             .checked_div(u32::try_from(asked.max(1)).unwrap_or(u32::MAX))

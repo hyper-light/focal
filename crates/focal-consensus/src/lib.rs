@@ -808,6 +808,14 @@ impl DurableNode {
     pub fn election_tick(&self) -> usize {
         self.config.election_tick
     }
+    /// The ticks this member waits beyond its election timeout before it
+    /// campaigns (`focal_raft::Raft::set_patience`): what its owner gives
+    /// it for the stalls it has seen in itself.
+    pub fn set_patience(&mut self, ticks: usize) -> Result<(), ConsensusError> {
+        self.check()?;
+        self.raw.raft.set_patience(ticks);
+        Ok(())
+    }
     /// The priority this node was given; in force once it has a term.
     pub fn priority(&self) -> i64 {
         self.priority

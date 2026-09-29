@@ -11312,14 +11312,18 @@ its single asks and "no leader that answers". Three causes, each fixed at its cl
 |---|---|---|
 | Owners gave a request its time by the clock while a loaded machine slowed their rounds | `ControlHost`, both directory hosts, `ReplicaHost` and its placement, managed and evidence sub-owners | A request's time is counted in the owner's periods; a period that passes without a tick (the writer persisting, a stop) is counted, refused |
 | The rig's owners ticked at wall pace while its in-process routers crawled | `tests/control_host.rs` | The routers probe the runtime and publish the sender's pace, as a node publishes its probes' round trips |
-| Owners stalled 0.6–8 s (threads the machine did not run) against a 250 ms election timeout: six terms in twelve seconds, every leader `NotReady` | `TickPace::derive_with_stall`, `pace.rs` | The election timeout covers the longest stall of the owner's own periods and one tail after it; a stall is remembered for ten times its length; `focal_root_period_longest_ms` / `focal_session_period_longest_ms` show it |
+| Owners stalled 0.6–8 s (threads the machine did not run) against a 250 ms election timeout: six terms in twelve seconds, every leader `NotReady` | `focal_raft::Raft::set_patience`, `TickPeriod::patience` | The replica waits, beyond its election timeout, as many ticks as the longest stall the owner remembers took and a tail after it; a stall is remembered for ten times its length. In ticks and not in the period: covering it by a longer period stretched every request's time and every cadence with it, which is what CI's slower runners then failed on. `focal_root_period_longest_ms` / `focal_session_period_longest_ms` show the stall |
 
-Every ask of the suite that expects an answer waits for a definite one, charged to the
-hosts' periods (`Rig::definite`, `read_on_leader`), and the wait for a leader reports what
-each host last answered, its refused periods, its longest period and its pace. Six copies
-at once: 18 of 18 runs. Eight: 7 of 8. Sixteen (a thread for every core fifteen times
-over): 14 of 16; what remains is a follower whose owner stalls longer than the leader's
-request time, which the leader's own periods do not see (27 §8.4).
+A request an owner holds is given the same patience beyond its time. Every ask of the
+suite that expects an answer waits for a definite one, charged to the hosts' periods
+(`Rig::definite`, `read_on_leader`), and the wait for a leader reports what each host last
+answered, its refused periods, its longest period and its pace. Six copies at once: 18 of
+18 runs, three rounds over. Eight: 5 of 8. Sixteen (a thread for every core fifteen times
+over): none; what remains is a leader whose term entry the stalled followers do not
+acknowledge in time, which the leader's own stall does not measure (27 §8.4). Covering a
+stall by a longer period instead passed 14 of 16 here and failed CI on all three platforms:
+every request's time and every cadence stretched with it, past what wall-bounded clients
+and slower runners allow.
 
 **A death, held and told.** `cluster plan` says for how many seconds a death still stands
 before a seat moves (`focal_directory::deaths_stand_for`, one rule with `deaths_held`). On
@@ -11332,10 +11336,41 @@ silent loses its seat to the spare without an operator
 `Capacity` only when none could be dialed, the pool's connections all taken by dials to the
 dead; each probe waits its share of the round or the peer's measured exchange tail.
 
+**CI on `1395e22`**, the first push of this batch, failed on every platform, each on a
+different wait, and all three said the same thing once read: what stretched a period
+stretched everything counted in it. Windows: a killed host's copy reopened but the wait
+for leadership to return to the founder was charged to the root owners' periods while the
+return runs at the session copies' pace (`Running::periods` now counts every copy a node
+hosts, by the one that ran fewest), and its allowance was a guess of thirty seconds where
+the return's own schedule, an ask that does not hold twice with its rests doubled, takes
+longer in the session's election window; the wait is given that schedule now. macOS: a client that gives a request two seconds of
+the clock waited for a host whose 500 ms, in periods stretched by a stall, were more (the
+test takes the client's own timeout as the unknown outcome it is). Linux: a heal's catch-up
+crawled for 300 s of root periods behind session copies whose periods a stall had
+stretched. On Windows again, a joined host's controller stopped `Retired` right after it
+renewed its credential. That one reproduced here, in the gate run, and was the rule and not
+the machine: a node was retired when the registry it observed did not authorize the
+certificate it held, and its own renewal, committed at the sponsor before the sponsor
+answers but not yet observed committed by the holder, is such a certificate whenever the
+holder's next observation predates the commit. The rule now judges by what the registry
+knows of the certificate held (`credential_retired`): the certificate listed, held while it
+authorizes and retired once revoked or expired; a certificate a renewal replaced, held
+within the grace the renewal left it and retired past it; a certificate the registry does
+not know, retired when it was issued at a registry revision no later than the listed one
+and held when it was issued later, a renewal or rotation the node made after the registry
+was observed, which the node converges on once it observes it
+(`a_credential_is_retired_by_what_the_registry_knows_of_it_not_by_its_absence`). The other
+three do not reproduce here, on this machine under load or on Linux in a container of
+three CPUs, one of them taken; what answers them is the form the stall rule has now:
+patience in ticks, the period untouched; a probe of a peer nothing is measured of yet
+given the round.
+
 **Gates** on the final tree (macOS arm64): `cargo fmt --all --check`, `check-contracts.py`,
 clippy with `-D warnings`, `check-production.sh`, `cargo deny`, and the workspace's tests
-with four threads: 148 suites, 2,869 tests, none failed, 3 ignored. The model was not
-checked here (no Java runtime); it has not changed since `d88cde3`.
+with four threads, on the final tree after the CI findings and the credential rule: 148
+suites, 2,870 tests, none failed, 3 ignored (before them: 148 suites, 2,869 tests, none
+failed, 3 ignored). The model was not checked here (no Java runtime); it has not changed
+since `d88cde3`.
 
 **Stage A, under injected load** (27 §6). Eighteen processes held every core of this
 machine busy (`load averages: 69.92 75.36 53.10` on 18 cores at the end of the run) while

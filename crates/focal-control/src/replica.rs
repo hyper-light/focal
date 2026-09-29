@@ -214,6 +214,13 @@ impl ControlReplica {
     pub fn election_tick(&self) -> usize {
         self.node.election_tick()
     }
+    /// The ticks the replica waits beyond its election timeout before it
+    /// campaigns (`DurableNode::set_patience`).
+    pub fn set_patience(&mut self, ticks: usize) -> Result<(), ControlError> {
+        self.check()?;
+        self.node.set_patience(ticks)?;
+        Ok(())
+    }
     pub fn configuration_index(&self) -> u64 {
         self.configuration_index
     }

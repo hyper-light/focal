@@ -33,7 +33,7 @@ struct TickShared {
     last_advance_ns: AtomicU64,
     longest_ns: AtomicU64,
     /// The longest a period took beyond what the owner meant it to be: a
-    /// stall, which the pace covers (`TickPace::derive_with_stall`) and
+    /// stall, which the replica's patience covers ([`Self::patience`]) and
     /// which is remembered, with when it was seen, for the margin the
     /// paths are covered by times its own length (`ELECTION_MARGIN`): a
     /// stall that lasted a second stands for ten, and a longer one takes
@@ -111,9 +111,29 @@ impl TickPeriod {
     pub(crate) fn longest(&self) -> Duration {
         Duration::from_nanos(self.0.longest_ns.load(Ordering::Relaxed))
     }
-    /// The stall the owner's pace covers now, in nanoseconds.
+    /// The stall the owner remembers now, in nanoseconds.
     pub(crate) fn stall(&self) -> u64 {
         self.stall_at(u64::try_from(began().elapsed().as_nanos()).unwrap_or(u64::MAX))
+    }
+    /// The ticks the stall is covered by: what the longest stall the owner
+    /// remembers took, and a tail of the paths after it, in periods of the
+    /// pace in force. The replica waits as many beyond its election
+    /// timeout before it campaigns (`focal_raft::Raft::set_patience`): a
+    /// node that stalls cannot tell a leader that stalls as it does from
+    /// one that died, and a leader's heartbeat leaves its tick, so the one
+    /// after a stall takes a tail to arrive. In ticks and not in the
+    /// period (27 §3.1 P2): what stretches is the election timeout, and
+    /// nothing else that is counted in periods.
+    pub(crate) fn patience(&self, configured: Duration, ceiling: Duration) -> usize {
+        let stall = self.stall();
+        if stall == 0 {
+            return 0;
+        }
+        let tail = self.derived().map_or(0, |pace| pace.broadcast_tail_ns);
+        let period = u64::try_from(self.get(configured, ceiling).as_nanos())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        usize::try_from(stall.saturating_add(tail).div_ceil(period)).unwrap_or(usize::MAX)
     }
     /// The period passed without a tick.
     pub(crate) fn refuse(&self) {

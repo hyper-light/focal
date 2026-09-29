@@ -600,6 +600,13 @@ impl Session {
     pub fn election_tick(&self) -> usize {
         self.consensus.election_tick()
     }
+    /// The ticks the replica waits beyond its election timeout before it
+    /// campaigns (`DurableNode::set_patience`).
+    pub fn set_patience(&mut self, ticks: usize) -> Result<(), LedgerError> {
+        self.check()?;
+        self.consensus.set_patience(ticks)?;
+        Ok(())
+    }
     /// What this leader tracks of one member's replication.
     pub fn peer(&self, node: u64) -> Option<focal_consensus::PeerProgress> {
         self.consensus.peer(node)

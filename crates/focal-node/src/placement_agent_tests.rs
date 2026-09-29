@@ -1072,9 +1072,29 @@ async fn the_controller_expands_a_laptop_session_to_three_hosts_that_survive_one
     }
     // The lost host returns, reopens its copy and rejoins as a voter.
     let peer_b = Running::start(&peer_settings[1]).await;
+    // Leadership returns to the founder by the return's own schedule (27
+    // §5): the founder fit for `FIT` windows, a quiet moment waited for up
+    // to `PATIENCE`, and a rest of `REST` windows after each ask, doubled
+    // after one that did not hold. Under load an ask may not hold twice:
+    // the wait is given the reopen's time and that schedule, in the
+    // session's election window, and not a guess at the sum.
+    let window = founder
+        .handles
+        .ledger
+        .as_ref()
+        .map(|host| {
+            host.tick_period()
+                .saturating_mul(u32::try_from(host.election_periods()).unwrap_or(u32::MAX))
+        })
+        .unwrap_or(Duration::from_secs(1));
+    let returns = window.saturating_mul(
+        crate::leader_return::FIT
+            + crate::leader_return::PATIENCE
+            + crate::leader_return::REST * ((1 << 3) - 1),
+    );
     if let Err(spent) = try_until(
         &[&founder, &peer_a, &peer_b],
-        Duration::from_secs(30),
+        Duration::from_secs(30).saturating_add(returns),
         async || {
             peer_b
                 .handles
@@ -1087,9 +1107,15 @@ async fn the_controller_expands_a_laptop_session_to_three_hosts_that_survive_one
     .await
     {
         panic!(
-            "the returning host never reopened its copy: {spent}: hosts={} status={:?} progress={:?}",
+            "the returning host never reopened its copy: {spent}: hosts={} status={:?} founder={:?} peer_a={:?} progress={:?}",
             peer_b.handles.fleet.hosts(ledger),
             peer_b.handles.placement.status().await,
+            founder.handles.ledger.as_ref().map(ReplicaHost::progress),
+            peer_a
+                .handles
+                .fleet
+                .current_host(ledger)
+                .map(|host| host.progress()),
             peer_b
                 .handles
                 .fleet

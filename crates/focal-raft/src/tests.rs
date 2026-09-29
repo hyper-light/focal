@@ -696,3 +696,28 @@ fn one_told_to_campaign_before_it_applied_a_change_campaigns_once_it_has() {
         assert_eq!(node.raft.term(), 1);
     }
 }
+
+/// A follower given patience campaigns only once its patience has passed
+/// beyond its election timeout; given none, at its timeout.
+#[test]
+fn a_follower_waits_its_patience_before_it_campaigns() {
+    let mut patient = follower();
+    patient.raft.set_patience(7);
+    assert_eq!(patient.raft.patience(), 7);
+    let timeout = patient.raft.randomized_election_timeout();
+    for _ in 0..timeout + 6 {
+        patient.tick().unwrap();
+    }
+    assert_eq!(patient.raft.state(), StateRole::Follower);
+    assert!(drain(&mut patient).is_empty());
+    patient.tick().unwrap();
+    assert_ne!(patient.raft.state(), StateRole::Follower);
+    let mut prompt = follower();
+    let timeout = prompt.raft.randomized_election_timeout();
+    for _ in 0..timeout - 1 {
+        prompt.tick().unwrap();
+    }
+    assert_eq!(prompt.raft.state(), StateRole::Follower);
+    prompt.tick().unwrap();
+    assert_ne!(prompt.raft.state(), StateRole::Follower);
+}

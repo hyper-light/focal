@@ -108,12 +108,7 @@ impl<V: AuthorityVerifier> Owner<V> {
                 return Err(DirectoryBootstrapError::Unavailable);
             }
             let deadline = self
-                .pace
-                .periods()
-                .checked_add(focal_timing::ProgressDeadline::periods(
-                    self.config.request_timeout,
-                    self.config.tick,
-                ))
+                .request_deadline()
                 .ok_or(DirectoryBootstrapError::Capacity)?;
             self.nonce = self
                 .nonce

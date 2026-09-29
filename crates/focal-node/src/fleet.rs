@@ -796,13 +796,11 @@ impl ReplicaHost {
         &self,
         paths: impl IntoIterator<Item = &'a focal_timing::PathRtt>,
     ) -> focal_timing::TickPace {
-        // The owner's own stalls are covered too (`ControlHost::pace`).
-        let pace = focal_timing::TickPace::derive_with_stall(
+        let pace = focal_timing::TickPace::derive(
             self.tick,
             self.tick_ceiling,
             self.pace.election_tick().max(1),
             paths,
-            self.pace.stall(),
         );
         self.pace.publish(pace);
         pace
@@ -1542,6 +1540,12 @@ impl Owner {
     fn tick(&mut self) -> Result<(), LedgerError> {
         self.pace
             .advance(self.pace.get(self.config.tick, self.config.tick_ceiling));
+        // What the owner has seen of its own stalls is the replica's
+        // patience before it campaigns (`ControlHost`).
+        self.session.set_patience(
+            self.pace
+                .patience(self.config.tick, self.config.tick_ceiling),
+        )?;
         // The committed placement names the session's preferred leader (27
         // §5): it outranks the other voters in an election among equally
         // current logs, so leadership returns to where placement put it and
@@ -3340,12 +3344,21 @@ impl Owner {
     /// request time in the periods it holds at the configured tick, counted
     /// as the owner runs them (27 §3.1 P2).
     fn request_deadline(&self) -> Option<u64> {
+        // And the ticks of the owner's own remembered stall, as its
+        // replica's patience is (`ControlHost::request_deadline`).
         self.pace
             .periods()
             .checked_add(focal_timing::ProgressDeadline::periods(
                 self.config.request_timeout,
                 self.config.tick,
-            ))
+            ))?
+            .checked_add(
+                u64::try_from(
+                    self.pace
+                        .patience(self.config.tick, self.config.tick_ceiling),
+                )
+                .unwrap_or(u64::MAX),
+            )
     }
     fn expire_pending(&mut self) {
         self.expire_placement();

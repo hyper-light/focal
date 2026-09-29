@@ -70,28 +70,42 @@ pub enum ControllerError {
 const ANNOUNCE_ROUND: Duration = Duration::from_secs(5);
 const ANNOUNCE_PROBES: usize = 9;
 
-/// Whether the committed registry knows this node and no longer authorizes
-/// the credential it holds. A registry that does not list the node at all
-/// (a fresh host observing the genesis checkpoint before it replicates its
-/// own enrollment) decides nothing.
+/// Whether the committed registry has retired the credential a node holds.
+/// A registry that does not list the node at all (a fresh host observing the
+/// genesis checkpoint before it replicates its own enrollment) decides
+/// nothing. One that lists the node under the certificate held has retired
+/// it when that certificate no longer authorizes (revoked, expired). One
+/// that lists the node under another certificate has retired the one held
+/// when it is past the grace a renewal left it and was issued at a registry
+/// revision no later than the listed one; a certificate the registry does
+/// not know that was issued at a later revision than the one it lists is a
+/// renewal or rotation this node made after the registry was observed: the
+/// node is ahead of its observation, not retired, and converges on the
+/// committed change once it observes it (`registry_ahead`, `rotation_ahead`).
 pub(crate) fn credential_retired(
     enrollment: &EnrollmentRegistry,
     node: u64,
     receipt: &EnrollmentReceipt,
     now: i64,
 ) -> bool {
-    let known = enrollment
+    let Some(listed) = enrollment
         .enrollments()
-        .any(|listed| listed.identity.node_id == Some(node));
-    known
-        && authorize_node_contact(
-            enrollment,
-            node,
-            receipt.identity.principal,
-            certificate_fingerprint(&receipt.certificate),
-            now,
-        )
-        .is_err()
+        .find(|listed| listed.identity.node_id == Some(node))
+    else {
+        return false;
+    };
+    let held = certificate_fingerprint(&receipt.certificate);
+    if certificate_fingerprint(&listed.certificate) == held {
+        return authorize_node_contact(enrollment, node, receipt.identity.principal, held, now)
+            .is_err();
+    }
+    if enrollment
+        .retired(now)
+        .any(|(retired, _)| certificate_fingerprint(&retired.certificate) == held)
+    {
+        return false;
+    }
+    receipt.revision <= listed.revision
 }
 /// Receipt release follows committed enrollment and the controller's active
 /// grant projection. Only that controller writes the registry; a delayed join

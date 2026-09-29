@@ -591,22 +591,21 @@ impl ControlHost {
         ))
     }
     /// Derive this owner's tick period from the measured paths to the
-    /// group's other voters and from the owner's own stalls (27 §3.1 P2),
-    /// and put it in force from the next tick. A group whose paths all sit
-    /// inside the configured period, on a node whose owner runs its
-    /// periods on time, keeps the configured period.
+    /// group's other voters (27 §3.1 P2) and put it in force from the next
+    /// tick. A group whose paths all sit inside the configured period keeps
+    /// the configured period. The owner's own stalls do not touch the
+    /// period: they are the replica's patience (`TickPeriod::patience`).
     pub fn pace<'a>(
         &self,
         paths: impl IntoIterator<Item = &'a focal_timing::PathRtt>,
     ) -> focal_timing::TickPace {
-        let pace = focal_timing::TickPace::derive_with_stall(
+        let pace = focal_timing::TickPace::derive(
             self.config.tick,
             self.config.tick_ceiling,
             // Before the owner has opened its replica the count is unknown;
             // one tick is the conservative reading (the longest period).
             self.pace.election_tick().max(1),
             paths,
-            self.pace.stall(),
         );
         self.pace.publish(pace);
         pace
@@ -826,6 +825,12 @@ impl<V: AuthorityVerifier> Owner<V> {
                 if Instant::now() >= next_tick {
                     self.pace
                         .advance(self.pace.get(self.config.tick, self.config.tick_ceiling));
+                    // What the owner has seen of its own stalls is the
+                    // replica's patience before it campaigns.
+                    self.replica.set_patience(
+                        self.pace
+                            .patience(self.config.tick, self.config.tick_ceiling),
+                    )?;
                     // A tick that was refused the room, or that came while
                     // the one before it is still persisted, changed
                     // nothing: the period has passed without it. A member
@@ -1379,13 +1384,7 @@ impl<V: AuthorityVerifier> Owner<V> {
             });
             return;
         }
-        let deadline = self
-            .pace
-            .periods()
-            .checked_add(focal_timing::ProgressDeadline::periods(
-                self.config.request_timeout,
-                self.config.tick,
-            ));
+        let deadline = self.request_deadline();
         if let (Some(waiting), Some(deadline)) = (waiting, deadline) {
             self.pending.push_back(Pending {
                 header,
@@ -1404,6 +1403,26 @@ impl<V: AuthorityVerifier> Owner<V> {
     /// A reply is given once what it was made from is released: the one that
     /// asked may look at the budget the moment it is answered, and finds
     /// there what its answer holds and nothing of the owner's.
+    /// The owner's period at which a request taken now is given up: the
+    /// request time in the periods it holds at the configured tick, and the
+    /// ticks of the owner's own remembered stall beyond it, as its
+    /// replica's patience is (`TickPeriod::patience`): a barrier this owner
+    /// was late to run for a stall of its own is not given up for it.
+    fn request_deadline(&self) -> Option<u64> {
+        self.pace
+            .periods()
+            .checked_add(focal_timing::ProgressDeadline::periods(
+                self.config.request_timeout,
+                self.config.tick,
+            ))?
+            .checked_add(
+                u64::try_from(
+                    self.pace
+                        .patience(self.config.tick, self.config.tick_ceiling),
+                )
+                .unwrap_or(u64::MAX),
+            )
+    }
     fn drain(&mut self) -> Result<(), ControlError> {
         let mut finished = Vec::new();
         let drained = self.drain_events(&mut finished);

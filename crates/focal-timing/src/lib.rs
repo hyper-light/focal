@@ -225,9 +225,6 @@ pub struct TickPace {
     /// Round trips measured across the voter paths that fed this pace: the
     /// witness that the pace is measured and not the floor it defaults to.
     pub samples: u64,
-    /// The longest the owner's own recent periods stalled beyond what
-    /// they meant to be, which the election timeout covers as well.
-    pub stall_ns: u64,
 }
 
 impl TickPace {
@@ -250,24 +247,6 @@ impl TickPace {
         election_tick: usize,
         paths: impl IntoIterator<Item = &'a PathRtt>,
     ) -> Self {
-        Self::derive_with_stall(configured, ceiling, election_tick, paths, 0)
-    }
-    /// [`Self::derive`], for an owner whose own recent periods stalled by
-    /// `stall_ns` at most beyond what they meant to be: the election
-    /// timeout covers the stall and one tail after it as well,
-    /// `election_tick × period ≥ stall + tail`. A heartbeat leaves the
-    /// leader's tick, so a leader that stalls as this node does sends none
-    /// for the stall, and the one it then sends takes a tail to arrive; a
-    /// node that stalls cannot tell such a leader from one that died. A
-    /// stall is a fact about the node and not noise about a path: it is
-    /// covered whole, and by the longest seen, not a tail of the many.
-    pub fn derive_with_stall<'a>(
-        configured: Duration,
-        ceiling: Duration,
-        election_tick: usize,
-        paths: impl IntoIterator<Item = &'a PathRtt>,
-        stall_ns: u64,
-    ) -> Self {
         let mut tail = 0u64;
         let mut samples = 0u64;
         for path in paths {
@@ -277,20 +256,15 @@ impl TickPace {
             }
         }
         let ticks = u64::try_from(election_tick).unwrap_or(u64::MAX).max(1);
-        let needed = ELECTION_MARGIN
-            .saturating_mul(tail)
-            .max(stall_ns.saturating_add(tail))
-            .div_ceil(ticks);
+        let needed = ELECTION_MARGIN.saturating_mul(tail).div_ceil(ticks);
         let floor = nanos(configured).max(1);
         let ceiling = nanos(ceiling).max(floor);
         Self {
             period: Duration::from_nanos(needed.clamp(floor, ceiling)),
             broadcast_tail_ns: tail,
             samples,
-            stall_ns,
         }
     }
-
     /// The election timeout this pace gives a node of `election_tick` ticks.
     pub fn election_timeout(&self, election_tick: usize) -> Duration {
         let ticks = u32::try_from(election_tick).unwrap_or(u32::MAX);
@@ -496,36 +470,6 @@ mod tests {
         assert_eq!(
             pace.election_timeout(usize::MAX),
             CEILING.saturating_mul(u32::MAX)
-        );
-    }
-
-    /// An owner that stalled has its election timeout cover the stall and
-    /// one tail after it; a stall inside the ten tails of the paths changes
-    /// nothing, and none at all is the pace of the paths.
-    #[test]
-    fn a_stall_of_the_owner_is_covered_whole_with_a_tail_after_it() {
-        let mut path = PathRtt::default();
-        for _ in 0..PATH_WINDOW {
-            path.on_sample(10 * MS);
-        }
-        let paths = TickPace::derive(TICK, CEILING, ELECTION_TICK, [&path]);
-        let tail = paths.broadcast_tail_ns;
-        // Ten tails cover a stall of nine.
-        let small = TickPace::derive_with_stall(TICK, CEILING, ELECTION_TICK, [&path], 9 * tail);
-        assert_eq!(small.period, paths.period);
-        assert_eq!(small.stall_ns, 9 * tail);
-        // A stall of a second stretches the timeout to the second and a tail.
-        let stall = 1_000 * MS;
-        let stalled = TickPace::derive_with_stall(TICK, CEILING, ELECTION_TICK, [&path], stall);
-        let ticks = u64::try_from(ELECTION_TICK).unwrap();
-        assert_eq!(
-            stalled.period,
-            Duration::from_nanos((stall + tail).div_ceil(ticks))
-        );
-        assert!(stalled.period > paths.period);
-        assert_eq!(
-            TickPace::derive_with_stall(TICK, CEILING, ELECTION_TICK, [&path], 0),
-            paths
         );
     }
 }

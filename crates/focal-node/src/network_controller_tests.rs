@@ -636,3 +636,145 @@ async fn contact_announcement_reaches_alternate_after_blackholed_preferred_leade
     serving.await.unwrap();
     pool.close();
 }
+
+/// The rule that stops a controller whose credential the committed registry
+/// has retired (24 §11) judges the certificate held by what the registry
+/// knows of it: listed and authorizing, listed and revoked, replaced and in
+/// its grace, replaced and past it, or issued after the registry was observed.
+#[test]
+fn a_credential_is_retired_by_what_the_registry_knows_of_it_not_by_its_absence() {
+    use focal_enrollment::{
+        BootstrapAuthority, EnrollmentRole, InviteOptions, JoinKey, JoinPreparation,
+        RenewPreparation,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let cluster = [7; 16];
+    let now = unix_time().unwrap();
+    let authority = BootstrapAuthority::open_or_create(
+        dir.path().join("authority"),
+        cluster,
+        vec!["localhost".into()],
+        now,
+    )
+    .unwrap();
+    let limits = EnrollmentLimits::default();
+    let mut registry = EnrollmentRegistry::new(
+        cluster,
+        authority.ca_certificate().to_vec(),
+        2,
+        limits.clone(),
+    )
+    .unwrap();
+    let draft = registry
+        .prepare_invitation(
+            &authority,
+            InviteOptions {
+                endpoint: "127.0.0.1:8443".into(),
+                server_name: "localhost".into(),
+                role: EnrollmentRole::Node,
+                expires_at: now + 600,
+            },
+            now,
+        )
+        .unwrap();
+    registry
+        .apply_committed(draft.command(), registry.applied_index() + 1)
+        .unwrap();
+    let invitation = draft.release(&registry).unwrap();
+    let key = JoinKey::open_or_create(dir.path().join("node"), cluster).unwrap();
+    // A join request is only issued over a connection the invitation trusts.
+    let mut client = rustls::ClientConnection::new(
+        std::sync::Arc::new(invitation.client_config().unwrap()),
+        rustls::pki_types::ServerName::try_from(invitation.trust().server_name.clone()).unwrap(),
+    )
+    .unwrap();
+    let mut server = rustls::ServerConnection::new(std::sync::Arc::new(
+        authority.server_identity().server_config().unwrap(),
+    ))
+    .unwrap();
+    let mut request = None;
+    for _ in 0..32 {
+        if client.wants_write() {
+            let mut bytes = Vec::new();
+            client.write_tls(&mut bytes).unwrap();
+            server.read_tls(&mut std::io::Cursor::new(bytes)).unwrap();
+            server.process_new_packets().unwrap();
+        }
+        if server.wants_write() {
+            let mut bytes = Vec::new();
+            server.write_tls(&mut bytes).unwrap();
+            client.read_tls(&mut std::io::Cursor::new(bytes)).unwrap();
+            client.process_new_packets().unwrap();
+        }
+        if !client.is_handshaking() && !server.is_handshaking() {
+            request = Some(invitation.request_after_tls(&client, &key, now).unwrap());
+            break;
+        }
+    }
+    let request = request.expect("the enrollment TLS handshake finishes");
+    let JoinPreparation::Commit(joined) = registry.prepare_join(&authority, &request, now).unwrap()
+    else {
+        panic!("a first join commits")
+    };
+    registry
+        .apply_committed(&joined, registry.applied_index() + 1)
+        .unwrap();
+    let first = registry.release(&request, now).unwrap();
+    let node = first.identity.node_id.unwrap();
+    let material = key
+        .complete(&first, authority.ca_certificate(), now)
+        .unwrap();
+    // The certificate listed, authorizing.
+    assert!(!credential_retired(&registry, node, &first, now));
+    // A registry that does not list the node decides nothing.
+    let fresh = EnrollmentRegistry::new(
+        cluster,
+        authority.ca_certificate().to_vec(),
+        2,
+        limits.clone(),
+    )
+    .unwrap();
+    assert!(!credential_retired(&fresh, node, &first, now));
+    // The registry as the holder last observed it, before its renewal commits.
+    let observed =
+        EnrollmentRegistry::restore(&registry.checkpoint().unwrap(), cluster, limits).unwrap();
+    let renewal = material.renewal_request(&key, &first).unwrap();
+    let at = now + 10;
+    let grace = 30;
+    let RenewPreparation::Commit(renew) = registry
+        .prepare_renew(&authority, &renewal, at, grace)
+        .unwrap()
+    else {
+        panic!("a first renewal commits")
+    };
+    registry
+        .apply_committed(&renew, registry.applied_index() + 1)
+        .unwrap();
+    let renewed = registry.release_renewal(&renewal, at).unwrap();
+    assert!(renewed.revision > first.revision);
+    // The holder presents the renewal before it observes the commit: ahead of
+    // its observation, not retired.
+    assert!(!credential_retired(&observed, node, &renewed, at));
+    // Observed, the renewal is the certificate listed.
+    assert!(!credential_retired(&registry, node, &renewed, at));
+    // The certificate the renewal replaced holds through its grace, not past it.
+    assert!(!credential_retired(
+        &registry,
+        node,
+        &first,
+        at + grace as i64 - 1
+    ));
+    assert!(credential_retired(
+        &registry,
+        node,
+        &first,
+        at + grace as i64
+    ));
+    // A revocation retires the certificate listed and the replaced one at once.
+    let revoked = registry.prepare_revoke(first.invitation, at).unwrap();
+    registry
+        .apply_committed(&revoked, registry.applied_index() + 1)
+        .unwrap();
+    assert!(credential_retired(&registry, node, &renewed, at));
+    assert!(credential_retired(&registry, node, &first, at));
+}

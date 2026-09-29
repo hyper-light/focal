@@ -161,11 +161,18 @@ fn a_drained_session_leader_hands_leadership_on_before_it_is_removed() {
                 .iter()
                 .map(|node| {
                     format!(
-                        "leader {:?}; health {}",
+                        "leader {:?}; health {}; periods {}",
                         session_leader(node, &ledger),
                         String::from_utf8_lossy(
                             &run(node, None, &["cluster", "node", "health"]).stdout
+                        ),
+                        String::from_utf8_lossy(
+                            &run(node, None, &["cluster", "node", "metrics"]).stdout
                         )
+                        .lines()
+                        .filter(|line| line.contains("period") || line.contains("pace"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
                     )
                 })
                 .collect();

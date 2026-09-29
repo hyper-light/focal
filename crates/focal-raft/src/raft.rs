@@ -243,6 +243,14 @@ pub struct Raft<S> {
     pub(crate) election_elapsed: usize,
     heartbeat_elapsed: usize,
     randomized_election_timeout: usize,
+    /// Ticks this member waits beyond its election timeout before it
+    /// campaigns: its patience, given by its owner for what it has seen
+    /// of itself. A member whose own periods stalled cannot tell a leader
+    /// that stalls as it does from one that died, so it waits as long as
+    /// its own longest stall took, and a tail after. A stall is covered in
+    /// ticks and not by a longer tick, so nothing else the member counts
+    /// in ticks grows with it.
+    patience: usize,
     /// What this member approved by itself.
     pub(crate) held: Proposals,
     /// What the voters hold above this member's log, as it was told.
@@ -497,6 +505,7 @@ impl<S: Storage> Raft<S> {
             election_elapsed: 0,
             heartbeat_elapsed: 0,
             randomized_election_timeout: config.election_tick,
+            patience: 0,
             held: Proposals::new(config.limits.proposals, config.limits.proposal_bytes),
             votes: Votes::new(
                 usize::try_from(config.limits.fast_window).unwrap_or(usize::MAX),
@@ -648,6 +657,16 @@ impl<S: Storage> Raft<S> {
     /// force changes between operations and never within one.
     pub(crate) fn settle_priority(&mut self) {
         self.priority_in_force = if self.term == 0 { 0 } else { self.priority };
+    }
+    /// The ticks this member waits beyond its election timeout before it
+    /// campaigns.
+    pub fn patience(&self) -> usize {
+        self.patience
+    }
+    /// Give this member `ticks` of patience beyond its election timeout,
+    /// for the stalls its owner has seen in itself.
+    pub fn set_patience(&mut self, ticks: usize) {
+        self.patience = ticks;
     }
     /// For a harness that orders elections.
     pub fn set_randomized_election_timeout(&mut self, ticks: usize) -> Result<()> {
@@ -1001,7 +1020,12 @@ impl<S: Storage> Raft<S> {
     }
     fn tick_election(&mut self) -> Result<bool> {
         self.election_elapsed = self.election_elapsed.saturating_add(1);
-        if self.election_elapsed < self.randomized_election_timeout || !self.promotable {
+        if self.election_elapsed
+            < self
+                .randomized_election_timeout
+                .saturating_add(self.patience)
+            || !self.promotable
+        {
             return Ok(false);
         }
         self.election_elapsed = 0;
