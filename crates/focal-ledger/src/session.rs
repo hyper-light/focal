@@ -265,6 +265,17 @@ pub struct Session {
     /// the same refusal.
     seed_progress: bool,
     retained: Option<PendingDelivery>,
+    /// Read barriers a leader answered above this copy's applied index (27
+    /// §5, follower reads; the audit's F55): held, bounded by the reads the
+    /// core keeps in flight and charged once for that bound, until the
+    /// entries they name are applied. An answer that arrives before the
+    /// append that carries its index is replication lag, never corruption.
+    parked_reads: Vec<focal_consensus::ReadBarrier>,
+    parked_charge: Option<Allocation>,
+    /// Barriers parked, and barriers dropped at the parked bound, since
+    /// this session opened.
+    reads_parked: u64,
+    reads_dropped: u64,
 }
 
 impl Session {
@@ -477,6 +488,10 @@ impl Session {
             seed_progress: false,
             custody_pending: None,
             retained: None,
+            parked_reads: Vec::new(),
+            parked_charge: None,
+            reads_parked: 0,
+            reads_dropped: 0,
         };
         // Recovery consumes prior committed outcomes without executing their effects.
         // A delivery retained at startup (an import waiting for its host to seal
@@ -965,6 +980,7 @@ impl Session {
 
     pub fn read_index(&mut self, context: Vec<u8>) -> Result<(), LedgerError> {
         self.check()?;
+        self.refuse_at_parked_bound()?;
         self.consensus.read_index(context)?;
         Ok(())
     }
@@ -1266,7 +1282,11 @@ impl Session {
             delivery.native = Some(NativeOutput::reserve(
                 &self.budget,
                 delivery.events.committed.len(),
-                delivery.events.read_states.len(),
+                delivery
+                    .events
+                    .read_states
+                    .len()
+                    .saturating_add(self.parked_reads.len()),
             )?);
         }
         let applied_index = delivery.events.applied_index;
@@ -1301,7 +1321,11 @@ impl Session {
                     delivery.native = Some(NativeOutput::reserve(
                         &self.budget,
                         delivery.events.committed.len().saturating_sub(next),
-                        delivery.events.read_states.len(),
+                        delivery
+                            .events
+                            .read_states
+                            .len()
+                            .saturating_add(self.parked_reads.len()),
                     )?);
                 }
                 continue;
@@ -1397,27 +1421,36 @@ impl Session {
         if let Some(engine) = self.native.as_deref_mut() {
             engine.finish_entries(applied_index)?;
         }
+        // Barriers parked by an earlier delivery whose index this one
+        // reached, in the order they were parked, each removed only once it
+        // is answered: a retryable refusal leaves it parked.
+        while let Some(position) = self
+            .parked_reads
+            .iter()
+            .position(|barrier| barrier.index <= self.applied_raft)
+        {
+            let barrier = self
+                .parked_reads
+                .get(position)
+                .cloned()
+                .ok_or(LedgerError::Corrupt)?;
+            self.complete_read(&barrier, leader, &status, delivery)?;
+            self.parked_reads.remove(position);
+        }
+        let bound = self.consensus.pending_reads();
         while let Some(barrier) = delivery.events.read_states.get(delivery.read) {
             if barrier.index > self.applied_raft {
-                return Err(LedgerError::Corrupt);
+                // Answered by a leader ahead of this copy (27 §5, F55):
+                // replication lag, never corruption. The read waits for
+                // the entries it names; the delivery goes on so they can
+                // arrive. A parked set that is full drops the barrier,
+                // counted, rather than hold back this delivery.
+                self.park_read(barrier, bound)?;
+                delivery.read = delivery.read.checked_add(1).ok_or(LedgerError::Capacity)?;
+                continue;
             }
-            if barrier.context == readiness_context(status.term) {
-                self.ready_term = Some(status.term);
-                if leader && let Some(engine) = self.native.as_deref_mut() {
-                    engine.promote(status.term, &self.consensus)?;
-                }
-            } else if engine::NativeEngine::<BuiltinNativeSchemas>::is_correlated_read(
-                &barrier.context,
-            ) {
-                let engine = self.native.as_deref_mut().ok_or(LedgerError::Corrupt)?;
-                let output = delivery.native.as_mut().ok_or(LedgerError::Corrupt)?;
-                engine.apply_correlated_read(barrier, output)?;
-            } else {
-                delivery
-                    .result
-                    .read_barriers
-                    .push((barrier.context.clone(), self.core.sequence()));
-            }
+            let barrier = barrier.clone();
+            self.complete_read(&barrier, leader, &status, delivery)?;
             delivery.read = delivery.read.checked_add(1).ok_or(LedgerError::Capacity)?;
         }
         if leader
@@ -1454,6 +1487,91 @@ impl Session {
             delivery.result._native_allocation = Some(allocation);
         }
         Ok(())
+    }
+
+    /// Answer one read barrier this copy has applied up to: the readiness
+    /// barrier of this term, a native correlated read, or a legacy read.
+    fn complete_read(
+        &mut self,
+        barrier: &focal_consensus::ReadBarrier,
+        leader: bool,
+        status: &NodeStatus,
+        delivery: &mut PendingDelivery,
+    ) -> Result<(), LedgerError> {
+        if barrier.context == readiness_context(status.term) {
+            self.ready_term = Some(status.term);
+            if leader && let Some(engine) = self.native.as_deref_mut() {
+                engine.promote(status.term, &self.consensus)?;
+            }
+        } else if engine::NativeEngine::<BuiltinNativeSchemas>::is_correlated_read(&barrier.context)
+        {
+            let engine = self.native.as_deref_mut().ok_or(LedgerError::Corrupt)?;
+            let output = delivery.native.as_mut().ok_or(LedgerError::Corrupt)?;
+            engine.apply_correlated_read(barrier, output)?;
+        } else {
+            delivery
+                .result
+                .read_barriers
+                .push((barrier.context.clone(), self.core.sequence()));
+        }
+        Ok(())
+    }
+    /// Hold a barrier answered above the applied index until the entries it
+    /// names are applied. The set is bounded by the reads the core holds in
+    /// flight and charged once for that bound; at the bound the barrier is
+    /// dropped and counted — never a retained delivery, which would hold
+    /// back the very entries the parked reads wait for — and new reads are
+    /// refused at the request (`refuse_at_parked_bound`).
+    fn park_read(
+        &mut self,
+        barrier: &focal_consensus::ReadBarrier,
+        bound: usize,
+    ) -> Result<(), LedgerError> {
+        if self.parked_reads.len() >= bound {
+            self.reads_dropped = self.reads_dropped.saturating_add(1);
+            return Ok(());
+        }
+        if self.parked_charge.is_none() {
+            let bytes = std::mem::size_of::<focal_consensus::ReadBarrier>()
+                .checked_mul(bound)
+                .ok_or(LedgerError::Capacity)?;
+            let permit = self
+                .budget
+                .reserve(BudgetKind::Pending, BudgetLane::Completion, bytes)?;
+            self.parked_reads
+                .try_reserve_exact(bound)
+                .map_err(|_| LedgerError::Capacity)?;
+            self.parked_charge = Some(permit.commit());
+        }
+        let mut context = Vec::new();
+        context
+            .try_reserve_exact(barrier.context.len())
+            .map_err(|_| LedgerError::Capacity)?;
+        context.extend_from_slice(&barrier.context);
+        self.parked_reads.push(focal_consensus::ReadBarrier {
+            index: barrier.index,
+            context,
+        });
+        self.reads_parked = self.reads_parked.saturating_add(1);
+        Ok(())
+    }
+    /// A copy whose parked reads are at their bound is too far behind to
+    /// take another: the read is refused here, typed, rather than dropped
+    /// when its answer comes.
+    fn refuse_at_parked_bound(&self) -> Result<(), LedgerError> {
+        if self.parked_reads.len() >= self.consensus.pending_reads() {
+            return Err(LedgerError::Capacity);
+        }
+        Ok(())
+    }
+    /// Read barriers answered above this copy's applied index and held until
+    /// it caught up, since this session opened (27 §5, follower reads).
+    pub fn reads_parked(&self) -> u64 {
+        self.reads_parked
+    }
+    /// Read barriers dropped at the parked bound since this session opened.
+    pub fn reads_dropped(&self) -> u64 {
+        self.reads_dropped
     }
 
     /// The next reconstruction of the native owner is refused as memory:

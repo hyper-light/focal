@@ -119,6 +119,12 @@ struct Cluster {
     /// Replicas whose host is not sealing legacy payloads or pulling seed
     /// chunks yet: their retained delivery makes no progress.
     no_seal: Vec<u64>,
+    /// A replica whose appends and snapshots are held back (`held`) until
+    /// released: the way to make an answer overtake the entries it names.
+    hold_appends_to: Option<u64>,
+    held: Vec<Message>,
+    /// Every native read boundary a poll returned: (node, correlation, index).
+    boundaries: Vec<(u64, crate::ReadCorrelation, u64)>,
 }
 impl Cluster {
     fn new(size: u64, hosted: &[bool]) -> Self {
@@ -151,6 +157,9 @@ impl Cluster {
             refusals: Vec::new(),
             sealed: Vec::new(),
             no_seal: Vec::new(),
+            hold_appends_to: None,
+            held: Vec::new(),
+            boundaries: Vec::new(),
         }
     }
     fn node_ref(&self, id: u64) -> &Session {
@@ -223,6 +232,8 @@ impl Cluster {
         {
             let mut messages = Vec::new();
             let mut progressed = false;
+            let mut recorded = Vec::new();
+            let mut delivered = false;
             for id in self.live() {
                 let node = self.node(id);
                 match node.poll() {
@@ -230,6 +241,12 @@ impl Cluster {
                         progressed |= !events.committed.is_empty()
                             || !events.native_committed.is_empty()
                             || !events.native_read_boundaries.is_empty();
+                        recorded.extend(
+                            events
+                                .native_read_boundaries
+                                .iter()
+                                .map(|boundary| (id, boundary.correlation, boundary.raft_index)),
+                        );
                         messages.extend(events.messages);
                     }
                     Err(LedgerError::Retry) => {
@@ -259,6 +276,7 @@ impl Cluster {
                     Err(error) => panic!("poll {id}: {error:?}"),
                 }
             }
+            self.boundaries.extend(recorded);
             if messages.is_empty() && !progressed {
                 return true;
             }
@@ -270,6 +288,14 @@ impl Cluster {
                 if !self.live().contains(&to) {
                     continue;
                 }
+                if self.hold_appends_to == Some(to)
+                    && (message.msg_type == MessageType::MsgAppend as i32
+                        || message.msg_type == MessageType::MsgSnapshot as i32)
+                {
+                    self.held.push(message);
+                    continue;
+                }
+                delivered = true;
                 let snapshot = message.msg_type == MessageType::MsgSnapshot as i32;
                 match self.node(to).step(message) {
                     Ok(()) => {}
@@ -289,8 +315,19 @@ impl Cluster {
                         .unwrap();
                 }
             }
+            if !delivered && !progressed {
+                return true;
+            }
         }
         false
+    }
+    /// Deliver the held appends and snapshots, in the order they were sent.
+    fn release_held(&mut self) {
+        self.hold_appends_to = None;
+        for message in std::mem::take(&mut self.held) {
+            let to = message.to;
+            self.node(to).step(message).unwrap();
+        }
     }
     fn settle(&mut self, isolated: &[u64]) {
         for _ in 0..8 {
@@ -2000,6 +2037,74 @@ fn a_hosted_authority_retires_a_family_and_stays_authoritative() {
         Some(continuation)
     );
     assert_eq!(cluster.node(1).native_retention().unwrap().retired, 1);
+}
+
+/// A follower's read answered by the leader above the follower's applied
+/// index (the audit's F55): the answer can reach the follower before the
+/// append that carries the index — replication lag, never corruption. The
+/// read is held, bounded and funded, the delivery goes on so the entries can
+/// arrive, and once they are applied the reader is answered at a prefix no
+/// older than the leader's commit at the time it asked.
+#[test]
+fn a_follower_read_answered_ahead_of_its_log_waits_for_the_entries_and_stays_live() {
+    let mut cluster = Cluster::new(3, &[true, true, true]);
+    cluster.elect(1, &[]);
+    cluster.activate(1, &[]);
+    let first = creation(cluster.next(PARTIES.issuer), 1);
+    cluster.commit(1, PARTIES.issuer, first, &[]);
+    cluster.pump(&[]);
+    assert_eq!(cluster.status(2, 1), Some(ClaimStatus::Generated));
+    // The leader commits a second claim with node 3 while node 2's appends
+    // are held back.
+    cluster.hold_appends_to = Some(2);
+    let second = creation(cluster.next(PARTIES.issuer), 2);
+    cluster.commit(1, PARTIES.issuer, second, &[]);
+    assert_eq!(cluster.status(2, 2), None);
+    let leader_applied = cluster.node(1).status().applied_index;
+    // Node 2 asks a linearizable read. The leader confirms its commit
+    // index — beyond node 2's log — and the answer reaches node 2 while the
+    // appends are still held: the read waits and the replica stays live.
+    let correlation = crate::ReadCorrelation([21; 16]);
+    cluster.node(2).native_read_index(correlation).unwrap();
+    cluster.pump(&[]);
+    assert!(
+        !cluster
+            .boundaries
+            .iter()
+            .any(|(node, c, _)| *node == 2 && *c == correlation),
+        "{:?}",
+        cluster.boundaries
+    );
+    assert_eq!(cluster.node(2).reads_parked(), 1);
+    assert_eq!(cluster.node(2).reads_dropped(), 0);
+    assert_eq!(cluster.status(2, 2), None);
+    // The appends arrive: node 2 applies them and answers the read at the
+    // leader's prefix.
+    cluster.release_held();
+    cluster.settle(&[]);
+    cluster.pump(&[]);
+    let (_, _, index) = cluster
+        .boundaries
+        .iter()
+        .find(|(node, c, _)| *node == 2 && *c == correlation)
+        .copied()
+        .unwrap_or_else(|| panic!("{:?}", cluster.boundaries));
+    assert!(index >= leader_applied, "{index} < {leader_applied}");
+    assert!(cluster.node(2).status().applied_index >= index);
+    assert_eq!(cluster.status(2, 2), Some(ClaimStatus::Generated));
+    // Caught up, the next read is answered without waiting.
+    let again = crate::ReadCorrelation([22; 16]);
+    cluster.node(2).native_read_index(again).unwrap();
+    cluster.pump(&[]);
+    assert!(
+        cluster
+            .boundaries
+            .iter()
+            .any(|(node, c, _)| *node == 2 && *c == again),
+        "{:?}",
+        cluster.boundaries
+    );
+    assert_eq!(cluster.node(2).reads_parked(), 1);
 }
 
 /// A reconstruction refused after the retirement record applied (memory):

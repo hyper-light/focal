@@ -12010,3 +12010,26 @@ authority allowed and refused. Left in place and described in the remediation
 record: the hosted apply loop reconstructs the owner in line right after a
 retirement applies, and a retryable refusal there retains the delivery at the
 applied entry, which the resume re-applies as `Corrupt`.
+
+### 2026-09-29 — F55: a follower's read answered ahead of its log waits, and the replica stays live
+
+The hosted `Session` required a read barrier's index to be applied the moment
+the leader's answer arrived (`barrier.index > applied_raft` → `Corrupt`, then
+`Failed`), though a `MsgReadIndexResp` owes no ordering to the append that
+carries its index: on a three-voter hosted cluster with node 2's appends held
+back, one linearizable read asked of node 2 failed its session
+(`poll 2: Corrupt`, reproduced first). The standalone engine already parked such
+barriers (D4); the hosted session now does the same: a barrier above the applied
+index is held — bounded by the reads the core keeps in flight
+(`DurableNode::pending_reads`), charged once for that bound — until the entries
+it names are applied, the delivery goes on so they can arrive, and each parked
+barrier is answered, in order, at the first delivery that reaches its index and
+leaves the set only then. At the bound a new read is refused as `Capacity` at the
+request (`read_index`, `native_read_index`, and the engine's) and a barrier that
+still arrives is dropped and counted (`reads_dropped`), never held back with the
+delivery — the engine's loop now does the same instead of retaining the
+delivery, which would have blocked the entries the parked reads wait for.
+`session::native_tests::a_follower_read_answered_ahead_of_its_log_waits_for_the_entries_and_stays_live`:
+the read parked (`reads_parked == 1`), the replica live, the boundary answered at
+an index no older than the leader's applied index at the time of the ask once the
+held appends are released, the claim applied, the next read answered at once.

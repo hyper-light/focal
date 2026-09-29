@@ -1197,6 +1197,7 @@ impl Session {
                 leader: self.status().leader_id,
             });
         }
+        self.refuse_at_parked_bound()?;
         let engine = self
             .native
             .as_deref_mut()

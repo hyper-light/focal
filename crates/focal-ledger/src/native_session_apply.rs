@@ -1041,7 +1041,17 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             if barrier.index > self.applied_raft {
                 // Answered by a leader ahead of this copy: the read waits
                 // for the entries it names (27 §5, follower reads).
-                self.park_read(barrier, bound)?;
+                match self.park_read(barrier, bound) {
+                    Ok(()) => {}
+                    // The parked set is full: the barrier is dropped and
+                    // counted, never held back with the delivery — the
+                    // delivery carries the entries the parked reads wait
+                    // for; new reads are refused at the request.
+                    Err(NativeSessionError::Capacity) => {
+                        self.reads_dropped = self.reads_dropped.saturating_add(1);
+                    }
+                    Err(error) => return Err(error),
+                }
                 delivery.read = add(delivery.read, 1)?;
                 continue;
             }
@@ -1114,6 +1124,11 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         correlation: ReadCorrelation,
     ) -> Result<(), NativeSessionError> {
         self.require_reader(&consensus.status())?;
+        // A copy whose parked reads are at their bound is too far behind to
+        // take another: refused here, typed, not dropped when answered.
+        if self.parked_reads.len() >= consensus.pending_reads() {
+            return Err(NativeSessionError::Capacity);
+        }
         let mut context = [0u8; 24];
         if let Some(prefix) = context.get_mut(..8) {
             prefix.copy_from_slice(CORRELATION);

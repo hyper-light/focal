@@ -67,7 +67,7 @@ ruling before work starts).
 | F52 | P2 | in tree (encode) | 11 | [F52](#f52) |
 | F53 | P2 | open | 10 | — |
 | F54 | P2 | in tree | 12 | [F54](#f54) |
-| F55 | P1 | open | 13 | — |
+| F55 | P1 | in tree | 13 | [F55](#f55) |
 | F56 | P1 | open | 13 | — |
 | F57 | P1 | open | 14 | — |
 | F58 | P2 | open | 14 | — |
@@ -433,3 +433,32 @@ engine; refusals by name), `engine_tests`, `cli/tests.rs`
 `command_tree_tests::documented_cli_commands_and_their_flags_resolve_in_the_command_tree`,
 `tests/cli_discovery.rs::the_native_catalogue_examples_and_validation_need_no_state_either`,
 `tests/cli_native_quickstart.rs::the_documented_native_quickstart_runs_verbatim`.
+
+## F55
+
+**Cause.** The hosted `Session`'s delivery treated a read barrier whose index lay
+above its applied index as corruption; the leader's `MsgReadIndexResp` can precede
+the append that carries that index (separate QUIC streams and exchanges), so a
+lagging follower failed its session on a legitimate read. The standalone engine had
+been given parking for exactly this (D4); the hosted path had not.
+
+**Fix.** The hosted session parks such barriers (`parked_reads`, bounded by
+`DurableNode::pending_reads`, charged once for the bound), lets the delivery go on so
+the entries can arrive, and answers parked barriers in order at the first delivery
+whose applied index reaches them, removing each only once answered (a retryable
+refusal loses none); the delivery's native output is reserved for them too. At the
+bound: `read_index`/`native_read_index` (hosted) and the engine's `read_index` refuse a
+new read as `Capacity`; a barrier that still arrives is dropped and counted
+(`reads_dropped`) in both the hosted loop and the engine's — the engine previously
+propagated `Capacity` as a retryable refusal, retaining the delivery that carried the
+entries its parked reads waited for (a stall at the bound; closed at its cause).
+Context identity, the readiness barrier, native correlated reads and legacy reads
+complete through one `complete_read`.
+
+**Tests.** `session::native_tests::a_follower_read_answered_ahead_of_its_log_waits_for_the_entries_and_stays_live`
+(before the fix: `poll 2: Corrupt`), the standalone
+`native_session::cluster_tests::a_follower_under_memory_pressure_keeps_its_delivery_and_finishes_when_memory_returns`
+and the D4 follower-read tests unchanged. The bound's refusal and drop are exercised
+by construction (the bound is the core's in-flight read limit); a parked set of that
+size needs a cluster harness that holds hundreds of answered reads, left to the
+campaign.

@@ -428,7 +428,16 @@ asked of a replica that does not lead is served by that replica: its core forwar
 the read's barrier to the leader (`MsgReadIndex`, thesis §6.4), the answer names the
 leader's commit index, the engine parks the barrier until this copy has applied
 that index (bounded by the reads the core holds in flight, `DurableNode::pending_reads`),
-and the page is read from the copy's own committed core (`read_at_least`). A
+and the page is read from the copy's own committed core (`read_at_least`). The
+hosted `Session` parks the same way (2026-09-29, the audit's F55: the leader's
+answer may reach a follower before the append that carries its index — QUIC
+streams and separate exchanges owe no ordering between them — and that is
+replication lag, never corruption; before this the hosted session failed closed on
+it). The parked set is charged once for its bound; a copy at the bound refuses a
+new read as `Capacity` at the request and drops, counted (`reads_dropped`), a
+barrier it cannot hold rather than hold back the delivery that carries the very
+entries the parked reads wait for; a parked barrier leaves the set only once it is
+answered, so a retryable refusal loses none. A
 follower that knows no leader refuses the read as before (`NotReady`, and the
 client's bounded resends ride out the election). Before this a follower's operator
 socket refused every such read and the client resent it for its whole 30 s ceiling

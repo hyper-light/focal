@@ -979,6 +979,10 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
     pub fn reads_parked(&self) -> u64 {
         self.engine.reads_parked
     }
+    /// Read barriers dropped at the parked bound since this session opened.
+    pub fn reads_dropped(&self) -> u64 {
+        self.engine.reads_dropped
+    }
     /// Encode the committed Core at the fully delivered prefix under a retained
     /// output permit and hand bytes and permit together to consensus. Completion
     /// requires the actual durable fence observed by `poll`/`try_poll`.
