@@ -12066,3 +12066,28 @@ managed/summary/list contexts — carries the owner's node id and an incarnation
 drawn when the owner started, so contexts never repeat across replicas or
 restarts. Etcd's contract is the reference: a request context is unique per
 read round; where a caller's context collides anyway, no asker is stranded.
+
+### 2026-09-29 — F62: an expired consumer returns its slot
+
+The cursor registry kept every consumer row for ever: expiry and resync released
+a row's retention but not its slot, admission counted the whole map, and no
+operation removed a row, so a fleet that creates distinct consumer names reached
+a cumulative ceiling of 4096 per registry with no live observer at all
+(reproduced at a bound of one: one expired row, zero live consumers, `Capacity`).
+A released row — an ordinary consumer whose lease expired or whose cursor was
+sent to resync — is now retired when a registration needs its slot (until then
+it stays, so a consumer that comes back reads why it must reseed), named in the
+prepared update so the session's owner record leaves with it (the name is free
+for another principal); generations are
+the registry's revisions, unique across every incarnation of a name, so a stale
+token or renewal of a retired consumer is refused (`MissingConsumer`, or
+`WrongGeneration` against the name's next incarnation) and never moves its
+cursor; the checkpoint invariant `generation ≤ revision` is validated on
+restore; a protected consumer is never retired. No format changed: the
+checkpoint schema and every field are as before, the fixtures replay.
+Tests: `focal-stream/tests/consumer_retirement.rs` (the slot returns and the
+stale token is refused; at the bound the released rows leave together and a
+protected one never; 4608 distinct names churn through a registry of 4096 that
+stays bounded and restores), and the session's
+`an_expired_consumer_s_name_is_free_for_another_principal` (the owner record
+follows the row).

@@ -175,7 +175,19 @@ the floor reported.
 and travels only with its checkpoints; the retirement record of §4 commits
 it. Registered consumers are the only retention obligation the floor
 weighs besides the archive; request-stream receipts retire through their
-own committed floors ([15](15-managed-request-streams.md)).
+own committed floors ([15](15-managed-request-streams.md)). A consumer's
+row does not outlive its obligation (2026-09-29, the audit's F62): an
+ordinary consumer whose lease expired, or whose cursor was sent to resync,
+holds nothing, and its row is retired — named in the prepared update, so
+the session's owner record leaves with it — when a registration needs its
+slot (until then it stays, so a consumer that comes back reads why it must
+reseed); the registry's bound
+(`max_consumers`, 4096) therefore bounds the live consumers, never the
+names ever seen. A retired name registers again under a generation no
+earlier token carries (a generation is the revision that issued it), so a
+stale acknowledgment or renewal is refused as the wrong generation and
+never moves the next incarnation's cursor; a protected consumer leaves by
+acknowledgment alone.
 
 ## 4. Retirement to the archive (R8.4b, 2026-09-10)
 

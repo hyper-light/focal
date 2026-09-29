@@ -134,10 +134,18 @@ pub struct PreparedCursorUpdate {
     owner: focal_memory::OwnerId,
     base_revision: u64,
     next: Root,
+    /// The consumers this update retired: released rows (an ordinary lease
+    /// expired, or a cursor sent to resync) whose slot a registration needed
+    /// or whose position the floor passed. Their names are free; whatever
+    /// the embedding keeps per consumer follows them out.
+    retired: Vec<ConsumerId>,
 }
 impl PreparedCursorUpdate {
     pub fn checkpoint(&self) -> &CursorCheckpoint {
         &self.next.checkpoint
+    }
+    pub fn retired(&self) -> &[ConsumerId] {
+        &self.retired
     }
 }
 
@@ -266,7 +274,14 @@ impl CursorRegistry {
         let mut checkpoint = old.clone();
         checkpoint.clock = command.now;
         checkpoint.revision = next_revision;
-        apply_operation(&mut checkpoint, &command.operation, published, self.config)?;
+        let mut retired = Vec::new();
+        apply_operation(
+            &mut checkpoint,
+            &command.operation,
+            published,
+            self.config,
+            &mut retired,
+        )?;
         validate_checkpoint(&checkpoint, published, self.config)?;
         Ok(PreparedCursorUpdate {
             owner: self.owner,
@@ -275,6 +290,7 @@ impl CursorRegistry {
                 checkpoint,
                 _allocation: allocation,
             },
+            retired,
         })
     }
 
@@ -299,12 +315,69 @@ impl CursorRegistry {
     }
 }
 
+/// A row that holds no obligation any more: an ordinary consumer whose lease
+/// expired, or whose cursor was sent to resync. Its retention is released
+/// already (`retention_limit`); the row stays, so the consumer that comes
+/// back reads why it must reseed, until a registration needs its slot —
+/// never a protected consumer, whose obligation ends by explicit
+/// acknowledgment alone.
+fn released(row: &CursorRecord, clock: u64) -> bool {
+    row.mode != CursorMode::Protected
+        && (row.expires_at <= clock || matches!(row.mode, CursorMode::Resync { .. }))
+}
+/// Retire every released row, naming each, so the embedding's per-consumer
+/// state follows. A retired name registers again under a generation no
+/// earlier token carries (generations are the registry's revisions), so
+/// nothing stale can move or renew the new incarnation.
+fn retire_released(
+    state: &mut CursorCheckpoint,
+    retired: &mut Vec<ConsumerId>,
+) -> Result<(), StreamError> {
+    let clock = state.clock;
+    let leaving = |row: &CursorRecord| released(row, clock);
+    let count = state.consumers.values().filter(|row| leaving(row)).count();
+    if count == 0 {
+        return Ok(());
+    }
+    retired
+        .try_reserve(count)
+        .map_err(|_| StreamError::Capacity)?;
+    state.consumers.retain(|id, row| {
+        if leaving(row) {
+            retired.push(*id);
+            false
+        } else {
+            true
+        }
+    });
+    Ok(())
+}
+/// Room for one more consumer: the bound, after the released rows leave.
+fn admit_consumer(
+    state: &mut CursorCheckpoint,
+    config: RegistryConfig,
+    retired: &mut Vec<ConsumerId>,
+) -> Result<(), StreamError> {
+    if state.consumers.len() >= config.max_consumers {
+        retire_released(state, retired)?;
+    }
+    if state.consumers.len() >= config.max_consumers {
+        return Err(StreamError::Capacity);
+    }
+    Ok(())
+}
+
 fn apply_operation(
     state: &mut CursorCheckpoint,
     operation: &CursorOperation,
     published: SessionSeq,
     config: RegistryConfig,
+    retired: &mut Vec<ConsumerId>,
 ) -> Result<(), StreamError> {
+    // A generation is the revision that issued it: unique across every
+    // incarnation of a name, so a token of a retired consumer never matches
+    // the row that took its name.
+    let generation = state.revision;
     match operation {
         CursorOperation::Register {
             consumer,
@@ -321,9 +394,7 @@ fn apply_operation(
             if state.consumers.contains_key(consumer) {
                 return Err(StreamError::DuplicateConsumer);
             }
-            if state.consumers.len() >= config.max_consumers {
-                return Err(StreamError::Capacity);
-            }
+            admit_consumer(state, config, retired)?;
             state.consumers.insert(
                 *consumer,
                 CursorRecord {
@@ -332,7 +403,7 @@ fn apply_operation(
                             ledger: state.ledger,
                             consumer: *consumer,
                         },
-                        generation: 1,
+                        generation,
                         scope: *scope,
                         position: *start,
                     },
@@ -397,24 +468,15 @@ fn apply_operation(
             if *snapshot > published {
                 return Err(StreamError::CursorAhead);
             }
-            let generation = match state.consumers.get(consumer) {
+            match state.consumers.get(consumer) {
                 Some(old) if old.mode == CursorMode::Protected => {
                     return Err(StreamError::Invalid(
                         "protected consumer cannot skip history by reseeding",
                     ));
                 }
-                Some(old) => old
-                    .token
-                    .generation
-                    .checked_add(1)
-                    .ok_or(StreamError::CounterExhausted)?,
-                None => {
-                    if state.consumers.len() >= config.max_consumers {
-                        return Err(StreamError::Capacity);
-                    }
-                    1
-                }
-            };
+                Some(_) => {}
+                None => admit_consumer(state, config, retired)?,
+            }
             state.consumers.insert(
                 *consumer,
                 CursorRecord {
@@ -497,9 +559,7 @@ fn apply_operation(
             if state.consumers.contains_key(consumer) {
                 return Err(StreamError::DuplicateConsumer);
             }
-            if state.consumers.len() >= config.max_consumers {
-                return Err(StreamError::Capacity);
-            }
+            admit_consumer(state, config, retired)?;
             state.consumers.insert(
                 *consumer,
                 CursorRecord {
@@ -508,7 +568,7 @@ fn apply_operation(
                             ledger: state.ledger,
                             consumer: *consumer,
                         },
-                        generation: 1,
+                        generation,
                         scope: *scope,
                         position: *start,
                     },
@@ -585,7 +645,7 @@ fn validate_checkpoint(
         if row.token.key.consumer != *id {
             return Err(StreamError::WrongConsumer);
         }
-        if row.token.generation == 0 {
+        if row.token.generation == 0 || row.token.generation > state.revision {
             return Err(StreamError::WrongGeneration);
         }
         row.token.position.validate(state.ledger, published)?;

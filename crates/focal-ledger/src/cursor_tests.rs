@@ -715,3 +715,72 @@ fn maintenance_expiry_waits_for_quorum_before_releasing_projection_pin() {
         assert_eq!(s.cursor_meta.receipts.len(), 1);
     }
 }
+
+/// An expired consumer's slot returns (the audit's F62), and its name with it:
+/// the owner record leaves with the row, so another principal registers the
+/// name once the slot frees.
+#[test]
+fn an_expired_consumer_s_name_is_free_for_another_principal() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut limits = SessionLimits::default();
+    limits.cursors.max_consumers = 1;
+    let mut s = Session::open(dir.path(), identity(), config(), limits).unwrap();
+    elect(&mut s);
+    let first = ParticipantId::from_u128(1);
+    let second = ParticipantId::from_u128(2);
+    s.submit_local(&epoch(1)).unwrap();
+    let mut negotiate = input(
+        300,
+        Command::NegotiateEpoch {
+            epoch: RequestEpoch(1),
+        },
+    );
+    negotiate.principal = second;
+    s.submit_local(&negotiate).unwrap();
+    let one = ConsumerId::from_u128(1);
+    let two = ConsumerId::from_u128(2);
+    let register_as = |s: &Session, id: u128, principal: ParticipantId, consumer, now: u64| {
+        let mut request = cursor_input(
+            s,
+            id,
+            CursorOperation::Register {
+                consumer,
+                scope: ContentHash([8; 32]),
+                filter: DeltaFilter::All,
+                start: Position::origin(identity()),
+                expires_at: now + 1000,
+            },
+        );
+        request.key.principal = principal;
+        request.command.now = now;
+        request
+    };
+    cursor_receipt(
+        s.submit_cursor_local(&register_as(&s, 10, first, one, 0))
+            .unwrap(),
+    );
+    assert_eq!(s.cursor_owner(one), Some(first));
+    // At the bound while the lease lives: refused.
+    assert!(matches!(
+        s.submit_cursor_local(&register_as(&s, 11, second, two, 500)),
+        Err(LedgerError::Stream(focal_stream::StreamError::Capacity))
+    ));
+    assert_eq!(s.cursor_owner(one), Some(first));
+    // The lease ended: the registration goes through; the expired row and
+    // its owner record leave.
+    cursor_receipt(
+        s.submit_cursor_local(&register_as(&s, 12, second, two, 2000))
+            .unwrap(),
+    );
+    assert!(s.cursor(one).is_none());
+    assert_eq!(s.cursor_owner(one), None);
+    assert_eq!(s.cursor_owner(two), Some(second));
+    // The name is the other principal's to register once its slot frees.
+    cursor_receipt(
+        s.submit_cursor_local(&register_as(&s, 13, second, one, 4000))
+            .unwrap(),
+    );
+    assert_eq!(s.cursor_owner(one), Some(second));
+    assert!(s.cursor(two).is_none());
+    assert_eq!(s.cursor_owner(two), None);
+}

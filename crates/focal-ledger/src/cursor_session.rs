@@ -364,6 +364,11 @@ impl Session {
             receipts: self.cursor_meta.receipts.clone(),
             owners: self.cursor_meta.owners.clone(),
         };
+        // A retired consumer's name is free: its owner leaves with its row,
+        // so whoever registers the name next owns it.
+        for retired in prepared.retired() {
+            metadata.owners.remove(retired);
+        }
         if let Some(consumer) = consumer {
             metadata
                 .owners

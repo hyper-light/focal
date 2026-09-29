@@ -74,7 +74,7 @@ ruling before work starts).
 | F59 | P2 | open | 15 | — |
 | F60 | P2 | open | 15 | — |
 | F61 | P2 | open | 15 | — |
-| F62 | P1 | open | 15 | — |
+| F62 | P1 | in tree | 15 | [F62](#f62) |
 | F63 | P2 | in tree | 13 | [F63](#f63) |
 | F64 | P2 | open | 15 | — |
 | F65 | P2 | open | 15 | — |
@@ -510,3 +510,34 @@ defence where a caller collides anyway.
 index), `read::tests::reads_leave_in_the_order_asked_once_one_is_confirmed` (the
 second asker recorded), the D4 follower-read and the differential suites unchanged
 (the harness asks under unique contexts).
+
+## F62
+
+**Cause.** The cursor registry removed no row: expiry and resync released a
+consumer's retention obligation, admission compared the whole map against
+`max_consumers`, `AdvanceFloor` left expired rows in place, and `CursorOperation` had
+no retirement; distinct consumer names therefore reached a cumulative ceiling of
+4096 per registry. The session's owner record (`CursorMetadata.owners`) would have
+kept the old principal even if the row had gone.
+
+**Fix.** `released(row)` = ordinary and (lease expired or in `Resync`);
+`retire_released` removes every such row when a registration finds the map at its
+bound (`admit_consumer`) — not before: a consumer that comes back reads from its row
+why it must reseed (`LeaseExpired`, the resync reason), which the durable-delivery
+tests hold to — and names them in `PreparedCursorUpdate::retired`, which the session uses to drop
+the owner record before it charges the metadata. Generations are issued from the
+registry's revision (unique for ever; `validate_checkpoint` requires
+`generation ≤ revision`), so a token or renewal of a retired incarnation is refused
+(`MissingConsumer`, or `WrongGeneration` once the name is taken again) and never moves
+the new cursor. Protected consumers are never released. No durable format changed
+(schema 1; the `generation` field's values only), so no fixture moves. Owner
+metadata and receipts: owners follow the row; receipts are bounded by
+`cursor_receipts` as before.
+
+**Tests.** `focal-stream/tests/consumer_retirement.rs`:
+`an_expired_consumer_returns_its_slot_and_no_stale_token_reaches_the_name_s_next_incarnation`
+(bound one; before the fix the second registration was `Capacity`),
+`at_the_bound_the_released_rows_leave_together_and_a_protected_one_never`,
+`a_churn_of_more_names_than_the_bound_passes_through_a_bounded_registry_that_restores`
+(4608 names, ≤ 4096 rows, restore); `session::cursor_tests::an_expired_consumer_s_name_is_free_for_another_principal`
+(owner pruned; before, the second principal was `WrongActor`).
