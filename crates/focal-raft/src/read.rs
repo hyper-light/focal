@@ -19,8 +19,11 @@ pub struct ReadState {
 pub struct PendingRead {
     /// What the asker calls the read.
     pub context: Vec<u8>,
-    /// Who asked; zero or the leader itself for a read asked here.
-    pub from: NodeId,
+    /// Who asked, in the order they asked: zero or the leader itself for a
+    /// read asked here, and every other member that asked under the same
+    /// context while it waited. A read asked twice is one read, and each
+    /// asker is answered.
+    origins: Vec<NodeId>,
     /// The leader's commit when it was asked.
     pub index: u64,
     /// Who confirmed the leader since, in order.
@@ -29,6 +32,13 @@ pub struct PendingRead {
 impl PendingRead {
     pub fn acks(&self) -> &[NodeId] {
         &self.acks
+    }
+    pub fn origins(&self) -> &[NodeId] {
+        &self.origins
+    }
+    /// The askers, the index and the context, to answer each asker.
+    pub fn into_parts(self) -> (Vec<NodeId>, u64, Vec<u8>) {
+        (self.origins, self.index, self.context)
     }
 }
 
@@ -59,7 +69,8 @@ impl ReadOnly {
             .iter()
             .position(|read| read.context.as_slice() == context)
     }
-    /// A read asked twice is one read.
+    /// A read asked twice is one read; a second asker of a read that waits
+    /// is answered with it, never lost to the first.
     pub fn add(
         &mut self,
         index: u64,
@@ -67,7 +78,17 @@ impl ReadOnly {
         from: NodeId,
         leader: NodeId,
     ) -> Result<()> {
-        if self.position(&context).is_some() {
+        if let Some(position) = self.position(&context) {
+            let Some(read) = self.queue.get_mut(position) else {
+                return Ok(());
+            };
+            if !read.origins.contains(&from) {
+                if read.origins.len() >= crate::MAX_MEMBERS {
+                    return Err(Error::Capacity("members that ask one read"));
+                }
+                read.origins.try_reserve(1).map_err(|_| Error::Memory)?;
+                read.origins.push(from);
+            }
             return Ok(());
         }
         if self.queue.len() >= self.limit {
@@ -80,9 +101,14 @@ impl ReadOnly {
         acks.try_reserve(1)
             .map_err(|_| Error::Capacity("reads that wait for their quorum"))?;
         acks.push(leader);
+        let mut origins = Vec::new();
+        origins
+            .try_reserve(1)
+            .map_err(|_| Error::Capacity("reads that wait for their quorum"))?;
+        origins.push(from);
         self.queue.push_back(PendingRead {
             context,
-            from,
+            origins,
             index,
             acks,
         });
@@ -135,6 +161,11 @@ impl ReadOnly {
             bytes
                 .saturating_add(read.context.capacity())
                 .saturating_add(
+                    read.origins
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<NodeId>()),
+                )
+                .saturating_add(
                     read.acks
                         .capacity()
                         .saturating_mul(std::mem::size_of::<NodeId>()),
@@ -169,9 +200,10 @@ mod tests {
         assert_eq!(
             confirmed
                 .iter()
-                .map(|read| (read.index, read.from))
+                .map(|read| (read.index, read.origins().to_vec()))
                 .collect::<Vec<_>>(),
-            vec![(5, 0), (6, 2)]
+            // The second asker of "a" (member 3) is answered with it.
+            vec![(5, vec![0, 3]), (6, vec![2])]
         );
         assert_eq!(confirmed[1].acks(), [1, 2, 3]);
         assert_eq!(reads.advance(b"b").count(), 0);

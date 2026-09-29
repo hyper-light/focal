@@ -12033,3 +12033,36 @@ delivery, which would have blocked the entries the parked reads wait for.
 the read parked (`reads_parked == 1`), the replica live, the boundary answered at
 an index no older than the leader's applied index at the time of the ask once the
 held appends are released, the claim applied, the next read answered at once.
+
+### 2026-09-29 — F56: Raft acknowledgments admitted beside the participants; F63: every asker of one read is answered
+
+**F56.** The replica owner admitted a peer's Raft message into the same pending
+queue as its participants (`pending_clients`, 128): once participant work
+filled it, the heartbeat and append answers that quorum progress — and those
+participants' own completion — needed were refused `Capacity`. Reproduced with
+a one-slot queue: one waiting participant read, the followers' heartbeat answers
+refused through the leader's authenticated ingress. Peers and participants are
+now admitted under separate bounds: participants keep `pending_clients`; Raft
+traffic has its own reserve, the members the configuration names (voters,
+learners, admitted) times the in-flight window the core itself allows one peer
+(`NodeConfig::max_inflight_messages`, `Session::inflight_window`) — every member
+may have its whole window outstanding, no more; neither side takes the other's
+slots. The reply still waits behind the exact Ready fence.
+`fleet::list_tests::peer_admission_tests::a_full_participant_queue_still_admits_the_acknowledgments_it_waits_on`
+(before the fix: the answers refused `Capacity`; after: `PeerAccepted`, the
+participant's read completes, and the reserve is three voters' windows).
+
+**F63.** The core's read-only queue keyed pending reads on their context alone:
+a second member forwarding the same context was dropped with its origin, and
+the leader answered the first only. The native correlation hashed principal,
+request id and an owner-local nonce, so the same principal's exact retry at two
+replicas, or at one across a restart, could name one context twice. A pending
+read now keeps every asker (bounded by `MAX_MEMBERS`, memory reserved) and the
+leader answers each when the quorum confirms
+(`tests::a_read_asked_by_two_members_under_one_context_answers_both`: two
+followers, one context, two `MsgReadIndexResp`), and every read context an owner
+mints — the native correlation (`focal.native.read-correlation.v2`) and the
+managed/summary/list contexts — carries the owner's node id and an incarnation
+drawn when the owner started, so contexts never repeat across replicas or
+restarts. Etcd's contract is the reference: a request context is unique per
+read round; where a caller's context collides anyway, no asker is stranded.

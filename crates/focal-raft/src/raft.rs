@@ -1541,7 +1541,21 @@ impl<S: Storage> Raft<S> {
             .map_err(|_| Error::Memory)?;
         confirmed.extend(self.read_only.advance(context));
         for read in confirmed {
-            self.answer_read(read.from, read.index, read.context)?;
+            // Every asker of the read is answered; the context is copied
+            // for all but the last.
+            let (origins, index, context) = read.into_parts();
+            let last = origins.len().saturating_sub(1);
+            for (position, from) in origins.into_iter().enumerate() {
+                if position == last {
+                    self.answer_read(from, index, context)?;
+                    break;
+                }
+                let mut copy = Vec::new();
+                copy.try_reserve_exact(context.len())
+                    .map_err(|_| Error::Memory)?;
+                copy.extend_from_slice(&context);
+                self.answer_read(from, index, copy)?;
+            }
         }
         Ok(())
     }

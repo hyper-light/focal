@@ -654,6 +654,9 @@ struct Owner {
     lost_coalesced: u64,
     lost_dropped: u64,
     progress: watch::Sender<ProgressState>,
+    /// Drawn when this owner started: with the node id it scopes every read
+    /// context the owner mints, so a nonce that restarts from zero, or one
+    /// aligned with another replica's, never repeats a context (F63).
     incarnation: u64,
     nonce: u64,
     support_cursor: u64,
@@ -809,6 +812,9 @@ impl ReplicaHost {
         let tick_ceiling = config.tick_ceiling;
         let pace = crate::pace::TickPeriod::default();
         pace.announce(session.election_tick());
+        let mut incarnation = [0u8; 8];
+        getrandom::fill(&mut incarnation).map_err(|_| LedgerError::Capacity)?;
+        let incarnation = u64::from_le_bytes(incarnation);
         let owner = Owner {
             leader_return: crate::leader_return::LeaderReturn::new(session.election_tick()),
             pace: pace.clone(),
@@ -835,7 +841,7 @@ impl ReplicaHost {
             lost_coalesced: 0,
             lost_dropped: 0,
             progress,
-            incarnation: 0,
+            incarnation,
             nonce: 0,
             support_cursor: 0,
             dropped: 0,
@@ -2281,6 +2287,35 @@ impl Owner {
             }
         });
     }
+    /// Pending Raft acknowledgments: each an authenticated peer's message
+    /// stepped, its reply behind the exact Ready fence.
+    fn pending_peers(&self) -> usize {
+        self.pending
+            .iter()
+            .filter(|pending| matches!(pending.waiting, WaitingFor::PeerPersistence))
+            .count()
+    }
+    /// Pending participant requests: the queue less the peers'.
+    fn pending_participants(&self) -> usize {
+        self.pending.len().saturating_sub(self.pending_peers())
+    }
+    /// The Raft traffic admitted beside the participants' bound (F56): every
+    /// member the configuration names — voters, learners and the admitted —
+    /// may have its whole in-flight window outstanding at once, the window
+    /// the core itself allows a peer (`NodeConfig::max_inflight_messages`).
+    /// Participants never take these slots and peers never take theirs, so
+    /// admitted participant work cannot refuse the acknowledgments its own
+    /// completion waits on, and peers cannot crowd the participants out.
+    fn peer_reserve(&self) -> usize {
+        let status = self.session.status();
+        let members = status
+            .voters
+            .len()
+            .saturating_add(status.learners.len())
+            .saturating_add(self.admitted.len())
+            .max(1);
+        members.saturating_mul(self.session.inflight_window())
+    }
     fn request(
         &mut self,
         verified: VerifiedRequest,
@@ -2312,7 +2347,10 @@ impl Owner {
                 {
                     return Err(AccessError::Unauthorized);
                 }
-                if self.pending.len() == self.config.pending_clients {
+                // Raft traffic is admitted beside the participants (F56):
+                // a full participant queue never refuses the acknowledgments
+                // its own completion waits on.
+                if self.pending_peers() >= self.peer_reserve() {
                     return Err(AccessError::Capacity);
                 }
                 self.session
@@ -2365,7 +2403,7 @@ impl Owner {
                     operation: ManagedOperation::Submit { .. },
                     ..
                 } => {
-                    if self.pending.len() == self.config.pending_clients {
+                    if self.pending_participants() >= self.config.pending_clients {
                         return Err(AccessError::Capacity);
                     }
                     let (key, family, intent) = managed_request_identity(request)
@@ -2455,7 +2493,7 @@ impl Owner {
                     operation: ManagedOperation::Cursor(stream),
                     ..
                 } => {
-                    if self.pending.len() == self.config.pending_clients {
+                    if self.pending_participants() >= self.config.pending_clients {
                         return Err(AccessError::Capacity);
                     }
                     let (key, family, intent) = managed_request_identity(request)
@@ -2492,7 +2530,7 @@ impl Owner {
                     Ok(Response::Error(AccessError::OutcomeUnknown))
                 }
                 Operation::RequestStreamControl { .. } => {
-                    if self.pending.len() == self.config.pending_clients {
+                    if self.pending_participants() >= self.config.pending_clients {
                         return Err(AccessError::Capacity);
                     }
                     let input = verified.into_request_stream_control()?;
@@ -2514,7 +2552,7 @@ impl Owner {
                     Ok(Response::Error(AccessError::OutcomeUnknown))
                 }
                 Operation::RequestStreamRead { cluster, query } => {
-                    if self.pending.len() == self.config.pending_clients {
+                    if self.pending_participants() >= self.config.pending_clients {
                         return Err(AccessError::Capacity);
                     }
                     if *cluster != self.session.cluster_id() {
@@ -2523,6 +2561,8 @@ impl Owner {
                     self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                     let mut context = b"focal.replica.managed.read.v1\0".to_vec();
                     context.extend_from_slice(&self.nonce.to_be_bytes());
+                    context.extend_from_slice(&self.session.status().node_id.to_be_bytes());
+                    context.extend_from_slice(&self.incarnation.to_be_bytes());
                     context.extend_from_slice(&peer.principal().0);
                     context.extend_from_slice(&request.request_id.0);
                     self.session.read_index(context.clone()).map_err(access)?;
@@ -2538,7 +2578,7 @@ impl Owner {
                     Ok(Response::Error(AccessError::Unavailable))
                 }
                 Operation::Submit { .. } | Operation::OpenEpoch { .. } => {
-                    if self.pending.len() == self.config.pending_clients {
+                    if self.pending_participants() >= self.config.pending_clients {
                         return Err(AccessError::Capacity);
                     }
                     let evidence = if matches!(
@@ -2595,7 +2635,7 @@ impl Owner {
                     }
                 }
                 Operation::Stream(stream) => {
-                    if self.pending.len() == self.config.pending_clients {
+                    if self.pending_participants() >= self.config.pending_clients {
                         return Err(AccessError::Capacity);
                     }
                     let pending = self.streams.begin(
@@ -2612,12 +2652,14 @@ impl Owner {
                     if !self.session.is_authoritative() {
                         return Err(AccessError::Unavailable);
                     }
-                    if self.pending.len() == self.config.pending_clients {
+                    if self.pending_participants() >= self.config.pending_clients {
                         return Err(AccessError::Capacity);
                     }
                     self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                     let mut context = b"focal.replica.monitor.v1\0".to_vec();
                     context.extend_from_slice(&self.nonce.to_be_bytes());
+                    context.extend_from_slice(&self.session.status().node_id.to_be_bytes());
+                    context.extend_from_slice(&self.incarnation.to_be_bytes());
                     context.extend_from_slice(&peer.principal().0);
                     context.extend_from_slice(&request.request_id.0);
                     self.session.read_index(context.clone()).map_err(access)?;
@@ -2628,12 +2670,14 @@ impl Owner {
                     if !self.session.is_authoritative() {
                         return Err(AccessError::Unavailable);
                     }
-                    if self.pending.len() == self.config.pending_clients {
+                    if self.pending_participants() >= self.config.pending_clients {
                         return Err(AccessError::Capacity);
                     }
                     self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                     let mut context = b"focal.replica.summary.v1\0".to_vec();
                     context.extend_from_slice(&self.nonce.to_be_bytes());
+                    context.extend_from_slice(&self.session.status().node_id.to_be_bytes());
+                    context.extend_from_slice(&self.incarnation.to_be_bytes());
                     context.extend_from_slice(&peer.principal().0);
                     context.extend_from_slice(&request.request_id.0);
                     self.session.read_index(context.clone()).map_err(access)?;
@@ -2644,12 +2688,14 @@ impl Owner {
                     if !self.session.is_authoritative() {
                         return Err(AccessError::Unavailable);
                     }
-                    if self.pending.len() == self.config.pending_clients {
+                    if self.pending_participants() >= self.config.pending_clients {
                         return Err(AccessError::Capacity);
                     }
                     self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                     let mut context = b"focal.replica.reconcile.v1\0".to_vec();
                     context.extend_from_slice(&self.nonce.to_be_bytes());
+                    context.extend_from_slice(&self.session.status().node_id.to_be_bytes());
+                    context.extend_from_slice(&self.incarnation.to_be_bytes());
                     context.extend_from_slice(&peer.principal().0);
                     context.extend_from_slice(&request.request_id.0);
                     self.session.read_index(context.clone()).map_err(access)?;
@@ -2669,12 +2715,14 @@ impl Owner {
                         if !self.session.is_authoritative() {
                             return Err(AccessError::Unavailable);
                         }
-                        if self.pending.len() == self.config.pending_clients {
+                        if self.pending_participants() >= self.config.pending_clients {
                             return Err(AccessError::Capacity);
                         }
                         self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                         let mut context = b"focal.replica.list.v1\0".to_vec();
                         context.extend_from_slice(&self.nonce.to_be_bytes());
+                        context.extend_from_slice(&self.session.status().node_id.to_be_bytes());
+                        context.extend_from_slice(&self.incarnation.to_be_bytes());
                         context.extend_from_slice(&peer.principal().0);
                         context.extend_from_slice(&request.request_id.0);
                         self.session.read_index(context.clone()).map_err(access)?;
@@ -2710,12 +2758,14 @@ impl Owner {
                         if !self.session.is_authoritative() {
                             return Err(AccessError::Unavailable);
                         }
-                        if self.pending.len() == self.config.pending_clients {
+                        if self.pending_participants() >= self.config.pending_clients {
                             return Err(AccessError::Capacity);
                         }
                         self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                         let mut context = b"focal.replica.selection.v1\0".to_vec();
                         context.extend_from_slice(&self.nonce.to_be_bytes());
+                        context.extend_from_slice(&self.session.status().node_id.to_be_bytes());
+                        context.extend_from_slice(&self.incarnation.to_be_bytes());
                         context.extend_from_slice(&peer.principal().0);
                         context.extend_from_slice(&request.request_id.0);
                         self.session.read_index(context.clone()).map_err(access)?;
@@ -2751,12 +2801,14 @@ impl Owner {
                         if !self.session.is_authoritative() {
                             return Err(AccessError::Unavailable);
                         }
-                        if self.pending.len() == self.config.pending_clients {
+                        if self.pending_participants() >= self.config.pending_clients {
                             return Err(AccessError::Capacity);
                         }
                         self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                         let mut context = b"focal.replica.validators.v1\0".to_vec();
                         context.extend_from_slice(&self.nonce.to_be_bytes());
+                        context.extend_from_slice(&self.session.status().node_id.to_be_bytes());
+                        context.extend_from_slice(&self.incarnation.to_be_bytes());
                         context.extend_from_slice(&peer.principal().0);
                         context.extend_from_slice(&request.request_id.0);
                         self.session.read_index(context.clone()).map_err(access)?;
@@ -2792,12 +2844,14 @@ impl Owner {
                         if !self.session.is_authoritative() {
                             return Err(AccessError::Unavailable);
                         }
-                        if self.pending.len() == self.config.pending_clients {
+                        if self.pending_participants() >= self.config.pending_clients {
                             return Err(AccessError::Capacity);
                         }
                         self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                         let mut context = b"focal.replica.traversal.v1\0".to_vec();
                         context.extend_from_slice(&self.nonce.to_be_bytes());
+                        context.extend_from_slice(&self.session.status().node_id.to_be_bytes());
+                        context.extend_from_slice(&self.incarnation.to_be_bytes());
                         context.extend_from_slice(&peer.principal().0);
                         context.extend_from_slice(&request.request_id.0);
                         self.session.read_index(context.clone()).map_err(access)?;
@@ -2829,12 +2883,14 @@ impl Owner {
                 }
                 Operation::Read(read) => {
                     if matches!(read.consistency, ReadConsistency::Linearizable) {
-                        if self.pending.len() == self.config.pending_clients {
+                        if self.pending_participants() >= self.config.pending_clients {
                             return Err(AccessError::Capacity);
                         }
                         self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                         let mut context = b"focal.replica.read.v1\0".to_vec();
                         context.extend_from_slice(&self.nonce.to_be_bytes());
+                        context.extend_from_slice(&self.session.status().node_id.to_be_bytes());
+                        context.extend_from_slice(&self.incarnation.to_be_bytes());
                         context.extend_from_slice(&peer.principal().0);
                         context.extend_from_slice(&request.request_id.0);
                         self.session.read_index(context.clone()).map_err(access)?;
@@ -2860,7 +2916,7 @@ impl Owner {
                     }
                 }
                 Operation::Native { frame } => {
-                    if self.pending.len() == self.config.pending_clients {
+                    if self.pending_participants() >= self.config.pending_clients {
                         return Err(AccessError::Capacity);
                     }
                     let header = native_frame_admissible(frame, peer, request)?;
@@ -2916,11 +2972,13 @@ impl Owner {
                         if !self.session.serves_native_reads() {
                             return Err(AccessError::Unavailable);
                         }
-                        if self.pending.len() == self.config.pending_clients {
+                        if self.pending_participants() >= self.config.pending_clients {
                             return Err(AccessError::Capacity);
                         }
                         self.nonce = self.nonce.checked_add(1).ok_or(AccessError::Unavailable)?;
                         let correlation = crate::native_reads::correlation(
+                            self.session.status().node_id,
+                            self.incarnation,
                             peer.principal(),
                             request.request_id,
                             self.nonce,

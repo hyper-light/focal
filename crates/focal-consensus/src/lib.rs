@@ -824,6 +824,12 @@ impl DurableNode {
     pub fn pending_reads(&self) -> usize {
         self.config.max_inflight_messages.saturating_add(1)
     }
+    /// The messages this member lets one peer have in flight at once
+    /// (`NodeConfig::max_inflight_messages`): what an owner admits of a
+    /// peer's traffic beside its participants (F56).
+    pub fn inflight_window(&self) -> usize {
+        self.config.max_inflight_messages
+    }
     /// The ticks this member waits beyond its election timeout before it
     /// campaigns (`focal_raft::Raft::set_patience`): what its owner gives
     /// it for the stalls it has seen in itself.

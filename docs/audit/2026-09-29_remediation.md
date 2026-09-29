@@ -68,14 +68,14 @@ ruling before work starts).
 | F53 | P2 | open | 10 | — |
 | F54 | P2 | in tree | 12 | [F54](#f54) |
 | F55 | P1 | in tree | 13 | [F55](#f55) |
-| F56 | P1 | open | 13 | — |
+| F56 | P1 | in tree | 13 | [F56](#f56) |
 | F57 | P1 | open | 14 | — |
 | F58 | P2 | open | 14 | — |
 | F59 | P2 | open | 15 | — |
 | F60 | P2 | open | 15 | — |
 | F61 | P2 | open | 15 | — |
 | F62 | P1 | open | 15 | — |
-| F63 | P2 | open | 13 | — |
+| F63 | P2 | in tree | 13 | [F63](#f63) |
 | F64 | P2 | open | 15 | — |
 | F65 | P2 | open | 15 | — |
 
@@ -462,3 +462,51 @@ and the D4 follower-read tests unchanged. The bound's refusal and drop are exerc
 by construction (the bound is the core's in-flight read limit); a parked set of that
 size needs a cluster harness that holds hundreds of answered reads, left to the
 campaign.
+
+## F56
+
+**Cause.** One pending queue (`pending_clients` = 128) admitted participants and
+peers alike; a peer's Raft message — the heartbeat or append answer quorum progress
+needs — was refused `Capacity` once participants filled it, though those participants
+waited on exactly that progress.
+
+**Fix.** Two bounds: participants keep `pending_clients`; Raft ingress is admitted
+under a reserve of its own — the members the configuration names (voters, learners,
+the admitted) times the in-flight window the core allows one peer
+(`NodeConfig::max_inflight_messages`, exposed as `DurableNode::inflight_window` and
+`Session::inflight_window`) — derived, not chosen: every member may have its whole
+window outstanding at once and no more. Neither side takes the other's slots
+(`pending_peers`, `pending_participants`, `peer_reserve` in `fleet.rs`; all sixteen
+participant admission sites count participants only). Acknowledgment stays behind the
+exact Ready fence (`WaitingFor::PeerPersistence`). Byte funding is unchanged: each
+request still carries its admitted charge.
+
+**Tests.** `fleet::list_tests::peer_admission_tests::a_full_participant_queue_still_admits_the_acknowledgments_it_waits_on`
+(one-slot participant queue; before the fix the followers' answers through the
+leader's authenticated ingress were `Capacity`; after, `PeerAccepted` and the waiting
+read completes; the reserve equals three voters' windows). The audit's 128-client
+campaign with paused WAL, cancellation and joint configurations belongs to the
+KIND/nightly campaigns (F26/F28).
+
+## F63
+
+**Cause.** `ReadOnly::add` keyed a pending read on its context and dropped a second
+asker with its origin; `answer_read` answered one origin. The native correlation
+hashed principal, request id and an owner-local nonce only, so the same principal's
+exact retry at two followers with aligned nonces, or at one owner across a restart,
+produced one context.
+
+**Fix.** A pending read keeps every asker in the order asked (`origins`, bounded by
+`MAX_MEMBERS`, memory reserved; `into_parts`), and `confirm_reads` answers each (the
+context copied for all but the last). Every read context an owner mints carries the
+owner's node id and an incarnation drawn at its start (`focal.native.read-correlation.v2`;
+the managed, summary and list contexts extended the same way), so a nonce that
+restarts or aligns with another replica's never repeats a context. The etcd
+`read_only` contract (unique context per round) is the reference; the origins are the
+defence where a caller collides anyway.
+
+**Tests.** `focal-raft::tests::a_read_asked_by_two_members_under_one_context_answers_both`
+(two followers forward one context; one pending read; both answered at the confirmed
+index), `read::tests::reads_leave_in_the_order_asked_once_one_is_confirmed` (the
+second asker recorded), the D4 follower-read and the differential suites unchanged
+(the harness asks under unique contexts).

@@ -646,6 +646,10 @@ impl Session {
     pub fn status(&self) -> NodeStatus {
         self.consensus.status()
     }
+    /// The messages the core lets one peer have in flight at once.
+    pub fn inflight_window(&self) -> usize {
+        self.consensus.inflight_window()
+    }
     /// Current-term authority has crossed the committed ReadIndex barrier.
     /// Recovered workers must check this before dispatch, even without a write.
     pub fn is_authoritative(&self) -> bool {

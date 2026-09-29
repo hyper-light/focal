@@ -721,3 +721,48 @@ fn a_follower_waits_its_patience_before_it_campaigns() {
     prompt.tick().unwrap();
     assert_ne!(prompt.raft.state(), StateRole::Follower);
 }
+
+#[test]
+fn a_read_asked_by_two_members_under_one_context_answers_both() {
+    let mut node = leader();
+    let mut append = answer(MessageType::MsgAppendResponse, 2, 1, 1);
+    append.index = 1;
+    node.step(append).unwrap();
+    drain(&mut node);
+    // Two followers forward a read under the same context: one read waits,
+    // with two askers.
+    for from in [2u64, 3] {
+        let mut asked = answer(MessageType::MsgReadIndex, from, 1, 1);
+        asked.entries = vec![Entry {
+            data: b"same".to_vec(),
+            ..Entry::default()
+        }];
+        node.step(asked).unwrap();
+    }
+    assert_eq!(node.raft.pending_read_count(), 1);
+    drain(&mut node);
+    let mut heartbeat = answer(MessageType::MsgHeartbeatResponse, 2, 1, 1);
+    heartbeat.context = b"same".to_vec();
+    node.step(heartbeat).unwrap();
+    // The quorum confirms the read once, and each asker is answered.
+    let answers: Vec<(u64, u64, Vec<u8>)> = drain(&mut node)
+        .into_iter()
+        .filter(|message| proto::message_type(message) == Some(MessageType::MsgReadIndexResp))
+        .map(|message| {
+            (
+                message.to,
+                message.index,
+                message
+                    .entries
+                    .first()
+                    .map(|entry| entry.data.clone())
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        answers,
+        vec![(2, 1, b"same".to_vec()), (3, 1, b"same".to_vec())]
+    );
+    assert_eq!(node.raft.pending_read_count(), 0);
+}

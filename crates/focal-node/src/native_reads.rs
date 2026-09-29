@@ -107,12 +107,21 @@ pub(crate) fn role(peer: &AuthenticatedPeer) -> Result<NativePeerRole, AccessErr
         PeerRole::Node { .. } => Err(AccessError::Unauthorized),
     }
 }
+/// The correlation of one native read barrier: the principal's request as
+/// this owner minted it — its node and its incarnation (drawn when the owner
+/// started) scope the nonce, so the same principal's exact retry at two
+/// replicas, or at one replica across a restart, never names one context
+/// twice (the audit's F63: a leader answers one context once).
 pub(crate) fn correlation(
+    node: u64,
+    incarnation: u64,
     principal: ParticipantId,
     request: RequestId,
     nonce: u64,
 ) -> ReadCorrelation {
-    let mut hash = blake3::Hasher::new_derive_key("focal.native.read-correlation.v1");
+    let mut hash = blake3::Hasher::new_derive_key("focal.native.read-correlation.v2");
+    hash.update(&node.to_le_bytes());
+    hash.update(&incarnation.to_le_bytes());
     hash.update(&principal.0);
     hash.update(&request.0);
     hash.update(&nonce.to_le_bytes());
@@ -134,7 +143,9 @@ pub(crate) fn local(
     let profile = profile(session)?;
     let role = role(peer)?;
     if matches!(read.consistency, ReadConsistency::Linearizable) {
-        let correlation = correlation(peer.principal(), request_id, 0);
+        // The embedded owner is the only asker of its own core: no other
+        // origin can share its contexts.
+        let correlation = correlation(session.status().node_id, 0, peer.principal(), request_id, 0);
         session.native_read_index(correlation).map_err(access)?;
         let mut boundary = None;
         for _ in 0..BARRIER_POLLS {
