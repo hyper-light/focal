@@ -60,6 +60,7 @@ struct SnapshotEnvelopeV2 {
     schema: u16,
     ledger: LedgerId,
     raft_index: u64,
+    #[serde(with = "focal_memory::serde_bytes")]
     core: Vec<u8>,
     cursors: CursorCheckpoint,
     cursor_meta: CursorMetadata,

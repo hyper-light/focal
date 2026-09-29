@@ -95,6 +95,7 @@ pub enum Operation {
     /// Consensus payload is interpreted only by authenticated node ingress.
     Raft {
         group: [u8; 16],
+        #[serde(with = "focal_memory::serde_bytes")]
         message: Vec<u8>,
     },
     /// Allocate/admit only the authenticated principal's requested epoch.
@@ -111,6 +112,7 @@ pub enum Operation {
     /// Bounded metadata RPC; interpreted only by the authenticated control owner.
     Control {
         group: [u8; 16],
+        #[serde(with = "focal_memory::serde_bytes")]
         request: Vec<u8>,
     },
     /// Node-only content custody protocol. A durable reply attests one disk,
@@ -119,6 +121,7 @@ pub enum Operation {
     /// Authenticated node discovery; the control owner accepts read RPCs only.
     PeerControl {
         group: [u8; 16],
+        #[serde(with = "focal_memory::serde_bytes")]
         request: Vec<u8>,
     },
     /// Announce only this authenticated Node's reachable endpoint. The root
@@ -146,6 +149,7 @@ pub enum Operation {
     EnrollmentControl {
         group: [u8; 16],
         genesis: [u8; 32],
+        #[serde(with = "focal_memory::serde_bytes")]
         request: Vec<u8>,
     },
     List(crate::ListRequest),
@@ -179,6 +183,7 @@ pub enum Operation {
     /// One borrowed native input frame (`FCNINPUT`), journaled and admitted
     /// exactly as sent; only the native profile carries it.
     Native {
+        #[serde(with = "focal_memory::serde_bytes")]
         frame: Vec<u8>,
     },
     NativeRead(crate::NativeReadRequest),
@@ -188,6 +193,7 @@ pub enum Operation {
     /// readiness. Never a plan, a fence, or another node's facts.
     PlacementControl {
         group: [u8; 16],
+        #[serde(with = "focal_memory::serde_bytes")]
         request: Vec<u8>,
     },
     /// Ask the authenticated node to sign one session fact it can witness from
@@ -195,6 +201,7 @@ pub enum Operation {
     /// signature alone; a quorum is assembled by the caller.
     SessionSign {
         group: [u8; 16],
+        #[serde(with = "focal_memory::serde_bytes")]
         request: Vec<u8>,
     },
     /// Node-only liveness probe: a direct probe of the receiver or an indirect
@@ -203,6 +210,7 @@ pub enum Operation {
     /// Answered from the receiver's published state without an owner round
     /// trip; it grants nothing and commits nothing.
     Probe {
+        #[serde(with = "focal_memory::serde_bytes")]
         request: Vec<u8>,
     },
     /// Ask the authenticated node for one range-movement fact its hosted
@@ -212,6 +220,7 @@ pub enum Operation {
     /// state and attests it before proposing it.
     RangeControl {
         group: [u8; 16],
+        #[serde(with = "focal_memory::serde_bytes")]
         request: Vec<u8>,
     },
     /// Ask the node that leads a session's log to state the session's facts
@@ -222,6 +231,7 @@ pub enum Operation {
     /// connection; the log applies it under its own committed rules.
     SessionControl {
         group: [u8; 16],
+        #[serde(with = "focal_memory::serde_bytes")]
         request: Vec<u8>,
     },
 }
@@ -500,6 +510,7 @@ pub enum UploadRequest {
     Append {
         upload: [u8; 16],
         offset: u64,
+        #[serde(with = "focal_memory::serde_bytes")]
         bytes: Vec<u8>,
     },
     Seal {
@@ -537,11 +548,13 @@ pub enum CustodyRequest {
         transfer: [u8; 16],
         policy_revision: u64,
         content: ContentRef,
+        #[serde(with = "focal_memory::serde_bytes")]
         manifest: Vec<u8>,
     },
     Chunk {
         transfer: [u8; 16],
         index: u32,
+        #[serde(with = "focal_memory::serde_bytes")]
         bytes: Vec<u8>,
     },
     Seal {
@@ -588,14 +601,17 @@ pub enum CustodyReply {
     Cancelled,
     Manifest {
         content: ContentRef,
+        #[serde(with = "focal_memory::serde_bytes")]
         manifest: Vec<u8>,
     },
     Chunk {
         index: u32,
+        #[serde(with = "focal_memory::serde_bytes")]
         bytes: Vec<u8>,
     },
     SeedChunk {
         hash: ContentHash,
+        #[serde(with = "focal_memory::serde_bytes")]
         bytes: Vec<u8>,
     },
 }
@@ -603,6 +619,7 @@ pub enum CustodyReply {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentChunk {
     pub offset: u64,
+    #[serde(with = "focal_memory::serde_bytes")]
     pub bytes: Vec<u8>,
     pub eof: bool,
 }
@@ -690,6 +707,7 @@ pub enum Response {
     Upload(UploadReply),
     Content(ContentChunk),
     Control {
+        #[serde(with = "focal_memory::serde_bytes")]
         response: Vec<u8>,
     },
     Custody(CustodyReply),
@@ -708,7 +726,7 @@ pub enum Response {
     NativeListed(crate::NativeListPage),
     /// The receiver's probe reply: its acknowledgement or relayed outcome,
     /// coordinate, health and piggyback.
-    Probe(Vec<u8>),
+    Probe(#[serde(with = "focal_memory::serde_bytes")] Vec<u8>),
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponseEnvelope {

@@ -75,6 +75,7 @@ pub struct Record {
     pub kind: RecordKind,
     pub index: u64,
     pub term: u64,
+    #[serde(with = "focal_memory::serde_bytes")]
     pub payload: Vec<u8>,
 }
 
@@ -880,6 +881,7 @@ mod tests {
             kind: FloorEraKind,
             index: u64,
             term: u64,
+            #[serde(with = "focal_memory::serde_bytes")]
             payload: Vec<u8>,
         }
         for (kind, old_kind) in [
@@ -954,6 +956,7 @@ mod tests {
             kind: TransitionEraKind,
             index: u64,
             term: u64,
+            #[serde(with = "focal_memory::serde_bytes")]
             payload: Vec<u8>,
         }
         for (kind, old_kind) in [
@@ -1021,6 +1024,7 @@ mod tests {
             kind: PreviousKind,
             index: u64,
             term: u64,
+            #[serde(with = "focal_memory::serde_bytes")]
             payload: Vec<u8>,
         }
         for (kind, previous) in [

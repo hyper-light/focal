@@ -11796,3 +11796,26 @@ protocol words `PersistencePending` `not_ready`. The in-process tests ask once
 now (`fleet_native_tests`, `fleet_import_tests`), and `tests/online_activation.rs`
 asks a fresh founder once through its running node's admin socket, without the
 harness riding out exit 6, and writes a claim natively after it.
+
+### 2026-09-29 — byte payloads read in one exact reservation (allocation audit R5)
+
+A `Vec<u8>` field derives as a sequence: written as varint(len) and every byte,
+read back one byte at a time into a vector that guesses its size from the
+length and grows, and measured per byte on every size pass. postcard writes
+`serialize_bytes` as the same varint(len) and the same bytes, so
+`focal_memory::serde_bytes` (behind the crate's `serde` feature) keeps every wire
+and durable byte — proved across the varint boundaries (0, 1, 127, 128, 300,
+16 383, 16 384, 70 000 bytes) in both directions — and reads a field back with
+one exact, fallible reservation of what the frame holds (postcard checks the
+length against the input before the visitor runs; a length beyond it is a decode
+error, tested), while a text format's sequence still reads. Annotated: the wire's
+19 message fields and the native payload, artifact, legacy row and list cursor;
+the WAL's `Record.payload` and the three era records; the ledger's checkpoint
+envelopes (`SnapshotEnvelope`, `SnapshotEnvelopeV2`); a range's `DataRow`. Fixed
+arrays (`[u8; 16]`) are untouched: they carry no length, and `serialize_bytes`
+would add one. Measured (`docs/qualification/performance/2026-09-29-macos-arm64.md`):
+decode of a native frame 1964 → 102 ns at 4 KiB and 30 695 → 776 ns at 64 KiB,
+encode 262 → 120 and 3040 → 1072 ns, the empty frame's fixed cost unchanged; the
+WAL's path A moves 3.6× fewer bytes per 4 KiB append (16 810 → 4 607) with half
+the reallocations. Nothing on disk or on the wire changed; the frozen-format and
+replay suites pass unchanged.

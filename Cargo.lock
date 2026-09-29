@@ -701,7 +701,9 @@ dependencies = [
 name = "focal-memory"
 version = "0.1.0"
 dependencies = [
+ "postcard",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

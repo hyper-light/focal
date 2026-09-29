@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataRow {
     pub key: StorageKey,
+    #[serde(with = "focal_memory::serde_bytes")]
     pub value: Vec<u8>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -872,7 +872,7 @@ pub struct NativeResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NativePayload {
-    Inline(Vec<u8>),
+    Inline(#[serde(with = "focal_memory::serde_bytes")] Vec<u8>),
     Content(ContentRef),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -921,6 +921,7 @@ pub struct NativeArtifact {
     pub schema: u16,
     pub kind: String,
     pub schema_hash: ContentHash,
+    #[serde(with = "focal_memory::serde_bytes")]
     pub metadata: Vec<u8>,
     pub payload: NativePayload,
     pub producer: ParticipantId,
@@ -1119,6 +1120,7 @@ pub struct NativeStanding {
 #[serde(deny_unknown_fields)]
 pub struct NativeLegacyRow {
     pub key: NativeObjectRef,
+    #[serde(with = "focal_memory::serde_bytes")]
     pub bytes: Vec<u8>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1260,7 +1262,7 @@ impl NativeListFilter {
 /// Opaque node-authenticated continuation; a changed filter, principal or
 /// route epoch makes it invalid rather than silently repositioning.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeListCursor(pub Vec<u8>);
+pub struct NativeListCursor(#[serde(with = "focal_memory::serde_bytes")] pub Vec<u8>);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeListRequest {
