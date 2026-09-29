@@ -317,7 +317,15 @@ pub fn render(
         resources.push(file);
     }
     assets.push("pdb.yaml", budgets(&request.namespace, failures));
-    let mut kustomization = format!("namespace: {}\nresources:\n", request.namespace);
+    // The namespace is an object of the kustomization, first: `kubectl
+    // apply -k .` on a fresh cluster creates it before anything named in it,
+    // where a kustomization that only set `namespace:` failed there with
+    // "namespaces \"focal\" not found" (the KIND campaign of 2026-09-29, D1).
+    assets.push("namespace.yaml", namespace_object(&request.namespace));
+    let mut kustomization = format!(
+        "namespace: {}\nresources:\n  - namespace.yaml\n",
+        request.namespace
+    );
     for resource in &resources {
         let _ = writeln!(kustomization, "  - {resource}");
     }
@@ -340,6 +348,11 @@ pub fn render(
         ns = request.namespace,
     ));
     Ok(assets)
+}
+fn namespace_object(namespace: &str) -> String {
+    format!(
+        "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: {namespace}\n  labels:\n    app.kubernetes.io/name: focal\n    app.kubernetes.io/managed-by: focal-deployment-render\n"
+    )
 }
 fn service(namespace: &str, port: u16) -> String {
     format!(

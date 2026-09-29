@@ -951,7 +951,11 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             delivery.output = Some(NativeOutput::reserve(
                 &self.budget,
                 delivery.events.committed.len(),
-                delivery.events.read_states.len(),
+                delivery
+                    .events
+                    .read_states
+                    .len()
+                    .saturating_add(self.parked_reads.len()),
             )?);
         }
         if !delivery.snapshot {
@@ -994,26 +998,21 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             delivery.membership = add(delivery.membership, 1)?;
         }
         self.finish_entries(applied_index)?;
+        // Barriers parked by an earlier delivery whose index this one reached.
+        let bound = consensus.pending_reads();
+        for barrier in self.take_applied_parked_reads() {
+            self.apply_read_barrier(&barrier, leader, &status, consensus, delivery)?;
+        }
         while let Some(barrier) = delivery.events.read_states.get(delivery.read) {
             if barrier.index > self.applied_raft {
-                return Err(NativeSessionError::Corrupt);
+                // Answered by a leader ahead of this copy: the read waits
+                // for the entries it names (27 §5, follower reads).
+                self.park_read(barrier, bound)?;
+                delivery.read = add(delivery.read, 1)?;
+                continue;
             }
-            // Classify the barrier by its 8-byte magic, not by full equality with
-            // the current term: READINESS and CORRELATION share their first seven
-            // bytes, so a readiness barrier confirmed in a prior term and drained
-            // after a term bump would otherwise be misread as a correlated read
-            // and fail closed. A readiness barrier for the current term promotes;
-            // a stale-term one is a benign internal barrier and is ignored.
-            if barrier.context.starts_with(READINESS.as_slice()) {
-                if leader && barrier.context == readiness(status.term) {
-                    self.promote(status.term, consensus)?;
-                }
-            } else if Self::is_correlated_read(&barrier.context) {
-                let output = delivery.output.as_mut().ok_or(NativeSessionError::Failed)?;
-                self.apply_correlated_read(barrier, output)?;
-            } else {
-                return Err(NativeSessionError::Corrupt);
-            }
+            let barrier = barrier.clone();
+            self.apply_read_barrier(&barrier, leader, &status, consensus, delivery)?;
             delivery.read = add(delivery.read, 1)?;
         }
         self.settle(&status, consensus)?;
@@ -1024,6 +1023,33 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         {
             self.request_read(consensus, &readiness(status.term))?;
             self.readiness_requested = Some(status.term);
+        }
+        Ok(())
+    }
+    /// One barrier this copy has applied up to. Classified by its 8-byte
+    /// magic, not by full equality with the current term: READINESS and
+    /// CORRELATION share their first seven bytes, so a readiness barrier
+    /// confirmed in a prior term and drained after a term bump would
+    /// otherwise be misread as a correlated read and fail closed. A
+    /// readiness barrier for the current term promotes; a stale-term one is
+    /// a benign internal barrier and is ignored.
+    fn apply_read_barrier(
+        &mut self,
+        barrier: &focal_consensus::ReadBarrier,
+        leader: bool,
+        status: &NodeStatus,
+        consensus: &mut DurableNode,
+        delivery: &mut Delivery,
+    ) -> Result<(), NativeSessionError> {
+        if barrier.context.starts_with(READINESS.as_slice()) {
+            if leader && barrier.context == readiness(status.term) {
+                self.promote(status.term, consensus)?;
+            }
+        } else if Self::is_correlated_read(&barrier.context) {
+            let output = delivery.output.as_mut().ok_or(NativeSessionError::Failed)?;
+            self.apply_correlated_read(barrier, output)?;
+        } else {
+            return Err(NativeSessionError::Corrupt);
         }
         Ok(())
     }
@@ -1053,7 +1079,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         consensus: &mut DurableNode,
         correlation: ReadCorrelation,
     ) -> Result<(), NativeSessionError> {
-        self.require_authority(&consensus.status())?;
+        self.require_reader(&consensus.status())?;
         let mut context = [0u8; 24];
         if let Some(prefix) = context.get_mut(..8) {
             prefix.copy_from_slice(CORRELATION);

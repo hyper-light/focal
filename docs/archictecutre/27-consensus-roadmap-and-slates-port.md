@@ -423,6 +423,20 @@ in send order. A group's owner thread stays the only writer of its state.
 **Learners.** Present. Added with the new core: learners never count toward either
 quorum and never vote, tested as slates tests it.
 
+**Follower reads** (2026-09-29; the KIND campaign's D4). A linearizable native read
+asked of a replica that does not lead is served by that replica: its core forwards
+the read's barrier to the leader (`MsgReadIndex`, thesis §6.4), the answer names the
+leader's commit index, the engine parks the barrier until this copy has applied
+that index (bounded by the reads the core holds in flight, `DurableNode::pending_reads`),
+and the page is read from the copy's own committed core (`read_at_least`). A
+follower that knows no leader refuses the read as before (`NotReady`, and the
+client's bounded resends ride out the election). Before this a follower's operator
+socket refused every such read and the client resent it for its whole 30 s ceiling
+before reporting `unavailable` (`tests/follower_reads.rs`, three real processes:
+written through the leader, read through each host). Reads therefore scale across
+the voters of a log, and a copy's read is exactly as fresh as the leader's commit
+index at the moment it asked.
+
 ## 6. Order of work
 
 | Stage | Content | Exit evidence |

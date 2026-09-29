@@ -808,6 +808,11 @@ impl DurableNode {
     pub fn election_tick(&self) -> usize {
         self.config.election_tick
     }
+    /// The reads this member may hold in flight: the core's own bound, which
+    /// a follower's parked read barriers share (27 §5, follower reads).
+    pub fn pending_reads(&self) -> usize {
+        self.config.max_inflight_messages.saturating_add(1)
+    }
     /// The ticks this member waits beyond its election timeout before it
     /// campaigns (`focal_raft::Raft::set_patience`): what its owner gives
     /// it for the stalls it has seen in itself.
@@ -1058,7 +1063,13 @@ impl DurableNode {
     /// Quorum ReadIndex completion arrives in drain. Publication must also reach
     /// its index before a linearizable read is served. No clock lease is involved.
     fn read_index_inner(&mut self, context: Vec<u8>) -> Result<(), ConsensusError> {
-        self.check_leader()?;
+        // A follower asks through its leader: the core forwards the read and
+        // the answer names the leader's commit index (27 §5, follower reads).
+        // One that knows no leader has no one to ask.
+        self.check()?;
+        if self.raw.raft.state() != StateRole::Leader && self.raw.raft.leader_id() == 0 {
+            return Err(ConsensusError::NotLeader { leader: 0 });
+        }
         if context.is_empty() || context.len() > 1024 {
             return Err(ConsensusError::Capacity);
         }

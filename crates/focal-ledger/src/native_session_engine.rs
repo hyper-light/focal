@@ -73,6 +73,13 @@ pub(crate) struct NativeEngine<S: NativeSchemaVerifier> {
     pub(super) admissions_since_sample: u32,
     pub(super) ready_term: Option<u64>,
     pub(super) readiness_requested: Option<u64>,
+    /// Read barriers the leader answered above this copy's applied index:
+    /// a follower's reads wait for the entries, never the other way round.
+    /// Bounded by the core's reads in flight; charged once, when first used.
+    pub(super) parked_reads: Vec<focal_consensus::ReadBarrier>,
+    pub(super) parked_charge: Option<Allocation>,
+    /// Barriers parked since this engine opened, for diagnostics.
+    pub(super) reads_parked: u64,
     pub(super) observed_term: u64,
     pub(super) observed_leader: bool,
     pub(super) reconstruction_needed: bool,
@@ -170,6 +177,9 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             admissions_since_sample: 0,
             ready_term: None,
             readiness_requested: None,
+            parked_reads: Vec::new(),
+            parked_charge: None,
+            reads_parked: 0,
             observed_term: 0,
             observed_leader: false,
             reconstruction_needed: true,
@@ -583,6 +593,81 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             });
         }
         Ok(())
+    }
+    /// Whether this replica may serve a linearizable read: as the authority,
+    /// or as a follower that knows its leader — the read's barrier goes to
+    /// the leader through the core, and the answer waits for this copy to
+    /// have applied the index it names (27 §5, follower reads).
+    pub(crate) fn serves_reads(&self, status: &NodeStatus) -> bool {
+        self.is_authoritative(status)
+            || (!self.failed
+                && status.leader_id != 0
+                && self.genesis.is_some()
+                && self.domain.is_some())
+    }
+    pub(super) fn require_reader(&self, status: &NodeStatus) -> Result<(), NativeSessionError> {
+        self.check()?;
+        if !self.serves_reads(status) {
+            return Err(NativeSessionError::NotReady {
+                leader: status.leader_id,
+            });
+        }
+        Ok(())
+    }
+    /// Hold a barrier answered above the applied index until the entries it
+    /// names have been applied; bounded by the reads the core holds in
+    /// flight, so a follower far behind refuses new reads rather than grows.
+    pub(super) fn park_read(
+        &mut self,
+        barrier: &focal_consensus::ReadBarrier,
+        bound: usize,
+    ) -> Result<(), NativeSessionError> {
+        if self.parked_reads.len() >= bound {
+            return Err(NativeSessionError::Capacity);
+        }
+        if self.parked_charge.is_none() {
+            let permit = self.budget.reserve(
+                BudgetKind::Pending,
+                BudgetLane::Completion,
+                array::<focal_consensus::ReadBarrier>(bound)?,
+            )?;
+            self.parked_reads
+                .try_reserve_exact(bound)
+                .map_err(|_| NativeSessionError::Capacity)?;
+            self.parked_charge = Some(permit.commit());
+        }
+        let mut context = reserved(barrier.context.len())?;
+        context.extend_from_slice(&barrier.context);
+        self.parked_reads.push(focal_consensus::ReadBarrier {
+            index: barrier.index,
+            context,
+        });
+        self.reads_parked = self.reads_parked.saturating_add(1);
+        Ok(())
+    }
+    /// The parked barriers this copy has now applied up to, in the order
+    /// they were parked; the rest stay.
+    pub(super) fn take_applied_parked_reads(&mut self) -> Vec<focal_consensus::ReadBarrier> {
+        let applied = self.applied_raft;
+        let mut ready = Vec::new();
+        let mut index = 0;
+        while index < self.parked_reads.len() {
+            if self
+                .parked_reads
+                .get(index)
+                .is_some_and(|barrier| barrier.index <= applied)
+            {
+                let barrier = self.parked_reads.remove(index);
+                if ready.try_reserve_exact(1).is_err() {
+                    self.parked_reads.insert(index, barrier);
+                    break;
+                }
+                ready.push(barrier);
+            } else {
+                index = index.saturating_add(1);
+            }
+        }
+        ready
     }
 
     /// Stage one input against the owner and submit the resulting candidate.

@@ -11656,3 +11656,61 @@ rendered deployment leaves the root group a single voter; C3 consensus messages
 refused `Busy` on the two-permit per-peer lane are dropped uncounted; the
 audit's R1/R2 (one durable group commit per proposal; one fsync per commit) are
 design decisions to take.
+
+### 2026-09-29 — two of the KIND campaign's defects at their causes: the rendered Namespace, the activation a late voter could not apply
+
+**D1.** The Kubernetes renderer set `namespace:` on every object and emitted no
+Namespace object, so `kubectl apply -k .` on a fresh cluster failed with
+"namespaces \"focal\" not found". It renders `namespace.yaml` first in the
+kustomization now; the checked-in manifests and the render golden test follow.
+
+**D2, the campaign's headline.** Every voter added by `deployment apply` after
+`activate-native` stopped with `Corrupt` ("persisted ledger identity, format or
+prefix mismatch") and the session stayed in Catchup for good, the pods Ready.
+Reproduced in process
+(`a_voter_added_after_a_genesis_activation_promises_the_successor_and_applies_it`,
+`session_native_tests.rs`): a founder alone activates, a copy joins, states its
+promise of the successor decoder until it is durable and is admitted as a
+learner — the ledger's own gate, the node's `ManagedSupport` probe in process —
+and its replay of the founder's log fails at the activation record. Not at the
+decoder floor, which the promise had made durable, but at the record's
+configuration: `apply_activation` compared the record's hash of the
+configuration it was proposed under with the consensus's *current*
+configuration, which on the copy already held the learner's own addition,
+committed after the record and handed over in the same batch — while the
+ledger's applied position (`membership_state.configuration_index`, advanced in
+order by `apply_delivered_membership`) was still the record's. On any replica the
+same comparison fails on any replay past a later configuration change. The record
+names its configuration by the index that committed it, which within one log
+identifies one configuration; the apply compares that index alone now (the hash
+stays in the record, computed at proposal). The test goes on to promote the copy,
+commit natively on both, and reopen the copy with its immutable bootstrap to
+replay the record again. The campaign record is updated; D3 (a transient
+`unavailable` on the first `activate-native`), D4 (a follower's operator read
+stalls for the client's 30 s resend ceiling: `LedgerError::NotReady` reaches the
+client as `Unavailable`, with no leader named and no forwarding) and D5 (the
+rendered deployment leaves the root group a single voter) remain open.
+
+### 2026-09-29 — follower reads: the KIND campaign's D4 at its cause
+
+A domain read asked of a host that did not lead the session refused it
+(`NotReady`, reaching the client as `Unavailable`), and the client resent it for
+its whole 30 s ceiling before reporting `unavailable` — on both hosts, every time
+(the campaign's 6 of 6 reads at 30.08–30.15 s). A follower serves a linearizable
+read now (27 §5): the consensus admits the read on a follower that knows its
+leader (`read_index_inner`; the core forwards `MsgReadIndex` and the leader
+answers with its commit index), the engine parks a barrier answered above this
+copy's applied index until the entries it names have been applied — bounded by
+the reads the core holds in flight (`DurableNode::pending_reads`), charged once —
+where it failed closed (`Corrupt`) on the same condition before, and the page is
+read from the copy's own committed core at that index (`read_at_least`); the
+node's read dispatch and its resolution ask `serves_native_reads` instead of
+`is_authoritative`. A follower with no leader to ask refuses as before, and the
+client's bounded resends ride out the election. On three real processes
+(`tests/follower_reads.rs`: written through the leader, read through each host's
+operator socket, three rounds) every read answered in **45–47 ms for the whole CLI
+invocation**, with the claim the leader had just committed; the ledger's cluster
+test asks a barrier of a follower and serves it at the committed sequence, and an
+isolated authority still completes none. Reads therefore scale across a log's
+voters, and a copy's read is exactly as fresh as the leader's commit index at the
+moment it asked.

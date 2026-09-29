@@ -955,6 +955,11 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
     pub fn read_index(&mut self, correlation: ReadCorrelation) -> Result<(), NativeSessionError> {
         self.engine.read_index(&mut self.consensus, correlation)
     }
+    /// Read barriers answered above this copy's applied index and held until
+    /// it caught up, since it opened (27 §5, follower reads).
+    pub fn reads_parked(&self) -> u64 {
+        self.engine.reads_parked
+    }
     /// Encode the committed Core at the fully delivered prefix under a retained
     /// output permit and hand bytes and permit together to consensus. Completion
     /// requires the actual durable fence observed by `poll`/`try_poll`.

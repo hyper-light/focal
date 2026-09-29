@@ -179,6 +179,36 @@ impl Cluster {
         );
         self.nodes[id as usize - 1] = Some(node);
     }
+    /// A node that joins the group later, opened as a copy that knows the
+    /// voters of the moment: the placement agent's `open_copy`, in process.
+    fn join(&mut self, id: u64, hosted: bool) {
+        assert_eq!(id as usize, self.nodes.len() + 1);
+        let config = NodeConfig::joining(
+            id,
+            CLUSTER,
+            ledger().session.0,
+            self.voters.clone(),
+            Vec::new(),
+        );
+        // The writer creates the content directory the reader opens.
+        self.stores.push(writer(self.dir.path(), id));
+        let path = self.dir.path().join(format!("wal-{id}"));
+        let node = if hosted {
+            Session::open_hosted(
+                path,
+                ledger(),
+                config,
+                SessionLimits::default(),
+                hosting_with(self.dir.path(), id, self.limits),
+            )
+            .unwrap()
+        } else {
+            Session::open(path, ledger(), config, SessionLimits::default()).unwrap()
+        };
+        self.hosted.push(hosted);
+        self.nodes.push(Some(node));
+        self.voters.push(id);
+    }
     fn pump(&mut self, isolated: &[u64]) {
         for _ in 0..400 {
             if self.round(isolated) {
@@ -714,6 +744,101 @@ fn a_voter_without_native_hosting_blocks_activation_and_a_downgraded_replica_can
     let sequences = cluster.native_sequences();
     assert!(
         sequences.iter().all(|(_, seq)| *seq == Some(SessionSeq(2))),
+        "{sequences:?}"
+    );
+}
+
+/// A voter added after the activation was proposed never promised the
+/// successor decoder: its copy replays the founder's log, activation record
+/// included, and must promise as it meets the record and apply it once the
+/// promise is durable — as the ingress fence does for native history — and
+/// never fail closed (the KIND campaign of 2026-09-29, D2: both hosts added
+/// by `deployment apply` after `activate-native` stopped with Corrupt, the
+/// session stuck in Catchup for good).
+#[test]
+fn a_voter_added_after_a_genesis_activation_promises_the_successor_and_applies_it() {
+    let mut cluster = Cluster::new(1, &[true]);
+    cluster.elect(1, &[]);
+    cluster.activate(1, &[]);
+    let create = creation(cluster.next(PARTIES.issuer), 1);
+    let created = cluster.commit(1, PARTIES.issuer, create, &[]);
+    cluster.join(2, true);
+    // The leader admits a learner only once it has recorded the learner's
+    // durable promise of the successor decoder: the node's `ManagedSupport`
+    // probe, in process, asked again until the copy's promise is durable
+    // (the managed floor persists first, the successor's after it).
+    for _ in 0..8 {
+        cluster.exchange_support(&[]);
+        if cluster.node(2).native_support_ready() {
+            break;
+        }
+    }
+    cluster.exchange_support(&[]);
+    assert!(cluster.node(2).native_support_ready());
+    let learner = membership_request(
+        cluster.node_ref(1),
+        1,
+        MembershipChange::AddLearner { node: 2 },
+    );
+    cluster.node(1).propose_membership(&learner).unwrap();
+    for _ in 0..16 {
+        cluster.settle(&[]);
+        if cluster.node(2).activation().is_native() {
+            break;
+        }
+    }
+    assert!(
+        cluster.node(2).activation().is_native(),
+        "the joined copy never applied the activation: {:?}",
+        cluster.node(2).activation()
+    );
+    assert!(cluster.node(2).native_support_ready());
+    assert_eq!(
+        cluster.node(2).native_outcome(created.invocation).unwrap(),
+        Some(created)
+    );
+    // Promoted, it votes, and follows what the group commits natively. The
+    // addition invalidated the promises recorded under the configuration
+    // before it; the members state theirs again under the new one, as the
+    // node's probes do.
+    cluster.exchange_support(&[]);
+    let promotion = membership_request(
+        cluster.node_ref(1),
+        2,
+        MembershipChange::Promote { node: 2 },
+    );
+    cluster.node(1).propose_membership(&promotion).unwrap();
+    cluster.settle(&[]);
+    assert!(cluster.node(1).status().voters.contains(&2));
+    let second = creation(cluster.next(PARTIES.issuer), 2);
+    cluster.commit(1, PARTIES.issuer, second, &[]);
+    cluster.settle(&[]);
+    let sequences = cluster.native_sequences();
+    assert!(
+        sequences.iter().all(|(_, seq)| *seq == Some(SessionSeq(2))),
+        "{sequences:?}"
+    );
+    // Restarted, the copy opens with the bootstrap it was installed with —
+    // immutable, checked against its identity record — and replays its log
+    // from the start, activation record included: the record is judged
+    // against the configuration of its own index, not the latest.
+    cluster.stop(2);
+    let reopened = Session::open_hosted(
+        cluster.dir.path().join("wal-2"),
+        ledger(),
+        NodeConfig::joining(2, CLUSTER, ledger().session.0, vec![1], Vec::new()),
+        SessionLimits::default(),
+        hosting_with(cluster.dir.path(), 2, cluster.limits),
+    )
+    .unwrap();
+    cluster.nodes[1] = Some(reopened);
+    assert!(cluster.node(2).activation().is_native());
+    let third = creation(cluster.next(PARTIES.issuer), 3);
+    cluster.commit(1, PARTIES.issuer, third, &[]);
+    cluster.settle(&[]);
+    let sequences = cluster.native_sequences();
+    assert!(
+        sequences.iter().all(|(_, seq)| *seq == Some(SessionSeq(3))),
         "{sequences:?}"
     );
 }
@@ -2594,4 +2719,18 @@ fn a_sustained_workload_stays_within_its_budgets_and_keeps_every_outcome() {
     assert_eq!(written.manifest.retired_families, ROUNDS as u64);
     let verified = backup::verify(&files, &dir, backup::decoder_pair().1, &budget).unwrap();
     assert!(verified.complete(), "{:?}", verified.problems);
+}
+
+fn membership_request(
+    session: &Session,
+    id: u8,
+    change: MembershipChange,
+) -> SessionMembershipRequest {
+    let view = session.membership().unwrap();
+    SessionMembershipRequest {
+        id: [id; 16],
+        expected_index: view.configuration_index,
+        expected: view.configuration,
+        change,
+    }
 }

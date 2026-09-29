@@ -88,6 +88,9 @@ struct Cluster {
     failed: Vec<u64>,
     /// Flip one byte of every committed-record entry delivered to this node.
     corrupt_to: Option<u64>,
+    /// Deliver messages of this kind before the others of a round: the
+    /// leader's answer to a barrier ahead of the entries it names.
+    deliver_first: Option<MessageType>,
 }
 impl Cluster {
     fn new() -> Self {
@@ -132,6 +135,7 @@ impl Cluster {
             fail_ok: Vec::new(),
             failed: Vec::new(),
             corrupt_to: None,
+            deliver_first: None,
         }
     }
     fn node(&mut self, id: u64) -> &mut Node {
@@ -208,6 +212,9 @@ impl Cluster {
             }
             if messages.is_empty() && !progressed {
                 return;
+            }
+            if let Some(kind) = self.deliver_first {
+                messages.sort_by_key(|message| message.msg_type != kind as i32);
             }
             for mut message in messages {
                 if isolated.contains(&message.from) || isolated.contains(&message.to) {
@@ -593,19 +600,67 @@ fn concurrent_correlated_read_barriers_return_their_own_correlation_at_an_applie
         assert_eq!(boundary.native_sequence, SessionSeq(1));
         assert!(cluster.node(1).read_at_least(boundary).is_ok());
     }
-    // Followers cannot serve a barrier; an isolated authority cannot complete one.
-    assert!(
-        cluster
-            .node(2)
-            .read_index(ReadCorrelation([3; 16]))
-            .is_err()
+    // A follower serves a barrier too (27 §5, follower reads): its core
+    // forwards the read to the leader, the answer names the leader's commit
+    // index, and the follower serves once it has applied it — here what the
+    // leader committed before, at the same sequence.
+    cluster
+        .node(2)
+        .read_index(ReadCorrelation([3; 16]))
+        .unwrap();
+    cluster.pump(&[]);
+    let seen = std::mem::take(&mut cluster.boundaries);
+    assert_eq!(
+        seen.iter()
+            .map(|boundary| boundary.correlation.0)
+            .collect::<Vec<_>>(),
+        vec![[3; 16]]
     );
+    for boundary in seen {
+        assert_eq!(boundary.native_sequence, SessionSeq(1));
+        assert!(cluster.node(2).read_at_least(boundary).is_ok());
+    }
+    // An isolated authority cannot complete one, nor can a follower with no
+    // leader to ask.
     cluster
         .node(1)
         .read_index(ReadCorrelation([4; 16]))
         .unwrap();
     cluster.pump(&[2, 3]);
     assert!(cluster.boundaries.is_empty());
+}
+
+/// A follower's barrier answered above its applied index waits for the
+/// entries it names — the leader's commit index — and is served once they
+/// are applied, at the sequence they made; it never fails closed.
+#[test]
+fn a_followers_barrier_answered_ahead_of_its_log_waits_for_the_entries() {
+    let mut cluster = Cluster::new();
+    cluster.elect(1, &[]);
+    // Two commits the follower is cut off from.
+    let first = cluster.creation(1);
+    cluster.commit(1, PARTIES.issuer, first, &[2]);
+    let second = cluster.creation(2);
+    cluster.commit(1, PARTIES.issuer, second, &[2]);
+    assert_eq!(cluster.sequence(2), SessionSeq(0));
+    // Back, it asks; the leader's answer reaches it before the entries do.
+    cluster.deliver_first = Some(MessageType::MsgReadIndexResp);
+    cluster
+        .node(2)
+        .read_index(ReadCorrelation([9; 16]))
+        .unwrap();
+    cluster.pump(&[]);
+    let seen = std::mem::take(&mut cluster.boundaries);
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    let boundary = seen[0];
+    assert_eq!(boundary.correlation.0, [9; 16]);
+    assert_eq!(boundary.native_sequence, SessionSeq(2));
+    assert!(cluster.node(2).read_at_least(boundary).is_ok());
+    assert!(
+        cluster.node(2).reads_parked() >= 1,
+        "the answer came with the entries"
+    );
+    assert!(cluster.status(2, 2).is_some());
 }
 
 #[test]

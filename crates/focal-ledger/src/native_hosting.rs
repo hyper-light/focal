@@ -526,10 +526,18 @@ impl Session {
                 Err(LedgerError::Corrupt)
             };
         }
+        // The record names the configuration it was proposed under by the
+        // index that committed it, which this replica has applied in order
+        // (`apply_delivered_membership`) up to this entry: equal indices are
+        // one configuration of one log. The record's hash of it is not
+        // compared with the consensus's current configuration, which may
+        // already hold a change committed after this entry — in the same
+        // batch, on a copy that joined after the activation (the KIND
+        // campaign of 2026-09-29, D2: every voter added after
+        // `activate-native` failed closed here), or on any replay.
         if record.predecessor != managed_format_hash()
             || record.successor != native_format_hash()
             || record.configuration_index != self.membership_state.configuration_index
-            || record.configuration_hash != configuration_hash(&self.consensus.membership_configuration())
             || record.v1_sequence != self.core.sequence().0
             || record.v1_applied_raft > entry.index
         {
@@ -1144,9 +1152,19 @@ impl Session {
     }
     /// Request a quorum read barrier for a native read; its boundary arrives
     /// in a later poll under the same correlation.
+    /// Whether a linearizable native read can be served here: by the
+    /// authority, or by a follower that knows its leader (27 §5).
+    pub fn serves_native_reads(&self) -> bool {
+        !self.failed
+            && self.retained.is_none()
+            && self
+                .native
+                .as_deref()
+                .is_some_and(|engine| engine.serves_reads(&self.consensus.status()))
+    }
     pub fn native_read_index(&mut self, correlation: ReadCorrelation) -> Result<(), LedgerError> {
         self.check()?;
-        if !self.is_authoritative() || self.retained.is_some() {
+        if !self.serves_native_reads() {
             return Err(LedgerError::NotReady {
                 leader: self.status().leader_id,
             });

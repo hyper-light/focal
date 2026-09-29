@@ -2793,7 +2793,10 @@ impl Owner {
                         return Err(AccessError::Unavailable);
                     }
                     if matches!(read.consistency, ReadConsistency::Linearizable) {
-                        if !self.session.is_authoritative() {
+                        // A follower serves it too: its barrier goes to the
+                        // leader, and the answer waits for this copy to have
+                        // applied the index it names (27 §5).
+                        if !self.session.serves_native_reads() {
                             return Err(AccessError::Unavailable);
                         }
                         if self.pending.len() == self.config.pending_clients {
@@ -3199,7 +3202,7 @@ impl Owner {
                     role,
                     profile,
                     read,
-                } if pending.term == status.term && self.session.is_authoritative() => events
+                } if pending.term == status.term && self.session.serves_native_reads() => events
                     .native_read_boundaries
                     .iter()
                     .find(|boundary| boundary.correlation == *correlation)
