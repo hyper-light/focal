@@ -1,0 +1,30 @@
+{
+  "name": "@hyper-light/focal-linux-x64-musl",
+  "version": "0.0.0",
+  "description": "The focal executable for linux-x64-musl; installed by @hyper-light/focal",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hyper-light/focal.git"
+  },
+  "license": "MIT",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "libc": [
+    "musl"
+  ],
+  "files": [
+    "focal",
+    "LICENSE",
+    "THIRD-PARTY-NOTICES.txt"
+  ],
+  "engines": {
+    "node": ">= 18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

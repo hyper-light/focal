@@ -48,12 +48,25 @@ The [release implementation](../../scripts/release/release.py) separates checks:
    acknowledged writes, reopen the same data directory and verify exact recovery.
    It invokes the supplied executable, never Cargo or an embedding substitute.
 4. Require every platform and the workspace verification job. Collect exactly
-   the six binaries, provenance manifest and SHA256SUMS. Reject missing, duplicate,
-   altered or unexpected files and inconsistent version/source metadata.
+   the eight binaries, provenance manifest, third-party notices, SBOM and
+   SHA256SUMS. Reject missing, duplicate, altered or unexpected files and
+   inconsistent version/source metadata.
 5. For an intentional version-tag push, verify the remote tag and refuse an
    already-existing release. Create an unpublished draft, upload the entire set,
    download and compare every uploaded byte, then publish. A failed upload or
    verification leaves the draft unpublished. A manual run cannot publish.
+6. Package the collection for the registries ([`packages.py`](../../scripts/release/packages.py)):
+   one wheel per target for PyPI (`focal-node`; the executable as the wheel's only
+   script, tagged for the platform it was built and smoked on) and one npm archive
+   per package (`@hyper-light/focal`, whose optional dependencies are the eight
+   platform packages). Built from the verified collection, never recompiled;
+   deterministic; re-read against the collection; and installed on the runner
+   through `pip` and `npm` before they are kept, on manual dispatches too.
+7. After the release is published, publish the wheels to PyPI and the archives
+   to npm under each registry's trusted publishing (OIDC): no token is stored,
+   a rerun skips what is already live, and a registry that refuses leaves the
+   GitHub release as it is. The one-time registry setup is in the
+   [operator instructions](../../scripts/release/README.md).
 
 Raw binary names, checksums and machine-readable provenance remain stable public
 installation interfaces. SHA-256 provides byte-integrity checks; OS code signing

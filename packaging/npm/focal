@@ -1,0 +1,49 @@
+#!/usr/bin/env node
+// The `focal` command before `postinstall` has run (or when scripts are
+// disabled), and always on Windows: spawn the native executable from the
+// platform package with this process's stdio, forwarding the signals a
+// terminal or an MCP client sends, and exit as it exits. On Unix the
+// postinstall step replaces this file with the executable itself.
+"use strict";
+
+const { spawn } = require("node:child_process");
+const { binaryPath } = require("./postinstall");
+
+const executable = binaryPath();
+if (executable === null) {
+  console.error(
+    "[focal] the native executable for this platform is not installed " +
+      "(see https://github.com/hyper-light/focal#install)",
+  );
+  process.exit(1);
+}
+
+const child = spawn(executable, process.argv.slice(2), { stdio: "inherit" });
+const forwarded = ["SIGINT", "SIGTERM", "SIGHUP"];
+const handlers = forwarded.map((signal) => {
+  const handler = () => {
+    if (!child.killed) {
+      try {
+        child.kill(signal);
+      } catch (_) {
+        // Already gone.
+      }
+    }
+  };
+  process.on(signal, handler);
+  return [signal, handler];
+});
+
+child.on("error", (error) => {
+  console.error(`[focal] could not run ${executable}: ${error.message}`);
+  process.exit(1);
+});
+
+child.on("exit", (code, signal) => {
+  for (const [name, handler] of handlers) process.removeListener(name, handler);
+  if (signal !== null) {
+    process.kill(process.pid, signal);
+    return;
+  }
+  process.exit(code === null ? 1 : code);
+});

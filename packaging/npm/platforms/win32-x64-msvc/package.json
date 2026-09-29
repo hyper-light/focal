@@ -1,0 +1,27 @@
+{
+  "name": "@hyper-light/focal-win32-x64-msvc",
+  "version": "0.0.0",
+  "description": "The focal executable for win32-x64-msvc; installed by @hyper-light/focal",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hyper-light/focal.git"
+  },
+  "license": "MIT",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "focal.exe",
+    "LICENSE",
+    "THIRD-PARTY-NOTICES.txt"
+  ],
+  "engines": {
+    "node": ">= 18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

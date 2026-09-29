@@ -159,6 +159,63 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
+  package:
+    # The PyPI wheels and the npm archives are built from the complete,
+    # verified collection — never a second compilation — re-read against it,
+    # and installed here the way a user installs them: the GNU x86_64 wheel
+    # through pip and the matching npm platform package through npm, each
+    # answering `focal --version` with the workspace's version. A manual
+    # dispatch builds and checks them without publishing, like the binaries.
+    needs: [guard, collect]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '24'
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: complete-release-assets
+          path: release-assets
+      - name: Build every wheel and npm archive from the verified collection
+        run: python3 scripts/release/packages.py build --collection release-assets --output packages
+      - name: Re-read every archive against the collection
+        run: python3 scripts/release/packages.py verify --collection release-assets --input packages
+      - name: Check the wheels' metadata as the index will
+        run: |
+          python3 -m pip install --disable-pip-version-check --quiet twine==7.0.0
+          python3 -m twine check --strict packages/wheels/*.whl
+      - name: Install the GNU x86_64 wheel with pip and run it
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          python3 -m venv wheel-smoke
+          wheel-smoke/bin/pip install --disable-pip-version-check packages/wheels/*-manylinux_2_39_x86_64.whl
+          test "$(wheel-smoke/bin/focal --version)" = "focal $version"
+      - name: Install the npm wrapper with its platform package and run it
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          mkdir npm-smoke && cd npm-smoke && npm init -y >/dev/null
+          npm install --no-audit --no-fund \
+            "../packages/npm/hyper-light-focal-linux-x64-gnu-$version.tgz" \
+            "../packages/npm/hyper-light-focal-$version.tgz"
+          test "$(./node_modules/.bin/focal --version)" = "focal $version"
+          # Without install scripts the command is the Node shim, which spawns the executable.
+          cd .. && mkdir npm-shim && cd npm-shim && npm init -y >/dev/null
+          npm install --ignore-scripts --no-audit --no-fund \
+            "../packages/npm/hyper-light-focal-linux-x64-gnu-$version.tgz" \
+            "../packages/npm/hyper-light-focal-$version.tgz"
+          test "$(./node_modules/.bin/focal --version)" = "focal $version"
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: complete-packages
+          path: packages/**
+          if-no-files-found: error
+          compression-level: 0
+
   publish:
     # Dispatching this workflow on a tag is still a nonpublishing artifact build.
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
@@ -180,3 +237,71 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/release/release.py publish --input release-assets
+
+  publish-pypi:
+    # After the GitHub release is published: the wheels to PyPI, under PyPI's
+    # trusted publishing (OIDC) — the workflow holds no token. A rerun after a
+    # partial publication skips the files the index already has.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [publish, package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: complete-release-assets
+          path: release-assets
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: complete-packages
+          path: packages
+      - name: Re-read every archive against the collection before publishing
+        run: python3 scripts/release/packages.py verify --collection release-assets --input packages
+      - uses: pypa/gh-action-pypi-publish@v1.14.2
+        with:
+          packages-dir: packages/wheels
+          skip-existing: true
+          print-hash: true
+
+  publish-npm:
+    # After the GitHub release is published: the eight platform packages, then
+    # the wrapper that depends on them, under npm's trusted publishing (OIDC)
+    # — no token anywhere. A version the registry already serves is left as
+    # it is, so a rerun completes what a failed run left.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [publish, package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Require an npm that publishes with OIDC (11.5.1 or later)
+        run: |
+          have=$(npm --version)
+          test "$(printf '%s\n11.5.1\n' "$have" | sort -V | head -n1)" = "11.5.1" || { echo "npm $have cannot use trusted publishing"; exit 1; }
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: complete-release-assets
+          path: release-assets
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: complete-packages
+          path: packages
+      - name: Publish the platform packages, then the wrapper
+        run: python3 scripts/release/packages.py publish-npm --collection release-assets --input packages
