@@ -80,6 +80,12 @@ pub struct ControlProgress {
     pub applied_index: u64,
     pub revisions: ControlRevisions,
     pub dropped_replication: u64,
+    /// Exchanges the driver could not make at all, told to the core (27
+    /// §3.3); reports coalesced into a peer already held, and reports
+    /// beyond the bound on peers held.
+    pub peers_unreachable: u64,
+    pub peer_reports_coalesced: u64,
+    pub peer_reports_dropped: u64,
     pub stopped: bool,
     /// The compaction floor: index of the most recent metadata snapshot, or
     /// zero before the first compaction. `applied_index - snapshot_index` is
@@ -307,11 +313,19 @@ struct Owner<V> {
     progress: watch::Sender<ControlProgressState>,
     nonce: u64,
     dropped: u64,
+    unreachable: u64,
     failure: Option<String>,
     pub(crate) pace: TickPeriod,
     /// Peers the driver could not reach, reported to the core each tick.
     lost_sender: mpsc::SyncSender<u64>,
     lost: mpsc::Receiver<u64>,
+    /// Peers the driver reported lost, each once, kept until the core can
+    /// be told (bounded by the members a configuration names); reports of
+    /// a peer already held are coalesced, and reports beyond the bound are
+    /// dropped, both counted.
+    lost_peers: Vec<u64>,
+    lost_coalesced: u64,
+    lost_dropped: u64,
     /// The reply to a stop, and the owner's period at which a leader's
     /// hand-off is given up on: the stop completes once the log leads
     /// elsewhere, or then.
@@ -564,6 +578,9 @@ impl ControlHost {
                 applied_index: replica.applied_index(),
                 revisions: replica.revisions(),
                 dropped_replication: 0,
+                peers_unreachable: 0,
+                peer_reports_coalesced: 0,
+                peer_reports_dropped: 0,
                 stopped: false,
                 snapshot_index: 0,
                 peers: Vec::new(),
@@ -580,6 +597,9 @@ impl ControlHost {
             stopping: None,
             lost_sender,
             lost,
+            lost_peers: Vec::new(),
+            lost_coalesced: 0,
+            lost_dropped: 0,
             limits: limits.clone(),
             budget: budget.clone(),
             pending: VecDeque::new(),
@@ -590,6 +610,7 @@ impl ControlHost {
             progress,
             nonce: 0,
             dropped: 0,
+            unreachable: 0,
             failure: None,
             pace: pace.clone(),
         };
@@ -858,23 +879,7 @@ impl<V: AuthorityVerifier> Owner<V> {
                     // that is not ticked waits longer before it campaigns,
                     // and a leader sends its heartbeats a period later
                     // (27 §3.1 P3). It is no reason for the owner to end.
-                    // What the driver could not reach since the last tick,
-                    // told to the core: it probes those members instead. A
-                    // core fenced by a write it still persists is told next
-                    // tick; the report keeps its place.
-                    for _ in 0..crate::fleet::LOST_PEERS {
-                        let Ok(peer) = self.lost.try_recv() else {
-                            break;
-                        };
-                        match self.replica.report_unreachable(peer) {
-                            Ok(()) => {}
-                            Err(error) if self.replica.checkpoint_retryable(&error) => {
-                                let _ = self.lost_sender.try_send(peer);
-                                break;
-                            }
-                            Err(error) => return Err(error),
-                        }
-                    }
+                    self.report_lost()?;
                     match self.replica.tick() {
                         Ok(()) => {}
                         Err(error) if self.replica.checkpoint_retryable(&error) => {
@@ -1856,6 +1861,39 @@ impl<V: AuthorityVerifier> Owner<V> {
             Err(error) => Err(error),
         }
     }
+    /// What the driver could not reach since the last tick, told to the
+    /// core: it probes those members instead. Gathered first, each peer
+    /// once (coalesced and dropped beyond the bound, both counted), then
+    /// told while the core can be told; one fenced by a write it still
+    /// persists hears the rest next tick, the peers keeping their place.
+    fn report_lost(&mut self) -> Result<(), ControlError> {
+        for _ in 0..crate::fleet::LOST_PEERS {
+            let Ok(peer) = self.lost.try_recv() else {
+                break;
+            };
+            match self.lost_peers.binary_search(&peer) {
+                Ok(_) => self.lost_coalesced = self.lost_coalesced.saturating_add(1),
+                Err(at)
+                    if self.lost_peers.len() < crate::fleet::LOST_PEERS
+                        && self.lost_peers.try_reserve(1).is_ok() =>
+                {
+                    self.lost_peers.insert(at, peer);
+                }
+                Err(_) => self.lost_dropped = self.lost_dropped.saturating_add(1),
+            }
+        }
+        while let Some(&peer) = self.lost_peers.last() {
+            match self.replica.report_unreachable(peer) {
+                Ok(()) => {
+                    self.lost_peers.pop();
+                    self.unreachable = self.unreachable.saturating_add(1);
+                }
+                Err(error) if self.replica.checkpoint_retryable(&error) => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
     fn publish_progress(&self, stopped: bool) {
         let status = self.replica.status();
         self.progress.send_modify(|state| {
@@ -1867,6 +1905,9 @@ impl<V: AuthorityVerifier> Owner<V> {
                 applied_index: self.replica.applied_index(),
                 revisions: self.replica.revisions(),
                 dropped_replication: self.dropped,
+                peers_unreachable: self.unreachable,
+                peer_reports_coalesced: self.lost_coalesced,
+                peer_reports_dropped: self.lost_dropped,
                 stopped,
                 snapshot_index: self.replica.snapshot_index(),
                 peers: self.replica.peer_progress(),

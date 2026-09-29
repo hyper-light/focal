@@ -18,9 +18,14 @@ Production code returns and handles errors. It never aborts the thread it runs o
   (`DurableNode::guarded_in`), and the path that reaches the panic is closed at
   its cause as well. The boundary is the last fence, never the fix.
 - The workspace lints deny these (`Cargo.toml`, `[workspace.lints.clippy]`) and
-  `bash scripts/check-production.sh` enforces them. Never add an `#[allow]` for
-  one of them to production code. Test modules carry the `cfg_attr(test, allow(..))`
-  block the other crates use.
+  `bash scripts/check-production.sh` enforces them twice over: Clippy on every
+  library and binary target, and `scripts/check_production_policy.py` on the
+  source, which refuses any production `#[allow]` of one of them (the opt-out a
+  `deny` would honour) and proves itself on its fixtures first. Never add an
+  `#[allow]` for one of them to production code — the measurement tools
+  (`tools/load`) and `focal-sim` included. Test modules carry the
+  `cfg_attr(test, allow(..))` block the other crates use, or an `allow` inside
+  a `#[cfg(test)]` item.
 
 ## 2. Nothing grows without a bound.
 

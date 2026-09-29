@@ -810,17 +810,22 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
         .await
         .unwrap();
         // A round some of whose asks left this node cannot know their
-        // outcome; one none of whose asks could be dialed, the pool's three
-        // connections all taken by dials to the dead, was refused the room
-        // here and says so.
+        // outcome: a dial was started, or an exchange was counted lost. One
+        // none of whose asks could be dialed — the pool's three connections
+        // all taken by dials to the dead, or the peer in the cooldown its
+        // failed dial began, which the pool counts lost without dialing —
+        // was refused the room here and says so: nothing was dialed.
         let after = replicas[0].pool.stats();
         match answer {
             Err(ControlFailure::OutcomeUnknown) => {
-                assert!(after.lost > sent.lost, "{sent:?} {after:?}");
+                assert!(
+                    after.dials > sent.dials || after.lost > sent.lost,
+                    "{sent:?} {after:?}"
+                );
             }
             Err(ControlFailure::Capacity) => {
                 assert!(after.busy > sent.busy, "{sent:?} {after:?}");
-                assert_eq!(after.lost, sent.lost, "{sent:?} {after:?}");
+                assert_eq!(after.dials, sent.dials, "{sent:?} {after:?}");
             }
             other => panic!("the round over dead routes answered {other:?}"),
         }

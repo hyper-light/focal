@@ -203,6 +203,11 @@ pub struct ReplicaProgress {
     /// Exchanges the driver could not make at all, told to the core so it
     /// probes the peer instead of streaming to it (27 §3.3).
     pub peers_unreachable: u64,
+    /// Reports of a peer the owner already held for the core, and reports
+    /// beyond the bound on peers held: the feedback is a hint about a
+    /// peer, coalesced and never grown.
+    pub peer_reports_coalesced: u64,
+    pub peer_reports_dropped: u64,
     pub stopped: bool,
     /// The group's voters as this replica's committed configuration names
     /// them; the paths a pace is derived from (27 §3.1 P2).
@@ -641,6 +646,13 @@ struct Owner {
     /// Peers the driver could not reach, reported to the core each period.
     lost_sender: mpsc::SyncSender<u64>,
     lost: mpsc::Receiver<u64>,
+    /// Peers the driver reported lost, each once, kept until the core can
+    /// be told (bounded by the members a configuration names); reports of
+    /// a peer already held are coalesced, and reports beyond the bound are
+    /// dropped, both counted.
+    lost_peers: Vec<u64>,
+    lost_coalesced: u64,
+    lost_dropped: u64,
     progress: watch::Sender<ProgressState>,
     incarnation: u64,
     nonce: u64,
@@ -766,6 +778,8 @@ impl ReplicaHost {
                 sequence: session.sequence(),
                 dropped_replication: 0,
                 peers_unreachable: 0,
+                peer_reports_coalesced: 0,
+                peer_reports_dropped: 0,
                 stopped: false,
                 voters: status.voters.clone(),
                 admitted: Vec::new(),
@@ -817,6 +831,9 @@ impl ReplicaHost {
             outbound,
             lost_sender,
             lost,
+            lost_peers: Vec::new(),
+            lost_coalesced: 0,
+            lost_dropped: 0,
             progress,
             incarnation: 0,
             nonce: 0,
@@ -1758,27 +1775,43 @@ impl Owner {
     /// Shared-worker progress never waits on a disk receipt. The exact Ready
     /// remains inside Session until its WAL owner reports a completed fence.
     /// What the driver could not reach since the last period, told to the
-    /// core: it probes those members instead of streaming to them. A core
-    /// fenced by a write it still persists, or short of the room, is told
-    /// next period: the report keeps its place, and the session goes on —
-    /// a report is a hint about a peer, never a reason for the owner to
-    /// end. A channel already full of reports names the peer already, or
-    /// its next lost send does.
+    /// core: it probes those members instead of streaming to them. The
+    /// reports are gathered first, each peer once (a peer lost more often
+    /// is coalesced; more peers than the bound are dropped, both counted),
+    /// then told while the core can be told: one fenced by a write it still
+    /// persists, or short of the room, hears the rest next period, the
+    /// peers keeping their place. A report is a hint about a peer, never a
+    /// reason for the owner to end.
     fn report_lost(&mut self) -> Result<(), LedgerError> {
         for _ in 0..LOST_PEERS {
             let Ok(peer) = self.lost.try_recv() else {
-                return Ok(());
+                break;
             };
+            match self.lost_peers.binary_search(&peer) {
+                Ok(_) => self.lost_coalesced = self.lost_coalesced.saturating_add(1),
+                Err(at)
+                    if self.lost_peers.len() < LOST_PEERS
+                        && self.lost_peers.try_reserve(1).is_ok() =>
+                {
+                    self.lost_peers.insert(at, peer);
+                }
+                Err(_) => self.lost_dropped = self.lost_dropped.saturating_add(1),
+            }
+        }
+        while let Some(&peer) = self.lost_peers.last() {
             match self.session.report_unreachable(peer) {
-                Ok(()) => self.unreachable = self.unreachable.saturating_add(1),
+                Ok(()) => {
+                    self.lost_peers.pop();
+                    self.unreachable = self.unreachable.saturating_add(1);
+                }
                 Err(
-                    LedgerError::Consensus(focal_consensus::ConsensusError::PersistencePending)
+                    LedgerError::Consensus(
+                        focal_consensus::ConsensusError::PersistencePending
+                        | focal_consensus::ConsensusError::Capacity,
+                    )
                     | LedgerError::Capacity
                     | LedgerError::Memory(_),
-                ) => {
-                    let _ = self.lost_sender.try_send(peer);
-                    return Ok(());
-                }
+                ) => return Ok(()),
                 Err(error) => return Err(error),
             }
         }
@@ -2223,6 +2256,8 @@ impl Owner {
                 sequence: self.session.sequence(),
                 dropped_replication: self.dropped,
                 peers_unreachable: self.unreachable,
+                peer_reports_coalesced: self.lost_coalesced,
+                peer_reports_dropped: self.lost_dropped,
                 stopped,
                 voters: status.voters.clone(),
                 admitted: self.admitted.clone(),

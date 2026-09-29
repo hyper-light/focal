@@ -8,6 +8,29 @@ use focal_model::lifecycle::{
 };
 use focal_model::*;
 use focal_wire::{NATIVE_PROTOCOL_VERSION, Operation, RequestEnvelope};
+use std::fmt;
+
+/// A frame the fixed shapes here could not build: the model refused a
+/// declaration or a policy, or the codec its encoding. None is expected of
+/// these constants; each is reported rather than unwound on.
+#[derive(Debug)]
+pub struct FrameError {
+    stage: &'static str,
+    error: String,
+}
+impl FrameError {
+    fn at(stage: &'static str, error: impl fmt::Display) -> Self {
+        Self {
+            stage,
+            error: error.to_string(),
+        }
+    }
+}
+impl fmt::Display for FrameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.stage, self.error)
+    }
+}
 
 fn native_binding(ledger: LedgerId, id: u128) -> Binding {
     Binding {
@@ -18,13 +41,19 @@ fn native_binding(ledger: LedgerId, id: u128) -> Binding {
     }
 }
 
-fn definition(issuer: ParticipantId, binding: Binding) -> validation::Declaration {
+fn definition(
+    issuer: ParticipantId,
+    binding: Binding,
+) -> Result<validation::Declaration, FrameError> {
     let claim_id = u128::from_be_bytes(binding.object.0);
+    let object = claim_id
+        .checked_add(10_000)
+        .ok_or_else(|| FrameError::at("declaration id", "arithmetic overflow"))?;
     validation::Declaration::new(
         Principal::Actor(issuer),
         validation::DeclarationSpec {
             binding: Binding {
-                object: ObjectId::from_u128(claim_id.checked_add(10_000).unwrap()),
+                object: ObjectId::from_u128(object),
                 ..binding
             },
             claim: ClaimId(binding.object.0),
@@ -47,12 +76,17 @@ fn definition(issuer: ParticipantId, binding: Binding) -> validation::Declaratio
             slot_bytes: 64,
         },
     )
-    .unwrap()
+    .map_err(|error| FrameError::at("declaration", error))
 }
 
-fn proposal(ledger: LedgerId, issuer: ParticipantId, subject: ParticipantId, id: u128) -> Proposal {
+fn proposal(
+    ledger: LedgerId,
+    issuer: ParticipantId,
+    subject: ParticipantId,
+    id: u128,
+) -> Result<Proposal, FrameError> {
     let binding = native_binding(ledger, id);
-    Proposal {
+    Ok(Proposal {
         definition: ClaimDefinition {
             binding,
             issuer,
@@ -61,12 +95,13 @@ fn proposal(ledger: LedgerId, issuer: ParticipantId, subject: ParticipantId, id:
             max_responses: 4,
             created: SessionSeq(999),
             graph: graph::Declaration::empty(),
-            lineage: Lineage::root(binding, RootCommandId::from_u128(1)).unwrap(),
+            lineage: Lineage::root(binding, RootCommandId::from_u128(1))
+                .map_err(|error| FrameError::at("lineage", error))?,
             acceptance: aggregation::AcceptancePolicy::new(
                 binding,
                 issuer,
                 &[],
-                &[definition(issuer, binding)],
+                &[definition(issuer, binding)?],
                 aggregation::Limits {
                     max_slots: 8,
                     max_checks: 16,
@@ -74,7 +109,7 @@ fn proposal(ledger: LedgerId, issuer: ParticipantId, subject: ParticipantId, id:
                     max_updates: 8,
                 },
             )
-            .unwrap(),
+            .map_err(|error| FrameError::at("acceptance policy", error))?,
             scope_limits: scope::ScopeLimits {
                 scopes: 8,
                 roots: 32,
@@ -82,7 +117,7 @@ fn proposal(ledger: LedgerId, issuer: ParticipantId, subject: ParticipantId, id:
             },
         },
         owner: None,
-    }
+    })
 }
 
 fn create(
@@ -91,13 +126,13 @@ fn create(
     worker: ParticipantId,
     request: u128,
     id: u128,
-) -> NativeInput {
-    let proposals = vec![proposal(ledger, issuer, worker, id)];
+) -> Result<NativeInput, FrameError> {
+    let proposals = vec![proposal(ledger, issuer, worker, id)?];
     let declarations = proposals
         .iter()
         .map(|p| definition(issuer, p.definition.binding))
-        .collect();
-    NativeInput {
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(NativeInput {
         request: RequestKey {
             principal: issuer,
             epoch: RequestEpoch(1),
@@ -107,10 +142,10 @@ fn create(
             claims: proposals,
             declarations,
         },
-    }
+    })
 }
 
-fn frame(ledger: LedgerId, input: &NativeInput) -> Vec<u8> {
+fn frame(ledger: LedgerId, input: &NativeInput) -> Result<Vec<u8>, FrameError> {
     let plan = input_codec::EncodingPlan::prepare(
         input_codec::InputFrame::Request {
             ledger,
@@ -122,10 +157,15 @@ fn frame(ledger: LedgerId, input: &NativeInput) -> Vec<u8> {
             visits: 1 << 28,
         },
     )
-    .unwrap();
-    let mut bytes = vec![0; plan.quote().bytes];
-    plan.write_into(&mut bytes).unwrap();
+    .map_err(|error| FrameError::at("encoding plan", error))?;
+    let mut bytes = Vec::new();
     bytes
+        .try_reserve_exact(plan.quote().bytes)
+        .map_err(|error| FrameError::at("frame buffer", error))?;
+    bytes.resize(plan.quote().bytes, 0);
+    plan.write_into(&mut bytes)
+        .map_err(|error| FrameError::at("frame encode", error))?;
+    Ok(bytes)
 }
 
 /// One native Create request envelope.
@@ -135,16 +175,16 @@ pub fn create_envelope(
     worker: ParticipantId,
     request: u128,
     id: u128,
-) -> RequestEnvelope {
-    let input = create(ledger, issuer, worker, request, id);
-    RequestEnvelope {
+) -> Result<RequestEnvelope, FrameError> {
+    let input = create(ledger, issuer, worker, request, id)?;
+    Ok(RequestEnvelope {
         protocol: NATIVE_PROTOCOL_VERSION,
         ledger,
         route_epoch: RouteEpoch(1),
         request_epoch: RequestEpoch(1),
         request_id: RequestId::from_u128(request),
         operation: Operation::Native {
-            frame: frame(ledger, &input),
+            frame: frame(ledger, &input)?,
         },
-    }
+    })
 }

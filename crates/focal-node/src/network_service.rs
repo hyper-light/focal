@@ -1292,6 +1292,8 @@ impl NetworkService {
                 periods: host.periods(),
                 refused_periods: host.refused_periods(),
                 peers_unreachable: progress.peers_unreachable,
+                peer_reports_coalesced: progress.peer_reports_coalesced,
+                peer_reports_dropped: progress.peer_reports_dropped,
                 longest_period_ms: u64::try_from(host.longest_period().as_millis())
                     .unwrap_or(u64::MAX),
             });
@@ -1338,6 +1340,9 @@ impl NetworkService {
                 longest_period_ms: u64::try_from(self.handles.control.longest_period().as_millis())
                     .unwrap_or(u64::MAX),
                 peers: root.peers.clone(),
+                peers_unreachable: root.peers_unreachable,
+                peer_reports_coalesced: root.peer_reports_coalesced,
+                peer_reports_dropped: root.peer_reports_dropped,
             },
             peers: self.pool.stats(),
             listener: self.listener.admission(),

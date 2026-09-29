@@ -95,6 +95,9 @@ impl Fixture {
                 applied_index: replica.applied_index(),
                 revisions: replica.revisions(),
                 dropped_replication: 0,
+                peers_unreachable: 0,
+                peer_reports_coalesced: 0,
+                peer_reports_dropped: 0,
                 stopped: false,
                 snapshot_index: 0,
                 peers: Vec::new(),
@@ -122,8 +125,12 @@ impl Fixture {
             progress,
             nonce: 0,
             dropped: 0,
+            unreachable: 0,
             lost_sender: lost.0,
             lost: lost.1,
+            lost_peers: Vec::new(),
+            lost_coalesced: 0,
+            lost_dropped: 0,
             failure: None,
             pace: Default::default(),
         };
@@ -378,4 +385,46 @@ fn the_tick_period_is_clamped_between_the_configured_period_and_its_ceiling() {
     assert!(bad.validate().is_err());
     bad.tick_ceiling = Duration::from_secs(11);
     assert!(bad.validate().is_err());
+}
+
+/// The root owner holds the driver's lost-peer reports for the core each
+/// peer once — a peer reported again in the same period is coalesced,
+/// counted — and tells the core every held peer once it can; a report is a
+/// hint about a peer, never a reason for the owner to end. (The bound on
+/// peers held, and a fenced core, are exercised on the session owner,
+/// whose harness pauses the WAL.)
+#[test]
+fn the_root_owner_holds_lost_peers_each_once_and_tells_the_core() {
+    let mut fixture = Fixture::new();
+    for peer in 1..=1000u64 {
+        fixture.owner.lost_sender.try_send(peer).unwrap();
+    }
+    fixture.owner.lost_sender.try_send(7).unwrap();
+    fixture.owner.lost_sender.try_send(7).unwrap();
+    fixture.owner.report_lost().unwrap();
+    assert!(
+        fixture.owner.lost_peers.is_empty(),
+        "every held peer was told"
+    );
+    assert_eq!(fixture.owner.unreachable, 1000, "each peer told once");
+    assert_eq!(
+        fixture.owner.lost_coalesced, 2,
+        "reported thrice: coalesced twice"
+    );
+    assert_eq!(fixture.owner.lost_dropped, 0);
+    assert_eq!(
+        fixture.owner.replica.status().leader_id,
+        1,
+        "the owner is live and leads"
+    );
+    fixture.owner.publish_progress(false);
+    let progress = fixture.owner.progress.borrow().value.clone();
+    assert_eq!(
+        (
+            progress.peers_unreachable,
+            progress.peer_reports_coalesced,
+            progress.peer_reports_dropped
+        ),
+        (1000, 2, 0)
+    );
 }

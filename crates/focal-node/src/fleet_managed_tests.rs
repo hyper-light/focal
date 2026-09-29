@@ -479,3 +479,61 @@ fn a_lost_peer_reported_while_a_write_persists_is_told_next_period() {
     assert_eq!(owner.unreachable, 1, "told once the write was durable");
     assert!(owner.lost.try_recv().is_err(), "the report was consumed");
 }
+
+/// Reports of lost exchanges are held for the core each peer once: a peer
+/// reported again while it is held is coalesced, and peers beyond the bound
+/// on those held are dropped — both counted, neither a reason to grow —
+/// and every held peer is told once the core can be told.
+#[test]
+fn lost_peers_are_held_each_once_and_told_when_the_core_can_be() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut owner, _outgoing, budget) = assemble(session(directory.path(), 1));
+    let pause = owner.session.shared_wal().pause_for_test().unwrap();
+    let verified = verify_request(actor(), register(), &owner.client_limits).unwrap();
+    let charge = budget
+        .reserve(BudgetKind::Pending, BudgetLane::Ordinary, 128 * 1024)
+        .unwrap()
+        .commit();
+    let (send, _receive) = oneshot::channel();
+    owner
+        .accept(Work::Request(
+            Box::new(AdmittedRequest {
+                verified,
+                witness: None,
+                native: None,
+            }),
+            send,
+            charge,
+        ))
+        .unwrap();
+    assert!(owner.session.persistence_pending());
+    // As many distinct peers as the bound, one of them reported three times.
+    for peer in 1..=u64::try_from(LOST_PEERS).unwrap() {
+        owner.lost_sender.try_send(peer).unwrap();
+    }
+    owner.report_lost().unwrap();
+    assert_eq!(owner.lost_peers.len(), LOST_PEERS);
+    assert_eq!(
+        (owner.unreachable, owner.lost_coalesced, owner.lost_dropped),
+        (0, 0, 0)
+    );
+    owner.lost_sender.try_send(7).unwrap();
+    owner.lost_sender.try_send(7).unwrap();
+    owner.lost_sender.try_send(5_000).unwrap();
+    owner.report_lost().unwrap();
+    assert_eq!(
+        owner.lost_peers.len(),
+        LOST_PEERS,
+        "the set never grows past the bound"
+    );
+    assert_eq!(
+        (owner.unreachable, owner.lost_coalesced, owner.lost_dropped),
+        (0, 2, 1),
+        "the held peer coalesced twice, the peer beyond the bound dropped"
+    );
+    drop(pause);
+    settle(&mut owner);
+    owner.report_lost().unwrap();
+    assert!(owner.lost_peers.is_empty(), "every held peer was told");
+    assert_eq!(owner.unreachable, u64::try_from(LOST_PEERS).unwrap());
+}

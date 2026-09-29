@@ -57,6 +57,12 @@ pub struct RootMetrics {
     /// Periods the root owner has run since it started: its progress, which
     /// a wait on this node is charged in (27 §3.1 P8).
     pub periods: u64,
+    /// Exchanges of the root replica the driver could not make at all, each
+    /// told to the core; reports coalesced into a peer already held, and
+    /// reports dropped beyond the bound (27 §3.3).
+    pub peers_unreachable: u64,
+    pub peer_reports_coalesced: u64,
+    pub peer_reports_dropped: u64,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PeerRtt {
@@ -119,8 +125,11 @@ pub struct SessionMetrics {
     /// refused the room or still persisted.
     pub refused_periods: u64,
     /// Exchanges of the session's replica the driver could not make at
-    /// all, each told to the core (27 §3.3).
+    /// all, each told to the core (27 §3.3); reports coalesced into a peer
+    /// already held for the core, and reports dropped beyond the bound.
     pub peers_unreachable: u64,
+    pub peer_reports_coalesced: u64,
+    pub peer_reports_dropped: u64,
     /// The longest a period of the owner took, in milliseconds
     /// (`RootMetrics::longest_period_ms`).
     pub longest_period_ms: u64,
@@ -384,6 +393,21 @@ impl MetricsSnapshot {
             "focal_root_periods_refused_total",
             "Periods in which the root replica was not ticked: it was refused the room, or still persisted what the tick before had left.",
             self.root.refused_periods,
+        );
+        text.counter(
+            "focal_root_peers_unreachable_total",
+            "Exchanges of the root replica the driver could not make at all, each told to the core, which probes the peer instead of streaming to it.",
+            self.root.peers_unreachable,
+        );
+        text.counter(
+            "focal_root_peer_reports_coalesced_total",
+            "Reports of a lost exchange with a peer the root owner already held for the core: coalesced into the one it holds.",
+            self.root.peer_reports_coalesced,
+        );
+        text.counter(
+            "focal_root_peer_reports_dropped_total",
+            "Reports of a lost exchange dropped because the root owner held reports for as many peers as a configuration can name.",
+            self.root.peer_reports_dropped,
         );
         text.gauge(
             "focal_root_period_longest_ms",
@@ -702,7 +726,7 @@ impl MetricsSnapshot {
             "Whether sessions beyond the bound were left out.",
             u8::from(self.sessions_truncated),
         );
-        let series: [(&str, &str, &str); 29] = [
+        let series: [(&str, &str, &str); 31] = [
             (
                 "focal_session_periods_total",
                 "counter",
@@ -717,6 +741,16 @@ impl MetricsSnapshot {
                 "focal_session_peers_unreachable_total",
                 "counter",
                 "Exchanges of the session's replica the driver could not make at all, each told to the core, which probes the peer instead of streaming to it.",
+            ),
+            (
+                "focal_session_peer_reports_coalesced_total",
+                "counter",
+                "Reports of a lost exchange with a peer the session's owner already held for the core: coalesced into the one it holds.",
+            ),
+            (
+                "focal_session_peer_reports_dropped_total",
+                "counter",
+                "Reports of a lost exchange dropped because the owner held reports for as many peers as a configuration can name; the peer's next lost exchange reports it.",
             ),
             (
                 "focal_session_period_longest_ms",
@@ -856,6 +890,12 @@ impl MetricsSnapshot {
                     "focal_session_periods_total" => Some(session.periods),
                     "focal_session_periods_refused_total" => Some(session.refused_periods),
                     "focal_session_peers_unreachable_total" => Some(session.peers_unreachable),
+                    "focal_session_peer_reports_coalesced_total" => {
+                        Some(session.peer_reports_coalesced)
+                    }
+                    "focal_session_peer_reports_dropped_total" => {
+                        Some(session.peer_reports_dropped)
+                    }
                     "focal_session_period_longest_ms" => Some(session.longest_period_ms),
                     "focal_session_leader" => Some(session.leader),
                     "focal_session_preferred_leader" => session.preferred_leader,
@@ -1006,6 +1046,8 @@ mod tests {
             sessions: vec![SessionMetrics {
                 periods: 0,
                 peers_unreachable: 0,
+                peer_reports_coalesced: 0,
+                peer_reports_dropped: 0,
                 tenant: "t".into(),
                 session: "s".into(),
                 committed_index: 9,
