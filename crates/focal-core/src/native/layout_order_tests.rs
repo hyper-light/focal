@@ -229,3 +229,108 @@ fn one_objects_rows_are_contiguous_and_family_scans_stay_ordered() {
     assert!(meta < first_timer, "control rows order by family");
     assert_eq!(affinity(&Key::Meta), [0; 16]);
 }
+
+/// Every evaluation key of a corpus that varies every field: claims and
+/// validations whose ids are not monotonic in their number, every target
+/// variant with ids that disagree with the variant order, and generations
+/// spanning the range.
+fn evaluation_corpus() -> Vec<EvaluationKey> {
+    // Ids chosen so numeric order, byte order and insertion order disagree.
+    let ids: [[u8; 16]; 3] = [[9; 16], [2; 16], [0x7f; 16]];
+    let mut keys = Vec::new();
+    for claim_id in ids {
+        for validation_id in ids {
+            for response in ids {
+                for artifact in ids {
+                    for slot in [3u32, 0, 1] {
+                        let targets = [
+                            EvaluationTarget::Admission,
+                            EvaluationTarget::Increment {
+                                artifact: ArtifactId(artifact),
+                            },
+                            EvaluationTarget::Work {
+                                response: TestamentId(response),
+                                slot,
+                                artifact: ArtifactId(artifact),
+                            },
+                            EvaluationTarget::MissingSlot {
+                                response: TestamentId(response),
+                                slot,
+                            },
+                            EvaluationTarget::Delivery {
+                                response: TestamentId(response),
+                            },
+                        ];
+                        for target in targets {
+                            for generation in [0u64, 1, 2, u64::MAX] {
+                                keys.push(EvaluationKey {
+                                    claim: ClaimId(claim_id),
+                                    validation: ValidationId(validation_id),
+                                    target,
+                                    generation,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// The storage order of an evaluation row is the derived order of its core
+/// key, which is the derived order of its wire key: a cursor compared in
+/// either vocabulary names the same position in the scan (F07), and the
+/// conversion between the two loses nothing.
+#[test]
+fn evaluation_rows_are_stored_in_key_order_and_the_wire_key_orders_the_same() {
+    use super::event_record::{evaluation_key, evaluation_key_of};
+    let keys = evaluation_corpus();
+    assert!(keys.len() > 1_000, "{}", keys.len());
+    for a in &keys {
+        assert_eq!(evaluation_key_of(evaluation_key(*a)), *a, "{a:?}");
+        for b in &keys {
+            let core = a.cmp(b);
+            assert_eq!(
+                Key::Evaluation(*a).cmp(&Key::Evaluation(*b)),
+                core,
+                "storage order disagrees with the key order: {a:?} vs {b:?}"
+            );
+            assert_eq!(
+                evaluation_key(*a).cmp(&evaluation_key(*b)),
+                core,
+                "wire order disagrees with the key order: {a:?} vs {b:?}"
+            );
+        }
+    }
+    // One declaration's keys are one contiguous span of its claim's span, so a
+    // scan from the first key of a (claim, validation) that stops at the first
+    // key of another sees exactly that declaration's rows.
+    let mut stored: Vec<Key> = keys.iter().map(|key| Key::Evaluation(*key)).collect();
+    stored.sort();
+    for pair in stored.windows(2) {
+        let (Key::Evaluation(a), Key::Evaluation(b)) = (pair[0], pair[1]) else {
+            panic!("evaluation keys");
+        };
+        assert!((a.claim, a.validation) <= (b.claim, b.validation));
+    }
+    let claim = ClaimId([2; 16]);
+    let validation = ValidationId([9; 16]);
+    let span: Vec<usize> = stored
+        .iter()
+        .enumerate()
+        .filter(|(_, key)| {
+            matches!(key, Key::Evaluation(key) if key.claim == claim && key.validation == validation)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert!(!span.is_empty());
+    assert_eq!(
+        span.last().copied(),
+        span.first().map(|first| first + span.len() - 1),
+        "a declaration's evaluations are interleaved with another's"
+    );
+}

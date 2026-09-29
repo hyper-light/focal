@@ -3,6 +3,8 @@ use super::*;
 
 #[path = "adoption_increment_tests.rs"]
 mod adoption_tests;
+#[path = "increment_scan_tests.rs"]
+mod scan_tests;
 use focal_memory::{BudgetKind, BudgetLane};
 use focal_model::lifecycle::artifact_descriptor::ResultProvenance;
 use focal_model::{

@@ -350,6 +350,7 @@ impl State {
                             evaluations: true,
                             history: false,
                         },
+                        after: None,
                     },
                     max_items: self.options.max_items,
                 }))

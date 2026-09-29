@@ -19,8 +19,8 @@ ruling before work starts).
 | F04 | P1 | open | 2 | — |
 | F05 | P2 | open | 2 | — |
 | F06 | P1 | open | 2 | — |
-| F07 | P2 | open | 4 | — |
-| F08 | P2 | open | 4 | — |
+| F07 | P2 | in tree | 4 | [F07](#f07) |
+| F08 | P2 | in tree | 4 | [F08](#f08) |
 | F09 | P2 | open | 2 | — |
 | F10 | P2 | open | 4 | — |
 | F11 | P2 | open | 4 | — |
@@ -214,3 +214,63 @@ the chart's readiness probes ask it while startup and liveness keep `alive`.
 **Tests.** `network_service::tests::a_host_stays_alive_and_its_readiness_stays_bounded_while_the_root_leader_is_down`
 (serving with the root leader down), `…::a_node_whose_session_owner_stopped_is_alive_and_not_serving`,
 the render goldens and `tests/deployment_kubernetes.rs`.
+
+## F07
+
+**Cause.** The declaration's evaluation page walked the claim's registrations in
+registration order — submission order, not key order — and compared its cursor as a
+key; and it set the continuation to the row it had not shown once the page was full.
+Two comparisons that disagreed about what "after" meant.
+
+**Fix.** The core scans one declaration's evaluations in key order
+(`Core::native_declaration_evaluations_from(claim, validation, after)`, an exclusive
+resume after any key, a cursor of another declaration or claim restarting at the
+declaration's first key); the node page judges fullness before consuming a row and
+names the last consumed key as `next`; the wire requires `claim` on the query (the
+rows' affinity, 25 §6), an exact prefix for any resumed page, and validates the
+page's shape (strictly increasing keys of that declaration after the cursor, a
+continuation never behind the last row nor the cursor sent). The claim expansion got
+the same treatment: an ordered expansion (responses from the latest cycle back, then
+evaluations in key order), a continuation where it fills, a resumed page without the
+claim. The responses list passes the rows above a resumed cursor uncharged, so a page
+of one row and one visit progresses.
+
+**Tests.** `focal-core::native::increment_scan_tests` (registration order ≠ key order,
+resume after every key and after keys no row has),
+`focal-node::native_reads_tests::evaluation_pages_of_every_size_concatenate_to_the_whole_span_at_one_prefix`
+(272 evaluations; sizes 1–273 incl. exact boundaries; refusals),
+`…::a_claim_expansion_continues_where_its_page_filled_and_never_repeats_the_claim`,
+`…::the_responses_list_reaches_the_end_of_a_long_chain_one_row_per_page`,
+`focal-wire::native::tests::native_pages_are_validated_against_the_shape_their_query_names`.
+
+## F08
+
+**Cause.** The client requested one page of 256 evaluations, ignored its
+continuation, and selected the "current" evaluation among the objects it had; the
+validation context did the same. The core allows 4096 evaluations per claim.
+
+**Fix.** The owner selects (`NativeReadQuery::SelectEvaluation(NativeSelectionQuery
+{claim, validation, selector, generation, live})`): over the declaration's whole span
+the targets `NativeEvaluationSelector::selects` names (the one copy of the rule the
+compiler, the context read and the owner share), at the named generation when there
+is one, live when asked, the tie set at the highest generation. One object is the
+current evaluation, several are an ambiguity the caller narrows (`validation.begin`
+without `--target` under several current increments is refused, never guessed), a
+set that would not fit the page is `Capacity`, never cut. `validation.begin`/`report`
+resolve through it (`Requirement::Evaluation`), `validation.context` selects through
+it (`live: false`, `generation` when named), and `validation.get` follows the
+declaration's pages at exactly the first page's prefix, bounded by the core's
+evaluations per claim over a page (`EVALUATION_PAGES` = 16 × 256 = 4096), an endless
+span a `Capacity` refusal. **Decision:** the read query's registered encoding changed
+in place (`Claim` gained `after`, `Evaluations` gained `claim`, `SelectEvaluation`
+appended) and the frozen fixture was re-registered, recorded in doc 19: no release
+carries the native profile, so no peer speaks the previous shape.
+
+**Tests.**
+`focal-node::native_reads_tests::the_owner_selects_the_current_evaluation_over_the_whole_span_and_the_client_binds_it`
+(the selected evaluation at position 264 of 272; the tie set of 16; `Capacity` at
+15; a named generation; empty selectors; the compiled `BeginIncrement`; the
+ambiguity; the context read), `…::validation_get_follows_the_evaluation_pages_to_the_end`
+(three requests: the definition, a page at least at its prefix, the rest exactly
+there), `focal-native-client::tests::validation_get_follows_pages_at_one_prefix_and_refuses_a_span_beyond_its_bound`,
+the wire shape test above.

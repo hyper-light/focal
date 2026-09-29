@@ -92,6 +92,9 @@ mod native_host_tests;
 mod native_ingress;
 mod native_lists;
 mod native_reads;
+#[cfg(test)]
+#[path = "native_reads_tests.rs"]
+mod native_reads_tests;
 mod native_timers;
 
 /// Test-only: tighten a fresh temp path to owner-only. On Unix this sets the

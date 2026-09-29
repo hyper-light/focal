@@ -9,50 +9,37 @@ use focal_model::lifecycle::{Binding, validation};
 use focal_model::*;
 use focal_wire::{
     NativeAttempt, NativeBinding, NativeEvaluation, NativeEvaluationTarget, NativeEvidenceFailure,
-    NativeObject, NativeObjectRef, NativePhase, NativeTarget, NativeValidationState,
-    NativeWorkArtifactState,
+    NativeObject, NativeObjectRef, NativePhase, NativeTarget, NativeWorkArtifactState,
 };
 
-/// Which current evaluation of a declaration a verb addresses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EvaluationSelector {
-    /// The whole-work evaluation of a manifest slot (any slot when `None`).
-    WholeWork {
-        slot: Option<u32>,
-    },
-    Admission,
-    /// The increment evaluation of one work artifact (any when `None`).
-    Increment {
-        artifact: Option<ArtifactId>,
-    },
-}
-impl EvaluationSelector {
-    /// `phase` is `whole_work`, `admission` or `increment`; `target` names the
-    /// increment's work artifact.
-    pub fn parse(
-        phase: &str,
-        slot: Option<u32>,
-        target: Option<&str>,
-    ) -> Result<Self, CompileError> {
-        use focal_client::input::InputError;
-        match (phase, slot, target) {
-            ("whole_work", slot, None) => Ok(Self::WholeWork { slot }),
-            ("admission", None, None) => Ok(Self::Admission),
-            ("increment", None, target) => Ok(Self::Increment {
-                artifact: target.map(parse_id).transpose()?.map(ArtifactId),
-            }),
-            ("whole_work" | "admission", _, Some(_)) => Err(InputError::Invalid(
-                "target names an increment's work artifact; it needs phase increment",
-            )
-            .into()),
-            ("admission" | "increment", Some(_), _) => Err(InputError::Invalid(
-                "slot selects a whole-work evaluation; it cannot combine with this phase",
-            )
-            .into()),
-            _ => {
-                Err(InputError::Invalid("phase must be whole_work, admission or increment").into())
-            }
-        }
+/// Which current evaluation of a declaration a verb addresses: the wire's
+/// selector, whose `selects` is the one copy of the rule the compiler, the
+/// context read and the owner's selection share.
+pub type EvaluationSelector = focal_wire::NativeEvaluationSelector;
+
+/// `phase` is `whole_work`, `admission` or `increment`; `target` names the
+/// increment's work artifact.
+pub fn parse_selector(
+    phase: &str,
+    slot: Option<u32>,
+    target: Option<&str>,
+) -> Result<EvaluationSelector, CompileError> {
+    use focal_client::input::InputError;
+    match (phase, slot, target) {
+        ("whole_work", slot, None) => Ok(EvaluationSelector::WholeWork { slot }),
+        ("admission", None, None) => Ok(EvaluationSelector::Admission),
+        ("increment", None, target) => Ok(EvaluationSelector::Increment {
+            artifact: target.map(parse_id).transpose()?.map(ArtifactId),
+        }),
+        ("whole_work" | "admission", _, Some(_)) => Err(InputError::Invalid(
+            "target names an increment's work artifact; it needs phase increment",
+        )
+        .into()),
+        ("admission" | "increment", Some(_), _) => Err(InputError::Invalid(
+            "slot selects a whole-work evaluation; it cannot combine with this phase",
+        )
+        .into()),
+        _ => Err(InputError::Invalid("phase must be whole_work, admission or increment").into()),
     }
 }
 
@@ -60,7 +47,26 @@ impl EvaluationSelector {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Requirement {
     Objects(Vec<NativeObjectRef>),
-    Evaluations { validation: ValidationId },
+    /// The current evaluation of one declaration under its claim, selected
+    /// by the owner over the declaration's whole evaluation span (F08).
+    Evaluation {
+        claim: ClaimId,
+        validation: ValidationId,
+        selector: EvaluationSelector,
+    },
+}
+fn evaluation_requirement(
+    claim: &str,
+    validation: &str,
+    phase: &str,
+    slot: Option<u32>,
+    target: Option<&str>,
+) -> Result<Requirement, CompileError> {
+    Ok(Requirement::Evaluation {
+        claim: ClaimId(parse_id(claim)?),
+        validation: ValidationId(parse_id(validation)?),
+        selector: parse_selector(phase, slot, target)?,
+    })
 }
 
 /// The reads an operation needs, in order. Creation of a root claim needs
@@ -130,15 +136,23 @@ pub fn requirements(operation: &NativeAuthoredOperation) -> Result<Vec<Requireme
         }
         Op::ValidationBegin(document) => vec![
             Requirement::Objects(vec![claim(&document.claim)?]),
-            Requirement::Evaluations {
-                validation: ValidationId(parse_id(&document.validation)?),
-            },
+            evaluation_requirement(
+                &document.claim,
+                &document.validation,
+                &document.phase,
+                document.slot,
+                document.target.as_deref(),
+            )?,
         ],
         Op::ValidationReport(document) => vec![
             Requirement::Objects(vec![claim(&document.claim)?]),
-            Requirement::Evaluations {
-                validation: ValidationId(parse_id(&document.validation)?),
-            },
+            evaluation_requirement(
+                &document.claim,
+                &document.validation,
+                &document.phase,
+                document.slot,
+                document.target.as_deref(),
+            )?,
         ],
         Op::ClaimReleaseScope(document) | Op::ValidationSealIncrements(document) => {
             vec![Requirement::Objects(vec![claim(&document.claim)?])]
@@ -395,7 +409,9 @@ impl Resolved {
     }
     /// The current evaluation of `validation` under `claim` the selector
     /// names: the highest non-terminal generation of that phase, optionally
-    /// restricted to one slot or one increment target.
+    /// restricted to one slot or one increment target. A tie is judged at
+    /// the highest generation seen once every evaluation has been seen: two
+    /// lower live matches before a unique higher one are not an ambiguity.
     pub fn evaluation(
         &self,
         claim: ClaimId,
@@ -403,40 +419,32 @@ impl Resolved {
         selector: EvaluationSelector,
     ) -> Result<&ResolvedEvaluation, CompileError> {
         let mut selected: Option<&ResolvedEvaluation> = None;
+        let mut tied = false;
         for evaluation in &self.evaluations {
             if evaluation.key.claim != claim
                 || evaluation.key.validation != validation
                 || evaluation.terminal
+                || !selector.selects(focal_core::native::event_record::evaluation_target(
+                    evaluation.key.target,
+                ))
             {
-                continue;
-            }
-            let matches = match (selector, evaluation.key.target) {
-                (EvaluationSelector::WholeWork { slot: None }, EvaluationTarget::Work { .. }) => {
-                    true
-                }
-                (
-                    EvaluationSelector::WholeWork { slot: Some(wanted) },
-                    EvaluationTarget::Work { slot, .. },
-                ) => slot == wanted,
-                (EvaluationSelector::Admission, EvaluationTarget::Admission) => true,
-                (
-                    EvaluationSelector::Increment { artifact: wanted },
-                    EvaluationTarget::Increment { artifact },
-                ) => wanted.is_none_or(|wanted| wanted == artifact),
-                _ => false,
-            };
-            if !matches {
                 continue;
             }
             match selected {
                 Some(current) if current.key.generation > evaluation.key.generation => {}
                 Some(current) if current.key.generation == evaluation.key.generation => {
-                    return Err(CompileError::Unsupported(
-                        "several current evaluations match; name the slot or target",
-                    ));
+                    tied = true;
                 }
-                _ => selected = Some(evaluation),
+                _ => {
+                    selected = Some(evaluation);
+                    tied = false;
+                }
             }
+        }
+        if tied {
+            return Err(CompileError::Unsupported(
+                "several current evaluations match; name the slot or target",
+            ));
         }
         selected.ok_or(CompileError::Missing("current evaluation"))
     }
@@ -527,14 +535,6 @@ fn failure(value: NativeEvidenceFailure) -> EvidenceFailure {
         NativeEvidenceFailure::Metadata => EvidenceFailure::Metadata,
     }
 }
-fn terminal(state: NativeValidationState) -> bool {
-    !matches!(
-        state,
-        NativeValidationState::Ready
-            | NativeValidationState::Validating
-            | NativeValidationState::ValidatingQualityBar
-    )
-}
 fn resolved_evaluation(ledger: LedgerId, evaluation: &NativeEvaluation) -> ResolvedEvaluation {
     ResolvedEvaluation {
         binding: binding(ledger, evaluation.binding),
@@ -549,6 +549,6 @@ fn resolved_evaluation(ledger: LedgerId, evaluation: &NativeEvaluation) -> Resol
         evaluator: evaluation.evaluator,
         attempt: evaluation.current_attempt.map(attempt),
         has_begun: evaluation.has_begun,
-        terminal: terminal(evaluation.state),
+        terminal: evaluation.state.is_terminal(),
     }
 }

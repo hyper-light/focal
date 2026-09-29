@@ -250,6 +250,7 @@ async fn an_embedded_node_activates_offline_admits_frames_exactly_once_and_serve
                 evaluations: true,
                 ..NativeClaimExpand::default()
             },
+            after: None,
         }),
     );
     let outcome_read = envelope(

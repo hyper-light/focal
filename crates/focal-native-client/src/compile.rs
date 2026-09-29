@@ -787,7 +787,7 @@ fn selected_evaluation<'a>(
     slot: Option<u32>,
     target: Option<&str>,
 ) -> Result<&'a ResolvedEvaluation, CompileError> {
-    let selector = EvaluationSelector::parse(phase, slot, target)?;
+    let selector = crate::resolve::parse_selector(phase, slot, target)?;
     let evaluation = resolved.evaluation(
         ClaimId(claim.binding.object.0),
         ValidationId(parse_id(validation)?),

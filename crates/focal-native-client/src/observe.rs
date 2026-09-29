@@ -37,7 +37,7 @@ const STATE_ONLY: NativeClaimExpand = NativeClaimExpand {
     history: false,
 };
 
-fn claim_of(page: &NativeReadPage) -> Option<&NativeClaim> {
+pub(crate) fn claim_of(page: &NativeReadPage) -> Option<&NativeClaim> {
     page.objects.iter().find_map(|object| match object {
         NativeObject::Claim(claim) => Some(&**claim),
         _ => None,
@@ -74,6 +74,7 @@ pub fn lineage(
         query: NativeReadQuery::Claim {
             id,
             expand: CLAIM_EXPAND,
+            after: None,
         },
         max_items: READ_ITEMS,
     })?;
@@ -105,6 +106,7 @@ pub fn lineage(
         let page = at_least(NativeReadQuery::Claim {
             id: parent,
             expand: CONTENT_ONLY,
+            after: None,
         })?;
         visited = add(visited, page.visited)?;
         let Some(ancestor) = claim_of(&page) else {
@@ -157,6 +159,7 @@ pub fn lineage(
         let page = at_least(NativeReadQuery::Claim {
             id: follower,
             expand: CONTENT_ONLY,
+            after: None,
         })?;
         visited = add(visited, page.visited)?;
         if let Some(object) = take_claim(page) {
@@ -200,6 +203,7 @@ pub fn wait(
             query: NativeReadQuery::Claim {
                 id,
                 expand: STATE_ONLY,
+                after: None,
             },
             max_items: 1,
         })?;

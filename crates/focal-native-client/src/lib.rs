@@ -39,7 +39,8 @@ pub use frame::{FrameLimits, encode_frame, fingerprint};
 pub use observe::{LINEAGE_DEPTH, Pause, WAIT_PROBES, lineage, wait};
 pub use resolve::{
     EvaluationSelector, Requirement, Resolved, ResolvedArtifact, ResolvedClaim, ResolvedDiagnostic,
-    ResolvedEvaluation, ResolvedResponse, ResolvedResultTestament, ResolvedWork, requirements,
+    ResolvedEvaluation, ResolvedResponse, ResolvedResultTestament, ResolvedWork, parse_selector,
+    requirements,
 };
 
 use focal_client::input::InputError;

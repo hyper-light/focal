@@ -186,6 +186,7 @@ fn main() {
                 query: NativeReadQuery::Claim {
                     id: ClaimId::from_u128(claim),
                     expand: NativeClaimExpand::default(),
+                    after: None,
                 },
                 max_items: 1,
             }),

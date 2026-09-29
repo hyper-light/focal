@@ -434,12 +434,69 @@ pub struct NativeContextQuery {
     pub results_after: Option<ObjectRevision>,
     pub limit: u32,
 }
+/// Which current evaluation of one declaration a verb or a context read
+/// addresses. This is the one copy of the selection rule: the compiler, the
+/// context read and the owner's selection query all ask `selects`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NativeEvaluationSelector {
+    /// The whole-work evaluation of a manifest slot (any slot when `None`).
+    WholeWork {
+        slot: Option<u32>,
+    },
+    Admission,
+    /// The increment evaluation of one work artifact (any when `None`).
+    Increment {
+        artifact: Option<ArtifactId>,
+    },
+}
+impl NativeEvaluationSelector {
+    /// Whether an evaluation of `target` is one the selector names. A missing
+    /// slot and a delivery are never selected: a verb addresses a slot's
+    /// artifact, an admission or an increment.
+    pub fn selects(self, target: NativeEvaluationTarget) -> bool {
+        match (self, target) {
+            (Self::WholeWork { slot: None }, NativeEvaluationTarget::Work { .. }) => true,
+            (Self::WholeWork { slot: Some(wanted) }, NativeEvaluationTarget::Work { slot, .. }) => {
+                slot == wanted
+            }
+            (Self::Admission, NativeEvaluationTarget::Admission) => true,
+            (
+                Self::Increment { artifact: wanted },
+                NativeEvaluationTarget::Increment { artifact },
+            ) => wanted.is_none_or(|wanted| wanted == artifact),
+            _ => false,
+        }
+    }
+}
+/// The owner's selection of the current evaluation of one declaration at one
+/// prefix: over the declaration's whole evaluation span (bounded by the
+/// core's evaluations per claim, never by a page), the evaluations the
+/// selector names, at `generation` when one is named, live (not terminal)
+/// when `live`, and of those the ones at the highest generation. The page
+/// holds that tie set: one object is the unique current evaluation, several
+/// are an ambiguity the caller must narrow, none is a missing current
+/// evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeSelectionQuery {
+    pub claim: ClaimId,
+    pub validation: ValidationId,
+    pub selector: NativeEvaluationSelector,
+    pub generation: Option<u64>,
+    pub live: bool,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NativeReadQuery {
     Objects(Vec<NativeObjectRef>),
+    /// One claim and its expansion. The expansion is ordered: the responses
+    /// from the latest cycle back, then the evaluations in key order; a page
+    /// that fills before it ends carries the position to resume at, and a
+    /// resumed page (`after`, an exact read at the same prefix) holds only
+    /// the rest of the expansion.
     Claim {
         id: ClaimId,
         expand: NativeClaimExpand,
+        after: Option<NativeContinuation>,
     },
     Outcome(NativeInvocationRef),
     Receipt(ReceiptId),
@@ -451,7 +508,11 @@ pub enum NativeReadQuery {
         claim: ClaimId,
         after: Option<u32>,
     },
+    /// The evaluations of one declaration under its claim in key order, a
+    /// page at a time. `after` is the last key the previous page consumed;
+    /// the next page starts strictly after it, at the same exact prefix.
     Evaluations {
+        claim: ClaimId,
         validation: ValidationId,
         after: Option<NativeEvaluationKey>,
     },
@@ -465,6 +526,7 @@ pub enum NativeReadQuery {
         limit: u32,
     },
     Standing,
+    SelectEvaluation(NativeSelectionQuery),
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -479,18 +541,42 @@ impl NativeReadRequest {
             return Err(AccessError::InvalidRequest);
         }
         let within = |count: u32| count != 0 && count <= self.max_items;
+        // A continuation names a position in one exact prefix: a resumed page
+        // is served only at the prefix the previous page was.
+        let exact = matches!(self.consistency, ReadConsistency::Exact(_));
         let valid = match &self.query {
             NativeReadQuery::Objects(objects) => u32::try_from(objects.len()).is_ok_and(within),
-            NativeReadQuery::Claim { id, .. } => !id.is_zero(),
+            NativeReadQuery::Claim { id, after, .. } => {
+                !id.is_zero()
+                    && match after {
+                        None => true,
+                        Some(NativeContinuation::Responses { .. }) => exact,
+                        Some(NativeContinuation::Evaluations(key)) => exact && key.claim == *id,
+                        Some(_) => false,
+                    }
+            }
             NativeReadQuery::Receipt(id) => !id.is_zero(),
             NativeReadQuery::Monitor { claim, id } => !claim.is_zero() && !id.is_zero(),
             NativeReadQuery::Responses { claim, .. } => !claim.is_zero(),
-            NativeReadQuery::Evaluations { validation, .. } => !validation.is_zero(),
+            NativeReadQuery::Evaluations {
+                claim,
+                validation,
+                after,
+            } => {
+                !claim.is_zero()
+                    && !validation.is_zero()
+                    && after.is_none_or(|after| {
+                        exact && after.claim == *claim && after.validation == *validation
+                    })
+            }
             NativeReadQuery::Results { evaluation, .. } => {
                 !evaluation.claim.is_zero() && !evaluation.validation.is_zero()
             }
             NativeReadQuery::ValidationContext(query) => {
                 !query.validation.is_zero() && !query.claim.is_zero() && within(query.limit)
+            }
+            NativeReadQuery::SelectEvaluation(query) => {
+                !query.claim.is_zero() && !query.validation.is_zero()
             }
             NativeReadQuery::Events { limit, .. } => within(*limit),
             NativeReadQuery::Outcome(_) | NativeReadQuery::Standing => true,

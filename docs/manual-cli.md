@@ -509,8 +509,9 @@ also observes an operation the MCP adapter journaled under the same context
 
 Reads on a native ledger return native documents: `focal get claim ID` (with
 its content, scopes, responses and evaluations), `focal get testament ID`,
-`focal get artifact ID` and `focal get validation ID` (the definition and its
-current evaluations at one prefix); `focal get validation ID --context`
+`focal get artifact ID` and `focal get validation ID` (the definition and every
+evaluation of its span at one prefix, the owner's pages followed to the end);
+`focal get validation ID --context`
 composes, at one prefix, everything an evaluator needs: the claim, the
 definition, the registration and evaluation selected like `validation
 begin` (`--phase admission|increment`, `--slot N`, `--target ARTIFACT`,

@@ -296,24 +296,64 @@ impl Core<NativeState> {
                 _ => None,
             })
     }
-    /// One claim's evaluation keys in key order, after `after` when given.
-    fn claim_evaluations_from(
+    /// One claim's evaluation keys in key order, after `after` when given
+    /// (exclusive). The keys of one claim are one contiguous span (25 §3),
+    /// bounded by `evaluations_per_claim`; a resume key of another claim is
+    /// ignored and the scan starts at the span's first key.
+    pub fn native_claim_evaluations_from(
         &self,
         claim: ClaimId,
         after: Option<EvaluationKey>,
     ) -> impl Iterator<Item = EvaluationKey> + '_ {
-        let start = Key::Evaluation(after.unwrap_or(EvaluationKey {
+        let first = EvaluationKey {
             claim,
             validation: ValidationId(MIN_ID),
             target: EvaluationTarget::Admission,
             generation: 0,
-        }));
+        };
+        let (start, exclusive) = match after {
+            Some(key) if key.claim == claim => (key, true),
+            _ => (first, false),
+        };
         self.state
             .rows
-            .entries_from(&start, after.is_some())
+            .entries_from(&Key::Evaluation(start), exclusive)
             .take_while(
                 move |entry| matches!(entry.key, Key::Evaluation(key) if key.claim == claim),
             )
+            .filter_map(|entry| match entry.key {
+                Key::Evaluation(key) => Some(key),
+                _ => None,
+            })
+    }
+    /// One declaration's evaluation keys under its claim in key order, after
+    /// `after` when given (exclusive). The keys of one (claim, validation)
+    /// are one contiguous span within the claim's (the validation follows the
+    /// claim in the key), so the scan visits no row outside the declaration's
+    /// own evaluations and ends at their last key; a resume key of another
+    /// claim or declaration is ignored and the scan starts at the first key.
+    pub fn native_declaration_evaluations_from(
+        &self,
+        claim: ClaimId,
+        validation: ValidationId,
+        after: Option<EvaluationKey>,
+    ) -> impl Iterator<Item = EvaluationKey> + '_ {
+        let first = EvaluationKey {
+            claim,
+            validation,
+            target: EvaluationTarget::Admission,
+            generation: 0,
+        };
+        let (start, exclusive) = match after {
+            Some(key) if key.claim == claim && key.validation == validation => (key, true),
+            _ => (first, false),
+        };
+        self.state
+            .rows
+            .entries_from(&Key::Evaluation(start), exclusive)
+            .take_while(move |entry| {
+                matches!(entry.key, Key::Evaluation(key) if key.claim == claim && key.validation == validation)
+            })
             .filter_map(|entry| match entry.key {
                 Key::Evaluation(key) => Some(key),
                 _ => None,
@@ -329,18 +369,18 @@ impl Core<NativeState> {
         after: Option<EvaluationKey>,
     ) -> Box<dyn Iterator<Item = EvaluationKey> + '_> {
         if let Some(claim) = claim {
-            return Box::new(self.claim_evaluations_from(claim, after));
+            return Box::new(self.native_claim_evaluations_from(claim, after));
         }
         // The claim the resume position lies in finishes first; later claims
         // follow from the identity index.
         let current = after.map(|key| key.claim);
         let head = current
-            .map(|claim| self.claim_evaluations_from(claim, after))
+            .map(|claim| self.native_claim_evaluations_from(claim, after))
             .into_iter()
             .flatten();
         let rest = self
             .native_claims_from(current)
-            .flat_map(move |claim| self.claim_evaluations_from(claim, None));
+            .flat_map(move |claim| self.native_claim_evaluations_from(claim, None));
         Box::new(head.chain(rest))
     }
 }

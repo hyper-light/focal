@@ -456,7 +456,11 @@ fn the_two_party_workflow_compiles_from_documents_and_commits_through_the_owner(
         requirements(&begin).unwrap(),
         vec![
             Requirement::Objects(vec![focal_wire::NativeObjectRef::Claim(claim)]),
-            Requirement::Evaluations { validation }
+            Requirement::Evaluation {
+                claim,
+                validation,
+                selector: crate::EvaluationSelector::WholeWork { slot: None },
+            }
         ]
     );
     let resolved = h.resolved(claim, None, Some(key));
@@ -2120,4 +2124,211 @@ fn the_wait_observer_and_the_lineage_read_compose_bounded_exact_reads() {
     );
     assert_eq!(tokens[0], ReadConsistency::Linearizable);
     assert!(tokens[1..].iter().all(|consistency| matches!(consistency, ReadConsistency::AtLeast(token) if token.sequence == SessionSeq(20))));
+}
+
+#[test]
+fn validation_get_follows_pages_at_one_prefix_and_refuses_a_span_beyond_its_bound() {
+    use focal_client::operations::{NativeObjectDocument, NativeReadOperation};
+    use focal_wire::*;
+    let claim = ClaimId::from_u128(10);
+    let validation = ValidationId::from_u128(11);
+    let token = |sequence: u64| ReadToken {
+        ledger: ledger(),
+        sequence: SessionSeq(sequence),
+        route_epoch: RouteEpoch(1),
+    };
+    let binding = |object: u128| NativeBinding {
+        object: ObjectId::from_u128(object),
+        content: ContentHash([9; 32]),
+        revision: ObjectRevision(1),
+    };
+    let definition = NativeObject::Definition(Box::new(NativeDefinition {
+        binding: binding(11),
+        claim,
+        issuer: ISSUER,
+        declaration_index: 0,
+        kind: ValidationKind::Receipt,
+        phase: ValidationPhase::WholeWork,
+        mode: ValidationMode::Required,
+        target: NativeTargetDeclaration::Delivery,
+        program: NativeProgram::Delivery,
+        deadline: Deadline {
+            timer: TimerId::from_u128(1),
+            generation: 1,
+            at: 10_000,
+        },
+        attempt_bound: 1,
+        content: None,
+    }));
+    let evaluation = |generation: u64| {
+        let key = NativeEvaluationKey {
+            claim,
+            validation,
+            target: NativeEvaluationTarget::Work {
+                response: TestamentId::from_u128(16),
+                slot: 0,
+                artifact: ArtifactId::from_u128(15),
+            },
+            generation,
+        };
+        (
+            key,
+            NativeObject::Evaluation(Box::new(NativeEvaluation {
+                binding: binding(500 + generation as u128),
+                key,
+                target: NativeTarget::Artifact {
+                    response: binding(16),
+                    slot: 0,
+                    artifact: binding(15),
+                },
+                state: NativeValidationState::Ready,
+                phase: NativePhase::Programmatic,
+                declared_phase: ValidationPhase::WholeWork,
+                declaration_index: 1,
+                issuer: ISSUER,
+                evaluator: Some(EVALUATOR),
+                mode: ValidationMode::Required,
+                receipt: None,
+                has_begun: false,
+                attempt_index: None,
+                attempt_bound: 2,
+                fence: None,
+                suppression: None,
+                last_result: None,
+                sealed: None,
+                deadline: Deadline {
+                    timer: TimerId::from_u128(1),
+                    generation: 1,
+                    at: 10_000,
+                },
+                current_attempt: None,
+            })),
+        )
+    };
+    let operation = NativeReadOperation::ValidationGet(NativeObjectDocument { id: hex(11) });
+    // A span of three pages: the driver follows each continuation at exactly
+    // the first page's prefix and returns the definition with every row.
+    let mut sent = Vec::new();
+    let mut reads = |request: NativeReadRequest| -> Result<NativeReadPage, DriveError> {
+        sent.push(request.consistency.clone());
+        let (objects, next) = match request.query {
+            NativeReadQuery::Objects(_) => (vec![definition.clone()], None),
+            NativeReadQuery::Evaluations { after, .. } => {
+                let generation = after.map_or(1, |key| key.generation + 1);
+                let (key, object) = evaluation(generation);
+                let next = (generation < 3).then_some(NativeContinuation::Evaluations(key));
+                (vec![object], next)
+            }
+            other => panic!("{other:?}"),
+        };
+        Ok(NativeReadPage {
+            token: token(4),
+            native_sequence: SessionSeq(4),
+            logical_time: 0,
+            objects,
+            next,
+            visited: 1,
+        })
+    };
+    let mut lists = |_: NativeListRequest| -> Result<NativeListPage, DriveError> {
+        panic!("a validation read lists nothing")
+    };
+    let mut pause = |_: std::time::Duration| Ok(());
+    let page = match read(
+        &operation,
+        &context(ISSUER),
+        &mut reads,
+        &mut lists,
+        &mut pause,
+    )
+    .unwrap()
+    {
+        NativeReadOutcome::Page(page) => page,
+        NativeReadOutcome::Wait(wait) => panic!("{wait:?}"),
+    };
+    assert_eq!(page.objects.len(), 4);
+    assert!(matches!(page.objects[0], NativeObject::Definition(_)));
+    let generations: Vec<u64> = page.objects[1..]
+        .iter()
+        .map(|object| match object {
+            NativeObject::Evaluation(evaluation) => evaluation.key.generation,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(generations, [1, 2, 3]);
+    assert!(page.next.is_none());
+    assert_eq!(page.visited, 4);
+    assert_eq!(
+        sent,
+        vec![
+            ReadConsistency::Linearizable,
+            ReadConsistency::AtLeast(token(4)),
+            ReadConsistency::Exact(token(4)),
+            ReadConsistency::Exact(token(4)),
+        ]
+    );
+    // A span that never ends is refused at the driver's page bound — the
+    // core's evaluations per claim over a page — as a capacity, never
+    // returned short as if it were whole.
+    let mut served = 0usize;
+    let mut endless = |request: NativeReadRequest| -> Result<NativeReadPage, DriveError> {
+        served += 1;
+        let (objects, next) = match request.query {
+            NativeReadQuery::Objects(_) => (vec![definition.clone()], None),
+            NativeReadQuery::Evaluations { after, .. } => {
+                let (key, object) = evaluation(after.map_or(1, |key| key.generation + 1));
+                (vec![object], Some(NativeContinuation::Evaluations(key)))
+            }
+            other => panic!("{other:?}"),
+        };
+        Ok(NativeReadPage {
+            token: token(4),
+            native_sequence: SessionSeq(4),
+            logical_time: 0,
+            objects,
+            next,
+            visited: 1,
+        })
+    };
+    let result = read(
+        &operation,
+        &context(ISSUER),
+        &mut endless,
+        &mut lists,
+        &mut pause,
+    );
+    assert!(
+        matches!(result, Err(DriveError::Input(InputError::Capacity))),
+        "{result:?}"
+    );
+    assert_eq!(served, 1 + crate::driver::EVALUATION_PAGES);
+    // A continuation of another kind is not an evaluation page.
+    let mut wrong = |request: NativeReadRequest| -> Result<NativeReadPage, DriveError> {
+        let (objects, next) = match request.query {
+            NativeReadQuery::Objects(_) => (vec![definition.clone()], None),
+            NativeReadQuery::Evaluations { .. } => (
+                vec![evaluation(1).1],
+                Some(NativeContinuation::Responses { cycle: 1 }),
+            ),
+            other => panic!("{other:?}"),
+        };
+        Ok(NativeReadPage {
+            token: token(4),
+            native_sequence: SessionSeq(4),
+            logical_time: 0,
+            objects,
+            next,
+            visited: 1,
+        })
+    };
+    assert!(matches!(
+        read(
+            &operation,
+            &context(ISSUER),
+            &mut wrong,
+            &mut lists,
+            &mut pause
+        ),
+        Err(DriveError::Input(InputError::Invalid(_)))
+    ));
 }

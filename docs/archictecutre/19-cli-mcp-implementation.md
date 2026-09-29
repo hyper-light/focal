@@ -78,6 +78,12 @@ exactly as the client journaled it; `NativeRead` (tag 26) returns fixed-prefix
 documents of committed native rows; `NativeList` (tag 27) is a bounded list
 over the native index families ([22 §7](22-native-record-format.md)), served
 statelessly from the committed prefix with a node-authenticated continuation.
+The registered encodings of the three operations are pinned by
+`native_tests::native_envelopes_and_replies_round_trip_with_frozen_bytes`; the
+read query's shape changed once, on 2026-09-29 (the audit's F07 and F08: the
+claim expansion's continuation, the declaration page's claim and the
+`SelectEvaluation` query), before any release carried the profile, and the
+fixture was re-registered with it.
 Under the profile the shared content transfer,
 managed request stream, reconcile, summary and stream operations stay
 admissible; legacy typed submissions and legacy reads do not, and native
@@ -106,8 +112,20 @@ acceptance slots, scopes and authored content; definitions with their program
 and authored specification; evaluations bound to their declaration; accepted
 results; artifacts with local custody; work artifacts and diagnostics;
 responses; result testaments; receipts; monitors; outcomes; creation results;
-events; frozen legacy rows as bytes). Claim expansions append the related
-objects to the same page. Bounded lists are served from the index families,
+events; frozen legacy rows as bytes). A claim expansion appends the related
+objects to the same page in one order — the responses from the latest cycle
+back, then the evaluations in key order — and a page that fills before the
+expansion ends carries the position to resume at (`after`, an exact read at
+the same prefix that never repeats the claim) rather than truncating. A
+declaration's evaluations page in key order under its claim, the continuation
+the last key the page consumed, so pages of any size concatenate to the whole
+span at one prefix. The owner selects the current evaluation of a declaration
+itself (`SelectEvaluation`: of the declaration's whole span — bounded by the
+core's evaluations per claim, never by a page — the targets the selector
+names, at the named generation when there is one, live when asked, the tie set
+at the highest generation; one object is the current evaluation, several an
+ambiguity the caller narrows, a set that does not fit a `Capacity` refusal,
+never a cut). Bounded lists are served from the index families,
 the validation context is composed from one prefix, and the node's timers
 are scheduled by the due-timer family
 ([22 §7](22-native-record-format.md#7-secondary-index-families)); claim
@@ -128,7 +146,8 @@ carries `wire = Native` and `retry = NativeN1`, and publishes a hand-written
 input schema ([native_schema.rs](../../crates/focal-client/src/operations/native_schema.rs)).
 The host first asks the compiler which committed objects the verb binds to
 (`requirements`: the claim, the claim and its response, or the claim and the
-current evaluations of one declaration), reads them once at a fixed prefix and
+owner's selection of the current evaluation of one declaration over its whole
+span — never a page of it), reads them once at a fixed prefix and
 extracts their bindings (`Resolved`), then compiles the document, the
 authenticated context, the claimed request identity and those bindings into a
 `NativeInput` and encodes the `FCNINPUT` frame

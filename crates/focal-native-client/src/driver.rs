@@ -24,6 +24,9 @@ use std::cell::RefCell;
 /// Items requested per fixed-prefix read page. The owner bounds what it
 /// serves; a host never needs more than one bounded page per requirement.
 pub const READ_ITEMS: u32 = 256;
+/// The pages `validation.get` follows at most: the core's evaluations per
+/// claim over a page (4096 / 256).
+pub(crate) const EVALUATION_PAGES: usize = 16;
 
 /// One blocking fixed-prefix read. The host supplies the envelope, transport
 /// and cancellation; the driver supplies only the query.
@@ -84,10 +87,20 @@ pub fn resolve(
     for requirement in requirements {
         let query = match requirement {
             Requirement::Objects(references) => NativeReadQuery::Objects(references),
-            Requirement::Evaluations { validation } => NativeReadQuery::Evaluations {
+            // The owner selects the current evaluation over the declaration's
+            // whole span at one prefix (F08): no page of the client's is the
+            // universe of the selection.
+            Requirement::Evaluation {
+                claim,
                 validation,
-                after: None,
-            },
+                selector,
+            } => NativeReadQuery::SelectEvaluation(NativeSelectionQuery {
+                claim,
+                validation,
+                selector,
+                generation: None,
+                live: true,
+            }),
         };
         let page = reads(NativeReadRequest {
             consistency: ReadConsistency::Linearizable,
@@ -234,6 +247,7 @@ fn read_page(
         NativeReadOperation::ClaimGet(document) => linearizable(NativeReadQuery::Claim {
             id: ClaimId(id(&document.id)?),
             expand: CLAIM_EXPAND,
+            after: None,
         })?,
         NativeReadOperation::TestamentGet(document) => {
             let testament = TestamentId(id(&document.id)?);
@@ -256,25 +270,58 @@ fn read_page(
                 linearizable(NativeReadQuery::Objects(vec![NativeObjectRef::Definition(
                     validation,
                 )]))?;
-            let mut evaluations = reads(NativeReadRequest {
-                consistency: ReadConsistency::AtLeast(definition.token),
-                query: NativeReadQuery::Evaluations {
-                    validation,
-                    after: None,
-                },
-                max_items: READ_ITEMS,
-            })?;
-            let mut objects = definition.objects;
-            objects
-                .try_reserve(evaluations.objects.len())
-                .map_err(|_| InputError::Capacity)?;
-            objects.append(&mut evaluations.objects);
-            evaluations.objects = objects;
-            evaluations
+            let claim = definition.objects.iter().find_map(|object| match object {
+                NativeObject::Definition(definition) => Some(definition.claim),
+                _ => None,
+            });
+            let mut page = definition;
+            if let Some(claim) = claim {
+                // Every evaluation of the declaration, a page at a time in
+                // key order, the pages after the first pinned to the first
+                // one's prefix; the span is bounded by the core's
+                // evaluations per claim, so the pages are too.
+                let mut after = None;
+                let mut pages = 0usize;
+                loop {
+                    if pages >= EVALUATION_PAGES {
+                        return Err(InputError::Capacity.into());
+                    }
+                    pages = pages.saturating_add(1);
+                    let mut more = reads(NativeReadRequest {
+                        consistency: if after.is_none() {
+                            ReadConsistency::AtLeast(page.token)
+                        } else {
+                            ReadConsistency::Exact(page.token)
+                        },
+                        query: NativeReadQuery::Evaluations {
+                            claim,
+                            validation,
+                            after,
+                        },
+                        max_items: READ_ITEMS,
+                    })?;
+                    page.token = more.token;
+                    page.native_sequence = more.native_sequence;
+                    page.logical_time = more.logical_time;
+                    page.visited = page.visited.saturating_add(more.visited);
+                    page.objects
+                        .try_reserve(more.objects.len())
+                        .map_err(|_| InputError::Capacity)?;
+                    page.objects.append(&mut more.objects);
+                    match more.next {
+                        Some(NativeContinuation::Evaluations(key)) => after = Some(key),
+                        Some(_) => {
+                            return Err(InputError::Invalid("evaluation continuation").into());
+                        }
+                        None => break,
+                    }
+                }
+            }
+            page
         }
         NativeReadOperation::ValidationContext(document) => {
             let validation = ValidationId(id(&document.validation)?);
-            let selector = EvaluationSelector::parse(
+            let selector = crate::resolve::parse_selector(
                 &document.phase,
                 document.slot,
                 document.target.as_deref(),
@@ -291,54 +338,37 @@ fn read_page(
                     _ => None,
                 })
                 .ok_or(CompileError::Missing("definition"))?;
-            let evaluations = reads(NativeReadRequest {
+            // The owner selects over the declaration's whole span at one
+            // prefix (F08): the tie set at the highest generation the selector
+            // names, at the named generation when there is one, of any state.
+            let selection = reads(NativeReadRequest {
                 consistency: ReadConsistency::AtLeast(definition.token),
-                query: NativeReadQuery::Evaluations {
+                query: NativeReadQuery::SelectEvaluation(NativeSelectionQuery {
+                    claim,
                     validation,
-                    after: None,
-                },
+                    selector,
+                    generation: document.generation,
+                    live: false,
+                }),
                 max_items: READ_ITEMS,
             })?;
-            // The same selection as validation.begin, over the wire objects:
-            // the highest live generation of the requested phase, or the
-            // exact generation when one is named.
-            let mut selected: Option<&NativeEvaluation> = None;
-            for object in &evaluations.objects {
-                let NativeObject::Evaluation(evaluation) = object else {
-                    continue;
-                };
-                let matches = match (selector, evaluation.key.target) {
-                    (
-                        EvaluationSelector::WholeWork { slot: None },
-                        NativeEvaluationTarget::Work { .. },
-                    ) => true,
-                    (
-                        EvaluationSelector::WholeWork { slot: Some(wanted) },
-                        NativeEvaluationTarget::Work { slot, .. },
-                    ) => slot == wanted,
-                    (EvaluationSelector::Admission, NativeEvaluationTarget::Admission) => true,
-                    (
-                        EvaluationSelector::Increment { artifact: wanted },
-                        NativeEvaluationTarget::Increment { artifact },
-                    ) => wanted.is_none_or(|wanted| wanted == artifact),
-                    _ => false,
-                };
-                if !matches
-                    || document
-                        .generation
-                        .is_some_and(|wanted| evaluation.key.generation != wanted)
-                {
-                    continue;
+            let mut selected = selection.objects.iter().filter_map(|object| match object {
+                NativeObject::Evaluation(evaluation) => Some(evaluation),
+                _ => None,
+            });
+            let (target, generation) = match (selected.next(), selected.next()) {
+                (Some(evaluation), None) => {
+                    (Some(evaluation.key.target), Some(evaluation.key.generation))
                 }
-                if selected.is_none_or(|current| current.key.generation < evaluation.key.generation)
-                {
-                    selected = Some(evaluation);
+                (Some(_), Some(_)) => {
+                    return Err(CompileError::Unsupported(
+                        "several current evaluations match; name the slot or target",
+                    )
+                    .into());
                 }
-            }
-            let (target, generation) = match selected {
-                Some(evaluation) => (Some(evaluation.key.target), Some(evaluation.key.generation)),
-                None => (None, document.generation),
+                (None, _) => (None, document.generation),
             };
+            let evaluations = selection;
             let kind = match selector {
                 EvaluationSelector::Admission => NativeContextKind::Admission,
                 EvaluationSelector::Increment { .. } => NativeContextKind::Increment,

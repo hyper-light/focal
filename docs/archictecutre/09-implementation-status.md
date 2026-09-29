@@ -11883,3 +11883,44 @@ readiness probe and the Helm chart ask it; startup and liveness stay `alive`.
 sees a healthy follower serve with the root leader down;
 `a_node_whose_session_owner_stopped_is_alive_and_not_serving` sees a founder whose
 session owner stopped stay alive and stop serving.
+
+### 2026-09-29 — evaluation pages that concatenate, a selection the owner makes over the whole span (the audit's F07, F08)
+
+The declaration page walked the claim's registrations in registration order
+and compared its cursor as a key: a page that filled named the row it had not
+shown, so the next page skipped it (F07). The client read the first page of a
+declaration's evaluations, ignored its continuation, and chose the "current"
+evaluation among those objects, though the core allows 4096 per claim (F08).
+Now the core scans one declaration's evaluations in key order
+(`native_declaration_evaluations_from`, resumable exclusively after any key,
+proved against registration order and cursors no row has), the page's
+continuation is the last key it consumed and the page is judged full before a
+row is consumed, so pages of every size — 1, 2, 3, 5, 17, 64, 255, 256, 257,
+271, 272, 273 — concatenate to a 272-evaluation span without a skip or a
+repeat at one exact prefix; a resumed page that is not exact, a cursor of
+another claim or declaration, or a declaration under another claim is
+refused. The owner selects the current evaluation itself
+(`NativeReadQuery::SelectEvaluation`): over the declaration's whole span the
+targets the selector names, at the named generation when one is, live when
+asked, the tie set at the highest generation — one object, or several the
+caller must narrow, or a `Capacity` refusal when the set would not fit, never a
+cut. `validation.begin`/`report` resolve through that selection (the compiled
+`BeginIncrement` binds the evaluation at position 264 of 272, past the first
+page), `validation.context` selects the same way, and `validation.get` follows
+the declaration's pages at exactly the first page's prefix to the end (bounded
+by the core's evaluations per claim over a page; an endless span is a
+`Capacity` refusal, a foreign continuation invalid). The claim expansion is
+ordered — the responses from the latest cycle back, then the evaluations in
+key order — and a page that fills carries the position to resume at instead
+of truncating; a resumed page never repeats the claim. The responses list
+passes the rows above a resumed cursor uncharged, so a page of one row and one
+visit reaches the end of a 17-response chain. The wire validates each page's
+shape against its query (key order, a forward continuation, one tie set, no
+repeated claim). The read query's registered encoding changed with it (doc 19
+records the re-registration; no release carried the profile before).
+Tests: `focal-core` `native::increment_scan_tests`, `focal-node`
+`native_reads_tests` (five, over a real owner through the node's own page and
+the client's driver), `focal-wire`
+`native::tests::native_pages_are_validated_against_the_shape_their_query_names`,
+`focal-native-client`
+`validation_get_follows_pages_at_one_prefix_and_refuses_a_span_beyond_its_bound`.
