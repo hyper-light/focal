@@ -32,6 +32,8 @@ pub(crate) struct NativeEngine<S: NativeSchemaVerifier> {
     /// The seeded checkpoint this replica cannot install until the chunks
     /// it names are local; the host pulls them and polls again.
     pub(super) pending_seed: Option<PendingSeed>,
+    /// The objects a retained delivery could not read locally (24 §20).
+    pub(super) pending_custody: Option<PendingCustody>,
     pub(super) schemas: S,
     pub(super) budget: MemoryBudget,
     pub(super) ledger: LedgerId,
@@ -143,6 +145,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             reader,
             seeds,
             pending_seed: None,
+            pending_custody: None,
             schemas,
             budget,
             ledger,
@@ -313,11 +316,13 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         if let Some(manifest) =
             crate::native_checkpoint::Checkpoint::describe(bytes, self.limits.checkpoint)?
         {
+            // Reserve the manifest's chunk count once instead of growing by one
+            // per chunk (which was O(n^2) in reallocations).
+            chunks
+                .try_reserve_exact(manifest.len())
+                .map_err(|_| NativeSessionError::Capacity)?;
             for chunk in manifest.chunks() {
                 let chunk = chunk?;
-                chunks
-                    .try_reserve_exact(1)
-                    .map_err(|_| NativeSessionError::Capacity)?;
                 chunks.push(chunk.hash);
             }
         }
@@ -531,6 +536,13 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     pub(crate) fn pending_seed(&self) -> Option<&PendingSeed> {
         self.pending_seed.as_ref()
     }
+    pub(crate) fn pending_custody(&self) -> Option<&PendingCustody> {
+        self.pending_custody.as_ref()
+    }
+    pub(crate) fn take_pending_custody(&mut self) -> Option<PendingCustody> {
+        self.pending_custody.take()
+    }
+
     pub(crate) fn pending_count(&self) -> usize {
         self.pending.len()
     }
@@ -595,7 +607,6 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         }
         let limit = self.limits.recovery.native.pending;
         let full = self.pending.len() >= limit || self.pending.len() == self.pending.capacity();
-        let headroom = self.disk_headroom_ok(consensus)?;
         let domain = self.limits.content_domain;
         let Some(Domain::Active(owner, _)) = self.domain.as_mut() else {
             return Err(NativeSessionError::Failed);
@@ -624,17 +635,40 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 }
             }
         }
-        if (full || !headroom) && matches!(staged, NativeStaging::Prepared { .. }) {
-            // A full queue here is an accounting inconsistency (the owner's queue
-            // is bounded by the same limit); missing disk headroom is ordinary
-            // pressure. Both refuse only the fresh candidate; an exact retry of
-            // committed work was already answered by the owner above.
-            if let NativeStaging::Prepared { candidate, .. } = staged {
-                owner.discard_from(candidate)?;
+        if let NativeStaging::Prepared { candidate, .. } = staged {
+            // Sample disk headroom only for fresh work, and after prepare: a full
+            // queue is an accounting inconsistency (the owner's queue is bounded
+            // by the same limit) and missing headroom is ordinary pressure, but a
+            // transient statfs error must refuse only this fresh candidate - never
+            // an exact retry of committed work, which the owner already answered
+            // above as Existing and which consumes no new disk. Discard the
+            // candidate before returning any refusal.
+            // `disk_headroom_ok` needs `&mut self`, so the `owner` borrow taken
+            // above must end first (its last use is the movement fence). Discard
+            // through a helper that re-borrows the owner rather than holding it
+            // across the sample.
+            let headroom = match self.disk_headroom_ok(consensus) {
+                Ok(headroom) => headroom,
+                Err(error) => {
+                    self.discard_candidate(candidate)?;
+                    return Err(error);
+                }
+            };
+            if full || !headroom {
+                self.discard_candidate(candidate)?;
+                return Err(NativeSessionError::Capacity);
             }
-            return Err(NativeSessionError::Capacity);
         }
         self.submit_staged(consensus, staged, status.term)
+    }
+    /// Discard a prepared candidate, re-borrowing the active owner. Used when a
+    /// refusal is decided after a `&mut self` call has ended the owner borrow.
+    fn discard_candidate(&mut self, candidate: NativeCandidate) -> Result<(), NativeSessionError> {
+        let Some(Domain::Active(owner, _)) = self.domain.as_mut() else {
+            return Err(NativeSessionError::Failed);
+        };
+        owner.discard_from(candidate)?;
+        Ok(())
     }
     /// Sample the WAL filesystem's free space when due and decide whether a
     /// fresh candidate may be admitted. Far above the watermark one sample

@@ -1,4 +1,3 @@
-#![cfg(unix)]
 #![allow(
     clippy::panic,
     clippy::unwrap_used,
@@ -15,11 +14,10 @@
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader},
-    os::unix::fs::PermissionsExt,
     path::Path,
     process::{Child, Command, Output, Stdio},
     sync::mpsc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 struct Server(Child);
@@ -30,14 +28,40 @@ impl Drop for Server {
     }
 }
 fn private(path: &Path) {
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // A fresh directory is already owner-only on Windows (its DACL is inherited
+    // from the owner-owned temp root); on Unix, tighten it to 0700.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
+fn scratch(prefix: &str) -> tempfile::TempDir {
+    // Unix keeps the path short for the Unix-socket path limit (/tmp); Windows
+    // names its pipe by a hash of the data directory, so the default temp root
+    // is fine there.
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix);
+    #[cfg(unix)]
+    {
+        builder.tempdir_in("/tmp").unwrap()
+    }
+    #[cfg(not(unix))]
+    {
+        builder.tempdir().unwrap()
+    }
+}
+#[path = "support/deadline.rs"]
+mod deadline;
 #[path = "support/ports.rs"]
 mod ports;
 fn address() -> String {
     ports::address()
 }
 fn start(root: &Path, advertise: &str) -> Server {
+    deadline::observe(root);
     // Four rows per member: the balancer splits the group while the
     // workflow runs (doc 25 §8), so every step below runs across a reshape.
     let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
@@ -158,14 +182,8 @@ const PROOF: &str = r#"{"passed":3,"failed":0,"skipped":0}"#;
 
 #[test]
 fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive_a_kill() {
-    let founder = tempfile::Builder::new()
-        .prefix("focal-native-a1-")
-        .tempdir_in("/tmp")
-        .unwrap();
-    let client = tempfile::Builder::new()
-        .prefix("focal-native-a1-client-")
-        .tempdir_in("/tmp")
-        .unwrap();
+    let founder = scratch("focal-native-a1-");
+    let client = scratch("focal-native-a1-client-");
     private(founder.path());
     private(client.path());
     let root = founder.path();
@@ -381,9 +399,9 @@ fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive
     // A reply lost on a closed stdout leaves the exact frame journaled; the
     // recovery command replays it and finds the committed receipt.
     {
-        use std::os::{fd::OwnedFd, unix::net::UnixStream};
-        let (closed, output) = UnixStream::pair().unwrap();
-        drop(closed);
+        // A stdout whose reader is gone: writes fail, mimicking a lost reply.
+        let (reader, output) = std::io::pipe().unwrap();
+        drop(reader);
         let second = json!({
             "description": "A second request.",
             "target": alice,
@@ -401,7 +419,7 @@ fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive
                 "--format",
                 "json",
             ])
-            .stdout(Stdio::from(OwnedFd::from(output)))
+            .stdout(Stdio::from(output))
             .stderr(Stdio::piped());
         let failed = command.output().unwrap();
         assert!(!failed.status.success());
@@ -431,7 +449,7 @@ fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive
     }
     // The balancer reshaped the group under the workflow: the map holds
     // several members, every one with rows, at a later range epoch.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
     loop {
         let output = run(root, None, &["cluster", "replicas", "ranges", "list"]);
         let view: Option<Value> = output
@@ -449,7 +467,7 @@ fn two_participants_complete_a_native_claim_cycle_through_the_binary_and_survive
             break;
         }
         assert!(
-            Instant::now() < deadline,
+            deadline.open(),
             "the balancer never split the group: {view:?}"
         );
         std::thread::sleep(Duration::from_millis(250));

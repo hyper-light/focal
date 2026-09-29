@@ -173,7 +173,11 @@ impl DirectoryStartup {
             ControlHost::spawn_directory(permit, self.wal.clone(), self.budget.clone(), None)?;
         owners.register(PhysicalOwner::Control(owner))?;
         self.state.send_replace(Some(host.clone()));
-        let replication = crate::replication::drive_directory_replication(output, pool, 16);
+        let replication = crate::replication::drive_directory_replication(
+            output,
+            pool,
+            pool.limits().max_inflight.min(1024),
+        );
         let refresh = refresh_authority(self.plan, root, &host, installed_index, expires_at);
         let first = async {
             tokio::pin!(replication, refresh);
@@ -297,7 +301,11 @@ async fn drive_hosted(
             },
         );
     });
-    let replication = crate::replication::drive_directory_replication(output, pool, 16);
+    let replication = crate::replication::drive_directory_replication(
+        output,
+        pool,
+        pool.limits().max_inflight.min(1024),
+    );
     let refresh = refresh_authority(plan, root, &host, installed_index, expires_at);
     tokio::pin!(replication, refresh);
     tokio::select! {

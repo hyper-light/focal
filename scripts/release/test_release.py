@@ -5,10 +5,12 @@ import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import tempfile
 import unittest
 from unittest.mock import patch
 
+import notices
 import release
 
 
@@ -54,7 +56,7 @@ class ReleaseTests(unittest.TestCase):
     def test_collection_preserves_all_raw_bytes_and_checksums(self):
         self.collect()
         names = self.verify()
-        self.assertEqual(len(names), 8)
+        self.assertEqual(len(names), len(self.platforms["include"]) + 4)
         for row in self.platforms["include"]:
             name = row["asset"]
             self.assertEqual((self.source / f"binary-{name}" / name).read_bytes(), (self.destination / name).read_bytes())
@@ -191,6 +193,138 @@ class ReleaseTests(unittest.TestCase):
         calls = self.publish_fixture(exists=True)
         self.assertFalse(any(call[0] in {"POST", "upload", "PATCH"} for call in calls))
 
+
+
+class PortableExecutableTests(unittest.TestCase):
+    """The import-table parser reads DLL names from a synthetic PE32+ image."""
+
+    @staticmethod
+    def image(dll_names):
+        section_rva = 0x200
+        descriptors = section_rva
+        names_at = descriptors + 20 * (len(dll_names) + 1)
+        data = bytearray(0x400)
+        data[0:2] = b"MZ"
+        struct.pack_into("<I", data, 0x3C, 0x40)  # e_lfanew
+        pe = 0x40
+        data[pe : pe + 4] = b"PE\0\0"
+        coff = pe + 4
+        struct.pack_into("<H", data, coff, 0x8664)      # machine x86_64
+        struct.pack_into("<H", data, coff + 2, 1)        # one section
+        struct.pack_into("<H", data, coff + 16, 240)     # size of optional header
+        optional = coff + 20
+        struct.pack_into("<H", data, optional, 0x20B)    # PE32+ magic
+        struct.pack_into("<II", data, optional + 112 + 8, section_rva, 20 * (len(dll_names) + 1))
+        section = optional + 240
+        data[section : section + 8] = b".idata\0\0"
+        struct.pack_into("<IIII", data, section + 8, 0x200, section_rva, 0x200, section_rva)
+        cursor = names_at
+        for index, name in enumerate(dll_names):
+            struct.pack_into("<IIIII", data, descriptors + 20 * index, 0, 0, 0, cursor, 0)
+            encoded = name.encode() + b"\0"
+            data[cursor : cursor + len(encoded)] = encoded
+            cursor += len(encoded)
+        return bytes(data)
+
+    def test_single_import_is_read(self):
+        self.assertEqual(release.pe_imported_dlls(self.image(["KERNEL32.dll"])), {"kernel32.dll"})
+
+    def test_several_imports_are_read_and_lowercased(self):
+        self.assertEqual(
+            release.pe_imported_dlls(self.image(["KERNEL32.dll", "bcrypt.dll", "WS2_32.dll"])),
+            {"kernel32.dll", "bcrypt.dll", "ws2_32.dll"},
+        )
+
+    def test_a_non_pe_image_is_refused(self):
+        with self.assertRaises(ValueError):
+            release.pe_imported_dlls(b"\x7fELF" + b"\0" * 60)
+
+
+
+class NoticesTests(unittest.TestCase):
+    def test_drift_detection_rejects_a_stale_roster(self):
+        inventory = {("serde", "1.0.0"): {"name": "serde", "version": "1.0.0", "license": "MIT", "source": "reg"}}
+        packages = [
+            {"name": "serde", "version": "1.0.0", "source": "reg"},
+            {"name": "tokio", "version": "1.0.0", "source": "reg"},  # missing from roster
+            {"name": "focal-node", "version": "0.1.0", "source": None},  # workspace, not counted
+        ]
+        with self.assertRaises(SystemExit) as caught:
+            notices.check_drift(inventory, packages)
+        self.assertIn("tokio 1.0.0", str(caught.exception))
+
+    def test_drift_detection_rejects_a_removed_dependency(self):
+        inventory = {
+            ("serde", "1.0.0"): {"name": "serde", "version": "1.0.0", "license": "MIT", "source": "reg"},
+            ("gone", "0.1.0"): {"name": "gone", "version": "0.1.0", "license": "MIT", "source": "reg"},
+        }
+        packages = [{"name": "serde", "version": "1.0.0", "source": "reg"}]
+        with self.assertRaises(SystemExit) as caught:
+            notices.check_drift(inventory, packages)
+        self.assertIn("gone 0.1.0", str(caught.exception))
+
+    def test_workspace_crates_are_absent_from_notices_and_present_in_the_sbom(self):
+        packages = [
+            {"name": "serde", "version": "1.0.0", "source": "reg", "license": "MIT"},
+            {"name": "focal-node", "version": "0.1.0", "source": None, "license": "MIT"},
+        ]
+        text = notices.render_notices(packages)
+        self.assertIn("serde 1.0.0", text)
+        self.assertNotIn("focal-node", text)
+        sbom = json.loads(notices.render_sbom(packages, "1.0.0", "abc"))
+        self.assertEqual(sbom["spdxVersion"], "SPDX-2.3")
+        self.assertEqual({p["name"] for p in sbom["packages"]}, {"serde", "focal-node"})
+
+    def test_a_vendored_crate_is_third_party_with_the_roster_locator(self):
+        # A lockfile package without a source that is not a workspace member is
+        # built from vendor/: it is a third-party notice with the archive it was
+        # unpacked from as its locator, and counts toward roster drift.
+        locator = "https://static.crates.io/crates/aws-lc-sys/aws-lc-sys-0.45.0.crate#sha256=9bff"
+        inventory = {
+            ("aws-lc-sys", "0.45.0"): {"name": "aws-lc-sys", "version": "0.45.0", "license": "ISC", "source": locator},
+        }
+        vendored = {"name": "aws-lc-sys", "version": "0.45.0", "source": None, "third_party": True, "vendored": True}
+        member = {"name": "focal-node", "version": "0.1.0", "source": None, "third_party": False, "vendored": False}
+        notices.check_drift(inventory, [vendored, member])
+        with self.assertRaises(SystemExit) as caught:
+            notices.check_drift({}, [vendored, member])
+        self.assertIn("aws-lc-sys 0.45.0", str(caught.exception))
+        resolved = notices.resolve_licenses(inventory, [vendored, member])
+        self.assertEqual(resolved[0]["license"], "ISC")
+        self.assertEqual(resolved[0]["source"], locator)
+        self.assertEqual(resolved[1]["license"], notices.WORKSPACE_LICENSE)
+        self.assertIsNone(resolved[1]["source"])
+        text = notices.render_notices(resolved)
+        self.assertIn("aws-lc-sys 0.45.0", text)
+        self.assertIn(f"Source:  {locator}", text)
+        self.assertIn("Built from: vendor/aws-lc-sys", text)
+        self.assertNotIn("focal-node", text)
+        sbom = json.loads(notices.render_sbom(resolved, "1.0.0", "abc"))
+        by_name = {p["name"]: p for p in sbom["packages"]}
+        self.assertEqual(by_name["aws-lc-sys"]["downloadLocation"], locator)
+        self.assertEqual(by_name["focal-node"]["downloadLocation"], "NOASSERTION")
+
+    def test_the_locked_graph_marks_the_vendored_crates_and_the_workspace_apart(self):
+        members = notices.workspace_members()
+        self.assertIn("focal-node", members)
+        self.assertNotIn("aws-lc-sys", members)
+        by_name = {p["name"]: p for p in notices.lock_packages()}
+        for name in ("aws-lc-sys", "aws-lc-rs"):
+            self.assertIsNone(by_name[name]["source"])
+            self.assertTrue(by_name[name]["third_party"] and by_name[name]["vendored"], name)
+        self.assertFalse(by_name["focal-node"]["third_party"])
+        self.assertTrue(by_name["serde"]["third_party"] and not by_name["serde"]["vendored"])
+
+    def test_generate_is_deterministic_and_covers_the_locked_graph(self):
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            a = notices.generate(first, "9.9.9", "cafef00d")
+            b = notices.generate(second, "9.9.9", "cafef00d")
+            self.assertEqual(a, [notices.NOTICES, notices.SBOM])
+            for name in a:
+                self.assertEqual((Path(first) / name).read_bytes(), (Path(second) / name).read_bytes())
+            sbom = json.loads((Path(first) / notices.SBOM).read_text())
+            locked = notices.lock_packages()
+            self.assertEqual(len(sbom["packages"]), len(locked))
 
 if __name__ == "__main__":
     unittest.main()

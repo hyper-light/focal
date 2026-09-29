@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     network_bootstrap::signer_principal,
-    network_service::tests::{Running, settings},
+    network_service::tests::{Running, settings, try_until, until},
     placement_agent::tests::join_peer,
 };
 use focal_control::{ControlRead, ControlReadResult};
@@ -27,32 +27,30 @@ async fn wait_for_contact(
     fingerprint: [u8; 32],
 ) {
     let mut last = None;
-    let result = tokio::time::timeout(Duration::from_secs(30), async {
-        let mut sequence = 1u128;
-        loop {
-            match founder
-                .handles
-                .control
-                .read(
-                    root_reader(founder, founder_dir),
-                    RequestId::from_u128(sequence),
-                    ControlRead::Contacts,
-                )
-                .await
-            {
-                Ok(ControlReadResult::Contacts(snapshot)) => {
-                    if snapshot.contacts.records.iter().any(|contact| {
-                        contact.node == node && contact.certificate_fingerprint == fingerprint
-                    }) {
-                        return;
-                    }
-                    last = Some(format!("{:?}", snapshot.contacts.records));
+    let mut sequence = 0u128;
+    let result = try_until(&[founder], Duration::from_secs(30), async || {
+        sequence += 1;
+        match founder
+            .handles
+            .control
+            .read(
+                root_reader(founder, founder_dir),
+                RequestId::from_u128(sequence),
+                ControlRead::Contacts,
+            )
+            .await
+        {
+            Ok(ControlReadResult::Contacts(snapshot)) => {
+                if snapshot.contacts.records.iter().any(|contact| {
+                    contact.node == node && contact.certificate_fingerprint == fingerprint
+                }) {
+                    return Some(());
                 }
-                other => last = Some(format!("{other:?}")),
+                last = Some(format!("{:?}", snapshot.contacts.records));
             }
-            sequence += 1;
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            other => last = Some(format!("{other:?}")),
         }
+        None
     })
     .await;
     assert!(
@@ -128,21 +126,23 @@ async fn a_joined_host_renews_its_credential_presents_it_everywhere_and_converge
     let peer = Running::start(&peer_settings).await;
     // The controller sees the registry ahead of the receipt it holds and
     // converges on the committed renewal by itself.
-    let converged = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
+    let converged = until(
+        "the restarted host converges on the committed renewal",
+        &[&founder, &peer],
+        Duration::from_secs(30),
+        async || {
             let current = match peer.handles.credentials.current().await {
                 Ok(current) => current,
-                Err(error) => return Err(error),
+                Err(error) => return Some(Err(error)),
             };
             if current.renewals == 1 {
-                return Ok(current);
+                return Some(Ok(current));
             }
             assert_eq!(current.expires_at, before.expires_at);
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .expect("the restarted host never converged on the committed renewal");
+            None
+        },
+    )
+    .await;
     let converged = match converged {
         Ok(converged) => converged,
         Err(error) => panic!(
@@ -167,6 +167,133 @@ async fn a_joined_host_renews_its_credential_presents_it_everywhere_and_converge
         again.certificate_fingerprint,
     )
     .await;
+    peer.stop().await;
+    founder.stop().await;
+}
+
+/// The identity the root's grant names for `node`, once it names it.
+async fn granted_identity(founder: &Running, node: u64) -> Option<[u8; 32]> {
+    let observation = founder.handles.control.observe_root().await.ok()?;
+    let authority = observation.authority()?;
+    authority
+        .nodes
+        .get(&node)
+        .map(|grant| grant.enrollment.identity.0)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joined_host_rotates_its_key_is_regranted_under_it_and_adopts_a_committed_rotation_after_a_crash()
+ {
+    let founder_dir = tempfile::tempdir().unwrap();
+    let peer_dir = tempfile::tempdir().unwrap();
+    let founder_settings = settings(founder_dir.path());
+    let peer_settings = settings(peer_dir.path());
+    let founder = Running::start(&founder_settings).await;
+    let (peer, node) = join_peer(&founder, founder_dir.path(), "host", &peer_settings).await;
+    assert_eq!(
+        founder.handles.credentials.rotate().await,
+        Err(RenewalError::Unsupported)
+    );
+    let before = peer.handles.credentials.current().await.unwrap();
+    assert_eq!(before.rotations, 0);
+    // The root granted the node under the key it enrolled with.
+    let granted = until(
+        "the node is granted",
+        &[&founder, &peer],
+        Duration::from_secs(30),
+        async || granted_identity(&founder, node).await,
+    )
+    .await;
+    assert_eq!(granted, before.key_identity);
+    let key_dir = peer_dir.path().join("JOIN").join("node-key");
+    let held_key = std::fs::read(key_dir.join("join-key.bin")).unwrap();
+    let held_receipt = std::fs::read(key_dir.join("enrollment.bin")).unwrap();
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    // The rotation: a new key under the same identity and principal,
+    // presented at once and announced to the root.
+    let rotated = peer.handles.credentials.rotate().await.unwrap();
+    assert_eq!(rotated.node, node);
+    assert_eq!(rotated.principal, before.principal);
+    assert_ne!(rotated.key_identity, before.key_identity);
+    assert_ne!(
+        rotated.certificate_fingerprint,
+        before.certificate_fingerprint
+    );
+    assert_eq!(rotated.rotations, 1);
+    assert_eq!(rotated.renewals, 0);
+    let adopted_key = std::fs::read(key_dir.join("join-key.bin")).unwrap();
+    assert_ne!(adopted_key, held_key);
+    assert!(
+        !peer_dir
+            .path()
+            .join("JOIN")
+            .join("node-key.next")
+            .join("join-key.bin")
+            .exists(),
+        "the staged key is cleared once adopted"
+    );
+    wait_for_contact(
+        &founder,
+        founder_dir.path(),
+        node,
+        rotated.certificate_fingerprint,
+    )
+    .await;
+    // The root re-grants the node under its new key.
+    until(
+        "the node is re-granted under its rotated key",
+        &[&founder, &peer],
+        Duration::from_secs(30),
+        async || {
+            (granted_identity(&founder, node).await == Some(rotated.key_identity)).then_some(())
+        },
+    )
+    .await;
+    // Under the rotated key a renewal is an ordinary renewal.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let renewed = peer.handles.credentials.renew().await.unwrap();
+    assert_eq!(renewed.key_identity, rotated.key_identity);
+    assert_eq!(renewed.renewals, 1);
+    assert_eq!(renewed.rotations, 1);
+    // Crash window: the sponsor committed a rotation but the holder still
+    // has the previous key and receipt, with the new key staged. The
+    // restarted host adopts the committed rotation by itself.
+    peer.stop().await;
+    let staged = peer_dir.path().join("JOIN").join("node-key.next");
+    std::fs::create_dir_all(&staged).unwrap();
+    crate::set_test_mode(&staged, 0o700);
+    for name in ["join-key.bin", "join-key.bin.initialized"] {
+        let source = key_dir.join(name);
+        if source.exists() {
+            std::fs::copy(&source, staged.join(name)).unwrap();
+        }
+    }
+    std::fs::write(key_dir.join("join-key.bin"), &held_key).unwrap();
+    std::fs::write(key_dir.join("enrollment.bin"), &held_receipt).unwrap();
+    let peer = Running::start(&peer_settings).await;
+    let converged = until(
+        "the restarted host adopts the committed rotation",
+        &[&founder, &peer],
+        Duration::from_secs(30),
+        async || match peer.handles.credentials.current().await {
+            Ok(current) if current.rotations == 1 => Some(Ok(current)),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        },
+    )
+    .await;
+    let converged = match converged {
+        Ok(converged) => converged,
+        Err(error) => panic!(
+            "the restarted host's controller stopped ({error}): {:?}",
+            peer.outcome().await
+        ),
+    };
+    assert_eq!(converged.key_identity, rotated.key_identity);
+    assert_eq!(
+        converged.certificate_fingerprint,
+        renewed.certificate_fingerprint
+    );
     peer.stop().await;
     founder.stop().await;
 }

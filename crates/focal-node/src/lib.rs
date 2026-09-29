@@ -32,11 +32,15 @@ pub mod fleet;
 #[cfg(test)]
 mod fleet_tests;
 pub mod gc;
+pub mod history;
 pub mod host;
+pub mod leader_balancer;
+pub mod leader_return;
 pub mod liveness;
 #[cfg(test)]
 mod liveness_tests;
 pub mod managed_service;
+pub mod metrics;
 pub mod network_admin;
 pub mod network_bootstrap;
 pub mod network_contacts;
@@ -47,10 +51,12 @@ pub mod network_listener;
 pub mod network_service;
 pub mod network_state;
 pub mod node_directory;
+mod pace;
 pub mod placement;
 pub mod placement_agent;
 pub mod placement_collect;
 pub mod placement_control;
+pub mod placement_executor;
 pub mod placement_journal;
 pub mod placement_proof;
 pub mod quorum_enrollment;
@@ -66,6 +72,8 @@ pub mod session_registration;
 mod streams;
 #[cfg(test)]
 mod streams_tests;
+pub mod topology;
+pub mod upgrade;
 
 mod managed_support;
 
@@ -85,3 +93,19 @@ mod native_ingress;
 mod native_lists;
 mod native_reads;
 mod native_timers;
+
+/// Test-only: tighten a fresh temp path to owner-only. On Unix this sets the
+/// POSIX mode the private-directory checks require; on Windows a fresh temp
+/// directory already inherits an owner-only DACL from the temp root, so it is a
+/// no-op (mirrors the cli_native_a1 harness). Confined to `cfg(test)`, so no
+/// production build sees it.
+#[cfg(test)]
+pub(crate) fn set_test_mode(path: &std::path::Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+}

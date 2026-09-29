@@ -24,6 +24,7 @@ pub mod operation_store;
 pub mod operations;
 mod participant;
 pub mod pending;
+pub mod trace;
 mod transport;
 pub mod validation_context;
 pub mod watch;
@@ -48,6 +49,7 @@ pub use focal_wire::{
     NativeReadRequest, NativeReceipt, NativeRefusal, NativeRefusalKind, NativeStanding,
     NativeTicket,
 };
+pub use trace::{TraceEntry, TraceOutcome, TraceSink};
 pub use transport::*;
 #[cfg(test)]
 #[path = "native_client_tests.rs"]

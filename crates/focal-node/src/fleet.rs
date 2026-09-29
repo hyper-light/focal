@@ -100,6 +100,9 @@ pub struct ReplicaConfig {
     pub pending_clients: usize,
     pub replication_queue: usize,
     pub tick: Duration,
+    /// The longest the tick period is stretched for a far group (27 §3.1
+    /// P2); the election timeout is at most the election ticks times this.
+    pub tick_ceiling: Duration,
     pub request_timeout: Duration,
     /// Checkpoint and compact the log once this many entries have applied
     /// past the last snapshot (26 §3, the log's retirement boundary).
@@ -129,6 +132,7 @@ impl ReplicaConfig {
             pending_clients: 128,
             replication_queue: 128,
             tick: Duration::from_millis(100),
+            tick_ceiling: Duration::from_secs(2),
             request_timeout: Duration::from_secs(5),
             checkpoint_after_entries: 4096,
             #[cfg(test)]
@@ -156,6 +160,19 @@ pub struct ReplicaProgress {
     pub sequence: SessionSeq,
     pub dropped_replication: u64,
     pub stopped: bool,
+    /// The group's voters as this replica's committed configuration names
+    /// them; the paths a pace is derived from (27 §3.1 P2).
+    pub voters: Vec<u64>,
+    /// The members this replica admits replication from by the directory's
+    /// word, sorted.
+    pub admitted: Vec<u64>,
+    /// This replica's election priority, from its committed placement.
+    pub priority: i64,
+    /// The voters the directory places in the preferred leader's zone.
+    pub near: Near,
+    /// How often this replica asked leadership to return to the preferred
+    /// leader, and how often that did not hold (27 §5).
+    pub returns: crate::leader_return::Stats,
     /// The route epoch this replica serves clients at; a committed
     /// activation moves the session ahead of it until the host re-fences.
     pub route_epoch: RouteEpoch,
@@ -166,6 +183,14 @@ pub struct ReplicaProgress {
     /// the chunks it lacks from a peer (25 §5): the snapshot's Raft
     /// coordinates and how many chunks are missing.
     pub seed_pending: Option<SeedPending>,
+    /// A retained delivery this replica cannot apply until its host pulls
+    /// the content objects it names from a required copy (24 §20).
+    pub custody_pending: Option<CustodyPending>,
+}
+/// The objects a retained delivery still lacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CustodyPending {
+    pub missing: usize,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SeedPending {
@@ -244,6 +269,21 @@ enum Work {
         oneshot::Sender<Result<(), LedgerError>>,
         Allocation,
     ),
+    /// The content objects a retained delivery lacks (24 §20).
+    CustodyObjects(
+        oneshot::Sender<Result<Vec<focal_model::ContentRef>, LedgerError>>,
+        Allocation,
+    ),
+    /// The host pulled objects a retained delivery lacked; it retries at once.
+    CustodyPulled(oneshot::Sender<Result<(), LedgerError>>, Allocation),
+    /// The members the committed directory names for this session, and
+    /// those of them in its preferred leader's zone.
+    Admit(
+        Vec<u64>,
+        Near,
+        oneshot::Sender<Result<(), LedgerError>>,
+        Allocation,
+    ),
     /// Serve clients at an activated route: `(route, policy revision)`.
     Refence(
         RouteEpoch,
@@ -292,7 +332,10 @@ struct PendingMembershipCall {
     proposed: bool,
     context: Option<Vec<u8>>,
     term: u64,
-    deadline: Instant,
+    /// The owner's period at which the request is given up: its time in
+    /// the owner's rounds and not the clock's (27 §3.1 P2), so an owner
+    /// that a loaded machine slows gives up nothing it would have answered.
+    deadline: u64,
     charge: Allocation,
 }
 impl PendingMembershipCall {
@@ -394,6 +437,27 @@ pub struct ReplicaHost {
     client_frame_bytes: u32,
     client_max_items: u32,
     request_timeout: Duration,
+    pace: crate::pace::TickPeriod,
+    tick: Duration,
+    tick_ceiling: Duration,
+}
+/// The most members a replica admits by the directory's word: the largest
+/// configuration, entering and leaving.
+const MAX_ADMITTED: usize = 2048;
+/// The election priority of a session's preferred leader, of the voters in
+/// its zone, and of its other voters (27 §5).
+pub const PREFERRED_LEADER_PRIORITY: i64 = 3;
+pub const ZONE_PRIORITY: i64 = 2;
+pub const VOTER_PRIORITY: i64 = 1;
+/// The voters the committed directory places in the zone of a session's
+/// preferred leader: who leads in its place where it cannot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Near {
+    /// The preferred leader they are near to. They rank by it only while
+    /// the session's own committed placement prefers the same.
+    pub leader: u64,
+    /// Sorted, without the leader.
+    pub voters: Vec<u64>,
 }
 struct ProgressState {
     value: ReplicaProgress,
@@ -492,7 +556,10 @@ struct Pending {
     response: oneshot::Sender<OwnedResponse>,
     waiting: WaitingFor,
     term: u64,
-    deadline: Instant,
+    /// The owner's period at which the request is given up: its time in
+    /// the owner's rounds and not the clock's (27 §3.1 P2), so an owner
+    /// that a loaded machine slows gives up nothing it would have answered.
+    deadline: u64,
     _charge: Allocation,
 }
 impl Pending {
@@ -514,6 +581,13 @@ struct Owner {
     runtime: Option<focal_runtime::Runtime>,
     pending: VecDeque<Pending>,
     memberships: VecDeque<PendingMembershipCall>,
+    /// The members the committed directory names for this session, sorted:
+    /// the peers whose replication this replica admits beside those of its
+    /// own applied configuration. A copy that has applied nothing yet knows
+    /// only the configuration its log began with.
+    admitted: Vec<u64>,
+    /// The voters in the preferred leader's zone, by the directory's word.
+    near: Near,
     deferred_managed: VecDeque<managed_support_owner::DeferredManaged>,
     deferred_backing: Option<Allocation>,
     snapshot_feedback: crate::snapshot_feedback::SnapshotFeedback,
@@ -531,9 +605,16 @@ struct Owner {
     #[cfg(test)]
     dropped_snapshots: u64,
     budget: MemoryBudget,
+    pace: crate::pace::TickPeriod,
+    /// When leadership goes back to the placement's preferred leader.
+    leader_return: crate::leader_return::LeaderReturn,
     nonblocking: bool,
-    stopping: Option<(oneshot::Sender<Result<(), LedgerError>>, Instant)>,
+    /// The reply to a stop, and the owner's period at which the stop is
+    /// given up on.
+    stopping: Option<(oneshot::Sender<Result<(), LedgerError>>, u64)>,
     next_tick: Instant,
+    /// When a leader whose period is stretched sends its next heartbeats.
+    next_beat: Instant,
     wake_at: Instant,
 }
 impl ReplicaHost {
@@ -591,6 +672,8 @@ impl ReplicaHost {
             || !(1..=1024).contains(&config.replication_queue)
             || config.tick < Duration::from_millis(10)
             || config.tick > Duration::from_secs(1)
+            || config.tick_ceiling < config.tick
+            || config.tick_ceiling > Duration::from_secs(10)
             || config.request_timeout.is_zero()
             || config.request_timeout > Duration::from_secs(60)
         {
@@ -626,9 +709,15 @@ impl ReplicaHost {
                 sequence: session.sequence(),
                 dropped_replication: 0,
                 stopped: false,
+                voters: status.voters.clone(),
+                admitted: Vec::new(),
+                priority: session.priority(),
+                near: Near::default(),
+                returns: crate::leader_return::Stats::default(),
                 route_epoch: config.route_epoch,
                 import_pending: None,
                 seed_pending: None,
+                custody_pending: None,
             },
             _allocation: None,
         });
@@ -644,7 +733,13 @@ impl ReplicaHost {
         let client_frame_bytes = client_limits.max_frame_bytes;
         let client_max_items = client_limits.max_items;
         let request_timeout = config.request_timeout;
+        let tick = config.tick;
+        let tick_ceiling = config.tick_ceiling;
+        let pace = crate::pace::TickPeriod::default();
+        pace.announce(session.election_tick());
         let owner = Owner {
+            leader_return: crate::leader_return::LeaderReturn::new(session.election_tick()),
+            pace: pace.clone(),
             session,
             config,
             limits,
@@ -654,6 +749,8 @@ impl ReplicaHost {
             runtime,
             pending: VecDeque::new(),
             memberships: VecDeque::new(),
+            admitted: Vec::new(),
+            near: Near::default(),
             deferred_managed: VecDeque::new(),
             deferred_backing: None,
             snapshot_feedback: crate::snapshot_feedback::SnapshotFeedback::default(),
@@ -672,6 +769,7 @@ impl ReplicaHost {
             nonblocking: false,
             stopping: None,
             next_tick: Instant::now(),
+            next_beat: Instant::now(),
             wake_at: Instant::now(),
         };
         Ok((
@@ -682,12 +780,59 @@ impl ReplicaHost {
                 client_frame_bytes,
                 client_max_items,
                 request_timeout,
+                pace,
+                tick,
+                tick_ceiling,
             },
             owner,
         ))
     }
     pub fn progress(&self) -> ReplicaProgress {
         self.progress.borrow().value.clone()
+    }
+    /// Derive this replica's tick period from the measured paths to its
+    /// group's other voters (27 §3.1 P2), in force from its next tick.
+    pub fn pace<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a focal_timing::PathRtt>,
+    ) -> focal_timing::TickPace {
+        let pace = focal_timing::TickPace::derive(
+            self.tick,
+            self.tick_ceiling,
+            self.pace.election_tick().max(1),
+            paths,
+        );
+        self.pace.publish(pace);
+        pace
+    }
+    /// The pace in force: the last derivation, or the configured period
+    /// with no samples before any.
+    pub fn current_pace(&self) -> focal_timing::TickPace {
+        self.pace
+            .derived()
+            .unwrap_or_else(|| focal_timing::TickPace::floor(self.tick))
+    }
+    /// The periods this replica's owner has run; what a wait on it is
+    /// charged in (27 §3.1 P8).
+    /// The periods in which the replica was not ticked: refused the room,
+    /// or still persisting.
+    pub fn refused_periods(&self) -> u64 {
+        self.pace.refused()
+    }
+    /// Periods in one election timeout of this replica.
+    pub fn election_periods(&self) -> u64 {
+        u64::try_from(self.pace.election_tick()).unwrap_or(u64::MAX)
+    }
+    pub fn periods(&self) -> u64 {
+        self.pace.periods()
+    }
+    /// The longest a period of the owner took, from one to the next
+    /// (`ControlHost::longest_period`).
+    pub fn longest_period(&self) -> Duration {
+        self.pace.longest()
+    }
+    pub fn tick_period(&self) -> Duration {
+        self.pace.get(self.tick, self.tick_ceiling)
     }
     pub fn memory_stats(&self) -> focal_memory::BudgetStats {
         self.budget.stats()
@@ -756,6 +901,45 @@ impl ReplicaHost {
         let (send, receive) = oneshot::channel();
         self.sender
             .try_send(Work::ActivateNative(call, send, charge))
+            .map_err(|error| match error {
+                HostQueueError::Full => LedgerError::Capacity,
+                HostQueueError::Disconnected => LedgerError::Failed,
+            })?;
+        receive.await.map_err(|_| LedgerError::OutcomeUnknown)?
+    }
+    /// Admit replication from the members the committed directory names
+    /// for this session (its active voters, the voters of a pending plan and
+    /// the copies being retired). A replica's own applied configuration
+    /// names its peers once it has applied it; a copy that has applied
+    /// nothing knows only the configuration its log began with, and would
+    /// refuse a leader outside it. Replaces what was admitted before.
+    pub async fn admit_members(&self, members: Vec<u64>) -> Result<(), LedgerError> {
+        self.admit(members, Near::default()).await
+    }
+    /// [`Self::admit_members`], with the voters the directory places in the
+    /// zone of the session's preferred leader: they outrank the other
+    /// voters in an election and lead in the preferred leader's place
+    /// (27 §5). Replaces what was said before.
+    pub async fn admit(&self, mut members: Vec<u64>, mut near: Near) -> Result<(), LedgerError> {
+        members.sort_unstable();
+        members.dedup();
+        near.voters.sort_unstable();
+        near.voters.dedup();
+        if members.len() > MAX_ADMITTED
+            || members.first() == Some(&0)
+            || near.voters.len() > MAX_ADMITTED
+            || near.voters.first() == Some(&0)
+            || near.voters.binary_search(&near.leader).is_ok()
+        {
+            return Err(LedgerError::Capacity);
+        }
+        let charge = self
+            .budget
+            .reserve(BudgetKind::Control, BudgetLane::Completion, 64 * 1024)?
+            .commit();
+        let (send, receive) = oneshot::channel();
+        self.sender
+            .try_send(Work::Admit(members, near, send, charge))
             .map_err(|error| match error {
                 HostQueueError::Full => LedgerError::Capacity,
                 HostQueueError::Disconnected => LedgerError::Failed,
@@ -890,6 +1074,40 @@ impl ReplicaHost {
             })?;
         receive.await.map_err(|_| LedgerError::OutcomeUnknown)?
     }
+    /// The content objects a retained delivery lacks (24 §20), for the host
+    /// to pull from a required copy.
+    pub async fn pending_custody_objects(
+        &self,
+    ) -> Result<Vec<focal_model::ContentRef>, LedgerError> {
+        let charge = self
+            .budget
+            .reserve(BudgetKind::Control, BudgetLane::Completion, 64 * 1024)?
+            .commit();
+        let (send, receive) = oneshot::channel();
+        self.sender
+            .try_send(Work::CustodyObjects(send, charge))
+            .map_err(|error| match error {
+                HostQueueError::Full => LedgerError::Capacity,
+                HostQueueError::Disconnected => LedgerError::Failed,
+            })?;
+        receive.await.map_err(|_| LedgerError::OutcomeUnknown)?
+    }
+    /// Tell the replica its host pulled objects a retained delivery lacked;
+    /// the delivery retries at once.
+    pub async fn custody_pulled(&self) -> Result<(), LedgerError> {
+        let charge = self
+            .budget
+            .reserve(BudgetKind::Control, BudgetLane::Completion, 4096)?
+            .commit();
+        let (send, receive) = oneshot::channel();
+        self.sender
+            .try_send(Work::CustodyPulled(send, charge))
+            .map_err(|error| match error {
+                HostQueueError::Full => LedgerError::Capacity,
+                HostQueueError::Disconnected => LedgerError::Failed,
+            })?;
+        receive.await.map_err(|_| LedgerError::OutcomeUnknown)?
+    }
     /// Trusted in-process control read, completed behind a quorum ReadIndex.
     pub async fn membership(&self) -> Result<MembershipReply, LedgerError> {
         self.membership_call(None).await
@@ -960,14 +1178,21 @@ impl RequestHandler for ReplicaHost {
     fn supports_native_requests(&self) -> bool {
         true
     }
-    fn handle(
-        &self,
-        request: VerifiedRequest,
-    ) -> Pin<Box<dyn Future<Output = ResponseEnvelope> + Send + '_>> {
-        Box::pin(async move { self.submit_inner(request, None, None).await.into_envelope() })
+    fn handle<'a>(
+        &'a self,
+        request: &'a VerifiedRequest,
+    ) -> Pin<Box<dyn Future<Output = ResponseEnvelope> + Send + 'a>> {
+        // The request is queued into `Work` and outlives this call, so it is
+        // owned from here; clone once at the queue boundary (the transport no
+        // longer clones every request).
+        Box::pin(async move {
+            self.submit_inner(request.clone(), None, None)
+                .await
+                .into_envelope()
+        })
     }
-    fn handle_accounted(&self, request: VerifiedRequest) -> OwnedHandlerFuture<'_> {
-        Box::pin(self.submit_inner(request, None, None))
+    fn handle_accounted<'a>(&'a self, request: &'a VerifiedRequest) -> OwnedHandlerFuture<'a> {
+        Box::pin(self.submit_inner(request.clone(), None, None))
     }
 }
 impl ReplicaHost {
@@ -1147,6 +1372,41 @@ impl Owner {
             let _ = observer.0.try_send(self.session.ledger());
         }
     }
+    /// The interval of a leader's heartbeats at the configured period.
+    fn beat_interval(&self) -> Duration {
+        self.config
+            .tick
+            .saturating_mul(u32::try_from(self.session.heartbeat_tick().max(1)).unwrap_or(u32::MAX))
+    }
+    /// Whether this owner beats apart from its ticks: it leads, and its
+    /// period is stretched. A stretched period stretches the election
+    /// timeout, which is what it is for; the heartbeats of a leader keep
+    /// the cadence its followers were configured to expect. Each node
+    /// stretches by what it measured itself, and a leader that beat at its
+    /// own stretched period would be presumed dead by a follower that
+    /// measured less (27 §3.1 P2).
+    fn beats(&self) -> bool {
+        self.pace
+            .stretched(self.config.tick, self.config.tick_ceiling)
+            && self.session.status().role == StateRole::Leader
+    }
+    fn beat_if_due(&mut self) -> Result<(), LedgerError> {
+        if !self.beats() || Instant::now() < self.next_beat {
+            return Ok(());
+        }
+        match self.session.beat() {
+            Ok(())
+            | Err(LedgerError::Consensus(
+                focal_consensus::ConsensusError::PersistencePending
+                | focal_consensus::ConsensusError::Capacity,
+            )) => {}
+            Err(error) => return Err(error),
+        }
+        self.next_beat = Instant::now()
+            .checked_add(self.beat_interval())
+            .ok_or(LedgerError::Failed)?;
+        Ok(())
+    }
     fn run(mut self, receiver: mpsc::Receiver<Work>) {
         let mut next_tick = Instant::now();
         let result = (|| -> Result<(), LedgerError> {
@@ -1155,10 +1415,19 @@ impl Owner {
                 if Instant::now() >= next_tick {
                     self.tick()?;
                     next_tick = Instant::now()
-                        .checked_add(self.config.tick)
+                        .checked_add(self.pace.get(self.config.tick, self.config.tick_ceiling))
                         .ok_or(LedgerError::Failed)?;
                 }
-                match receiver.recv_timeout(next_tick.saturating_duration_since(Instant::now())) {
+                self.beat_if_due()?;
+                if self.session.has_ready() {
+                    self.drain()?;
+                }
+                let wake = if self.beats() {
+                    next_tick.min(self.next_beat)
+                } else {
+                    next_tick
+                };
+                match receiver.recv_timeout(wake.saturating_duration_since(Instant::now())) {
                     Ok(work) => {
                         if self.accept(work)? {
                             return Ok(());
@@ -1269,7 +1538,38 @@ impl Owner {
         }
     }
     fn tick(&mut self) -> Result<(), LedgerError> {
-        self.session.tick()?;
+        self.pace
+            .advance(self.pace.get(self.config.tick, self.config.tick_ceiling));
+        // What the owner has seen of its own stalls is the replica's
+        // patience before it campaigns (`ControlHost`).
+        self.session.set_patience(
+            self.pace
+                .patience(self.config.tick, self.config.tick_ceiling),
+        )?;
+        // The committed placement names the session's preferred leader (27
+        // §5): it outranks the other voters in an election among equally
+        // current logs, so leadership returns to where placement put it and
+        // a voter that merely timed out first does not take it. Policy from
+        // committed state, applied by the owner; never from liveness.
+        let priority = self.rank(self.session.status().node_id);
+        if self.session.priority() != priority {
+            self.session.set_priority(priority)?;
+        }
+        // A tick that was refused the room, or that came while the one
+        // before it is still persisted, changed nothing: the period has
+        // passed without it (27 §3.1 P3), and the replica goes on.
+        match self.session.tick() {
+            Ok(()) => {}
+            Err(
+                LedgerError::Capacity
+                | LedgerError::Consensus(
+                    focal_consensus::ConsensusError::Capacity
+                    | focal_consensus::ConsensusError::PersistencePending,
+                ),
+            ) => self.pace.refuse(),
+            Err(error) => return Err(error),
+        }
+        self.return_leadership()?;
         if self.session.status().role == StateRole::Leader {
             let now = wall_ms()?.max(self.session.cursor_clock());
             match self.session.propose_cursor_clock(now) {
@@ -1290,6 +1590,100 @@ impl Owner {
         self.checkpoint_by_cadence()?;
         self.progress_managed()
     }
+    /// The election priority of `node` by the session's committed
+    /// placement: its preferred leader first, then the voters the
+    /// directory places in that leader's zone, then the rest.
+    fn rank(&self, node: u64) -> i64 {
+        match self.session.active_placement() {
+            Some(spec) if spec.placement.preferred_leader == node => PREFERRED_LEADER_PRIORITY,
+            Some(spec)
+                if spec.placement.preferred_leader == self.near.leader
+                    && spec.placement.voters.contains_key(&node)
+                    && self.near.voters.binary_search(&node).is_ok() =>
+            {
+                ZONE_PRIORITY
+            }
+            _ => VOTER_PRIORITY,
+        }
+    }
+    /// Hands leadership to a voter the placement ranks above this replica
+    /// when this replica leads in its place and that member has stayed
+    /// current (`leader_return`, 27 §5): to the preferred leader, and while
+    /// that one is not there to take it, to a voter in its zone. A refusal
+    /// is counted and rested on; only a failure of the session itself is
+    /// an error.
+    fn return_leadership(&mut self) -> Result<(), LedgerError> {
+        let status = self.session.status();
+        let leads = self.session.is_authoritative();
+        let own = self.rank(status.node_id);
+        let votes = |node: u64| {
+            node != status.node_id
+                && status.voters.contains(&node)
+                && self
+                    .session
+                    .active_placement()
+                    .is_some_and(|spec| spec.placement.voters.contains_key(&node))
+        };
+        let fit = |node: u64| {
+            self.session.peer(node).is_some_and(|peer| {
+                peer.state == 1 && peer.matched >= status.committed_index && peer.recent_active
+            })
+        };
+        let preferred = self
+            .session
+            .active_placement()
+            .map(|spec| spec.placement.preferred_leader)
+            .filter(|node| votes(*node));
+        // The preferred leader, unless it is not there to take it and a
+        // voter of its zone is. Counted for the preferred leader where no
+        // one is, so that it is asked once it has come back and stayed.
+        let target = if !leads {
+            preferred
+        } else {
+            match preferred {
+                Some(node) if fit(node) => Some(node),
+                _ if own < ZONE_PRIORITY => self
+                    .near
+                    .voters
+                    .iter()
+                    .copied()
+                    .find(|node| votes(*node) && self.rank(*node) > own && fit(*node))
+                    .or(preferred),
+                preferred => preferred,
+            }
+        };
+        let peer = match (leads, target) {
+            (true, Some(node)) => self.session.peer(node),
+            _ => None,
+        };
+        let seen = crate::leader_return::Seen {
+            leads,
+            preferred: target,
+            current: peer
+                .is_some_and(|peer| peer.state == 1 && peer.matched >= status.committed_index),
+            heard: peer.is_some_and(|peer| peer.recent_active),
+            transferring: self.session.transferring().is_some(),
+            settled: self.stopping.is_none()
+                && self.memberships.is_empty()
+                && self.placement.is_none()
+                && !self.session.configuration_pending(),
+            quiet: self.session.pending_count() == 0,
+        };
+        let crate::leader_return::Verdict::Ask(target) = self.leader_return.observe(seen) else {
+            return Ok(());
+        };
+        match self.session.transfer_leader(target) {
+            Ok(()) => Ok(()),
+            Err(
+                error @ (LedgerError::Failed
+                | LedgerError::Consensus(focal_consensus::ConsensusError::Failed)),
+            ) => Err(error),
+            Err(_) => {
+                self.leader_return.refused();
+                Ok(())
+            }
+        }
+    }
     /// Shared-worker progress never waits on a disk receipt. The exact Ready
     /// remains inside Session until its WAL owner reports a completed fence.
     fn progress_group(&mut self) -> Result<bool, LedgerError> {
@@ -1308,7 +1702,17 @@ impl Owner {
         self.progress_managed()?;
         self.checkpoint_if_due()?;
         if let Some((_, deadline)) = self.stopping.as_ref() {
-            let expired = Instant::now() >= *deadline;
+            // A stop ticks the replica no more, but its time passes in the
+            // owner's periods all the same: each is counted, refused.
+            if Instant::now() >= self.next_tick {
+                self.pace
+                    .advance(self.pace.get(self.config.tick, self.config.tick_ceiling));
+                self.pace.refuse();
+                self.next_tick = Instant::now()
+                    .checked_add(self.pace.get(self.config.tick, self.config.tick_ceiling))
+                    .ok_or(LedgerError::Failed)?;
+            }
+            let expired = self.pace.periods() >= *deadline;
             if expired && self.session.has_ready() {
                 if let Some((response, _)) = self.stopping.take() {
                     let _ = response.send(Err(LedgerError::OutcomeUnknown));
@@ -1326,11 +1730,24 @@ impl Owner {
             }
             return Ok(false);
         }
-        if !self.session.persistence_pending() && Instant::now() >= self.next_tick {
-            self.tick()?;
+        if Instant::now() >= self.next_tick {
+            if self.session.persistence_pending() {
+                // The period passed without a tick: the writer still
+                // persists what the tick before left (27 §3.1 P3). It is
+                // counted, refused, so that what waits its time in the
+                // owner's periods waits no longer than it would have.
+                self.pace
+                    .advance(self.pace.get(self.config.tick, self.config.tick_ceiling));
+                self.pace.refuse();
+            } else {
+                self.tick()?;
+            }
             self.next_tick = Instant::now()
-                .checked_add(self.config.tick)
+                .checked_add(self.pace.get(self.config.tick, self.config.tick_ceiling))
                 .ok_or(LedgerError::Failed)?;
+        }
+        if !self.session.persistence_pending() {
+            self.beat_if_due()?;
         }
         Ok(false)
     }
@@ -1345,6 +1762,9 @@ impl Owner {
         // makes no progress on its own; it resumes when a chunk lands.
         if self.session.has_ready() && !self.session.seed_waiting() {
             return Ok(self.next_tick.min(Instant::now()));
+        }
+        if self.beats() {
+            return Ok(self.next_tick.min(self.next_beat));
         }
         Ok(self.next_tick)
     }
@@ -1427,6 +1847,13 @@ impl Owner {
                 self.drain()?;
                 let _ = response.send(result);
             }
+            Work::Admit(members, near, response, charge) => {
+                self.admitted = members;
+                self.near = near;
+                self.publish_progress(false);
+                drop(charge);
+                let _ = response.send(Ok(()));
+            }
             Work::Refence(route, revision, response, charge) => {
                 let result = if route < self.config.route_epoch {
                     Err(LedgerError::PlacementConflict)
@@ -1497,6 +1924,21 @@ impl Owner {
                 let _ = response.send(result);
                 self.drain()?;
             }
+            Work::CustodyObjects(response, charge) => {
+                let result = match self.session.pending_custody() {
+                    Some(pending) => pending.missing_objects().map_err(LedgerError::Native),
+                    None => Ok(Vec::new()),
+                };
+                drop(charge);
+                let _ = response.send(result);
+            }
+            Work::CustodyPulled(response, charge) => {
+                // The retained delivery retries at every poll; this one is
+                // brought forward so the pulled objects are read at once.
+                drop(charge);
+                let _ = response.send(Ok(()));
+                self.drain()?;
+            }
             Work::Membership(call, charge) => {
                 self.accept_membership(*call, charge);
                 self.drain()?;
@@ -1556,9 +1998,7 @@ impl Owner {
             let _ = response.send(Err(LedgerError::Capacity));
             return Ok(());
         }
-        let deadline = Instant::now()
-            .checked_add(self.config.request_timeout)
-            .ok_or(LedgerError::Capacity)?;
+        let deadline = self.request_deadline().ok_or(LedgerError::Capacity)?;
         self.stopping = Some((response, deadline));
         Ok(())
     }
@@ -1606,6 +2046,11 @@ impl Owner {
                 sequence: self.session.sequence(),
                 dropped_replication: self.dropped,
                 stopped,
+                voters: status.voters.clone(),
+                admitted: self.admitted.clone(),
+                priority: self.session.priority(),
+                near: self.near.clone(),
+                returns: self.leader_return.stats(),
                 route_epoch: self.config.route_epoch,
                 import_pending: self.session.pending_import(),
                 seed_pending: self.session.pending_seed().map(|pending| SeedPending {
@@ -1613,6 +2058,12 @@ impl Owner {
                     term: pending.term,
                     missing: pending.missing.len(),
                 }),
+                custody_pending: self
+                    .session
+                    .pending_custody()
+                    .map(|pending| CustodyPending {
+                        missing: pending.missing.len(),
+                    }),
             }
         });
     }
@@ -1631,9 +2082,7 @@ impl Owner {
         let result = (|| -> Result<Response, AccessError> {
             let request = verified.request();
             let peer = verified.peer();
-            let deadline = Instant::now()
-                .checked_add(self.config.request_timeout)
-                .ok_or(AccessError::Unavailable)?;
+            let deadline = self.request_deadline().ok_or(AccessError::Unavailable)?;
             if request.ledger != self.session.ledger() {
                 return Err(AccessError::Unauthorized);
             }
@@ -1643,7 +2092,9 @@ impl Owner {
                 };
                 let status = self.session.status();
                 if *group != self.session.group_id()
-                    || (!status.voters.contains(&node_id) && !status.learners.contains(&node_id))
+                    || (!status.voters.contains(&node_id)
+                        && !status.learners.contains(&node_id)
+                        && self.admitted.binary_search(&node_id).is_err())
                 {
                     return Err(AccessError::Unauthorized);
                 }
@@ -1663,7 +2114,9 @@ impl Owner {
                     return Err(AccessError::Unauthorized);
                 };
                 let status = self.session.status();
-                if (!status.voters.contains(&node_id) && !status.learners.contains(&node_id))
+                if (!status.voters.contains(&node_id)
+                    && !status.learners.contains(&node_id)
+                    && self.admitted.binary_search(&node_id).is_err())
                     || *group != self.session.group_id()
                     || request.route_epoch != self.config.route_epoch
                 {
@@ -2365,7 +2818,7 @@ impl Owner {
                 &self.client_limits,
             );
         }
-        let input = verified.clone().into_authenticated(AuthorityContext {
+        let input = verified.to_authenticated(AuthorityContext {
             runtime: false,
             cause: Cause::Root(self.config.root),
             policy_revision: self.config.policy_revision,
@@ -2870,7 +3323,7 @@ impl Owner {
             };
             if let Some(result) = result {
                 pending.finish(result);
-            } else if Instant::now() >= pending.deadline || status.term != pending.term {
+            } else if self.pace.periods() >= pending.deadline || status.term != pending.term {
                 let error = match &pending.waiting {
                     WaitingFor::Mutation(_)
                     | WaitingFor::ManagedMutation { .. }
@@ -2887,9 +3340,29 @@ impl Owner {
         }
         Ok(())
     }
+    /// The owner's period at which a request taken now is given up: the
+    /// request time in the periods it holds at the configured tick, counted
+    /// as the owner runs them (27 §3.1 P2).
+    fn request_deadline(&self) -> Option<u64> {
+        // And the ticks of the owner's own remembered stall, as its
+        // replica's patience is (`ControlHost::request_deadline`).
+        self.pace
+            .periods()
+            .checked_add(focal_timing::ProgressDeadline::periods(
+                self.config.request_timeout,
+                self.config.tick,
+            ))?
+            .checked_add(
+                u64::try_from(
+                    self.pace
+                        .patience(self.config.tick, self.config.tick_ceiling),
+                )
+                .unwrap_or(u64::MAX),
+            )
+    }
     fn expire_pending(&mut self) {
         self.expire_placement();
-        let now = Instant::now();
+        let now = self.pace.periods();
         let count = self.memberships.len();
         for _ in 0..count {
             let Some(pending) = self.memberships.pop_front() else {
@@ -2950,9 +3423,7 @@ impl Owner {
             self.memberships
                 .try_reserve(1)
                 .map_err(|_| LedgerError::Capacity)?;
-            let deadline = Instant::now()
-                .checked_add(self.config.request_timeout)
-                .ok_or(LedgerError::Capacity)?;
+            let deadline = self.request_deadline().ok_or(LedgerError::Capacity)?;
             let mut proposed = true;
             if let Some(request) = &call.request {
                 match self.session.propose_membership(request) {
@@ -3013,7 +3484,7 @@ impl Owner {
             }
             if pending.term != status.term
                 || status.role != StateRole::Leader
-                || Instant::now() >= pending.deadline
+                || self.pace.periods() >= pending.deadline
             {
                 self.finish_membership(pending, Err(LedgerError::OutcomeUnknown));
                 continue;

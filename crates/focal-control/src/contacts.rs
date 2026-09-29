@@ -43,7 +43,29 @@ pub struct NodeContactCommand {
     pub advertise: SocketAddr,
     pub expected_generation: u64,
     pub decided_at: i64,
+    /// The node's declared failure-domain labels (24 §22).
+    pub region: Option<String>,
+    pub zone: Option<String>,
+    /// The name the node advertises (`host:port`, 24 §24), when it has one.
+    pub endpoint: Option<String>,
 }
+/// The longest failure-domain label a contact carries (24 §22).
+/// Retire a removed node's contact record (24 §19): the operator's request,
+/// admitted only once nothing enrolls the node any more, so a live node's
+/// reachability can never be retired by mistake. Retirement frees the
+/// table's bounded slot; without it, every node that ever joined would
+/// occupy one forever and a fleet that scales up and down would exhaust
+/// `ContactLimits::max_nodes`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetireContactCommand {
+    pub node: u64,
+    /// The record's generation as the operator read it; a record that moved
+    /// since, or is absent, compares failed.
+    pub expected_generation: u64,
+}
+pub const MAX_TOPOLOGY_LABEL_BYTES: usize = 64;
+/// The longest advertised name a contact carries (24 §24).
+pub const MAX_ENDPOINT_NAME_BYTES: usize = 259;
 impl NodeContactCommand {
     /// The owner's decision time is committed in the full envelope, but does
     /// not change client intent on retry. Existing command hashes stay intact.
@@ -58,6 +80,9 @@ impl NodeContactCommand {
                 self.certificate_fingerprint,
                 self.advertise,
                 self.expected_generation,
+                &self.region,
+                &self.zone,
+                &self.endpoint,
             ),
         )
     }
@@ -76,6 +101,13 @@ pub struct ContactRecord {
     pub generation: u64,
     pub decided_at: i64,
     pub committed_index: u64,
+    /// The node's declared failure-domain labels (24 §22); a zone needs its
+    /// region.
+    pub region: Option<String>,
+    pub zone: Option<String>,
+    /// The name the node advertises (`host:port`, 24 §24): peers re-resolve
+    /// it when `advertise` stops answering.
+    pub endpoint: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContactCheckpoint {
@@ -85,6 +117,139 @@ pub struct ContactCheckpoint {
     pub applied_index: u64,
     /// Strictly sorted by physical node. Each node has at most one current row.
     pub records: Vec<ContactRecord>,
+    /// The mutations no surviving row accounts for (24 §19): each retired
+    /// row's generations plus the retirement itself. `revision` counts every
+    /// mutation, so the surviving rows' generations plus this equal it
+    /// exactly, and the checkpoint's counters stay exact after rows are gone.
+    pub retired_mutations: u64,
+    /// The index of the last retirement; `applied_index` is the later of it
+    /// and the latest surviving row's commit.
+    pub last_retirement_index: u64,
+}
+pub const CONTACT_CHECKPOINT_SCHEMA: u16 = 4;
+/// The contact checkpoint as schema 3 wrote it, before retirement counters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactCheckpointV3 {
+    pub schema: u16,
+    pub cluster: [u8; 16],
+    pub revision: u64,
+    pub applied_index: u64,
+    pub records: Vec<ContactRecord>,
+}
+impl From<ContactCheckpointV3> for ContactCheckpoint {
+    fn from(legacy: ContactCheckpointV3) -> Self {
+        Self {
+            schema: CONTACT_CHECKPOINT_SCHEMA,
+            cluster: legacy.cluster,
+            revision: legacy.revision,
+            applied_index: legacy.applied_index,
+            records: legacy.records,
+            retired_mutations: 0,
+            last_retirement_index: 0,
+        }
+    }
+}
+/// A contact row as schema 2 wrote it, before advertised names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactRecordV2 {
+    pub node: u64,
+    pub principal: [u8; 16],
+    pub certificate_fingerprint: [u8; 32],
+    pub advertise: SocketAddr,
+    pub server_name: String,
+    pub generation: u64,
+    pub decided_at: i64,
+    pub committed_index: u64,
+    pub region: Option<String>,
+    pub zone: Option<String>,
+}
+/// The contact checkpoint as schema 2 wrote it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactCheckpointV2 {
+    pub schema: u16,
+    pub cluster: [u8; 16],
+    pub revision: u64,
+    pub applied_index: u64,
+    pub records: Vec<ContactRecordV2>,
+}
+impl From<ContactCheckpointV2> for ContactCheckpoint {
+    fn from(legacy: ContactCheckpointV2) -> Self {
+        Self {
+            schema: CONTACT_CHECKPOINT_SCHEMA,
+            cluster: legacy.cluster,
+            revision: legacy.revision,
+            applied_index: legacy.applied_index,
+            records: legacy
+                .records
+                .into_iter()
+                .map(|record| ContactRecord {
+                    node: record.node,
+                    principal: record.principal,
+                    certificate_fingerprint: record.certificate_fingerprint,
+                    advertise: record.advertise,
+                    server_name: record.server_name,
+                    generation: record.generation,
+                    decided_at: record.decided_at,
+                    committed_index: record.committed_index,
+                    region: record.region,
+                    zone: record.zone,
+                    endpoint: None,
+                })
+                .collect(),
+            retired_mutations: 0,
+            last_retirement_index: 0,
+        }
+    }
+}
+/// A contact row as schema 1 wrote it, before topology labels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactRecordV1 {
+    pub node: u64,
+    pub principal: [u8; 16],
+    pub certificate_fingerprint: [u8; 32],
+    pub advertise: SocketAddr,
+    pub server_name: String,
+    pub generation: u64,
+    pub decided_at: i64,
+    pub committed_index: u64,
+}
+/// The contact checkpoint as schema 1 wrote it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactCheckpointV1 {
+    pub schema: u16,
+    pub cluster: [u8; 16],
+    pub revision: u64,
+    pub applied_index: u64,
+    pub records: Vec<ContactRecordV1>,
+}
+impl From<ContactCheckpointV1> for ContactCheckpoint {
+    fn from(legacy: ContactCheckpointV1) -> Self {
+        Self {
+            schema: CONTACT_CHECKPOINT_SCHEMA,
+            cluster: legacy.cluster,
+            revision: legacy.revision,
+            applied_index: legacy.applied_index,
+            records: legacy
+                .records
+                .into_iter()
+                .map(|record| ContactRecord {
+                    node: record.node,
+                    principal: record.principal,
+                    certificate_fingerprint: record.certificate_fingerprint,
+                    advertise: record.advertise,
+                    server_name: record.server_name,
+                    generation: record.generation,
+                    decided_at: record.decided_at,
+                    committed_index: record.committed_index,
+                    region: None,
+                    zone: None,
+                    endpoint: None,
+                })
+                .collect(),
+            retired_mutations: 0,
+            last_retirement_index: 0,
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContactSnapshot {
@@ -158,6 +323,9 @@ pub(crate) struct PreparedNodeContact {
     base_revision: u64,
     base_index: u64,
     node: u64,
+    /// A retirement: `state` no longer carries `node`, and publication has
+    /// no committed index to write.
+    retire: bool,
     allocation: Allocation,
 }
 impl NodeContacts {
@@ -168,11 +336,13 @@ impl NodeContacts {
     ) -> Result<Self, ControlError> {
         Self::restore(
             ContactCheckpoint {
-                schema: 1,
+                schema: CONTACT_CHECKPOINT_SCHEMA,
                 cluster,
                 revision: 0,
                 applied_index: 0,
                 records: Vec::new(),
+                retired_mutations: 0,
+                last_retirement_index: 0,
             },
             limits,
             budget,
@@ -219,6 +389,8 @@ impl NodeContacts {
         enrollment: &EnrollmentRegistry,
     ) -> Result<PreparedNodeContact, ControlError> {
         validate_contact_address(command.advertise)?;
+        validate_labels(&command.region, &command.zone)?;
+        validate_endpoint(&command.endpoint)?;
         let existing = self
             .state
             .records
@@ -274,6 +446,9 @@ impl NodeContacts {
             generation: generation.checked_add(1).ok_or(ControlError::Capacity)?,
             decided_at: command.decided_at,
             committed_index: 0,
+            region: clone_label(&command.region)?,
+            zone: clone_label(&command.zone)?,
+            endpoint: clone_label(&command.endpoint)?,
         };
         let mut records = Vec::new();
         records
@@ -296,7 +471,7 @@ impl NodeContacts {
             Err(_) => return Err(ControlError::Failed),
         }
         let state = ContactCheckpoint {
-            schema: 1,
+            schema: CONTACT_CHECKPOINT_SCHEMA,
             cluster: self.state.cluster,
             revision: self
                 .state
@@ -305,6 +480,8 @@ impl NodeContacts {
                 .ok_or(ControlError::Capacity)?,
             applied_index: self.state.applied_index,
             records,
+            retired_mutations: self.state.retired_mutations,
+            last_retirement_index: self.state.last_retirement_index,
         };
         if postcard::experimental::serialized_size(&state)?
             .checked_add(20)
@@ -318,6 +495,83 @@ impl NodeContacts {
             base_revision: self.state.revision,
             base_index: self.state.applied_index,
             node: command.node,
+            retire: false,
+            allocation,
+        })
+    }
+    /// Retire a record (24 §19). Refused while any committed enrollment still
+    /// authorizes the node under the record's principal: removal revokes the
+    /// node's invitation first, and only then may its contact go.
+    pub(crate) fn prepare_retire(
+        &self,
+        command: &RetireContactCommand,
+        enrollment: &EnrollmentRegistry,
+    ) -> Result<PreparedNodeContact, ControlError> {
+        let position = self
+            .state
+            .records
+            .binary_search_by_key(&command.node, |record| record.node)
+            .map_err(|_| focal_directory::DirectoryError::CompareFailed)?;
+        let record = self
+            .state
+            .records
+            .get(position)
+            .ok_or(ControlError::Failed)?;
+        if record.generation != command.expected_generation {
+            return Err(focal_directory::DirectoryError::CompareFailed.into());
+        }
+        let still_enrolled = enrollment.enrollments().any(|receipt| {
+            receipt.identity.node_id == Some(command.node)
+                && receipt.identity.principal == record.principal
+                && !matches!(enrollment.invitation_revoked(receipt.invitation), Ok(true))
+        });
+        if still_enrolled {
+            return Err(focal_enrollment::EnrollmentError::Unauthorized.into());
+        }
+        let allocation = self
+            .budget
+            .reserve(
+                BudgetKind::Control,
+                BudgetLane::Completion,
+                state_charge(&self.state, 0)?,
+            )?
+            .commit();
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(self.state.records.len())
+            .map_err(|_| ControlError::Capacity)?;
+        for (index, existing) in self.state.records.iter().enumerate() {
+            if index != position {
+                records.push(clone_record(existing)?);
+            }
+        }
+        let state = ContactCheckpoint {
+            schema: CONTACT_CHECKPOINT_SCHEMA,
+            cluster: self.state.cluster,
+            revision: self
+                .state
+                .revision
+                .checked_add(1)
+                .ok_or(ControlError::Capacity)?,
+            applied_index: self.state.applied_index,
+            records,
+            // The row's generations and the retirement itself leave the table.
+            retired_mutations: self
+                .state
+                .retired_mutations
+                .checked_add(record.generation)
+                .and_then(|mutations| mutations.checked_add(1))
+                .ok_or(ControlError::Capacity)?,
+            // Publication writes the retirement's own index here.
+            last_retirement_index: self.state.last_retirement_index,
+        };
+        Ok(PreparedNodeContact {
+            state,
+            owner: self.owner,
+            base_revision: self.state.revision,
+            base_index: self.state.applied_index,
+            node: command.node,
+            retire: true,
             allocation,
         })
     }
@@ -336,14 +590,21 @@ impl NodeContacts {
         let position = prepared
             .state
             .records
-            .binary_search_by_key(&prepared.node, |record| record.node)
-            .map_err(|_| ControlError::Failed)?;
-        prepared
-            .state
-            .records
-            .get_mut(position)
-            .ok_or(ControlError::Failed)?
-            .committed_index = index;
+            .binary_search_by_key(&prepared.node, |record| record.node);
+        match (prepared.retire, position) {
+            (false, Ok(position)) => {
+                prepared
+                    .state
+                    .records
+                    .get_mut(position)
+                    .ok_or(ControlError::Failed)?
+                    .committed_index = index;
+            }
+            // A retirement carries no record for the node; its index is the
+            // table's, so the counters stay exact.
+            (true, Err(_)) => prepared.state.last_retirement_index = index,
+            _ => return Err(ControlError::Failed),
+        }
         prepared.state.applied_index = index;
         self.state = prepared.state;
         self._allocation = prepared.allocation;
@@ -364,7 +625,43 @@ fn clone_record(record: &ContactRecord) -> Result<ContactRecord, ControlError> {
         generation: record.generation,
         decided_at: record.decided_at,
         committed_index: record.committed_index,
+        region: clone_label(&record.region)?,
+        zone: clone_label(&record.zone)?,
+        endpoint: clone_label(&record.endpoint)?,
     })
+}
+fn clone_label(label: &Option<String>) -> Result<Option<String>, ControlError> {
+    let Some(label) = label else {
+        return Ok(None);
+    };
+    let mut owned = String::new();
+    owned
+        .try_reserve_exact(label.len())
+        .map_err(|_| ControlError::Capacity)?;
+    owned.push_str(label);
+    Ok(Some(owned))
+}
+/// An advertised name is bounded and non-empty (24 §24).
+fn validate_endpoint(endpoint: &Option<String>) -> Result<(), ControlError> {
+    if endpoint
+        .as_ref()
+        .is_some_and(|name| name.is_empty() || name.len() > MAX_ENDPOINT_NAME_BYTES)
+    {
+        return Err(ControlError::Invalid);
+    }
+    Ok(())
+}
+/// Labels are bounded and non-empty; a zone needs its region.
+fn validate_labels(region: &Option<String>, zone: &Option<String>) -> Result<(), ControlError> {
+    let bad = |label: &Option<String>| {
+        label
+            .as_ref()
+            .is_some_and(|label| label.is_empty() || label.len() > MAX_TOPOLOGY_LABEL_BYTES)
+    };
+    if bad(region) || bad(zone) || (zone.is_some() && region.is_none()) {
+        return Err(ControlError::Invalid);
+    }
+    Ok(())
 }
 fn state_charge(state: &ContactCheckpoint, extra: usize) -> Result<usize, ControlError> {
     let rows = state
@@ -386,13 +683,15 @@ fn validate_checkpoint(
     limits: ContactLimits,
     max_index: u64,
 ) -> Result<(), ControlError> {
-    if state.schema != 1
+    if state.schema != CONTACT_CHECKPOINT_SCHEMA
         || state.cluster == [0; 16]
         || state.applied_index > max_index
         || state.records.len() > limits.max_nodes
         || state.revision < state.records.len() as u64
-        || state.records.is_empty() != (state.revision == 0)
-        || state.records.is_empty() != (state.applied_index == 0)
+        || (state.revision == 0) != (state.applied_index == 0)
+        || state.retired_mutations > state.revision
+        || state.last_retirement_index > state.applied_index
+        || (state.retired_mutations == 0) != (state.last_retirement_index == 0)
         || postcard::experimental::serialized_size(state)? > limits.max_checkpoint_bytes
     {
         return Err(ControlError::Corrupt("contact checkpoint"));
@@ -402,6 +701,7 @@ fn validate_checkpoint(
     let mut latest_index = 0;
     for record in &state.records {
         validate_contact_address(record.advertise)?;
+        validate_labels(&record.region, &record.zone)?;
         if record.node <= prior
             || record.principal == [0; 16]
             || record.certificate_fingerprint == [0; 32]
@@ -421,7 +721,13 @@ fn validate_checkpoint(
             .ok_or(ControlError::Capacity)?;
         latest_index = latest_index.max(record.committed_index);
     }
-    if revisions != state.revision || latest_index != state.applied_index {
+    // Every mutation is counted once: the surviving rows' generations plus
+    // the mutations retired with their rows equal the revision, and the
+    // table's index is the latest commit among surviving rows and
+    // retirements.
+    if revisions.checked_add(state.retired_mutations) != Some(state.revision)
+        || latest_index.max(state.last_retirement_index) != state.applied_index
+    {
         return Err(ControlError::Corrupt("contact checkpoint counters"));
     }
     Ok(())
@@ -501,11 +807,110 @@ mod tests {
             advertise: "127.0.0.1:7443".parse().unwrap(),
             expected_generation: 0,
             decided_at: NOW,
+            region: Some("region-a".into()),
+            zone: Some("zone-1".into()),
+            endpoint: Some("node-1.focal.example:7443".into()),
         };
         (disk, registry, command)
     }
     fn budget() -> MemoryBudget {
         MemoryBudget::new(1024 * 1024, 512 * 1024).unwrap()
+    }
+    /// Retirement frees a removed node's slot exactly, and never a live
+    /// node's: the record of a node the registry still enrolls stays.
+    #[test]
+    fn a_contact_is_retired_only_once_nothing_enrolls_its_node() {
+        let (_disk, registry, command) = fixture();
+        let mut contacts = NodeContacts::new(CLUSTER, ContactLimits::default(), budget()).unwrap();
+        let staged = contacts.prepare(&command, &registry).unwrap();
+        contacts.publish(staged, 5).unwrap();
+        // A second record for a node nothing enrolls, as a checkpoint carries it.
+        let mut checkpoint = contacts.checkpoint().clone();
+        let mut gone = checkpoint.records[0].clone();
+        gone.node = 7;
+        gone.principal = [7; 16];
+        gone.certificate_fingerprint = [7; 32];
+        gone.server_name = "node-7.focal.test".into();
+        checkpoint.records.push(gone);
+        checkpoint.revision = 2;
+        let mut contacts =
+            NodeContacts::restore(checkpoint, ContactLimits::default(), budget(), 5).unwrap();
+        assert_eq!(contacts.checkpoint().records.len(), 2);
+        // The enrolled node's record cannot be retired.
+        let live = RetireContactCommand {
+            node: 1,
+            expected_generation: 1,
+        };
+        assert!(contacts.prepare_retire(&live, &registry).is_err());
+        // The removed node's record is retired at the generation named, once.
+        let wrong = RetireContactCommand {
+            node: 7,
+            expected_generation: 2,
+        };
+        assert!(matches!(
+            contacts.prepare_retire(&wrong, &registry),
+            Err(ControlError::Directory(
+                focal_directory::DirectoryError::CompareFailed
+            ))
+        ));
+        let retire = RetireContactCommand {
+            node: 7,
+            expected_generation: 1,
+        };
+        let staged = contacts.prepare_retire(&retire, &registry).unwrap();
+        assert_eq!(
+            contacts.checkpoint().records.len(),
+            2,
+            "preparation publishes nothing"
+        );
+        contacts.publish(staged, 9).unwrap();
+        let state = contacts.checkpoint();
+        assert_eq!(state.records.len(), 1);
+        assert_eq!(state.records[0].node, 1);
+        assert_eq!(state.revision, 3);
+        assert_eq!(state.applied_index, 9);
+        assert!(matches!(
+            contacts.prepare_retire(&retire, &registry),
+            Err(ControlError::Directory(
+                focal_directory::DirectoryError::CompareFailed
+            ))
+        ));
+        assert_eq!(
+            state.retired_mutations, 2,
+            "the row's generation and the retirement"
+        );
+        assert_eq!(state.last_retirement_index, 9);
+        // The retired table restores as a checkpoint, and the schema-3 shape
+        // (no retirements) still decodes.
+        let restored =
+            NodeContacts::restore(state.clone(), ContactLimits::default(), budget(), 9).unwrap();
+        assert_eq!(restored.checkpoint(), state);
+        let legacy = ContactCheckpoint::from(ContactCheckpointV3 {
+            schema: 3,
+            cluster: CLUSTER,
+            revision: 1,
+            applied_index: 5,
+            records: vec![state.records[0].clone()],
+        });
+        NodeContacts::restore(legacy, ContactLimits::default(), budget(), 5).unwrap();
+        // An emptied table (its last row retired) is not a fresh one: it
+        // restores with its counters, and without them it is corrupt.
+        let emptied = ContactCheckpoint {
+            schema: CONTACT_CHECKPOINT_SCHEMA,
+            cluster: CLUSTER,
+            revision: 3,
+            applied_index: 12,
+            records: Vec::new(),
+            retired_mutations: 3,
+            last_retirement_index: 12,
+        };
+        NodeContacts::restore(emptied.clone(), ContactLimits::default(), budget(), 12).unwrap();
+        let mut uncounted = emptied.clone();
+        uncounted.retired_mutations = 2;
+        assert!(NodeContacts::restore(uncounted, ContactLimits::default(), budget(), 12).is_err());
+        let mut unindexed = emptied;
+        unindexed.last_retirement_index = 11;
+        assert!(NodeContacts::restore(unindexed, ContactLimits::default(), budget(), 12).is_err());
     }
     #[test]
     fn contact_publication_is_commit_only_fenced_and_checkpoint_exact() {

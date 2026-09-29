@@ -54,7 +54,7 @@ impl ConsumerCheckpoint {
         if self.schema != 1 {
             return Err(StreamError::Invalid("unknown consumer checkpoint schema"));
         }
-        let (cursor, decision) = match event {
+        let (cursor, decision, delta_id) = match event {
             StreamEvent::Delta { cursor, delta } => {
                 if delta.schema != 1 || delta.id.sequence.0 == 0 {
                     return Err(StreamError::SourceViolation(
@@ -66,7 +66,7 @@ impl ConsumerCheckpoint {
                         "event cursor does not identify delta",
                     ));
                 }
-                (*cursor, ConsumerDecision::ApplyDelta)
+                (*cursor, ConsumerDecision::ApplyDelta, Some(delta.id))
             }
             StreamEvent::Resolved { cursor } => {
                 if !matches!(cursor.position.offset, crate::PositionOffset::Resolved) {
@@ -74,7 +74,7 @@ impl ConsumerCheckpoint {
                         "resolved event carries partial position",
                     ));
                 }
-                (*cursor, ConsumerDecision::AdvanceResolved)
+                (*cursor, ConsumerDecision::AdvanceResolved, None)
             }
             StreamEvent::Resync { cursor, reason, .. } => {
                 self.cursor.same_stream(*cursor)?;
@@ -88,6 +88,28 @@ impl ConsumerCheckpoint {
                 next: *self,
                 decision: ConsumerDecision::Duplicate,
             });
+        }
+        // A forward delta must be contiguous within its sequence, mirroring the
+        // server's validate_delta: without this a skipped ordinal (5,1) -> (5,3)
+        // silently corrupts the local projection with the missing effect, and a
+        // new sequence must begin at ordinal 0. Applied only to non-duplicate
+        // deltas (duplicates were short-circuited above).
+        if let Some(id) = delta_id {
+            let previous = self.cursor.position;
+            if id.sequence == previous.sequence {
+                let crate::PositionOffset::Delta(ordinal) = previous.offset else {
+                    return Err(StreamError::SourceViolation(
+                        "delta after resolved transaction",
+                    ));
+                };
+                if ordinal.checked_add(1) != Some(id.ordinal) {
+                    return Err(StreamError::SourceViolation("delta ordinal gap"));
+                }
+            } else if id.ordinal != 0 {
+                return Err(StreamError::SourceViolation(
+                    "transaction starts after ordinal zero",
+                ));
+            }
         }
         Ok(PreparedConsumerAdvance {
             base: *self,

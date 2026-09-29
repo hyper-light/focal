@@ -73,9 +73,17 @@ impl IntentJournal {
         let mut journal = PrivateJournal::open(path)?;
         let saved = match journal.read()? {
             Some(bytes) => {
-                let (value, rest): (Saved, _) = postcard::take_from_bytes(&bytes)?;
+                let (mut value, rest): (Saved, _) = postcard::take_from_bytes(&bytes)?;
                 if !rest.is_empty() {
                     return Err(IntentError::Identity);
+                }
+                // A journal that never carried an intent adopts the client it
+                // is opened with: a host's root journal was named by a local
+                // client before hosts submitted root intents through the
+                // root leader as their enrolled principal (24 §16).
+                if value.client != client && value.completed == 0 && value.pending.is_none() {
+                    value.client = client;
+                    journal.replace(&postcard::to_stdvec(&value)?)?;
                 }
                 value
             }

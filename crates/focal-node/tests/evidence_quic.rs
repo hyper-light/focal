@@ -171,10 +171,10 @@ enum TestService {
     Managed(ManagedService),
 }
 impl RequestHandler for TestService {
-    fn handle(&self, request: VerifiedRequest) -> HandlerFuture<'_> {
+    fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
         Box::pin(async move { self.handle_accounted(request).await.into_envelope() })
     }
-    fn handle_accounted(&self, request: VerifiedRequest) -> OwnedHandlerFuture<'_> {
+    fn handle_accounted<'a>(&'a self, request: &'a VerifiedRequest) -> OwnedHandlerFuture<'a> {
         match self {
             Self::Single(service) => service.handle_accounted(request),
             Self::Managed(service) => service.handle_accounted(request),
@@ -438,6 +438,7 @@ impl Fleet {
             let endpoint = PeerEndpoint {
                 address: server.local_addr().unwrap(),
                 server_name: identity.name.clone(),
+                name: None,
             };
             routes.insert(id, endpoint.clone());
             pending.push((
@@ -790,7 +791,16 @@ async fn evidence_scenario(managed: bool) {
     let leader = fleet.leader().await;
     assert_eq!(leader, 0);
     let mut bytes = br#"{"passed":7,"failed":0,"skipped":1}"#.to_vec();
-    bytes.resize(20 * 1024, b' ');
+    // More chunks than a transfer keeps in flight and than a copy takes
+    // ahead, and no two of them alike: a transfer goes by several streams,
+    // and a chunk that came to the wrong place is another object.
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    bytes.resize_with(300 * 1024, || {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        [b' ', b'\n', b'\t', b'\r'][(state >> 62) as usize]
+    });
     let seal = upload(&fleet.replicas[leader].actor, 1, &bytes).await;
     let sealed = eventual(&fleet.replicas[leader].actor, &seal).await;
     let Response::Upload(UploadReply::Sealed(reference)) = &sealed.result else {

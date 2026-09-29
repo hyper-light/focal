@@ -166,7 +166,8 @@ impl Owner {
 
 pub(super) struct DeferredManaged {
     work: Work,
-    deadline: Instant,
+    /// The owner's period at which the work is given up (`fleet::Pending`).
+    deadline: u64,
 }
 impl Owner {
     /// Return false while this exact owned input is waiting for the local floor
@@ -279,7 +280,7 @@ impl Owner {
             reject_managed_work(work, LedgerError::Capacity);
             return Ok(());
         }
-        let Some(deadline) = Instant::now().checked_add(self.config.request_timeout) else {
+        let Some(deadline) = self.request_deadline() else {
             reject_managed_work(work, LedgerError::Capacity);
             return Ok(());
         };
@@ -328,7 +329,7 @@ impl Owner {
                 Work::ManagedSupport(call, _) => call.response.is_closed(),
                 _ => false,
             };
-            if cancelled || self.stopping.is_some() || Instant::now() >= pending.deadline {
+            if cancelled || self.stopping.is_some() || self.pace.periods() >= pending.deadline {
                 reject_managed_work(pending.work, LedgerError::OutcomeUnknown);
                 continue;
             }

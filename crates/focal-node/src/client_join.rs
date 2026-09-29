@@ -91,18 +91,15 @@ impl PendingClientJoin {
         expected: Option<ClientInvitation>,
         shared: bool,
     ) -> Result<Self, JoinError> {
-        use std::os::unix::fs::MetadataExt;
         let parent = path.parent().ok_or(JoinError::Invalid)?;
-        let metadata = fs::symlink_metadata(parent)?;
-        if !metadata.is_dir() || metadata.mode() & 0o077 != 0 {
-            return Err(JoinError::Permissions);
-        }
+        let parent_owner =
+            focal_platform::fs::private_dir_owner(parent)?.ok_or(JoinError::Permissions)?;
         let mut marker = path.as_os_str().to_os_string();
         marker.push(".client-initialized");
         let marker = std::path::PathBuf::from(marker);
         let initialized = match fs::symlink_metadata(&marker) {
-            Ok(value) => {
-                if !value.is_file() || value.uid() != metadata.uid() || value.mode() & 0o077 != 0 {
+            Ok(_) => {
+                if !focal_platform::fs::check_private_file(&marker, &parent_owner, 1)? {
                     return Err(JoinError::Permissions);
                 }
                 true
@@ -213,13 +210,10 @@ impl PendingClientJoin {
             drop(self.verify(&receipt, now)?);
             return Ok(receipt);
         }
-        let address = self
-            .bundle
-            .invitation()
-            .trust()
-            .endpoint
-            .parse()
-            .map_err(|_| JoinError::Invalid)?;
+        let address =
+            crate::network_state::resolve_endpoint(&self.bundle.invitation().trust().endpoint)
+                .await
+                .map_err(|_| JoinError::Invalid)?;
         let receipt = std::panic::AssertUnwindSafe(client.redeem(
             address,
             self.bundle.invitation(),

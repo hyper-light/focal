@@ -32,7 +32,7 @@ impl SnapshotFeedback {
         message: &Message,
         budget: &MemoryBudget,
     ) -> Result<Option<oneshot::Sender<SnapshotStatus>>, SnapshotFeedbackError> {
-        if message.get_msg_type() != MessageType::MsgSnapshot {
+        if message.msg_type != MessageType::MsgSnapshot as i32 {
             return Ok(None);
         }
         if message.to == 0 || message.term == 0 || message.get_snapshot().get_metadata().index == 0

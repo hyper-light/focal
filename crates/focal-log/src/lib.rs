@@ -21,7 +21,6 @@
 //! `File::sync_all` and directory synchronization provide the OS/filesystem flush
 //! contract. This does not claim protection against a drive that lies about flushes.
 
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -60,6 +59,14 @@ pub enum RecordKind {
     /// One ordered successor promise, preserving the original decoder floor.
     /// Append-only ordinal: floor-aware older binaries must refuse this stream.
     DecoderTransition,
+    /// The group has the fast track: part of what the group is, written
+    /// once beside its identity. Appended at variant 8, so a binary that
+    /// knows no fast track refuses the stream and never joins such a group
+    /// by the classic rules.
+    FastTrack,
+    /// An entry a member approved by itself, held beside its log until the
+    /// log reaches its index. Variant 9.
+    Proposal,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -187,7 +194,7 @@ impl Wal {
             .read(true)
             .write(true)
             .open(directory.join("LOCK"))?;
-        lock.try_lock_exclusive().map_err(|e| {
+        focal_platform::try_lock_exclusive(&lock).map_err(|e| {
             if e.kind() == std::io::ErrorKind::WouldBlock {
                 LogError::Locked
             } else {
@@ -472,15 +479,18 @@ impl Wal {
                 .checked_add(1)
                 .ok_or(LogError::Capacity)?;
             let len = u32::try_from(data.len()).map_err(|_| LogError::Capacity)?;
-            let mut header = Vec::with_capacity(FRAME_HEADER);
-            header.extend_from_slice(&len.to_le_bytes());
-            header.extend_from_slice(&sequence.to_le_bytes());
-            header.extend_from_slice(&self.position.checksum.to_le_bytes());
+            // A fixed-size stack header (len u32, sequence u64, previous CRC u32,
+            // then this frame's CRC u32) avoids a per-record heap allocation; the
+            // byte layout is identical to the frozen frame format.
+            let mut header = [0u8; FRAME_HEADER];
+            header[0..4].copy_from_slice(&len.to_le_bytes());
+            header[4..12].copy_from_slice(&sequence.to_le_bytes());
+            header[12..16].copy_from_slice(&self.position.checksum.to_le_bytes());
             let mut hash = crc32fast::Hasher::new();
-            hash.update(&header);
+            hash.update(&header[..16]);
             hash.update(data);
             let checksum = hash.finalize();
-            header.extend_from_slice(&checksum.to_le_bytes());
+            header[16..20].copy_from_slice(&checksum.to_le_bytes());
             let location = FrameLocation {
                 generation: self.position.generation,
                 segment: self.position.segment,
@@ -527,7 +537,7 @@ fn segment_path(directory: &Path, generation: u64, segment: u64) -> PathBuf {
 }
 
 fn sync_dir(directory: &Path) -> Result<(), LogError> {
-    File::open(directory)?.sync_all()?;
+    focal_platform::sync_dir(directory)?;
     Ok(())
 }
 
@@ -610,7 +620,7 @@ fn install_fence(
     file.write_all(&data)?;
     file.write_all(&crc32fast::hash(&data).to_le_bytes())?;
     file.sync_all()?;
-    fs::rename(temp, directory.join("CURRENT"))?;
+    focal_platform::fs::atomic_replace(&temp, &directory.join("CURRENT"))?;
     sync_dir(directory)
 }
 
@@ -924,6 +934,75 @@ mod tests {
             postcard::from_bytes::<Record>(&encoded).unwrap(),
             transition
         );
+    }
+    #[test]
+    fn appended_fast_track_kinds_preserve_every_ordinal_before_them_and_refuse_older_decoders() {
+        #[derive(Serialize, Deserialize)]
+        enum TransitionEraKind {
+            Entry,
+            HardState,
+            Configuration,
+            Snapshot,
+            Identity,
+            Checkpoint,
+            DecoderFloor,
+            DecoderTransition,
+        }
+        #[derive(Serialize, Deserialize)]
+        struct TransitionEraRecord {
+            log: LogicalLogId,
+            kind: TransitionEraKind,
+            index: u64,
+            term: u64,
+            payload: Vec<u8>,
+        }
+        for (kind, old_kind) in [
+            (RecordKind::Entry, TransitionEraKind::Entry),
+            (RecordKind::HardState, TransitionEraKind::HardState),
+            (RecordKind::Configuration, TransitionEraKind::Configuration),
+            (RecordKind::Snapshot, TransitionEraKind::Snapshot),
+            (RecordKind::Identity, TransitionEraKind::Identity),
+            (RecordKind::Checkpoint, TransitionEraKind::Checkpoint),
+            (RecordKind::DecoderFloor, TransitionEraKind::DecoderFloor),
+            (
+                RecordKind::DecoderTransition,
+                TransitionEraKind::DecoderTransition,
+            ),
+        ] {
+            let current = Record {
+                log: LogicalLogId([1; 16]),
+                kind,
+                index: 3,
+                term: 2,
+                payload: vec![4, 5],
+            };
+            let old = TransitionEraRecord {
+                log: current.log,
+                kind: old_kind,
+                index: current.index,
+                term: current.term,
+                payload: current.payload.clone(),
+            };
+            assert_eq!(
+                postcard::to_allocvec(&current).unwrap(),
+                postcard::to_allocvec(&old).unwrap()
+            );
+        }
+        for (kind, ordinal) in [(RecordKind::FastTrack, 8u8), (RecordKind::Proposal, 9)] {
+            let record = Record {
+                log: LogicalLogId([1; 16]),
+                kind,
+                index: 5,
+                term: 2,
+                payload: vec![7, 7],
+            };
+            let encoded = postcard::to_allocvec(&record).unwrap();
+            let mut expected = vec![1; 16];
+            expected.extend_from_slice(&[ordinal, 5, 2, 2, 7, 7]);
+            assert_eq!(encoded, expected);
+            assert!(postcard::from_bytes::<TransitionEraRecord>(&encoded).is_err());
+            assert_eq!(postcard::from_bytes::<Record>(&encoded).unwrap(), record);
+        }
     }
     #[test]
     fn appended_decoder_floor_refuses_frozen_old_decoder_and_preserves_legacy_bytes() {

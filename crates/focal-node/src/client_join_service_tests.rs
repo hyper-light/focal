@@ -4,14 +4,13 @@ use crate::{
     network_join::{ClientInvitation, NodeInvitation, PendingClientJoin},
 };
 use focal_enrollment::{EnrollmentClient, EnrollmentRole, TransportLimits};
-use std::os::unix::fs::PermissionsExt;
 
 #[tokio::test]
 async fn client_invitation_enrolls_only_actor_and_preserves_key_across_restart_and_loss() {
     let founder_disk = tempfile::tempdir().unwrap();
     let client_disk = tempfile::tempdir().unwrap();
     for path in [founder_disk.path(), client_disk.path()] {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::set_test_mode(path, 0o700);
     }
     let settings = settings(founder_disk.path());
     let founder = Running::start(&settings).await;

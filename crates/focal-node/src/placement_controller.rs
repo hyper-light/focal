@@ -42,10 +42,31 @@ const CHANGE_ADD_LEARNER: u8 = 1;
 const CHANGE_PROMOTE: u8 = 2;
 const CHANGE_REMOVE: u8 = 3;
 const SESSION_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Leader hints the controller keeps, one per session it could not reach
+/// at the leader it first asked.
+const SESSION_LEADER_HINTS: usize = 4096;
 
 /// How the controller reaches a session's log: its own replica when this
 /// node leads the log, otherwise the node that does, over the authenticated
 /// peer connection (`Operation::SessionControl`, 24 §9).
+/// Who leads after `leaving`: the placement's preferred leader where it
+/// votes, otherwise the first voter that stays. None when no other voter
+/// exists, which a removal refuses by itself.
+fn successor(
+    descriptor: &SessionDescriptor,
+    configuration: &focal_consensus::MembershipConfiguration,
+    leaving: u64,
+) -> Option<u64> {
+    let preferred = descriptor.active.placement.preferred_leader;
+    if preferred != leaving && configuration.voters.contains(&preferred) {
+        return Some(preferred);
+    }
+    configuration
+        .voters
+        .iter()
+        .copied()
+        .find(|voter| *voter != leaving)
+}
 pub(super) enum SessionDriver {
     Local(ReplicaHost),
     Remote { leader: u64 },
@@ -89,14 +110,29 @@ impl PlacementAgent {
         )
         .await
         .map_err(|_| AgentError::Control(ControlFailure::Unavailable))?
-        .map_err(|_| AgentError::Control(ControlFailure::Unavailable))?;
+        .map_err(|error| {
+            AgentError::Control(match error {
+                PeerSendError::Rejected(AccessError::Unauthorized) => ControlFailure::Unauthorized,
+                PeerSendError::Rejected(
+                    AccessError::InvalidRequest | AccessError::UnsupportedOperation,
+                ) => ControlFailure::Invalid,
+                PeerSendError::Rejected(AccessError::Capacity) => ControlFailure::Capacity,
+                _ => ControlFailure::Unavailable,
+            })
+        })?;
         let reply: SessionControlReply =
             postcard::from_bytes(&bytes).map_err(|_| AgentError::Identity)?;
         if let SessionControlReply::Refused(failure) = &reply {
             if let ControlFailure::NotLeader { leader } = failure
                 && *leader != 0
             {
-                // Follow the log to where it leads on the next pass.
+                // Follow the log to where it leads on the next pass. The
+                // hints are a cache: full, it is emptied and learned again.
+                if self.session_leaders.len() >= SESSION_LEADER_HINTS
+                    && !self.session_leaders.contains_key(&descriptor.ledger)
+                {
+                    self.session_leaders.clear();
+                }
                 let _ = self.session_leaders.insert(descriptor.ledger, *leader);
             }
             return Err(AgentError::Control(*failure));
@@ -109,15 +145,17 @@ impl PlacementAgent {
         pool: &PeerConnectionPool,
         driver: &SessionDriver,
         descriptor: &SessionDescriptor,
-    ) -> Result<HostedSessionFacts, AgentError> {
+    ) -> Result<std::sync::Arc<HostedSessionFacts>, AgentError> {
         match driver {
-            SessionDriver::Local(host) => Ok(host.registration_facts().await?.value().clone()),
+            // A locally hosted session shares its facts without a deep copy; only
+            // the remote path, which decodes them off the wire, must own them.
+            SessionDriver::Local(host) => Ok(host.registration_facts().await?.value_arc()),
             SessionDriver::Remote { leader } => {
                 match self
                     .session_call(pool, *leader, descriptor, SessionCall::Facts)
                     .await?
                 {
-                    SessionControlReply::Facts(facts) => Ok(*facts),
+                    SessionControlReply::Facts(facts) => Ok(std::sync::Arc::new(*facts)),
                     _ => Err(AgentError::Identity),
                 }
             }
@@ -145,6 +183,52 @@ impl PlacementAgent {
                     _ => Err(AgentError::Identity),
                 }
             }
+        }
+    }
+    /// Range movement, balancing and holder publication drive the movement
+    /// map on the log's own replica (25 §6–§9), so a voter that does not
+    /// lead a session with such work asks its leader for leadership — one
+    /// raft transfer message the leader answers by timing this voter into a
+    /// campaign; a plan needs no claim (it is driven through the leader), and
+    /// a node that is not a voter, or a session without range work, asks for
+    /// nothing.
+    async fn claim_for_ranges(&self, descriptor: &SessionDescriptor, handles: &NetworkHandles) {
+        let node = self.state.node;
+        let Ok(host) = handles.fleet.current_host(descriptor.ledger) else {
+            return;
+        };
+        if host.progress().leader == 0 {
+            return;
+        }
+        let voter = match host.registration_facts().await {
+            Ok(facts) => facts
+                .value()
+                .membership
+                .configuration
+                .voters
+                .contains(&node),
+            Err(_) => false,
+        };
+        if !voter {
+            return;
+        }
+        let queued = self
+            .move_requests
+            .iter()
+            .any(|job| job.ledger == descriptor.ledger);
+        let ranges = match host.range_view(false).await {
+            Ok(view) => {
+                view.pending.is_some()
+                    || !view.history.is_empty()
+                    || descriptor
+                        .holders
+                        .as_ref()
+                        .is_none_or(|holders| holders.epoch < view.epoch.0)
+            }
+            Err(_) => false,
+        };
+        if queued || ranges {
+            let _ = host.transfer_leader(node).await;
         }
     }
     /// Which driver reaches the session's log from here: the hosted replica
@@ -215,6 +299,9 @@ impl PlacementAgent {
             return Ok(None);
         };
         let driver = self.session_driver(handles, descriptor).await;
+        if driver.local().is_none() {
+            self.claim_for_ranges(descriptor, handles).await;
+        }
         let facts = self.session_facts(pool, &driver, descriptor).await?;
         let membership = &facts.membership;
         let configuration = &membership.configuration;
@@ -318,14 +405,30 @@ impl PlacementAgent {
         match &descriptor.pending {
             Some(plan) => {
                 self.drive_plan(
-                    handles, pool, descriptor, plan, snapshot, installed, grant, &facts, &driver,
+                    handles,
+                    pool,
+                    descriptor,
+                    plan,
+                    snapshot,
+                    installed,
+                    grant,
+                    facts.as_ref(),
+                    &driver,
                     now,
                 )
                 .await
             }
             None => {
                 self.retire_and_heal(
-                    handles, pool, descriptor, directory, snapshot, installed, &facts, &driver, now,
+                    handles,
+                    pool,
+                    descriptor,
+                    directory,
+                    snapshot,
+                    installed,
+                    facts.as_ref(),
+                    &driver,
+                    now,
                 )
                 .await
             }
@@ -359,6 +462,24 @@ impl PlacementAgent {
                 .nodes
                 .get(&job.node)
                 .map(|grant| grant.enrollment.generation);
+            // A move outside the session's residency is refused before any
+            // byte moves (24 §22).
+            let residency = &descriptor.active.policy.residency;
+            let region = authority
+                .nodes
+                .get(&job.node)
+                .map_or(focal_directory::RegionId::UNKNOWN, |grant| {
+                    grant.enrollment.region
+                });
+            if !residency.is_empty() && !residency.contains(&region) {
+                let _ = job.reply.send(Err(AgentError::Residency(
+                    crate::placement_executor::ExecutorError::OutsideResidency {
+                        node: job.node,
+                        region,
+                    },
+                )));
+                continue;
+            }
             crate::fault::hit(crate::fault::FaultSite::MovementBegin);
             let result = match generation {
                 None => Err(AgentError::Identity),
@@ -544,6 +665,9 @@ impl PlacementAgent {
         }
         // Progress of every replica-held member that stays, then activation.
         let mut unchanged = Vec::new();
+        unchanged
+            .try_reserve_exact(digests.members.len())
+            .map_err(|_| AgentError::Capacity)?;
         for member in digests
             .members
             .iter()
@@ -698,6 +822,39 @@ impl PlacementAgent {
         )
         .map_err(|_| AgentError::Identity)?
         .revision())
+    }
+    /// The node `driver` reaches the log at.
+    fn leads(&self, driver: &SessionDriver) -> u64 {
+        match driver {
+            SessionDriver::Local(_) => self.state.node,
+            SessionDriver::Remote { leader } => *leader,
+        }
+    }
+    /// Begin moving the log's leadership to `target`, through `driver`. A
+    /// transfer that does not complete is begun again on a later pass.
+    async fn transfer_leadership(
+        &mut self,
+        pool: &PeerConnectionPool,
+        driver: &SessionDriver,
+        descriptor: &SessionDescriptor,
+        target: u64,
+    ) -> Result<Option<AgentStep>, AgentError> {
+        match driver {
+            SessionDriver::Local(host) => host.transfer_leader(target).await?,
+            SessionDriver::Remote { leader } => {
+                match self
+                    .session_call(pool, *leader, descriptor, SessionCall::Transfer { target })
+                    .await?
+                {
+                    SessionControlReply::Transferring => {}
+                    _ => return Err(AgentError::Identity),
+                }
+            }
+        }
+        // The log leads elsewhere from the next election: forget where it
+        // led, and follow it from what its replicas say.
+        let _ = self.session_leaders.remove(&descriptor.ledger);
+        Ok(Some(AgentStep::Advanced))
     }
     /// Apply one session-log configuration change exactly once, through
     /// `driver`.
@@ -1045,6 +1202,17 @@ impl PlacementAgent {
                     return self.intend_partition(handles, command).await.map(Some);
                 }
                 AssignmentPhase::Draining => {
+                    // A leader does not remove itself (27 §5): leadership
+                    // moves to a voter that stays, and that leader removes
+                    // this node on a later pass.
+                    if configuration.voters.contains(node)
+                        && self.leads(driver) == *node
+                        && let Some(target) = successor(descriptor, configuration, *node)
+                    {
+                        return self
+                            .transfer_leadership(pool, driver, descriptor, target)
+                            .await;
+                    }
                     if configuration.contains(*node) {
                         return self
                             .change_membership(
@@ -1079,14 +1247,32 @@ impl PlacementAgent {
             }
         }
         // Self-healing: the active placement must still verify against the
-        // live registry; otherwise plan again under the same policy.
+        // live registry; otherwise plan again under the same policy. The check
+        // is a pure function of the descriptor's active placement and the node
+        // set, so skip it while neither has moved since it last passed.
         let config = self.partition_config();
-        if focal_directory::verify_placement(
-            &descriptor.active,
-            &directory.nodes,
-            config.max_members,
-        )
-        .is_ok()
+        let fingerprint = (descriptor.authority.record_hash, directory.revision);
+        let verified = self.verified_active.get(&descriptor.ledger) == Some(&fingerprint)
+            || focal_directory::verify_placement(
+                &descriptor.active,
+                &directory.nodes,
+                config.max_members,
+            )
+            .is_ok();
+        if verified {
+            self.verified_active.insert(descriptor.ledger, fingerprint);
+            // A placement that holds may still be led where too many are.
+            return self
+                .balance_leader(handles, descriptor, directory, snapshot, installed, now)
+                .await;
+        }
+        self.verified_active.remove(&descriptor.ledger);
+        // A death that has not stood for one election window of the group
+        // that would lose the voter moves nothing yet (27 §3.1 P4): a
+        // member that is back within it keeps its seat, and the group has
+        // not been without it for longer than it takes to elect.
+        let hold = self.retirement_hold(handles, driver);
+        if !focal_directory::deaths_held(&descriptor.active.placement, &directory.nodes, now, hold)
         {
             return Ok(None);
         }
@@ -1101,13 +1287,20 @@ impl PlacementAgent {
             }
             id
         });
-        match focal_directory::propose_placement_keeping(
+        let leading = self.take_leading(directory);
+        let proposal = focal_directory::heal_placement(
             &directory.nodes,
             &descriptor.active.policy,
-            &descriptor.active.placement.voters,
+            &descriptor.active.placement,
+            focal_directory::Leading {
+                counts: &leading.counts,
+                current: Some(descriptor.active.placement.preferred_leader),
+            },
             config.max_members,
             config.min_disk_available,
-        ) {
+        );
+        self.leading = Some(leading);
+        match proposal {
             Ok(proposal) => {
                 let command = self.session_command(
                     descriptor,
@@ -1146,17 +1339,193 @@ impl PlacementAgent {
             }
         }
     }
+    /// Move a session's preferred leader to another of its voters where
+    /// that one leads two sessions fewer, the directory has said so for
+    /// long enough, and no other session of the partition is moving its
+    /// own (`leader_balancer`, 27 §5). The move is a plan over the members
+    /// the session has: it is prepared, cut over and activated as any
+    /// other, and leadership follows the placement once it is active.
+    async fn balance_leader(
+        &mut self,
+        handles: &NetworkHandles,
+        descriptor: &SessionDescriptor,
+        directory: &PartitionCheckpoint,
+        snapshot: &ControlSnapshot,
+        installed: &ControlAuthoritySnapshot,
+        now: i64,
+    ) -> Result<Option<AgentStep>, AgentError> {
+        let config = self.partition_config();
+        let leading = self.take_leading(directory);
+        let desired = focal_directory::leader_move(
+            descriptor,
+            &directory.nodes,
+            &leading.counts,
+            config.max_members,
+        );
+        let moving = leading.moving;
+        self.leading = Some(leading);
+        let due = self.leader_balancer.observe(
+            descriptor.ledger,
+            desired
+                .as_ref()
+                .map(|desired| desired.placement.preferred_leader),
+            now,
+        );
+        let Some(desired) = desired.filter(|_| due && !moving) else {
+            // Where the session is led where it should be, a seat of it
+            // may still be away from home.
+            return self
+                .balance_home(
+                    handles, descriptor, directory, snapshot, installed, moving, now,
+                )
+                .await;
+        };
+        let target = desired.placement.preferred_leader;
+        // What the move was decided on: the report of the node it goes to.
+        let Some(report) = directory
+            .nodes
+            .get(&target)
+            .and_then(|node| node.load)
+            .map(|load| load.report)
+        else {
+            return Ok(None);
+        };
+        let operation = OperationId({
+            let mut hasher = blake3::Hasher::new_derive_key("focal.placement.lead.v1");
+            hasher.update(&descriptor.ledger.tenant.0);
+            hasher.update(&descriptor.ledger.session.0);
+            hasher.update(&descriptor.authority.record_hash.0);
+            hasher.update(&target.to_le_bytes());
+            let mut id = [0; 16];
+            for (target, source) in id.iter_mut().zip(hasher.finalize().as_bytes()) {
+                *target = *source;
+            }
+            id
+        });
+        let command = self.session_command(
+            descriptor,
+            snapshot,
+            installed,
+            now,
+            SessionChange::Plan {
+                operation,
+                desired,
+                observations: BTreeMap::from([(target, report)]),
+            },
+            None,
+        )?;
+        let step = self.intend_partition(handles, command).await?;
+        self.leader_balancer.moved();
+        Ok(Some(step))
+    }
+    /// Give one seat of a session whose policy names home regions to a
+    /// node that is there, where the directory has said so for long enough
+    /// and no other session of the partition is being balanced
+    /// (`focal_directory::home_move`, 27 §3.1 P4). A plan like any other.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one bounded pass over borrowed observations; no state is retained"
+    )]
+    async fn balance_home(
+        &mut self,
+        handles: &NetworkHandles,
+        descriptor: &SessionDescriptor,
+        directory: &PartitionCheckpoint,
+        snapshot: &ControlSnapshot,
+        installed: &ControlAuthoritySnapshot,
+        moving: bool,
+        now: i64,
+    ) -> Result<Option<AgentStep>, AgentError> {
+        let config = self.partition_config();
+        let proposal = if self.home_balancer.config().enabled {
+            focal_directory::home_move(
+                descriptor,
+                &directory.nodes,
+                config.max_members,
+                config.min_disk_available,
+            )
+        } else {
+            None
+        };
+        let newcomer = proposal
+            .as_ref()
+            .and_then(|proposal| proposal.observations.keys().next().copied());
+        let due = self.home_balancer.observe(descriptor.ledger, newcomer, now);
+        let (Some(proposal), Some(newcomer)) = (proposal.filter(|_| due && !moving), newcomer)
+        else {
+            return Ok(None);
+        };
+        let operation = OperationId({
+            let mut hasher = blake3::Hasher::new_derive_key("focal.placement.home.v1");
+            hasher.update(&descriptor.ledger.tenant.0);
+            hasher.update(&descriptor.ledger.session.0);
+            hasher.update(&descriptor.authority.record_hash.0);
+            hasher.update(&newcomer.to_le_bytes());
+            let mut id = [0; 16];
+            for (target, source) in id.iter_mut().zip(hasher.finalize().as_bytes()) {
+                *target = *source;
+            }
+            id
+        });
+        let command = self.session_command(
+            descriptor,
+            snapshot,
+            installed,
+            now,
+            SessionChange::Plan {
+                operation,
+                desired: proposal.spec,
+                observations: proposal.observations,
+            },
+            None,
+        )?;
+        let step = self.intend_partition(handles, command).await?;
+        self.home_balancer.moved();
+        self.leader_balancer.moved();
+        Ok(Some(step))
+    }
+    /// How long a death stands before it moves a seat, in seconds: one
+    /// election window of the session's group where this node hosts a copy
+    /// of it, and of the partition's own group otherwise, at the pace the
+    /// group runs at. Twice its election timeout, which is the longest a
+    /// member waits before it campaigns; a second at least, which is what
+    /// the controller's clock counts.
+    fn retirement_hold(&self, handles: &NetworkHandles, driver: &SessionDriver) -> i64 {
+        let (period, elections) = match driver.local() {
+            Some(host) => (host.tick_period(), host.election_periods()),
+            None => (
+                handles.control.tick_period(),
+                handles.control.election_periods(),
+            ),
+        };
+        retirement_hold(period, elections)
+    }
     /// The bounds the partition applies to every placement it accepts.
     pub(super) fn partition_config(&self) -> focal_directory::PartitionConfig {
         focal_directory::PartitionConfig::default()
     }
 }
 
+/// One election window in the seconds the controller's clock counts,
+/// rounded up.
+pub(crate) fn retirement_hold(period: Duration, election_periods: u64) -> i64 {
+    let window = period
+        .as_millis()
+        .saturating_mul(u128::from(election_periods.max(1)))
+        .saturating_mul(2);
+    i64::try_from(window.div_ceil(1_000))
+        .unwrap_or(i64::MAX)
+        .max(1)
+}
 /// What the controller would do next for one session, from the committed
 /// directory alone: the operator's `cluster plan`. Never executes anything.
+/// `stands` is for how many seconds more a death of the placement stands
+/// before a heal may move its seat (27 §5; `focal_directory::deaths_stand_for`),
+/// none where no death stands or the caller cannot tell.
 pub(crate) fn planned_actions(
     descriptor: &SessionDescriptor,
     nodes: &std::collections::BTreeMap<u64, focal_directory::NodeRecord>,
+    stands: Option<i64>,
 ) -> Vec<String> {
     let mut actions = Vec::new();
     let mut push = |action: String| {
@@ -1170,7 +1539,7 @@ pub(crate) fn planned_actions(
                 && report.achieved != Some(report.desired)
             {
                 push(format!(
-                    "replan under the active policy: {} of {} promised failures achieved{}",
+                    "replan under the active policy: {} of {} promised failures achieved{}{}",
                     report
                         .achieved
                         .map_or("none".to_owned(), |achieved| achieved
@@ -1181,6 +1550,11 @@ pub(crate) fn planned_actions(
                         .blocked_by
                         .first()
                         .map(|blocker| format!(" ({:?})", blocker.reason))
+                        .unwrap_or_default(),
+                    stands
+                        .map(|seconds| format!(
+                            "; a death stands for {seconds} s more before a seat moves"
+                        ))
                         .unwrap_or_default()
                 ));
             }

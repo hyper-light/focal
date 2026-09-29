@@ -243,7 +243,7 @@ fn quorum_list_requires_fresh_barrier_and_continuations_keep_the_committed_prefi
         minority.try_recv(),
         Err(oneshot::error::TryRecvError::Empty)
     ));
-    fixture.owners[0].pending.front_mut().unwrap().deadline = Instant::now();
+    fixture.owners[0].pending.front_mut().unwrap().deadline = 0;
     fixture.owners[0].expire_pending();
     assert!(matches!(
         minority.try_recv().unwrap().into_envelope().result,

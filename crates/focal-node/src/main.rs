@@ -50,6 +50,10 @@ struct Args {
     /// Use a named ledger connection; cluster administration requires a Unix context.
     #[arg(long, global = true)]
     client_context: Option<String>,
+    /// Append each client request/response exchange as JSON lines to this file
+    /// (black-box history capture; diagnostic).
+    #[arg(long, global = true, hide = true)]
+    trace_file: Option<PathBuf>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -71,6 +75,11 @@ enum Commands {
         advertise: Option<String>,
         #[arg(long)]
         listen: Option<SocketAddr>,
+        /// Enroll from this invitation first when the data directory holds
+        /// no identity yet (24 §24), then start: one command for a
+        /// supervised or packaged host.
+        #[arg(long)]
+        invite_file: Option<PathBuf>,
     },
     /// Inspect and administer the selected physical node through its local socket.
     Cluster {
@@ -85,6 +94,13 @@ enum Commands {
         advertise: String,
         #[arg(long)]
         listen: Option<SocketAddr>,
+    },
+    /// Give the data directory to the node's user (24 §24): create it, set
+    /// `--owner UID:GID` and mode 0700, then exit. For an init step that
+    /// runs privileged before the node runs as that user.
+    PrepareVolume {
+        #[arg(long)]
+        owner: String,
     },
     /// Run/resume the real claim/testament/validator example with exclusive local ownership.
     Demo,
@@ -128,6 +144,7 @@ fn main() {
         Err(error) => error.exit(),
     };
     drop(matches);
+    cli::trace::configure(args.trace_file.clone());
     if let Err(error) = execute(args) {
         let _ = cli::errors::report(error.as_ref(), format, &mut std::io::stderr().lock());
         std::process::exit(cli::errors::classification(error.as_ref()).exit_code);
@@ -143,7 +160,8 @@ fn execute(args: Args) -> Result<()> {
                     shape_only: false,
                 },
         } => {
-            let settings = load_settings(args.config.as_deref(), args.data_dir, false)?;
+            let settings =
+                load_settings(args.config.as_deref(), args.data_dir, Resolution::Command)?;
             return cli::schema_validate(
                 &settings,
                 args.client_context.as_deref(),
@@ -163,7 +181,7 @@ fn execute(args: Args) -> Result<()> {
         _ => args,
     };
     if matches!(&args.command, Commands::Mcp { .. }) {
-        let settings = load_settings(args.config.as_deref(), args.data_dir, false)?;
+        let settings = load_settings(args.config.as_deref(), args.data_dir, Resolution::Command)?;
         return cli::serve(&settings, args.client_context.as_deref()).map_err(Into::into);
     }
     let service = matches!(&args.command, Commands::Start { .. });
@@ -191,10 +209,20 @@ fn execute(args: Args) -> Result<()> {
 /// file that sets one to another value is refused by name, except for a
 /// policy request (`deployment plan`/`explain`), where the file is what the
 /// operator asks for.
+/// How the invoked command resolves a policy the committed store already
+/// holds: the pod's own `start` yields to the committed policy, a policy
+/// request keeps the file's values, and every other command is refused if
+/// the file diverges (directing to plan/apply).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Resolution {
+    Start,
+    Request,
+    Command,
+}
 fn load_settings(
     config: Option<&Path>,
     data_dir: Option<PathBuf>,
-    request: bool,
+    resolution: Resolution,
 ) -> Result<Settings> {
     let file = match config {
         Some(path) => {
@@ -228,23 +256,33 @@ fn load_settings(
                 .ok()
                 .flatten()
         });
-    let resolved = if request {
-        focal_node::config::resolve_request(&overrides, file, committed.as_ref())?
-    } else {
-        focal_node::config::resolve(&overrides, file, committed.as_ref())?
+    let resolved = match resolution {
+        Resolution::Start => {
+            focal_node::config::resolve_start(&overrides, file, committed.as_ref())?
+        }
+        Resolution::Request => {
+            focal_node::config::resolve_request(&overrides, file, committed.as_ref())?
+        }
+        Resolution::Command => focal_node::config::resolve(&overrides, file, committed.as_ref())?,
     };
     Ok(resolved.settings)
 }
 fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
     let data_dir_override = args.data_dir.clone();
-    let request = matches!(
+    let resolution = if matches!(
         &args.command,
         Commands::Deployment {
             command: cli::deployment::DeploymentCommand::Plan { .. }
                 | cli::deployment::DeploymentCommand::Explain { .. }
         }
-    );
-    let mut settings = load_settings(args.config.as_deref(), args.data_dir, request)?;
+    ) {
+        Resolution::Request
+    } else if matches!(&args.command, Commands::Start { .. }) {
+        Resolution::Start
+    } else {
+        Resolution::Command
+    };
+    let mut settings = load_settings(args.config.as_deref(), args.data_dir, resolution)?;
     match args.command {
         Commands::Mcp {
             command: McpCommand::Serve,
@@ -252,7 +290,11 @@ fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
         Commands::Context { command } => {
             cli::context::run(runtime, &settings, command).map_err(Into::into)
         }
-        Commands::Start { advertise, listen } => {
+        Commands::Start {
+            advertise,
+            listen,
+            invite_file,
+        } => {
             if let Some(advertise) = advertise {
                 settings.node.advertise = Some(advertise);
             }
@@ -260,8 +302,16 @@ fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
                 settings.node.listen = Some(listen);
             }
             settings.validate()?;
+            // An uninitialized directory enrolls first; an initialized one
+            // keeps its identity and ignores the invitation.
+            if let Some(invite_file) = invite_file
+                && !settings.data_dir()?.join("IDENTITY").exists()
+            {
+                runtime.block_on(join(&settings, &invite_file))?;
+            }
             runtime.block_on(start(settings))
         }
+        Commands::PrepareVolume { owner } => prepare_volume(&settings.data_dir()?, &owner),
         Commands::Cluster { command } => {
             let selected = cli::context::admin_settings(&settings, args.client_context.as_deref())?;
             cli::cluster::run(runtime, &selected, command)
@@ -339,11 +389,24 @@ async fn start(settings: Settings) -> Result<()> {
     // The exclusive data-directory owner may clean its socket after a crash, but
     // it must never remove an ordinary file or a symlink at that location.
     if let Ok(metadata) = std::fs::symlink_metadata(&path) {
-        use std::os::unix::fs::{FileTypeExt, MetadataExt};
-        if !metadata.file_type().is_socket()
-            || metadata.uid() != std::fs::metadata(node.root())?.uid()
+        #[cfg(unix)]
         {
-            return Err("refusing to replace a non-owned socket path".into());
+            use std::os::unix::fs::{FileTypeExt, MetadataExt};
+            if !metadata.file_type().is_socket()
+                || metadata.uid() != std::fs::metadata(node.root())?.uid()
+            {
+                return Err("refusing to replace a non-owned socket path".into());
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            // The local endpoint is a named-pipe rendezvous file, not a
+            // socket. Never remove one owned by another user; the transport
+            // fences a live server by name when it rebinds.
+            let _ = &metadata;
+            if focal_platform::fs::owner_at(&path)? != focal_platform::fs::current_owner()? {
+                return Err("refusing to replace a non-owned local endpoint path".into());
+            }
         }
         std::fs::remove_file(&path)?;
     }
@@ -385,7 +448,7 @@ async fn start(settings: Settings) -> Result<()> {
         signal_result?;
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     };
-    tokio::time::timeout(std::time::Duration::from_secs(30), cleanup)
+    tokio::time::timeout(focal_node::network_service::SHUTDOWN_DEADLINE, cleanup)
         .await
         .map_err(|_| "shutdown deadline exceeded; recovery will replay the durable log")?
 }
@@ -406,8 +469,39 @@ async fn invite(settings: &Settings, name: &str, output: &Path) -> Result<()> {
     if bundle.name() != name || bundle.genesis().founder != identity {
         return Err("invitation response belongs to another founder or node name".into());
     }
+    // `--output -` hands the invitation to the caller's pipe: a packaged
+    // founder has no writable path an operator can read back (24 §24).
+    if output.as_os_str() == "-" {
+        let mut out = std::io::stdout().lock();
+        out.write_all(&bundle.encode()?)?;
+        return Ok(out.flush()?);
+    }
     bundle.write_new(output)?;
     print_json(&serde_json::json!({"condition":"InvitationWritten","node":name,"output":output}))
+}
+/// Create the data directory for the node's user (24 §24).
+fn prepare_volume(root: &Path, owner: &str) -> Result<()> {
+    let (uid, gid) = owner
+        .split_once(':')
+        .and_then(|(uid, gid)| Some((uid.parse::<u32>().ok()?, gid.parse::<u32>().ok()?)))
+        .ok_or("--owner must be UID:GID")?;
+    std::fs::create_dir_all(root)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::os::unix::fs::chown(root, Some(uid), Some(gid))?;
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (uid, gid);
+        return Err("prepare-volume needs a Unix filesystem".into());
+    }
+    #[cfg(unix)]
+    {
+        File::open(root)?.sync_all()?;
+        print_json(&serde_json::json!({"condition":"VolumePrepared","path":root,"owner":owner}))
+    }
 }
 async fn start_network(settings: Settings) -> Result<()> {
     let service = focal_node::network_service::NetworkService::open(&settings).await?;
@@ -422,7 +516,6 @@ async fn start_network(settings: Settings) -> Result<()> {
 async fn join(settings: &Settings, invite_file: &Path) -> Result<()> {
     let bundle = NodeInvitation::load(invite_file)?;
     let (listen, advertise) = resolve_addresses(settings).await?;
-    let pending = PendingJoin::open(settings, bundle, listen, advertise)?;
     let bind = if advertise.is_ipv4() {
         "0.0.0.0:0"
     } else {
@@ -433,6 +526,42 @@ async fn join(settings: &Settings, invite_file: &Path) -> Result<()> {
         bind,
         focal_enrollment::TransportLimits::default(),
     )?;
+    let pending = match PendingJoin::open(settings, bundle, listen, advertise) {
+        Ok(pending) => pending,
+        // A different invitation than the one journaled here, and no identity
+        // yet: the journaled join is settled with the founder first (24 §24).
+        // A receipt means this node is already enrolled under it and the new
+        // invitation is not needed; a terminal refusal (revoked, expired,
+        // redeemed by another, wrong cluster, unauthorized) retires it and the
+        // new invitation is joined; an unknown outcome keeps the journal.
+        Err(focal_node::network_join::JoinError::Conflict)
+            if !settings.data_dir()?.join("IDENTITY").exists() =>
+        {
+            let previous = PendingJoin::resume(settings)?;
+            let now = focal_node::network_bootstrap::unix_time()?;
+            match previous.redeem(&client, now).await {
+                Ok(receipt) => {
+                    client.close();
+                    let joined =
+                        previous.install(receipt, focal_node::network_bootstrap::unix_time()?)?;
+                    return print_json(joined.directory.identity());
+                }
+                Err(error) if focal_node::network_join::terminal_rejection(&error) => {
+                    previous.retire()?;
+                    let bundle = NodeInvitation::load(invite_file)?;
+                    PendingJoin::open(settings, bundle, listen, advertise)?
+                }
+                Err(error) => {
+                    client.close();
+                    return Err(error.into());
+                }
+            }
+        }
+        Err(error) => {
+            client.close();
+            return Err(error.into());
+        }
+    };
     let receipt = pending
         .redeem(&client, focal_node::network_bootstrap::unix_time()?)
         .await;
@@ -447,7 +576,20 @@ async fn shutdown_signal() -> std::io::Result<()> {
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::select! { result=tokio::signal::ctrl_c()=>result, _=terminate.recv()=>Ok(()) }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows;
+        let mut ctrl_break = windows::ctrl_break()?;
+        let mut ctrl_close = windows::ctrl_close()?;
+        let mut ctrl_shutdown = windows::ctrl_shutdown()?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = ctrl_break.recv() => Ok(()),
+            _ = ctrl_close.recv() => Ok(()),
+            _ = ctrl_shutdown.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     tokio::signal::ctrl_c().await
 }
 fn read_file(path: &Path, max: usize) -> Result<Vec<u8>> {
@@ -466,6 +608,12 @@ fn read_file(path: &Path, max: usize) -> Result<Vec<u8>> {
         return Err("input exceeds its byte budget".into());
     }
     Ok(bytes)
+}
+fn print_text(text: &str) -> Result<()> {
+    let mut out = std::io::stdout().lock();
+    out.write_all(text.as_bytes())?;
+    out.flush()?;
+    Ok(())
 }
 fn print_json(value: &impl Serialize) -> Result<()> {
     writeln!(

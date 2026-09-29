@@ -1,4 +1,31 @@
 use crate::*;
+/// The longest failure-domain label a node may announce (24 §22).
+pub const MAX_TOPOLOGY_LABEL_BYTES: usize = 64;
+/// The longest advertised name (`host:port`) a contact carries (24 §24):
+/// a DNS name of at most 253 bytes, a colon and a port.
+pub const MAX_ENDPOINT_NAME_BYTES: usize = 259;
+/// An advertised name is `host:port` where the host is a DNS name (never an
+/// address literal, which needs no resolution) and the port is nonzero.
+pub fn valid_endpoint_name(name: &str) -> bool {
+    if name.len() > MAX_ENDPOINT_NAME_BYTES {
+        return false;
+    }
+    let Some((host, port)) = name.rsplit_once(':') else {
+        return false;
+    };
+    if host.is_empty()
+        || host.contains(':')
+        || host.parse::<std::net::IpAddr>().is_ok()
+        || !port.parse::<u16>().is_ok_and(|port| port != 0)
+    {
+        return false;
+    }
+    matches!(
+        rustls::pki_types::ServerName::try_from(host.to_owned()),
+        Ok(rustls::pki_types::ServerName::DnsName(_))
+    )
+}
+
 use focal_model::*;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -36,8 +63,13 @@ impl AuthenticatedPeer {
         })
     }
     /// Borrowed scope check for trusted service routers before ledger lookup.
+    /// A node peer is infrastructure: it replicates, hosts and drives the
+    /// sessions the directory assigns it across every tenant, and every
+    /// operation its role may issue is validated against committed placement
+    /// and enrollment facts, so its grant's tenants do not scope it. A
+    /// client's grant does.
     pub fn permits_tenant(&self, tenant: TenantId) -> bool {
-        self.grant.tenants.contains(&tenant)
+        matches!(self.grant.role, PeerRole::Node { .. }) || self.grant.tenants.contains(&tenant)
     }
     pub fn principal(&self) -> ParticipantId {
         self.grant.principal
@@ -282,6 +314,84 @@ impl VerifiedRequest {
             command,
         })
     }
+    /// Borrowed twin of `into_authenticated` for handlers that receive
+    /// `&VerifiedRequest`: clones only the command, never the whole envelope or
+    /// peer. Semantics are otherwise identical (server authority still enters
+    /// here, never through decoded client input).
+    pub fn to_authenticated(
+        &self,
+        mut authority: AuthorityContext,
+    ) -> Result<AuthenticatedInput, AccessError> {
+        let (expected_revision, command, epoch_allocation) = match &self.request.operation {
+            Operation::Submit {
+                expected_revision,
+                command,
+            } => (*expected_revision, command.clone(), false),
+            Operation::OpenEpoch { epoch } => {
+                (None, Command::NegotiateEpoch { epoch: *epoch }, true)
+            }
+            _ => return Err(AccessError::InvalidRequest),
+        };
+        authority.runtime = matches!(self.peer.role(), PeerRole::Runtime) || epoch_allocation;
+        verify_authored_claims(
+            &command,
+            self.request.ledger,
+            self.peer.principal(),
+            &authority,
+        )?;
+        Ok(AuthenticatedInput {
+            ledger: self.request.ledger,
+            principal: self.peer.principal(),
+            request_epoch: self.request.request_epoch,
+            request_id: self.request.request_id,
+            expected_revision,
+            authority,
+            command,
+        })
+    }
+    /// Borrowed twin of `into_managed`; clones only the command.
+    pub fn to_managed(
+        &self,
+        mut authority: AuthorityContext,
+    ) -> Result<ManagedAuthenticatedInput, AccessError> {
+        let Operation::Managed {
+            key,
+            operation:
+                ManagedOperation::Submit {
+                    expected_revision,
+                    command,
+                },
+        } = &self.request.operation
+        else {
+            return Err(AccessError::InvalidRequest);
+        };
+        authority.runtime = matches!(self.peer.role(), PeerRole::Runtime);
+        verify_authored_claims(
+            command,
+            self.request.ledger,
+            self.peer.principal(),
+            &authority,
+        )?;
+        Ok(ManagedAuthenticatedInput {
+            key: *key,
+            expected_revision: *expected_revision,
+            authority,
+            command: command.clone(),
+        })
+    }
+    /// Borrowed twin of `into_request_stream_control`; clones only the command.
+    pub fn to_request_stream_control(&self) -> Result<RequestStreamControlInput, AccessError> {
+        let Operation::RequestStreamControl { cluster, command } = &self.request.operation else {
+            return Err(AccessError::InvalidRequest);
+        };
+        Ok(RequestStreamControlInput {
+            cluster: *cluster,
+            ledger: self.request.ledger,
+            principal: self.peer.principal(),
+            id: self.request.request_id,
+            command: command.clone(),
+        })
+    }
 }
 
 pub fn verify_request(
@@ -290,7 +400,7 @@ pub fn verify_request(
     limits: &WireLimits,
 ) -> Result<VerifiedRequest, AccessError> {
     // Tenant authorization precedes all ledger-specific work and error disclosure.
-    if !peer.grant.tenants.contains(&request.ledger.tenant) {
+    if !peer.permits_tenant(request.ledger.tenant) {
         return Err(AccessError::Unauthorized);
     }
     let managed = matches!(
@@ -313,7 +423,8 @@ pub fn verify_request(
     {
         return Err(AccessError::UnsupportedProtocol);
     }
-    if request.ledger.session.is_zero()
+    if request.ledger.tenant.is_zero()
+        || request.ledger.session.is_zero()
         || request.request_id.is_zero()
         || request.request_epoch.0 == 0
     {
@@ -435,9 +546,8 @@ fn request_shape(
     limits: &WireLimits,
     peer: Option<&AuthenticatedPeer>,
 ) -> Result<(), AccessError> {
-    let bytes = encode_payload(request, limits.max_frame_bytes)
-        .map_err(|_| AccessError::Capacity)?
-        .len() as u64;
+    let bytes = crate::frame::payload_len(request, limits.max_frame_bytes)
+        .map_err(|_| AccessError::Capacity)? as u64;
     let items = match &request.operation {
         Operation::RequestStreamControl { cluster, command } => {
             let principal = peer.ok_or(AccessError::UnsupportedOperation)?.principal();
@@ -702,11 +812,25 @@ fn request_shape(
             sequence,
             acknowledged_through,
             advertise,
+            region,
+            zone,
+            endpoint,
             ..
         } => {
+            let bad_label = |label: &Option<String>| {
+                label
+                    .as_ref()
+                    .is_some_and(|label| label.is_empty() || label.len() > MAX_TOPOLOGY_LABEL_BYTES)
+            };
             if *group == [0; 16]
                 || *sequence == 0
                 || *acknowledged_through >= *sequence
+                || bad_label(region)
+                || bad_label(zone)
+                || (zone.is_some() && region.is_none())
+                || endpoint
+                    .as_deref()
+                    .is_some_and(|name| !valid_endpoint_name(name))
                 || advertise.port() == 0
                 || advertise.ip().is_unspecified()
                 || advertise.ip().is_multicast()

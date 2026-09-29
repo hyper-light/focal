@@ -11,7 +11,8 @@ use focal_control::{
 };
 use focal_enrollment::{
     CredentialMaterial, EnrollmentClient, EnrollmentError, EnrollmentLimits, EnrollmentReceipt,
-    EnrollmentRegistry, EnrollmentRole, Invitation, JoinKey, JoinTransportError, PrivateJournal,
+    EnrollmentRegistry, EnrollmentRole, Invitation, JoinFailure, JoinKey, JoinTransportError,
+    PrivateJournal,
 };
 use focal_model::{RequestEpoch, RequestId, RouteEpoch};
 use focal_wire::{
@@ -155,17 +156,26 @@ impl NodeInvitation {
         {
             return Err(JoinError::Invalid);
         }
-        let address = self
-            .invitation
-            .trust()
-            .endpoint
-            .parse::<SocketAddr>()
-            .map_err(|_| JoinError::Invalid)?;
+        // The sponsor's endpoint is an address or a `host:port` name (24
+        // §24); the founder's own reachability is validated by shape only.
+        let endpoint = &self.invitation.trust().endpoint;
+        let address = match endpoint.parse::<SocketAddr>() {
+            Ok(address) => address,
+            Err(_) if focal_wire::valid_endpoint_name(endpoint) => {
+                let port = endpoint
+                    .rsplit_once(':')
+                    .and_then(|(_, port)| port.parse::<u16>().ok())
+                    .ok_or(JoinError::Invalid)?;
+                SocketAddr::from(([127, 0, 0, 1], port))
+            }
+            Err(_) => return Err(JoinError::Invalid),
+        };
         NetworkState {
-            schema: 1,
+            schema: crate::network_state::NETWORK_STATE_SCHEMA,
             node: self.genesis.founder.node,
             listen: address,
             advertise: address,
+            endpoint: None,
             sponsor: self.invitation.trust().clone(),
             genesis: self.genesis.clone(),
         }
@@ -230,8 +240,12 @@ impl NodeInvitation {
         value.validate_role(role)?;
         Ok(value)
     }
+    /// Read an invitation the operator delivered: a file `cluster invite`
+    /// wrote (mode 0600), or one a packaged secret mounted (24 §24) — a
+    /// symbolic link to a regular file owned by another user, readable by
+    /// this process's group and by nobody else, writable by its owner alone.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, JoinError> {
-        Self::decode(&read_private(path.as_ref(), MAX_BUNDLE)?)
+        Self::decode(&read_invitation(path.as_ref(), MAX_BUNDLE)?)
     }
     /// Atomic install never overwrites a different file. An exact retry also
     /// resyncs the existing inode and directory before reporting success.
@@ -257,6 +271,11 @@ pub struct PendingJoin {
     bundle: NodeInvitation,
     listen: SocketAddr,
     advertise: SocketAddr,
+    /// The `host:port` name this node advertises when its operator gave one
+    /// (24 §24). It is committed with the first contact so peers can
+    /// re-resolve it when `advertise` stops answering; an address-only
+    /// operator leaves it unset.
+    endpoint: Option<String>,
     key: JoinKey,
     _journal: PrivateJournal,
     directory: JoinDirectory,
@@ -352,6 +371,7 @@ impl PendingJoin {
             bundle,
             listen: state.listen,
             advertise: state.advertise,
+            endpoint: crate::network_state::advertised_name(settings),
             key,
             _journal: journal,
             directory,
@@ -378,13 +398,10 @@ impl PendingJoin {
             self.verify(&receipt, now)?;
             return Ok(receipt);
         }
-        let address = self
-            .bundle
-            .invitation
-            .trust()
-            .endpoint
-            .parse()
-            .map_err(|_| JoinError::Invalid)?;
+        let address =
+            crate::network_state::resolve_endpoint(&self.bundle.invitation.trust().endpoint)
+                .await
+                .map_err(|_| JoinError::Invalid)?;
         let receipt = std::panic::AssertUnwindSafe(client.redeem(
             address,
             &self.bundle.invitation,
@@ -420,20 +437,51 @@ impl PendingJoin {
             .key
             .complete(receipt, &self.bundle.invitation.trust().ca_certificate, now)?)
     }
+    /// Retire this pending join (24 §24): its journal and never-enrolled key
+    /// move under a marker named by the invitation they were for, so a
+    /// different invitation can be joined from this data directory. Only for
+    /// a join the founder has refused terminally; a join whose outcome is
+    /// unknown keeps its journal and is retried exactly.
+    pub fn retire(self) -> Result<(), JoinError> {
+        let invitation = self.bundle.invitation.id();
+        let root = self.directory.root().to_path_buf();
+        // Release the journal and key leases before moving their directory.
+        drop(self);
+        let join = root.join("JOIN");
+        let mut retired = join.as_os_str().to_owned();
+        retired.push(".retired-");
+        for byte in invitation {
+            retired.push(format!("{byte:02x}"));
+        }
+        std::fs::rename(&join, std::path::PathBuf::from(retired))?;
+        let marker = root.join("JOIN.initialized");
+        if marker.exists() {
+            std::fs::remove_file(&marker)?;
+        }
+        Ok(())
+    }
     pub fn install(self, receipt: EnrollmentReceipt, now: i64) -> Result<JoinedNode, JoinError> {
         let credentials = self.verify(&receipt, now)?;
         let mut identity = self.bundle.genesis.founder.clone();
         identity.node = receipt.identity.node_id.ok_or(JoinError::Invalid)?;
-        let state = NetworkState {
-            schema: 1,
+        let mut state = NetworkState {
+            schema: crate::network_state::NETWORK_STATE_SCHEMA,
             node: identity.node,
             listen: self.listen,
             advertise: self.advertise,
+            endpoint: self.endpoint.clone(),
             sponsor: self.bundle.invitation.trust().clone(),
             genesis: self.bundle.genesis.clone(),
         };
         state.validate(&identity)?;
         let directory = self.directory.install(identity)?;
+        // Reachability adopted at a later start (24 §24) outlives the join
+        // journal's addresses.
+        if let Some(saved) = NetworkState::load(&directory)? {
+            state.listen = saved.listen;
+            state.advertise = saved.advertise;
+            state.endpoint = saved.endpoint;
+        }
         state.install(&directory)?;
         Ok(JoinedNode {
             state,
@@ -519,6 +567,12 @@ impl JoinedNode {
                 acknowledged_through: 0,
                 expected_generation: 0,
                 advertise: self.state.advertise,
+                // The network controller announces the node's topology with
+                // its running contact (24 §22); this first intent is address
+                // only.
+                region: None,
+                zone: None,
+                endpoint: self.state.endpoint.clone(),
             },
         })
     }
@@ -561,12 +615,11 @@ impl JoinedNode {
             let limits = crate::control_host::ControlHost::wire_limits();
             let registry = genesis_registry(&self.state.genesis)?;
             let founder = registry.enrollments().next().ok_or(JoinError::Invalid)?;
-            let address: SocketAddr = self
-                .state
-                .sponsor
-                .endpoint
-                .parse()
-                .map_err(|_| JoinError::Invalid)?;
+            // The sponsor is an address or a `host:port` name (24 §24); a
+            // name is resolved at each use, so a founder that moved behind it
+            // is still reached.
+            let address: SocketAddr =
+                crate::network_state::resolve_endpoint(&self.state.sponsor.endpoint).await?;
             let bind = if address.is_ipv4() {
                 "0.0.0.0:0"
             } else {
@@ -639,13 +692,30 @@ fn genesis_registry(genesis: &NetworkGenesis) -> Result<EnrollmentRegistry, Join
         EnrollmentLimits::default(),
     )?)
 }
+/// Whether the founder refused a join for good: the invitation is revoked,
+/// expired, redeemed under another key, for another cluster, or not
+/// authorized. Capacity, unavailability and an unknown outcome are not
+/// terminal — the same join is retried exactly.
+pub fn terminal_rejection(error: &JoinError) -> bool {
+    matches!(
+        error,
+        JoinError::Transport(JoinTransportError::Rejected(
+            JoinFailure::Revoked
+                | JoinFailure::Expired
+                | JoinFailure::Used
+                | JoinFailure::WrongCluster
+                | JoinFailure::Unauthorized
+        ))
+    )
+}
 fn validate_journal(journal: &JoinJournal) -> Result<NodeInvitation, JoinError> {
     let bundle = NodeInvitation::decode(&journal.bundle.0)?;
     NetworkState {
-        schema: 1,
+        schema: crate::network_state::NETWORK_STATE_SCHEMA,
         node: bundle.genesis.founder.node,
         listen: journal.listen,
         advertise: journal.advertise,
+        endpoint: None,
         sponsor: bundle.invitation.trust().clone(),
         genesis: bundle.genesis.clone(),
     }
@@ -662,6 +732,38 @@ fn save_journal(journal: &mut PrivateJournal, state: &JoinJournal) -> Result<(),
 }
 fn read_private(path: &Path, max: usize) -> Result<Zeroizing<Vec<u8>>, JoinError> {
     check_private(path)?;
+    read_checked(path, max)
+}
+fn read_invitation(path: &Path, max: usize) -> Result<Zeroizing<Vec<u8>>, JoinError> {
+    check_invitation(path)?;
+    read_checked(path, max)
+}
+/// An invitation file is a regular file (links followed: a mounted secret
+/// is a link into its volume) that nobody but its owner may write and
+/// nobody outside its group may read.
+fn check_invitation(path: &Path) -> Result<(), JoinError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(path)?;
+        if !metadata.is_file() || metadata.mode() & 0o027 != 0 || metadata.nlink() != 1 {
+            return Err(JoinError::Permissions);
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows has no group/other split; a delivered invitation must be a
+        // regular file owned by the current user under an owner-only DACL.
+        let owner = focal_platform::fs::current_owner()?;
+        match focal_platform::fs::check_private_file(path, &owner, 1) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(JoinError::Permissions),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+fn read_checked(path: &Path, max: usize) -> Result<Zeroizing<Vec<u8>>, JoinError> {
     let mut file = File::open(path)?;
     if file.metadata()?.len() > max as u64 {
         return Err(JoinError::Capacity);
@@ -695,12 +797,18 @@ fn check_private(path: &Path) -> Result<(), JoinError> {
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
-        Err(JoinError::Permissions)
+        // The owner-only DACL is the Windows analogue of 0600; a singly-linked
+        // regular file owned by the current user with no other access.
+        let owner = focal_platform::fs::current_owner()?;
+        match focal_platform::fs::check_private_file(path, &owner, 1) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(JoinError::Permissions),
+            Err(error) => Err(error.into()),
+        }
     }
 }
+#[cfg(unix)]
 fn write_private_new(path: &Path, bytes: &[u8]) -> Result<(), JoinError> {
-    use fs2::FileExt;
     let parent = path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -719,11 +827,9 @@ fn write_private_new(path: &Path, bytes: &[u8]) -> Result<(), JoinError> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    #[cfg(not(unix))]
-    return Err(JoinError::Permissions);
     let lock = options.open(&lock_path)?;
     check_private(&lock_path)?;
-    lock.try_lock_exclusive()?;
+    focal_platform::try_lock_exclusive(&lock)?;
     if fs::symlink_metadata(path).is_ok() {
         recover_output_link(path, &temporary)?;
         if read_private(path, MAX_BUNDLE)?.as_slice() != bytes {
@@ -776,6 +882,72 @@ fn write_private_new(path: &Path, bytes: &[u8]) -> Result<(), JoinError> {
         }
     }
 }
+#[cfg(not(unix))]
+fn write_private_new(path: &Path, bytes: &[u8]) -> Result<(), JoinError> {
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().ok_or(JoinError::Invalid)?;
+    let digest = blake3::hash(name.as_encoded_bytes()).to_hex();
+    let temporary = parent.join(format!(".focal-invitation-{digest}.pending"));
+    let lock_path = parent.join(format!(".focal-invitation-{digest}.lock"));
+    if fs::symlink_metadata(&lock_path).is_ok() {
+        check_private(&lock_path)?;
+    }
+    // Serialize concurrent publications of this exact output path.
+    let lock = focal_platform::fs::open_private(&lock_path, true, true, true)?;
+    check_private(&lock_path)?;
+    focal_platform::try_lock_exclusive(&lock)?;
+    // Republishing the identical bytes is success; different bytes at the same
+    // path is a genuine conflict. The installed file is already durable, so no
+    // read-time re-sync (FlushFileBuffers would reject a read-only handle).
+    if fs::symlink_metadata(path).is_ok() {
+        check_private(path)?;
+        if read_private(path, MAX_BUNDLE)?.as_slice() != bytes {
+            return Err(JoinError::Conflict);
+        }
+        return Ok(());
+    }
+    // A private interrupted temporary is unacknowledged; the held exclusive lock
+    // makes its removal unambiguous.
+    if fs::symlink_metadata(&temporary).is_ok() {
+        check_private(&temporary)?;
+        fs::remove_file(&temporary)?;
+    }
+    let mut file = focal_platform::fs::create_private_new(&temporary, false, true)?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok::<_, std::io::Error>(())
+    })();
+    drop(file);
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    // Atomic, no-clobber, write-through publish. MoveFileExW without
+    // REPLACE_EXISTING fails AlreadyExists if a racing publisher installed the
+    // destination first (detected as a conflict below); WRITE_THROUGH is the
+    // durability fence Windows offers in place of a directory fsync. The closed
+    // temp handle lets Windows move it.
+    match focal_platform::fs::atomic_create_new(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&temporary);
+            check_private(path)?;
+            if read_private(path, MAX_BUNDLE)?.as_slice() != bytes {
+                return Err(JoinError::Conflict);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(error.into())
+        }
+    }
+}
+#[cfg(unix)]
 fn recover_output_link(path: &Path, temporary: &Path) -> Result<(), JoinError> {
     #[cfg(unix)]
     {

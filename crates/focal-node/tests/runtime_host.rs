@@ -597,6 +597,17 @@ async fn threaded_owners_recover_execution_after_leader_loss_and_restart() {
     fleet.isolated.store(1, Ordering::SeqCst);
     let (_, sequence) = fleet.terminal(Some(0)).await;
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    // The isolated former leader cancels its run when it learns it no longer
+    // leads, which its own quorum check decides on its own clock — after the
+    // majority has already finished. The property is that the run is
+    // cancelled, exactly once, not that it happens before the successor ends.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while late.cancelled.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the isolated former leader never cancelled its run");
     assert_eq!(late.cancelled.load(Ordering::SeqCst), 1);
     fleet.isolated.store(0, Ordering::SeqCst);
     fleet.all_at(sequence).await;

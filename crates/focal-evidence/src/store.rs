@@ -2,12 +2,12 @@ use focal_memory::{
     BudgetLane, DiskBudget, DiskBudgetConfig, DiskKind, DiskReservation, DiskStats,
 };
 use focal_model::{ContentClass, ContentDomainId, ContentHash, ContentRef};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 const MANIFEST_MAGIC: &[u8] = b"focal.evidence.manifest\0\x01\0";
 const UPLOAD_SCHEMA: u16 = 1;
@@ -99,7 +99,7 @@ fn disk_reserve(
     lane: BudgetLane,
     bytes: u64,
 ) -> Result<DiskReservation, ContentError> {
-    disk.refresh_with(|| fs2::available_space(root).ok());
+    disk.refresh_with(|| focal_platform::available_space(root));
     disk.reserve(kind, lane, bytes)
         .map_err(|_| ContentError::Capacity)
 }
@@ -277,7 +277,7 @@ impl ContentStore {
             .read(true)
             .write(true)
             .open(root.join("LOCK"))?;
-        lock.try_lock_exclusive().map_err(|e| {
+        focal_platform::try_lock_exclusive(&lock).map_err(|e| {
             if e.kind() == std::io::ErrorKind::WouldBlock {
                 ContentError::Locked
             } else {
@@ -624,6 +624,13 @@ impl ContentStore {
         let buffer_len = usize::try_from(upload.offset.min(self.limits.chunk_bytes as u64))
             .map_err(|_| ContentError::Capacity)?;
         let mut buffer = zeroed_buffer(buffer_len)?;
+        // The chunk count is known from the object size and chunk length;
+        // reserve once instead of growing the manifest by one per chunk.
+        let chunk_count = usize::try_from(upload.offset.div_ceil(buffer_len.max(1) as u64))
+            .map_err(|_| ContentError::Capacity)?;
+        chunks
+            .try_reserve_exact(chunk_count)
+            .map_err(|_| ContentError::Capacity)?;
         let mut remaining = upload.offset;
         while remaining > 0 {
             let count = usize::try_from(remaining.min(buffer.len() as u64))
@@ -633,7 +640,6 @@ impl ContentStore {
             hasher.update(block);
             let hash = ContentHash(*blake3::hash(block).as_bytes());
             install_verified_chunk(&directory.join(format!("{hash}.chunk")), block, hash)?;
-            chunks.try_reserve(1).map_err(|_| ContentError::Capacity)?;
             chunks.push(Chunk {
                 hash,
                 length: count as u32,
@@ -1043,18 +1049,30 @@ fn read_verified_at(
     let manifest = manifest_at(root, reference)?;
     let dir = root.join("objects").join(hex(&reference.domain.0));
     let mut whole = blake3::Hasher::new();
-    for chunk in manifest.chunks {
-        let bytes = read_bounded(
-            &dir.join(format!("{}.chunk", chunk.hash)),
-            MAX_TRANSFER_CHUNK_BYTES,
-        )?;
-        if bytes.len() != chunk.length as usize
-            || ContentHash(*blake3::hash(&bytes).as_bytes()) != chunk.hash
-        {
+    // One scratch buffer sized to the largest chunk, reused for every chunk,
+    // instead of allocating a fresh buffer (up to a full chunk) per chunk.
+    let scratch_len = manifest
+        .chunks
+        .iter()
+        .map(|chunk| chunk.length as usize)
+        .max()
+        .unwrap_or(0);
+    let mut scratch = zeroed_buffer(scratch_len)?;
+    for chunk in &manifest.chunks {
+        let len = chunk.length as usize;
+        let block = scratch.get_mut(..len).ok_or(ContentError::Corrupt)?;
+        let mut file = File::open(dir.join(format!("{}.chunk", chunk.hash)))?;
+        file.read_exact(block)?;
+        // The chunk file must be exactly `len`: a trailing byte is corruption.
+        let mut extra = [0u8; 1];
+        if file.read(&mut extra)? != 0 {
             return Err(ContentError::Corrupt);
         }
-        whole.update(&bytes);
-        sink.write_all(&bytes)?;
+        if ContentHash(*blake3::hash(block).as_bytes()) != chunk.hash {
+            return Err(ContentError::Corrupt);
+        }
+        whole.update(block);
+        sink.write_all(block)?;
     }
     if ContentHash(*whole.finalize().as_bytes()) != manifest.stream_digest {
         return Err(ContentError::Corrupt);
@@ -1160,6 +1178,40 @@ fn install_verified_chunk(
         if previous != bytes || ContentHash(*blake3::hash(&previous).as_bytes()) != hash {
             return Err(ContentError::Corrupt);
         }
+        refresh_mtime(path)?;
+        return Ok(());
+    }
+    atomic_install(path, bytes)
+}
+/// Mark a content-addressed file as freshly referenced. Dedup keeps an existing
+/// file rather than rewriting it, so without this a chunk shared with a newly
+/// sealed object would keep its old mtime; a collector pass that scanned the
+/// object domain before the seal could then reclaim a live chunk (its grace
+/// window already elapsed). Refreshing the mtime keeps a re-referenced chunk
+/// inside its grace window. It is a hint, not a durability fence, so no fsync.
+fn refresh_mtime(path: &Path) -> Result<(), ContentError> {
+    OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .set_modified(SystemTime::now())?;
+    Ok(())
+}
+/// Install a chunk a custody transfer received (24 §20). The bytes were
+/// verified against the chunk's hash by the caller. A file already holding
+/// them is left alone; one holding anything else is corrupt under this
+/// content-addressed name and is replaced by the verified bytes, never
+/// kept: a recopy is how a corrupt chunk is repaired.
+pub(crate) fn install_transferred_chunk(
+    path: &Path,
+    bytes: &[u8],
+    hash: ContentHash,
+) -> Result<(), ContentError> {
+    if path.exists()
+        && read_bounded(path, bytes.len()).is_ok_and(|previous| {
+            previous == bytes && ContentHash(*blake3::hash(&previous).as_bytes()) == hash
+        })
+    {
+        refresh_mtime(path)?;
         return Ok(());
     }
     atomic_install(path, bytes)
@@ -1174,7 +1226,7 @@ fn atomic_install(path: &Path, bytes: &[u8]) -> Result<(), ContentError> {
         .open(&temp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    fs::rename(&temp, path)?;
+    focal_platform::fs::atomic_replace(&temp, path)?;
     sync_directory(path.parent().ok_or(ContentError::Invalid)?)?;
     Ok(())
 }
@@ -1194,10 +1246,15 @@ fn durable_directory(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 fn sync_directory(path: &Path) -> std::io::Result<()> {
-    File::open(path)?.sync_all()
+    focal_platform::sync_dir(path)
 }
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write as _;
+    let mut hex = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 #[cfg(test)]

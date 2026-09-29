@@ -16,6 +16,10 @@ use super::{
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget, MemoryError};
 use focal_model::{LedgerId, RequestEpoch, RequestId, RouteEpoch};
 use focal_wire::{Operation, PROTOCOL_VERSION, PeerConnectionPool, PeerSendError, RequestEnvelope};
+
+#[cfg(test)]
+#[path = "swim_tests.rs"]
+mod swim_tests;
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -36,8 +40,11 @@ pub const MAX_INFLIGHT: usize = 16;
 pub const MAX_EVENTS: usize = 32;
 const INBOX_DEPTH: usize = 64;
 /// Bytes reserved for the driver's whole state: members, suspicions,
-/// gossip, events and one probe round.
-const STATE_BYTES: usize = MAX_MEMBERS * 640 + 96 * 1024;
+/// gossip, events, one probe round and the confirmations in progress.
+const STATE_BYTES: usize = MAX_MEMBERS * 640 + 96 * 1024 + MAX_CONFIRMATIONS * 96;
+/// Contact confirmations (24 §24) the driver holds at once: one per node
+/// whose committed address is being asked, each a bounded probe.
+pub const MAX_CONFIRMATIONS: usize = 64;
 /// How long the data service waits for the driver to answer a direct probe.
 const DIRECT_ANSWER: Duration = Duration::from_millis(750);
 
@@ -59,6 +66,13 @@ pub struct LivenessConfig {
     pub extension_min_grant_ms: u64,
     /// The local health score at which a suspected host asks for time.
     pub extension_score: u8,
+    /// Failed probe rounds an as-yet-unconfirmed member is allowed before it
+    /// is suspected like any other. Never reaching a member is treated first
+    /// as this node's own fault (Lifeguard's self-blame already stretches the
+    /// timeouts), but only for this many rounds: a member that never answers
+    /// at its committed address must become visible to the detector, not stay
+    /// "alive" forever.
+    pub unconfirmed_patience: u32,
     pub vivaldi: VivaldiConfig,
 }
 impl Default for LivenessConfig {
@@ -73,6 +87,7 @@ impl Default for LivenessConfig {
             suspicion_spread: 6.0,
             extension_min_grant_ms: 1_000,
             extension_score: 2,
+            unconfirmed_patience: 3,
             vivaldi: VivaldiConfig::default(),
         }
     }
@@ -90,7 +105,8 @@ impl LivenessConfig {
             && self.suspicion_factor >= 1.0
             && self.suspicion_spread.is_finite()
             && self.suspicion_spread >= 1.0
-            && self.extension_min_grant_ms > 0;
+            && self.extension_min_grant_ms > 0
+            && self.unconfirmed_patience >= 1;
         if ok {
             Ok(())
         } else {
@@ -108,7 +124,10 @@ impl LivenessConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LocalFacts {
     pub generation: u64,
-    pub members: BTreeMap<u64, u64>,
+    /// Shared so an unchanged membership re-reports each tick (its witness must
+    /// advance) as a cheap refcount bump instead of rebuilding and cloning the
+    /// whole map.
+    pub members: std::sync::Arc<BTreeMap<u64, u64>>,
     pub witness: u64,
     pub overloaded: bool,
 }
@@ -127,6 +146,10 @@ pub struct MemberView {
     pub extended_ms: u64,
     /// The direct probe timeout currently applied to this member.
     pub timeout_ms: u64,
+    /// The last measured round-trip time to this member, in milliseconds:
+    /// the interval between a direct probe and its answer. `None` until one
+    /// probe has been answered.
+    pub rtt_ms: Option<u64>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LivenessEvent {
@@ -225,6 +248,23 @@ enum Inbound {
         request: ProbeRequest,
         reply: oneshot::Sender<ProbeReply>,
     },
+    /// Ask `node` at exactly `address` and say whether it answered as
+    /// itself (24 §24): the root confirms a contact is gone before letting
+    /// another address take it. The answer is immediate: a verdict the
+    /// driver reached a moment ago, or `None` while its probe is in flight
+    /// (started by this ask when none was).
+    Confirm {
+        node: u64,
+        address: std::net::SocketAddr,
+        reply: oneshot::Sender<Result<Option<bool>, ProbeError>>,
+    },
+}
+/// One contact confirmation: the probe in flight (`verdict` unset) or its
+/// verdict and when it was reached.
+#[derive(Debug, Clone, Copy)]
+struct Confirmation {
+    verdict: Option<bool>,
+    at_ms: u64,
 }
 /// The data service and the placement agent's side of the driver.
 #[derive(Clone)]
@@ -318,6 +358,32 @@ impl LivenessHandle {
             .map_err(|_| ProbeError::Unavailable)?;
         reply.encode().map_err(|_| ProbeError::Capacity)
     }
+    /// Whether `node` answers a probe at exactly `address` now (24 §24).
+    /// Bounded by the probe timeout cap; a driver at capacity or gone is
+    /// an error, never a verdict.
+    pub async fn confirm(
+        &self,
+        node: u64,
+        address: std::net::SocketAddr,
+    ) -> Result<Option<bool>, ProbeError> {
+        let (reply, receive) = oneshot::channel();
+        self.inbox
+            .try_send(Inbound::Confirm {
+                node,
+                address,
+                reply,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => ProbeError::Capacity,
+                mpsc::error::TrySendError::Closed(_) => ProbeError::Unavailable,
+            })?;
+        // The driver answers from its state, never from the network: the
+        // wait covers its turn on the loop, not a probe.
+        tokio::time::timeout(DIRECT_ANSWER, receive)
+            .await
+            .map_err(|_| ProbeError::Unavailable)?
+            .map_err(|_| ProbeError::Unavailable)?
+    }
 }
 impl LivenessView {
     fn empty(node: u64, config: &LivenessConfig) -> Self {
@@ -341,6 +407,10 @@ struct Pending {
     sequence: u64,
     indirect_outstanding: usize,
     acknowledged: bool,
+    /// When this probe round began (its direct probe send). Direct proof of life
+    /// received at or after this time refutes the round, so an indirect failure
+    /// never suspects a member that answered us meanwhile.
+    started_ms: u64,
 }
 struct Member {
     generation: u64,
@@ -353,6 +423,16 @@ struct Member {
     extensions: ExtensionTracker,
     grace_until_ms: u64,
     probe: Option<Pending>,
+    /// The last measured round-trip time to this member (24 §22): a probe's
+    /// answer minus its send. `None` until the first answer.
+    last_rtt_ms: Option<u64>,
+    /// When direct evidence of this member's life last arrived (a message from
+    /// it, its direct probe reply, or a relay's acknowledgement). Gossip does
+    /// not update it. Used to refute an in-flight probe round (SWIM Lifeguard).
+    last_alive_ms: u64,
+    /// Consecutive failed probe rounds while still unconfirmed; any direct
+    /// proof of life clears it.
+    unconfirmed_rounds: u32,
 }
 impl Member {
     fn new(generation: u64, now_ms: u64, config: &LivenessConfig) -> Self {
@@ -367,6 +447,9 @@ impl Member {
             extensions: fresh_tracker(config),
             grace_until_ms: 0,
             probe: None,
+            last_rtt_ms: None,
+            last_alive_ms: 0,
+            unconfirmed_rounds: 0,
         }
     }
     fn view(&self, timeout_ms: u64) -> MemberView {
@@ -384,6 +467,7 @@ impl Member {
             extensions: self.extensions.count(),
             extended_ms: self.extensions.total_ms(),
             timeout_ms,
+            rtt_ms: self.last_rtt_ms,
         }
     }
 }
@@ -421,6 +505,8 @@ struct State {
     /// The accuser to ask for time, once, after learning of a suspicion.
     pending_extension: Option<(u64, ExtensionRequest)>,
     inflight: usize,
+    /// Contact confirmations by the node and the committed address asked.
+    confirmations: BTreeMap<(u64, std::net::SocketAddr), Confirmation>,
 }
 impl State {
     fn new(node: u64, config: &LivenessConfig) -> Self {
@@ -444,6 +530,7 @@ impl State {
             overloaded: false,
             pending_extension: None,
             inflight: 0,
+            confirmations: BTreeMap::new(),
         }
     }
     fn random(&mut self) -> u64 {
@@ -506,6 +593,11 @@ enum Done {
         reply: oneshot::Sender<ProbeReply>,
         result: Result<Vec<u8>, PeerSendError>,
     },
+    Confirm {
+        node: u64,
+        address: std::net::SocketAddr,
+        result: Result<Vec<u8>, PeerSendError>,
+    },
 }
 type Inflight<'a> = FuturesUnordered<Pin<Box<dyn Future<Output = Done> + Send + 'a>>>;
 
@@ -528,13 +620,25 @@ impl LivenessDriver {
         let mut next = started.checked_add(period).unwrap_or(started);
         loop {
             let now_ms = elapsed_ms(started);
+            let counters = self.state.counters;
+            let mut refresh = false;
             tokio::select! {
                 biased;
                 inbound = self.inbox.recv() => {
-                    let Some(Inbound::Probe { request, reply }) = inbound else {
-                        return;
-                    };
-                    self.on_inbound(request, reply, now_ms, pool, &mut inflight);
+                    match inbound {
+                        Some(Inbound::Probe { request, reply }) => {
+                            self.on_inbound(request, reply, now_ms, pool, &mut inflight);
+                        }
+                        Some(Inbound::Confirm {
+                            node,
+                            address,
+                            reply,
+                        }) => {
+                            let answer = self.confirm(node, address, now_ms, pool, &mut inflight);
+                            let _ = reply.send(answer);
+                        }
+                        None => return,
+                    }
                 }
                 Some(done) = inflight.next(), if !inflight.is_empty() => {
                     self.state.inflight = self.state.inflight.saturating_sub(1);
@@ -543,6 +647,7 @@ impl LivenessDriver {
                     }
                 }
                 () = tokio::time::sleep_until(next) => {
+                    refresh = true;
                     let at = Instant::now();
                     let late = at.saturating_duration_since(next);
                     if late > period.checked_div(2).unwrap_or(period) {
@@ -556,7 +661,13 @@ impl LivenessDriver {
                     }
                 }
             }
-            self.publish();
+            // Rebuild and publish the view only when a settled verdict changed or
+            // on the periodic tick (which refreshes RTT/coordinate-derived view
+            // fields). A stale or duplicate message and a no-op probe ack no
+            // longer rebuild the whole view every event.
+            if refresh || self.state.counters != counters {
+                self.publish();
+            }
         }
     }
     fn publish(&mut self) {
@@ -800,6 +911,7 @@ impl LivenessDriver {
             sequence,
             indirect_outstanding: 0,
             acknowledged: false,
+            started_ms: now_ms,
         });
         self.state.counters.probes_sent = self.state.counters.probes_sent.saturating_add(1);
         self.state.inflight = self.state.inflight.saturating_add(1);
@@ -815,6 +927,67 @@ impl LivenessDriver {
             }
         }));
         Ok(())
+    }
+    /// One direct probe outside the detector's schedule: it teaches nothing
+    /// and decides nothing about the member, it only answers whether the
+    /// node is there.
+    /// Answer a contact confirmation from the verdicts held: a verdict
+    /// reached within the last two probe caps stands (the mover announces
+    /// again within a tick of learning it); otherwise a probe is started
+    /// unless one is in flight, and the answer is "not yet". A request
+    /// never waits on the network, so the root answers a contact
+    /// announcement at once whatever the old address does.
+    fn confirm<'a>(
+        &mut self,
+        target: u64,
+        address: std::net::SocketAddr,
+        now_ms: u64,
+        pool: &'a PeerConnectionPool,
+        inflight: &mut Inflight<'a>,
+    ) -> Result<Option<bool>, ProbeError> {
+        let fresh = self.config.timeout_cap_ms.saturating_mul(2);
+        self.state.confirmations.retain(|_, confirmation| {
+            confirmation.verdict.is_none() || now_ms.saturating_sub(confirmation.at_ms) <= fresh
+        });
+        if let Some(confirmation) = self.state.confirmations.get(&(target, address)) {
+            return Ok(confirmation.verdict);
+        }
+        if self.state.confirmations.len() >= MAX_CONFIRMATIONS
+            || self.state.inflight >= MAX_INFLIGHT
+        {
+            return Err(ProbeError::Capacity);
+        }
+        let request = self.request(ProbeKind::Direct, None);
+        let body = request.encode().map_err(|_| ProbeError::Invalid)?;
+        // The cap, not the member's tuned timeout: a wrong "gone" admits a
+        // clone, a slow "there" only delays a move.
+        let timeout = Duration::from_millis(self.config.timeout_cap_ms);
+        let envelope = self.envelope(body);
+        self.state.inflight = self.state.inflight.saturating_add(1);
+        self.state.confirmations.insert(
+            (target, address),
+            Confirmation {
+                verdict: None,
+                at_ms: now_ms,
+            },
+        );
+        inflight.push(Box::pin(async move {
+            let result = match tokio::time::timeout(
+                timeout,
+                pool.probe_at(target, address, &envelope),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(PeerSendError::Lost),
+            };
+            Done::Confirm {
+                node: target,
+                address,
+                result,
+            }
+        }));
+        Ok(None)
     }
     fn send_indirect<'a>(
         &mut self,
@@ -892,7 +1065,7 @@ impl LivenessDriver {
             .get(&request.sender)
             .is_some_and(|member| member.generation == request.generation);
         if known {
-            self.learn_alive(request.sender, request.incarnation, now_ms);
+            self.learn_alive(request.sender, request.incarnation, now_ms, true);
             if let Some(member) = self.state.members.get_mut(&request.sender) {
                 member.coordinate = Some(request.coordinate);
             }
@@ -953,6 +1126,36 @@ impl LivenessDriver {
         inflight: &mut Inflight<'a>,
     ) -> bool {
         match done {
+            Done::Confirm {
+                node,
+                address,
+                result,
+            } => {
+                // Anything that answered over a connection authenticated as
+                // the node is the node, whatever it answered: a refusal, a
+                // node too young to gossip. Only silence is absence, and a
+                // probe the pool could not send is no verdict at all: the
+                // next ask probes again.
+                let verdict = match result {
+                    Ok(_) | Err(PeerSendError::Rejected(_)) => Some(true),
+                    Err(PeerSendError::Lost) => Some(false),
+                    Err(_) => None,
+                };
+                match verdict {
+                    Some(verdict) => {
+                        self.state.confirmations.insert(
+                            (node, address),
+                            Confirmation {
+                                verdict: Some(verdict),
+                                at_ms: now_ms,
+                            },
+                        );
+                    }
+                    None => {
+                        self.state.confirmations.remove(&(node, address));
+                    }
+                }
+            }
             Done::Direct {
                 target,
                 sequence,
@@ -1020,7 +1223,7 @@ impl LivenessDriver {
                             target: relayed,
                             acknowledged: Some(incarnation),
                         } if relayed == target => {
-                            self.learn_alive(target, incarnation, now_ms);
+                            self.learn_alive(target, incarnation, now_ms, true);
                             true
                         }
                         _ => false,
@@ -1107,14 +1310,16 @@ impl LivenessDriver {
                 {
                     return Verdict::Inconclusive;
                 }
-                let rtt = now_ms.saturating_sub(sent_at_ms) as f64;
+                let elapsed = now_ms.saturating_sub(sent_at_ms);
+                let rtt = elapsed as f64;
                 self.state
                     .coordinate
                     .update(&reply.coordinate, rtt, &self.config.vivaldi);
                 if let Some(member) = self.state.members.get_mut(&from) {
                     member.coordinate = Some(reply.coordinate);
+                    member.last_rtt_ms = Some(elapsed);
                 }
-                self.learn_alive(from, reply.incarnation, now_ms);
+                self.learn_alive(from, reply.incarnation, now_ms, true);
                 for update in &reply.updates {
                     self.on_update(*update, now_ms);
                 }
@@ -1136,11 +1341,28 @@ impl LivenessDriver {
         let Some(member) = self.state.members.get_mut(&target) else {
             return;
         };
+        let round_started = member.probe.as_ref().map(|pending| pending.started_ms);
         member.probe = None;
-        if !member.confirmed
-            || member.status == MemberStatus::Dead
+        // Direct proof of life received at or after this round began refutes it:
+        // a member that answered us (or a relay) during the probe window must not
+        // be suspected just because the indirect probes over a degraded path
+        // failed (SWIM Lifeguard).
+        let refuted = round_started.is_some_and(|started| member.last_alive_ms >= started);
+        // A member this node has never reached is first given the benefit of
+        // the doubt (the fault may be ours), but only for a bounded number of
+        // rounds; past that it is suspected exactly like a confirmed member,
+        // so a node that never answers at its committed address is never
+        // invisible to the detector.
+        if !member.confirmed {
+            member.unconfirmed_rounds = member.unconfirmed_rounds.saturating_add(1);
+            if member.unconfirmed_rounds < config.unconfirmed_patience {
+                return;
+            }
+        }
+        if member.status == MemberStatus::Dead
             || member.suspicion.is_some()
             || now_ms < member.grace_until_ms
+            || refuted
         {
             return;
         }
@@ -1173,12 +1395,20 @@ impl LivenessDriver {
         });
     }
     /// Direct evidence that `node` answers at `incarnation`.
-    fn learn_alive(&mut self, node: u64, incarnation: u64, now_ms: u64) {
+    fn learn_alive(&mut self, node: u64, incarnation: u64, now_ms: u64, direct: bool) {
         let config = self.config;
         let me = self.node;
         let Some(member) = self.state.members.get_mut(&node) else {
             return;
         };
+        // Direct evidence (a message from the member, its probe reply, or a
+        // relay's acknowledgement) records the time even for a stale incarnation,
+        // since it still proves the member is alive now; gossip (hearsay) does
+        // not, so it can never refute an in-flight probe round.
+        if direct {
+            member.last_alive_ms = now_ms;
+            member.unconfirmed_rounds = 0;
+        }
         if incarnation < member.incarnation {
             return;
         }
@@ -1231,7 +1461,7 @@ impl LivenessDriver {
         match update.status {
             MemberStatus::Alive => {
                 if update.incarnation > member.incarnation {
-                    self.learn_alive(update.node, update.incarnation, now_ms);
+                    self.learn_alive(update.node, update.incarnation, now_ms, false);
                 }
             }
             MemberStatus::Suspect => {

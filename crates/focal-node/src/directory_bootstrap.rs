@@ -163,9 +163,9 @@ impl PartitionPlan {
                 delegation: self.delegation,
                 revision: 0,
                 sealed: None,
-                nodes: BTreeMap::new(),
-                sessions: BTreeMap::new(),
-                routes: std::collections::VecDeque::new(),
+                nodes: std::sync::Arc::new(BTreeMap::new()),
+                sessions: std::sync::Arc::new(BTreeMap::new()),
+                routes: std::sync::Arc::new(std::collections::VecDeque::new()),
                 routes_from: 0,
             },
             (Some(expected), Some(image)) => {

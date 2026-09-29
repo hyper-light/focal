@@ -184,6 +184,15 @@ pub struct NativeLimits {
     pub work_artifacts_per_cycle: usize,
     pub diagnostics_per_cycle: usize,
     pub response_summary_bytes: usize,
+    /// The guaranteed inline size of a completion/respondent report or
+    /// diagnostic artifact descriptor the owner pre-reserves per outstanding
+    /// receipt (doc 18 §6.7). This decouples the per-respondent completion
+    /// promise from `preparation_bytes`: inline payloads up to this bound are
+    /// guaranteed, and larger artifact content rides the separately bounded
+    /// content store as a `Payload::Content` pointer rather than pinning owner
+    /// RAM. Keeping it small is what lets one node hold many concurrent
+    /// respondents (the per-node concurrency envelope that sizes the ledger).
+    pub report_descriptor_bytes: usize,
     /// Inputs one artifact may cite, and so the `ArtifactInput` index rows its
     /// admission writes (22 §7); never above the model's fixed ceiling.
     pub artifact_inputs: usize,
@@ -217,6 +226,7 @@ impl Default for NativeLimits {
             work_artifacts_per_cycle: 256,
             diagnostics_per_cycle: 64,
             response_summary_bytes: 64 * 1024,
+            report_descriptor_bytes: 128 * 1024,
             artifact_inputs: 16,
             legacy_rows: 4_000_000,
             legacy_row_bytes: 1024 * 1024,
@@ -1115,19 +1125,30 @@ pub struct NativeRowCursor(Key);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentRoot {
     /// An artifact's payload held as a content object.
-    Artifact(focal_model::lifecycle::artifact_descriptor::ContentPointer),
+    Artifact {
+        artifact: ArtifactId,
+        pointer: focal_model::lifecycle::artifact_descriptor::ContentPointer,
+    },
     /// An artifact's payload held inline: the object every replica sealed
     /// at admission under the canonical chunking, so its root is the same
     /// on every node and the record names it.
-    Inline(focal_model::lifecycle::artifact_descriptor::ContentPointer),
-    /// A retired family's archive bundle, by content root and length.
-    Bundle { root: ContentHash, bytes: u64 },
+    Inline {
+        artifact: ArtifactId,
+        pointer: focal_model::lifecycle::artifact_descriptor::ContentPointer,
+    },
+    /// A retired family's archive bundle, by the retired claim, content
+    /// root and length.
+    Bundle {
+        claim: ClaimId,
+        root: ContentHash,
+        bytes: u64,
+    },
 }
 impl ContentRoot {
     /// The object's content root.
     pub fn root(&self) -> ContentHash {
         match self {
-            Self::Artifact(pointer) | Self::Inline(pointer) => pointer.root,
+            Self::Artifact { pointer, .. } | Self::Inline { pointer, .. } => pointer.root,
             Self::Bundle { root, .. } => *root,
         }
     }
@@ -1502,6 +1523,24 @@ impl Core<NativeState> {
     pub fn native_outcome(&self, request: impl Into<NativeInvocation>) -> Option<NativeOutcome> {
         as_outcome(self.state.rows.get(&Key::Outcome(request.into())))
     }
+    /// Every committed native outcome (the retry-dedup records that survive a
+    /// checkpoint) in native-sequence order — one per committed record. The
+    /// offline publications reader projects these to the linearizability
+    /// checker's receipts; each carries its `invocation`, `sequence` and
+    /// `intent`.
+    pub fn native_outcomes(&self) -> Vec<NativeOutcome> {
+        let mut outcomes: Vec<NativeOutcome> = self
+            .state
+            .rows
+            .entries()
+            .filter_map(|entry| match &entry.value {
+                Row::Outcome(outcome) => Some(*outcome),
+                _ => None,
+            })
+            .collect();
+        outcomes.sort_by_key(|outcome| outcome.sequence.0);
+        outcomes
+    }
     /// The continuation of a claim that retired to the archive (26 §4).
     pub fn native_retired(&self, id: ClaimId) -> Option<&RetiredClaim> {
         match self.state.rows.get(&Key::Retired(id)) {
@@ -1535,23 +1574,30 @@ impl Core<NativeState> {
             }
             visited = visited.saturating_add(1);
             last = Some(entry.key);
-            match &entry.value {
-                Row::Artifact(owned) => {
+            match (&entry.key, &entry.value) {
+                (Key::Artifact(id), Row::Artifact(owned)) => {
                     use focal_model::lifecycle::artifact_descriptor::PayloadSpec;
                     if let Some(artifact) = owned.get() {
                         match artifact.descriptor().payload() {
                             PayloadSpec::Content(pointer) => {
-                                push(ContentRoot::Artifact(pointer))?;
+                                push(ContentRoot::Artifact {
+                                    artifact: *id,
+                                    pointer,
+                                })?;
                             }
                             PayloadSpec::Inline(_) => {
                                 // An inline payload was sealed as an object
                                 // at admission; the row's custody names it.
-                                push(ContentRoot::Inline(artifact.custody().payload()))?;
+                                push(ContentRoot::Inline {
+                                    artifact: *id,
+                                    pointer: artifact.custody().payload(),
+                                })?;
                             }
                         }
                     }
                 }
-                Row::Retired(value) => push(ContentRoot::Bundle {
+                (Key::Retired(claim), Row::Retired(value)) => push(ContentRoot::Bundle {
+                    claim: *claim,
                     root: value.bundle,
                     bytes: value.bytes,
                 })?,

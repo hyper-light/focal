@@ -327,7 +327,7 @@ pub(super) fn store_in(
     }
     if std::fs::symlink_metadata(&path).is_ok() {
         std::fs::remove_dir_all(&path)?;
-        std::fs::File::open(parent)?.sync_all()?;
+        focal_platform::sync_dir(parent)?;
     }
     let store = NativeOperationStore::create(path, NativeStoreLimits::default())?;
     let mut options = std::fs::OpenOptions::new();
@@ -340,7 +340,7 @@ pub(super) fn store_in(
     let mut file = options.open(&marker)?;
     file.write_all(b"FCLNST01")?;
     file.sync_all()?;
-    std::fs::File::open(parent)?.sync_all()?;
+    focal_platform::sync_dir(parent)?;
     Ok(Some(store))
 }
 /// The exclusive creation lock `<name>.lock` beside the store, held only

@@ -101,10 +101,16 @@ cluster intent does not become a last-writer-wins startup option. `explain` name
 value's source. Implemented 2026-09-10 (R9.1, `crates/focal-node/src/config/`): the
 schema check names an unknown key by its full path (`node.shards`) before the typed
 parse; the store's committed policy lives in `POLICY` as `FCLPOL2` with a revision and a
-hash (the original bare pair reads as revision 1, unchanged on disk); a start whose file
-sets a policy field to another value is refused as `CommittedPolicyChange` naming the
-field and directing to plan/apply, while omitted policy fields take the committed values
-and are reported as `committed` at that revision; `deployment explain` prints `requested`
+hash (the original bare pair reads as revision 1, unchanged on disk); config resolution has
+three modes on an initialized store. The pod's own `start` treats the committed policy as
+authoritative: omitted policy fields take the committed values, and a file value that differs
+also yields to it (both reported as `committed` at that revision) — the file only seeds the
+first start, and `deployment apply` may have committed stronger durability than that seed, so a
+restart is never refused for carrying what the fleet already carries (revised 2026-09-13: the
+earlier blanket `CommittedPolicyChange` refusal crash-looped every founder restart after an
+apply from a static configmap). An operator command still refuses a file that sets a policy
+field to another value, naming the field and directing to plan/apply; a policy request
+(plan/explain) keeps the file's values as the request. `deployment explain` prints `requested`
 (the file), `effective` (the committed policy) and `sources` per field
 (`command_line`, `file`, `creation_default`, `committed`). Identity keys, membership epochs, seeds learned from peers, placements,
 and measured scheduling decisions live in managed state, not generated user YAML.
@@ -144,6 +150,12 @@ streams typed evidence, closes a testament, validates it, and verifies satisfact
 The qualification harness then crashes/restarts the server and reads the same request
 receipt and evidence hash. The demo itself does not shut down the running server. This
 same demo command remains the application-level acceptance probe at every later stage.
+
+Implemented 2026-09-10 (R9.6, [24 §24](24-placement-execution-and-fleet-control.md)):
+`focal deployment render systemd --config FILE --output DIR` writes the hardened unit
+and its configuration (`deploy/systemd` is that output for `deploy/config/systemd.yaml`);
+`start --invite-file` lets a supervised host enroll and start in one command; a host
+restarted at another address, or advertising a name, is adopted and announced.
 
 ## 4. Stage 2: add machines through secure membership
 
@@ -230,7 +242,19 @@ retention/resource allocation. A new unmeasured deployment uses a documented bou
 bootstrap allocation and labels it unqualified; it cannot claim a measured envelope.
 
 The operator reviews and applies generated assets with its existing Kubernetes tooling.
-Rendering and dry-run do not alter a cluster. Enrollment uses bounded bootstrap tickets
+Rendering and dry-run do not alter a cluster. Every rendered pod's mounted
+configuration is its *first-start seed* — the pod's zone and single-node
+durability (`survive: node, max_failures: 0`), the only first start a lone node
+can satisfy (a founder alone cannot promise zone survival). The *requested*
+policy is rendered beside it in the same ConfigMap as `target.yaml` and mounted
+read-only at `/etc/focal-target/target.yaml`. Once every host pod is Ready, the
+operator commits it once from the founder — `deployment plan --config
+/etc/focal-target/target.yaml --output <plan>` then `deployment apply
+--plan-file <plan>` — and from then on the committed policy carries every
+restart (§2), so the static ConfigMap never has to follow it. This is why a
+pod's ConfigMap holds the seed, not the guarantee: a StatefulSet ConfigMap is
+static, and pinning the guarantee would make the first start unsatisfiable and,
+after an apply, crash-loop every restart on a policy mismatch. Enrollment uses bounded bootstrap tickets
 delivered through the configured secret mechanism; rendered public manifests contain
 secret references, not invitation or private-key values. The renderer emits a separate
 restricted credential-installation action when no secret reference has been supplied.
@@ -246,6 +270,18 @@ Readiness distinguishes process availability, catch-up, authoritative serving, a
 policy satisfaction. A disruption budget complements Focal's membership checks; it
 does not prove that arbitrary eviction preserves quorum or artifact custody.
 
+Implemented 2026-09-10 (R9.6, [24 §24](24-placement-execution-and-fleet-control.md)):
+`focal deployment render kubernetes --config FILE --namespace NS --output DIR [--image
+--storage-class --secret --zone ... --nodes --volume --port]` writes the objects above as
+plain manifests and a kustomization, names the facts it lacks (`missing`: image, storage
+class, invitation secret, zones) and never touches a cluster; `deploy/kubernetes` is that
+output for `deploy/config/kubernetes.yaml` and `deploy/helm/focal` templates the same
+objects. Pods advertise their StatefulSet names, so a rescheduled pod is found again
+through the name its contact carries; a founder pod's invitations name the founder. Not
+yet executed: a run on a real cluster (`kind` or otherwise), the image build, and `helm
+template` (neither `helm` nor a cluster was available where this was written); the
+Kubernetes journey (DC07/DC08) stands in with local processes.
+
 ## 6. Stage 4: availability-zone survival adds domain facts and one intent
 
 ```yaml
@@ -256,7 +292,8 @@ durability:
 ```
 
 Zone identity is imported from the configured trusted infrastructure adapter or supplied
-as a node fact. Kubernetes commonly exposes `topology.kubernetes.io/zone` and
+as a node fact (`topology.region` and `topology.zone` in the node's local configuration,
+announced with its contact and granted as its failure domains; [24 §22](24-placement-execution-and-fleet-control.md)). Kubernetes commonly exposes `topology.kubernetes.io/zone` and
 `topology.kubernetes.io/region`; topology spreading operates on such labels. See
 [Kubernetes topology spread constraints](https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/).
 Names alone do not prove independence: operators own correct physical failure-domain
@@ -295,7 +332,8 @@ placement:
 ```
 
 `home_regions` selects normal authority placement eligibility. `residency` is the hard
-boundary for all scoped durable copies and derived state, not merely a leader location.
+boundary for all scoped durable copies and derived state, not merely a leader location
+(executed by the residency fence, [24 §22](24-placement-execution-and-fleet-control.md)).
 The example permits regional survival using eligible remote locations while keeping
 normal writes homed in region-a. During an authorized region outage, temporary authority
 may run in a surviving residency region under the selected failover contract; `explain`

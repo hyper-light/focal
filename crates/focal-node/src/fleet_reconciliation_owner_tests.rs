@@ -63,7 +63,7 @@ fn reconciliation_waiters_are_bounded_cancelable_and_fenced_by_route_and_term() 
     ));
     fixture.owners[0].config.route_epoch = RouteEpoch(1);
     let mut deadline = read(&mut fixture, 3);
-    fixture.owners[0].pending.front_mut().unwrap().deadline = Instant::now();
+    fixture.owners[0].pending.front_mut().unwrap().deadline = 0;
     fixture.owners[0].expire_pending();
     assert!(matches!(
         deadline.try_recv().unwrap().envelope().result,

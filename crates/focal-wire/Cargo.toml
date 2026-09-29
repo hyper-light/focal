@@ -6,21 +6,36 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 focal-model = { version = "0.1.0", path = "../focal-model" }
 focal-memory = { version = "0.1.0", path = "../focal-memory" }
+focal-timing = { version = "0.1.0", path = "../focal-timing" }
 focal-stream = { version = "0.1.0", path = "../focal-stream" }
 blake3.workspace = true
 postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+# The congestion controller's interface names a type quinn does not re-export.
+quinn-proto = { version = "0.11.18", default-features = false, features = ["rustls-aws-lc-rs"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
+
+[target.'cfg(windows)'.dependencies]
+focal-platform = { version = "0.1.0", path = "../focal-platform" }
 
 [dev-dependencies]
-rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
+tokio = { workspace = true, features = ["test-util"] }
+focal-model = { version = "0.1.0", path = "../focal-model" }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "aws_lc_rs"] }
+bytes = "1"
+focal-sim = { version = "0.1.0", path = "../focal-sim" }
 serde_json.workspace = true
 tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "codec"
+harness = false

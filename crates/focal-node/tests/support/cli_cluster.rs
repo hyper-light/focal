@@ -270,4 +270,51 @@ fn actual_cli_invitation_inspection_revocation_and_retry_never_disclose_token() 
     assert!(!rejected.status.success());
     assert_redacted(&rejected, &token);
     assert!(!peer.path().join("IDENTITY").exists());
+
+    // The revoked invitation no longer denotes the name: inviting `unused`
+    // again issues a fresh invitation (a new id), and a peer joins with it
+    // under the same name. Retrying that name is exact again.
+    let fresh = founder.path().join("unused-again.invite");
+    success(
+        founder.path(),
+        &[
+            "cluster",
+            "invite",
+            "--node",
+            "unused",
+            "--output",
+            fresh.to_str().unwrap(),
+        ],
+    );
+    let renewed = NodeInvitation::load(&fresh).unwrap();
+    assert_ne!(renewed.invitation().id(), bundle.invitation().id());
+    assert_eq!(renewed.name(), "unused");
+    let again = founder.path().join("unused-again-2.invite");
+    success(
+        founder.path(),
+        &[
+            "cluster",
+            "invite",
+            "--node",
+            "unused",
+            "--output",
+            again.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        NodeInvitation::load(&again).unwrap().invitation().id(),
+        renewed.invitation().id(),
+        "the live invitation for the name is returned exactly"
+    );
+    success(
+        peer.path(),
+        &[
+            "join",
+            "--invite-file",
+            fresh.to_str().unwrap(),
+            "--advertise",
+            &address(),
+        ],
+    );
+    assert!(peer.path().join("IDENTITY").exists());
 }

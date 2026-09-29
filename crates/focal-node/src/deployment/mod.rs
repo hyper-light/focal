@@ -10,6 +10,7 @@
 pub mod apply;
 pub mod observe;
 pub mod plan;
+pub mod render;
 #[cfg(test)]
 mod tests;
 
@@ -39,12 +40,18 @@ pub enum DeploymentError {
     Blocked(usize),
     #[error("the directory view is truncated; the plan cannot name every session")]
     Truncated,
+    #[error(
+        "the directory has not reported this node yet: it is still starting, or it runs no directory; plan from a node that does, once `cluster placement` shows it"
+    )]
+    NotObserved,
     #[error("deployment plan needs the requested configuration (--config FILE)")]
     NoConfig,
     #[error("requested policy is unsatisfiable here: {0}")]
     Unsatisfiable(#[from] crate::placement::PlacementError),
     #[error("deployment artifact exceeds its bound")]
     Capacity,
+    #[error("render: {0}")]
+    Render(String),
 }
 impl DeploymentError {
     pub fn classification(&self) -> focal_client::failure::Failure {
@@ -64,7 +71,12 @@ impl DeploymentError {
                 exit_code: 6,
             },
             Self::Truncated | Self::Capacity => Failure::error("capacity", 6),
-            Self::NoConfig => Failure::error("invalid_input", 2),
+            Self::NotObserved => Failure {
+                condition: "NotReady",
+                code: "not_observed",
+                exit_code: 6,
+            },
+            Self::NoConfig | Self::Render(_) => Failure::error("invalid_input", 2),
             Self::Config(_) | Self::Admin(_) | Self::Io(_) => Failure::error("deployment", 1),
         }
     }

@@ -329,9 +329,10 @@ fn failure(error: LedgerError) -> ControlFailure {
         LedgerError::NotReady { leader } => ControlFailure::NotLeader { leader },
         LedgerError::OutcomeUnknown => ControlFailure::OutcomeUnknown,
         LedgerError::MembershipConflict => ControlFailure::CompareFailed,
-        LedgerError::Consensus(focal_consensus::ConsensusError::LearnerBehind) => {
-            ControlFailure::NotReady
-        }
+        LedgerError::Consensus(
+            focal_consensus::ConsensusError::LearnerBehind
+            | focal_consensus::ConsensusError::LeaderLeaving,
+        ) => ControlFailure::NotReady,
         LedgerError::Managed(_) => ControlFailure::NotReady,
         LedgerError::Consensus(focal_consensus::ConsensusError::NotLeader { leader }) => {
             ControlFailure::NotLeader { leader }

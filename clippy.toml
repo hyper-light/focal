@@ -1,5 +1,17 @@
 # Production assertions and convenience output macros may unwind. Tests opt out
 # explicitly at their crate root; production handles failures with typed results.
+# The accessors generated for the enumerations of the wire and log types
+# unwind on a value they do not know, and a peer chooses the value.
+# `focal_raft::proto` reads them as options.
+disallowed-methods = [
+  { path = "raft_proto::eraftpb::Message::get_msg_type", reason = "unwinds on an unknown value; use focal_raft::proto::message_type" },
+  { path = "raft_proto::eraftpb::Entry::get_entry_type", reason = "unwinds on an unknown value; use focal_raft::proto::entry_type" },
+  { path = "raft_proto::eraftpb::ConfChange::get_change_type", reason = "unwinds on an unknown value; use focal_raft::proto::Plan" },
+  { path = "raft_proto::eraftpb::ConfChangeSingle::get_change_type", reason = "unwinds on an unknown value; use focal_raft::proto::Plan" },
+  { path = "raft_proto::eraftpb::ConfChangeV2::get_transition", reason = "unwinds on an unknown value; use focal_raft::proto::Plan" },
+  { path = "raft_proto::eraftpb::ConfChangeV2::enter_joint", reason = "unwinds on an unknown value; use focal_raft::proto::Plan" },
+  { path = "raft_proto::eraftpb::ConfChangeV2::leave_joint", reason = "unwinds on an unknown value; use focal_raft::proto::Plan" },
+]
 disallowed-macros = [
   "std::assert", "std::assert_eq", "std::assert_ne",
   "std::debug_assert", "std::debug_assert_eq", "std::debug_assert_ne",

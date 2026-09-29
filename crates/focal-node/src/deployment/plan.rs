@@ -48,6 +48,9 @@ pub struct ObservedNode {
     pub alive: bool,
     pub eligible: bool,
     pub disk_available: Option<u64>,
+    /// The failure-domain labels the node announced (24 §22).
+    pub region: Option<String>,
+    pub zone: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Observed {

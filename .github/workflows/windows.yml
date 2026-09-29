@@ -1,0 +1,62 @@
+name: Windows build
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows:
+    name: windows build
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.94.1 --profile minimal --component clippy
+        shell: bash
+      - name: Install protoc
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver=29.3
+          url="https://github.com/protocolbuffers/protobuf/releases/download/v${ver}/protoc-${ver}-win64.zip"
+          curl -sSL "$url" -o protoc.zip
+          7z x protoc.zip -oprotoc-dist >/dev/null
+          echo "PROTOC=$(pwd)/protoc-dist/bin/protoc.exe" >> "$GITHUB_ENV"
+      - name: Build the workspace
+        shell: bash
+        run: cargo build --workspace --locked
+      - name: Platform FFI tests (DACL, SID, file identity, locks, paths)
+        shell: bash
+        run: cargo test -p focal-platform --locked
+      - name: Wire tests (named-pipe local transport round-trip)
+        shell: bash
+        run: cargo test -p focal-wire --locked
+      - name: Enrollment tests (private credential persistence, PKI, invitations)
+        shell: bash
+        # The founder's credential bootstrap persists through this crate's
+        # PrivateDirectory. Its own suite exercises BootstrapAuthority/JoinKey
+        # open_or_create and install/read round-trips - the exact Windows path
+        # the A1 binary drives - and runs in seconds, so a durability regression
+        # is caught here before the multi-minute release A1 build.
+        run: cargo test -p focal-enrollment --locked
+      - name: Node library tests (cross-platform unit suites)
+        shell: bash
+        # The focal-node lib unit suites (config, cli, cluster-admin, joins,
+        # native ingress/reads, ...) now compile and run on Windows; POSIX-only
+        # mode/symlink/hardlink assertions are cfg(unix), their Windows analogues
+        # covered by the platform FFI suite.
+        run: cargo test -p focal-node --lib --locked
+      - name: A1 product gate on the real binary (CLI, activation, restart, retry)
+        shell: bash
+        # The integration test drives the shipped artifact, so it runs the
+        # release binary — the optimized build users get, which needs ~700 KiB
+        # of stack (well within a Windows process's 1 MiB main thread). A debug
+        # build's un-optimized async poll frames need ~2 MiB, a rustc codegen
+        # characteristic, not a product cost.
+        run: cargo test -p focal-node --test cli_native_a1 --release --locked
+      - name: A1 product gate through the MCP adapter (stdio tools, restart, retry)
+        shell: bash
+        # The MCP counterpart of the A1 gate: two participants each behind their
+        # own `focal mcp serve`, complete claim cycle through native tools, kill
+        # and restart, identical reads, exact retry. Release for the same stack
+        # reason as the CLI gate (both drive the founder start path).
+        run: cargo test -p focal-node --test mcp_native_a1 --release --locked

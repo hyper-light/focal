@@ -505,15 +505,10 @@ fn report<T>(
     result
 }
 fn path_bytes(path: &Path) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
-    path.as_os_str().as_bytes().to_vec()
+    focal_platform::path_to_bytes(path)
 }
 fn path_from_bytes(bytes: Vec<u8>) -> Result<PathBuf> {
-    use std::os::unix::ffi::OsStringExt;
-    if bytes.contains(&0) {
-        return Err(other(TransferError::Corrupt));
-    }
-    Ok(std::ffi::OsString::from_vec(bytes).into())
+    focal_platform::path_from_bytes(&bytes).ok_or_else(|| other(TransferError::Corrupt))
 }
 
 #[cfg(test)]

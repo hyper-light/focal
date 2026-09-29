@@ -184,9 +184,25 @@ fn private_output_is_noclobber_and_recovers_both_atomic_install_crash_windows() 
     let alias = output.with_extension("symlink");
     symlink(&output, &alias).unwrap();
     assert!(matches!(
-        bundle.write_new(alias),
+        bundle.write_new(&alias),
         Err(JoinError::Permissions)
     ));
+    // A delivered invitation is read through a link and may be group-readable
+    // (a mounted secret, 24 §24), never group-writable or world-readable.
+    assert_eq!(
+        NodeInvitation::load(&alias).unwrap().encode().unwrap(),
+        bundle.encode().unwrap()
+    );
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o440)).unwrap();
+    assert!(NodeInvitation::load(&output).is_ok());
+    for mode in [0o660, 0o604, 0o444, 0o404] {
+        fs::set_permissions(&output, fs::Permissions::from_mode(mode)).unwrap();
+        assert!(
+            matches!(NodeInvitation::load(&output), Err(JoinError::Permissions)),
+            "{mode:o}"
+        );
+    }
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o600)).unwrap();
 }
 #[test]
 fn journal_precedes_network_reuses_key_and_rejects_changed_intent_or_lost_key() {
@@ -392,7 +408,7 @@ async fn pinned_enrollment_unknown_reply_restart_installs_exact_node_without_mem
     assert!(!disk.path().join("cluster").exists());
     let contact = joined.contact_request().unwrap();
     assert!(matches!(contact.operation, Operation::NodeContact {
-        group, sequence:1, acknowledged_through:0, expected_generation:0, advertise:address
+        group, sequence:1, acknowledged_through:0, expected_generation:0, advertise:address, ..
     } if group==joined.state.genesis.root.group && address==advertise));
     drop(joined);
     let joined = JoinedNode::open(&settings, now()).unwrap();
@@ -405,4 +421,41 @@ async fn pinned_enrollment_unknown_reply_restart_installs_exact_node_without_mem
     client.close();
     server.close();
     task.await.unwrap();
+}
+
+/// An operator who advertises a `host:port` name has that name carried into
+/// the join and committed with the first contact (24 §24): peers re-resolve
+/// it when the address behind it stops answering, which is how a rescheduled
+/// host stays reachable. Before this, the join dropped the name and every
+/// host's committed contact was address-only, so a host that moved was
+/// unreachable until declared dead. The name comes from the operator's
+/// configuration on open and on resume alike; an address literal names
+/// nothing to re-resolve and leaves it unset.
+#[test]
+fn a_join_carries_the_advertised_name_so_peers_can_re_resolve_a_moved_host() {
+    let mut fixture = Fixture::new();
+    let (listen, advertise) = addresses();
+    let disk = tempfile::tempdir().unwrap();
+    let mut named = settings(disk.path());
+    named.node.listen = Some(listen);
+    named.node.advertise = Some("host-b.example:7444".into());
+    let pending = PendingJoin::open(&named, fixture.bundle(), listen, advertise).unwrap();
+    assert_eq!(pending.endpoint.as_deref(), Some("host-b.example:7444"));
+    drop(pending);
+    let resumed = PendingJoin::resume(&named).unwrap();
+    assert_eq!(
+        resumed.endpoint.as_deref(),
+        Some("host-b.example:7444"),
+        "a resumed join derives the name from the same configuration"
+    );
+    drop(resumed);
+    let disk = tempfile::tempdir().unwrap();
+    let mut addressed = settings(disk.path());
+    addressed.node.listen = Some(listen);
+    addressed.node.advertise = Some(advertise.to_string());
+    let pending = PendingJoin::open(&addressed, fixture.bundle(), listen, advertise).unwrap();
+    assert!(
+        pending.endpoint.is_none(),
+        "an address literal names nothing to re-resolve"
+    );
 }

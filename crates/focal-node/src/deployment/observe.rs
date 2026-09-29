@@ -8,7 +8,10 @@ use std::collections::BTreeSet;
 
 /// Observe the node: its committed policy and, when it runs a directory,
 /// every session the placement view names. A truncated view is refused
-/// because a plan must name every session it covers.
+/// because a plan must name every session it covers, and a view that does
+/// not name this node yet (the directory is still installing, or this node
+/// acts on no partition) is refused because a plan composed from it would
+/// promise a level nothing was asked to provide.
 pub async fn observe(admin: &ClusterAdmin, network: bool) -> Result<Observation, DeploymentError> {
     let committed =
         read_committed(admin.root())?.ok_or(crate::config::ConfigError::PolicyMissing)?;
@@ -28,6 +31,9 @@ pub async fn observe(admin: &ClusterAdmin, network: bool) -> Result<Observation,
     }
     let view = admin.placement_view().await?;
     let (sessions, nodes) = convert(&view)?;
+    if !nodes.iter().any(|node| node.node == identity.node) {
+        return Err(DeploymentError::NotObserved);
+    }
     Ok(Observation {
         deployment,
         committed,
@@ -72,6 +78,8 @@ pub fn convert(
                     alive: node.alive,
                     eligible: node.eligible,
                     disk_available: node.disk_available,
+                    region: node.region.clone(),
+                    zone: node.zone.clone(),
                 });
             }
         }

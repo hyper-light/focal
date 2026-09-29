@@ -113,7 +113,7 @@ fn raw_tls(
     material: Option<&CredentialMaterial>,
     protocols: Vec<Vec<u8>>,
 ) -> quinn::ClientConfig {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut roots = rustls::RootCertStore::empty();
     roots.add(CertificateDer::from(ca.to_vec())).unwrap();
     let builder = rustls::ClientConfig::builder_with_provider(provider)
@@ -533,7 +533,7 @@ async fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() 
     roots.add(CertificateDer::from(ca.clone())).unwrap();
     let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
         Arc::new(roots),
-        Arc::new(rustls::crypto::ring::default_provider()),
+        Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
     )
     .build()
     .unwrap();

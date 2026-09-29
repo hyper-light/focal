@@ -27,17 +27,11 @@ async fn view_when(
     what: &str,
     condition: impl Fn(&crate::liveness::LivenessView) -> bool,
 ) -> crate::liveness::LivenessView {
-    tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            let view = running.handles.liveness.view();
-            if condition(&view) {
-                return view;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+    crate::network_service::tests::until(what, &[running], Duration::from_secs(60), async || {
+        let view = running.handles.liveness.view();
+        condition(&view).then_some(view)
     })
     .await
-    .unwrap_or_else(|_| panic!("liveness view never reached: {what}"))
 }
 async fn confirmed(running: &Running, members: &[u64]) -> crate::liveness::LivenessView {
     view_when(running, "members confirmed", |view| {

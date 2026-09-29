@@ -532,8 +532,12 @@ impl PlacementAgent {
             return Err(AgentError::Identity);
         }
         let step = self.intend_partition(handles, command).await?;
-        // The merged-away partition is forgotten for restarts; its sealed
-        // group keeps refusing until shutdown.
+        // Record the retire durably before deleting the source's host record, so
+        // a crash between the committed Absorb and the delete cannot re-host the
+        // sealed, now-absorbed source forever on restart; drain_pending_retires
+        // replays it. Then delete the record (its group keeps refusing until it
+        // is gone). Both are idempotent.
+        self.record_pending_retire(fence.source)?;
         handles.directory.request(HostRequest::Retire {
             partition: fence.source,
         })?;

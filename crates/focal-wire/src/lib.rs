@@ -13,35 +13,40 @@
 //! Bounded authenticated protocol shared by embedded and QUIC adapters.
 //! Async transport entry points require a Tokio runtime with IO and time drivers.
 //! Missing runtime context returns a typed transport error before dispatch.
+mod admission;
 mod auth;
+pub mod congestion;
 mod frame;
 mod handler;
 mod list;
+mod local;
 mod managed;
 mod message;
 mod native;
 mod peer_mutations;
 mod peers;
 mod reconcile;
+mod round;
 mod transport;
 mod traversal;
-#[cfg(unix)]
-mod unix;
 mod validators;
+pub use admission::*;
 pub use auth::*;
 pub use frame::*;
 pub use handler::*;
 pub use list::*;
+pub use local::{LocalRemote, LocalServer};
 pub use managed::*;
 pub use message::*;
 pub use native::*;
 pub use peer_mutations::*;
 pub use peers::*;
 pub use reconcile::*;
+pub use round::*;
+// Historic names kept so the ~25 call sites do not churn across the port.
+pub use local::{LocalRemote as UnixRemote, LocalServer as UnixServer};
 pub use transport::*;
 pub use traversal::*;
-#[cfg(unix)]
-pub use unix::*;
 pub use validators::*;
 #[cfg(test)]
 mod tests;

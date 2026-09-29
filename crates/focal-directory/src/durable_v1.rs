@@ -117,7 +117,8 @@ v1_struct_later!(NodeLoad {
     available_memory: u64,
     active_weight: u64
 } later {
-    disk_available: 0
+    disk_available: 0,
+    capability: 0
 });
 v1_struct_later!(NodeRecord { enrollment: NodeEnrollment, load: Option<NodeLoad> } later {
     liveness: None

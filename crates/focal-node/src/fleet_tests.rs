@@ -4,6 +4,7 @@ use crate::fleet::*;
 use focal_consensus::NodeConfig;
 use focal_ledger::{Session, SessionLimits};
 use focal_model::*;
+use focal_timing::ProgressDeadline;
 use focal_wire::*;
 use std::{
     collections::BTreeSet,
@@ -13,6 +14,11 @@ use std::{
     },
     time::Duration,
 };
+
+const TICK: Duration = Duration::from_millis(20);
+/// How long the slowest owner may run no period at all before a wait calls
+/// it wedged.
+const FROZEN: Duration = Duration::from_secs(60);
 
 fn ledger() -> LedgerId {
     LedgerId {
@@ -68,7 +74,7 @@ impl Fleet {
             )
             .unwrap();
             let mut service = ReplicaConfig::new(RootCommandId::from_u128(3));
-            service.tick = Duration::from_millis(20);
+            service.tick = TICK;
             service.request_timeout = Duration::from_millis(500);
             let (host, owner, channel) =
                 ReplicaHost::spawn(session, service, ReplicaHost::wire_limits()).unwrap();
@@ -122,8 +128,50 @@ impl Fleet {
             isolated,
         }
     }
+    fn periods(&self) -> Vec<u64> {
+        self.hosts.iter().map(ReplicaHost::periods).collect()
+    }
+    /// A wait charged to the owners' own periods (27 §3.1 P8): what ten
+    /// seconds held at the configured tick, however long that takes here.
+    fn deadline(&self) -> ProgressDeadline {
+        ProgressDeadline::begin(
+            &self.periods(),
+            ProgressDeadline::periods(Duration::from_secs(10), TICK),
+            FROZEN,
+        )
+    }
+    /// Move leadership off `from`. Leadership observed is not leadership
+    /// held: an owner that lost it between the observation and the transfer
+    /// refuses, and the group has then already done what was asked.
+    async fn depose(&self, from: usize) -> usize {
+        let mut wait = self.deadline();
+        let mut from_now = from;
+        loop {
+            let target = (from_now + 1) % self.hosts.len();
+            match self.hosts[from_now]
+                .transfer_leader(target as u64 + 1)
+                .await
+            {
+                Ok(()) => {}
+                Err(focal_ledger::LedgerError::Consensus(
+                    focal_consensus::ConsensusError::NotLeader { .. },
+                )) => {}
+                Err(error) => panic!("transfer from {from_now}: {error:?}"),
+            }
+            let leader = self.leader(None).await;
+            if leader != from {
+                return leader;
+            }
+            from_now = leader;
+            if let Err(spent) = wait.check(&self.periods()) {
+                panic!("leadership never left {from}: {spent}");
+            }
+            tokio::time::sleep(TICK).await;
+        }
+    }
     async fn leader(&self, excluding: Option<usize>) -> usize {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        let mut wait = self.deadline();
+        {
             loop {
                 for (index, host) in self.hosts.iter().enumerate() {
                     let p = host.progress();
@@ -148,32 +196,46 @@ impl Fleet {
                         }
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                if let Err(spent) = wait.check(&self.periods()) {
+                    panic!(
+                        "no ready leader: {spent}; {:?}",
+                        self.hosts.iter().map(|h| h.progress()).collect::<Vec<_>>()
+                    );
+                }
+                tokio::time::sleep(TICK).await;
             }
-        })
-        .await
-        .expect("no ready leader")
+        }
     }
     async fn all_at(&self, sequence: SessionSeq) {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while self.hosts.iter().any(|h| h.progress().sequence < sequence) {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut wait = self.deadline();
+        while self.hosts.iter().any(|h| h.progress().sequence < sequence) {
+            if let Err(spent) = wait.check(&self.periods()) {
+                panic!(
+                    "replicas did not converge on {sequence:?}: {spent}; {:?}",
+                    self.hosts.iter().map(|h| h.progress()).collect::<Vec<_>>()
+                );
             }
-        })
-        .await
-        .expect("replicas did not converge");
+            tokio::time::sleep(TICK).await;
+        }
     }
-    async fn retry_exact(
+    async fn retry_exact(&self, candidate: usize, request: &RequestEnvelope) -> ResponseEnvelope {
+        self.retry_exact_as(actor(), candidate, request).await
+    }
+    /// As `retry_exact`, asked by `peer`. A read that was answered gives no
+    /// lease on the leader that answered it: the next one, whoever asks it,
+    /// may find no quorum in time and is asked again.
+    async fn retry_exact_as(
         &self,
+        peer: AuthenticatedPeer,
         mut candidate: usize,
         request: &RequestEnvelope,
     ) -> ResponseEnvelope {
-        let mut last = None;
-        let result = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut wait = self.deadline();
+        {
             loop {
                 let reply = dispatch(
                     &self.hosts[candidate],
-                    actor(),
+                    peer.clone(),
                     request.clone(),
                     &ReplicaHost::wire_limits(),
                 )
@@ -184,15 +246,17 @@ impl Fleet {
                 ) {
                     return reply;
                 }
-                last = Some((candidate, self.hosts[candidate].progress(), reply));
+                if let Err(spent) = wait.check(&self.periods()) {
+                    panic!(
+                        "exact retry did not complete: {spent}; last={:?}",
+                        (candidate, self.hosts[candidate].progress(), reply)
+                    );
+                }
                 // A completed read or converged prefix does not grant a lease
                 // on this leader. Preserve the complete request during healing.
                 candidate = self.leader(None).await;
             }
-        })
-        .await;
-        result
-            .unwrap_or_else(|error| panic!("exact retry did not complete: {error}; last={last:?}"))
+        }
     }
     async fn stop(mut self) {
         for host in &self.hosts {
@@ -217,6 +281,9 @@ impl Drop for Fleet {
         }
     }
 }
+
+#[path = "fleet_leader_return_tests.rs"]
+mod leader_return_tests;
 
 #[path = "fleet_summary_tests.rs"]
 mod summary_tests;
@@ -297,12 +364,7 @@ async fn exact_retry_rediscovery_preserves_receipt_after_cached_owner_loses_lead
         Response::Submitted(MutationReply::Committed(_))
     ));
     fleet.all_at(SessionSeq(1)).await;
-    let target = (previous + 1) % fleet.hosts.len();
-    fleet.hosts[previous]
-        .transfer_leader(target as u64 + 1)
-        .await
-        .unwrap();
-    let replacement = fleet.leader(Some(previous)).await;
+    let replacement = fleet.depose(previous).await;
     assert_ne!(replacement, previous);
     let stale = dispatch(
         &fleet.hosts[previous],
@@ -311,12 +373,14 @@ async fn exact_retry_rediscovery_preserves_receipt_after_cached_owner_loses_lead
         &ReplicaHost::wire_limits(),
     )
     .await;
+    // The deposed owner refuses; one the group has since elected again
+    // answers with the receipt it committed. Never anything else.
     assert!(
         matches!(
             stale.result,
             Response::Error(AccessError::Unavailable | AccessError::OutcomeUnknown)
-        ),
-        "cached owner unexpectedly retained authority: {stale:?}"
+        ) || stale == first,
+        "cached owner answered with another outcome: {stale:?}"
     );
     assert_eq!(fleet.retry_exact(previous, &request).await, first);
     assert_eq!(fleet.hosts[replacement].progress().sequence, SessionSeq(1));

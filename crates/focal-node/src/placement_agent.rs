@@ -91,6 +91,8 @@ pub enum AgentError {
     Stopped,
     #[error("placement agent runtime is unavailable")]
     Runtime,
+    #[error("residency: {0}")]
+    Residency(#[from] crate::placement_executor::ExecutorError),
     #[error("placement intent: {0}")]
     Intent(#[from] IntentError),
     #[error("metadata owner: {0}")]
@@ -378,6 +380,11 @@ pub struct PlacementAgent {
     credentials: CredentialMaterial,
     root: PathBuf,
     custody: BTreeMap<LedgerId, CustodyScope>,
+    /// The residency fence installed with each ledger's custody scope
+    /// (24 §22), re-installed when the boundary or a node's region changes.
+    fences: BTreeMap<LedgerId, crate::placement_executor::ResidencyFence>,
+    /// The region every directory-listed node reported, refreshed each pass.
+    node_regions: BTreeMap<u64, focal_directory::RegionId>,
     /// The pending placement scope announced to the content host per hosted
     /// ledger, so its peers can pull checkpoint seeds before activation.
     pending_custody: BTreeMap<LedgerId, CustodyScope>,
@@ -410,6 +417,14 @@ pub struct PlacementAgent {
     /// The partitions as the last tick observed them, for the operator.
     last_observed: Vec<(Delegation, PartitionCheckpoint)>,
     observed_at: i64,
+    /// The liveness member set derived from the last observation, shared so an
+    /// unchanged membership re-reports each tick without rebuilding the map.
+    member_facts: std::sync::Arc<BTreeMap<u64, u64>>,
+    member_generation: u64,
+    /// Per session, the (descriptor authority, directory revision) last seen to
+    /// verify: the self-heal placement check is a pure function of those two, so
+    /// an unchanged pair skips re-verifying against the whole node set each tick.
+    verified_active: BTreeMap<LedgerId, (ContentHash, u64)>,
     /// Operator plan requests, answered by the next pass over the partition
     /// holding each session; a request that outlives the agent is lost and
     /// its exact retry finds the committed plan.
@@ -421,7 +436,52 @@ pub struct PlacementAgent {
     move_requests: Vec<MoveRangeJob>,
     /// Per-member observations behind automatic splits and merges (25 §8).
     balancer: crate::range_balancer::Balancer,
+    /// Per-session observations behind moves of a preferred leader (27 §5).
+    pub(super) leader_balancer: crate::leader_balancer::LeaderBalancer,
+    /// Per-session observations behind moves of a seat toward the home
+    /// regions (27 §3.1 P4).
+    pub(super) home_balancer: crate::leader_balancer::LeaderBalancer,
+    /// Where sessions are led, as one revision of one partition's
+    /// directory commits it: counted once for every session of a pass.
+    pub(super) leading: Option<Leading>,
     _allocation: Allocation,
+}
+/// The voters of `descriptor`'s active placement that the directory places
+/// in the zone of its preferred leader; none while that zone is not known.
+pub(super) fn near(
+    descriptor: &SessionDescriptor,
+    directory: &PartitionCheckpoint,
+) -> crate::fleet::Near {
+    let placement = &descriptor.active.placement;
+    let leader = placement.preferred_leader;
+    let zone = |node: &u64| {
+        directory
+            .nodes
+            .get(node)
+            .map(|record| (record.enrollment.region, record.enrollment.zone))
+            .filter(|(region, zone)| region.0 != [0; 16] && zone.0 != [0; 16])
+    };
+    let voters = match zone(&leader) {
+        Some(home) => placement
+            .voters
+            .keys()
+            .filter(|voter| **voter != leader && zone(voter) == Some(home))
+            .copied()
+            .collect(),
+        None => Vec::new(),
+    };
+    crate::fleet::Near { leader, voters }
+}
+/// Where the sessions of a partition are led at one revision of it.
+pub(super) struct Leading {
+    partition: focal_directory::PartitionId,
+    revision: u64,
+    /// Sessions that prefer each node as their leader.
+    pub(super) counts: BTreeMap<u64, u64>,
+    /// A session is being balanced: it moves its preferred leader among
+    /// the members it has, or one seat to another node, under the policy
+    /// it has.
+    pub(super) moving: bool,
 }
 const MAX_MOVE_REQUESTS: usize = 64;
 impl PlacementAgent {
@@ -462,6 +522,8 @@ impl PlacementAgent {
             root,
             custody,
             pending_custody: BTreeMap::new(),
+            fences: BTreeMap::new(),
+            node_regions: BTreeMap::new(),
             node_budget,
             admission,
             wal,
@@ -480,11 +542,24 @@ impl PlacementAgent {
             ticks: 0,
             last_observed: Vec::new(),
             observed_at: 0,
+            member_facts: std::sync::Arc::new(BTreeMap::new()),
+            member_generation: 0,
+            verified_active: BTreeMap::new(),
             plan_requests: BTreeMap::new(),
             move_requests: Vec::new(),
             balancer: crate::range_balancer::Balancer::new(
                 crate::range_balancer::BalancerConfig::from_env(),
             ),
+            leader_balancer: crate::leader_balancer::LeaderBalancer::new(
+                crate::leader_balancer::LeaderBalancerConfig::from_env(),
+            ),
+            home_balancer: crate::leader_balancer::LeaderBalancer::new(
+                crate::leader_balancer::LeaderBalancerConfig::from_env_of(
+                    crate::leader_balancer::HOME_BALANCE_ENV,
+                    crate::leader_balancer::HOME_HOLD_ENV,
+                ),
+            ),
+            leading: None,
             _allocation: allocation,
         })
     }
@@ -601,6 +676,76 @@ impl PlacementAgent {
         .await
         .unwrap_or(Err(AgentError::Runtime))
     }
+    fn pending_retires_path(&self) -> PathBuf {
+        self.root.join("cluster").join("pending-retires")
+    }
+    /// Partition ids whose host must be retired after a committed merge. A merge
+    /// commits the Absorb durably (in the intent journal) and then deletes the
+    /// source's host record; a crash between the two would re-host the sealed,
+    /// now-absorbed source on restart forever. Recording the id durably before
+    /// the delete, and replaying it each tick, closes that window.
+    fn load_pending_retires(&self) -> Vec<PartitionId> {
+        // Best effort: a missing or unreadable list means nothing is pending; the
+        // record is only a retry hint, and the retire it drives is idempotent.
+        let Ok(bytes) = std::fs::read(self.pending_retires_path()) else {
+            return Vec::new();
+        };
+        bytes
+            .chunks_exact(16)
+            .filter_map(|chunk| <[u8; 16]>::try_from(chunk).ok().map(PartitionId))
+            .collect()
+    }
+    fn store_pending_retires(&self, ids: &[PartitionId]) -> Result<(), AgentError> {
+        let path = self.pending_retires_path();
+        if ids.is_empty() {
+            return match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(_) => Err(AgentError::Capacity),
+            };
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(ids.len().saturating_mul(16))
+            .map_err(|_| AgentError::Capacity)?;
+        for id in ids {
+            bytes.extend_from_slice(&id.0);
+        }
+        if let Some(parent) = path.parent() {
+            crate::embedded::durable_dir(parent).map_err(|_| AgentError::Capacity)?;
+        }
+        atomic_file(&path, &bytes).map_err(|_| AgentError::Capacity)
+    }
+    /// Record a source for retirement durably, before its host record is deleted.
+    fn record_pending_retire(&self, source: PartitionId) -> Result<(), AgentError> {
+        let mut ids = self.load_pending_retires();
+        if ids.iter().any(|id| id.0 == source.0) {
+            return Ok(());
+        }
+        ids.try_reserve(1).map_err(|_| AgentError::Capacity)?;
+        ids.push(source);
+        self.store_pending_retires(&ids)
+    }
+    /// Retire every recorded source (idempotent), then drop those the directory
+    /// no longer hosts. Runs each tick so a merge whose retire was lost to a
+    /// crash still converges.
+    fn drain_pending_retires(&self, handles: &NetworkHandles) -> Result<(), AgentError> {
+        let ids = self.load_pending_retires();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut remaining = Vec::new();
+        for id in ids {
+            handles
+                .directory
+                .request(crate::network_service::HostRequest::Retire { partition: id })?;
+            if handles.directory.is_hosted(id) {
+                remaining.try_reserve(1).map_err(|_| AgentError::Capacity)?;
+                remaining.push(id);
+            }
+        }
+        self.store_pending_retires(&remaining)
+    }
     /// One bounded pass; public for the service tests. Every partition the
     /// root delegates is visited in namespace order: hosted partitions this
     /// node leads locally, the rest through the founder; a sealed partition
@@ -619,18 +764,30 @@ impl PlacementAgent {
             self.reopen_installed(handles).await?;
             self.reopened = true;
         }
+        // Retire any source whose merge committed but whose host-record delete was
+        // lost to a crash; idempotent and self-clearing once the host is gone.
+        self.drain_pending_retires(handles)?;
+        // The founder submits root intents to the root it leads under its
+        // local client; a host submits them through the root leader's
+        // placement-control ingress, which binds the request client to the
+        // sender's enrolled principal (24 §16).
+        let root_client = if self.state.genesis.founder.node == node {
+            client
+        } else {
+            crate::placement_control::root_intent_client(self.principal.0)
+        };
         if self.journals.is_none() {
             self.journals = Some(Journals {
                 root: IntentJournal::open(
                     &self.root,
                     "placement-root",
                     self.state.genesis.root,
-                    client,
+                    root_client,
                 )?,
                 partitions: BTreeMap::new(),
             });
         }
-        let root_peer = self.peer(client, self.state.genesis.root_namespace)?;
+        let root_peer = self.peer(root_client, self.state.genesis.root_namespace)?;
         let namespace = handles.directory.namespace();
         let partition_peer = self.peer(client, namespace)?;
         {
@@ -717,18 +874,37 @@ impl PlacementAgent {
                 observed.push((*delegation, access, snapshot, installed));
             }
         }
-        self.last_observed = observed
-            .iter()
-            .filter_map(|(delegation, _, snapshot, _)| match &snapshot.state {
-                ControlBootstrap::Partition { directory } => Some((*delegation, directory.clone())),
-                _ => None,
-            })
-            .collect();
+        // The last-observed snapshot only feeds the operator's on-demand
+        // placement view, so rebuild it (a deep clone of every partition
+        // directory) only when a partition's revision actually moved. In steady
+        // state — the common case at fleet scale — this tick clones nothing.
+        let unchanged = observed.len() == self.last_observed.len()
+            && observed.iter().zip(&self.last_observed).all(
+                |((delegation, _, snapshot, _), (previous, checkpoint))| {
+                    delegation.partition == previous.partition
+                        && matches!(
+                            &snapshot.state,
+                            ControlBootstrap::Partition { directory }
+                                if directory.revision == checkpoint.revision
+                        )
+                },
+            );
+        if !unchanged {
+            let mut next = Vec::new();
+            next.try_reserve(observed.len())
+                .map_err(|_| AgentError::Capacity)?;
+            for (delegation, _, snapshot, _) in &observed {
+                if let ControlBootstrap::Partition { directory } = &snapshot.state {
+                    next.push((*delegation, directory.clone()));
+                }
+            }
+            self.last_observed = next;
+        }
         self.observed_at = now;
         if observed.is_empty() {
             return Ok(AgentStep::Idle);
         }
-        self.report_liveness_facts(handles, &observed);
+        self.report_liveness_facts(handles, &observed, unchanged);
         let root_leader = handles.control.progress().leader == node;
         for (delegation, access, snapshot, installed) in &observed {
             let ControlBootstrap::Partition { directory } = &snapshot.state else {
@@ -806,7 +982,8 @@ impl PlacementAgent {
                 return Ok(step);
             }
             for descriptor in directory.sessions.values() {
-                self.sync_custody(handles, descriptor).await?;
+                Self::sync_members(handles, descriptor, directory).await?;
+                self.sync_custody(handles, descriptor, directory).await?;
                 if let Some(step) = self
                     .answer_plan_request(handles, descriptor, directory, snapshot, installed, now)
                     .await?
@@ -904,25 +1081,38 @@ impl PlacementAgent {
     /// enrolled node of every observed partition, at its highest generation),
     /// how far this node has progressed, and whether admission is refusing
     /// capacity.
-    fn report_liveness_facts(&mut self, handles: &NetworkHandles, observed: &[Observed]) {
+    fn report_liveness_facts(
+        &mut self,
+        handles: &NetworkHandles,
+        observed: &[Observed],
+        unchanged: bool,
+    ) {
         self.ticks = self.ticks.saturating_add(1);
-        let node = self.state.node;
-        let mut generation = 0;
-        let mut members: BTreeMap<u64, u64> = BTreeMap::new();
-        for (_, _, snapshot, _) in observed {
-            let ControlBootstrap::Partition { directory } = &snapshot.state else {
-                continue;
-            };
-            if let Some(record) = directory.nodes.get(&node) {
-                generation = generation.max(record.enrollment.generation);
-            }
-            for (id, record) in &directory.nodes {
-                if *id == node || !record.enrollment.eligible {
+        // The member set and generation derive only from the observed partition
+        // directories, so recompute them only when a directory actually moved;
+        // otherwise re-report the cached Arc (a refcount bump) with the advancing
+        // witness. Only `overloaded` and `witness` change every tick.
+        if !unchanged {
+            let node = self.state.node;
+            let mut generation = 0;
+            let mut members: BTreeMap<u64, u64> = BTreeMap::new();
+            for (_, _, snapshot, _) in observed {
+                let ControlBootstrap::Partition { directory } = &snapshot.state else {
                     continue;
+                };
+                if let Some(record) = directory.nodes.get(&node) {
+                    generation = generation.max(record.enrollment.generation);
                 }
-                let known = members.entry(*id).or_insert(0);
-                *known = (*known).max(record.enrollment.generation);
+                for (id, record) in directory.nodes.iter() {
+                    if *id == node || !record.enrollment.eligible {
+                        continue;
+                    }
+                    let known = members.entry(*id).or_insert(0);
+                    *known = (*known).max(record.enrollment.generation);
+                }
             }
+            self.member_generation = generation;
+            self.member_facts = std::sync::Arc::new(members);
         }
         let report = self
             .admission
@@ -933,8 +1123,8 @@ impl PlacementAgent {
                 .disk_free
                 .is_some_and(|free| free < report.disk_headroom);
         handles.liveness.report(crate::liveness::LocalFacts {
-            generation,
-            members,
+            generation: self.member_generation,
+            members: std::sync::Arc::clone(&self.member_facts),
             witness: self.ticks,
             overloaded,
         });
@@ -1201,30 +1391,44 @@ impl PlacementAgent {
         // A reopened copy serves the route its log has committed; a fresh copy
         // has none yet and takes the plan's target scope for its custody.
         let mut config = ReplicaConfig::new(self.identity.root);
-        let (scope, voters, copies) = match (session.active_fence(), session.active_placement()) {
-            (Some(fence), Some(spec)) => {
-                config.route_epoch = fence.to_route;
-                config.policy_revision = fence.placement_epoch;
-                (
-                    CustodyScope {
-                        ledger,
-                        route_epoch: fence.to_route,
-                        policy_revision: fence.placement_epoch,
-                    },
-                    spec.placement.voters.keys().copied().collect(),
-                    spec.placement.content_copies.keys().copied().collect(),
-                )
-            }
-            _ => (
-                CustodyScope {
-                    ledger,
-                    route_epoch: copy.route_epoch,
-                    policy_revision: copy.policy_revision,
-                },
-                copy.voters.clone(),
-                copy.copies.clone(),
-            ),
-        };
+        let (scope, voters, copies, residency) =
+            match (session.active_fence(), session.active_placement()) {
+                (Some(fence), Some(spec)) => {
+                    config.route_epoch = fence.to_route;
+                    config.policy_revision = fence.placement_epoch;
+                    (
+                        CustodyScope {
+                            ledger,
+                            route_epoch: fence.to_route,
+                            policy_revision: fence.placement_epoch,
+                        },
+                        spec.placement.voters.keys().copied().collect(),
+                        spec.placement.content_copies.keys().copied().collect(),
+                        spec.policy.residency.clone(),
+                    )
+                }
+                // A journaled copy's boundary is learned with the next custody
+                // sync, which re-installs the fence (24 §22). Until its log
+                // commits a fence the copy serves the session's route as it
+                // is now: the plan's target route is the current one plus one
+                // (`PendingPlacement::next_route`), and a leader probing a
+                // prospective learner speaks the current route. Serving the
+                // default route would refuse every leader past the first
+                // activation, and the session could never heal.
+                _ => {
+                    config.route_epoch = RouteEpoch(copy.route_epoch.0.saturating_sub(1).max(1));
+                    (
+                        CustodyScope {
+                            ledger,
+                            route_epoch: copy.route_epoch,
+                            policy_revision: copy.policy_revision,
+                        },
+                        copy.voters.clone(),
+                        copy.copies.clone(),
+                        BTreeSet::new(),
+                    )
+                }
+            };
         let sequence = handles
             .fleet
             .status()
@@ -1236,7 +1440,8 @@ impl PlacementAgent {
             .install(sequence, FleetReplica { session, config })
             .await
             .map_err(|failure| AgentError::Fleet(failure.error))?;
-        self.install_custody(handles, scope, voters, copies).await?;
+        self.install_custody(handles, scope, voters, copies, residency)
+            .await?;
         Ok(installed.value().host().clone())
     }
     /// Install one custody scope for a hosted ledger, replacing the previous.
@@ -1246,9 +1451,13 @@ impl PlacementAgent {
         scope: CustodyScope,
         voters: BTreeSet<u64>,
         copies: BTreeSet<u64>,
+        residency: BTreeSet<focal_directory::RegionId>,
     ) -> Result<(), AgentError> {
+        let fence =
+            crate::placement_executor::ResidencyFence::new(residency, self.node_regions.clone())
+                .map_err(|_| AgentError::Capacity)?;
         let previous = self.custody.get(&scope.ledger).copied();
-        if previous == Some(scope) {
+        if previous == Some(scope) && self.fences.get(&scope.ledger) == Some(&fence) {
             return Ok(());
         }
         handles
@@ -1264,11 +1473,53 @@ impl PlacementAgent {
             .evidence
             .replace_placement(
                 previous,
-                EvidencePlacement::committed(scope, voters, copies)?,
+                EvidencePlacement::committed(scope, voters, copies, fence.clone())?,
             )
             .await?;
         self.custody.insert(scope.ledger, scope);
+        self.fences.insert(scope.ledger, fence);
         Ok(())
+    }
+    /// Tell a hosted copy which members the committed directory names for
+    /// its session: the active voters, the voters of a pending plan and the
+    /// copies being retired. The copy admits their replication before it
+    /// has applied a configuration that names them (a new copy begins at
+    /// the configuration its log began with, and the log may lead anywhere).
+    /// With them, the voters the directory places in the zone of the
+    /// session's preferred leader: they outrank the other voters (27 §5).
+    async fn sync_members(
+        handles: &NetworkHandles,
+        descriptor: &SessionDescriptor,
+        directory: &PartitionCheckpoint,
+    ) -> Result<(), AgentError> {
+        let Ok(host) = handles.fleet.current_host(descriptor.ledger) else {
+            return Ok(());
+        };
+        let members: BTreeSet<u64> = descriptor
+            .active
+            .placement
+            .voters
+            .keys()
+            .chain(
+                descriptor
+                    .pending
+                    .iter()
+                    .flat_map(|plan| plan.desired.placement.voters.keys()),
+            )
+            .chain(descriptor.retiring.keys())
+            .copied()
+            .collect();
+        let near = near(descriptor, directory);
+        let progress = host.progress();
+        if progress.admitted.iter().eq(members.iter()) && progress.near == near {
+            return Ok(());
+        }
+        match host.admit(members.into_iter().collect(), near).await {
+            // Refused for room or lost with its owner: asked again on the
+            // next pass, from what the directory says then.
+            Ok(()) | Err(LedgerError::Capacity | LedgerError::OutcomeUnknown) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
     /// Keep a hosted ledger's custody scope at the placement the directory
     /// has activated; a pending plan changes nothing until it activates.
@@ -1276,6 +1527,7 @@ impl PlacementAgent {
         &mut self,
         handles: &NetworkHandles,
         descriptor: &SessionDescriptor,
+        directory: &PartitionCheckpoint,
     ) -> Result<(), AgentError> {
         let node = self.state.node;
         if !handles.fleet.hosts(descriptor.ledger)
@@ -1315,11 +1567,17 @@ impl PlacementAgent {
             return Ok(());
         }
         let placement = &descriptor.active.placement;
+        // The residency boundary and every known node's region travel with
+        // the custody scope (24 §22).
+        for (id, record) in directory.nodes.iter() {
+            self.node_regions.insert(*id, record.enrollment.region);
+        }
         self.install_custody(
             handles,
             scope,
             placement.voters.keys().copied().collect(),
             placement.content_copies.keys().copied().collect(),
+            descriptor.active.policy.residency.clone(),
         )
         .await
     }
@@ -1454,6 +1712,54 @@ impl PlacementAgent {
         OperationId(id)
     }
     /// Answer an operator's plan request for this session from the committed
+    /// Where the sessions of `directory` are led, counted when its revision
+    /// was first seen. Taken out of the agent while it is read, and put
+    /// back by the caller.
+    pub(super) fn take_leading(&mut self, directory: &PartitionCheckpoint) -> Leading {
+        let partition = directory.delegation.partition;
+        match self.leading.take() {
+            Some(leading)
+                if leading.partition == partition && leading.revision == directory.revision =>
+            {
+                leading
+            }
+            _ => {
+                // Sessions that left the partition take their
+                // observations with them.
+                let namespace = directory.delegation.namespace;
+                self.leader_balancer.retain(|ledger| {
+                    !namespace.contains(*ledger) || directory.sessions.contains_key(ledger)
+                });
+                self.home_balancer.retain(|ledger| {
+                    !namespace.contains(*ledger) || directory.sessions.contains_key(ledger)
+                });
+                Leading {
+                    partition,
+                    revision: directory.revision,
+                    // Counted as nothing, every leader is kept where it is.
+                    counts: if self.leader_balancer.config().enabled {
+                        focal_directory::leading(&directory.sessions)
+                    } else {
+                        BTreeMap::new()
+                    },
+                    moving: directory.sessions.values().any(|session| {
+                        session.pending.as_ref().is_some_and(|plan| {
+                            let (now, next) = (&session.active.placement, &plan.desired.placement);
+                            let left = now
+                                .voters
+                                .keys()
+                                .filter(|voter| !next.voters.contains_key(voter))
+                                .count();
+                            plan.desired.policy == session.active.policy
+                                && now.voters.len() == next.voters.len()
+                                && left <= 1
+                                && (left == 1 || now.preferred_leader != next.preferred_leader)
+                        })
+                    }),
+                }
+            }
+        }
+    }
     /// directory: the pending plan if one exists, "satisfied" when the active
     /// placement already provides the durability, otherwise a plan under the
     /// active policy with the requested durability, journaled for the
@@ -1512,13 +1818,20 @@ impl PlacementAgent {
                     durability,
                     ..descriptor.active.policy.clone()
                 };
-                match focal_directory::propose_placement_keeping(
+                let leading = self.take_leading(directory);
+                let proposal = focal_directory::heal_placement(
                     &directory.nodes,
                     &policy,
-                    &descriptor.active.placement.voters,
+                    &descriptor.active.placement,
+                    focal_directory::Leading {
+                        counts: &leading.counts,
+                        current: Some(descriptor.active.placement.preferred_leader),
+                    },
                     config.max_members,
                     config.min_disk_available,
-                ) {
+                );
+                self.leading = Some(leading);
+                match proposal {
                     Ok(proposal) => {
                         let operation = Self::requested_plan_id(descriptor, durability);
                         let voters: Vec<u64> =
@@ -1667,6 +1980,42 @@ impl PlacementAgent {
         }
         let manifest = crate::backup::read_manifest(&request.input)?;
         let ledger = manifest.prefix.ledger;
+        let group = match &request.decision {
+            RestoreDecision::SameIncarnation { .. } => manifest.prefix.group.0,
+            RestoreDecision::RecoveryIncarnation { .. } => {
+                if !request.new_incarnation {
+                    return Err(AgentError::Restore(
+                        "the backup's source is not fenced: its cluster or a member of its membership could act again; pass --new-incarnation to restore as a recovery incarnation under a new log group",
+                    ));
+                }
+                crate::backup::recovery_group(&manifest, node)
+            }
+        };
+        // Resume idempotently. An interrupted restore may have durably recorded
+        // and attached this exact copy before its reply reached the operator,
+        // who then reissues the same command. The recovery group is a pure
+        // function of the backup and this node, so a copy already installed
+        // under it is this very restore, already complete: report it restored
+        // rather than refuse a re-run that would change nothing. A copy at the
+        // same ledger under a different group is a genuine conflict and still
+        // falls through to the guards below.
+        if self.installs.as_ref().is_some_and(|installs| {
+            installs
+                .record
+                .installed
+                .get(&ledger)
+                .is_some_and(|copy| copy.group == group && copy.created)
+        }) {
+            return Ok(crate::backup::RestoredSession {
+                ledger,
+                group,
+                node,
+                decision: request.decision,
+                manifest,
+                objects_imported: 0,
+                seeds_installed: 0,
+            });
+        }
         if handles.fleet.replica_target(ledger).is_ok() {
             return Err(AgentError::Restore("this node already hosts the session"));
         }
@@ -1679,17 +2028,6 @@ impl PlacementAgent {
                 "this cluster's directory already holds the session; a live descriptor is replaced by a placement plan, not a restore",
             ));
         }
-        let group = match &request.decision {
-            RestoreDecision::SameIncarnation { .. } => manifest.prefix.group.0,
-            RestoreDecision::RecoveryIncarnation { .. } => {
-                if !request.new_incarnation {
-                    return Err(AgentError::Restore(
-                        "the backup's source is not fenced: its cluster or a member of its membership could act again; pass --new-incarnation to restore as a recovery incarnation under a new log group",
-                    ));
-                }
-                crate::backup::recovery_group(&manifest, node)
-            }
-        };
         let installs = self.installs.as_ref().ok_or(AgentError::Identity)?;
         if installs.record.installed.contains_key(&ledger)
             || installs
@@ -1755,6 +2093,7 @@ impl PlacementAgent {
         })
         .await
         .map_err(|_| AgentError::Runtime)??;
+        crate::fault::hit(crate::fault::FaultSite::RestoreImported);
         let consensus = DurableNode::restore_on_wal_in(
             NodeConfig::single(node, cluster, group),
             self.wal.clone(),
@@ -1767,6 +2106,7 @@ impl PlacementAgent {
                 transition: Some(decoder),
             },
         )?;
+        crate::fault::hit(crate::fault::FaultSite::RestoreLogged);
         let copy = InstalledCopy {
             group,
             bootstrap_voters: vec![node],
@@ -1779,6 +2119,7 @@ impl PlacementAgent {
         let installs = self.installs.as_mut().ok_or(AgentError::Identity)?;
         installs.record.installed.insert(ledger, copy.clone());
         installs.save_on(&handles.control).await?;
+        crate::fault::hit(crate::fault::FaultSite::RestoreRecorded);
         self.attach_copy(handles, ledger, &copy, consensus, &tenant)
             .await?;
         Ok(crate::backup::RestoredSession {
@@ -1918,16 +2259,19 @@ impl PlacementAgent {
             }
             let expected_generation = match directory.nodes.get(&id) {
                 Some(existing) if existing.enrollment == grant.enrollment => continue,
-                Some(existing)
-                    if existing.enrollment.generation < grant.enrollment.generation
-                        && grant.enrollment.generation
-                            == existing.enrollment.generation.saturating_add(1) =>
-                {
+                // Accept any forward move, not only +1. The root advances a node's
+                // generation once per drain/undrain, and this partition's authority
+                // snapshot holds only the latest grant per node, so an intermediate
+                // generation (e.g. a drain immediately undrained) is never presented
+                // here. Requiring exactly +1 would freeze the enrollment forever and
+                // keep serving a since-drained node. The grant is self-contained and
+                // verified at apply, and the compare-and-set on expected_generation
+                // guards against a lost concurrent update.
+                Some(existing) if existing.enrollment.generation < grant.enrollment.generation => {
                     Some(existing.enrollment.generation)
                 }
                 Some(_) => continue,
-                None if grant.enrollment.generation == 1 => None,
-                None => continue,
+                None => None,
             };
             let command = ControlCommand::VerifiedPartition(VerifiedPartitionCommand {
                 command: PartitionCommand {
@@ -2002,6 +2346,7 @@ impl PlacementAgent {
             // Free bytes of the data volume that no queued durable write has
             // been promised, as the disk envelope estimates them.
             disk_available: self.wal.available_bytes().unwrap_or(0),
+            capability: crate::upgrade::announced_level(),
         };
         let command = ControlCommand::VerifiedPartition(VerifiedPartitionCommand {
             command: PartitionCommand {
@@ -2346,15 +2691,38 @@ impl PlacementAgent {
                 return collected.finish();
             }
         }
+        let body = crate::placement_collect::sign_request_body(&fact, window)
+            .ok_or(CollectError::Capacity)?;
+        // Every other voter is asked at once (27 §3.1 P1): the round ends at
+        // the first majority, so a voter that is gone costs nothing the
+        // majority does not need, and its budget is derived from what these
+        // voters were measured to take.
+        let mut asks = Vec::new();
+        asks.try_reserve_exact(voters.len())
+            .map_err(|_| CollectError::Capacity)?;
         for voter in voters.iter().copied().filter(|voter| *voter != node) {
             let id = self.next_request_id().map_err(|_| CollectError::Capacity)?;
-            let Some(proof) = remote_signature(pool, voter, ledger, group, &fact, window, id).await
-            else {
-                continue;
-            };
-            if collected.merge(proof)? {
-                return collected.finish();
+            asks.push((
+                voter,
+                remote_signature(pool, voter, ledger, group, &body, id),
+            ));
+        }
+        let budget = pool.round_budget(
+            asks.iter().map(|(voter, _)| *voter),
+            handles.control.tick_period(),
+        );
+        let mut refused = None;
+        focal_wire::gather(asks, budget, |_, proof| match collected.merge(proof) {
+            Ok(complete) => complete,
+            Err(error) => {
+                refused = Some(error);
+                true
             }
+        })
+        .await
+        .map_err(|_| CollectError::Capacity)?;
+        if let Some(error) = refused {
+            return Err(error);
         }
         collected.finish()
     }

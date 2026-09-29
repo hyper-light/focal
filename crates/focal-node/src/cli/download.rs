@@ -266,7 +266,6 @@ mod tests {
     }
     #[test]
     fn actual_verified_chunks_and_inline_bytes_publish_complete_new_private_files() {
-        use std::os::unix::fs::MetadataExt;
         let directory = tempfile::tempdir().unwrap();
         let bytes = (0..20_111)
             .map(|index| (index % 251) as u8)
@@ -287,7 +286,11 @@ mod tests {
             let output = directory.path().join(name);
             payload(&runtime, &client, envelope, &data, &output).unwrap();
             assert_eq!(fs::read(&output).unwrap(), bytes);
-            assert_eq!(fs::metadata(output).unwrap().mode() & 0o777, 0o600);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(fs::metadata(&output).unwrap().mode() & 0o777, 0o600);
+            }
         }
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 3);
     }
@@ -302,9 +305,14 @@ mod tests {
         assert_eq!(fs::read(&output).unwrap(), b"previous");
         assert!(Temporary::create(&output).is_err());
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
-        fs::remove_file(&output).unwrap();
-        std::os::unix::fs::symlink(directory.path().join("absent"), &output).unwrap();
-        assert!(Temporary::create(&output).is_err());
+        // A symlinked output is a Unix-only shape; on Windows Temporary::create
+        // refuses a reparse point through the platform layer instead.
+        #[cfg(unix)]
+        {
+            fs::remove_file(&output).unwrap();
+            std::os::unix::fs::symlink(directory.path().join("absent"), &output).unwrap();
+            assert!(Temporary::create(&output).is_err());
+        }
     }
     #[test]
     fn malformed_offsets_lengths_eof_and_empty_progress_never_publish_partial_content() {

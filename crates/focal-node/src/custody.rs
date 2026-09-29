@@ -102,9 +102,16 @@ struct PendingPeers {
     peers: BTreeSet<u64>,
     _allocation: Allocation,
 }
+/// The bytes of the hash a manifest names a chunk by: a manifest of as
+/// many bytes names one chunk at most.
+const CHUNK_NAME_BYTES: usize = focal_model::ContentHash([0; 32]).0.len();
 struct Transfer {
     manifest: TransferManifest,
     next_missing: usize,
+    /// The chunks that were taken, a bit for each chunk of the manifest: a
+    /// transfer goes by several streams, and what they carry arrives in no
+    /// order. None for a manifest that is sent from.
+    taken: Vec<u64>,
     expires: Instant,
     _allocation: Allocation,
 }
@@ -318,9 +325,11 @@ impl CustodyStore {
         );
         Ok(())
     }
-    /// Authorize a seed read: a node of the installed placement at its route,
-    /// or a node of an announced pending placement at that placement's route.
-    fn authorize_seed(&self, verified: &VerifiedRequest) -> Result<CustodyScope, AccessError> {
+    /// Authorize a read: a node of the installed placement at its route, or
+    /// a node of an announced pending placement at that placement's route
+    /// (25 §5, 24 §20). A copy the directory is preparing reads the seeds
+    /// and objects it lacks from this node before the placement activates.
+    fn authorize_read(&self, verified: &VerifiedRequest) -> Result<CustodyScope, AccessError> {
         let request = verified.request();
         let PeerRole::Node { node_id } = verified.peer().role() else {
             return Err(AccessError::Unauthorized);
@@ -350,6 +359,28 @@ impl CustodyStore {
         } else {
             Err(AccessError::Unauthorized)
         }
+    }
+    /// A read's scope is the installed policy's or the announced pending
+    /// placement's (`authorize_read`); the object must be of the tenant.
+    fn check_read_scope(
+        &self,
+        scope: CustodyScope,
+        content: &ContentRef,
+    ) -> Result<(), AccessError> {
+        let installed = self
+            .installed(scope.ledger)
+            .is_some_and(|policy| policy.scope() == scope);
+        let pending = self
+            .pending
+            .get(&scope.ledger)
+            .is_some_and(|pending| pending.scope == scope);
+        if !installed && !pending {
+            return Err(AccessError::Unavailable);
+        }
+        if content.domain != ContentDomainId(scope.ledger.tenant.0) {
+            return Err(AccessError::Unauthorized);
+        }
+        Ok(())
     }
     pub fn check_policy(&self, scope: CustodyScope) -> Result<(), AccessError> {
         let policy = self
@@ -421,11 +452,13 @@ impl CustodyStore {
         &self,
         manifest: TransferManifest,
         next_missing: usize,
+        taken: Vec<u64>,
         allocation: Allocation,
     ) -> Result<Transfer, AccessError> {
         Ok(Transfer {
             manifest,
             next_missing,
+            taken,
             expires: self.deadline()?,
             _allocation: allocation,
         })
@@ -435,19 +468,30 @@ impl CustodyStore {
         verified: &VerifiedRequest,
     ) -> Result<Accounted<CustodyReply>, AccessError> {
         self.expire(Instant::now())?;
-        let seed = matches!(
+        // Reads — a seed, an object's manifest, the transfer that describes
+        // it, its chunks, a verification — are open to the nodes of the
+        // installed placement and of an announced pending one; writes (a
+        // chunk received, a seal) only to the installed placement's nodes.
+        let read = matches!(
             verified.request().operation,
-            Operation::Custody(CustodyRequest::SeedChunk { .. })
+            Operation::Custody(
+                CustodyRequest::SeedChunk { .. }
+                    | CustodyRequest::Manifest { .. }
+                    | CustodyRequest::Open { .. }
+                    | CustodyRequest::ReadChunk { .. }
+                    | CustodyRequest::Verify { .. }
+                    | CustodyRequest::Cancel { .. }
+            )
         );
-        let scope = if seed {
-            self.authorize_seed(verified)?
+        let scope = if read {
+            self.authorize_read(verified)?
         } else {
             self.authorize(verified)?
         };
         let PeerRole::Node { node_id } = verified.peer().role() else {
             return Err(AccessError::Unauthorized);
         };
-        if !seed
+        if !read
             && !self
                 .installed(scope.ledger)
                 .is_some_and(|p| p.peers.contains(&node_id))
@@ -481,7 +525,7 @@ impl CustodyStore {
                 content,
                 manifest,
             } => {
-                self.check_scope(
+                self.check_read_scope(
                     CustodyScope {
                         policy_revision: *policy_revision,
                         ..scope
@@ -500,10 +544,19 @@ impl CustodyStore {
                     opened(existing)?
                 } else {
                     let total = self.room(content)?;
+                    // A bit for each chunk the manifest may name, in words.
+                    let bits = manifest
+                        .len()
+                        .checked_div(CHUNK_NAME_BYTES)
+                        .unwrap_or(0)
+                        .div_ceil(8)
+                        .checked_add(size_of::<u64>())
+                        .ok_or(AccessError::Capacity)?;
                     let amount = manifest
                         .len()
                         .checked_mul(4)
                         .and_then(|n| n.checked_add(4096))
+                        .and_then(|n| n.checked_add(bits))
                         .ok_or(AccessError::Capacity)?;
                     let allocation =
                         self.reserve(BudgetKind::Control, BudgetLane::Ordinary, amount)?;
@@ -530,10 +583,22 @@ impl CustodyStore {
                             {
                                 break;
                             }
+                            // A chunk that fails its hash is missing too: the
+                            // import installs verified bytes over it (24 §20).
+                            Err(ContentError::Corrupt) => break,
                             Err(error) => return Err(content_error(error)),
                         }
                     }
-                    let retained = self.descriptor(descriptor, next_missing, allocation)?;
+                    let words = descriptor.chunks().div_ceil(u64::BITS as usize);
+                    if words.checked_mul(size_of::<u64>()).is_none_or(|n| n > bits) {
+                        return Err(AccessError::InvalidRequest);
+                    }
+                    let mut taken = Vec::new();
+                    taken
+                        .try_reserve_exact(words)
+                        .map_err(|_| AccessError::Capacity)?;
+                    taken.resize(words, 0);
+                    let retained = self.descriptor(descriptor, next_missing, taken, allocation)?;
                     let reply = opened(&retained)?;
                     self.transfers.insert(key, retained);
                     self.transfer_bytes = total;
@@ -551,18 +616,38 @@ impl CustodyStore {
                     .get_mut(&(scope, node_id, *transfer))
                     .ok_or(AccessError::Unavailable)?;
                 let index_usize = usize::try_from(*index).map_err(|_| AccessError::Capacity)?;
-                if index_usize > retained.next_missing {
-                    return Err(AccessError::InvalidRequest);
-                }
+                // Any chunk of the manifest, in any order: the store holds
+                // each to the hash the manifest names it by.
                 self.store
                     .import_chunk(&retained.manifest, index_usize, bytes)
                     .map_err(content_error)?;
                 retained.expires = deadline;
-                if index_usize == retained.next_missing {
-                    retained.next_missing = retained
-                        .next_missing
-                        .checked_add(1)
-                        .ok_or(AccessError::Capacity)?;
+                let word = index_usize.checked_div(u64::BITS as usize).unwrap_or(0);
+                let bit = u32::try_from(index_usize.checked_rem(u64::BITS as usize).unwrap_or(0))
+                    .ok()
+                    .and_then(|bit| 1_u64.checked_shl(bit))
+                    .ok_or(AccessError::InvalidRequest)?;
+                *retained
+                    .taken
+                    .get_mut(word)
+                    .ok_or(AccessError::InvalidRequest)? |= bit;
+                // The first that is lacked is past everything taken
+                // after it without a gap.
+                while retained.next_missing < retained.manifest.chunks() {
+                    let next = retained.next_missing;
+                    let word = next.checked_div(u64::BITS as usize).unwrap_or(0);
+                    let bit = u32::try_from(next.checked_rem(u64::BITS as usize).unwrap_or(0))
+                        .ok()
+                        .and_then(|bit| 1_u64.checked_shl(bit))
+                        .ok_or(AccessError::InvalidRequest)?;
+                    if retained
+                        .taken
+                        .get(word)
+                        .is_none_or(|taken| taken & bit == 0)
+                    {
+                        break;
+                    }
+                    retained.next_missing = next.checked_add(1).ok_or(AccessError::Capacity)?;
                 }
                 CustodyReply::ChunkStored { index: *index }
             }
@@ -594,7 +679,7 @@ impl CustodyStore {
                 policy_revision,
                 content,
             } => {
-                self.check_scope(
+                self.check_read_scope(
                     CustodyScope {
                         policy_revision: *policy_revision,
                         ..scope
@@ -619,7 +704,7 @@ impl CustodyStore {
                 content,
                 max_bytes,
             } => {
-                self.check_scope(
+                self.check_read_scope(
                     CustodyScope {
                         policy_revision: *policy_revision,
                         ..scope
@@ -725,7 +810,7 @@ impl CustodyStore {
             if descriptor.resident_bytes().map_err(content_error)? > amount {
                 return Err(AccessError::Capacity);
             }
-            let retained = self.descriptor(descriptor, 0, allocation)?;
+            let retained = self.descriptor(descriptor, 0, Vec::new(), allocation)?;
             self.exports.insert(key, retained);
             self.transfer_bytes = total;
         }

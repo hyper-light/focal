@@ -257,12 +257,13 @@ impl GcAgent {
                 };
                 for root in page.roots {
                     match root {
-                        ContentRoot::Artifact(pointer) | ContentRoot::Inline(pointer) => {
+                        ContentRoot::Artifact { pointer, .. }
+                        | ContentRoot::Inline { pointer, .. } => {
                             protection
                                 .protect_object(domain, pointer.root)
                                 .map_err(content)?;
                         }
-                        ContentRoot::Bundle { root, bytes } => {
+                        ContentRoot::Bundle { root, bytes, .. } => {
                             protection.protect_object(domain, root).map_err(content)?;
                             bundles
                                 .try_reserve_exact(1)
@@ -299,7 +300,21 @@ impl GcAgent {
                             protection.protect_object(domain, inner).map_err(content)?;
                         }
                     }
-                    None => pass.bundles_unreadable = pass.bundles_unreadable.saturating_add(1),
+                    None => {
+                        // The bundle header is not readable here (absent policy,
+                        // bytes not resident on this replica, or a structural
+                        // check failure), so this domain's protection set is
+                        // provably incomplete — the payload objects the header
+                        // names are unknown. Mark the domain opaque and stop
+                        // collecting it this pass, exactly as an incomplete roots
+                        // walk does; otherwise those payloads, now referenced only
+                        // by this bundle, would be reclaimed and the archived
+                        // family permanently lost.
+                        pass.bundles_unreadable = pass.bundles_unreadable.saturating_add(1);
+                        protection.opaque_domain(domain).map_err(content)?;
+                        pass.opaque_domains = pass.opaque_domains.saturating_add(1);
+                        break;
+                    }
                 }
                 tokio::task::yield_now().await;
             }

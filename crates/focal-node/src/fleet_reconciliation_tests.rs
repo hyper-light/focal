@@ -58,14 +58,12 @@ async fn receipt_reads_require_live_quorum_preserve_privacy_and_recover_after_le
     })
     .unwrap();
     let hidden = page(
-        dispatch(
-            &fleet.hosts[leader],
-            stranger.clone(),
-            queried.clone(),
-            &ReplicaHost::wire_limits(),
-        )
-        .await,
+        fleet
+            .retry_exact_as(stranger.clone(), leader, &queried)
+            .await,
     );
+    // The reads that follow are asked of one that leads.
+    let leader = fleet.leader(None).await;
     assert_eq!(hidden.page.principal, stranger.principal());
     assert!(matches!(
         hidden.page.result,

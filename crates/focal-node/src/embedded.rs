@@ -251,20 +251,18 @@ pub(crate) fn install_policy(
         atomic_file,
     )?)
 }
-/// The committed policy of an initialized store, checked against
-/// `settings` (a differing field is refused by name); `None` for a fresh
-/// directory that has no policy yet.
+/// The committed policy of an initialized store; `None` for a fresh
+/// directory that has no policy yet. A committed policy is authoritative:
+/// it is what the fleet already carries, and `deployment apply` may have
+/// committed stronger durability than the file's first-start seed, so a
+/// differing `settings` value is not a refusal (that would keep the node
+/// from ever restarting after a sanctioned apply). Config resolution
+/// already yields the committed value for a start; this only reads it.
 pub(crate) fn check_policy(
     root: &Path,
-    settings: &Settings,
+    _settings: &Settings,
 ) -> Result<Option<crate::config::CommittedPolicy>, NodeError> {
-    let Some(committed) = crate::config::policy::read_committed(root)? else {
-        return Ok(None);
-    };
-    if let Some(field) = committed.intent.differing_field(&settings.policy_intent()) {
-        return Err(crate::config::ConfigError::CommittedPolicyChange { field }.into());
-    }
-    Ok(Some(committed))
+    Ok(crate::config::policy::read_committed(root)?)
 }
 pub(crate) fn durable_dir(path: &Path) -> Result<(), std::io::Error> {
     if path.is_dir() {
@@ -280,9 +278,9 @@ pub(crate) fn durable_dir(path: &Path) -> Result<(), std::io::Error> {
     }
     #[cfg(not(unix))]
     fs::create_dir(path)?;
-    File::open(path)?.sync_all()?;
+    focal_platform::sync_dir(path)?;
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        File::open(parent)?.sync_all()?;
+        focal_platform::sync_dir(parent)?;
     }
     Ok(())
 }
@@ -295,8 +293,10 @@ pub(crate) fn atomic_file(path: &Path, bytes: &[u8]) -> Result<(), std::io::Erro
         .open(&temporary)?;
     file.write_all(bytes)?;
     file.sync_all()?;
-    fs::rename(temporary, path)?;
-    File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()
+    // Close before rename: Windows refuses to rename a file with an open handle.
+    drop(file);
+    focal_platform::fs::atomic_replace(&temporary, path)?;
+    focal_platform::sync_dir(path.parent().unwrap_or_else(|| Path::new(".")))
 }
 
 #[cfg(test)]

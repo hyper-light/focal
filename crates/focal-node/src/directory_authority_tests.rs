@@ -208,6 +208,9 @@ fn owner(
             revisions: replica.revisions(),
             dropped_replication: 0,
             stopped: false,
+            snapshot_index: 0,
+            peers: Vec::new(),
+            failure: None,
         },
         _allocation: None,
     });
@@ -226,6 +229,8 @@ fn owner(
         progress,
         nonce: 0,
         dropped: 0,
+        failure: None,
+        pace: Default::default(),
     }
 }
 
@@ -276,7 +281,7 @@ async fn stop_commits_admitted_refresh_without_starting_a_postcommit_read_before
         phase: Some(RefreshPhase::Writing(change)),
         context: None,
         term: owner.replica.status().term,
-        deadline: Instant::now() + Duration::from_secs(5),
+        deadline: u64::MAX,
         response: Some(response),
         reply_charge: Some(reply_charge),
         _input: input,
@@ -357,7 +362,7 @@ async fn canceled_admitted_refresh_keeps_exact_intent_and_recovers_unknown_commi
         phase: Some(RefreshPhase::Writing(change)),
         context: None,
         term: owner.replica.status().term,
-        deadline: Instant::now() + Duration::from_secs(5),
+        deadline: u64::MAX,
         response: Some(send),
         reply_charge: Some(reply_charge),
         _input: input,

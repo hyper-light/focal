@@ -14,8 +14,10 @@
 //!
 //! `propose` accepts work for replication. Only `drain` emits committed entries,
 //! after Ready and LightReady commit metadata are durable. The application must
-//! publish that complete prefix before replying to clients. The implementation
-//! follows <https://docs.rs/raft/0.7.0/raft/raw_node/struct.RawNode.html>.
+//! publish that complete prefix before replying to clients. The core is
+//! `focal-raft` (27 §4.2): it keeps the log and speaks the messages of
+//! `raft-rs` 0.7, which groups ran on before, so a group whose nodes are
+//! replaced one by one is one group throughout.
 
 mod membership;
 mod memory;
@@ -24,10 +26,12 @@ mod checkpoint;
 mod decoder;
 mod persistence;
 mod storage;
+/// A group's timing, derived from the round trips it measures (27 §3.1 P2).
+pub use focal_timing as timing;
 
 use focal_log::{LogError, LogicalLogId, Record, RecordKind, WalIdentity, WalLease, WalOptions};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, DiskBudget, MemoryBudget};
-use raft::{Config, RawNode, Storage};
+use focal_raft::{Config, Limits, RawNode, Storage, proto};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
@@ -38,12 +42,13 @@ use storage::RamLog;
 use thiserror::Error;
 
 pub use focal_log::{FaultPoint, SharedWal};
-pub use raft::eraftpb::{
+use focal_raft::progress::ProgressState;
+pub use focal_raft::proto::protocompat::{PbMessage, PbMessageExt};
+pub use focal_raft::proto::{
     ConfChange, ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState,
     Entry, EntryType, HardState, Message, MessageType, Snapshot,
 };
-pub use raft::protocompat::{PbMessage, PbMessageExt};
-pub use raft::{SnapshotStatus, StateRole};
+pub use focal_raft::{SnapshotStatus, StateRole};
 
 /// The image a restored logical log begins with (26 §6): the application
 /// snapshot at one index and term, and the decoder floor (with its
@@ -70,6 +75,15 @@ pub struct NodeConfig {
     pub max_entry_bytes: usize,
     pub max_uncommitted_bytes: u64,
     pub max_inflight_messages: usize,
+    /// Whether the group has the fast track (27 §4): a proposal from a
+    /// member that does not lead goes to every voter at once, and is
+    /// committed when a fast quorum holds it. It is part of what the group
+    /// is, the same at every member and for as long as the group lives. It
+    /// is no part of the identity record, whose bytes are as they were: a
+    /// group that has it says so in a record of its own, which a binary
+    /// that knows no fast track refuses.
+    #[serde(skip)]
+    pub fast: bool,
 }
 
 impl NodeConfig {
@@ -97,6 +111,7 @@ impl NodeConfig {
             max_entry_bytes: 4 * 1024 * 1024,
             max_uncommitted_bytes: 32 * 1024 * 1024,
             max_inflight_messages: 128,
+            fast: false,
         }
     }
 
@@ -132,9 +147,9 @@ pub enum ConsensusError {
     #[error("durable log: {0}")]
     Log(#[from] LogError),
     #[error("Raft: {0}")]
-    Raft(#[from] raft::Error),
+    Raft(#[from] focal_raft::Error),
     #[error("Raft protocol codec: {0}")]
-    Protobuf(#[from] raft::protocompat::PbError),
+    Protobuf(#[from] proto::protocompat::PbError),
     #[error("encoding: {0}")]
     Encoding(#[from] postcard::Error),
     #[error("configuration: {0}")]
@@ -161,6 +176,14 @@ pub enum ConsensusError {
     LearnerBehind,
     #[error("invalid peer message: {0}")]
     MalformedMessage(&'static str),
+    #[error("a leader does not remove itself; transfer leadership first")]
+    LeaderLeaving,
+}
+
+impl From<focal_raft::StorageError> for ConsensusError {
+    fn from(error: focal_raft::StorageError) -> Self {
+        Self::Raft(focal_raft::Error::Storage(error))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -190,6 +213,9 @@ pub struct NodeEvents {
     pub committed: Vec<CommittedEntry>,
     pub membership: Vec<AppliedMembership>,
     pub read_states: Vec<ReadBarrier>,
+    /// What was proposed here by the fast track and another entry took the
+    /// index of: it is not in the log, and its proposer proposes it again.
+    pub displaced: Vec<CommittedEntry>,
     pub snapshot: Option<AppliedSnapshot>,
     /// Includes Raft-internal entries; this is never a SessionSeq.
     pub applied_index: u64,
@@ -202,6 +228,19 @@ impl NodeEvents {
     }
 }
 
+/// One peer's replication progress as this leader tracks it (§ diagnostics).
+/// Meaningful only while this node leads; empty otherwise. `state` is 0=probe,
+/// 1=replicate, 2=snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerProgress {
+    pub node: u64,
+    pub matched: u64,
+    pub next_index: u64,
+    pub state: u8,
+    pub recent_active: bool,
+    pub paused: bool,
+    pub pending_snapshot: u64,
+}
 #[derive(Clone, Debug)]
 pub struct NodeStatus {
     pub node_id: u64,
@@ -232,6 +271,13 @@ pub struct DurableNode {
     compiled_decoders: Option<decoder::DecoderPair>,
     decoder_transition: Option<decoder::DecoderPair>,
     decoder_write: Option<decoder::PendingDecoderFloor>,
+    // A decoder-gated recovery cannot drain at open (the unconfirmed decoder
+    // makes `check` refuse), so the committed conf-change replay that rebuilds
+    // membership is deferred until the decoder is confirmed. While it is pending,
+    // no election or network step may observe the stale snapshot-only voter set.
+    membership_rebuild_pending: bool,
+    /// The election priority the owner configured; see `set_priority`.
+    priority: i64,
     // Drop after any pending Ready/output payloads, including owner cancellation.
     active_allocation: Option<Allocation>,
 }
@@ -298,8 +344,9 @@ impl DurableNode {
     /// index and term under the bootstrap membership, and a hard state that
     /// commits it; then open the group exactly as a restart would, so the
     /// snapshot is delivered to the application as a recovered one. A log
-    /// that already holds any record is refused: a restore never overwrites
-    /// history.
+    /// that already holds any other record is refused: a restore never
+    /// overwrites history. One that holds this image and nothing else is
+    /// opened: a restore that is issued again goes on where it was cut.
     pub fn restore_on_wal_in(
         config: NodeConfig,
         shared: SharedWal,
@@ -328,16 +375,6 @@ impl DurableNode {
         }
         {
             let mut wal = shared.lease(LogicalLogId(config.group_id))?;
-            let mut populated = false;
-            wal.replay(|_| {
-                populated = true;
-                Ok(())
-            })?;
-            if populated {
-                return Err(ConsensusError::Configuration(
-                    "restore into a populated log",
-                ));
-            }
             let conf = ConfState {
                 voters: config.voters.clone(),
                 learners: config.learners.clone(),
@@ -356,9 +393,12 @@ impl DurableNode {
             };
             let mut records = Vec::new();
             records
-                .try_reserve_exact(5)
+                .try_reserve_exact(6)
                 .map_err(|_| ConsensusError::Capacity)?;
             records.push(identity_record(&config)?);
+            if config.fast {
+                records.push(fast_track_record(&config));
+            }
             records.push(decoder::floor_record(config.group_id, image.floor)?);
             if let Some((predecessor, successor)) = image.transition {
                 records.push(decoder::transition_record(
@@ -383,8 +423,27 @@ impl DurableNode {
                 image.term,
                 &hard,
             )?);
-            wal.validate_append(&records)?;
-            wal.append_in(&records, BudgetLane::Completion)?;
+            // A log that holds this image and nothing else is this
+            // restore, begun before and cut before its copy was recorded:
+            // the image is written by one append, which a log holds whole
+            // or not at all, so it is opened as it is. Any other record is
+            // history.
+            let mut held = 0_usize;
+            let mut same = true;
+            wal.replay(|record| {
+                same = same && records.get(held) == Some(&record);
+                held = held.saturating_add(1);
+                Ok(())
+            })?;
+            if held != 0 && !(same && held == records.len()) {
+                return Err(ConsensusError::Configuration(
+                    "restore into a populated log",
+                ));
+            }
+            if held == 0 {
+                wal.validate_append(&records)?;
+                wal.append_in(&records, BudgetLane::Completion)?;
+            }
         }
         Self::open_on_wal_in(config, shared, parent_budget)
     }
@@ -423,6 +482,7 @@ impl DurableNode {
         let mut wal = shared.lease(LogicalLogId(config.group_id))?;
         let mut storage = RamLog::new(&config, budget.clone())?;
         let mut persisted_config = None;
+        let mut persisted_fast = false;
         let mut required_decoder = None;
         let mut decoder_transition = None;
         let mut replay_error = None;
@@ -444,6 +504,7 @@ impl DurableNode {
                         replay_record(
                             &mut storage,
                             &mut persisted_config,
+                            &mut persisted_fast,
                             &mut required_decoder,
                             &mut decoder_transition,
                             record,
@@ -465,6 +526,7 @@ impl DurableNode {
                 || persisted.group_id != config.group_id
                 || persisted.voters != config.voters
                 || persisted.learners != config.learners
+                || persisted_fast != config.fast
             {
                 return Err(ConsensusError::Configuration(
                     "persisted identity/bootstrap configuration mismatch",
@@ -477,10 +539,21 @@ impl DurableNode {
             {
                 return Err(ConsensusError::Corruption("missing group identity"));
             }
-            wal.append_in(&[identity_record(&config)?], BudgetLane::Completion)?;
+            if persisted_fast {
+                return Err(ConsensusError::Corruption("missing group identity"));
+            }
+            let mut records = Vec::new();
+            records
+                .try_reserve_exact(2)
+                .map_err(|_| ConsensusError::Capacity)?;
+            records.push(identity_record(&config)?);
+            if config.fast {
+                records.push(fast_track_record(&config));
+            }
+            wal.append_in(&records, BudgetLane::Completion)?;
         }
         storage.validate()?;
-        let applied = storage.snapshot.get_metadata().index;
+        let applied = proto::snapshot_index(&storage.snapshot);
         let recovered_allocation = if storage.snapshot.is_empty() {
             None
         } else {
@@ -494,7 +567,6 @@ impl DurableNode {
         let recovered_snapshot =
             (!storage.snapshot.is_empty()).then(|| snapshot_event(&storage.snapshot));
         let raft_config = Config {
-            id: config.node_id,
             election_tick: config.election_tick,
             heartbeat_tick: config.heartbeat_tick,
             applied,
@@ -504,10 +576,17 @@ impl DurableNode {
             max_committed_size_per_ready: 16 * 1024 * 1024,
             check_quorum: true,
             pre_vote: true,
-            ..Default::default()
+            fast: config.fast,
+            seed: election_seed(&config),
+            limits: Limits {
+                // Reads are admitted against the window (`read_index_inner`);
+                // the core's own bound is the same and never the first met.
+                pending_reads: config.max_inflight_messages.saturating_add(1),
+                ..Limits::default()
+            },
+            ..Config::new(config.node_id)
         };
         raft_config.validate()?;
-        let logger = slog::Logger::root(slog::Discard, slog::o!());
         // Snapshot membership can differ from bootstrap membership on recovery.
         let recovered_members = storage
             .conf_state
@@ -524,10 +603,8 @@ impl DurableNode {
                 .checked_mul(4096)
                 .ok_or(ConsensusError::Capacity)?,
         )?;
-        let raw = catch_unwind(AssertUnwindSafe(|| {
-            RawNode::new(&raft_config, storage, &logger)
-        }))
-        .map_err(|_| ConsensusError::DependencyFailure)??;
+        let raw = catch_unwind(AssertUnwindSafe(|| RawNode::new(&raft_config, storage)))
+            .map_err(|_| ConsensusError::DependencyFailure)??;
         let mut node = Self {
             config,
             raw,
@@ -547,6 +624,11 @@ impl DurableNode {
             compiled_decoders: None,
             decoder_transition,
             decoder_write: None,
+            // The complement of the constructor rebuild below: a gated recovery
+            // (required_decoder set) cannot drain yet, so its rebuild is deferred
+            // to decoder confirmation and fenced until then.
+            membership_rebuild_pending: required_decoder.is_some(),
+            priority: 0,
         };
         // Rebuild committed membership before elections or network messages can
         // run. Application replay is retained for the caller's first drain.
@@ -565,6 +647,42 @@ impl DurableNode {
     }
     pub fn propose(&mut self, data: Vec<u8>) -> Result<(), ConsensusError> {
         self.propose_in(data, BudgetLane::Ordinary)
+    }
+    /// Proposes by the fast track (27 §4), from a member that does not
+    /// lead: the entry goes to every voter, for the index after what this
+    /// member holds, and is committed when a fast quorum holds it or the
+    /// leader's classic quorum does, whichever is first. The index it was
+    /// proposed for. Success is admission, as of `propose`: the entry is
+    /// committed when `drain` gives it, and is given in
+    /// `NodeEvents::displaced` when another took its index.
+    ///
+    /// A leader proposes as it always did.
+    pub fn propose_fast(&mut self, data: Vec<u8>) -> Result<u64, ConsensusError> {
+        self.propose_fast_in(data, BudgetLane::Ordinary)
+    }
+    pub fn propose_fast_in(
+        &mut self,
+        data: Vec<u8>,
+        lane: BudgetLane,
+    ) -> Result<u64, ConsensusError> {
+        self.check()?;
+        if !self.config.fast {
+            return Err(ConsensusError::Configuration("the group has no fast track"));
+        }
+        if data.is_empty() || data.len() > self.config.max_entry_bytes {
+            return Err(ConsensusError::Capacity);
+        }
+        self.guarded_in(data.capacity(), 0, lane, |replica| {
+            Ok(replica.raw.propose_fast(Vec::new(), data)?)
+        })
+    }
+    /// Whether the group has the fast track.
+    pub fn fast(&self) -> bool {
+        self.config.fast
+    }
+    /// What the fast track did at this member since it opened.
+    pub fn fast_stats(&self) -> focal_raft::FastStats {
+        self.raw.raft.fast_stats()
     }
     pub fn propose_in(&mut self, data: Vec<u8>, lane: BudgetLane) -> Result<(), ConsensusError> {
         self.guarded_in(data.capacity(), 0, lane, |replica| {
@@ -601,11 +719,7 @@ impl DurableNode {
     /// validated before Raft; unexpected dependency failures stop this replica.
     pub fn step(&mut self, message: Message) -> Result<(), ConsensusError> {
         let bytes = memory::message_bytes(&message)?;
-        let added = if message
-            .entries
-            .iter()
-            .any(|e| e.get_entry_type() != EntryType::EntryNormal)
-        {
+        let added = if message.entries.iter().any(proto::changes_configuration) {
             1024
         } else {
             message
@@ -645,6 +759,71 @@ impl DurableNode {
             |replica| replica.propose_conf_change_inner(change),
         )
     }
+    /// This node's election priority (27 §5). A voter refuses its vote, and
+    /// its pre-vote, to a candidate of lower priority unless that candidate's
+    /// log is strictly longer than the voter's, so among equally current
+    /// members the one of highest priority wins and a lower one that times
+    /// out first does not take the group. Priority never outranks the log:
+    /// the election restriction is unchanged, and a group whose highest
+    /// priority member is gone still elects among the rest. It is policy the
+    /// owner sets from committed placement, not part of the node's durable
+    /// identity.
+    ///
+    /// It takes effect once this node has a term. A node still at term zero
+    /// has no log to defend, and its refusal would bear no term a candidate
+    /// could hear: a group's first election is decided by timeouts alone.
+    ///
+    /// A lower priority is voted for all the same when its log is more
+    /// current than the voter's, by its last term and then its length
+    /// (`focal_raft::Precedence::Log`): a voter that refuses for priority
+    /// could then have been elected itself, so priority never leaves a group
+    /// that can elect without a leader.
+    pub fn set_priority(&mut self, priority: i64) -> Result<(), ConsensusError> {
+        self.check()?;
+        if priority < 0 {
+            return Err(ConsensusError::Configuration(
+                "election priority must not be negative",
+            ));
+        }
+        self.priority = priority;
+        self.raw.set_priority(priority);
+        Ok(())
+    }
+    /// Ticks without leader contact before this node campaigns.
+    /// Ticks between a leader's heartbeats.
+    pub fn heartbeat_tick(&self) -> usize {
+        self.config.heartbeat_tick
+    }
+    /// A leader sends its heartbeats now; any other role does nothing. For
+    /// an owner whose tick period is stretched (27 §3.1 P2): the election
+    /// timeout follows the period, and the heartbeats keep the cadence the
+    /// followers were configured to expect.
+    pub fn beat(&mut self) -> Result<(), ConsensusError> {
+        self.guarded(|replica| {
+            replica.check()?;
+            replica.raw.ping()?;
+            Ok(())
+        })
+    }
+    pub fn election_tick(&self) -> usize {
+        self.config.election_tick
+    }
+    /// The ticks this member waits beyond its election timeout before it
+    /// campaigns (`focal_raft::Raft::set_patience`): what its owner gives
+    /// it for the stalls it has seen in itself.
+    pub fn set_patience(&mut self, ticks: usize) -> Result<(), ConsensusError> {
+        self.check()?;
+        self.raw.raft.set_patience(ticks);
+        Ok(())
+    }
+    /// The priority this node was given; in force once it has a term.
+    pub fn priority(&self) -> i64 {
+        self.priority
+    }
+    /// The priority votes are judged by now.
+    pub fn effective_priority(&self) -> i64 {
+        self.raw.raft.priority_in_force()
+    }
     pub fn transfer_leader(&mut self, node: u64) -> Result<(), ConsensusError> {
         self.guarded(|replica| replica.transfer_leader_inner(node))
     }
@@ -660,7 +839,7 @@ impl DurableNode {
                 "randomized election timeout must lie in [election_tick, 2 * election_tick)",
             ));
         }
-        self.raw.raft.set_randomized_election_timeout(ticks);
+        self.raw.raft.set_randomized_election_timeout(ticks)?;
         Ok(())
     }
     pub fn report_unreachable(&mut self, node: u64) -> Result<(), ConsensusError> {
@@ -684,11 +863,11 @@ impl DurableNode {
     ) -> Result<(), ConsensusError> {
         self.check()?;
         if index == 0
-            || self.raw.raft.term != term
+            || self.raw.raft.term() != term
             || self
                 .raw
                 .raft
-                .prs()
+                .tracker()
                 .get(node)
                 .is_none_or(|progress| progress.pending_snapshot != index)
         {
@@ -749,10 +928,15 @@ impl DurableNode {
         {
             return Err(ConsensusError::Capacity);
         }
-        if MessageType::from_i32(message.msg_type).is_none() {
-            return Err(ConsensusError::MalformedMessage("unknown message type"));
+        if message.msg_type == focal_raft::fast::FAST_PROPOSE
+            || message.msg_type == focal_raft::fast::FAST_VOTE
+        {
+            return self.step_fast(message);
         }
-        if message.get_msg_type() == MessageType::MsgPropose {
+        let Some(kind) = MessageType::from_i32(message.msg_type) else {
+            return Err(ConsensusError::MalformedMessage("unknown message type"));
+        };
+        if kind == MessageType::MsgPropose {
             return Err(ConsensusError::MalformedMessage(
                 "proposals must enter through the leader's application admission",
             ));
@@ -782,10 +966,7 @@ impl DurableNode {
             .checked_add(1)
             .ok_or(ConsensusError::Capacity)?;
         for entry in &message.entries {
-            if EntryType::from_i32(entry.entry_type).is_none() {
-                return Err(ConsensusError::MalformedMessage("unknown entry type"));
-            }
-            if message.get_msg_type() == MessageType::MsgAppend {
+            if kind == MessageType::MsgAppend {
                 if entry.index != expected_index || entry.term > message.term {
                     return Err(ConsensusError::MalformedMessage(
                         "invalid appended log sequence",
@@ -798,14 +979,45 @@ impl DurableNode {
             if entry.index == u64::MAX || entry.term == u64::MAX {
                 return Err(ConsensusError::Capacity);
             }
-            match entry.get_entry_type() {
-                EntryType::EntryConfChange => {
-                    decode_proto::<ConfChange>(&entry.data)?;
-                }
-                EntryType::EntryConfChangeV2 => {
-                    decode_proto::<ConfChangeV2>(&entry.data)?;
-                }
-                EntryType::EntryNormal => {}
+            // A change is read here as it is where it is applied: one that
+            // does not decode, or names a kind or a transition this member
+            // does not know, is no entry a peer may send.
+            proto::Plan::of_entry(entry)
+                .map_err(|_| ConsensusError::MalformedMessage("an entry that cannot be read"))?;
+        }
+        self.raw.step(message)?;
+        Ok(())
+    }
+
+    /// A proposal by the fast track, or what a voter holds of one.
+    fn step_fast(&mut self, message: Message) -> Result<(), ConsensusError> {
+        if !self.config.fast {
+            return Err(ConsensusError::MalformedMessage(
+                "the fast track in a group that has none",
+            ));
+        }
+        if message.term == u64::MAX || message.commit == u64::MAX {
+            return Err(ConsensusError::Capacity);
+        }
+        if message.entries.is_empty() || message.entries.len() > 256 {
+            return Err(ConsensusError::MalformedMessage(
+                "a proposal that states nothing, or too much",
+            ));
+        }
+        for entry in &message.entries {
+            if entry.entry_type != EntryType::EntryNormal as i32
+                || entry.data.is_empty()
+                || entry.index == 0
+            {
+                return Err(ConsensusError::MalformedMessage(
+                    "what may not go by the fast track",
+                ));
+            }
+            if entry.data.len() > self.config.max_entry_bytes
+                || entry.index == u64::MAX
+                || entry.term == u64::MAX
+            {
+                return Err(ConsensusError::Capacity);
             }
         }
         self.raw.step(message)?;
@@ -840,7 +1052,7 @@ impl DurableNode {
     }
     fn tick_inner(&mut self) -> Result<(), ConsensusError> {
         self.check()?;
-        self.raw.tick();
+        self.raw.tick()?;
         Ok(())
     }
     /// Quorum ReadIndex completion arrives in drain. Publication must also reach
@@ -859,7 +1071,7 @@ impl DurableNode {
         {
             return Err(ConsensusError::Capacity);
         }
-        self.raw.read_index(context);
+        self.raw.read_index(context)?;
         Ok(())
     }
     fn propose_conf_change_inner(&mut self, change: ConfChangeV2) -> Result<(), ConsensusError> {
@@ -872,6 +1084,9 @@ impl DurableNode {
                 "a membership change is already in flight",
             ));
         }
+        // One this member could not read where it is applied is not proposed.
+        proto::Plan::of(&change)
+            .map_err(|_| ConsensusError::Configuration("unknown kind of membership change"))?;
         let joint = !self.raw.store().conf_state.voters_outgoing.is_empty();
         if joint != change.changes.is_empty() {
             return Err(ConsensusError::Configuration(
@@ -885,19 +1100,29 @@ impl DurableNode {
             if update.node_id == 0 {
                 return Err(ConsensusError::Configuration("zero member ID"));
             }
-            if update.get_change_type() == ConfChangeType::AddNode {
+            // Leadership moves first, by the decision of who removes the
+            // node; the next leader removes it (27 §5). A leader that
+            // applies its own removal all the same, proposed by one that
+            // led before it, hands the group to a voter that holds the
+            // whole log and follows.
+            let leaves = update.change_type == ConfChangeType::RemoveNode as i32
+                || update.change_type == ConfChangeType::AddLearnerNode as i32;
+            if leaves && update.node_id == self.raw.raft.id() {
+                return Err(ConsensusError::LeaderLeaving);
+            }
+            if update.change_type == ConfChangeType::AddNode as i32 {
                 let progress = self
                     .raw
                     .raft
-                    .prs()
+                    .tracker()
                     .get(update.node_id)
                     .ok_or(ConsensusError::LearnerBehind)?;
-                if progress.matched < self.raw.raft.raft_log.committed {
+                if progress.matched < self.raw.raft.log().committed() {
                     return Err(ConsensusError::LearnerBehind);
                 }
             }
         }
-        self.raw.propose_conf_change(Vec::new(), change)?;
+        self.raw.propose_conf_change(Vec::new(), &change)?;
         Ok(())
     }
     /// On the leader, hand leadership to another current voter. On a
@@ -908,26 +1133,26 @@ impl DurableNode {
     fn transfer_leader_inner(&mut self, node: u64) -> Result<(), ConsensusError> {
         self.check()?;
         let voter = self.raw.store().conf_state.voters.contains(&node);
-        if self.raw.raft.state == StateRole::Leader {
+        if self.raw.raft.state() == StateRole::Leader {
             if !voter || node == self.config.node_id {
                 return Err(ConsensusError::Configuration(
                     "transfer target must be another current voter",
                 ));
             }
-            self.raw.transfer_leader(node);
+            self.raw.transfer_leader(node)?;
             return Ok(());
         }
-        if node != self.config.node_id || !voter || self.raw.raft.leader_id == 0 {
+        if node != self.config.node_id || !voter || self.raw.raft.leader_id() == 0 {
             return Err(ConsensusError::NotLeader {
-                leader: self.raw.raft.leader_id,
+                leader: self.raw.raft.leader_id(),
             });
         }
-        self.raw.transfer_leader(node);
+        self.raw.transfer_leader(node)?;
         Ok(())
     }
     fn report_unreachable_inner(&mut self, node: u64) -> Result<(), ConsensusError> {
         self.check()?;
-        self.raw.report_unreachable(node);
+        self.raw.report_unreachable(node)?;
         Ok(())
     }
     fn report_snapshot_inner(
@@ -936,7 +1161,7 @@ impl DurableNode {
         status: SnapshotStatus,
     ) -> Result<(), ConsensusError> {
         self.check()?;
-        self.raw.report_snapshot(node, status);
+        self.raw.report_snapshot(node, status)?;
         Ok(())
     }
     /// Immutable bootstrap membership validated against the durable identity
@@ -957,14 +1182,73 @@ impl DurableNode {
         let conf = &self.raw.store().conf_state;
         NodeStatus {
             node_id: self.config.node_id,
-            leader_id: self.raw.raft.leader_id,
-            term: self.raw.raft.term,
-            committed_index: self.raw.raft.raft_log.committed,
+            leader_id: self.raw.raft.leader_id(),
+            term: self.raw.raft.term(),
+            committed_index: self.raw.raft.log().committed(),
             applied_index: self.delivered_index,
-            role: self.raw.raft.state,
+            role: self.raw.raft.state(),
             voters: conf.voters.clone(),
             learners: conf.learners.clone(),
         }
+    }
+    /// Per-peer replication progress this node tracks as leader (empty when not
+    /// leading). Diagnostic only; it reflects in-memory Raft progress and is
+    /// never persisted or replicated.
+    pub fn peer_progress(&self) -> Vec<PeerProgress> {
+        if self.raw.raft.state() != StateRole::Leader {
+            return Vec::new();
+        }
+        let self_id = self.config.node_id;
+        self.raw
+            .raft
+            .tracker()
+            .iter()
+            .filter(|(node, _)| *node != self_id)
+            .map(|(node, progress)| PeerProgress {
+                node,
+                matched: progress.matched,
+                next_index: progress.next_index,
+                state: match progress.state {
+                    ProgressState::Probe => 0,
+                    ProgressState::Replicate => 1,
+                    ProgressState::Snapshot => 2,
+                },
+                recent_active: progress.recent_active,
+                paused: progress.paused,
+                pending_snapshot: progress.pending_snapshot,
+            })
+            .collect()
+    }
+
+    /// What this leader tracks of one member's replication; nothing when
+    /// it does not lead or tracks no such member. Allocates nothing, so an
+    /// owner may ask on every tick.
+    pub fn peer(&self, node: u64) -> Option<PeerProgress> {
+        if self.raw.raft.state() != StateRole::Leader || node == self.config.node_id {
+            return None;
+        }
+        let progress = self.raw.raft.tracker().get(node)?;
+        Some(PeerProgress {
+            node,
+            matched: progress.matched,
+            next_index: progress.next_index,
+            state: match progress.state {
+                ProgressState::Probe => 0,
+                ProgressState::Replicate => 1,
+                ProgressState::Snapshot => 2,
+            },
+            recent_active: progress.recent_active,
+            paused: progress.paused,
+            pending_snapshot: progress.pending_snapshot,
+        })
+    }
+    /// The member this leader is handing leadership to, while it is.
+    pub fn transferring(&self) -> Option<u64> {
+        self.raw.raft.lead_transferee()
+    }
+    /// A configuration change is in the log and not applied yet.
+    pub fn configuration_pending(&self) -> bool {
+        self.raw.raft.pending_conf_index() > self.delivered_index
     }
 
     /// The index of the stored snapshot the log is compacted behind (zero
@@ -979,12 +1263,13 @@ impl DurableNode {
     pub fn has_committed_current_term(&self) -> bool {
         !self.failed
             && self.decoder_confirmed()
+            && !self.membership_rebuild_pending
             && !self.persistence_pending()
             && self
                 .raw
                 .store()
-                .term(self.raw.raft.raft_log.committed)
-                .is_ok_and(|term| term == self.raw.raft.term)
+                .term(self.raw.raft.log().committed())
+                .is_ok_and(|term| term == self.raw.raft.term())
     }
 
     fn apply_entries(
@@ -994,7 +1279,8 @@ impl DurableNode {
         delivered_index: &mut u64,
     ) -> Result<(), ConsensusError> {
         for entry in entries {
-            if entry.index
+            let index = entry.index;
+            if index
                 != delivered_index
                     .checked_add(1)
                     .ok_or(ConsensusError::Capacity)?
@@ -1003,22 +1289,24 @@ impl DurableNode {
                     "non-contiguous committed delivery",
                 ));
             }
-            match entry.get_entry_type() {
+            let kind = EntryType::from_i32(entry.entry_type)
+                .ok_or(ConsensusError::Corruption("committed entry of no kind"))?;
+            match kind {
                 EntryType::EntryNormal => {
                     if !entry.data.is_empty() {
                         events.committed.push(CommittedEntry {
                             index: entry.index,
                             term: entry.term,
-                            data: entry.data.to_vec(),
+                            data: entry.data,
                         });
                     }
                 }
                 EntryType::EntryConfChange => {
                     let change = decode_proto::<ConfChange>(&entry.data)?;
                     let before = self.membership_configuration();
-                    let conf = self.raw.apply_conf_change(&change)?;
+                    let conf = self.raw.apply_conf_change_v1(&change)?;
                     let after = MembershipConfiguration::from_conf(&conf);
-                    self.raw.mut_store().conf_state = conf;
+                    self.raw.store_mut().conf_state = conf;
                     events.membership.push(AppliedMembership {
                         index: entry.index,
                         term: entry.term,
@@ -1032,7 +1320,7 @@ impl DurableNode {
                     let before = self.membership_configuration();
                     let conf = self.raw.apply_conf_change(&change)?;
                     let after = MembershipConfiguration::from_conf(&conf);
-                    self.raw.mut_store().conf_state = conf;
+                    self.raw.store_mut().conf_state = conf;
                     events.membership.push(AppliedMembership {
                         index: entry.index,
                         term: entry.term,
@@ -1042,17 +1330,21 @@ impl DurableNode {
                     });
                 }
             }
-            *delivered_index = entry.index;
+            *delivered_index = index;
         }
         Ok(())
     }
     pub fn inject_fault_once(&mut self, point: FaultPoint) {
         self.wal.inject_fault_once(point);
     }
-    /// Upstream Raft uses assertions for invariant violations. No unwind may
-    /// escape the replica boundary or release partly assembled events. The node
-    /// becomes unusable on a dependency failure; reopening revalidates disk state.
-    /// This boundary requires Rust's unwind profile and cannot contain abort/OOM.
+    /// The core returns what it refuses and never unwinds; what it depends on
+    /// (the codec, the allocator's collections) is not the core. No unwind
+    /// may escape the replica boundary or release partly assembled events:
+    /// this is the last fence, and nothing is known to reach it. The node
+    /// becomes unusable on a dependency failure, and on an error of the core
+    /// that says its state no longer adds up; reopening revalidates disk
+    /// state. This boundary requires Rust's unwind profile and cannot contain
+    /// abort/OOM.
     fn guarded<T>(
         &mut self,
         operation: impl FnOnce(&mut Self) -> Result<T, ConsensusError>,
@@ -1067,6 +1359,14 @@ impl DurableNode {
         operation: impl FnOnce(&mut Self) -> Result<T, ConsensusError>,
     ) -> Result<T, ConsensusError> {
         self.check()?;
+        // Fence every Raft-participating operation (propose, step, campaign,
+        // tick, conf change, transfer, reports) until the deferred committed
+        // membership rebuild has run. `poll_drain` bypasses `guarded_in`, so the
+        // rebuild that clears this flag is never blocked by it. `confirm_decoder`
+        // clears it eagerly, so this is a retryable safety net, not the norm.
+        if self.membership_rebuild_pending {
+            return Err(ConsensusError::PersistencePending);
+        }
         if self.persistence_pending() {
             return Err(ConsensusError::PersistencePending);
         }
@@ -1080,6 +1380,14 @@ impl DurableNode {
         let result = catch_unwind(AssertUnwindSafe(|| operation(self)));
         match result {
             Ok(result) => {
+                if let Err(ConsensusError::Raft(error)) = &result
+                    && error.is_fatal()
+                {
+                    // An operation stopped half way: what the core holds is
+                    // not what it would hold had it not begun.
+                    self.failed = true;
+                    return result;
+                }
                 let retained = match memory::raw_bytes(&self.raw) {
                     Ok(bytes) => bytes,
                     Err(error) => {
@@ -1116,10 +1424,16 @@ impl DurableNode {
             Ok(())
         }
     }
+    /// Whether this node stopped on a dependency or persistence failure and
+    /// must be reopened. A refusal that changed nothing leaves it false, so a
+    /// caller can tell "try again" from "this replica is gone".
+    pub fn failed(&self) -> bool {
+        self.failed
+    }
     fn check_state(&self) -> Result<(), ConsensusError> {
         if self.failed {
             Err(ConsensusError::Failed)
-        } else if self.raw.raft.term == u64::MAX || self.raw.store().last_index()? == u64::MAX {
+        } else if self.raw.raft.term() == u64::MAX || self.raw.store().last_index()? == u64::MAX {
             Err(ConsensusError::Capacity)
         } else {
             Ok(())
@@ -1127,11 +1441,11 @@ impl DurableNode {
     }
     fn check_leader(&self) -> Result<(), ConsensusError> {
         self.check()?;
-        if self.raw.raft.state == StateRole::Leader {
+        if self.raw.raft.state() == StateRole::Leader {
             Ok(())
         } else {
             Err(ConsensusError::NotLeader {
-                leader: self.raw.raft.leader_id,
+                leader: self.raw.raft.leader_id(),
             })
         }
     }
@@ -1161,6 +1475,22 @@ fn proto_record(
         payload: message.write_to_bytes()?,
     })
 }
+/// What this replica's election timeouts are drawn from: the system's
+/// randomness, and where there is none, the replica's own identity, which
+/// no other member of its group shares.
+fn election_seed(config: &NodeConfig) -> u64 {
+    let mut bytes = [0u8; 8];
+    if getrandom::fill(&mut bytes).is_ok() {
+        return u64::from_le_bytes(bytes);
+    }
+    config
+        .group_id
+        .iter()
+        .chain(&config.cluster_id)
+        .fold(config.node_id, |seed, byte| {
+            (seed ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+}
 fn snapshot_event(snapshot: &Snapshot) -> AppliedSnapshot {
     AppliedSnapshot {
         index: snapshot.get_metadata().index,
@@ -1170,9 +1500,20 @@ fn snapshot_event(snapshot: &Snapshot) -> AppliedSnapshot {
     }
 }
 
+/// Says that the group has the fast track.
+fn fast_track_record(config: &NodeConfig) -> Record {
+    Record {
+        log: LogicalLogId(config.group_id),
+        kind: RecordKind::FastTrack,
+        index: 0,
+        term: 0,
+        payload: b"FOCALFT1".to_vec(),
+    }
+}
 fn replay_record(
     storage: &mut RamLog,
     config: &mut Option<NodeConfig>,
+    fast: &mut bool,
     required_decoder: &mut Option<[u8; 32]>,
     decoder_transition: &mut Option<decoder::DecoderPair>,
     record: Record,
@@ -1183,6 +1524,33 @@ fn replay_record(
                 return Err(ConsensusError::Corruption("duplicate group identity"));
             }
             *config = Some(postcard::from_bytes(&record.payload)?);
+        }
+        RecordKind::FastTrack => {
+            if config.is_none() || *fast || record.payload != b"FOCALFT1" {
+                return Err(ConsensusError::Corruption(
+                    "duplicate, unbound or unknown fast track record",
+                ));
+            }
+            *fast = true;
+        }
+        RecordKind::Proposal => {
+            if !*fast {
+                return Err(ConsensusError::Corruption(
+                    "a proposal in a group that has no fast track",
+                ));
+            }
+            let entry = decode_proto::<Entry>(&record.payload)?;
+            if entry.index != record.index
+                || entry.term != record.term
+                || entry.entry_type != EntryType::EntryNormal as i32
+                || entry.data.is_empty()
+            {
+                return Err(ConsensusError::Corruption("proposal envelope mismatch"));
+            }
+            // What the log has reached since is set aside.
+            if entry.index > storage.last_index()? {
+                storage.hold_proposal(entry)?;
+            }
         }
         RecordKind::DecoderFloor => {
             if config.is_none() || required_decoder.is_some() {
@@ -1325,6 +1693,14 @@ fn decode_proto<T: PbMessage + Default>(bytes: &[u8]) -> Result<T, ConsensusErro
 
 #[cfg(test)]
 mod borrowed_proposal_tests;
+#[cfg(test)]
+mod fast_track_tests;
+#[cfg(test)]
+mod raft_safety_tests;
+#[cfg(test)]
+mod sim_election_tests;
+#[cfg(test)]
+mod sim_fast_tests;
 #[cfg(test)]
 mod tests;
 

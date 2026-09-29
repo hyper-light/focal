@@ -631,14 +631,25 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 header.range
             };
             let started = std::time::Instant::now();
+            let reader = RecordingReader::new(&self.reader);
             let prepared = record::replay::prepare(
                 core,
                 &record,
                 expected_range,
                 self.limits.recovery,
-                &self.reader,
+                &reader,
                 &self.schemas,
-            )?;
+            );
+            let missing = reader.take_missing();
+            self.pending_custody = if missing.is_empty() {
+                None
+            } else {
+                Some(PendingCustody::new(missing, &self.budget)?)
+            };
+            let prepared = prepared?;
+            let Some(Domain::Passive(core)) = self.domain.as_mut() else {
+                return Err(NativeSessionError::Failed);
+            };
             let outcome = match core.publish_native(prepared) {
                 Ok(outcome) => outcome,
                 Err(refused) => return Err(refused.error.into()),
@@ -728,12 +739,21 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         let mut sequence = self.sequence()?;
         let mut recording_range = self.recording_range;
         let mut recording_term = self.recording_term;
-        let mut expected_index = self.applied_raft;
+        // Anchor consecutiveness on the run's own first index, not applied_raft +
+        // 1: consensus drops empty term-start no-ops from the committed stream, so
+        // the first record of a run can sit at applied_raft + 2 (or further). The
+        // single-entry path tolerates that same gap (it checks only
+        // entry.index <= applied_raft); record_run guarantees the batch is
+        // internally contiguous, so only successors must be strictly consecutive.
+        let mut expected_index: Option<u64> = None;
         for entry in entries {
-            expected_index = expected_index.saturating_add(1);
-            if entry.index <= self.applied_raft
+            let want = match expected_index {
+                Some(previous) => previous.checked_add(1).ok_or(NativeSessionError::Corrupt)?,
+                None => entry.index,
+            };
+            if entry.index != want
+                || entry.index <= self.applied_raft
                 || entry.index > applied_index
-                || entry.index != expected_index
                 || !entry.data.starts_with(&record::MAGIC)
             {
                 return Err(NativeSessionError::Corrupt);
@@ -760,6 +780,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             sequence = header.outcome.sequence;
             recording_range = Some(header.range);
             recording_term = entry.term;
+            expected_index = Some(entry.index);
         }
         if matches!(self.domain, Some(Domain::Active(..))) {
             self.passive_for_replay()?;
@@ -768,14 +789,21 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             return Err(NativeSessionError::Failed);
         };
         let started = std::time::Instant::now();
+        let reader = RecordingReader::new(&self.reader);
         let batch = record::materialize::materialize_batch(
             core,
             &records,
             self.limits.recovery,
-            &self.reader,
+            &reader,
             &self.schemas,
             self.limits.materializer,
         );
+        let missing = reader.take_missing();
+        self.pending_custody = if missing.is_empty() {
+            None
+        } else {
+            Some(PendingCustody::new(missing, &self.budget)?)
+        };
         let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let stats = &mut self.materializer;
         stats.micros = stats.micros.saturating_add(elapsed);
@@ -970,13 +998,21 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             if barrier.index > self.applied_raft {
                 return Err(NativeSessionError::Corrupt);
             }
-            if barrier.context == readiness(status.term) {
-                if leader {
+            // Classify the barrier by its 8-byte magic, not by full equality with
+            // the current term: READINESS and CORRELATION share their first seven
+            // bytes, so a readiness barrier confirmed in a prior term and drained
+            // after a term bump would otherwise be misread as a correlated read
+            // and fail closed. A readiness barrier for the current term promotes;
+            // a stale-term one is a benign internal barrier and is ignored.
+            if barrier.context.starts_with(READINESS.as_slice()) {
+                if leader && barrier.context == readiness(status.term) {
                     self.promote(status.term, consensus)?;
                 }
-            } else {
+            } else if Self::is_correlated_read(&barrier.context) {
                 let output = delivery.output.as_mut().ok_or(NativeSessionError::Failed)?;
                 self.apply_correlated_read(barrier, output)?;
+            } else {
+                return Err(NativeSessionError::Corrupt);
             }
             delivery.read = add(delivery.read, 1)?;
         }

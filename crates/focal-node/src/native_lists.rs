@@ -704,25 +704,26 @@ fn events(
     };
     let prefix = core.native_sequence();
     let slots = std::iter::from_fn(move || {
-        while sequence <= prefix {
-            let at = (sequence, ordinal);
-            match core.native_event(sequence, ordinal) {
-                Some(event) => {
-                    ordinal = ordinal.saturating_add(1);
-                    return Some((at, Some(event)));
-                }
-                None if ordinal == 0 => {
-                    // A record without events still occupies the sequence.
-                    sequence = SessionSeq(sequence.0.checked_add(1)?);
-                }
-                None => {
-                    sequence = SessionSeq(sequence.0.checked_add(1)?);
-                    ordinal = 0;
-                    return Some((at, None));
-                }
+        // One slot per call: every event-less slot (an empty record at ordinal 0,
+        // or the end of a record's events) yields one charged miss, so Walk::run
+        // counts it against max_visits and can stop and resume between records —
+        // a long run of records without events can no longer walk the prefix
+        // unbounded within a single page.
+        if sequence > prefix {
+            return None;
+        }
+        let at = (sequence, ordinal);
+        match core.native_event(sequence, ordinal) {
+            Some(event) => {
+                ordinal = ordinal.saturating_add(1);
+                Some((at, Some(event)))
+            }
+            None => {
+                sequence = SessionSeq(sequence.0.checked_add(1)?);
+                ordinal = 0;
+                Some((at, None))
             }
         }
-        None
     });
     walk.run(
         slots,

@@ -96,6 +96,9 @@ impl Fixture {
                 revisions: replica.revisions(),
                 dropped_replication: 0,
                 stopped: false,
+                snapshot_index: 0,
+                peers: Vec::new(),
+                failure: None,
             },
             _allocation: None,
         });
@@ -117,6 +120,8 @@ impl Fixture {
             progress,
             nonce: 0,
             dropped: 0,
+            failure: None,
+            pace: Default::default(),
         };
         drop(root);
         Self {
@@ -146,10 +151,8 @@ impl Fixture {
                 let Operation::Raft { message, .. } = &frame.request.operation else {
                     panic!("not Raft")
                 };
-                if focal_consensus::decode_message(message)
-                    .unwrap()
-                    .get_msg_type()
-                    == MessageType::MsgSnapshot
+                if focal_consensus::decode_message(message).unwrap().msg_type
+                    == MessageType::MsgSnapshot as i32
                 {
                     return frame;
                 }
@@ -262,10 +265,8 @@ fn control_snapshot_old_term_completion_cannot_release_current_flight_and_frame_
                 panic!("not Raft")
             };
             assert_ne!(
-                focal_consensus::decode_message(message)
-                    .unwrap()
-                    .get_msg_type(),
-                MessageType::MsgSnapshot
+                focal_consensus::decode_message(message).unwrap().msg_type,
+                MessageType::MsgSnapshot as i32
             );
             fixture.deliver(frame);
         }
@@ -275,4 +276,102 @@ fn control_snapshot_old_term_completion_cannot_release_current_flight_and_frame_
     assert!(budget.stats().used > 0);
     drop(current);
     assert_eq!(budget.stats().used, 0);
+}
+
+/// A stored snapshot carries the configuration at its index; a member admitted
+/// after that snapshot cannot be caught up by it. When a membership change
+/// commits above the snapshot floor the owner must refresh the snapshot to the
+/// current configuration, otherwise a later-joined learner whose `next_index`
+/// reaches the floor wedges (the leader can neither append below the floor nor
+/// install a snapshot whose configuration omits the learner). This proves the
+/// refresh fires on the stale-configuration trigger and lands at or above the
+/// membership change, so the fresh snapshot includes the new member.
+#[test]
+fn maybe_checkpoint_refreshes_a_snapshot_whose_configuration_predates_a_member() {
+    use focal_consensus::MembershipChange;
+    let mut fixture = Fixture::new();
+    // The fixture checkpointed at bootstrap, so a snapshot floor already exists
+    // whose configuration is voters=[1], learners=[2].
+    let floor_before = fixture.owner.replica.snapshot_index();
+    assert!(floor_before > 0, "the bootstrap snapshot exists");
+    // Admit a third node as a learner: the membership change commits above the
+    // floor, so the stored snapshot's configuration can no longer contain every
+    // member.
+    fixture
+        .owner
+        .replica
+        .submit(
+            ControlRequest {
+                id: ControlRequestId {
+                    client: [214; 16],
+                    sequence: 1,
+                },
+                acknowledged_through: 0,
+                command: ControlCommand::Membership(ControlMembershipCommand {
+                    expected_configuration_index: fixture.owner.replica.configuration_index(),
+                    expected: fixture.owner.replica.membership_configuration(),
+                    change: MembershipChange::AddLearner { node: 3 },
+                }),
+            },
+            &NoDirectoryAuthority,
+        )
+        .unwrap();
+    fixture.owner.replica.drain(&NoDirectoryAuthority).unwrap();
+    let configuration_index = fixture.owner.replica.configuration_index();
+    assert!(
+        configuration_index > fixture.owner.replica.snapshot_index(),
+        "the membership change is above the snapshot floor: the snapshot is now stale"
+    );
+    // The owner refreshes the snapshot to the current committed configuration.
+    fixture.owner.maybe_checkpoint().unwrap();
+    assert!(
+        fixture.owner.replica.snapshot_index() >= configuration_index,
+        "maybe_checkpoint refreshed the snapshot to include the membership change \
+         (was {floor_before}, now {})",
+        fixture.owner.replica.snapshot_index()
+    );
+}
+
+/// The owner's tick period is never shorter than configured nor longer than
+/// its ceiling, whatever is derived for it (27 §3.1 P2).
+#[test]
+fn the_tick_period_is_clamped_between_the_configured_period_and_its_ceiling() {
+    let config = ControlHostConfig::new(LedgerId {
+        tenant: focal_model::TenantId([1; 16]),
+        session: focal_model::SessionId([2; 16]),
+    });
+    let pace = TickPeriod::default();
+    assert_eq!(
+        pace.get(config.tick, config.tick_ceiling),
+        config.tick,
+        "unset is as configured"
+    );
+    assert_eq!(pace.election_tick(), 0, "unknown until the owner opens");
+    pace.announce(10);
+    assert_eq!(pace.election_tick(), 10);
+    pace.set(Duration::from_millis(1));
+    assert_eq!(pace.get(config.tick, config.tick_ceiling), config.tick);
+    pace.set(Duration::from_millis(750));
+    assert_eq!(
+        pace.get(config.tick, config.tick_ceiling),
+        Duration::from_millis(750)
+    );
+    pace.set(Duration::from_secs(3600));
+    assert_eq!(
+        pace.get(config.tick, config.tick_ceiling),
+        config.tick_ceiling
+    );
+    // A shared handle sees what the other wrote.
+    let shared = pace.clone();
+    shared.set(Duration::from_millis(300));
+    assert_eq!(
+        pace.get(config.tick, config.tick_ceiling),
+        Duration::from_millis(300)
+    );
+    // A ceiling under the period, or past ten seconds, is not a configuration.
+    let mut bad = config.clone();
+    bad.tick_ceiling = Duration::from_millis(50);
+    assert!(bad.validate().is_err());
+    bad.tick_ceiling = Duration::from_secs(11);
+    assert!(bad.validate().is_err());
 }

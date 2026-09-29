@@ -16,6 +16,8 @@ pub enum AdminAction {
     NodeIdentity,
     NodeHealth,
     NodeConfiguration,
+    NodeReadiness,
+    NodeMetrics,
     ReplicaDiagnostics {
         session: Option<[u8; 16]>,
     },
@@ -43,6 +45,12 @@ pub enum AdminAction {
     Restore {
         input: String,
         new_incarnation: bool,
+    },
+    Repair {
+        tenant: Option<[u8; 16]>,
+        session: Option<[u8; 16]>,
+        after: Option<[u8; 16]>,
+        limit: u32,
     },
     ReplicaTransfer {
         session: Option<[u8; 16]>,
@@ -101,6 +109,7 @@ pub enum AdminAction {
         expected_revision: Option<u64>,
     },
     RenewCredential,
+    RotateCredential,
     Placement,
     Plan,
     InviteClient {
@@ -111,6 +120,10 @@ pub enum AdminAction {
         tenant: [u8; 16],
     },
     Tenants,
+    UpgradeStatus,
+    ActivateFence {
+        level: u32,
+    },
     CreateSession {
         tenant: [u8; 16],
         name: String,
@@ -267,6 +280,23 @@ struct BackupVerify {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ActivateFence {
+    fence: u32,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Repair {
+    tenant: Option<String>,
+    session: Option<String>,
+    after: Option<String>,
+    #[serde(default = "default_repair_limit")]
+    limit: u32,
+}
+fn default_repair_limit() -> u32 {
+    256
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Restore {
     input: String,
     #[serde(default)]
@@ -285,12 +315,18 @@ pub(crate) fn parse(
 ) -> Result<AdminAction, InputError> {
     let value = serde_json::Value::Object(arguments);
     let action = match name {
-        "cluster.node.identity" | "cluster.node.health" | "cluster.node.config" => {
+        "cluster.node.identity"
+        | "cluster.node.health"
+        | "cluster.node.config"
+        | "cluster.node.readiness"
+        | "cluster.node.metrics" => {
             let _: Empty = serde_json::from_value(value)
                 .map_err(|_| InputError::Invalid("node inspection"))?;
             match name {
                 "cluster.node.identity" => AdminAction::NodeIdentity,
                 "cluster.node.health" => AdminAction::NodeHealth,
+                "cluster.node.readiness" => AdminAction::NodeReadiness,
+                "cluster.node.metrics" => AdminAction::NodeMetrics,
                 _ => AdminAction::NodeConfiguration,
             }
         }
@@ -351,6 +387,28 @@ pub(crate) fn parse(
                 return Err(InputError::Invalid("backup input"));
             }
             AdminAction::BackupVerify { input: args.input }
+        }
+        "cluster.repair" => {
+            let args: Repair =
+                serde_json::from_value(value).map_err(|_| InputError::Invalid("repair input"))?;
+            if args.tenant.is_some() && args.session.is_none() {
+                return Err(InputError::Invalid("a tenant needs its session"));
+            }
+            if args.limit == 0 || args.limit > 4096 {
+                return Err(InputError::Invalid("repair limit"));
+            }
+            AdminAction::Repair {
+                tenant: args
+                    .tenant
+                    .map(|tenant| focal_client::input::parse_id(&tenant))
+                    .transpose()?,
+                session: parse_session(args.session)?,
+                after: args
+                    .after
+                    .map(|after| focal_client::input::parse_id(&after))
+                    .transpose()?,
+                limit: args.limit,
+            }
         }
         "cluster.restore" => {
             let args: Restore =
@@ -504,6 +562,19 @@ pub(crate) fn parse(
                 tenant: focal_client::input::parse_id(&args.tenant)?,
             }
         }
+        "cluster.upgrade.status" => {
+            let _: Empty = serde_json::from_value(value)
+                .map_err(|_| InputError::Invalid("unexpected upgrade input"))?;
+            AdminAction::UpgradeStatus
+        }
+        "cluster.upgrade.activate" => {
+            let args: ActivateFence =
+                serde_json::from_value(value).map_err(|_| InputError::Invalid("fence"))?;
+            if args.fence == 0 {
+                return Err(InputError::Invalid("fence"));
+            }
+            AdminAction::ActivateFence { level: args.fence }
+        }
         "cluster.sessions.create" => {
             let args: CreateSession = serde_json::from_value(value)
                 .map_err(|_| InputError::Invalid("tenant and session name"))?;
@@ -541,6 +612,7 @@ pub(crate) fn parse(
         | "cluster.nodes.list"
         | "cluster.request.inspect"
         | "cluster.credentials.renew"
+        | "cluster.credentials.rotate"
         | "cluster.placement"
         | "cluster.plan"
         | "cluster.tenants.list" => {
@@ -551,6 +623,7 @@ pub(crate) fn parse(
                 "cluster.membership.show" => AdminAction::Configuration,
                 "cluster.nodes.list" => AdminAction::Contacts,
                 "cluster.credentials.renew" => AdminAction::RenewCredential,
+                "cluster.credentials.rotate" => AdminAction::RotateCredential,
                 "cluster.placement" => AdminAction::Placement,
                 "cluster.plan" => AdminAction::Plan,
                 "cluster.tenants.list" => AdminAction::Tenants,
@@ -724,12 +797,14 @@ mod tests {
                 | "cluster.credentials.revoke" => json!({"id":"01010101010101010101010101010101"}),
                 "cluster.client.invite" => json!({"name":"alice","output":"/tmp/alice.invite"}),
                 "cluster.tenants.admit" => json!({"tenant":"09090909090909090909090909090909"}),
+                "cluster.upgrade.activate" => json!({"fence":1}),
                 "cluster.archive.show" => json!({"claim":"01010101010101010101010101010101"}),
                 "cluster.gc.restore" => {
                     json!({"domain":"01010101010101010101010101010101","root":"0202020202020202020202020202020202020202020202020202020202020202"})
                 }
                 "cluster.backup.create" => json!({"output":"/tmp/focal-backup"}),
                 "cluster.backup.verify" => json!({"input":"/tmp/focal-backup"}),
+                "cluster.repair" => json!({"limit":16}),
                 "cluster.restore" => json!({"input":"/tmp/focal-backup","new_incarnation":true}),
                 "cluster.sessions.create" => {
                     json!({"tenant":"09090909090909090909090909090909","name":"orders"})

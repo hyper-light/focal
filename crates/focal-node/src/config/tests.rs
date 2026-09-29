@@ -106,6 +106,16 @@ fn a_committed_policy_wins_over_omitted_fields_and_refuses_a_conflicting_file_by
             field: "durability.max_failures"
         })
     ));
+    // A start yields to the committed policy for the same differing field
+    // rather than refusing (the file only seeds the first start).
+    let resolved =
+        resolve_start(&CliOverrides::default(), Some((&changed, &presence)), Some(&committed))
+            .unwrap();
+    assert_eq!(
+        resolved.settings.durability.max_failures, committed.intent.durability.max_failures,
+        "a start carries the committed durability, not the file's stale seed"
+    );
+    assert_eq!(resolved.sources["durability.max_failures"], ConfigSource::Committed(3));
     let (changed, presence) = yaml("version: 1\nplacement:\n  residency: [a]");
     assert!(matches!(
         resolve(&CliOverrides::default(), Some((&changed, &presence)), Some(&committed)),

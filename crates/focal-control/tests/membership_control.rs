@@ -119,7 +119,7 @@ impl Cluster {
                 if !self.nodes[(to - 1) as usize].accepts_peer(from) {
                     continue;
                 }
-                let snapshot = message.get_msg_type() == MessageType::MsgSnapshot;
+                let snapshot = message.msg_type == MessageType::MsgSnapshot as i32;
                 self.nodes[(to - 1) as usize]
                     .step_authenticated(from, &message.write_to_bytes().unwrap())
                     .unwrap();
@@ -289,7 +289,35 @@ fn learner_admission_catchup_promotion_and_exact_receipt_survive_checkpoint_and_
             break;
         }
     }
-    let leader = leader.expect("surviving three-voter quorum elects a leader");
+    let mut leader = leader.expect("surviving three-voter quorum elects a leader");
+    if leader == 3 {
+        // The member to remove was elected. A leader does not remove itself
+        // (27 §5): it refuses, hands leadership to a voter that stays, and
+        // that leader removes it.
+        assert!(matches!(
+            cluster.nodes[leader].submit(removed.clone(), &NoEvidence),
+            Err(ControlError::Consensus(
+                focal_consensus::ConsensusError::LeaderLeaving
+            ))
+        ));
+        let current = cluster.nodes[leader].configuration();
+        cluster.nodes[leader]
+            .transfer(&focal_control::ControlTransfer {
+                expected_configuration_index: current.configuration_index,
+                expected: current.configuration,
+                target: 2,
+            })
+            .unwrap();
+        let mut moved = None;
+        for _ in 0..100 {
+            cluster.ticks(Some(1), 1);
+            moved = (1..3).find(|index| cluster.nodes[*index].status().role == StateRole::Leader);
+            if moved.is_some() {
+                break;
+            }
+        }
+        leader = moved.expect("leadership moves to a voter that stays");
+    }
     cluster.nodes[leader]
         .submit(removed.clone(), &NoEvidence)
         .unwrap();

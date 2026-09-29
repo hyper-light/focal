@@ -85,22 +85,15 @@ impl FoundingNetwork {
     /// Recover durable state without demanding a local one-voter election.
     /// The foreground service starts transports and establishes quorum readiness.
     pub async fn prepare(settings: &Settings) -> NetworkResult<Self> {
+        Box::pin(Self::prepare_inner(settings)).await
+    }
+    async fn prepare_inner(settings: &Settings) -> NetworkResult<Self> {
         Self::open_inner(settings, false).await
     }
     async fn open_inner(settings: &Settings, local_readiness: bool) -> NetworkResult<Self> {
         tokio::runtime::Handle::try_current().map_err(|_| NetworkError::RuntimeRequired)?;
         let directory = NodeDirectory::open(settings)?;
         let identity = directory.identity();
-        let budget = MemoryBudget::new(1024 * 1024 * 1024, 256 * 1024 * 1024)?;
-        // Covers bounded manifest decode, founding PKI/draft buffers and duplicate
-        // serialized bootstrap inputs during recovery. Shrunk before publication.
-        let mut bootstrap_allocation = budget
-            .reserve(
-                BudgetKind::Recovery,
-                BudgetLane::Completion,
-                4 * 1024 * 1024,
-            )?
-            .commit();
         let saved = NetworkState::load(&directory)?;
         if saved
             .as_ref()
@@ -116,10 +109,60 @@ impl FoundingNetwork {
         {
             return Err(NetworkError::LegacyBootstrap);
         }
-        let (listen, advertise) = match &saved {
-            Some(state) => state.startup_addresses(settings).await?,
-            None => resolve_addresses(settings).await?,
+        let (listen, advertise, endpoint) = match &saved {
+            Some(state) => {
+                let startup = state.startup_addresses(settings).await?;
+                (startup.listen, startup.advertise, startup.endpoint)
+            }
+            None => {
+                let (listen, advertise) = resolve_addresses(settings).await?;
+                (
+                    listen,
+                    advertise,
+                    crate::network_state::advertised_name(settings),
+                )
+            }
         };
+        // The founder bootstrap - PKI generation, WAL and consensus recovery,
+        // enrollment - is unbounded CPU- and IO-blocking work. Run it on a
+        // blocking thread so it neither stalls the async runtime nor executes on
+        // the executor's shallow poll stack (a Windows main thread is 1 MiB).
+        let settings = settings.clone();
+        tokio::task::spawn_blocking(move || {
+            Self::bootstrap_blocking(
+                &settings,
+                directory,
+                saved,
+                listen,
+                advertise,
+                endpoint,
+                local_readiness,
+            )
+        })
+        .await
+        .map_err(|_| NetworkError::RuntimeRequired)?
+    }
+    /// The synchronous founder bootstrap, run off the executor by [open_inner].
+    fn bootstrap_blocking(
+        settings: &Settings,
+        directory: NodeDirectory,
+        saved: Option<NetworkState>,
+        listen: std::net::SocketAddr,
+        advertise: std::net::SocketAddr,
+        endpoint: Option<String>,
+        local_readiness: bool,
+    ) -> NetworkResult<Self> {
+        let identity = directory.identity();
+        let budget = MemoryBudget::new(1024 * 1024 * 1024, 256 * 1024 * 1024)?;
+        // Covers bounded manifest decode, founding PKI/draft buffers and duplicate
+        // serialized bootstrap inputs during recovery. Shrunk before publication.
+        let mut bootstrap_allocation = budget
+            .reserve(
+                BudgetKind::Recovery,
+                BudgetLane::Completion,
+                4 * 1024 * 1024,
+            )?
+            .commit();
         let committed = crate::embedded::check_policy(directory.root(), settings)?;
         // The founder pins its policy alone, so the first start must be
         // satisfiable by this node's own facts. A committed policy is the
@@ -187,12 +230,15 @@ impl FoundingNetwork {
         ));
         let control_identity = bootstrap.identity(&options)?;
         let state = NetworkState {
-            schema: 1,
+            schema: crate::network_state::NETWORK_STATE_SCHEMA,
             node: identity.node,
             listen,
             advertise,
+            endpoint: endpoint.clone(),
             sponsor: ServerTrust {
-                endpoint: advertise.to_string(),
+                // Invitations name the founder as its operator did (24 §24):
+                // a name outlives the address behind it.
+                endpoint: endpoint.clone().unwrap_or_else(|| advertise.to_string()),
                 server_name: names.first().ok_or(NodeError::Identity)?.clone(),
                 ca_certificate: authority.ca_certificate().to_vec(),
                 server_fingerprint: server_fingerprint(authority.server_certificate()),
@@ -204,8 +250,15 @@ impl FoundingNetwork {
                 bootstrap: bootstrap.clone(),
             },
         };
+        // A restart may resolve a new listen/advertise address (a rescheduled
+        // pod, a fresh DHCP lease, a moved VM): peers reach the founder by its
+        // pinned endpoint name, not this transient snapshot. `install` accepts a
+        // saved state whose identity (node, sponsor trust, genesis) is unchanged
+        // and rewrites only the transport addresses; a real identity change is
+        // still refused. A strict equality here would corrupt-fail every
+        // restart that resolved a new address.
         if saved.as_ref().is_some_and(|saved| saved != &state) {
-            return Err(NodeError::Identity.into());
+            state.install(&directory)?;
         }
         state.validate(identity)?;
         let wal = SharedWal::open_with_budgets(

@@ -21,7 +21,7 @@ use std::{
     path::Path,
     process::{Child, Command, Output, Stdio},
     sync::mpsc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 struct Server(Child);
@@ -34,12 +34,15 @@ impl Drop for Server {
 fn private(path: &Path) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
+#[path = "support/deadline.rs"]
+mod deadline;
 #[path = "support/ports.rs"]
 mod ports;
 fn address() -> String {
     ports::address()
 }
 fn start(root: &Path, advertise: &str) -> Server {
+    deadline::observe(root);
     let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
         .args([
             "--data-dir",
@@ -262,7 +265,7 @@ fn a_backup_holds_the_prefix_and_its_proof_and_verifies_without_the_node() {
     ));
     // The export waits for the session's registration with the directory:
     // a backup is taken under a committed placement.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
     loop {
         let placement = admin(root, &["cluster", "placement"]);
         let registered = placement["result"]["placement"]["partitions"]
@@ -274,10 +277,7 @@ fn a_backup_holds_the_prefix_and_its_proof_and_verifies_without_the_node() {
         if registered {
             break;
         }
-        assert!(
-            Instant::now() < deadline,
-            "the session never registered: {placement}"
-        );
+        assert!(deadline.open(), "the session never registered: {placement}");
         std::thread::sleep(Duration::from_millis(200));
     }
     // The first backup: the envelope and the sealed payload.
@@ -359,7 +359,7 @@ fn a_backup_holds_the_prefix_and_its_proof_and_verifies_without_the_node() {
     // its header names.
     committed(&cli(root, None, &["claim", "cancel", &claim]));
     committed(&cli(root, None, &["claim", "release-scope", &claim]));
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
     loop {
         let output = run(root, None, &["get", "claim", &claim, "--format", "json"]);
         if output.status.success()
@@ -368,7 +368,7 @@ fn a_backup_holds_the_prefix_and_its_proof_and_verifies_without_the_node() {
         {
             break;
         }
-        assert!(Instant::now() < deadline, "the claim never retired");
+        assert!(deadline.open(), "the claim never retired");
         std::thread::sleep(Duration::from_millis(200));
     }
     let second = founder.path().join("backups").join("second");

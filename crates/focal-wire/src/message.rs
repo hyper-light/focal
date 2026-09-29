@@ -129,6 +129,16 @@ pub enum Operation {
         acknowledged_through: u64,
         expected_generation: u64,
         advertise: std::net::SocketAddr,
+        /// The node's failure-domain labels as its operator declared them
+        /// (24 §22); a zone needs its region. Labels are at most 64 bytes.
+        region: Option<String>,
+        zone: Option<String>,
+        /// The name the node was told to advertise (`host:port`) when its
+        /// operator gave a name rather than an address (24 §24): peers
+        /// re-resolve it when the announced address stops answering, so a
+        /// node that moves keeps its identity. At most
+        /// `MAX_ENDPOINT_NAME_BYTES`.
+        endpoint: Option<String>,
     },
     /// Only the immutable genesis founder may use the enrollment owner's
     /// dedicated sequence stream. The root reauthorizes the certificate and
@@ -215,6 +225,29 @@ pub enum Operation {
         request: Vec<u8>,
     },
 }
+/// What a request is to the connection that carries it; see
+/// [`Operation::class`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TrafficClass {
+    /// Content: as much as the path takes, behind everything else.
+    Bulk,
+    /// What a participant asks and is answered.
+    Exchange,
+    /// Consensus, liveness and the fleet's own control.
+    Control,
+}
+impl TrafficClass {
+    /// The priority of the class's streams: a stream of a higher one sends
+    /// all it has before one of a lower sends anything, and streams of one
+    /// priority take turns.
+    pub const fn priority(self) -> i32 {
+        match self {
+            Self::Bulk => -10,
+            Self::Exchange => 0,
+            Self::Control => 10,
+        }
+    }
+}
 /// One movement fact request: an operation, a member and a kind.
 pub const MAX_RANGE_CONTROL_REQUEST_BYTES: usize = 4 * 1024;
 /// One session control call: a membership change with its expected
@@ -265,6 +298,45 @@ impl Operation {
             Self::Probe { .. } => 30,
             Self::RangeControl { .. } => 31,
             Self::SessionControl { .. } => 32,
+        }
+    }
+    /// What goes first where one connection carries several requests at
+    /// once (27 §3.1): what a group or the fleet needs to stay led and
+    /// known, then what a participant asks, then content. A class orders
+    /// what a sender has not sent yet, its own streams among each other; it
+    /// is no part of the request and grants nothing.
+    pub fn class(&self) -> TrafficClass {
+        match self {
+            Self::Raft { .. }
+            | Self::Probe { .. }
+            | Self::Control { .. }
+            | Self::PeerControl { .. }
+            | Self::NodeContact { .. }
+            | Self::EnrollmentControl { .. }
+            | Self::ManagedSupport { .. }
+            | Self::PlacementControl { .. }
+            | Self::SessionSign { .. }
+            | Self::RangeControl { .. }
+            | Self::SessionControl { .. } => TrafficClass::Control,
+            Self::Upload(_) | Self::Download { .. } | Self::Custody(_) => TrafficClass::Bulk,
+            Self::Submit { .. }
+            | Self::Read(_)
+            | Self::Subscribe(_)
+            | Self::OpenEpoch { .. }
+            | Self::Stream(_)
+            | Self::List(_)
+            | Self::Reconcile(_)
+            | Self::Managed { .. }
+            | Self::RequestStreamControl { .. }
+            | Self::RequestStreamRead { .. }
+            | Self::Traverse(_)
+            | Self::Validators(_)
+            | Self::Summary
+            | Self::Monitor { .. }
+            | Self::Select(_)
+            | Self::Native { .. }
+            | Self::NativeRead(_)
+            | Self::NativeList(_) => TrafficClass::Exchange,
         }
     }
     pub fn is_mutation(&self) -> bool {

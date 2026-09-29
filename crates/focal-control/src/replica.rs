@@ -39,6 +39,7 @@ struct CheckpointV2<S = ControlBootstrap> {
     retries: RetryCheckpoint,
     authority: ControlAuthoritySnapshot,
 }
+/// The shape schemas 3 and 4 wrote: contacts without topology labels.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct CheckpointV3<S = ControlBootstrap> {
     schema: u16,
@@ -48,9 +49,44 @@ struct CheckpointV3<S = ControlBootstrap> {
     retries: RetryCheckpoint,
     authority: Option<ControlAuthoritySnapshot>,
     configuration_index: u64,
+    contacts: Option<crate::contacts::ContactCheckpointV1>,
+}
+/// The shape schema 5 wrote: contacts without advertised names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CheckpointV5<S = ControlBootstrap> {
+    schema: u16,
+    identity: ControlIdentity,
+    applied_index: u64,
+    state: S,
+    retries: RetryCheckpoint,
+    authority: Option<ControlAuthoritySnapshot>,
+    configuration_index: u64,
+    contacts: Option<crate::contacts::ContactCheckpointV2>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CheckpointV6<S = ControlBootstrap> {
+    schema: u16,
+    identity: ControlIdentity,
+    applied_index: u64,
+    state: S,
+    retries: RetryCheckpoint,
+    authority: Option<ControlAuthoritySnapshot>,
+    configuration_index: u64,
+    contacts: Option<crate::contacts::ContactCheckpointV3>,
+}
+/// Schema 7: contacts carry retirement counters (24 §19).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CheckpointV7<S = ControlBootstrap> {
+    schema: u16,
+    identity: ControlIdentity,
+    applied_index: u64,
+    state: S,
+    retries: RetryCheckpoint,
+    authority: Option<ControlAuthoritySnapshot>,
+    configuration_index: u64,
     contacts: Option<ContactCheckpoint>,
 }
-const CHECKPOINT_SCHEMA: u16 = 4;
+const CHECKPOINT_SCHEMA: u16 = 7;
 const COMMAND_SCHEMA: u16 = 2;
 struct Pending {
     request: ControlRequestId,
@@ -160,8 +196,36 @@ impl ControlReplica {
     pub fn status(&self) -> NodeStatus {
         self.node.status()
     }
+    pub fn peer_progress(&self) -> Vec<focal_consensus::PeerProgress> {
+        self.node.peer_progress()
+    }
     pub fn applied_index(&self) -> u64 {
         self.applied_index
+    }
+    /// The compaction floor: the index of the most recent installed snapshot,
+    /// or zero if the log has never been compacted.
+    pub fn snapshot_index(&self) -> u64 {
+        self.node.snapshot_index()
+    }
+    /// The Raft index of the most recent committed membership change. A stored
+    /// snapshot older than this carries a configuration that excludes members
+    /// added since, so it cannot catch such a member up.
+    /// Ticks without leader contact before this replica campaigns.
+    pub fn election_tick(&self) -> usize {
+        self.node.election_tick()
+    }
+    /// The ticks the replica waits beyond its election timeout before it
+    /// campaigns (`DurableNode::set_patience`).
+    pub fn set_patience(&mut self, ticks: usize) -> Result<(), ControlError> {
+        self.check()?;
+        self.node.set_patience(ticks)?;
+        Ok(())
+    }
+    pub fn configuration_index(&self) -> u64 {
+        self.configuration_index
+    }
+    pub fn membership_configuration(&self) -> MembershipConfiguration {
+        self.node.membership_configuration()
     }
     pub fn has_pending(&self) -> bool {
         self.pending.is_some()
@@ -333,11 +397,13 @@ impl ControlReplica {
                         .contacts()
                         .cloned()
                         .unwrap_or(ContactCheckpoint {
-                            schema: 1,
+                            schema: crate::contacts::CONTACT_CHECKPOINT_SCHEMA,
                             cluster: self.identity.cluster.0,
                             revision: 0,
                             applied_index: 0,
                             records: Vec::new(),
+                            retired_mutations: 0,
+                            last_retirement_index: 0,
                         }),
                 }))
             }
@@ -482,6 +548,19 @@ impl ControlReplica {
         self.node.tick()?;
         Ok(())
     }
+    /// Ticks between a leader's heartbeats.
+    pub fn heartbeat_tick(&self) -> usize {
+        self.node.heartbeat_tick()
+    }
+    /// A leader sends its heartbeats now; see `DurableNode::beat`.
+    pub fn beat(&mut self) -> Result<(), ControlError> {
+        self.check()?;
+        self.node.beat()?;
+        Ok(())
+    }
+    pub fn leads(&self) -> bool {
+        self.node.status().role == focal_consensus::StateRole::Leader
+    }
     /// Trusted in-process transport/testing seam. Production ingress must bind
     /// cluster/group and sender identity before delivering the message.
     pub fn step(&mut self, message: Message) -> Result<(), ControlError> {
@@ -572,10 +651,11 @@ impl ControlReplica {
             owner_term: status.term,
             request,
         };
-        let encoded_len = postcard::experimental::serialized_size(&envelope)?;
-        if encoded_len > self.options.limits.max_command_bytes {
-            return Err(ControlError::Capacity);
-        }
+        // Serialize the envelope once: its bytes give the length (for admission
+        // and the machine's charge), its hash, and the committed command, instead
+        // of serializing it for each of those in turn.
+        let encoded = encode(&envelope, self.options.limits.max_command_bytes)?;
+        let encoded_len = encoded.len();
         let allocation = self
             .budget
             .reserve(
@@ -598,8 +678,7 @@ impl ControlReplica {
             self.identity,
             &self.options,
         )?;
-        let envelope_hash = hash("focal.control.envelope.v1", &envelope)?;
-        let encoded = encode(&envelope, self.options.limits.max_command_bytes)?;
+        let envelope_hash = hash_bytes("focal.control.envelope.v1", &encoded);
         let membership = if let ControlCommand::Membership(change) = &envelope.request.command {
             Some(PreparedConfiguration {
                 index: change.expected_configuration_index,
@@ -632,12 +711,24 @@ impl ControlReplica {
     /// Persist Raft state before releasing messages; publish all committed
     /// metadata before emitting completion or fulfilled ReadIndex barriers.
     /// Any persistence/replay/publication failure fail-stops this owner.
+    /// A drain the node refused before it took anything, for the room or
+    /// for what it still persists, is none: the node is as it was, and the
+    /// drain is asked again (`checkpoint_retryable`).
     pub fn drain(
         &mut self,
         verifier: &impl AuthorityVerifier,
     ) -> Result<ControlEvents, ControlError> {
         self.check()?;
-        let result = self.drain_inner(verifier);
+        let events = match self.node.drain() {
+            Ok(events) => events,
+            Err(error) if !self.node.failed() => return Err(error.into()),
+            Err(error) => {
+                self.failed = true;
+                self.pending = None;
+                return Err(error.into());
+            }
+        };
+        let result = self.drain_inner(events, verifier);
         if result.is_err() {
             self.failed = true;
             self.pending = None;
@@ -646,9 +737,9 @@ impl ControlReplica {
     }
     fn drain_inner(
         &mut self,
+        mut events: focal_consensus::NodeEvents,
         verifier: &impl AuthorityVerifier,
     ) -> Result<ControlEvents, ControlError> {
-        let mut events = self.node.drain()?;
         let mut output = ControlEvents {
             allocation: events.take_allocation(),
             ..Default::default()
@@ -706,11 +797,56 @@ impl ControlReplica {
                         },
                         newer.authority,
                         newer.configuration_index,
-                        newer.contacts,
+                        newer.contacts.map(ContactCheckpoint::from),
                     )
                 }
                 4 => {
                     let newer: CheckpointV3 = decode(&snapshot.data, limit)?;
+                    (
+                        Checkpoint {
+                            schema: CHECKPOINT_SCHEMA,
+                            identity: newer.identity,
+                            applied_index: newer.applied_index,
+                            state: newer.state,
+                            retries: newer.retries,
+                        },
+                        newer.authority,
+                        newer.configuration_index,
+                        newer.contacts.map(ContactCheckpoint::from),
+                    )
+                }
+                5 => {
+                    let newer: CheckpointV5 = decode(&snapshot.data, limit)?;
+                    (
+                        Checkpoint {
+                            schema: CHECKPOINT_SCHEMA,
+                            identity: newer.identity,
+                            applied_index: newer.applied_index,
+                            state: newer.state,
+                            retries: newer.retries,
+                        },
+                        newer.authority,
+                        newer.configuration_index,
+                        newer.contacts.map(ContactCheckpoint::from),
+                    )
+                }
+                6 => {
+                    let newer: CheckpointV6 = decode(&snapshot.data, limit)?;
+                    (
+                        Checkpoint {
+                            schema: CHECKPOINT_SCHEMA,
+                            identity: newer.identity,
+                            applied_index: newer.applied_index,
+                            state: newer.state,
+                            retries: newer.retries,
+                        },
+                        newer.authority,
+                        newer.configuration_index,
+                        newer.contacts.map(ContactCheckpoint::from),
+                    )
+                }
+                7 => {
+                    let newer: CheckpointV7 = decode(&snapshot.data, limit)?;
                     (
                         Checkpoint {
                             schema: CHECKPOINT_SCHEMA,
@@ -974,7 +1110,7 @@ impl ControlReplica {
             .machine
             .export_authority(self.identity, self.applied_index)?;
         let bytes = encode(
-            &CheckpointV3 {
+            &CheckpointV7 {
                 schema: CHECKPOINT_SCHEMA,
                 identity: self.identity,
                 applied_index: self.applied_index,
@@ -988,9 +1124,35 @@ impl ControlReplica {
         )?;
         let result = self.node.checkpoint(self.applied_index, bytes);
         if result.is_err() {
-            self.failed = true;
+            // A checkpoint the log had no room to admit stays unadmitted:
+            // withdraw it so the node is mutable again and a later attempt
+            // starts afresh. Nothing was written.
+            self.node.cancel_unadmitted_checkpoint();
+            // Only a node that actually stopped stops this replica. A refusal
+            // that changed nothing (Raft has work outstanding, persistence is
+            // in flight, memory or log pressure) is retried by the caller;
+            // treating it as fatal ended the root leader under ordinary load.
+            if self.node.failed() {
+                self.failed = true;
+            }
         }
         result.map_err(ControlError::from)
+    }
+    /// Whether a checkpoint error is a refusal that changed nothing and may
+    /// be retried later, rather than a failure of this replica.
+    pub fn checkpoint_retryable(&self, error: &ControlError) -> bool {
+        !self.failed
+            && matches!(
+                error,
+                ControlError::NotReady
+                    | ControlError::Busy
+                    | ControlError::Memory(_)
+                    | ControlError::Consensus(
+                        focal_consensus::ConsensusError::PersistencePending
+                            | focal_consensus::ConsensusError::CheckpointIndex
+                            | focal_consensus::ConsensusError::Capacity
+                    )
+            )
     }
     fn validate_state_scope(&self, state: &ControlBootstrap) -> Result<(), ControlError> {
         match (self.identity.scope, state) {

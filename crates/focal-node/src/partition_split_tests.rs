@@ -3,7 +3,7 @@
 //! the hosted partition from its record, and the two merge back once they
 //! are small; every step is a committed directory fact.
 use crate::{
-    network_service::tests::{Running, settings},
+    network_service::tests::{Running, settings, try_until, until},
     placement_agent::tests::{observe, partition_host},
 };
 use focal_control::ControlBootstrap;
@@ -15,29 +15,24 @@ async fn delegations(running: &Running) -> BTreeMap<NamespaceKey, focal_director
     let ControlBootstrap::Root { directory, .. } = &root.snapshot().state else {
         panic!("root state");
     };
-    directory.delegations.clone()
+    directory.delegations.as_ref().clone()
 }
 async fn wait_delegations(
     running: &Running,
     what: &str,
     condition: impl Fn(&BTreeMap<NamespaceKey, focal_directory::Delegation>) -> bool,
 ) -> BTreeMap<NamespaceKey, focal_directory::Delegation> {
-    let reached = tokio::time::timeout(Duration::from_secs(120), async {
-        loop {
-            let current = delegations(running).await;
-            if condition(&current) {
-                return current;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+    let reached = try_until(&[running], Duration::from_secs(120), async || {
+        let current = delegations(running).await;
+        condition(&current).then_some(current)
     })
     .await;
     match reached {
         Ok(current) => current,
-        Err(_) => {
+        Err(spent) => {
             let status = running.handles.placement.status().await;
             panic!(
-                "root delegations never reached: {what}; agent {:?}; hosted {}",
+                "root delegations never reached: {what}: {spent}; agent {:?}; hosted {}",
                 status.map(|status| (
                     status.last_error,
                     status.root_intents,
@@ -62,23 +57,18 @@ async fn wait_partition(
     what: &str,
     condition: impl Fn(&PartitionCheckpoint) -> bool,
 ) -> PartitionCheckpoint {
-    let reached = tokio::time::timeout(Duration::from_secs(120), async {
-        loop {
-            if let Some(state) = partition_state(running, partition).await
-                && condition(&state)
-            {
-                return state;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
+    let reached = try_until(&[running], Duration::from_secs(120), async || {
+        partition_state(running, partition)
+            .await
+            .filter(|state| condition(state))
     })
     .await;
     match reached {
         Ok(state) => state,
-        Err(_) => {
+        Err(spent) => {
             let status = running.handles.placement.status().await;
             panic!(
-                "partition never reached: {what}; agent {:?}; state {:?}",
+                "partition never reached: {what}: {spent}; agent {:?}; state {:?}",
                 status.map(|status| (
                     status.last_error,
                     status.root_intents,
@@ -220,20 +210,22 @@ async fn a_crowded_partition_splits_survives_a_restart_and_merges_back() {
     assert!(absorbed.sealed.is_none());
     // The merged-away partition is forgotten for restarts, and the union stays
     // under the split threshold.
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while directory
-            .path()
-            .join("cluster/partitions")
-            .read_dir()
-            .unwrap()
-            .count()
-            != 0
-        {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .unwrap();
+    until(
+        "the merged-away partition is forgotten",
+        &[&founder],
+        Duration::from_secs(30),
+        async || {
+            (directory
+                .path()
+                .join("cluster/partitions")
+                .read_dir()
+                .unwrap()
+                .count()
+                == 0)
+                .then_some(())
+        },
+    )
+    .await;
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(delegations(&founder).await.len(), 1);
     founder.stop().await;

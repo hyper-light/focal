@@ -107,7 +107,7 @@ pub(crate) fn apply_session(
                 next_membership: session
                     .membership_epoch
                     .checked_add(u64::from(
-                        desired.placement.voters != session.active.placement.voters,
+                        desired.placement.adds_voter_over(&session.active.placement),
                     ))
                     .ok_or(DirectoryError::CounterExhausted)?,
                 next_placement: session
@@ -337,6 +337,10 @@ pub(crate) fn apply_session(
             session.membership_epoch = authority.membership_epoch;
             session.placement_epoch = plan.next_placement;
             session.authority = authority.clone();
+            // Published holders are relative to the previous placement; the new
+            // active placement may drop or re-generation nodes, so stale holder
+            // hints are cleared here and republished against the new membership.
+            session.holders = None;
             let kept = session.active.placement.nodes();
             session.retiring.retain(|node, _| !kept.contains(node));
             for node in previous.placement.nodes() {

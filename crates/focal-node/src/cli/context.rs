@@ -7,7 +7,7 @@ use focal_enrollment::PrivateJournal;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Write},
     path::Path,
     sync::{Mutex, OnceLock},
@@ -160,15 +160,15 @@ impl Store {
         }
         if !initialized {
             super::private_parent(root)?;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&marker)?;
+            let mut file = focal_platform::fs::open_private(&marker, false, true, true)?;
             file.write_all(b"FCLCTX01")?;
             file.sync_all()?;
-            File::open(root)?.sync_all()?;
+            // Unix fsyncs the directory so the new entry is durable; Windows
+            // uses write-through semantics and does not flush a directory.
+            #[cfg(unix)]
+            {
+                File::open(root)?.sync_all()?;
+            }
         }
         let mut journal = if shared {
             PrivateJournal::open_shared(&path).map_err(other)?
@@ -659,8 +659,13 @@ pub(super) fn connect(profile: Profile, history: PathBuf) -> Result<Context> {
                 initialized: Mutex::new(()),
                 transport: OnceLock::new(),
             }));
+            let client = Client::new(transport, RetryPolicy::default(), limits, 1)?;
+            let client = match super::trace::sink() {
+                Some(sink) => client.with_trace(sink),
+                None => client,
+            };
             Ok(Context {
-                client: Client::new(transport, RetryPolicy::default(), limits, 1)?,
+                client,
                 build,
                 operation,
                 root: history,
@@ -720,8 +725,13 @@ pub(super) fn connect(profile: Profile, history: PathBuf) -> Result<Context> {
                 initialized: Mutex::new(()),
                 transport: OnceLock::new(),
             }));
+            let client = Client::new(transport, RetryPolicy::default(), limits, 1)?;
+            let client = match super::trace::sink() {
+                Some(sink) => client.with_trace(sink),
+                None => client,
+            };
             Ok(Context {
-                client: Client::new(transport, RetryPolicy::default(), limits, 1)?,
+                client,
                 build,
                 operation,
                 root: history,
@@ -827,14 +837,29 @@ fn enroll(
     })?;
     super::super::print_json(&serde_json::json!({"condition":"Enrolled","name":selected,"principal":ParticipantId(receipt.identity.principal),"request_id":pending.request_id(),"selected":false})).map_err(CliError::Other)
 }
+/// A secret credential (a private key) must be reachable only by its owner:
+/// mode `& 0o077 == 0` on Unix; owned by the current user on Windows, where an
+/// owner-only DACL is the access control.
+fn credential_is_owner_private(path: &Path, metadata: &fs::Metadata) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = path;
+        Ok(metadata.mode() & 0o077 == 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Ok(focal_platform::fs::owner_at(path)? == focal_platform::fs::current_owner()?)
+    }
+}
 fn read_credential(path: &Path, secret: bool) -> Result<Vec<u8>> {
-    use std::os::unix::fs::MetadataExt;
     let before = fs::symlink_metadata(path)?;
     if !before.is_file()
         || before.len() > 64 * 1024
         || before.len() == 0
-        || before.nlink() != 1
-        || (secret && before.mode() & 0o077 != 0)
+        || focal_platform::fs::path_hard_link_count(path)? != 1
+        || (secret && !credential_is_owner_private(path, &before)?)
     {
         return Err(InputError::Invalid(
             "credential must be a bounded regular file; keys must be owner-private",
@@ -843,7 +868,7 @@ fn read_credential(path: &Path, secret: bool) -> Result<Vec<u8>> {
     }
     let mut file = File::open(path)?;
     let opened = file.metadata()?;
-    if before.dev() != opened.dev() || before.ino() != opened.ino() {
+    if focal_platform::fs::path_identity(path)? != focal_platform::fs::file_identity(&file)? {
         return Err(InputError::Invalid("credential changed during open").into());
     }
     let length = usize::try_from(opened.len()).map_err(|_| InputError::Capacity)?;
@@ -863,10 +888,13 @@ fn read_credential(path: &Path, secret: bool) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     fn settings() -> (tempfile::TempDir, Settings) {
         let root = tempfile::tempdir().unwrap();
-        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let mut settings = Settings::default();
         settings.node.data_dir = Some(root.path().into());
         (root, settings)
@@ -942,8 +970,15 @@ mod tests {
         let forged = br#"{"transport":"unix","node_data_dir":"/tmp","runtime":true}"#;
         assert!(parse_document::<Profile>(forged, InputFormat::Json).is_err());
     }
+    // POSIX permission/symlink/hardlink rejection: read_credential refuses a
+    // group/other-readable mode, a symlinked credential and a multiply-linked
+    // one. Windows enforces the private-credential contract through DACLs,
+    // reparse-point refusal and the link count (focal-platform FFI suite), so
+    // this shape is Unix-only.
+    #[cfg(unix)]
     #[test]
     fn credential_loading_rejects_symlinks_hardlinks_oversize_and_public_keys() {
+        use std::os::unix::fs::PermissionsExt;
         let (root, _) = settings();
         let path = root.path().join("key");
         fs::write(&path, b"key").unwrap();

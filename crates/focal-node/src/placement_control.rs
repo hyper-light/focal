@@ -8,7 +8,9 @@ use crate::{
     placement_proof::{AccountedAuthorityProof, PlacementProofError, ProofWindow},
 };
 use focal_control::{ControlCommand, ControlFailure, ControlRpc};
-use focal_directory::{AssignmentPhase, AuthorityProof, PartitionOperation, SessionChange};
+use focal_directory::{
+    AssignmentPhase, AuthorityProof, PartitionOperation, SessionChange, SessionFenceKind,
+};
 use focal_ledger::SessionPlacementRequest;
 use focal_wire::{MAX_PLACEMENT_CONTROL_REQUEST_BYTES, PeerRole, VerifiedRequest};
 use serde::{Deserialize, Serialize};
@@ -63,7 +65,12 @@ pub(crate) fn decode_placement_control(
             let ControlRpc::Submit(request) = &rpc else {
                 return Err(ControlFailure::Unauthorized);
             };
-            if request.id.client != verified.peer().principal().0 {
+            // The request client is the sender's enrolled principal, or the
+            // client its root intents are named by (distinct from its
+            // partition intents, which share this owner's receipt space).
+            let principal = verified.peer().principal().0;
+            if request.id.client != principal && request.id.client != root_intent_client(principal)
+            {
                 return Err(ControlFailure::Unauthorized);
             }
             // A node bootstraps the group of a session it created alone: a
@@ -114,8 +121,29 @@ pub(crate) fn decode_placement_control(
                     }
                     _ => false,
                 },
-                PartitionOperation::SealForTransfer { .. }
-                | PartitionOperation::CreateSession { .. } => false,
+                // A node registers a session it created alone: a placement
+                // whose only voter, materializer and copy is the sender, under
+                // the creation fence the partition verifies by proof (24 §16).
+                PartitionOperation::CreateSession {
+                    placement,
+                    authority,
+                    ..
+                } => {
+                    authority.kind == SessionFenceKind::Created
+                        && placement.placement.voters.len() == 1
+                        && placement.placement.voters.contains_key(&node_id)
+                        && placement
+                            .placement
+                            .materializers
+                            .keys()
+                            .all(|member| *member == node_id)
+                        && placement
+                            .placement
+                            .content_copies
+                            .keys()
+                            .all(|member| *member == node_id)
+                }
+                PartitionOperation::SealForTransfer { .. } => false,
             };
             if !own {
                 return Err(ControlFailure::Unauthorized);
@@ -126,6 +154,17 @@ pub(crate) fn decode_placement_control(
     }
 }
 
+/// The client a node's root intents are named by when it submits them
+/// through the root leader (24 §16): derived from its enrolled principal so
+/// it never collides with the partition intents the same owner retains.
+pub fn root_intent_client(principal: [u8; 16]) -> [u8; 16] {
+    let hash = blake3::derive_key("focal.placement.root-intents.v1", &principal);
+    let mut value = [0; 16];
+    for (target, source) in value.iter_mut().zip(hash) {
+        *target = source;
+    }
+    value
+}
 /// One signing job handed to the node's credential owner.
 pub struct SignJob {
     pub permit: crate::placement_proof::SessionProofPermit,

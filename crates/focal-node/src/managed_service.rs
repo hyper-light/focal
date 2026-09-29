@@ -292,10 +292,10 @@ impl RequestHandler for ManagedService {
     fn supports_native_requests(&self) -> bool {
         true
     }
-    fn handle(&self, request: VerifiedRequest) -> HandlerFuture<'_> {
+    fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
         Box::pin(async move { self.handle_accounted(request).await.into_envelope() })
     }
-    fn handle_accounted(&self, request: VerifiedRequest) -> OwnedHandlerFuture<'_> {
+    fn handle_accounted<'a>(&'a self, request: &'a VerifiedRequest) -> OwnedHandlerFuture<'a> {
         Box::pin(async move {
             let fail = |error| OwnedResponse::new(request.request().reply(Response::Error(error)));
             // VerifiedRequest already checks this at transport ingress. Repeat
@@ -313,22 +313,22 @@ impl RequestHandler for ManagedService {
                 return self.content.handle_accounted(request).await;
             }
             if matches!(request.request().operation, Operation::SessionSign { .. }) {
-                let result = self.sign(&request).await;
+                let result = self.sign(request).await;
                 return OwnedResponse::new(request.request().reply(result));
             }
             if matches!(request.request().operation, Operation::Probe { .. }) {
-                let result = self.probe(&request).await;
+                let result = self.probe(request).await;
                 return OwnedResponse::new(request.request().reply(result));
             }
             if matches!(request.request().operation, Operation::RangeControl { .. }) {
-                let result = self.range_control(&request).await;
+                let result = self.range_control(request).await;
                 return OwnedResponse::new(request.request().reply(result));
             }
             if matches!(
                 request.request().operation,
                 Operation::SessionControl { .. }
             ) {
-                let result = self.session_control(&request).await;
+                let result = self.session_control(request).await;
                 return OwnedResponse::new(request.request().reply(result));
             }
             let ledger = request.request().ledger;

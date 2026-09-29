@@ -24,6 +24,17 @@ macOS 15 arm64/x86_64, GNU Linux arm64/x86_64 built on Ubuntu 24.04, and static
 musl Linux arm64/x86_64. Each runs on its native processor. The musl binary runs
 inside the pinned Rust Alpine image and on the native Ubuntu runner; binary
 inspection verifies architecture and absence of dynamic musl dependencies.
+Every lane compiles the cryptographic provider, AWS-LC, from the sources under
+[`vendor/`](../../vendor/README.md) with the lane's C compiler ([07](07-decisions-and-traceability.md) F57): the GNU and
+macOS lanes with the runner's toolchain, the musl lanes with the Alpine image's
+`build-base`, Windows x86_64 with the prebuilt NASM objects the crate carries and
+Windows arm64 with the clang-cl toolset; no lane needs CMake, Go or bindgen. The
+Windows executables link their C runtime statically (`+crt-static` on the two
+Windows lanes, as the musl lanes do), so they import no `vcruntime140.dll` and need no
+Visual C++ redistributable; their import table is the set `release.py` verifies —
+the kernel, security, `bcrypt.dll`, `bcryptprimitives.dll` (whose `ProcessPrng` the Rust
+standard library draws hashing randomness from, part of Windows since 8), sockets and
+the API-set stubs — as the dispatched release run showed on both Windows lanes.
 
 The [release implementation](../../scripts/release/release.py) separates checks:
 
@@ -70,6 +81,22 @@ Implement these in dependency order:
    seals and client journals. Surface unsupported durability as an error. Test
    acknowledged writes across process kill and reopen, interrupted publication,
    locked destinations, disk-full conditions and stale temporary files.
+
+   *Implemented mechanism.* Every durable install writes a temporary file,
+   `sync_all`s it, **closes the handle**, then publishes through
+   `focal_platform::fs::atomic_replace`. On Unix that is `std::fs::rename`
+   paired with a following `focal_platform::sync_dir` (the directory `fsync`
+   that makes the rename durable). On Windows it is
+   `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`, whose
+   write-through flag is the durability fence, so `sync_dir` is a no-op there
+   (Windows offers no directory `fsync`). Closing the source handle first is
+   mandatory: Windows refuses to rename a file that still has an open handle.
+   `std::fs::rename` must not be used for a durability-critical publish, because
+   it carries no write-through guarantee on Windows and would leave the metadata
+   update unflushed with no directory `fsync` to follow. This covers the WAL
+   `CURRENT` fence, the node identity/policy files, enrollment credential stores,
+   the client operation/pending/artifact-transfer journals, evidence content
+   installs, GC round promotions, upload terminals and the backup `FileMedium`.
 3. **Authenticated local transport.** Implement bounded same-user named pipes or
    an equivalently authenticated native local transport for data and admin
    operations. Reuse framed typed requests, deadlines, backpressure and owned

@@ -28,7 +28,8 @@ pub(super) struct PendingPlacementCall {
     call: PlacementCall,
     context: Option<Vec<u8>>,
     term: u64,
-    deadline: Instant,
+    /// The owner's period at which the call is given up (`fleet::Pending`).
+    deadline: u64,
     charge: Allocation,
 }
 impl PendingPlacementCall {
@@ -124,9 +125,7 @@ impl Owner {
             if self.placement.is_some() || self.stopping.is_some() {
                 return Err(LedgerError::Capacity);
             }
-            let deadline = Instant::now()
-                .checked_add(self.config.request_timeout)
-                .ok_or(LedgerError::Capacity)?;
+            let deadline = self.request_deadline().ok_or(LedgerError::Capacity)?;
             self.session.propose_placement(&call.request)?;
             Ok(deadline)
         })();
@@ -149,7 +148,7 @@ impl Owner {
     }
     pub(super) fn expire_placement(&mut self) {
         if self.placement.as_ref().is_some_and(|pending| {
-            pending.call.response.is_closed() || Instant::now() >= pending.deadline
+            pending.call.response.is_closed() || self.pace.periods() >= pending.deadline
         }) && let Some(pending) = self.placement.take()
         {
             pending.finish(Err(LedgerError::OutcomeUnknown));
@@ -163,7 +162,7 @@ impl Owner {
         if pending.call.response.is_closed()
             || pending.term != status.term
             || status.role != StateRole::Leader
-            || Instant::now() >= pending.deadline
+            || self.pace.periods() >= pending.deadline
         {
             pending.finish(Err(LedgerError::OutcomeUnknown));
             return Ok(());

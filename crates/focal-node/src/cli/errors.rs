@@ -57,6 +57,21 @@ pub(crate) fn classification(error: &(dyn Error + 'static)) -> Failure {
     if let Some(error) = error.downcast_ref::<focal_node::cluster_admin::ClusterAdminError>() {
         return error.classification();
     }
+    if let Some(focal_node::network_service::ServiceError::Controller(
+        focal_node::network_controller::ControllerError::Fenced { .. },
+    )) = error.downcast_ref::<focal_node::network_service::ServiceError>()
+    {
+        return Failure::error("upgrade_fenced", 5);
+    }
+    if let Some(focal_node::network_service::ServiceError::Controller(
+        focal_node::network_controller::ControllerError::Retired
+        | focal_node::network_controller::ControllerError::Enrollment(
+            focal_enrollment::EnrollmentError::Revoked | focal_enrollment::EnrollmentError::Expired,
+        ),
+    )) = error.downcast_ref::<focal_node::network_service::ServiceError>()
+    {
+        return Failure::error("credential_retired", 5);
+    }
     if let Some(error) = error.downcast_ref::<focal_node::deployment::DeploymentError>() {
         use focal_node::deployment::DeploymentError;
         return match error {
@@ -84,6 +99,24 @@ pub(crate) fn classification(error: &(dyn Error + 'static)) -> Failure {
     }
     if let Some(error) = error.downcast_ref::<std::io::Error>() {
         return io(error);
+    }
+    // A directory another process owns and a directory this user cannot
+    // write are refused by name wherever in the chain they surface: the
+    // operator's next step differs (stop the other writer; fix the mode).
+    let mut cause: Option<&(dyn Error + 'static)> = Some(error);
+    for _ in 0..16 {
+        let Some(current) = cause else { break };
+        if let Some(focal_node::embedded::NodeError::Locked) =
+            current.downcast_ref::<focal_node::embedded::NodeError>()
+        {
+            return Failure::error("directory_owned", 6);
+        }
+        if let Some(io) = current.downcast_ref::<std::io::Error>()
+            && io.kind() == std::io::ErrorKind::PermissionDenied
+        {
+            return Failure::error("permission_denied", 2);
+        }
+        cause = current.source();
     }
     if let Some(error) = error.downcast_ref::<serde_json::Error>() {
         return error

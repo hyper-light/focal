@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 import queue
 import signal
@@ -42,10 +43,14 @@ def structured(binary, directory, *arguments):
 
 
 def start(binary, directory, log):
+    # Windows graceful stop is a CTRL_BREAK_EVENT to the child's own process
+    # group, so the child must lead a new group; Unix uses SIGTERM directly.
+    flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
     process = subprocess.Popen(
         [str(binary), "--data-dir", str(directory), "start"],
         stdout=log,
         stderr=log,
+        creationflags=flags,
     )
     deadline = time.monotonic() + 45
     try:
@@ -70,6 +75,8 @@ def finish(process, crash=False):
         require(False, f"server unexpectedly exited: {process.returncode}")
     if crash:
         process.kill()
+    elif os.name == "nt":
+        process.send_signal(signal.CTRL_BREAK_EVENT)
     else:
         process.send_signal(signal.SIGTERM)
     try:
@@ -153,10 +160,14 @@ def mcp(binary, directory, claim_id, marker, log):
 
 
 def smoke(binary):
+    if not binary.exists() and os.name == "nt":
+        binary = binary.with_suffix(".exe")
     binary = binary.resolve(strict=True)
     version = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["package"]["version"]
-    # A short private path also fits macOS's Unix-socket path limit.
-    with tempfile.TemporaryDirectory(prefix="focal-release-", dir="/tmp") as temporary:
+    # A short private path fits macOS's Unix-socket path limit; Windows names
+    # its pipe by a hash of the data directory, so the default temp root is fine.
+    base = None if os.name == "nt" else "/tmp"
+    with tempfile.TemporaryDirectory(prefix="focal-release-", dir=base) as temporary:
         directory = Path(temporary) / "ledger"
         with (Path(temporary) / "service.log").open("w+") as log:
             server = None

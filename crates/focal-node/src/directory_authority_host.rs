@@ -21,7 +21,9 @@ pub(super) struct PendingAuthority {
     phase: Option<RefreshPhase>,
     context: Option<Vec<u8>>,
     term: u64,
-    deadline: Instant,
+    /// The owner's period at which the refresh is given up: its time in
+    /// the owner's rounds, not the clock's (`control_host::Pending`).
+    deadline: u64,
     response: Option<RefreshReply>,
     reply_charge: Option<Allocation>,
     _input: Allocation,
@@ -96,8 +98,7 @@ impl<V: AuthorityVerifier> Owner<V> {
             if self.replica.status().role != StateRole::Leader {
                 return Err(DirectoryBootstrapError::Unavailable);
             }
-            Instant::now()
-                .checked_add(self.config.request_timeout)
+            self.request_deadline()
                 .ok_or(DirectoryBootstrapError::Capacity)
         })();
         match result {
@@ -139,7 +140,7 @@ impl<V: AuthorityVerifier> Owner<V> {
             .response
             .as_ref()
             .is_some_and(|reply| reply.is_closed());
-        if canceled || Instant::now() >= pending.deadline {
+        if canceled || self.pace.periods() >= pending.deadline {
             pending.respond(Err(DirectoryBootstrapError::Unavailable));
             if initial {
                 return Err(DirectoryBootstrapError::Unavailable);

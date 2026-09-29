@@ -1,0 +1,368 @@
+//! The fast track on durable nodes (27 §4): what a member approved by itself
+//! is on disk before it says so, outlives a restart and a checkpoint, and a
+//! group is opened with the track it was made with.
+use crate::{
+    ConsensusError, DurableNode, Entry, Message, MessageType, NodeConfig, PbMessageExt, StateRole,
+    tests::config,
+};
+use focal_log::{LogicalLogId, RecordKind, SharedWal, WalIdentity, WalOptions};
+use focal_raft::fast::{FAST_PROPOSE, FAST_VOTE};
+
+fn fast(id: u64) -> NodeConfig {
+    let mut config = config(id);
+    config.voters = vec![1, 2, 3];
+    config.fast = true;
+    config
+}
+struct Group {
+    dirs: Vec<tempfile::TempDir>,
+    nodes: Vec<DurableNode>,
+    applied: Vec<Vec<Vec<u8>>>,
+    displaced: Vec<Vec<Vec<u8>>>,
+    /// What is on its way.
+    net: Vec<Message>,
+}
+impl Group {
+    fn new() -> Self {
+        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let nodes = dirs
+            .iter()
+            .enumerate()
+            .map(|(i, dir)| DurableNode::open(fast(i as u64 + 1), dir.path()).unwrap())
+            .collect();
+        let mut group = Self {
+            dirs,
+            nodes,
+            applied: vec![Vec::new(); 3],
+            displaced: vec![Vec::new(); 3],
+            net: Vec::new(),
+        };
+        group.nodes[0].campaign().unwrap();
+        group.settle();
+        assert_eq!(group.nodes[0].status().role, StateRole::Leader);
+        assert!(group.nodes[0].has_committed_current_term());
+        group
+    }
+    fn drain(&mut self) {
+        for (i, node) in self.nodes.iter_mut().enumerate() {
+            let events = node.drain().unwrap();
+            self.applied[i].extend(events.committed.into_iter().map(|entry| entry.data));
+            self.displaced[i].extend(events.displaced.into_iter().map(|entry| entry.data));
+            self.net.extend(events.messages);
+        }
+    }
+    /// Delivers what `carried` admits until nothing it admits is sent.
+    fn carry(&mut self, carried: impl Fn(&Message) -> bool) {
+        for _ in 0..100 {
+            self.drain();
+            let (sent, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.net)
+                .into_iter()
+                .partition(&carried);
+            self.net = kept;
+            if sent.is_empty() {
+                return;
+            }
+            for message in sent {
+                let to = message.to;
+                // As a peer sends it: encoded, and its sender the one the
+                // transport knows.
+                let encoded = message.write_to_bytes().unwrap();
+                self.nodes[(to - 1) as usize]
+                    .step_authenticated(message.from, &encoded)
+                    .unwrap();
+            }
+        }
+        panic!("message delivery failed to quiesce");
+    }
+    fn settle(&mut self) {
+        self.carry(|_| true);
+    }
+    fn reopen(&mut self, node: usize) {
+        let config = fast(node as u64 + 1);
+        let dir = self.dirs[node].path().to_path_buf();
+        // The node that was is gone before its log is opened again.
+        let placeholder = tempfile::tempdir().unwrap();
+        let mut other = config.clone();
+        other.group_id = [0xee; 16];
+        let old = std::mem::replace(
+            &mut self.nodes[node],
+            DurableNode::open(other, placeholder.path()).unwrap(),
+        );
+        drop(old);
+        self.nodes[node] = DurableNode::open(config, dir).unwrap();
+    }
+    fn held(&self, node: usize) -> Vec<(u64, Vec<u8>)> {
+        self.nodes[node]
+            .raw
+            .raft
+            .proposals()
+            .map(|held| (held.index, held.data.clone()))
+            .collect()
+    }
+}
+
+#[test]
+fn a_followers_proposal_is_committed_by_the_fast_quorum_and_applied_by_all() {
+    let mut group = Group::new();
+    let before = group.nodes[0].status().committed_index;
+    let index = group.nodes[1].propose_fast(b"fast".to_vec()).unwrap();
+    assert_eq!(index, before + 1);
+    // To every voter; and the votes, to the leader. What the leader sends
+    // its members waits.
+    group.carry(|message| message.msg_type == FAST_PROPOSE);
+    assert_eq!(group.held(2), vec![(index, b"fast".to_vec())]);
+    group.carry(|message| message.msg_type == FAST_VOTE);
+    assert_eq!(group.nodes[0].status().committed_index, index);
+    assert_eq!(group.nodes[0].fast_stats().committed, 1);
+    assert!(
+        !group
+            .net
+            .iter()
+            .any(|message| message.msg_type == MessageType::MsgAppendResponse as i32),
+        "a member answered the leader before the index was committed"
+    );
+    assert_eq!(group.applied[0].last().unwrap(), b"fast");
+    group.settle();
+    for node in 0..3 {
+        assert_eq!(group.applied[node].last().unwrap(), b"fast");
+        assert!(group.held(node).is_empty());
+    }
+    assert_eq!(group.nodes[1].fast_stats().proposed, 1);
+    assert!(group.displaced.iter().all(Vec::is_empty));
+    // A leader proposes as it always did.
+    let index = group.nodes[0].propose_fast(b"led".to_vec()).unwrap();
+    group.settle();
+    assert_eq!(group.nodes[2].status().committed_index, index);
+    assert_eq!(group.applied[2].last().unwrap(), b"led");
+}
+
+#[test]
+fn what_a_member_approved_is_on_disk_before_it_says_so_and_after_it_stopped() {
+    let mut group = Group::new();
+    let index = group.nodes[1].propose_fast(b"held".to_vec()).unwrap();
+    // The vote is of what is durable: none is sent before the drain that
+    // persists what is held.
+    assert!(group.nodes[1].has_ready());
+    group.carry(|message| message.msg_type == FAST_PROPOSE && message.to == 3);
+    assert!(
+        group
+            .net
+            .iter()
+            .any(|message| message.msg_type == FAST_VOTE && message.from == 3)
+    );
+    group.net.clear();
+    for node in [1, 2] {
+        group.reopen(node);
+        assert_eq!(group.held(node), vec![(index, b"held".to_vec())]);
+    }
+    let lease = |dir: &std::path::Path, node: u64| {
+        let wal = SharedWal::open(
+            dir,
+            WalOptions::new(WalIdentity {
+                cluster: fast(node).cluster_id,
+                node,
+                stream: 0,
+            }),
+        )
+        .unwrap();
+        let lease = wal.lease(LogicalLogId(fast(node).group_id)).unwrap();
+        let mut kinds = Vec::new();
+        lease
+            .replay(|record| {
+                kinds.push((record.kind, record.index));
+                Ok(())
+            })
+            .unwrap();
+        kinds
+    };
+    // A checkpoint keeps what is held above it.
+    let applied = group.nodes[2].status().applied_index;
+    group.nodes[2]
+        .checkpoint(applied, b"state".to_vec())
+        .unwrap();
+    group.reopen(2);
+    assert_eq!(group.held(2), vec![(index, b"held".to_vec())]);
+    let dir = group.dirs[2].path().to_path_buf();
+    let placeholder = tempfile::tempdir().unwrap();
+    let mut other = fast(3);
+    other.group_id = [0xee; 16];
+    let old = std::mem::replace(
+        &mut group.nodes[2],
+        DurableNode::open(other, placeholder.path()).unwrap(),
+    );
+    drop(old);
+    let kinds = lease(&dir, 3);
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|(kind, _)| *kind == RecordKind::FastTrack)
+            .count(),
+        1
+    );
+    assert!(kinds.contains(&(RecordKind::Proposal, index)));
+    group.nodes[2] = DurableNode::open(fast(3), &dir).unwrap();
+    // With the leader gone, whoever is elected takes what the two hold.
+    for _ in 0..60 {
+        for node in [1, 2] {
+            group.nodes[node].tick().unwrap();
+        }
+        group.carry(|message| message.from != 1 && message.to != 1);
+        if group.nodes[1..]
+            .iter()
+            .any(|node| node.status().role == StateRole::Leader)
+        {
+            break;
+        }
+    }
+    let leader = (1..3)
+        .find(|node| group.nodes[*node].status().role == StateRole::Leader)
+        .expect("the two elect");
+    assert!(group.nodes[leader].fast_stats().recovered >= 1);
+    group.carry(|message| message.from != 1 && message.to != 1);
+    for node in [1, 2] {
+        assert!(group.applied[node].iter().any(|entry| entry == b"held"));
+        assert!(group.held(node).is_empty());
+    }
+}
+
+#[test]
+fn of_two_proposals_for_one_index_the_one_not_taken_is_said_to_its_proposer() {
+    let mut group = Group::new();
+    let first = group.nodes[1].propose_fast(b"one".to_vec()).unwrap();
+    let second = group.nodes[2].propose_fast(b"two".to_vec()).unwrap();
+    assert_eq!(first, second);
+    group.settle();
+    let taken = group.applied[0].last().unwrap().clone();
+    let (winner, loser) = if taken == b"one" { (1, 2) } else { (2, 1) };
+    assert!(group.displaced[winner].is_empty());
+    assert_eq!(group.displaced[loser].len(), 1);
+    assert_ne!(group.displaced[loser][0], taken);
+    for node in 0..3 {
+        assert_eq!(group.applied[node].last().unwrap(), &taken);
+    }
+    // It proposes again, and is taken at the next index.
+    let again = group.displaced[loser][0].clone();
+    let index = group.nodes[loser].propose_fast(again.clone()).unwrap();
+    assert_eq!(index, first + 1);
+    group.settle();
+    for node in 0..3 {
+        assert_eq!(group.applied[node].last().unwrap(), &again);
+    }
+}
+
+#[test]
+fn a_group_is_opened_with_the_track_it_was_made_with() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(DurableNode::open(fast(1), dir.path()).unwrap());
+    assert!(matches!(
+        DurableNode::open(
+            {
+                let mut classic = fast(1);
+                classic.fast = false;
+                classic
+            },
+            dir.path()
+        ),
+        Err(ConsensusError::Configuration(_))
+    ));
+    drop(DurableNode::open(fast(1), dir.path()).unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let mut classic = fast(1);
+    classic.fast = false;
+    let mut node = DurableNode::open(classic.clone(), dir.path()).unwrap();
+    assert!(matches!(
+        DurableNode::open(fast(1), tempfile::tempdir().unwrap().path()).map(|node| node.fast()),
+        Ok(true)
+    ));
+    // A group that has none neither proposes by it nor hears of it.
+    assert!(matches!(
+        node.propose_fast(b"x".to_vec()),
+        Err(ConsensusError::Configuration(_))
+    ));
+    for kind in [FAST_PROPOSE, FAST_VOTE] {
+        let message = Message {
+            msg_type: kind,
+            from: 2,
+            to: 1,
+            term: 1,
+            entries: vec![Entry {
+                index: 1,
+                data: vec![1],
+                ..Entry::default()
+            }],
+            ..Message::default()
+        };
+        assert!(matches!(
+            node.step(message),
+            Err(ConsensusError::MalformedMessage(_))
+        ));
+    }
+    assert!(!node.failed());
+    drop(node);
+    assert!(matches!(
+        DurableNode::open(fast(1), dir.path()),
+        Err(ConsensusError::Configuration(_))
+    ));
+    // The identity a group states is as it was before there was a fast
+    // track: a group that has none writes what it always wrote.
+    let mut identity = classic.clone();
+    identity.fast = true;
+    assert_eq!(
+        postcard::to_stdvec(&identity).unwrap(),
+        postcard::to_stdvec(&classic).unwrap()
+    );
+}
+
+#[test]
+fn what_may_not_go_by_the_fast_track_is_refused_before_the_core() {
+    let mut group = Group::new();
+    let proposal = |entry: Entry| Message {
+        msg_type: FAST_PROPOSE,
+        from: 3,
+        to: 2,
+        entries: vec![entry],
+        ..Message::default()
+    };
+    let refused = [
+        proposal(Entry {
+            entry_type: crate::EntryType::EntryConfChangeV2 as i32,
+            index: 2,
+            data: vec![1],
+            ..Entry::default()
+        }),
+        proposal(Entry {
+            index: 2,
+            ..Entry::default()
+        }),
+        proposal(Entry {
+            data: vec![1],
+            ..Entry::default()
+        }),
+        Message {
+            msg_type: FAST_PROPOSE,
+            from: 3,
+            to: 2,
+            ..Message::default()
+        },
+    ];
+    for message in refused {
+        assert!(matches!(
+            group.nodes[1].step(message),
+            Err(ConsensusError::MalformedMessage(_))
+        ));
+    }
+    assert!(matches!(
+        group.nodes[1].step(proposal(Entry {
+            index: 2,
+            data: vec![0; 4 * 1024 * 1024 + 1],
+            ..Entry::default()
+        })),
+        Err(ConsensusError::Capacity)
+    ));
+    assert!(!group.nodes[1].failed());
+    assert!(group.held(1).is_empty());
+    assert!(matches!(
+        group.nodes[1].propose_fast(Vec::new()),
+        Err(ConsensusError::Capacity)
+    ));
+}

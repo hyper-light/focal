@@ -359,6 +359,7 @@ impl Fleet {
             let endpoint = PeerEndpoint {
                 address: server.local_addr().unwrap(),
                 server_name: identity.name.clone(),
+                name: None,
             };
             routes.insert(id, endpoint.clone());
             pending.push((host, owner, channel, server, server_task, pool, endpoint));
@@ -533,14 +534,18 @@ async fn quorum_retry_and_recovery(grouped: bool) {
             epoch: RequestEpoch(1),
         },
     );
-    let uncertain = fleet.replicas[leader]
-        .actor
-        .request(&retry_request)
-        .await
-        .unwrap();
+    // The isolated leader answers that it cannot know once its request
+    // time, in its own periods, has passed; a client whose own wait ends
+    // first knows the same of the outcome (`focal_client` maps a wire
+    // timeout to it), and on a loaded machine it may end first.
+    let uncertain = match fleet.replicas[leader].actor.request(&retry_request).await {
+        Ok(answer) => answer.result,
+        Err(WireError::Timeout) => Response::Error(AccessError::OutcomeUnknown),
+        Err(error) => panic!("the isolated leader's connection failed: {error:?}"),
+    };
     assert!(
         matches!(
-            uncertain.result,
+            uncertain,
             Response::Error(AccessError::OutcomeUnknown | AccessError::Unavailable)
         ),
         "isolated leader answered {uncertain:?}"

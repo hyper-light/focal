@@ -157,7 +157,8 @@ impl Cluster {
         Ok(())
     }
     fn corrupt(&self, message: &mut Message) {
-        if self.corrupt_to != Some(message.to) || message.get_msg_type() != MessageType::MsgAppend {
+        if self.corrupt_to != Some(message.to) || message.msg_type != MessageType::MsgAppend as i32
+        {
             return;
         }
         for entry in message.mut_entries().iter_mut() {
@@ -217,7 +218,7 @@ impl Cluster {
                     continue;
                 }
                 self.corrupt(&mut message);
-                let snapshot = message.get_msg_type() == MessageType::MsgSnapshot;
+                let snapshot = message.msg_type == MessageType::MsgSnapshot as i32;
                 let retry_ok = self.retry_ok.contains(&to);
                 match self.node(to).step(message) {
                     Ok(()) => {}
@@ -825,6 +826,16 @@ fn commit_isolated(
 /// Commit `inputs` on the leader while `isolated` cannot hear; it stays cut
 /// off, so later commits join the same delivery when it reconnects.
 fn commit_apart(cluster: &mut Cluster, isolated: u64, inputs: Vec<(ParticipantId, NativeInput)>) {
+    commit_apart_on(cluster, 1, isolated, inputs);
+}
+/// As `commit_apart`, but proposing to an explicit `leader` — used to commit a
+/// second batch under a new term after a leadership handover.
+fn commit_apart_on(
+    cluster: &mut Cluster,
+    leader: u64,
+    isolated: u64,
+    inputs: Vec<(ParticipantId, NativeInput)>,
+) {
     let mut outcomes = Vec::new();
     for (position, (actor, input)) in inputs.into_iter().enumerate() {
         // Every pending candidate holds its funded report and record buffer
@@ -834,23 +845,58 @@ fn commit_apart(cluster: &mut Cluster, isolated: u64, inputs: Vec<(ParticipantId
             cluster.pump(&[isolated]);
         }
         let request = input.request;
-        match cluster.propose(1, actor, input) {
+        match cluster.propose(leader, actor, input) {
             NativeSubmission::Committed(outcome) => outcomes.push((request, outcome)),
             NativeSubmission::Pending { outcome, .. } => outcomes.push((request, outcome)),
         }
     }
     for _ in 0..8 {
         cluster.pump(&[isolated]);
-        if outcomes
-            .iter()
-            .all(|(request, outcome)| cluster.node(1).outcome(*request).unwrap() == Some(*outcome))
-        {
+        if outcomes.iter().all(|(request, outcome)| {
+            cluster.node(leader).outcome(*request).unwrap() == Some(*outcome)
+        }) {
             break;
         }
     }
     for (request, outcome) in &outcomes {
-        assert_eq!(cluster.node(1).outcome(*request).unwrap(), Some(*outcome));
+        assert_eq!(
+            cluster.node(leader).outcome(*request).unwrap(),
+            Some(*outcome)
+        );
     }
+}
+
+#[test]
+fn a_parallel_batch_after_a_leadership_change_crosses_the_term_start_gap() {
+    // Node 3 has four workers and receives records from two terms in one
+    // catch-up delivery. The new leader's term-start no-op is an empty entry
+    // dropped from the committed stream, so the first record of the second term
+    // sits at applied_raft + 2, not + 1. The parallel batch path must anchor on
+    // the run's own first index (as the single-entry path already does) or it
+    // fails closed on this routine leader change and the follower dies on a
+    // valid log.
+    let mut cluster =
+        Cluster::with_limits(|id| materializer_limits(if id == 3 { 4 } else { 1 }, false));
+    cluster.elect(1, &[]);
+    let first: Vec<_> = (1..=4u128)
+        .map(|claim| (PARTIES.issuer, cluster.creation(claim)))
+        .collect();
+    commit_apart_on(&mut cluster, 1, 3, first);
+    // Hand leadership to node 2 (a new term, hence a term-start no-op) while
+    // node 3 is still cut off, then commit a second batch under the new term.
+    cluster.elect(2, &[3]);
+    let second: Vec<_> = (5..=8u128)
+        .map(|claim| (PARTIES.issuer, cluster.creation(claim)))
+        .collect();
+    commit_apart_on(&mut cluster, 2, 3, second);
+    // Reconnect node 3: it replays both terms in one delivery, crossing the gap.
+    cluster.settle(&[]);
+    cluster.pump(&[]);
+    let claims: Vec<u128> = (1..=8).collect();
+    assert_same_digest(&mut cluster, &claims);
+    let stats = cluster.node(3).materializer_stats();
+    assert_eq!(stats.violations, 0, "{stats:?}");
+    assert!(stats.parallel_batches >= 1, "{stats:?}");
 }
 
 #[test]
@@ -1916,4 +1962,116 @@ fn committed_retirements_apply_on_every_replica_and_fence_proposals() {
     assert_eq!(cluster.node(2).retired_families(), 1);
     assert_eq!(cluster.status(2, 1), None);
     assert_same_digest(&mut cluster, &[2, 3, 5, 6]);
+}
+
+/// A range split and a later merge are session decisions (25 §4): the authority
+/// commits one layout record that every replica applies between native records,
+/// so the three voters hold one layout under one epoch throughout. This drives
+/// a split, does work under the two-member layout, then merges back, and proves
+/// at each step that all live replicas agree on the layout epoch, the recording
+/// range, the native prefix, and every claim's committed status — the merge
+/// mechanism exercised across a replicated cluster.
+#[test]
+fn a_range_split_and_merge_replicate_and_every_voter_converges() {
+    use focal_memory::RangeId;
+    let mut cluster = Cluster::new();
+    cluster.elect(1, &[]);
+    // Work under the genesis (single-member) layout.
+    cluster.received_claim(1);
+    let create2 = cluster.creation(2);
+    cluster.commit(1, PARTIES.issuer, create2, &[]);
+    cluster.pump(&[]);
+    for id in cluster.live() {
+        assert_eq!(
+            cluster.node(id).native_layout_epoch().unwrap(),
+            0,
+            "genesis layout epoch is zero on {id}"
+        );
+    }
+    cluster.assert_same_state(&[1, 2]);
+    // The origin member's durable identity (the only boundary at genesis).
+    let origin = cluster
+        .node(1)
+        .native_layout()
+        .unwrap()
+        .next()
+        .expect("origin member")
+        .0;
+    // Split the origin at a mid affinity, naming the upper member with a fresh
+    // identity. `propose_layout` commits the record through Raft like any
+    // native record, so a pump replicates it to every follower.
+    let upper = RangeId(0x5eed_5eed_5eed_5eed_5eed_5eed_5eed_5eed);
+    cluster
+        .node(1)
+        .propose_layout(LayoutOperation::Split {
+            at: [0x80; 16],
+            id: upper,
+        })
+        .unwrap();
+    for _ in 0..8 {
+        cluster.pump(&[]);
+        if cluster.node(1).native_layout_epoch().unwrap() == 1 {
+            break;
+        }
+    }
+    for id in cluster.live() {
+        assert_eq!(
+            cluster.node(id).native_layout_epoch().unwrap(),
+            1,
+            "the split's layout record replicated to {id}"
+        );
+        let members: Vec<RangeId> = cluster
+            .node(id)
+            .native_layout()
+            .unwrap()
+            .map(|(range, _)| range)
+            .collect();
+        assert_eq!(members.len(), 2, "{id} holds the two-member layout");
+        assert!(members.contains(&upper), "{id} holds the new upper member");
+    }
+    cluster.assert_same_state(&[1, 2]);
+    // Do more work under the two-member layout, then progress an existing claim.
+    let create3 = cluster.creation(3);
+    cluster.commit(1, PARTIES.issuer, create3, &[]);
+    let expected = cluster.claim(1, 2);
+    let post = fx::post(cluster.next(PARTIES.issuer), expected);
+    cluster.commit(1, PARTIES.issuer, post, &[]);
+    cluster.pump(&[]);
+    cluster.assert_same_state(&[1, 2, 3]);
+    // Merge the origin with the member above it, returning to one member.
+    cluster
+        .node(1)
+        .propose_layout(LayoutOperation::Merge { left: origin })
+        .unwrap();
+    for _ in 0..8 {
+        cluster.pump(&[]);
+        if cluster.node(1).native_layout_epoch().unwrap() == 2 {
+            break;
+        }
+    }
+    for id in cluster.live() {
+        assert_eq!(
+            cluster.node(id).native_layout_epoch().unwrap(),
+            2,
+            "the merge's layout record replicated to {id}"
+        );
+        assert_eq!(
+            cluster.node(id).native_layout().unwrap().count(),
+            1,
+            "{id} returned to a single member after the merge"
+        );
+    }
+    // Every claim survives the split and merge with identical committed status,
+    // and a fresh follower rebuilt from the checkpoint agrees.
+    cluster.assert_same_state(&[1, 2, 3]);
+    assert_eq!(cluster.status(1, 1), Some(ClaimStatus::Received));
+    cluster.stop(3);
+    cluster.reopen(3).unwrap();
+    cluster.pump(&[]);
+    cluster.assert_same_state(&[1, 2, 3]);
+    assert_eq!(
+        cluster.node(3).native_layout_epoch().unwrap(),
+        2,
+        "the reopened follower recovered the merged layout"
+    );
 }

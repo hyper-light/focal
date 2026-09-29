@@ -8,16 +8,18 @@ license.workspace = true
 [dependencies]
 focal-log = { version = "0.1.0", path = "../focal-log" }
 focal-memory = { version = "0.1.0", path = "../focal-memory" }
+focal-raft = { version = "0.1.0", path = "../focal-raft" }
+focal-timing = { version = "0.1.0", path = "../focal-timing" }
+getrandom.workspace = true
 postcard.workspace = true
-raft.workspace = true
 serde.workspace = true
-slog.workspace = true
 thiserror.workspace = true
 
 [features]
 test-support = []
 
 [dev-dependencies]
+focal-sim = { version = "0.1.0", path = "../focal-sim" }
 focal-log = { version = "0.1.0", path = "../focal-log", features = ["test-support"] }
 tempfile.workspace = true
 

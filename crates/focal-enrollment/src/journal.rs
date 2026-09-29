@@ -71,6 +71,24 @@ impl PrivateJournal {
         }
         result
     }
+    /// Remember another invitation for a request whose earlier one is
+    /// finished (revoked, or expired unredeemed) and retired; the ordinary
+    /// `remember_invitation` stays set-once.
+    pub fn replace_invitation(
+        &mut self,
+        request: [u8; 32],
+        invitation: [u8; 16],
+    ) -> Result<(), EnrollmentError> {
+        if self.failed {
+            return Err(EnrollmentError::Corrupt);
+        }
+        let name = format!("invite-{}", crate::hex(&request));
+        let result = self.directory.replace(&name, &invitation);
+        if result.is_err() && !matches!(result, Err(EnrollmentError::Locked)) {
+            self.failed = true;
+        }
+        result
+    }
     pub fn replace(&mut self, bytes: &[u8]) -> Result<(), EnrollmentError> {
         if self.failed {
             return Err(EnrollmentError::Corrupt);

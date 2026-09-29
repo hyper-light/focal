@@ -572,7 +572,7 @@ impl Cluster {
                 if isolated == Some(message.from) || isolated == Some(message.to) {
                     continue;
                 }
-                let snapshot = message.get_msg_type() == MessageType::MsgSnapshot;
+                let snapshot = message.msg_type == MessageType::MsgSnapshot as i32;
                 let from = message.from;
                 let to = message.to;
                 self.nodes[(to - 1) as usize].step(message).unwrap();
@@ -695,8 +695,15 @@ fn lagging_metadata_replica_installs_committed_checkpoint_and_retry_windows() {
     ));
 }
 
+/// A drain refused the room took nothing from the log: nothing is
+/// published while the room is gone, however often the drain is asked, the
+/// replica is no failed one, and what waited is committed by the drain that
+/// is asked once the room is back. A reopened replica finds the receipt.
+/// The replica stopped for the first refusal before, and its owner with it:
+/// a node short of memory for one period lost its root until it was started
+/// again.
 #[test]
-fn total_budget_exhaustion_never_publishes_and_reopen_allows_exact_retry() {
+fn a_drain_refused_the_room_publishes_nothing_and_commits_once_the_room_is_back() {
     let dir = tempfile::tempdir().unwrap();
     let keys = tempfile::tempdir().unwrap();
     let authority = authority(&keys);
@@ -715,26 +722,74 @@ fn total_budget_exhaustion_never_publishes_and_reopen_allows_exact_retry() {
         )
         .unwrap()
         .commit();
-    assert!(matches!(
-        replica.drain(&Evidence),
-        Err(ControlError::Consensus(
-            focal_consensus::ConsensusError::Capacity
-        ))
-    ));
-    assert_eq!(replica.root().unwrap().revision(), 0);
-    assert!(matches!(
-        replica.drain(&Evidence),
-        Err(ControlError::Failed)
-    ));
+    for _ in 0..8 {
+        let refused = replica.drain(&Evidence);
+        assert!(
+            matches!(
+                refused,
+                Err(ControlError::Consensus(
+                    focal_consensus::ConsensusError::Capacity
+                ))
+            ),
+            "{:?}",
+            refused.map(|_| ())
+        );
+        assert!(replica.checkpoint_retryable(&refused.unwrap_err()));
+        assert_eq!(replica.root().unwrap().revision(), 0);
+        assert!(replica.receipt(pending.id).unwrap().is_none());
+    }
     drop(pressure);
+    let receipt = replica.drain(&Evidence).unwrap().completed.unwrap();
+    assert_eq!(receipt.request, pending.id);
+    assert_eq!(receipt.revisions.root, 1);
+    assert_eq!(replica.root().unwrap().revision(), 1);
     drop(replica);
     let mut replica = ControlReplica::open(options(1), bootstrap, allowance, dir.path()).unwrap();
     leader(&mut replica);
-    assert!(replica.receipt(pending.id).unwrap().is_none());
-    let receipt = commit(&mut replica, pending.clone());
-    assert_eq!(receipt.revisions.root, 1);
+    assert_eq!(replica.receipt(pending.id).unwrap(), Some(receipt));
     assert_eq!(
         replica.submit(pending, &Evidence).unwrap(),
         ControlSubmission::Existing(receipt)
     );
+}
+
+/// A checkpoint refused because Raft has work outstanding changes nothing and
+/// must leave the replica serving: compaction runs on a timer beside ordinary
+/// traffic, and a refusal that stopped the replica ended the root leader.
+#[test]
+fn a_checkpoint_refused_while_raft_has_work_outstanding_leaves_the_replica_serving() {
+    let mut cluster = Cluster::new();
+    cluster.nodes[0].campaign().unwrap();
+    cluster.pump(None);
+    cluster.nodes[0]
+        .submit(request(1, 1, 0, region(0, 1)), &Evidence)
+        .unwrap();
+    cluster.pump(None);
+    assert_eq!(cluster.nodes[0].root().unwrap().revision(), 1);
+    // Heartbeats are queued and not yet drained: Raft has Ready outstanding.
+    let mut refused = None;
+    for _ in 0..64 {
+        cluster.nodes[0].tick().unwrap();
+        match cluster.nodes[0].checkpoint() {
+            Ok(()) => {}
+            Err(error) => {
+                refused = Some(error);
+                break;
+            }
+        }
+    }
+    let refused = refused.expect("a checkpoint beside undrained work is refused");
+    assert!(
+        cluster.nodes[0].checkpoint_retryable(&refused),
+        "the refusal is retryable: {refused}"
+    );
+    // The replica still replicates, commits and compacts.
+    cluster.pump(None);
+    cluster.nodes[0]
+        .submit(request(1, 2, 1, region(1, 2)), &Evidence)
+        .unwrap();
+    cluster.pump(None);
+    assert_eq!(cluster.nodes[0].root().unwrap().revision(), 2);
+    assert_eq!(cluster.nodes[2].root().unwrap().revision(), 2);
+    cluster.nodes[0].checkpoint().unwrap();
 }

@@ -18,6 +18,7 @@ focal-memory = { version = "0.1.0", path = "../focal-memory" }
 focal-stream = { version = "0.1.0", path = "../focal-stream" }
 focal-directory = { version = "0.1.0", path = "../focal-directory" }
 focal-ranges = { version = "0.1.0", path = "../focal-ranges" }
+focal-platform = { version = "0.1.0", path = "../focal-platform" }
 blake3.workspace = true
 postcard.workspace = true
 serde.workspace = true

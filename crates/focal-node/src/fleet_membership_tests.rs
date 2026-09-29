@@ -223,7 +223,7 @@ fn membership_reply_and_cancelled_intent_preserve_permit_lifetimes() {
         if cancel {
             drop(receive);
         } else {
-            owner.memberships.front_mut().unwrap().deadline = Instant::now();
+            owner.memberships.front_mut().unwrap().deadline = 0;
             owner.expire_pending();
             assert!(matches!(
                 receive.blocking_recv().unwrap(),

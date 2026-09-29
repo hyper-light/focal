@@ -1,0 +1,4065 @@
+{
+  "laptop": {
+    "builds_on": [],
+    "introduces": [
+      "native engine",
+      "start",
+      "participant",
+      "standing",
+      "claim",
+      "receipt",
+      "artifact",
+      "read",
+      "crash",
+      "one writer",
+      "unwritable directory",
+      "full volume",
+      "identity",
+      "placement view",
+      "explain",
+      "plan",
+      "apply",
+      "backup",
+      "tenant",
+      "restore",
+      "connection"
+    ],
+    "inputs": [
+      "data directory",
+      "loopback address",
+      "participant name",
+      "invitation file",
+      "claim document",
+      "artifact content",
+      "file size limit",
+      "policy file",
+      "plan file",
+      "backup directory",
+      "tenant",
+      "session"
+    ],
+    "executed_by": "deployment_laptop",
+    "not_executed": [
+      "power loss: the crash is a kill; storage cuts at every durable boundary are the crash matrix (R11)",
+      "the demo through MCP: mcp_native_a1 runs the same claims through the MCP server"
+    ],
+    "steps": [
+      {
+        "concept": "native engine",
+        "inputs": [
+          "data directory"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "cluster",
+          "replicas",
+          "activate-native"
+        ]
+      },
+      {
+        "concept": "start",
+        "inputs": [
+          "data directory",
+          "loopback address"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "start",
+          "--advertise",
+          "<address>"
+        ]
+      },
+      {
+        "concept": "participant",
+        "inputs": [
+          "participant name"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "cluster",
+          "client",
+          "invite",
+          "--name",
+          "alice",
+          "--output",
+          "<client>/alice.invite"
+        ]
+      },
+      {
+        "concept": "participant",
+        "inputs": [
+          "invitation file"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "context",
+          "enroll",
+          "alice",
+          "--invite-file",
+          "<client>/alice.invite"
+        ]
+      },
+      {
+        "concept": "standing",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "status"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "receipt",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "receipt",
+          "acquire",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "artifact",
+        "inputs": [
+          "artifact content"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "artifact",
+          "submit",
+          "--claim",
+          "<id>",
+          "--slot",
+          "0",
+          "--text",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "get",
+          "claim",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "get",
+          "artifact",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "crash",
+        "command": [
+          "kill",
+          "-KILL",
+          "<laptop process>"
+        ]
+      },
+      {
+        "concept": "start",
+        "inputs": [
+          "data directory"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "start"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "get",
+          "claim",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "get",
+          "artifact",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "one writer",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "start"
+        ]
+      },
+      {
+        "concept": "unwritable directory",
+        "command": [
+          "chmod",
+          "0500",
+          "<unwritable>"
+        ]
+      },
+      {
+        "concept": "unwritable directory",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<unwritable>",
+          "start"
+        ]
+      },
+      {
+        "concept": "full volume",
+        "inputs": [
+          "file size limit"
+        ],
+        "command": [
+          "ulimit",
+          "-f",
+          "<blocks>",
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "start"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "start",
+        "inputs": [
+          "data directory"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "start"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "get",
+          "claim",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "get",
+          "artifact",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "identity",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "cluster",
+          "node",
+          "identity"
+        ]
+      },
+      {
+        "concept": "placement view",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "cluster",
+          "placement"
+        ]
+      },
+      {
+        "concept": "explain",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "deployment",
+          "explain"
+        ]
+      },
+      {
+        "concept": "plan",
+        "inputs": [
+          "policy file"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "--config",
+          "<laptop>/policy.yaml",
+          "deployment",
+          "plan",
+          "--dry-run"
+        ]
+      },
+      {
+        "concept": "plan",
+        "inputs": [
+          "policy file",
+          "plan file"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "--config",
+          "<laptop>/policy.yaml",
+          "deployment",
+          "plan",
+          "--output",
+          "<laptop>/laptop.plan"
+        ]
+      },
+      {
+        "concept": "apply",
+        "inputs": [
+          "plan file"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "deployment",
+          "apply",
+          "--plan-file",
+          "<laptop>/laptop.plan"
+        ]
+      },
+      {
+        "concept": "apply",
+        "inputs": [
+          "plan file"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "deployment",
+          "apply",
+          "--plan-file",
+          "<laptop>/tampered.plan"
+        ]
+      },
+      {
+        "concept": "backup",
+        "inputs": [
+          "backup directory"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop>",
+          "cluster",
+          "backup",
+          "create",
+          "--output",
+          "<laptop>/backup"
+        ]
+      },
+      {
+        "concept": "crash",
+        "command": [
+          "kill",
+          "-KILL",
+          "<laptop process>"
+        ]
+      },
+      {
+        "concept": "native engine",
+        "inputs": [
+          "data directory"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop-b>",
+          "cluster",
+          "replicas",
+          "activate-native"
+        ]
+      },
+      {
+        "concept": "start",
+        "inputs": [
+          "data directory",
+          "loopback address"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop-b>",
+          "start",
+          "--advertise",
+          "<address>"
+        ]
+      },
+      {
+        "concept": "apply",
+        "inputs": [
+          "plan file"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop-b>",
+          "deployment",
+          "apply",
+          "--plan-file",
+          "<laptop>/laptop.plan"
+        ]
+      },
+      {
+        "concept": "tenant",
+        "inputs": [
+          "tenant"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop-b>",
+          "cluster",
+          "tenants",
+          "admit",
+          "--tenant",
+          "<id>"
+        ]
+      },
+      {
+        "concept": "restore",
+        "inputs": [
+          "backup directory"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop-b>",
+          "cluster",
+          "restore",
+          "--input",
+          "<laptop>/backup"
+        ]
+      },
+      {
+        "concept": "restore",
+        "inputs": [
+          "backup directory"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop-b>",
+          "cluster",
+          "restore",
+          "--input",
+          "<laptop>/backup",
+          "--new-incarnation"
+        ]
+      },
+      {
+        "concept": "connection",
+        "inputs": [
+          "tenant",
+          "session"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<reader>",
+          "context",
+          "add",
+          "restored",
+          "--node-data-dir",
+          "<laptop-b>",
+          "--tenant",
+          "<id>",
+          "--session",
+          "<id>"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<reader>",
+          "--client-context",
+          "restored",
+          "get",
+          "claim",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "start",
+        "inputs": [
+          "invitation file"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<fresh>",
+          "start",
+          "--invite-file",
+          "<laptop-b>/garbage.invite"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<laptop-b>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>"
+        ]
+      }
+    ]
+  },
+  "fleet": {
+    "builds_on": [
+      "laptop"
+    ],
+    "introduces": [
+      "invitation",
+      "join",
+      "remove",
+      "drain"
+    ],
+    "inputs": [
+      "data directory",
+      "address",
+      "participant name",
+      "invitation file",
+      "claim document",
+      "artifact content",
+      "host name",
+      "invitation id",
+      "policy file",
+      "plan file",
+      "node id"
+    ],
+    "executed_by": "deployment_fleet",
+    "not_executed": [
+      "an expired invitation: lifetimes are a day by default and at most seven; expiry is the enrollment registry's unit tests"
+    ],
+    "steps": [
+      {
+        "concept": "native engine",
+        "inputs": [
+          "data directory"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "replicas",
+          "activate-native"
+        ]
+      },
+      {
+        "concept": "start",
+        "inputs": [
+          "data directory",
+          "address"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "start",
+          "--advertise",
+          "<address>"
+        ]
+      },
+      {
+        "concept": "participant",
+        "inputs": [
+          "participant name"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "client",
+          "invite",
+          "--name",
+          "alice",
+          "--output",
+          "<client>/alice.invite"
+        ]
+      },
+      {
+        "concept": "participant",
+        "inputs": [
+          "invitation file"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "context",
+          "enroll",
+          "alice",
+          "--invite-file",
+          "<client>/alice.invite"
+        ]
+      },
+      {
+        "concept": "standing",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "status"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "receipt",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "receipt",
+          "acquire",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "artifact",
+        "inputs": [
+          "artifact content"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "artifact",
+          "submit",
+          "--claim",
+          "<id>",
+          "--slot",
+          "0",
+          "--text",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "claim",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "artifact",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "invitation",
+        "inputs": [
+          "host name"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "invite",
+          "--node",
+          "host-a",
+          "--output",
+          "-"
+        ]
+      },
+      {
+        "concept": "join",
+        "inputs": [
+          "invitation file",
+          "address"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<host-a>/focal.yaml",
+          "--data-dir",
+          "<host-a>",
+          "start",
+          "--advertise",
+          "<address>",
+          "--invite-file",
+          "<host-a>/host-a.invite"
+        ]
+      },
+      {
+        "concept": "join",
+        "inputs": [
+          "invitation file",
+          "address"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<replay>",
+          "start",
+          "--advertise",
+          "<address>",
+          "--invite-file",
+          "<host-a>/host-a.invite"
+        ]
+      },
+      {
+        "concept": "invitation",
+        "inputs": [
+          "host name"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "invite",
+          "--node",
+          "host-b",
+          "--output",
+          "-"
+        ]
+      },
+      {
+        "concept": "join",
+        "inputs": [
+          "invitation file",
+          "address"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<tampered>",
+          "start",
+          "--advertise",
+          "<address>",
+          "--invite-file",
+          "<tampered>/tampered.invite"
+        ]
+      },
+      {
+        "concept": "join",
+        "inputs": [
+          "invitation file",
+          "address"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<host-b>/focal.yaml",
+          "--data-dir",
+          "<host-b>",
+          "start",
+          "--advertise",
+          "<address>",
+          "--invite-file",
+          "<host-b>/host-b.invite"
+        ]
+      },
+      {
+        "concept": "invitation",
+        "inputs": [
+          "host name"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "invite",
+          "--node",
+          "host-r",
+          "--output",
+          "-"
+        ]
+      },
+      {
+        "concept": "invitation",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "invitations",
+          "list"
+        ]
+      },
+      {
+        "concept": "invitation",
+        "inputs": [
+          "invitation id"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "invitations",
+          "revoke",
+          "<id>"
+        ]
+      },
+      {
+        "concept": "join",
+        "inputs": [
+          "invitation file",
+          "address"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<revoked>",
+          "start",
+          "--advertise",
+          "<address>",
+          "--invite-file",
+          "<revoked>/host-r.invite"
+        ]
+      },
+      {
+        "concept": "placement view",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "placement"
+        ]
+      },
+      {
+        "concept": "plan",
+        "inputs": [
+          "policy file",
+          "plan file"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "--config",
+          "<founder>/node-1.yaml",
+          "deployment",
+          "plan",
+          "--output",
+          "<founder>/node-1.plan"
+        ]
+      },
+      {
+        "concept": "apply",
+        "inputs": [
+          "plan file"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "deployment",
+          "apply",
+          "--plan-file",
+          "<founder>/node-1.plan",
+          "--wait",
+          "180"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "claim",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "artifact",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "receipt",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "receipt",
+          "acquire",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "artifact",
+        "inputs": [
+          "artifact content"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "artifact",
+          "submit",
+          "--claim",
+          "<id>",
+          "--slot",
+          "0",
+          "--text",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "claim",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "artifact",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "get",
+          "claim",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "get",
+          "artifact",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "plan",
+        "inputs": [
+          "policy file",
+          "plan file"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "--config",
+          "<founder>/node-2.yaml",
+          "deployment",
+          "plan",
+          "--output",
+          "<founder>/node-2.plan"
+        ]
+      },
+      {
+        "concept": "apply",
+        "inputs": [
+          "plan file"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "deployment",
+          "apply",
+          "--plan-file",
+          "<founder>/node-2.plan"
+        ]
+      },
+      {
+        "concept": "plan",
+        "inputs": [
+          "policy file",
+          "plan file"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "--config",
+          "<founder>/node-1-again.yaml",
+          "deployment",
+          "plan",
+          "--output",
+          "<founder>/node-1-again.plan"
+        ]
+      },
+      {
+        "concept": "apply",
+        "inputs": [
+          "plan file"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "deployment",
+          "apply",
+          "--plan-file",
+          "<founder>/node-1-again.plan"
+        ]
+      },
+      {
+        "concept": "plan",
+        "inputs": [
+          "policy file",
+          "plan file"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "--config",
+          "<founder>/node-1-home-early.yaml",
+          "deployment",
+          "plan",
+          "--output",
+          "<founder>/node-1-home-early.plan"
+        ]
+      },
+      {
+        "concept": "plan",
+        "inputs": [
+          "policy file",
+          "plan file"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "--config",
+          "<founder>/node-1-res.yaml",
+          "deployment",
+          "plan",
+          "--output",
+          "<founder>/node-1-res.plan"
+        ]
+      },
+      {
+        "concept": "apply",
+        "inputs": [
+          "plan file"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "deployment",
+          "apply",
+          "--plan-file",
+          "<founder>/node-1-res.plan",
+          "--wait",
+          "180"
+        ]
+      },
+      {
+        "concept": "explain",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "deployment",
+          "explain"
+        ]
+      },
+      {
+        "concept": "apply",
+        "inputs": [
+          "plan file"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "deployment",
+          "apply",
+          "--plan-file",
+          "<founder>/node-1-home-early.plan"
+        ]
+      },
+      {
+        "concept": "remove",
+        "inputs": [
+          "node id"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "nodes",
+          "remove",
+          "--node",
+          "<id>"
+        ]
+      },
+      {
+        "concept": "drain",
+        "inputs": [
+          "node id"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "nodes",
+          "drain",
+          "--node",
+          "<id>"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "claim",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "artifact",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "invitation",
+        "inputs": [
+          "host name"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "invite",
+          "--node",
+          "host-c",
+          "--output",
+          "-"
+        ]
+      },
+      {
+        "concept": "join",
+        "inputs": [
+          "invitation file",
+          "address"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<host-c>/focal.yaml",
+          "--data-dir",
+          "<host-c>",
+          "start",
+          "--advertise",
+          "<address>",
+          "--invite-file",
+          "<host-c>/host-c.invite"
+        ]
+      },
+      {
+        "concept": "remove",
+        "inputs": [
+          "node id"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "nodes",
+          "remove",
+          "--node",
+          "<n>"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "claim",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "artifact",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "claim",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      }
+    ]
+  },
+  "zones": {
+    "builds_on": [
+      "laptop",
+      "fleet"
+    ],
+    "introduces": [
+      "zone survival",
+      "zone loss",
+      "zone return",
+      "region survival"
+    ],
+    "inputs": [
+      "data directory",
+      "address",
+      "zone fact",
+      "participant name",
+      "invitation file",
+      "host name",
+      "claim document",
+      "artifact content",
+      "tenant",
+      "session",
+      "survive zone",
+      "survive region"
+    ],
+    "executed_by": "deployment_zones",
+    "not_executed": [
+      "a host that announced no zone: the directory grants no zone domain to it, so a zone-survival plan never counts it; the cli_zones unit covers the domain grant"
+    ],
+    "steps": [
+      {
+        "concept": "native engine",
+        "inputs": [
+          "data directory"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "replicas",
+          "activate-native"
+        ]
+      },
+      {
+        "concept": "start",
+        "inputs": [
+          "data directory",
+          "address",
+          "zone fact"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "start",
+          "--advertise",
+          "<address>"
+        ]
+      },
+      {
+        "concept": "participant",
+        "inputs": [
+          "participant name"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "client",
+          "invite",
+          "--name",
+          "alice",
+          "--output",
+          "<client>/alice.invite"
+        ]
+      },
+      {
+        "concept": "participant",
+        "inputs": [
+          "invitation file"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "context",
+          "enroll",
+          "alice",
+          "--invite-file",
+          "<client>/alice.invite"
+        ]
+      },
+      {
+        "concept": "standing",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "status"
+        ]
+      },
+      {
+        "concept": "invitation",
+        "inputs": [
+          "host name"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "invite",
+          "--node",
+          "host-b",
+          "--output",
+          "-"
+        ]
+      },
+      {
+        "concept": "join",
+        "inputs": [
+          "invitation file",
+          "address"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<host-b>/focal.yaml",
+          "--data-dir",
+          "<host-b>",
+          "start",
+          "--advertise",
+          "<address>",
+          "--invite-file",
+          "<host-b>/host-b.invite"
+        ]
+      },
+      {
+        "concept": "invitation",
+        "inputs": [
+          "host name"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "invite",
+          "--node",
+          "host-c",
+          "--output",
+          "-"
+        ]
+      },
+      {
+        "concept": "join",
+        "inputs": [
+          "invitation file",
+          "address"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<host-c>/focal.yaml",
+          "--data-dir",
+          "<host-c>",
+          "start",
+          "--advertise",
+          "<address>",
+          "--invite-file",
+          "<host-c>/host-c.invite"
+        ]
+      },
+      {
+        "concept": "placement view",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "placement"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "receipt",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "receipt",
+          "acquire",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "artifact",
+        "inputs": [
+          "artifact content"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "artifact",
+          "submit",
+          "--claim",
+          "<id>",
+          "--slot",
+          "0",
+          "--text",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "claim",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "artifact",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "zone survival",
+        "inputs": [
+          "tenant",
+          "session",
+          "survive zone"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "sessions",
+          "plan",
+          "--tenant",
+          "<id>",
+          "--session",
+          "<id>",
+          "--survive",
+          "zone",
+          "--max-failures",
+          "1"
+        ]
+      },
+      {
+        "concept": "zone loss",
+        "command": [
+          "kill",
+          "-STOP",
+          "<host in a3>"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "claim",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "zone return",
+        "command": [
+          "kill",
+          "-CONT",
+          "<host in a3>"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "claim",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "region survival",
+        "inputs": [
+          "survive region"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "sessions",
+          "plan",
+          "--tenant",
+          "<id>",
+          "--session",
+          "<id>",
+          "--survive",
+          "region",
+          "--max-failures",
+          "1",
+          "--dry-run"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "claim",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "artifact",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      }
+    ]
+  },
+  "regions": {
+    "builds_on": [
+      "laptop",
+      "fleet",
+      "zones"
+    ],
+    "introduces": [
+      "peer latency",
+      "region loss",
+      "region return",
+      "ranges",
+      "residency fence"
+    ],
+    "inputs": [
+      "data directory",
+      "address",
+      "region fact",
+      "participant name",
+      "invitation file",
+      "host name",
+      "claim document",
+      "artifact content",
+      "tenant",
+      "session",
+      "survive region",
+      "member",
+      "node outside residency"
+    ],
+    "executed_by": "deployment_regions",
+    "not_executed": [
+      "measured cross-region RTT under real latency: the fleet is one host, so the RTT gauge is present and near zero; a real trial qualifies the adapter"
+    ],
+    "steps": [
+      {
+        "concept": "native engine",
+        "inputs": [
+          "data directory"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "replicas",
+          "activate-native"
+        ]
+      },
+      {
+        "concept": "start",
+        "inputs": [
+          "data directory",
+          "address",
+          "region fact"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "start",
+          "--advertise",
+          "<address>"
+        ]
+      },
+      {
+        "concept": "participant",
+        "inputs": [
+          "participant name"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "client",
+          "invite",
+          "--name",
+          "alice",
+          "--output",
+          "<client>/alice.invite"
+        ]
+      },
+      {
+        "concept": "participant",
+        "inputs": [
+          "invitation file"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "context",
+          "enroll",
+          "alice",
+          "--invite-file",
+          "<client>/alice.invite"
+        ]
+      },
+      {
+        "concept": "standing",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "status"
+        ]
+      },
+      {
+        "concept": "invitation",
+        "inputs": [
+          "host name"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "invite",
+          "--node",
+          "host-b",
+          "--output",
+          "-"
+        ]
+      },
+      {
+        "concept": "join",
+        "inputs": [
+          "invitation file",
+          "address"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<host-b>/focal.yaml",
+          "--data-dir",
+          "<host-b>",
+          "start",
+          "--advertise",
+          "<address>",
+          "--invite-file",
+          "<host-b>/host-b.invite"
+        ]
+      },
+      {
+        "concept": "invitation",
+        "inputs": [
+          "host name"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "invite",
+          "--node",
+          "host-c",
+          "--output",
+          "-"
+        ]
+      },
+      {
+        "concept": "join",
+        "inputs": [
+          "invitation file",
+          "address"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<host-c>/focal.yaml",
+          "--data-dir",
+          "<host-c>",
+          "start",
+          "--advertise",
+          "<address>",
+          "--invite-file",
+          "<host-c>/host-c.invite"
+        ]
+      },
+      {
+        "concept": "invitation",
+        "inputs": [
+          "host name"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "invite",
+          "--node",
+          "host-d",
+          "--output",
+          "-"
+        ]
+      },
+      {
+        "concept": "join",
+        "inputs": [
+          "invitation file",
+          "address"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<host-d>/focal.yaml",
+          "--data-dir",
+          "<host-d>",
+          "start",
+          "--advertise",
+          "<address>",
+          "--invite-file",
+          "<host-d>/host-d.invite"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "receipt",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "receipt",
+          "acquire",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "artifact",
+        "inputs": [
+          "artifact content"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "artifact",
+          "submit",
+          "--claim",
+          "<id>",
+          "--slot",
+          "0",
+          "--text",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "claim",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "artifact",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "region survival",
+        "inputs": [
+          "tenant",
+          "session",
+          "survive region"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "sessions",
+          "plan",
+          "--tenant",
+          "<id>",
+          "--session",
+          "<id>",
+          "--survive",
+          "region",
+          "--max-failures",
+          "1"
+        ]
+      },
+      {
+        "concept": "peer latency",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "node",
+          "metrics"
+        ]
+      },
+      {
+        "concept": "region loss",
+        "command": [
+          "kill",
+          "-STOP",
+          "<host in r3>"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "region return",
+        "command": [
+          "kill",
+          "-CONT",
+          "<host in r3>"
+        ]
+      },
+      {
+        "concept": "ranges",
+        "inputs": [
+          "session"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "replicas",
+          "ranges",
+          "--session",
+          "<id>",
+          "list"
+        ]
+      },
+      {
+        "concept": "residency fence",
+        "inputs": [
+          "session",
+          "member",
+          "node outside residency"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<founder>/focal.yaml",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "replicas",
+          "ranges",
+          "--session",
+          "<id>",
+          "move",
+          "--member",
+          "<id>",
+          "--node",
+          "<id>"
+        ]
+      }
+    ]
+  },
+  "upgrade": {
+    "builds_on": [
+      "laptop",
+      "fleet"
+    ],
+    "introduces": [
+      "upgrade status",
+      "upgrade activate",
+      "capability level"
+    ],
+    "inputs": [
+      "data directory",
+      "address",
+      "participant name",
+      "invitation file",
+      "host name",
+      "claim document",
+      "artifact content",
+      "fence level",
+      "capability level",
+      "env FOCAL_CAPABILITY_LEVEL"
+    ],
+    "executed_by": "deployment_upgrade",
+    "not_executed": [
+      "a real newer binary at a higher level: the fence mechanism is exercised with the levels one binary announces; a second binary at a higher capability qualifies a real version step"
+    ],
+    "steps": [
+      {
+        "concept": "native engine",
+        "inputs": [
+          "data directory"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "replicas",
+          "activate-native"
+        ]
+      },
+      {
+        "concept": "start",
+        "inputs": [
+          "data directory",
+          "address"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "start",
+          "--advertise",
+          "<address>"
+        ]
+      },
+      {
+        "concept": "participant",
+        "inputs": [
+          "participant name"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "client",
+          "invite",
+          "--name",
+          "alice",
+          "--output",
+          "<client>/alice.invite"
+        ]
+      },
+      {
+        "concept": "participant",
+        "inputs": [
+          "invitation file"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "context",
+          "enroll",
+          "alice",
+          "--invite-file",
+          "<client>/alice.invite"
+        ]
+      },
+      {
+        "concept": "standing",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "status"
+        ]
+      },
+      {
+        "concept": "invitation",
+        "inputs": [
+          "host name"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "invite",
+          "--node",
+          "host",
+          "--output",
+          "-"
+        ]
+      },
+      {
+        "concept": "join",
+        "inputs": [
+          "invitation file",
+          "address"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<host>",
+          "start",
+          "--advertise",
+          "<address>",
+          "--invite-file",
+          "<host>/host.invite"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "receipt",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "receipt",
+          "acquire",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "artifact",
+        "inputs": [
+          "artifact content"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "artifact",
+          "submit",
+          "--claim",
+          "<id>",
+          "--slot",
+          "0",
+          "--text",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "claim",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "artifact",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "upgrade status",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "upgrade",
+          "status"
+        ]
+      },
+      {
+        "concept": "upgrade activate",
+        "inputs": [
+          "fence level"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<host>",
+          "cluster",
+          "upgrade",
+          "activate",
+          "--fence",
+          "1"
+        ]
+      },
+      {
+        "concept": "upgrade activate",
+        "inputs": [
+          "fence level"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "upgrade",
+          "activate",
+          "--fence",
+          "2"
+        ]
+      },
+      {
+        "concept": "upgrade activate",
+        "inputs": [
+          "fence level"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "upgrade",
+          "activate",
+          "--fence",
+          "1"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "claim",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "artifact",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "capability level",
+        "inputs": [
+          "address",
+          "capability level",
+          "env FOCAL_CAPABILITY_LEVEL"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<host>",
+          "start",
+          "--advertise",
+          "<address>"
+        ]
+      },
+      {
+        "concept": "start",
+        "inputs": [
+          "address"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<host>",
+          "start",
+          "--advertise",
+          "<address>"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      }
+    ]
+  },
+  "workloads": {
+    "builds_on": [
+      "laptop",
+      "fleet"
+    ],
+    "introduces": [
+      "budget metrics"
+    ],
+    "inputs": [
+      "data directory",
+      "address",
+      "participant name",
+      "invitation file",
+      "host name",
+      "claim document",
+      "artifact content"
+    ],
+    "executed_by": "deployment_workloads",
+    "not_executed": [
+      "disk-growth and checkpoint/recovery envelopes under a long mixed load: measured by the R11 workload generator, not this correctness walk"
+    ],
+    "steps": [
+      {
+        "concept": "native engine",
+        "inputs": [
+          "data directory"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "replicas",
+          "activate-native"
+        ]
+      },
+      {
+        "concept": "start",
+        "inputs": [
+          "data directory",
+          "address"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "start",
+          "--advertise",
+          "<address>"
+        ]
+      },
+      {
+        "concept": "participant",
+        "inputs": [
+          "participant name"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "client",
+          "invite",
+          "--name",
+          "alice",
+          "--output",
+          "<client>/alice.invite"
+        ]
+      },
+      {
+        "concept": "participant",
+        "inputs": [
+          "invitation file"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "context",
+          "enroll",
+          "alice",
+          "--invite-file",
+          "<client>/alice.invite"
+        ]
+      },
+      {
+        "concept": "standing",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "status"
+        ]
+      },
+      {
+        "concept": "invitation",
+        "inputs": [
+          "host name"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "invite",
+          "--node",
+          "host-a",
+          "--output",
+          "-"
+        ]
+      },
+      {
+        "concept": "join",
+        "inputs": [
+          "invitation file",
+          "address"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<host-a>",
+          "start",
+          "--advertise",
+          "<address>",
+          "--invite-file",
+          "<host-a>/host-a.invite"
+        ]
+      },
+      {
+        "concept": "invitation",
+        "inputs": [
+          "host name"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "invite",
+          "--node",
+          "host-b",
+          "--output",
+          "-"
+        ]
+      },
+      {
+        "concept": "join",
+        "inputs": [
+          "invitation file",
+          "address"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<host-b>",
+          "start",
+          "--advertise",
+          "<address>",
+          "--invite-file",
+          "<host-b>/host-b.invite"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "receipt",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "receipt",
+          "acquire",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "artifact",
+        "inputs": [
+          "artifact content"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "artifact",
+          "submit",
+          "--claim",
+          "<id>",
+          "--slot",
+          "0",
+          "--text",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "budget metrics",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "node",
+          "metrics"
+        ]
+      }
+    ]
+  },
+  "kubernetes": {
+    "builds_on": [
+      "laptop",
+      "fleet"
+    ],
+    "introduces": [
+      "render kubernetes"
+    ],
+    "inputs": [
+      "config",
+      "namespace",
+      "image",
+      "invitation secret",
+      "zones",
+      "data directory",
+      "address",
+      "participant name",
+      "invitation file",
+      "claim document",
+      "artifact content",
+      "host name"
+    ],
+    "executed_by": "deployment_kubernetes",
+    "not_executed": [
+      "a run on a real Kubernetes cluster and `helm template`: neither a cluster nor helm is available here; the manifests are byte-checked against the renderer in deployment_render, and pods stand in with local processes"
+    ],
+    "steps": [
+      {
+        "concept": "render kubernetes",
+        "inputs": [
+          "config",
+          "namespace",
+          "image",
+          "invitation secret",
+          "zones"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<render>",
+          "--config",
+          "<render>/kubernetes.yaml",
+          "deployment",
+          "render",
+          "kubernetes",
+          "--namespace",
+          "focal",
+          "--image",
+          "focal:0.1.0",
+          "--secret",
+          "focal-invitations",
+          "--zone",
+          "a",
+          "--zone",
+          "b",
+          "--zone",
+          "c",
+          "--output",
+          "<render>/rendered"
+        ]
+      },
+      {
+        "concept": "render kubernetes",
+        "inputs": [
+          "config",
+          "namespace",
+          "image",
+          "invitation secret",
+          "zones"
+        ],
+        "command": [
+          "focal",
+          "--config",
+          "<config>",
+          "deployment",
+          "render",
+          "kubernetes",
+          "--namespace",
+          "focal",
+          "--image",
+          "<image>",
+          "--secret",
+          "<secret>",
+          "--zone",
+          "<zone>",
+          "--output",
+          "<dir>"
+        ]
+      },
+      {
+        "concept": "native engine",
+        "inputs": [
+          "data directory"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "replicas",
+          "activate-native"
+        ]
+      },
+      {
+        "concept": "start",
+        "inputs": [
+          "data directory",
+          "address"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "start",
+          "--advertise",
+          "<address>"
+        ]
+      },
+      {
+        "concept": "participant",
+        "inputs": [
+          "participant name"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "client",
+          "invite",
+          "--name",
+          "alice",
+          "--output",
+          "<client>/alice.invite"
+        ]
+      },
+      {
+        "concept": "participant",
+        "inputs": [
+          "invitation file"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "context",
+          "enroll",
+          "alice",
+          "--invite-file",
+          "<client>/alice.invite"
+        ]
+      },
+      {
+        "concept": "standing",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "status"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "receipt",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "receipt",
+          "acquire",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "artifact",
+        "inputs": [
+          "artifact content"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "artifact",
+          "submit",
+          "--claim",
+          "<id>",
+          "--slot",
+          "0",
+          "--text",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "claim",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "artifact",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "invitation",
+        "inputs": [
+          "host name"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "cluster",
+          "invite",
+          "--node",
+          "host",
+          "--output",
+          "-"
+        ]
+      },
+      {
+        "concept": "crash",
+        "command": [
+          "kill",
+          "-KILL",
+          "<joining pod>"
+        ]
+      },
+      {
+        "concept": "start",
+        "inputs": [
+          "invitation file",
+          "address"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<host>",
+          "start",
+          "--advertise",
+          "<address>",
+          "--invite-file",
+          "<host>/host.invite"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "claim",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "artifact",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "inputs": [
+          "claim document"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "submit",
+          "claim",
+          "--json",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "claim",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "claim",
+          "post",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "receipt",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "receipt",
+          "acquire",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "artifact",
+        "inputs": [
+          "artifact content"
+        ],
+        "command": [
+          "focal",
+          "--data-dir",
+          "<client>",
+          "--client-context",
+          "alice",
+          "artifact",
+          "submit",
+          "--claim",
+          "<id>",
+          "--slot",
+          "0",
+          "--text",
+          "<document>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "claim",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      },
+      {
+        "concept": "read",
+        "command": [
+          "focal",
+          "--data-dir",
+          "<founder>",
+          "get",
+          "artifact",
+          "<id>",
+          "--format",
+          "json"
+        ]
+      }
+    ]
+  }
+}

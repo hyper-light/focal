@@ -43,7 +43,7 @@ async fn elected_root_without_current_term_commit_returns_retryable_directory_re
                 .unwrap();
             votes.extend(events.messages.into_iter().filter(|message| {
                 matches!(
-                    message.get_msg_type(),
+                    MessageType::from_i32(message.msg_type).unwrap(),
                     MessageType::MsgRequestPreVote
                         | MessageType::MsgRequestPreVoteResponse
                         | MessageType::MsgRequestVote

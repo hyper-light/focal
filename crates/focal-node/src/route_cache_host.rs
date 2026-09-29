@@ -179,20 +179,24 @@ impl RouteCacheDriver {
             .map(|(_, delegation)| *delegation)
             .filter(|delegation| delegation.namespace.contains(ledger))
     }
-    async fn delegation_of(
+    /// Observe the root once and index its delegations by partition, so a
+    /// refresh over N watches costs one root observation and O(log n) lookups
+    /// instead of one observation plus a linear scan per watch.
+    async fn delegation_index(
         &self,
         handles: &NetworkHandles,
-        partition: focal_directory::PartitionId,
-    ) -> Option<Delegation> {
+    ) -> Option<std::collections::BTreeMap<focal_directory::PartitionId, Delegation>> {
         let root = handles.control.observe_root().await.ok()?;
         let ControlBootstrap::Root { directory, .. } = &root.snapshot().state else {
             return None;
         };
-        directory
-            .delegations
-            .values()
-            .find(|delegation| delegation.partition == partition)
-            .copied()
+        Some(
+            directory
+                .delegations
+                .values()
+                .map(|delegation| (delegation.partition, *delegation))
+                .collect(),
+        )
     }
     /// One read of the partition that holds a delegation: the local host when
     /// this node hosts it, else the founder over the peer pool.
@@ -281,8 +285,14 @@ impl RouteCacheDriver {
     async fn refresh(&mut self, handles: &NetworkHandles, pool: &PeerConnectionPool, now: u64) {
         let _ = self.cache.advance(now);
         let watches: Vec<_> = self.cache.watches().collect();
+        if watches.is_empty() {
+            return;
+        }
+        let Some(index) = self.delegation_index(handles).await else {
+            return;
+        };
         for (partition, _epoch, revision) in watches {
-            let Some(delegation) = self.delegation_of(handles, partition).await else {
+            let Some(delegation) = index.get(&partition).copied() else {
                 continue;
             };
             let Some(ControlReadResult::RouteChanges(batch)) = self

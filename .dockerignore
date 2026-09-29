@@ -1,0 +1,8 @@
+# Build context excludes: keep only sources the musl build needs.
+target/
+.git/
+**/*.rs.bk
+docs/qualification/
+tools/load/target/
+/tmp/
+.DS_Store

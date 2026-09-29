@@ -366,6 +366,7 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
             PeerEndpoint {
                 address: server.local_addr().unwrap(),
                 server_name: receipts[index].identity.server_name.clone(),
+                name: None,
             },
         );
         let serving_server = server.clone();
@@ -558,14 +559,19 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
         ),
         ControlReply::Rejected(ControlFailure::Unauthorized)
     );
+    // A node peer is not scoped by tenant on the wire (24 §16); the owner
+    // still refuses a request addressed outside its namespace.
     let mut wrong_scope = packet.clone();
     wrong_scope.ledger.tenant = TenantId::from_u128(999);
     assert_eq!(
-        replicas[0]
-            .pool
-            .send_enrollment_control(2, &wrong_scope)
-            .await,
-        Err(PeerSendError::Rejected(AccessError::Unauthorized))
+        control_reply(
+            &replicas[0]
+                .pool
+                .send_enrollment_control(2, &wrong_scope)
+                .await
+                .unwrap()
+        ),
+        ControlReply::Rejected(ControlFailure::Unauthorized)
     );
     assert!(
         verify_request(
@@ -628,31 +634,62 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
             )
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while replicas[2].host.progress().leader != 3 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        // Charged to the periods the replicas run (27 §3.1 P8).
+        let periods = || -> Vec<u64> {
+            replicas
+                .iter()
+                .map(|replica| replica.host.periods())
+                .collect()
+        };
+        let deadline = || {
+            focal_timing::ProgressDeadline::begin(
+                &periods(),
+                focal_timing::ProgressDeadline::periods(
+                    Duration::from_secs(5),
+                    replicas[0].host.tick_period(),
+                ),
+                Duration::from_secs(60),
+            )
+        };
+        let mut wait = deadline();
+        while replicas[2].host.progress().leader != 3 || replicas[0].host.progress().leader != 3 {
+            if let Err(spent) = wait.check(&periods()) {
+                panic!(
+                    "leadership never moved to 3: {spent}: {:?}",
+                    replicas
+                        .iter()
+                        .map(|replica| replica.host.progress())
+                        .collect::<Vec<_>>()
+                );
             }
-        })
-        .await
-        .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while replicas[0].host.progress().leader != 3 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let blackhole = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut stale = routes.clone();
         stale.get_mut(&2).unwrap().address = blackhole.local_addr().unwrap();
         replicas[0].pool.replace_routes(2, stale).unwrap();
-        let cursor = adapter.route_cursor.load(Ordering::Relaxed);
-        state(&adapter).await;
-        assert_eq!(
-            adapter.route_cursor.load(Ordering::Relaxed),
-            cursor,
-            "known installed leader should bypass dead earlier routes entirely"
-        );
+        // A call that finds the leader it knows asks no other route. A
+        // leader that was slow to answer, or had been replaced, sends the
+        // call on to the routes, and the dead one among them is asked in
+        // its turn: so without the bypass no call leaves the cursor where
+        // it was, and with it a call does once the leader answers in time.
+        let mut wait = deadline();
+        loop {
+            let cursor = adapter.route_cursor.load(Ordering::Relaxed);
+            state(&adapter).await;
+            if adapter.route_cursor.load(Ordering::Relaxed) == cursor {
+                break;
+            }
+            if let Err(spent) = wait.check(&periods()) {
+                panic!(
+                    "no call went to the known leader alone: {spent}: {:?}",
+                    replicas
+                        .iter()
+                        .map(|replica| replica.host.progress())
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
         replicas[0].pool.replace_routes(3, routes.clone()).unwrap();
         signer
             .invite(RequestId::from_u128(42), intent.clone())
@@ -756,6 +793,7 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
                 PeerEndpoint {
                     address: blackhole.local_addr().unwrap(),
                     server_name: receipts[2].identity.server_name.clone(),
+                    name: None,
                 },
             )
         })
@@ -764,15 +802,28 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
     let before = allowance.stats();
     for id in [202, 203] {
         let previous = adapter.route_cursor.load(Ordering::Relaxed);
-        assert!(matches!(
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                adapter.read_state(RequestId::from_u128(id))
-            )
-            .await
-            .unwrap(),
-            Err(ControlFailure::OutcomeUnknown | ControlFailure::Unavailable)
-        ));
+        let sent = replicas[0].pool.stats();
+        let answer = tokio::time::timeout(
+            Duration::from_secs(5),
+            adapter.read_state(RequestId::from_u128(id)),
+        )
+        .await
+        .unwrap();
+        // A round some of whose asks left this node cannot know their
+        // outcome; one none of whose asks could be dialed, the pool's three
+        // connections all taken by dials to the dead, was refused the room
+        // here and says so.
+        let after = replicas[0].pool.stats();
+        match answer {
+            Err(ControlFailure::OutcomeUnknown) => {
+                assert!(after.lost > sent.lost, "{sent:?} {after:?}");
+            }
+            Err(ControlFailure::Capacity) => {
+                assert!(after.busy > sent.busy, "{sent:?} {after:?}");
+                assert_eq!(after.lost, sent.lost, "{sent:?} {after:?}");
+            }
+            other => panic!("the round over dead routes answered {other:?}"),
+        }
         let current = adapter.route_cursor.load(Ordering::Relaxed);
         assert!((100..116).contains(&current));
         if previous >= 100 {

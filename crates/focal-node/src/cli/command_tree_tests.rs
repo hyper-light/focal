@@ -225,3 +225,96 @@ fn every_surface_descriptor_cli_path_resolves_in_the_command_tree() {
         None
     );
 }
+
+/// Every `focal …` command shown in `docs/manual-cli.md` resolves to a real
+/// node of the command tree (or is an explicitly planned exception), so the
+/// manual cannot document a verb the CLI lacks. Global flags and their values
+/// are skipped; the leading run of lowercase command words is walked, and each
+/// word must be a subcommand while the current node still has subcommands
+/// (positionals and flags after a leaf end the path).
+#[test]
+fn documented_cli_commands_resolve_in_the_command_tree() {
+    // Commands documented as planned but not yet in the tree. Empty: the manual
+    // documents only executable commands today.
+    const PLANNED: &[&str] = &[];
+    const GLOBALS: &[&str] = &[
+        "--config",
+        "--data-dir",
+        "--client-context",
+        "--trace-file",
+        "--format",
+    ];
+
+    let manual = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/manual-cli.md");
+    let text = std::fs::read_to_string(&manual)
+        .unwrap_or_else(|error| panic!("read {}: {error}", manual.display()));
+    let root = command();
+
+    let mut checked = 0usize;
+    let mut in_fence = false;
+    for raw in text.lines() {
+        // Only executable examples inside fenced code blocks are commands; a
+        // prose mention of `focal` in backticks is not.
+        if raw.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if !in_fence {
+            continue;
+        }
+        let line = raw.replace('`', " ");
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let mut index = 0;
+        while index < tokens.len() {
+            if tokens[index] != "focal" {
+                index += 1;
+                continue;
+            }
+            index += 1;
+            // Skip global flags (and their values) that may precede the verb.
+            while index < tokens.len() && GLOBALS.contains(&tokens[index]) {
+                index += 1;
+                if index < tokens.len() {
+                    index += 1;
+                }
+            }
+            // The leading lowercase command words.
+            let mut path: Vec<&str> = Vec::new();
+            while index < tokens.len() {
+                let token = tokens[index];
+                if token.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+                    && token.starts_with(|c: char| c.is_ascii_lowercase())
+                {
+                    path.push(token);
+                    index += 1;
+                } else {
+                    break;
+                }
+            }
+            if path.is_empty() {
+                continue;
+            }
+            let joined = path.join(" ");
+            if PLANNED.contains(&joined.as_str()) {
+                checked += 1;
+                continue;
+            }
+            let mut current = &root;
+            for word in &path {
+                if let Some(child) = current.find_subcommand(word) {
+                    current = child;
+                } else {
+                    assert!(
+                        !current.has_subcommands(),
+                        "docs/manual-cli.md: `focal {joined}` — `{word}` is not a command \
+                         (add it to the tree or list it as planned)"
+                    );
+                    // A leaf reached: the remaining words are positionals.
+                    break;
+                }
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked >= 20, "only {checked} documented commands checked");
+}

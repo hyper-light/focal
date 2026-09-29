@@ -756,3 +756,157 @@ fn disk_headroom_watermark_refuses_fresh_admission_but_answers_exact_retries() {
     commit(&mut session, create(2, 2), "create with headroom");
     assert_eq!(session.sequence().unwrap(), SessionSeq(2));
 }
+
+// R11 §1: the offline-recovered committed prefix is the authoritative
+// publication history for the linearizability checker. `NativeSession::open`
+// reconstructs the prefix from the checkpoint + WAL tail with no live server,
+// and each `NativeCommit` projects to the generic `MutationReceipt` the checker
+// compares. A black-box client trace (focal-client `TraceSink`) supplies the
+// matching `Invoke`/`Complete` events; here we drive the session directly and
+// synthesize a client's committed observations to validate the projection and
+// the checker against real recovered data.
+//
+// `state_hash` on a publication uses the commit's on-log `record_hash`: a
+// per-prefix-unique identity read straight from disk. (A black-box client
+// cannot compute the owner's full-state digest for a read, so per-prefix
+// full-state hashes matter only to the white-box driver; the black-box harness
+// only needs a unique marker per prefix.)
+fn commit_receipt(commit: &NativeCommit) -> focal_model::MutationReceipt {
+    let outcome = commit.outcome;
+    let key = match outcome.invocation {
+        focal_core::native::NativeInvocation::Request(key) => key,
+        other => panic!("history workload issues only participant requests, got {other:?}"),
+    };
+    focal_model::MutationReceipt {
+        ledger: outcome.ledger,
+        key,
+        sequence: outcome.sequence,
+        command_hash: outcome.intent,
+        // A native commit's identity is (ledger, key, sequence, intent); the
+        // generic result is not part of it. The checker compares receipts only
+        // for equality and every projection uses this same placeholder.
+        outcome: focal_model::CommandResult::Noop,
+    }
+}
+
+#[test]
+fn recovered_prefix_is_a_linearizable_publication_history() {
+    use focal_sim::history::{Consistency, Event, Initial, Outcome, Request};
+
+    let dir = tempfile::tempdir().unwrap();
+    let parent = MemoryBudget::new(256 << 20, 64 << 20).unwrap();
+    let created;
+    let posted;
+    {
+        // No checkpoint: the whole prefix replays from the WAL tail on reopen,
+        // so the recovered committed list is contiguous from sequence one.
+        let mut session = open_dir(dir.path(), &parent);
+        lead(&mut session);
+        created = commit(&mut session, create(1, 100), "create");
+        let (_, expected) = claim_status(&session, 100);
+        posted = commit(&mut session, post(2, expected), "post");
+        assert_eq!(session.sequence().unwrap(), SessionSeq(2));
+    }
+
+    // Reopen purely from disk and take the authoritative publication order.
+    std::fs::create_dir_all(dir.path().join("content")).unwrap();
+    let opened = NativeSession::open(
+        dir.path().join("wal"),
+        config(),
+        ledger(),
+        RangeId(1),
+        NativeContentProfile::ProjectionOnly,
+        limits(),
+        &parent,
+        store(&dir.path().join("content")),
+        BuiltinNativeSchemas,
+    )
+    .unwrap();
+    let committed = opened.initial.committed;
+    assert_eq!(
+        committed
+            .iter()
+            .map(|c| c.outcome.sequence)
+            .collect::<Vec<_>>(),
+        vec![SessionSeq(1), SessionSeq(2)],
+        "recovered prefix is contiguous from sequence one"
+    );
+    // The recovered commits carry the same outcomes the live session reported.
+    assert_eq!(committed[0].outcome, created);
+    assert_eq!(committed[1].outcome, posted);
+
+    // Publications (from the owner) and a client's committed observations.
+    let publications: Vec<Event> = committed
+        .iter()
+        .map(|commit| Event::Publish {
+            receipt: commit_receipt(commit),
+            state_hash: commit.record_hash,
+        })
+        .collect();
+    let receipts: Vec<focal_model::MutationReceipt> =
+        committed.iter().map(commit_receipt).collect();
+
+    // Both requests in flight, then both publish, then both complete.
+    let mut events = Vec::new();
+    for (call, receipt) in receipts.iter().enumerate() {
+        events.push(Event::Invoke {
+            call: call as u64,
+            request: Request::Mutation {
+                ledger: receipt.ledger,
+                key: receipt.key,
+                command_hash: receipt.command_hash,
+            },
+        });
+    }
+    events.extend(publications.iter().cloned());
+    for (call, receipt) in receipts.iter().enumerate() {
+        events.push(Event::Complete {
+            call: call as u64,
+            outcome: Outcome::Committed(receipt.clone()),
+        });
+    }
+
+    let initial = [Initial {
+        ledger: ledger(),
+        sequence: SessionSeq(0),
+        state_hash: ContentHash([0; 32]),
+    }];
+    let report = focal_sim::history::check(&initial, &events, 64).unwrap();
+    assert_eq!(report.publications, 2);
+    assert_eq!(report.reads, 0);
+    assert_eq!(report.retries, 0);
+    assert_eq!(report.unknown, 0);
+    assert_eq!(report.pending, 0);
+    let _ = Consistency::Linearizable;
+
+    // One request key committing at two contiguous prefixes is a checker
+    // violation: the second publication reuses key one at sequence two, so the
+    // prefix stays contiguous but the receipt key collides.
+    let duplicate = vec![
+        publications[0].clone(),
+        Event::Publish {
+            receipt: focal_model::MutationReceipt {
+                sequence: SessionSeq(2),
+                ..commit_receipt(&committed[0])
+            },
+            state_hash: ContentHash([1; 32]),
+        },
+    ];
+    assert_eq!(
+        focal_sim::history::check(&initial, &duplicate, 64),
+        Err(focal_sim::history::HistoryError::DuplicateCommit)
+    );
+
+    // Reporting a mutation's success before its publication is premature.
+    let premature = vec![
+        events[0].clone(),
+        Event::Complete {
+            call: 0,
+            outcome: Outcome::Committed(receipts[0].clone()),
+        },
+    ];
+    assert_eq!(
+        focal_sim::history::check(&initial, &premature, 64),
+        Err(focal_sim::history::HistoryError::PrematureSuccess)
+    );
+}

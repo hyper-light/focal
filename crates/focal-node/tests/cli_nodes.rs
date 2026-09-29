@@ -24,7 +24,7 @@ use std::{
     path::Path,
     process::{Child, Command, Output, Stdio},
     sync::mpsc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 struct Server(Child);
@@ -60,12 +60,15 @@ fn failure(root: &Path, args: &[&str]) -> (i32, String) {
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
 }
+#[path = "support/deadline.rs"]
+mod deadline;
 #[path = "support/ports.rs"]
 mod ports;
 fn address() -> String {
     ports::address()
 }
 fn start(root: &Path, address: Option<&str>) -> (Server, Value) {
+    deadline::observe(root);
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
     command.args(["--data-dir", root.to_str().unwrap(), "start"]);
     if let Some(address) = address {
@@ -161,9 +164,9 @@ fn wait_for(
     timeout: Duration,
     condition: impl Fn(&Value) -> bool,
 ) -> Value {
-    let deadline = Instant::now() + timeout;
+    let mut deadline = deadline::Deadline::after(timeout);
     let mut last = None;
-    while Instant::now() < deadline {
+    while deadline.open() {
         if let Some(view) = placement(root) {
             if condition(&view) {
                 return view;
@@ -327,6 +330,15 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     assert_eq!(result["changed"], true);
     assert_eq!(result["generation"], 2);
     assert!(result["operation_id"].as_str().unwrap().starts_with("a1:"));
+    // A remove that follows the drain at once is refused for the copies the
+    // host still holds — never as "not drained": the committed grant is
+    // ineligible even while the partition is still observing it.
+    let (code, report) = failure(
+        founder,
+        &["cluster", "nodes", "remove", "--node", &drained_text],
+    );
+    assert_eq!(code, 5, "{report}");
+    assert!(report.contains("[node_holding]"), "{report}");
     let again = success(
         founder,
         &["cluster", "nodes", "drain", "--node", &drained_text],
@@ -365,7 +377,19 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
     assert_eq!(removed["node"], drained);
     assert_eq!(removed["membership_removed"], true, "{removed}");
     assert_eq!(removed["revoked"], true, "{removed}");
+    assert_eq!(removed["contact_retired"], true, "{removed}");
     let invitation = removed["invitation"].as_str().unwrap().to_owned();
+    // The removed node's committed contact is gone: the bounded contact
+    // table keeps no slot for a node that no longer exists.
+    let listed = success(founder, &["cluster", "nodes", "list"]);
+    assert!(
+        !listed["result"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|contact| contact["node"] == drained),
+        "{listed}"
+    );
     let repeated = success(
         founder,
         &["cluster", "nodes", "remove", "--node", &drained_text],
@@ -373,6 +397,7 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
         .clone();
     assert_eq!(repeated["membership_removed"], false, "{repeated}");
     assert_eq!(repeated["revoked"], false);
+    assert_eq!(repeated["contact_retired"], false, "{repeated}");
     assert_eq!(repeated["invitation"], invitation);
     let inspected = success(founder, &["cluster", "invitations", "get", &invitation]);
     assert_eq!(
@@ -413,9 +438,9 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
                 .is_some_and(|node| node["eligible"] == false && node["generation"] == 2)
         },
     );
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
     let mut refused = None;
-    while Instant::now() < deadline {
+    while deadline.open() {
         let (code, report) = failure(
             founder,
             &["cluster", "nodes", "remove", "--node", &victim_text],
@@ -515,7 +540,7 @@ fn a_drained_host_is_healed_around_removed_once_empty_and_a_drain_without_capaci
 /// then it is refused as holding.
 fn wait_for_removal(founder: &Path, node: u64) -> Value {
     let text = node.to_string();
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(120));
     loop {
         let output = command(founder, &["cluster", "nodes", "remove", "--node", &text]);
         if output.status.success() {
@@ -528,10 +553,7 @@ fn wait_for_removal(founder: &Path, node: u64) -> Value {
                 || stderr.contains("[unavailable]"),
             "{stderr}"
         );
-        assert!(
-            Instant::now() < deadline,
-            "removal stayed refused: {stderr}"
-        );
+        assert!(deadline.open(), "removal stayed refused: {stderr}");
         std::thread::sleep(Duration::from_millis(500));
     }
 }

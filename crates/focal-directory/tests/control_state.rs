@@ -111,6 +111,7 @@ fn nodes(partition: &mut DirectoryPartition) {
                     available_memory: 1_000_000,
                     active_weight: 4 - id,
                     disk_available: 1 << 30,
+                    capability: 0,
                 },
             },
         );
@@ -279,6 +280,7 @@ fn independent_namespace_partitions_never_store_or_mutate_each_others_sessions()
                 available_memory: 100,
                 active_weight: 100,
                 disk_available: 1 << 30,
+                capability: 0,
             },
         },
     };
@@ -558,6 +560,7 @@ fn membership_and_load_reports_bind_verified_node_incarnations() {
                 available_memory: u64::MAX,
                 active_weight: 0,
                 disk_available: 1 << 30,
+                capability: 0,
             },
         },
     };
@@ -592,7 +595,7 @@ fn measured_placement_and_worst_domain_loss_cover_quorum_and_content_independent
         propose_placement(&directory.checkpoint().nodes, &residency, 31, 1),
         Err(DirectoryError::NoPlacement)
     );
-    let mut missing = directory.checkpoint().nodes.clone();
+    let mut missing = directory.checkpoint().nodes.as_ref().clone();
     missing.get_mut(&1).unwrap().enrollment.region = RegionId::from_u128(0);
     assert!(matches!(
         verify_placement(&proposal.spec, &missing, 31),
@@ -700,6 +703,7 @@ fn metadata_partition_transfer_is_sealed_cas_fenced_and_hash_checked() {
                 available_memory: 10,
                 active_weight: 1,
                 disk_available: 1 << 30,
+                capability: 0,
             },
         },
     };
@@ -708,7 +712,11 @@ fn metadata_partition_transfer_is_sealed_cas_fenced_and_hash_checked() {
         Err(DirectoryError::StaleEpoch)
     ));
     let mut tampered = checkpoint;
-    tampered.nodes.get_mut(&1).unwrap().enrollment.endpoint = "wrong:443".into();
+    std::sync::Arc::make_mut(&mut tampered.nodes)
+        .get_mut(&1)
+        .unwrap()
+        .enrollment
+        .endpoint = "wrong:443".into();
     assert!(matches!(
         DirectoryPartition::install_transferred(
             tampered,
@@ -986,8 +994,7 @@ fn recovery_rejects_malformed_pending_fences_and_checkpoint_epochs() {
     );
     let checkpoint = directory.checkpoint().clone();
     let mut malformed = checkpoint.clone();
-    malformed
-        .sessions
+    std::sync::Arc::make_mut(&mut malformed.sessions)
         .get_mut(&session)
         .unwrap()
         .pending
@@ -999,7 +1006,11 @@ fn recovery_rejects_malformed_pending_fences_and_checkpoint_epochs() {
         Err(DirectoryError::StaleEpoch)
     ));
     let mut malformed = checkpoint.clone();
-    malformed.sessions.get_mut(&session).unwrap().authority.kind = SessionFenceKind::Cutover;
+    std::sync::Arc::make_mut(&mut malformed.sessions)
+        .get_mut(&session)
+        .unwrap()
+        .authority
+        .kind = SessionFenceKind::Cutover;
     assert!(matches!(
         DirectoryPartition::restore(malformed, PartitionConfig::default(), budget()),
         Err(DirectoryError::StaleEpoch)
@@ -1011,8 +1022,7 @@ fn recovery_rejects_malformed_pending_fences_and_checkpoint_epochs() {
         Err(DirectoryError::StaleEpoch)
     ));
     let mut malformed = checkpoint;
-    malformed
-        .sessions
+    std::sync::Arc::make_mut(&mut malformed.sessions)
         .get_mut(&session)
         .unwrap()
         .pending

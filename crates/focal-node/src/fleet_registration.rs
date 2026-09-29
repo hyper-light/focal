@@ -7,12 +7,18 @@ use crate::session_registration::HostedSessionFacts;
 const REGISTRATION_BYTES: usize = 64 * 1024;
 
 pub struct RegistrationFactsReply {
-    value: HostedSessionFacts,
+    value: std::sync::Arc<HostedSessionFacts>,
     _charge: Allocation,
 }
 impl RegistrationFactsReply {
     pub fn value(&self) -> &HostedSessionFacts {
-        &self.value
+        self.value.as_ref()
+    }
+    /// Share the facts without copying them: the placement controller reads these
+    /// per session per tick, so a locally hosted session's facts are handed out
+    /// as a refcount bump rather than a deep clone.
+    pub fn value_arc(&self) -> std::sync::Arc<HostedSessionFacts> {
+        std::sync::Arc::clone(&self.value)
     }
 }
 impl ReplicaHost {
@@ -41,11 +47,12 @@ impl Owner {
         &self,
         charge: Allocation,
     ) -> Result<RegistrationFactsReply, LedgerError> {
-        let value =
-            HostedSessionFacts::from_session(&self.session).map_err(|error| match error {
+        let value = std::sync::Arc::new(HostedSessionFacts::from_session(&self.session).map_err(
+            |error| match error {
                 crate::session_registration::SessionRegistrationError::Ledger(error) => error,
                 _ => LedgerError::Capacity,
-            })?;
+            },
+        )?);
         Ok(RegistrationFactsReply {
             value,
             _charge: charge,

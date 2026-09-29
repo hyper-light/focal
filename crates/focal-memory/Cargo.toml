@@ -13,3 +13,7 @@ serde = ["dep:serde"]
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "budget"
+harness = false

@@ -15,6 +15,19 @@ jobs:
         run: cargo install cargo-deny --version 0.20.2 --locked
       - name: Audit dependencies
         run: cargo deny check advisories bans licenses sources
+  model:
+    # The fast track's model (docs/models/FastTrack.tla): every state of the
+    # model a change is checked with, and the rule the core does not follow,
+    # which the checker must refuse.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Java
+        run: java -version
+      - name: Check the model
+        run: bash scripts/check-model.sh
+      - name: The checker refuses the wrong rule
+        run: bash scripts/check-model.sh wrong
   check:
     strategy:
       fail-fast: false
@@ -40,6 +53,10 @@ jobs:
       - name: Production panic policy
         run: bash scripts/check-production.sh
       - name: Tests
-        run: bash scripts/cargo.sh test --workspace --locked
+        # Bound test parallelism to match the release workflow: the multi-node
+        # fleet and runbook tests each spawn several node processes, so running
+        # every test binary at once oversubscribes memory and the node correctly
+        # refuses admission at capacity, failing a test that is otherwise sound.
+        run: bash scripts/cargo.sh test --workspace --locked -- --test-threads=4
       - name: Release build
         run: bash scripts/cargo.sh build --release --workspace --locked

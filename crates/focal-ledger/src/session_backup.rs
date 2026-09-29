@@ -256,9 +256,9 @@ pub mod backup {
             }
             #[cfg(not(unix))]
             std::fs::create_dir(path)?;
-            std::fs::File::open(path)?.sync_all()?;
+            focal_platform::sync_dir(path)?;
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                std::fs::File::open(parent)?.sync_all()?;
+                focal_platform::sync_dir(parent)?;
             }
             Ok(())
         }
@@ -276,13 +276,20 @@ pub mod backup {
             file.write_all(bytes)
         }
         fn sync_file(&mut self, path: &Path) -> std::io::Result<()> {
-            std::fs::File::open(path)?.sync_all()
+            // Open with write access: FlushFileBuffers rejects a read-only handle
+            // on Windows. write(true) without truncate reopens the existing file
+            // in place; fsync/FlushFileBuffers then makes its bytes durable.
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)?
+                .sync_all()
         }
         fn sync_dir(&mut self, path: &Path) -> std::io::Result<()> {
-            std::fs::File::open(path)?.sync_all()
+            focal_platform::sync_dir(path)
         }
         fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
-            std::fs::rename(from, to)
+            focal_platform::fs::atomic_replace(from, to)
         }
         fn exists(&self, path: &Path) -> bool {
             path.exists()
@@ -586,13 +593,13 @@ pub mod backup {
             let page = core.native_content_roots(cursor, PAGE)?;
             for root in page.roots {
                 match root {
-                    ContentRoot::Artifact(pointer) | ContentRoot::Inline(pointer) => {
+                    ContentRoot::Artifact { pointer, .. } | ContentRoot::Inline { pointer, .. } => {
                         if pointer.domain != domain {
                             return Err(BackupError::Corrupt("artifact domain"));
                         }
                         objects.insert(pointer.root);
                     }
-                    ContentRoot::Bundle { root, bytes } => {
+                    ContentRoot::Bundle { root, bytes, .. } => {
                         objects.insert(root);
                         bundles.try_reserve_exact(1).map_err(|_| BackupError::Capacity)?;
                         bundles.push((root, bytes));

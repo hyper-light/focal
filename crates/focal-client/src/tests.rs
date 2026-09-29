@@ -141,7 +141,7 @@ fn missing_time_driver_and_panicking_transport_do_not_unwind_or_replace_write_id
 async fn embedded_transport_checks_managed_syntax_capability_before_dispatch() {
     struct Legacy;
     impl RequestHandler for Legacy {
-        fn handle(&self, request: VerifiedRequest) -> HandlerFuture<'_> {
+        fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
             assert_eq!(request.request().protocol, PROTOCOL_VERSION);
             Box::pin(async move {
                 request
@@ -301,6 +301,75 @@ async fn lost_reply_retries_the_identical_command_and_request_identity() {
     let expected = request();
     let response = client.submit(expected.clone()).await.unwrap();
     assert_eq!(response, MutationReply::Committed(receipt(&expected)));
+}
+/// Answers `Unavailable` for the first `refusals` requests, then commits.
+struct UnavailableThen {
+    requests: Mutex<Vec<RequestEnvelope>>,
+    refusals: usize,
+}
+impl ClientTransport for UnavailableThen {
+    fn request<'a>(
+        &'a self,
+        _route: Option<&'a RouteHint>,
+        request: &'a RequestEnvelope,
+    ) -> TransportFuture<'a> {
+        Box::pin(async move {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request.clone());
+            assert_eq!(request, &super::tests::request());
+            if requests.len() <= self.refusals {
+                return Ok(request.reply(Response::Error(AccessError::Unavailable)));
+            }
+            Ok(
+                request.reply(Response::Submitted(MutationReply::Committed(receipt(
+                    request,
+                )))),
+            )
+        })
+    }
+}
+/// An availability refusal admitted nothing: the identical request is
+/// resent with backoff past the attempts kept for lost replies, and one
+/// that outlasts the clock is reported as the refusal, never as an unknown
+/// outcome or a transport failure.
+#[tokio::test]
+async fn availability_refusals_are_resent_within_the_clock_and_reported_as_refusals() {
+    let client = Client::new(
+        UnavailableThen {
+            requests: Mutex::new(vec![]),
+            refusals: 9,
+        },
+        policy(),
+        WireLimits::default(),
+        8,
+    )
+    .unwrap();
+    let expected = request();
+    let response = client.submit(expected.clone()).await.unwrap();
+    assert_eq!(response, MutationReply::Committed(receipt(&expected)));
+    assert_eq!(client.transport().requests.lock().unwrap().len(), 10);
+    let client = Client::new(
+        UnavailableThen {
+            requests: Mutex::new(vec![]),
+            refusals: usize::MAX,
+        },
+        RetryPolicy {
+            max_attempts: 3,
+            max_elapsed: Duration::from_millis(200),
+            base_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(20),
+        },
+        WireLimits::default(),
+        8,
+    )
+    .unwrap();
+    let error = client.submit(expected.clone()).await.unwrap_err();
+    assert!(
+        matches!(error, ClientError::Access(AccessError::Unavailable)),
+        "{error:?}"
+    );
+    let sent = client.transport().requests.lock().unwrap().len();
+    assert!(sent > 3 && sent <= 64, "{sent}");
 }
 #[tokio::test]
 async fn exhausted_retry_retains_exact_request_and_redacts_error_payload() {
@@ -472,3 +541,184 @@ fn unrepresentable_retry_deadlines_are_rejected_before_scheduling() {
 
 #[path = "retry_uncertainty_tests.rs"]
 mod retry_uncertainty;
+
+// A transport that answers every request with a committed receipt, so the trace
+// hook sees a definite `Committed` outcome.
+struct AlwaysCommits;
+impl ClientTransport for AlwaysCommits {
+    fn request<'a>(
+        &'a self,
+        _route: Option<&'a RouteHint>,
+        request: &'a RequestEnvelope,
+    ) -> TransportFuture<'a> {
+        Box::pin(async move {
+            Ok(
+                request.reply(Response::Submitted(MutationReply::Committed(receipt(
+                    request,
+                )))),
+            )
+        })
+    }
+}
+
+// A transport that refuses with an access error, so the trace hook sees a
+// definite `Refused` outcome.
+struct AlwaysRefuses;
+impl ClientTransport for AlwaysRefuses {
+    fn request<'a>(
+        &'a self,
+        _route: Option<&'a RouteHint>,
+        request: &'a RequestEnvelope,
+    ) -> TransportFuture<'a> {
+        Box::pin(async move { Ok(request.reply(Response::Error(AccessError::Unauthorized))) })
+    }
+}
+
+#[derive(Default)]
+struct RecordingSink {
+    entries: Mutex<Vec<TraceEntry>>,
+}
+impl TraceSink for RecordingSink {
+    fn record(&self, entry: TraceEntry) {
+        if let Ok(mut entries) = self.entries.lock() {
+            entries.push(entry);
+        }
+    }
+}
+
+#[tokio::test]
+async fn trace_records_committed_exchange_with_envelope_identity() {
+    let sink = std::sync::Arc::new(RecordingSink::default());
+    struct Shared(std::sync::Arc<RecordingSink>);
+    impl TraceSink for Shared {
+        fn record(&self, entry: TraceEntry) {
+            self.0.record(entry);
+        }
+    }
+    let client = Client::new(AlwaysCommits, policy(), WireLimits::default(), 1)
+        .unwrap()
+        .with_trace(Box::new(Shared(std::sync::Arc::clone(&sink))));
+    let req = request();
+    let response = client.request(req.clone()).await.unwrap();
+    assert!(matches!(
+        response.result,
+        Response::Submitted(MutationReply::Committed(_))
+    ));
+    let entries = sink.entries.lock().unwrap();
+    assert_eq!(entries.len(), 1, "exactly one exchange traced");
+    let entry = &entries[0];
+    assert_eq!(entry.call, 0, "first call numbered zero");
+    assert_eq!(entry.ledger, req.ledger);
+    assert_eq!(entry.request_epoch, req.request_epoch);
+    assert_eq!(entry.request_id, req.request_id);
+    assert!(entry.mutation, "Submit is a mutation");
+    assert!(
+        entry.completed_nanos >= entry.invoked_nanos,
+        "monotone stamps"
+    );
+    assert_eq!(
+        entry.outcome,
+        TraceOutcome::Committed {
+            sequence: SessionSeq(12),
+            command_hash: ContentHash([9; 32]),
+        }
+    );
+}
+
+#[tokio::test]
+async fn trace_numbers_calls_monotonically_and_records_refusals() {
+    let sink = std::sync::Arc::new(RecordingSink::default());
+    struct Shared(std::sync::Arc<RecordingSink>);
+    impl TraceSink for Shared {
+        fn record(&self, entry: TraceEntry) {
+            self.0.record(entry);
+        }
+    }
+    let client = Client::new(AlwaysRefuses, policy(), WireLimits::default(), 1)
+        .unwrap()
+        .with_trace(Box::new(Shared(std::sync::Arc::clone(&sink))));
+    // Two reads: refusals leave nothing admitted and must not become Unknown.
+    let read = RequestEnvelope {
+        operation: Operation::Read(ReadRequest {
+            consistency: ReadConsistency::Linearizable,
+            query: ReadQuery::Objects(vec![ObjectRef::claim(
+                request().ledger,
+                ClaimId::from_u128(5),
+            )]),
+            max_items: 1,
+        }),
+        ..request()
+    };
+    // A refused read surfaces as an error to the caller, but the exchange is
+    // still traced (as a definite `Refused`).
+    assert!(matches!(
+        client.request(read.clone()).await,
+        Err(ClientError::Access(_))
+    ));
+    assert!(matches!(
+        client.request(read).await,
+        Err(ClientError::Access(_))
+    ));
+    let entries = sink.entries.lock().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].call, 0);
+    assert_eq!(entries[1].call, 1);
+    assert!(!entries[0].mutation, "Read is not a mutation");
+    assert_eq!(entries[0].outcome, TraceOutcome::Refused);
+    assert_eq!(entries[1].outcome, TraceOutcome::Refused);
+}
+
+#[tokio::test]
+async fn untraced_client_needs_no_sink() {
+    // The default client has no trace; requests still complete normally.
+    let client = Client::new(AlwaysCommits, policy(), WireLimits::default(), 1).unwrap();
+    let response = client.request(request()).await.unwrap();
+    assert!(matches!(
+        response.result,
+        Response::Submitted(MutationReply::Committed(_))
+    ));
+}
+
+// Finding 2 (audit 2026-09-13): a Duplicate domain reply is a committed-on-retry
+// proof; it must trace as Committed, not Unknown.
+#[tokio::test]
+async fn a_duplicate_domain_reply_traces_as_committed() {
+    struct DuplicateReply;
+    impl ClientTransport for DuplicateReply {
+        fn request<'a>(
+            &'a self,
+            _: Option<&'a RouteHint>,
+            request: &'a RequestEnvelope,
+        ) -> TransportFuture<'a> {
+            Box::pin(async move {
+                Ok(request.reply(Response::Submitted(MutationReply::Domain(
+                    DomainOutcome::Duplicate(Box::new(receipt(request))),
+                ))))
+            })
+        }
+    }
+    struct Shared(std::sync::Arc<RecordingSink>);
+    impl TraceSink for Shared {
+        fn record(&self, entry: TraceEntry) {
+            self.0.record(entry);
+        }
+    }
+    let sink = std::sync::Arc::new(RecordingSink::default());
+    let client = Client::new(DuplicateReply, policy(), WireLimits::default(), 1)
+        .unwrap()
+        .with_trace(Box::new(Shared(std::sync::Arc::clone(&sink))));
+    let reply = client.submit(request()).await.unwrap();
+    assert!(matches!(
+        reply,
+        MutationReply::Domain(DomainOutcome::Duplicate(_))
+    ));
+    let entries = sink.entries.lock().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].outcome,
+        TraceOutcome::Committed {
+            sequence: SessionSeq(12),
+            command_hash: ContentHash([9; 32]),
+        }
+    );
+}

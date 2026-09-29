@@ -110,15 +110,27 @@ impl GossipBuffer {
     /// broadcast first, each counted as broadcast once more; an update that
     /// reached its count leaves the buffer.
     pub fn piggyback(&mut self) -> Vec<LivenessUpdate> {
-        let mut order: Vec<(u32, u64)> = self
-            .entries
-            .iter()
-            .filter(|(_, entry)| entry.broadcasts < entry.max_broadcasts)
-            .map(|(node, entry)| (entry.broadcasts, *node))
-            .collect();
+        // Charge the working set, then select the MAX_PIGGYBACK least-broadcast
+        // updates with a partial select (O(n)) rather than a full sort (O(n log
+        // n)); the few selected are then ordered least-broadcast first, so the
+        // result is identical to a full sort followed by take(MAX_PIGGYBACK).
+        let mut order: Vec<(u32, u64)> = Vec::new();
+        if order.try_reserve_exact(self.entries.len()).is_err() {
+            return Vec::new();
+        }
+        order.extend(
+            self.entries
+                .iter()
+                .filter(|(_, entry)| entry.broadcasts < entry.max_broadcasts)
+                .map(|(node, entry)| (entry.broadcasts, *node)),
+        );
+        if order.len() > MAX_PIGGYBACK {
+            order.select_nth_unstable(MAX_PIGGYBACK);
+            order.truncate(MAX_PIGGYBACK);
+        }
         order.sort_unstable();
         let mut selected = Vec::new();
-        if selected.try_reserve_exact(MAX_PIGGYBACK).is_err() {
+        if selected.try_reserve_exact(order.len()).is_err() {
             return selected;
         }
         for (_, node) in order.into_iter().take(MAX_PIGGYBACK) {

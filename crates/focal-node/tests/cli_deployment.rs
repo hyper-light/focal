@@ -25,7 +25,7 @@ use std::{
     path::Path,
     process::{Child, Command, Output, Stdio},
     sync::mpsc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 struct Server(Child);
@@ -63,12 +63,15 @@ fn failure(root: &Path, config: Option<&Path>, args: &[&str]) -> (i32, String) {
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
 }
+#[path = "support/deadline.rs"]
+mod deadline;
 #[path = "support/ports.rs"]
 mod ports;
 fn address() -> String {
     ports::address()
 }
 fn start(root: &Path, config: Option<&Path>, address: Option<&str>) -> (Server, Value) {
+    deadline::observe(root);
     let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
     command.args(["--data-dir", root.to_str().unwrap()]);
     if let Some(config) = config {
@@ -148,9 +151,9 @@ fn wait_for(
     timeout: Duration,
     condition: impl Fn(&Value) -> bool,
 ) -> Value {
-    let deadline = Instant::now() + timeout;
+    let mut deadline = deadline::Deadline::after(timeout);
     let mut last = None;
-    while Instant::now() < deadline {
+    while deadline.open() {
         if let Some(view) = placement(root) {
             if condition(&view) {
                 return view;
@@ -609,12 +612,43 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
     assert_eq!(code, 2, "{report}");
     assert!(report.contains("[committed_policy]"), "{report}");
     assert!(report.contains("durability.max_failures"), "{report}");
+    // Explain observes the running directory (08 §9): the three-host fleet
+    // provides the committed `max_failures` 1 and the session has applied
+    // it, so the plan is valid and the guarantee is active. The observed
+    // section names every node and the session's achieved level.
     let explained = explain(founder, None);
-    assert_eq!(
-        explained["condition"], "GuaranteeUnsatisfied",
-        "one local node"
-    );
+    assert_eq!(explained["condition"], "PlanValid", "{explained}");
+    assert_eq!(explained["activated"], true, "{explained}");
     assert_eq!(explained["committed_revision"], 2);
     assert_eq!(explained["effective"]["durability"]["max_failures"], 1);
     assert_eq!(explained["requested"]["durability"]["max_failures"], 1);
+    let observed = &explained["observed"];
+    assert!(
+        observed["nodes"].as_array().unwrap().len() >= 3,
+        "{explained}"
+    );
+    assert_eq!(
+        observed["sessions"][0]["achieved"]["max_failures"], 1,
+        "{explained}"
+    );
+    // Explained against a single-node inventory instead, the committed
+    // policy cannot be satisfied and the guarantee is unmet.
+    let inventory = files.join("one-node.json");
+    std::fs::write(
+        &inventory,
+        serde_json::json!([{"id": 1, "topology": {"zone": null, "region": null}, "verified": true, "eligible": true}]).to_string(),
+    )
+    .unwrap();
+    let (code, report) = failure(
+        founder,
+        None,
+        &[
+            "deployment",
+            "explain",
+            "--inventory",
+            inventory.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(code, 9, "{report}");
+    assert!(report.contains("[guarantee_unsatisfied]"), "{report}");
 }

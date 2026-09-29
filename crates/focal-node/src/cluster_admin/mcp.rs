@@ -13,6 +13,14 @@ impl AdminBackend for ClusterAdmin {
                     self.operator(crate::network_admin::OperatorRead::Identity)
                         .await
                 }
+                AdminAction::NodeReadiness => {
+                    self.operator(crate::network_admin::OperatorRead::Readiness)
+                        .await
+                }
+                AdminAction::NodeMetrics => {
+                    self.operator(crate::network_admin::OperatorRead::Metrics)
+                        .await
+                }
                 AdminAction::NodeHealth => {
                     self.operator(crate::network_admin::OperatorRead::Health)
                         .await
@@ -59,6 +67,26 @@ impl AdminBackend for ClusterAdmin {
                 }
                 AdminAction::BackupVerify { input } => {
                     ClusterAdmin::backup_verify(std::path::Path::new(&input))
+                }
+                AdminAction::Repair {
+                    tenant,
+                    session,
+                    after,
+                    limit,
+                } => {
+                    self.repair(
+                        focal_model::LedgerId {
+                            tenant: tenant
+                                .map(focal_model::TenantId)
+                                .unwrap_or(self.identity.ledger.tenant),
+                            session: session
+                                .map(focal_model::SessionId)
+                                .unwrap_or(self.identity.ledger.session),
+                        },
+                        after,
+                        limit,
+                    )
+                    .await
                 }
                 AdminAction::Restore {
                     input,
@@ -163,10 +191,13 @@ impl AdminBackend for ClusterAdmin {
                     expected_revision,
                 } => self.revoke(id, expected_revision).await,
                 AdminAction::RenewCredential => self.renew_credential().await,
+                AdminAction::RotateCredential => self.rotate_credential().await,
                 AdminAction::Placement => self.placement().await,
                 AdminAction::Plan => self.plan().await,
                 AdminAction::AdmitTenant { tenant } => self.admit_tenant(tenant).await,
                 AdminAction::Tenants => self.tenants().await,
+                AdminAction::UpgradeStatus => self.upgrade_status().await,
+                AdminAction::ActivateFence { level } => self.activate_fence(level).await,
                 AdminAction::CreateSession { tenant, name } => {
                     self.create_session(tenant, &name).await
                 }

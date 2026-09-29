@@ -5,9 +5,8 @@ use focal_client::{
     operation_store::{OperationStore, StoreError, StoreLimits},
     pending::OperationContext,
 };
-use fs2::FileExt;
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
 };
@@ -128,11 +127,8 @@ struct Bootstrap {
 }
 impl Bootstrap {
     fn open(root: &Path) -> std::result::Result<Self, BootstrapError> {
-        use std::os::unix::fs::MetadataExt;
-        let metadata = fs::symlink_metadata(root)?;
-        if !metadata.is_dir() || metadata.mode() & 0o077 != 0 {
-            return Err(BootstrapError::Permissions);
-        }
+        let owner =
+            focal_platform::fs::private_dir_owner(root)?.ok_or(BootstrapError::Permissions)?;
         let lock_path = root.join(LOCK);
         let first = !exists(&lock_path)?;
         if first {
@@ -140,22 +136,18 @@ impl Bootstrap {
                 return Err(BootstrapError::Incomplete);
             }
         } else {
-            check_file(&lock_path, metadata.uid())?;
+            check_file(&lock_path, &owner)?;
         }
-        let lock = options()
-            .read(true)
-            .write(true)
-            .create_new(first)
-            .open(&lock_path)
-            .map_err(|error| {
+        let lock =
+            focal_platform::fs::open_private(&lock_path, true, true, first).map_err(|error| {
                 if error.kind() == std::io::ErrorKind::AlreadyExists {
                     BootstrapError::Locked
                 } else {
                     error.into()
                 }
             })?;
-        check_open_file(&lock_path, &lock, metadata.uid())?;
-        lock.try_lock_exclusive().map_err(|error| {
+        check_open_file(&lock_path, &lock, &owner)?;
+        focal_platform::try_lock_exclusive(&lock).map_err(|error| {
             if error.kind() == std::io::ErrorKind::WouldBlock {
                 BootstrapError::Locked
             } else {
@@ -164,7 +156,10 @@ impl Bootstrap {
         })?;
         if first {
             lock.sync_all()?;
-            File::open(root)?.sync_all()?;
+            #[cfg(unix)]
+            {
+                File::open(root)?.sync_all()?;
+            }
         }
         Ok(Self {
             root: root.into(),
@@ -199,26 +194,26 @@ impl Bootstrap {
         }
     }
     fn write_marker(&self, context: &OperationContext) -> std::result::Result<(), BootstrapError> {
-        let mut file = options()
-            .write(true)
-            .create_new(true)
-            .open(self.root.join(MARKER))?;
+        let mut file =
+            focal_platform::fs::open_private(&self.root.join(MARKER), false, true, true)?;
         file.write_all(MAGIC)?;
         for field in fields(context) {
             file.write_all(field)?;
         }
         file.write_all(digest(context).as_bytes())?;
         file.sync_all()?;
-        File::open(&self.root)?.sync_all()?;
+        #[cfg(unix)]
+        {
+            File::open(&self.root)?.sync_all()?;
+        }
         Ok(())
     }
     fn read_marker(&self, context: &OperationContext) -> std::result::Result<(), BootstrapError> {
-        use std::os::unix::fs::MetadataExt;
         let path = self.root.join(MARKER);
-        let owner = fs::metadata(&self.root)?.uid();
-        check_file(&path, owner)?;
+        let owner = focal_platform::fs::owner_at(&self.root)?;
+        check_file(&path, &owner)?;
         let mut file = File::open(&path)?;
-        check_open_file(&path, &file, owner)?;
+        check_open_file(&path, &file, &owner)?;
         if file.metadata()?.len() != MARKER_BYTES {
             return Err(BootstrapError::Incomplete);
         }
@@ -244,8 +239,14 @@ impl Bootstrap {
         if mismatch {
             return Err(BootstrapError::Context);
         }
-        file.sync_all()?;
-        File::open(&self.root)?.sync_all()?;
+        // The marker was written and synced by its installer before it could be
+        // read back; a read handle needs no re-sync (FlushFileBuffers rejects a
+        // read-only handle on Windows). The directory entry is fenced below.
+        drop(file);
+        #[cfg(unix)]
+        {
+            File::open(&self.root)?.sync_all()?;
+        }
         Ok(())
     }
     #[cfg(test)]
@@ -274,12 +275,6 @@ fn digest(context: &OperationContext) -> blake3::Hash {
     }
     hash.finalize()
 }
-fn options() -> OpenOptions {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut options = OpenOptions::new();
-    options.mode(0o600);
-    options
-}
 fn exists(path: &Path) -> std::result::Result<bool, BootstrapError> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -287,43 +282,40 @@ fn exists(path: &Path) -> std::result::Result<bool, BootstrapError> {
         Err(error) => Err(error.into()),
     }
 }
-fn check_file(path: &Path, owner: u32) -> std::result::Result<(), BootstrapError> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            BootstrapError::Incomplete
-        } else {
-            error.into()
+fn check_file(
+    path: &Path,
+    owner: &focal_platform::fs::Owner,
+) -> std::result::Result<(), BootstrapError> {
+    match focal_platform::fs::check_private_file(path, owner, 1) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(BootstrapError::Permissions),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(BootstrapError::Incomplete)
         }
-    })?;
-    if !metadata.is_file()
-        || metadata.mode() & 0o077 != 0
-        || metadata.uid() != owner
-        || metadata.nlink() != 1
-    {
-        return Err(BootstrapError::Permissions);
+        Err(error) => Err(error.into()),
     }
-    Ok(())
 }
 fn check_open_file(
     path: &Path,
     file: &File,
-    owner: u32,
+    owner: &focal_platform::fs::Owner,
 ) -> std::result::Result<(), BootstrapError> {
-    use std::os::unix::fs::MetadataExt;
-    check_file(path, owner)?;
-    let path_metadata = fs::symlink_metadata(path)?;
-    let metadata = file.metadata()?;
-    if metadata.dev() != path_metadata.dev()
-        || metadata.ino() != path_metadata.ino()
-        || !metadata.is_file()
-        || metadata.mode() & 0o077 != 0
-        || metadata.uid() != owner
-        || metadata.nlink() != 1
-    {
-        return Err(BootstrapError::Permissions);
+    match focal_platform::fs::check_open_private_file(path, file, owner) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(BootstrapError::Permissions),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(BootstrapError::Incomplete)
+        }
+        Err(error) => Err(error.into()),
     }
-    Ok(())
+}
+
+#[cfg(all(test, unix))]
+fn options() -> std::fs::OpenOptions {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = std::fs::OpenOptions::new();
+    options.mode(0o600);
+    options
 }
 
 #[cfg(test)]
@@ -337,10 +329,15 @@ enum Fault {
 mod tests {
     use super::*;
     use focal_model::{LedgerId, ParticipantId, SessionId, TenantId};
-    use std::os::unix::fs::{PermissionsExt, symlink};
     fn private_root() -> tempfile::TempDir {
         let temp = tempfile::tempdir().unwrap();
-        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        // Unix tightens the temp dir to 0700; a fresh Windows temp dir already
+        // inherits an owner-only DACL from the temp root.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
         temp
     }
     fn context() -> OperationContext {
@@ -362,14 +359,18 @@ mod tests {
         let store = open(temp.path()).unwrap();
         assert_eq!(store.root(), temp.path().join(STORE));
         assert_eq!(store.usage().unwrap().operations, 0);
-        assert_eq!(
-            fs::metadata(temp.path().join(MARKER))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(temp.path().join(MARKER))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
         let original = fs::read(temp.path().join(STORE).join("catalogue.bin")).unwrap();
         let boot = Bootstrap::open(temp.path()).unwrap();
         let mut other = context();
@@ -432,30 +433,39 @@ mod tests {
         fs::write(&marker, corrupt).unwrap();
         assert!(matches!(open(temp.path()), Err(BootstrapError::Incomplete)));
         fs::write(&marker, &original).unwrap();
-        fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(matches!(
-            open(temp.path()),
-            Err(BootstrapError::Permissions)
-        ));
-        fs::remove_file(&marker).unwrap();
-        symlink(temp.path().join("missing"), &marker).unwrap();
-        assert!(matches!(
-            open(temp.path()),
-            Err(BootstrapError::Permissions)
-        ));
-        fs::remove_file(&marker).unwrap();
-        let mut file = options()
-            .write(true)
-            .create_new(true)
-            .open(&marker)
-            .unwrap();
-        file.write_all(&original).unwrap();
-        drop(file);
-        fs::hard_link(&marker, temp.path().join("linked")).unwrap();
-        assert!(matches!(
-            open(temp.path()),
-            Err(BootstrapError::Permissions)
-        ));
+        // POSIX permission/symlink/hardlink rejection: a group/other-readable
+        // mode, a reparse-point marker and a multiply-linked marker are all
+        // refused. Windows enforces the private-file contract through DACLs,
+        // reparse-point refusal and the file link count instead (covered by the
+        // focal-platform FFI suite), so this shape is Unix-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{PermissionsExt, symlink};
+            fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(matches!(
+                open(temp.path()),
+                Err(BootstrapError::Permissions)
+            ));
+            fs::remove_file(&marker).unwrap();
+            symlink(temp.path().join("missing"), &marker).unwrap();
+            assert!(matches!(
+                open(temp.path()),
+                Err(BootstrapError::Permissions)
+            ));
+            fs::remove_file(&marker).unwrap();
+            let mut file = options()
+                .write(true)
+                .create_new(true)
+                .open(&marker)
+                .unwrap();
+            file.write_all(&original).unwrap();
+            drop(file);
+            fs::hard_link(&marker, temp.path().join("linked")).unwrap();
+            assert!(matches!(
+                open(temp.path()),
+                Err(BootstrapError::Permissions)
+            ));
+        }
     }
     #[test]
     fn entered_async_runtime_is_rejected_before_any_context_or_bootstrap_io() {

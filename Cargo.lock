@@ -154,6 +154,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-lc-rs"
+version = "1.18.1"
+dependencies = [
+ "aws-lc-sys",
+ "untrusted 0.7.1",
+ "zeroize",
+]
+
+[[package]]
+name = "aws-lc-sys"
+version = "0.45.0"
+dependencies = [
+ "cc",
+ "cmake",
+ "dunce",
+ "fs_extra",
+ "pkg-config",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -218,6 +238,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "005ec2760ca554fae18df7a11195552ec576cd665632a881bc011d5bb2fd4d80"
 dependencies = [
  "find-msvc-tools",
+ "jobserver",
+ "libc",
  "shlex",
 ]
 
@@ -292,6 +314,15 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
+
+[[package]]
+name = "cmake"
+version = "0.1.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "cobs"
@@ -374,6 +405,12 @@ dependencies = [
  "quote",
  "syn 3.0.5",
 ]
+
+[[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "either"
@@ -462,8 +499,8 @@ dependencies = [
  "focal-core",
  "focal-evidence",
  "focal-model",
+ "focal-platform",
  "focal-wire",
- "fs2",
  "postcard",
  "serde",
  "serde-saphyr",
@@ -479,10 +516,12 @@ version = "0.1.0"
 dependencies = [
  "focal-log",
  "focal-memory",
+ "focal-raft",
+ "focal-sim",
+ "focal-timing",
+ "getrandom 0.3.4",
  "postcard",
- "raft",
  "serde",
- "slog",
  "tempfile",
  "thiserror 2.0.20",
 ]
@@ -538,14 +577,14 @@ dependencies = [
 name = "focal-enrollment"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "blake3",
  "focal-log",
- "fs2",
+ "focal-platform",
  "getrandom 0.3.4",
  "postcard",
  "quinn",
  "rcgen 0.14.10",
- "ring",
  "rustls",
  "serde",
  "tempfile",
@@ -563,7 +602,7 @@ dependencies = [
  "blake3",
  "focal-memory",
  "focal-model",
- "fs2",
+ "focal-platform",
  "postcard",
  "serde",
  "serde_json",
@@ -596,6 +635,7 @@ dependencies = [
  "focal-graph",
  "focal-memory",
  "focal-model",
+ "focal-platform",
  "focal-ranges",
  "focal-sim",
  "focal-stream",
@@ -606,12 +646,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "focal-load"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "focal-client",
+ "focal-core",
+ "focal-ledger",
+ "focal-model",
+ "focal-node",
+ "focal-wire",
+ "getrandom 0.3.4",
+ "serde",
+ "serde-saphyr",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "focal-log"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
  "focal-memory",
- "fs2",
+ "focal-platform",
  "postcard",
  "serde",
  "tempfile",
@@ -694,11 +753,13 @@ dependencies = [
  "focal-model",
  "focal-native-client",
  "focal-node",
+ "focal-platform",
  "focal-ranges",
  "focal-runtime",
+ "focal-sim",
  "focal-stream",
+ "focal-timing",
  "focal-wire",
- "fs2",
  "futures-util",
  "getrandom 0.3.4",
  "postcard",
@@ -712,6 +773,26 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "zeroize",
+]
+
+[[package]]
+name = "focal-platform"
+version = "0.1.0"
+dependencies = [
+ "rustix 1.1.4",
+ "tempfile",
+ "tokio",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "focal-raft"
+version = "0.1.0"
+dependencies = [
+ "raft",
+ "raft-proto",
+ "slog",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -762,15 +843,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "focal-timing"
+version = "0.1.0"
+
+[[package]]
 name = "focal-wire"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "bytes",
  "focal-memory",
  "focal-model",
+ "focal-platform",
+ "focal-sim",
  "focal-stream",
+ "focal-timing",
+ "futures-util",
  "postcard",
  "quinn",
+ "quinn-proto",
  "rcgen 0.13.2",
  "rustls",
  "serde",
@@ -781,14 +872,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "fs2"
-version = "0.4.3"
+name = "fs_extra"
+version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
-dependencies = [
- "libc",
- "winapi",
-]
+checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "futures-core"
@@ -954,6 +1041,16 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
+
+[[package]]
+name = "jobserver"
+version = "0.1.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
+dependencies = [
+ "getrandom 0.4.3",
+ "libc",
+]
 
 [[package]]
 name = "js-sys"
@@ -1128,6 +1225,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
+name = "pkg-config"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
+
+[[package]]
 name = "postcard"
 version = "1.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1274,10 +1377,11 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.17"
+version = "0.11.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04759210543be93709136e28212294a659ef5001836ff4eab4d663e4529bba83"
+checksum = "a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc"
 dependencies = [
+ "aws-lc-rs",
  "bytes",
  "getrandom 0.4.3",
  "lru-slab",
@@ -1414,7 +1518,7 @@ version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75e669e5202259b5314d1ea5397316ad400819437857b90861765f24c4cf80a2"
 dependencies = [
- "ring",
+ "aws-lc-rs",
  "rustls-pki-types",
  "time",
  "yasna 0.5.2",
@@ -1426,7 +1530,7 @@ version = "0.14.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8774e05a7d0de114588e6a28fe7e71694b82614ed569d86d8b389dfbc98b8ad8"
 dependencies = [
- "ring",
+ "aws-lc-rs",
  "rustls-pki-types",
  "time",
  "x509-parser",
@@ -1473,7 +1577,7 @@ dependencies = [
  "cfg-if",
  "getrandom 0.2.17",
  "libc",
- "untrusted",
+ "untrusted 0.9.0",
  "windows-sys 0.52.0",
 ]
 
@@ -1529,12 +1633,12 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
+ "aws-lc-rs",
  "once_cell",
- "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -1557,9 +1661,10 @@ version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
+ "aws-lc-rs",
  "ring",
  "rustls-pki-types",
- "untrusted",
+ "untrusted 0.9.0",
 ]
 
 [[package]]
@@ -1919,6 +2024,12 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "untrusted"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a156c684c91ea7d62626509bce3cb4e1d9ed5c4d978f7b4352658f96a4c26b4a"
+
+[[package]]
+name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
@@ -2010,28 +2121,6 @@ dependencies = [
  "once_cell",
  "rustix 0.38.44",
 ]
-
-[[package]]
-name = "winapi"
-version = "0.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419"
-dependencies = [
- "winapi-i686-pc-windows-gnu",
- "winapi-x86_64-pc-windows-gnu",
-]
-
-[[package]]
-name = "winapi-i686-pc-windows-gnu"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
-
-[[package]]
-name = "winapi-x86_64-pc-windows-gnu"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "windows-link"
@@ -2134,12 +2223,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d43b0f71ce057da06bc0851b23ee24f3f86190b07203dd8f567d0b706a185202"
 dependencies = [
  "asn1-rs",
+ "aws-lc-rs",
  "data-encoding",
  "der-parser",
  "lazy_static",
  "nom",
  "oid-registry",
- "ring",
  "rusticata-macros",
  "thiserror 2.0.20",
  "time",

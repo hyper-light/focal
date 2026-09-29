@@ -1,0 +1,29 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: focal-founder
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: focal
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: focal
+      app.kubernetes.io/component: founder
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: focal-hosts
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: focal
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  maxUnavailable: {{ .Values.maxFailures }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: focal
+      app.kubernetes.io/component: host

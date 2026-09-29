@@ -80,8 +80,8 @@ impl EnrollmentRegistry {
             server_fingerprint(&proof.certificate),
             proof.statement_hash,
         );
-        ring::signature::UnparsedPublicKey::new(
-            &ring::signature::ECDSA_P256_SHA256_ASN1,
+        aws_lc_rs::signature::UnparsedPublicKey::new(
+            &aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1,
             certificate.public_key().subject_public_key.data.as_ref(),
         )
         .verify(&message, &proof.signature)

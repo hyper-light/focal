@@ -206,6 +206,14 @@ const MAX_BLOCKERS: usize = 256;
 
 /// Measure the active placement against the node registry and report the
 /// pending plan's outstanding work. Bounded by the placement's member count.
+fn push(blocked_by: &mut Vec<Blocker>, blocker: Blocker) -> Result<(), DirectoryError> {
+    if blocked_by.len() >= MAX_BLOCKERS {
+        return Err(DirectoryError::Capacity);
+    }
+    blocked_by.push(blocker);
+    Ok(())
+}
+
 pub fn effective_guarantee(
     session: &SessionDescriptor,
     nodes: &BTreeMap<u64, NodeRecord>,
@@ -220,13 +228,6 @@ pub fn effective_guarantee(
     blocked_by
         .try_reserve_exact(MAX_BLOCKERS)
         .map_err(|_| DirectoryError::Memory(focal_memory::MemoryError::AllocationFailed))?;
-    let mut push = |blocker: Blocker| -> Result<(), DirectoryError> {
-        if blocked_by.len() >= MAX_BLOCKERS {
-            return Err(DirectoryError::Capacity);
-        }
-        blocked_by.push(blocker);
-        Ok(())
-    };
     let class = session.active.policy.durability.survive;
     let mut evaluable = true;
     let mut tolerated = u16::MAX;
@@ -239,39 +240,54 @@ pub fn effective_guarantee(
         let mut alive = 0_usize;
         for (id, generation) in members {
             let Some(node) = nodes.get(id) else {
-                push(Blocker {
-                    node: Some(*id),
-                    reason: BlockReason::MissingNode,
-                })?;
+                push(
+                    &mut blocked_by,
+                    Blocker {
+                        node: Some(*id),
+                        reason: BlockReason::MissingNode,
+                    },
+                )?;
                 continue;
             };
             if node.enrollment.generation != *generation {
-                push(Blocker {
-                    node: Some(*id),
-                    reason: BlockReason::StaleNode,
-                })?;
+                push(
+                    &mut blocked_by,
+                    Blocker {
+                        node: Some(*id),
+                        reason: BlockReason::StaleNode,
+                    },
+                )?;
                 continue;
             }
             if !node.enrollment.eligible {
-                push(Blocker {
-                    node: Some(*id),
-                    reason: BlockReason::IneligibleNode,
-                })?;
+                push(
+                    &mut blocked_by,
+                    Blocker {
+                        node: Some(*id),
+                        reason: BlockReason::IneligibleNode,
+                    },
+                )?;
                 continue;
             }
             if !node.is_alive() {
-                push(Blocker {
-                    node: Some(*id),
-                    reason: BlockReason::DeadNode,
-                })?;
+                push(
+                    &mut blocked_by,
+                    Blocker {
+                        node: Some(*id),
+                        reason: BlockReason::DeadNode,
+                    },
+                )?;
                 continue;
             }
             let Ok(domain) = placement::failure_domain(&node.enrollment, class) else {
                 evaluable = false;
-                push(Blocker {
-                    node: Some(*id),
-                    reason: BlockReason::UnknownDomain,
-                })?;
+                push(
+                    &mut blocked_by,
+                    Blocker {
+                        node: Some(*id),
+                        reason: BlockReason::UnknownDomain,
+                    },
+                )?;
                 continue;
             };
             alive = add(alive, 1)?;
@@ -315,10 +331,13 @@ pub fn effective_guarantee(
     });
     if let Some(plan) = &session.pending {
         match plan.phase {
-            PlacementPhase::Planned => push(Blocker {
-                node: None,
-                reason: BlockReason::AwaitingActivation,
-            })?,
+            PlacementPhase::Planned => push(
+                &mut blocked_by,
+                Blocker {
+                    node: None,
+                    reason: BlockReason::AwaitingActivation,
+                },
+            )?,
             PlacementPhase::Cutover => {
                 for progress in plan.progress.values() {
                     if plan
@@ -326,16 +345,22 @@ pub fn effective_guarantee(
                         .as_ref()
                         .is_some_and(|barrier| progress.through < barrier.sequence)
                     {
-                        push(Blocker {
-                            node: Some(progress.node),
-                            reason: BlockReason::Assignment(progress.phase),
-                        })?;
+                        push(
+                            &mut blocked_by,
+                            Blocker {
+                                node: Some(progress.node),
+                                reason: BlockReason::Assignment(progress.phase),
+                            },
+                        )?;
                     }
                 }
-                push(Blocker {
-                    node: None,
-                    reason: BlockReason::AwaitingActivation,
-                })?;
+                push(
+                    &mut blocked_by,
+                    Blocker {
+                        node: None,
+                        reason: BlockReason::AwaitingActivation,
+                    },
+                )?;
             }
             _ => {
                 let mut complete = true;
@@ -345,39 +370,61 @@ pub fn effective_guarantee(
                         .filter(|_| progress.phase == AssignmentPhase::Failed)
                     {
                         complete = false;
-                        push(Blocker {
-                            node: Some(progress.node),
-                            reason: BlockReason::Refused(code),
-                        })?;
+                        push(
+                            &mut blocked_by,
+                            Blocker {
+                                node: Some(progress.node),
+                                reason: BlockReason::Refused(code),
+                            },
+                        )?;
                     } else if !progress.phase.at_least(required_phase(&progress.roles)) {
                         complete = false;
-                        push(Blocker {
-                            node: Some(progress.node),
-                            reason: BlockReason::Assignment(progress.phase),
-                        })?;
+                        push(
+                            &mut blocked_by,
+                            Blocker {
+                                node: Some(progress.node),
+                                reason: BlockReason::Assignment(progress.phase),
+                            },
+                        )?;
                     }
                 }
                 if complete {
-                    push(Blocker {
-                        node: None,
-                        reason: BlockReason::AwaitingCutover,
-                    })?;
+                    push(
+                        &mut blocked_by,
+                        Blocker {
+                            node: None,
+                            reason: BlockReason::AwaitingCutover,
+                        },
+                    )?;
                 }
             }
         }
     }
     for retiring in session.retiring.values() {
-        push(Blocker {
-            node: Some(retiring.node),
-            reason: BlockReason::Draining,
-        })?;
+        push(
+            &mut blocked_by,
+            Blocker {
+                node: Some(retiring.node),
+                reason: BlockReason::Draining,
+            },
+        )?;
     }
+    // A refusal blocks only what it refused: while the session is short of
+    // its promise (a level below the desired one, or a member the report
+    // already names) a session-level refusal says why the controller has
+    // not healed it; once the active placement is whole again, the
+    // refusals it left behind are history, not blockers.
+    let unmet = achieved.is_none_or(|level| level.max_failures < desired.max_failures)
+        || !blocked_by.is_empty();
     for refusal in &session.refusals {
-        if refusal.node.is_none() && session.pending.is_none() {
-            push(Blocker {
-                node: None,
-                reason: BlockReason::Refused(refusal.code),
-            })?;
+        if refusal.node.is_none() && session.pending.is_none() && unmet {
+            push(
+                &mut blocked_by,
+                Blocker {
+                    node: None,
+                    reason: BlockReason::Refused(refusal.code),
+                },
+            )?;
         }
     }
     blocked_by.shrink_to_fit();

@@ -9,14 +9,14 @@ license.workspace = true
 focal-model = { version = "0.1.0", path = "../focal-model" }
 focal-enrollment = { version = "0.1.0", path = "../focal-enrollment" }
 focal-memory = { version = "0.1.0", path = "../focal-memory", features = ["serde"] }
-serde.workspace = true
+serde = { workspace = true, features = ["rc"] }
 postcard.workspace = true
 blake3.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 focal-consensus = { version = "0.1.0", path = "../focal-consensus" }
-rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
 
 [lints]
 workspace = true

@@ -1,7 +1,6 @@
 //! A lock belongs to one scoped owner, not to the last inherited descriptor.
 //! Process creation can duplicate an open file description before close-on-exec
 //! runs. Closing only the owner's File would leave its flock held by that copy.
-use fs2::FileExt;
 use std::{fs::File, io};
 
 /// Deliberately neither Clone nor an owning File conversion: the critical
@@ -12,7 +11,7 @@ pub(crate) struct FileLock {
 }
 impl FileLock {
     pub(crate) fn acquire(file: File) -> io::Result<Self> {
-        file.try_lock_exclusive()?;
+        focal_platform::try_lock_exclusive(&file)?;
         // Construct immediately after acquisition so subsequent initialization
         // errors release the lock as well as normal owner completion.
         Ok(Self { file })
@@ -22,7 +21,7 @@ impl FileLock {
     pub(crate) fn acquire_within(file: File, wait: std::time::Duration) -> io::Result<Self> {
         let deadline = std::time::Instant::now().checked_add(wait);
         loop {
-            match file.try_lock_exclusive() {
+            match focal_platform::try_lock_exclusive(&file) {
                 Ok(()) => return Ok(Self { file }),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     if deadline.is_none_or(|deadline| std::time::Instant::now() >= deadline) {
@@ -41,7 +40,7 @@ impl FileLock {
 impl Drop for FileLock {
     fn drop(&mut self) {
         loop {
-            match FileExt::unlock(&self.file) {
+            match focal_platform::unlock(&self.file) {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 // Drop cannot report IO errors or panic. File's close remains
                 // the fallback; acquisition and durability errors retain their

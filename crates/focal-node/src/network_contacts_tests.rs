@@ -53,6 +53,9 @@ fn packet() -> RequestEnvelope {
             acknowledged_through: 0,
             expected_generation: 0,
             advertise: "127.0.0.1:7444".parse().unwrap(),
+            region: None,
+            zone: None,
+            endpoint: None,
         },
     }
 }
@@ -165,7 +168,7 @@ async fn contact_uses_active_committed_certificate_and_exact_receipt_survives_lo
                 let dropped = dropped.clone();
                 async move {
                     let header = request.request().clone();
-                    let response = handler.handle(request).await;
+                    let response = handler.handle(&request).await;
                     if matches!(decode(response.clone()), ControlReply::Committed(_))
                         && !dropped.swap(true, Ordering::SeqCst)
                     {
@@ -279,7 +282,7 @@ async fn contact_uses_active_committed_certificate_and_exact_receipt_survives_lo
     let contacts = NodeContactHost::new(host.clone()).unwrap();
     let retry = verify_request(peer.clone(), packet(), &limits).unwrap();
     assert_eq!(
-        decode(contacts.handle(retry).await),
+        decode(contacts.handle(&retry).await),
         ControlReply::Committed(first)
     );
     let revoke = registry.prepare_revoke(receipt.invitation, now()).unwrap();
@@ -306,6 +309,9 @@ async fn contact_uses_active_committed_certificate_and_exact_receipt_survives_lo
                     advertise: "127.0.0.1:7555".parse().unwrap(),
                     expected_generation: 1,
                     decided_at: now(),
+                    region: None,
+                    zone: None,
+                    endpoint: None,
                 }),
             }
         )
@@ -330,7 +336,7 @@ async fn contact_uses_active_committed_certificate_and_exact_receipt_survives_lo
     assert_eq!(
         decode(
             contacts
-                .handle(verify_request(peer, packet(), &limits).unwrap())
+                .handle(&verify_request(peer, packet(), &limits).unwrap())
                 .await
         ),
         ControlReply::Rejected(ControlFailure::Unauthorized)

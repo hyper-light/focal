@@ -147,6 +147,7 @@ enum Action {
     Revoke(InvitationId, oneshot::Sender<Answer<()>>),
     Authorize(Vec<u8>, oneshot::Sender<Answer<PeerGrant>>),
     AdmitTenant([u8; 16], oneshot::Sender<Answer<()>>),
+    ActivateFence(u32, oneshot::Sender<Answer<focal_enrollment::UpgradeFence>>),
     Stop(oneshot::Sender<()>),
 }
 struct Work {
@@ -346,6 +347,23 @@ impl QuorumEnrollmentHost {
             .map_err(|_| QuorumEnrollmentError::Stopped)?
             .result
     }
+    /// Raise the upgrade fence to `level` ([24](../../../docs/archictecutre/24-placement-execution-and-fleet-control.md)
+    /// §21): a committed enrollment fact under the founder authority. A
+    /// fence at or above `level` is answered as it is.
+    pub async fn activate_fence(
+        &self,
+        level: u32,
+    ) -> Result<focal_enrollment::UpgradeFence, QuorumEnrollmentError> {
+        if level == 0 {
+            return Err(EnrollmentError::Invalid.into());
+        }
+        let (send, receive) = oneshot::channel();
+        self.enqueue(Action::ActivateFence(level, send), 16)?;
+        receive
+            .await
+            .map_err(|_| QuorumEnrollmentError::Stopped)?
+            .result
+    }
     pub async fn authorize_certificate(
         &self,
         certificate: Vec<u8>,
@@ -439,6 +457,13 @@ impl QuorumEnrollmentDriver {
                 }
                 Action::AdmitTenant(tenant, send) => {
                     let result = self.admit_tenant(control, tenant).await;
+                    let _ = send.send(Answer {
+                        result,
+                        _charge: work._charge,
+                    });
+                }
+                Action::ActivateFence(level, send) => {
+                    let result = self.activate_fence(control, level).await;
                     let _ = send.send(Answer {
                         result,
                         _charge: work._charge,
@@ -580,9 +605,38 @@ impl QuorumEnrollmentDriver {
         let path = self
             .directory
             .join(blake3::Hash::from_bytes(slot).to_hex().as_str());
-        if remembered.is_some() && !path.try_exists().map_err(EnrollmentError::Io)? {
-            self.failed = true;
-            return Err(EnrollmentError::Corrupt.into());
+        // A name denotes one invitation at a time (retrying the same name is
+        // exact), but not forever: an invitation that is finished — revoked,
+        // or expired before anyone redeemed it — no longer denotes the name,
+        // and the next invitation under that name is a fresh one (a removed
+        // StatefulSet ordinal comes back under the same name; 24 §24). The
+        // retired slot is kept under a marker until the new one is remembered,
+        // so a crash between the steps reads as a retirement, never as
+        // corruption. A redeemed invitation still denotes its enrolled node.
+        let mut retired = None;
+        if path.try_exists().map_err(EnrollmentError::Io)? {
+            let pending = PendingInvitation::open(&path, self.config.root.cluster.0)?;
+            if finished(&registry, pending.id(), now) {
+                let marker = retired_marker(&path, pending.id());
+                std::fs::rename(&path, &marker).map_err(EnrollmentError::Io)?;
+                retired = Some(pending.id());
+            }
+        }
+        if let Some(previous) = remembered
+            && !path.try_exists().map_err(EnrollmentError::Io)?
+            && retired.is_none()
+        {
+            // Remembered but absent: a retirement whose successor was never
+            // written (crash after the rename), or corruption.
+            if retired_marker(&path, previous)
+                .try_exists()
+                .map_err(EnrollmentError::Io)?
+            {
+                retired = Some(previous);
+            } else {
+                self.failed = true;
+                return Err(EnrollmentError::Corrupt.into());
+            }
         }
         let pending = if path.try_exists().map_err(EnrollmentError::Io)? {
             PendingInvitation::open(&path, self.config.root.cluster.0)?
@@ -608,13 +662,33 @@ impl QuorumEnrollmentDriver {
         if pending.intent_hash() != hash {
             return Err(QuorumEnrollmentError::IntentConflict);
         }
-        if remembered.is_some_and(|invitation| invitation != pending.id()) {
-            self.failed = true;
-            return Err(EnrollmentError::Corrupt.into());
-        }
-        if let Err(error) = self.disk.remember_invitation(slot, pending.id()) {
-            self.failed = true;
-            return Err(error.into());
+        match remembered {
+            Some(previous) if previous == pending.id() => {}
+            Some(previous) => {
+                // Another invitation is remembered for this name: acceptable
+                // only as the retired predecessor of this one.
+                let predecessor_retired = retired == Some(previous)
+                    || retired_marker(&path, previous)
+                        .try_exists()
+                        .map_err(EnrollmentError::Io)?;
+                if !predecessor_retired {
+                    self.failed = true;
+                    return Err(EnrollmentError::Corrupt.into());
+                }
+                if let Err(error) = self.disk.replace_invitation(slot, pending.id()) {
+                    self.failed = true;
+                    return Err(error.into());
+                }
+                // The successor is remembered: the retired secret is useless
+                // and its marker no longer needed (best effort).
+                let _ = std::fs::remove_dir_all(retired_marker(&path, previous));
+            }
+            None => {
+                if let Err(error) = self.disk.remember_invitation(slot, pending.id()) {
+                    self.failed = true;
+                    return Err(error.into());
+                }
+            }
         }
         match pending.release(&registry) {
             Ok(invitation) => return Ok(invitation),
@@ -703,6 +777,26 @@ impl QuorumEnrollmentDriver {
         }
         Ok(())
     }
+    async fn activate_fence(
+        &mut self,
+        control: &impl EnrollmentControl,
+        level: u32,
+    ) -> Result<focal_enrollment::UpgradeFence, QuorumEnrollmentError> {
+        self.reconcile(control).await?;
+        let (registry, charge) = self.registry(control).await?;
+        if registry.fence().level >= level {
+            return Ok(registry.fence());
+        }
+        let command = registry.prepare_activate_fence(&self.authority, level, now()?)?;
+        drop(registry);
+        drop(charge);
+        self.commit(control, command).await?;
+        let (registry, _charge) = self.registry(control).await?;
+        if registry.fence().level < level {
+            return Err(EnrollmentError::NotCommitted.into());
+        }
+        Ok(registry.fence())
+    }
     /// The grant a certificate earns: the configured tenants and every tenant
     /// the committed registry admits, so admission never needs a restart and
     /// a credential never serves a tenant the cluster has not committed.
@@ -746,6 +840,30 @@ fn reserve(
         .reserve(kind, BudgetLane::Ordinary, bytes)
         .map(|reservation| reservation.commit())
         .map_err(|_| EnrollmentError::Capacity.into())
+}
+/// Whether a committed invitation no longer denotes its name: revoked, or
+/// expired before it was redeemed. An uncommitted or redeemed one does.
+fn finished(registry: &EnrollmentRegistry, id: InvitationId, now: i64) -> bool {
+    registry.invitation_status(id).is_some_and(|status| {
+        status.revoked || (status.enrollment.is_none() && status.expires_at <= now)
+    })
+}
+/// Where a finished invitation's private slot is kept while its successor is
+/// being remembered.
+fn retired_marker(path: &std::path::Path, id: InvitationId) -> std::path::PathBuf {
+    let mut marker = path.as_os_str().to_owned();
+    marker.push(format!(
+        ".retired-{}",
+        blake3::Hash::from_bytes(widen(id)).to_hex()
+    ));
+    std::path::PathBuf::from(marker)
+}
+fn widen(id: InvitationId) -> [u8; 32] {
+    let mut wide = [0; 32];
+    for (target, byte) in wide.iter_mut().zip(id.iter()) {
+        *target = *byte;
+    }
+    wide
 }
 fn save(disk: &mut PrivateJournal, journal: &Journal) -> Result<(), QuorumEnrollmentError> {
     let size =

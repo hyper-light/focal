@@ -14,6 +14,8 @@ import subprocess
 import tempfile
 import tomllib
 
+import notices
+
 
 ROOT = Path(__file__).resolve().parents[2]
 CATALOG = Path(__file__).with_name("platforms.json")
@@ -24,6 +26,7 @@ REQUIRED_TARGETS = {
     "aarch64-apple-darwin", "x86_64-apple-darwin",
     "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu",
     "aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl",
+    "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc",
 }
 
 
@@ -62,7 +65,7 @@ def configuration(root=ROOT, catalog=CATALOG):
     require(len(node) == 1 and node[0]["version"] == version, "Cargo.lock focal-node version mismatch")
     platforms = json.loads(catalog.read_text())
     rows = platforms["include"]
-    require({row["target"] for row in rows} == REQUIRED_TARGETS, "release matrix must contain all six required Unix targets")
+    require({row["target"] for row in rows} == REQUIRED_TARGETS, "release matrix must contain all eight required targets")
     require(len({row["target"] for row in rows}) == len(rows), "duplicate target")
     require(len({row["asset"] for row in rows}) == len(rows), "duplicate release asset")
     for row in rows:
@@ -109,9 +112,52 @@ def guard():
     print(f"Guard passed for workspace {version}, Rust {toolchain}, {len(platforms['include'])} targets")
 
 
+def pe_imported_dlls(data):
+    """The set of DLL names a PE32+ image imports, parsed without any library."""
+    require(len(data) >= 0x40 and data[:2] == b"MZ", "not a PE image")
+    lfanew = struct.unpack_from("<I", data, 0x3C)[0]
+    require(data[lfanew : lfanew + 4] == b"PE\0\0", "missing PE signature")
+    coff = lfanew + 4
+    number_of_sections = struct.unpack_from("<H", data, coff + 2)[0]
+    size_of_optional = struct.unpack_from("<H", data, coff + 16)[0]
+    optional = coff + 20
+    require(struct.unpack_from("<H", data, optional)[0] == 0x20B, "expected a PE32+ (64-bit) image")
+    # Data directory 1 is the import table (RVA, size); PE32+ directories begin
+    # at optional-header offset 112, each eight bytes.
+    import_rva = struct.unpack_from("<I", data, optional + 112 + 8)[0]
+    sections = []
+    for index in range(number_of_sections):
+        base = optional + size_of_optional + 40 * index
+        virtual_size, virtual_address, raw_size, raw_pointer = struct.unpack_from("<IIII", data, base + 8)
+        sections.append((virtual_address, max(virtual_size, raw_size), raw_pointer))
+
+    def to_offset(rva):
+        for virtual_address, span, raw_pointer in sections:
+            if virtual_address <= rva < virtual_address + span:
+                return raw_pointer + (rva - virtual_address)
+        return None
+
+    dlls = set()
+    if import_rva == 0:
+        return dlls
+    table = to_offset(import_rva)
+    require(table is not None, "import table RVA is outside every section")
+    for index in range(4096):
+        descriptor = table + 20 * index
+        fields = struct.unpack_from("<IIIII", data, descriptor)
+        if fields == (0, 0, 0, 0, 0):
+            break
+        name = to_offset(fields[3])
+        require(name is not None, "import name RVA is outside every section")
+        dlls.add(data[name : data.index(b"\0", name)].decode("ascii", "replace").lower())
+    return dlls
+
+
 def verify_native(binary, row, version):
     architecture = row["target"].split("-")[0]
-    machine = {"arm64": "aarch64", "AMD64": "x86_64"}.get(platform.machine(), platform.machine())
+    machine = {"arm64": "aarch64", "AMD64": "x86_64", "ARM64": "aarch64"}.get(
+        platform.machine(), platform.machine()
+    )
     require(machine == architecture, "cross-compiled output must be smoked on its native architecture")
     with binary.open("rb") as source:
         header = source.read(64)
@@ -133,6 +179,25 @@ def verify_native(binary, row, version):
             versions = re.findall(r"GLIBC_(\d+)\.(\d+)(?:\.(\d+))?", output("readelf", "--version-info", str(binary)))
             require(all(tuple(int(part or 0) for part in value) <= (2, 39, 0) for value in versions),
                     "GNU executable exceeds the documented glibc 2.39 baseline")
+    elif "windows" in row["target"]:
+        require(platform.system() == "Windows", "Windows binary needs a Windows smoke host")
+        require(header[:2] == b"MZ", "expected a PE image")
+        data = binary.read_bytes()
+        lfanew = struct.unpack_from("<I", data, 0x3C)[0]
+        require(struct.unpack_from("<H", data, lfanew + 4)[0] == {"x86_64": 0x8664, "aarch64": 0xAA64}[architecture],
+                "PE machine differs from asset name")
+        # Only the OS libraries Focal links: kernel, security (SID/DACL), the
+        # RNG (`bcrypt.dll`, and `bcryptprimitives.dll`, whose `ProcessPrng`
+        # the Rust standard library draws its hashing randomness from; part of
+        # Windows since 8), sockets and the API-set stubs. No bundled runtime
+        # — the C runtime is linked in (`+crt-static`, the release workflow),
+        # so no `vcruntime140.dll` — and no OpenSSL.
+        allowed = {"kernel32.dll", "advapi32.dll", "bcrypt.dll", "bcryptprimitives.dll", "ntdll.dll",
+                   "ws2_32.dll", "userenv.dll", "secur32.dll", "crypt32.dll", "rpcrt4.dll",
+                   "kernelbase.dll"}
+        unexpected = {name for name in pe_imported_dlls(data)
+                      if name not in allowed and not name.startswith("api-ms-win-")}
+        require(not unexpected, f"unpackaged Windows imports: {sorted(unexpected)}")
     else:
         require(platform.system() == "Darwin", "macOS binary needs a macOS smoke host")
         require(header[:4] == b"\xcf\xfa\xed\xfe", "expected little-endian Mach-O64")
@@ -149,7 +214,8 @@ def stage(target, destination):
     matches = [row for row in platforms["include"] if row["target"] == target]
     require(len(matches) == 1, "target is absent from the release matrix")
     row = matches[0]
-    binary = ROOT / "target" / target / "release" / "focal"
+    name = "focal.exe" if "windows" in target else "focal"
+    binary = ROOT / "target" / target / "release" / name
     require(binary.is_file() and not binary.is_symlink(), "release output is not a regular executable")
     verify_native(binary, row, version)
     destination.mkdir(parents=True, exist_ok=False)
@@ -194,7 +260,11 @@ def collect(source, destination, version, toolchain, platforms, commit):
             records.append(metadata)
         manifest = {"schema": 1, "version": version, "commit": commit, "toolchain": toolchain, "assets": records}
         (temporary / MANIFEST).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-        names = sorted([row["asset"] for row in records] + [MANIFEST])
+        # The third-party notices and the SPDX SBOM ship beside the binaries; the
+        # generator cross-checks the reviewed dependency roster against the locked
+        # graph, so drift fails the release rather than shipping stale notices.
+        extra = notices.generate(temporary, version, commit)
+        names = sorted([row["asset"] for row in records] + [MANIFEST] + extra)
         (temporary / SUMS).write_text("".join(f"{digest(temporary / name)}  {name}\n" for name in names))
         verify_collection(temporary, version, toolchain, platforms, commit)
         temporary.rename(destination)
@@ -204,14 +274,15 @@ def collect(source, destination, version, toolchain, platforms, commit):
 
 
 def verify_collection(directory, version, toolchain, platforms, commit):
-    expected = {row["asset"] for row in platforms["include"]} | {MANIFEST, SUMS}
+    expected = {row["asset"] for row in platforms["include"]} | {MANIFEST, SUMS, notices.NOTICES, notices.SBOM}
     require(regular_files(directory) == expected, "release asset set is incomplete or unexpected")
     manifest = json.loads((directory / MANIFEST).read_text())
     require((manifest.get("schema"), manifest.get("version"), manifest.get("toolchain"), manifest.get("commit"))
             == (1, version, toolchain, commit), "release manifest source mismatch")
     records = manifest["assets"]
     require(len(records) == len(platforms["include"]), "duplicate or missing manifest asset")
-    require({row["asset"] for row in records} == expected - {MANIFEST, SUMS}, "manifest asset names mismatch")
+    require({row["asset"] for row in records} == expected - {MANIFEST, SUMS, notices.NOTICES, notices.SBOM},
+            "manifest asset names mismatch")
     for row in records:
         platform_row = next(item for item in platforms["include"] if item["asset"] == row["asset"])
         require(all(row.get(name) == value for name, value in platform_row.items()), "manifest target mismatch")
@@ -281,11 +352,14 @@ def publish(directory):
             "Download the raw binary for your platform, verify it with SHA256SUMS, "
             "and make it executable. No Rust installation is needed.\n\n"
             "GNU Linux binaries require glibc 2.39 or later; musl binaries are static. "
-            "macOS binaries target macOS 15 or later. macOS signing/notarization and "
-            "Windows binaries are not provided by this release.\n\n"
+            "macOS binaries target macOS 15 or later. Windows binaries target Windows 10 "
+            "1809 / Server 2019 or later and carry their C runtime, so no Visual C++ "
+            "redistributable is needed. macOS notarization and Windows Authenticode "
+            "signing are not applied by this release.\n\n"
             "Every asset passed native server startup, CLI mutation/read, acknowledged-write "
-            "crash recovery and MCP protocol/read smoke. See release-manifest.json for "
-            "target, source and digest details.\n")
+            "crash recovery and MCP protocol/read smoke. THIRD-PARTY-NOTICES.txt lists every "
+            "bundled crate and its license; sbom.spdx.json is the SPDX 2.3 bill of materials. "
+            "See release-manifest.json for target, source and digest details.\n")
     draft = api(f"{base}/releases", "POST", {"tag_name": tag, "target_commitish": commit,
                 "name": f"Focal {version}", "body": body, "draft": True,
                 "prerelease": "-" in version.split("+")[0]})

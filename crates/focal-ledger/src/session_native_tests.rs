@@ -240,7 +240,7 @@ impl Cluster {
                 if !self.live().contains(&to) {
                     continue;
                 }
-                let snapshot = message.get_msg_type() == MessageType::MsgSnapshot;
+                let snapshot = message.msg_type == MessageType::MsgSnapshot as i32;
                 match self.node(to).step(message) {
                     Ok(()) => {}
                     Err(LedgerError::NativeUnsupported) => {
@@ -2452,7 +2452,8 @@ fn a_sustained_workload_stays_within_its_budgets_and_keeps_every_outcome() {
                 let page = cluster.node(1).native_content_roots(cursor, 4096).unwrap();
                 for root in page.roots {
                     match root {
-                        ContentRoot::Artifact(pointer) | ContentRoot::Inline(pointer) => {
+                        ContentRoot::Artifact { pointer, .. }
+                        | ContentRoot::Inline { pointer, .. } => {
                             protection.protect_object(domain, pointer.root).unwrap();
                         }
                         ContentRoot::Bundle { root, .. } => {

@@ -1,0 +1,10 @@
+# The requested configuration the checked-in Kubernetes manifests are
+# rendered from (deploy/kubernetes, doc 08 §5): three zones surviving the
+# loss of one. Render your own with
+#   focal deployment render kubernetes --config FILE --namespace NS --output DIR ...
+version: 1
+topology:
+  region: eu-a
+durability:
+  survive: zone
+  max_failures: 1

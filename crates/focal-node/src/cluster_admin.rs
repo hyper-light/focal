@@ -6,14 +6,15 @@ use crate::{
     network_admin::{ADMIN_SOCKET, AdminCommand, AdminRead, admin_principal, admin_wire_limits},
 };
 use focal_client::admin::{
-    AdminConfiguration, AdminContact, AdminCredential, AdminInvitation, AdminResult,
+    AdminConfiguration, AdminContact, AdminCredential, AdminInvitation, AdminNodeCapability,
+    AdminResult, AdminUpgrade,
 };
 use focal_control::*;
 use focal_enrollment::PrivateJournal;
 use focal_wire::{AccessError, Response, UnixRemote, WireError};
 use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
 };
@@ -25,6 +26,14 @@ mod mcp;
 mod replicas;
 #[cfg(test)]
 mod tests;
+
+/// A remove that follows its drain waits this long, in this many polls, for the
+/// placement partition to observe the committed ineligibility.
+/// How often a grant change that lost to a concurrent re-grant is prepared
+/// again.
+const ELIGIBILITY_ATTEMPTS: u32 = 4;
+const REMOVE_DRAIN_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+const REMOVE_DRAIN_POLLS: u32 = 20;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClusterAdminError {
@@ -64,10 +73,30 @@ pub enum ClusterAdminError {
     NodeHolding { node: u64, sessions: usize },
     #[error("node {0} is still eligible for placement; drain it first")]
     NotDrained(u64),
+    #[error("node {0} is drained, but the placement controller has not observed it yet; retry")]
+    DrainPending(u64),
+    #[error("node {0} still leads the root group; its leadership is being transferred; retry")]
+    LeaderLeaving(u64),
     #[error("node {0} is not enrolled in the directory")]
     UnknownNode(u64),
     #[error("node {0} is not alive, eligible and reporting; it cannot take over")]
     NotReady(u64),
+    #[error(
+        "the upgrade fence cannot rise to level {level}: nodes {behind:?} report a lower capability or none"
+    )]
+    MembersBehind { level: u32, behind: Vec<u64> },
+    #[error("the upgrade fence is at level {current} and never lowers to {requested}")]
+    FenceRegression { current: u32, requested: u32 },
+    #[error(
+        "node {node} (region {region:?}) lies outside the session's residency {residency:?}; no copy moves there"
+    )]
+    OutsideResidency {
+        node: u64,
+        region: Option<String>,
+        residency: Vec<String>,
+    },
+    #[error("probe {0} does not hold on this node")]
+    ProbeFailed(&'static str),
     #[error("bounded admin capacity or request sequence is exhausted")]
     Capacity,
 }
@@ -110,7 +139,17 @@ impl ClusterAdminError {
             },
             Self::NodeHolding { .. } => Failure::error("node_holding", 5),
             Self::NotDrained(_) => Failure::error("not_drained", 5),
+            Self::DrainPending(_) => Failure::error("drain_pending", 5),
+            Self::LeaderLeaving(_) => Failure::error("leader_leaving", 5),
             Self::NotReady(_) => Failure::error("node_not_ready", 5),
+            Self::MembersBehind { .. } => Failure::error("members_behind", 5),
+            Self::OutsideResidency { .. } => Failure::error("outside_residency", 5),
+            Self::FenceRegression { .. } => Failure::error("invalid_input", 2),
+            Self::ProbeFailed(_) => Failure {
+                condition: "NotReady",
+                code: "probe_failed",
+                exit_code: 1,
+            },
             Self::Invalid | Self::Control(ControlFailure::Invalid | ControlFailure::RetryOrder) => {
                 Failure::error("invalid_input", 2)
             }
@@ -203,6 +242,14 @@ impl ClusterAdmin {
                 if value.node == self.identity.node =>
             {
                 Ok(AdminResult::Storage { storage: *value })
+            }
+            (OperatorRead::Readiness, OperatorReply::Readiness(value))
+                if value.node == self.identity.node && value.alive =>
+            {
+                Ok(AdminResult::Readiness { readiness: *value })
+            }
+            (OperatorRead::Metrics, OperatorReply::Metrics(text)) if text.len() <= 8 << 20 => {
+                Ok(AdminResult::Metrics { text })
             }
             (OperatorRead::Gc, OperatorReply::Gc(value))
                 if value.node == self.identity.node
@@ -311,6 +358,35 @@ impl ClusterAdmin {
             backup: reply.backup,
         })
     }
+    /// Repair a hosted session's custody on this node (24 §20).
+    pub async fn repair(
+        &self,
+        ledger: focal_model::LedgerId,
+        after: Option<[u8; 16]>,
+        limit: u32,
+    ) -> Result<AdminResult> {
+        let bytes = self
+            .exchange_bytes(AdminCommand::Repair {
+                tenant: ledger.tenant.0,
+                session: ledger.session.0,
+                after,
+                limit,
+            })
+            .await?;
+        let (reply, tail): (crate::network_admin::RepairedReply, _) =
+            postcard::take_from_bytes(&bytes).map_err(|_| ClusterAdminError::Invalid)?;
+        if !tail.is_empty()
+            || reply.schema != crate::network_admin::REPAIRED_REPLY_SCHEMA
+            || reply.repair.session != ledger.session.to_string()
+            || reply.repair.tenant != ledger.tenant.to_string()
+            || reply.repair.node != self.identity.node
+        {
+            return Err(ClusterAdminError::Invalid);
+        }
+        Ok(AdminResult::Repaired {
+            repair: reply.repair,
+        })
+    }
     /// Verify a backup directory offline (26 §6): no running node and no
     /// data directory are needed, only a binary that can read the format.
     pub fn backup_verify(input: &Path) -> Result<AdminResult> {
@@ -376,6 +452,35 @@ impl ClusterAdmin {
                     expires_at: summary.expires_at,
                     certificate_fingerprint: hex(&summary.certificate_fingerprint),
                     renewals: summary.renewals,
+                    key_identity: hex(&summary.key_identity),
+                    rotations: summary.rotations,
+                })
+            }
+            CredentialReply::Renewed(_) => Err(ClusterAdminError::Invalid),
+            CredentialReply::Failed(error) => Err(error.into()),
+        }
+    }
+    /// Rotate this node's own credential to a fresh key under the same
+    /// identity (24 §11); the founder's identity is never rotated here.
+    pub async fn rotate_credential(&self) -> Result<AdminResult> {
+        use crate::credential_renewal::CredentialReply;
+        let bytes = self.exchange_bytes(AdminCommand::RotateCredential).await?;
+        let (reply, tail): (CredentialReply, _) =
+            postcard::take_from_bytes(&bytes).map_err(|_| ClusterAdminError::Invalid)?;
+        if !tail.is_empty() {
+            return Err(ClusterAdminError::Invalid);
+        }
+        match reply {
+            CredentialReply::Renewed(summary) if summary.node == self.identity.node => {
+                Ok(AdminResult::CredentialRotated {
+                    node: summary.node,
+                    principal: hex(&summary.principal),
+                    issued_at: summary.issued_at,
+                    expires_at: summary.expires_at,
+                    certificate_fingerprint: hex(&summary.certificate_fingerprint),
+                    key_identity: hex(&summary.key_identity),
+                    renewals: summary.renewals,
+                    rotations: summary.rotations,
                 })
             }
             CredentialReply::Renewed(_) => Err(ClusterAdminError::Invalid),
@@ -461,6 +566,98 @@ impl ClusterAdmin {
         }
         Ok(Self::tenants_view(reply))
     }
+    async fn upgrade_reply(
+        &self,
+        command: AdminCommand,
+    ) -> Result<crate::network_admin::UpgradeReply> {
+        let bytes = self.exchange_bytes(command).await?;
+        let (reply, tail): (crate::network_admin::UpgradeReply, _) =
+            postcard::take_from_bytes(&bytes).map_err(|_| ClusterAdminError::Invalid)?;
+        if !tail.is_empty()
+            || reply.schema != crate::network_admin::UPGRADE_REPLY_SCHEMA
+            || reply.announced > reply.binary
+            || reply.nodes.len() > 65536
+            || !reply
+                .nodes
+                .windows(2)
+                .all(|pair| matches!(pair, [left, right] if left.0 < right.0))
+        {
+            return Err(ClusterAdminError::Invalid);
+        }
+        Ok(reply)
+    }
+    fn upgrade_view(reply: &crate::network_admin::UpgradeReply) -> AdminUpgrade {
+        AdminUpgrade {
+            fence_level: reply.fence.level,
+            fence_activated_at: reply.fence.activated_at,
+            fence_revision: reply.fence.revision,
+            binary_level: reply.binary,
+            announced_level: reply.announced,
+            applied_index: reply.applied_index,
+            registry_revision: reply.revision,
+            nodes: reply
+                .nodes
+                .iter()
+                .map(|(node, capability)| AdminNodeCapability {
+                    node: *node,
+                    capability: *capability,
+                })
+                .collect(),
+            activatable: reply
+                .nodes
+                .iter()
+                .map(|(_, capability)| *capability)
+                .min()
+                .unwrap_or(0),
+        }
+    }
+    /// The upgrade fence and every node's reported capability (24 §21).
+    pub async fn upgrade_status(&self) -> Result<AdminResult> {
+        let reply = self.upgrade_reply(AdminCommand::UpgradeStatus).await?;
+        Ok(AdminResult::Upgrade {
+            upgrade: Self::upgrade_view(&reply),
+        })
+    }
+    /// Raise the upgrade fence to `level` (24 §21): refused by name while a
+    /// node reports a lower capability or none, never lowered; a fence
+    /// already at `level` reads as done.
+    pub async fn activate_fence(&self, level: u32) -> Result<AdminResult> {
+        if level == 0 {
+            return Err(ClusterAdminError::Invalid);
+        }
+        let status = self.upgrade_reply(AdminCommand::UpgradeStatus).await?;
+        if level < status.fence.level {
+            return Err(ClusterAdminError::FenceRegression {
+                current: status.fence.level,
+                requested: level,
+            });
+        }
+        if level == status.fence.level {
+            return Ok(AdminResult::FenceActivated {
+                upgrade: Self::upgrade_view(&status),
+                changed: false,
+            });
+        }
+        let behind: Vec<u64> = status
+            .nodes
+            .iter()
+            .filter(|(_, capability)| *capability < level)
+            .map(|(node, _)| *node)
+            .collect();
+        if status.nodes.is_empty() || !behind.is_empty() {
+            return Err(ClusterAdminError::MembersBehind { level, behind });
+        }
+        let reply = self
+            .upgrade_reply(AdminCommand::ActivateFence { level })
+            .await?;
+        if reply.fence.level < level {
+            return Err(ClusterAdminError::Invalid);
+        }
+        Ok(AdminResult::FenceActivated {
+            upgrade: Self::upgrade_view(&reply),
+            changed: reply.changed,
+        })
+    }
     /// Create an application session on this node for a served tenant, or
     /// find the one the same name already denotes.
     pub async fn create_session(&self, tenant: [u8; 16], name: &str) -> Result<AdminResult> {
@@ -545,17 +742,35 @@ impl ClusterAdmin {
         })
     }
     pub fn available(settings: &Settings) -> Result<Option<Self>> {
-        use std::os::unix::fs::{FileTypeExt, MetadataExt};
         let admin = Self::open(settings)?;
         match fs::symlink_metadata(admin.root.join(ADMIN_SOCKET)) {
             Ok(metadata) => {
-                let root = fs::symlink_metadata(&admin.root)?;
-                if !root.is_dir()
-                    || root.mode() & 0o077 != 0
-                    || !metadata.file_type().is_socket()
-                    || metadata.uid() != root.uid()
+                #[cfg(unix)]
                 {
-                    return Err(ClusterAdminError::Corrupt);
+                    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+                    let root = fs::symlink_metadata(&admin.root)?;
+                    if !root.is_dir()
+                        || root.mode() & 0o077 != 0
+                        || !metadata.file_type().is_socket()
+                        || metadata.uid() != root.uid()
+                    {
+                        return Err(ClusterAdminError::Corrupt);
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    // The admin endpoint is a named-pipe rendezvous file. The
+                    // data directory and the file must both be owned by the
+                    // current user and reachable by no one else.
+                    let _ = &metadata;
+                    let owner = focal_platform::fs::current_owner()?;
+                    let private_root = focal_platform::fs::private_dir_owner(&admin.root)?
+                        .is_some_and(|found| found == owner);
+                    if !private_root
+                        || focal_platform::fs::owner_at(&admin.root.join(ADMIN_SOCKET))? != owner
+                    {
+                        return Err(ClusterAdminError::Corrupt);
+                    }
                 }
                 Ok(Some(admin))
             }
@@ -838,12 +1053,123 @@ impl ClusterAdmin {
         let (_, saved) = self.journal(false)?;
         saved_view(self.identity.node, &saved)
     }
+    /// One readiness probe (08 §9): the readiness report when `check`
+    /// holds, `probe_failed` (exit 1) otherwise, for a supervisor's probe.
+    pub async fn probe(&self, check: &str) -> Result<AdminResult> {
+        // Liveness is the process answering on its own socket, nothing more:
+        // it is answered by the identity read, which touches no root, session
+        // or placement state, so a node whose control plane is unreachable
+        // still reports alive. A liveness probe that waited on the readiness
+        // report timed out whenever the root leader was down and had the
+        // supervisor kill healthy hosts (24 §15).
+        if check == "alive" {
+            return self
+                .operator(crate::network_admin::OperatorRead::Identity)
+                .await
+                .map_err(|_| ClusterAdminError::ProbeFailed("alive"));
+        }
+        let result = self
+            .operator(crate::network_admin::OperatorRead::Readiness)
+            .await?;
+        let AdminResult::Readiness { readiness } = &result else {
+            return Err(ClusterAdminError::Invalid);
+        };
+        let (name, holds) = match check {
+            "catching-up" => ("catching-up", readiness.catching_up),
+            "authoritative" => ("authoritative", readiness.authoritative),
+            "policy" => ("policy", readiness.policy_satisfied),
+            _ => return Err(ClusterAdminError::Invalid),
+        };
+        if holds {
+            Ok(result)
+        } else {
+            Err(ClusterAdminError::ProbeFailed(name))
+        }
+    }
     /// Set a node's placement eligibility (24 §19): the root re-issues the
     /// node's grant at its next generation, after which the controller heals
     /// every placement that named the node and retires its copies (drain),
     /// or considers it again (undrain). Exact on retry; a node already in the
     /// requested state commits nothing.
+    /// Whether the committed grant for `node` is already ineligible: the
+    /// eligibility prepare read yields no command when the grant already
+    /// states what is asked.
+    async fn grant_ineligible(&self, node: u64) -> Result<bool> {
+        let reply = self
+            .exchange(AdminCommand::Read(AdminRead::PrepareEligibility {
+                node,
+                eligible: false,
+            }))
+            .await;
+        match reply {
+            Ok(ControlReply::Read(ControlReadResult::PreparedEligibility {
+                node: prepared,
+                eligible: false,
+                command,
+                ..
+            })) if prepared == node => Ok(command.is_none()),
+            Ok(_) => Err(ClusterAdminError::Invalid),
+            Err(ClusterAdminError::Control(ControlFailure::Invalid)) => {
+                Err(ClusterAdminError::UnknownNode(node))
+            }
+            Err(error) => Err(error),
+        }
+    }
+    /// The authority revision a grant for `node` would be compared at now,
+    /// read through the same preparation a change is built from. The
+    /// preparation of the state the grant already has carries no command,
+    /// so the opposite one is asked.
+    async fn authority_revision(&self, node: u64, eligible: bool) -> Result<u64> {
+        for eligible in [eligible, !eligible] {
+            match self
+                .exchange(AdminCommand::Read(AdminRead::PrepareEligibility {
+                    node,
+                    eligible,
+                }))
+                .await?
+            {
+                ControlReply::Read(ControlReadResult::PreparedEligibility {
+                    node: prepared,
+                    command,
+                    ..
+                }) if prepared == node => {
+                    if let Some(command) = command {
+                        return Ok(command.expected_revision);
+                    }
+                }
+                _ => return Err(ClusterAdminError::Invalid),
+            }
+        }
+        Err(ClusterAdminError::Invalid)
+    }
+    /// Make `node` eligible or not. The grant is compared at the authority
+    /// revision it was prepared from, and the controller commits grants of
+    /// its own whenever a node announces itself: a change that lost that
+    /// race is proven superseded and prepared again from the revision that
+    /// won, a bounded number of times.
     pub async fn node_eligibility(&self, node: u64, eligible: bool) -> Result<AdminResult> {
+        let mut attempts = 0u32;
+        loop {
+            match self.node_eligibility_once(node, eligible).await {
+                Err(ClusterAdminError::Control(ControlFailure::CompareFailed))
+                    if attempts < ELIGIBILITY_ATTEMPTS =>
+                {
+                    attempts = attempts.saturating_add(1);
+                    let (_, saved) = self.journal(false)?;
+                    let Some(latest) = saved.latest.as_ref() else {
+                        return Err(ControlFailure::CompareFailed.into());
+                    };
+                    if latest.receipt.is_none() && !latest.superseded {
+                        let reference = operation_id(self.identity.node, latest.operation);
+                        drop(saved);
+                        self.reconcile(&reference).await?;
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+    async fn node_eligibility_once(&self, node: u64, eligible: bool) -> Result<AdminResult> {
         if node == 0 {
             return Err(ClusterAdminError::Invalid);
         }
@@ -956,7 +1282,29 @@ impl ClusterAdmin {
         if node == 0 || node == self.identity.node {
             return Err(ClusterAdminError::Invalid);
         }
-        let placement = self.placement_view().await?;
+        // The drain commits the grant ineligible; the placement partition
+        // observes that a controller round later. A remove that follows its
+        // drain at once must not read as "never drained": when the committed
+        // grant is already ineligible, wait — bounded — for the partition to
+        // say so, and name the pending drain if it still has not.
+        let mut placement = self.placement_view().await?;
+        let mut waited = 0u32;
+        while placement
+            .partitions
+            .iter()
+            .flat_map(|partition| partition.nodes.iter())
+            .any(|entry| entry.node == node && entry.eligible)
+        {
+            if waited == 0 && !self.grant_ineligible(node).await? {
+                return Err(ClusterAdminError::NotDrained(node));
+            }
+            if waited >= REMOVE_DRAIN_POLLS {
+                return Err(ClusterAdminError::DrainPending(node));
+            }
+            waited = waited.saturating_add(1);
+            tokio::time::sleep(REMOVE_DRAIN_POLL).await;
+            placement = self.placement_view().await?;
+        }
         let mut record = None;
         let mut holding = 0usize;
         for partition in &placement.partitions {
@@ -994,6 +1342,9 @@ impl ClusterAdmin {
             });
         }
         let current = self.configuration().await?;
+        if current.configuration.voters.contains(&node) {
+            self.lead_elsewhere(node, &current.configuration).await?;
+        }
         let membership_removed = if current.configuration.contains(node) {
             self.membership(MembershipChange::Remove { node }, None)
                 .await?;
@@ -1046,12 +1397,64 @@ impl ClusterAdmin {
             }
             None => (None, false),
         };
+        // Last, once nothing enrolls the node: its contact record, so the
+        // bounded contact table does not keep a slot for every node that
+        // ever joined (24 §19). Exact: an absent record reads as done.
+        let contact_retired = self.retire_contact(node).await?;
         Ok(AdminResult::NodeRemoved {
             node,
             membership_removed,
             invitation,
             revoked,
+            contact_retired,
         })
+    }
+    /// Retire a removed node's committed contact record as a journaled
+    /// request at the generation the operator read; `false` when no record
+    /// remains. The root refuses it while any enrollment still authorizes the
+    /// node, so an operator cannot retire a live node's reachability.
+    async fn retire_contact(&self, node: u64) -> Result<bool> {
+        let AdminResult::Contacts { nodes, .. } = self.read(AdminRead::Contacts).await? else {
+            return Err(ClusterAdminError::Invalid);
+        };
+        let Some(record) = nodes.iter().find(|contact| contact.node == node) else {
+            return Ok(false);
+        };
+        let (mut journal, mut saved) = self.journal(true)?;
+        if saved
+            .latest
+            .as_ref()
+            .is_some_and(|latest| latest.receipt.is_none() && !latest.superseded)
+        {
+            return Err(ClusterAdminError::Pending);
+        }
+        let sequence = saved.next_control;
+        let operation = saved.next;
+        let next = operation
+            .checked_add(1)
+            .ok_or(ClusterAdminError::Capacity)?;
+        sequence.checked_add(1).ok_or(ClusterAdminError::Capacity)?;
+        let request = ControlRequest {
+            id: ControlRequestId {
+                client: admin_principal(&self.identity).0,
+                sequence,
+            },
+            acknowledged_through: sequence.checked_sub(1).ok_or(ClusterAdminError::Corrupt)?,
+            command: ControlCommand::RetireContact(focal_control::RetireContactCommand {
+                node,
+                expected_generation: record.generation,
+            }),
+        };
+        saved.next = next;
+        saved.latest = Some(Latest {
+            operation,
+            request,
+            receipt: None,
+            superseded: false,
+        });
+        save(&mut journal, &saved)?;
+        self.drive(&mut journal, &mut saved).await?;
+        Ok(true)
     }
     /// Replace a node (24 §19): drain `node` once `replacement` is enrolled,
     /// alive, eligible and reporting, so the healed placements have a host
@@ -1073,6 +1476,45 @@ impl ClusterAdmin {
             return Err(ClusterAdminError::NotReady(replacement));
         }
         self.node_eligibility(node, false).await
+    }
+    /// A leader does not remove itself (27 §5): while `leaving` leads the
+    /// root group, move its leadership to a voter that stays (this node
+    /// where it votes) and wait, bounded, for the group to follow.
+    async fn lead_elsewhere(
+        &self,
+        leaving: u64,
+        configuration: &focal_consensus::MembershipConfiguration,
+    ) -> Result<()> {
+        let target = if configuration.voters.contains(&self.identity.node) {
+            Some(self.identity.node)
+        } else {
+            configuration
+                .voters
+                .iter()
+                .copied()
+                .find(|voter| *voter != leaving)
+        };
+        for _ in 0..=REMOVE_DRAIN_POLLS {
+            let AdminResult::Membership { leader, .. } = self.read(AdminRead::Membership).await?
+            else {
+                return Err(ClusterAdminError::Invalid);
+            };
+            if leader != 0 && leader != leaving {
+                return Ok(());
+            }
+            if leader == leaving
+                && let Some(target) = target
+            {
+                // Refused while an earlier transfer or an election is in
+                // progress; the next read says where the group leads.
+                match self.transfer(target, None).await {
+                    Ok(_) | Err(ClusterAdminError::Control(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            tokio::time::sleep(REMOVE_DRAIN_POLL).await;
+        }
+        Err(ClusterAdminError::LeaderLeaving(leaving))
     }
     pub async fn transfer(&self, target: u64, expected_index: Option<u64>) -> Result<AdminResult> {
         let current = self.configuration().await?;
@@ -1130,6 +1572,36 @@ impl ClusterAdmin {
         if latest.receipt.is_some() || latest.superseded {
             return saved_view(self.identity.node, &saved);
         }
+        // A contact retirement can never commit once its record is gone or
+        // has moved past the generation it named (node ids are never reused;
+        // generations only rise). Read the table before the receipt, so an
+        // absent receipt at the later prefix is absence for good.
+        let contact_superseded = match &latest.request.command {
+            ControlCommand::RetireContact(command) => {
+                let AdminResult::Contacts { nodes, .. } = self.read(AdminRead::Contacts).await?
+                else {
+                    return Err(ClusterAdminError::Invalid);
+                };
+                Some(!nodes.iter().any(|contact| {
+                    contact.node == command.node
+                        && contact.generation == command.expected_generation
+                }))
+            }
+            _ => None,
+        };
+        // A grant compared at an authority revision can never commit once
+        // the authority has moved past it (revisions only rise).
+        let grant_superseded = match &latest.request.command {
+            ControlCommand::Authority(command) => match &command.operation {
+                focal_directory::AuthorityOperation::GrantNode { grant, .. } => Some(
+                    self.authority_revision(grant.enrollment.node, grant.enrollment.eligible)
+                        .await?
+                        > command.expected_revision,
+                ),
+                _ => None,
+            },
+            _ => None,
+        };
         let reply = self
             .exchange(AdminCommand::Read(AdminRead::Reconcile {
                 sequence: latest.request.id.sequence,
@@ -1151,6 +1623,10 @@ impl ClusterAdmin {
             ControlCommand::Enrollment(command) if command.revoked_invitation().is_some() => {
                 enrollment_revision > command.expected_revision()
             }
+            ControlCommand::RetireContact(_) => {
+                contact_superseded.ok_or(ClusterAdminError::Corrupt)?
+            }
+            ControlCommand::Authority(_) => grant_superseded.ok_or(ClusterAdminError::Corrupt)?,
             _ => return Err(ClusterAdminError::Corrupt),
         };
         if let Some(receipt) = receipt {
@@ -1194,6 +1670,36 @@ impl ClusterAdmin {
     ) -> Result<AdminResult> {
         if tenant == [0; 16] || session == [0; 16] || member == [0; 16] || node == 0 {
             return Err(ClusterAdminError::Invalid);
+        }
+        // The residency fence (24 §22) is checked here by name before the
+        // agent refuses it: the session's boundary against the node's
+        // announced region.
+        let view = self.placement_view().await?;
+        let session_hex = hex(&session);
+        let tenant_hex = hex(&tenant);
+        if let Some(target) = view
+            .partitions
+            .iter()
+            .flat_map(|partition| partition.sessions.iter())
+            .find(|entry| entry.session == session_hex && entry.tenant == tenant_hex)
+            && !target.residency.is_empty()
+        {
+            let region = view
+                .partitions
+                .iter()
+                .flat_map(|partition| partition.nodes.iter())
+                .find(|entry| entry.node == node)
+                .and_then(|entry| entry.region.clone());
+            if region
+                .as_ref()
+                .is_none_or(|region| !target.residency.contains(region))
+            {
+                return Err(ClusterAdminError::OutsideResidency {
+                    node,
+                    region,
+                    residency: target.residency.clone(),
+                });
+            }
         }
         let bytes = self
             .exchange_bytes(AdminCommand::MoveRange {
@@ -1392,26 +1898,18 @@ fn initialize_named(
     directory: &str,
     marker: &str,
 ) -> Result<bool> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let metadata = fs::symlink_metadata(root)?;
-    if !metadata.is_dir() || metadata.mode() & 0o077 != 0 {
-        return Err(ClusterAdminError::Corrupt);
-    }
+    let owner = focal_platform::fs::private_dir_owner(root)?.ok_or(ClusterAdminError::Corrupt)?;
     let path = root.join(marker);
     let expected = postcard::to_allocvec(identity).map_err(|_| ClusterAdminError::Capacity)?;
     match fs::symlink_metadata(&path) {
         Ok(info) => {
-            if !info.is_file()
-                || info.uid() != metadata.uid()
-                || info.mode() & 0o077 != 0
-                || info.nlink() != 1
+            if !focal_platform::fs::check_private_file(&path, &owner, 1)?
                 || info.len() != expected.len() as u64
             {
                 return Err(ClusterAdminError::Corrupt);
             }
-            let mut file = File::open(path)?;
-            let opened = file.metadata()?;
-            if opened.dev() != info.dev() || opened.ino() != info.ino() {
+            let mut file = File::open(&path)?;
+            if !focal_platform::fs::check_open_private_file(&path, &file, &owner)? {
                 return Err(ClusterAdminError::Corrupt);
             }
             let mut actual = vec![0; expected.len()];
@@ -1419,24 +1917,30 @@ fn initialize_named(
             if actual != expected || !root.join(directory).is_dir() {
                 return Err(ClusterAdminError::Corrupt);
             }
-            file.sync_all()?;
-            File::open(root)?.sync_all()?;
+            // The file was written and synced by its installer before this
+            // marker was ever readable; a read handle needs no re-sync (and
+            // FlushFileBuffers rejects a read-only handle on Windows). The
+            // directory entry is fenced below.
+            drop(file);
+            #[cfg(unix)]
+            {
+                File::open(root)?.sync_all()?;
+            }
             return Ok(false);
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
             if root.join(directory).exists() {
                 return Err(ClusterAdminError::Corrupt);
             }
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)?;
+            let mut file = focal_platform::fs::open_private(&path, false, true, true)?;
             file.write_all(&expected)?;
             file.sync_all()?;
-            File::open(root)?.sync_all()?;
             // No request can be transmitted before the child state is synced.
             // A crash during initialization leaves explicit fail-closed evidence.
+            #[cfg(unix)]
+            {
+                File::open(root)?.sync_all()?;
+            }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(ClusterAdminError::Expired);
@@ -1523,6 +2027,7 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 fn mutation_command(request: ControlRequest) -> Result<AdminCommand> {
     match &request.command {
         ControlCommand::Membership(_) => Ok(AdminCommand::Membership(Box::new(request))),
+        ControlCommand::RetireContact(_) => Ok(AdminCommand::RetireContact(Box::new(request))),
         ControlCommand::Authority(focal_directory::AuthorityCommand {
             operation: focal_directory::AuthorityOperation::GrantNode { .. },
             ..

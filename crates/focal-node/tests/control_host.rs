@@ -87,6 +87,10 @@ fn exhaust(memory: &MemoryBudget) -> Vec<focal_memory::Allocation> {
     }
     panic!("the control budget never reached exhaustion")
 }
+/// How long an owner may run no period before a wait calls it wedged.
+const FROZEN: Duration = Duration::from_secs(60);
+/// The tick of the owners of a rig.
+const RIG_TICK: Duration = Duration::from_millis(25);
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -170,7 +174,7 @@ impl Rig {
             )
             .unwrap();
             let mut config = ControlHostConfig::new(namespace());
-            config.tick = Duration::from_millis(25);
+            config.tick = RIG_TICK;
             config.request_timeout = Duration::from_millis(350);
             let (host, owner, channel) =
                 ControlHost::spawn(replica, RejectUnverifiedEvidence, config, allowance).unwrap();
@@ -182,6 +186,16 @@ impl Rig {
             let hosts = self.hosts.clone();
             let isolated = self.isolated.clone();
             self.routers.push(tokio::spawn(async move {
+                // What the machine takes to wake a task that asked for a
+                // millisecond is the path the sender's pace is derived from
+                // (27 §3.1 P2), as a node derives its pace from the round
+                // trips its probes measure: a loaded machine stretches the
+                // owners' periods here as it does there, and every wait
+                // charged to them with it. A probe, and not what a message
+                // takes to be handled: that is the owner's own period, and a
+                // pace fed its own period holds itself wherever it is.
+                let mut paths: std::collections::BTreeMap<u64, focal_timing::PathRtt> =
+                    std::collections::BTreeMap::new();
                 while let Some(frame) = channel.recv().await {
                     let excluded = isolated.load(Ordering::SeqCst);
                     if excluded == from || excluded == frame.target {
@@ -196,39 +210,122 @@ impl Rig {
                         &ControlHost::wire_limits(),
                     )
                     .unwrap();
-                    let _ = target.handle(verified).await;
+                    let _ = target.handle(&verified).await;
+                    let asked = std::time::Instant::now();
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    let taken = u64::try_from(asked.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    paths.entry(frame.target).or_default().on_sample(taken);
+                    if let Some(sender) = hosts.get(from.saturating_sub(1) as usize) {
+                        sender.pace(paths.values());
+                    }
                     drop(frame);
                 }
             }));
         }
     }
+    fn periods(&self) -> Vec<u64> {
+        self.hosts.iter().map(ControlHost::periods).collect()
+    }
+    /// A wait charged to the owners' own periods (27 §3.1 P8): what ten
+    /// seconds hold at the tick they are configured with, however long
+    /// that takes on the machine the test runs on.
+    fn deadline(&self) -> focal_timing::ProgressDeadline {
+        focal_timing::ProgressDeadline::begin(
+            &self.periods(),
+            focal_timing::ProgressDeadline::periods(Duration::from_secs(10), RIG_TICK),
+            FROZEN,
+        )
+    }
     async fn leader(&self, exclude: u64) -> usize {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                for (index, host) in self.hosts.iter().enumerate() {
-                    let status = host.progress();
-                    if status.node != exclude
-                        && status.leader == status.node
-                        && host
-                            .read(
-                                peer(PeerRole::Runtime),
-                                RequestId::from_u128(900),
-                                ControlRead::State,
-                            )
-                            .await
-                            .is_ok()
+        let mut wait = self.deadline();
+        // What each host last answered a read with, for the wait's report.
+        let mut answered: Vec<Option<ControlFailure>> = vec![None; self.hosts.len()];
+        // Every ask is a new one.
+        let mut asked = 0u128;
+        loop {
+            for (index, host) in self.hosts.iter().enumerate() {
+                let status = host.progress();
+                if status.node != exclude && status.leader == status.node {
+                    asked += 1;
+                    match host
+                        .read(
+                            peer(PeerRole::Runtime),
+                            RequestId::from_u128(900_000 + asked),
+                            ControlRead::State,
+                        )
+                        .await
                     {
-                        return index;
+                        Ok(_) => return index,
+                        Err(error) => {
+                            if let Some(slot) = answered.get_mut(index) {
+                                *slot = Some(error);
+                            }
+                        }
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        })
-        .await
-        .unwrap()
+            if let Err(spent) = wait.check(&self.periods()) {
+                panic!(
+                    "no leader that answers: {spent}; last read answers {answered:?}; periods {:?} refused {:?} longest {:?} pace {:?}; {:?}",
+                    self.periods(),
+                    self.hosts
+                        .iter()
+                        .map(ControlHost::refused_periods)
+                        .collect::<Vec<_>>(),
+                    self.hosts
+                        .iter()
+                        .map(ControlHost::longest_period)
+                        .collect::<Vec<_>>(),
+                    self.hosts
+                        .iter()
+                        .map(ControlHost::current_pace)
+                        .collect::<Vec<_>>(),
+                    self.hosts.iter().map(|h| h.progress()).collect::<Vec<_>>()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
     async fn state(&self, index: usize) -> ControlSnapshot {
         self.state_on_leader(index).await.1
+    }
+    /// The definite answer of host `index` to `request`, asked by `role`:
+    /// an outcome unknown, a host without the room or one not ready is
+    /// asked again, charged to the hosts' periods, and the exact request
+    /// finds the same receipt however often it is asked. A host that does
+    /// not lead hands the ask to the one that does, `excluded` aside; with
+    /// `follow` false its refusal to lead is the answer.
+    async fn definite(
+        &self,
+        index: &mut usize,
+        role: PeerRole,
+        request: &ControlRequest,
+        follow: Option<u64>,
+    ) -> Result<ControlReceipt, ControlFailure> {
+        let mut wait = self.deadline();
+        loop {
+            match self.hosts[*index].submit(peer(role), request.clone()).await {
+                Err(
+                    ControlFailure::OutcomeUnknown
+                    | ControlFailure::Unavailable
+                    | ControlFailure::NotReady
+                    | ControlFailure::Capacity,
+                ) => {}
+                Err(ControlFailure::NotLeader { .. }) if follow.is_some() => {
+                    *index = self.leader(follow.unwrap_or(0)).await;
+                }
+                answer => {
+                    if let Ok(receipt) = &answer {
+                        assert_eq!(receipt.request, request.id);
+                    }
+                    return answer;
+                }
+            }
+            if let Err(spent) = wait.check(&self.periods()) {
+                panic!("no definite answer to {:?}: {spent}", request.id);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
     async fn commit_on_leader(
         &self,
@@ -239,56 +336,58 @@ impl Rig {
         // A successful setup read is not a lease on the leader. Preserve the
         // exact command and request ID across short host deadlines or elections;
         // the tests below still exercise minority/refusal boundaries directly.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match self.hosts[index]
-                    .submit(peer(PeerRole::Runtime), request.clone())
-                    .await
-                {
-                    Ok(receipt) => {
-                        assert_eq!(receipt.request, request.id);
-                        return (index, receipt);
-                    }
-                    Err(
-                        ControlFailure::OutcomeUnknown
-                        | ControlFailure::Unavailable
-                        | ControlFailure::NotLeader { .. }
-                        | ControlFailure::NotReady,
-                    ) => index = self.leader(excluded).await,
-                    Err(error) => panic!("unexpected setup mutation failure: {error:?}"),
-                }
-            }
-        })
-        .await
-        .expect("exact setup mutation did not commit within five seconds")
+        match self
+            .definite(&mut index, PeerRole::Runtime, &request, Some(excluded))
+            .await
+        {
+            Ok(receipt) => (index, receipt),
+            Err(error) => panic!("unexpected setup mutation failure: {error:?}"),
+        }
     }
-    async fn state_on_leader(&self, mut index: usize) -> (usize, ControlSnapshot) {
-        // A completed ReadIndex is not an owner lease. These eventual-state
-        // assertions rediscover on transient leadership loss, while direct
-        // minority reads elsewhere in the tests must still fail immediately.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match self.hosts[index]
-                    .read(
-                        peer(PeerRole::Runtime),
-                        RequestId::from_u128(901),
-                        ControlRead::State,
-                    )
-                    .await
-                {
-                    Ok(ControlReadResult::State(snapshot)) => return (index, snapshot),
-                    Ok(_) => panic!("state expected"),
-                    Err(
-                        ControlFailure::Unavailable
-                        | ControlFailure::NotLeader { .. }
-                        | ControlFailure::NotReady,
-                    ) => index = self.leader(0).await,
-                    Err(error) => panic!("unexpected state read failure: {error:?}"),
-                }
+    /// `read` answered by whoever leads: a completed ReadIndex is not an
+    /// owner lease, so a host that stopped leading or is not ready hands
+    /// the read on, charged to the hosts' periods. Direct minority reads
+    /// elsewhere in the tests must still fail immediately.
+    async fn read_on_leader(
+        &self,
+        mut index: usize,
+        id: u128,
+        read: ControlRead,
+    ) -> (usize, ControlReadResult) {
+        let mut wait = self.deadline();
+        // Every ask is a new one.
+        let mut asked = 0u128;
+        loop {
+            asked += 1;
+            match self.hosts[index]
+                .read(
+                    peer(PeerRole::Runtime),
+                    RequestId::from_u128(id * 1_000_000 + asked),
+                    read.clone(),
+                )
+                .await
+            {
+                Ok(result) => return (index, result),
+                Err(
+                    ControlFailure::Unavailable
+                    | ControlFailure::NotLeader { .. }
+                    | ControlFailure::NotReady
+                    | ControlFailure::OutcomeUnknown
+                    | ControlFailure::Capacity,
+                ) => index = self.leader(0).await,
+                Err(error) => panic!("unexpected read failure: {error:?}"),
             }
-        })
-        .await
-        .expect("no quorum-ready state owner within five seconds")
+            if let Err(spent) = wait.check(&self.periods()) {
+                panic!("no quorum-ready owner answers {read:?}: {spent}");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    async fn state_on_leader(&self, index: usize) -> (usize, ControlSnapshot) {
+        match self.read_on_leader(index, 901, ControlRead::State).await {
+            (index, ControlReadResult::State(snapshot)) => (index, snapshot),
+            _ => panic!("state expected"),
+        }
     }
     async fn stop(&mut self) {
         for host in &self.hosts {
@@ -324,19 +423,65 @@ async fn directory_bootstrap_authorization_requires_a_fresh_root_quorum() {
     let mut rig = Rig::new(root_bootstrap(&authority), GROUP);
     let leader = rig.leader(0).await;
     let plan = FirstDirectoryPlan::derive(CLUSTER, 1).unwrap();
+    // The definite answer of the host: one without the room, or not ready,
+    // is asked again, charged to the owners' periods.
+    // A barrier that the host gave up on in its request's time is asked
+    // again too (`Unavailable`), except where the host cannot complete one:
+    // a leader that the quorum does not reach.
+    async fn definite(
+        rig: &Rig,
+        index: usize,
+        plan: FirstDirectoryPlan,
+        quorum: bool,
+    ) -> Result<(), DirectoryBootstrapError> {
+        let mut wait = rig.deadline();
+        let mut last;
+        loop {
+            match rig.hosts[index].prepare_directory(plan).await {
+                Err(
+                    error @ (DirectoryBootstrapError::Capacity
+                    | DirectoryBootstrapError::NotReady
+                    | DirectoryBootstrapError::Control(
+                        ControlError::Capacity | ControlError::Busy | ControlError::NotReady,
+                    )),
+                ) => last = Some(error),
+                Err(DirectoryBootstrapError::Unavailable) if quorum => {
+                    last = Some(DirectoryBootstrapError::Unavailable);
+                }
+                answer => return answer.map(|_| ()),
+            }
+            if let Err(spent) = wait.check(&rig.periods()) {
+                panic!(
+                    "no definite answer to the directory plan: {spent}; last {last:?}; leads {:?} periods {:?} longest {:?} pace {:?}",
+                    rig.hosts[index].progress().leader,
+                    rig.periods(),
+                    rig.hosts
+                        .iter()
+                        .map(ControlHost::longest_period)
+                        .collect::<Vec<_>>(),
+                    rig.hosts[index].current_pace()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
     // The quorum is live, but no real delegation/grant exists in this root.
-    assert!(matches!(
-        rig.hosts[leader].prepare_directory(plan).await,
-        Err(DirectoryBootstrapError::Unauthorized)
-    ));
+    let answer = definite(&rig, leader, plan, true).await;
+    assert!(
+        matches!(answer, Err(DirectoryBootstrapError::Unauthorized)),
+        "{answer:?}"
+    );
     let old_leader = rig.hosts[leader].progress().node;
     rig.isolated.store(old_leader, Ordering::SeqCst);
     // Even denial must be evaluated behind this request's new barrier. A
-    // previously completed read cannot authorize a later startup request.
-    assert!(matches!(
-        rig.hosts[leader].prepare_directory(plan).await,
-        Err(DirectoryBootstrapError::Unavailable)
-    ));
+    // previously completed read cannot authorize a later startup request:
+    // the isolated leader's barrier never completes, and it says so once
+    // it has waited a request's time of its own periods.
+    let answer = definite(&rig, leader, plan, false).await;
+    assert!(
+        matches!(answer, Err(DirectoryBootstrapError::Unavailable)),
+        "{answer:?}"
+    );
     rig.isolated.store(0, Ordering::SeqCst);
     rig.stop().await;
 }
@@ -426,10 +571,10 @@ async fn root_enrollment_majority_commit_exact_retry_and_disk_restart() {
     .unwrap();
     let mut rig = Rig::new(root_bootstrap(&authority), GROUP);
     rig.hosts[0].campaign().await.unwrap();
-    let leader = rig.leader(0).await;
+    let mut leader = rig.leader(0).await;
     let first = request(1, region(0, 1));
-    let first_receipt = rig.hosts[leader]
-        .submit(peer(PeerRole::Runtime), first.clone())
+    let first_receipt = rig
+        .definite(&mut leader, PeerRole::Runtime, &first, Some(0))
         .await
         .unwrap();
     assert_eq!(first_receipt.revisions.root, 1);
@@ -455,9 +600,14 @@ async fn root_enrollment_majority_commit_exact_retry_and_disk_restart() {
             .await
             .is_err()
     );
-    let majority = rig.leader(isolated_id).await;
-    let second_receipt = rig.hosts[majority]
-        .submit(peer(PeerRole::Runtime), pending.clone())
+    let mut majority = rig.leader(isolated_id).await;
+    let second_receipt = rig
+        .definite(
+            &mut majority,
+            PeerRole::Runtime,
+            &pending,
+            Some(isolated_id),
+        )
         .await
         .unwrap();
     assert_eq!(second_receipt.revisions.root, 2);
@@ -476,8 +626,14 @@ async fn root_enrollment_majority_commit_exact_retry_and_disk_restart() {
         )
         .unwrap();
     let invitation_request = request(3, ControlCommand::Enrollment(draft.command().clone()));
-    let invitation_receipt = rig.hosts[majority]
-        .submit(peer(PeerRole::Runtime), invitation_request.clone())
+    let mut majority = majority;
+    let invitation_receipt = rig
+        .definite(
+            &mut majority,
+            PeerRole::Runtime,
+            &invitation_request,
+            Some(0),
+        )
         .await
         .unwrap();
     let (majority, snapshot) = rig.state_on_leader(majority).await;
@@ -491,8 +647,14 @@ async fn root_enrollment_majority_commit_exact_retry_and_disk_restart() {
         panic!("new enrollment expected")
     };
     let enrollment_request = request(4, ControlCommand::Enrollment(command));
-    let enrollment_receipt = rig.hosts[majority]
-        .submit(peer(PeerRole::Runtime), enrollment_request.clone())
+    let mut majority = majority;
+    let enrollment_receipt = rig
+        .definite(
+            &mut majority,
+            PeerRole::Runtime,
+            &enrollment_request,
+            Some(0),
+        )
         .await
         .unwrap();
     let enrolled = registry(&rig.state(majority).await)
@@ -504,7 +666,7 @@ async fn root_enrollment_majority_commit_exact_retry_and_disk_restart() {
     rig.stop().await;
     rig.start();
     rig.hosts[0].campaign().await.unwrap();
-    let recovered = rig.leader(0).await;
+    let mut recovered = rig.leader(0).await;
     for (request, receipt) in [
         (first, first_receipt),
         (pending, second_receipt),
@@ -512,8 +674,7 @@ async fn root_enrollment_majority_commit_exact_retry_and_disk_restart() {
         (enrollment_request, enrollment_receipt),
     ] {
         assert_eq!(
-            rig.hosts[recovered]
-                .submit(peer(PeerRole::Runtime), request)
+            rig.definite(&mut recovered, PeerRole::Runtime, &request, Some(0))
                 .await
                 .unwrap(),
             receipt
@@ -549,11 +710,15 @@ async fn partition_owner_replication_and_authorization_are_independent_of_root()
     .unwrap();
     let mut rig = Rig::new(ControlBootstrap::partition(&directory), group);
     rig.hosts[0].campaign().await.unwrap();
-    let leader = rig.leader(0).await;
+    let mut leader = rig.leader(0).await;
     assert_eq!(
-        rig.hosts[leader]
-            .submit(peer(PeerRole::Actor), request(1, region(0, 1)))
-            .await,
+        rig.definite(
+            &mut leader,
+            PeerRole::Actor,
+            &request(1, region(0, 1)),
+            Some(0)
+        )
+        .await,
         Err(ControlFailure::Unauthorized)
     );
     let forged = ControlRequest {
@@ -565,15 +730,18 @@ async fn partition_owner_replication_and_authorization_are_independent_of_root()
         command: region(0, 1),
     };
     assert_eq!(
-        rig.hosts[leader]
-            .submit(peer(PeerRole::Runtime), forged)
+        rig.definite(&mut leader, PeerRole::Runtime, &forged, Some(0))
             .await,
         Err(ControlFailure::Unauthorized)
     );
     assert_eq!(
-        rig.hosts[leader]
-            .submit(peer(PeerRole::Runtime), request(1, region(0, 1)))
-            .await,
+        rig.definite(
+            &mut leader,
+            PeerRole::Runtime,
+            &request(1, region(0, 1)),
+            Some(0)
+        )
+        .await,
         Err(ControlFailure::WrongOwner)
     );
     let request = request(
@@ -588,8 +756,8 @@ async fn partition_owner_replication_and_authorization_are_independent_of_root()
             },
         }),
     );
-    let receipt = rig.hosts[leader]
-        .submit(peer(PeerRole::Runtime), request.clone())
+    let receipt = rig
+        .definite(&mut leader, PeerRole::Runtime, &request, Some(0))
         .await
         .unwrap();
     assert_eq!(receipt.revisions.partition, 1);
@@ -617,7 +785,7 @@ async fn partition_owner_replication_and_authorization_are_independent_of_root()
         };
         let verified =
             verify_request(peer(PeerRole::Runtime), wire, &ControlHost::wire_limits()).unwrap();
-        let result = rig.hosts[leader].handle(verified).await;
+        let result = rig.hosts[leader].handle(&verified).await;
         let Response::Control { response } = result.result else {
             panic!("control response expected")
         };
@@ -652,17 +820,16 @@ async fn partition_owner_replication_and_authorization_are_independent_of_root()
     )
     .unwrap();
     assert_eq!(
-        rig.hosts[leader].handle(verified).await.result,
+        rig.hosts[leader].handle(&verified).await.result,
         Response::Error(AccessError::Unauthorized)
     );
     tokio::time::sleep(Duration::from_millis(150)).await;
     rig.stop().await;
     rig.start();
     rig.hosts[0].campaign().await.unwrap();
-    let recovered = rig.leader(0).await;
+    let mut recovered = rig.leader(0).await;
     assert_eq!(
-        rig.hosts[recovered]
-            .submit(peer(PeerRole::Runtime), request)
+        rig.definite(&mut recovered, PeerRole::Runtime, &request, Some(0))
             .await
             .unwrap(),
         receipt
@@ -703,24 +870,21 @@ async fn owned_control_response_retains_input_and_export_budgets_until_delivery_
     )
     .unwrap();
     host.campaign().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if host
-                .read(
-                    peer(PeerRole::Runtime),
-                    RequestId::from_u128(1),
-                    ControlRead::State,
-                )
-                .await
-                .is_ok()
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+    let mut wait = focal_timing::ProgressDeadline::begin(&[host.periods()], 100, FROZEN);
+    while host
+        .read(
+            peer(PeerRole::Runtime),
+            RequestId::from_u128(1),
+            ControlRead::State,
+        )
+        .await
+        .is_err()
+    {
+        if let Err(spent) = wait.check(&[host.periods()]) {
+            panic!("the owner never led: {spent}; {:?}", host.progress());
         }
-    })
-    .await
-    .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let before = memory.stats();
     let request = RequestEnvelope {
         protocol: PROTOCOL_VERSION,
@@ -739,7 +903,7 @@ async fn owned_control_response_retains_input_and_export_budgets_until_delivery_
         &ControlHost::wire_limits(),
     )
     .unwrap();
-    let response = host.handle_accounted(verified).await;
+    let response = host.handle_accounted(&verified).await;
     assert!(matches!(
         response.envelope().result,
         Response::Control { .. }
@@ -815,6 +979,9 @@ async fn follower_root_observation_exports_one_durable_prefix_and_retains_delive
                 advertise: "127.0.0.1:7443".parse().unwrap(),
                 expected_generation: 0,
                 decided_at: now(),
+                region: None,
+                zone: None,
+                endpoint: None,
             }),
         ),
     );
@@ -840,13 +1007,18 @@ async fn follower_root_observation_exports_one_durable_prefix_and_retains_delive
     config.tick = Duration::from_secs(1);
     let (host, owner, outgoing) =
         ControlHost::spawn(replica, RejectUnverifiedEvidence, config, memory.clone()).unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while host.progress().applied_index != membership.committed_index {
-            tokio::time::sleep(Duration::from_millis(1)).await;
+    // What was durable is applied when the owner opens, before its first
+    // period: the wait is for the owner's thread to have run at all.
+    let mut wait = focal_timing::ProgressDeadline::begin(&[host.periods()], 30, FROZEN);
+    while host.progress().applied_index != membership.committed_index {
+        if let Err(spent) = wait.check(&[host.periods()]) {
+            panic!(
+                "what was durable was never applied: {spent}; {:?}",
+                host.progress()
+            );
         }
-    })
-    .await
-    .unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
     assert_eq!(host.progress().leader, 0);
     assert!(matches!(
         host.read(
@@ -858,12 +1030,29 @@ async fn follower_root_observation_exports_one_durable_prefix_and_retains_delive
         Err(ControlFailure::NotLeader { .. })
     ));
     let before = memory.stats();
-    let exhausted = exhaust(&memory);
-    assert!(matches!(
-        host.observe_root().await,
-        Err(ControlFailure::Capacity)
-    ));
-    drop(exhausted);
+    // The owner shares the budget: what it reserves for a tick it gives
+    // back when the tick is over, and room given back after the budget was
+    // filled admits an observation. An observation that was admitted is
+    // delivered and dropped, and the budget is filled again, until one is
+    // asked with no room: that one is refused.
+    let mut refused = false;
+    for _ in 0..64 {
+        let exhausted = exhaust(&memory);
+        let observed = host.observe_root().await;
+        drop(exhausted);
+        match observed {
+            Err(ControlFailure::Capacity) => {
+                refused = true;
+                break;
+            }
+            Ok(observation) => drop(observation),
+            Err(error) => panic!(
+                "an observation failed for no room of its own: {error:?}; the owner: {:?}",
+                host.progress().failure
+            ),
+        }
+    }
+    assert!(refused, "an observation was never refused for room");
     assert_eq!(
         memory.stats().by_kind[focal_memory::BudgetKind::Control as usize],
         before.by_kind[focal_memory::BudgetKind::Control as usize]
@@ -978,14 +1167,9 @@ async fn membership_requires_runtime_and_returns_only_committed_configuration_re
     let mut rig = Rig::new(root_bootstrap(&authority), GROUP);
     rig.hosts[0].campaign().await.unwrap();
     let leader = rig.leader(0).await;
-    let ControlReadResult::Configuration(before) = rig.hosts[leader]
-        .read(
-            peer(PeerRole::Runtime),
-            RequestId::from_u128(910),
-            ControlRead::Configuration,
-        )
+    let (leader, ControlReadResult::Configuration(before)) = rig
+        .read_on_leader(leader, 910, ControlRead::Configuration)
         .await
-        .unwrap()
     else {
         panic!("configuration")
     };
@@ -997,33 +1181,30 @@ async fn membership_requires_runtime_and_returns_only_committed_configuration_re
             change: MembershipChange::AddLearner { node: 4 },
         }),
     );
+    let mut leader = leader;
     for role in [
         PeerRole::Actor,
         PeerRole::Evaluator,
         PeerRole::Node { node_id: 2 },
     ] {
         assert!(matches!(
-            rig.hosts[leader].submit(peer(role), add.clone()).await,
+            rig.definite(&mut leader, role, &add, Some(0)).await,
             Err(ControlFailure::Unauthorized)
         ));
     }
     let (leader, added) = rig.commit_on_leader(leader, add.clone(), 0).await;
-    let ControlReadResult::Configuration(after) = rig.hosts[leader]
-        .read(
-            peer(PeerRole::Runtime),
-            RequestId::from_u128(911),
-            ControlRead::Configuration,
-        )
+    let (leader, ControlReadResult::Configuration(after)) = rig
+        .read_on_leader(leader, 911, ControlRead::Configuration)
         .await
-        .unwrap()
     else {
         panic!("configuration")
     };
     assert_eq!(after.configuration_index, added.committed_index);
     assert_eq!(after.configuration.learners, vec![4]);
+    // A follower answers the exact request from what was committed.
+    let mut follower = (leader + 1) % 3;
     assert_eq!(
-        rig.hosts[(leader + 1) % 3]
-            .submit(peer(PeerRole::Runtime), add)
+        rig.definite(&mut follower, PeerRole::Runtime, &add, None)
             .await
             .unwrap(),
         added
@@ -1051,18 +1232,14 @@ async fn membership_requires_runtime_and_returns_only_committed_configuration_re
             change: MembershipChange::Remove { node: 4 },
         }),
     );
-    let removed = rig.hosts[leader]
-        .submit(peer(PeerRole::Runtime), remove)
+    let mut leader = leader;
+    let removed = rig
+        .definite(&mut leader, PeerRole::Runtime, &remove, Some(0))
         .await
         .unwrap();
-    let ControlReadResult::Configuration(current) = rig.hosts[leader]
-        .read(
-            peer(PeerRole::Runtime),
-            RequestId::from_u128(912),
-            ControlRead::Configuration,
-        )
+    let (leader, ControlReadResult::Configuration(current)) = rig
+        .read_on_leader(leader, 912, ControlRead::Configuration)
         .await
-        .unwrap()
     else {
         panic!("configuration")
     };
@@ -1084,12 +1261,33 @@ async fn membership_requires_runtime_and_returns_only_committed_configuration_re
             .await,
         Err(ControlFailure::Unauthorized)
     ));
-    rig.hosts[leader]
-        .transfer(peer(PeerRole::Runtime), RequestId::from_u128(914), transfer)
-        .await
-        .unwrap();
-    let next = rig.leader(rig.hosts[leader].progress().node).await;
-    assert_eq!(rig.hosts[next].progress().node, target);
+    // A transfer asks the target to campaign; on a machine that starves
+    // its owners another voter may have campaigned first. Leadership is
+    // handed on from whoever leads until the target leads.
+    let mut leads = leader;
+    let mut led = false;
+    for attempt in 0..16u128 {
+        let asked = rig.hosts[leads]
+            .transfer(
+                peer(PeerRole::Runtime),
+                RequestId::from_u128(914 + attempt),
+                transfer.clone(),
+            )
+            .await;
+        assert!(
+            matches!(
+                asked,
+                Ok(_) | Err(ControlFailure::NotLeader { .. } | ControlFailure::Unavailable)
+            ),
+            "{asked:?}"
+        );
+        leads = rig.leader(rig.hosts[leads].progress().node).await;
+        if rig.hosts[leads].progress().node == target {
+            led = true;
+            break;
+        }
+    }
+    assert!(led, "the target of a transfer never led");
     rig.stop().await;
 }
 
@@ -1144,10 +1342,20 @@ async fn recovered_control_events_are_forwarded_once_and_keep_frames_charged_aft
     let mut frames = Vec::new();
     let mut actual = Vec::new();
     for _ in 0..expected.len() {
-        let frame = tokio::time::timeout(Duration::from_secs(3), outgoing.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        // The owner frames what was recovered when it starts, before its
+        // first period.
+        let mut wait = focal_timing::ProgressDeadline::begin(&[host.periods()], 30, FROZEN);
+        let frame = loop {
+            match outgoing.try_recv() {
+                Ok(frame) => break frame,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                Err(error) => panic!("the owner closed what it sends on: {error}"),
+            }
+            if let Err(spent) = wait.check(&[host.periods()]) {
+                panic!("what was recovered was never framed: {spent}");
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
         let Operation::Raft { group, message } = &frame.request.operation else {
             panic!("replication frame");
         };
@@ -1169,4 +1377,89 @@ async fn recovered_control_events_are_forwarded_once_and_keep_frames_charged_aft
     assert!(memory.stats().by_kind[focal_memory::BudgetKind::Control as usize] > 0);
     drop(frames);
     assert_eq!(memory.stats().used, 0);
+}
+
+/// An owner that is refused the room is not ticked and drains nothing, and
+/// goes on: the periods pass, it says how many of them passed without a
+/// tick, and it leads and answers once the room is back. Before, it stopped for
+/// the refusal of one tick or of one drain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_owner_refused_the_room_waits_and_goes_on() {
+    let data = tempfile::tempdir().unwrap();
+    let authority = BootstrapAuthority::open_or_create(
+        data.path().join("ca"),
+        CLUSTER,
+        vec!["localhost".into()],
+        now(),
+    )
+    .unwrap();
+    let memory = budget();
+    let replica = ControlReplica::open(
+        ControlOptions::new(NodeConfig::single(1, CLUSTER, GROUP)),
+        root_bootstrap(&authority),
+        memory.clone(),
+        data.path().join("log"),
+    )
+    .unwrap();
+    let mut config = ControlHostConfig::new(namespace());
+    config.tick = Duration::from_millis(10);
+    let (host, owner, _outgoing) =
+        ControlHost::spawn(replica, RejectUnverifiedEvidence, config, memory.clone()).unwrap();
+    let answers = async || {
+        host.read(
+            peer(PeerRole::Runtime),
+            RequestId::from_u128(1),
+            ControlRead::State,
+        )
+        .await
+    };
+    host.campaign().await.unwrap();
+    let mut wait = focal_timing::ProgressDeadline::begin(&[host.periods()], 500, FROZEN);
+    while answers().await.is_err() {
+        if let Err(spent) = wait.check(&[host.periods()]) {
+            panic!("the owner never led: {spent}; {:?}", host.progress());
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // No room, for fifty periods of the owner. What it frees is taken
+    // again, so that it is refused whatever it gives back.
+    let (began, refused) = (host.periods(), host.refused_periods());
+    let mut held = Vec::new();
+    let mut wait = focal_timing::ProgressDeadline::begin(&[began], 5_000, FROZEN);
+    while host.periods() < began + 50 {
+        held.extend(exhaust(&memory));
+        if let Err(spent) = wait.check(&[host.periods()]) {
+            panic!(
+                "the owner stopped its periods: {spent}; {:?}",
+                host.progress()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let progress = host.progress();
+    assert!(!progress.stopped, "{progress:?}");
+    assert_eq!(progress.failure, None);
+    assert!(
+        host.refused_periods() > refused,
+        "fifty periods without room, and none of them refused"
+    );
+    // The room is back: it leads, or is elected again, and answers.
+    drop(held);
+    let mut wait = focal_timing::ProgressDeadline::begin(&[host.periods()], 2_000, FROZEN);
+    let mut asked = false;
+    while answers().await.is_err() {
+        if !asked && host.progress().leader == 0 {
+            asked = host.campaign().await.is_ok();
+        }
+        if let Err(spent) = wait.check(&[host.periods()]) {
+            panic!(
+                "the owner never answered again: {spent}; {:?}",
+                host.progress()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(host.progress().failure, None);
+    host.stop().await.unwrap();
+    owner.join().unwrap();
 }

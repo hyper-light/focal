@@ -61,6 +61,12 @@ jobs:
     name: Native build and smoke (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    # Every step is a bash step, on Windows too: the Windows lanes' default
+    # shell is PowerShell, which reads `$TOOLCHAIN` as its own empty variable
+    # and installed no toolchain (the first dispatch that reached them).
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.guard.outputs.matrix) }}
@@ -69,6 +75,12 @@ jobs:
       TOOLCHAIN: ${{ needs.guard.outputs.toolchain }}
       MUSL_IMAGE: ${{ needs.guard.outputs.musl_image }}
       MACOSX_DEPLOYMENT_TARGET: '15.0'
+      # The Windows executables carry their C runtime, as the musl ones do:
+      # nothing to install on the machine that runs them, and the import
+      # table the staging step verifies names no `vcruntime140.dll`. The
+      # flag reaches only the target's crates, since the build names its
+      # target; the musl lanes set the same flag inside their container.
+      RUSTFLAGS: ${{ startsWith(matrix.target, 'x86_64-pc-windows') && '-C target-feature=+crt-static' || startsWith(matrix.target, 'aarch64-pc-windows') && '-C target-feature=+crt-static' || '' }}
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-python@v5.6.0
@@ -86,6 +98,16 @@ jobs:
       - name: Install protobuf compiler (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
+      - name: Install protobuf compiler (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver=29.3
+          url="https://github.com/protocolbuffers/protobuf/releases/download/v${ver}/protoc-${ver}-win64.zip"
+          curl -sSL "$url" -o protoc.zip
+          7z x protoc.zip -oprotoc-dist >/dev/null
+          echo "PROTOC=$(pwd)/protoc-dist/bin/protoc.exe" >> "$GITHUB_ENV"
       - name: Build native executable
         if: ${{ !matrix.musl }}
         run: bash scripts/cargo.sh build --release --locked -p focal-node --bin focal --target "$TARGET"
@@ -104,8 +126,10 @@ jobs:
             '
           sudo chown -R "$(id -u):$(id -g)" target
       - name: Smoke the actual server, CLI, crash recovery and MCP executable
+        shell: bash
         run: python3 scripts/release/smoke.py "target/$TARGET/release/focal"
       - name: Verify target and staticness; stage raw binary and provenance
+        shell: bash
         run: python3 scripts/release/release.py stage --target "$TARGET" --output staged
       - uses: actions/upload-artifact@v4.6.2
         with:

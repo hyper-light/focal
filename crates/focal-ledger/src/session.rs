@@ -1,6 +1,7 @@
 use crate::native_session::{
     FailureClass, NativeCommit, NativeOutput, NativeReadBoundary, NativeSessionError,
-    NativeSessionLimits, NativeSubmission, NativeTimerInput, PendingSeed, ReadCorrelation, engine,
+    NativeSessionLimits, NativeSubmission, NativeTimerInput, PendingCustody, PendingSeed,
+    ReadCorrelation, engine,
 };
 use crate::request_streams::{
     ManagedError, PreparedStream, RequestStreamLimits, RequestStreams, RequestStreamsCheckpoint,
@@ -16,7 +17,8 @@ use focal_core::{
 };
 use focal_evidence::{BuiltinNativeSchemas, ContentReader, ContentStore, VerifiedNativeArtifact};
 use focal_graph::{
-    GraphConfig, GraphError, GraphSnapshot, GraphStore, PreparedGraph, reference_charge,
+    ArtifactEvidence, GraphConfig, GraphError, GraphSnapshot, GraphStore, PreparedGraph,
+    reference_charge,
 };
 use focal_memory::{
     Allocation, BudgetKind, BudgetLane, BudgetStats, MemoryBudget, MemoryError, RangeId,
@@ -254,6 +256,9 @@ pub struct Session {
     /// adopted, so the missing chunks are kept here for the host to pull
     /// while the delivery is retained.
     seed_pending: Option<PendingSeed>,
+    /// The objects a retained snapshot install could not read locally
+    /// (24 §20); the engine that would have held them was not adopted.
+    custody_pending: Option<PendingCustody>,
     /// A seed chunk landed since the retained delivery last tried to
     /// assemble the checkpoint; until one does, resuming would only repeat
     /// the same refusal.
@@ -469,6 +474,7 @@ impl Session {
             hosting,
             seed_pending: None,
             seed_progress: false,
+            custody_pending: None,
             retained: None,
         };
         // Recovery consumes prior committed outcomes without executing their effects.
@@ -573,6 +579,46 @@ impl Session {
         }
         self.step(message)
     }
+    /// This replica's election priority (27 §5); see
+    /// `DurableNode::set_priority`.
+    pub fn set_priority(&mut self, priority: i64) -> Result<(), LedgerError> {
+        Ok(self.consensus.set_priority(priority)?)
+    }
+    pub fn priority(&self) -> i64 {
+        self.consensus.priority()
+    }
+    /// Ticks between a leader's heartbeats.
+    pub fn heartbeat_tick(&self) -> usize {
+        self.consensus.heartbeat_tick()
+    }
+    /// A leader sends its heartbeats now; see `DurableNode::beat`.
+    pub fn beat(&mut self) -> Result<(), LedgerError> {
+        self.check()?;
+        Ok(self.consensus.beat()?)
+    }
+    /// Ticks without leader contact before this replica campaigns.
+    pub fn election_tick(&self) -> usize {
+        self.consensus.election_tick()
+    }
+    /// The ticks the replica waits beyond its election timeout before it
+    /// campaigns (`DurableNode::set_patience`).
+    pub fn set_patience(&mut self, ticks: usize) -> Result<(), LedgerError> {
+        self.check()?;
+        self.consensus.set_patience(ticks)?;
+        Ok(())
+    }
+    /// What this leader tracks of one member's replication.
+    pub fn peer(&self, node: u64) -> Option<focal_consensus::PeerProgress> {
+        self.consensus.peer(node)
+    }
+    /// The member this leader is handing leadership to, while it is.
+    pub fn transferring(&self) -> Option<u64> {
+        self.consensus.transferring()
+    }
+    /// A configuration change is in the log and not applied yet.
+    pub fn configuration_pending(&self) -> bool {
+        self.consensus.configuration_pending()
+    }
     pub fn status(&self) -> NodeStatus {
         self.consensus.status()
     }
@@ -584,6 +630,18 @@ impl Session {
     }
     pub fn sequence(&self) -> SessionSeq {
         self.core.sequence()
+    }
+    /// The committed native prefix as ordered outcomes — one per committed
+    /// record, in native-sequence order (offline publications reader, R11 §1).
+    /// Empty when this ledger has no native engine. Survives a checkpoint (the
+    /// outcomes are recovered state, not a delivery delta).
+    pub fn native_committed_outcomes(
+        &self,
+    ) -> Result<Vec<focal_core::native::NativeOutcome>, LedgerError> {
+        match self.native.as_deref() {
+            Some(engine) => Ok(engine.committed_core()?.native_outcomes()),
+            None => Ok(Vec::new()),
+        }
     }
     pub fn ledger(&self) -> LedgerId {
         self.ledger
@@ -916,7 +974,7 @@ impl Session {
         if self.consensus.checkpoint_pending() {
             self.consensus.finish_checkpoint()?;
         }
-        let acquired = self.consensus.drain().map_err(LedgerError::from);
+        let acquired = self.consensus.drain().map_err(|error| self.refused(error));
         let result = acquired.and_then(|events| self.apply_events(events));
         self.finish_poll(result)
     }
@@ -943,7 +1001,23 @@ impl Session {
                 let result = self.apply_events(events);
                 self.finish_poll(result).map(Some)
             }
-            Err(error) => self.finish_poll(Err(error.into())).map(Some),
+            Err(error) => {
+                let error = self.refused(error);
+                self.finish_poll(Err(error)).map(Some)
+            }
+        }
+    }
+    /// What a drain failed with. One the node refused before it took
+    /// anything, for the room or for what it still persists, left the node
+    /// as it was: it is asked again, and the session goes on.
+    fn refused(&self, error: ConsensusError) -> LedgerError {
+        if self.consensus.failed() {
+            error.into()
+        } else {
+            match error {
+                ConsensusError::Capacity | ConsensusError::PersistencePending => LedgerError::Retry,
+                error => error.into(),
+            }
         }
     }
     fn finish_poll(

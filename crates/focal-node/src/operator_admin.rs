@@ -36,11 +36,21 @@ pub enum OperatorRead {
     Gc,
     /// The storage view of this node (26 §7).
     Storage,
+    /// The node's readiness probes (08 §9).
+    Readiness,
+    /// The node's metrics as Prometheus text (08 §9, 24 §23).
+    Metrics,
 }
 impl OperatorRead {
     pub(super) fn validate(self) -> Result<(), AccessError> {
         let valid = match self {
-            Self::Identity | Self::Health | Self::Configuration | Self::Gc | Self::Storage => true,
+            Self::Identity
+            | Self::Health
+            | Self::Configuration
+            | Self::Gc
+            | Self::Storage
+            | Self::Readiness
+            | Self::Metrics => true,
             Self::Replica { session } => !session.is_zero(),
             Self::Archive { session, claim } => !session.is_zero() && !claim.is_zero(),
         };
@@ -53,6 +63,10 @@ impl OperatorRead {
 }
 /// Sessions the storage view lists before it reports truncation.
 const MAX_STORAGE_SESSIONS: usize = 256;
+/// The whole readiness report's wait budget (08 §9): well under a
+/// supervisor's exec-probe timeout, so a root or session leader that is
+/// unreachable makes the report incomplete, never late.
+const READINESS_BUDGET: std::time::Duration = std::time::Duration::from_millis(400);
 #[derive(Serialize, Deserialize)]
 pub(crate) enum OperatorReply {
     Identity(AdminNodeIdentity),
@@ -64,6 +78,9 @@ pub(crate) enum OperatorReply {
     Archive(Option<Box<AdminArchiveBundle>>),
     Gc(Box<focal_client::admin::AdminGc>),
     Storage(Box<focal_client::admin::AdminStorage>),
+    Readiness(Box<focal_client::admin::AdminReadiness>),
+    /// Prometheus text (24 §23).
+    Metrics(String),
 }
 impl LocalNetworkAdmin {
     pub(super) async fn operator_read(&self, read: OperatorRead) -> Result<Vec<u8>, AccessError> {
@@ -105,6 +122,19 @@ impl LocalNetworkAdmin {
                     root_tenant: namespace.tenant.to_string(),
                     root_session: namespace.session.to_string(),
                 }))
+            }
+            OperatorRead::Readiness => self
+                .readiness()
+                .await
+                .map(|readiness| OperatorReply::Readiness(Box::new(readiness))),
+            OperatorRead::Metrics => {
+                let view = self.metrics.as_ref().ok_or(AccessError::Unavailable)?;
+                let text = view
+                    .borrow()
+                    .as_ref()
+                    .map(crate::metrics::MetricsSnapshot::render)
+                    .unwrap_or_else(|| "# metrics not sampled yet\n".to_owned());
+                Ok(OperatorReply::Metrics(text))
             }
             OperatorRead::Health => {
                 let root = self
@@ -315,4 +345,123 @@ fn hex(bytes: &[u8]) -> String {
         .flat_map(|byte| [byte >> 4, byte & 15])
         .filter_map(|nibble| char::from_digit(u32::from(nibble), 16))
         .collect()
+}
+
+impl LocalNetworkAdmin {
+    /// The readiness probes (08 §9), derived from the root replica's
+    /// progress, every hosted replica's diagnostics and the placement view
+    /// the agent last observed. Nothing here is a quorum read.
+    async fn readiness(&self) -> Result<focal_client::admin::AdminReadiness, AccessError> {
+        use focal_client::admin::{AdminReadiness, AdminRootProgress, AdminSessionReadiness};
+        let control = self.control.as_ref().ok_or(AccessError::Unavailable)?;
+        let fleet = self.fleet.as_ref().ok_or(AccessError::Unavailable)?;
+        let root = control.progress();
+        // The report is bounded as a whole: the placement view and each
+        // session's diagnostics can wait on the root or a session leader that
+        // is currently unreachable, and a supervisor's probe must not hang
+        // with them. What the budget does not cover is reported as absent
+        // (`truncated`, no directory view), which never satisfies the policy
+        // — honest, and bounded.
+        let deadline = tokio::time::Instant::now()
+            .checked_add(READINESS_BUDGET)
+            .ok_or(AccessError::Capacity)?;
+        let placement = match &self.placement {
+            Some(handle) => match tokio::time::timeout_at(deadline, handle.directory()).await {
+                Ok(Ok(report)) => {
+                    let (now, holds) = self.session_holds(&report);
+                    Some(placement_reply(
+                        report,
+                        &self.topology_labels().await,
+                        now,
+                        &holds,
+                    ))
+                }
+                Ok(Err(_)) | Err(_) => None,
+            },
+            None => None,
+        };
+        let listed = |ledger: focal_model::LedgerId| {
+            placement.as_ref().and_then(|reply| {
+                reply.placement.partitions.iter().find_map(|partition| {
+                    partition.sessions.iter().find(|session| {
+                        session.tenant == ledger.tenant.to_string()
+                            && session.session == ledger.session.to_string()
+                    })
+                })
+            })
+        };
+        let mut sessions = Vec::new();
+        let mut truncated = false;
+        let mut after = None;
+        while let Some((ledger, host)) = fleet.next_host(after) {
+            after = Some(ledger);
+            if sessions.len() >= MAX_STORAGE_SESSIONS {
+                truncated = true;
+                break;
+            }
+            let progress = host.progress();
+            let Ok(Ok(reply)) = tokio::time::timeout_at(deadline, host.diagnostics()).await else {
+                truncated = true;
+                break;
+            };
+            let diagnostics = reply.value();
+            let directory = listed(ledger);
+            sessions.try_reserve(1).map_err(|_| AccessError::Capacity)?;
+            sessions.push(AdminSessionReadiness {
+                tenant: ledger.tenant.to_string(),
+                session: ledger.session.to_string(),
+                leader: progress.leader,
+                authoritative: diagnostics.authoritative,
+                committed_index: diagnostics.committed_index,
+                applied_index: diagnostics.applied_index,
+                seed_pending: progress.seed_pending.is_some(),
+                import_pending: progress.import_pending.is_some(),
+                custody_pending: progress.custody_pending.is_some(),
+                stopped: progress.stopped,
+                desired_max_failures: directory.map(|session| session.max_failures),
+                achieved_max_failures: directory.and_then(|session| session.achieved_max_failures),
+                blocked_by: directory
+                    .map(|session| session.blocked_by.clone())
+                    .unwrap_or_default(),
+            });
+        }
+        let node = self.identity.node;
+        let leads_root = root.leader == node && !root.stopped;
+        let authoritative = leads_root
+            || sessions
+                .iter()
+                .any(|session| session.leader == node && session.authoritative && !session.stopped);
+        let following = root.leader != 0
+            && !root.stopped
+            && sessions.iter().all(|session| {
+                session.leader != 0
+                    && !session.stopped
+                    && !session.seed_pending
+                    && !session.import_pending
+                    && !session.custody_pending
+            });
+        let policy_satisfied = !truncated
+            && sessions.iter().all(|session| {
+                session.blocked_by.is_empty()
+                    && match (session.desired_max_failures, session.achieved_max_failures) {
+                        (Some(desired), Some(achieved)) => achieved >= desired,
+                        _ => false,
+                    }
+            });
+        Ok(AdminReadiness {
+            node,
+            alive: true,
+            catching_up: following && !authoritative,
+            authoritative,
+            policy_satisfied,
+            root: AdminRootProgress {
+                leader: root.leader,
+                term: root.term,
+                applied_index: root.applied_index,
+                stopped: root.stopped,
+            },
+            sessions,
+            truncated,
+        })
+    }
 }

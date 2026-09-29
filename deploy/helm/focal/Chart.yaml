@@ -1,0 +1,6 @@
+apiVersion: v2
+name: focal
+description: Focal nodes as StatefulSets with their own volumes and enrollments (doc 08 §5). The same objects `focal deployment render kubernetes` writes, parameterised.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

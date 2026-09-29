@@ -1,0 +1,7 @@
+version: 1
+node:
+  advertise: "host-1.example:7443"
+  metrics_listen: "127.0.0.1:9464"
+durability:
+  survive: node
+  max_failures: 0

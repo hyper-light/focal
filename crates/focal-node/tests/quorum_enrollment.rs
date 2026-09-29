@@ -124,7 +124,7 @@ impl Rig {
             )
             .unwrap();
             let mut config = ControlHostConfig::new(namespace());
-            config.tick = Duration::from_millis(25);
+            config.tick = TICK;
             config.request_timeout = Duration::from_millis(350);
             let (host, owner, channel) =
                 ControlHost::spawn(replica, RejectUnverifiedEvidence, config, allowance).unwrap();
@@ -150,14 +150,21 @@ impl Rig {
                         &ControlHost::wire_limits(),
                     )
                     .unwrap();
-                    let _ = target.handle(verified).await;
+                    let _ = target.handle(&verified).await;
                     drop(frame);
                 }
             }));
         }
     }
     async fn leader(&self, exclude: u64) -> usize {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        let periods =
+            |rig: &Self| -> Vec<u64> { rig.hosts.iter().map(ControlHost::periods).collect() };
+        let mut wait = focal_timing::ProgressDeadline::begin(
+            &periods(self),
+            focal_timing::ProgressDeadline::periods(Duration::from_secs(5), TICK),
+            Duration::from_secs(60),
+        );
+        {
             loop {
                 for (index, host) in self.hosts.iter().enumerate() {
                     let status = host.progress();
@@ -175,11 +182,18 @@ impl Rig {
                         return index;
                     }
                 }
+                if let Err(spent) = wait.check(&periods(self)) {
+                    panic!(
+                        "no leader: {spent}: {:?}",
+                        self.hosts
+                            .iter()
+                            .map(|host| host.progress())
+                            .collect::<Vec<_>>()
+                    );
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        })
-        .await
-        .unwrap()
+        }
     }
     async fn state(&self, index: usize) -> ControlSnapshot {
         let ControlReadResult::State(snapshot) = self.hosts[index]
@@ -251,6 +265,27 @@ struct Router {
     hosts: Vec<ControlHost>,
     selected: Arc<AtomicU64>,
     fault: Arc<AtomicU64>,
+    isolated: Arc<AtomicU64>,
+    /// Whether this transport reaches the whole group and asks the host
+    /// that leads, as a node's does, or one host alone.
+    follows: bool,
+}
+enum Ask {
+    Read(RequestId),
+    Submit(Box<ControlRequest>),
+}
+enum Answer {
+    Read(Box<ControlReadResult>),
+    Receipt(ControlReceipt),
+}
+const TICK: Duration = Duration::from_millis(25);
+/// A refusal that says where the group is, not what it decided: the
+/// transport asks the host that leads (`NetworkEnrollmentControl` does).
+fn elsewhere(failure: &ControlFailure) -> bool {
+    matches!(
+        failure,
+        ControlFailure::Unavailable | ControlFailure::NotLeader { .. } | ControlFailure::NotReady
+    )
 }
 impl Router {
     fn new(rig: &Rig, leader: usize) -> Self {
@@ -258,6 +293,62 @@ impl Router {
             hosts: rig.hosts.clone(),
             selected: Arc::new(AtomicU64::new(leader as u64)),
             fault: Arc::new(AtomicU64::new(0)),
+            isolated: rig.isolated.clone(),
+            follows: false,
+        }
+    }
+    fn following(rig: &Rig, leader: usize) -> Self {
+        Self {
+            follows: true,
+            ..Self::new(rig, leader)
+        }
+    }
+    /// The hosts the network reaches, by index.
+    fn reached(&self) -> impl Iterator<Item = (usize, &ControlHost)> {
+        let isolated = self.isolated.load(Ordering::SeqCst);
+        self.hosts
+            .iter()
+            .enumerate()
+            .filter(move |(index, _)| *index as u64 + 1 != isolated)
+    }
+    /// Ask the selected host, and the host that leads when the group is
+    /// elsewhere; the wait is charged to the periods the reached hosts run.
+    async fn follow(&self, ask: Ask) -> Result<Answer, ControlFailure> {
+        let periods = |router: &Self| -> Vec<u64> {
+            router.reached().map(|(_, host)| host.periods()).collect()
+        };
+        let mut wait = focal_timing::ProgressDeadline::begin(
+            &periods(self),
+            focal_timing::ProgressDeadline::periods(Duration::from_secs(5), TICK),
+            Duration::from_secs(60),
+        );
+        loop {
+            let asked = match &ask {
+                Ask::Read(id) => self
+                    .host()
+                    .read(peer(PeerRole::Runtime), *id, ControlRead::State)
+                    .await
+                    .map(|read| Answer::Read(Box::new(read))),
+                Ask::Submit(request) => self
+                    .host()
+                    .submit(peer(PeerRole::Runtime), (**request).clone())
+                    .await
+                    .map(Answer::Receipt),
+            };
+            let failure = match asked {
+                Err(failure) if self.follows && elsewhere(&failure) => failure,
+                result => return result,
+            };
+            if wait.check(&periods(self)).is_err() {
+                return Err(failure);
+            }
+            if let Some((index, _)) = self.reached().find(|(_, host)| {
+                let progress = host.progress();
+                progress.leader == progress.node
+            }) {
+                self.selected.store(index as u64, Ordering::SeqCst);
+            }
+            tokio::time::sleep(TICK).await;
         }
     }
     fn host(&self) -> &ControlHost {
@@ -273,12 +364,11 @@ impl EnrollmentControl for Router {
     }
     fn read_state(&self, id: RequestId) -> ControlFuture<'_, ControlSnapshot> {
         Box::pin(async move {
-            match self
-                .host()
-                .read(peer(PeerRole::Runtime), id, ControlRead::State)
-                .await?
-            {
-                ControlReadResult::State(state) => Ok(state),
+            match self.follow(Ask::Read(id)).await? {
+                Answer::Read(read) => match *read {
+                    ControlReadResult::State(state) => Ok(state),
+                    _ => Err(ControlFailure::Invalid),
+                },
                 _ => Err(ControlFailure::Invalid),
             }
         })
@@ -289,7 +379,10 @@ impl EnrollmentControl for Router {
             if mode == 1 {
                 return Err(ControlFailure::OutcomeUnknown);
             }
-            let receipt = self.host().submit(peer(PeerRole::Runtime), request).await?;
+            let Answer::Receipt(receipt) = self.follow(Ask::Submit(Box::new(request))).await?
+            else {
+                return Err(ControlFailure::Invalid);
+            };
             if mode == 2 {
                 return Err(ControlFailure::OutcomeUnknown);
             }
@@ -340,7 +433,7 @@ async fn quorum_decisions_survive_lost_responses_leader_change_and_signer_restar
     let mut rig = Rig::new(root_bootstrap(&ca), GROUP);
     rig.hosts[0].campaign().await.unwrap();
     let first = rig.leader(0).await;
-    let router = Router::new(&rig, first);
+    let router = Router::following(&rig, first);
     let config = signer_config(router.identity());
     let (host, driver) =
         QuorumEnrollmentHost::create(ca, &staging, config.clone(), budget()).unwrap();
@@ -405,7 +498,7 @@ async fn quorum_decisions_survive_lost_responses_leader_change_and_signer_restar
     rig.stop().await;
     rig.start();
     let leader = rig.leader(0).await;
-    let router = Router::new(&rig, leader);
+    let router = Router::following(&rig, leader);
     let (host, driver) =
         QuorumEnrollmentHost::open(authority(&ca_path), &staging, config.clone(), budget())
             .unwrap();

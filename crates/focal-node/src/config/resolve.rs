@@ -84,34 +84,63 @@ const LOCAL_FIELDS: [&str; 8] = [
     "topology.region",
 ];
 
-/// Resolve the settings a startup runs with. `file` is the parsed
-/// configuration file with `presence` naming the keys it set; `committed`
-/// is the store's policy when the store exists. A policy field the file
-/// sets to a value other than the committed one is refused by name; one
-/// the file omits takes the committed value.
+/// How a policy field the file sets to a value other than the committed one
+/// is treated.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PolicyMode {
+    /// The pod's own long-running start: the committed policy is
+    /// authoritative and a differing file value yields to it. The file only
+    /// seeds the first start, and `deployment apply` may have committed
+    /// stronger durability than that seed, so a restart must never be
+    /// refused for carrying what the fleet already carries.
+    Start,
+    /// An operator command: a file that sets a policy field to a value other
+    /// than the committed one is refused by name, directing to plan/apply,
+    /// so an operator learns their edit does not take effect that way.
+    Enforce,
+    /// A policy request (`deployment plan`, `explain`): the file's value is
+    /// the request and is kept.
+    Request,
+}
+/// Resolve the settings an operator command runs with (identity, cluster,
+/// deployment apply, …). A policy field the file sets to a value other than
+/// the committed one is refused by name; an omitted field takes the
+/// committed value.
 pub fn resolve(
     cli: &CliOverrides,
     file: Option<(&Settings, &FilePresence)>,
     committed: Option<&CommittedPolicy>,
 ) -> Result<ResolvedSettings, ConfigError> {
-    resolve_with(cli, file, committed, true)
+    resolve_with(cli, file, committed, PolicyMode::Enforce)
+}
+/// Resolve the settings the pod's own `start` runs with. The committed
+/// policy is authoritative: a differing file value yields to it rather than
+/// refusing (a refusal would crash-loop a node whose static file seeded the
+/// first start while `deployment apply` committed a stronger policy). The
+/// divergence is visible through `deployment explain`.
+pub fn resolve_start(
+    cli: &CliOverrides,
+    file: Option<(&Settings, &FilePresence)>,
+    committed: Option<&CommittedPolicy>,
+) -> Result<ResolvedSettings, ConfigError> {
+    resolve_with(cli, file, committed, PolicyMode::Start)
 }
 /// Resolve a policy request (`deployment plan`, `explain`): the file's
 /// policy fields are what the operator asks for, so a value other than the
-/// committed one is the request, not a refusal; omitted fields still take
-/// the committed values.
+/// committed one is the request; omitted fields still take the committed
+/// values.
 pub fn resolve_request(
     cli: &CliOverrides,
     file: Option<(&Settings, &FilePresence)>,
     committed: Option<&CommittedPolicy>,
 ) -> Result<ResolvedSettings, ConfigError> {
-    resolve_with(cli, file, committed, false)
+    resolve_with(cli, file, committed, PolicyMode::Request)
 }
 fn resolve_with(
     cli: &CliOverrides,
     file: Option<(&Settings, &FilePresence)>,
     committed: Option<&CommittedPolicy>,
-    enforce: bool,
+    mode: PolicyMode,
 ) -> Result<ResolvedSettings, ConfigError> {
     let mut settings = file.map_or_else(Settings::default, |(settings, _)| settings.clone());
     let mut sources = FieldSources::new();
@@ -142,10 +171,14 @@ fn resolve_with(
                 }
                 _ => requested.placement.residency != intent.placement.residency,
             };
-            if set && differs && enforce {
+            if set && differs && mode == PolicyMode::Enforce {
                 return Err(ConfigError::CommittedPolicyChange { field });
             }
-            if !set {
+            // Unset always takes the committed value; a start also lets the
+            // committed value win over a differing file value (a request keeps
+            // the file value as what it asks for).
+            let committed_wins = !set || (differs && mode == PolicyMode::Start);
+            if committed_wins {
                 sources.insert(field, ConfigSource::Committed(committed.revision.0));
                 match field {
                     "durability.survive" => settings.durability.survive = intent.durability.survive,

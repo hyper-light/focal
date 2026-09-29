@@ -300,6 +300,22 @@ impl RecoveryIndex {
             .try_reserve(count)
             .map_err(|_| LogError::Capacity)
     }
+    /// Total on-disk bytes across every indexed group. A checkpoint rewrite
+    /// copies all of these forward into a new generation while the old one is
+    /// still live, so this is the additional disk a checkpoint must be promised.
+    fn total_bytes(&self) -> Result<u64, LogError> {
+        let mut total = 0u64;
+        for group in self.groups.values() {
+            for chunk in &group.chunks {
+                for frame in &chunk.frames {
+                    total = total
+                        .checked_add(frame.length as u64)
+                        .ok_or(LogError::Capacity)?;
+                }
+            }
+        }
+        Ok(total)
+    }
     fn prepare(
         &mut self,
         log: LogicalLogId,
@@ -341,6 +357,7 @@ struct Writer {
     lease_generation: u64,
     limits: WalWriterLimits,
     budget: MemoryBudget,
+    disk: DiskBudget,
     stats: WalWriterStats,
 }
 fn reserve(
@@ -463,6 +480,7 @@ impl SharedWal {
             lease_generation: 0,
             limits,
             budget: budget.clone(),
+            disk: disk.clone(),
             stats,
         };
         let (sender, receiver) = mpsc::sync_channel(capacity);
@@ -494,7 +512,7 @@ impl SharedWal {
         let directory = &self.0.directory;
         self.0
             .disk
-            .refresh_with(|| fs2::available_space(directory).ok());
+            .refresh_with(|| focal_platform::available_space(directory));
         Ok(self.0.disk.uncommitted_free())
     }
     /// The disk envelope this writer draws from, for the other durable owners
@@ -511,7 +529,7 @@ impl SharedWal {
         let directory = &self.0.directory;
         self.0
             .disk
-            .refresh_with(|| fs2::available_space(directory).ok());
+            .refresh_with(|| focal_platform::available_space(directory));
         let bytes = u64::try_from(bytes).map_err(|_| LogError::Capacity)?;
         self.0
             .disk
@@ -580,7 +598,8 @@ impl SharedWal {
         checkpoint: bool,
         lane: BudgetLane,
     ) -> Result<(), LogError> {
-        let bytes = self.validate_batch(log, records)?;
+        let mut sizes = Vec::new();
+        let bytes = self.validate_batch(log, records, Some(&mut sizes))?;
         let slot = reserve(&self.0.slots, BudgetKind::Pending, lane, 1)?;
         let amount = records
             .len()
@@ -602,8 +621,7 @@ impl SharedWal {
         encoded
             .try_reserve_exact(records.len())
             .map_err(|_| LogError::Capacity)?;
-        for record in records {
-            let length = postcard::experimental::serialized_size(record)?;
+        for (record, &length) in records.iter().zip(&sizes) {
             let mut data = Vec::new();
             data.try_reserve_exact(length)
                 .map_err(|_| LogError::Capacity)?;
@@ -629,7 +647,18 @@ impl SharedWal {
             Command::Append(batch)
         })
     }
-    fn validate_batch(&self, log: LogicalLogId, records: &[Record]) -> Result<usize, LogError> {
+    fn validate_batch(
+        &self,
+        log: LogicalLogId,
+        records: &[Record],
+        mut sizes: Option<&mut Vec<usize>>,
+    ) -> Result<usize, LogError> {
+        if let Some(sizes) = sizes.as_deref_mut() {
+            sizes.clear();
+            sizes
+                .try_reserve_exact(records.len())
+                .map_err(|_| LogError::Capacity)?;
+        }
         let mut bytes = 0usize;
         for record in records {
             if record.log != log {
@@ -638,6 +667,11 @@ impl SharedWal {
             let length = postcard::experimental::serialized_size(record)?;
             if length > self.0.options.max_record_bytes {
                 return Err(LogError::Capacity);
+            }
+            // Reuse this size in the encode loop instead of a second full
+            // serialization traversal per record.
+            if let Some(sizes) = sizes.as_deref_mut() {
+                sizes.push(length);
             }
             bytes = bytes
                 .checked_add(length)
@@ -659,6 +693,7 @@ fn default_lane(records: &[Record]) -> Result<BudgetLane, LogError> {
                 | RecordKind::Identity
                 | RecordKind::DecoderFloor
                 | RecordKind::DecoderTransition
+                | RecordKind::FastTrack
         )
     }) {
         return Ok(BudgetLane::Ordinary);
@@ -723,7 +758,7 @@ impl WalLease {
     /// Rejects a batch that cannot fit even under immutable ancestor ceilings.
     /// Current pressure can still prevent admission; this reserves no space.
     pub fn validate_append(&self, records: &[Record]) -> Result<(), LogError> {
-        let bytes = self.shared.validate_batch(self.log, records)?;
+        let bytes = self.shared.validate_batch(self.log, records, None)?;
         let metadata = std::mem::size_of::<Vec<u8>>()
             .checked_add(std::mem::size_of::<FrameLocation>())
             .and_then(|size| size.checked_mul(records.len()))
@@ -1005,7 +1040,12 @@ impl Writer {
             match result {
                 Ok(chunk) => prepared.push((batch, chunk)),
                 Err(error) => {
-                    self.wal.failed = true;
+                    // Pre-write, per-batch errors (a bounded slot-reservation
+                    // shortage, a locked logical group) are batch-local: nothing
+                    // has touched disk yet, so the physical writer and every other
+                    // logical group stay healthy. Fail only this batch and keep
+                    // the rest; the writer is poisoned only by post-write failures
+                    // below, never by a recoverable prepare-phase condition.
                     batch.reply.finish(Err(error));
                 }
             }
@@ -1091,6 +1131,21 @@ impl Writer {
     fn checkpoint(&mut self, batch: Batch) {
         let result = (|| {
             self.valid(batch.log, batch.generation)?;
+            // The rewrite copies every logical group forward into a new
+            // generation while the old one is still on disk, so its peak is the
+            // whole current log, not just the retained batch reserved at
+            // admission. Reserve that peak as transient headroom held across the
+            // rewrite (released when this scope ends, since cleanup frees the old
+            // generation): a full volume is refused cleanly here instead of
+            // hitting ENOSPC mid-copy and poisoning the physical writer.
+            let _forward = self
+                .disk
+                .reserve(
+                    DiskKind::Checkpoint,
+                    BudgetLane::Completion,
+                    self.index.total_bytes()?,
+                )
+                .map_err(|_| LogError::Capacity)?;
             let _scratch = reserve(
                 &self.budget,
                 BudgetKind::Recovery,

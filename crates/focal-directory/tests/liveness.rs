@@ -71,6 +71,7 @@ fn load(id: u64) -> NodeLoad {
         available_memory: 1_000_000,
         active_weight: 1,
         disk_available: 1 << 30,
+        capability: 0,
     }
 }
 fn partition() -> DirectoryPartition {
@@ -382,7 +383,10 @@ fn schema_two_and_three_checkpoints_both_restore_and_verdicts_survive_a_round_tr
     DirectoryPartition::restore(converted, PartitionConfig::default(), budget()).unwrap();
     // A malformed verdict does not restore.
     let mut corrupt = checkpoint.clone();
-    corrupt.nodes.get_mut(&1).unwrap().liveness = Some(NodeLiveness {
+    std::sync::Arc::make_mut(&mut corrupt.nodes)
+        .get_mut(&1)
+        .unwrap()
+        .liveness = Some(NodeLiveness {
         alive: false,
         incarnation: 4,
         witness: 0,

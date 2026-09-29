@@ -67,6 +67,8 @@ pub enum ServiceError {
     Control(#[from] focal_control::ControlError),
     #[error("directory startup: {0}")]
     Directory(#[from] crate::directory_bootstrap::DirectoryBootstrapError),
+    #[error("control owner stopped: {0}")]
+    ControlOwner(String),
     #[error("root request: {0}")]
     ControlRequest(#[from] focal_control::ControlFailure),
     #[error("ledger: {0}")]
@@ -103,6 +105,15 @@ pub enum ServiceError {
     ShutdownTimeout,
 }
 
+/// How long a stopping node gives its owners to finish — every copy's
+/// checkpoint, the root's, the content store's — before it exits and leaves
+/// recovery to replay the durable log. The process managers the deployments
+/// run under are configured above it (`deploy/`: `TimeoutStopSec`, the pod's
+/// termination grace), so a stop that reaches this bound is the node's own
+/// failure to stop, never the manager's kill. A test that stops a node waits
+/// this long and then that the node kept its word.
+pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
+
 #[derive(Clone, Debug, Serialize)]
 pub struct NetworkServiceStatus {
     pub condition: &'static str,
@@ -138,6 +149,59 @@ pub(crate) struct DataService {
     root_group: [u8; 16],
     directory: DirectoryHandle,
     ledger: ManagedService,
+    /// The failure detector's view: a contact announcement that would move
+    /// a node the detector still sees alive at its committed address is
+    /// refused (24 §24), so a clone never displaces a live node.
+    liveness: crate::liveness::LivenessHandle,
+}
+/// What the root does with a contact announcement that names another
+/// address than the node's committed one (24 §24).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContactAdmission {
+    /// Nothing answers as the node at its committed address, or the
+    /// address is unchanged: the announcement reaches the root.
+    Proceed,
+    /// Something still answers as the node there: a second process with
+    /// the node's identity, refused for as long as the first serves.
+    Clone,
+    /// The committed address is being asked: the mover is told to announce
+    /// again, and does within a tick.
+    Unknown,
+}
+impl DataService {
+    /// Whether `node` may announce `advertise` in place of its committed
+    /// contact. The committed address itself is asked: the detector's
+    /// verdict is about the node wherever it answers from (a moved node
+    /// refutes its suspicion from its new address), while a clone is a
+    /// second answer at the old one. The request never waits on that probe:
+    /// the driver answers with the verdict it holds or starts the probe
+    /// and says so.
+    async fn contact_admission(
+        &self,
+        node: u64,
+        advertise: std::net::SocketAddr,
+    ) -> ContactAdmission {
+        let Ok(observation) = self.control.observe_root().await else {
+            return ContactAdmission::Proceed;
+        };
+        let Some(record) = observation
+            .contacts()
+            .contacts
+            .records
+            .iter()
+            .find(|record| record.node == node)
+        else {
+            return ContactAdmission::Proceed;
+        };
+        if record.advertise == advertise {
+            return ContactAdmission::Proceed;
+        }
+        match self.liveness.confirm(node, record.advertise).await {
+            Ok(Some(true)) => ContactAdmission::Clone,
+            Ok(Some(false)) => ContactAdmission::Proceed,
+            Ok(None) | Err(_) => ContactAdmission::Unknown,
+        }
+    }
 }
 impl RequestHandler for DataService {
     fn supports_managed_requests(&self) -> bool {
@@ -149,10 +213,10 @@ impl RequestHandler for DataService {
     fn supports_native_requests(&self) -> bool {
         true
     }
-    fn handle(&self, request: VerifiedRequest) -> HandlerFuture<'_> {
+    fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
         Box::pin(async move { self.handle_accounted(request).await.into_envelope() })
     }
-    fn handle_accounted(&self, request: VerifiedRequest) -> OwnedHandlerFuture<'_> {
+    fn handle_accounted<'a>(&'a self, request: &'a VerifiedRequest) -> OwnedHandlerFuture<'a> {
         Box::pin(async move {
             let group = match &request.request().operation {
                 Operation::Control { group, .. }
@@ -164,6 +228,28 @@ impl RequestHandler for DataService {
                 _ => None,
             };
             if group == Some(self.root_group) {
+                if let Operation::NodeContact { advertise, .. } = &request.request().operation
+                    && let PeerRole::Node { node_id } = request.peer().role()
+                {
+                    let failure = match self.contact_admission(node_id, *advertise).await {
+                        ContactAdmission::Proceed => None,
+                        ContactAdmission::Clone => {
+                            Some(focal_control::ControlFailure::CompareFailed)
+                        }
+                        ContactAdmission::Unknown => {
+                            Some(focal_control::ControlFailure::Unavailable)
+                        }
+                    };
+                    if let Some(failure) = failure {
+                        let reply = focal_control::ControlReply::Rejected(failure)
+                            .encode(ControlHost::wire_limits().max_frame_bytes as usize);
+                        let response = match reply {
+                            Ok(response) => Response::Control { response },
+                            Err(_) => Response::Error(AccessError::Unavailable),
+                        };
+                        return OwnedResponse::new(request.request().reply(response));
+                    }
+                }
                 return self.control.handle_accounted(request).await;
             }
             if let Some(group) = group
@@ -316,6 +402,17 @@ pub struct NetworkService {
     founder_fingerprint: [u8; 32],
     budget: MemoryBudget,
     _configuration: Allocation,
+    /// The cluster this node belongs to, for restoring the enrollment
+    /// registry the metrics sampler reads the fence from.
+    cluster: [u8; 16],
+    /// The WAL writer, for its statistics in the metrics snapshot.
+    wal: SharedWal,
+    /// The fixed labels of this node's metrics and the latest snapshot the
+    /// sampler published (24 §23).
+    metrics_labels: crate::metrics::MetricLabels,
+    metrics: tokio::sync::watch::Sender<Option<crate::metrics::MetricsSnapshot>>,
+    /// The loopback endpoint bound at open when `node.metrics_listen` names one.
+    metrics_listener: Option<tokio::net::TcpListener>,
     // All service handles and futures drop before registration closes. The
     // reaper retains LOCK even if a caller cancels run_until or keeps a handle.
     owners: Option<OwnerGate>,
@@ -337,6 +434,9 @@ struct Prepared {
 }
 impl Prepared {
     async fn open(settings: &Settings) -> Result<Self, ServiceError> {
+        Box::pin(Self::open_inner(settings)).await
+    }
+    async fn open_inner(settings: &Settings) -> Result<Self, ServiceError> {
         settings.validate().map_err(NodeError::from)?;
         if settings
             .data_dir()
@@ -345,10 +445,14 @@ impl Prepared {
             .exists()
         {
             let joined = JoinedNode::open(settings, unix_time()?)?;
-            let (listen, advertise) = joined.state.startup_addresses(settings).await?;
+            let startup = joined.state.startup_addresses(settings).await?;
             let mut state = joined.state;
-            state.listen = listen;
-            state.advertise = advertise;
+            state.listen = startup.listen;
+            state.advertise = startup.advertise;
+            state.endpoint = startup.endpoint;
+            if startup.changed {
+                state.install(&joined.directory)?;
+            }
             let budget = MemoryBudget::new(1024 * 1024 * 1024, 256 * 1024 * 1024)?;
             let allocation = budget
                 .reserve(BudgetKind::Recovery, BudgetLane::Completion, 256 * 1024)?
@@ -445,7 +549,16 @@ impl NetworkService {
     }
     // Tests retain ephemeral listener reservations and transfer the actual
     // socket here. Production startup uses the same TLS/listener construction.
+    /// The startup state machine (every recovered owner, registry and handle
+    /// across its awaits) lives on the heap, so a caller's stack carries one
+    /// frame however many services it opens.
     async fn open_with_socket(
+        settings: &Settings,
+        socket: Option<std::net::UdpSocket>,
+    ) -> Result<Self, ServiceError> {
+        Box::pin(Self::open_with_socket_inner(settings, socket)).await
+    }
+    async fn open_with_socket_inner(
         settings: &Settings,
         socket: Option<std::net::UdpSocket>,
     ) -> Result<Self, ServiceError> {
@@ -507,6 +620,11 @@ impl NetworkService {
             unix_time()?,
         )?;
         let founder_fingerprint = founder_fingerprint(&state)?;
+        // A sponsor named rather than addressed resolves at each start
+        // (24 §24); an unresolvable name is not fatal here.
+        let sponsor_address = crate::network_state::resolve_endpoint(&state.sponsor.endpoint)
+            .await
+            .ok();
         let mut controller = NetworkController::new(
             state.clone(),
             receipt.clone(),
@@ -514,6 +632,20 @@ impl NetworkService {
             root.clone(),
             budget.child(128 * 1024 * 1024, 32 * 1024 * 1024)?,
         )?;
+        if let Some(address) = sponsor_address {
+            controller = controller.with_sponsor_address(address);
+        }
+        let mut controller = controller.with_topology(
+            settings.topology.clone(),
+            settings
+                .placement
+                .residency
+                .iter()
+                .chain(&settings.placement.home_regions)
+                .chain(&settings.topology.region)
+                .cloned()
+                .collect(),
+        );
         let (credential_handle, credential_requests) =
             crate::credential_renewal::CredentialHandle::channel(4);
         let limits = ControlHost::wire_limits();
@@ -591,35 +723,57 @@ impl NetworkService {
         } else {
             None
         };
-        // The content store draws on the WAL's volume envelope: one
-        // watermark guards every durable owner of the data directory.
-        let content = ContentStore::open_with_disk(
-            root.join("content"),
-            StoreLimits {
-                max_content_bytes: 64 * 1024 * 1024,
-                max_staging_bytes: 128 * 1024 * 1024,
-                max_uploads: 16,
-                chunk_bytes: 1024 * 1024,
-                max_manifest_bytes: 1024 * 1024,
-            },
-            wal.disk_budget(),
-        )?;
         let tenant = budget.child(512 * 1024 * 1024, 128 * 1024 * 1024)?;
-        let session = if founder {
-            let consensus = DurableNode::open_on_wal_in(
-                NodeConfig::single(identity.node, identity.cluster, identity.ledger.session.0),
-                wal.clone(),
-                &tenant,
-            )?;
-            Some(Session::from_node_in_hosted(
-                identity.ledger,
-                consensus,
-                SessionLimits::default(),
-                &tenant,
-                native_hosting(&root, &identity, wal.disk_budget()).map_err(NodeError::Content)?,
-            )?)
-        } else {
-            None
+        // The content store and the founder's durable application session both
+        // recover by replaying the WAL - unbounded CPU- and IO-blocking work
+        // that must not run on the async executor (it would stall the runtime
+        // and, in debug builds, materialize its un-optimized poll frames on the
+        // executor's shallow 1 MiB Windows main-thread stack). Recover them on a
+        // blocking thread, exactly as the founder bootstrap does. The content
+        // store draws on the WAL's volume envelope: one watermark guards every
+        // durable owner of the data directory.
+        let (content, session) = {
+            let root = root.clone();
+            let wal = wal.clone();
+            let identity = identity.clone();
+            let tenant = tenant.clone();
+            tokio::task::spawn_blocking(move || -> Result<_, ServiceError> {
+                let content = ContentStore::open_with_disk(
+                    root.join("content"),
+                    StoreLimits {
+                        max_content_bytes: 64 * 1024 * 1024,
+                        max_staging_bytes: 128 * 1024 * 1024,
+                        max_uploads: 16,
+                        chunk_bytes: 1024 * 1024,
+                        max_manifest_bytes: 1024 * 1024,
+                    },
+                    wal.disk_budget(),
+                )?;
+                let session = if founder {
+                    let consensus = DurableNode::open_on_wal_in(
+                        NodeConfig::single(
+                            identity.node,
+                            identity.cluster,
+                            identity.ledger.session.0,
+                        ),
+                        wal.clone(),
+                        &tenant,
+                    )?;
+                    Some(Session::from_node_in_hosted(
+                        identity.ledger,
+                        consensus,
+                        SessionLimits::default(),
+                        &tenant,
+                        native_hosting(&root, &identity, wal.disk_budget())
+                            .map_err(NodeError::Content)?,
+                    )?)
+                } else {
+                    None
+                };
+                Ok((content, session))
+            })
+            .await
+            .map_err(|_| ServiceError::Owner("store recovery task failed to join"))??
         };
         // The founder's custody and serving scope follow the placement its
         // session has committed; a fresh session starts at the single-node
@@ -696,6 +850,16 @@ impl NetworkService {
                 policy.scope(),
                 spec.placement.voters.keys().copied().collect(),
                 spec.placement.content_copies.keys().copied().collect(),
+                // The founder alone at startup: its own declared region; the
+                // agent installs every node's region as it syncs (24 §22).
+                crate::placement_executor::ResidencyFence::new(
+                    spec.policy.residency.clone(),
+                    std::collections::BTreeMap::from([(
+                        identity.node,
+                        crate::topology::ids(&settings.topology).0,
+                    )]),
+                )
+                .map_err(|_| AccessError::Capacity)?,
             )?),
             (Some(policy), None) => {
                 let facts = [crate::placement::NodeFacts {
@@ -761,13 +925,47 @@ impl NetworkService {
             recovered,
         )?;
         owners.register(PhysicalOwner::Control(control_owner))?;
+        // A binary behind the fence this node's root replica has applied
+        // does not start serving at all (24 §21); the controller keeps
+        // checking as the root advances.
+        if let Ok(observation) = control.observe_root().await
+            && let focal_control::ControlBootstrap::Root { enrollment, .. } =
+                &observation.snapshot().state
+            && let Ok(registry) = focal_enrollment::EnrollmentRegistry::restore(
+                enrollment,
+                identity.cluster,
+                focal_enrollment::EnrollmentLimits::default(),
+            )
+        {
+            let announced = crate::upgrade::announced_level();
+            if !crate::upgrade::admits(registry.fence(), announced) {
+                return Err(ServiceError::Controller(
+                    crate::network_controller::ControllerError::Fenced {
+                        fence: registry.fence().level,
+                        announced,
+                    },
+                ));
+            }
+            // A credential the registry no longer authorizes does not start
+            // (24 §11; runbooks/expired-credentials).
+            if crate::network_controller::credential_retired(
+                &registry,
+                identity.node,
+                &receipt,
+                unix_time()?,
+            ) {
+                return Err(ServiceError::Controller(
+                    crate::network_controller::ControllerError::Retired,
+                ));
+            }
+        }
         // Every node has one bounded owner, including nodes awaiting their
         // first assignment. Installation changes routing without creating an
         // executor or physical WAL writer for each logical session.
         let (fleet, owner, ledger_output) = ReplicaFleet::spawn_managed(
             identity.node,
             identity.cluster,
-            vec![wal],
+            vec![wal.clone()],
             vec![FleetTenant {
                 tenant: identity.ledger.tenant,
                 weight: 1,
@@ -802,6 +1000,23 @@ impl NetworkService {
         )?;
         let (gc_agent, gc_handle) = crate::gc::GcAgent::from_env(identity.node);
         let (archive_agent, archive_handle) = crate::archive_agent::ArchiveAgent::from_env();
+        let (metrics, metrics_view) =
+            tokio::sync::watch::channel::<Option<crate::metrics::MetricsSnapshot>>(None);
+        let metrics_labels = crate::metrics::MetricLabels {
+            node: identity.node,
+            cluster: crate::cluster_admin::hex(&identity.cluster),
+            region: settings.topology.region.clone(),
+            zone: settings
+                .topology
+                .region
+                .as_ref()
+                .and_then(|_| settings.topology.zone.clone()),
+            role: if founder { "founder" } else { "host" },
+        };
+        let metrics_listener = match settings.node.metrics_listen {
+            Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
+            None => None,
+        };
         if let Some((server, handler)) = admin.take() {
             admin = Some((
                 server,
@@ -812,13 +1027,16 @@ impl NetworkService {
                     .with_credentials(credential_handle.clone())
                     .with_placement(placement_handle.clone())
                     .with_gc(gc_handle.clone())
-                    .with_archive(archive_handle.clone()),
+                    .with_archive(archive_handle.clone())
+                    .with_evidence(coordinator.clone())
+                    .with_metrics(metrics_view.clone()),
             ));
         }
         let data = DataService {
             control: control.clone(),
             root_group: state.genesis.root.group,
             directory: directory.clone(),
+            liveness: liveness_handle.clone(),
             ledger: ManagedService::new(fleet.clone(), content.clone(), coordinator.clone())
                 .with_signing(control.clone(), placement_handle.clone())
                 .with_liveness(liveness_handle.clone())
@@ -870,8 +1088,217 @@ impl NetworkService {
             founder_fingerprint,
             budget,
             _configuration: allocation,
+            cluster: identity.cluster,
+            wal,
+            metrics_labels,
+            metrics,
+            metrics_listener,
             owners: Some(owners),
         })
+    }
+    /// One metrics sample of everything this node knows about itself (24 §23).
+    async fn sample_metrics(&self) -> crate::metrics::MetricsSnapshot {
+        fn count(value: usize) -> u64 {
+            u64::try_from(value).unwrap_or(u64::MAX)
+        }
+        use crate::metrics::{
+            AgentMetrics, CredentialMetrics, LivenessMetrics, MetricsSnapshot, RootMetrics,
+            SessionMetrics,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
+            .unwrap_or(0);
+        let (disk, staged_uploads, staged_bytes) = match self.handles.content.disk_stats().await {
+            Ok((disk, uploads, bytes)) => (Some(disk), count(uploads), bytes),
+            Err(_) => (None, 0, 0),
+        };
+        let root = self.handles.control.progress();
+        let pace = self.handles.control.current_pace();
+        let view = self.handles.liveness.view();
+        let mut liveness = LivenessMetrics {
+            health_score: view.health.score,
+            probes_sent: view.counters.probes_sent,
+            probes_answered: view.counters.probes_answered,
+            probe_timeouts: view.counters.probe_timeouts,
+            suspicions: view.counters.suspicions,
+            deaths: view.counters.deaths,
+            refutations: view.counters.refutations,
+            ..LivenessMetrics::default()
+        };
+        let mut peer_rtts = Vec::new();
+        for (node, member) in &view.members {
+            if let Some(rtt_ms) = member.rtt_ms {
+                peer_rtts.push(crate::metrics::PeerRtt {
+                    peer: *node,
+                    rtt_ms,
+                });
+            }
+        }
+        for member in view.members.values() {
+            match member.status {
+                crate::liveness::MemberStatus::Alive => {
+                    liveness.alive = liveness.alive.saturating_add(1)
+                }
+                crate::liveness::MemberStatus::Suspect => {
+                    liveness.suspect = liveness.suspect.saturating_add(1)
+                }
+                crate::liveness::MemberStatus::Dead => {
+                    liveness.dead = liveness.dead.saturating_add(1)
+                }
+            }
+        }
+        let credential = self
+            .handles
+            .credentials
+            .current()
+            .await
+            .ok()
+            .map(|summary| CredentialMetrics {
+                expires_at: summary.expires_at,
+                renewals: summary.renewals,
+                rotations: summary.rotations,
+            });
+        let (directory, agent) = match (
+            self.handles.placement.directory().await,
+            self.handles.placement.status().await,
+        ) {
+            (Ok(directory), Ok(status)) => (
+                Some(directory),
+                Some(AgentMetrics {
+                    root_intents: status.root_intents,
+                    partition_intents: status.partition_intents,
+                    installed: count(status.installed.len()),
+                    last_error: status.last_error.is_some(),
+                    last_refusal: status.last_refusal.is_some(),
+                    admission: status.admission,
+                }),
+            ),
+            (Ok(directory), Err(_)) => (Some(directory), None),
+            (Err(_), _) => (None, None),
+        };
+        let mut sessions = Vec::new();
+        let mut truncated = false;
+        let mut after = None;
+        while let Some((ledger, host)) = self.handles.fleet.next_host(after) {
+            after = Some(ledger);
+            if sessions.len() >= crate::metrics::MAX_SESSIONS || sessions.try_reserve(1).is_err() {
+                truncated = true;
+                break;
+            }
+            let progress = host.progress();
+            let Ok(reply) = host.diagnostics().await else {
+                continue;
+            };
+            let diagnostics = reply.value();
+            let listed = directory.as_ref().and_then(|report| {
+                report.partitions.iter().find_map(|(_, checkpoint)| {
+                    checkpoint.sessions.get(&ledger).map(|descriptor| {
+                        let guarantee =
+                            focal_directory::effective_guarantee(descriptor, &checkpoint.nodes)
+                                .ok();
+                        (
+                            descriptor.route_epoch.0,
+                            descriptor.placement_epoch,
+                            descriptor.active.policy.durability.max_failures,
+                            guarantee
+                                .as_ref()
+                                .and_then(|report| report.achieved)
+                                .map(|achieved| achieved.max_failures),
+                            guarantee
+                                .as_ref()
+                                .map(|report| count(report.blocked_by.len())),
+                        )
+                    })
+                })
+            });
+            sessions.push(SessionMetrics {
+                tenant: ledger.tenant.to_string(),
+                session: ledger.session.to_string(),
+                leader: progress.leader,
+                term: progress.term,
+                committed_index: diagnostics.committed_index,
+                applied_index: diagnostics.applied_index,
+                sequence: diagnostics.sequence,
+                pending: count(diagnostics.pending),
+                authoritative: diagnostics.authoritative,
+                preferred_leader: diagnostics.preferred_leader,
+                leader_returns: diagnostics.leader_returns,
+                leader_returns_failed: diagnostics.leader_returns_failed,
+                native_authoritative: diagnostics.native_authoritative,
+                log_entries_since_checkpoint: diagnostics.log_entries_since_checkpoint,
+                retention: diagnostics.retention.clone(),
+                seed_chunks_missing: diagnostics.seed_chunks_missing.map(count),
+                custody_objects_missing: diagnostics.custody_objects_missing.map(count),
+                delivery_retained: diagnostics.delivery_retained,
+                route_epoch: listed.map(|listed| listed.0),
+                placement_epoch: listed.map(|listed| listed.1),
+                desired_max_failures: listed.map(|listed| listed.2),
+                achieved_max_failures: listed.and_then(|listed| listed.3),
+                blocked: listed.and_then(|listed| listed.4),
+                tick_period_ms: u64::try_from(host.tick_period().as_millis()).unwrap_or(u64::MAX),
+                broadcast_tail_us: host.current_pace().broadcast_tail_ns / 1_000,
+                pace_samples: host.current_pace().samples,
+                refused_periods: host.refused_periods(),
+                longest_period_ms: u64::try_from(host.longest_period().as_millis())
+                    .unwrap_or(u64::MAX),
+            });
+        }
+        let fence_level = self
+            .handles
+            .control
+            .observe_root()
+            .await
+            .ok()
+            .and_then(|observation| match &observation.snapshot().state {
+                focal_control::ControlBootstrap::Root { enrollment, .. } => {
+                    focal_enrollment::EnrollmentRegistry::restore(
+                        enrollment,
+                        self.cluster,
+                        focal_enrollment::EnrollmentLimits::default(),
+                    )
+                    .ok()
+                    .map(|registry| registry.fence().level)
+                }
+                _ => None,
+            })
+            .unwrap_or(0);
+        MetricsSnapshot {
+            sampled_ms: now,
+            labels: self.metrics_labels.clone(),
+            memory: self.budget.stats(),
+            disk,
+            staged_uploads,
+            staged_bytes,
+            wal: self.wal.stats().ok(),
+            fleet: self.handles.fleet.status(),
+            root: RootMetrics {
+                leader: root.leader,
+                term: root.term,
+                applied_index: root.applied_index,
+                stopped: root.stopped,
+                snapshot_index: root.snapshot_index,
+                tick_period_ms: u64::try_from(pace.period.as_millis()).unwrap_or(u64::MAX),
+                broadcast_tail_us: pace.broadcast_tail_ns / 1_000,
+                pace_samples: pace.samples,
+                periods: self.handles.control.periods(),
+                refused_periods: self.handles.control.refused_periods(),
+                longest_period_ms: u64::try_from(self.handles.control.longest_period().as_millis())
+                    .unwrap_or(u64::MAX),
+                peers: root.peers.clone(),
+            },
+            peers: self.pool.stats(),
+            listener: self.listener.admission(),
+            peer_rtts,
+            liveness,
+            credential,
+            sessions,
+            sessions_truncated: truncated,
+            agent,
+            fence_level,
+            announced_level: crate::upgrade::announced_level(),
+        }
     }
 
     /// Drive borrowed ingress and egress on a runtime with IO and time enabled.
@@ -946,15 +1373,19 @@ impl NetworkService {
         };
         // A future may be moved to another runtime between polls. Contain the
         // timer dependency here too, after the earlier run boundary has ended.
-        std::panic::AssertUnwindSafe(async {
-            tokio::time::timeout(Duration::from_secs(30), cleanup)
+        let cleaned = std::panic::AssertUnwindSafe(async {
+            tokio::time::timeout(SHUTDOWN_DEADLINE, cleanup)
                 .await
                 .map_err(|_| ServiceError::ShutdownTimeout)?
         })
         .catch_unwind()
         .await
-        .map_err(|_| ServiceError::Runtime)??;
-        running
+        .map_err(|_| ServiceError::Runtime)
+        .and_then(|cleaned| cleaned);
+        // What ended the service is the cause; a failure while cleaning up
+        // after it (an owner that had already stopped cannot be joined
+        // cleanly) must not replace it.
+        running.and(cleaned)
     }
     async fn run_tasks<F, R>(&mut self, shutdown: F, mut on_status: R) -> Result<(), ServiceError>
     where
@@ -969,7 +1400,13 @@ impl NetworkService {
             .control_output
             .take()
             .ok_or(ServiceError::Owner("egress already consumed"))?;
-        let control_driver = drive_control_replication(output, &self.pool, 16);
+        // Concurrent sends are bounded by the pool's own admission: a peer
+        // that stopped answering holds at most `per_peer_inflight` of them
+        // for one dial and then fails fast, so the driver's cap only has to
+        // exceed what the unreachable peers of a moment can hold at once,
+        // never leaving live followers' appends queued behind dead ones.
+        let inflight = self.pool.limits().max_inflight.min(1024);
+        let control_driver = drive_control_replication(output, &self.pool, inflight);
         let directory_startup = self.directory_startup.take();
         let owners = self
             .owners
@@ -982,9 +1419,10 @@ impl NetworkService {
             }
         };
         let ledger_output = self.ledger_output.take();
+        let metrics_listener = self.metrics_listener.take();
         let ledger_driver = async {
             match ledger_output {
-                Some(output) => drive_fleet_replication(output, &self.pool, 16)
+                Some(output) => drive_fleet_replication(output, &self.pool, inflight)
                     .await
                     .map(|_| ()),
                 None => std::future::pending().await,
@@ -1076,6 +1514,68 @@ impl NetworkService {
             &self.budget,
             &self.handles.content,
         );
+        // The metrics sampler publishes a fresh snapshot on a fixed cadence
+        // (24 §23); the admin socket and the loopback endpoint render the
+        // latest one, never sampling on a caller's behalf.
+        let metrics_sampler = async {
+            loop {
+                let snapshot = self.sample_metrics().await;
+                self.metrics.send_replace(Some(snapshot));
+                tokio::time::sleep(crate::metrics::SAMPLE_INTERVAL).await;
+            }
+        };
+        // The root group's tick period follows the round trips this node
+        // measures to the group's other voters (27 §3.1 P2). A group inside
+        // one period keeps the configured period; a far one is stretched so
+        // its election timeout stays ten round-trip tails of its slowest
+        // voter. While the root cannot be observed the last pace stands.
+        let pacer = async {
+            loop {
+                if let Ok(observation) = self.handles.control.observe_root().await {
+                    let local = self.status.node;
+                    let paths: Vec<focal_timing::PathRtt> = observation
+                        .configuration()
+                        .configuration
+                        .voters
+                        .iter()
+                        .filter(|voter| **voter != local)
+                        .filter_map(|voter| self.pool.path(*voter))
+                        .collect();
+                    self.handles.control.pace(paths.iter());
+                }
+                // Every hosted session paces itself by its own voters: a
+                // session whose voters are near keeps the configured period
+                // beside one whose voters are far.
+                let local = self.status.node;
+                let pace_session = |host: &ReplicaHost| {
+                    let paths: Vec<focal_timing::PathRtt> = host
+                        .progress()
+                        .voters
+                        .iter()
+                        .filter(|voter| **voter != local)
+                        .filter_map(|voter| self.pool.path(*voter))
+                        .collect();
+                    host.pace(paths.iter());
+                };
+                if let Some(host) = &self.handles.ledger {
+                    pace_session(host);
+                }
+                let mut after = None;
+                while let Some((ledger, host)) = self.handles.fleet.next_host(after) {
+                    pace_session(&host);
+                    after = Some(ledger);
+                    tokio::task::yield_now().await;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        };
+        let metrics_view = self.metrics.subscribe();
+        let metrics_endpoint = async {
+            match metrics_listener {
+                Some(listener) => crate::metrics::serve_loopback(listener, metrics_view).await,
+                None => std::future::pending().await,
+            }
+        };
         let ready = async {
             if let Some(ledger) = &self.handles.ledger {
                 loop {
@@ -1132,7 +1632,10 @@ impl NetworkService {
             evidence_driver,
             signer_driver,
             ready,
-            shutdown
+            shutdown,
+            metrics_sampler,
+            metrics_endpoint,
+            pacer
         );
         tokio::select! {
             result=&mut shutdown=>result.map_err(ServiceError::Io),
@@ -1152,24 +1655,52 @@ impl NetworkService {
             result=&mut ledger_driver=>result.map_err(ServiceError::from).and(Err(ServiceError::Owner("ledger egress ended"))),
             _=&mut evidence_driver=>Err(ServiceError::Owner("evidence driver ended")),
             _=&mut signer_driver=>Err(ServiceError::Owner("enrollment driver ended")),
-            _=self.handles.control.closed()=>Err(ServiceError::Owner("control owner ended")),
+            ()=&mut metrics_sampler=>Err(ServiceError::Owner("metrics sampler ended")),
+            ()=&mut pacer=>Err(ServiceError::Owner("pace driver ended")),
+            result=&mut metrics_endpoint=>result.map_err(ServiceError::Io).and(Err(ServiceError::Owner("metrics endpoint ended"))),
+            _=self.handles.control.closed()=>Err(match self.handles.control.progress().failure {
+                Some(failure) => ServiceError::ControlOwner(failure),
+                None => ServiceError::Owner("control owner ended"),
+            }),
         }
     }
 }
 fn clean_socket(path: &Path, root: &Path) -> Result<(), ServiceError> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata)
-            if metadata.file_type().is_socket()
-                && metadata.uid() == std::fs::metadata(root)?.uid() =>
-        {
-            std::fs::remove_file(path)?
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata)
+                if metadata.file_type().is_socket()
+                    && metadata.uid() == std::fs::metadata(root)?.uid() =>
+            {
+                std::fs::remove_file(path)?
+            }
+            Ok(_) => return Err(ServiceError::Owner("refusing non-owned socket path")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
-        Ok(_) => return Err(ServiceError::Owner("refusing non-owned socket path")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
+        Ok(())
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        // A named-pipe rendezvous file, not a socket: remove it only when we
+        // own it, so a stale one is cleared but another user's is refused.
+        let _ = root;
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {
+                if focal_platform::fs::owner_at(path)? != focal_platform::fs::current_owner()? {
+                    return Err(ServiceError::Owner(
+                        "refusing non-owned local endpoint path",
+                    ));
+                }
+                std::fs::remove_file(path)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
 }
 fn founder_fingerprint(state: &NetworkState) -> Result<[u8; 32], ServiceError> {
     let focal_control::ControlBootstrap::Root { enrollment, .. } = &state.genesis.bootstrap else {

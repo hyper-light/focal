@@ -54,7 +54,7 @@ Claim: d4cc83c48c5ad2bafaa1802bb87c3e07
 > Focal has no release yet. The local service, the whole claim and evidence workflow through
 > the CLI and MCP, restart recovery, durable retries, and joining nodes into a cluster all
 > work today. Automatic placement across hosts, range movement, archival and restore,
-> Kubernetes packaging, multi-region operation and Windows are still being built.
+> Kubernetes packaging, multi-region operation, native Windows arm64 and binary signing are still being built.
 > [docs/REMAINING.md](docs/REMAINING.md) lists each piece and what closes it.
 
 ## Install
@@ -72,10 +72,15 @@ focal --help
 
 > [!NOTE]
 > The release workflow builds one raw binary per platform (macOS arm64 and x64, Linux arm64
-> and x64 on glibc and static musl), smoke-tests each on its own hardware, and attaches them
-> with `SHA256SUMS`. When a release is published, download the file for your platform, check
-> its digest, `chmod +x` it and put it on your `PATH`; nothing else is needed. Windows needs
-> its own transport and filesystem port first.
+> and x64 on glibc and static musl, and Windows x64 and arm64), smoke-tests each on its own
+> hardware, and attaches them with `SHA256SUMS`. When a release is published, download the
+> file for your platform, check its digest, `chmod +x` it (or, on Windows, unblock the
+> `.exe`) and put it on your `PATH`; nothing else is needed. The native Windows x64 build is
+> tested in CI on every push: its filesystem layer (owner-only DACLs, file identity,
+> write-through publication), named-pipe local transport, credential enrollment, and the
+> first product gate through both the CLI and the MCP adapter — including a killed and
+> restarted node with exact retries. Windows arm64 is built but not yet exercised on native
+> hardware, and the binaries are not yet signed.
 
 ## Quickstart
 
@@ -352,13 +357,17 @@ The founder advertises an endpoint and writes a one-use invitation; the second m
 enrolls from it and starts:
 
 ```sh
-focal --data-dir ~/focal-founder start --advertise 192.0.2.10:7443
+focal --data-dir ~/focal-founder start --advertise founder.example:7443
 focal --data-dir ~/focal-founder cluster invite --node worker-2 --output worker-2.invite
 
-# on the second host, after copying the invitation
-focal --data-dir ~/focal-node join --invite-file worker-2.invite --advertise 192.0.2.20:7443
-focal --data-dir ~/focal-node start
+# on the second host, after copying the invitation: enroll and start in one command
+focal --data-dir ~/focal-node start --invite-file worker-2.invite --advertise worker-2.example:7443
 ```
+
+An address works as well as a name; a name is announced with the node so peers find it
+again when the address behind it changes. For a supervised host or a Kubernetes
+namespace, `focal deployment render systemd|kubernetes` writes the packaging
+([deploy/](deploy/)).
 
 > [!IMPORTANT]
 > Joining lets the new node take part in the cluster; it does not yet copy your ledger onto
@@ -374,15 +383,21 @@ in [docs/network-startup.md](docs/network-startup.md) and [docs/cluster-admin.md
 | Step | What you decide | Today (2026-09-09) |
 |---|---|---|
 | Laptop | Where to keep the data | Works: durable service, restart, the full workflow through CLI and MCP |
-| VMs or bare metal | Reachable addresses, who may join, how many node failures to survive | Works: join, authenticated transport, membership, leader transfer, credential renewal. In the test suite only: a placement controller that expands a ledger to three hosts and heals a lost one. Not yet: the `cluster plan` and `deployment apply` commands that expose it |
-| Kubernetes | Storage and packaging | Planned; no manifests or images yet |
-| Several zones | Verified failure domains, what zone loss you accept | The planner and `deployment explain` (offline); zone-loss qualification remains |
+| VMs or bare metal | Reachable addresses, who may join, how many node failures to survive | Works: join (also `start --invite-file`), authenticated transport, names that outlive addresses, membership, leader transfer, credential renewal and rotation, drain/remove/replace, repair, backup/restore, the upgrade fence; `deployment plan`/`apply` commit a durability policy and the placement controller expands and heals the ledgers; `deployment render systemd` writes the unit |
+| Kubernetes | Storage and packaging | `deployment render kubernetes` writes the manifests (`deploy/kubernetes`), a Helm chart and a container recipe are checked in; not yet executed on a real cluster |
+| Several zones | Verified failure domains, what zone loss you accept | Declared zones are announced and granted, voters spread across them, residency fenced; zone-loss journeys remain to be recorded |
 | Several regions | Residency, home regions, the latency you will pay for remote durability | Architecture and schema; the geographic executor remains |
 | Global fleet | Per-tenant geography and resource policy | Target; the partitioned directory exists, scale qualification remains |
 
 > [!NOTE]
-> Small-cluster tests are not evidence of global throughput, and Focal has no published
-> benchmark yet. The contract for each step is
+> Small-cluster tests are not evidence of global throughput. Per-operation and single-node
+> microbenchmarks and a capacity envelope are published — the admission, request-codec,
+> durable-append and domain-reduce floors, and the measured one-session reduce ceiling — but
+> fleet and global throughput remain unmeasured, stated only as an envelope. An end-to-end
+> workload generator ([`tools/load`](tools/load/README.md)) and a nightly seeded campaign now
+> measure the full client→commit path and assert loss-free, exactly-once operation under load;
+> their runs will replace the envelope's simulated rows. See the
+> [capacity envelope](docs/qualification/capacity-envelope.md). The contract for each step is
 > [08](docs/archictecutre/08-stepped-complexity-and-deployment.md); the placement design is
 > [24](docs/archictecutre/24-placement-execution-and-fleet-control.md).
 
@@ -396,6 +411,7 @@ in [docs/network-startup.md](docs/network-startup.md) and [docs/cluster-admin.md
 | [Monitors](docs/monitors.md) | Durable wait predicates under a claim |
 | [Building](docs/building.md) | Toolchain, checks, the release lane |
 | [Architecture](docs/archictecutre/README.md) | Design documents 00–24 |
+| [Performance & capacity](docs/qualification/capacity-envelope.md) | Measured per-operation and durability floors, the one-session reduce ceiling, and the capacity envelope |
 | [Remaining work](docs/REMAINING.md) · [Implementation status](docs/archictecutre/09-implementation-status.md) | What is left, and the dated evidence for what is done |
 
 ## Contributing / development

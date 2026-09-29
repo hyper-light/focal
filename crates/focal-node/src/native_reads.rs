@@ -573,12 +573,18 @@ pub(crate) fn page(
             let mut objects = Vec::new();
             let mut visited = 0u32;
             let budget = limit.saturating_add(EVENT_SCAN_SLACK);
-            let mut last = None;
+            // The last slot actually visited, not the last event emitted: a page
+            // may exhaust its visit budget on a run of event-less records without
+            // matching anything, and the continuation must still advance past
+            // them. Resume is self-correcting — the cursor points at a consumed
+            // slot, the scan restarts at ordinal+1, and an empty ordinal falls
+            // through to the next sequence — so a record-boundary cursor is safe.
+            let mut last_visited = None;
             while sequence <= prefix && objects.len() < *limit as usize && visited < budget {
                 visited = visited.saturating_add(1);
+                last_visited = Some((sequence, ordinal));
                 match core.native_event(sequence, ordinal) {
                     Some(event) => {
-                        last = Some((sequence, ordinal));
                         objects.push(NativeObject::Event(Box::new(docs::event_record(event))));
                         ordinal = ordinal.saturating_add(1);
                     }
@@ -588,9 +594,15 @@ pub(crate) fn page(
                     }
                 }
             }
-            let next = last
-                .filter(|_| objects.len() >= *limit as usize || visited >= budget)
-                .map(|(sequence, ordinal)| NativeContinuation::Events { sequence, ordinal });
+            // More remains only if the scan stopped before the prefix end (a full
+            // page or an exhausted visit budget); `sequence > prefix` is the true
+            // end and yields no continuation.
+            let next = if sequence <= prefix {
+                last_visited
+                    .map(|(sequence, ordinal)| NativeContinuation::Events { sequence, ordinal })
+            } else {
+                None
+            };
             Ok(finish(reader, objects, next, visited))
         }
         NativeReadQuery::Standing => {

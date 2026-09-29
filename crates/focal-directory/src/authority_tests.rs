@@ -260,6 +260,7 @@ fn node_capability_allows_unknown_geography_without_promising_zone_or_region_sur
                         available_memory: 1024,
                         active_weight: *id,
                         disk_available: 1024,
+                        capability: 0,
                     }),
                     liveness: None,
                 },
@@ -428,6 +429,73 @@ fn topology_requires_enrolled_identity_and_actual_metadata_publication() {
             .verify_enrollment(&enrolled)
             .is_err()
     );
+    // A retired credential can still be drained (its grant withdrawn as it
+    // stands), never re-armed or moved.
+    assert!(
+        fixture
+            .enrollment
+            .authorize_certificate(&fixture.receipts[&2].certificate, fixture.now)
+            .is_err(),
+        "the revoked certificate still authorizes"
+    );
+    let current = fixture.authority.node(2).unwrap().clone();
+    let withdrawn = NodeTopologyGrant {
+        enrollment: NodeEnrollment {
+            generation: 2,
+            eligible: false,
+            attestation: ContentHash([0; 32]),
+            ..current.enrollment.clone()
+        },
+        principal: current.principal,
+        expires_at: current.expires_at,
+    };
+    for (index, (grant, accepted)) in [
+        (
+            NodeTopologyGrant {
+                enrollment: NodeEnrollment {
+                    eligible: true,
+                    ..withdrawn.enrollment.clone()
+                },
+                ..withdrawn.clone()
+            },
+            false,
+        ),
+        (
+            NodeTopologyGrant {
+                enrollment: NodeEnrollment {
+                    zone: ZoneId([7; 16]),
+                    ..withdrawn.enrollment.clone()
+                },
+                ..withdrawn.clone()
+            },
+            false,
+        ),
+        (withdrawn.clone(), true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let prepared = fixture.authority.prepare(
+            &fixture.command(AuthorityOperation::GrantNode {
+                grant,
+                expected_generation: Some(1),
+            }),
+            &fixture.enrollment,
+        );
+        assert_eq!(
+            prepared.is_ok(),
+            accepted,
+            "case {index}: {:?}",
+            prepared.err()
+        );
+    }
+    fixture.commit(AuthorityOperation::GrantNode {
+        grant: withdrawn,
+        expected_generation: Some(1),
+    });
+    let drained = fixture.authority.node(2).unwrap();
+    assert!(!drained.enrollment.eligible);
+    assert_eq!(drained.enrollment.generation, 2);
 }
 
 fn pump(nodes: &mut BTreeMap<u64, DurableNode>) {

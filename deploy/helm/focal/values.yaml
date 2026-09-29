@@ -1,0 +1,32 @@
+# The requested policy and the infrastructure facts the renderer asks for.
+# Defaults match deploy/kubernetes (three zones surviving the loss of one).
+image: "focal:0.1.0"
+port: 7443
+# node | zone. Region survival is one deployment per region (08 §7).
+survive: zone
+maxFailures: 1
+region: "eu-a"
+# Zone survival: the founder is the first zone's first node; `hosts` are the
+# host pods placed in that zone besides it. Node survival: leave `zones`
+# empty and set `hosts` below.
+zones:
+  - name: a
+    hosts: 0
+  - name: b
+    hosts: 1
+  - name: c
+    hosts: 1
+# Node survival only: host pods in the single `focal-hosts` set (2f).
+hosts: 2
+# Empty: the cluster's default storage class.
+storageClass: ""
+volume: 20Gi
+# One invitation per host pod, `<pod>.invite`, issued by the founder
+# (deploy/kubernetes/invitations.sh).
+invitationsSecret: focal-invitations
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    memory: 2Gi

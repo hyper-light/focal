@@ -26,6 +26,9 @@ pub enum SessionCall {
     Membership(SessionMembershipRequest),
     /// Propose one placement record (a cutover or an activation).
     Placement(SessionPlacementRequest),
+    /// Begin moving leadership to `target`, a voter. The log leads
+    /// elsewhere only once an election says so.
+    Transfer { target: u64 },
 }
 /// The body of `Operation::SessionControl`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +44,8 @@ pub enum SessionControlReply {
     Placed,
     /// `NotLeader { leader }` names where the log leads, when known.
     Refused(ControlFailure),
+    /// A transfer began.
+    Transferring,
 }
 
 fn refusal(error: LedgerError) -> ControlFailure {
@@ -48,6 +53,10 @@ fn refusal(error: LedgerError) -> ControlFailure {
         LedgerError::Capacity => ControlFailure::Capacity,
         LedgerError::NotReady { leader } => ControlFailure::NotLeader { leader },
         LedgerError::OutcomeUnknown => ControlFailure::OutcomeUnknown,
+        LedgerError::Consensus(
+            focal_consensus::ConsensusError::LearnerBehind
+            | focal_consensus::ConsensusError::LeaderLeaving,
+        ) => ControlFailure::NotReady,
         LedgerError::MembershipConflict | LedgerError::PlacementConflict => {
             ControlFailure::CompareFailed
         }
@@ -68,18 +77,28 @@ pub async fn authorized_controller(
     let ControlBootstrap::Root { directory, .. } = &observation.snapshot().state else {
         return false;
     };
-    let Some(authority) = observation.authority() else {
-        return false;
-    };
+    // A partition the root group itself owns is judged by the root's own
+    // applied configuration, which every root replica holds; another
+    // owner group by the installed authority's grant for it.
+    let root_group = observation.snapshot().identity.group;
     directory
         .delegations
         .values()
         .filter(|delegation| delegation.namespace.contains(ledger))
         .any(|delegation| {
-            authority
-                .groups
-                .get(&delegation.log_group)
-                .is_some_and(|group| group.voters.contains_key(&requester))
+            if delegation.log_group.0 == root_group {
+                return observation
+                    .configuration()
+                    .configuration
+                    .voters
+                    .contains(&requester);
+            }
+            observation.authority().is_some_and(|authority| {
+                authority
+                    .groups
+                    .get(&delegation.log_group)
+                    .is_some_and(|group| group.voters.contains_key(&requester))
+            })
         })
 }
 
@@ -111,6 +130,10 @@ pub async fn serve(
         },
         SessionCall::Placement(request) => match host.propose_placement(request).await {
             Ok(_) => SessionControlReply::Placed,
+            Err(error) => SessionControlReply::Refused(refusal(error)),
+        },
+        SessionCall::Transfer { target } => match host.transfer_leader(target).await {
+            Ok(()) => SessionControlReply::Transferring,
             Err(error) => SessionControlReply::Refused(refusal(error)),
         },
     }

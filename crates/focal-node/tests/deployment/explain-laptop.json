@@ -1,0 +1,88 @@
+{
+  "activated": true,
+  "committed_revision": 1,
+  "condition": "PlanValid",
+  "effective": {
+    "durability": {
+      "max_failures": 0,
+      "survive": "node"
+    },
+    "placement": {
+      "home_regions": [],
+      "residency": []
+    }
+  },
+  "observed": {
+    "nodes": [
+      {
+        "alive": true,
+        "eligible": true,
+        "node": 0,
+        "region": null,
+        "zone": null
+      }
+    ],
+    "observed_at": 0,
+    "sessions": [
+      {
+        "achieved": {
+          "max_failures": 0,
+          "survive": "node"
+        },
+        "blocked_by": [],
+        "desired": {
+          "max_failures": 0,
+          "survive": "node"
+        },
+        "pending": false,
+        "session": "<id>",
+        "tenant": "<id>"
+      }
+    ]
+  },
+  "plan": {
+    "content_copies": [
+      0
+    ],
+    "durability": {
+      "max_failures": 0,
+      "survive": "node"
+    },
+    "preferred_leader": 0,
+    "voters": [
+      0
+    ]
+  },
+  "requested": {
+    "durability": {
+      "max_failures": 0,
+      "survive": "node"
+    },
+    "placement": {
+      "home_regions": [],
+      "residency": []
+    }
+  },
+  "sources": {
+    "durability.max_failures": {
+      "committed": 1
+    },
+    "durability.survive": {
+      "committed": 1
+    },
+    "node.advertise": "creation_default",
+    "node.data_dir": "command_line",
+    "node.listen": "creation_default",
+    "node.max_tenants": "creation_default",
+    "node.metrics_listen": "creation_default",
+    "node.seeds": "creation_default",
+    "placement.home_regions": {
+      "committed": 1
+    },
+    "placement.residency": {
+      "committed": 1
+    },
+    "topology.region": "creation_default",
+    "topology.zone": "creation_default"
+  }
+}

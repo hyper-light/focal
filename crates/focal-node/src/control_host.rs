@@ -24,7 +24,16 @@ pub struct ControlHostConfig {
     pub pending_requests: usize,
     pub replication_queue: usize,
     pub tick: Duration,
+    /// The longest the tick period is stretched for a far group (27 §3.1
+    /// P2). It bounds how long a dead leader goes unnoticed: the election
+    /// timeout is at most the election ticks times this.
+    pub tick_ceiling: Duration,
     pub request_timeout: Duration,
+    /// Compact the metadata log once this many entries have been applied past
+    /// the last snapshot. Bounds the log in steady state and lets a lagging
+    /// follower catch up from a trusted snapshot instead of replaying every
+    /// authority fact (24 §16). Never zero.
+    pub checkpoint_interval: u64,
     /// Trusted immutable-genesis pin; absent means remote enrollment is denied.
     pub enrollment_authority: Option<crate::network_control::FounderControlAuthority>,
 }
@@ -37,7 +46,9 @@ impl ControlHostConfig {
             pending_requests: 64,
             replication_queue: 128,
             tick: Duration::from_millis(100),
+            tick_ceiling: Duration::from_secs(2),
             request_timeout: Duration::from_secs(5),
+            checkpoint_interval: 1024,
             enrollment_authority: None,
         }
     }
@@ -47,8 +58,11 @@ impl ControlHostConfig {
             || self.route_epoch.0 == 0
             || !(1..=1024).contains(&self.queue_items)
             || !(1..=1024).contains(&self.pending_requests)
+            || self.checkpoint_interval == 0
             || !(1..=1024).contains(&self.replication_queue)
             || !(Duration::from_millis(10)..=Duration::from_secs(1)).contains(&self.tick)
+            || self.tick_ceiling < self.tick
+            || self.tick_ceiling > Duration::from_secs(10)
             || self.request_timeout.is_zero()
             || self.request_timeout > Duration::from_secs(60)
         {
@@ -67,6 +81,16 @@ pub struct ControlProgress {
     pub revisions: ControlRevisions,
     pub dropped_replication: u64,
     pub stopped: bool,
+    /// The compaction floor: index of the most recent metadata snapshot, or
+    /// zero before the first compaction. `applied_index - snapshot_index` is
+    /// the retained log length.
+    pub snapshot_index: u64,
+    /// Per-peer replication progress while this node leads (diagnostic).
+    pub peers: Vec<focal_consensus::PeerProgress>,
+    /// Why the owner stopped, when it stopped on a failure rather than on
+    /// request: the error its loop ended with, or that it unwound. Without
+    /// this a stopped control plane reads as an unexplained shutdown.
+    pub failure: Option<String>,
 }
 struct ControlProgressState {
     value: ControlProgress,
@@ -192,8 +216,11 @@ pub struct ControlHost {
     config: ControlHostConfig,
     limits: WireLimits,
     budget: MemoryBudget,
+    pub(crate) pace: TickPeriod,
 }
 pub struct ControlOwner(JoinHandle<()>);
+
+pub(crate) use crate::pace::TickPeriod;
 
 /// One durable local prefix for transport reconstruction. This observation
 /// grants neither a current quorum read nor permission to change membership.
@@ -241,7 +268,12 @@ struct Pending {
     response: oneshot::Sender<Completed>,
     waiting: Waiting,
     term: u64,
-    deadline: Instant,
+    /// The owner's period at which the request is given up: the request
+    /// time in the periods it holds at the configured tick, counted as the
+    /// owner runs them (27 §3.1 P2). A request waits its time in the
+    /// owner's rounds and not the clock's, so an owner that a loaded
+    /// machine slows gives up nothing it would have answered.
+    deadline: u64,
     enrollment: bool,
     root_peer: Option<RootPeer>,
     _charge: Allocation,
@@ -267,6 +299,8 @@ struct Owner<V> {
     progress: watch::Sender<ControlProgressState>,
     nonce: u64,
     dropped: u64,
+    failure: Option<String>,
+    pub(crate) pace: TickPeriod,
 }
 impl ControlHost {
     /// Validate a durable session-owner witness against this control owner's
@@ -503,6 +537,7 @@ impl ControlHost {
         let (peers, incoming) = mpsc::sync_channel(config.replication_queue);
         let (outbound, outgoing) = async_mpsc::channel(config.replication_queue);
         let status = replica.status();
+        let pace = TickPeriod::default();
         let (progress, changes) = watch::channel(ControlProgressState {
             value: ControlProgress {
                 identity: replica.identity(),
@@ -513,6 +548,9 @@ impl ControlHost {
                 revisions: replica.revisions(),
                 dropped_replication: 0,
                 stopped: false,
+                snapshot_index: 0,
+                peers: Vec::new(),
+                failure: None,
             },
             _allocation: None,
         });
@@ -531,6 +569,8 @@ impl ControlHost {
             progress,
             nonce: 0,
             dropped: 0,
+            failure: None,
+            pace: pace.clone(),
         };
         let thread = std::thread::Builder::new()
             .name(format!("focal-control-{}", status.node_id))
@@ -541,6 +581,7 @@ impl ControlHost {
                 sender,
                 peers,
                 progress: changes,
+                pace,
                 config,
                 limits,
                 budget,
@@ -548,6 +589,58 @@ impl ControlHost {
             ControlOwner(thread),
             outgoing,
         ))
+    }
+    /// Derive this owner's tick period from the measured paths to the
+    /// group's other voters (27 §3.1 P2) and put it in force from the next
+    /// tick. A group whose paths all sit inside the configured period keeps
+    /// the configured period. The owner's own stalls do not touch the
+    /// period: they are the replica's patience (`TickPeriod::patience`).
+    pub fn pace<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a focal_timing::PathRtt>,
+    ) -> focal_timing::TickPace {
+        let pace = focal_timing::TickPace::derive(
+            self.config.tick,
+            self.config.tick_ceiling,
+            // Before the owner has opened its replica the count is unknown;
+            // one tick is the conservative reading (the longest period).
+            self.pace.election_tick().max(1),
+            paths,
+        );
+        self.pace.publish(pace);
+        pace
+    }
+    /// The periods the owner has run; what a wait on it is charged in
+    /// (27 §3.1 P8).
+    pub fn periods(&self) -> u64 {
+        self.pace.periods()
+    }
+    /// Periods in one election timeout of this replica; none before its
+    /// owner has opened it.
+    pub fn election_periods(&self) -> u64 {
+        u64::try_from(self.pace.election_tick()).unwrap_or(u64::MAX)
+    }
+    /// The periods in which the replica was not ticked: refused the room,
+    /// or still persisting.
+    pub fn refused_periods(&self) -> u64 {
+        self.pace.refused()
+    }
+    /// The longest a period of the owner took, from one to the next: a
+    /// stall of the owner, which its replica's followers may have taken
+    /// for its death.
+    pub fn longest_period(&self) -> Duration {
+        self.pace.longest()
+    }
+    /// The tick period in force.
+    pub fn tick_period(&self) -> Duration {
+        self.pace.get(self.config.tick, self.config.tick_ceiling)
+    }
+    /// The pace in force: the last derivation, or the configured period
+    /// with no samples before any.
+    pub fn current_pace(&self) -> focal_timing::TickPace {
+        self.pace
+            .derived()
+            .unwrap_or_else(|| focal_timing::TickPace::floor(self.config.tick))
     }
     pub fn progress(&self) -> ControlProgress {
         self.progress.borrow().value.clone()
@@ -640,7 +733,7 @@ impl ControlHost {
             },
         };
         let verified = verify_request(peer, request, &self.limits).map_err(access_failure)?;
-        let response = self.handle(verified).await;
+        let response = self.handle(&verified).await;
         match response.result {
             Response::Control { response } => {
                 ControlReply::decode(&response, self.limits.max_frame_bytes as usize)
@@ -652,10 +745,10 @@ impl ControlHost {
     }
 }
 impl RequestHandler for ControlHost {
-    fn handle(&self, request: VerifiedRequest) -> HandlerFuture<'_> {
+    fn handle<'a>(&'a self, request: &'a VerifiedRequest) -> HandlerFuture<'a> {
         Box::pin(async move { self.handle_accounted(request).await.into_envelope() })
     }
-    fn handle_accounted(&self, request: VerifiedRequest) -> OwnedHandlerFuture<'_> {
+    fn handle_accounted<'a>(&'a self, request: &'a VerifiedRequest) -> OwnedHandlerFuture<'a> {
         Box::pin(async move {
             let unknown = request
                 .request()
@@ -687,7 +780,11 @@ impl RequestHandler for ControlHost {
             };
             let (send, receive) = oneshot::channel();
             let queue = if peer { &self.peers } else { &self.sender };
-            match queue.try_send(Work::Request(Box::new(request), send, charge.commit())) {
+            match queue.try_send(Work::Request(
+                Box::new(request.clone()),
+                send,
+                charge.commit(),
+            )) {
                 Ok(()) => receive
                     .await
                     .map(Completed::into_owned)
@@ -698,13 +795,24 @@ impl RequestHandler for ControlHost {
         })
     }
 }
+/// A request, its answer, and what the answer's export is charged to.
+type Finished = (
+    Pending,
+    Result<ControlReply, ControlFailure>,
+    Option<Allocation>,
+);
 impl<V: AuthorityVerifier> Owner<V> {
     fn run(mut self, receiver: mpsc::Receiver<Work>, peers: mpsc::Receiver<Work>) {
-        let _result = catch_unwind(AssertUnwindSafe(|| -> Result<(), ControlError> {
+        self.pace.announce(self.replica.election_tick());
+        let result = catch_unwind(AssertUnwindSafe(|| -> Result<(), ControlError> {
             self.drain()?;
             let mut next_tick = Instant::now()
-                .checked_add(self.config.tick)
+                .checked_add(self.pace.get(self.config.tick, self.config.tick_ceiling))
                 .ok_or(ControlError::Capacity)?;
+            let beat = self.config.tick.saturating_mul(
+                u32::try_from(self.replica.heartbeat_tick().max(1)).unwrap_or(u32::MAX),
+            );
+            let mut next_beat = Instant::now();
             loop {
                 for _ in 0..8 {
                     match peers.try_recv() {
@@ -715,10 +823,52 @@ impl<V: AuthorityVerifier> Owner<V> {
                     }
                 }
                 if Instant::now() >= next_tick {
-                    self.replica.tick()?;
+                    self.pace
+                        .advance(self.pace.get(self.config.tick, self.config.tick_ceiling));
+                    // What the owner has seen of its own stalls is the
+                    // replica's patience before it campaigns.
+                    self.replica.set_patience(
+                        self.pace
+                            .patience(self.config.tick, self.config.tick_ceiling),
+                    )?;
+                    // A tick that was refused the room, or that came while
+                    // the one before it is still persisted, changed
+                    // nothing: the period has passed without it. A member
+                    // that is not ticked waits longer before it campaigns,
+                    // and a leader sends its heartbeats a period later
+                    // (27 §3.1 P3). It is no reason for the owner to end.
+                    match self.replica.tick() {
+                        Ok(()) => {}
+                        Err(error) if self.replica.checkpoint_retryable(&error) => {
+                            self.pace.refuse();
+                        }
+                        Err(error) => return Err(error),
+                    }
                     self.drain()?;
+                    self.maybe_checkpoint()?;
                     next_tick = Instant::now()
-                        .checked_add(self.config.tick)
+                        .checked_add(self.pace.get(self.config.tick, self.config.tick_ceiling))
+                        .ok_or(ControlError::Capacity)?;
+                }
+                // A stretched period stretches the election timeout, which
+                // is what it is for. The heartbeats of a leader keep the
+                // cadence its followers were configured to expect: each
+                // node stretches by what it measured itself, and a leader
+                // that beat at its own stretched period would be presumed
+                // dead by a follower that measured less (27 §3.1 P2).
+                if self.replica.leads()
+                    && self
+                        .pace
+                        .stretched(self.config.tick, self.config.tick_ceiling)
+                    && Instant::now() >= next_beat
+                {
+                    match self.replica.beat() {
+                        Ok(()) => self.drain()?,
+                        Err(error) if self.replica.checkpoint_retryable(&error) => {}
+                        Err(error) => return Err(error),
+                    }
+                    next_beat = Instant::now()
+                        .checked_add(beat)
                         .ok_or(ControlError::Capacity)?;
                 }
                 // Peer ingress has its own reserved queue. The short idle wait
@@ -737,6 +887,11 @@ impl<V: AuthorityVerifier> Owner<V> {
                 }
             }
         }));
+        self.failure = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(_) => Some("control owner unwound".to_owned()),
+        };
         self.stop_waiters();
         self.publish_progress(true);
     }
@@ -1153,7 +1308,19 @@ impl<V: AuthorityVerifier> Owner<V> {
                     if !contact && matches!(request.command, ControlCommand::NodeContact(_)) {
                         return Err(ControlFailure::Unauthorized);
                     }
-                    if request.id.client != principal.0 {
+                    // Retiring a contact is the operator's (24 §19): only the
+                    // local admin path, never a peer over the network.
+                    if matches!(request.command, ControlCommand::RetireContact(_))
+                        && !matches!(verified.peer().role(), PeerRole::Runtime)
+                    {
+                        return Err(ControlFailure::Unauthorized);
+                    }
+                    // A node's root intents over placement control are named
+                    // by the client derived from its principal (24 §16).
+                    let root_intent = placement
+                        && request.id.client
+                            == crate::placement_control::root_intent_client(principal.0);
+                    if request.id.client != principal.0 && !root_intent {
                         return Err(ControlFailure::Unauthorized);
                     }
                     match self
@@ -1217,7 +1384,7 @@ impl<V: AuthorityVerifier> Owner<V> {
             });
             return;
         }
-        let deadline = Instant::now().checked_add(self.config.request_timeout);
+        let deadline = self.request_deadline();
         if let (Some(waiting), Some(deadline)) = (waiting, deadline) {
             self.pending.push_back(Pending {
                 header,
@@ -1233,14 +1400,58 @@ impl<V: AuthorityVerifier> Owner<V> {
             self.send(header, response, result, charge, None);
         }
     }
+    /// A reply is given once what it was made from is released: the one that
+    /// asked may look at the budget the moment it is answered, and finds
+    /// there what its answer holds and nothing of the owner's.
+    /// The owner's period at which a request taken now is given up: the
+    /// request time in the periods it holds at the configured tick, and the
+    /// ticks of the owner's own remembered stall beyond it, as its
+    /// replica's patience is (`TickPeriod::patience`): a barrier this owner
+    /// was late to run for a stall of its own is not given up for it.
+    fn request_deadline(&self) -> Option<u64> {
+        self.pace
+            .periods()
+            .checked_add(focal_timing::ProgressDeadline::periods(
+                self.config.request_timeout,
+                self.config.tick,
+            ))?
+            .checked_add(
+                u64::try_from(
+                    self.pace
+                        .patience(self.config.tick, self.config.tick_ceiling),
+                )
+                .unwrap_or(u64::MAX),
+            )
+    }
     fn drain(&mut self) -> Result<(), ControlError> {
+        let mut finished = Vec::new();
+        let drained = self.drain_events(&mut finished);
+        for (pending, result, output) in finished {
+            self.finish_charged(pending, result, output);
+        }
+        drained
+    }
+    fn drain_events(&mut self, finished: &mut Vec<Finished>) -> Result<(), ControlError> {
+        // Every request that waits may be answered by this drain.
+        finished
+            .try_reserve_exact(self.pending.len())
+            .map_err(|_| ControlError::Capacity)?;
         // Declare the source permit first so remaining event buffers drop
         // before it on every exit. Frames/replies below allocate new encoded
         // buffers under their own permits, retained through transport send.
         let _source_allocation;
         let mut events = match self.initial.take() {
             Some(events) => events,
-            None => self.replica.drain(&self.verifier)?,
+            None => match self.replica.drain(&self.verifier) {
+                Ok(events) => events,
+                // Refused before anything was taken: what waits to be
+                // drained waits for the next drain.
+                Err(error) if self.replica.checkpoint_retryable(&error) => {
+                    self.pace.refuse();
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            },
         };
         _source_allocation = events.take_allocation();
         let status = self.replica.status();
@@ -1356,18 +1567,18 @@ impl<V: AuthorityVerifier> Owner<V> {
                 } else {
                     result
                 };
-                self.finish_charged(pending, result, read_charge.take());
+                finished.push((pending, result, read_charge.take()));
             } else if pending.response.is_closed() {
                 drop(pending);
             } else if pending.term != status.term
                 || status.role != StateRole::Leader
-                || Instant::now() >= pending.deadline
+                || self.pace.periods() >= pending.deadline
             {
                 let failure = match pending.waiting {
                     Waiting::Write(_) => ControlFailure::OutcomeUnknown,
                     _ => ControlFailure::Unavailable,
                 };
-                self.finish(pending, Err(failure));
+                finished.push((pending, Err(failure), None));
             } else {
                 self.pending.push_back(pending);
             }
@@ -1379,7 +1590,7 @@ impl<V: AuthorityVerifier> Owner<V> {
             let snapshot = match self.snapshot_feedback.begin(&message, &self.budget) {
                 Ok(snapshot) => snapshot,
                 Err(_) => {
-                    if message.get_msg_type() == focal_consensus::MessageType::MsgSnapshot {
+                    if message.msg_type == focal_consensus::MessageType::MsgSnapshot as i32 {
                         self.replica.report_snapshot_at(
                             message.to,
                             message.term,
@@ -1512,6 +1723,61 @@ impl<V: AuthorityVerifier> Owner<V> {
             _output: output,
         });
     }
+    /// Refresh the log snapshot when either the log has grown
+    /// `checkpoint_interval` entries past the last snapshot (steady-state
+    /// bounding) or a membership change has committed above the snapshot floor
+    /// so the stored snapshot's configuration is stale.
+    ///
+    /// The second trigger is essential for correctness, not just bounding: a
+    /// snapshot carries the committed configuration at its index, and a
+    /// follower cannot be caught up by a snapshot whose configuration predates
+    /// the follower's own admission (it would install a membership that does
+    /// not contain it). The genesis snapshot excludes every later-joined node,
+    /// so without this a freshly joined learner whose `next_index` reaches the
+    /// compaction floor wedges: the leader can neither append below the floor
+    /// nor install its stale snapshot, and it oscillates Probe/Snapshot
+    /// forever. Re-checkpointing at the current applied index mints a snapshot
+    /// whose configuration includes the follower, which then installs and
+    /// catches up. It fires at most once per membership change (afterward the
+    /// floor is at or above `configuration_index`), never per entry.
+    ///
+    /// Compaction is skipped, not forced, when a proposal, directory bootstrap,
+    /// enrollment refresh or caller read is in flight so no in-flight fence is
+    /// invalidated; the next tick retries. `NotReady`/`Busy` is transient and
+    /// never fails the owner.
+    fn maybe_checkpoint(&mut self) -> Result<(), ControlError> {
+        let applied = self.replica.applied_index();
+        if applied == 0
+            || self.replica.has_pending()
+            || self.directory.is_some()
+            || self.authority_refresh.is_some()
+            || !self.pending.is_empty()
+        {
+            return Ok(());
+        }
+        let floor = self.replica.snapshot_index();
+        if applied <= floor {
+            return Ok(());
+        }
+        let interval_reached = applied.saturating_sub(floor) >= self.config.checkpoint_interval;
+        // The stored snapshot carries the configuration at its index. Once a
+        // membership change commits above the floor, that snapshot excludes the
+        // member(s) it added and can no longer catch them up, so refresh it to
+        // the current committed configuration. This fires at most once per
+        // membership change (afterward the floor is at or above the change),
+        // never per entry, so it cannot storm.
+        let stale_configuration = floor < self.replica.configuration_index();
+        if !interval_reached && !stale_configuration {
+            return Ok(());
+        }
+        match self.replica.checkpoint() {
+            Ok(()) => Ok(()),
+            // Compaction is opportunistic: a refusal that changed nothing is
+            // tried again on a later tick and never ends the owner.
+            Err(error) if self.replica.checkpoint_retryable(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
     fn publish_progress(&self, stopped: bool) {
         let status = self.replica.status();
         self.progress.send_modify(|state| {
@@ -1524,6 +1790,9 @@ impl<V: AuthorityVerifier> Owner<V> {
                 revisions: self.replica.revisions(),
                 dropped_replication: self.dropped,
                 stopped,
+                snapshot_index: self.replica.snapshot_index(),
+                peers: self.replica.peer_progress(),
+                failure: self.failure.clone(),
             }
         });
     }
