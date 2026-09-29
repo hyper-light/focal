@@ -11954,6 +11954,14 @@ validation, the V1 example refused by the field the native contract lacks). The 
 and the manual carry the native quickstart and the rule.
 ### 2026-09-29 — F02 — a retirement that the same configuration cannot restore
 
+Addendum: the hosted apply loop reconstructed the owner after a retirement record
+applied and before the delivery cursor passed the entry, so a reconstruction refused
+for memory was retried against an entry already applied and failed the session as
+`Corrupt` (reproduced first). The cursor now passes the entry before the
+reconstruction and a ready authority rebuilds its owner at the end of every delivery
+until it can; the refusal is a `Retry`, the record applies once
+(`session::native_tests::a_reconstruction_refused_after_the_record_applied_is_retried_without_reapplying_it`).
+
 The audit's F02 (P1). `Core::retire_native_family` incremented the outcome
 count and published a retirement's outcome at the next prefix without asking
 the core's outcome bound, while checkpoint recovery requires the count it

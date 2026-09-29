@@ -86,6 +86,10 @@ pub(crate) struct NativeEngine<S: NativeSchemaVerifier> {
     pub(super) observed_term: u64,
     pub(super) observed_leader: bool,
     pub(super) reconstruction_needed: bool,
+    /// Reconstructions the next promotions refuse as memory, for the tests
+    /// of the session's handling of a refused reconstruction.
+    #[cfg(test)]
+    pub(crate) refuse_reconstructions: u32,
     pub(super) failed: bool,
     pub(super) materializer: super::MaterializerStats,
     pub(super) _pending_allocation: Allocation,
@@ -187,6 +191,8 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             observed_term: 0,
             observed_leader: false,
             reconstruction_needed: true,
+            #[cfg(test)]
+            refuse_reconstructions: 0,
             failed: false,
             materializer: super::MaterializerStats::default(),
             _pending_allocation: permit.commit(),

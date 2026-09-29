@@ -2002,6 +2002,67 @@ fn a_hosted_authority_retires_a_family_and_stays_authoritative() {
     assert_eq!(cluster.node(1).native_retention().unwrap().retired, 1);
 }
 
+/// A reconstruction refused after the retirement record applied (memory):
+/// the record stays applied once, the poll is retried — never failed as
+/// corruption because the resumed delivery met an entry already applied —
+/// and the next poll rebuilds the authority, which admits work again.
+#[test]
+fn a_reconstruction_refused_after_the_record_applied_is_retried_without_reapplying_it() {
+    use focal_core::native::NativeCommand;
+    let mut cluster = Cluster::new(1, &[true]);
+    cluster.elect(1, &[]);
+    cluster.activate(1, &[]);
+    let create = creation(cluster.next(PARTIES.issuer), 1);
+    cluster.commit(1, PARTIES.issuer, create, &[]);
+    let expected = cluster.claim(1, 1);
+    let cancel = fx::cancel(cluster.next(PARTIES.issuer), expected);
+    cluster.commit(1, PARTIES.issuer, cancel, &[]);
+    let expected = cluster.claim(1, 1);
+    let release = NativeInput {
+        request: cluster.next(PARTIES.issuer),
+        command: NativeCommand::ReleaseScope { expected },
+    };
+    cluster.commit(1, PARTIES.issuer, release, &[]);
+    let (bundle, length, through) = {
+        let node = cluster.node(1);
+        let limits = node.native_encoding_limits().unwrap();
+        let core = node.native_core().unwrap();
+        let family = core.retirement_family(ClaimId::from_u128(1)).unwrap();
+        let through = core.native_sequence();
+        let quote = core.archive_family_quote(&family, through, limits).unwrap();
+        (quote.hash, quote.bytes as u64, through)
+    };
+    cluster
+        .node(1)
+        .native_propose_retirement(ClaimId::from_u128(1), bundle, length, through)
+        .unwrap();
+    cluster.node(1).refuse_next_reconstruction_for_test();
+    let mut polls = Vec::new();
+    for _ in 0..32 {
+        match cluster.node(1).poll() {
+            Ok(_) => polls.push("ok"),
+            Err(LedgerError::Retry) => polls.push("retry"),
+            Err(error) => panic!("{error:?} after {polls:?}"),
+        }
+        if cluster.node(1).native_authoritative()
+            && !cluster.node(1).native_retention().unwrap().retiring
+        {
+            break;
+        }
+    }
+    assert!(polls.contains(&"retry"), "{polls:?}");
+    assert!(cluster.node(1).native_authoritative(), "{polls:?}");
+    let report = cluster.node(1).native_retention().unwrap();
+    assert_eq!(report.retired, 1, "{report:?}");
+    assert!(!report.retiring);
+    assert_eq!(cluster.status(1, 1), None);
+    assert_eq!(cluster.node(1).native_sequence().unwrap(), SessionSeq(4));
+    // Admission continues on the rebuilt authority.
+    let second = creation(cluster.next(PARTIES.issuer), 2);
+    cluster.commit(1, PARTIES.issuer, second, &[]);
+    assert_eq!(cluster.status(1, 2), Some(ClaimStatus::Generated));
+}
+
 /// The hosted authority at the outcome bound (26 §4): one under it the
 /// retirement is allowed and the authority, reconstructed over the retired
 /// core at once, stays authoritative and admits nothing fresh past the

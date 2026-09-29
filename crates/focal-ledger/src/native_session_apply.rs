@@ -192,6 +192,16 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             }
             self.resolve_suffix(SuffixEvidence::NewerTermBarrier)?;
         }
+        #[cfg(test)]
+        if self.refuse_reconstructions > 0 {
+            self.refuse_reconstructions = self.refuse_reconstructions.saturating_sub(1);
+            return Err(NativeSessionError::Memory(
+                focal_memory::MemoryError::Capacity {
+                    requested: 1,
+                    available: 0,
+                },
+            ));
+        }
         let domain = self.domain.take().ok_or(NativeSessionError::Failed)?;
         self.domain = Some(match domain {
             Domain::Active(owner, permit) => Domain::Active(owner, permit),

@@ -238,6 +238,19 @@ refusal at reconstruction can. The cure is to advance the cursor before the
 reconstruction and retry the reconstruction alone, as the standalone engine retries
 it at its readiness barrier.
 
+**Addendum (the latent bug found while closing F02).** The hosted apply loop
+(`session.rs`) reconstructed the owner right after a retirement record applied,
+before it advanced the delivery cursor past the entry: a reconstruction refused for
+memory was retained by `drive` at an entry the engine had already applied, the resumed
+delivery met it again, the engine refused it as `Corrupt` and the session failed
+closed. Reproduced (`a_reconstruction_refused_after_the_record_applied_is_retried_without_reapplying_it`,
+before the fix: `Native(Corrupt) after ["retry"]`). Fixed at the cause: the cursor
+passes the entry before the reconstruction, and an authority whose owner still waits
+to be rebuilt rebuilds it at the end of every delivery until it can — the refusal is a
+`Retry`, the record applies once, the next poll is authoritative and admits work. The
+refusal is induced through a test-only hook (`refuse_next_reconstruction_for_test`),
+since no external pressure reaches the reconstruction alone once the entry applied.
+
 ## F24
 
 Designed as the metadata-plane package (root voters by policy, the guarantee counting

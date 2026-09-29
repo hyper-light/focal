@@ -1317,16 +1317,19 @@ impl Session {
                     }
                     return Err(error.into());
                 }
+                self.applied_raft = entry.index;
+                delivery.entry = next;
                 // A retirement record (26 §4) applies through the committed
                 // core on an authority too; past this term's readiness
                 // barrier every earlier entry is applied, so the owner is
-                // reconstructed here instead of at a later barrier.
+                // reconstructed here instead of at a later barrier — after
+                // the cursor passed the entry: a reconstruction refused for
+                // memory is retried at the end of every delivery, and the
+                // resumed delivery never meets an entry already applied.
                 if leader && self.ready_term == Some(status.term) && engine.reconstruction_needed()
                 {
                     engine.promote(status.term, &self.consensus)?;
                 }
-                self.applied_raft = entry.index;
-                delivery.entry = next;
                 continue;
             }
             if self.apply_managed_entry(&entry.data, entry.index, &mut delivery.result)? {
@@ -1425,6 +1428,16 @@ impl Session {
             self.consensus.read_index(readiness_context(status.term))?;
             self.readiness_requested = Some(status.term);
         }
+        // An authority whose owner still waits to be rebuilt — a
+        // reconstruction refused for memory after the entry that needed it
+        // applied — rebuilds it here, once per delivery, until it can.
+        if leader
+            && self.ready_term == Some(status.term)
+            && let Some(engine) = self.native.as_deref_mut()
+            && engine.reconstruction_needed()
+        {
+            engine.promote(status.term, &self.consensus)?;
+        }
         if let Some(engine) = self.native.as_deref_mut() {
             engine.settle(&status, &mut self.consensus)?;
             if let Some(refusal) = engine.flush_after_delivery(&mut self.consensus) {
@@ -1441,6 +1454,15 @@ impl Session {
             delivery.result._native_allocation = Some(allocation);
         }
         Ok(())
+    }
+
+    /// The next reconstruction of the native owner is refused as memory:
+    /// the tests of a refused reconstruction after an applied entry.
+    #[cfg(test)]
+    pub(crate) fn refuse_next_reconstruction_for_test(&mut self) {
+        if let Some(engine) = self.native.as_deref_mut() {
+            engine.refuse_reconstructions = engine.refuse_reconstructions.saturating_add(1);
+        }
     }
 
     pub fn deltas_after(
