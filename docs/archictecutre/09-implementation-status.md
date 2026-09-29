@@ -11514,5 +11514,12 @@ ten and less than thirty, which is the service keeping its word and the harness 
 against it. The deadline is one named constant now (`network_service::SHUTDOWN_DEADLINE`,
 used by the service, the embedded node's stop and the harness), and the harness waits that
 deadline and the frozen allowance after it: what it catches is a service that does not return
-at all, and a slow stop reports the service's own `ShutdownTimeout`.
+at all, and a slow stop reports the service's own `ShutdownTimeout`. **The fourth dispatch, on that tree (`ef5588c`), passed whole:** the guard, the
+workspace test job (37 minutes), all eight native lanes — Windows arm64 (clang-cl) and x86_64
+(the prebuilt NASM objects), each with the static C runtime, built, smoked, verified and
+staged; both macOS, both glibc and both musl — and `collect`, which rendered the third-party
+notices and the SPDX SBOM from the locked graph with the two vendored crates listed by their
+archives (run 36550010518; `publish` skipped, as a dispatch must). The third dispatch had
+already passed all eight lanes (its test job failing only on the harness bound above). The
+branch's CI is green on every commit of this batch on all three platforms.
 
