@@ -61,6 +61,12 @@ jobs:
     name: Native build and smoke (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    # Every step is a bash step, on Windows too: the Windows lanes' default
+    # shell is PowerShell, which reads `$TOOLCHAIN` as its own empty variable
+    # and installed no toolchain (the first dispatch that reached them).
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.guard.outputs.matrix) }}

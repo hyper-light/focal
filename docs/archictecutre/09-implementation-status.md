@@ -11492,5 +11492,10 @@ refine that for vendored crates, and the tests now cover the vendored shape (lis
 archive as the locator and "Built from: vendor/…", counted toward roster drift, and the real
 lock marking `aws-lc-sys` and `aws-lc-rs` vendored and `focal-node` not; 20 tests). The
 orchestration tests were outside the six gates and are now run beside `cargo deny` in the
-local gate; the lanes' results are recorded with the next batch.
+local gate; the lanes' results are recorded with the next batch. The second dispatch passed the guard and its two Windows lanes failed before
+building anything: their toolchain step ran `rustup toolchain install "$TOOLCHAIN"` in
+PowerShell, the runner's default shell, which reads `$TOOLCHAIN` as a PowerShell variable and
+so installed nothing — the release workflow had run only on these two dispatches and its
+Windows lanes never before ([20](20-binary-distribution.md) §3). The build job's steps are
+bash steps everywhere now.
 
