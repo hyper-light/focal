@@ -3,10 +3,11 @@ use focal_memory::{
 };
 use focal_model::{ContentClass, ContentDomainId, ContentHash, ContentRef};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 const MANIFEST_MAGIC: &[u8] = b"focal.evidence.manifest\0\x01\0";
@@ -232,7 +233,94 @@ pub struct ContentStore {
     disk: DiskBudget,
     /// The collector's pass in progress (26 §5).
     collector: gc::CollectorState,
+    /// Sealed objects' chunk plans, each validated once under its immutable
+    /// digest (the audit's F19); a lock, since readers share the store
+    /// across threads, held for one range's read; poisoned, it is an error.
+    plans: Mutex<PlanCache>,
     _writer_lock: File,
+}
+
+/// A sealed object's chunks with each chunk's start: a range finds its first
+/// chunk by search instead of scanning the manifest from its head, and the
+/// manifest is read, hashed and validated once per object while its plan is
+/// held. Every chunk delivered is still read whole and hashed.
+struct Plan {
+    class: ContentClass,
+    length: u64,
+    chunks: Vec<Chunk>,
+    starts: Vec<u64>,
+}
+impl Plan {
+    fn of(manifest: Manifest) -> Result<Self, ContentError> {
+        let mut starts = Vec::new();
+        starts
+            .try_reserve_exact(manifest.chunks.len())
+            .map_err(|_| ContentError::Capacity)?;
+        let mut start = 0u64;
+        for chunk in &manifest.chunks {
+            starts.push(start);
+            start = start
+                .checked_add(u64::from(chunk.length))
+                .ok_or(ContentError::Corrupt)?;
+        }
+        Ok(Self {
+            class: manifest.class,
+            length: manifest.length,
+            chunks: manifest.chunks,
+            starts,
+        })
+    }
+    /// The chunk holding `offset`: the last one starting at or before it.
+    fn first_chunk(&self, offset: u64) -> usize {
+        self.starts
+            .partition_point(|&start| start <= offset)
+            .saturating_sub(1)
+    }
+}
+/// The plans held: as many as the store admits uploads, the least recently
+/// used given up first — a bound on memory of that many manifests' chunks,
+/// the same allowance the store's upload states have.
+struct PlanCache {
+    plans: VecDeque<((ContentDomainId, ContentHash), Plan)>,
+    bound: usize,
+    /// Manifests read and validated: a test's evidence that a paged read
+    /// loads its plan once.
+    loads: u64,
+}
+impl PlanCache {
+    fn new(bound: usize) -> Self {
+        Self {
+            plans: VecDeque::new(),
+            bound: bound.max(1),
+            loads: 0,
+        }
+    }
+    /// The object's plan, loaded and validated once, then held; a reference
+    /// that names the same root with another class or length is refused as
+    /// the manifest's own validation refuses it.
+    fn plan(&mut self, root: &Path, reference: &ContentRef) -> Result<&Plan, ContentError> {
+        let key = (reference.domain, reference.root);
+        if let Some(at) = self.plans.iter().position(|(held, _)| *held == key) {
+            if let Some(entry) = self.plans.remove(at) {
+                self.plans.push_back(entry);
+            }
+        } else {
+            let plan = Plan::of(manifest_at(root, reference)?)?;
+            self.loads = self.loads.saturating_add(1);
+            while self.plans.len() >= self.bound {
+                self.plans.pop_front();
+            }
+            self.plans
+                .try_reserve(1)
+                .map_err(|_| ContentError::Capacity)?;
+            self.plans.push_back((key, plan));
+        }
+        let (_, plan) = self.plans.back().ok_or(ContentError::Failed)?;
+        if plan.class != reference.class || plan.length != reference.length {
+            return Err(ContentError::Corrupt);
+        }
+        Ok(plan)
+    }
 }
 
 impl ContentStore {
@@ -289,6 +377,7 @@ impl ContentStore {
         durable_directory(&root.join("checkpoints"))?;
         durable_directory(&root.join("custody"))?;
         durable_directory(&root.join("receipts"))?;
+        let plans = Mutex::new(PlanCache::new(limits.max_uploads));
         let mut store = Self {
             root,
             limits,
@@ -299,6 +388,7 @@ impl ContentStore {
             disk,
             failed: false,
             collector: gc::CollectorState::new(),
+            plans,
             _writer_lock: lock,
         };
         store.recover_uploads()?;
@@ -774,7 +864,9 @@ impl ContentStore {
         if max_bytes == 0 || max_bytes > MAX_TRANSFER_CHUNK_BYTES || offset > reference.length {
             return Err(ContentError::Capacity);
         }
-        let manifest = self.manifest(reference)?;
+        self.check()?;
+        let mut plans = self.plans.lock().map_err(|_| ContentError::Failed)?;
+        let plan = plans.plan(&self.root, reference)?;
         let end = offset
             .checked_add(max_bytes as u64)
             .ok_or(ContentError::Capacity)?
@@ -785,8 +877,9 @@ impl ContentStore {
             .try_reserve_exact(usize::try_from(length).map_err(|_| ContentError::Capacity)?)
             .map_err(|_| ContentError::Capacity)?;
         let directory = self.root.join("objects").join(hex(&reference.domain.0));
-        let mut start = 0u64;
-        for chunk in manifest.chunks {
+        let first = plan.first_chunk(offset);
+        let mut start = plan.starts.get(first).copied().unwrap_or(reference.length);
+        for chunk in plan.chunks.iter().skip(first) {
             let next = start
                 .checked_add(u64::from(chunk.length))
                 .ok_or(ContentError::Corrupt)?;
@@ -847,6 +940,9 @@ impl ContentStore {
         (self.uploads.len(), self.staged_bytes)
     }
 
+    /// The manifest read and validated afresh: what the tests compare a
+    /// held plan against.
+    #[cfg(test)]
     fn manifest(&self, reference: &ContentRef) -> Result<Manifest, ContentError> {
         self.check()?;
         manifest_at(&self.root, reference)
@@ -1468,6 +1564,67 @@ mod tests {
         let mut wrong = reference.clone();
         wrong.domain = ContentDomainId([3; 16]);
         assert!(s.verify(&wrong).is_err());
+    }
+
+    /// A paged read loads and validates the object's manifest once and finds
+    /// each page's first chunk by search (the audit's F19); the plans held
+    /// are bounded by the uploads the store admits.
+    #[test]
+    fn paged_reads_load_the_plan_once_and_hold_a_bounded_number_of_plans() {
+        let root = tempfile::tempdir().unwrap();
+        let mut limits = limits();
+        limits.chunk_bytes = 4;
+        limits.max_uploads = 2;
+        let mut store = ContentStore::open(root.path(), limits).unwrap();
+        let mut references = Vec::new();
+        for object in 0..3u8 {
+            let id = UploadId([object; 16]);
+            let bytes: Vec<u8> = (0..64u8)
+                .map(|i| i.wrapping_mul(object.wrapping_add(1)))
+                .collect();
+            store
+                .begin(
+                    id,
+                    ContentDomainId([2; 16]),
+                    ContentClass::Evidence,
+                    bytes.len() as u64,
+                    None,
+                )
+                .unwrap();
+            for (i, part) in bytes.chunks(4).enumerate() {
+                store.append(id, (i * 4) as u64, part).unwrap();
+            }
+            let reference = store.seal(id).unwrap();
+            store.finish(id).unwrap();
+            references.push((reference, bytes));
+        }
+        let (reference, bytes) = &references[0];
+        let mut paged = Vec::new();
+        for offset in (0..bytes.len()).step_by(3) {
+            paged.extend(store.read_range(reference, offset as u64, 3).unwrap());
+        }
+        assert_eq!(&paged, bytes, "the pages are the object");
+        assert_eq!(
+            store.plans.lock().unwrap().loads,
+            1,
+            "one manifest read for every page"
+        );
+        for (reference, bytes) in &references {
+            assert_eq!(&store.read_range(reference, 5, 7).unwrap(), &bytes[5..12]);
+        }
+        assert_eq!(
+            store.plans.lock().unwrap().plans.len(),
+            2,
+            "held plans are bounded"
+        );
+        assert_eq!(store.plans.lock().unwrap().loads, 3);
+        // A reference with the right root and the wrong length is refused.
+        let mut wrong = reference.clone();
+        wrong.length = 63;
+        assert!(matches!(
+            store.read_range(&wrong, 0, 4),
+            Err(ContentError::Corrupt)
+        ));
     }
 
     #[test]

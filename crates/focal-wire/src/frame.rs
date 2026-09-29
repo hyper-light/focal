@@ -95,14 +95,18 @@ pub fn encode_payload<T: Serialize>(value: &T, limit: u32) -> Result<Vec<u8>, Wi
     if capacity > limit as usize {
         return Err(WireError::Limit);
     }
-    let mut bytes = payload_buffer(capacity)?;
-    let size = postcard::to_slice(value, &mut bytes)
-        .map_err(|error| match error {
-            postcard::Error::SerializeBufferFull => WireError::Limit,
-            _ => WireError::InvalidFrame,
-        })?
-        .len();
-    bytes.truncate(size);
+    // The buffer is reserved to the measured size and written once, by
+    // appending: no pass zeroes it first (the audit's F52), and a measured
+    // size the encode did not match — a value that serialized to more or
+    // to less — is an invalid frame, never a grown buffer.
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|_| WireError::Allocation)?;
+    let bytes = postcard::to_extend(value, bytes).map_err(|_| WireError::InvalidFrame)?;
+    if bytes.len() != capacity || bytes.capacity() != capacity {
+        return Err(WireError::InvalidFrame);
+    }
     Ok(bytes)
 }
 pub fn decode_payload<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, WireError> {

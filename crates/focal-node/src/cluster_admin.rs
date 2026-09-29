@@ -1075,6 +1075,7 @@ impl ClusterAdmin {
             return Err(ClusterAdminError::Invalid);
         };
         let (name, holds) = match check {
+            "serving" => ("serving", readiness.serving),
             "catching-up" => ("catching-up", readiness.catching_up),
             "authoritative" => ("authoritative", readiness.authoritative),
             "policy" => ("policy", readiness.policy_satisfied),

@@ -1077,7 +1077,46 @@ async fn a_host_stays_alive_and_its_readiness_stays_bounded_while_the_root_leade
         matches!(readiness, Ok(Err(ClusterAdminError::ProbeFailed(_)))),
         "a host without a root leader is not catching up: {readiness:?}"
     );
+    // Serving asks whether the owners run, never for a quorum: a healthy
+    // follower with the root leader down is ready to serve (the audit's
+    // F25), so its supervisor keeps it in the endpoints its peers need.
+    tokio::time::timeout(Duration::from_secs(3), admin.probe("serving"))
+        .await
+        .expect("serving answers within the readiness budget")
+        .expect("a healthy host serves with the root leader down");
     host.stop().await;
+}
+
+/// A node one of whose session owners stopped is alive and not serving (the
+/// audit's F25): its supervisor's liveness keeps it, its readiness takes it
+/// out until the owner runs again — with no leadership or quorum asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_whose_session_owner_stopped_is_alive_and_not_serving() {
+    use crate::cluster_admin::{ClusterAdmin, ClusterAdminError};
+    let dir = tempfile::tempdir().unwrap();
+    let settings = settings(dir.path());
+    let founder = Running::start(&settings).await;
+    let admin = ClusterAdmin::open(&settings).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), admin.probe("serving"))
+        .await
+        .expect("serving answers within the readiness budget")
+        .expect("a founder whose owners run serves");
+    let (_, session) = founder
+        .handles
+        .fleet
+        .next_host(None)
+        .expect("the founder's session");
+    session.stop().await.unwrap();
+    tokio::time::timeout(Duration::from_millis(800), admin.probe("alive"))
+        .await
+        .expect("alive answers at once")
+        .expect("the process answers while a session owner is stopped");
+    let serving = tokio::time::timeout(Duration::from_secs(3), admin.probe("serving")).await;
+    assert!(
+        matches!(serving, Ok(Err(ClusterAdminError::ProbeFailed("serving")))),
+        "a stopped session owner is not serving: {serving:?}"
+    );
+    founder.stop().await;
 }
 
 /// A joined host measures its path to the root's voter and derives its tick

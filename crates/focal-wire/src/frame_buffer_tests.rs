@@ -254,3 +254,19 @@ async fn raw_read_stops_at_declared_frame_and_stream_end_is_checked_separately()
         Err(WireError::InvalidFrame)
     ));
 }
+
+/// An encode appends into a buffer reserved to the measured size: the bytes
+/// are the ones a whole-vector serialization produces, and the buffer was
+/// neither zeroed first nor grown (the audit's F52).
+#[test]
+fn an_encode_writes_its_reserved_buffer_once_and_exactly() {
+    let value = (7u32, vec![9u8; 70_000], "seventy thousand".to_owned());
+    let encoded = encode_payload(&value, MAX_FRAME_BYTES as u32).unwrap();
+    assert_eq!(encoded, postcard::to_stdvec(&value).unwrap());
+    assert_eq!(
+        encoded.capacity(),
+        encoded.len(),
+        "reserved exactly, never grown"
+    );
+    assert!(matches!(encode_payload(&value, 16), Err(WireError::Limit)));
+}

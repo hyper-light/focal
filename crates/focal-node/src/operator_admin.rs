@@ -426,6 +426,14 @@ impl LocalNetworkAdmin {
             });
         }
         let node = self.identity.node;
+        // Serving is the owners running: the root's and every installed
+        // session's — a session stopped on a failure leaves the fleet's
+        // running count below its installed count, a planned stop the same
+        // — with no leadership or quorum asked of them.
+        let fleet_status = fleet.status();
+        let serving = !root.stopped
+            && !fleet_status.stopped
+            && fleet_status.running == fleet_status.installed;
         let leads_root = root.leader == node && !root.stopped;
         let authoritative = leads_root
             || sessions
@@ -451,6 +459,7 @@ impl LocalNetworkAdmin {
         Ok(AdminReadiness {
             node,
             alive: true,
+            serving,
             catching_up: following && !authoritative,
             authoritative,
             policy_satisfied,

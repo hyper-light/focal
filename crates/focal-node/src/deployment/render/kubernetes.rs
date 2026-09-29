@@ -339,7 +339,7 @@ pub fn render(
         "Apply the founder first (`kubectl apply -k .` applies everything; host pods wait for their invitation), run invitations.sh once focal-founder-0 is Ready to issue and install the invitations, then the hosts enroll and start.".into(),
     );
     assets.notes.push(
-        "Probes ask the node: startup, liveness and readiness are `cluster node probe --check alive`; `catching-up`, `authoritative` and `policy` are for inspection (`kubectl exec`) and never gate restarts, so a healthy node is not restarted for a missing quorum.".into(),
+        "Probes ask the node: startup and liveness are `cluster node probe --check alive` (the process answers); readiness is `--check serving` (its owners run — never a quorum, which peers need this pod's endpoint to re-form: the Service publishes not-ready addresses); `catching-up`, `authoritative` and `policy` are for inspection (`kubectl exec`) and never gate restarts, so a healthy node is not restarted for a missing quorum.".into(),
     );
     assets.notes.push(format!(
         "Every pod starts at single-node durability (survive: node, max_failures: 0), the only first start a lone node can satisfy; the requested policy ({} survival, max_failures {}) is mounted as {TARGET_DIR}/{TARGET_FILE}. Once every host pod is Ready, commit it from the founder: `kubectl -n {ns} exec focal-founder-0 -c focal -- /focal --data-dir {DATA_DIR} deployment plan --config {TARGET_DIR}/{TARGET_FILE} --output {DATA_DIR}/target.plan` then `... deployment apply --plan-file {DATA_DIR}/target.plan`. The committed policy then carries every restart; the configmap never has to follow it (08 §2).",
@@ -412,12 +412,19 @@ fn stateful_set(
     if !set.founder {
         out.push_str("            - \"--invite-file\"\n            - \"/etc/focal/invitations/$(POD_NAME).invite\"\n");
     }
+    // Startup and liveness ask whether the process answers; readiness asks
+    // whether its owners serve (the audit's F25) — never for a quorum, which
+    // peers need this pod's endpoint to re-form (the Service publishes
+    // not-ready addresses for that).
     let probe = format!(
         "            exec:\n              command: [\"/focal\", \"--data-dir\", \"{DATA_DIR}\", \"cluster\", \"node\", \"probe\", \"--check\", \"alive\"]\n"
     );
+    let serving = format!(
+        "            exec:\n              command: [\"/focal\", \"--data-dir\", \"{DATA_DIR}\", \"cluster\", \"node\", \"probe\", \"--check\", \"serving\"]\n"
+    );
     let _ = write!(
         out,
-        "          env:\n            - name: POD_NAME\n              valueFrom:\n                fieldRef:\n                  fieldPath: metadata.name\n            - name: POD_NAMESPACE\n              valueFrom:\n                fieldRef:\n                  fieldPath: metadata.namespace\n          ports:\n            - name: peer\n              containerPort: {port}\n              protocol: UDP\n          securityContext:\n            allowPrivilegeEscalation: false\n            readOnlyRootFilesystem: true\n            capabilities:\n              drop: [\"ALL\"]\n          resources:\n            requests:\n              cpu: 500m\n              memory: 1Gi\n            limits:\n              memory: 2Gi\n          startupProbe:\n{probe}            periodSeconds: 5\n            failureThreshold: 60\n          livenessProbe:\n{probe}            periodSeconds: 10\n            failureThreshold: 6\n          readinessProbe:\n{probe}            periodSeconds: 5\n            failureThreshold: 3\n          volumeMounts:\n            - name: data\n              mountPath: {DATA_DIR}\n            - name: config\n              mountPath: /etc/focal/focal.yaml\n              subPath: focal.yaml\n              readOnly: true\n"
+        "          env:\n            - name: POD_NAME\n              valueFrom:\n                fieldRef:\n                  fieldPath: metadata.name\n            - name: POD_NAMESPACE\n              valueFrom:\n                fieldRef:\n                  fieldPath: metadata.namespace\n          ports:\n            - name: peer\n              containerPort: {port}\n              protocol: UDP\n          securityContext:\n            allowPrivilegeEscalation: false\n            readOnlyRootFilesystem: true\n            capabilities:\n              drop: [\"ALL\"]\n          resources:\n            requests:\n              cpu: 500m\n              memory: 1Gi\n            limits:\n              memory: 2Gi\n          startupProbe:\n{probe}            periodSeconds: 5\n            failureThreshold: 60\n          livenessProbe:\n{probe}            periodSeconds: 10\n            failureThreshold: 6\n          readinessProbe:\n{serving}            periodSeconds: 5\n            failureThreshold: 3\n          volumeMounts:\n            - name: data\n              mountPath: {DATA_DIR}\n            - name: config\n              mountPath: /etc/focal/focal.yaml\n              subPath: focal.yaml\n              readOnly: true\n"
     );
     if !set.founder {
         out.push_str("            - name: invitations\n              mountPath: /etc/focal/invitations\n              readOnly: true\n");

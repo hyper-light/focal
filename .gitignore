@@ -22,3 +22,6 @@ target
 
 # Python bytecode from the release scripts (the workflow sets PYTHONDONTWRITEBYTECODE)
 __pycache__/
+
+# Isolated worktrees of implementation agents
+.claude/worktrees/

@@ -11835,3 +11835,51 @@ corrected to the host's 16 KiB page, agrees with the RSS growth per claim it sat
 next to (10.7 KB against 10.9 KB); the "moved" figures of §2 are marked upper bounds;
 process figures state the page size from now on, and counted runs attribute while
 uninstrumented runs measure.
+
+### 2026-09-29 — F31: the arena's page directory doubles; F52: an encode written once
+
+F31: `Arena::add_page` built a new directory of length n+1 and moved every page
+descriptor into it on every page added — O(P²) descriptor moves over P pages, and
+a fresh allocation each time. The directory grows to the power of two of its
+length now, charged for its whole capacity before anything of the arena changes
+(a refusal leaves the directory, its charge and every handle as they were), and a
+directory with room takes a page without a new allocation or charge;
+`the_page_directory_grows_by_doubling_and_is_charged_for_its_capacity` adds a
+thousand pages and sees eleven reallocations. F52, the wire's half: `encode_payload`
+reserved the measured size, zeroed the whole buffer, then overwrote it; it appends
+into the reserved buffer now (`postcard::to_extend`), refusing a value whose
+encoding did not match its measured size as an invalid frame rather than growing;
+`an_encode_writes_its_reserved_buffer_once_and_exactly` holds the bytes identical to
+a whole-vector serialization and the capacity exact. The WAL's half is R6's one
+buffer per batch, written the same way; the receive side's buffer stays initialized
+until F03's funded, arriving-bytes reader replaces it.
+
+### 2026-09-29 — F19 and F25: a range read finds its chunk once; readiness asks whether the owners serve
+
+F19: every `read_range` of an evidence object read, hashed, decoded and validated
+the whole manifest, then scanned its chunks from the head to the requested offset —
+a paged download of an N-chunk object did O(N²) manifest work. The content store
+holds a sealed object's chunk plan (`Plan`: the chunks and each one's start),
+validated once under the object's immutable digest and held for as many objects as
+the store admits uploads (least recently used given up), and a range finds its first
+chunk by search; a reference naming the same root with another class or length is
+refused as the manifest's validation refuses it, and every delivered chunk is still
+read whole and hashed. `paged_reads_load_the_plan_once_and_hold_a_bounded_number_of_plans`
+pages an object in threes with one manifest read and holds two plans of three
+objects. Pages remain chunk-sized on the wire (`max_frame_bytes`), so a page reads
+one chunk; a cache of verified chunk bytes is not added (its memory would be
+uncharged).
+
+F25: the rendered startup, liveness and readiness probes all asked `--check alive`,
+which reads only the node's identity, so a pod whose owners had stopped stayed
+Ready. `cluster node probe --check serving` asks whether the owners serve: the root
+replica's not stopped and every installed session's running (a session stopped on
+a failure or on request leaves the fleet's running count below its installed
+count) — never leadership or a quorum, since a readiness that failed for a missing
+quorum would take the pod from the endpoints its peers need to re-form one (the
+headless Service publishes not-ready addresses for that reason). The renderer's
+readiness probe and the Helm chart ask it; startup and liveness stay `alive`.
+`a_host_stays_alive_and_its_readiness_stays_bounded_while_the_root_leader_is_down`
+sees a healthy follower serve with the root leader down;
+`a_node_whose_session_owner_stopped_is_alive_and_not_serving` sees a founder whose
+session owner stopped stay alive and stop serving.

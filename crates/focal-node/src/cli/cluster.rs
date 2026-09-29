@@ -233,7 +233,7 @@ pub(crate) enum NodeCommand {
     /// One readiness probe for a supervisor: exit 0 when it holds, 1
     /// (`probe_failed`) otherwise.
     Probe {
-        #[arg(long, value_parser = ["alive", "catching-up", "authoritative", "policy"])]
+        #[arg(long, value_parser = ["alive", "serving", "catching-up", "authoritative", "policy"])]
         check: String,
     },
 }

@@ -31,19 +31,19 @@ ruling before work starts).
 | F16 | P2 | open | 3 | — |
 | F17 | P2 | open | 6 | — |
 | F18 | P2 | open | 6 | — |
-| F19 | P2 | open | 6 | — |
+| F19 | P2 | in tree | 6 | [F19](#f19) |
 | F20 | P1 | open | 3 | — |
 | F21 | P1 | open | 7 | — |
 | F22 | P1 | open | 5 | — |
 | F23 | P2 | open | 6 | — |
 | F24 | P1 | designed | 5 | [F24](#f24) |
-| F25 | P2 | open | 5 | — |
+| F25 | P2 | in tree | 5 | [F25](#f25) |
 | F26 | P2 | open | 7 | — |
 | F27 | P3 | closed (a6cb86e) | 1 | [F27](#f27) |
 | F28 | P1 | open | 7 | — |
 | F29 | P3 | open | 7 | — |
 | F30 | P2 | open | 7 | — |
-| F31 | P3 | open | 6 | — |
+| F31 | P3 | in tree | 6 | [F31](#f31) |
 | F32 | P1 | open | 7 | — |
 | F33 | P2 | open | 4 | — |
 | F34 | P2 | open | 4 | — |
@@ -64,7 +64,7 @@ ruling before work starts).
 | F49 | P1 | open | 9 | — |
 | F50 | P2 | open | 11 | — |
 | F51 | P2 | open | 11 | — |
-| F52 | P2 | open | 11 | — |
+| F52 | P2 | in tree (encode) | 11 | [F52](#f52) |
 | F53 | P2 | open | 10 | — |
 | F54 | P2 | in tree | 12 | [F54](#f54) |
 
@@ -159,3 +159,58 @@ states the page size.
 **Tests.** The benches that include the allocator (`focal-memory`, `-wire`, `-log`,
 `-core`, `-raft`, `focal-load`) build under `--benches` clippy; the counters are
 exercised by every `allocs` bench run.
+
+## F31
+
+**Cause.** `Arena::add_page` rebuilt the page directory at length n+1 on every page,
+moving every descriptor (O(P²)) and allocating each time.
+
+**Fix.** The directory grows to the power of two of its length, charged for its
+whole capacity before anything changes; a directory with room takes a page without
+an allocation or a charge. Failure atomicity, peak accounting, stable generational
+handles and non-reuse are untouched.
+
+**Tests.** `arena::tests::the_page_directory_grows_by_doubling_and_is_charged_for_its_capacity`
+(a thousand pages, eleven reallocations, the root charge covering the capacity); the
+generation-exhaustion test unchanged.
+
+## F52
+
+**Cause.** The wire encoder and the WAL's per-record encode reserved the measured size,
+zeroed the whole buffer, then overwrote it.
+
+**Fix (wire, in tree).** `encode_payload` appends into its reserved buffer
+(`postcard::to_extend`); an encoding that does not match its measured size is an
+invalid frame, never a grown buffer. **WAL:** R6 (one buffer per batch, written by
+appending). **Receive side:** stays initialized until F03's funded arriving-bytes
+reader, which allocates as bytes arrive. Fence serialization and its path strings are
+R2's concern.
+
+**Tests.** `an_encode_writes_its_reserved_buffer_once_and_exactly` (bytes identical to a
+whole-vector serialization; capacity exact; the limit refusal unchanged).
+
+## F19
+
+**Cause.** `ContentStore::read_range` loaded, hashed, decoded and validated the whole
+manifest and scanned chunks from the head on every page.
+
+**Fix.** A validated chunk plan per sealed object (`Plan`, held in a bounded LRU of as
+many plans as the store admits uploads, keyed by the object's immutable digest) with
+each chunk's start; the first chunk of a range is found by search; a reference with
+the right root and the wrong class or length is refused; every delivered chunk is
+still read whole and hashed.
+
+**Tests.** `store::tests::paged_reads_load_the_plan_once_and_hold_a_bounded_number_of_plans`;
+the existing boundary and verification tests unchanged.
+
+## F25
+
+**Cause.** Readiness was wired to the identity-only `alive` probe.
+
+**Fix.** `AdminReadiness.serving` (the root's and every installed session's owner
+running, no quorum asked); `cluster node probe --check serving`; the renderer's and
+the chart's readiness probes ask it while startup and liveness keep `alive`.
+
+**Tests.** `network_service::tests::a_host_stays_alive_and_its_readiness_stays_bounded_while_the_root_leader_is_down`
+(serving with the root leader down), `…::a_node_whose_session_owner_stopped_is_alive_and_not_serving`,
+the render goldens and `tests/deployment_kubernetes.rs`.

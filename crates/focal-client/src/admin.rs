@@ -28,9 +28,14 @@ pub struct AdminNodeHealth {
     #[serde(default)]
     pub placement: Option<AdminPlacementAgent>,
 }
-/// The node's readiness (doc 08 §9): the four probes a supervisor asks,
+/// The node's readiness (doc 08 §9): the five probes a supervisor asks,
 /// with the facts they are derived from. `alive` holds whenever the node
-/// answers; `catching_up` when every replica it hosts and its root replica
+/// answers; `serving` when its owners run — the root replica's and every
+/// installed session's, none stopped, on request or on a failure — which
+/// is what a supervisor's readiness asks: it never requires leadership or
+/// a quorum, since a readiness that failed for a missing quorum would take
+/// the pod from the endpoints its peers need to re-form one (the audit's
+/// F25); `catching_up` when every replica it hosts and its root replica
 /// follow a known leader with nothing pending but the node leads none of
 /// them; `authoritative` when it leads the root or a hosted session's log
 /// at a committed prefix; `policy_satisfied` when every session it hosts
@@ -41,6 +46,8 @@ pub struct AdminNodeHealth {
 pub struct AdminReadiness {
     pub node: u64,
     pub alive: bool,
+    #[serde(default)]
+    pub serving: bool,
     pub catching_up: bool,
     pub authoritative: bool,
     pub policy_satisfied: bool,
