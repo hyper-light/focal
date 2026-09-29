@@ -20,6 +20,12 @@ impl Meter {
     pub(super) fn remaining(&self) -> usize {
         self.remaining.get()
     }
+    /// Lend `amount` more: what a restore adds once it has counted the rows
+    /// a term is charged per.
+    pub(super) fn extend(&self, amount: usize) {
+        self.remaining
+            .set(self.remaining.get().saturating_add(amount));
+    }
     pub(super) fn charge(&self, amount: usize) -> Result<(), CodecError> {
         self.remaining.set(
             self.remaining

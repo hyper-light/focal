@@ -8,6 +8,9 @@ use focal_model::lifecycle::aggregation::PublicationPosition;
 use read_source::{Meter, model_error};
 
 pub(super) const PHASES: usize = 8;
+/// The hydration phase that holds the artifact rows, the ones whose custody
+/// a restore recovers.
+pub(super) const ARTIFACT_PHASE: usize = 2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum IndexKey {
     Claim(ClaimId),
@@ -92,7 +95,7 @@ pub(super) fn phase(key: Key) -> Result<usize, NativeError> {
         | Key::DueTimer(..)
         | Key::ByObject(..) => 0,
         Key::Definition(_) | Key::ClaimContent(_) => 1,
-        Key::Artifact(_) => 2,
+        Key::Artifact(_) => ARTIFACT_PHASE,
         Key::Diagnostic(_) | Key::Work(_) => 3,
         Key::Evaluation(_) | Key::Accepted(_) | Key::DeliveryResult(_) | Key::MissingResult(_) => 4,
         Key::Response(_) => 5,

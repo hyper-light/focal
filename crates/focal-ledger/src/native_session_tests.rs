@@ -1217,3 +1217,21 @@ fn a_version_one_record_applies_where_it_fits_and_is_inert_where_it_does_not() {
         assert_eq!(continuation.bytes, 1);
     }
 }
+
+/// The standard configuration's recovery work is the envelope of the largest
+/// checkpoint it admits, derived from its own checkpoint bounds — no chosen
+/// constant (the audit's F57).
+#[test]
+fn the_standard_recovery_work_is_derived_from_the_checkpoint_bounds() {
+    let limits = NativeSessionLimits::standard(ContentDomainId::from_u128(93));
+    let checkpoint = limits.checkpoint;
+    assert_eq!(
+        limits.recovery.work,
+        focal_core::native::record_codec::recovery::Work::for_limits(
+            checkpoint.visits,
+            checkpoint.assembled_bytes,
+            checkpoint.rows
+        )
+    );
+    assert!(limits.recovery.work.model > 1 << 30);
+}

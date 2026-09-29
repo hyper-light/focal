@@ -69,7 +69,7 @@ ruling before work starts).
 | F54 | P2 | in tree | 12 | [F54](#f54) |
 | F55 | P1 | in tree | 13 | [F55](#f55) |
 | F56 | P1 | in tree | 13 | [F56](#f56) |
-| F57 | P1 | open | 14 | — |
+| F57 | P1 | in tree | 14 | [F57](#f57) |
 | F58 | P2 | in tree | 14 | [F58](#f58) |
 | F59 | P2 | open | 15 | — |
 | F60 | P2 | open | 15 | — |
@@ -565,3 +565,38 @@ one budget the caller passes.
 own figure). Cancellation and error cleanup of a refused restore are the existing
 `recovery` refusal tests' concern; the typed refusal when the completion reserve
 itself is too small is `Memory(Capacity)` from the same budget.
+
+## F57
+
+**Cause.** The recovery work allowances (`recovery::Work`) were chosen constants
+(`1 << 30` each) unrelated to the admission bounds, and `HistoryIndex::build`
+precharged `sort_visits(2 × events)` before it counted the population; a history the
+configuration admitted (4096 claims, 69 633 rows) spent 2.86 G model and 1.17 G
+lookup units and was refused at restore.
+
+**Fix.** The allowance is derived, never chosen: `Work::for_shape(visits, bytes, rows)`
+— `(PHASES + 1)` whole scans of the inspection's visits plus 32 parsing visits a body
+byte; source 4096/row + 64/byte; model 65 536/row + 256/byte + `sort_visits(2 × rows)`;
+lookup 65 536/row — extended, once the index has counted the artifact rows, by a
+custody recovery per artifact at the largest verification any schema may declare
+(`NativeVerificationBudget::ceiling().recovery_work()`, the very term `Custody::recover`
+charges). The sort is charged after the population is counted. `restore_measured`
+returns what was allowed and used; the standard configuration's `work` is
+`Work::for_limits` at its checkpoint bounds. The per-unit ceilings are measured over the
+recorded workflows at authored maxima and pinned. **Envelope, not admission check:**
+admitting a state whose checkpoint would not encode (rows beyond the checkpoint's row
+bound) is the checkpoint's own refusal (`EncodingLimits.rows`) and the families'
+retirement (26 §4) is the lifecycle that keeps history within it; F46's WAL index
+expansion is separate and open.
+
+**Measurements.** Projection workflow (301 rows, 83 619 bytes, 170 354 visits): parsing
+3.06 M (18/byte beyond 9 scans), source 494/row, lookup 15 954/row, custody 6 artifacts;
+authored (27 rows): model 39 179/row, 113/byte, lookup 4503/row. 4096 claims: allowed
+model 10.04 G, used 2.86 G; lookup allowed 4.56 G, used 1.17 G; parsing 545 M / 318 M;
+source 976 M / 27 M; 16 s in debug.
+
+**Tests.** `bound_tests::a_restore_s_work_stays_within_the_envelope_its_checkpoint_declares`,
+`replay::tests::a_history_of_thousands_of_claims_restores_under_the_derived_envelope`
+(the old constant is below the used model and lookup work),
+`native_session::tests::the_standard_recovery_work_is_derived_from_the_checkpoint_bounds`,
+the recovery and replay suites unchanged.

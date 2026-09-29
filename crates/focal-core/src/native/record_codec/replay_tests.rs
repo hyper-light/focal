@@ -591,3 +591,57 @@ fn a_restore_is_funded_by_the_completion_allowance_and_never_waits_on_ordinary_c
     let restored = restore(pool).unwrap_or_else(|error| panic!("{error:?}"));
     checkpoint::compare(&original, &restored);
 }
+
+/// The audit's F57 shape: thousands of claims under the production
+/// configuration's recovery envelope. The old fixed allowance (`1 << 30` model
+/// units) refused the restore of 4096 claims; the envelope derived from the
+/// checkpoint's own bounds admits every checkpoint the configuration admits,
+/// and the history sort is charged for its population, not twice the events.
+#[test]
+fn a_history_of_thousands_of_claims_restores_under_the_derived_envelope() {
+    use focal_memory::BudgetLane;
+    let directory = tempfile::tempdir().unwrap();
+    let store = checkpoint::store(directory.path());
+    let mut original = f::core();
+    let claims = 4096u64;
+    for n in 1..=claims {
+        let prepared = prepare_input(
+            &original,
+            n,
+            f::creation(
+                u128::from(n),
+                u128::from(n),
+                &[(ValidationMode::Required, true)],
+                None,
+            ),
+        );
+        original.publish_native(prepared).unwrap();
+    }
+    let bytes = checkpoint::encode(&original);
+    let structural = checkpoint::inspect(&bytes);
+    let quote = structural.quote();
+    // The production ceiling: the largest checkpoint the standard
+    // configuration admits (256 MiB assembled, 256 M inspection visits,
+    // 100 000 rows), which the old constant fell short of.
+    let ceiling = recovery::Work::for_limits(256 << 20, 256 << 20, 100_000);
+    assert!(ceiling.model > 1 << 30, "{ceiling:?}");
+    let mut limits = checkpoint::limits(original.limits);
+    limits.work = ceiling;
+    let (restored, envelope) = recovery::restore_measured(
+        &structural,
+        RangeId(4096),
+        limits,
+        checkpoint::budget(),
+        &store,
+        &BuiltinNativeSchemas,
+        BudgetLane::Completion,
+    )
+    .unwrap_or_else(|error| panic!("{error:?} for rows {} bytes {}", quote.rows, quote.bytes));
+    checkpoint::compare(&original, &restored);
+    eprintln!(
+        "{claims} claims: rows {} bytes {} visits {} allowed {:?} used {:?}",
+        quote.rows, quote.bytes, quote.visits, envelope.allowed, envelope.used
+    );
+    assert!(envelope.used.within(envelope.allowed));
+    assert!(envelope.allowed.within(ceiling));
+}

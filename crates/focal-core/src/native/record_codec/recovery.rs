@@ -49,6 +49,102 @@ pub struct Work {
     pub model: usize,
     pub lookup: usize,
 }
+/// The scans of a checkpoint's bytes a restore charges whole: the index scan
+/// and one scan per hydration phase, each the inspection's visits.
+const PARSING_SCANS: usize = read_index::PHASES.saturating_add(1);
+/// The parsing of the row and event bodies themselves, per body byte: the
+/// codec's cursor visits a body's fields and bytes several times over
+/// (measured at 18 visits per byte on the workflows at authored maxima).
+const PARSE_PER_BYTE: usize = 32;
+/// Per-row and per-byte ceilings of a restore's work, measured over the
+/// recorded workflows at authored maxima
+/// (`bound_tests::a_restore_s_work_stays_within_the_envelope_its_checkpoint_declares`,
+/// which pins them: a restore that outgrows one fails there, and the ceiling
+/// is raised from the measurement, never guessed). Model work per row is the
+/// row's own validation and its visits as a target — a row is looked up from
+/// its outcome, its claim, its head and the history index, each a bounded
+/// directory descent.
+const SOURCE_PER_ROW: usize = 4096;
+const SOURCE_PER_BYTE: usize = 64;
+const MODEL_PER_ROW: usize = 65_536;
+const MODEL_PER_BYTE: usize = 256;
+const LOOKUP_PER_ROW: usize = 65_536;
+impl Work {
+    /// The work a restore may spend on a checkpoint of the declared shape (the
+    /// audit's F57): the scans of its bytes, a ceiling per row and per byte,
+    /// and the history sort at its bound (every event a primary entry and at
+    /// most one secondary). A checkpoint the configuration admits fits by
+    /// construction; a body that costs more than its declared rows and bytes
+    /// allow is refused. Saturating: a ceiling past `usize` is still a bound.
+    pub fn for_shape(visits: usize, bytes: usize, rows: usize) -> Self {
+        let sort = read_history::sort_visits(rows.saturating_mul(2)).unwrap_or(usize::MAX);
+        Self {
+            parsing: visits
+                .saturating_mul(PARSING_SCANS)
+                .saturating_add(bytes.saturating_mul(PARSE_PER_BYTE)),
+            source: rows
+                .saturating_mul(SOURCE_PER_ROW)
+                .saturating_add(bytes.saturating_mul(SOURCE_PER_BYTE)),
+            model: rows
+                .saturating_mul(MODEL_PER_ROW)
+                .saturating_add(bytes.saturating_mul(MODEL_PER_BYTE))
+                .saturating_add(sort),
+            lookup: rows.saturating_mul(LOOKUP_PER_ROW),
+        }
+    }
+    /// The ceiling for the largest checkpoint a configuration admits:
+    /// `for_shape` at the inspection's visits, bytes and rows.
+    pub fn for_limits(visits: usize, bytes: usize, rows: usize) -> Self {
+        Self::for_shape(visits, bytes, rows)
+    }
+    fn min(self, other: Self) -> Self {
+        Self {
+            parsing: self.parsing.min(other.parsing),
+            source: self.source.min(other.source),
+            model: self.model.min(other.model),
+            lookup: self.lookup.min(other.lookup),
+        }
+    }
+    /// What was spent of `self` once the meters ran.
+    fn used(self, meters: &Meters) -> Self {
+        Self {
+            parsing: self.parsing.saturating_sub(meters.parsing.remaining()),
+            source: self.source.saturating_sub(meters.source.remaining()),
+            model: self.model.saturating_sub(meters.model.remaining()),
+            lookup: self.lookup.saturating_sub(meters.lookup.remaining()),
+        }
+    }
+    /// The model work one artifact row may add: a custody recovery under the
+    /// largest verification any schema may declare. Charged once the index
+    /// has counted the artifact rows, since a checkpoint's shape does not
+    /// name its families.
+    pub fn custody_per_artifact() -> usize {
+        NativeVerificationBudget::ceiling().recovery_work()
+    }
+    fn extended(self, model: usize) -> Self {
+        Self {
+            model: self.model.saturating_add(model),
+            ..self
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn extended_for_test(self, model: usize) -> Self {
+        self.extended(model)
+    }
+    /// Whether every allowance of `self` is at most `other`'s.
+    pub fn within(self, other: Self) -> bool {
+        self.parsing <= other.parsing
+            && self.source <= other.source
+            && self.model <= other.model
+            && self.lookup <= other.lookup
+    }
+}
+/// What a restore was allowed and what it spent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Envelope {
+    pub allowed: Work,
+    pub used: Work,
+}
 pub(super) struct Meters {
     pub(super) parsing: Meter,
     pub(super) source: Meter,
@@ -111,15 +207,13 @@ impl<S: NativeSchemaVerifier, R: NativeCustodyReader> read_evidence::Custody for
         let verification =
             NativeVerificationBudget::for_schema(descriptor.schema_hash(), self.schemas)?;
         // Prepay bounded content-tree reads/hashes, byte comparison and schema
-        // traversal under the pinned verifier's declared maximum. Verifier
-        // implementations remain trusted bounded native code, not agent jobs.
-        let visits = verification
-            .maximum_bytes()
-            .checked_mul(64)
-            .and_then(|n| n.checked_add(verification.peak_bytes()))
-            .and_then(|n| n.checked_add(4096))
-            .ok_or(NativeError::Capacity("custody recovery work"))?;
-        self.work.charge(visits).map_err(read_evidence::codec)?;
+        // traversal under the pinned verifier's declared maximum
+        // (`recovery_work`, the term the envelope carries per artifact row).
+        // Verifier implementations remain trusted bounded native code, not
+        // agent jobs.
+        self.work
+            .charge(verification.recovery_work())
+            .map_err(read_evidence::codec)?;
         // The row reservation already covers its final inline custody value.
         // Verification's independent permit covers tree/schema scratch until
         // the genuine token is moved into that already-funded row.
@@ -196,15 +290,48 @@ pub fn restore<S: NativeSchemaVerifier, R: NativeCustodyReader>(
 pub fn restore_in<S: NativeSchemaVerifier, R: NativeCustodyReader>(
     checkpoint: &checkpoint::StructuralCheckpoint<'_>,
     range: RangeId,
-    mut limits: Limits,
+    limits: Limits,
     budget: MemoryBudget,
     store: &R,
     schemas: &S,
     lane: BudgetLane,
 ) -> Result<Core<NativeState>, NativeError> {
+    restore_measured(checkpoint, range, limits, budget, store, schemas, lane).map(|(core, _)| core)
+}
+/// [`restore_in`], with the work it spent: what the envelope's measurement
+/// pins itself to. The allowance is the envelope of this checkpoint's
+/// declared shape under the configuration's ceiling: an admitted checkpoint
+/// always fits, and a body that costs more than its shape allows is refused.
+pub(crate) fn restore_measured<S: NativeSchemaVerifier, R: NativeCustodyReader>(
+    checkpoint: &checkpoint::StructuralCheckpoint<'_>,
+    range: RangeId,
+    limits: Limits,
+    budget: MemoryBudget,
+    store: &R,
+    schemas: &S,
+    lane: BudgetLane,
+) -> Result<(Core<NativeState>, Envelope), NativeError> {
+    let quote = checkpoint.quote();
+    let work = Work::for_shape(quote.visits, quote.bytes, quote.rows).min(limits.work);
+    restore_with_work(
+        checkpoint, range, limits, budget, store, schemas, lane, work,
+    )
+}
+/// The restore under an explicit allowance, spending reported.
+#[allow(clippy::too_many_arguments)] // The restore's inputs, each its own owner's.
+pub(crate) fn restore_with_work<S: NativeSchemaVerifier, R: NativeCustodyReader>(
+    checkpoint: &checkpoint::StructuralCheckpoint<'_>,
+    range: RangeId,
+    mut limits: Limits,
+    budget: MemoryBudget,
+    store: &R,
+    schemas: &S,
+    lane: BudgetLane,
+    work: Work,
+) -> Result<(Core<NativeState>, Envelope), NativeError> {
     let header = checkpoint.header();
     limits.native = checked_native_limits(header.ledger, limits.native)?;
-    let meters = Meters::new(limits.work);
+    let meters = Meters::new(work);
     let custody = Custody {
         store,
         schemas,
@@ -219,6 +346,20 @@ pub fn restore_in<S: NativeSchemaVerifier, R: NativeCustodyReader>(
         &meters.lookup,
         lane,
     )?;
+    // The artifact rows are counted now: each may recover its custody under
+    // the largest verification a schema may declare.
+    let artifacts = index
+        .counts
+        .get(read_index::ARTIFACT_PHASE)
+        .copied()
+        .unwrap_or(0);
+    let custody_work = artifacts.saturating_mul(Work::custody_per_artifact());
+    // The custody term extends the shape's envelope, never past the
+    // configuration's ceiling.
+    let allowed = work.extended(custody_work).min(limits.work);
+    meters
+        .model
+        .extend(allowed.model.saturating_sub(work.model));
     let shared = Shared {
         index: &index,
         header,
@@ -306,13 +447,17 @@ pub fn restore_in<S: NativeSchemaVerifier, R: NativeCustodyReader>(
     // All decoder/index/workspace borrows end before exposing the sole owner.
     drop(shared);
     drop(index);
-    Ok(Core {
-        state: NativeState {
-            ledger: header.ledger,
-            profile: header.profile,
-            rows,
-            budget,
+    let used = allowed.used(&meters);
+    Ok((
+        Core {
+            state: NativeState {
+                ledger: header.ledger,
+                profile: header.profile,
+                rows,
+                budget,
+            },
+            limits: limits.native,
         },
-        limits: limits.native,
-    })
+        Envelope { allowed, used },
+    ))
 }

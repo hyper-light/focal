@@ -126,6 +126,7 @@ impl NativeSessionLimits {
             attempts: 64,
             slot_bytes: 4096,
         };
+        let checkpoint = crate::native_checkpoint::Limits::default();
         Self {
             recovery: recovery::Limits {
                 // Bounded owner shapes: every completion-class admission funds
@@ -183,12 +184,15 @@ impl NativeSessionLimits {
                     construction_bytes: 4 * 1024 * 1024,
                 },
                 creation_objects: 4096,
-                work: recovery::Work {
-                    parsing: 1 << 30,
-                    source: 1 << 30,
-                    model: 1 << 30,
-                    lookup: 1 << 30,
-                },
+                // The work a restore of the largest checkpoint this
+                // configuration admits may spend, derived from the
+                // checkpoint's own bounds (the audit's F57): an admitted
+                // checkpoint always fits its recovery envelope.
+                work: recovery::Work::for_limits(
+                    checkpoint.visits,
+                    checkpoint.assembled_bytes,
+                    checkpoint.rows,
+                ),
             },
             encoding: record::EncodingLimits {
                 // One record: a preparation-sized body at the codec's fourfold
@@ -203,7 +207,7 @@ impl NativeSessionLimits {
                 rows: 100_000,
                 row_bytes: 6 << 20,
             },
-            checkpoint: crate::native_checkpoint::Limits::default(),
+            checkpoint,
             frame_bytes: 1 << 20,
             decode_work: input_codec::DecodeWork {
                 parse: 1 << 28,

@@ -12113,3 +12113,32 @@ completion allowance is asked for exactly what recovery needs.
 `native::record_codec::replay::tests::a_restore_is_funded_by_the_completion_allowance_and_never_waits_on_ordinary_credit`
 (every ordinary byte held → restores; a completion-only 8 MiB pool → restores;
 before the fix, `Memory(Capacity)` at the first root).
+
+### 2026-09-29 — F57: a restore's work is the envelope of the checkpoint's shape
+
+The recovery work allowances were a chosen constant (`1 << 30` for each of
+parsing, source, model and lookup) with no relation to the history admission
+bounds, and the history index precharged a heapsort over twice the events
+before it knew the population: a history of 4096 claims under the standard
+configuration (69 633 rows, 10.8 MB, 8192 events) did not restore (the audit's
+reproduction: `Contract(Capacity)` at the model meter; measured here: 2.86 G
+model units and 1.17 G lookup units spent, both past the old constant). Now
+`recovery::Work::for_shape(visits, bytes, rows)` is the envelope of the
+checkpoint's declared shape — whole scans of the inspection's visits, body
+parsing per byte, per-row and per-byte ceilings, the sort at its bound, a
+lookup ceiling per row, and once the index has counted the artifact rows a
+custody recovery per artifact under the largest verification a schema may
+declare (`NativeVerificationBudget::ceiling().recovery_work()`, the same term
+`Custody::recover` charges) — and the sort is charged for the entries there
+are. The standard configuration's work is `Work::for_limits` at its checkpoint
+bounds (256 Mi visits, 256 MiB, 100 000 rows). The per-unit ceilings (source
+4096/row and 64/byte, model 65 536/row and 256/byte, lookup 65 536/row, body
+parsing 32/byte) are measured on the recorded workflows at authored maxima
+(projection: 301 rows, source 494/row, lookup 15 954/row, parsing 18/byte;
+authored: 27 rows, model 39 179/row and 113/byte, lookup 4503/row) and pinned
+by `bound_tests::a_restore_s_work_stays_within_the_envelope_its_checkpoint_declares`;
+`replay::tests::a_history_of_thousands_of_claims_restores_under_the_derived_envelope`
+restores the 4096-claim history in 16 s under the derived ceiling and within its
+envelope; `native_session::tests::the_standard_recovery_work_is_derived_from_the_checkpoint_bounds`
+holds the configuration to the derivation. Record replay's per-record meters
+draw on the same ceiling as before.

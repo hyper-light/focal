@@ -311,6 +311,20 @@ and its entire temporary peak participates in recovery memory admission.
 
 Parsing, model work, source callbacks and dependency lookup use separate
 cumulative allowances across all phases and both preparation/build passes.
+The allowances of a restore are the envelope of the checkpoint's own declared
+shape (2026-09-29, the audit's F57; `recovery::Work::for_shape`): the
+inspection's visits for each whole scan (the index and every hydration
+phase) plus the body parsing per byte; a ceiling per row and per byte for
+source and model work; the history sort at its bound (every event a primary
+entry and at most one secondary), charged for the entries there are once
+they are counted; a lookup ceiling per row; and, once the index has counted
+the artifact rows, a custody recovery per artifact under the largest
+verification any schema may declare. The per-unit ceilings are measured on
+the recorded workflows at authored maxima and pinned by a test that fails
+when a restore outgrows one. A configuration's recovery work is that envelope
+at its checkpoint bounds (`Work::for_limits`), never a chosen constant, so
+every checkpoint the configuration admits fits its recovery, and a body that
+costs more than its declared rows and bytes allow is refused.
 An opaque cursor or model inspection exclusively borrows its offered work
 allowance; nested use of that same meter cannot spend it concurrently. Known
 model work can instead be debited in advance, leaving a separate remainder for
