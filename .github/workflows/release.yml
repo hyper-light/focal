@@ -75,6 +75,12 @@ jobs:
       TOOLCHAIN: ${{ needs.guard.outputs.toolchain }}
       MUSL_IMAGE: ${{ needs.guard.outputs.musl_image }}
       MACOSX_DEPLOYMENT_TARGET: '15.0'
+      # The Windows executables carry their C runtime, as the musl ones do:
+      # nothing to install on the machine that runs them, and the import
+      # table the staging step verifies names no `vcruntime140.dll`. The
+      # flag reaches only the target's crates, since the build names its
+      # target; the musl lanes set the same flag inside their container.
+      RUSTFLAGS: ${{ startsWith(matrix.target, 'x86_64-pc-windows') && '-C target-feature=+crt-static' || startsWith(matrix.target, 'aarch64-pc-windows') && '-C target-feature=+crt-static' || '' }}
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-python@v5.6.0

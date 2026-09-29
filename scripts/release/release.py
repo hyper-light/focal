@@ -187,9 +187,14 @@ def verify_native(binary, row, version):
         require(struct.unpack_from("<H", data, lfanew + 4)[0] == {"x86_64": 0x8664, "aarch64": 0xAA64}[architecture],
                 "PE machine differs from asset name")
         # Only the OS libraries Focal links: kernel, security (SID/DACL), the
-        # RNG, sockets and the API-set stubs. No bundled runtime, no OpenSSL.
-        allowed = {"kernel32.dll", "advapi32.dll", "bcrypt.dll", "ntdll.dll", "ws2_32.dll",
-                   "userenv.dll", "secur32.dll", "crypt32.dll", "rpcrt4.dll", "kernelbase.dll"}
+        # RNG (`bcrypt.dll`, and `bcryptprimitives.dll`, whose `ProcessPrng`
+        # the Rust standard library draws its hashing randomness from; part of
+        # Windows since 8), sockets and the API-set stubs. No bundled runtime
+        # — the C runtime is linked in (`+crt-static`, the release workflow),
+        # so no `vcruntime140.dll` — and no OpenSSL.
+        allowed = {"kernel32.dll", "advapi32.dll", "bcrypt.dll", "bcryptprimitives.dll", "ntdll.dll",
+                   "ws2_32.dll", "userenv.dll", "secur32.dll", "crypt32.dll", "rpcrt4.dll",
+                   "kernelbase.dll"}
         unexpected = {name for name in pe_imported_dlls(data)
                       if name not in allowed and not name.startswith("api-ms-win-")}
         require(not unexpected, f"unpackaged Windows imports: {sorted(unexpected)}")
@@ -348,7 +353,8 @@ def publish(directory):
             "and make it executable. No Rust installation is needed.\n\n"
             "GNU Linux binaries require glibc 2.39 or later; musl binaries are static. "
             "macOS binaries target macOS 15 or later. Windows binaries target Windows 10 "
-            "1809 / Server 2019 or later. macOS notarization and Windows Authenticode "
+            "1809 / Server 2019 or later and carry their C runtime, so no Visual C++ "
+            "redistributable is needed. macOS notarization and Windows Authenticode "
             "signing are not applied by this release.\n\n"
             "Every asset passed native server startup, CLI mutation/read, acknowledged-write "
             "crash recovery and MCP protocol/read smoke. THIRD-PARTY-NOTICES.txt lists every "

@@ -29,8 +29,12 @@ Every lane compiles the cryptographic provider, AWS-LC, from the sources under
 macOS lanes with the runner's toolchain, the musl lanes with the Alpine image's
 `build-base`, Windows x86_64 with the prebuilt NASM objects the crate carries and
 Windows arm64 with the clang-cl toolset; no lane needs CMake, Go or bindgen. The
-Windows import table stays within the set `release.py` verifies, since AWS-LC
-links `bcrypt.dll` and loads `bcryptprimitives.dll` (ProcessPrng) at run time.
+Windows executables link their C runtime statically (`+crt-static` on the two
+Windows lanes, as the musl lanes do), so they import no `vcruntime140.dll` and need no
+Visual C++ redistributable; their import table is the set `release.py` verifies —
+the kernel, security, `bcrypt.dll`, `bcryptprimitives.dll` (whose `ProcessPrng` the Rust
+standard library draws hashing randomness from, part of Windows since 8), sockets and
+the API-set stubs — as the dispatched release run showed on both Windows lanes.
 
 The [release implementation](../../scripts/release/release.py) separates checks:
 

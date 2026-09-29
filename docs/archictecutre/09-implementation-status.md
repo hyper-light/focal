@@ -11497,5 +11497,13 @@ building anything: their toolchain step ran `rustup toolchain install "$TOOLCHAI
 PowerShell, the runner's default shell, which reads `$TOOLCHAIN` as a PowerShell variable and
 so installed nothing — the release workflow had run only on these two dispatches and its
 Windows lanes never before ([20](20-binary-distribution.md) §3). The build job's steps are
-bash steps everywhere now.
+bash steps everywhere now. With bash on every lane, the two Windows lanes built the provider
+(arm64 with clang-cl, x86_64 with the crate's prebuilt NASM objects) and passed the smoke
+of the server, the CLI, crash recovery and MCP, and were refused at staging for two
+imports the verifier had never seen because it had never seen a Windows binary:
+`bcryptprimitives.dll`, whose `ProcessPrng` the Rust standard library draws its hashing
+randomness from (allowed; part of Windows since 8), and `vcruntime140.dll`, the dynamic C
+runtime (not allowed: the Windows lanes now link the runtime statically, as the musl lanes
+do, so the executables need no Visual C++ redistributable). The six Unix lanes and the
+workspace test job passed on the provider on both dispatches.
 
