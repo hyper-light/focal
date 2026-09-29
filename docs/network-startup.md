@@ -47,6 +47,16 @@ focal --data-dir /tmp/focal-worker-2 start
 
 The founder’s `Ready` record also waits for committed initial directory activation. This requires no new configuration or geographic labels.
 
+A planned stop — SIGTERM, a process manager's stop — prints one last record,
+`{"condition": "Stopped", "sessions_led": n, "sessions_handed_off": m}`: the
+sessions this node led when it was told to stop, and how many of those it handed
+off to another voter before it went ([27 §5](archictecutre/27-consensus-roadmap-and-slates-port.md)).
+A leader hands off by asking its most caught-up voter to campaign at once and
+waiting, for at most one election timeout of its own periods, until the log leads
+elsewhere; `sessions_handed_off < sessions_led` means a hand-off ran out of that
+time (no voter was reachable, or none was caught up), and the survivors elected
+after their election timeout instead.
+
 The joined node’s startup record is `CatchingUp`, with `assigned_ledger: false`. The network controller commits its authenticated contact and node capability before admitting it as a root learner. The capability records verified identity and eligibility; region and zone remain unknown until an infrastructure authority supplies them. No geography settings are needed for this step. The startup record is not a continuous progress report. A joined node has its own private local admin socket for live inspection and authorized membership operations; issuing invitations still requires the founder's signing backend.
 
 From another terminal, inspect the saved identities or the founder's published application prefix:

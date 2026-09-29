@@ -112,6 +112,9 @@ pub struct SessionMetrics {
     /// measured tail it was derived from, in microseconds, and how many
     /// round trips fed it (27 §3.1 P2).
     pub tick_period_ms: u64,
+    /// Periods the session's owner has run: the unit its replica's election
+    /// timer counts, and what a wait on it is charged in (27 §3.1 P8).
+    pub periods: u64,
     /// Periods in which the owner's replica was not ticked: it was
     /// refused the room or still persisted.
     pub refused_periods: u64,
@@ -696,7 +699,12 @@ impl MetricsSnapshot {
             "Whether sessions beyond the bound were left out.",
             u8::from(self.sessions_truncated),
         );
-        let series: [(&str, &str, &str); 27] = [
+        let series: [(&str, &str, &str); 28] = [
+            (
+                "focal_session_periods_total",
+                "counter",
+                "Periods the session's owner has run since it started: the unit its replica's election timer counts.",
+            ),
             (
                 "focal_session_periods_refused_total",
                 "counter",
@@ -837,6 +845,7 @@ impl MetricsSnapshot {
                     ("session", session.session.as_str()),
                 ];
                 let value: Option<u64> = match name {
+                    "focal_session_periods_total" => Some(session.periods),
                     "focal_session_periods_refused_total" => Some(session.refused_periods),
                     "focal_session_period_longest_ms" => Some(session.longest_period_ms),
                     "focal_session_leader" => Some(session.leader),
@@ -986,6 +995,7 @@ mod tests {
             liveness: LivenessMetrics::default(),
             credential: None,
             sessions: vec![SessionMetrics {
+                periods: 0,
                 tenant: "t".into(),
                 session: "s".into(),
                 committed_index: 9,

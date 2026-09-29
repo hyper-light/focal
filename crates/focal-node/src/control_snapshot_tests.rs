@@ -103,6 +103,7 @@ impl Fixture {
             _allocation: None,
         });
         let owner = Owner {
+            stopping: None,
             replica,
             initial: None,
             verifier: NoDirectoryAuthority,

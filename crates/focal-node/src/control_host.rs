@@ -301,6 +301,10 @@ struct Owner<V> {
     dropped: u64,
     failure: Option<String>,
     pub(crate) pace: TickPeriod,
+    /// The reply to a stop, and the owner's period at which a leader's
+    /// hand-off is given up on: the stop completes once the log leads
+    /// elsewhere, or then.
+    stopping: Option<(oneshot::Sender<Result<(), ControlFailure>>, u64)>,
 }
 impl ControlHost {
     /// Validate a durable session-owner witness against this control owner's
@@ -559,6 +563,7 @@ impl ControlHost {
             initial,
             verifier,
             config: config.clone(),
+            stopping: None,
             limits: limits.clone(),
             budget: budget.clone(),
             pending: VecDeque::new(),
@@ -850,6 +855,9 @@ impl<V: AuthorityVerifier> Owner<V> {
                         .checked_add(self.pace.get(self.config.tick, self.config.tick_ceiling))
                         .ok_or(ControlError::Capacity)?;
                 }
+                if self.handed_off() && self.finish_stop()? {
+                    return Ok(());
+                }
                 // A stretched period stretches the election timeout, which
                 // is what it is for. The heartbeats of a leader keep the
                 // cadence its followers were configured to expect: each
@@ -1040,24 +1048,60 @@ impl<V: AuthorityVerifier> Owner<V> {
                 let _ = response.send(result);
             }
             Work::Stop(response) => {
-                // Stop follow-up reads/enrollment admissions before the final
-                // drain. Otherwise a committed refresh can enqueue a new
-                // ReadIndex during drain and invalidate the checkpoint fence.
-                // This releases caller interest only: admitted proposals and
-                // their prepared state remain owned by the replica below.
-                self.stop_waiters();
-                let result = self.drain().and_then(|_| {
-                    if self.replica.has_pending() || self.replica.applied_index() == 0 {
-                        Ok(())
-                    } else {
-                        self.replica.checkpoint()
-                    }
+                if self.stopping.is_some() {
+                    let _ = response.send(Err(ControlFailure::Capacity));
+                    return Ok(false);
+                }
+                // A leader hands its log off before it goes (27 §5): the
+                // most caught-up voter is asked to campaign now, and the
+                // stop completes once the log leads elsewhere — or after
+                // the transfer's own bound, one election timeout, in this
+                // owner's periods — while this replica keeps ticking and
+                // beating so the heir is caught up and asked. A leader that
+                // went silent cost the survivors that whole timeout.
+                let bound = self.replica.heir().and_then(|heir| {
+                    self.replica.hand_off(heir).ok()?;
+                    let timeout = u64::try_from(self.replica.election_tick()).ok()?;
+                    self.pace.periods().checked_add(timeout)
                 });
-                let _ = response.send(result.map_err(ControlFailure::from));
-                return Ok(true);
+                self.stopping = Some((response, bound.unwrap_or(0)));
+                self.drain()?;
+                return self.finish_stop();
             }
         }
         Ok(false)
+    }
+    /// Whether a pending stop no longer waits on a hand-off: the log leads
+    /// elsewhere, or the hand-off's bound has passed.
+    fn handed_off(&self) -> bool {
+        self.stopping
+            .as_ref()
+            .is_some_and(|(_, bound)| !self.replica.leads() || self.pace.periods() >= *bound)
+    }
+    /// Completes a pending stop once nothing waits on a hand-off; whether
+    /// the owner ends.
+    fn finish_stop(&mut self) -> Result<bool, ControlError> {
+        if !self.handed_off() {
+            return Ok(false);
+        }
+        let Some((response, _)) = self.stopping.take() else {
+            return Ok(false);
+        };
+        // Stop follow-up reads/enrollment admissions before the final
+        // drain. Otherwise a committed refresh can enqueue a new
+        // ReadIndex during drain and invalidate the checkpoint fence.
+        // This releases caller interest only: admitted proposals and
+        // their prepared state remain owned by the replica below.
+        self.stop_waiters();
+        let result = self.drain().and_then(|_| {
+            if self.replica.has_pending() || self.replica.applied_index() == 0 {
+                Ok(())
+            } else {
+                self.replica.checkpoint()
+            }
+        });
+        let _ = response.send(result.map_err(ControlFailure::from));
+        Ok(true)
     }
     fn observe_root(&self, input: Allocation) -> Result<RootObservation, ControlFailure> {
         if self.replica.identity().scope != ControlScope::Root {

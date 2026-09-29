@@ -505,13 +505,19 @@ fn prepare_volume(root: &Path, owner: &str) -> Result<()> {
 }
 async fn start_network(settings: Settings) -> Result<()> {
     let service = focal_node::network_service::NetworkService::open(&settings).await?;
-    service
+    let stopped = service
         .run_until(shutdown_signal(), |status| {
             let json = serde_json::to_string_pretty(status).map_err(std::io::Error::other)?;
             writeln!(std::io::stdout().lock(), "{json}")
         })
         .await?;
-    Ok(())
+    // The last line a planned stop prints: what this node led, and what it
+    // handed off before it went (27 §5).
+    print_json(&serde_json::json!({
+        "condition": "Stopped",
+        "sessions_led": stopped.sessions_led,
+        "sessions_handed_off": stopped.sessions_handed_off,
+    }))
 }
 async fn join(settings: &Settings, invite_file: &Path) -> Result<()> {
     let bundle = NodeInvitation::load(invite_file)?;

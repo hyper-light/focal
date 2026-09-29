@@ -195,7 +195,12 @@ impl FleetManager {
         ledger: LedgerId,
     ) -> Result<([u8; 16], ReplicaHost), FleetError> {
         let state = self.state.borrow();
-        if state.status.stopped || state.quiesced {
+        // A quiesced fleet installs nothing and lists nothing, but it still
+        // routes to the sessions it holds while they stop one at a time: a
+        // stopping leader hands its log off (27 §5), which is its peers'
+        // messages until the log leads elsewhere, and each session refuses
+        // for itself what a stop must refuse.
+        if state.status.stopped {
             return Err(FleetError::Unavailable);
         }
         let entry = state.entries.get(&ledger).ok_or(FleetError::Unavailable)?;
@@ -447,7 +452,10 @@ impl FleetManager {
     /// after shutdown admission; its proposals retain unknown outcomes. Canceling
     /// this future leaves the fleet quiesced: resume it or call shutdown, then
     /// join the owner. The embedding service supplies its overall grace deadline.
-    pub async fn stop_all(&self) -> Result<(), FleetError> {
+    /// Stops every session; how many this node led at the stop and how
+    /// many of those it handed off (27 §5).
+    pub async fn stop_all(&self) -> Result<FleetStopReport, FleetError> {
+        let mut report = FleetStopReport::default();
         let permit = self.permit()?;
         let (reply, receive) = oneshot::channel();
         self.send(ManagementWork::Quiesce {
@@ -474,10 +482,16 @@ impl FleetManager {
             if host.stop().await.is_err() {
                 complete = false;
             }
+            if let Some(hand_off) = host.progress().stop_hand_off {
+                report.sessions_led = report.sessions_led.saturating_add(1);
+                if hand_off.completed {
+                    report.sessions_handed_off = report.sessions_handed_off.saturating_add(1);
+                }
+            }
         }
         self.shutdown().await?;
         if complete {
-            Ok(())
+            Ok(report)
         } else {
             Err(FleetError::Unavailable)
         }
@@ -497,6 +511,13 @@ impl FleetManager {
 enum Latest {
     Installed(Box<FleetInstallation>),
     Removed(FleetRemoval),
+}
+/// What a fleet's stop handed off: the sessions this node led when the stop
+/// began, and those whose log led elsewhere before their replica stopped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FleetStopReport {
+    pub sessions_led: u32,
+    pub sessions_handed_off: u32,
 }
 pub(super) struct ManagementOwner {
     state: watch::Sender<ManagementState>,

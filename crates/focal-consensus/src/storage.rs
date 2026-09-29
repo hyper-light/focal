@@ -118,10 +118,18 @@ impl RamLog {
             BudgetLane::Completion,
             amount,
         )?;
+        // Grow to the power of two the budget was just charged for, not by
+        // the addition alone: reserving exactly what was asked moved the
+        // whole retained log on every commit (two reallocations a commit,
+        // hundreds of kilobytes each before a checkpoint) for the same
+        // charge.
         let result = self
             .entries
-            .try_reserve_exact(additional)
-            .and_then(|()| self.charges.try_reserve_exact(additional));
+            .try_reserve_exact(capacity.saturating_sub(self.entries.len()))
+            .and_then(|()| {
+                self.charges
+                    .try_reserve_exact(capacity.saturating_sub(self.charges.len()))
+            });
         let actual = self
             .entries
             .capacity()
@@ -437,5 +445,42 @@ impl Storage for RamLog {
             return Err(StorageError::SnapshotTemporarilyUnavailable);
         }
         Ok(self.snapshot.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::config;
+
+    /// The budget is charged for the next power of two of what the log
+    /// needs, so the slots grow to that: one reallocation per doubling, not
+    /// one per commit moving the whole log each time.
+    #[test]
+    fn slots_grow_to_the_power_of_two_the_budget_was_charged_for() {
+        let budget = MemoryBudget::new(64 * 1024 * 1024, 0).unwrap();
+        let mut log = RamLog::new(&config(1), budget).unwrap();
+        let mut capacities = Vec::new();
+        for _ in 0..1_000 {
+            log.reserve_slots(1).unwrap();
+            let capacity = log.entries.capacity();
+            if capacities.last() != Some(&capacity) {
+                capacities.push(capacity);
+            }
+            assert!(capacity.is_power_of_two(), "{capacity}");
+            assert!(log.charges.capacity() >= capacity);
+            // What the slots hold is what the budget holds for them.
+            let charged = log.slots.as_ref().map(|slots| slots.bytes()).unwrap_or(0);
+            assert!(
+                charged >= capacity * std::mem::size_of::<Entry>(),
+                "{charged} charged for {capacity} slots"
+            );
+            log.entries.push_back(Entry::default());
+            log.charges.push_back(
+                reserve(&log.budget, BudgetKind::Payload, BudgetLane::Completion, 1).unwrap(),
+            );
+        }
+        // Doublings only: 1, 2, 4, ..., 1024.
+        assert!(capacities.len() <= 11, "{capacities:?}");
     }
 }

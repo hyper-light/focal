@@ -522,6 +522,24 @@ impl ControlReplica {
         self.node.transfer_leader(request.target)?;
         Ok(())
     }
+    /// Hand leadership to `target` for this replica's own planned stop: no
+    /// fence, since the owner is not carrying out a placement decision but
+    /// leaving, and the group is better led by any live voter than by none.
+    pub fn hand_off(&mut self, target: u64) -> Result<(), ControlError> {
+        self.check_ready()?;
+        self.node.transfer_leader(target)?;
+        Ok(())
+    }
+    /// The voter to hand leadership to when this leader stops: the most
+    /// caught-up one that is heard from, none while this replica does not
+    /// lead or no other voter is.
+    pub fn heir(&self) -> Option<u64> {
+        let status = self.node.status();
+        if status.role != focal_consensus::StateRole::Leader {
+            return None;
+        }
+        crate::heir(&status, &self.node.peer_progress())
+    }
     pub fn receipt(&self, id: ControlRequestId) -> Result<Option<ControlReceipt>, ControlError> {
         self.check()?;
         if !self.drained {

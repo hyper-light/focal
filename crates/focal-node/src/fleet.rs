@@ -48,7 +48,7 @@ mod range_owner;
 use evidence_owner::{EvidenceCall, PendingEvidenceCall};
 pub use grouped::management::{
     FleetError, FleetIncarnation, FleetInstallFailure, FleetInstallation, FleetManager,
-    FleetRemoval, FleetReply, FleetStatus, ManagedFleetConfig,
+    FleetRemoval, FleetReply, FleetStatus, FleetStopReport, ManagedFleetConfig,
 };
 pub use grouped::{FleetReplica, FleetReplication, FleetTenant, ReplicaFleet, ReplicaFleetParts};
 pub use placement_owner::{CommittedPlacement, PlacementReply, SessionPlacementRequest};
@@ -152,11 +152,21 @@ impl ReplicationFrame {
         crate::snapshot_feedback::complete(&mut self.snapshot, accepted);
     }
 }
+/// A stopping leader's hand-off of its log (27 §5): the voter it asked to
+/// campaign, and whether the log led elsewhere before the replica stopped
+/// ticking. None while the replica did not lead when its stop began.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StopHandOff {
+    pub heir: u64,
+    pub completed: bool,
+}
 #[derive(Clone, Debug)]
 pub struct ReplicaProgress {
     pub node: u64,
     pub leader: u64,
     pub term: u64,
+    /// The hand-off a planned stop made, once the stop began.
+    pub stop_hand_off: Option<StopHandOff>,
     pub sequence: SessionSeq,
     pub dropped_replication: u64,
     pub stopped: bool,
@@ -612,6 +622,11 @@ struct Owner {
     /// The reply to a stop, and the owner's period at which the stop is
     /// given up on.
     stopping: Option<(oneshot::Sender<Result<(), LedgerError>>, u64)>,
+    /// While a stopping leader hands its log off: the owner's period at
+    /// which the hand-off is given up on.
+    handing_off: Option<u64>,
+    /// The hand-off this replica's stop made, reported in its progress.
+    stop_hand_off: Option<StopHandOff>,
     next_tick: Instant,
     /// When a leader whose period is stretched sends its next heartbeats.
     next_beat: Instant,
@@ -706,6 +721,7 @@ impl ReplicaHost {
                 node: status.node_id,
                 leader: status.leader_id,
                 term: status.term,
+                stop_hand_off: None,
                 sequence: session.sequence(),
                 dropped_replication: 0,
                 stopped: false,
@@ -768,6 +784,8 @@ impl ReplicaHost {
             budget: budget.clone(),
             nonblocking: false,
             stopping: None,
+            handing_off: None,
+            stop_hand_off: None,
             next_tick: Instant::now(),
             next_beat: Instant::now(),
             wake_at: Instant::now(),
@@ -1701,7 +1719,10 @@ impl Owner {
         }
         self.progress_managed()?;
         self.checkpoint_if_due()?;
-        if let Some((_, deadline)) = self.stopping.as_ref() {
+        let handing_off = self.handing_off();
+        if let Some((_, deadline)) = self.stopping.as_ref()
+            && !handing_off
+        {
             // A stop ticks the replica no more, but its time passes in the
             // owner's periods all the same: each is counted, refused.
             if Instant::now() >= self.next_tick {
@@ -1714,12 +1735,16 @@ impl Owner {
             }
             let expired = self.pace.periods() >= *deadline;
             if expired && self.session.has_ready() {
+                // What the stop made of its hand-off is published before
+                // the reply: the fleet reads it once the reply is in.
+                self.publish_progress(true);
                 if let Some((response, _)) = self.stopping.take() {
                     let _ = response.send(Err(LedgerError::OutcomeUnknown));
                 }
                 return Ok(true);
             }
             if !self.session.has_ready() {
+                self.publish_progress(true);
                 if let Some((response, _)) = self.stopping.take() {
                     // The shared WAL already owns the recoverable durable
                     // prefix. Avoid a synchronous whole-WAL checkpoint rewrite
@@ -1963,7 +1988,11 @@ impl Owner {
                 // create the leader-readiness ReadIndex; the second consumes
                 // its local Ready output. Shutdown does not dispatch effects
                 // or wait for unavailable peers to commit pending proposals.
+                // A leader asks its heir to campaign first: the drain sends
+                // that, and the group is led again without an election
+                // timeout even though this owner does not stay for it.
                 let result = (|| {
+                    self.hand_off()?;
                     self.drain_with_runtime(false)?;
                     self.drain_with_runtime(false)?;
                     // A pending proposal remains recoverable in Raft's log;
@@ -1999,8 +2028,75 @@ impl Owner {
             return Ok(());
         }
         let deadline = self.request_deadline().ok_or(LedgerError::Capacity)?;
+        self.hand_off()?;
         self.stopping = Some((response, deadline));
         Ok(())
+    }
+    /// A leader hands its log off before it goes (27 §5): the most
+    /// caught-up voter is asked to campaign now, and until the log leads
+    /// elsewhere — or the transfer's own bound, one election timeout, has
+    /// passed in this owner's periods — the replica ticks and beats as a
+    /// leader does, so the heir is caught up and asked. A leader that went
+    /// silent cost the survivors that whole timeout, for every log it led.
+    fn hand_off(&mut self) -> Result<(), LedgerError> {
+        let status = self.session.status();
+        if status.role != StateRole::Leader {
+            return Ok(());
+        }
+        let peers: Vec<focal_consensus::PeerProgress> = status
+            .voters
+            .iter()
+            .filter_map(|voter| self.session.peer(*voter))
+            .collect();
+        // The placement's preferred leader takes it when it qualifies:
+        // leadership would return there anyway.
+        let preferred = self
+            .session
+            .active_placement()
+            .map(|spec| spec.placement.preferred_leader)
+            .filter(|node| {
+                peers
+                    .iter()
+                    .any(|peer| peer.node == *node && peer.state == 1 && peer.recent_active)
+                    && *node != status.node_id
+            });
+        let Some(heir) = preferred.or_else(|| focal_control::heir(&status, &peers)) else {
+            return Ok(());
+        };
+        match self.session.transfer_leader(heir) {
+            Ok(()) => {
+                let timeout = u64::try_from(self.session.election_tick()).unwrap_or(u64::MAX);
+                self.handing_off = self.pace.periods().checked_add(timeout);
+                self.stop_hand_off = Some(StopHandOff {
+                    heir,
+                    completed: false,
+                });
+                Ok(())
+            }
+            Err(
+                error @ (LedgerError::Failed
+                | LedgerError::Consensus(focal_consensus::ConsensusError::Failed)),
+            ) => Err(error),
+            // Refused (a transfer already under way, a member that is not a
+            // voter after all): the stop goes on as it did.
+            Err(_) => Ok(()),
+        }
+    }
+    /// Whether a stopping leader is still handing its log off; the hand-off
+    /// is complete once the log leads elsewhere before its bound.
+    fn handing_off(&mut self) -> bool {
+        let Some(bound) = self.handing_off else {
+            return false;
+        };
+        let leads = self.session.status().role == StateRole::Leader;
+        if leads && self.pace.periods() < bound {
+            return true;
+        }
+        if !leads && let Some(hand_off) = self.stop_hand_off.as_mut() {
+            hand_off.completed = true;
+        }
+        self.handing_off = None;
+        false
     }
     fn close(&mut self) {
         self.close_managed();
@@ -2051,6 +2147,7 @@ impl Owner {
                 priority: self.session.priority(),
                 near: self.near.clone(),
                 returns: self.leader_return.stats(),
+                stop_hand_off: self.stop_hand_off,
                 route_epoch: self.config.route_epoch,
                 import_pending: self.session.pending_import(),
                 seed_pending: self.session.pending_seed().map(|pending| SeedPending {

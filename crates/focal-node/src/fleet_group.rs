@@ -351,7 +351,10 @@ impl GroupOwner {
             self.reschedule(routed.ledger)?;
             return Ok(());
         }
-        if owner.stopping.is_some() {
+        // A stopping session takes no more work — except while its leader
+        // hands the log off (27 §5): its peers' messages are how the heir is
+        // caught up and asked, and how this replica's term ends.
+        if owner.stopping.is_some() && owner.handing_off.is_none() {
             return Ok(());
         }
         self.nonce = self.nonce.checked_add(1).ok_or(LedgerError::Capacity)?;
@@ -442,8 +445,14 @@ impl GroupOwner {
                 match self
                     .scheduler
                     .schedule_when(|ledger| {
+                        // A stopping session takes no more work — except
+                        // while its leader hands the log off, which is
+                        // messages both ways: the heir's append responses
+                        // say when it is caught up, and its vote request
+                        // ends this replica's term.
                         sessions.get(&ledger).is_none_or(|owner| {
-                            !owner.session.persistence_pending() && owner.stopping.is_none()
+                            !owner.session.persistence_pending()
+                                && (owner.stopping.is_none() || owner.handing_off.is_some())
                         })
                     })
                     .map_err(|_| LedgerError::Failed)?

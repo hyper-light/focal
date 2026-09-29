@@ -114,6 +114,52 @@ pub enum ServiceError {
 /// this long and then that the node kept its word.
 pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
 
+/// What stopping the owners returned, kept apart so that what ended the
+/// service is reported as the cause and a stop's failure beside it.
+struct StoppedOwners {
+    fleet: Result<crate::fleet::FleetStopReport, ServiceError>,
+    directory: Result<(), ServiceError>,
+    hosted: Result<(), ServiceError>,
+    control: Result<(), ServiceError>,
+}
+/// How a service stopped: the sessions this node led when it was told to
+/// stop, and how many of those it handed off before it went (27 §5). The
+/// node prints it as its last status line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ServiceStopped {
+    pub sessions_led: u32,
+    pub sessions_handed_off: u32,
+}
+/// Stop the owners that speak to peers: the fleet's sessions, the directory
+/// and every hosted partition, the control groups. Run while the drivers
+/// that carry their messages and the listener that receives their peers'
+/// still run (27 §5): a leader among them hands its log off first, which is
+/// messages both ways, and a stop that had already ended the egress made
+/// every hand-off a silence its survivors waited out.
+async fn stop_owners(handles: &NetworkHandles) -> StoppedOwners {
+    let fleet = handles.fleet.stop_all().await.map_err(ServiceError::from);
+    let directory = match handles.directory.host() {
+        Some(host) => host.stop().await.map_err(ServiceError::from),
+        None => Ok(()),
+    };
+    // Every partition a split added on this node stops with the first.
+    let mut hosted = Ok(());
+    let first = handles.directory.plan().partition();
+    for partition in handles.directory.hosted() {
+        if partition.plan.partition() != first
+            && let Err(error) = partition.host.stop().await
+        {
+            hosted = Err(ServiceError::from(error));
+        }
+    }
+    let control = handles.control.stop().await.map_err(ServiceError::from);
+    StoppedOwners {
+        fleet,
+        directory,
+        hosted,
+        control,
+    }
+}
 #[derive(Clone, Debug, Serialize)]
 pub struct NetworkServiceStatus {
     pub condition: &'static str,
@@ -1240,6 +1286,7 @@ impl NetworkService {
                 tick_period_ms: u64::try_from(host.tick_period().as_millis()).unwrap_or(u64::MAX),
                 broadcast_tail_us: host.current_pace().broadcast_tail_ns / 1_000,
                 pace_samples: host.current_pace().samples,
+                periods: host.periods(),
                 refused_periods: host.refused_periods(),
                 longest_period_ms: u64::try_from(host.longest_period().as_millis())
                     .unwrap_or(u64::MAX),
@@ -1304,7 +1351,11 @@ impl NetworkService {
     /// Drive borrowed ingress and egress on a runtime with IO and time enabled.
     /// Shutdown closes admission and joins disk owners; cancellation keeps the
     /// directory locked while any externally retained physical handle is live.
-    pub async fn run_until<F, R>(mut self, shutdown: F, on_status: R) -> Result<(), ServiceError>
+    pub async fn run_until<F, R>(
+        mut self,
+        shutdown: F,
+        on_status: R,
+    ) -> Result<ServiceStopped, ServiceError>
     where
         F: Future<Output = std::io::Result<()>>,
         R: FnMut(&NetworkServiceStatus) -> std::io::Result<()>,
@@ -1313,43 +1364,34 @@ impl NetworkService {
         // The task set's state (every pinned driver future) lives on the heap
         // for the service's life, so the caller's stack carries only this
         // frame however many drivers the service composes.
-        let running = std::panic::AssertUnwindSafe(Box::pin(self.run_tasks(shutdown, on_status)))
-            .catch_unwind()
-            .await
-            .unwrap_or(Err(ServiceError::Runtime));
+        let (running, stopped) =
+            match std::panic::AssertUnwindSafe(Box::pin(self.run_tasks(shutdown, on_status)))
+                .catch_unwind()
+                .await
+                .unwrap_or(Err(ServiceError::Runtime))
+            {
+                Ok(stopped) => (Ok(()), stopped),
+                Err(error) => (Err(error), None),
+            };
         self.listener.close();
         self.local.close();
         if let Some((server, _)) = &self.admin {
             server.close();
         }
-        self.pool.close();
         let cleanup = async {
-            let fleet = self
-                .handles
-                .fleet
-                .stop_all()
-                .await
-                .map_err(ServiceError::from);
-            let directory = match self.handles.directory.host() {
-                Some(host) => host.stop().await.map_err(ServiceError::from),
-                None => Ok(()),
+            // An orderly shutdown stopped the owners while the drivers ran;
+            // a run that a driver's end cut short stops them here, with no
+            // one to carry a hand-off.
+            let StoppedOwners {
+                fleet,
+                directory,
+                hosted,
+                control,
+            } = match stopped {
+                Some(stopped) => stopped,
+                None => stop_owners(&self.handles).await,
             };
-            // Every partition a split added on this node stops with the first.
-            let mut hosted = Ok(());
-            let first = self.handles.directory.plan().partition();
-            for partition in self.handles.directory.hosted() {
-                if partition.plan.partition() != first
-                    && let Err(error) = partition.host.stop().await
-                {
-                    hosted = Err(ServiceError::from(error));
-                }
-            }
-            let control = self
-                .handles
-                .control
-                .stop()
-                .await
-                .map_err(ServiceError::from);
+            self.pool.close();
             let content = self
                 .handles
                 .content
@@ -1363,13 +1405,16 @@ impl NetworkService {
                 .finish()
                 .await;
             joined?;
-            fleet?;
+            let fleet = fleet?;
             directory?;
             hosted?;
             control?;
             content?;
             self.listener.shutdown().await;
-            Ok::<(), ServiceError>(())
+            Ok::<ServiceStopped, ServiceError>(ServiceStopped {
+                sessions_led: fleet.sessions_led,
+                sessions_handed_off: fleet.sessions_handed_off,
+            })
         };
         // A future may be moved to another runtime between polls. Contain the
         // timer dependency here too, after the earlier run boundary has ended.
@@ -1387,7 +1432,15 @@ impl NetworkService {
         // cleanly) must not replace it.
         running.and(cleaned)
     }
-    async fn run_tasks<F, R>(&mut self, shutdown: F, mut on_status: R) -> Result<(), ServiceError>
+    /// Runs until `shutdown` resolves or a driver ends. On shutdown the
+    /// owners are stopped here, while the listener and the replication
+    /// drivers still run, and what their stops returned is handed back for
+    /// the cleanup; a driver's end returns its error and no stops.
+    async fn run_tasks<F, R>(
+        &mut self,
+        shutdown: F,
+        mut on_status: R,
+    ) -> Result<Option<StoppedOwners>, ServiceError>
     where
         F: Future<Output = std::io::Result<()>>,
         R: FnMut(&NetworkServiceStatus) -> std::io::Result<()>,
@@ -1615,6 +1668,7 @@ impl NetworkService {
             }
             std::future::pending::<Result<(), ServiceError>>().await
         };
+        let handles = &self.handles;
         tokio::pin!(
             network,
             local,
@@ -1637,9 +1691,9 @@ impl NetworkService {
             metrics_endpoint,
             pacer
         );
-        tokio::select! {
-            result=&mut shutdown=>result.map_err(ServiceError::Io),
-            result=&mut ready=>result,
+        let signalled = tokio::select! {
+            result=&mut shutdown=>result.map_err(ServiceError::Io).map(|()| true),
+            result=&mut ready=>result.map(|()| false),
             result=&mut network=>result.map_err(ServiceError::Wire).and(Err(ServiceError::Owner("network listener ended"))),
             result=&mut local=>result.map_err(ServiceError::Wire).and(Err(ServiceError::Owner("local listener ended"))),
             result=&mut admin=>result.map_err(ServiceError::Wire).and(Err(ServiceError::Owner("admin listener ended"))),
@@ -1647,7 +1701,7 @@ impl NetworkService {
             result=&mut placement_agent=>result.map_err(ServiceError::Agent).and(Err(ServiceError::Owner("placement agent ended"))),
             result=&mut archive_agent=>result.map_err(ServiceError::Access).and(Err(ServiceError::Owner("archive agent ended"))),
             result=&mut gc_agent=>result.map_err(ServiceError::Access).and(Err(ServiceError::Owner("collector agent ended"))),
-            result=&mut directory_driver=>result,
+            result=&mut directory_driver=>result.map(|()| false),
             ()=&mut liveness=>Err(ServiceError::Owner("liveness driver ended")),
             ()=&mut routes=>Err(ServiceError::Owner("route cache driver ended")),
             _=&mut managed_support=>Err(ServiceError::Owner("managed capability driver ended")),
@@ -1662,7 +1716,27 @@ impl NetworkService {
                 Some(failure) => ServiceError::ControlOwner(failure),
                 None => ServiceError::Owner("control owner ended"),
             }),
+        };
+        if !signalled? {
+            return Ok(None);
         }
+        // The stop phase: the owners stop while the listener that receives
+        // their peers' messages and the drivers that carry theirs are still
+        // polled — a leader among them hands its log off first (27 §5),
+        // which is messages both ways. A driver that ends here was closed
+        // by an owner that stopped; it is not what ends the service.
+        let stops = stop_owners(handles);
+        tokio::pin!(stops);
+        let (mut network_ended, mut control_ended, mut ledger_ended) = (false, false, false);
+        let stopped = loop {
+            tokio::select! {
+                stopped = &mut stops => break stopped,
+                _ = &mut network, if !network_ended => network_ended = true,
+                _ = &mut control_driver, if !control_ended => control_ended = true,
+                _ = &mut ledger_driver, if !ledger_ended => ledger_ended = true,
+            }
+        };
+        Ok(Some(stopped))
     }
 }
 fn clean_socket(path: &Path, root: &Path) -> Result<(), ServiceError> {

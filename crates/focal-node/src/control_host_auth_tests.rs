@@ -183,6 +183,7 @@ async fn root_read_rechecks_enrollment_when_its_quorum_barrier_completes() {
         _allocation: None,
     });
     let mut owner = Owner {
+        stopping: None,
         replica: network.control,
         initial: None,
         verifier: NoDirectoryAuthority,

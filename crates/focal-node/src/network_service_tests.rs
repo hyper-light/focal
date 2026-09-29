@@ -25,7 +25,7 @@ pub(crate) struct Running {
     /// The node's data handler, for requests without a transport.
     pub(crate) data: DataService,
     stop: Option<oneshot::Sender<()>>,
-    task: tokio::task::JoinHandle<Result<(), ServiceError>>,
+    task: tokio::task::JoinHandle<Result<ServiceStopped, ServiceError>>,
 }
 impl Running {
     pub(crate) async fn start(settings: &TestSettings) -> Self {
@@ -81,10 +81,10 @@ impl Running {
     /// stop reports is the service's own `ShutdownTimeout`, not a guess of
     /// the harness about how long a stop takes on this machine.
     async fn stopped(
-        task: &mut tokio::task::JoinHandle<Result<(), ServiceError>>,
+        task: &mut tokio::task::JoinHandle<Result<ServiceStopped, ServiceError>>,
     ) -> Result<(), ServiceError> {
         match tokio::time::timeout(SHUTDOWN_DEADLINE.saturating_add(FROZEN), task).await {
-            Ok(joined) => joined.unwrap(),
+            Ok(joined) => joined.unwrap().map(|_| ()),
             Err(_) => panic!(
                 "the service did not return within its shutdown deadline of {SHUTDOWN_DEADLINE:?} and a frozen allowance of {FROZEN:?}"
             ),

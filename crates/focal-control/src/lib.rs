@@ -27,6 +27,29 @@ pub use contacts::*;
 pub use membership::*;
 pub use replica::*;
 pub use rpc::*;
+
+/// The voter a stopping leader hands its log to (27 §5): among the voters
+/// it has heard from recently and is replicating to, the one whose log
+/// matches furthest — the transfer catches it up to the last entry before
+/// it is asked to campaign, so the nearest one is the quickest — and the
+/// lowest id among equals, so that every reading of the same progress
+/// names one heir. None while no other voter qualifies: a leader alone
+/// has no one to hand off to, and stops as it did.
+pub fn heir(
+    status: &focal_consensus::NodeStatus,
+    peers: &[focal_consensus::PeerProgress],
+) -> Option<u64> {
+    peers
+        .iter()
+        .filter(|peer| {
+            peer.node != status.node_id
+                && status.voters.contains(&peer.node)
+                && peer.state == 1
+                && peer.recent_active
+        })
+        .max_by_key(|peer| (peer.matched, core::cmp::Reverse(peer.node)))
+        .map(|peer| peer.node)
+}
 pub use state::*;
 
 use focal_directory::{DirectoryError, PartitionCommand, PartitionConfig, RootCommand, RootConfig};

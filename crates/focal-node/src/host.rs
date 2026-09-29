@@ -656,7 +656,8 @@ fn dispatch(
         }
     };
     response.result = result.unwrap_or_else(Response::Error);
-    if encode_payload(&response, limits.max_frame_bytes).is_err() {
+    // The limit alone decides: the reply is encoded once, by the transport.
+    if payload_len(&response, limits.max_frame_bytes).is_err() {
         response.result = Response::Error(AccessError::Capacity);
     }
     response

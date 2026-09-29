@@ -215,6 +215,7 @@ fn owner(
         _allocation: None,
     });
     Owner {
+        stopping: None,
         replica,
         initial: None,
         verifier: NoDirectoryAuthority,

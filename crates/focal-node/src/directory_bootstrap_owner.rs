@@ -106,6 +106,7 @@ impl ControlHost {
                             initial: None,
                             verifier: crate::cluster::NoDirectoryAuthority,
                             config,
+                            stopping: None,
                             limits,
                             budget,
                             pending: VecDeque::new(),

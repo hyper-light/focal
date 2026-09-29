@@ -11578,3 +11578,81 @@ zip member marked a regular file, `S_IFREG`, which the builder now sets), run by
 `uvx --from <wheel> focal`, all eight wheels passing `twine check`, and the npm
 pair installed with and without install scripts (`focal 0.1.0` both ways, the
 command on `PATH` a Mach-O executable after postinstall and the Node shim without).
+
+### 2026-09-29 — the port from slates, batch one: a round's whole deadline, a leader that hands off when told to stop; the allocation audit's first two reductions
+
+**What slates has that focal lacked, catalogued.** Every transport, runtime and
+consensus change slates made since focal's last port (2026-09-10 to 09-29) is
+judged in [`docs/qualification/slates-delta-2026-09-29.md`](../qualification/slates-delta-2026-09-29.md):
+of its transport work quinn already provides eighteen items and focal had five;
+its consensus work leaves two defect classes present in focal and one port of
+the first rank, all three taken here or next. The KIND fault campaign
+([`docs/qualification/campaigns/2026-09-29-kind.md`](../qualification/campaigns/2026-09-29-kind.md))
+brought focal up on real pods, passed the two-party workflow through them and
+measured kills, partitions and netem, and found five defects (D1 to D5, open
+below); the allocation audit
+([`docs/qualification/allocations-2026-09-29.md`](../qualification/allocations-2026-09-29.md))
+counted 357 allocations, 12 reallocations and 574 KB per committed claim, six
+`F_FULLFSYNC` per claim, and ranked sixteen reductions.
+
+**A round that has gathered nothing is given its whole deadline** (27 §3.1 P1).
+`RoundBudget::derive` judged every round at three quarters of its deadline; a
+round with no answer in hand ended there, though the deadline was derived from
+the tail of the round's peers so an answer inside it is the one the round opened
+for — the defect slates found in its `DispatchWait` on 2026-09-29, in focal's port
+since P1. `DeadlineExtender::judgement_ns` is the deadline while nothing has
+arrived and the lookahead once something has; the wire round's test that pinned
+the old rule (`a_round_with_no_answer_ends_at_its_lookahead`, 75 ms) now ends at
+100 ms, and an answer at 90 ms of a 100 ms round is collected.
+
+**A leader told to stop hands its log off** (27 §5; slates 4e38d3e). A replica that
+leads when its owner is told to stop asks the most caught-up voter it hears from to
+campaign (`focal_control::heir`: replicating, recently active, the furthest
+matched, the lowest id among equals; a session prefers its placement's preferred
+leader when that one qualifies) and keeps ticking and beating until the log leads
+elsewhere or one election timeout of its own periods has passed, then stops as
+before; the control groups do the same in their loop. On three real processes
+(`tests/stop_handoff.rs`: three voters, the session's leader sent SIGTERM) the
+survivors were led again in **84 ms, in one term**, where the leader that went
+silent had cost them 5.2 to 7.0 s under this machine's load. The test reads the
+succession from the survivors' live `cluster replicas diagnostics` (the metrics
+are sampled every five seconds and cannot time a hand-off) and requires the
+stopped node's own account of it: a planned stop now prints one last status
+record, `{"condition": "Stopped", "sessions_led": n, "sessions_handed_off": m}`
+([network-startup](../network-startup.md)), from the replica's progress
+(`StopHandOff`) through the fleet's stop (`FleetStopReport`) and the service
+(`ServiceStopped`). Four defects of the stop path stood in the way, each found by
+the test: the service's `select!` returned on the signal and dropped the egress
+drivers and the listener before the owners stopped, so nothing a leader sent
+could leave and nothing its peers sent could arrive (a stop is now a phase of
+`run_tasks`: the owners stop while `network`, `control_driver` and
+`ledger_driver` are still polled, and a driver that ends because an owner closed
+it is not what ends the service); the fleet's quiesce refused every routing lookup
+(`replica_target` routes to a fleet's sessions while they stop, each refusing for
+itself); the shared worker discarded every message routed to a stopping session
+(`enqueue` and `schedule_when` keep a handing-off session's work); the peer pool
+closed before the owners (it closes after them). `focal_session_periods_total`
+joins the metrics: the session owner's periods, the unit its election timer
+counts.
+
+**The audit's first reductions.** R3: `RamLog::reserve_slots` charged the budget
+for the next power of two of what the log needs and then reserved exactly the
+addition, so every commit moved the whole retained log (two reallocations a
+commit, hundreds of kilobytes before a checkpoint); it reserves to the charged
+power of two now (`slots_grow_to_the_power_of_two_the_budget_was_charged_for`,
+failing first). R8: the host and the object reads encoded a whole reply only to
+measure it; `payload_len` applies the same limit without allocating. The audit's
+counting benches (`allocs` in focal-memory, -wire, -log, -core, -raft and
+tools/load; bench-only, a counting allocator with sampled sites) are kept for the
+reductions to come.
+
+**Open, from the campaign and the catalog:** D1 the rendered kustomization emits no
+Namespace object; D2 a native activation over an empty prefix before scale-out
+fail-closes the voters added after it (they never promised the successor decoder
+floor); D3 the first `activate-native` after a fresh founder answers a transient
+unavailable; D4 an operator read on a follower's socket stalls 30 s (the client's
+retry ceiling) instead of forwarding or refusing with the leader named; D5 the
+rendered deployment leaves the root group a single voter; C3 consensus messages
+refused `Busy` on the two-permit per-peer lane are dropped uncounted; the
+audit's R1/R2 (one durable group commit per proposal; one fsync per commit) are
+design decisions to take.
