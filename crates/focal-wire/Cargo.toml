@@ -16,10 +16,10 @@ postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 # The congestion controller's interface names a type quinn does not re-export.
-quinn-proto = { version = "0.11.18", default-features = false, features = ["rustls-ring"] }
-rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+quinn-proto = { version = "0.11.18", default-features = false, features = ["rustls-aws-lc-rs"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
 
 [target.'cfg(windows)'.dependencies]
 focal-platform = { version = "0.1.0", path = "../focal-platform" }
@@ -27,7 +27,7 @@ focal-platform = { version = "0.1.0", path = "../focal-platform" }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 focal-model = { version = "0.1.0", path = "../focal-model" }
-rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "aws_lc_rs"] }
 bytes = "1"
 focal-sim = { version = "0.1.0", path = "../focal-sim" }
 serde_json.workspace = true

@@ -82,7 +82,7 @@ fn server_config(
     ca: &[u8],
     limits: &WireLimits,
 ) -> Result<quinn::ServerConfig, WireError> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut roots = rustls::RootCertStore::empty();
     roots
         .add(CertificateDer::from(ca))

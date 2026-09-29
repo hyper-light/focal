@@ -16,7 +16,7 @@ blake3.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 focal-consensus = { version = "0.1.0", path = "../focal-consensus" }
-rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
 
 [lints]
 workspace = true

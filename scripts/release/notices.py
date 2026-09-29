@@ -18,6 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 INVENTORY = ROOT / "docs" / "dependencies" / "inventory.tsv"
 LOCKFILE = ROOT / "Cargo.lock"
+WORKSPACE = ROOT / "Cargo.toml"
 WORKSPACE_LICENSE = "MIT"
 NOTICES = "THIRD-PARTY-NOTICES.txt"
 SBOM = "sbom.spdx.json"
@@ -25,6 +26,23 @@ SBOM = "sbom.spdx.json"
 
 def die(message):
     raise SystemExit(f"notices: {message}")
+
+
+def workspace_members():
+    """The names of the workspace's own crates: every package under a
+    `[workspace] members` glob. A package in `Cargo.lock` without a `source`
+    that is not one of these is a third-party crate built from `vendor/`
+    (`[patch.crates-io]`), which the notices and the SBOM must list."""
+    workspace = tomllib.loads(WORKSPACE.read_text())
+    names = set()
+    for pattern in workspace.get("workspace", {}).get("members", []):
+        for manifest in sorted(ROOT.glob(f"{pattern}/Cargo.toml")):
+            package = tomllib.loads(manifest.read_text()).get("package")
+            if package and "name" in package:
+                names.add(package["name"])
+    if not names:
+        die("no workspace members found under the [workspace] members globs")
+    return names
 
 
 def read_inventory():
@@ -48,21 +66,29 @@ def read_inventory():
 
 def lock_packages():
     document = tomllib.loads(LOCKFILE.read_text())
+    members = workspace_members()
     packages = []
     for package in document.get("package", []):
+        source = package.get("source")
+        # Workspace members and vendored path crates have no `source` in the
+        # lockfile; registry and git crates do. A vendored crate is third
+        # party: its locator comes from the roster (the crates.io archive it
+        # was unpacked from and that archive's checksum, `vendor/README.md`).
+        vendored = source is None and package["name"] not in members
         packages.append(
             {
                 "name": package["name"],
                 "version": package["version"],
-                # Workspace/path members have no `source`; registry/git crates do.
-                "source": package.get("source"),
+                "source": source,
+                "third_party": source is not None or vendored,
+                "vendored": vendored,
             }
         )
     return sorted(packages, key=lambda package: (package["name"], package["version"]))
 
 
 def check_drift(inventory, packages):
-    external = {(p["name"], p["version"]) for p in packages if p["source"]}
+    external = {(p["name"], p["version"]) for p in packages if p["third_party"]}
     listed = set(inventory)
     missing = external - listed
     extra = listed - external
@@ -79,11 +105,15 @@ def resolve_licenses(inventory, packages):
     resolved = []
     for package in packages:
         key = (package["name"], package["version"])
-        if package["source"]:
+        if package["third_party"]:
             license_ = inventory[key]["license"]
+            # A vendored crate's locator is the roster's: the registry archive
+            # it is a verbatim copy of, with that archive's checksum.
+            source = package["source"] or inventory[key]["source"]
         else:
             license_ = WORKSPACE_LICENSE
-        resolved.append({**package, "license": license_})
+            source = None
+        resolved.append({**package, "license": license_, "source": source})
     return resolved
 
 
@@ -97,13 +127,16 @@ def render_notices(packages):
     )
     blocks = []
     for package in packages:
-        if not package["source"]:
+        if not package["third_party"]:
             continue  # the workspace's own crates are not third-party notices
-        blocks.append(
+        block = (
             f"{package['name']} {package['version']}\n"
             f"  License: {package['license']}\n"
             f"  Source:  {package['source']}\n"
         )
+        if package["vendored"]:
+            block += f"  Built from: vendor/{package['name']}, a verbatim copy of that archive\n"
+        blocks.append(block)
     return header + "\n".join(blocks)
 
 

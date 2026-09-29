@@ -11410,3 +11410,60 @@ four suites at a time on an otherwise idle machine:
 The suites wait on facts charged to the owners' periods, and the owners' pace covers the
 stalls the load causes, so what took longer was the machine's work and not the tests'
 waiting; none gave up.
+
+### 2026-09-29 — CI on `ad2f6f0`; one cryptographic provider, built from the tree (F57)
+
+**CI on `ad2f6f0`** (the racy first-poll test stated as its effects): green on all three
+platforms — Windows build, and the Rust contracts workflow's model, dependencies, Linux and
+macOS checks. The batch before it, `c1af831`, closed the owed items of the period.
+
+**One cryptographic provider.** Every TLS, QUIC and certificate dependency now names
+aws-lc-rs — `rustls` `aws_lc_rs`, `quinn` and `quinn-proto` `rustls-aws-lc-rs`, `rcgen`
+`aws_lc_rs`, `x509-parser` `verify-aws` — and the ECDSA P-256 verification of enrollment
+statements is `aws_lc_rs::signature` (the same API shape as before). `ring` is enabled by no
+crate and no feature; it stays in `Cargo.lock` only as `quinn-proto`'s dependency for
+`wasm32-unknown-unknown`, which focal does not build (`cargo tree -i ring` is empty on every
+shipped target). `scripts/check-contracts.py` refuses a manifest that depends on `ring` or
+turns a ring feature back on ([07](07-decisions-and-traceability.md) F57).
+
+**Built from the tree.** `aws-lc-rs` 1.18.1 and `aws-lc-sys` 0.45.0 (AWS-LC 5.7.0) are
+checked in under `vendor/`, verbatim copies of the crates.io archives whose SHA-256 were
+checked against the registry's before unpacking and are recorded in `vendor/README.md`;
+`[patch.crates-io]` builds them from there, offline. They are third-party code, not
+workspace members: focal's lints and panic policy do not extend to them, and the release
+notices and SBOM list them from `Cargo.lock` with the archive as their locator
+(`scripts/release/notices.py` learned that a lockfile package without a source that is not a
+workspace member is a vendored crate). No lane needs CMake, Go or bindgen; the toolchain
+notes are in [building.md](../building.md) and [20](20-binary-distribution.md) §2.
+
+**What the provider costs a process.** AWS-LC seeds its randomness from CPU jitter entropy
+(SP 800-90B; kept on), and the first randomness a process draws pays for it once. Measured in
+isolation on this machine (macOS arm64, native release builds, eight runs each): the first 32
+bytes from aws-lc-rs take 20.6–25.2 ms, from ring 0.002 ms — about 4,000 jitter samples (the
+1,124-sample startup health test, a 960-sample fill of a fresh collector, two 960-sample
+blocks for the 48-byte root seed; ≈ 6 µs a sample, the sample being the timed unoptimized
+Keccak loop that *is* the noise source). On focal's own paths, release builds of the tree
+before (`ad2f6f0`, ring) and of this tree, on the same machine in one sitting (a background
+load of 4–14 throughout, seen by both):
+
+| Path | before | after |
+|---|---|---|
+| A networked founder's `start --advertise` to its readiness line — twelve rounds each, the binaries alternating every round | median 3,181 ms (2,664–3,463) | median 3,100 ms (2,691–3,578) |
+| `cluster invite` (an admin request the founder signs) — two passes of ten | 111 / 106 ms | 100 / 107 ms |
+| A peer's `join --invite-file` (a CLI process enrolling over TLS: its first randomness) — two passes of ten | 315 / 332 ms | 321 / 327 ms |
+| The joined peer's `start` to its readiness line — two passes of ten | 124 / 111 ms | 99 / 122 ms |
+
+An embedded `start` (a Unix socket, no cryptography) measured 162 ms before and after. The
+22 ms is a fixed cost for each process that draws randomness; on these paths it lies inside
+the run-to-run spread (the founder's three seconds are its root election, not cryptography),
+and where it is paid in full is a short-lived process that does one cryptographic thing,
+which the isolated measurement is.
+
+The structural half of that cost — the startup test's 1,124 health-tested samples, which
+the standard allows to be used (§4.3 item 4) and which jitterentropy frees, and the fill of
+the fresh collector — is a change proposed upstream and not a build flag: the flag that
+removes the latency removes the entropy source. What remains after it is the price of a
+per-process 90B source, and whether focal keeps paying it is recorded here when decided.
+
+**Gates** on the final tree (macOS arm64): `cargo fmt --all --check`, `check-contracts.py`, clippy with `-D warnings`, `check-production.sh`, `cargo deny`, and the workspace's tests with four threads: 148 suites, 2,870 tests, none failed, 3 ignored — the same counts as the ring tree, with the process-spawning suites within their usual spread (`placement_binary` 205.0 s against 204.5 s, `runbooks` 145.0 s against 142.7 s). `cargo deny` passes with seven
+duplicate-version warnings (`docs/dependencies/README.md`).

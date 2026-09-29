@@ -1986,7 +1986,7 @@ async fn multiplexed_connection_cannot_bypass_data_alpn_or_client_identity() {
         let pki = Pki::new();
         let (server_certificate, server_key) = pki.issue(true);
         let (client_certificate, client_key) = pki.issue(false);
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut roots = rustls::RootCertStore::empty();
         roots
             .add(CertificateDer::from(pki.ca.der().to_vec()))

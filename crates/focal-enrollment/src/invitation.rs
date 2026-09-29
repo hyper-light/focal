@@ -46,7 +46,7 @@ impl ServerTrust {
     /// credential; the exact leaf pin is checked on the connection.
     pub fn client_config(&self) -> Result<rustls::ClientConfig, EnrollmentError> {
         self.validate()?;
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut config = rustls::ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|_| EnrollmentError::Crypto)?
@@ -95,7 +95,7 @@ impl ServerTrust {
         let (first, intermediates) = certificates
             .split_first()
             .ok_or(EnrollmentError::Unauthorized)?;
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
             Arc::new(self.roots()?),
             provider,
@@ -203,7 +203,7 @@ impl Invitation {
     /// Ordinary TLS 1.3 chain/name verification; no custom verifier or 0-RTT.
     pub fn client_config(&self) -> Result<rustls::ClientConfig, EnrollmentError> {
         self.data.trust.validate()?;
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut config = rustls::ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|_| EnrollmentError::Crypto)?

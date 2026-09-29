@@ -213,7 +213,7 @@ pub fn server_tls(
     limits: &WireLimits,
 ) -> Result<quinn::ServerConfig, WireError> {
     limits.validate()?;
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
         Arc::new(roots(client_roots)?),
         provider.clone(),
@@ -251,7 +251,7 @@ pub fn client_tls(
     limits: &WireLimits,
 ) -> Result<quinn::ClientConfig, WireError> {
     limits.validate()?;
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut tls = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|_| WireError::Authentication)?

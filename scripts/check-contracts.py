@@ -13,6 +13,32 @@ links = 0
 for manifest in sorted((ROOT / "crates").glob("*/Cargo.toml")):
     if not re.search(r"(?m)^\[lints\]\s*\nworkspace\s*=\s*true\s*$", manifest.read_text()):
         errors.append(f"workspace lint policy not inherited: {manifest.relative_to(ROOT)}")
+
+# One cryptographic provider (decision F57, doc 07): aws-lc-rs, built from the
+# sources in vendor/. No workspace manifest may depend on `ring` or turn on a
+# crate's ring-backed feature; every TLS, QUIC and certificate dependency names
+# the aws-lc-rs feature instead, so the choice cannot drift crate by crate.
+RING_FEATURES = {
+    "rustls": ("ring", "aws_lc_rs"),
+    "quinn": ("rustls-ring", "rustls-aws-lc-rs"),
+    "quinn-proto": ("rustls-ring", "rustls-aws-lc-rs"),
+    "rcgen": ("ring", "aws_lc_rs"),
+    "x509-parser": ("verify", "verify-aws"),
+}
+for manifest in sorted(list((ROOT / "crates").glob("*/Cargo.toml")) + list((ROOT / "tools").glob("*/Cargo.toml"))):
+    for line in manifest.read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if re.match(r"^ring\s*=", line):
+            errors.append(f"direct dependency on ring: {manifest.relative_to(ROOT)}")
+        for crate, (ring_feature, aws_feature) in RING_FEATURES.items():
+            if not re.match(rf"^{re.escape(crate)}\s*=", line):
+                continue
+            features = re.search(r"features\s*=\s*\[([^\]]*)\]", line)
+            names = set(re.findall(r'"([^"]+)"', features[1])) if features else set()
+            if ring_feature in names or aws_feature not in names:
+                errors.append(
+                    f"{manifest.relative_to(ROOT)}: {crate} must use the {aws_feature} feature, not {ring_feature}"
+                )
 for path in sorted(DOCS.glob("*.md")):
     for target in re.findall(r"(?<!!)\[[^\]]*\]\(([^)]+)\)", path.read_text()):
         target = target.split("#", 1)[0]

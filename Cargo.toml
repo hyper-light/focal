@@ -49,6 +49,13 @@ arithmetic_side_effects = "deny"
 disallowed_macros = "deny"
 disallowed_methods = "deny"
 
+# The crypto provider is built from the sources checked into `vendor/`, byte
+# for byte the crates.io archives whose checksums `vendor/README.md` records,
+# so a release is built from what was reviewed and can be built offline.
+[patch.crates-io]
+aws-lc-rs = { path = "vendor/aws-lc-rs" }
+aws-lc-sys = { path = "vendor/aws-lc-sys" }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

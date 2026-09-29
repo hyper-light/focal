@@ -496,7 +496,7 @@ fn tls_ca_and_name_verification_does_not_replace_the_exact_invited_leaf_pin() {
     };
     let config = |certificate: Vec<u8>, key: &KeyPair| {
         let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
+            rustls::crypto::aws_lc_rs::default_provider(),
         ))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .unwrap()

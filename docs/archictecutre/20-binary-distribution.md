@@ -24,6 +24,13 @@ macOS 15 arm64/x86_64, GNU Linux arm64/x86_64 built on Ubuntu 24.04, and static
 musl Linux arm64/x86_64. Each runs on its native processor. The musl binary runs
 inside the pinned Rust Alpine image and on the native Ubuntu runner; binary
 inspection verifies architecture and absence of dynamic musl dependencies.
+Every lane compiles the cryptographic provider, AWS-LC, from the sources under
+[`vendor/`](../../vendor/README.md) with the lane's C compiler ([07](07-decisions-and-traceability.md) F57): the GNU and
+macOS lanes with the runner's toolchain, the musl lanes with the Alpine image's
+`build-base`, Windows x86_64 with the prebuilt NASM objects the crate carries and
+Windows arm64 with the clang-cl toolset; no lane needs CMake, Go or bindgen. The
+Windows import table stays within the set `release.py` verifies, since AWS-LC
+links `bcrypt.dll` and loads `bcryptprimitives.dll` (ProcessPrng) at run time.
 
 The [release implementation](../../scripts/release/release.py) separates checks:
 

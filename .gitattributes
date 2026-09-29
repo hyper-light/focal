@@ -1,0 +1,2 @@
+# Third-party sources built into the binaries (vendor/README.md), not focal's own.
+vendor/** linguist-vendored

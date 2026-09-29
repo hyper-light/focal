@@ -13,7 +13,10 @@ Building from source is optional, for contributors or a custom build. The
 workspace pins Rust 1.94.1 and edition 2024. `Cargo.lock` records the resolved
 dependency graph. Install Rust through rustup and a native protobuf compiler
 (`brew install protobuf` on macOS; `apt-get install protobuf-compiler` on
-Debian/Ubuntu), then run from the checkout:
+Debian/Ubuntu), then run from the checkout. The cryptographic provider, aws-lc-rs, compiles AWS-LC from the
+sources under `vendor/` with the C compiler the workspace already needs; no CMake, Go or bindgen is required on
+any target focal ships (Windows x86_64 uses the prebuilt NASM objects the crate carries; Windows arm64 needs the
+clang-cl toolset of Visual Studio, [20](archictecutre/20-binary-distribution.md)):
 
 ```sh
 bash scripts/cargo.sh build --release -p focal-node --bin focal --locked
@@ -42,8 +45,8 @@ python3 scripts/check-contracts.py
 The general CI matrix requests Linux x86_64 and macOS arm64 checks; the release
 workflow additionally requires all six native binary lanes. Configured jobs do
 not prove those environments have passed. Local verification is on macOS arm64.
-`cargo-deny` 0.20.2 passed advisories, bans, licenses, and sources on 2026-09-05,
-with ten duplicate-version warnings and no advisory suppressions;
+`cargo-deny` 0.20.2 passed advisories, bans, licenses, and sources on 2026-09-29,
+with seven duplicate-version warnings and no advisory suppressions;
 [dependency review](dependencies/README.md) records the scope. Windows requires a
 real native transport and durable filesystem port. Complete release-matrix
 qualification, Meta-scale performance, and multi-region deployment remain

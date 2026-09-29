@@ -49,10 +49,10 @@ serde_json.workspace = true
 serde_saphyr = { workspace = true, features = ["serialize"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-std"] }
-rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
 # Listener shutdown observes the final runtime owner. Reaudit Quinn's endpoint/
 # connection socket-before-runtime drop ordering before changing this version.
-quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 zeroize = "1.8"
 
 [dev-dependencies]
@@ -61,4 +61,4 @@ focal-sim = { version = "0.1.0", path = "../focal-sim" }
 focal-core = { version = "0.1.0", path = "../focal-core", features = ["test-support"] }
 focal-log = { version = "0.1.0", path = "../focal-log", features = ["test-support"] }
 tempfile.workspace = true
-rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring", "x509-parser"] }
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "aws_lc_rs", "x509-parser"] }
