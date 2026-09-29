@@ -105,6 +105,15 @@ pub enum ServiceError {
     ShutdownTimeout,
 }
 
+/// How long a stopping node gives its owners to finish — every copy's
+/// checkpoint, the root's, the content store's — before it exits and leaves
+/// recovery to replay the durable log. The process managers the deployments
+/// run under are configured above it (`deploy/`: `TimeoutStopSec`, the pod's
+/// termination grace), so a stop that reaches this bound is the node's own
+/// failure to stop, never the manager's kill. A test that stops a node waits
+/// this long and then that the node kept its word.
+pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
+
 #[derive(Clone, Debug, Serialize)]
 pub struct NetworkServiceStatus {
     pub condition: &'static str,
@@ -1365,7 +1374,7 @@ impl NetworkService {
         // A future may be moved to another runtime between polls. Contain the
         // timer dependency here too, after the earlier run boundary has ended.
         let cleaned = std::panic::AssertUnwindSafe(async {
-            tokio::time::timeout(Duration::from_secs(30), cleanup)
+            tokio::time::timeout(SHUTDOWN_DEADLINE, cleanup)
                 .await
                 .map_err(|_| ServiceError::ShutdownTimeout)?
         })

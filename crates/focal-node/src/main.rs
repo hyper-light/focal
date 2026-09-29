@@ -448,7 +448,7 @@ async fn start(settings: Settings) -> Result<()> {
         signal_result?;
         Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
     };
-    tokio::time::timeout(std::time::Duration::from_secs(30), cleanup)
+    tokio::time::timeout(focal_node::network_service::SHUTDOWN_DEADLINE, cleanup)
         .await
         .map_err(|_| "shutdown deadline exceeded; recovery will replay the durable log")?
 }

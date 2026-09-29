@@ -11505,5 +11505,14 @@ imports the verifier had never seen because it had never seen a Windows binary:
 randomness from (allowed; part of Windows since 8), and `vcruntime140.dll`, the dynamic C
 runtime (not allowed: the Windows lanes now link the runtime statically, as the musl lanes
 do, so the executables need no Visual C++ redistributable). The six Unix lanes and the
-workspace test job passed on the provider on both dispatches.
+workspace test job passed on the provider on both dispatches. The third dispatch's own workspace test job failed one unit test,
+`network_service::tests::a_founder_restarted_on_a_new_listen_address_behind_its_advertised_endpoint_recovers`,
+at the test harness's stop: `Running::stop` gave a stopping service ten seconds of the clock
+where the service gives its own cleanup thirty (`ShutdownTimeout`; the deployments' process
+managers wait 45). Here a stop takes about a second; on the loaded runner one took more than
+ten and less than thirty, which is the service keeping its word and the harness guessing
+against it. The deadline is one named constant now (`network_service::SHUTDOWN_DEADLINE`,
+used by the service, the embedded node's stop and the harness), and the harness waits that
+deadline and the frozen allowance after it: what it catches is a service that does not return
+at all, and a slow stop reports the service's own `ShutdownTimeout`.
 

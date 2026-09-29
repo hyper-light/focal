@@ -68,18 +68,27 @@ impl Running {
     /// Stop and report how the service ended, without unwrapping.
     pub(crate) async fn outcome(mut self) -> Result<(), ServiceError> {
         let _ = self.stop.take().unwrap().send(());
-        tokio::time::timeout(Duration::from_secs(10), &mut self.task)
-            .await
-            .unwrap()
-            .unwrap()
+        Self::stopped(&mut self.task).await
     }
     pub(crate) async fn stop(mut self) {
         let _ = self.stop.take().unwrap().send(());
-        tokio::time::timeout(Duration::from_secs(10), &mut self.task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        Self::stopped(&mut self.task).await.unwrap();
+    }
+    /// A stopping service keeps its own word: its cleanup ends within
+    /// `SHUTDOWN_DEADLINE`, by finishing or by `ShutdownTimeout`. The wait
+    /// here is that deadline and the frozen allowance after it, so what it
+    /// catches is a service that did not return at all, and what a slow
+    /// stop reports is the service's own `ShutdownTimeout`, not a guess of
+    /// the harness about how long a stop takes on this machine.
+    async fn stopped(
+        task: &mut tokio::task::JoinHandle<Result<(), ServiceError>>,
+    ) -> Result<(), ServiceError> {
+        match tokio::time::timeout(SHUTDOWN_DEADLINE.saturating_add(FROZEN), task).await {
+            Ok(joined) => joined.unwrap(),
+            Err(_) => panic!(
+                "the service did not return within its shutdown deadline of {SHUTDOWN_DEADLINE:?} and a frozen allowance of {FROZEN:?}"
+            ),
+        }
     }
 }
 /// How long the slowest observed owner may run no period at all before a
