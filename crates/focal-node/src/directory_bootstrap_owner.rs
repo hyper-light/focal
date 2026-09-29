@@ -101,12 +101,15 @@ impl ControlHost {
                 let _outcome = catch_unwind(AssertUnwindSafe(
                     || -> Result<(), DirectoryBootstrapError> {
                         let opened = permit.open(wal, &budget, image)?;
+                        let lost = std::sync::mpsc::sync_channel(crate::fleet::LOST_PEERS);
                         let owner = Owner {
                             replica: opened.into_replica(),
                             initial: None,
                             verifier: crate::cluster::NoDirectoryAuthority,
                             config,
                             stopping: None,
+                            lost_sender: lost.0,
+                            lost: lost.1,
                             limits,
                             budget,
                             pending: VecDeque::new(),

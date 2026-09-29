@@ -102,10 +102,18 @@ pub struct ControlReplicationFrame {
     pub target: u64,
     pub request: RequestEnvelope,
     snapshot: Option<oneshot::Sender<focal_consensus::SnapshotStatus>>,
+    /// Where the driver says the peer could not be reached (`ReplicationFrame::lost`).
+    lost: Option<mpsc::SyncSender<u64>>,
     // Retained until transport finishes, including connection setup/retries.
     _charge: Allocation,
 }
 impl ControlReplicationFrame {
+    /// The driver could not reach the peer at all.
+    pub(crate) fn lost(&mut self) {
+        if let Some(lost) = self.lost.take() {
+            let _ = lost.try_send(self.target);
+        }
+    }
     /// Transport acceptance releases snapshot flow control only. The separate
     /// Raft response remains responsible for durable replication progress.
     pub(crate) fn report_snapshot(&mut self, accepted: bool) {
@@ -301,6 +309,9 @@ struct Owner<V> {
     dropped: u64,
     failure: Option<String>,
     pub(crate) pace: TickPeriod,
+    /// Peers the driver could not reach, reported to the core each tick.
+    lost_sender: mpsc::SyncSender<u64>,
+    lost: mpsc::Receiver<u64>,
     /// The reply to a stop, and the owner's period at which a leader's
     /// hand-off is given up on: the stop completes once the log leads
     /// elsewhere, or then.
@@ -471,7 +482,9 @@ impl ControlHost {
         WireLimits {
             max_frame_bytes: 10 * 1024 * 1024,
             max_cost: 40 * 1024 * 1024,
-            ..WireLimits::default()
+            ..WireLimits::for_consensus(
+                u32::try_from(focal_consensus::DEFAULT_INFLIGHT_WINDOW).unwrap_or(u32::MAX),
+            )
         }
     }
     pub fn spawn<V: AuthorityVerifier + Send + 'static>(
@@ -558,12 +571,15 @@ impl ControlHost {
             },
             _allocation: None,
         });
+        let (lost_sender, lost) = mpsc::sync_channel(crate::fleet::LOST_PEERS);
         let owner = Owner {
             replica,
             initial,
             verifier,
             config: config.clone(),
             stopping: None,
+            lost_sender,
+            lost,
             limits: limits.clone(),
             budget: budget.clone(),
             pending: VecDeque::new(),
@@ -842,6 +858,23 @@ impl<V: AuthorityVerifier> Owner<V> {
                     // that is not ticked waits longer before it campaigns,
                     // and a leader sends its heartbeats a period later
                     // (27 §3.1 P3). It is no reason for the owner to end.
+                    // What the driver could not reach since the last tick,
+                    // told to the core: it probes those members instead. A
+                    // core fenced by a write it still persists is told next
+                    // tick; the report keeps its place.
+                    for _ in 0..crate::fleet::LOST_PEERS {
+                        let Ok(peer) = self.lost.try_recv() else {
+                            break;
+                        };
+                        match self.replica.report_unreachable(peer) {
+                            Ok(()) => {}
+                            Err(error) if self.replica.checkpoint_retryable(&error) => {
+                                let _ = self.lost_sender.try_send(peer);
+                                break;
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
                     match self.replica.tick() {
                         Ok(()) => {}
                         Err(error) if self.replica.checkpoint_retryable(&error) => {
@@ -1688,6 +1721,7 @@ impl<V: AuthorityVerifier> Owner<V> {
                     target: message.to,
                     request,
                     snapshot,
+                    lost: Some(self.lost_sender.clone()),
                     _charge: charge.commit(),
                 })
                 .is_err()

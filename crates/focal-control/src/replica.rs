@@ -625,6 +625,13 @@ impl ControlReplica {
         self.node.report_snapshot_at(peer, term, index, status)?;
         Ok(())
     }
+    /// Trusted transport feedback: an exchange with `peer` was lost; the
+    /// core probes the member instead of streaming to it.
+    pub fn report_unreachable(&mut self, peer: u64) -> Result<(), ControlError> {
+        self.check()?;
+        self.node.report_unreachable(peer)?;
+        Ok(())
+    }
 
     pub fn submit(
         &mut self,

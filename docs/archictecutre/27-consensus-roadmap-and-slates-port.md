@@ -576,6 +576,26 @@ transfer all of whose chunks were refused, none answered between them, is refuse
 copy of a release that takes chunks in their order only refuses one that came ahead,
 and is sent them one after another from the first.
 
+**The lanes of a connection are derived (2026-09-29).** A connection had sixteen
+streams, two of them for what a group asks of the peer, and the pool let two exchanges
+to a peer be in flight for all the groups the two nodes share, while the core keeps a
+hundred and twenty-eight messages in flight to a follower (`NodeConfig::max_inflight_messages`,
+the pipeline of the thesis's §10.2.1): the pipeline on the wire was two, and a message
+that found the lane full was refused (`Busy`), counted by the driver and dropped, so the
+leader learned of the gap only from the follower's next answer. The streams are derived
+now (`WireLimits::for_consensus`, `PeerPoolLimits::for_consensus`): one for the probe,
+the consensus window for what groups ask of the peer (`DEFAULT_INFLIGHT_WINDOW`, 128;
+a window derived from the path will follow, section 8.5 C6), and for content what the
+reference path holds in flight a stream's window at a time and one (`content_streams`:
+1 Gbit/s at 100 ms is twelve megabytes, thirteen streams) — 142, and the pool's lanes
+follow: the window to each peer, and the window for every connection it may open in
+all. A message of a group that finds its lane full waits its turn as content does, for
+as long as its exchange has (`PeerPoolLimits::timeout`), and is refused past that,
+which the driver counts (`focal_peer_messages_busy_total`); one to a peer the pool
+could not reach at all is told to the frame's owner, which reports the peer to its
+core (`Session::report_unreachable`), so the leader probes the member instead of
+streaming to it, counted per session (`focal_session_peers_unreachable_total`).
+
 **How long an exchange waits.** An exchange was given a time: five seconds by the
 pool, thirty by a connection. A megabyte needs 1.7 Mbit/s for the first and 0.28 for
 the second, and a path that carries less carried no content at all. The parts of an
@@ -670,7 +690,7 @@ of it was changed.
 
 | Open | Why it matters |
 |---|---|
-| The streams of a connection, sixteen by default (`WireLimits::streams_per_connection`) | The lane of content is derived from them; they are set. 1 Gbit/s at 100 ms holds twelve megabytes in flight, which thirteen streams carry (section 7) |
+| The streams of a connection, sixteen by default (`WireLimits::streams_per_connection`) | Done (2026-09-29): derived from the consensus window and the reference path (`WireLimits::for_consensus`, section 7), and a group's message waits its turn on its lane, bounded by its exchange's time, instead of being refused; a peer the pool could not reach at all is told to the core, which probes it |
 | The pool's deadline of five seconds for what is not content, the announcement's round of five and enrollment control's of four | Set, not derived. An exchange of a group with a peer further than that is not made; no path on this planet is, but a peer under load may be |
 | The request time an owner gives what it holds (`request_timeout`, five seconds) | Set, not derived; counted in the owner's periods now, so a loaded machine stretches it, but a follower whose owner stalls for longer than the leader's request time is not seen by the leader, whose own periods run on time. Under eight and sixteen copies of the control suite at once this is what remains (five of eight runs, none of sixteen): a leader whose term entry the stalled followers do not acknowledge in time answers `NotReady` until leadership has moved again. The request time should follow the exchange tails of the voters (`PeerConnectionPool::exchange_tail`), which a stalled follower stretches and the leader's own stall does not |
 | The control suite's single asks inside a request deadline of 350 ms | Done, at the cause: the owner gave a request 350 ms of the clock while a loaded machine slowed its rounds, so every ask timed out. A request now waits its time in the owner's own periods (`ControlHost`, `Pending::deadline`), and every ask of the suite that expects an answer waits for a definite one, charged to the hosts' periods (`Rig::definite`, `read_on_leader`); eight copies of the suite at once pass |

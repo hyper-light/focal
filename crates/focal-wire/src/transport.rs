@@ -56,6 +56,26 @@ const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// window is read as it arrives, so the window bounds what is in flight
 /// and not what is sent.
 pub const STREAM_WINDOW_CEILING: u32 = 1024 * 1024;
+/// The path the content lane is sized for: what one gigabit per second
+/// holds in flight over a hundred milliseconds (27 §7), a wide-area link
+/// between data centres; a nearer path fills fewer of its streams and a
+/// further one is not carried faster by more of them than the window
+/// the law opens.
+pub const REFERENCE_PATH_BITS_PER_SECOND: u64 = 1_000_000_000;
+pub const REFERENCE_PATH_ROUND_TRIP: std::time::Duration = std::time::Duration::from_millis(100);
+/// The streams a transfer to one peer may hold at once: what the
+/// reference path holds in flight, a stream's window at a time, and one
+/// ([`bulk_width`]): thirteen.
+pub fn content_streams() -> u32 {
+    let in_flight = REFERENCE_PATH_BITS_PER_SECOND
+        .saturating_mul(u64::try_from(REFERENCE_PATH_ROUND_TRIP.as_millis()).unwrap_or(u64::MAX))
+        .checked_div(8_000)
+        .unwrap_or(0);
+    let streams = in_flight
+        .div_ceil(u64::from(STREAM_WINDOW_CEILING))
+        .saturating_add(1);
+    u32::try_from(streams).unwrap_or(u32::MAX)
+}
 
 /// By how many streams a transfer goes on a connection whose law holds
 /// `window` bytes in flight, `most` at most: one for every megabyte the
@@ -698,7 +718,7 @@ async fn open_remote(
         _endpoint: endpoint.clone(),
         capacity: Arc::new(RemoteCapacity {
             data: Semaphore::new(limits.streams_per_connection as usize),
-            control: Semaphore::new(2),
+            control: Semaphore::new(limits.control_streams as usize),
             held: Held::default(),
         }),
     })
@@ -756,7 +776,13 @@ impl QuicRemote {
         } else {
             &self.capacity.data
         };
-        let _permit = lane.try_acquire().map_err(|_| WireError::Limit)?;
+        // The request waits its turn on the lane, no longer than the time
+        // its peer is given: a burst of a group's messages is carried in
+        // order, never refused for the lane being full at that instant.
+        let _permit = tokio::time::timeout(period, lane.acquire())
+            .await
+            .map_err(|_| WireError::Limit)?
+            .map_err(|_| WireError::Connection)?;
         let bytes = postcard::experimental::serialized_size(request)
             .map_err(|_| WireError::InvalidFrame)?;
         // The answer begins once the request has been carried and the

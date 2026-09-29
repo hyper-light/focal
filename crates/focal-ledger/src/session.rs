@@ -547,6 +547,14 @@ impl Session {
             .report_snapshot_at(node, term, index, status)?;
         Ok(())
     }
+    /// Trusted transport feedback: an exchange with `node` was lost — a dial
+    /// that failed, an answer that never came. The core probes the member
+    /// instead of streaming to it (27 §3.3).
+    pub fn report_unreachable(&mut self, node: u64) -> Result<(), LedgerError> {
+        self.check()?;
+        self.consensus.report_unreachable(node)?;
+        Ok(())
+    }
     pub fn step_authenticated(
         &mut self,
         peer_node_id: u64,

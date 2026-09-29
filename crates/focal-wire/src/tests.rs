@@ -1374,6 +1374,108 @@ async fn a_route_retired_during_its_dial_leaves_no_connection_behind() {
     task.await.unwrap().unwrap();
 }
 
+#[test]
+fn the_lanes_of_a_connection_are_derived_from_the_consensus_window_and_the_path() {
+    // Thirteen streams carry what the reference path holds (27 §7).
+    assert_eq!(content_streams(), 13);
+    let limits = WireLimits::for_consensus(128);
+    assert_eq!(
+        (limits.control_streams, limits.streams_per_connection),
+        (128, 142)
+    );
+    limits.validate().unwrap();
+    let pool = PeerPoolLimits::for_consensus(128);
+    assert_eq!(pool.per_peer_inflight, 128);
+    assert_eq!(
+        pool.max_inflight,
+        128 * PeerPoolLimits::default().max_connections
+    );
+    // A control lane wider than the connection is refused.
+    let mut wrong = WireLimits::default();
+    wrong.control_streams = wrong.streams_per_connection + 1;
+    assert!(wrong.validate().is_err());
+}
+
+/// A group's messages to a peer beyond its lane wait their turn and are all
+/// carried, in order: none is refused for the lane being full at that
+/// instant, which cost a vote a whole election timeout.
+#[tokio::test]
+async fn a_groups_message_waits_its_turn_on_the_lane_instead_of_being_refused() {
+    use std::collections::BTreeMap;
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(16).unwrap();
+    let mut node_grant = grant();
+    node_grant.role = PeerRole::Node { node_id: 7 };
+    registry
+        .register_certificate(&certificate, node_grant)
+        .unwrap();
+    let arrived = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (counted, released, seen) = (arrived.clone(), release.clone(), order.clone());
+    let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| {
+        let (counted, released, seen) = (counted.clone(), released.clone(), seen.clone());
+        async move {
+            seen.lock().unwrap().push(verified.request().request_id.0);
+            counted.add_permits(1);
+            released.notified().await;
+            verified.request().reply(Response::PeerAccepted)
+        }
+    });
+    let (server, task) = server(&pki, registry, handler).await;
+    let pool = Arc::new(
+        PeerConnectionPool::new(
+            connector(&pki, certificate, key),
+            PeerPoolLimits {
+                per_peer_inflight: 1,
+                attempts: 1,
+                ..PeerPoolLimits::default()
+            },
+        )
+        .unwrap(),
+    );
+    pool.replace_routes(
+        1,
+        BTreeMap::from([(
+            2,
+            PeerEndpoint {
+                address: server.local_addr().unwrap(),
+                server_name: "localhost".into(),
+                name: None,
+            },
+        )]),
+    )
+    .unwrap();
+    let mut sends = Vec::new();
+    for id in 0..3u128 {
+        let mut packet = request(90 + id);
+        packet.operation = Operation::Raft {
+            group: [2; 16],
+            message: vec![7, 8, 9],
+        };
+        let sending = pool.clone();
+        sends.push(tokio::spawn(async move { sending.send(2, &packet).await }));
+    }
+    // One reaches the peer at a time; the others wait on the lane, refused
+    // by no one, and each is released once it has arrived.
+    for _ in 0..3 {
+        arrived.acquire_many(1).await.unwrap().forget();
+        assert_eq!(pool.stats().busy, 0);
+        release.notify_one();
+    }
+    for send in sends {
+        assert_eq!(send.await.unwrap(), Ok(()));
+    }
+    assert_eq!(pool.stats().busy, 0);
+    assert_eq!(pool.stats().delivered, 3);
+    let seen = order.lock().unwrap().clone();
+    assert_eq!(seen.len(), 3, "{seen:?}");
+    pool.close();
+    server.close();
+    task.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn peer_pool_saturation_is_bounded_and_route_change_retires_active_connections() {
     use std::collections::BTreeMap;

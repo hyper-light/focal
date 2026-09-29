@@ -441,3 +441,41 @@ fn deliver_frame(owner: &mut Owner, mut frame: ReplicationFrame, force_admission
     frame.report_snapshot(accepted);
     accepted
 }
+
+/// A peer the driver could not reach is told to the core (27 §3.3) — but a
+/// core fenced by a write it still persists refuses the report, which is
+/// then told next period, the report keeping its place on the owner's own
+/// channel; the session is not stopped for a hint about a peer.
+#[test]
+fn a_lost_peer_reported_while_a_write_persists_is_told_next_period() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut owner, _outgoing, budget) = assemble(session(directory.path(), 1));
+    let pause = owner.session.shared_wal().pause_for_test().unwrap();
+    let verified = verify_request(actor(), register(), &owner.client_limits).unwrap();
+    let charge = budget
+        .reserve(BudgetKind::Pending, BudgetLane::Ordinary, 128 * 1024)
+        .unwrap()
+        .commit();
+    let (send, _receive) = oneshot::channel();
+    owner
+        .accept(Work::Request(
+            Box::new(AdmittedRequest {
+                verified,
+                witness: None,
+                native: None,
+            }),
+            send,
+            charge,
+        ))
+        .unwrap();
+    assert!(owner.session.persistence_pending());
+    owner.lost_sender.try_send(7).unwrap();
+    owner.report_lost().unwrap();
+    assert_eq!(owner.unreachable, 0, "the fenced core was not told");
+    assert!(owner.session.persistence_pending());
+    drop(pause);
+    settle(&mut owner);
+    owner.report_lost().unwrap();
+    assert_eq!(owner.unreachable, 1, "told once the write was durable");
+    assert!(owner.lost.try_recv().is_err(), "the report was consumed");
+}

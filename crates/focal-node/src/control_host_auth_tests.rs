@@ -182,6 +182,7 @@ async fn root_read_rechecks_enrollment_when_its_quorum_barrier_completes() {
         },
         _allocation: None,
     });
+    let lost = std::sync::mpsc::sync_channel(crate::fleet::LOST_PEERS);
     let mut owner = Owner {
         stopping: None,
         replica: network.control,
@@ -198,6 +199,8 @@ async fn root_read_rechecks_enrollment_when_its_quorum_barrier_completes() {
         progress,
         nonce: 0,
         dropped: 0,
+        lost_sender: lost.0,
+        lost: lost.1,
         failure: None,
         pace: Default::default(),
     };

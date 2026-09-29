@@ -145,9 +145,40 @@ pub struct ReplicationFrame {
     pub target: u64,
     pub request: RequestEnvelope,
     snapshot: Option<oneshot::Sender<focal_consensus::SnapshotStatus>>,
+    /// Where the driver says the peer could not be reached: the owner
+    /// reports it to the core, which probes the member instead of
+    /// streaming to it. Bounded by the members a configuration names.
+    lost: Option<mpsc::SyncSender<u64>>,
     _charge: Allocation,
 }
+/// The peers an owner may have lost exchanges with between two of its
+/// periods: at most every member once (`focal_raft::MAX_MEMBERS`); a peer
+/// lost more often within a period is reported once.
+pub(crate) const LOST_PEERS: usize = 1024;
 impl ReplicationFrame {
+    /// The driver could not reach the peer at all.
+    pub(crate) fn lost(&mut self) {
+        if let Some(lost) = self.lost.take() {
+            let _ = lost.try_send(self.target);
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        target: u64,
+        request: RequestEnvelope,
+        lost: mpsc::SyncSender<u64>,
+        budget: &MemoryBudget,
+    ) -> Result<Self, LedgerError> {
+        Ok(Self {
+            target,
+            request,
+            snapshot: None,
+            lost: Some(lost),
+            _charge: budget
+                .reserve(BudgetKind::Control, BudgetLane::Completion, 4096)?
+                .commit(),
+        })
+    }
     pub(crate) fn report_snapshot(&mut self, accepted: bool) {
         crate::snapshot_feedback::complete(&mut self.snapshot, accepted);
     }
@@ -169,6 +200,9 @@ pub struct ReplicaProgress {
     pub stop_hand_off: Option<StopHandOff>,
     pub sequence: SessionSeq,
     pub dropped_replication: u64,
+    /// Exchanges the driver could not make at all, told to the core so it
+    /// probes the peer instead of streaming to it (27 §3.3).
+    pub peers_unreachable: u64,
     pub stopped: bool,
     /// The group's voters as this replica's committed configuration names
     /// them; the paths a pace is derived from (27 §3.1 P2).
@@ -604,11 +638,15 @@ struct Owner {
     placement: Option<PendingPlacementCall>,
     evidence: Option<PendingEvidenceCall>,
     outbound: async_mpsc::Sender<ReplicationFrame>,
+    /// Peers the driver could not reach, reported to the core each period.
+    lost_sender: mpsc::SyncSender<u64>,
+    lost: mpsc::Receiver<u64>,
     progress: watch::Sender<ProgressState>,
     incarnation: u64,
     nonce: u64,
     support_cursor: u64,
     dropped: u64,
+    unreachable: u64,
     /// A member was added after the log was compacted: the next checkpoint
     /// is due so the snapshot that seeds it names it in its configuration.
     checkpoint_due: bool,
@@ -640,7 +678,9 @@ impl ReplicaHost {
         WireLimits {
             max_frame_bytes: 10 * 1024 * 1024,
             max_cost: 40 * 1024 * 1024,
-            ..WireLimits::default()
+            ..WireLimits::for_consensus(
+                u32::try_from(focal_consensus::DEFAULT_INFLIGHT_WINDOW).unwrap_or(u32::MAX),
+            )
         }
     }
     pub fn spawn(
@@ -716,6 +756,7 @@ impl ReplicaHost {
             return Err(LedgerError::PlacementConflict);
         }
         let status = session.status();
+        let (lost_sender, lost) = mpsc::sync_channel(LOST_PEERS);
         let (progress, changes) = watch::channel(ProgressState {
             value: ReplicaProgress {
                 node: status.node_id,
@@ -724,6 +765,7 @@ impl ReplicaHost {
                 stop_hand_off: None,
                 sequence: session.sequence(),
                 dropped_replication: 0,
+                peers_unreachable: 0,
                 stopped: false,
                 voters: status.voters.clone(),
                 admitted: Vec::new(),
@@ -773,11 +815,14 @@ impl ReplicaHost {
             placement: None,
             evidence: None,
             outbound,
+            lost_sender,
+            lost,
             progress,
             incarnation: 0,
             nonce: 0,
             support_cursor: 0,
             dropped: 0,
+            unreachable: 0,
             checkpoint_due: false,
             #[cfg(test)]
             dropped_snapshots: 0,
@@ -1642,9 +1687,15 @@ impl Owner {
                     .active_placement()
                     .is_some_and(|spec| spec.placement.voters.contains_key(&node))
         };
+        // Fit to lead: caught up to what is committed and heard from, and
+        // not being sent a snapshot. Not the pipeline's state: a member the
+        // leader lost a message to is probed (27 §3.3) until its log moves,
+        // which a log with nothing proposed never does.
         let fit = |node: u64| {
             self.session.peer(node).is_some_and(|peer| {
-                peer.state == 1 && peer.matched >= status.committed_index && peer.recent_active
+                peer.state != focal_consensus::PEER_SNAPSHOT
+                    && peer.matched >= status.committed_index
+                    && peer.recent_active
             })
         };
         let preferred = self
@@ -1677,8 +1728,10 @@ impl Owner {
         let seen = crate::leader_return::Seen {
             leads,
             preferred: target,
-            current: peer
-                .is_some_and(|peer| peer.state == 1 && peer.matched >= status.committed_index),
+            current: peer.is_some_and(|peer| {
+                peer.state != focal_consensus::PEER_SNAPSHOT
+                    && peer.matched >= status.committed_index
+            }),
             heard: peer.is_some_and(|peer| peer.recent_active),
             transferring: self.session.transferring().is_some(),
             settled: self.stopping.is_none()
@@ -1704,7 +1757,35 @@ impl Owner {
     }
     /// Shared-worker progress never waits on a disk receipt. The exact Ready
     /// remains inside Session until its WAL owner reports a completed fence.
+    /// What the driver could not reach since the last period, told to the
+    /// core: it probes those members instead of streaming to them. A core
+    /// fenced by a write it still persists, or short of the room, is told
+    /// next period: the report keeps its place, and the session goes on —
+    /// a report is a hint about a peer, never a reason for the owner to
+    /// end. A channel already full of reports names the peer already, or
+    /// its next lost send does.
+    fn report_lost(&mut self) -> Result<(), LedgerError> {
+        for _ in 0..LOST_PEERS {
+            let Ok(peer) = self.lost.try_recv() else {
+                return Ok(());
+            };
+            match self.session.report_unreachable(peer) {
+                Ok(()) => self.unreachable = self.unreachable.saturating_add(1),
+                Err(
+                    LedgerError::Consensus(focal_consensus::ConsensusError::PersistencePending)
+                    | LedgerError::Capacity
+                    | LedgerError::Memory(_),
+                ) => {
+                    let _ = self.lost_sender.try_send(peer);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
     fn progress_group(&mut self) -> Result<bool, LedgerError> {
+        self.report_lost()?;
         self.views
             .advance(&mut self.session)
             .map_err(|_| LedgerError::Failed)?;
@@ -2141,6 +2222,7 @@ impl Owner {
                 term: status.term,
                 sequence: self.session.sequence(),
                 dropped_replication: self.dropped,
+                peers_unreachable: self.unreachable,
                 stopped,
                 voters: status.voters.clone(),
                 admitted: self.admitted.clone(),
@@ -3016,6 +3098,7 @@ impl Owner {
             let frame = ReplicationFrame {
                 target: message.to,
                 snapshot,
+                lost: Some(self.lost_sender.clone()),
                 _charge: charge.commit(),
                 request: RequestEnvelope {
                     protocol: PROTOCOL_VERSION,

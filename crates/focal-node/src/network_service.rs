@@ -727,7 +727,10 @@ impl NetworkService {
             )?,
             limits.clone(),
         )?;
-        let pool = PeerConnectionPool::new(connector, PeerPoolLimits::default())?;
+        let pool = PeerConnectionPool::new(
+            connector,
+            PeerPoolLimits::for_consensus(focal_consensus::DEFAULT_INFLIGHT_WINDOW),
+        )?;
         let socket = root.join("focal.sock");
         clean_socket(&socket, &root)?;
         // The local grant follows the committed registry: the controller
@@ -1288,6 +1291,7 @@ impl NetworkService {
                 pace_samples: host.current_pace().samples,
                 periods: host.periods(),
                 refused_periods: host.refused_periods(),
+                peers_unreachable: progress.peers_unreachable,
                 longest_period_ms: u64::try_from(host.longest_period().as_millis())
                     .unwrap_or(u64::MAX),
             });

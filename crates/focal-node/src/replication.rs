@@ -83,6 +83,12 @@ impl Frame {
             Self::Control(frame) => frame.report_snapshot(accepted),
         }
     }
+    fn lost(&mut self) {
+        match self {
+            Self::Session(frame) => frame.lost(),
+            Self::Control(frame) => frame.lost(),
+        }
+    }
     fn request(&self) -> &focal_wire::RequestEnvelope {
         match self {
             Self::Session(frame) => &frame.request,
@@ -130,6 +136,13 @@ async fn drive(
                     tasks.push(AssertUnwindSafe(async move {
                         let result = pool.send(frame.target(), frame.request()).await;
                         frame.complete(result.is_ok());
+                        // A peer that could not be reached at all is told to
+                        // the frame's owner, whose core probes it instead of
+                        // streaming into a void (27 §3.3); a lane that was
+                        // full or a peer that refused is not that.
+                        if matches!(result, Err(PeerSendError::Lost)) {
+                            frame.lost();
+                        }
                         // Keep the whole frame, especially its Allocation, alive
                         // across connection setup, retries and response receipt.
                         drop(frame);
@@ -149,3 +162,7 @@ async fn drive(
     }
     Ok(report)
 }
+
+#[cfg(test)]
+#[path = "replication_tests.rs"]
+mod tests;

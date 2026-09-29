@@ -767,7 +767,13 @@ pub struct WireLimits {
     pub max_items: u32,
     pub max_cost: u64,
     pub max_connections: usize,
+    /// The streams a connection holds at once: the probe's, the control
+    /// lane's and the content lane's ([`WireLimits::for_consensus`]).
     pub streams_per_connection: u32,
+    /// The control lane: consensus exchanges to the peer at once, the
+    /// leader's pipeline to one follower (`DEFAULT_INFLIGHT_WINDOW`), so the
+    /// wire is never narrower than the core.
+    pub control_streams: u32,
     pub request_timeout: std::time::Duration,
 }
 impl Default for WireLimits {
@@ -778,11 +784,26 @@ impl Default for WireLimits {
             max_cost: 4 * 1024 * 1024,
             max_connections: 128,
             streams_per_connection: 16,
+            control_streams: 2,
             request_timeout: std::time::Duration::from_secs(30),
         }
     }
 }
 impl WireLimits {
+    /// The lanes of a connection derived: one stream for the probe, the
+    /// consensus window for the control lane, and the content lane the
+    /// reference path fills ([`crate::content_streams`]).
+    pub fn for_consensus(window: u32) -> Self {
+        let streams = window
+            .saturating_add(crate::content_streams())
+            .saturating_add(1)
+            .min(1024);
+        Self {
+            streams_per_connection: streams,
+            control_streams: window.min(streams),
+            ..Self::default()
+        }
+    }
     pub fn validate(&self) -> Result<(), AccessError> {
         if !(1024..=16 * 1024 * 1024).contains(&self.max_frame_bytes)
             || self.max_items == 0
@@ -792,6 +813,8 @@ impl WireLimits {
             || self.max_connections > 65536
             || self.streams_per_connection == 0
             || self.streams_per_connection > 1024
+            || self.control_streams == 0
+            || self.control_streams > self.streams_per_connection
             || self.request_timeout.is_zero()
             || self.request_timeout > std::time::Duration::from_secs(120)
         {

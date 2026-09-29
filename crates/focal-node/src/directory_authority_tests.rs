@@ -214,6 +214,7 @@ fn owner(
         },
         _allocation: None,
     });
+    let lost = std::sync::mpsc::sync_channel(crate::fleet::LOST_PEERS);
     Owner {
         stopping: None,
         replica,
@@ -230,6 +231,8 @@ fn owner(
         progress,
         nonce: 0,
         dropped: 0,
+        lost_sender: lost.0,
+        lost: lost.1,
         failure: None,
         pace: Default::default(),
     }

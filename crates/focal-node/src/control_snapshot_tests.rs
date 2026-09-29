@@ -102,6 +102,7 @@ impl Fixture {
             },
             _allocation: None,
         });
+        let lost = std::sync::mpsc::sync_channel(crate::fleet::LOST_PEERS);
         let owner = Owner {
             stopping: None,
             replica,
@@ -121,6 +122,8 @@ impl Fixture {
             progress,
             nonce: 0,
             dropped: 0,
+            lost_sender: lost.0,
+            lost: lost.1,
             failure: None,
             pace: Default::default(),
         };

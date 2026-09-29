@@ -118,6 +118,9 @@ pub struct SessionMetrics {
     /// Periods in which the owner's replica was not ticked: it was
     /// refused the room or still persisted.
     pub refused_periods: u64,
+    /// Exchanges of the session's replica the driver could not make at
+    /// all, each told to the core (27 §3.3).
+    pub peers_unreachable: u64,
     /// The longest a period of the owner took, in milliseconds
     /// (`RootMetrics::longest_period_ms`).
     pub longest_period_ms: u64,
@@ -699,7 +702,7 @@ impl MetricsSnapshot {
             "Whether sessions beyond the bound were left out.",
             u8::from(self.sessions_truncated),
         );
-        let series: [(&str, &str, &str); 28] = [
+        let series: [(&str, &str, &str); 29] = [
             (
                 "focal_session_periods_total",
                 "counter",
@@ -709,6 +712,11 @@ impl MetricsSnapshot {
                 "focal_session_periods_refused_total",
                 "counter",
                 "Periods in which the session's replica was not ticked: it was refused the room, or still persisted.",
+            ),
+            (
+                "focal_session_peers_unreachable_total",
+                "counter",
+                "Exchanges of the session's replica the driver could not make at all, each told to the core, which probes the peer instead of streaming to it.",
             ),
             (
                 "focal_session_period_longest_ms",
@@ -847,6 +855,7 @@ impl MetricsSnapshot {
                 let value: Option<u64> = match name {
                     "focal_session_periods_total" => Some(session.periods),
                     "focal_session_periods_refused_total" => Some(session.refused_periods),
+                    "focal_session_peers_unreachable_total" => Some(session.peers_unreachable),
                     "focal_session_period_longest_ms" => Some(session.longest_period_ms),
                     "focal_session_leader" => Some(session.leader),
                     "focal_session_preferred_leader" => session.preferred_leader,
@@ -996,6 +1005,7 @@ mod tests {
             credential: None,
             sessions: vec![SessionMetrics {
                 periods: 0,
+                peers_unreachable: 0,
                 tenant: "t".into(),
                 session: "s".into(),
                 committed_index: 9,

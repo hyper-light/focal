@@ -39,6 +39,7 @@ pub fn admin_wire_limits() -> WireLimits {
         max_items: 1,
         max_connections: 8,
         streams_per_connection: 1,
+        control_streams: 1,
         request_timeout: Duration::from_secs(20),
     }
 }

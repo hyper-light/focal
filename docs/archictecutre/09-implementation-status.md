@@ -11714,3 +11714,60 @@ test asks a barrier of a follower and serves it at the committed sequence, and a
 isolated authority still completes none. Reads therefore scale across a log's
 voters, and a copy's read is exactly as fresh as the leader's commit index at the
 moment it asked.
+
+### 2026-09-29 — C3: the lanes of a connection derived from the core's window, a lost exchange the core hears of; the liveness view before an answer
+
+**The consensus lane (27 §7).** A connection had sixteen streams, two of them the
+lane for what a group asks of the peer (`RemoteCapacity::control`), and the pool let
+two exchanges to a peer be in flight (`per_peer_inflight`) for every group the two
+nodes share, while the core keeps 128 messages in flight to a follower
+(`NodeConfig::max_inflight_messages`): the leader's pipeline on the wire was two. A
+Raft message that found either lane full was refused at once (`try_acquire` →
+`WireError::Limit` → `PeerSendError::Busy`), counted by the driver
+(`focal_peer_messages_busy_total`) and dropped, and a message to a peer the pool could
+not reach was counted and dropped the same way, so a leader kept streaming to a peer it
+could not reach. The streams of a connection are derived now (`WireLimits::for_consensus`,
+`PeerPoolLimits::for_consensus`, `DEFAULT_INFLIGHT_WINDOW` in focal-consensus): one for
+the probe, the consensus window for the control lane (`WireLimits::control_streams`),
+and the content lane the reference path fills (`content_streams`: 1 Gbit/s × 100 ms =
+12 MiB, thirteen streams of a megabyte's window) — 142 streams, which quinn's
+`max_concurrent_bidi_streams` follows on both ends, the connection's receive window
+bounding buffered bytes whatever the count; the pool's lanes follow the same window,
+per peer and in all. A Raft send waits its turn on the control lane and on the slot's
+lane (`acquire().await`), bounded by the exchange's time (`PeerPoolLimits::timeout`),
+and is `Busy` past it, counted as before; a `Lost` exchange reaches the frame's owner
+(`ReplicationFrame::lost`, a sync channel of `LOST_PEERS` per owner) and the owner
+reports the peer to its core before its next period (`Session::report_unreachable`,
+`ReplicaHost::report_unreachable`), which probes the member instead of streaming to it;
+counted per session (`focal_session_peers_unreachable_total`). Tests: the wire's
+`the_lanes_of_a_connection_are_derived_from_the_consensus_window_and_the_path` (142
+streams, 128 the control lane, 13 content, the default pool's lanes 128 per peer) and
+`a_groups_message_waits_its_turn_on_the_lane_instead_of_being_refused` (messages beyond
+a lane of one complete in order, none refused); the node's
+`a_peer_that_cannot_be_reached_is_told_to_the_frames_owner` (a route to a socket
+nothing answers on: the driver counts the exchange lost and the owner is told the peer).
+The workspace gates found two consequences of a report that is real now, both fixed at
+their cause. A report reaching a core fenced by a write it still persisted
+(`guarded_in`: `PersistencePending`) was propagated by the owner as the period's error,
+which stops the session ("stopped after application failure"); a report is a hint about
+a peer, so the owner keeps it for the next period (it goes back on its own channel) and
+goes on, and the control host the same. And a member the leader lost one message to is
+probed by the core until its log moves (`MsgUnreachable` → `become_probe`, the
+raft-rs/etcd rule: a probe ends when the match index advances, which a log with nothing
+proposed never does), while the leader's return of leadership (27 §5) and a stopping
+leader's choice of heir judged a member fit only in the replicate state: a voter that
+came back caught up and heard from was never asked, and the placement test
+`the_controller_expands_a_laptop_session_to_three_hosts_that_survive_one_loss` waited out
+its budget. Fitness is the log now — caught up to what is committed, heard from, not
+being sent a snapshot (`PEER_SNAPSHOT`) — in `return_leadership`, the return policy's
+`current` and `focal_control::heir`.
+
+**Liveness: the view before the answer.** PR #3's Windows run failed
+`probes_bind_their_sender_refute_self_suspicion_and_ration_extensions` at
+`extensions` 0 ≠ 1: the driver answered a probe whose extension it had granted, the
+test took the view once it had the answer, and the driver's loop had not yet reached
+the publish that follows an answer. The driver publishes before any probe answer leaves
+now (`LivenessDriver::answer_published`), keyed by the counters the published view was
+built from (`published`; the loop's end-of-iteration publish compares against the
+same), so a reader that holds an answer sees in the view what the answer reports. No
+wait was lengthened.

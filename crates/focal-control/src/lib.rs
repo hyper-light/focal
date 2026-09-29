@@ -29,7 +29,7 @@ pub use replica::*;
 pub use rpc::*;
 
 /// The voter a stopping leader hands its log to (27 §5): among the voters
-/// it has heard from recently and is replicating to, the one whose log
+/// it has heard from recently and is not sending a snapshot, the one whose log
 /// matches furthest — the transfer catches it up to the last entry before
 /// it is asked to campaign, so the nearest one is the quickest — and the
 /// lowest id among equals, so that every reading of the same progress
@@ -44,7 +44,7 @@ pub fn heir(
         .filter(|peer| {
             peer.node != status.node_id
                 && status.voters.contains(&peer.node)
-                && peer.state == 1
+                && peer.state != focal_consensus::PEER_SNAPSHOT
                 && peer.recent_active
         })
         .max_by_key(|peer| (peer.matched, core::cmp::Reverse(peer.node)))
@@ -255,4 +255,60 @@ fn hash<T: Serialize>(domain: &'static str, value: &T) -> Result<[u8; 32], Contr
         value,
         Sink(blake3::Hasher::new_derive_key(domain)),
     )?)
+}
+
+#[cfg(test)]
+mod heir_tests {
+    use super::heir;
+    use focal_consensus::{
+        NodeStatus, PEER_PROBE, PEER_REPLICATE, PEER_SNAPSHOT, PeerProgress, StateRole,
+    };
+
+    fn peer(node: u64, matched: u64, state: u8, recent_active: bool) -> PeerProgress {
+        PeerProgress {
+            node,
+            matched,
+            next_index: matched.saturating_add(1),
+            state,
+            recent_active,
+            paused: false,
+            pending_snapshot: 0,
+        }
+    }
+    fn leader(voters: &[u64]) -> NodeStatus {
+        NodeStatus {
+            node_id: 1,
+            leader_id: 1,
+            term: 3,
+            committed_index: 40,
+            applied_index: 40,
+            role: StateRole::Leader,
+            voters: voters.to_vec(),
+            learners: Vec::new(),
+        }
+    }
+
+    /// A voter the leader is probing after a lost message (27 §3.3) is as
+    /// fit an heir as one it streams to — its log is what counts; one being
+    /// sent a snapshot, one not heard from and a learner are not asked.
+    #[test]
+    fn the_heir_is_the_furthest_voter_heard_from_whatever_its_pipeline_state() {
+        let status = leader(&[1, 2, 3, 4, 5]);
+        let peers = [
+            peer(2, 40, PEER_REPLICATE, true),
+            peer(3, 40, PEER_PROBE, true),
+            peer(4, 12, PEER_SNAPSHOT, true),
+            peer(5, 40, PEER_REPLICATE, false),
+            peer(6, 40, PEER_REPLICATE, true),
+        ];
+        // Equal logs: the lowest id, and the probed voter counts.
+        assert_eq!(heir(&status, &peers), Some(2));
+        let peers = [
+            peer(2, 39, PEER_REPLICATE, true),
+            peer(3, 40, PEER_PROBE, true),
+            peer(4, 41, PEER_SNAPSHOT, true),
+        ];
+        assert_eq!(heir(&status, &peers), Some(3));
+        assert_eq!(heir(&status, &[peer(4, 41, PEER_SNAPSHOT, true)]), None);
+    }
 }

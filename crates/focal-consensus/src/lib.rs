@@ -110,7 +110,7 @@ impl NodeConfig {
             heartbeat_tick: 2,
             max_entry_bytes: 4 * 1024 * 1024,
             max_uncommitted_bytes: 32 * 1024 * 1024,
-            max_inflight_messages: 128,
+            max_inflight_messages: DEFAULT_INFLIGHT_WINDOW,
             fast: false,
         }
     }
@@ -192,6 +192,11 @@ pub struct CommittedEntry {
     pub term: u64,
     pub data: Vec<u8>,
 }
+/// The messages a leader keeps in flight to one follower before an
+/// acknowledgement (`NodeConfig::max_inflight_messages`, thesis §10.2.1's
+/// pipeline): the wire's control lane to a peer is derived from it, so the
+/// pipeline is never narrower on the wire than in the core (27 §3.1 P1).
+pub const DEFAULT_INFLIGHT_WINDOW: usize = 128;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReadBarrier {
     pub index: u64,
@@ -236,11 +241,17 @@ pub struct PeerProgress {
     pub node: u64,
     pub matched: u64,
     pub next_index: u64,
+    /// The leader's pipeline to the member: [`PEER_PROBE`] (one message
+    /// at a time, after a lost one or a rejection), [`PEER_REPLICATE`]
+    /// (streaming) or [`PEER_SNAPSHOT`] (being sent a snapshot).
     pub state: u8,
     pub recent_active: bool,
     pub paused: bool,
     pub pending_snapshot: u64,
 }
+pub const PEER_PROBE: u8 = 0;
+pub const PEER_REPLICATE: u8 = 1;
+pub const PEER_SNAPSHOT: u8 = 2;
 #[derive(Clone, Debug)]
 pub struct NodeStatus {
     pub node_id: u64,
@@ -1244,9 +1255,9 @@ impl DurableNode {
             matched: progress.matched,
             next_index: progress.next_index,
             state: match progress.state {
-                ProgressState::Probe => 0,
-                ProgressState::Replicate => 1,
-                ProgressState::Snapshot => 2,
+                ProgressState::Probe => PEER_PROBE,
+                ProgressState::Replicate => PEER_REPLICATE,
+                ProgressState::Snapshot => PEER_SNAPSHOT,
             },
             recent_active: progress.recent_active,
             paused: progress.paused,

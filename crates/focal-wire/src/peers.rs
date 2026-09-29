@@ -61,6 +61,19 @@ impl Default for PeerPoolLimits {
     }
 }
 impl PeerPoolLimits {
+    /// The pool's lanes derived from the consensus window: as many
+    /// exchanges to one peer at once as the leader's pipeline to a follower,
+    /// and as many in all as every connection's lane holds.
+    pub fn for_consensus(window: usize) -> Self {
+        let defaults = Self::default();
+        Self {
+            per_peer_inflight: window.clamp(1, 65536),
+            max_inflight: window
+                .saturating_mul(defaults.max_connections)
+                .clamp(1, 65536),
+            ..defaults
+        }
+    }
     fn validate(&self) -> Result<(), PeerSendError> {
         if self.max_routes == 0
             || self.max_routes > 65536
@@ -68,7 +81,7 @@ impl PeerPoolLimits {
             || self.max_connections > self.max_routes
             || self.max_inflight == 0
             || self.max_inflight > 65536
-            || !(1..=2).contains(&self.per_peer_inflight)
+            || !(1..=65536).contains(&self.per_peer_inflight)
             || !(1..=64).contains(&self.max_probe_inflight)
             || !(1..=3).contains(&self.attempts)
             || self.timeout.is_zero()
@@ -796,16 +809,24 @@ impl PeerConnectionPool {
                 // A route that changed has a lane of its own, and the turn
                 // that was waited for is none on it.
                 let _peer = if probe {
-                    Some(&slot.probes)
+                    Some(slot.probes.try_acquire().map_err(|_| PeerSendError::Busy)?)
                 } else if !bulk {
-                    Some(&slot.inflight)
+                    // A group's message waits its turn on the peer's lane,
+                    // no longer than the exchange's time: a burst is carried
+                    // in order, never refused for the lane being full at
+                    // that instant, which cost the group a whole election
+                    // timeout for a vote and its pipeline for an append.
+                    Some(
+                        tokio::time::timeout(self.limits.timeout, slot.inflight.acquire())
+                            .await
+                            .map_err(|_| PeerSendError::Busy)?
+                            .map_err(|_| PeerSendError::Closed)?,
+                    )
                 } else if waited.as_ref().is_some_and(|had| Arc::ptr_eq(had, &slot)) {
                     None
                 } else {
-                    Some(&slot.bulk)
-                }
-                .map(|lane| lane.try_acquire().map_err(|_| PeerSendError::Busy))
-                .transpose()?;
+                    Some(slot.bulk.try_acquire().map_err(|_| PeerSendError::Busy)?)
+                };
                 let connected = tokio::time::timeout(self.limits.timeout, self.connection(&slot))
                     .await
                     .unwrap_or(Err(PeerSendError::Lost));
