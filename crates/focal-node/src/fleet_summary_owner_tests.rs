@@ -49,7 +49,7 @@ fn summary_waiters_release_allowance_on_cancel_deadline_route_change_and_deliver
     assert!(fixture.owners[0].pending.is_empty());
     assert!(fixture.owners[0].budget.stats().used < held);
     let mut expired = read(&mut fixture, 3);
-    fixture.owners[0].pending.front_mut().unwrap().deadline = Instant::now();
+    fixture.owners[0].pending.front_mut().unwrap().deadline = 0;
     fixture.owners[0].expire_pending();
     assert!(matches!(
         expired.try_recv().unwrap().envelope().result,

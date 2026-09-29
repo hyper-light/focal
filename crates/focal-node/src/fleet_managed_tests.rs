@@ -161,7 +161,7 @@ fn passive_support_is_readonly_and_canceled_floor_input_never_registers() {
             charge,
         ))
         .unwrap();
-    owner.deferred_managed.back_mut().unwrap().deadline = Instant::now();
+    owner.deferred_managed.back_mut().unwrap().deadline = 0;
     owner.progress_managed().unwrap();
     assert!(owner.session.persistence_pending());
     assert!(owner.deferred_managed.is_empty());

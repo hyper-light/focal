@@ -1084,40 +1084,205 @@ async fn repair(
         // A repair re-asks every other required copy, receipt or not: a
         // receipt records an answer once given, not the bytes still held. A
         // copy outside the residency boundary is neither asked nor given.
-        for peer in placement.copies.iter().filter(|peer| **peer != node) {
-            if !placement.fence.admits(*peer) {
-                continue;
+        // They are asked at once: a copy that answers late or not at all
+        // delays no other.
+        let mut copies = FuturesUnordered::new();
+        for peer in placement.copies.iter().copied() {
+            if peer != node && placement.fence.admits(peer) {
+                let reference = &reference;
+                copies.push(async move {
+                    if holds(pool, peer, scope, transfer, reference).await {
+                        content
+                            .record_receipt(scope, receipt_for(scope, peer, reference))
+                            .await?;
+                        return Ok(false);
+                    }
+                    Ok::<_, AccessError>(
+                        push(content, pool, scope, transfer, peer, reference)
+                            .await
+                            .is_ok(),
+                    )
+                });
             }
-            let verified = remote(
-                pool,
-                *peer,
-                scope,
-                transfer,
-                CustodyRequest::Verify {
-                    policy_revision: scope.policy_revision,
-                    content: reference.clone(),
-                },
-            )
-            .await;
-            if matches!(
-                verified,
-                Ok(CustodyReply::Durable { content: found, policy_revision })
-                    if found == reference && policy_revision == scope.policy_revision
-            ) {
-                content
-                    .record_receipt(scope, receipt_for(scope, *peer, &reference))
-                    .await?;
-                continue;
+        }
+        let mut failed = None;
+        while let Some(given) = copies.next().await {
+            match given {
+                Ok(true) => {
+                    report.pushed = report.pushed.checked_add(1).ok_or(AccessError::Capacity)?;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    failed.get_or_insert(error);
+                }
             }
-            if push(content, pool, scope, transfer, *peer, &reference)
-                .await
-                .is_ok()
-            {
-                report.pushed = report.pushed.checked_add(1).ok_or(AccessError::Capacity)?;
-            }
+        }
+        drop(copies);
+        if let Some(error) = failed {
+            return Err(error);
         }
     }
     Ok(report)
+}
+/// Whether a copy answers that it holds the object durably, now.
+async fn holds(
+    pool: &PeerConnectionPool,
+    peer: u64,
+    scope: CustodyScope,
+    transfer: [u8; 16],
+    reference: &ContentRef,
+) -> bool {
+    matches!(
+        remote(
+            pool,
+            peer,
+            scope,
+            transfer,
+            CustodyRequest::Verify {
+                policy_revision: scope.policy_revision,
+                content: reference.clone(),
+            },
+        )
+        .await,
+        Ok(CustodyReply::Durable { content: found, policy_revision })
+            if found == *reference && policy_revision == scope.policy_revision
+    )
+}
+/// Move the chunks a copy lacks, `width` of them at once: each chunk is a
+/// megabyte at most and goes by a stream of its own, which carries a
+/// megabyte in a round trip, so a transfer carries as many as it has
+/// streams. `width` is asked whenever a chunk is begun, since it is what
+/// the path holds now (`PeerConnectionPool::bulk_width`); `moved` moves
+/// one chunk. A copy takes the chunks of a manifest in any order.
+///
+/// What the copy has room for is found as a sender finds what a path
+/// carries (RFC 5681 §3.1): a chunk refused the room while another is in
+/// flight is moved again, and the transfer keeps half as many in flight
+/// as it had; from then on it keeps one more for every time as many were
+/// answered as it keeps. The transfer is refused the room itself when a
+/// chunk is refused with none in flight, and when as many were refused as
+/// it had begun and none was answered between them.
+///
+/// A copy of a release that takes chunks in their order only refuses one
+/// that came ahead: it is sent them one after another, from the first
+/// that was lacked, once.
+async fn striped<F>(
+    width: impl Fn() -> usize,
+    lacked: std::ops::Range<u32>,
+    moved: impl Fn(u32) -> F,
+) -> Result<(), AccessError>
+where
+    F: Future<Output = Result<(), AccessError>>,
+{
+    let attempt = |index: u32| {
+        let moving = moved(index);
+        async move { (index, moving.await) }
+    };
+    // The most that are kept in flight, whatever the path holds, once the
+    // copy has refused one; and how many were answered since it changed.
+    let mut most = None::<usize>;
+    let mut answered = 0_usize;
+    let mut ordered = false;
+    let mut next = lacked.start;
+    // The chunks that were refused the room, moved before any after them,
+    // and how many were since one was answered.
+    let mut again = std::collections::BTreeSet::new();
+    let mut refused = 0_usize;
+    // How many were begun and are not answered.
+    let mut open = 0_usize;
+    let mut flying = FuturesUnordered::new();
+    loop {
+        let keep = if ordered {
+            1
+        } else {
+            width().min(most.unwrap_or(usize::MAX)).max(1)
+        };
+        while flying.len() < keep {
+            if let Some(index) = again.pop_first() {
+                flying.push(attempt(index));
+            } else if next < lacked.end {
+                open = open.saturating_add(1);
+                flying.push(attempt(next));
+                next = next.checked_add(1).ok_or(AccessError::Capacity)?;
+            } else {
+                break;
+            }
+        }
+        match flying.next().await {
+            None => return Ok(()),
+            Some((_, Ok(()))) => {
+                open = open.saturating_sub(1);
+                refused = 0;
+                answered = answered.saturating_add(1);
+                if let Some(kept) = most
+                    && answered >= kept
+                {
+                    most = Some(kept.saturating_add(1));
+                    answered = 0;
+                }
+            }
+            Some((index, Err(AccessError::Capacity))) if !flying.is_empty() && refused < open => {
+                again.insert(index);
+                refused = refused.saturating_add(1);
+                answered = 0;
+                most = Some(
+                    flying
+                        .len()
+                        .saturating_add(1)
+                        .checked_div(2)
+                        .unwrap_or(1)
+                        .max(1),
+                );
+            }
+            Some((_, Err(AccessError::InvalidRequest))) if !ordered => {
+                flying = FuturesUnordered::new();
+                again.clear();
+                open = 0;
+                refused = 0;
+                ordered = true;
+                next = lacked.start;
+            }
+            Some((_, Err(error))) => return Err(error),
+        }
+    }
+}
+/// Send a copy the chunks it lacks ([`striped`]).
+async fn send_chunks(
+    content: &ContentHost,
+    pool: &PeerConnectionPool,
+    peer: u64,
+    scope: CustodyScope,
+    transfer: [u8; 16],
+    reference: &ContentRef,
+    lacked: std::ops::Range<u32>,
+) -> Result<(), AccessError> {
+    striped(
+        || pool.bulk_width(peer),
+        lacked,
+        async |index: u32| {
+            let bytes = content
+                .read_transfer_chunk(
+                    scope,
+                    reference.clone(),
+                    usize::try_from(index).map_err(|_| AccessError::Capacity)?,
+                )
+                .await?;
+            remote(
+                pool,
+                peer,
+                scope,
+                transfer,
+                CustodyRequest::Chunk {
+                    transfer,
+                    index,
+                    bytes: bytes.value().clone(),
+                },
+            )
+            .await
+            .map(|_| ())
+        },
+    )
+    .await
 }
 /// Give one required copy an object this node holds: open the transfer
 /// with this node's manifest, send the chunks the copy lacks, seal, record
@@ -1154,23 +1319,16 @@ async fn push(
     if chunks as usize != manifest.value().chunks() || next_missing > chunks {
         return Err(AccessError::InvalidRequest);
     }
-    for index in next_missing..chunks {
-        let bytes = content
-            .read_transfer_chunk(scope, reference.clone(), index as usize)
-            .await?;
-        remote(
-            pool,
-            peer,
-            scope,
-            transfer,
-            CustodyRequest::Chunk {
-                transfer,
-                index,
-                bytes: bytes.value().clone(),
-            },
-        )
-        .await?;
-    }
+    send_chunks(
+        content,
+        pool,
+        peer,
+        scope,
+        transfer,
+        reference,
+        next_missing..chunks,
+    )
+    .await?;
     let reply = remote(
         pool,
         peer,
@@ -1249,50 +1407,56 @@ async fn obligation(
         RequestId(reference.root.0[..16].try_into().unwrap_or([0; 16])),
         reference,
     );
-    for peer in &required {
-        if !placement.fence.admits(*peer) {
+    // The copies without a receipt are asked at once: one that answers
+    // late or not at all delays no other.
+    let mut copies = FuturesUnordered::new();
+    for peer in required.iter().copied() {
+        if !placement.fence.admits(peer) {
             continue;
         }
-        if content
-            .receipt(scope, reference.root, *peer)
-            .await?
-            .is_some_and(|receipt| {
-                receipt.route_epoch == scope.route_epoch
-                    && receipt.policy_revision == scope.policy_revision
-                    && receipt.length == reference.length
-            })
-        {
-            held.insert(*peer);
-            continue;
+        copies.push(async move {
+            if content
+                .receipt(scope, reference.root, peer)
+                .await?
+                .is_some_and(|receipt| {
+                    receipt.route_epoch == scope.route_epoch
+                        && receipt.policy_revision == scope.policy_revision
+                        && receipt.length == reference.length
+                })
+            {
+                return Ok(Some(peer));
+            }
+            let durable = if peer == node {
+                content
+                    .export_manifest(scope, reference.clone())
+                    .await
+                    .is_ok()
+            } else {
+                holds(pool, peer, scope, transfer, reference).await
+            };
+            if durable {
+                content
+                    .record_receipt(scope, receipt_for(scope, peer, reference))
+                    .await?;
+            }
+            Ok::<_, AccessError>(durable.then_some(peer))
+        });
+    }
+    let mut failed = None;
+    while let Some(answered) = copies.next().await {
+        match answered {
+            Ok(Some(peer)) => {
+                held.insert(peer);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                failed.get_or_insert(error);
+            }
         }
-        let durable = if *peer == node {
-            content
-                .export_manifest(scope, reference.clone())
-                .await
-                .is_ok()
-        } else {
-            matches!(
-                remote(
-                    pool,
-                    *peer,
-                    scope,
-                    transfer,
-                    CustodyRequest::Verify {
-                        policy_revision: scope.policy_revision,
-                        content: reference.clone(),
-                    },
-                )
-                .await,
-                Ok(CustodyReply::Durable { content: found, policy_revision })
-                    if found == *reference && policy_revision == scope.policy_revision
-            )
-        };
-        if durable {
-            content
-                .record_receipt(scope, receipt_for(scope, *peer, reference))
-                .await?;
-            held.insert(*peer);
-        }
+    }
+    drop(copies);
+    if let Some(error) = failed {
+        return Err(error);
     }
     Ok(CustodyObligation {
         scope,
@@ -1601,91 +1765,53 @@ async fn replicate(
 ) -> Result<(), AccessError> {
     let scope = placement.scope;
     let transfer = transfer_id(scope, request, reference);
-    let manifest = content.export_manifest(scope, reference.clone()).await?;
     // This node's own sealed object is its own receipt.
     if placement.copies.contains(&node) {
         content
             .record_receipt(scope, receipt_for(scope, node, reference))
             .await?;
     }
-    for peer in &placement.copies {
-        if *peer == node {
-            continue;
-        }
-        placement.admits(*peer)?;
-        if matches!(remote(pool, *peer, scope, transfer, CustodyRequest::Verify { policy_revision: scope.policy_revision, content: reference.clone() }).await,
-            Ok(CustodyReply::Durable { content: found, policy_revision }) if found == *reference && policy_revision == scope.policy_revision)
-        {
-            content
-                .record_receipt(scope, receipt_for(scope, *peer, reference))
-                .await?;
-            continue;
-        }
-        let opened = remote(
-            pool,
-            *peer,
-            scope,
-            transfer,
-            CustodyRequest::Open {
-                transfer,
-                policy_revision: scope.policy_revision,
-                content: reference.clone(),
-                manifest: manifest.value().encoded().to_vec(),
-            },
-        )
-        .await?;
-        let CustodyReply::Opened {
-            chunks,
-            next_missing,
-        } = opened
-        else {
-            return Err(AccessError::InvalidRequest);
-        };
-        if chunks as usize != manifest.value().chunks() || next_missing > chunks {
-            return Err(AccessError::InvalidRequest);
-        }
-        for index in next_missing..chunks {
-            let bytes = content
-                .read_transfer_chunk(scope, reference.clone(), index as usize)
-                .await?;
-            remote(
-                pool,
-                *peer,
-                scope,
-                transfer,
-                CustodyRequest::Chunk {
-                    transfer,
-                    index,
-                    bytes: bytes.value().clone(),
-                },
-            )
-            .await?;
-        }
-        let reply = remote(
-            pool,
-            *peer,
-            scope,
-            transfer,
-            CustodyRequest::Seal { transfer },
-        )
-        .await?;
-        if !matches!(reply, CustodyReply::Durable { content: found, policy_revision } if found == *reference && policy_revision == scope.policy_revision)
-        {
-            return Err(AccessError::InvalidRequest);
-        }
-        content
-            .record_receipt(scope, receipt_for(scope, *peer, reference))
-            .await?;
-        let _ = remote(
-            pool,
-            *peer,
-            scope,
-            transfer,
-            CustodyRequest::Cancel { transfer },
-        )
-        .await;
+    // Every copy is asked at once, and every one of them to the end: a
+    // copy that fails or answers late delays no other, and what the others
+    // took they hold whatever became of it. The first failure is what the
+    // replication failed with.
+    let mut copies = FuturesUnordered::new();
+    for peer in placement
+        .copies
+        .iter()
+        .copied()
+        .filter(|peer| *peer != node)
+    {
+        placement.admits(peer)?;
+        copies.push(replicate_to(
+            content, pool, scope, transfer, peer, reference,
+        ));
     }
-    Ok(())
+    let mut failed = None;
+    while let Some(replicated) = copies.next().await {
+        if let Err(error) = replicated {
+            failed.get_or_insert(error);
+        }
+    }
+    failed.map_or(Ok(()), Err)
+}
+/// One copy of [`replicate`]: nothing is sent to a copy that holds the
+/// object, and a copy that took it says so durably before its receipt is
+/// recorded.
+async fn replicate_to(
+    content: &ContentHost,
+    pool: &PeerConnectionPool,
+    scope: CustodyScope,
+    transfer: [u8; 16],
+    peer: u64,
+    reference: &ContentRef,
+) -> Result<(), AccessError> {
+    if holds(pool, peer, scope, transfer, reference).await {
+        return content
+            .record_receipt(scope, receipt_for(scope, peer, reference))
+            .await;
+    }
+    push(content, pool, scope, transfer, peer, reference).await
 }
 async fn ensure_local(
     content: &ContentHost,
@@ -1771,43 +1897,50 @@ async fn pull(
     else {
         return Err(AccessError::InvalidRequest);
     };
-    for index in next_missing..chunks {
-        let reply = remote(
-            pool,
-            peer,
-            scope,
-            transfer,
-            CustodyRequest::ReadChunk {
+    let max_bytes = u32::try_from(focal_evidence::MAX_TRANSFER_CHUNK_BYTES)
+        .map_err(|_| AccessError::Capacity)?;
+    striped(
+        || pool.bulk_width(peer),
+        next_missing..chunks,
+        async |index: u32| {
+            let reply = remote(
+                pool,
+                peer,
+                scope,
                 transfer,
-                index,
-                max_bytes: u32::try_from(focal_evidence::MAX_TRANSFER_CHUNK_BYTES)
-                    .map_err(|_| AccessError::Capacity)?,
-            },
-        )
-        .await?;
-        let CustodyReply::Chunk {
-            index: found,
-            bytes,
-        } = reply
-        else {
-            return Err(AccessError::InvalidRequest);
-        };
-        if index != found {
-            return Err(AccessError::InvalidRequest);
-        }
-        local(
-            content,
-            node,
-            scope,
-            transfer,
-            CustodyRequest::Chunk {
-                transfer,
-                index,
+                CustodyRequest::ReadChunk {
+                    transfer,
+                    index,
+                    max_bytes,
+                },
+            )
+            .await?;
+            let CustodyReply::Chunk {
+                index: found,
                 bytes,
-            },
-        )
-        .await?;
-    }
+            } = reply
+            else {
+                return Err(AccessError::InvalidRequest);
+            };
+            if index != found {
+                return Err(AccessError::InvalidRequest);
+            }
+            local(
+                content,
+                node,
+                scope,
+                transfer,
+                CustodyRequest::Chunk {
+                    transfer,
+                    index,
+                    bytes,
+                },
+            )
+            .await
+            .map(|_| ())
+        },
+    )
+    .await?;
     let reply = local(
         content,
         node,

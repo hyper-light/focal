@@ -268,7 +268,12 @@ struct Pending {
     response: oneshot::Sender<Completed>,
     waiting: Waiting,
     term: u64,
-    deadline: Instant,
+    /// The owner's period at which the request is given up: the request
+    /// time in the periods it holds at the configured tick, counted as the
+    /// owner runs them (27 §3.1 P2). A request waits its time in the
+    /// owner's rounds and not the clock's, so an owner that a loaded
+    /// machine slows gives up nothing it would have answered.
+    deadline: u64,
     enrollment: bool,
     root_peer: Option<RootPeer>,
     _charge: Allocation,
@@ -586,20 +591,22 @@ impl ControlHost {
         ))
     }
     /// Derive this owner's tick period from the measured paths to the
-    /// group's other voters (27 §3.1 P2) and put it in force from the next
-    /// tick. A group whose paths all sit inside the configured period keeps
-    /// the configured period.
+    /// group's other voters and from the owner's own stalls (27 §3.1 P2),
+    /// and put it in force from the next tick. A group whose paths all sit
+    /// inside the configured period, on a node whose owner runs its
+    /// periods on time, keeps the configured period.
     pub fn pace<'a>(
         &self,
         paths: impl IntoIterator<Item = &'a focal_timing::PathRtt>,
     ) -> focal_timing::TickPace {
-        let pace = focal_timing::TickPace::derive(
+        let pace = focal_timing::TickPace::derive_with_stall(
             self.config.tick,
             self.config.tick_ceiling,
             // Before the owner has opened its replica the count is unknown;
             // one tick is the conservative reading (the longest period).
             self.pace.election_tick().max(1),
             paths,
+            self.pace.stall(),
         );
         self.pace.publish(pace);
         pace
@@ -618,6 +625,12 @@ impl ControlHost {
     /// or still persisting.
     pub fn refused_periods(&self) -> u64 {
         self.pace.refused()
+    }
+    /// The longest a period of the owner took, from one to the next: a
+    /// stall of the owner, which its replica's followers may have taken
+    /// for its death.
+    pub fn longest_period(&self) -> Duration {
+        self.pace.longest()
     }
     /// The tick period in force.
     pub fn tick_period(&self) -> Duration {
@@ -811,7 +824,8 @@ impl<V: AuthorityVerifier> Owner<V> {
                     }
                 }
                 if Instant::now() >= next_tick {
-                    self.pace.advance();
+                    self.pace
+                        .advance(self.pace.get(self.config.tick, self.config.tick_ceiling));
                     // A tick that was refused the room, or that came while
                     // the one before it is still persisted, changed
                     // nothing: the period has passed without it. A member
@@ -1365,7 +1379,13 @@ impl<V: AuthorityVerifier> Owner<V> {
             });
             return;
         }
-        let deadline = Instant::now().checked_add(self.config.request_timeout);
+        let deadline = self
+            .pace
+            .periods()
+            .checked_add(focal_timing::ProgressDeadline::periods(
+                self.config.request_timeout,
+                self.config.tick,
+            ));
         if let (Some(waiting), Some(deadline)) = (waiting, deadline) {
             self.pending.push_back(Pending {
                 header,
@@ -1533,7 +1553,7 @@ impl<V: AuthorityVerifier> Owner<V> {
                 drop(pending);
             } else if pending.term != status.term
                 || status.role != StateRole::Leader
-                || Instant::now() >= pending.deadline
+                || self.pace.periods() >= pending.deadline
             {
                 let failure = match pending.waiting {
                     Waiting::Write(_) => ControlFailure::OutcomeUnknown,

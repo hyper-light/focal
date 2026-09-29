@@ -57,6 +57,117 @@ const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// and not what is sent.
 pub const STREAM_WINDOW_CEILING: u32 = 1024 * 1024;
 
+/// By how many streams a transfer goes on a connection whose law holds
+/// `window` bytes in flight, `most` at most: one for every megabyte the
+/// window holds, and one. A stream carries no more than a megabyte in a
+/// round trip ([`STREAM_WINDOW_CEILING`]), so a window of less is filled by
+/// one; and the law opens its window no further than what is sent fills
+/// it, so the stream that is one more is what lets it find that the path
+/// holds more (`tests/congestion.rs`).
+pub fn bulk_width(window: u64, most: usize) -> usize {
+    usize::try_from(
+        window
+            .checked_div(u64::from(STREAM_WINDOW_CEILING))
+            .unwrap_or(0),
+    )
+    .unwrap_or(usize::MAX)
+    .saturating_add(1)
+    .min(most.max(1))
+}
+/// What the exchanges under way on a connection have to send, in bytes.
+#[derive(Default)]
+struct Held(std::sync::atomic::AtomicU64);
+/// What one exchange has to send, held until it ends.
+struct Sending<'a> {
+    held: &'a Held,
+    bytes: u64,
+}
+impl Held {
+    fn send(&self, bytes: usize) -> (Sending<'_>, u64) {
+        use std::sync::atomic::Ordering;
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        // A count that would not fit is held at what fits.
+        let mut before = self.0.load(Ordering::Acquire);
+        loop {
+            let after = before.saturating_add(bytes);
+            match self
+                .0
+                .compare_exchange_weak(before, after, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    let sending = Sending {
+                        held: self,
+                        bytes: after.saturating_sub(before),
+                    };
+                    return (sending, after);
+                }
+                Err(found) => before = found,
+            }
+        }
+    }
+    fn now(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+impl Drop for Sending<'_> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let mut before = self.held.0.load(Ordering::Acquire);
+        while let Err(found) = self.held.0.compare_exchange_weak(
+            before,
+            before.saturating_sub(self.bytes),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            before = found;
+        }
+    }
+}
+/// Wait for `work`, which sends `bytes` over `connection`, as long as the
+/// path takes to carry them. Every `period` that ends without it is
+/// charged what the connection sent in it and has not found lost. The
+/// work is given up at the end of a period in which less than a datagram
+/// was sent ([`LEAST_PROGRESS`]), and at the end of one that began when
+/// all the exchanges on the connection had to send beside it (`held`) and
+/// `bytes` more had been sent: the peer had the request and a period to
+/// answer it. So a megabyte is given eight seconds and more on a path
+/// that carries a megabit in a second, and an exchange whose peer
+/// stopped taking it one period or two on any path.
+///
+/// What is held is no more than the frames of the streams of a
+/// connection, and every period but the last sends a datagram of it: the
+/// wait ends.
+async fn carried<T>(
+    connection: &Connection,
+    held: &Held,
+    bytes: usize,
+    period: std::time::Duration,
+    work: impl Future<Output = Result<T, WireError>>,
+) -> Result<T, WireError> {
+    let sent = || {
+        let stats = connection.stats();
+        stats.udp_tx.bytes.saturating_sub(stats.path.lost_bytes)
+    };
+    let (_sending, mut owed) = held.send(bytes);
+    let mut charged = 0_u64;
+    let mut before = sent();
+    let mut work = std::pin::pin!(work);
+    loop {
+        let had = charged >= owed;
+        if let Ok(done) = tokio::time::timeout(period, work.as_mut()).await {
+            return done;
+        }
+        let now = sent();
+        let moved = now.saturating_sub(before);
+        before = now;
+        if had || moved < u64::try_from(LEAST_PROGRESS).unwrap_or(u64::MAX) {
+            return Err(WireError::Timeout);
+        }
+        charged = charged.saturating_add(moved);
+        // What came to the connection since is sent in turn with this.
+        owed = owed.max(held.now());
+    }
+}
 fn transport(limits: &WireLimits) -> Result<Arc<quinn::TransportConfig>, WireError> {
     quic_transport(limits).map(Arc::new)
 }
@@ -356,6 +467,8 @@ async fn serve_authenticated_connection_inner<H: RequestHandler + Clone>(
     limits.max_items = negotiated.max_items;
     let task_limit = (limits.streams_per_connection as usize).saturating_add(2);
     let mut tasks = JoinSet::new();
+    // What the answers under way on this connection have to send.
+    let held = Arc::new(Held::default());
     loop {
         tokio::select! {
             Some(_)=tasks.join_next(),if !tasks.is_empty()=>{},
@@ -363,25 +476,31 @@ async fn serve_authenticated_connection_inner<H: RequestHandler + Clone>(
                 let Ok((mut send,mut recv))=streams else{break};
                 if let Some(admitted) = &admitted { admitted.used(); }
                 if tasks.len() >= task_limit {let _=send.reset(2u8.into());let _=recv.stop(2u8.into());continue;}
-                let registry=registry.clone();let limits=limits.clone();let handler=handler.clone();
+                let registry=registry.clone();let limits=limits.clone();let handler=handler.clone();let carrying=connection.clone();let held=held.clone();
                 tasks.spawn(async move {
+                    // Each part of an exchange has its own wait: what is
+                    // asked as it arrives, its handler the time of a
+                    // request (`dispatch`), and its answer as long as the
+                    // path takes to carry it.
                     let work=async {
                         // Recheck registry on every stream, so revocation applies
                         // to already established authenticated connections.
                         let peer=registry.authenticate(fingerprint)?;
-                        let request:RequestEnvelope=read_frame(&mut recv,FrameKind::Request,limits.max_frame_bytes).await?;require_end(&mut recv).await?;
+                        let header=tokio::time::timeout(limits.request_timeout,read_frame_header(&mut recv,FrameKind::Request,limits.max_frame_bytes))
+                            .await.map_err(|_|WireError::Timeout)??;
+                        let request:RequestEnvelope=read_payload_arriving(&mut recv,header,limits.request_timeout).await?;
+                        tokio::time::timeout(limits.request_timeout,require_end(&mut recv))
+                            .await.map_err(|_|WireError::Timeout)??;
                         send.set_priority(request.operation.class().priority()).map_err(|_|WireError::Connection)?;
                         let response = if negotiated.accepts_protocol(request.protocol) {
                             dispatch_accounted(&handler,peer,request,&limits).await
                         } else {
                             OwnedResponse::new(request.reply(Response::Error(AccessError::UnsupportedProtocol)))
                         };
-                        send_owned_response(send,response,limits.max_frame_bytes).await
+                        let bytes=postcard::experimental::serialized_size(response.envelope()).map_err(|_|WireError::InvalidFrame)?;
+                        carried(&carrying,&held,bytes,limits.request_timeout,send_owned_response(send,response,limits.max_frame_bytes)).await
                     };
-                    let _=transport_exchange(async {
-                        tokio::time::timeout(limits.request_timeout,work)
-                            .await.map_err(|_|WireError::Timeout)?
-                    }).await;
+                    let _=transport_exchange(work).await;
                 });
             }
         }
@@ -580,6 +699,7 @@ async fn open_remote(
         capacity: Arc::new(RemoteCapacity {
             data: Semaphore::new(limits.streams_per_connection as usize),
             control: Semaphore::new(2),
+            held: Held::default(),
         }),
     })
 }
@@ -595,6 +715,8 @@ pub struct QuicRemote {
 struct RemoteCapacity {
     data: Semaphore,
     control: Semaphore,
+    /// What the requests under way on the connection have to send.
+    held: Held,
 }
 impl QuicRemote {
     pub fn negotiated(&self) -> Negotiated {
@@ -603,17 +725,28 @@ impl QuicRemote {
     pub fn close(&self) {
         self.connection.close(0u8.into(), b"client closed");
     }
+    /// What the law of the connection holds in flight, in bytes.
+    pub fn window(&self) -> u64 {
+        self.connection.stats().path.cwnd
+    }
     pub async fn request(&self, request: &RequestEnvelope) -> Result<ResponseEnvelope, WireError> {
-        transport_exchange(async {
-            tokio::time::timeout(self.limits.request_timeout, self.request_inner(request))
-                .await
-                .map_err(|_| WireError::Timeout)?
-        })
-        .await
+        self.request_within(request, self.limits.request_timeout)
+            .await
+    }
+    /// An exchange whose peer is given `period` to answer what it has
+    /// been asked, and whose request and answer are given as long as the
+    /// path takes to carry them ([`carried`], [`read_payload_arriving`]).
+    pub async fn request_within(
+        &self,
+        request: &RequestEnvelope,
+        period: std::time::Duration,
+    ) -> Result<ResponseEnvelope, WireError> {
+        transport_exchange(self.request_inner(request, period)).await
     }
     async fn request_inner(
         &self,
         request: &RequestEnvelope,
+        period: std::time::Duration,
     ) -> Result<ResponseEnvelope, WireError> {
         if !self.negotiated.accepts_protocol(request.protocol) {
             return Err(WireError::Access(AccessError::UnsupportedProtocol));
@@ -624,28 +757,40 @@ impl QuicRemote {
             &self.capacity.data
         };
         let _permit = lane.try_acquire().map_err(|_| WireError::Limit)?;
-        let (mut send, mut recv) = self
-            .connection
-            .open_bi()
+        let bytes = postcard::experimental::serialized_size(request)
+            .map_err(|_| WireError::InvalidFrame)?;
+        // The answer begins once the request has been carried and the
+        // peer has answered it.
+        let asked = async {
+            let (mut send, mut recv) = self
+                .connection
+                .open_bi()
+                .await
+                .map_err(|_| WireError::Connection)?;
+            send.set_priority(request.operation.class().priority())
+                .map_err(|_| WireError::Connection)?;
+            write_frame(
+                &mut send,
+                FrameKind::Request,
+                request,
+                self.negotiated.max_frame_bytes,
+            )
+            .await?;
+            send.finish().map_err(|_| WireError::Connection)?;
+            let header = read_frame_header(
+                &mut recv,
+                FrameKind::Response,
+                self.negotiated.max_frame_bytes,
+            )
+            .await?;
+            Ok((recv, header))
+        };
+        let (mut recv, header) =
+            carried(&self.connection, &self.capacity.held, bytes, period, asked).await?;
+        let response: ResponseEnvelope = read_payload_arriving(&mut recv, header, period).await?;
+        tokio::time::timeout(period, require_end(&mut recv))
             .await
-            .map_err(|_| WireError::Connection)?;
-        send.set_priority(request.operation.class().priority())
-            .map_err(|_| WireError::Connection)?;
-        write_frame(
-            &mut send,
-            FrameKind::Request,
-            request,
-            self.negotiated.max_frame_bytes,
-        )
-        .await?;
-        send.finish().map_err(|_| WireError::Connection)?;
-        let response = read_frame(
-            &mut recv,
-            FrameKind::Response,
-            self.negotiated.max_frame_bytes,
-        )
-        .await?;
-        require_end(&mut recv).await?;
+            .map_err(|_| WireError::Timeout)??;
         validate_response(request, &response, None, &self.limits)?;
         Ok(response)
     }

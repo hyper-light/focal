@@ -12,7 +12,7 @@ use std::time::Duration;
 
 /// The owners' configured period: what an allowance in seconds is counted
 /// in (the `ControlHostConfig` default).
-const PERIOD: Duration = Duration::from_millis(100);
+pub const PERIOD: Duration = Duration::from_millis(100);
 /// How long the slowest process may run no period before it is called
 /// wedged, at least.
 const FROZEN: Duration = Duration::from_secs(60);

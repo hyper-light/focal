@@ -25,8 +25,30 @@ struct TickShared {
     /// The periods in which the replica was not ticked, because it was
     /// refused the room or still persisted what the tick before had left.
     refused: AtomicU64,
+    /// When the owner last ran a period, as nanoseconds since the process
+    /// began; and the longest a period took, from one to the next. An owner
+    /// that stalls in a period (a disk that took long, a thread that was
+    /// not scheduled) is seen here and nowhere else: its replica missed
+    /// its heartbeats and its followers may have campaigned.
+    last_advance_ns: AtomicU64,
+    longest_ns: AtomicU64,
+    /// The longest a period took beyond what the owner meant it to be: a
+    /// stall, which the pace covers (`TickPace::derive_with_stall`) and
+    /// which is remembered, with when it was seen, for the margin the
+    /// paths are covered by times its own length (`ELECTION_MARGIN`): a
+    /// stall that lasted a second stands for ten, and a longer one takes
+    /// its place at once. The excess and not the period: a period is what
+    /// the pace made it, and a pace fed its own periods would hold itself
+    /// wherever it was.
+    stall_ns: AtomicU64,
+    stall_seen_ns: AtomicU64,
     /// The last derivation as one value, for observers.
     derived: Mutex<Option<focal_timing::TickPace>>,
+}
+/// When this process began, for the owners' periods to be timed against.
+fn began() -> std::time::Instant {
+    static BEGAN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *BEGAN.get_or_init(std::time::Instant::now)
 }
 impl TickPeriod {
     #[cfg(test)]
@@ -57,9 +79,41 @@ impl TickPeriod {
         Duration::from_nanos(self.0.period_ns.load(Ordering::Relaxed))
             .clamp(configured, ceiling.max(configured))
     }
-    /// The owner ran one period.
-    pub(crate) fn advance(&self) {
+    /// The owner ran one period, which it meant to be `intended` long.
+    pub(crate) fn advance(&self, intended: Duration) {
         self.0.periods.fetch_add(1, Ordering::Relaxed);
+        let now = u64::try_from(began().elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let last = self.0.last_advance_ns.swap(now, Ordering::Relaxed);
+        if last != 0 {
+            let took = now.saturating_sub(last);
+            self.0.longest_ns.fetch_max(took, Ordering::Relaxed);
+            let meant = u64::try_from(intended.as_nanos()).unwrap_or(u64::MAX);
+            let excess = took.saturating_sub(meant);
+            if excess >= self.stall_at(now) {
+                self.0.stall_ns.store(excess, Ordering::Relaxed);
+                self.0.stall_seen_ns.store(now, Ordering::Relaxed);
+            }
+        }
+    }
+    /// The stall remembered at `now`: none once it has stood for the
+    /// margin times its length.
+    fn stall_at(&self, now: u64) -> u64 {
+        let stall = self.0.stall_ns.load(Ordering::Relaxed);
+        let seen = self.0.stall_seen_ns.load(Ordering::Relaxed);
+        let held = now.saturating_sub(seen);
+        if held >= focal_timing::ELECTION_MARGIN.saturating_mul(stall) {
+            0
+        } else {
+            stall
+        }
+    }
+    /// The longest a period took, from one to the next.
+    pub(crate) fn longest(&self) -> Duration {
+        Duration::from_nanos(self.0.longest_ns.load(Ordering::Relaxed))
+    }
+    /// The stall the owner's pace covers now, in nanoseconds.
+    pub(crate) fn stall(&self) -> u64 {
+        self.stall_at(u64::try_from(began().elapsed().as_nanos()).unwrap_or(u64::MAX))
     }
     /// The period passed without a tick.
     pub(crate) fn refuse(&self) {

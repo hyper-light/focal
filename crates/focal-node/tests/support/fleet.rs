@@ -389,22 +389,30 @@ pub fn enroll_client(founder: &Node, client: &Node, name: &str) -> String {
             invitation.to_str().unwrap(),
         ],
     );
-    let enrolled = run(
-        client,
-        None,
-        &[
-            "context",
-            "enroll",
-            name,
-            "--invite-file",
-            invitation.to_str().unwrap(),
-        ],
-    );
-    assert!(
-        enrolled.status.success(),
-        "{}",
-        String::from_utf8_lossy(&enrolled.stderr)
-    );
+    // An enrollment whose outcome is unknown is issued again with the
+    // identity that was saved, as the refusal says.
+    let mut wait = Progress::begin(&[founder], Duration::from_secs(120));
+    loop {
+        let enrolled = run(
+            client,
+            None,
+            &[
+                "context",
+                "enroll",
+                name,
+                "--invite-file",
+                invitation.to_str().unwrap(),
+            ],
+        );
+        if enrolled.status.success() {
+            break;
+        }
+        let refusal = String::from_utf8_lossy(&enrolled.stderr).into_owned();
+        assert!(
+            refusal.contains("outcome is unknown") && wait.spent().is_none(),
+            "{refusal}"
+        );
+    }
     let standing = admin(client, &["--client-context", name, "status"]);
     hex_hash(&objects(&standing)[0]["Standing"]["principal"])
 }

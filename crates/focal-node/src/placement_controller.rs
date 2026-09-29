@@ -1519,9 +1519,13 @@ pub(crate) fn retirement_hold(period: Duration, election_periods: u64) -> i64 {
 }
 /// What the controller would do next for one session, from the committed
 /// directory alone: the operator's `cluster plan`. Never executes anything.
+/// `stands` is for how many seconds more a death of the placement stands
+/// before a heal may move its seat (27 §5; `focal_directory::deaths_stand_for`),
+/// none where no death stands or the caller cannot tell.
 pub(crate) fn planned_actions(
     descriptor: &SessionDescriptor,
     nodes: &std::collections::BTreeMap<u64, focal_directory::NodeRecord>,
+    stands: Option<i64>,
 ) -> Vec<String> {
     let mut actions = Vec::new();
     let mut push = |action: String| {
@@ -1535,7 +1539,7 @@ pub(crate) fn planned_actions(
                 && report.achieved != Some(report.desired)
             {
                 push(format!(
-                    "replan under the active policy: {} of {} promised failures achieved{}",
+                    "replan under the active policy: {} of {} promised failures achieved{}{}",
                     report
                         .achieved
                         .map_or("none".to_owned(), |achieved| achieved
@@ -1546,6 +1550,11 @@ pub(crate) fn planned_actions(
                         .blocked_by
                         .first()
                         .map(|blocker| format!(" ({:?})", blocker.reason))
+                        .unwrap_or_default(),
+                    stands
+                        .map(|seconds| format!(
+                            "; a death stands for {seconds} s more before a seat moves"
+                        ))
                         .unwrap_or_default()
                 ));
             }

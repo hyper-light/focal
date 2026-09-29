@@ -367,7 +367,15 @@ impl LocalNetworkAdmin {
             .ok_or(AccessError::Capacity)?;
         let placement = match &self.placement {
             Some(handle) => match tokio::time::timeout_at(deadline, handle.directory()).await {
-                Ok(Ok(report)) => Some(placement_reply(report, &self.topology_labels().await)),
+                Ok(Ok(report)) => {
+                    let (now, holds) = self.session_holds(&report);
+                    Some(placement_reply(
+                        report,
+                        &self.topology_labels().await,
+                        now,
+                        &holds,
+                    ))
+                }
                 Ok(Err(_)) | Err(_) => None,
             },
             None => None,

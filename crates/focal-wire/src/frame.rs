@@ -189,6 +189,42 @@ pub async fn read_frame_payload_into<'a, R: AsyncRead + Unpin>(
     Ok(payload)
 }
 
+/// The least of a payload that a wait brings, where it does not bring its
+/// end: what one datagram of the least size a path of QUIC carries holds.
+pub const LEAST_PROGRESS: usize = 1_200;
+
+/// Read the payload of `header` and decode it, however long the path
+/// takes to carry it: a payload is given up when a `wait` has brought
+/// neither its end nor [`LEAST_PROGRESS`] more of it. So it is read in as
+/// many waits as it has datagrams at most, and a megabyte arrives over a
+/// path that carries a megabit in a second as over one that carries a
+/// thousand.
+pub async fn read_payload_arriving<R: AsyncRead + Unpin, T: DeserializeOwned>(
+    reader: &mut R,
+    header: FrameHeader,
+    wait: std::time::Duration,
+) -> Result<T, WireError> {
+    let mut bytes = payload_buffer(header.payload_bytes())?;
+    let mut filled = 0_usize;
+    while filled < bytes.len() {
+        let owed = filled.saturating_add(LEAST_PROGRESS).min(bytes.len());
+        let arrived = tokio::time::timeout(wait, async {
+            while filled < owed {
+                let rest = bytes.get_mut(filled..).ok_or(WireError::Limit)?;
+                let read = reader.read(rest).await?;
+                if read == 0 {
+                    return Err(WireError::InvalidFrame);
+                }
+                filled = filled.saturating_add(read);
+            }
+            Ok(())
+        })
+        .await;
+        arrived.map_err(|_| WireError::Timeout)??;
+    }
+    decode_payload(&bytes)
+}
+
 /// Read a raw framed payload into an already-owned buffer. Framing does not
 /// deserialize, authenticate, verify content or require the enclosing stream to
 /// end; callers still perform those checks for their negotiated protocol.

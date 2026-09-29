@@ -20,7 +20,6 @@ use std::{
 
 const MAX_ROUTE_PROBES: usize = 8;
 const ROUTE_ROUND_TIMEOUT: Duration = Duration::from_secs(4);
-const ROUTE_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Constructed only by the trusted owner from its immutable genesis manifest.
 /// No serialized request or live contact table can replace this pin. A changed
@@ -199,7 +198,10 @@ impl<'a> NetworkEnrollmentControl<'a> {
         // A borrowed adapter may move to a runtime without a timer driver.
         // Contain timer/transport dependency panics without repolling an unwind.
         AssertUnwindSafe(async {
-            tokio::time::timeout(ROUTE_ROUND_TIMEOUT, self.call_round(id, rpc))
+            // A round has the time of one probe at least, however far
+            // the peer it asks first.
+            let round = ROUTE_ROUND_TIMEOUT.max(self.pool.limits().timeout);
+            tokio::time::timeout(round, self.call_round(id, rpc))
                 .await
                 .unwrap_or(Err(ControlFailure::OutcomeUnknown))
         })
@@ -246,7 +248,16 @@ impl<'a> NetworkEnrollmentControl<'a> {
                     .map_err(ControlFailure::from)?,
             },
         };
+        // What the round failed with, once it has: an ask whose outcome is
+        // unknown may have been taken by the peer, and no later refusal of
+        // the room here makes it known. A round none of whose asks left
+        // this node (every dial refused the room, `Capacity`) says so.
         let mut failure = ControlFailure::Unavailable;
+        let failed = |failure: &mut ControlFailure, error: ControlFailure| {
+            if !matches!(failure, ControlFailure::OutcomeUnknown) {
+                *failure = error;
+            }
+        };
         let progress = self.local.progress();
         let mut preferred = (progress.leader != 0).then_some(progress.leader);
         if progress.leader == progress.node && !progress.stopped {
@@ -268,7 +279,7 @@ impl<'a> NetworkEnrollmentControl<'a> {
                     if let ControlFailure::NotLeader { leader } = error {
                         preferred = Some(leader);
                     }
-                    failure = error;
+                    failed(&mut failure, error);
                 }
                 Err(error) => return Err(error),
             }
@@ -283,7 +294,8 @@ impl<'a> NetworkEnrollmentControl<'a> {
             }
             *attempted.get_mut(slot).ok_or(ControlFailure::Invalid)? = target;
             let result = tokio::time::timeout(
-                ROUTE_PROBE_TIMEOUT,
+                self.pool
+                    .exchange_wait(target, ROUTE_ROUND_TIMEOUT, MAX_ROUTE_PROBES),
                 self.pool.send_enrollment_control(target, &packet),
             )
             .await
@@ -296,7 +308,7 @@ impl<'a> NetworkEnrollmentControl<'a> {
                     if let ControlFailure::NotLeader { leader } = error {
                         preferred = Some(leader);
                     }
-                    failure = error;
+                    failed(&mut failure, error);
                 }
                 Err(error) => return Err(error),
             }

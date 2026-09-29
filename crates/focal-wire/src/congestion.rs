@@ -18,6 +18,11 @@
 //! It is integer arithmetic throughout, reads the caller's clock, and keeps
 //! three samples for each of its four windows.
 //!
+//! What differs from the law as slates has it, by measurement
+//! (`tests/congestion.rs`): slow start judges a doubling by what was sent
+//! after the last one, and a round trip moves the window by half of itself
+//! at most ([`DEFAULT_STRIDE`]).
+//!
 //! What differs under quinn: quinn paces by its own rule, at five quarters
 //! of the window per smoothed round trip, where Copa would pace at twice
 //! the window per `RTTstanding`; the window is Copa's and the pacing
@@ -44,6 +49,16 @@ const NEARLY_EMPTY_FRACTION: u64 = 10;
 const VELOCITY_DIRECTION_THRESHOLD: u32 = 3;
 /// Copa §4.3: δ = 1/2, as `1/δ`.
 pub const DEFAULT_INV_DELTA: u64 = 2;
+/// A round trip moves the window by half of itself at most. The velocity
+/// of the paper and of slates is bounded by `cwnd·δ` packets, by which one
+/// round trip moves the window by all of itself; what the window's change
+/// does to the queue is heard of a round trip later, so a window that
+/// falls for the queue it built falls to its floor, and one that grows to
+/// the path's rate grows past it. Over the paths of `tests/congestion.rs`
+/// half is what answers soonest, and carries within a thousandth of the
+/// most: at 100 Mbit/s and 100 ms 95% of the path where the whole carries
+/// 67%.
+pub const DEFAULT_STRIDE: u64 = 2;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Sample {
@@ -158,6 +173,9 @@ pub struct Copa {
     window: u64,
     default_inv_delta: u64,
     inv_delta: u64,
+    /// What part of the window a round trip moves it by at most, as its
+    /// inverse.
+    stride: u64,
     competitive: bool,
     slow_start: bool,
     last_double: Option<u64>,
@@ -177,6 +195,11 @@ pub struct Copa {
 }
 impl Copa {
     pub fn new(datagram: u64, inv_delta: u64) -> Self {
+        Self::with_stride(datagram, inv_delta, DEFAULT_STRIDE)
+    }
+    /// A law whose window a round trip moves by a `stride`th of itself at
+    /// most.
+    pub fn with_stride(datagram: u64, inv_delta: u64, stride: u64) -> Self {
         let datagram = datagram.max(1);
         let initial = INITIAL_WINDOW_DATAGRAMS.saturating_mul(datagram);
         Self {
@@ -185,6 +208,7 @@ impl Copa {
             window: initial,
             default_inv_delta: inv_delta.max(1),
             inv_delta: inv_delta.max(1),
+            stride: stride.max(1),
             competitive: false,
             slow_start: true,
             last_double: None,
@@ -215,6 +239,14 @@ impl Copa {
     }
     pub fn inv_delta(&self) -> u64 {
         self.inv_delta
+    }
+    /// How many times the step a packet acknowledged moves the window by.
+    pub fn velocity(&self) -> u64 {
+        self.velocity
+    }
+    /// The least round trip of the last ten seconds.
+    pub fn min_rtt(&self) -> Option<u64> {
+        self.min_rtt.map(|filter| filter.get())
     }
     /// The least round trip of the last half smoothed round trip.
     pub fn standing_rtt(&self) -> Option<u64> {
@@ -274,9 +306,18 @@ impl Copa {
             return;
         }
         if self.slow_start && increase {
+            // The queue a doubling builds is seen by what was sent after
+            // it, a round trip of sending later and a round trip of
+            // acknowledging after that. A doubling judged by what was sent
+            // before the last one doubles once more than the path holds:
+            // at 100 Mbit/s and 100 ms the window came to 3.07 MB where the
+            // path and its queue hold 2.5 MB, the queue overflowed for as
+            // long as the transfer lasted, and what was asked beside it
+            // took four round trips (`tests/congestion.rs`).
+            let sent = now.saturating_sub(rtt);
             match self.last_double {
                 None => self.last_double = Some(now),
-                Some(then) if now.saturating_sub(then) > srtt => {
+                Some(then) if sent > then.saturating_add(srtt) => {
                     self.window = self.window.saturating_mul(2);
                     self.last_double = Some(now);
                 }
@@ -346,6 +387,7 @@ impl Copa {
             .window
             .checked_div(self.datagram)
             .and_then(|packets| packets.checked_div(self.inv_delta))
+            .and_then(|packets| packets.checked_div(self.stride))
             .unwrap_or(1)
             .max(1);
         self.velocity = self.velocity.min(cap);
@@ -397,18 +439,22 @@ impl Copa {
 pub struct CopaConfig {
     /// `1/δ`: how many packets of queue a sender aims to keep, about.
     pub inv_delta: u64,
+    /// What part of the window a round trip moves it by at most, as its
+    /// inverse.
+    pub stride: u64,
 }
 impl Default for CopaConfig {
     fn default() -> Self {
         Self {
             inv_delta: DEFAULT_INV_DELTA,
+            stride: DEFAULT_STRIDE,
         }
     }
 }
 impl ControllerFactory for CopaConfig {
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
         Box::new(CopaController {
-            law: Copa::new(u64::from(current_mtu), self.inv_delta),
+            law: Copa::with_stride(u64::from(current_mtu), self.inv_delta, self.stride),
             began: now,
             srtt: 0,
         })
@@ -504,14 +550,24 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_queue_doubles_the_window_each_round_trip_of_slow_start() {
+    fn an_empty_queue_doubles_the_window_once_what_was_sent_after_the_last_doubling_is_heard_of() {
         let mut law = Copa::new(DATAGRAM, 2);
         let start = law.window();
         assert_eq!(start, 10 * DATAGRAM);
-        for step in 0..=21 {
+        // Heard of at 0: what is acknowledged until 200 ms was sent
+        // within a round trip of it.
+        for step in 0..=20 {
             ack(&mut law, step * 10 * MS, 100 * MS, true);
+            assert_eq!(law.window(), start, "at {step}");
         }
+        ack(&mut law, 210 * MS, 100 * MS, true);
         assert_eq!(law.window(), 2 * start);
+        for step in 22..=41 {
+            ack(&mut law, step * 10 * MS, 100 * MS, true);
+            assert_eq!(law.window(), 2 * start, "at {step}");
+        }
+        ack(&mut law, 420 * MS, 100 * MS, true);
+        assert_eq!(law.window(), 4 * start);
         assert!(law.in_slow_start());
     }
     #[test]

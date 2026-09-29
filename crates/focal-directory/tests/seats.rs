@@ -469,3 +469,38 @@ fn a_death_moves_a_seat_once_it_has_stood() {
     assert!(!deaths_held(&sits, &nodes, 120, 10));
     assert!(deaths_held(&sits, &nodes, 125, 10));
 }
+
+#[test]
+fn how_long_a_death_still_stands_is_the_longest_left() {
+    let verdict = |alive: bool, decided_at: i64| NodeLiveness {
+        alive,
+        incarnation: 1,
+        witness: 1,
+        decided_at,
+    };
+    let mut nodes = fleet(&[(1, HOME, 0), (2, HOME, 0), (3, HOME, 0), (4, HOME, 0)]);
+    let sits = sitting(&[1, 2, 3], &[1, 2], 1);
+    // No one is dead: nothing stands.
+    assert_eq!(deaths_stand_for(&sits, &nodes, 0, 10), None);
+    nodes.get_mut(&2).unwrap().liveness = Some(verdict(false, 100));
+    assert_eq!(deaths_stand_for(&sits, &nodes, 100, 10), Some(10));
+    assert_eq!(deaths_stand_for(&sits, &nodes, 107, 10), Some(3));
+    assert_eq!(deaths_stand_for(&sits, &nodes, 110, 10), None);
+    // A clock behind the verdict: the whole hold.
+    assert_eq!(deaths_stand_for(&sits, &nodes, 99, 10), Some(10));
+    assert_eq!(deaths_stand_for(&sits, &nodes, i64::MIN, 10), Some(10));
+    // The longest left of two deaths; a death outside the placement is not
+    // waited for.
+    nodes.get_mut(&3).unwrap().liveness = Some(verdict(false, 106));
+    nodes.get_mut(&4).unwrap().liveness = Some(verdict(false, 120));
+    assert_eq!(deaths_stand_for(&sits, &nodes, 108, 10), Some(8));
+    assert_eq!(deaths_stand_for(&sits, &nodes, 116, 10), None);
+    // One rule: held is what stands no longer.
+    for now in 95..125 {
+        assert_eq!(
+            deaths_held(&sits, &nodes, now, 10),
+            deaths_stand_for(&sits, &nodes, now, 10).is_none(),
+            "{now}"
+        );
+    }
+}

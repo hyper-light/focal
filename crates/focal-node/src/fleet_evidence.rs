@@ -6,7 +6,8 @@ use futures_util::FutureExt;
 
 pub(super) struct EvidenceCall {
     ttl: u64,
-    deadline: Instant,
+    /// The owner's period at which the call is given up (`fleet::Pending`).
+    deadline: u64,
     response: oneshot::Sender<Result<DurableEvidenceSnapshot, LedgerError>>,
 }
 pub(super) struct PendingEvidenceCall {
@@ -40,8 +41,16 @@ impl ReplicaHost {
         if ttl == 0 {
             return Err(LedgerError::Capacity);
         }
-        let deadline = Instant::now()
-            .checked_add(self.request_timeout)
+        // The owner gives the call the request time of its own periods,
+        // and the caller waits for the owner's answer: given up by the
+        // owner, or lost with it.
+        let deadline = self
+            .pace
+            .periods()
+            .checked_add(focal_timing::ProgressDeadline::periods(
+                self.request_timeout,
+                self.tick,
+            ))
             .ok_or(LedgerError::Capacity)?;
         let charge = self
             .budget
@@ -61,14 +70,11 @@ impl ReplicaHost {
                 HostQueueError::Full => LedgerError::Capacity,
                 HostQueueError::Disconnected => LedgerError::Failed,
             })?;
-        std::panic::AssertUnwindSafe(async {
-            tokio::time::timeout(self.request_timeout, receive).await
-        })
-        .catch_unwind()
-        .await
-        .map_err(|_| LedgerError::OutcomeUnknown)?
-        .map_err(|_| LedgerError::OutcomeUnknown)?
-        .map_err(|_| LedgerError::OutcomeUnknown)?
+        std::panic::AssertUnwindSafe(receive)
+            .catch_unwind()
+            .await
+            .map_err(|_| LedgerError::OutcomeUnknown)?
+            .map_err(|_| LedgerError::OutcomeUnknown)?
     }
 }
 impl Owner {
@@ -115,7 +121,7 @@ impl Owner {
         };
         if self.stopping.is_some()
             || pending.call.response.is_closed()
-            || Instant::now() >= pending.call.deadline
+            || self.pace.periods() >= pending.call.deadline
         {
             self.session.cancel_checkpoint_evidence()?;
             pending.finish(Err(LedgerError::OutcomeUnknown));

@@ -65,6 +65,11 @@ pub enum ControllerError {
     Retired,
 }
 
+/// What one announcement is given, the leader and the routes it is handed
+/// on to together; and how many peers it asks at most, the leader first.
+const ANNOUNCE_ROUND: Duration = Duration::from_secs(5);
+const ANNOUNCE_PROBES: usize = 9;
+
 /// Whether the committed registry knows this node and no longer authorizes
 /// the credential it holds. A registry that does not list the node at all
 /// (a fresh host observing the genesis checkpoint before it replicates its
@@ -1057,11 +1062,9 @@ impl NetworkController {
                             .is_none_or(|at| at.elapsed() >= Duration::from_secs(1))
                         {
                             last_bootstrap_announce = Some(std::time::Instant::now());
-                            if let Ok(result) = tokio::time::timeout(
-                                Duration::from_secs(5),
-                                self.announce_unobserved(pool),
-                            )
-                            .await
+                            if let Ok(result) =
+                                tokio::time::timeout(ANNOUNCE_ROUND, self.announce_unobserved(pool))
+                                    .await
                             {
                                 result?;
                             }
@@ -1087,7 +1090,7 @@ impl NetworkController {
                 // expiration for an entire discovery sweep. Cancellation is an
                 // unknown outcome; the next round uses this exact contact key.
                 if let Ok(result) = tokio::time::timeout(
-                    Duration::from_secs(5),
+                    ANNOUNCE_ROUND,
                     self.announce(current, pool, host, registry),
                 )
                 .await
@@ -1758,7 +1761,7 @@ impl NetworkController {
         // stale leader progress cannot consume every round before discovery.
         if self.routes.contains_key(&leader)
             && let Ok(Ok(response)) = tokio::time::timeout(
-                Duration::from_secs(1),
+                pool.exchange_wait(leader, ANNOUNCE_ROUND, ANNOUNCE_PROBES),
                 pool.send_peer_control(leader, request),
             )
             .await
@@ -1776,7 +1779,7 @@ impl NetworkController {
         }
         // A bounded round visits only installed routes and advances before
         // waiting. Subsequent rounds never learn endpoints from redirects.
-        for _ in 0..8 {
+        for _ in 1..ANNOUNCE_PROBES {
             let Some(target) = pool.next_route_target(self.contact_cursor)? else {
                 self.contact_cursor = 0;
                 break;
@@ -1786,7 +1789,7 @@ impl NetworkController {
                 continue;
             }
             if let Ok(Ok(response)) = tokio::time::timeout(
-                Duration::from_secs(1),
+                pool.exchange_wait(target, ANNOUNCE_ROUND, ANNOUNCE_PROBES),
                 pool.send_peer_control(target, request),
             )
             .await

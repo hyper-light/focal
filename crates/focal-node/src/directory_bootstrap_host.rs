@@ -43,7 +43,9 @@ pub(super) struct PendingDirectory {
     plan: FirstDirectoryPlan,
     context: Vec<u8>,
     term: u64,
-    deadline: Instant,
+    /// The owner's period at which the request is given up: its time in
+    /// the owner's rounds, not the clock's (`control_host::Pending`).
+    deadline: u64,
     response: DirectoryReply,
     input: Allocation,
 }
@@ -105,8 +107,13 @@ impl<V: AuthorityVerifier> Owner<V> {
             {
                 return Err(DirectoryBootstrapError::Unavailable);
             }
-            let deadline = Instant::now()
-                .checked_add(self.config.request_timeout)
+            let deadline = self
+                .pace
+                .periods()
+                .checked_add(focal_timing::ProgressDeadline::periods(
+                    self.config.request_timeout,
+                    self.config.tick,
+                ))
                 .ok_or(DirectoryBootstrapError::Capacity)?;
             self.nonce = self
                 .nonce
@@ -146,7 +153,7 @@ impl<V: AuthorityVerifier> Owner<V> {
         let status = self.replica.status();
         if pending.term != status.term
             || status.role != StateRole::Leader
-            || Instant::now() >= pending.deadline
+            || self.pace.periods() >= pending.deadline
         {
             pending.finish(Err(DirectoryBootstrapError::Unavailable));
         } else if events.read_states.iter().any(|read| {

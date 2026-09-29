@@ -25,10 +25,18 @@ pub enum FaultSite {
     MovementActivate,
     /// A retired map is about to be cleaned up.
     MovementCleanup,
+    /// A restore brought the backup's content and seeds to this node; its
+    /// log is about to be begun.
+    RestoreImported,
+    /// A restore began the log of its group; the copy is about to be
+    /// recorded.
+    RestoreLogged,
+    /// A restore recorded its copy; the copy is about to be attached.
+    RestoreRecorded,
 }
 #[cfg(feature = "test-support")]
 impl FaultSite {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 12] = [
         Self::BeforePropose,
         Self::AfterCommitBeforeReply,
         Self::MovementBegin,
@@ -38,6 +46,9 @@ impl FaultSite {
         Self::MovementSeal,
         Self::MovementActivate,
         Self::MovementCleanup,
+        Self::RestoreImported,
+        Self::RestoreLogged,
+        Self::RestoreRecorded,
     ];
     fn name(self) -> &'static str {
         match self {
@@ -50,6 +61,9 @@ impl FaultSite {
             Self::MovementSeal => "movement-seal",
             Self::MovementActivate => "movement-activate",
             Self::MovementCleanup => "movement-cleanup",
+            Self::RestoreImported => "restore-imported",
+            Self::RestoreLogged => "restore-logged",
+            Self::RestoreRecorded => "restore-recorded",
         }
     }
     fn index(self) -> usize {
@@ -63,6 +77,9 @@ impl FaultSite {
             Self::MovementSeal => 6,
             Self::MovementActivate => 7,
             Self::MovementCleanup => 8,
+            Self::RestoreImported => 9,
+            Self::RestoreLogged => 10,
+            Self::RestoreRecorded => 11,
         }
     }
 }
@@ -86,7 +103,7 @@ pub fn hit(site: FaultSite) {
     #[cfg(feature = "test-support")]
     {
         use std::sync::atomic::{AtomicU32, Ordering};
-        static COUNTS: [AtomicU32; 9] = [const { AtomicU32::new(0) }; 9];
+        static COUNTS: [AtomicU32; 12] = [const { AtomicU32::new(0) }; 12];
         let Some((wanted, count)) = configured() else {
             return;
         };

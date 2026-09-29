@@ -288,9 +288,14 @@ impl TopologyLabels {
         )
     }
 }
+/// `now` is the controller's clock and `holds` how long a death of each
+/// session stands (`retirement_hold`), for `cluster plan` to say for how
+/// long a dead voter keeps its seat; a caller that cannot tell passes none.
 pub(crate) fn placement_reply(
     report: crate::placement_control::DirectoryReport,
     labels: &TopologyLabels,
+    now: Option<i64>,
+    holds: &std::collections::BTreeMap<focal_model::LedgerId, i64>,
 ) -> PlacementReply {
     use focal_client::admin::{
         AdminAssignmentProgress, AdminPartition, AdminPendingPlacement, AdminPlacement,
@@ -434,9 +439,19 @@ pub(crate) fn placement_reply(
                     }),
                 retiring: descriptor.retiring.keys().copied().collect(),
             });
-            for action in
-                crate::placement_agent::controller::planned_actions(descriptor, &checkpoint.nodes)
-            {
+            let stands = now.zip(holds.get(ledger)).and_then(|(now, hold)| {
+                focal_directory::deaths_stand_for(
+                    &descriptor.active.placement,
+                    &checkpoint.nodes,
+                    now,
+                    *hold,
+                )
+            });
+            for action in crate::placement_agent::controller::planned_actions(
+                descriptor,
+                &checkpoint.nodes,
+                stands,
+            ) {
                 actions.push(AdminPlannedAction {
                     partition: partition.clone(),
                     tenant: Some(ledger.tenant.to_string()),
@@ -1137,7 +1152,12 @@ impl LocalNetworkAdmin {
                     | AgentError::Fleet(crate::fleet::FleetError::Capacity) => {
                         AccessError::Capacity
                     }
-                    AgentError::Restore(_) | AgentError::Backup(_) | AgentError::Identity => {
+                    // A log that holds another history is refused as what
+                    // is asked, not as a node that cannot be reached.
+                    AgentError::Restore(_)
+                    | AgentError::Backup(_)
+                    | AgentError::Identity
+                    | AgentError::Consensus(focal_consensus::ConsensusError::Configuration(_)) => {
                         AccessError::InvalidRequest
                     }
                     _ => AccessError::Unavailable,
@@ -1177,7 +1197,8 @@ impl LocalNetworkAdmin {
             .directory()
             .await
             .map_err(|_| AccessError::Unavailable)?;
-        let reply = placement_reply(report, &self.topology_labels().await);
+        let (now, holds) = self.session_holds(&report);
+        let reply = placement_reply(report, &self.topology_labels().await, now, &holds);
         let len =
             postcard::experimental::serialized_size(&reply).map_err(|_| AccessError::Capacity)?;
         if len > MAX_COMMAND {
@@ -1190,6 +1211,40 @@ impl LocalNetworkAdmin {
         bytes.resize(len, 0);
         postcard::to_slice(&reply, &mut bytes).map_err(|_| AccessError::InvalidRequest)?;
         Ok(bytes)
+    }
+    /// The controller's clock, and for how long a death of each session of
+    /// `report` stands before its seat moves (27 §5): one election window
+    /// of the session's group where this node hosts a copy of it, and of
+    /// the partition's own group otherwise, as the controller reckons it
+    /// (`placement_controller::retirement_hold`).
+    pub(crate) fn session_holds(
+        &self,
+        report: &crate::placement_control::DirectoryReport,
+    ) -> (
+        Option<i64>,
+        std::collections::BTreeMap<focal_model::LedgerId, i64>,
+    ) {
+        use crate::placement_agent::controller::retirement_hold;
+        let now = crate::network_bootstrap::unix_time().ok();
+        let mut holds = std::collections::BTreeMap::new();
+        for (_, checkpoint) in &report.partitions {
+            for ledger in checkpoint.sessions.keys() {
+                let hosted = self
+                    .fleet
+                    .as_ref()
+                    .and_then(|fleet| fleet.replica_target(*ledger).ok())
+                    .map(|(_, host)| retirement_hold(host.tick_period(), host.election_periods()));
+                let hold = hosted.or_else(|| {
+                    self.control.as_ref().map(|control| {
+                        retirement_hold(control.tick_period(), control.election_periods())
+                    })
+                });
+                if let Some(hold) = hold {
+                    holds.insert(*ledger, hold);
+                }
+            }
+        }
+        (now, holds)
     }
     /// The region labels the root registered and the topology every node
     /// announced (24 §22), from this node's applied root replica; empty when

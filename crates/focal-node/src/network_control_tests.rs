@@ -802,15 +802,28 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
     let before = allowance.stats();
     for id in [202, 203] {
         let previous = adapter.route_cursor.load(Ordering::Relaxed);
-        assert!(matches!(
-            tokio::time::timeout(
-                Duration::from_secs(5),
-                adapter.read_state(RequestId::from_u128(id))
-            )
-            .await
-            .unwrap(),
-            Err(ControlFailure::OutcomeUnknown | ControlFailure::Unavailable)
-        ));
+        let sent = replicas[0].pool.stats();
+        let answer = tokio::time::timeout(
+            Duration::from_secs(5),
+            adapter.read_state(RequestId::from_u128(id)),
+        )
+        .await
+        .unwrap();
+        // A round some of whose asks left this node cannot know their
+        // outcome; one none of whose asks could be dialed, the pool's three
+        // connections all taken by dials to the dead, was refused the room
+        // here and says so.
+        let after = replicas[0].pool.stats();
+        match answer {
+            Err(ControlFailure::OutcomeUnknown) => {
+                assert!(after.lost > sent.lost, "{sent:?} {after:?}");
+            }
+            Err(ControlFailure::Capacity) => {
+                assert!(after.busy > sent.busy, "{sent:?} {after:?}");
+                assert_eq!(after.lost, sent.lost, "{sent:?} {after:?}");
+            }
+            other => panic!("the round over dead routes answered {other:?}"),
+        }
         let current = adapter.route_cursor.load(Ordering::Relaxed);
         assert!((100..116).contains(&current));
         if previous >= 100 {

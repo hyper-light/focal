@@ -2093,6 +2093,7 @@ impl PlacementAgent {
         })
         .await
         .map_err(|_| AgentError::Runtime)??;
+        crate::fault::hit(crate::fault::FaultSite::RestoreImported);
         let consensus = DurableNode::restore_on_wal_in(
             NodeConfig::single(node, cluster, group),
             self.wal.clone(),
@@ -2105,6 +2106,7 @@ impl PlacementAgent {
                 transition: Some(decoder),
             },
         )?;
+        crate::fault::hit(crate::fault::FaultSite::RestoreLogged);
         let copy = InstalledCopy {
             group,
             bootstrap_voters: vec![node],
@@ -2117,6 +2119,7 @@ impl PlacementAgent {
         let installs = self.installs.as_mut().ok_or(AgentError::Identity)?;
         installs.record.installed.insert(ledger, copy.clone());
         installs.save_on(&handles.control).await?;
+        crate::fault::hit(crate::fault::FaultSite::RestoreRecorded);
         self.attach_copy(handles, ledger, &copy, consensus, &tenant)
             .await?;
         Ok(crate::backup::RestoredSession {

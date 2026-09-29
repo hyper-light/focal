@@ -1451,6 +1451,314 @@ async fn peer_pool_saturation_is_bounded_and_route_change_retires_active_connect
     task.await.unwrap().unwrap();
 }
 
+/// A path between a client and `server` that carries `bits` in a second
+/// each way: a datagram waits its turn behind those before it, and one
+/// that finds `QUEUE` waiting is dropped.
+async fn narrow(
+    server: std::net::SocketAddr,
+    bits: u64,
+) -> (std::net::SocketAddr, Vec<tokio::task::JoinHandle<()>>) {
+    const QUEUE: usize = 32;
+    let front = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let back = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let address = front.local_addr().unwrap();
+    let client = Arc::new(std::sync::Mutex::new(None::<std::net::SocketAddr>));
+    let mut tasks = Vec::new();
+    for up in [true, false] {
+        let (from, to) = if up {
+            (front.clone(), back.clone())
+        } else {
+            (back.clone(), front.clone())
+        };
+        let (queue, mut waiting) = tokio::sync::mpsc::channel::<Vec<u8>>(QUEUE);
+        let known = client.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut datagram = vec![0u8; 65_536];
+            while let Ok((length, source)) = from.recv_from(&mut datagram).await {
+                if up {
+                    *known.lock().unwrap() = Some(source);
+                }
+                let _ = queue.try_send(datagram[..length].to_vec());
+            }
+        }));
+        let known = client.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut free = tokio::time::Instant::now();
+            while let Some(datagram) = waiting.recv().await {
+                free = free.max(tokio::time::Instant::now())
+                    + Duration::from_nanos(datagram.len() as u64 * 8 * 1_000_000_000 / bits);
+                tokio::time::sleep_until(free).await;
+                let target = if up {
+                    Some(server)
+                } else {
+                    *known.lock().unwrap()
+                };
+                if let Some(target) = target {
+                    let _ = to.send_to(&datagram, target).await;
+                }
+            }
+        }));
+    }
+    (address, tasks)
+}
+
+/// A megabyte over a path that takes longer to carry it than a request is
+/// given is carried, each way: an exchange waits as long as the path takes
+/// (`carried`, `read_payload_arriving`), and no longer for a peer that
+/// does not answer than the path would have taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn narrow_path_carries_a_megabyte_that_takes_longer_than_a_request_is_given() {
+    let wire = WireLimits {
+        request_timeout: Duration::from_secs(1),
+        max_frame_bytes: 2 * 1024 * 1024,
+        max_cost: 8 * 1024 * 1024,
+        ..Default::default()
+    };
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(16).unwrap();
+    let mut node_grant = grant();
+    node_grant.role = PeerRole::Node { node_id: 7 };
+    registry
+        .register_certificate(&certificate, node_grant)
+        .unwrap();
+    let megabyte: Vec<u8> = (0..1024 * 1024_u32).map(|at| (at % 251) as u8).collect();
+    let held = megabyte.clone();
+    let silent = Arc::new(tokio::sync::Notify::new());
+    let never = silent.clone();
+    let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| {
+        let (held, never) = (held.clone(), never.clone());
+        async move {
+            let reply = match &verified.request().operation {
+                Operation::Custody(CustodyRequest::Chunk { index, bytes, .. }) => {
+                    assert_eq!(bytes, &held);
+                    CustodyReply::ChunkStored { index: *index }
+                }
+                Operation::Custody(CustodyRequest::ReadChunk { index, .. }) => {
+                    CustodyReply::Chunk {
+                        index: *index,
+                        bytes: held,
+                    }
+                }
+                _ => {
+                    never.notified().await;
+                    CustodyReply::Cancelled
+                }
+            };
+            verified.request().reply(Response::Custody(reply))
+        }
+    });
+    let (server_certificate, server_key) = pki.issue(true);
+    let tls = server_tls(
+        TlsIdentity::from_pkcs8(vec![server_certificate], server_key),
+        vec![pki.ca.der().to_vec()],
+        &wire,
+    )
+    .unwrap();
+    let server = Arc::new(
+        QuicServer::bind("127.0.0.1:0".parse().unwrap(), tls, registry, wire.clone()).unwrap(),
+    );
+    let running = server.clone();
+    let task = tokio::spawn(async move { running.serve(handler).await });
+    // Four megabits in a second: a megabyte takes two seconds and more.
+    const BITS: u64 = 4_000_000;
+    let (path, relays) = narrow(server.local_addr().unwrap(), BITS).await;
+    let tls = client_tls(
+        TlsIdentity::from_pkcs8(vec![certificate], key),
+        vec![pki.ca.der().to_vec()],
+        &wire,
+    )
+    .unwrap();
+    let connector = QuicConnector::bind("127.0.0.1:0".parse().unwrap(), tls, wire.clone()).unwrap();
+    let remote = connector.connect(path, "localhost").await.unwrap();
+    let custody = |id: u128, operation: CustodyRequest| {
+        let mut packet = request(id);
+        packet.operation = Operation::Custody(operation);
+        packet
+    };
+    let began = std::time::Instant::now();
+    let stored = remote
+        .request(&custody(
+            1,
+            CustodyRequest::Chunk {
+                transfer: [1; 16],
+                index: 3,
+                bytes: megabyte.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        stored.result,
+        Response::Custody(CustodyReply::ChunkStored { index: 3 })
+    );
+    // No faster than the path carries it, which is longer than a request
+    // is given.
+    let least = Duration::from_millis(megabyte.len() as u64 * 8 * 1_000 / BITS);
+    assert!(least > wire.request_timeout);
+    let sent = began.elapsed();
+    assert!(sent >= least, "{sent:?}");
+    let began = std::time::Instant::now();
+    let read = remote
+        .request(&custody(
+            2,
+            CustodyRequest::ReadChunk {
+                transfer: [1; 16],
+                index: 4,
+                max_bytes: 1024 * 1024,
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        read.result,
+        Response::Custody(CustodyReply::Chunk {
+            index: 4,
+            bytes: megabyte.clone()
+        })
+    );
+    let received = began.elapsed();
+    assert!(received >= least, "{received:?}");
+    // A peer that does not answer what it was asked: the path has
+    // carried what was asked within one wait.
+    let began = std::time::Instant::now();
+    let unanswered = remote
+        .request_within(
+            &custody(3, CustodyRequest::Cancel { transfer: [1; 16] }),
+            Duration::from_millis(300),
+        )
+        .await;
+    assert!(
+        matches!(unanswered, Err(WireError::Timeout)),
+        "{unanswered:?}"
+    );
+    assert!(began.elapsed() >= Duration::from_millis(300));
+    silent.notify_waiters();
+    remote.close();
+    server.close();
+    task.await.unwrap().unwrap();
+    for relay in relays {
+        relay.abort();
+    }
+}
+
+/// Content to a peer has a lane of its own: a transfer that fills it
+/// refuses nothing a group sends there, content that comes to a full lane
+/// waits its turn, and what waits is counted and bounded.
+#[tokio::test]
+async fn content_waits_its_turn_and_refuses_nothing_a_group_sends() {
+    use std::collections::BTreeMap;
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(16).unwrap();
+    let mut node_grant = grant();
+    node_grant.role = PeerRole::Node { node_id: 7 };
+    registry
+        .register_certificate(&certificate, node_grant)
+        .unwrap();
+    let held = Arc::new(tokio::sync::Semaphore::new(0));
+    let arrived = Arc::new(tokio::sync::Semaphore::new(0));
+    let (gate, seen) = (held.clone(), arrived.clone());
+    let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| {
+        let (gate, seen) = (gate.clone(), seen.clone());
+        async move {
+            match &verified.request().operation {
+                Operation::Custody(CustodyRequest::Cancel { .. }) => {
+                    seen.add_permits(1);
+                    gate.acquire().await.unwrap().forget();
+                    verified
+                        .request()
+                        .reply(Response::Custody(CustodyReply::Cancelled))
+                }
+                _ => verified.request().reply(Response::PeerAccepted),
+            }
+        }
+    });
+    let (server, task) = server(&pki, registry, handler).await;
+    // Five streams: two for what is asked, one for the probe, and two
+    // for content.
+    let wire = WireLimits {
+        streams_per_connection: 5,
+        ..limits()
+    };
+    let tls = client_tls(
+        TlsIdentity::from_pkcs8(vec![certificate], key),
+        vec![pki.ca.der().to_vec()],
+        &wire,
+    )
+    .unwrap();
+    let connector = QuicConnector::bind("127.0.0.1:0".parse().unwrap(), tls, wire).unwrap();
+    let pool = Arc::new(
+        PeerConnectionPool::new(
+            connector,
+            PeerPoolLimits {
+                max_inflight: 4,
+                attempts: 1,
+                timeout: Duration::from_secs(30),
+                ..PeerPoolLimits::default()
+            },
+        )
+        .unwrap(),
+    );
+    pool.replace_routes(
+        1,
+        BTreeMap::from([(
+            2,
+            PeerEndpoint {
+                address: server.local_addr().unwrap(),
+                server_name: "localhost".into(),
+                name: None,
+            },
+        )]),
+    )
+    .unwrap();
+    let content = |id: u128| {
+        let mut packet = request(id);
+        packet.operation = Operation::Custody(CustodyRequest::Cancel { transfer: [3; 16] });
+        packet
+    };
+    let mut sent = Vec::new();
+    for id in 0..4 {
+        let (sending, packet) = (pool.clone(), content(100 + id));
+        sent.push(tokio::spawn(async move {
+            sending.send_custody(2, &packet).await
+        }));
+    }
+    // Two reached the peer and two wait their turn: the lane is full.
+    arrived.acquire_many(2).await.unwrap().forget();
+    while pool.stats().bulk_inflight < 4 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(arrived.available_permits(), 0);
+    // As much content as the pool counts is in flight or waits.
+    assert_eq!(
+        pool.send_custody(2, &content(110)).await,
+        Err(PeerSendError::Busy)
+    );
+    // What a group sends the peer is sent.
+    let mut packet = request(120);
+    packet.operation = Operation::Raft {
+        group: [2; 16],
+        message: vec![7, 8, 9],
+    };
+    assert_eq!(pool.send(2, &packet).await, Ok(()));
+    assert_eq!(pool.stats().inflight, 0);
+    // Those that waited go as those before them are answered.
+    held.add_permits(2);
+    arrived.acquire_many(2).await.unwrap().forget();
+    held.add_permits(2);
+    for pending in sent {
+        assert!(matches!(
+            pending.await.unwrap(),
+            Ok(CustodyReply::Cancelled)
+        ));
+    }
+    assert_eq!(pool.stats().bulk_inflight, 0);
+    pool.close();
+    server.close();
+    task.await.unwrap().unwrap();
+}
+
 #[test]
 fn missing_tokio_context_returns_errors_before_socket_or_handler_work() {
     use std::future::Future;

@@ -64,6 +64,8 @@ enum Law {
     Cubic,
     Bbr,
     Copa,
+    /// Copa whose window a round trip moves by this part of itself at most.
+    Stride(u64),
 }
 impl Law {
     const ALL: [Law; 4] = [Law::NewReno, Law::Cubic, Law::Bbr, Law::Copa];
@@ -73,6 +75,10 @@ impl Law {
             Law::Cubic => Arc::new(CubicConfig::default()),
             Law::Bbr => Arc::new(BbrConfig::default()),
             Law::Copa => Arc::new(focal_wire::congestion::CopaConfig::default()),
+            Law::Stride(stride) => Arc::new(focal_wire::congestion::CopaConfig {
+                stride,
+                ..focal_wire::congestion::CopaConfig::default()
+            }),
         }
     }
 }
@@ -93,6 +99,10 @@ struct Scenario {
     /// Whether what is asked goes before what is transferred
     /// (`SendStream::set_priority`).
     classes: bool,
+    /// Whether the transfers under way are as many as the law's window
+    /// holds megabytes, and one: `focal_wire::bulk_width`. `transfers` is
+    /// the most there are.
+    derived: bool,
 }
 impl Scenario {
     fn bdp_bytes(&self) -> u64 {
@@ -133,6 +143,8 @@ struct Measured {
     queue_drops: u64,
     lost: u64,
     datagrams: u64,
+    /// The transfers that were under way at once at the end.
+    streams: usize,
     /// Why the connection ended before the run did, and when.
     closed: Option<(u64, String)>,
 }
@@ -394,7 +406,12 @@ impl Run {
                 }
             }
             if self.connected {
-                while self.transfers.len() < self.scenario.transfers {
+                let width = if self.scenario.derived {
+                    focal_wire::bulk_width(connection.stats().path.cwnd, self.scenario.transfers)
+                } else {
+                    self.scenario.transfers
+                };
+                while self.transfers.len() < width {
                     let id = connection.streams().open(Dir::Uni).unwrap();
                     if self.scenario.classes {
                         connection
@@ -615,6 +632,7 @@ impl Run {
             queue_drops: stats.dropped_queue,
             lost: stats.dropped_loss,
             datagrams: self.datagrams,
+            streams: self.transfers.len(),
             closed: self.closed.clone(),
         }
     }
@@ -778,6 +796,7 @@ fn scenario(rate: u64, rtt_ms: u64, loss_ppm: u32, seconds: u64) -> Scenario {
         seed: 0xF0CA1,
         transfers: 1,
         classes: false,
+        derived: false,
     }
 }
 
@@ -1014,5 +1033,160 @@ fn what_is_asked_goes_before_what_is_transferred() {
             classes.carried_ppm * 100 >= turns.carried_ppm * 98,
             "{classes:?} {turns:?}"
         );
+    }
+}
+
+/// One stream is given a megabyte ahead of its reader
+/// (`STREAM_WINDOW_CEILING`), so it carries a megabyte in a round trip at
+/// most. A transfer that goes by several streams carries what the path
+/// carries, and what is asked beside it goes before it as before.
+#[test]
+fn a_transfer_by_several_streams_carries_what_the_path_carries() {
+    let pki = Pki::new();
+    println!("| Path | Streams | carried | p50 ms | p99 ms |");
+    println!("|---|---|---|---|---|");
+    for (rate, rtt) in [
+        (1_000_000, 100),
+        (10_000_000, 100),
+        (100_000_000, 1),
+        (100_000_000, 100),
+        (100_000_000, 300),
+        (1_000_000_000, 100),
+    ] {
+        let mut carried = Vec::new();
+        let megabytes = usize::try_from(scenario(rate, rtt, 0, 20).bdp_bytes() >> 20).unwrap();
+        // The lane of content on a connection of sixteen streams
+        // (`PeerConnectionPool::bulk_lane`).
+        const LANE: usize = 16 - 2 - 1;
+        for (transfers, derived) in [(1, false), (4, false), (8, false), (LANE, true)] {
+            let path = Scenario {
+                transfers,
+                classes: true,
+                derived,
+                ..scenario(rate, rtt, 0, 20)
+            };
+            let m = measure(path, Law::Copa, &pki);
+            assert_eq!(m.closed, None, "{}", path.name());
+            println!(
+                "| {} | {}{} | {:.1}% | {:.1} | {:.1} |",
+                path.name(),
+                m.streams,
+                if derived { " derived" } else { "" },
+                m.carried_ppm as f64 / 10_000.0,
+                m.p50_ns as f64 / MS as f64,
+                m.p99_ns as f64 / MS as f64
+            );
+            carried.push((m.carried_ppm, m.streams));
+        }
+        let [(one, _), _, (eight, _), (derived, streams)] = carried[..] else {
+            panic!("{carried:?}")
+        };
+        // Eight streams carry no less than one, and on a path that holds
+        // more than a megabyte in flight they carry more.
+        assert!(eight * 100 >= one * 95, "{carried:?}");
+        if megabytes >= 1 {
+            assert!(eight * 100 >= one * 115, "{carried:?}");
+        }
+        // As many streams as the window holds megabytes, and one, carry
+        // what the most streams carry, and are no more than the path
+        // holds megabytes and two: one where it holds less than one.
+        assert!(derived * 100 >= eight * 97, "{carried:?}");
+        // As many streams as the window holds megabytes, and one: no
+        // more than the path holds and two, and more than the window
+        // its transfer carried holds.
+        assert!(streams <= (megabytes + 2).min(LANE), "{carried:?}");
+        let held = megabytes * usize::try_from(derived).unwrap() / 1_000_000;
+        assert!(streams > held.min(LANE - 1), "{carried:?}");
+    }
+}
+
+/// Copa by what part of its window a round trip may move it by, over
+/// paths that carry a transfer by eight streams. **The rule, fixed before
+/// the run:** of the strides that carry, by geometric mean, ninety-nine
+/// hundredths of what the best carries, the one whose exchanges' 99th
+/// percentile has the least geometric mean is the law's.
+#[test]
+fn the_stride_of_the_law_is_the_one_that_was_measured() {
+    let pki = Pki::new();
+    let full = std::env::var_os("FOCAL_CONGESTION_FULL").is_some();
+    let mut scenarios = Vec::new();
+    let (rates, rtts, losses, seconds): (&[u64], &[u64], &[u32], u64) = if full {
+        (
+            &[1_000_000, 10_000_000, 100_000_000],
+            &[20, 100, 300],
+            &[0, 1_000, 10_000],
+            30,
+        )
+    } else {
+        (&[10_000_000], &[20, 100], &[0], 8)
+    };
+    for rate in rates {
+        for rtt in rtts {
+            for loss in losses {
+                scenarios.push(Scenario {
+                    transfers: 8,
+                    classes: true,
+                    ..scenario(*rate, *rtt, *loss, seconds)
+                });
+            }
+        }
+    }
+    if full {
+        scenarios.push(Scenario {
+            transfers: 8,
+            classes: true,
+            ..scenario(100_000_000, 1, 0, 30)
+        });
+    }
+    let strides = [1u64, 2, 4, 8, 16];
+    let mut delay = vec![Vec::new(); strides.len()];
+    let mut carried = vec![Vec::new(); strides.len()];
+    for path in &scenarios {
+        let measured: Vec<Measured> = strides
+            .iter()
+            .map(|stride| measure(*path, Law::Stride(*stride), &pki))
+            .collect();
+        let best = measured.iter().map(|m| m.p99_ns).min().unwrap().max(1);
+        let most = measured.iter().map(|m| m.carried_ppm).max().unwrap().max(1);
+        let mut line = format!("| {} |", path.name());
+        for (at, m) in measured.iter().enumerate() {
+            assert_eq!(m.closed, None);
+            delay[at].push(m.p99_ns.max(1) as f64 / best as f64);
+            carried[at].push(m.carried_ppm.max(1) as f64 / most as f64);
+            line += &format!(
+                " {:.0} / {:.1}% / {} |",
+                m.p99_ns as f64 / MS as f64,
+                m.carried_ppm as f64 / 10_000.0,
+                m.queue_drops
+            );
+        }
+        println!("{line}");
+    }
+    let judged: Vec<(u64, f64, f64)> = strides
+        .iter()
+        .enumerate()
+        .map(|(at, stride)| {
+            (
+                *stride,
+                geomean(delay[at].iter().copied()),
+                geomean(carried[at].iter().copied()),
+            )
+        })
+        .collect();
+    for (stride, delay, carried) in &judged {
+        println!("stride {stride}: p99 {delay:.3} carried {carried:.3}");
+    }
+    if full {
+        let most = judged
+            .iter()
+            .map(|(_, _, carried)| *carried)
+            .fold(0.0, f64::max);
+        let chosen = judged
+            .iter()
+            .filter(|(_, _, carried)| *carried >= most * 0.99)
+            .min_by(|left, right| left.1.total_cmp(&right.1))
+            .unwrap()
+            .0;
+        assert_eq!(chosen, focal_wire::congestion::DEFAULT_STRIDE);
     }
 }

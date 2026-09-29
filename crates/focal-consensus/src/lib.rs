@@ -344,8 +344,9 @@ impl DurableNode {
     /// index and term under the bootstrap membership, and a hard state that
     /// commits it; then open the group exactly as a restart would, so the
     /// snapshot is delivered to the application as a recovered one. A log
-    /// that already holds any record is refused: a restore never overwrites
-    /// history.
+    /// that already holds any other record is refused: a restore never
+    /// overwrites history. One that holds this image and nothing else is
+    /// opened: a restore that is issued again goes on where it was cut.
     pub fn restore_on_wal_in(
         config: NodeConfig,
         shared: SharedWal,
@@ -374,16 +375,6 @@ impl DurableNode {
         }
         {
             let mut wal = shared.lease(LogicalLogId(config.group_id))?;
-            let mut populated = false;
-            wal.replay(|_| {
-                populated = true;
-                Ok(())
-            })?;
-            if populated {
-                return Err(ConsensusError::Configuration(
-                    "restore into a populated log",
-                ));
-            }
             let conf = ConfState {
                 voters: config.voters.clone(),
                 learners: config.learners.clone(),
@@ -432,8 +423,27 @@ impl DurableNode {
                 image.term,
                 &hard,
             )?);
-            wal.validate_append(&records)?;
-            wal.append_in(&records, BudgetLane::Completion)?;
+            // A log that holds this image and nothing else is this
+            // restore, begun before and cut before its copy was recorded:
+            // the image is written by one append, which a log holds whole
+            // or not at all, so it is opened as it is. Any other record is
+            // history.
+            let mut held = 0_usize;
+            let mut same = true;
+            wal.replay(|record| {
+                same = same && records.get(held) == Some(&record);
+                held = held.saturating_add(1);
+                Ok(())
+            })?;
+            if held != 0 && !(same && held == records.len()) {
+                return Err(ConsensusError::Configuration(
+                    "restore into a populated log",
+                ));
+            }
+            if held == 0 {
+                wal.validate_append(&records)?;
+                wal.append_in(&records, BudgetLane::Completion)?;
+            }
         }
         Self::open_on_wal_in(config, shared, parent_budget)
     }

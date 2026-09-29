@@ -34,7 +34,10 @@ focal --data-dir FOUNDER cluster nodes remove --node LOST      # refused while i
 
 **Preserved guarantee.** No write is acknowledged with fewer copies than the placement
 promises; a healed placement is stronger only after its new copy is verified and promoted;
-removal is refused while the node holds a copy something still needs.
+removal is refused while the node holds a copy something still needs. A death is held for
+one election window of the session's group before it moves a seat
+([27 §5](../archictecutre/27-consensus-roadmap-and-slates-port.md)): a node that returns
+within it keeps its seat, and `cluster plan` says for how many seconds a death still stands.
 
 **Stop conditions.** Stop if `nodes replace` is refused for lack of capacity
 (`node_not_ready`, or the placement's `blocked_by` names capacity): add a host first. The
@@ -46,10 +49,14 @@ founder is never drained or removed.
 **Escalation.** A lost founder is not replaced by this runbook: restore it from its backup
 ([interrupted-restore](interrupted-restore.md)).
 
-**Executed test.** `runbook_node_loss`: a founder, two voters and a spare; one voter is
+**Executed tests.** `runbook_node_loss`: a founder, two voters and a spare; one voter is
 killed; a claim still commits; `nodes replace` heals the session onto the spare and
 `nodes remove` succeeds once the copies are retired; the session's guarantee is back to
-`max_failures: 1`.
+`max_failures: 1`. `runbook_node_loss_within_the_hold_moves_no_seat`: the same fleet; a
+voter goes silent (`SIGSTOP`), its death is committed and the plan says for how long it
+stands; it returns, keeps its seat, and nothing moves after the hold would have passed; it
+goes silent for good, and once its death has stood the seat goes to the spare without an
+operator.
 
 Every command above is under `focal --data-dir DIR cluster ...` on the node named, over its
 own admin socket ([cluster-admin.md](../cluster-admin.md)); reads never change the cluster.

@@ -54,7 +54,7 @@ are not driven in production.
 | # | From slates | Why focal needs it | Lands in |
 |---|---|---|---|
 | P1 | Progress-aware fan-out: `broadcast`, `DispatchWait`, `CommitBudget`, `Stragglers` | A round stops when every peer has reported or when no reply arrives within a stall window, and extends while a quorum is still filling. Late replies are folded into the operation they belong to. focal's drivers bound sends per peer but still decide by fixed deadlines. | `focal_timing::{RoundBudget, RoundWait}`, `focal_wire::gather`. Two differences from slates, both from what focal's transport is. The budget is derived from what exchanges with the round's peers were measured to take, the peer's work included, because a focal request waits on a commit at its peer and not on the path alone. And an exchange outstanding when its round ends is dropped, not kept to fold later: a Raft reply in focal is an inbound message of its own, and a signature past the majority has no use. The pool counts a dropped exchange as given up on and doubles what that peer is expected to take until it answers one (RFC 9002 §6.2), so an estimate that ended a round too early corrects itself |
-| P2 | Derived timing: `PathRtt` (RFC 9002 smoothing), `ElectionTiming::derive`, `round_budget` | focal's election and heartbeat ticks are constants. A WAN group whose round trip exceeds the fixed budget never elects. slates derives the election base from the slowest voter's tail. | `focal_timing::{PathRtt, TickPace}`; the pool measures each path by the liveness probes the peer answers, as the median of the latest sixteen and their median absolute deviation, so that an answer that came late does not set a group's election timeout; both owners tick at the derived period, and a leader beats at the configured cadence whatever its period. As in slates, what stretches is the election timeout and never the heartbeat |
+| P2 | Derived timing: `PathRtt` (RFC 9002 smoothing), `ElectionTiming::derive`, `round_budget` | focal's election and heartbeat ticks are constants. A WAN group whose round trip exceeds the fixed budget never elects. slates derives the election base from the slowest voter's tail. | `focal_timing::{PathRtt, TickPace}`; the pool measures each path by the liveness probes the peer answers, as the median of the latest sixteen and their median absolute deviation, so that an answer that came late does not set a group's election timeout; both owners tick at the derived period, and a leader beats at the configured cadence whatever its period. As in slates, what stretches is the election timeout and never the heartbeat. An owner's own stalls are covered too: the election timeout is ten tails of the slowest path, or the longest the owner's periods stalled beyond what they meant to be and one tail after it, whichever is more (`TickPace::derive_with_stall`); a stall is remembered for the margin times its own length, ten seconds for a stall of one, and a longer one takes its place at once, since a heartbeat leaves the leader's tick, a leader that stalls as this node does sends none for the stall, and a node that stalls cannot tell such a leader from one that died. A stall is a fact about the node and not noise about a path: the longest is covered whole, and it is the excess over the intended period that is measured, never the period itself, which the pace made and which would hold the pace wherever it was (`focal_root_period_longest_ms` is the longest a period took). A request an owner holds is given its time in the owner's periods and not the clock's (`ControlHost`, `ReplicaHost`, their directory, placement, managed and evidence sub-owners): a loaded machine slows the rounds and the request's time with them |
 | P3 | Period-counted timers | A starved node waits longer instead of campaigning. | The control and the replica owner tick once when their period has passed and begin the next from then: a period that was missed is not made up for, and the core counts ticks, so an owner that was starved for ten periods has waited eleven |
 | P4 | Voter reconciliation rules: retire only a death held continuously for one election window; sitting live voters keep their seats | focal's placement controller healed on the first verdict, and one ordering decided both who keeps a seat and who is nearest home. | `focal_directory::{heal_placement, home_move, deaths_held}` and the controller (section 5, seats) |
 | P5 | Admission by certificate: a pending-handshake reservation separate from authenticated slots, two slots per identity, replace on redial | focal bounds connections in total. One identity can take them. | `focal_wire::Admission`, in the node's listener. focal's identities are principals, and a participant may run several clients: a node holds 4 connections and any other identity 16. A connection past the bound replaces the one of that identity that was idle longest. Refusing the newcomer, which was the first rule here, made a participant whose clients exit without closing wait out the idle timeout of what they left behind |
@@ -84,7 +84,7 @@ are not driven in production.
 | Fixed probe deadline kills a starved peer | Fixed: RTT-bounded probe timeout, unconfirmed patience |
 | Abandoned request poisons the next | Not applicable: quinn streams |
 | Voter set never shrinks | Fixed: drain, remove, contact retirement |
-| Hard consensus budget under load | Fixed for what a group decides by (P1, `focal_wire::gather`); the transfers of section 6 stage C are still asked one peer after another |
+| Hard consensus budget under load | Fixed for what a group decides by (P1, `focal_wire::gather`), and for content, which is asked of every copy at once and waits as long as its path takes (section 7) |
 | Round expires inside the WAN round trip | Fixed: P2, the derived pace and the derived round budget |
 | Council retires a suspected voter | Fixed: a death moves a seat once it has stood for one election window of the group, and a heal moves nothing else (section 5, seats) |
 | Wall-clock test deadlines | Converted: the fleet, placement, service, split, route, credential and liveness suites of `focal-node`, and every binary suite (`tests/support/deadline.rs`, `tests/support/fleet.rs`) |
@@ -412,11 +412,11 @@ quorum and never vote, tested as slates tests it.
 | Stage | Content | Exit evidence |
 |---|---|---|
 | A | P8 per-progress deadlines; P7 network model in `focal-sim` | fleet suites pass under injected CPU load |
-| | *State 2026-09-27:* P7 in place with 32 tests. P8 in place for the suites named in section 3.3; the run under injected load is not recorded yet. | |
+| | *State 2026-09-28:* P7 in place with 32 tests. P8 in place for the suites named in section 3.3, and the run under injected load recorded ([09](09-implementation-status.md)): every core held busy, the fleet modules and ten binary suites pass, in the time they take on an idle machine. What the load does to an owner is measured (its longest period) and covered (its pace). | |
 | B | Priority elections wired; transfer on drain; P2 derived timing | election tests under LAN, regional and geographic profiles |
 | | *State 2026-09-28:* wired for session groups, with `drain_leader` on real processes. Elections run over `focal_sim::path` at the three profiles (`sim_election_tests`): real replicas on real logs in virtual time, at the derived pace. | |
 | C | P1 progress-aware fan-out; P5, P6 | dead-voter and straggler tests; no round waits out a dead peer |
-| | *State 2026-09-28:* P5 and P6 in place (`focal_wire::Admission`; a retirement always closes its connection). P1: the round is in place (`focal_timing::RoundBudget`, `RoundWait`; `focal_wire::gather`; `PeerConnectionPool::exchange_tail`, `round_budget`) and session-fact signatures are collected by it. Still asked one peer after another on fixed deadlines: custody replication and the custody and seed pulls (`evidence_service`, `managed_support`), and the fallback of enrollment control and of the contact announcement to the installed routes (`network_control`, `network_controller`). | |
+| | *State 2026-09-28:* P5 and P6 in place (`focal_wire::Admission`; a retirement always closes its connection). P1: the round is in place (`focal_timing::RoundBudget`, `RoundWait`; `focal_wire::gather`; `PeerConnectionPool::exchange_tail`, `round_budget`) and session-fact signatures are collected by it. Custody replication, the obligation and the repair ask every copy at once, and the custody and seed pulls bring a replica as much at once as the path holds, apart from the exchange of facts and without a deadline of their own (section 7). Enrollment control and the contact announcement still ask the installed routes one after another, and that is what they are: one request that one owner may take, handed to the leader that is known and then to whom a refusal names. What they wait for each is what an exchange with that peer was measured to take (`PeerConnectionPool::exchange_wait`). | |
 | D | `focal-raft` core: classic track at parity with raft-rs for focal's use | differential test against raft-rs over random schedules |
 | | *State 2026-09-28:* built and in service under `DurableNode` (section 4.5). Five campaigns of schedules compare the two cores step for step; a run of 15,000 schedules compared 80.8 million steps and found them equal ([09](09-implementation-status.md)). Groups of both cores together, and of this core alone under schedules that also remove the leader, are safe and settle. Replication costs what it cost (`benches/replicate.rs`). | |
 | E | Fast track in `focal-raft`; TLA+ model | section 4.4 invariants; latency measured against classic under 0 to 10% loss |
@@ -458,30 +458,113 @@ has merged what it merges (`too many gaps in stream buffer`). Two causes, both c
 A frame longer than the window is read as it arrives, so the window bounds what is in
 flight and not what is sent. What it costs is stated by the grid: one stream carries a
 megabyte in a round trip at most, 73% of 100 Mbit/s at 100 ms and 25% at 300 ms.
-Transfers that need more go by several streams, which the connection's window of
-eighteen megabytes allows; custody replication does not yet (section 6, stage C).
+Transfers that need more go by several streams (below).
 
 **The laws.** Twenty-seven paths of rate, round trip and loss, and three more (a deep
 queue, bursts of loss, a link within a building), thirty virtual seconds each:
 
 | Law | p99 of the best (geometric mean) | Carried of the best (geometric mean) | Stalled |
 |---|---|---|---|
-| NewReno | 1.276 | 0.402 | on 5 paths |
-| CUBIC, quinn's default | 1.193 | 0.455 | on 5 paths |
-| BBR | 1.998 | 0.965 | nowhere |
-| Copa (δ = 1/2) | 1.130 | 0.987 | nowhere |
+| NewReno | 1.367 | 0.399 | on 5 paths |
+| CUBIC, quinn's default | 1.278 | 0.452 | on 5 paths |
+| BBR | 2.140 | 0.958 | nowhere |
+| Copa (δ = 1/2, stride 2) | 1.082 | 0.998 | nowhere |
 
 NewReno and CUBIC take a loss for congestion. With one datagram in a thousand lost
 they carry 93 to 96% of 10 Mbit/s at 20 ms, 45 to 50% at 100 ms, and 2 to 6% of
 100 Mbit/s at 300 ms; with one in a hundred, 50 to 54% at best and under 1% at worst.
 BBR carries nearly what Copa carries and fills the queue to do it: at 10 Mbit/s and
 100 ms its exchanges take 604 ms at the 99th percentile, six round trips, where
-Copa's take 114. Copa is chosen. It
+Copa's take 113. Copa is chosen. It
 is slates' law (`crates/transport/src/congestion/copa.rs`) behind quinn's interface;
 what quinn does not let a law decide is the pacing, which stays quinn's. Where Copa is
-the worse: on a path of 1 Mbit/s and 20 ms its exchanges take 131 ms at the 99th
+the worse: on a path of 1 Mbit/s and 20 ms its exchanges take 134 ms at the 99th
 percentile where CUBIC's take 78, since it keeps about two datagrams queued, each 10 ms
-at that rate; and at 10 Mbit/s and 300 ms without loss it carries 69%.
+at that rate.
+
+**Two things the law does otherwise than it was taken**, both found on paths that
+hold megabytes in flight, where the law as taken carried 69% of 10 Mbit/s at 300 ms
+and opened its window to three megabytes on a path that holds one:
+
+| What | As taken | Here | Why |
+|---|---|---|---|
+| When slow start doubles | Once in a round trip, by the delay of what is acknowledged now | Once in a round trip, and only by what was sent after the doubling before it and a round trip more | What is acknowledged in the round trip after a doubling was sent before it: its delay says nothing of the window it is asked about, and a window doubled by it is doubled twice for one answer |
+| How far a round trip moves the window | By the velocity, which doubles each round trip the window moves the same way | By the velocity, and by no more than half of what the window over δ holds in datagrams (`DEFAULT_STRIDE`) | A velocity that has doubled for ten round trips moves a window past what the path holds before the delay it causes is seen |
+
+The stride was chosen by a rule fixed before the run (of the strides that carry, by
+geometric mean, ninety-nine hundredths of what the best carries, the one whose
+exchanges wait least), over the grid with a transfer by eight streams:
+
+| Stride | p99 of the best (geometric mean) | Carried of the best (geometric mean) |
+|---|---|---|
+| 1 | 1.149 | 0.951 |
+| 2 | 1.060 | 0.998 |
+| 4 | 1.064 | 0.999 |
+| 8 | 1.107 | 0.999 |
+| 16 | 1.131 | 0.999 |
+
+Copa carries 96.9% of 10 Mbit/s at 300 ms now, and 85.4% of 100 Mbit/s at 300 ms in
+thirty seconds that begin with its slow start.
+
+**A transfer by several streams.** A chunk of content is a megabyte at most and an
+exchange of its own, so a transfer has as many streams as it has chunks under way
+(`evidence_service::striped`). A copy takes the chunks of a manifest in any order: the
+store holds each to the hash the manifest names it by, and the copy keeps a bit for each
+chunk the manifest names, charged with the manifest. By how many streams a transfer goes is decided by what
+the connection's law holds in flight, whenever a chunk is begun: one for every
+megabyte of its window, and one (`focal_wire::bulk_width`). A window of less than a
+megabyte is filled by one stream; and the law opens its window no further than what
+is sent fills it, so the stream that is one more is what lets it find that the path
+holds more. Measured over twenty virtual seconds, against transfers by a fixed number
+of streams:
+
+| Path | One stream | Four | Eight | By the window | Streams it came to |
+|---|---|---|---|---|---|
+| 1 Mbit/s, 100 ms | 93.3% | 93.4% | 93.2% | 93.3% | 1 |
+| 10 Mbit/s, 100 ms | 96.9% | 96.3% | 96.9% | 96.9% | 1 |
+| 100 Mbit/s, 1 ms | 96.5% | 96.5% | 96.5% | 96.5% | 1 |
+| 100 Mbit/s, 100 ms | 73.4% | 92.2% | 92.6% | 95.2% | 2 |
+| 100 Mbit/s, 300 ms | 24.5% | 81.3% | 81.1% | 84.2% | 4 |
+| 1 Gbit/s, 100 ms | 7.4% | 29.5% | 59.0% | 81.1% | 11 |
+
+A path that carries a megabit in a second has one megabyte on it at a time, which it
+carries in eight seconds; eight would each take a minute. The last row reached eleven
+of the thirteen streams the lane holds: the window the law had reached in twenty
+seconds, not the path.
+
+Content has a lane of its own to each peer (`PeerConnectionPool::bulk_lane`): the
+streams of a connection that nothing else can have in flight, which are all of them but
+those of what is asked of the peer (`per_peer_inflight`) and of its probe. Each stream
+has the megabyte of its own window within the connection's, so what a group sends a
+peer is never refused for content. Content that finds the lane full waits its turn, in
+the order it came, so transfers to one peer share it; what waits and what is in flight
+are counted together and bounded (`focal_peer_content_inflight`). What the copy has room
+for is found as a sender finds what a path carries (RFC 5681 §3.1): a chunk refused the
+room while another is in flight is sent again and the transfer keeps half as many in
+flight; from then on one more for every time as many were answered as it keeps. A
+transfer all of whose chunks were refused, none answered between them, is refused. A
+copy of a release that takes chunks in their order only refuses one that came ahead,
+and is sent them one after another from the first.
+
+**How long an exchange waits.** An exchange was given a time: five seconds by the
+pool, thirty by a connection. A megabyte needs 1.7 Mbit/s for the first and 0.28 for
+the second, and a path that carries less carried no content at all. The parts of an
+exchange have waits of their own now, each charged to what it waits on
+(`transport::carried`, `frame::read_payload_arriving`):
+
+| Part | Waits until | Given up when |
+|---|---|---|
+| What is sent, and the peer's answer to it | The answer begins | A period ends in which the connection sent less than a datagram; or a period ends that began when the connection had sent all that its exchanges had to send: the peer had the request, and a period to answer |
+| What arrives | Its last byte | A period brings neither its end nor a datagram more of it |
+| The handler | It answers | The time of a request, as before |
+
+The period is the time the exchange was given before. What a connection sent is what
+it sent and has not found lost. So a megabyte crosses a path of 4 Mbit/s in both
+directions between endpoints that give a request one second
+(`narrow_path_carries_a_megabyte_that_takes_longer_than_a_request_is_given`, through a
+relay that carries that and drops what finds 32 datagrams waiting), and a peer that
+takes a request and does not answer is given up in one period or two on any path.
+Every period but the last moves a datagram of a bounded frame: the wait ends.
 
 **Classes** (`focal_wire::TrafficClass`, `Operation::class`). A stream of a higher
 priority sends all it has before one of a lower sends anything. Consensus, probes and
@@ -490,9 +573,9 @@ consensus message went before everything else and everything else took turns:
 
 | Path | Beside one transfer, p99 | Beside eight, in turn | Beside eight, by class |
 |---|---|---|---|
-| 1 Mbit/s, 100 ms | 190.5 ms | 260.3 ms | 170.9 ms |
-| 10 Mbit/s, 20 ms | 27.7 ms | 33.7 ms | 26.5 ms |
-| 100 Mbit/s, 1 ms | 2.1 ms | 2.7 ms | 1.9 ms |
+| 1 Mbit/s, 100 ms | 205.0 ms | 260.3 ms | 170.9 ms |
+| 10 Mbit/s, 20 ms | 28.0 ms | 34.6 ms | 26.8 ms |
+| 100 Mbit/s, 1 ms | 2.1 ms | 2.7 ms | 2.0 ms |
 
 A class orders what a sender has not sent; what is on the path already is kept short
 by the law.
@@ -514,7 +597,7 @@ has not changed since what focal took from it.
 | Fast Raft | Built in the core and the shell; no owner takes it yet (section 4.6) | `focal_raft::{fast, track}`, `DurableNode::propose_fast` | `tests/fast.rs` under schedules; `docs/models/FastTrack.tla` checked in CI; latency against the classic track, 0 to 10% loss |
 | Pre-vote | In service | `focal_raft::raft`, `Config::pre_vote` | compared with raft-rs step for step; `sim_election_tests` over three path profiles |
 | Priority elections | In service, three ranks | `fleet::{PREFERRED_LEADER_PRIORITY, ZONE_PRIORITY, VOTER_PRIORITY}` | `raft_safety_tests`; `fleet_leader_return_tests` |
-| Parallel vote replication and processing | In service for what a group decides by | `focal_wire::gather`, `focal_timing::RoundBudget` | round tests; dead-voter and straggler tests. The transfers of section 6 stage C are still asked one after another |
+| Parallel vote replication and processing | In service for what a group decides by | `focal_wire::gather`, `focal_timing::RoundBudget` | round tests; dead-voter and straggler tests. Content is asked of every copy at once and goes by as many streams as the path holds (section 7) |
 | Learners | In service | `focal_raft::configuration`, `progress` | differential campaigns with changes; the placement suites |
 | Multi-log synchronization | In service | `leader_return`, `focal_directory::leading`, `leader_balancer`, `seats` | `tests/leader_balance.rs` and `tests/home_balance.rs`, real processes |
 | Leader transfer | In service | `focal_raft::raft`, `ReplicaHost::transfer_leader` | differential campaigns; `drain_leader`; a transfer that reaches a member asking for votes (section 4.5) |
@@ -550,14 +633,17 @@ of it was changed.
 | Its measurements set the window to eight times the path | | What they report is not what a daemon reaches |
 | An object is owned where it was created, until that host dies; then by a survivor chosen by hash | The only host | Every write from elsewhere crosses the long path; nothing moves an owner to its writers or spreads owners |
 | No migration, no path validation, no keep-alive, no key update | Nothing to see | A laptop that changes networks, or a NAT that forgets, ends the session |
-| Copa carries 0.795 of 100 Mbit/s at 100 ms and 0.496 at 300 ms | | focal measured the same law at 69% of 10 Mbit/s at 300 ms: the law under-uses long paths in both |
+| Copa carries 0.795 of 100 Mbit/s at 100 ms and 0.496 at 300 ms | | focal measured the same law at 69% of 10 Mbit/s at 300 ms. With slow start judged by what was sent after a doubling and the stride bounded it carries 96.9% there (section 7); slates' law is as it was |
+| An exchange is given a time, whatever it carries | Nothing to see | A path that carries less than the object in that time carries none of it. focal had the same defect and waits on what the connection sent now (section 7) |
 
 ### 8.4 What is open in focal
 
 | Open | Why it matters |
 |---|---|
-| Transfers by as many streams as the path holds in flight; custody replication asked of all copies at once | One stream carries a megabyte in a round trip (section 7) |
-| The control suite's single asks inside a request deadline of 350 ms | They fail under six copies of the suite at once, as before |
-| A voter that dies and returns within the hold, end to end | The hold is tested by itself and by the dead-voter test |
-| The run under injected load (stage A) | Not recorded |
+| The streams of a connection, sixteen by default (`WireLimits::streams_per_connection`) | The lane of content is derived from them; they are set. 1 Gbit/s at 100 ms holds twelve megabytes in flight, which thirteen streams carry (section 7) |
+| The pool's deadline of five seconds for what is not content, the announcement's round of five and enrollment control's of four | Set, not derived. An exchange of a group with a peer further than that is not made; no path on this planet is, but a peer under load may be |
+| The request time an owner gives what it holds (`request_timeout`, five seconds) | Set, not derived; counted in the owner's periods now, so a loaded machine stretches it, but a follower whose owner stalls for longer than the leader's request time is not seen by the leader, whose own periods run on time. Under sixteen copies of the control suite at once this is what remains: a leader's barrier that a stalled follower does not answer in time (two of sixteen runs). The request time should follow the exchange tails of the voters (`PeerConnectionPool::exchange_tail`), which a stalled follower stretches |
+| The control suite's single asks inside a request deadline of 350 ms | Done, at the cause: the owner gave a request 350 ms of the clock while a loaded machine slowed its rounds, so every ask timed out. A request now waits its time in the owner's own periods (`ControlHost`, `Pending::deadline`), and every ask of the suite that expects an answer waits for a definite one, charged to the hosts' periods (`Rig::definite`, `read_on_leader`); eight copies of the suite at once pass |
+| A restore cut where it records its copy | Cut at three places and issued again on real processes (`runbook_interrupted_restore`); the cut between the copy's record and its attachment is covered by the record alone |
+| A voter that dies and returns within the hold, end to end | Done: `cluster plan` says for how many seconds a death still stands (`focal_directory::deaths_stand_for`), and a voter that returns within the hold keeps its seat on real processes while a spare waits; one that stays dead loses it to the spare without an operator (`runbook_node_loss_within_the_hold_moves_no_seat`) |
 | The fast track for an owner | A receipt states its entry's term: a durable format, and a decision |

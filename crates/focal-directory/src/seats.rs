@@ -288,14 +288,26 @@ pub fn deaths_held(
     now: i64,
     hold: i64,
 ) -> bool {
-    placement.nodes().iter().all(|id| {
-        nodes
-            .get(id)
-            .and_then(|node| node.liveness)
-            .filter(|verdict| !verdict.alive)
-            .is_none_or(|verdict| {
-                now.checked_sub(verdict.decided_at)
-                    .is_some_and(|dead| dead >= hold)
-            })
-    })
+    deaths_stand_for(placement, nodes, now, hold).is_none()
+}
+/// For how many seconds more the deaths of `placement` stand at `now`
+/// before they have stood `hold`: the longest any member declared dead has
+/// left. None once every death has stood ([`deaths_held`]); the whole of
+/// `hold` while a clock is behind a verdict.
+pub fn deaths_stand_for(
+    placement: &Placement,
+    nodes: &BTreeMap<u64, NodeRecord>,
+    now: i64,
+    hold: i64,
+) -> Option<i64> {
+    placement
+        .nodes()
+        .iter()
+        .filter_map(|id| nodes.get(id)?.liveness.filter(|verdict| !verdict.alive))
+        .filter_map(|verdict| {
+            let stood = now.checked_sub(verdict.decided_at).unwrap_or(0).max(0);
+            let left = hold.saturating_sub(stood);
+            (left > 0).then_some(left)
+        })
+        .max()
 }

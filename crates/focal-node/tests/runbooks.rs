@@ -772,109 +772,220 @@ fn runbook_interrupted_restore() {
         ],
     );
     assert_eq!(verified["result"]["kind"], "backup_verified", "{verified}");
-    // A fresh founder restores; it is killed as soon as the restore is
-    // issued, restarted, and the restore issued again.
-    let other = Node::new("restore-target");
-    let activation = admin(&other, &["cluster", "replicas", "activate-native"]);
-    assert_eq!(activation["activated"], true, "{activation}");
-    let address_b = address();
-    let server_b = start(&other, &["--advertise", &address_b]);
-    let admitted = admin(
-        &other,
-        &["cluster", "tenants", "admit", "--tenant", &tenant],
-    );
-    assert_eq!(admitted["result"]["kind"], "tenants", "{admitted}");
-    let restore_args = [
-        "cluster",
-        "restore",
-        "--input",
-        backup.to_str().unwrap(),
-        "--new-incarnation",
-    ];
-    let first = {
-        let other_root = other.root().to_path_buf();
-        let args: Vec<String> = restore_args.iter().map(|arg| (*arg).to_owned()).collect();
-        std::thread::spawn(move || {
-            let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
-            std::process::Command::new(env!("CARGO_BIN_EXE_focal"))
-                .args(["--data-dir", other_root.to_str().unwrap()])
-                .args(&borrowed)
-                .output()
-                .unwrap()
-        })
-    };
-    std::thread::sleep(Duration::from_millis(40));
-    drop(server_b);
-    let interrupted = first.join().unwrap();
-    let _server_b = start(&other, &["--advertise", &address_b]);
-    wait_until(
-        "the restarted node answers its admin socket",
-        Duration::from_secs(60),
-        || {
-            run(&other, None, &["cluster", "node", "readiness"])
-                .status
-                .success()
+    // A fresh founder restores and stops where the restore is cut: once
+    // it has the backup's content, once it has begun the log, and once it
+    // has recorded the copy. It is restarted, and the restore is issued
+    // again with the same arguments.
+    for cut in ["restore-imported", "restore-logged", "restore-recorded"] {
+        let other = Node::new(&format!("target-{cut}"));
+        let activation = admin(&other, &["cluster", "replicas", "activate-native"]);
+        assert_eq!(activation["activated"], true, "{activation}");
+        let address_b = address();
+        let fault = format!("{cut}:1");
+        let server_b = start_with(
+            &other,
+            &["--advertise", &address_b],
+            &[("FOCAL_FAULT", fault.as_str())],
+        );
+        let admitted = admin(
+            &other,
+            &["cluster", "tenants", "admit", "--tenant", &tenant],
+        );
+        assert_eq!(admitted["result"]["kind"], "tenants", "{admitted}");
+        let restore_args = [
+            "cluster",
+            "restore",
+            "--input",
+            backup.to_str().unwrap(),
+            "--new-incarnation",
+        ];
+        let interrupted = run(&other, None, &restore_args);
+        assert!(
+            !interrupted.status.success(),
+            "{cut}: the restore was not cut: {}",
+            String::from_utf8_lossy(&interrupted.stdout)
+        );
+        let mut server_b = server_b;
+        let ended = server_b.0.wait().unwrap();
+        assert!(!ended.success(), "{cut}: the node did not stop at the cut");
+        drop(server_b);
+        let _server_b = start(&other, &["--advertise", &address_b]);
+        let again = run(&other, None, &restore_args);
+        assert!(
+            again.status.success(),
+            "{cut}: the restore issued again: {}{}",
+            String::from_utf8_lossy(&again.stdout),
+            String::from_utf8_lossy(&again.stderr)
+        );
+        let value: Value = serde_json::from_slice(&again.stdout).unwrap();
+        assert_eq!(value["result"]["kind"], "restored", "{cut}: {value}");
+        // And once more: a restore that completed changes nothing.
+        let third = run(&other, None, &restore_args);
+        assert!(
+            third.status.success(),
+            "{cut}: {}",
+            String::from_utf8_lossy(&third.stderr)
+        );
+        // The claim reads back from the restored session over the
+        // operator's local connection, a session of a served tenant.
+        let client = Node::new(&format!("client-{cut}"));
+        let added = run(
+            &client,
+            None,
+            &[
+                "context",
+                "add",
+                "restored",
+                "--node-data-dir",
+                other.root().to_str().unwrap(),
+                "--tenant",
+                &tenant,
+                "--session",
+                &session,
+            ],
+        );
+        assert!(
+            added.status.success(),
+            "{}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+        let mut wait = Progress::begin(&[&other], Duration::from_secs(90));
+        let after = loop {
+            let output = run(
+                &client,
+                Some("restored"),
+                &["get", "claim", &claim, "--format", "json"],
+            );
+            if output.status.success()
+                && let Ok(page) = serde_json::from_slice::<Value>(&output.stdout)
+                && page["result"]["kind"] == "native_read"
+            {
+                break objects(&page)[0].clone();
+            }
+            assert!(
+                wait.spent().is_none(),
+                "{cut}: the restored session never answered: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        };
+        assert_eq!(claim_id(&after), claim_id(&before), "{cut}");
+        assert_eq!(claim_id(&after), claim, "{cut}");
+        assert_eq!(after["Claim"]["status"], before["Claim"]["status"], "{cut}");
+    }
+    let _ = Path::new("");
+}
+
+/// For how many seconds the plan says a death still stands, if it does.
+fn seconds_standing(plan: &str) -> Option<u64> {
+    let rest = plan.split("stands for ").nth(1)?;
+    rest.split(" s more").next()?.trim().parse().ok()
+}
+
+/// A voter that returns before its death has stood one election window
+/// keeps its seat, though a spare could take it (27 §5): the controller
+/// holds the death, `cluster plan` says for how long, and a heal moves the
+/// seat only once a death has stood.
+#[test]
+fn runbook_node_loss_within_the_hold_moves_no_seat() {
+    let (founder, _hosts, servers, members, workload, _tenant, ledger) =
+        three_voters(None, [None, None], None);
+    let spare = Node::new("spare");
+    let spare_address = address();
+    let (_spare_server, spare_id) = join_start(&founder, &spare, "spare", &spare_address);
+    wait_for(
+        &founder,
+        "the spare reports",
+        Duration::from_secs(90),
+        |view| {
+            node_row(view, spare_id)
+                .is_some_and(|row| row["alive"] == true && row["disk_available"].is_number())
         },
     );
-    let again = run(&other, None, &restore_args);
-    let text = String::from_utf8_lossy(&again.stdout).into_owned()
-        + &String::from_utf8_lossy(&again.stderr);
-    if again.status.success() {
-        let value: Value = serde_json::from_slice(&again.stdout).unwrap();
-        assert_eq!(value["result"]["kind"], "restored", "{value}");
-    } else {
-        // Already restored by the interrupted attempt: refused by name.
-        assert!(
-            interrupted.status.success(),
-            "neither attempt restored: {text}\n{}",
-            String::from_utf8_lossy(&interrupted.stderr)
-        );
-    }
-    // The claim reads back from the restored session over the operator's
-    // local connection, a session of a served tenant.
-    let client = Node::new("client-b");
-    let added = run(
-        &client,
-        None,
-        &[
-            "context",
-            "add",
-            "restored",
-            "--node-data-dir",
-            other.root().to_str().unwrap(),
-            "--tenant",
-            &tenant,
-            "--session",
-            &session,
-        ],
-    );
-    assert!(
-        added.status.success(),
-        "{}",
-        String::from_utf8_lossy(&added.stderr)
-    );
-    let mut deadline = deadline::Deadline::after(Duration::from_secs(90));
-    let after = loop {
-        let output = run(
-            &client,
-            Some("restored"),
-            &["get", "claim", &claim, "--format", "json"],
-        );
-        if output.status.success()
-            && let Ok(page) = serde_json::from_slice::<Value>(&output.stdout)
-            && page["result"]["kind"] == "native_read"
-        {
-            break objects(&page)[0].clone();
-        }
-        assert!(
-            deadline.open(),
-            "the restored session never answered: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        std::thread::sleep(Duration::from_millis(250));
+    let sorted = |value: &Value| {
+        let mut ids = ids(value);
+        ids.sort_unstable();
+        ids
     };
-    assert_eq!(claim_id(&after), claim_id(&before));
-    assert_eq!(claim_id(&after), claim);
-    assert_eq!(after["Claim"]["status"], before["Claim"]["status"]);
-    let _ = Path::new("");
+    let plan_text = || admin(&founder, &["cluster", "plan"])["result"]["actions"].to_string();
+    let before = session_row(&placement(&founder).unwrap(), &ledger)
+        .unwrap()
+        .clone();
+    let epoch = before["placement_epoch"].as_u64().unwrap();
+    let seated = sorted(&before["voters"]);
+    assert!(seated.contains(&members[2]), "{before}");
+    // A voter goes silent: its death is committed, and stands.
+    let silent = members[2];
+    servers[2].pause();
+    let claim = workload.write(&founder, "while a voter is silent");
+    wait_for(
+        &founder,
+        "the death is committed",
+        Duration::from_secs(120),
+        |view| !alive(view, silent),
+    );
+    let plan = plan_text();
+    let standing = seconds_standing(&plan)
+        .unwrap_or_else(|| panic!("the plan does not say the death stands: {plan}"));
+    // It returns while the death stands: nothing moved.
+    servers[2].resume();
+    let view = wait_for(
+        &founder,
+        "the voter is back",
+        Duration::from_secs(120),
+        |view| alive(view, silent) && guarantee(view, &ledger) == (Some(1), 0),
+    );
+    let back = session_row(&view, &ledger).unwrap();
+    assert_eq!(back["placement_epoch"], epoch, "{back}");
+    assert!(back["pending"].is_null(), "{back}");
+    // And nothing moves once the death would have stood: the founder runs
+    // the hold and one window more, charged to its progress.
+    let span = u64::try_from(
+        Duration::from_secs(standing + 1).as_millis() / deadline::progress::PERIOD.as_millis(),
+    )
+    .unwrap();
+    let began = periods(&founder).unwrap();
+    let mut wait = Progress::begin(&[&founder], Duration::from_secs(standing + 1 + 60));
+    while periods(&founder).is_none_or(|now| now < began + span) {
+        assert!(wait.spent().is_none(), "the founder stopped");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let rested = session_row(&placement(&founder).unwrap(), &ledger)
+        .unwrap()
+        .clone();
+    assert_eq!(rested["placement_epoch"], epoch, "{rested}");
+    assert_eq!(sorted(&rested["voters"]), seated, "{rested}");
+    assert!(rested["pending"].is_null(), "{rested}");
+    let plan = plan_text();
+    assert_eq!(seconds_standing(&plan), None, "{plan}");
+    assert_eq!(claim_id(&read_claim(&founder, &claim)), claim);
+    // Silent again, and for good: the death stands, and the seat goes to
+    // the spare without an operator.
+    servers[2].pause();
+    wait_for(
+        &founder,
+        "the death is committed again",
+        Duration::from_secs(120),
+        |view| !alive(view, silent),
+    );
+    let healed = wait_for(
+        &founder,
+        "healed onto the spare",
+        Duration::from_secs(240),
+        |view| {
+            session_row(view, &ledger).is_some_and(|session| {
+                session["pending"].is_null()
+                    && session["achieved_max_failures"] == 1
+                    && ids(&session["voters"]).contains(&spare_id)
+                    && !ids(&session["voters"]).contains(&silent)
+            })
+        },
+    );
+    let healed = session_row(&healed, &ledger).unwrap();
+    assert!(
+        healed["placement_epoch"].as_u64().unwrap() > epoch,
+        "{healed}"
+    );
+    assert_eq!(claim_id(&read_claim(&founder, &claim)), claim);
+    servers[2].resume();
 }

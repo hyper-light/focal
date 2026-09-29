@@ -46,6 +46,10 @@ pub struct RootMetrics {
     /// Periods in which the owner's replica was not ticked: it was
     /// refused the room or still persisted.
     pub refused_periods: u64,
+    /// The longest a period of the owner took, from one to the next, in
+    /// milliseconds: a stall of the owner, in a disk or a thread that was
+    /// not scheduled, which its followers may have taken for its death.
+    pub longest_period_ms: u64,
     /// The slowest measured voter path's round-trip tail, in microseconds.
     pub broadcast_tail_us: u64,
     /// Round trips that fed the pace; zero means the configured period.
@@ -111,6 +115,9 @@ pub struct SessionMetrics {
     /// Periods in which the owner's replica was not ticked: it was
     /// refused the room or still persisted.
     pub refused_periods: u64,
+    /// The longest a period of the owner took, in milliseconds
+    /// (`RootMetrics::longest_period_ms`).
+    pub longest_period_ms: u64,
     pub broadcast_tail_us: u64,
     pub pace_samples: u64,
 }
@@ -373,6 +380,11 @@ impl MetricsSnapshot {
             self.root.refused_periods,
         );
         text.gauge(
+            "focal_root_period_longest_ms",
+            "The longest a period of the root owner took, from one to the next: a stall, which the owner's pace covers from then on.",
+            self.root.longest_period_ms,
+        );
+        text.gauge(
             "focal_root_stopped",
             "Whether the root replica stopped.",
             u8::from(self.root.stopped),
@@ -473,6 +485,11 @@ impl MetricsSnapshot {
             "focal_peer_inflight",
             "Peer requests in flight.",
             self.peers.inflight,
+        );
+        text.gauge(
+            "focal_peer_content_inflight",
+            "Content to peers in flight or waiting its turn.",
+            self.peers.bulk_inflight,
         );
         text.gauge(
             "focal_listener_handshakes_pending",
@@ -679,11 +696,16 @@ impl MetricsSnapshot {
             "Whether sessions beyond the bound were left out.",
             u8::from(self.sessions_truncated),
         );
-        let series: [(&str, &str, &str); 26] = [
+        let series: [(&str, &str, &str); 27] = [
             (
                 "focal_session_periods_refused_total",
                 "counter",
                 "Periods in which the session's replica was not ticked: it was refused the room, or still persisted.",
+            ),
+            (
+                "focal_session_period_longest_ms",
+                "gauge",
+                "The longest a period of the session's owner took, from one to the next: a stall, which the owner's pace covers from then on.",
             ),
             (
                 "focal_session_leader",
@@ -816,6 +838,7 @@ impl MetricsSnapshot {
                 ];
                 let value: Option<u64> = match name {
                     "focal_session_periods_refused_total" => Some(session.refused_periods),
+                    "focal_session_period_longest_ms" => Some(session.longest_period_ms),
                     "focal_session_leader" => Some(session.leader),
                     "focal_session_preferred_leader" => session.preferred_leader,
                     "focal_session_leader_returns_total" => Some(session.leader_returns),
@@ -953,6 +976,7 @@ mod tests {
                 connections_opened: 1,
                 cached_connections: 1,
                 inflight: 0,
+                bulk_inflight: 0,
             },
             listener: focal_wire::AdmissionStats::default(),
             peer_rtts: vec![PeerRtt {

@@ -112,6 +112,8 @@ pub struct PeerPoolStats {
     pub connections_opened: u64,
     pub cached_connections: usize,
     pub inflight: usize,
+    /// Content in flight or waiting its turn on a peer's lane.
+    pub bulk_inflight: usize,
 }
 #[derive(Default)]
 struct Counters {
@@ -150,6 +152,8 @@ struct Slot {
     endpoint: PeerEndpoint,
     retired: AtomicBool,
     inflight: Semaphore,
+    /// The lane of content: what a transfer keeps in flight to this peer.
+    bulk: Semaphore,
     /// The probe lane: one liveness probe to this peer at a time.
     probes: Semaphore,
     /// Never held across an await: a retirement takes it and closes what it
@@ -290,6 +294,8 @@ pub struct PeerConnectionPool {
     state: Mutex<State>,
     inflight: Semaphore,
     probe_inflight: Semaphore,
+    /// Content in flight or waiting its turn, to every peer.
+    bulk_inflight: Semaphore,
     // OwnedSemaphorePermit lives in slots that can outlive cache membership.
     connections: Arc<Semaphore>,
     // A slot's detached dial records its outcome after every caller may have
@@ -301,12 +307,49 @@ impl PeerConnectionPool {
     pub fn limits(&self) -> &PeerPoolLimits {
         &self.limits
     }
+    /// The lane of content to one peer ([`TrafficClass::Bulk`]): the
+    /// streams of a connection that nothing else can have in flight, which
+    /// are all of them but those of what is asked of the peer
+    /// (`per_peer_inflight`) and of its probe; one at least. A transfer goes
+    /// by as many streams, since one stream carries a megabyte in a round
+    /// trip, and what a group needs of the peer is never refused for the
+    /// content on its way there: each stream has the megabyte of its own
+    /// window in the window of the connection. Content waits its turn on
+    /// the lane, in the order it came and no longer than `timeout`, so
+    /// transfers to one peer share it; as much content as `max_inflight`
+    /// is in flight or waits, counted apart from everything else.
+    pub fn bulk_lane(&self) -> usize {
+        usize::try_from(self.connector.limits().streams_per_connection)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(self.limits.per_peer_inflight)
+            .saturating_sub(1)
+            .max(1)
+    }
+    /// By how many streams a transfer to `target` goes now
+    /// ([`crate::bulk_width`]): what the law of the connection to it holds
+    /// in flight decides, and one stream while there is no connection.
+    pub fn bulk_width(&self, target: u64) -> usize {
+        let window = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.cached.get(&target).map(|entry| entry.slot.clone()))
+            .and_then(|slot| {
+                slot.connection
+                    .lock()
+                    .ok()
+                    .and_then(|cached| cached.as_ref().map(|entry| entry.remote.window()))
+            })
+            .unwrap_or(0);
+        crate::bulk_width(window, self.bulk_lane())
+    }
     pub fn new(connector: QuicConnector, limits: PeerPoolLimits) -> Result<Self, PeerSendError> {
         limits.validate()?;
         Ok(Self {
             connector,
             inflight: Semaphore::new(limits.max_inflight),
             probe_inflight: Semaphore::new(limits.max_probe_inflight),
+            bulk_inflight: Semaphore::new(limits.max_inflight),
             connections: Arc::new(Semaphore::new(limits.max_connections)),
             limits,
             state: Mutex::new(State {
@@ -387,6 +430,21 @@ impl PeerConnectionPool {
         let tail = exchange.taken.tail_ns()?;
         let factor = 1u64.checked_shl(exchange.abandoned.min(MAX_BACKOFF))?;
         Some(Duration::from_nanos(tail.saturating_mul(factor)))
+    }
+    /// How long one of `asked` peers that are asked one after another
+    /// within `round` is waited for: its share of the round, so that each
+    /// of them can be asked, and what an exchange with it is expected to
+    /// take where that is more ([`Self::exchange_tail`]); the pool's own
+    /// deadline at most. A peer across the planet is waited for as long
+    /// as it takes to answer, one that stopped answering twice as long
+    /// each time, and one that never answered its share.
+    pub fn exchange_wait(&self, target: u64, round: Duration, asked: usize) -> Duration {
+        let share = round
+            .checked_div(u32::try_from(asked.max(1)).unwrap_or(u32::MAX))
+            .unwrap_or(round);
+        self.exchange_tail(target)
+            .map_or(share, |tail| tail.max(share))
+            .min(self.limits.timeout)
     }
     /// The budget of a round that asks `targets` (27 §3.1 P1): derived from
     /// the slowest of them, and the pool's own deadline where one of them
@@ -708,20 +766,48 @@ impl PeerConnectionPool {
             measured: !probe && !matches!(request.operation, Operation::Raft { .. }),
             answered: false,
         };
+        let bulk = !probe && request.operation.class() == TrafficClass::Bulk;
         let _inflight = if probe {
             &self.probe_inflight
+        } else if bulk {
+            &self.bulk_inflight
         } else {
             &self.inflight
         }
         .try_acquire()
         .map_err(|_| PeerSendError::Busy)?;
-        tokio::time::timeout(self.limits.timeout, async {
+        // Content waits its turn; the time it has to be exchanged in
+        // begins once it has it.
+        let waited = if bulk { Some(self.slot(target)?) } else { None };
+        let _turn = match &waited {
+            Some(slot) => Some(
+                tokio::time::timeout(self.limits.timeout, slot.bulk.acquire())
+                    .await
+                    .map_err(|_| PeerSendError::Busy)?
+                    .map_err(|_| PeerSendError::Closed)?,
+            ),
+            None => None,
+        };
+        let exchange = async {
             for attempt in 0..self.limits.attempts {
                 let slot = self.slot(target)?;
-                let _peer = if probe { &slot.probes } else { &slot.inflight }
-                    .try_acquire()
-                    .map_err(|_| PeerSendError::Busy)?;
-                let (generation, remote) = match self.connection(&slot).await {
+                // A route that changed has a lane of its own, and the turn
+                // that was waited for is none on it.
+                let _peer = if probe {
+                    Some(&slot.probes)
+                } else if !bulk {
+                    Some(&slot.inflight)
+                } else if waited.as_ref().is_some_and(|had| Arc::ptr_eq(had, &slot)) {
+                    None
+                } else {
+                    Some(&slot.bulk)
+                }
+                .map(|lane| lane.try_acquire().map_err(|_| PeerSendError::Busy))
+                .transpose()?;
+                let connected = tokio::time::timeout(self.limits.timeout, self.connection(&slot))
+                    .await
+                    .unwrap_or(Err(PeerSendError::Lost));
+                let (generation, remote) = match connected {
                     Ok(connection) => connection,
                     Err(error) => {
                         if attempt.saturating_add(1) == self.limits.attempts {
@@ -732,7 +818,12 @@ impl PeerConnectionPool {
                     }
                 };
                 let sent = std::time::Instant::now();
-                match remote.request(request).await {
+                let answered = if bulk {
+                    remote.request_within(request, self.limits.timeout).await
+                } else {
+                    remote.request(request).await
+                };
+                match answered {
                     Ok(response) => match response.result {
                         value @ (Response::PeerAccepted
                         | Response::Custody(_)
@@ -781,9 +872,18 @@ impl PeerConnectionPool {
                 }
             }
             Err(PeerSendError::Lost)
-        })
-        .await
-        .map_err(|_| PeerSendError::Lost)?
+        };
+        // Content is given as long as the path takes to carry it, each
+        // part of its exchange by a wait of its own
+        // (`QuicRemote::request_within`); everything else the time of one
+        // exchange, whatever it is made of.
+        if bulk {
+            exchange.await
+        } else {
+            tokio::time::timeout(self.limits.timeout, exchange)
+                .await
+                .map_err(|_| PeerSendError::Lost)?
+        }
     }
     fn slot(&self, target: u64) -> Result<Arc<Slot>, PeerSendError> {
         let mut state = self.state.lock().map_err(|_| PeerSendError::Closed)?;
@@ -829,6 +929,7 @@ impl PeerConnectionPool {
             endpoint,
             retired: AtomicBool::new(false),
             inflight: Semaphore::new(self.limits.per_peer_inflight),
+            bulk: Semaphore::new(self.bulk_lane()),
             probes: Semaphore::new(1),
             connection: Mutex::new(None),
             dial: Mutex::new(None),
@@ -970,6 +1071,10 @@ impl PeerConnectionPool {
                 .limits
                 .max_inflight
                 .saturating_sub(self.inflight.available_permits()),
+            bulk_inflight: self
+                .limits
+                .max_inflight
+                .saturating_sub(self.bulk_inflight.available_permits()),
         }
     }
     pub fn close(&self) {

@@ -960,3 +960,209 @@ fn a_phase_beginning_frame_names_its_artifact_and_other_frames_do_not() {
     assert!(crate::native_ingress::evaluates_artifact(18));
     assert!(!crate::native_ingress::evaluates_artifact(6));
 }
+
+/// What [`striped`] was asked to move, as the peer of a test saw it.
+#[derive(Default)]
+struct Moved {
+    /// Every chunk that was begun, in the order it was.
+    begun: Vec<u32>,
+    /// The chunks that were answered.
+    answered: BTreeSet<u32>,
+    flying: usize,
+    most: usize,
+}
+impl Moved {
+    fn begin(&mut self, index: u32) {
+        self.begun.push(index);
+        self.flying += 1;
+        self.most = self.most.max(self.flying);
+    }
+    fn end(&mut self, index: u32, answered: bool) {
+        self.flying -= 1;
+        if answered {
+            self.answered.insert(index);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_transfer_keeps_as_many_chunks_in_flight_as_the_path_holds() {
+    let moved = std::cell::RefCell::new(Moved::default());
+    let result = striped(
+        || 8,
+        5..300,
+        async |index: u32| {
+            moved.borrow_mut().begin(index);
+            if index == 5 {
+                // The first is answered last: the others go on beside it.
+                while moved.borrow().answered.len() < 294 {
+                    tokio::task::yield_now().await;
+                }
+            } else {
+                tokio::task::yield_now().await;
+            }
+            moved.borrow_mut().end(index, true);
+            Ok(())
+        },
+    )
+    .await;
+    assert_eq!(result, Ok(()));
+    let moved = moved.into_inner();
+    assert_eq!(moved.most, 8);
+    assert_eq!(moved.begun.len(), 295);
+    assert_eq!(moved.answered, (5..300).collect());
+}
+
+/// What a copy has room for is found as a sender finds what a path
+/// carries: half as many on a refusal, one more for every round answered.
+#[tokio::test]
+async fn a_chunk_refused_the_room_is_moved_again_and_the_room_is_found() {
+    let moved = std::cell::RefCell::new(Moved::default());
+    let refusals = std::cell::Cell::new(0_usize);
+    let result = striped(
+        || 8,
+        0..400,
+        async |index: u32| {
+            moved.borrow_mut().begin(index);
+            tokio::task::yield_now().await;
+            // The copy has room for four at once.
+            let refused = moved.borrow().flying > 4;
+            moved.borrow_mut().end(index, !refused);
+            if refused {
+                refusals.set(refusals.get() + 1);
+                Err(AccessError::Capacity)
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .await;
+    assert_eq!(result, Ok(()));
+    let moved = moved.into_inner();
+    assert_eq!(moved.answered, (0..400).collect());
+    assert_eq!(moved.begun.len(), 400 + refusals.get());
+    // It was refused when it began with eight and each time it tried a
+    // fifth, which is once in the rounds it takes to come back to five:
+    // far fewer than the chunks it moved.
+    assert!((2..=100).contains(&refusals.get()), "{}", refusals.get());
+}
+
+#[tokio::test]
+async fn a_transfer_that_is_refused_the_room_throughout_is_refused_and_ends() {
+    for width in [1, 2, 8, 16] {
+        let moved = std::cell::RefCell::new(Moved::default());
+        let result = striped(
+            || width,
+            0..1000,
+            async |index: u32| {
+                moved.borrow_mut().begin(index);
+                tokio::task::yield_now().await;
+                moved.borrow_mut().end(index, false);
+                Err(AccessError::Capacity)
+            },
+        )
+        .await;
+        assert_eq!(result, Err(AccessError::Capacity));
+        // Every chunk it had begun, and as many again at most.
+        assert!(moved.borrow().begun.len() <= width * 2, "{width}");
+    }
+    // One chunk that is never taken beside others that are: the transfer
+    // ends when nothing but it is left.
+    let moved = std::cell::RefCell::new(Moved::default());
+    let result = striped(
+        || 4,
+        0..32,
+        async |index: u32| {
+            moved.borrow_mut().begin(index);
+            tokio::task::yield_now().await;
+            moved.borrow_mut().end(index, index != 7);
+            if index == 7 {
+                Err(AccessError::Capacity)
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .await;
+    assert_eq!(result, Err(AccessError::Capacity));
+    let moved = moved.into_inner();
+    assert!(!moved.answered.contains(&7));
+    assert!(moved.begun.len() <= 32 * 2);
+}
+
+#[tokio::test]
+async fn a_copy_that_takes_chunks_in_their_order_only_is_sent_them_one_after_another() {
+    let moved = std::cell::RefCell::new(Moved::default());
+    let next = std::cell::Cell::new(3_u32);
+    let result = striped(
+        || 8,
+        3..40,
+        async |index: u32| {
+            moved.borrow_mut().begin(index);
+            tokio::task::yield_now().await;
+            // The copy of the release before: a chunk past the first it
+            // lacks is refused, one it has is taken again.
+            let taken = index <= next.get();
+            if index == next.get() {
+                next.set(index + 1);
+            }
+            moved.borrow_mut().end(index, taken);
+            if taken {
+                Ok(())
+            } else {
+                Err(AccessError::InvalidRequest)
+            }
+        },
+    )
+    .await;
+    assert_eq!(result, Ok(()));
+    assert_eq!(next.get(), 40);
+    let moved = moved.into_inner();
+    assert_eq!(moved.answered, (3..40).collect());
+    // From the refusal on, one at a time and in order, from the first.
+    let from = moved.begun.iter().rposition(|index| *index == 3).unwrap();
+    assert!(moved.begun[from..].iter().copied().eq(3..40));
+    // A refusal that has nothing to do with order ends the transfer.
+    let result = striped(|| 1, 0..4, async |_| Err(AccessError::InvalidRequest)).await;
+    assert_eq!(result, Err(AccessError::InvalidRequest));
+    let result = striped(|| 8, 0..4, async |_| Err(AccessError::Unauthorized)).await;
+    assert_eq!(result, Err(AccessError::Unauthorized));
+    assert_eq!(striped(|| 8, 4..4, async |_| Ok(())).await, Ok(()));
+}
+
+#[tokio::test]
+async fn a_transfer_goes_by_as_many_streams_as_the_path_holds_when_a_chunk_is_begun() {
+    let moved = std::cell::RefCell::new(Moved::default());
+    // What the path holds: one stream until eight chunks were answered,
+    // four from then on, and two after forty.
+    let width = || match moved.borrow().answered.len() {
+        0..8 => 1,
+        8..40 => 4,
+        _ => 2,
+    };
+    let seen = std::cell::RefCell::new(Vec::new());
+    let result = striped(width, 0..64, async |index: u32| {
+        moved.borrow_mut().begin(index);
+        let answered = moved.borrow().answered.len();
+        let flying = moved.borrow().flying;
+        seen.borrow_mut().push((answered, flying));
+        tokio::task::yield_now().await;
+        moved.borrow_mut().end(index, true);
+        Ok(())
+    })
+    .await;
+    assert_eq!(result, Ok(()));
+    let seen = seen.into_inner();
+    assert_eq!(seen.len(), 64);
+    // What was begun while the path held more goes on; nothing is begun
+    // beside more than the path holds.
+    for (answered, flying) in &seen {
+        let most = match answered {
+            0..8 => 1,
+            8..44 => 4,
+            _ => 2,
+        };
+        assert!(flying <= &most, "{answered} {flying}");
+    }
+    assert!(seen.iter().any(|(_, flying)| *flying == 4));
+}

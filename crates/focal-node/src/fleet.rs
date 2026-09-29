@@ -332,7 +332,10 @@ struct PendingMembershipCall {
     proposed: bool,
     context: Option<Vec<u8>>,
     term: u64,
-    deadline: Instant,
+    /// The owner's period at which the request is given up: its time in
+    /// the owner's rounds and not the clock's (27 §3.1 P2), so an owner
+    /// that a loaded machine slows gives up nothing it would have answered.
+    deadline: u64,
     charge: Allocation,
 }
 impl PendingMembershipCall {
@@ -553,7 +556,10 @@ struct Pending {
     response: oneshot::Sender<OwnedResponse>,
     waiting: WaitingFor,
     term: u64,
-    deadline: Instant,
+    /// The owner's period at which the request is given up: its time in
+    /// the owner's rounds and not the clock's (27 §3.1 P2), so an owner
+    /// that a loaded machine slows gives up nothing it would have answered.
+    deadline: u64,
     _charge: Allocation,
 }
 impl Pending {
@@ -603,7 +609,9 @@ struct Owner {
     /// When leadership goes back to the placement's preferred leader.
     leader_return: crate::leader_return::LeaderReturn,
     nonblocking: bool,
-    stopping: Option<(oneshot::Sender<Result<(), LedgerError>>, Instant)>,
+    /// The reply to a stop, and the owner's period at which the stop is
+    /// given up on.
+    stopping: Option<(oneshot::Sender<Result<(), LedgerError>>, u64)>,
     next_tick: Instant,
     /// When a leader whose period is stretched sends its next heartbeats.
     next_beat: Instant,
@@ -788,11 +796,13 @@ impl ReplicaHost {
         &self,
         paths: impl IntoIterator<Item = &'a focal_timing::PathRtt>,
     ) -> focal_timing::TickPace {
-        let pace = focal_timing::TickPace::derive(
+        // The owner's own stalls are covered too (`ControlHost::pace`).
+        let pace = focal_timing::TickPace::derive_with_stall(
             self.tick,
             self.tick_ceiling,
             self.pace.election_tick().max(1),
             paths,
+            self.pace.stall(),
         );
         self.pace.publish(pace);
         pace
@@ -817,6 +827,11 @@ impl ReplicaHost {
     }
     pub fn periods(&self) -> u64 {
         self.pace.periods()
+    }
+    /// The longest a period of the owner took, from one to the next
+    /// (`ControlHost::longest_period`).
+    pub fn longest_period(&self) -> Duration {
+        self.pace.longest()
     }
     pub fn tick_period(&self) -> Duration {
         self.pace.get(self.tick, self.tick_ceiling)
@@ -1525,7 +1540,8 @@ impl Owner {
         }
     }
     fn tick(&mut self) -> Result<(), LedgerError> {
-        self.pace.advance();
+        self.pace
+            .advance(self.pace.get(self.config.tick, self.config.tick_ceiling));
         // The committed placement names the session's preferred leader (27
         // §5): it outranks the other voters in an election among equally
         // current logs, so leadership returns to where placement put it and
@@ -1682,7 +1698,17 @@ impl Owner {
         self.progress_managed()?;
         self.checkpoint_if_due()?;
         if let Some((_, deadline)) = self.stopping.as_ref() {
-            let expired = Instant::now() >= *deadline;
+            // A stop ticks the replica no more, but its time passes in the
+            // owner's periods all the same: each is counted, refused.
+            if Instant::now() >= self.next_tick {
+                self.pace
+                    .advance(self.pace.get(self.config.tick, self.config.tick_ceiling));
+                self.pace.refuse();
+                self.next_tick = Instant::now()
+                    .checked_add(self.pace.get(self.config.tick, self.config.tick_ceiling))
+                    .ok_or(LedgerError::Failed)?;
+            }
+            let expired = self.pace.periods() >= *deadline;
             if expired && self.session.has_ready() {
                 if let Some((response, _)) = self.stopping.take() {
                     let _ = response.send(Err(LedgerError::OutcomeUnknown));
@@ -1700,8 +1726,18 @@ impl Owner {
             }
             return Ok(false);
         }
-        if !self.session.persistence_pending() && Instant::now() >= self.next_tick {
-            self.tick()?;
+        if Instant::now() >= self.next_tick {
+            if self.session.persistence_pending() {
+                // The period passed without a tick: the writer still
+                // persists what the tick before left (27 §3.1 P3). It is
+                // counted, refused, so that what waits its time in the
+                // owner's periods waits no longer than it would have.
+                self.pace
+                    .advance(self.pace.get(self.config.tick, self.config.tick_ceiling));
+                self.pace.refuse();
+            } else {
+                self.tick()?;
+            }
             self.next_tick = Instant::now()
                 .checked_add(self.pace.get(self.config.tick, self.config.tick_ceiling))
                 .ok_or(LedgerError::Failed)?;
@@ -1958,9 +1994,7 @@ impl Owner {
             let _ = response.send(Err(LedgerError::Capacity));
             return Ok(());
         }
-        let deadline = Instant::now()
-            .checked_add(self.config.request_timeout)
-            .ok_or(LedgerError::Capacity)?;
+        let deadline = self.request_deadline().ok_or(LedgerError::Capacity)?;
         self.stopping = Some((response, deadline));
         Ok(())
     }
@@ -2044,9 +2078,7 @@ impl Owner {
         let result = (|| -> Result<Response, AccessError> {
             let request = verified.request();
             let peer = verified.peer();
-            let deadline = Instant::now()
-                .checked_add(self.config.request_timeout)
-                .ok_or(AccessError::Unavailable)?;
+            let deadline = self.request_deadline().ok_or(AccessError::Unavailable)?;
             if request.ledger != self.session.ledger() {
                 return Err(AccessError::Unauthorized);
             }
@@ -3287,7 +3319,7 @@ impl Owner {
             };
             if let Some(result) = result {
                 pending.finish(result);
-            } else if Instant::now() >= pending.deadline || status.term != pending.term {
+            } else if self.pace.periods() >= pending.deadline || status.term != pending.term {
                 let error = match &pending.waiting {
                     WaitingFor::Mutation(_)
                     | WaitingFor::ManagedMutation { .. }
@@ -3304,9 +3336,20 @@ impl Owner {
         }
         Ok(())
     }
+    /// The owner's period at which a request taken now is given up: the
+    /// request time in the periods it holds at the configured tick, counted
+    /// as the owner runs them (27 §3.1 P2).
+    fn request_deadline(&self) -> Option<u64> {
+        self.pace
+            .periods()
+            .checked_add(focal_timing::ProgressDeadline::periods(
+                self.config.request_timeout,
+                self.config.tick,
+            ))
+    }
     fn expire_pending(&mut self) {
         self.expire_placement();
-        let now = Instant::now();
+        let now = self.pace.periods();
         let count = self.memberships.len();
         for _ in 0..count {
             let Some(pending) = self.memberships.pop_front() else {
@@ -3367,9 +3410,7 @@ impl Owner {
             self.memberships
                 .try_reserve(1)
                 .map_err(|_| LedgerError::Capacity)?;
-            let deadline = Instant::now()
-                .checked_add(self.config.request_timeout)
-                .ok_or(LedgerError::Capacity)?;
+            let deadline = self.request_deadline().ok_or(LedgerError::Capacity)?;
             let mut proposed = true;
             if let Some(request) = &call.request {
                 match self.session.propose_membership(request) {
@@ -3430,7 +3471,7 @@ impl Owner {
             }
             if pending.term != status.term
                 || status.role != StateRole::Leader
-                || Instant::now() >= pending.deadline
+                || self.pace.periods() >= pending.deadline
             {
                 self.finish_membership(pending, Err(LedgerError::OutcomeUnknown));
                 continue;

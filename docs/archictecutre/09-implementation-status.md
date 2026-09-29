@@ -11275,3 +11275,89 @@ failed one until it is opened again. It states the new one
 `cargo deny`, and the workspace's tests with four threads: 148 suites, 2,856 tests,
 none failed, 3 ignored. The model was not checked here, for want of a Java runtime on
 this machine; it has not changed since `d88cde3`, whose model job passed.
+
+### 2026-09-28 — CI on `64396bc`; content by as many streams as the path holds; a stall covered; waits in the owner's periods; a restore that goes on; a death held and told
+
+**CI on `64396bc`.** Windows, macOS, the model and the dependencies passed; Linux failed
+one test, `runbook_interrupted_restore`: a restore cut after its log was begun and issued
+again was refused with `restore into a populated log`, the runbook's own case. Fixed at the
+cause: a log that holds the backup's image and nothing else is this restore, begun before
+and cut, and is opened as it is (`DurableNode::restore_on_wal_in`); any other record is
+history and the restore is refused as what is asked (`InvalidRequest`), not as a node that
+cannot be reached. The runbook test cuts the restore at each of three places
+(`restore-imported`, `restore-logged`, `restore-recorded`; `FaultSite`) on real processes
+and issues it again, twice.
+
+**Content, by as many streams as the path holds** (27 §7). A transfer's chunks are
+exchanges of their own, `bulk_width` of them at once: one stream for each megabyte the
+connection's law holds in flight, and one, asked whenever a chunk is begun. A copy takes
+the chunks of a manifest in any order (a bit per chunk, charged with the manifest); what a
+copy has room for is found as a path's room is (RFC 5681 §3.1). Content has a lane of its
+own to each peer, the streams of a connection that nothing else can have, waited on in turn
+and never taken from what a group asks. Every copy of a placement is asked at once, in
+replication, the obligation and the repair; a replica's seed and custody pulls bring it as
+much at once as the path holds, apart from the exchange of facts. The parts of an exchange
+wait each on what they wait for: what the connection sent, what arrives, the handler's
+time (`transport::carried`, `frame::read_payload_arriving`); a megabyte crosses 4 Mbit/s
+each way between endpoints that give a request one second. Copa's slow start doubles only
+by what was sent after the doubling before, and its stride is 2 (27 §7, measured). The
+law table: Copa 1.082 / 0.998, stalled nowhere; carried at 100 Mbit/s: 95.2% at 100 ms
+(one stream 73.4%), 84.2% at 300 ms (24.5%); at 1 Gbit/s 100 ms 81.1% by the window
+(59.0% by eight fixed streams).
+
+**Waits in the owner's periods.** Eight copies of `tests/control_host.rs` at once failed
+its single asks and "no leader that answers". Three causes, each fixed at its class:
+
+| Cause | Where | Fix |
+|---|---|---|
+| Owners gave a request its time by the clock while a loaded machine slowed their rounds | `ControlHost`, both directory hosts, `ReplicaHost` and its placement, managed and evidence sub-owners | A request's time is counted in the owner's periods; a period that passes without a tick (the writer persisting, a stop) is counted, refused |
+| The rig's owners ticked at wall pace while its in-process routers crawled | `tests/control_host.rs` | The routers probe the runtime and publish the sender's pace, as a node publishes its probes' round trips |
+| Owners stalled 0.6–8 s (threads the machine did not run) against a 250 ms election timeout: six terms in twelve seconds, every leader `NotReady` | `TickPace::derive_with_stall`, `pace.rs` | The election timeout covers the longest stall of the owner's own periods and one tail after it; a stall is remembered for ten times its length; `focal_root_period_longest_ms` / `focal_session_period_longest_ms` show it |
+
+Every ask of the suite that expects an answer waits for a definite one, charged to the
+hosts' periods (`Rig::definite`, `read_on_leader`), and the wait for a leader reports what
+each host last answered, its refused periods, its longest period and its pace. Six copies
+at once: 18 of 18 runs. Eight: 7 of 8. Sixteen (a thread for every core fifteen times
+over): 14 of 16; what remains is a follower whose owner stalls longer than the leader's
+request time, which the leader's own periods do not see (27 §8.4).
+
+**A death, held and told.** `cluster plan` says for how many seconds a death still stands
+before a seat moves (`focal_directory::deaths_stand_for`, one rule with `deaths_held`). On
+five real processes a voter that goes silent and returns within the hold keeps its seat
+while a spare waits, nothing moves once the hold would have passed, and one that stays
+silent loses its seat to the spare without an operator
+(`runbook_node_loss_within_the_hold_moves_no_seat`).
+
+**A round over dead routes** answers `OutcomeUnknown` once any ask left the node and
+`Capacity` only when none could be dialed, the pool's connections all taken by dials to the
+dead; each probe waits its share of the round or the peer's measured exchange tail.
+
+**Gates** on the final tree (macOS arm64): `cargo fmt --all --check`, `check-contracts.py`,
+clippy with `-D warnings`, `check-production.sh`, `cargo deny`, and the workspace's tests
+with four threads: 148 suites, 2,869 tests, none failed, 3 ignored. The model was not
+checked here (no Java runtime); it has not changed since `d88cde3`.
+
+**Stage A, under injected load** (27 §6). Eighteen processes held every core of this
+machine busy (`load averages: 69.92 75.36 53.10` on 18 cores at the end of the run) while
+the fleet, placement, service, split, route, credential and liveness modules of
+`focal-node` (87 tests) and ten binary suites ran from the gate's own binaries, four tests
+at a time. Every suite passed. Beside them, what the same suites took in the gate run,
+four suites at a time on an otherwise idle machine:
+
+| Suite | Under load | In the gate |
+|---|---|---|
+| `focal-node` modules (87 tests) | 101.6 s | — (254 tests in 120.9 s) |
+| `control_host` | 4.3 s | 3.7 s |
+| `control_quic` | 2.1 s | 1.7 s |
+| `fleet_quic` | 5.1 s | 5.3 s |
+| `evidence_quic` | 10.1 s | 9.1 s |
+| `drain_leader` | 53.9 s | 76.6 s |
+| `leader_balance` | 114.1 s | 107.7 s |
+| `home_balance` | 75.9 s | 70.6 s |
+| `placement_binary` (3) | 204.9 s | 204.5 s |
+| `runbooks` (12) | 143.7 s | 142.7 s |
+| `deployment_fleet` | 110.1 s | 104.4 s |
+
+The suites wait on facts charged to the owners' periods, and the owners' pace covers the
+stalls the load causes, so what took longer was the machine's work and not the tests'
+waiting; none gave up.

@@ -914,3 +914,108 @@ fn seed_chunks_are_served_to_installed_peers_and_announced_pending_peers_only() 
         Err(AccessError::Unavailable)
     ));
 }
+
+/// A transfer goes by several streams and its chunks arrive in no order:
+/// a copy takes any chunk of the manifest, the last before the first,
+/// counts what it lacks first, and seals what it has whole.
+#[test]
+fn the_chunks_of_a_manifest_are_taken_in_any_order() {
+    let source = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    // A manifest that names two hundred chunks.
+    let wide = StoreLimits {
+        max_manifest_bytes: 16384,
+        ..limits()
+    };
+    let mut sender = ContentStore::open(source.path(), wide.clone()).unwrap();
+    // 200 chunks of four bytes and one of two: more than three words of
+    // bits.
+    let bytes: Vec<u8> = (0..802_u32).map(|at| (at % 251) as u8).collect();
+    let content = stored(&mut sender, 1, 1, &bytes);
+    let manifest = sender.export_manifest(&content).unwrap();
+    let mut receiver = CustodyStore::new(
+        ContentStore::open(target.path(), wide).unwrap(),
+        CustodyConfig::new(1),
+        memory(),
+    )
+    .unwrap();
+    let ledger = ledger(1, 10);
+    receiver.install_policy(policy(ledger)).unwrap();
+    let transfer = [8; 16];
+    let open = |receiver: &mut CustodyStore| {
+        let opened = receiver
+            .request(&custody(
+                ledger,
+                1,
+                CustodyRequest::Open {
+                    transfer,
+                    policy_revision: 1,
+                    content: content.clone(),
+                    manifest: manifest.encoded().to_vec(),
+                },
+            ))
+            .unwrap();
+        let CustodyReply::Opened {
+            chunks,
+            next_missing,
+        } = opened.value()
+        else {
+            panic!("opened")
+        };
+        (*chunks, *next_missing)
+    };
+    let chunk = |receiver: &mut CustodyStore, index: usize, bytes: &[u8]| {
+        receiver
+            .request(&custody(
+                ledger,
+                2,
+                CustodyRequest::Chunk {
+                    transfer,
+                    index: index as u32,
+                    bytes: bytes.to_vec(),
+                },
+            ))
+            .map(|reply| reply.value().clone())
+    };
+    let part = |index: usize| bytes.chunks(4).nth(index).unwrap();
+    assert_eq!(open(&mut receiver), (201, 0));
+    // The last, and one the manifest does not name.
+    assert_eq!(
+        chunk(&mut receiver, 200, part(200)),
+        Ok(CustodyReply::ChunkStored { index: 200 })
+    );
+    assert!(chunk(&mut receiver, 201, part(0)).is_err());
+    // A chunk that is not the one the manifest names there is not taken.
+    assert!(chunk(&mut receiver, 7, part(8)).is_err());
+    for index in [3, 1, 2, 64, 65, 128] {
+        chunk(&mut receiver, index, part(index)).unwrap();
+    }
+    // Nothing that was taken ahead is the first that is lacked.
+    assert_eq!(open(&mut receiver), (201, 0));
+    assert!(matches!(
+        receiver.request(&custody(ledger, 3, CustodyRequest::Seal { transfer })),
+        Err(AccessError::InvalidRequest)
+    ));
+    // The first moves past everything taken after it without a gap.
+    chunk(&mut receiver, 0, part(0)).unwrap();
+    assert_eq!(open(&mut receiver), (201, 4));
+    // A chunk sent again is taken again and moves nothing.
+    chunk(&mut receiver, 2, part(2)).unwrap();
+    assert_eq!(open(&mut receiver), (201, 4));
+    for index in (4..200).rev() {
+        if ![64, 65, 128].contains(&index) {
+            chunk(&mut receiver, index, part(index)).unwrap();
+        }
+    }
+    assert_eq!(open(&mut receiver), (201, 201));
+    let sealed = receiver
+        .request(&custody(ledger, 4, CustodyRequest::Seal { transfer }))
+        .unwrap();
+    assert_eq!(
+        sealed.value(),
+        &CustodyReply::Durable {
+            policy_revision: 1,
+            content: content.clone()
+        }
+    );
+}
