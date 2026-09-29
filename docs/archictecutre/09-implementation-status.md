@@ -11771,3 +11771,28 @@ now (`LivenessDriver::answer_published`), keyed by the counters the published vi
 built from (`published`; the loop's end-of-iteration publish compares against the
 same), so a reader that holds an answer sees in the view what the answer reports. No
 wait was lengthened.
+
+### 2026-09-29 — the first online activation: the KIND campaign's D3 at its cause
+
+On every run of the campaign the first `cluster replicas activate-native` on a
+freshly Ready founder answered `[unavailable] metadata owner is unavailable`
+(exit 6) and the retry succeeded. Not a race with readiness: an activation needs
+the local promise of the native decoder durable and every voter's recorded, the
+promise is begun by the first thing that asks for it, and on an idle fresh
+founder that is the activation itself — `activation_barrier` →
+`begin_native_support` → `begin_managed_support` staged the `FOCALDF1` floor and
+returned `PersistencePending`, the owner answered with it at once, and the
+replica-admin protocol's catch-all worded a live owner "unavailable". The offline
+path (`activate_local`) and the in-process harnesses looped on exactly this
+condition, so nothing caught it. The owner holds an activation at its managed
+gate now (`Owner::activation_gate`, the gate that already holds managed work for
+the durable floor): it begins the support, holds while the write persists, holds
+while any voter's promise is missing (the support driver records them), and lets
+the call through once the barrier holds (`Session::native_activation_barrier`,
+read-only) — bounded by the request deadline in the owner's periods, past which
+the answer is the barrier's own refusal, not an unknown outcome; a session that
+cannot take an activation at all goes through to its definitive refusal. The
+protocol words `PersistencePending` `not_ready`. The in-process tests ask once
+now (`fleet_native_tests`, `fleet_import_tests`), and `tests/online_activation.rs`
+asks a fresh founder once through its running node's admin socket, without the
+harness riding out exit 6, and writes a claim natively after it.

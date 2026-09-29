@@ -334,6 +334,15 @@ impl Session {
     pub fn native_support_ready(&self) -> bool {
         self.consensus.decoder_floor_ready(native_format_hash())
     }
+    /// Whether an activation may be proposed now: the local native promise
+    /// durable and every voter's recorded (23 §5). The owner holds an
+    /// activation until it is, charged to its request time, where the
+    /// first activation of a fresh ledger was refused with the write it had
+    /// itself just started (the KIND campaign's D3).
+    pub fn native_activation_barrier(&self) -> Result<(), LedgerError> {
+        self.check()?;
+        self.require_native_support()
+    }
     /// Refuse native history before Raft persists it unless this replica's
     /// successor floor is durable. The transport drops the packet and Raft
     /// retransmits once the floor reaches disk; a replica without native

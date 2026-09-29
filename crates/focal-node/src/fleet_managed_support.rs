@@ -173,6 +173,9 @@ impl Owner {
     /// Return false while this exact owned input is waiting for the local floor
     /// or all current voter promises. No application proposal exists yet.
     pub(super) fn managed_gate(&mut self, work: &Work) -> Result<bool, LedgerError> {
+        if let Work::ActivateNative(..) = work {
+            return self.activation_gate();
+        }
         if let Work::Request(request, ..) = work
             && matches!(
                 request.verified.request().operation,
@@ -270,6 +273,34 @@ impl Owner {
                 .chain(&fact.voters_outgoing)
                 .any(|node| self.session.needs_managed_support(*node)))
     }
+    /// An activation waits for its barrier instead of being refused with
+    /// the write it started: the local native promise made durable, then
+    /// every voter's recorded by the support driver — bounded by the
+    /// request deadline, in this owner's periods (KIND D3). One the session
+    /// cannot take at all goes through to its definitive refusal.
+    fn activation_gate(&mut self) -> Result<bool, LedgerError> {
+        if !self.session.native_hosted()
+            || !self.session.is_authoritative()
+            || self.session.activation().is_native()
+        {
+            return Ok(true);
+        }
+        match self.session.begin_native_support() {
+            Ok(()) => {}
+            Err(LedgerError::Consensus(focal_consensus::ConsensusError::PersistencePending)) => {
+                return Ok(false);
+            }
+            Err(_) => return Ok(true),
+        }
+        match self.session.native_activation_barrier() {
+            Ok(()) => Ok(true),
+            Err(
+                LedgerError::Consensus(focal_consensus::ConsensusError::PersistencePending)
+                | LedgerError::Managed(focal_ledger::ManagedError::Unsupported),
+            ) => Ok(false),
+            Err(_) => Ok(true),
+        }
+    }
     pub(super) fn defer_managed(&mut self, work: Work) -> Result<(), LedgerError> {
         if self
             .deferred_managed
@@ -327,10 +358,21 @@ impl Owner {
             let cancelled = match &pending.work {
                 Work::Request(_, response, _) => response.is_closed(),
                 Work::ManagedSupport(call, _) => call.response.is_closed(),
+                Work::ActivateNative(_, response, _) => response.is_closed(),
                 _ => false,
             };
             if cancelled || self.stopping.is_some() || self.pace.periods() >= pending.deadline {
-                reject_managed_work(pending.work, LedgerError::OutcomeUnknown);
+                // Nothing of an activation was proposed: what its barrier
+                // still refuses is the answer, not an unknown outcome.
+                let error = match &pending.work {
+                    Work::ActivateNative(..) => self
+                        .session
+                        .native_activation_barrier()
+                        .err()
+                        .unwrap_or(LedgerError::OutcomeUnknown),
+                    _ => LedgerError::OutcomeUnknown,
+                };
+                reject_managed_work(pending.work, error);
                 continue;
             }
             if self.session.persistence_pending() {
@@ -378,6 +420,10 @@ pub(super) fn reject_managed_work(work: Work, error: LedgerError) {
         Work::ManagedSupport(call, charge) => {
             let SupportCall { received, response } = *call;
             drop(received);
+            let _ = response.send(Err(error));
+            drop(charge);
+        }
+        Work::ActivateNative(_, response, charge) => {
             let _ = response.send(Err(error));
             drop(charge);
         }
