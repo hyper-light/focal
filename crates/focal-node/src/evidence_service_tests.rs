@@ -309,21 +309,17 @@ async fn empty_owner_reconciles_cancellation_after_content_cas_and_fences_comple
     };
     let steady = fixture.budget.stats().used - _allocation.bytes();
     let next = placement(2, &[1]);
-    {
-        let update = driver.replace(
-            Some(first.scope()),
-            replacement(&fixture.budget, next.clone()),
-        );
-        let mut update = std::pin::pin!(update);
-        std::future::poll_fn(|cx| {
-            assert!(update.as_mut().poll(cx).is_pending());
-            std::task::Poll::Ready(())
-        })
-        .await;
-        // The content owner runs on its own thread. Stop polling the placement
-        // future until that CAS commits, then cancel before map publication.
-        fixture.host.check_policy(next.scope()).await.unwrap();
-    }
+    // A replacement cut between its content CAS and its map publication (the
+    // owner's future dropped, or the process, once the content owner on its
+    // own thread has committed) leaves content ahead of the map, and nothing
+    // else: the cut is produced as its effects, not as a poll the content
+    // owner might already have answered.
+    fixture
+        .host
+        .replace_policy(Some(first.scope()), next.custody_policy())
+        .await
+        .unwrap();
+    fixture.host.check_policy(next.scope()).await.unwrap();
     assert_eq!(driver.placements.get(&ledger()).unwrap().placement, first);
     assert_eq!(
         fixture.host.check_policy(first.scope()).await,

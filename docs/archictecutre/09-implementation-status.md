@@ -11365,6 +11365,20 @@ three CPUs, one of them taken; what answers them is the form the stall rule has 
 patience in ticks, the period untouched; a probe of a peer nothing is measured of yet
 given the round.
 
+**CI on `c1af831`** (the tree above). Linux and macOS passed every gate and every test (the
+model and the dependencies too); their check jobs took 49 minutes each where the last green
+run's took 38. Windows failed one unit test,
+`empty_owner_reconciles_cancellation_after_content_cas_and_fences_completed_proofs`, which
+asserted that the *first poll* of a placement replacement is pending so that it could drop the
+future between the content CAS and the map publication. That was a guess about scheduling:
+the content owner runs on its own thread and can answer the CAS before the oneshot is first
+polled (`ContentHost::call` sends, then awaits), and a two-vCPU runner did. The test now
+produces the cut as its effects — the policy committed through the host, the driver's map
+untouched — and checks the same reconciliation; thirty runs and the module pass, and fmt,
+contracts, clippy, the production lints, deny and the `focal-node` library suite (255 tests)
+pass on the tree with it. The workspace gate below ran on the tree before this test-only
+change.
+
 **Gates** on the final tree (macOS arm64): `cargo fmt --all --check`, `check-contracts.py`,
 clippy with `-D warnings`, `check-production.sh`, `cargo deny`, and the workspace's tests
 with four threads, on the final tree after the CI findings and the credential rule: 148
