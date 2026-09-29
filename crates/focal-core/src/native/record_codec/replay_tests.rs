@@ -522,3 +522,72 @@ fn repaired_frame_cannot_change_outcome_counts_or_delete_an_existing_history_row
     assert_eq!(recovered.native_budget(), budget);
     assert_eq!(checkpoint::encode(&recovered), before);
 }
+
+/// A restore completes admitted work — a checkpoint a replica installs — and
+/// is funded by the completion allowance (the audit's F58): with every byte
+/// of ordinary credit held by live admission it restores under the
+/// completion reserve alone, and a pool funded from the completion lane alone
+/// restores too; before, the roots, the layout and the assembled group were
+/// charged to the ordinary lane and the restore failed at their first byte.
+#[test]
+fn a_restore_is_funded_by_the_completion_allowance_and_never_waits_on_ordinary_credit() {
+    use focal_memory::{BudgetKind, BudgetLane, MemoryBudget};
+    let directory = tempfile::tempdir().unwrap();
+    let store = checkpoint::store(directory.path());
+    let mut original = f::core();
+    for n in 1..=4u64 {
+        let prepared = prepare_input(
+            &original,
+            10 * n,
+            f::creation(
+                u128::from(n),
+                u128::from(n),
+                &[(ValidationMode::Required, true)],
+                None,
+            ),
+        );
+        original.publish_native(prepared).unwrap();
+    }
+    let bytes = checkpoint::encode(&original);
+    let restore = |budget: MemoryBudget| {
+        recovery::restore(
+            &checkpoint::inspect(&bytes),
+            RangeId(77),
+            checkpoint::limits(original.limits),
+            budget,
+            &store,
+            &BuiltinNativeSchemas,
+        )
+    };
+    // Every byte of ordinary credit held, as admitted work under pressure
+    // holds it; the completion allowance is free.
+    let budget = checkpoint::budget();
+    let mut held = Vec::new();
+    let mut size = 1usize << 26;
+    while size >= 1 {
+        match budget.reserve(BudgetKind::Query, BudgetLane::Ordinary, size) {
+            Ok(reservation) => held.push(reservation),
+            Err(_) => size /= 2,
+        }
+    }
+    assert!(
+        budget
+            .reserve(BudgetKind::Query, BudgetLane::Ordinary, 1)
+            .is_err()
+    );
+    let restored = restore(budget.clone()).unwrap_or_else(|error| panic!("{error:?}"));
+    checkpoint::compare(&original, &restored);
+    drop(restored);
+    drop(held);
+    // A pool funded from the completion lane alone cannot admit ordinary
+    // work at all; the restore asks for none.
+    let pool = budget
+        .funded_child(BudgetLane::Completion, 8 << 20)
+        .unwrap();
+    assert!(
+        pool.reserve(BudgetKind::Query, BudgetLane::Ordinary, 1)
+            .is_err()
+    );
+    let restored = restore(pool).unwrap_or_else(|error| panic!("{error:?}"));
+    checkpoint::compare(&original, &restored);
+}

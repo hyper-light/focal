@@ -12091,3 +12091,25 @@ protected one never; 4608 distinct names churn through a registry of 4096 that
 stays bounded and restores), and the session's
 `an_expired_consumer_s_name_is_free_for_another_principal` (the owner record
 follows the row).
+
+### 2026-09-29 — F58: a restore is funded by the completion allowance alone
+
+`recovery::restore` completes admitted work — a committed checkpoint a replica
+installs, an activation a replica applies — and charged its later stages to the
+completion lane, but its first bytes to the ordinary one: the index store's
+root, the decoded layout, the hydration owner's root and the assembled group's
+directory (`RangeStore::new_partitioned`, `StructuralCheckpoint::layout`,
+`ranges::reserve`, which `assemble` called with a lane it did not pass on). With
+ordinary credit held entirely by admitted work the restore failed at its first
+root (`Memory(Capacity { requested: 224, available: 0 })`, reproduced), and a
+pool funded from the completion lane alone could not restore at all
+(`InvalidConfiguration`). The lane now travels the whole way:
+`restore_in(.., lane)` (with `restore` = the completion lane) reaches
+`Index::build`, `layout`, `begin_hydration_partitioned_in`, `from_store` and
+`reserve`, and the range store gained `new_partitioned_in`; layout splits and
+merges charge their directories to the lane they already took. Ordinary work
+still cannot borrow completion funding (`funded_child` refuses it), and the
+completion allowance is asked for exactly what recovery needs.
+`native::record_codec::replay::tests::a_restore_is_funded_by_the_completion_allowance_and_never_waits_on_ordinary_credit`
+(every ordinary byte held → restores; a completion-only 8 MiB pool → restores;
+before the fix, `Memory(Capacity)` at the first root).

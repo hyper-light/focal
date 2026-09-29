@@ -115,11 +115,13 @@ impl<'a> Index<'a> {
         budget: &MemoryBudget,
         parsing: &Meter,
         lookup: &Meter,
+        lane: BudgetLane,
     ) -> Result<Self, NativeError> {
         // The index never exports owner capabilities and has a different key/
         // value type from the restored ledger. Its local RangeId is not the
-        // recorded or fresh ledger incarnation.
-        let mut rows = RangeStore::new_partitioned(
+        // recorded or fresh ledger incarnation. Its root is the restore's
+        // lane's, as every page it fills is.
+        let mut rows = RangeStore::new_partitioned_in(
             RangeId(0),
             0,
             limits.range,
@@ -128,6 +130,7 @@ impl<'a> Index<'a> {
                 IndexKey::Claim(_) => 0,
                 IndexKey::Artifact(_) => 1,
             },
+            lane,
         )?;
         let capacity = limits
             .range

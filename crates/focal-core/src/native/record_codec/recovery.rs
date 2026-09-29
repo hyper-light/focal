@@ -169,13 +169,38 @@ impl<C> Shared<'_, '_, C> {
 /// On any refusal, all provisional roots, rows, indices and reservations drop.
 /// Success proves intrinsic/cross-row consistency of this Core snapshot; it
 /// neither activates a wire decoder nor acknowledges a replicated log entry.
+/// Restore a core from its checkpoint, funded by the completion allowance:
+/// what a restore completes is admitted work — a committed checkpoint a
+/// replica installs, an activation a replica applies — and ordinary credit,
+/// which live admission may hold entirely, is never its condition.
 pub fn restore<S: NativeSchemaVerifier, R: NativeCustodyReader>(
+    checkpoint: &checkpoint::StructuralCheckpoint<'_>,
+    range: RangeId,
+    limits: Limits,
+    budget: MemoryBudget,
+    store: &R,
+    schemas: &S,
+) -> Result<Core<NativeState>, NativeError> {
+    restore_in(
+        checkpoint,
+        range,
+        limits,
+        budget,
+        store,
+        schemas,
+        BudgetLane::Completion,
+    )
+}
+/// [`restore`] with every root, index, layout, hydration page and assembled
+/// member charged to `lane`.
+pub fn restore_in<S: NativeSchemaVerifier, R: NativeCustodyReader>(
     checkpoint: &checkpoint::StructuralCheckpoint<'_>,
     range: RangeId,
     mut limits: Limits,
     budget: MemoryBudget,
     store: &R,
     schemas: &S,
+    lane: BudgetLane,
 ) -> Result<Core<NativeState>, NativeError> {
     let header = checkpoint.header();
     limits.native = checked_native_limits(header.ledger, limits.native)?;
@@ -192,6 +217,7 @@ pub fn restore<S: NativeSchemaVerifier, R: NativeCustodyReader>(
         &budget,
         &meters.parsing,
         &meters.lookup,
+        lane,
     )?;
     let shared = Shared {
         index: &index,
@@ -207,13 +233,13 @@ pub fn restore<S: NativeSchemaVerifier, R: NativeCustodyReader>(
     // The rows are restored into one store, validated as a whole, then laid
     // out per the recorded layout (25 §4): members keep their durable
     // identities while the producer identity is the caller's fresh one.
-    let layout = checkpoint.layout(limits.native.max_ranges, &budget)?;
+    let layout = checkpoint.layout(limits.native.max_ranges, &budget, lane)?;
     let first_member = layout
         .members()
         .first()
         .map(|member| member.id)
         .ok_or(ContractError::InvalidManifest)?;
-    let mut owner = RangeStore::begin_hydration_partitioned(
+    let mut owner = RangeStore::begin_hydration_partitioned_in(
         first_member,
         limits.native.range,
         budget.clone(),
@@ -222,6 +248,7 @@ pub fn restore<S: NativeSchemaVerifier, R: NativeCustodyReader>(
             expected_entries,
             max_phases: read_index::PHASES,
         },
+        lane,
     )?;
     for phase in 0..read_index::PHASES {
         let count = *index
@@ -267,22 +294,14 @@ pub fn restore<S: NativeSchemaVerifier, R: NativeCustodyReader>(
             .map_err(|error| shared.refuse(error))
         })
         .map_err(|error| shared.error(error))?;
-    let rows = ranges::NativeRanges::from_store(
-        range,
-        layout,
-        rows,
-        &budget,
-        BudgetLane::Completion,
-        |row| {
-            let work =
-                read_dispatch::objects::copy_work(row).map_err(|error| shared.refuse(error))?;
-            meters
-                .model
-                .charge(work)
-                .map_err(|error| shared.refuse(read_evidence::codec(error)))?;
-            prepare::copy(row)
-        },
-    )
+    let rows = ranges::NativeRanges::from_store(range, layout, rows, &budget, lane, |row| {
+        let work = read_dispatch::objects::copy_work(row).map_err(|error| shared.refuse(error))?;
+        meters
+            .model
+            .charge(work)
+            .map_err(|error| shared.refuse(read_evidence::codec(error)))?;
+        prepare::copy(row)
+    })
     .map_err(|error| shared.error(error))?;
     // All decoder/index/workspace borrows end before exposing the sole owner.
     drop(shared);

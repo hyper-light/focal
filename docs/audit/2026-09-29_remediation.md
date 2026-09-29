@@ -70,7 +70,7 @@ ruling before work starts).
 | F55 | P1 | in tree | 13 | [F55](#f55) |
 | F56 | P1 | in tree | 13 | [F56](#f56) |
 | F57 | P1 | open | 14 | — |
-| F58 | P2 | open | 14 | — |
+| F58 | P2 | in tree | 14 | [F58](#f58) |
 | F59 | P2 | open | 15 | — |
 | F60 | P2 | open | 15 | — |
 | F61 | P2 | open | 15 | — |
@@ -541,3 +541,27 @@ metadata and receipts: owners follow the row; receipts are bounded by
 `a_churn_of_more_names_than_the_bound_passes_through_a_bounded_registry_that_restores`
 (4608 names, ≤ 4096 rows, restore); `session::cursor_tests::an_expired_consumer_s_name_is_free_for_another_principal`
 (owner pruned; before, the second principal was `WrongActor`).
+
+## F58
+
+**Cause.** Recovery charged its meters and later stages to the completion lane but
+its initial roots to the ordinary one: `RangeStore::new_partitioned` (the index and
+the hydration owner), `StructuralCheckpoint::layout` and `ranges::reserve` (the
+assembled group's directory; `assemble` took a lane and did not pass it on). Under
+ordinary pressure a required restore could not initialize; a completion-funded pool
+could not restore at all.
+
+**Fix.** `recovery::restore_in(.., lane)` threads the lane through
+`read_index::Index::build`, `layout`, `RangeStore::begin_hydration_partitioned_in`
+(new, with `new_partitioned_in`), `NativeRanges::from_store` and `reserve`;
+`restore` is the completion-lane form, which the checkpoint install and the import
+use. Layout splits and merges charge their directories to the lane they already
+took. Completion funding stays restricted (`funded_child` still refuses ordinary
+work through it); old state, input, scratch and new roots are all charged to the
+one budget the caller passes.
+
+**Tests.** `native::record_codec::replay::tests::a_restore_is_funded_by_the_completion_allowance_and_never_waits_on_ordinary_credit`
+(before the fix: `Memory(Capacity { requested: 224, available: 0 })` — the audit's
+own figure). Cancellation and error cleanup of a refused restore are the existing
+`recovery` refusal tests' concern; the typed refusal when the completion reserve
+itself is too small is `Memory(Capacity)` from the same budget.

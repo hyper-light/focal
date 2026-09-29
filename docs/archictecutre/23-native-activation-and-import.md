@@ -132,7 +132,12 @@ paths of [native_hosting.rs](../../crates/focal-ledger/src/native_hosting.rs).
 - Every replica translates its own legacy core at the activation apply
   boundary: rows are built with the recorded-fact constructors recovery uses,
   written as one `FCNROOTS2` image under a canonical incarnation, restored
-  through `recovery::restore` under the replica's own range, and the image
+  through `recovery::restore` under the replica's own range — funded, as
+  every restore is (2026-09-29, the audit's F58), by the completion
+  allowance: its index, layout, hydration pages and assembled members are
+  charged to the completion lane, so a replica whose ordinary credit admitted
+  work holds entirely still restores, and a pool funded from the completion
+  lane alone restores — and the image
   hash is compared with `native_root`. A different root is a divergent replica
   and fails closed (`ActivationConflict`); no bytes are transferred and no
   legacy command is rerun.

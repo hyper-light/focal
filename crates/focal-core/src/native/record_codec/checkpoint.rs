@@ -304,11 +304,13 @@ impl<'a> StructuralCheckpoint<'a> {
     }
     /// The range layout the rows are held in, decoded again from the
     /// inspected bytes into a layout of at most `max` members charged to
-    /// `budget` (25 §4).
+    /// `budget` on `lane` (25 §4) — the restore's lane, so a recovery funded
+    /// by the completion allowance never waits on ordinary credit.
     pub fn layout(
         &self,
         max: usize,
         budget: &MemoryBudget,
+        lane: BudgetLane,
     ) -> Result<ranges::RangeLayout, NativeError> {
         if self.members > max.min(ranges::MAX_LAYOUT_MEMBERS) {
             return Err(NativeError::Capacity("range layout members"));
@@ -316,7 +318,7 @@ impl<'a> StructuralCheckpoint<'a> {
         let allocation = budget
             .reserve(
                 BudgetKind::Roots,
-                BudgetLane::Ordinary,
+                lane,
                 prepare::array::<ranges::RangeBoundary>(self.members)?,
             )?
             .commit();
