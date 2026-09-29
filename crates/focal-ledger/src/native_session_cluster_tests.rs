@@ -4,7 +4,7 @@
 //! before reply, snapshot catch-up through the enclosing checkpoint, planned
 //! handover, correlated read barriers, a follower without evidence custody, a
 //! follower under memory pressure, and corrupted record bytes in transit.
-use super::tests::{exhaust, ledger, limits, store};
+use super::tests::{exhaust, ledger, limits, limits_with_outcomes, store};
 use super::*;
 use focal_consensus::{Message, MessageType, NodeConfig, SnapshotStatus};
 use focal_core::native::fixtures as fx;
@@ -21,13 +21,6 @@ type Node = NativeSession<BuiltinNativeSchemas>;
 
 fn config(id: u64) -> NodeConfig {
     NodeConfig::joining(id, [21; 16], [22; 16], vec![1, 2, 3], Vec::new())
-}
-fn open_node(
-    dir: &std::path::Path,
-    id: u64,
-    parent: &MemoryBudget,
-) -> Result<Opened<BuiltinNativeSchemas>, NativeSessionError> {
-    open_node_with(dir, id, parent, limits())
 }
 fn open_node_with(
     dir: &std::path::Path,
@@ -154,8 +147,17 @@ impl Cluster {
         drop(self.nodes.get_mut(id as usize - 1).unwrap().take());
     }
     fn reopen(&mut self, id: u64) -> Result<(), NativeSessionError> {
+        self.reopen_with(id, limits())
+    }
+    /// Reopen a stopped node under `limits`, the ones it was opened with when
+    /// the cluster's differ from the defaults.
+    fn reopen_with(
+        &mut self,
+        id: u64,
+        limits: NativeSessionLimits,
+    ) -> Result<(), NativeSessionError> {
         assert!(self.nodes.get(id as usize - 1).unwrap().is_none());
-        let opened = open_node(self.dir.path(), id, &self.parents[id as usize - 1])?;
+        let opened = open_node_with(self.dir.path(), id, &self.parents[id as usize - 1], limits)?;
         self.inbox.extend(opened.initial.consensus.messages);
         *self.nodes.get_mut(id as usize - 1).unwrap() = Some(opened.session);
         Ok(())
@@ -2017,6 +2019,94 @@ fn committed_retirements_apply_on_every_replica_and_fence_proposals() {
     assert_eq!(cluster.node(2).retired_families(), 1);
     assert_eq!(cluster.status(2, 1), None);
     assert_same_digest(&mut cluster, &[2, 3, 5, 6]);
+}
+
+/// Three voters one under the outcome bound: the authority retires the
+/// family at the bound, every replica that heard the record retires it
+/// alike, the record carries the bound, a follower that missed the release
+/// and the retirement is caught up by the authority's checkpoint and
+/// restores the retired state under the same bound, and a restart under
+/// that bound keeps it; an exact retry of the retired creation is still
+/// answered.
+#[test]
+fn a_cluster_at_the_outcome_bound_retires_and_a_lagging_follower_restores_under_it() {
+    use focal_core::native::NativeCommand;
+    let mut cluster = Cluster::with_limits(|_| limits_with_outcomes(4));
+    cluster.elect(1, &[]);
+    let create = cluster.creation(1);
+    let create_request = create.request;
+    let created = cluster.commit(1, PARTIES.issuer, create, &[]);
+    let expected = cluster.claim(1, 1);
+    let cancel = fx::cancel(cluster.next(PARTIES.issuer), expected);
+    cluster.commit(1, PARTIES.issuer, cancel, &[]);
+    // Node 3 misses the release and the retirement.
+    let expected = cluster.claim(1, 1);
+    let release = NativeInput {
+        request: cluster.next(PARTIES.issuer),
+        command: NativeCommand::ReleaseScope { expected },
+    };
+    cluster.commit(1, PARTIES.issuer, release, &[3]);
+    assert_eq!(cluster.sequence(1), SessionSeq(3));
+    let (root, bundle, length, through) = {
+        let core = cluster.node(1).committed_core().unwrap();
+        let family = core.retirement_family(ClaimId::from_u128(1)).unwrap();
+        let through = core.native_sequence();
+        let quote = core
+            .archive_family_quote(&family, through, limits().encoding)
+            .unwrap();
+        (family.root, quote.hash, quote.bytes as u64, through)
+    };
+    cluster
+        .node(1)
+        .propose_retirement(root, bundle, length, through)
+        .unwrap();
+    assert_eq!(
+        cluster
+            .node(1)
+            .retirement_in_flight()
+            .unwrap()
+            .outcome_limit,
+        Some(4)
+    );
+    cluster.pump(&[3]);
+    cluster.settle(&[3]);
+    for id in [1, 2] {
+        assert_eq!(cluster.sequence(id), SessionSeq(4), "node {id}");
+        assert_eq!(cluster.node(id).retired_families(), 1, "node {id}");
+        assert_eq!(cluster.node(id).retirements_inert(), 0, "node {id}");
+        assert_eq!(cluster.status(id, 1), None, "node {id}");
+    }
+    assert!(cluster.node(1).is_authoritative());
+    assert_eq!(cluster.sequence(3), SessionSeq(2));
+    // The authority's checkpoint carries the retired state at the bound;
+    // the follower restores it under the same bound.
+    cluster.node(1).begin_checkpoint().unwrap();
+    cluster.pump(&[3]);
+    assert!(!cluster.node(1).checkpoint_pending());
+    cluster.settle(&[]);
+    assert_eq!(cluster.sequence(3), SessionSeq(4));
+    assert_eq!(cluster.node(3).retired_families(), 1);
+    assert_eq!(cluster.status(3, 1), None);
+    assert_same_digest(&mut cluster, &[1]);
+    cluster.clock = cluster.clock.saturating_add(1);
+    let clock = cluster.clock;
+    assert_eq!(
+        cluster
+            .node(1)
+            .propose(
+                fx::context(PARTIES.issuer, clock),
+                creation_for(create_request, 1)
+            )
+            .unwrap(),
+        NativeSubmission::Committed(created)
+    );
+    // A restart under the bound keeps it.
+    cluster.stop(3);
+    cluster.reopen_with(3, limits_with_outcomes(4)).unwrap();
+    cluster.settle(&[]);
+    assert_eq!(cluster.sequence(3), SessionSeq(4));
+    assert_eq!(cluster.node(3).retired_families(), 1);
+    assert_same_digest(&mut cluster, &[1]);
 }
 
 /// A range split and a later merge are session decisions (25 §4): the authority

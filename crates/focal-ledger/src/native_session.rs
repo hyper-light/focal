@@ -259,6 +259,14 @@ pub enum NativeSessionError {
     Retiring,
     #[error("retirement refused: {0:?}")]
     Retirement(focal_core::native::retirement::RetirementRefusal),
+    /// A committed retirement the authority checked against an outcome
+    /// bound of `committed` makes a state this replica's bound of `local`
+    /// cannot hold: this replica is configured below the authority and
+    /// stops rather than diverge (26 §4).
+    #[error(
+        "a committed retirement was checked against an outcome bound of {committed}; this replica's bound of {local} cannot hold the state it makes"
+    )]
+    OutcomeBound { committed: u64, local: u64 },
 }
 impl From<focal_ranges::RangeError> for NativeSessionError {
     fn from(error: focal_ranges::RangeError) -> Self {
@@ -326,7 +334,8 @@ impl NativeSessionError {
             | Self::Checkpoint(_)
             | Self::Corrupt
             | Self::Legacy
-            | Self::Failed => FailClosed,
+            | Self::Failed
+            | Self::OutcomeBound { .. } => FailClosed,
         }
     }
 }
@@ -708,7 +717,10 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
     /// family is derived from the committed state first, so an applicable
     /// record is what the log carries. Refused while candidates are
     /// pending, a layout change, movement step or another retirement is in
-    /// flight, or the family is ineligible.
+    /// flight, or the family is ineligible — the outcome the retirement
+    /// publishes past the core's bound (`OutcomeCapacity`) or promised to a
+    /// live report (`OutcomesReserved`) among the reasons; nothing is
+    /// proposed and nothing fenced on a refusal.
     pub fn propose_retirement(
         &mut self,
         root: focal_model::ClaimId,
@@ -727,6 +739,13 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
     /// counted from genesis or the checkpoint that seeded it.
     pub fn retired_families(&self) -> u64 {
         self.engine.retired_families()
+    }
+    /// Committed retirement records this replica applied nothing for since
+    /// it opened (26 §4): the prefix they named had passed, a movement was
+    /// pending, or the committed state refused the family — a version-1
+    /// record beyond this replica's outcome bound among them.
+    pub fn retirements_inert(&self) -> u64 {
+        self.engine.retirements_inert()
     }
     /// Propose one movement step as a session decision (25 §6): checked
     /// against the committed coordinator state first, refused while

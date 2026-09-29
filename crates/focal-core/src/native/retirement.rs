@@ -55,6 +55,14 @@ pub enum RetirementRefusal {
         evaluation: EvaluationKey,
     },
     TooLarge,
+    /// The outcome the retirement publishes would take the core past its
+    /// outcome bound, the bound checkpoint recovery enforces: the state it
+    /// made could not be restored under the configuration that made it.
+    OutcomeCapacity,
+    /// The outcome is promised to a live report, or is the one control
+    /// outcome the owner keeps for an authority decision; it frees as the
+    /// reports arrive.
+    OutcomesReserved,
     /// The committed rows contradict themselves.
     Corrupt,
 }
@@ -338,9 +346,31 @@ impl Closure<'_> {
 }
 
 impl Core<NativeState> {
+    /// Whether the outcome a retirement publishes fits the core's outcome
+    /// bound, the bound checkpoint recovery enforces, as every outcome
+    /// ordinary admission publishes must: the first thing a family
+    /// derivation asks, before a row is walked, and what a session asks
+    /// before it derives one. One row read.
+    pub fn check_retirement_outcome(&self) -> Result<(), RetirementRefusal> {
+        let outcomes = match self.state.rows.get(&Key::Meta) {
+            Some(Row::Meta(meta)) => meta.outcomes,
+            _ => return Err(RetirementRefusal::Corrupt),
+        };
+        if outcomes
+            .checked_add(1)
+            .is_none_or(|next| next > self.limits.outcomes)
+        {
+            return Err(RetirementRefusal::OutcomeCapacity);
+        }
+        Ok(())
+    }
     /// The family rooted at `root` and every row it takes to the archive,
     /// or why it cannot leave yet. Deterministic over the committed rows.
+    /// Refused first, before a row is walked, when the outcome the
+    /// retirement publishes would pass the outcome bound
+    /// (`OutcomeCapacity`).
     pub fn retirement_family(&self, root: ClaimId) -> Result<RetirementFamily, RetirementRefusal> {
+        self.check_retirement_outcome()?;
         let mut closure = Closure {
             core: self,
             members: Vec::new(),
@@ -675,7 +705,13 @@ impl Core<NativeState> {
     /// that deletes every row of the family, leaves a `Retired` continuation
     /// where each member's claim row was, writes the prefix's own outcome
     /// (a `Retirement` invocation with the `Retire` operation) and the
-    /// updated meta row. Returns how many rows went.
+    /// updated meta row. Returns how many rows went. The outcome it
+    /// publishes is guarded as ordinary admission guards its own: one
+    /// outcome per published sequence (the invariant recovery checks; a
+    /// contradiction is `InvalidManifest`) and the core's outcome bound
+    /// (`Capacity`), so no publication makes a state the same configuration
+    /// cannot restore. The derivation refuses such a family first
+    /// (`OutcomeCapacity`); the guard here is the last fence, not the check.
     pub fn retire_native_family(
         &mut self,
         family: &RetirementFamily,
@@ -683,9 +719,26 @@ impl Core<NativeState> {
         bytes: u64,
         through: SessionSeq,
     ) -> Result<usize, NativeError> {
+        let mut meta = match self.state.rows.get(&Key::Meta) {
+            Some(Row::Meta(meta)) => *meta,
+            _ => return Err(ContractError::InvalidManifest.into()),
+        };
+        if u64::try_from(meta.outcomes).ok() != Some(self.native_sequence().0) {
+            return Err(ContractError::InvalidManifest.into());
+        }
+        if meta
+            .outcomes
+            .checked_add(1)
+            .is_none_or(|outcomes| outcomes > self.limits.outcomes)
+        {
+            return Err(NativeError::Capacity("outcomes"));
+        }
         let derived = self
             .retirement_family(family.root)
-            .map_err(|_| NativeError::Contract(ContractError::InvalidManifest))?;
+            .map_err(|refusal| match refusal {
+                RetirementRefusal::OutcomeCapacity => NativeError::Capacity("outcomes"),
+                _ => NativeError::Contract(ContractError::InvalidManifest),
+            })?;
         if derived != *family
             || bundle.0 == [0; 32]
             || bytes == 0
@@ -694,10 +747,6 @@ impl Core<NativeState> {
         {
             return Err(ContractError::InvalidManifest.into());
         }
-        let mut meta = match self.state.rows.get(&Key::Meta) {
-            Some(Row::Meta(meta)) => *meta,
-            _ => return Err(ContractError::InvalidManifest.into()),
-        };
         let sequence = SessionSeq(
             self.native_sequence()
                 .0

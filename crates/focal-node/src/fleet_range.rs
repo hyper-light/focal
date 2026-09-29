@@ -514,6 +514,12 @@ impl Owner {
         if !self.session.native_authoritative() {
             return Ok(None);
         }
+        // What the proposal will ask short of the family: nothing in flight,
+        // and the owner's outcome to spare beyond those it promised. A
+        // bundle is not sealed for a family that cannot be proposed.
+        if self.session.native_check_retirement().is_err() {
+            return Ok(None);
+        }
         let now = crate::native_ingress::logical_time(&self.session)
             .map_err(|_| LedgerError::NotReady { leader: 0 })?;
         let report = self.session.native_retention()?;

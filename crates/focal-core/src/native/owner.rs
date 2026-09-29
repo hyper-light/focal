@@ -986,6 +986,38 @@ impl NativeOwner {
         Ok(())
     }
 
+    /// Whether one family may retire now (26 §4): nothing pending, the
+    /// owner sound, and the outcome and sequence the retirement publishes
+    /// to spare beyond those the book holds for the reports it promised and
+    /// the one control it keeps for an authority decision — the check every
+    /// fresh candidate passes. [`Core::retirement_family`] checks the bound
+    /// alone; this is the bound less what is promised, so a retirement never
+    /// takes the outcome a live report was admitted against, and the owner
+    /// rebuilt over the retired core admits every report it promised. A
+    /// refusal of the book is `Capacity`, as for a candidate; a faulted
+    /// owner refuses the same way, as it refuses every fresh candidate.
+    pub fn check_retirement(&self) -> Result<(), NativeOwnerError> {
+        self.check_layout_change()?;
+        let view = View {
+            state: &self.core.state,
+            tail: None,
+        };
+        let mut meta = view.meta();
+        meta.outcomes = meta
+            .outcomes
+            .checked_add(1)
+            .ok_or(NativeError::Capacity("outcomes"))?;
+        let sequence = SessionSeq(
+            view.prefix()
+                .0
+                .checked_add(1)
+                .ok_or(NativeError::Capacity("sequence"))?,
+        );
+        self.book
+            .check_slots(meta, sequence, self.core.state.rows.len())?;
+        Ok(())
+    }
+
     /// Transfer a fully reconciled committed Core without allocating or copying
     /// rows. A pending or faulted owner is returned unchanged for reconciliation.
     #[allow(clippy::result_large_err)] // Return the identical owner without allocation on refusal.

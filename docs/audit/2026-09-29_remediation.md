@@ -14,7 +14,7 @@ ruling before work starts).
 | ID | Priority | Status | Batch | Where |
 |---|---|---|---|---|
 | F01 | P1 | closed (a6cb86e) | 1 | [F01](#f01) |
-| F02 | P1 | designed | 1 | — |
+| F02 | P1 | in tree | 1 | [F02](#f02) |
 | F03 | P1 | open | 3 | — |
 | F04 | P1 | open | 2 | — |
 | F05 | P2 | open | 2 | — |
@@ -113,6 +113,95 @@ the interleavings the audit lists beyond the Ready fence (LightReady, checkpoint
 decoder-floor writes, membership changes, memory pressure) are covered by the
 classification, not each by a test; a journey harness that fails on an owner-stop
 diagnostic is batch 7's F26/F28 work.
+
+## F02
+
+**Cause.** `Core::retire_native_family` (`crates/focal-core/src/native/retirement.rs`)
+incremented `meta.outcomes` and published a new prefix without enforcing
+`limits.outcomes`, while checkpoint recovery (`record_codec/read_validate.rs`,
+`Counts::check`) requires the restored count at or under the bound and equal to the
+prefix; nothing consulted the completion book's promised slots (`check_slots`, run
+for every candidate and at every owner rebuild). A retirement at the bound made a
+checkpoint the same configuration refused (`Contract(Capacity)`); one that fit the
+bound but took a promised outcome made every owner rebuild fail (`promote` at the
+readiness barrier: `NativeOwner::new` → `Capacity`, retried without end; in the
+hosted session the retained delivery re-applied the entry and `Corrupt` failed it
+closed). `limits.outcomes` is per node and was committed nowhere.
+
+**Fix.** Three checks and a committed bound. `Core::retirement_family` refuses the
+family before a row is walked when `outcomes + 1 > limits.outcomes`
+(`RetirementRefusal::OutcomeCapacity`, named before every other refusal);
+`retire_native_family` guards `meta.outcomes == native_sequence()` (a contradiction
+is `InvalidManifest`) and the bound (`Capacity("outcomes")`) before the increment —
+the last fence. `NativeOwner::check_retirement` (modelled on `check_layout_change`:
+nothing pending, not faulted) asks `book.check_slots` with the meta row one outcome
+and the prefix one sequence ahead, so a retirement never takes an outcome a live
+report was admitted against; the session names the refusal
+`RetirementRefusal::OutcomesReserved`. `NativeEngine::propose_retirement` runs the
+gates, derives the family, runs the reservation check, then encodes, so nothing is
+proposed or fenced on a refusal; `NativeEngine::check_retirement` /
+`Session::native_check_retirement` ask the same short of the family, and the archive
+agent (`fleet_range.rs::archive_family`) asks it before sealing a bundle. The
+retirement record is version 2 (`FOCALRT1`, 154 bytes, `outcome_limit: u64`, digest
+domain `.v2`); `write_into` refuses a record without a bound or whose prefix the bound
+does not hold one past, `decode` refuses the same and still reads version 1 (146
+bytes, `.v1` domain, `outcome_limit: None`). At application (`apply_retirement`) a
+replica whose own bound cannot hold the retirement's outcome fails closed with both
+bounds named (`NativeSessionError::OutcomeBound { committed, local }`, class
+`FailClosed`) when the record carries a bound; a version-1 record that does not fit
+is inert and counted (`retirements_inert`, exposed by `NativeSession` and
+`Session::native_retirements_inert`), as every inert record now is. Doc 26 §4
+carries the rule.
+
+**Tests.** `focal-core` `native::retirement_tests`:
+`a_retirement_that_fits_the_outcome_bound_restores_under_it` (bound 4, three
+outcomes: prefix = outcomes = 4, restore and `with_record_buffers` under the same
+limits, exact retry `Existing`, fresh request `Capacity("outcomes")`),
+`a_retirement_at_the_outcome_bound_is_refused_before_anything_changes` (bound 3:
+`OutcomeCapacity` at derivation, `Capacity("outcomes")` at publication, sequence,
+stats and budget unchanged), `a_retirement_past_the_bound_is_what_both_checks_refuse`
+(retired at 4, restored at 3 → `Contract(Capacity)`, rebuilt at 3 → `Capacity`),
+`families_retire_while_outcomes_remain_and_no_further` (two spare outcomes: two of
+three families), `a_retirement_never_takes_an_outcome_promised_to_a_live_report`
+(at the smallest bound an owner rebuilds under, the core check passes, the owner
+refuses, retiring regardless makes `NativeOwner::new` fail — the pre-fix deadlock;
+one higher, allowed, and the promised report and a deadline control admit).
+`focal-ledger`: `native_session::retirement::tests::a_record_carries_the_bound_its_retirement_fits`,
+`…::a_version_one_record_decodes_as_it_was_written` (golden bytes),
+`native_session::tests::a_retirement_at_the_outcome_bound_is_refused_and_nothing_is_fenced`,
+`…::a_retirement_that_fits_the_outcome_bound_reopens_under_it` (WAL-only and
+checkpoint reopens), `…::a_replica_below_the_committed_outcome_bound_fails_closed_on_the_record`,
+`…::a_version_one_record_applies_where_it_fits_and_is_inert_where_it_does_not`,
+`native_session::cluster_tests::a_cluster_at_the_outcome_bound_retires_and_a_lagging_follower_restores_under_it`
+(the cluster harness gained `reopen_with(limits)`),
+`session::native_tests::a_hosted_authority_retires_under_the_outcome_bound_and_is_refused_at_it`.
+The existing suites of both crates pass.
+
+**Decisions.** `OutcomeCapacity` is named before `OutcomesReserved`: the permanent
+refusal, not the one that frees. The record carries the bound rather than the bound
+becoming committed policy: the record is where the check happened, and a committed
+outcome policy belongs with F12 (lifetime history as active capacity). A replica
+below the committed bound fails closed, the rule 25 §4 applies to a layout a
+replica's member bound cannot hold; `apply_layout` words that refusal `Corrupt`
+("identity, profile or committed prefix mismatch"), and F02 names its own error with
+both bounds instead of borrowing a message that would mislead. A version-1 record is
+never a stop because its authority checked nothing. A checkpoint already encoded past
+its bound by the unchecked retirement is still refused at restore; its repair or
+migration is the operator's decision (the audit's "existing over-limit states") and
+stays open here. Left latent, not hit by any test: `crates/focal-ledger/src/session.rs`
+1312–1330, the hosted apply loop applies a native entry (`engine.apply_entry`, which
+advances the engine's own `applied_raft`, `native_session_apply.rs` 598–599) and then,
+on a leader past its readiness barrier, reconstructs the owner in line
+(`engine.promote`, 1324–1327) before it advances the session's `applied_raft` and the
+delivery's cursor (1328–1329); a retryable refusal of the reconstruction (the boxed
+owner's budget, `native_session_apply.rs` 203–217, or a memory refusal from
+`with_record_buffers`, 220–223) is retained by `drive` (1087–1096) at the applied
+entry, and the resume re-applies it, which the engine refuses as `Corrupt`
+(`native_session_apply.rs` 570–572) and the session fails closed (1315–1316). Before
+this fix the completion book's refusal took that route; after it only a memory
+refusal at reconstruction can. The cure is to advance the cursor before the
+reconstruction and retry the reconstruction alone, as the standalone engine retries
+it at its readiness barrier.
 
 ## F24
 

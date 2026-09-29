@@ -63,6 +63,9 @@ pub(crate) struct NativeEngine<S: NativeSchemaVerifier> {
     /// Families retired through the applied prefix, counted from genesis or
     /// the checkpoint that seeded this replica.
     pub(super) retired_families: u64,
+    /// Committed retirement records this replica applied nothing for since
+    /// it opened; a diagnostic, never an input to state.
+    pub(super) retirements_inert: u64,
     /// The chunks of this replica's latest checkpoint seed (25 §5): what
     /// its seed store must keep for peers that seed from it (26 §5).
     pub(super) seed_chunks: Vec<ContentHash>,
@@ -171,6 +174,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             archived_through: SessionSeq(0),
             retirement: None,
             retired_families: 0,
+            retirements_inert: 0,
             seed_chunks: Vec::new(),
             movement: None,
             disk_sample: None,
@@ -315,6 +319,13 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     pub(crate) fn retired_families(&self) -> u64 {
         self.retired_families
     }
+    /// Committed retirement records this replica applied nothing for since
+    /// it opened (26 §4): the prefix they named had passed, a movement was
+    /// pending, or the committed state refused the family — a version-1
+    /// record beyond this replica's outcome bound among them.
+    pub(crate) fn retirements_inert(&self) -> u64 {
+        self.retirements_inert
+    }
     /// The chunks of the latest checkpoint seed, sorted.
     pub(crate) fn seed_chunks(&self) -> &[ContentHash] {
         &self.seed_chunks
@@ -341,21 +352,11 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         self.seed_chunks = chunks;
         Ok(())
     }
-    /// Propose one family's retirement as a session decision (26 §4). Only
-    /// an authority with no pending candidate and nothing else in flight
-    /// may; the family is derived from the committed state and the bundle's
-    /// claim is checked against it before the record is proposed, so an
-    /// applicable record is what the log carries.
-    pub(crate) fn propose_retirement(
-        &mut self,
-        consensus: &mut DurableNode,
-        root: focal_model::ClaimId,
-        bundle: ContentHash,
-        bytes: u64,
-        through: SessionSeq,
-    ) -> Result<(), NativeSessionError> {
-        let status = consensus.status();
-        self.require_authority(&status)?;
+    /// The gates a retirement passes before its family is derived (26 §4):
+    /// authority, no retirement, layout change or movement step in flight,
+    /// no pending candidate and no delivery.
+    fn retirement_gates(&self, status: &NodeStatus) -> Result<(), NativeSessionError> {
+        self.require_authority(status)?;
         if self.retirement.is_some() {
             return Err(NativeSessionError::Retiring);
         }
@@ -372,11 +373,62 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         if !self.pending.is_empty() || self.delivery.is_some() {
             return Err(NativeSessionError::Capacity);
         }
+        Ok(())
+    }
+    /// The core's outcome bound (`OutcomeCapacity`, the permanent one,
+    /// named first), then the owner's word that the outcome a retirement
+    /// publishes is not one it promised to a live report or keeps for the
+    /// control (`OutcomesReserved`); the book's refusal is `Capacity`, as
+    /// for a candidate, and is named here for what it holds.
+    fn retirement_reservation(&self) -> Result<(), NativeSessionError> {
+        let Some(Domain::Active(owner, _)) = self.domain.as_ref() else {
+            return Err(NativeSessionError::Failed);
+        };
+        owner
+            .committed_core()
+            .check_retirement_outcome()
+            .map_err(NativeSessionError::Retirement)?;
+        owner.check_retirement().map_err(|error| match error {
+            NativeOwnerError::PendingCandidates => NativeSessionError::Capacity,
+            NativeOwnerError::Native(NativeError::Capacity(_)) => NativeSessionError::Retirement(
+                focal_core::native::retirement::RetirementRefusal::OutcomesReserved,
+            ),
+            other => other.into(),
+        })
+    }
+    /// Whether this authority could propose a retirement now (26 §4): the
+    /// gates and the owner's reservation `propose_retirement` applies, short
+    /// of the family itself. The archive agent asks before it seals a
+    /// bundle, so nothing is sealed for a family that cannot be proposed.
+    pub(crate) fn check_retirement(&self, status: &NodeStatus) -> Result<(), NativeSessionError> {
+        self.retirement_gates(status)?;
+        self.retirement_reservation()
+    }
+    /// Propose one family's retirement as a session decision (26 §4). Only
+    /// an authority with no pending candidate and nothing else in flight
+    /// may; the family is derived from the committed state (which refuses
+    /// one whose outcome would pass the core's bound), the owner's
+    /// reservation of outcomes for the reports it promised is checked, and
+    /// the bundle's claim is checked against the family, all before the
+    /// record is proposed, so an applicable record is what the log carries
+    /// and a refusal proposes and fences nothing. The record carries the
+    /// bound the retirement was checked against.
+    pub(crate) fn propose_retirement(
+        &mut self,
+        consensus: &mut DurableNode,
+        root: focal_model::ClaimId,
+        bundle: ContentHash,
+        bytes: u64,
+        through: SessionSeq,
+    ) -> Result<(), NativeSessionError> {
+        let status = consensus.status();
+        self.retirement_gates(&status)?;
         let core = self.committed_core()?;
         let family = core
             .retirement_family(root)
             .map_err(NativeSessionError::Retirement)?;
         let prefix = core.native_sequence();
+        self.retirement_reservation()?;
         if bundle.0 == [0; 32]
             || bytes == 0
             || through.0 == 0
@@ -388,6 +440,8 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             )
             .into());
         }
+        let outcome_limit = u64::try_from(self.limits.recovery.native.outcomes)
+            .map_err(|_| NativeSessionError::Capacity)?;
         let record = super::retirement::RetirementRecord {
             ledger: self.ledger,
             expected_prefix: prefix,
@@ -395,9 +449,10 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             bundle,
             bytes,
             through,
+            outcome_limit: Some(outcome_limit),
         };
         let mut encoded = [0u8; super::retirement::BYTES];
-        record.write_into(&mut encoded);
+        record.write_into(&mut encoded)?;
         let _permit = self.budget.reserve(
             BudgetKind::Pending,
             BudgetLane::Completion,

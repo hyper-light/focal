@@ -353,8 +353,17 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     }
     /// Apply a committed retirement record (26 §4): inert when the prefix
     /// it named has passed, a movement is pending, or the committed state
-    /// refuses the family; otherwise the same family leaves this replica
-    /// alike behind its continuation, and the record counts. On an
+    /// refuses the family — the same on every replica, and counted
+    /// (`retirements_inert`); otherwise the same family leaves this replica
+    /// alike behind its continuation, and the record counts. One refusal
+    /// is not inert: a record that carries the outcome bound the authority
+    /// checked it against, whose outcome this replica's own bound cannot
+    /// hold, fails closed (`OutcomeBound`) — this replica is configured
+    /// below the authority, and applying nothing where every other replica
+    /// retired would diverge silently, while applying it would make a
+    /// state its own checkpoint could not restore. A version-1 record
+    /// carries no bound (it was proposed without the check): where it does
+    /// not fit it is inert and counted, as any refused family. On an
     /// authority the record ends every pending candidate first; the owner
     /// is reconstructed at the next readiness barrier, as after any record
     /// it did not author.
@@ -367,6 +376,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             self.retirement = None;
         }
         if self.sequence()? != record.expected_prefix {
+            self.retirements_inert = self.retirements_inert.saturating_add(1);
             return Ok(());
         }
         if self
@@ -374,6 +384,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             .as_ref()
             .is_some_and(|movement| movement.pending().is_some())
         {
+            self.retirements_inert = self.retirements_inert.saturating_add(1);
             return Ok(());
         }
         if !self.pending.is_empty() {
@@ -385,13 +396,26 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         // a fresh readiness barrier and reconstructs its owner there.
         self.readiness_requested = None;
         self.reconstruction_needed = true;
+        let local = u64::try_from(self.limits.recovery.native.outcomes).unwrap_or(u64::MAX);
         let Some(Domain::Passive(core)) = self.domain.as_mut() else {
             return Err(NativeSessionError::Failed);
         };
-        let Ok(family) = core.retirement_family(record.root) else {
-            return Ok(());
+        let family = match core.retirement_family(record.root) {
+            Ok(family) => family,
+            Err(focal_core::native::retirement::RetirementRefusal::OutcomeCapacity) => {
+                if let Some(committed) = record.outcome_limit {
+                    return Err(NativeSessionError::OutcomeBound { committed, local });
+                }
+                self.retirements_inert = self.retirements_inert.saturating_add(1);
+                return Ok(());
+            }
+            Err(_) => {
+                self.retirements_inert = self.retirements_inert.saturating_add(1);
+                return Ok(());
+            }
         };
         if record.through < family.through {
+            self.retirements_inert = self.retirements_inert.saturating_add(1);
             return Ok(());
         }
         match core.retire_native_family(&family, record.bundle, record.bytes, record.through) {

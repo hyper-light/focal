@@ -11952,3 +11952,53 @@ fresh native ledger through the real binary (`tests/cli_native_quickstart.rs`: s
 post, a read showing the claim posted, the engine named by the context-backed
 validation, the V1 example refused by the field the native contract lacks). The README
 and the manual carry the native quickstart and the rule.
+### 2026-09-29 — F02 — a retirement that the same configuration cannot restore
+
+The audit's F02 (P1). `Core::retire_native_family` incremented the outcome
+count and published a retirement's outcome at the next prefix without asking
+the core's outcome bound, while checkpoint recovery requires the count it
+restores at or under `limits.outcomes` and equal to the prefix: a session that
+had admitted its bound's last outcome and then retired a family encoded a
+checkpoint the same limits refused (`Contract(Capacity)`), and an owner rebuilt
+over the core refused the same way. Nothing consulted the completion book
+either — the promised slots every candidate and every owner rebuild pass
+(`check_slots`) — so a retirement that fit the bound but took an outcome
+promised to a live report left a core no owner rebuilt over: `NativeOwner::new`
+refused `Capacity` at every readiness barrier, the authority never returned,
+and in the hosted session the retained delivery re-applied the entry and
+failed closed as `Corrupt`. The bound is per node and was committed nowhere.
+The outcome is guarded now as ordinary admission guards its own.
+`Core::retirement_family` refuses first, before a row is walked, when the
+outcomes counted plus one pass the bound (`RetirementRefusal::OutcomeCapacity`);
+`retire_native_family` refuses the same at publication (`Capacity("outcomes")`)
+after checking that the outcomes counted equal the prefix (a contradiction is
+`InvalidManifest`) — the last fence, never the check. `NativeOwner::check_retirement`,
+modelled on the layout change's check, asks the book what every fresh
+candidate is asked, with the meta row one outcome and the prefix one sequence
+ahead; the session names that refusal `OutcomesReserved`, and it frees as the
+reports arrive. `propose_retirement` runs its gates, derives the family, asks
+the owner, then encodes, so a refusal proposes and fences nothing; the archive
+agent asks `Session::native_check_retirement` before it seals a bundle. The
+retirement record is version 2 and carries the bound the retirement was
+checked against (`FOCALRT1`, 154 bytes, digest domain `.v2`; a record without
+a bound, or whose prefix its bound does not hold one past, is refused at
+encoding and decoding alike); at application a replica whose own bound cannot
+hold a committed retirement fails closed with both bounds named
+(`NativeSessionError::OutcomeBound { committed, local }`), as a layout record
+fails a replica below the authority's member bound, while a version-1 record
+that does not fit is inert and counted (`retirements_inert`), never a stop,
+since its authority checked nothing; version-1 records still decode, their
+golden bytes kept. Tests: the core at the bound less one, at it and past it,
+over several families, and against the book's promised slots (at the smallest
+bound an owner rebuilds under, the core's check passes, the owner refuses, and
+retiring regardless leaves a core no owner rebuilds over); a single session
+refused at the bound with nothing fenced and a reopen unchanged, allowed one
+under it with reopens from the log alone and from a checkpoint under the same
+bound, a replica below the committed bound refused on the record and opened
+under it, a version-1 record applied where it fits and inert where it does
+not; three voters at the bound with the lagging follower restored from the
+authority's checkpoint under the bound and restarted under it; the hosted
+authority allowed and refused. Left in place and described in the remediation
+record: the hosted apply loop reconstructs the owner in line right after a
+retirement applies, and a retryable refusal there retains the delivery at the
+applied entry, which the resume re-applies as `Corrupt`.

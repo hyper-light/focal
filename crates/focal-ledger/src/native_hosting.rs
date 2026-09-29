@@ -1113,6 +1113,25 @@ impl Session {
                 ))
             })
     }
+    /// Whether this authority could propose a retirement now (26 §4): the
+    /// gates `native_propose_retirement` applies before it derives a
+    /// family, the owner's reservation of outcomes for the reports it
+    /// promised among them. The archive agent asks before it seals a
+    /// bundle, so nothing is sealed for a family that cannot be proposed.
+    pub fn native_check_retirement(&self) -> Result<(), LedgerError> {
+        self.check()?;
+        let engine = self
+            .native
+            .as_deref()
+            .ok_or(LedgerError::NativeUnsupported)?;
+        engine.check_retirement(&self.consensus.status())?;
+        Ok(())
+    }
+    /// Committed retirement records this replica applied nothing for since
+    /// it opened (26 §4).
+    pub fn native_retirements_inert(&self) -> Result<u64, LedgerError> {
+        Ok(self.native_engine()?.retirements_inert())
+    }
     /// Propose one family's retirement as a session decision (26 §4).
     pub fn native_propose_retirement(
         &mut self,

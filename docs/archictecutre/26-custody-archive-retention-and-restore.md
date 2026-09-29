@@ -195,10 +195,14 @@ tombstoned link's owner read from its `Monitor` row), while a member's own
 monitor watches a claim outside the family (`LiveMonitor`), while an
 artifact outside the family took a member as an input (`LiveReference`),
 while a member's evaluation has begun and is neither terminal nor fenced
-(`LiveEvaluation`: the owner still holds its completion contract), or when
-the family exceeds 64 members or 65,536 rows (`TooLarge`). Outcome and
-creation-result rows stay: every native sequence keeps its one outcome, and
-an exact retry of a retired claim's creation is still answered from it.
+(`LiveEvaluation`: the owner still holds its completion contract), when
+the family exceeds 64 members or 65,536 rows (`TooLarge`), or — asked
+first, before a row is walked — when the outcome the retirement publishes
+would pass the core's outcome bound (`OutcomeCapacity`: `limits.outcomes`,
+the bound checkpoint recovery enforces on the count it restores; below).
+Outcome and creation-result rows stay: every native sequence keeps its one
+outcome, and an exact retry of a retired claim's creation is still answered
+from it.
 
 **The bundle.** `Core::archive_family_quote` and `archive_family_into` write
 the family's rows in key order into an `FCNARCHV` frame (magic, version 1,
@@ -223,22 +227,28 @@ and length; the retirement record carries both, and the continuation keeps
 both, so any replica can locate the bundle without a catalog record: the
 continuations are the catalog.
 
-**The record and its application.** `FOCALRT1` (146 fixed bytes: magic,
-version, ledger, the native prefix the family was derived at, the root, the
-bundle's content root, its length, the prefix it claims, a digest under
-`focal.native.session.retirement-record.v1`) is a session decision like a
-layout record ([25 §4](25-parallel-materialization-and-ranges.md)). Only
-the authority proposes it (`propose_retirement`), after deriving the family
-from its committed core and checking the bundle's claim against it (at
-least the family's last event, at most the derived prefix); refused while
-candidates are pending, a layout change, a movement step or another
-retirement is in flight, or the family is ineligible
-(`NativeSessionError::Retirement(refusal)`). While the record is in flight
-native admission, layout changes and movement steps answer `Retiring`
-(retryable), so the record is never wasted by a later prefix. Applied, the
-record is inert when the prefix it named has passed, when a movement is
-pending, or when the committed state refuses the family — the same on
-every replica; otherwise every replica derives the same family and
+**The record and its application.** `FOCALRT1` version 2 (154 fixed
+bytes: magic, version, ledger, the native prefix the family was derived at,
+the root, the bundle's content root, its length, the prefix it claims, the
+outcome bound the authority checked the retirement against, a digest under
+`focal.native.session.retirement-record.v2`; a version-1 record is the same
+without the bound, 146 bytes under the `.v1` domain, and still decodes) is
+a session decision like a layout record
+([25 §4](25-parallel-materialization-and-ranges.md)). Only the authority
+proposes it (`propose_retirement`), after deriving the family from its
+committed core, asking its owner whether the outcome the retirement
+publishes is to spare (below), and checking the bundle's claim against the
+family (at least the family's last event, at most the derived prefix);
+refused while candidates are pending, a layout change, a movement step or
+another retirement is in flight, or the family is ineligible
+(`NativeSessionError::Retirement(refusal)`), and a refusal proposes and
+fences nothing. While the record is in flight native admission, layout
+changes and movement steps answer `Retiring` (retryable), so the record is
+never wasted by a later prefix. Applied, the record is inert when the prefix
+it named has passed, when a movement is pending, or when the committed state
+refuses the family — the same on every replica, and counted
+(`retirements_inert`, a diagnostic of the replica, never an input to its
+state); otherwise every replica derives the same family and
 `Core::retire_native_family` deletes its rows, decrements the Meta counters
 per family, writes one `Retired(claim)` continuation per member (family
 49: the bundle's root and length, the prefix it claims, the claim's final
@@ -254,6 +264,46 @@ proposal go. The replica counts the families it applied; the count rides
 its checkpoint's retention section beside the archive's report and is
 restored from it, so a replica seeded from a checkpoint reports the count
 through the prefix it installed.
+
+**The outcome a retirement publishes (the audit's F02, 2026-09-29).** The
+retirement's outcome is one of the `limits.outcomes` a node admits — the
+bound checkpoint recovery enforces on the count it restores, and requires
+equal to the prefix. A retirement that published the bound's last outcome
+and one more made a state the same configuration could not restore
+(`Contract(Capacity)` from the checkpoint, `Capacity` from an owner rebuilt
+over it), and one that fit the bound but took an outcome the completion
+book had promised to a live report left a core no owner rebuilt over:
+`NativeOwner::new` refused at every readiness barrier and the authority
+never returned. The outcome is guarded now as ordinary admission guards its
+own, at three places. `Core::retirement_family` refuses the family first,
+before a row is walked, when the outcomes counted plus one pass the bound
+(`OutcomeCapacity`, the permanent refusal, named before any other);
+`Core::retire_native_family` refuses the same at publication
+(`Capacity("outcomes")`), after checking that the outcomes counted equal
+the prefix (a contradiction is `InvalidManifest`) — the last fence, never
+the check. `NativeOwner::check_retirement` asks the completion book what
+every fresh candidate is asked (`check_slots`, with the meta row one outcome
+and the prefix one sequence ahead): whether the outcome is to spare beyond
+those promised to live reports and the one control the owner keeps for an
+authority decision; the session names that refusal `OutcomesReserved`, and
+it frees as the reports arrive. `propose_retirement` runs its gates, derives
+the family, asks the owner, then encodes, so nothing is proposed or fenced
+on a refusal; `Session::native_check_retirement` asks the same short of the
+family, and the archive agent asks it before it seals a bundle. The record
+carries the bound the retirement was checked against, since
+`limits.outcomes` is a node's own setting and committed nowhere else; a
+record written without a bound, or whose prefix its bound does not hold one
+past, is refused at encoding and at decoding alike. At application a
+replica whose own bound cannot hold the retirement's outcome, where the
+record carries a bound, fails closed
+(`NativeSessionError::OutcomeBound { committed, local }`, both bounds
+named): it is configured below the authority, and applying nothing where
+every other replica retired would diverge silently, while applying the
+record would make a state its own checkpoint could not restore — the rule
+a layout record applies to a replica whose member bound is lower than the
+authority's (25 §4). A version-1 record carries no bound (it was proposed
+without the check): where it does not fit it is inert and counted, as any
+refused family, never a stop.
 
 **What the validators reconcile.** An outcome row still counts the events
 its sequence published, some of which left with a family. Every
@@ -309,15 +359,42 @@ the family's events and last sequence, the candidate walk and its cursor,
 the bundle's identity, structural verification and refusal of every
 corruption, retirement, the continuation, exact restore and validation of
 the checkpoint, continued admission; an owned tree keeps its parent and
-takes its children); `native_session::retirement::tests` (the record
-round-trips and refuses every corruption);
+takes its children; the outcome bound: a retirement one under it restores
+and rebuilds an owner under the same bound and still answers the exact
+retry while a fresh request meets the bound itself, one at the bound is
+refused at derivation and at publication with the sequence, the counters
+and the budget untouched, one past the bound is what both the checkpoint
+and the owner refuse, exactly the spare outcomes' worth of families retire
+and the next is refused, and the owner holds the outcomes promised to live
+reports back from a retirement — at the smallest bound an owner rebuilds
+under, the core's own check passes, the owner refuses, and retiring
+regardless leaves a core no owner rebuilds over, while one bound higher the
+retirement is allowed and the promised report and a deadline control are
+admitted after it); `native_session::retirement::tests` (the record
+round-trips and refuses every corruption, carries the bound its retirement
+fits and refuses one it does not, and a version-1 record decodes from the
+bytes its writer produced); `native_session::tests` (at the bound a
+retirement is refused with a typed refusal, nothing in flight, nothing
+fenced, and a reopen unchanged; one under it reopens from the log alone
+and from a checkpoint under the same bound; a replica below the committed
+bound fails closed on the record with both bounds named and opens under
+it; a version-1 record applies where it fits and is inert and counted
+where it does not);
 `native_session::cluster_tests::committed_retirements_apply_on_every_replica_and_fence_proposals`
 (authority-only proposal, refusals before proposal, fencing of native
 proposals, layout changes and a second retirement while one is in flight,
 identical state and digests on every replica, the continuation and the
 outcome, the exact retry of the retired claim's creation, no second
 retirement, a lagging follower seeded from a checkpoint with the count, a
-restart); `native_session::retention::tests` (the floor's inclusiveness);
+restart) and
+`…::a_cluster_at_the_outcome_bound_retires_and_a_lagging_follower_restores_under_it`
+(three voters one under the bound: the record carries it, the follower that
+missed the release and the retirement restores the retired state from the
+authority's checkpoint under the same bound and keeps it across a restart
+under it); `session::native_tests::a_hosted_authority_retires_under_the_outcome_bound_and_is_refused_at_it`
+(the hosted authority stays authoritative after an allowed retirement and
+admits nothing fresh past the bound; at the bound the refusal leaves nothing
+in flight); `native_session::retention::tests` (the floor's inclusiveness);
 `cli_retention.rs` as above.
 
 **Limits.** The grace and the interval are node-local environment
@@ -334,6 +411,13 @@ meaning. The agent proposes on the authority only, and the leader of a
 session whose consumers lag holds every family until they catch up. A
 bundle whose copies never answer stays sealed on the authority and is
 re-offered every tick; nothing reclaims it before R8.5's collector.
+`limits.outcomes` is a node's own setting: the record carries the bound a
+retirement was checked against, and a replica configured below it stops at
+the first committed retirement its bound cannot hold rather than diverge —
+a fleet whose nodes differ in the bound is raised at the low node, never
+retired around. A checkpoint already encoded past its bound by the
+unchecked retirement is still refused at restore; its repair is a decision
+the remediation record leaves open.
 
 ## 5. Reclaiming bytes: the collector (R8.5, 2026-09-10)
 

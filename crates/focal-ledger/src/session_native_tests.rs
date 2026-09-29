@@ -3,7 +3,7 @@
 //! checkpoint, restart, legacy refusal, and a replicated group where a replica
 //! without native hosting refuses native history at ingress until it hosts it.
 use super::*;
-use crate::native_session::tests::{ledger, limits as native_limits, store};
+use crate::native_session::tests::{ledger, limits as native_limits, limits_with_outcomes, store};
 use focal_consensus::{MessageType, SnapshotStatus};
 use focal_core::native::fixtures as fx;
 use focal_model::lifecycle::Binding;
@@ -2000,6 +2000,127 @@ fn a_hosted_authority_retires_a_family_and_stays_authoritative() {
         Some(continuation)
     );
     assert_eq!(cluster.node(1).native_retention().unwrap().retired, 1);
+}
+
+/// The hosted authority at the outcome bound (26 §4): one under it the
+/// retirement is allowed and the authority, reconstructed over the retired
+/// core at once, stays authoritative and admits nothing fresh past the
+/// bound; at it the retirement is refused before proposal, nothing is in
+/// flight and the authority stays authoritative.
+#[test]
+fn a_hosted_authority_retires_under_the_outcome_bound_and_is_refused_at_it() {
+    use focal_core::native::NativeCommand;
+    use focal_core::native::retirement::RetirementRefusal;
+    fn finished(cluster: &mut Cluster) -> NativeOutcome {
+        let create = creation(cluster.next(PARTIES.issuer), 1);
+        let created = cluster.commit(1, PARTIES.issuer, create, &[]);
+        let expected = cluster.claim(1, 1);
+        let cancel = fx::cancel(cluster.next(PARTIES.issuer), expected);
+        cluster.commit(1, PARTIES.issuer, cancel, &[]);
+        let expected = cluster.claim(1, 1);
+        let release = NativeInput {
+            request: cluster.next(PARTIES.issuer),
+            command: NativeCommand::ReleaseScope { expected },
+        };
+        cluster.commit(1, PARTIES.issuer, release, &[]);
+        created
+    }
+    // One under the bound: allowed.
+    let mut cluster = Cluster::with_limits(1, &[true], limits_with_outcomes(4));
+    cluster.elect(1, &[]);
+    cluster.activate(1, &[]);
+    let created = finished(&mut cluster);
+    let request = created.invocation;
+    let (bundle, length, through) = {
+        let node = cluster.node(1);
+        let limits = node.native_encoding_limits().unwrap();
+        let core = node.native_core().unwrap();
+        let family = core.retirement_family(ClaimId::from_u128(1)).unwrap();
+        let through = core.native_sequence();
+        let quote = core.archive_family_quote(&family, through, limits).unwrap();
+        (quote.hash, quote.bytes as u64, through)
+    };
+    cluster.node(1).native_check_retirement().unwrap();
+    cluster
+        .node(1)
+        .native_propose_retirement(ClaimId::from_u128(1), bundle, length, through)
+        .unwrap();
+    assert!(cluster.node(1).native_retention().unwrap().retiring);
+    cluster.pump(&[]);
+    let report = cluster.node(1).native_retention().unwrap();
+    assert_eq!(report.retired, 1, "{report:?}");
+    assert!(!report.retiring);
+    assert_eq!(cluster.node(1).native_sequence().unwrap(), SessionSeq(4));
+    assert_eq!(cluster.node(1).native_retirements_inert().unwrap(), 0);
+    assert!(
+        cluster.node(1).native_authoritative(),
+        "the owner rebuilds under the bound right after the record applies"
+    );
+    assert_eq!(cluster.status(1, 1), None);
+    let focal_core::native::NativeInvocation::Request(request) = request else {
+        panic!("a creation is a request")
+    };
+    cluster.clock = cluster.clock.saturating_add(1);
+    let clock = cluster.clock;
+    let store = &mut cluster.stores[0];
+    assert_eq!(
+        cluster.nodes[0]
+            .as_mut()
+            .unwrap()
+            .propose_native(
+                context(PARTIES.issuer, clock),
+                creation(request, 1),
+                NativeCustody::Store(store)
+            )
+            .unwrap(),
+        NativeSubmission::Committed(created)
+    );
+    // Nothing fresh fits past the bound, and the authority says so itself.
+    let fresh = creation(cluster.next(PARTIES.issuer), 2);
+    cluster.clock = cluster.clock.saturating_add(1);
+    let clock = cluster.clock;
+    let store = &mut cluster.stores[0];
+    assert!(matches!(
+        cluster.nodes[0].as_mut().unwrap().propose_native(
+            context(PARTIES.issuer, clock),
+            fresh,
+            NativeCustody::Store(store)
+        ),
+        Err(LedgerError::Native(NativeSessionError::Owner(
+            NativeOwnerError::Native(focal_core::native::NativeError::Capacity("outcomes"))
+        )))
+    ));
+    assert!(cluster.node(1).native_authoritative());
+    // At the bound: refused, nothing in flight, the authority untouched.
+    let mut cluster = Cluster::with_limits(1, &[true], limits_with_outcomes(3));
+    cluster.elect(1, &[]);
+    cluster.activate(1, &[]);
+    finished(&mut cluster);
+    let through = cluster.node(1).native_sequence().unwrap();
+    assert!(matches!(
+        cluster.node(1).native_check_retirement(),
+        Err(LedgerError::Native(NativeSessionError::Retirement(
+            RetirementRefusal::OutcomeCapacity
+        )))
+    ));
+    assert!(matches!(
+        cluster.node(1).native_propose_retirement(
+            ClaimId::from_u128(1),
+            ContentHash([9; 32]),
+            1,
+            through
+        ),
+        Err(LedgerError::Native(NativeSessionError::Retirement(
+            RetirementRefusal::OutcomeCapacity
+        )))
+    ));
+    let report = cluster.node(1).native_retention().unwrap();
+    assert!(!report.retiring, "{report:?}");
+    assert_eq!(report.retired, 0);
+    assert!(cluster.node(1).native_authoritative());
+    cluster.pump(&[]);
+    assert_eq!(cluster.node(1).native_sequence().unwrap(), SessionSeq(3));
+    assert_eq!(cluster.status(1, 1), Some(ClaimStatus::Cancelled));
 }
 
 /// The simulated disk as a backup medium: every install step is one

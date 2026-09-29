@@ -910,3 +910,310 @@ fn recovered_prefix_is_a_linearizable_publication_history() {
         Err(focal_sim::history::HistoryError::PrematureSuccess)
     );
 }
+
+/// The test limits with the outcome bound set to `outcomes`.
+pub(crate) fn limits_with_outcomes(outcomes: usize) -> NativeSessionLimits {
+    let mut limits = limits();
+    limits.recovery.native.outcomes = outcomes;
+    limits
+}
+fn cancel(request: u128, expected: Binding) -> NativeInput {
+    NativeInput {
+        request: key(request),
+        command: NativeCommand::Cancel { expected },
+    }
+}
+fn release(request: u128, expected: Binding) -> NativeInput {
+    NativeInput {
+        request: key(request),
+        command: NativeCommand::ReleaseScope { expected },
+    }
+}
+/// Create, cancel and release claim `claim` on an authoritative session:
+/// a family of one whose three outcomes are the prefix. Returns the
+/// creation's outcome, what an exact retry must keep answering.
+fn finished_family(
+    session: &mut NativeSession<BuiltinNativeSchemas>,
+    request: u128,
+    claim: u128,
+) -> NativeOutcome {
+    let created = commit(session, create(request, claim), "create");
+    let (_, expected) = claim_status(session, claim);
+    commit(session, cancel(request + 1, expected), "cancel");
+    let (_, expected) = claim_status(session, claim);
+    commit(session, release(request + 2, expected), "release");
+    created
+}
+/// Drive the session until the retirement it proposed has applied.
+fn apply_retirement(session: &mut NativeSession<BuiltinNativeSchemas>) {
+    for _ in 0..16 {
+        let _ = session.poll().unwrap();
+        if session.retirement_in_flight().is_none() {
+            return;
+        }
+    }
+    panic!("the retirement never applied");
+}
+
+/// At the outcome bound a retirement is refused at proposal with a typed
+/// refusal: nothing is proposed, nothing fenced, and the session goes on
+/// answering exact retries; a reopen finds the prefix unchanged and no
+/// family retired.
+#[test]
+fn a_retirement_at_the_outcome_bound_is_refused_and_nothing_is_fenced() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = MemoryBudget::new(256 << 20, 64 << 20).unwrap();
+    let created;
+    {
+        let mut session = open_with(dir.path(), &parent, limits_with_outcomes(3)).unwrap();
+        lead(&mut session);
+        created = finished_family(&mut session, 1, 100);
+        assert_eq!(session.sequence().unwrap(), SessionSeq(3));
+        let through = session.sequence().unwrap();
+        let refused = session
+            .propose_retirement(ClaimId::from_u128(100), ContentHash([9; 32]), 1, through)
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                NativeSessionError::Retirement(
+                    focal_core::native::retirement::RetirementRefusal::OutcomeCapacity
+                )
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(refused.class(), FailureClass::Request);
+        assert!(session.retirement_in_flight().is_none());
+        assert_eq!(session.retired_families(), 0);
+        // Nothing is fenced: an exact retry is answered, and a fresh
+        // request meets the bound itself, not a retirement in flight.
+        assert_eq!(
+            session.propose(context(), create(1, 100)).unwrap(),
+            NativeSubmission::Committed(created)
+        );
+        assert!(matches!(
+            session.propose(context(), create(4, 101)),
+            Err(NativeSessionError::Owner(NativeOwnerError::Native(
+                NativeError::Capacity("outcomes")
+            )))
+        ));
+        let _ = session.poll().unwrap();
+        assert_eq!(session.sequence().unwrap(), SessionSeq(3));
+    }
+    let mut session = open_with(dir.path(), &parent, limits_with_outcomes(3)).unwrap();
+    assert_eq!(session.sequence().unwrap(), SessionSeq(3));
+    assert_eq!(session.retired_families(), 0);
+    lead(&mut session);
+    assert_eq!(
+        session.propose(context(), create(1, 100)).unwrap(),
+        NativeSubmission::Committed(created)
+    );
+}
+
+/// The bundle of claim `claim`'s family from the committed core: the root,
+/// the digest, the length and the prefix it claims.
+fn bundle_of(
+    session: &NativeSession<BuiltinNativeSchemas>,
+    claim: u128,
+) -> (ClaimId, ContentHash, u64, SessionSeq) {
+    let core = session.committed_core().unwrap();
+    let family = core.retirement_family(ClaimId::from_u128(claim)).unwrap();
+    let through = core.native_sequence();
+    let quote = core
+        .archive_family_quote(&family, through, limits().encoding)
+        .unwrap();
+    (family.root, quote.hash, quote.bytes as u64, through)
+}
+
+/// One under the outcome bound a retirement is allowed: it publishes the
+/// bound's last outcome, the record carries the bound it was checked
+/// against, exact retries are still answered, and a reopen from the log
+/// alone and from a checkpoint under the same bound both restore it.
+#[test]
+fn a_retirement_that_fits_the_outcome_bound_reopens_under_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = MemoryBudget::new(256 << 20, 64 << 20).unwrap();
+    let created;
+    {
+        let mut session = open_with(dir.path(), &parent, limits_with_outcomes(4)).unwrap();
+        lead(&mut session);
+        created = finished_family(&mut session, 1, 100);
+        let (root, bundle, length, through) = bundle_of(&session, 100);
+        session
+            .propose_retirement(root, bundle, length, through)
+            .unwrap();
+        let record = session.retirement_in_flight().unwrap();
+        assert_eq!(record.outcome_limit, Some(4));
+        assert_eq!(record.expected_prefix, SessionSeq(3));
+        apply_retirement(&mut session);
+        assert_eq!(session.sequence().unwrap(), SessionSeq(4));
+        assert_eq!(session.retired_families(), 1);
+        assert_eq!(session.retirements_inert(), 0);
+        for _ in 0..4 {
+            let _ = session.poll().unwrap();
+            if session.is_authoritative() {
+                break;
+            }
+        }
+        assert!(
+            session.is_authoritative(),
+            "the owner rebuilds under the bound after the retirement"
+        );
+        assert_eq!(
+            session.propose(context(), create(1, 100)).unwrap(),
+            NativeSubmission::Committed(created)
+        );
+    }
+    // From the log alone.
+    {
+        let mut session = open_with(dir.path(), &parent, limits_with_outcomes(4)).unwrap();
+        assert_eq!(session.sequence().unwrap(), SessionSeq(4));
+        assert_eq!(session.retired_families(), 1);
+        assert!(
+            session
+                .committed_core()
+                .unwrap()
+                .native_retired(ClaimId::from_u128(100))
+                .is_some()
+        );
+        lead(&mut session);
+        assert_eq!(
+            session.propose(context(), create(1, 100)).unwrap(),
+            NativeSubmission::Committed(created)
+        );
+        session.begin_checkpoint().unwrap();
+        let _ = session.poll().unwrap();
+        assert!(!session.checkpoint_pending());
+    }
+    // From the checkpoint, under the same bound.
+    let mut session = open_with(dir.path(), &parent, limits_with_outcomes(4)).unwrap();
+    assert_eq!(session.sequence().unwrap(), SessionSeq(4));
+    assert_eq!(session.retired_families(), 1);
+    lead(&mut session);
+    assert_eq!(
+        session.propose(context(), create(1, 100)).unwrap(),
+        NativeSubmission::Committed(created)
+    );
+}
+
+/// The record carries the bound the authority checked: a replica opened
+/// under a lower bound that cannot hold the retirement's outcome fails
+/// closed on the record, with the two bounds named, instead of applying
+/// nothing where the authority retired.
+#[test]
+fn a_replica_below_the_committed_outcome_bound_fails_closed_on_the_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = MemoryBudget::new(256 << 20, 64 << 20).unwrap();
+    {
+        let mut session = open_with(dir.path(), &parent, limits_with_outcomes(4)).unwrap();
+        lead(&mut session);
+        finished_family(&mut session, 1, 100);
+        let (root, bundle, length, through) = bundle_of(&session, 100);
+        session
+            .propose_retirement(root, bundle, length, through)
+            .unwrap();
+        apply_retirement(&mut session);
+        assert_eq!(session.retired_families(), 1);
+    }
+    let Err(refused) = open_with(dir.path(), &parent, limits_with_outcomes(3)) else {
+        panic!("a replica below the committed bound opened")
+    };
+    assert!(
+        matches!(
+            refused,
+            NativeSessionError::OutcomeBound {
+                committed: 4,
+                local: 3
+            }
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(refused.class(), FailureClass::FailClosed);
+    // Reopened under the bound the record carries, the replica applies it.
+    let session = open_with(dir.path(), &parent, limits_with_outcomes(4)).unwrap();
+    assert_eq!(session.sequence().unwrap(), SessionSeq(4));
+    assert_eq!(session.retired_families(), 1);
+}
+
+/// A version-1 record, from a log written before the bound was carried:
+/// applied where its family fits the replica's bound, inert and counted
+/// where it does not — never a stop, since the authority that wrote it
+/// checked nothing.
+#[test]
+fn a_version_one_record_applies_where_it_fits_and_is_inert_where_it_does_not() {
+    let parent = MemoryBudget::new(256 << 20, 64 << 20).unwrap();
+    let v1 = |through: SessionSeq| {
+        let record = RetirementRecord {
+            ledger: ledger(),
+            expected_prefix: through,
+            root: ClaimId::from_u128(100),
+            bundle: ContentHash([9; 32]),
+            bytes: 1,
+            through,
+            outcome_limit: None,
+        };
+        let mut bytes = [0u8; retirement::BYTES_V1];
+        record.write_v1_into(&mut bytes);
+        bytes
+    };
+    let apply_raw = |session: &mut NativeSession<BuiltinNativeSchemas>, bytes: &[u8]| {
+        let applied = session.applied_raft();
+        session
+            .consensus
+            .propose_borrowed_in(bytes, BudgetLane::Completion)
+            .unwrap();
+        for _ in 0..16 {
+            let _ = session.poll().unwrap();
+            if session.applied_raft() > applied {
+                return;
+            }
+        }
+        panic!("the record never applied");
+    };
+    // Beyond the bound: inert, counted, the session live.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = open_with(dir.path(), &parent, limits_with_outcomes(3)).unwrap();
+        lead(&mut session);
+        let created = finished_family(&mut session, 1, 100);
+        apply_raw(&mut session, &v1(SessionSeq(3)));
+        assert_eq!(session.sequence().unwrap(), SessionSeq(3));
+        assert_eq!(session.retired_families(), 0);
+        assert_eq!(session.retirements_inert(), 1);
+        assert!(
+            session
+                .committed_core()
+                .unwrap()
+                .native_claim(ClaimId::from_u128(100))
+                .is_some()
+        );
+        for _ in 0..4 {
+            let _ = session.poll().unwrap();
+            if session.is_authoritative() {
+                break;
+            }
+        }
+        assert_eq!(
+            session.propose(context(), create(1, 100)).unwrap(),
+            NativeSubmission::Committed(created)
+        );
+    }
+    // Within the bound: applied as any record.
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = open_with(dir.path(), &parent, limits_with_outcomes(4)).unwrap();
+        lead(&mut session);
+        finished_family(&mut session, 1, 100);
+        apply_raw(&mut session, &v1(SessionSeq(3)));
+        assert_eq!(session.sequence().unwrap(), SessionSeq(4));
+        assert_eq!(session.retired_families(), 1);
+        assert_eq!(session.retirements_inert(), 0);
+        let continuation = *session
+            .committed_core()
+            .unwrap()
+            .native_retired(ClaimId::from_u128(100))
+            .unwrap();
+        assert_eq!(continuation.bundle, ContentHash([9; 32]));
+        assert_eq!(continuation.bytes, 1);
+    }
+}
