@@ -1033,11 +1033,16 @@ async fn the_controller_expands_a_laptop_session_to_three_hosts_that_survive_one
     assert_eq!(grant.voters.len(), 3);
     assert!(grant.learners.is_empty());
     // Losing one host keeps a quorum: the founder still answers a quorum read
-    // of its membership and stays leader.
+    // of its membership, and a voter that is still there leads. Which one is
+    // the placement's: it prefers the node the planner put first by load,
+    // and the leader hands over to that one (27 §5), so the founder leads
+    // only where it is preferred or the preferred one is the host lost.
+    let preferred = active.active.placement.preferred_leader;
     peer_b.stop().await;
     let replica = founder.handles.ledger.as_ref().unwrap();
     if let Err(spent) = try_until(&[&founder, &peer_a], Duration::from_secs(20), async || {
-        (replica.membership().await.is_ok() && replica.progress().leader == founder_node)
+        let leader = replica.progress().leader;
+        (replica.membership().await.is_ok() && (leader == founder_node || leader == node_a))
             .then_some(())
     })
     .await
@@ -1072,12 +1077,12 @@ async fn the_controller_expands_a_laptop_session_to_three_hosts_that_survive_one
     }
     // The lost host returns, reopens its copy and rejoins as a voter.
     let peer_b = Running::start(&peer_settings[1]).await;
-    // Leadership returns to the founder by the return's own schedule (27
-    // §5): the founder fit for `FIT` windows, a quiet moment waited for up
-    // to `PATIENCE`, and a rest of `REST` windows after each ask, doubled
-    // after one that did not hold. Under load an ask may not hold twice:
-    // the wait is given the reopen's time and that schedule, in the
-    // session's election window, and not a guess at the sum.
+    // Leadership settles on the placement's preferred leader by the return's
+    // own schedule (27 §5): that member fit for `FIT` windows, a quiet moment
+    // waited for up to `PATIENCE`, and a rest of `REST` windows after each
+    // ask, doubled after one that did not hold. Under load an ask may not
+    // hold twice: the wait is given the reopen's time and that schedule, in
+    // the session's election window, and not a guess at the sum.
     let window = founder
         .handles
         .ledger
@@ -1100,14 +1105,14 @@ async fn the_controller_expands_a_laptop_session_to_three_hosts_that_survive_one
                 .handles
                 .fleet
                 .current_host(ledger)
-                .is_ok_and(|copy| copy.progress().leader == founder_node)
+                .is_ok_and(|copy| copy.progress().leader == preferred)
                 .then_some(())
         },
     )
     .await
     {
         panic!(
-            "the returning host never reopened its copy: {spent}: hosts={} status={:?} founder={:?} peer_a={:?} progress={:?}",
+            "leadership never settled on the preferred leader {preferred} after the lost host returned: {spent}: hosts={} status={:?} founder={:?} peer_a={:?} progress={:?}",
             peer_b.handles.fleet.hosts(ledger),
             peer_b.handles.placement.status().await,
             founder.handles.ledger.as_ref().map(ReplicaHost::progress),

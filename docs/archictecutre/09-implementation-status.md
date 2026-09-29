@@ -11467,3 +11467,17 @@ per-process 90B source, and whether focal keeps paying it is recorded here when 
 
 **Gates** on the final tree (macOS arm64): `cargo fmt --all --check`, `check-contracts.py`, clippy with `-D warnings`, `check-production.sh`, `cargo deny`, and the workspace's tests with four threads: 148 suites, 2,870 tests, none failed, 3 ignored — the same counts as the ring tree, with the process-spawning suites within their usual spread (`placement_binary` 205.0 s against 204.5 s, `runbooks` 145.0 s against 142.7 s). `cargo deny` passes with seven
 duplicate-version warnings (`docs/dependencies/README.md`).
+
+**CI on `fc44850`.** Windows and Linux passed every gate and every test on the provider.
+macOS failed one unit test,
+`placement_agent::tests::the_controller_expands_a_laptop_session_to_three_hosts_that_survive_one_loss`:
+after the lost host returned it waited for leadership to return to the founder, and
+leadership had gone to `peer_a`. The placement preferred `peer_a` — the planner orders its
+candidates by home, incumbency, measured load, free memory, disk and id, so which voter a
+session prefers is a measured fact and not the founder by right — and the leader had handed
+over to it as [27](27-consensus-roadmap-and-slates-port.md) §5 says (`returns: asked 1,
+failed 0`). The test's own proposal, already asserted equal to the committed placement,
+named that node. It now waits for a live voter to lead while the host is lost and for the
+placement's preferred leader once it has returned, and says what it waited for. On this
+machine the placement prefers the founder and the test passed before and after (three runs,
+26 s); the fix is the invariant, not the order, and the provider is not the cause.
