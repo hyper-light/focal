@@ -145,7 +145,15 @@ fn main() {
     for i in 0..claims {
         let request = base + u128::from(i) + 1;
         let claim = base + 1_000_000 + u128::from(i);
-        let envelope = native::create_envelope(ledger, issuer, worker, request, claim).unwrap();
+        let envelope = native::create_envelope(
+            ledger,
+            issuer,
+            worker,
+            NativeContentProfile::ProjectionOnly,
+            request,
+            claim,
+        )
+        .unwrap();
         let before = meter.open();
         let result = runtime.block_on(client.request(envelope));
         meter.close(before);

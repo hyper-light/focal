@@ -18,6 +18,7 @@ focal-client = { version = "0.1.0", path = "../../crates/focal-client" }
 focal-core = { version = "0.1.0", path = "../../crates/focal-core" }
 focal-ledger = { version = "0.1.0", path = "../../crates/focal-ledger" }
 focal-model = { version = "0.1.0", path = "../../crates/focal-model" }
+focal-native-client = { version = "0.1.0", path = "../../crates/focal-native-client" }
 focal-node = { version = "0.1.0", path = "../../crates/focal-node" }
 focal-wire = { version = "0.1.0", path = "../../crates/focal-wire" }
 clap = { workspace = true }

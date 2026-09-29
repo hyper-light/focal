@@ -1,5 +1,9 @@
 //! The measured result (`--out` JSON): committed/refused/unknown counts, wall
-//! time, end-to-end committed throughput, and request latency percentiles.
+//! time, end-to-end committed throughput, request latency percentiles for the
+//! whole run and for its first and second half (by start time, so growth with
+//! session size shows), the read phase, and — when the shape asked for it —
+//! the reopen time of the node and its first read afterwards.
+use crate::error::LoadError;
 use crate::shape::WorkloadShape;
 use serde::Serialize;
 
@@ -9,60 +13,81 @@ pub struct Report {
     pub committed: u64,
     pub refused: u64,
     pub unknown: u64,
-    pub wall_ms: u64,
+    /// Wall time of the write phase, every worker included.
+    pub wall_ms: u128,
     pub throughput_ops_per_s: f64,
     pub latency_ns: Latency,
+    /// The writes that started in the first half of the write phase.
+    pub latency_ns_first_half: Latency,
+    /// The writes that started in the second half: dearer than the first when
+    /// the per-op cost grows with the session.
+    pub latency_ns_second_half: Latency,
     /// Claim reads issued after the creations (0 when the shape asks for none).
     pub reads: u64,
     /// Reads that returned the claim (a miss would indicate lost committed state).
     pub read_hits: u64,
+    /// Wall time of the read phase, every worker included.
+    pub read_wall_ms: u128,
     pub read_throughput_ops_per_s: f64,
     pub read_latency_ns: Latency,
+    /// Concurrent callers the run used.
+    pub workers: u16,
+    /// Distinct refusal reasons seen, at most a few, for diagnosis.
+    pub refusals: Vec<String>,
+    /// `reopen: true`: closing the node and reopening its directory until it
+    /// serves again, in milliseconds.
+    pub reopen_ms: Option<u128>,
+    /// `reopen: true`: the first linearizable read after the reopen.
+    pub first_read_after_reopen_ns: Option<u128>,
+    /// `reopen: true`: whether that read returned the last committed claim.
+    pub reopen_read_hit: Option<bool>,
+    /// Bytes under the node's data directory when the run ended (embedded).
+    pub data_dir_bytes: Option<u64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct Latency {
-    pub p50: u64,
-    pub p95: u64,
-    pub p99: u64,
-    pub max: u64,
+    pub p50: u128,
+    pub p95: u128,
+    pub p99: u128,
+    pub max: u128,
 }
 
-/// Percentiles of per-request latency samples in nanoseconds: nearest rank
-/// on a sorted copy, the rank rounded half up.
-pub fn latency(mut samples: Vec<u64>) -> Latency {
-    samples.sort_unstable();
-    let pick = |percent: u64| -> u64 {
-        let Some(last) = samples.len().checked_sub(1) else {
-            return 0;
-        };
-        let rank = u64::try_from(last)
-            .ok()
-            .and_then(|last| last.checked_mul(percent))
-            .and_then(|scaled| scaled.checked_add(50))
-            .map(|scaled| scaled.checked_div(100).unwrap_or(0))
-            .and_then(|rank| usize::try_from(rank).ok())
-            .unwrap_or(last);
-        samples.get(rank.min(last)).copied().unwrap_or(0)
-    };
-    Latency {
-        p50: pick(50),
-        p95: pick(95),
-        p99: pick(99),
-        max: samples.last().copied().unwrap_or(0),
+/// Percentiles of per-request latency samples: nearest rank on the sorted
+/// samples (sorted in place), the rank rounded to nearest.
+pub fn latency(samples: &mut [u128]) -> Result<Latency, LoadError> {
+    if samples.is_empty() {
+        return Ok(Latency::default());
     }
+    samples.sort_unstable();
+    let last = samples
+        .len()
+        .checked_sub(1)
+        .ok_or(LoadError::Bound("percentile of no samples"))?;
+    let pick = |percent: usize| -> Result<u128, LoadError> {
+        let index = last
+            .checked_mul(percent)
+            .and_then(|scaled| scaled.checked_add(50))
+            .and_then(|scaled| scaled.checked_div(100))
+            .ok_or(LoadError::Bound("percentile rank"))?;
+        samples
+            .get(index.min(last))
+            .copied()
+            .ok_or(LoadError::Bound("percentile rank"))
+    };
+    Ok(Latency {
+        p50: pick(50)?,
+        p95: pick(95)?,
+        p99: pick(99)?,
+        max: samples.last().copied().unwrap_or(0),
+    })
 }
 
-/// Operations per second from a count and the nanoseconds they took, to a
-/// thousandth: integer arithmetic, then the one conversion that is exact.
-pub fn per_second(count: u64, nanos: u64) -> f64 {
+/// Events per second over `nanos` of wall time; zero when no time passed.
+pub fn per_second(count: u64, nanos: u128) -> f64 {
     if nanos == 0 {
         return 0.0;
     }
-    let milli_ops = u128::from(count)
-        .checked_mul(1_000_000_000_000)
-        .map(|scaled| scaled.checked_div(u128::from(nanos)).unwrap_or(0))
-        .unwrap_or(u128::MAX);
-    let milli_ops = u32::try_from(milli_ops).unwrap_or(u32::MAX);
-    f64::from(milli_ops) / 1000.0
+    // Statistics only: precision loss past 2^53 is immaterial to a rate.
+    count as f64 / (nanos as f64 / 1e9)
 }
