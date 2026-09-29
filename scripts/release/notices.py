@@ -87,8 +87,19 @@ def lock_packages():
     return sorted(packages, key=lambda package: (package["name"], package["version"]))
 
 
+def is_third_party(package):
+    """A registry or git crate, or a vendored crate flagged by `lock_packages`.
+    A package described by its lockfile fields alone is third party exactly
+    when it has a source."""
+    return package.get("third_party", package["source"] is not None)
+
+
+def is_vendored(package):
+    return package.get("vendored", False)
+
+
 def check_drift(inventory, packages):
-    external = {(p["name"], p["version"]) for p in packages if p["third_party"]}
+    external = {(p["name"], p["version"]) for p in packages if is_third_party(p)}
     listed = set(inventory)
     missing = external - listed
     extra = listed - external
@@ -105,7 +116,7 @@ def resolve_licenses(inventory, packages):
     resolved = []
     for package in packages:
         key = (package["name"], package["version"])
-        if package["third_party"]:
+        if is_third_party(package):
             license_ = inventory[key]["license"]
             # A vendored crate's locator is the roster's: the registry archive
             # it is a verbatim copy of, with that archive's checksum.
@@ -127,14 +138,14 @@ def render_notices(packages):
     )
     blocks = []
     for package in packages:
-        if not package["third_party"]:
+        if not is_third_party(package):
             continue  # the workspace's own crates are not third-party notices
         block = (
             f"{package['name']} {package['version']}\n"
             f"  License: {package['license']}\n"
             f"  Source:  {package['source']}\n"
         )
-        if package["vendored"]:
+        if is_vendored(package):
             block += f"  Built from: vendor/{package['name']}, a verbatim copy of that archive\n"
         blocks.append(block)
     return header + "\n".join(blocks)

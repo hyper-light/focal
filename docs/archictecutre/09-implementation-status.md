@@ -11481,3 +11481,16 @@ named that node. It now waits for a live voter to lead while the host is lost an
 placement's preferred leader once it has returned, and says what it waited for. On this
 machine the placement prefers the founder and the test passed before and after (three runs,
 26 s); the fix is the invariant, not the order, and the provider is not the cause.
+
+**The release workflow, dispatched.** A manual dispatch of the release workflow builds and
+smokes every lane without publishing, so it was dispatched on `db7ffdc` to exercise the eight
+targets on the provider — the Windows arm64 lane's clang-cl above all. It stopped at its guard:
+`scripts/release/test_release.py` builds package rosters by hand in the lockfile's shape, and
+`notices.py` had begun to require the `third_party` flag only `lock_packages` sets. A package
+described by its lockfile fields alone is third party exactly when it has a source; the flags
+refine that for vendored crates, and the tests now cover the vendored shape (listed with its
+archive as the locator and "Built from: vendor/…", counted toward roster drift, and the real
+lock marking `aws-lc-sys` and `aws-lc-rs` vendored and `focal-node` not; 20 tests). The
+orchestration tests were outside the six gates and are now run beside `cargo deny` in the
+local gate; the lanes' results are recorded with the next batch.
+

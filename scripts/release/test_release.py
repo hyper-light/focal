@@ -275,6 +275,46 @@ class NoticesTests(unittest.TestCase):
         self.assertEqual(sbom["spdxVersion"], "SPDX-2.3")
         self.assertEqual({p["name"] for p in sbom["packages"]}, {"serde", "focal-node"})
 
+    def test_a_vendored_crate_is_third_party_with_the_roster_locator(self):
+        # A lockfile package without a source that is not a workspace member is
+        # built from vendor/: it is a third-party notice with the archive it was
+        # unpacked from as its locator, and counts toward roster drift.
+        locator = "https://static.crates.io/crates/aws-lc-sys/aws-lc-sys-0.45.0.crate#sha256=9bff"
+        inventory = {
+            ("aws-lc-sys", "0.45.0"): {"name": "aws-lc-sys", "version": "0.45.0", "license": "ISC", "source": locator},
+        }
+        vendored = {"name": "aws-lc-sys", "version": "0.45.0", "source": None, "third_party": True, "vendored": True}
+        member = {"name": "focal-node", "version": "0.1.0", "source": None, "third_party": False, "vendored": False}
+        notices.check_drift(inventory, [vendored, member])
+        with self.assertRaises(SystemExit) as caught:
+            notices.check_drift({}, [vendored, member])
+        self.assertIn("aws-lc-sys 0.45.0", str(caught.exception))
+        resolved = notices.resolve_licenses(inventory, [vendored, member])
+        self.assertEqual(resolved[0]["license"], "ISC")
+        self.assertEqual(resolved[0]["source"], locator)
+        self.assertEqual(resolved[1]["license"], notices.WORKSPACE_LICENSE)
+        self.assertIsNone(resolved[1]["source"])
+        text = notices.render_notices(resolved)
+        self.assertIn("aws-lc-sys 0.45.0", text)
+        self.assertIn(f"Source:  {locator}", text)
+        self.assertIn("Built from: vendor/aws-lc-sys", text)
+        self.assertNotIn("focal-node", text)
+        sbom = json.loads(notices.render_sbom(resolved, "1.0.0", "abc"))
+        by_name = {p["name"]: p for p in sbom["packages"]}
+        self.assertEqual(by_name["aws-lc-sys"]["downloadLocation"], locator)
+        self.assertEqual(by_name["focal-node"]["downloadLocation"], "NOASSERTION")
+
+    def test_the_locked_graph_marks_the_vendored_crates_and_the_workspace_apart(self):
+        members = notices.workspace_members()
+        self.assertIn("focal-node", members)
+        self.assertNotIn("aws-lc-sys", members)
+        by_name = {p["name"]: p for p in notices.lock_packages()}
+        for name in ("aws-lc-sys", "aws-lc-rs"):
+            self.assertIsNone(by_name[name]["source"])
+            self.assertTrue(by_name[name]["third_party"] and by_name[name]["vendored"], name)
+        self.assertFalse(by_name["focal-node"]["third_party"])
+        self.assertTrue(by_name["serde"]["third_party"] and not by_name["serde"]["vendored"])
+
     def test_generate_is_deterministic_and_covers_the_locked_graph(self):
         with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
             a = notices.generate(first, "9.9.9", "cafef00d")
