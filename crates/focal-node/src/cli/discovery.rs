@@ -1,9 +1,14 @@
-//! Offline discovery from the released authored registry and actual Clap tree.
-//! No node state, client journal, network connection or async runtime is opened.
+//! Offline discovery from the released authored registries and actual Clap
+//! tree. No node state, client journal, network connection or async runtime
+//! is opened. Both engines' catalogues are served, selected the way the
+//! mutation path selects them (`focal_client::operations::select_offline`):
+//! `--native` wins, else the only catalogue that has the name, else V1.
 use super::{CliError, Result, args::OutputFormat};
 use clap::{Subcommand, ValueEnum, builder::PossibleValuesParser};
 use clap_complete::{Generator, Shell};
-use focal_client::operations::{self, Capability, OperationDescriptor, ResultKind};
+use focal_client::operations::{
+    self, ApplicationDocument, Capability, OperationDescriptor, ResultKind, WireProfile,
+};
 use serde::{Serialize, Serializer, ser::SerializeSeq};
 use std::io::{self, Write};
 
@@ -16,6 +21,10 @@ pub(crate) enum SchemaCommand {
     List {
         #[arg(long, value_enum, default_value = "table")]
         format: OutputFormat,
+        /// List the native engine's catalogue (version 2) instead of the V1
+        /// catalogue a fresh ledger runs.
+        #[arg(long)]
+        native: bool,
     },
     /// Print a payload contract or an operation's authored input/result schema.
     Get {
@@ -29,7 +38,7 @@ pub(crate) enum SchemaCommand {
         native: bool,
     },
     /// The native operation coverage table: every owner operation with its
-    /// frame tags, actor, descriptor, CLI path and exposure.
+    /// frame tags, actor, descriptor, CLI path, exposure and example.
     Coverage {
         #[arg(long, value_enum, default_value = "table")]
         format: OutputFormat,
@@ -43,11 +52,18 @@ pub(crate) enum SchemaCommand {
         /// Check bounded DTO shape only, without loading any node/client identity.
         #[arg(long)]
         shape_only: bool,
+        /// Validate against the native engine's contract (version 2). With a
+        /// selected context the ledger's engine is probed and must agree.
+        #[arg(long)]
+        native: bool,
     },
     /// Print a normalized authored input; replace illustrative existing-object IDs.
     Example {
         #[arg(value_parser = operation_names())]
         operation: String,
+        /// Print the native engine's example (version 2) for a shared name.
+        #[arg(long)]
+        native: bool,
     },
 }
 
@@ -56,22 +72,44 @@ pub(crate) enum Direction {
     Input,
     Output,
 }
+/// Every application operation of either engine, for `example` and `validate`.
 pub(crate) fn operation_names() -> PossibleValuesParser {
+    PossibleValuesParser::new(all_operation_names())
+}
+/// The V1 catalogue alone: `request build` writes a legacy raw envelope.
+pub(crate) fn legacy_operation_names() -> PossibleValuesParser {
     PossibleValuesParser::new(operations::descriptors().iter().map(|value| value.name))
 }
-fn native_only_names() -> impl Iterator<Item = &'static str> {
-    operations::native_descriptors()
+/// The union of both catalogues in name order, each name once.
+fn all_operation_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = operations::descriptors()
         .iter()
+        .chain(operations::native_descriptors())
         .map(|value| value.name)
-        .filter(|name| operations::find(name).is_none())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 fn schema_names() -> PossibleValuesParser {
     PossibleValuesParser::new(
         ["test-report", "error-report", "domain-registry"]
             .into_iter()
-            .chain(operations::descriptors().iter().map(|value| value.name))
-            .chain(native_only_names()),
+            .chain(all_operation_names()),
     )
+}
+fn wire_of(native: bool) -> WireProfile {
+    if native {
+        WireProfile::Native
+    } else {
+        WireProfile::V1
+    }
+}
+fn engine_name(wire: WireProfile) -> &'static str {
+    match wire {
+        WireProfile::V1 => "v1",
+        WireProfile::Native => "native",
+    }
 }
 
 pub(crate) fn schema(command: SchemaCommand) -> Result<()> {
@@ -81,23 +119,24 @@ pub(crate) fn schema(command: SchemaCommand) -> Result<()> {
             operation,
             input,
             shape_only: true,
+            native,
         } => {
-            validate(&operation, input, None)?;
+            validate_offline(&operation, input, native)?;
         }
         SchemaCommand::Validate { .. } => {
             return Err(CliError::Input(
                 "schema validation requires selected client context or --shape-only".into(),
             ));
         }
-        SchemaCommand::List { format } => list(format, &mut output)?,
+        SchemaCommand::List { format, native } => list(wire_of(native), format, &mut output)?,
         SchemaCommand::Coverage { format } => coverage(format, &mut output)?,
         SchemaCommand::Get {
             name,
             direction,
             native,
         } => get(&name, direction, native, &mut output)?,
-        SchemaCommand::Example { operation } => {
-            json(&mut output, &example(&operation)?)?;
+        SchemaCommand::Example { operation, native } => {
+            json(&mut output, &example(native, &operation)?)?;
         }
     }
     output.flush()?;
@@ -165,6 +204,8 @@ fn coverage(format: OutputFormat, output: &mut dyn Write) -> Result<()> {
         exposure: &'static str,
         result: &'static str,
         reads: &'static str,
+        /// Whether `schema example DESCRIPTOR --native` prints a document.
+        example: bool,
     }
     let rows: Vec<Row> = native_coverage_table()
         .into_iter()
@@ -189,6 +230,9 @@ fn coverage(format: OutputFormat, output: &mut dyn Write) -> Result<()> {
             },
             result: row.result,
             reads: row.reads,
+            example: row
+                .name
+                .is_some_and(|name| operations::example(WireProfile::Native, name).is_ok()),
         })
         .collect();
     match format {
@@ -212,12 +256,12 @@ fn coverage(format: OutputFormat, output: &mut dyn Write) -> Result<()> {
         OutputFormat::Table => {
             writeln!(
                 output,
-                "OPERATION                 TAGS     ACTOR      EXPOSURE       DESCRIPTOR           CLI"
+                "OPERATION                 TAGS     ACTOR      EXPOSURE       DESCRIPTOR                  EXAMPLE  CLI"
             )?;
             for row in rows {
                 writeln!(
                     output,
-                    "{:<25} {:<8} {:<10} {:<14} {:<20} {}",
+                    "{:<25} {:<8} {:<10} {:<14} {:<27} {:<8} {}",
                     row.operation,
                     row.frame_tags
                         .iter()
@@ -227,6 +271,7 @@ fn coverage(format: OutputFormat, output: &mut dyn Write) -> Result<()> {
                     row.actor,
                     row.exposure,
                     row.descriptor.unwrap_or("-"),
+                    if row.example { "yes" } else { "-" },
                     if row.cli.is_empty() { "-" } else { row.cli },
                 )?;
             }
@@ -240,12 +285,11 @@ fn get(
     native: bool,
     output: &mut dyn Write,
 ) -> Result<()> {
-    let descriptor = if native || operations::find(name).is_none() {
-        operations::find_native(name)
-    } else {
-        operations::find(name)
-    };
-    if let Some(descriptor) = descriptor {
+    let builtin = matches!(name, "test-report" | "error-report" | "domain-registry");
+    if !builtin {
+        let wire = operations::select_offline(native, name)?;
+        let descriptor = operations::find_application(wire, name)
+            .ok_or_else(|| CliError::Input("unknown released schema name".into()))?;
         let value = match direction.unwrap_or(Direction::Input) {
             Direction::Input => descriptor.input_schema()?,
             Direction::Output => descriptor.output_schema()?,
@@ -255,6 +299,11 @@ fn get(
     if direction.is_some() {
         return Err(CliError::Input(
             "--direction applies only to authored operation schemas".into(),
+        ));
+    }
+    if native {
+        return Err(CliError::Input(
+            "--native applies only to authored operation schemas; a built-in payload contract has no engine".into(),
         ));
     }
     match name {
@@ -339,6 +388,8 @@ fn get(
 #[derive(Serialize)]
 struct OperationSummary<'a> {
     name: &'a str,
+    /// The engine whose catalogue this row belongs to (`v1` or `native`).
+    engine: &'static str,
     version: u16,
     description: &'a str,
     capability: &'static str,
@@ -351,6 +402,7 @@ struct OperationSummary<'a> {
 fn summary(value: &OperationDescriptor) -> OperationSummary<'_> {
     OperationSummary {
         name: value.name,
+        engine: engine_name(value.wire),
         version: value.version,
         description: value.description,
         capability: match value.capability {
@@ -369,13 +421,13 @@ fn summary(value: &OperationDescriptor) -> OperationSummary<'_> {
             ResultKind::Reconcile => "reconcile",
         },
         max_input_bytes: value.max_input_bytes,
-        example_available: raw_example(value.name).is_some(),
+        example_available: operations::example(value.wire, value.name).is_ok(),
     }
 }
-struct Catalog;
+struct Catalog(WireProfile);
 impl Serialize for Catalog {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        let descriptors = operations::descriptors();
+        let descriptors = operations::application(self.0);
         let mut sequence = serializer.serialize_seq(Some(descriptors.len()))?;
         for descriptor in descriptors {
             sequence.serialize_element(&summary(descriptor))?;
@@ -383,12 +435,13 @@ impl Serialize for Catalog {
         sequence.end()
     }
 }
-fn list(format: OutputFormat, output: &mut dyn Write) -> Result<()> {
+fn list(wire: WireProfile, format: OutputFormat, output: &mut dyn Write) -> Result<()> {
     match format {
         OutputFormat::Json | OutputFormat::Yaml => {
             #[derive(Serialize)]
             struct Inventory {
                 schema_version: u16,
+                engine: &'static str,
                 builtins: [&'static str; 3],
                 operations: Catalog,
             }
@@ -396,8 +449,9 @@ fn list(format: OutputFormat, output: &mut dyn Write) -> Result<()> {
                 output,
                 &Inventory {
                     schema_version: 1,
+                    engine: engine_name(wire),
                     builtins: ["test-report", "error-report", "domain-registry"],
-                    operations: Catalog,
+                    operations: Catalog(wire),
                 },
                 format,
             )
@@ -409,14 +463,16 @@ fn list(format: OutputFormat, output: &mut dyn Write) -> Result<()> {
             )?;
             writeln!(
                 output,
-                "\nOPERATION                 MODE      EXAMPLE  DESCRIPTION"
+                "\nOPERATION                   ENGINE  VERSION  MODE      EXAMPLE  DESCRIPTION"
             )?;
-            for descriptor in operations::descriptors() {
+            for descriptor in operations::application(wire) {
                 let value = summary(descriptor);
                 writeln!(
                     output,
-                    "{:<25} {:<9} {:<8} {}",
+                    "{:<27} {:<7} {:<8} {:<9} {:<8} {}",
                     value.name,
+                    value.engine,
+                    value.version,
                     if value.mutation { "mutation" } else { "read" },
                     if value.example_available { "yes" } else { "no" },
                     value.description,
@@ -427,94 +483,12 @@ fn list(format: OutputFormat, output: &mut dyn Write) -> Result<()> {
     }
 }
 
-// These are authored inputs, not fabricated server outcomes. Object references
-// are valid illustrative IDs that the caller must replace with actual results.
-// A newly released descriptor without an example is explicitly unavailable.
-fn raw_example(name: &str) -> Option<&'static str> {
-    match name {
-        "monitor.register" => Some(
-            r#"{"owner":"00000000000000000000000000000001","roots":[{"predicate":"satisfied","claim":"00000000000000000000000000000002"}],"deadline":{"timer":"00000000000000000000000000000003","generation":1,"at":4102444800}}"#,
-        ),
-        "claim.wait" => Some(
-            r#"{"claim":"00000000000000000000000000000001","until":"satisfied","timeout_ms":1000}"#,
-        ),
-        "monitor.get" => Some(r#"{"id":"00000000000000000000000000000004"}"#),
-        "claim.submit" => Some(
-            r#"{"target":"self","action":"handoff","description":"Deliver the checked report","validations":[{"kind":"receipt","phase":"whole_work","mode":"required","description":"Receive the report testament","evaluator":"self"}]}"#,
-        ),
-        "claim.submit_batch" => Some(
-            r#"{"claims":[{"target":"self","action":"handoff","description":"Deliver the checked report","validations":[{"kind":"receipt","phase":"whole_work","mode":"required","description":"Receive the report testament","evaluator":"self"}]}]}"#,
-        ),
-        "claim.post" | "validation.begin" | "validation.complete" => {
-            Some(r#"{"claim":"00000000000000000000000000000001"}"#)
-        }
-        "validation.begin_increment" => Some(
-            r#"{"claim":"00000000000000000000000000000010","validation":"00000000000000000000000000000012","target_hash":"1111111111111111111111111111111111111111111111111111111111111111","manifest":"2222222222222222222222222222222222222222222222222222222222222222"}"#,
-        ),
-        "claim.cancel" => Some(
-            r#"{"claim":"00000000000000000000000000000001","reason":"Work is no longer needed"}"#,
-        ),
-        "claim.progress" => Some(
-            r#"{"claim":"00000000000000000000000000000001","receipt":{"id":"00000000000000000000000000000002","epoch":1},"message":"Report prepared"}"#,
-        ),
-        "receipt.acquire" => Some(r#"{"claim":"00000000000000000000000000000001","epoch":1}"#),
-        "evidence.begin" => Some(
-            r#"{"claim":"00000000000000000000000000000001","receipt":{"id":"00000000000000000000000000000002","epoch":1}}"#,
-        ),
-        "testament.submit" => Some(
-            r#"{"claim":"00000000000000000000000000000001","receipt":{"id":"00000000000000000000000000000002","epoch":1},"evidence_set":"00000000000000000000000000000003","manifest":[],"summary":"Closing the response; supply the actual manifest when evidence is required","confidence":"committed","outcome":"complete"}"#,
-        ),
-        "artifact.submit" => Some(
-            r#"{"claim":"00000000000000000000000000000001","receipt":{"id":"00000000000000000000000000000002","epoch":1},"evidence_set":"00000000000000000000000000000003","kind":"test-report","schema_hash":"SCHEMA","payload":{"type":"text","text":"{\"passed\":1,\"failed\":0,\"skipped\":0}"}}"#,
-        ),
-        "artifact.register" => Some(
-            r#"{"id":"00000000000000000000000000000004","kind":"test-report","schema_hash":"SCHEMA","payload":{"type":"text","text":"{\"passed\":1,\"failed\":0,\"skipped\":0}"}}"#,
-        ),
-        "testament.receive" => Some(
-            r#"{"claim":"00000000000000000000000000000001","testament":"00000000000000000000000000000004"}"#,
-        ),
-        "validation.submit" => Some(
-            r#"{"validation":"00000000000000000000000000000005","target_hash":"1111111111111111111111111111111111111111111111111111111111111111","phase":"whole_work","epoch":1,"handler":{"id":"00000000000000000000000000000006","version":"2222222222222222222222222222222222222222222222222222222222222222","agentic":false},"attempt":0,"manifest":"3333333333333333333333333333333333333333333333333333333333333333","receipt":{"id":"00000000000000000000000000000002","epoch":1},"value":"pass","evidence":[{"id":"00000000000000000000000000000007","hash":"4444444444444444444444444444444444444444444444444444444444444444"}]}"#,
-        ),
-        "claim.supersede" => Some(
-            r#"{"predecessor":"00000000000000000000000000000001","successor":{"id":"00000000000000000000000000000005","occurrence":"00000000000000000000000000000006","target":"self","action":"handoff","description":"Deliver the corrected report","validations":[{"id":"00000000000000000000000000000007","kind":"receipt","phase":"whole_work","mode":"required","description":"Receive the corrected report testament","evaluator":"self"}]}}"#,
-        ),
-        "claim.get" | "testament.get" | "artifact.get" | "validation.get"
-        | "validation.context" => Some(r#"{"id":"00000000000000000000000000000001"}"#),
-        "validator.get" => Some(
-            r#"{"id":"00000000000000000000000000000006","version":"2222222222222222222222222222222222222222222222222222222222222222"}"#,
-        ),
-        "validator.list" | "ledger.summary" => Some("{}"),
-        "ledger.traverse" => Some(
-            r#"{"roots":["claim:00000000000000000000000000000001"],"edges":["requirement"],"depth":1,"limit":32}"#,
-        ),
-        "claim.list" | "testament.list" | "artifact.list" | "validation.list" => Some("{}"),
-        "request.epoch" => Some(r#"{"epoch":1}"#),
-        "request.status" => Some(r#"{"epoch":1,"request_id":"00000000000000000000000000000001"}"#),
-        _ => None,
-    }
-}
-fn example(name: &str) -> Result<serde_json::Value> {
-    let source = raw_example(name).ok_or_else(|| {
-        CliError::Input("no authored example is available for this released operation".into())
-    })?;
-    let expanded;
-    let source = if matches!(name, "artifact.submit" | "artifact.register") {
-        expanded = source.replace("SCHEMA", &focal_evidence::test_report_schema().to_string());
-        expanded.as_str()
-    } else {
-        source
-    };
-    let authored = operations::parse_json(name, source.as_bytes())?;
-    // Normalize through the actual typed decoder/serializer without expanding
-    // random IDs or claiming that the illustrative referenced objects exist.
-    let mut normalized: serde_json::Value =
-        serde_json::from_slice(&authored.canonical_intent()?)
-            .map_err(|_| CliError::Input("invalid normalized authored example".into()))?;
-    normalized
-        .as_object_mut()
-        .and_then(|value| value.remove("input"))
-        .ok_or_else(|| CliError::Input("normalized authored input is absent".into()))
+/// The normalized example of `name` on the engine offline selection picks:
+/// the engine's own authored example, decoded by the decoder the mutation
+/// path uses and re-serialized with every default expanded.
+fn example(native: bool, name: &str) -> Result<serde_json::Value> {
+    let wire = operations::select_offline(native, name)?;
+    Ok(operations::example(wire, name)?)
 }
 fn json(output: &mut dyn Write, value: &impl Serialize) -> Result<()> {
     serde_json::to_writer_pretty(&mut *output, value)
@@ -564,25 +538,103 @@ impl<W: Write> Write for LimitedWriter<W> {
 #[path = "discovery_tests.rs"]
 mod tests;
 
-pub(super) fn validate(
+/// `schema validate --shape-only`: the document decodes through the engine
+/// offline selection picks; nothing is loaded, journaled or sent.
+pub(super) fn validate_offline(
     operation: &str,
     input: super::args::DocumentInput,
-    context: Option<&super::Context>,
+    native: bool,
 ) -> Result<()> {
-    let authored = super::request_files::authored(operation, input)?;
-    if let Some(context) = context {
-        authored.preflight(&context.build)?;
-    }
+    let wire = operations::select_offline(native, operation)?;
+    let bytes = super::request_files::document_bytes(input)?;
+    let document = operations::decode_application(wire, operation, &bytes)?;
+    report_valid(
+        operation,
+        wire,
+        None,
+        "document shape only; identity and domain semantics unchecked",
+    )?;
+    drop(document);
+    Ok(())
+}
+
+/// `schema validate` under a selected context: the ledger's engine is probed
+/// the way every mutation probes it, an explicit `--native` must agree, and
+/// the document is checked the way that engine's mutation path checks it
+/// before it journals anything. V1 runs the shared builder's preflight; the
+/// native engine reads the committed bindings the verb needs at a fixed
+/// prefix, compiles the exact frame with throwaway identities, encodes and
+/// fingerprints it. No request, journal identity or mutation is created.
+pub(super) fn validate_online(
+    runtime: &tokio::runtime::Runtime,
+    context: &super::Context,
+    operation: &str,
+    input: super::args::DocumentInput,
+    native: bool,
+) -> Result<()> {
+    use focal_client::operations::ThrowawayIds;
+    use focal_model::RequestId;
+    let engine = super::native::detect(runtime, context)?;
+    let wire = operations::select_online(&engine, native)?;
+    let bytes = super::request_files::document_bytes(input)?;
+    let document = operations::decode_application(wire, operation, &bytes)?;
+    let checked = match document {
+        ApplicationDocument::V1(authored) => {
+            authored.preflight(&context.build)?;
+            "authored input and selected-identity preflight; server acceptance unchecked"
+        }
+        ApplicationDocument::Native(authored) => {
+            let standing = engine.standing().ok_or(CliError::InvalidResponse)?;
+            let profile = super::native::profile(standing);
+            focal_native_client::admissible(profile, &authored)?;
+            let resolved = focal_native_client::resolve(
+                context.build.ledger,
+                &authored,
+                &mut super::native::reads(runtime, context),
+            )?;
+            let limits = focal_native_client::CompileLimits::default();
+            let mut ids = ThrowawayIds::excluding(&authored.canonical_intent()?)?;
+            let compiled = focal_native_client::compile(
+                &authored,
+                &context.build,
+                RequestId(super::random_id()?),
+                &mut ids,
+                &resolved,
+                &limits,
+            )?;
+            let frame = focal_native_client::encode_frame(
+                context.build.ledger,
+                profile,
+                &compiled.input,
+                limits.encoding(),
+            )?;
+            focal_native_client::fingerprint(&frame, limits.native, limits.frame)?;
+            "authored input compiled against the ledger's committed bindings into its exact frame; nothing journaled or sent; server acceptance unchecked"
+        }
+        ApplicationDocument::NativeList(list) => {
+            focal_native_client::list_request(&list, &context.build)?;
+            "authored list resolved to its wire request; nothing sent"
+        }
+        ApplicationDocument::NativeRead(_) => "authored read decoded; nothing sent",
+    };
+    report_valid(operation, wire, Some(&engine), checked)
+}
+fn report_valid(
+    operation: &str,
+    wire: WireProfile,
+    engine: Option<&operations::Engine>,
+    checked: &str,
+) -> Result<()> {
     let mut output = io::stdout().lock();
+    let assumed = if engine.is_some_and(operations::Engine::assumed) {
+        ", assumed: the owner was unreachable"
+    } else {
+        ""
+    };
     writeln!(
         output,
-        "valid {} ({})",
-        operation,
-        if context.is_some() {
-            "authored input and selected-identity preflight; server acceptance unchecked"
-        } else {
-            "document shape only; identity and domain semantics unchecked"
-        }
+        "valid {operation} ({} engine{assumed}; {checked})",
+        engine_name(wire)
     )?;
     output.flush()?;
     Ok(())

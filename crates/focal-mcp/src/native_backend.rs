@@ -11,9 +11,10 @@ use crate::{Backend, ToolCall};
 use focal_client::input::InputError;
 use focal_client::native_store::{NativeOperation, NativeOperationId, NativeOperationStore};
 use focal_client::operations::{
-    OperationOutput, find_native, parse_native_json, parse_native_list_json, parse_native_read_json,
+    ApplicationDocument, Engine, OperationOutput, WireProfile, decode_application, find_application,
 };
 use focal_client::{ClientError, ClientTransport};
+use focal_model::RequestId;
 use focal_native_client::{CompileLimits, DriveError, NativeContentProfile, Preparation};
 use focal_wire::*;
 use serde_json::Value;
@@ -53,28 +54,26 @@ impl<T: ClientTransport> Backend<T> {
         let Some(journal) = self.native_journal.take() else {
             return Ok(());
         };
-        let request = envelope(
-            self.build.ledger,
-            Operation::NativeRead(NativeReadRequest {
-                consistency: ReadConsistency::Linearizable,
-                query: NativeReadQuery::Standing,
-                max_items: 1,
-            }),
-        )?;
-        let standing = match runtime.block_on(self.client.native_standing(request)) {
-            Ok(standing) => standing,
-            // An unreachable owner leaves the engine unknown. A journal from
-            // an earlier run proves the ledger is native, so the adapter
-            // refuses to start as V1 and mint identities in the wrong
-            // namespace; a fresh context keeps the V1 behaviour, whose
-            // startup never needed the network.
-            Err(ClientError::Transport) if !journal.initialized() => None,
-            Err(error) => return Err(error.into()),
-        };
-        if let Some(standing) = standing {
-            if standing.principal != self.context.principal {
-                return Err(BackendError::Configuration);
-            }
+        // The one standing read every host performs
+        // (`focal_client::operations::probe`), resolved with this adapter's
+        // own journal as the proof that an unreachable ledger is native: a
+        // journal from an earlier run refuses to start as V1 and mint
+        // identities in the wrong namespace, a fresh context keeps the V1
+        // behaviour, whose startup never needed the network. A standing for
+        // another principal is a misconfigured context.
+        let engine = runtime
+            .block_on(focal_client::operations::probe(
+                &self.client,
+                self.build.ledger,
+                RequestId(random_id()?),
+                journal.initialized(),
+                self.context.principal,
+            ))
+            .map_err(|error| match error {
+                ClientError::Configuration => BackendError::Configuration,
+                error => error.into(),
+            })?;
+        if let Engine::Native(standing) = engine {
             let store = journal.open().map_err(BackendError::NativeJournal)?;
             self.native = Some(Native {
                 store,
@@ -218,89 +217,41 @@ impl<T: ClientTransport> Backend<T> {
                 }
             }
             name => {
-                let descriptor = find_native(name)
+                let descriptor = find_application(WireProfile::Native, name)
                     .filter(|descriptor| {
                         crate::catalog_native::permitted(&native.standing, descriptor)
                     })
                     .ok_or(BackendError::Configuration)?;
-                if descriptor.result_kind == focal_client::operations::ResultKind::List {
-                    let bytes = bounded_json(&call.arguments)?;
-                    let list = parse_native_list_json(name, &bytes)?;
-                    let page = focal_native_client::list(
-                        &list,
-                        &self.build,
-                        &mut self.native_lists(runtime, cancel),
-                    )?;
-                    return Ok((
-                        "Listed",
-                        OperationOutput::NativeList {
-                            page: Box::new(page),
-                        },
-                    ));
-                }
-                if !descriptor.mutation {
-                    let bytes = bounded_json(&call.arguments)?;
-                    let read = parse_native_read_json(name, &bytes)?;
-                    // The wait observer and the lineage read share this
-                    // adapter's connection; the pause between wait probes is
-                    // cancellable like every other wait of this adapter.
-                    let outcome = {
-                        let cell = std::cell::RefCell::new(&mut *cancel);
-                        let mut reads = |request: NativeReadRequest| {
-                            let request =
-                                envelope(self.build.ledger, Operation::NativeRead(request))?;
-                            let mut cancel = cell.borrow_mut();
-                            runtime.block_on(async {
-                                tokio::select! {
-                                    result = self.client.native_read(request) => Ok(result?),
-                                    _ = &mut **cancel => Err(DriveError::Cancelled),
-                                }
-                            })
-                        };
-                        let mut lists = |request: NativeListRequest| {
-                            let request =
-                                envelope(self.build.ledger, Operation::NativeList(request))?;
-                            let mut cancel = cell.borrow_mut();
-                            runtime.block_on(async {
-                                tokio::select! {
-                                    result = self.client.native_list(request) => Ok(result?),
-                                    _ = &mut **cancel => Err(DriveError::Cancelled),
-                                }
-                            })
-                        };
-                        let mut pause = |duration: std::time::Duration| {
-                            let mut cancel = cell.borrow_mut();
-                            runtime.block_on(async {
-                                tokio::select! {
-                                    () = tokio::time::sleep(duration) => Ok(()),
-                                    _ = &mut **cancel => Err(DriveError::Cancelled),
-                                }
-                            })
-                        };
-                        focal_native_client::read(
-                            &read,
+                // An `n1:` reference belongs to the adapter envelope of a
+                // mutation, never to a read or list document.
+                let requested = if descriptor.mutation {
+                    take_native_id(&mut call.arguments)?
+                } else {
+                    None
+                };
+                let bytes = bounded_json(&call.arguments)?;
+                // The engine's decoder, selected by the descriptor's result
+                // kind the way every native host selects it.
+                let authored = match decode_application(WireProfile::Native, name, &bytes)? {
+                    ApplicationDocument::V1(_) => return Err(BackendError::Configuration),
+                    ApplicationDocument::NativeList(list) => {
+                        let page = focal_native_client::list(
+                            &list,
                             &self.build,
-                            &mut reads,
-                            &mut lists,
-                            &mut pause,
-                        )?
-                    };
-                    return Ok(match outcome {
-                        focal_native_client::NativeReadOutcome::Page(page) => (
-                            "Read",
-                            OperationOutput::NativeRead {
+                            &mut self.native_lists(runtime, cancel),
+                        )?;
+                        return Ok((
+                            "Listed",
+                            OperationOutput::NativeList {
                                 page: Box::new(page),
                             },
-                        ),
-                        focal_native_client::NativeReadOutcome::Wait(result) => (
-                            result.condition.as_str(),
-                            OperationOutput::NativeWait { result },
-                        ),
-                    });
-                }
-                let requested = take_native_id(&mut call.arguments)?;
-                let bytes = bounded_json(&call.arguments)?;
-                let authored = parse_native_json(name, &bytes)?;
+                        ));
+                    }
+                    ApplicationDocument::NativeRead(read) => {
+                        return self.native_read_call(runtime, &read, cancel);
+                    }
+                    ApplicationDocument::Native(authored) => authored,
+                };
                 if cancelled(cancel) {
                     return Err(BackendError::Cancelled);
                 }
@@ -321,6 +272,61 @@ impl<T: ClientTransport> Backend<T> {
                 self.native_drive(runtime, native, prepared, cancel)
             }
         }
+    }
+    /// One read, the lineage read (which also lists) or the wait observer.
+    /// All share this adapter's connection; the pause between wait probes is
+    /// cancellable like every other wait of this adapter.
+    fn native_read_call(
+        &self,
+        runtime: &Runtime,
+        read: &focal_client::operations::NativeReadOperation,
+        cancel: &mut oneshot::Receiver<()>,
+    ) -> Result<(&'static str, OperationOutput), BackendError> {
+        let outcome = {
+            let cell = std::cell::RefCell::new(&mut *cancel);
+            let mut reads = |request: NativeReadRequest| {
+                let request = envelope(self.build.ledger, Operation::NativeRead(request))?;
+                let mut cancel = cell.borrow_mut();
+                runtime.block_on(async {
+                    tokio::select! {
+                        result = self.client.native_read(request) => Ok(result?),
+                        _ = &mut **cancel => Err(DriveError::Cancelled),
+                    }
+                })
+            };
+            let mut lists = |request: NativeListRequest| {
+                let request = envelope(self.build.ledger, Operation::NativeList(request))?;
+                let mut cancel = cell.borrow_mut();
+                runtime.block_on(async {
+                    tokio::select! {
+                        result = self.client.native_list(request) => Ok(result?),
+                        _ = &mut **cancel => Err(DriveError::Cancelled),
+                    }
+                })
+            };
+            let mut pause = |duration: std::time::Duration| {
+                let mut cancel = cell.borrow_mut();
+                runtime.block_on(async {
+                    tokio::select! {
+                        () = tokio::time::sleep(duration) => Ok(()),
+                        _ = &mut **cancel => Err(DriveError::Cancelled),
+                    }
+                })
+            };
+            focal_native_client::read(read, &self.build, &mut reads, &mut lists, &mut pause)?
+        };
+        Ok(match outcome {
+            focal_native_client::NativeReadOutcome::Page(page) => (
+                "Read",
+                OperationOutput::NativeRead {
+                    page: Box::new(page),
+                },
+            ),
+            focal_native_client::NativeReadOutcome::Wait(result) => (
+                result.condition.as_str(),
+                OperationOutput::NativeWait { result },
+            ),
+        })
     }
     /// Send the exact journaled frame until the owner commits it. Only a
     /// committed receipt bound to the frame advances the journal; a refusal

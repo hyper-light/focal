@@ -21,7 +21,7 @@ ruling before work starts).
 | F06 | P1 | open | 2 | — |
 | F07 | P2 | in tree | 4 | [F07](#f07) |
 | F08 | P2 | in tree | 4 | [F08](#f08) |
-| F09 | P2 | open | 2 | — |
+| F09 | P2 | in tree | 2 | [F09](#f09) |
 | F10 | P2 | open | 4 | — |
 | F11 | P2 | open | 4 | — |
 | F12 | P1 | open | 5 | — |
@@ -274,3 +274,25 @@ ambiguity; the context read), `…::validation_get_follows_the_evaluation_pages_
 (three requests: the definition, a page at least at its prefix, the rest exactly
 there), `focal-native-client::tests::validation_get_follows_pages_at_one_prefix_and_refuses_a_span_beyond_its_bound`,
 the wire shape test above.
+## F09
+
+**Cause.** Discovery (`schema list|example|validate --shape-only`, name completion) used
+the V1 registry and decoder regardless of the ledger's engine; there was no native
+example generator; discovery's tests validated examples against the registry that
+produced them.
+
+**Fix.** One engine selector for every surface (`operations::engine`: offline `--native`
+→ the only catalogue with the name → V1; online the shared standing probe, contradiction
+refused, assumption reported); native examples for all 43 descriptors generated from the
+native contracts; `--native` on `list`, `get`, `example`, `validate`; engine and version
+in `schema list`; context-backed validation compiles against the ledger's bindings with
+throwaway identities; the MCP catalogue served by the same engine; README and manual
+carry the native quickstart and the rule.
+
+**Tests.** `discovery_tests` (both engines' examples decode and validate through their own
+engine; refusals by name), `engine_tests`, `cli/tests.rs`
+(`every_authored_descriptor_example_loads_through_its_command_with_the_same_intent`),
+`native_stdio_tests::the_generated_native_example_commits_through_the_adapter_unchanged`,
+`command_tree_tests::documented_cli_commands_and_their_flags_resolve_in_the_command_tree`,
+`tests/cli_discovery.rs::the_native_catalogue_examples_and_validation_need_no_state_either`,
+`tests/cli_native_quickstart.rs::the_documented_native_quickstart_runs_verbatim`.

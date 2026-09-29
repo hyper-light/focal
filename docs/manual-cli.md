@@ -24,14 +24,29 @@ do not create client journals or reserve request identities:
 ```sh
 focal schema list
 focal schema list --format json
+focal schema list --native
 focal schema get claim.submit
+focal schema get claim.submit --native
 focal schema get claim.submit --direction input
 focal schema get claim.submit --direction output
 focal schema example claim.submit > claim.json
+focal schema example claim.submit --native > claim.json
+focal schema validate claim.submit --native --shape-only --file claim.json
 focal schema get test-report
 focal schema get error-report
 focal schema get domain-registry
 ```
+
+Two engines share these names: the V1 engine a fresh ledger runs (version 1 descriptors)
+and the native engine (version 2). One rule selects the engine for every surface —
+catalogue, schema, example, validation and the mutation itself — so what discovery
+prints is what the ledger accepts: offline, `--native` wins, else the only catalogue that
+has the name (a native-only verb such as `claim.challenge` needs no flag), else V1; a V1-only
+name under `--native` is refused by name, never redirected. `schema list` shows each
+operation's engine and version. Online — a mutation, `status`, or `schema validate` with a
+client context — the ledger's engine is probed the way every mutation probes it; `--native`
+against a ledger that answers V1 is refused, and an engine assumed because the owner was
+unreachable is reported as assumed.
 
 Operation names and input/output schemas come from the shared authored operation
 registry used by the clients and MCP adapter. Input is the authored document, with
@@ -43,10 +58,14 @@ semantic checks, as the schema descriptions state. Built-in test-report and
 domain-registry output remain compatible; error-report supplies a bounded diagnostic
 contract. `--direction` applies only to operations.
 
-Examples pass through the real typed input decoder and serializer, including
-defaults. The claim example is a self-targeted handoff with a pure receipt
-requirement, suitable for trying the local protocol; it does not claim substantive
-quality checking. You can submit it using `focal submit claim --file claim.json`.
+Examples pass through the real typed input decoder and serializer of the engine that
+serves them, including defaults. The V1 claim example is a self-targeted handoff with a
+pure receipt requirement, suitable for trying the local protocol; the native claim
+example (`--native`) names another participant as its subject — the native owner never
+posts a claim on oneself — with a receipt requirement whose deadline lies far ahead
+(`deadline.at` is logical milliseconds since the epoch, the node's wall clock). Neither
+claims substantive quality checking. You can submit either with `focal submit claim
+--file claim.json` on a ledger of its engine; every native descriptor has an example.
 Other examples contain illustrative existing-object IDs; replace them with the
 actual claim, receipt, evidence-set and artifact references before sending. An
 empty example testament manifest is valid only when its actual evidence set is

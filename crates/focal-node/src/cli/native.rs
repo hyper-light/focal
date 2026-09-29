@@ -24,29 +24,22 @@ const STORE: &str = "native";
 /// identities and delivery marks, as the V1 request stores do.
 pub(super) const MCP_STORE: &str = "mcp-native";
 
-/// Probe the ledger's engine. A node without the native engine refuses the
-/// profile at negotiation before any frame is seen.
+/// Probe the ledger's engine: the one standing read every host performs
+/// (`focal_client::operations::probe`), resolved with this CLI's own native
+/// journal as the proof that an unreachable ledger is native. A node without
+/// the native engine refuses the profile at negotiation before any frame is
+/// seen.
 pub(super) fn detect(
     runtime: &tokio::runtime::Runtime,
     context: &Context,
-) -> Result<Option<NativeStanding>> {
-    let request = context.envelope(Operation::NativeRead(NativeReadRequest {
-        consistency: ReadConsistency::Linearizable,
-        query: NativeReadQuery::Standing,
-        max_items: 1,
-    }))?;
-    match runtime.block_on(context.client.native_standing(request)) {
-        Ok(standing) => Ok(standing),
-        // Without a reachable owner the engine is unknown. A context that has
-        // already journaled native operations stays native, so no V1 identity
-        // is minted for a native ledger; nothing was sent, so no journal is
-        // owed. Any other context keeps the V1 behaviour, whose local
-        // validation and journaling never needed the network.
-        Err(ClientError::Transport) if !initialized_in(&context.root.join("client"), STORE) => {
-            Ok(None)
-        }
-        Err(error) => Err(error.into()),
-    }
+) -> Result<focal_client::operations::Engine> {
+    Ok(runtime.block_on(focal_client::operations::probe(
+        &context.client,
+        context.build.ledger,
+        RequestId(random_id()?),
+        initialized_in(&context.root.join("client"), STORE),
+        context.build.actor,
+    ))?)
 }
 
 /// Whether a native journal named `name` has been created under `parent`.
@@ -463,7 +456,7 @@ fn render_list_page(page: NativeListPage, format: OutputFormat) -> Result<()> {
 }
 
 /// One blocking linearizable read per driver requirement on this context.
-fn reads<'a>(
+pub(super) fn reads<'a>(
     runtime: &'a tokio::runtime::Runtime,
     context: &'a Context,
 ) -> impl FnMut(NativeReadRequest) -> std::result::Result<NativeReadPage, DriveError> + 'a {

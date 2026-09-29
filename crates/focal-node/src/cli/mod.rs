@@ -90,6 +90,11 @@ pub(super) enum CliError {
     #[error(transparent)]
     Other(Box<dyn std::error::Error + Send + Sync>),
 }
+impl From<focal_client::operations::EngineError> for CliError {
+    fn from(error: focal_client::operations::EngineError) -> Self {
+        Self::Input(error.to_string())
+    }
+}
 impl From<focal_native_client::DriveError> for CliError {
     fn from(error: focal_native_client::DriveError) -> Self {
         use focal_native_client::DriveError;
@@ -211,7 +216,7 @@ pub(super) fn run(
     selection: Option<&str>,
 ) -> Result<()> {
     let context = Context::open(settings, selection)?;
-    if let Some(standing) = native::detect(runtime, &context)? {
+    if let focal_client::operations::Engine::Native(standing) = native::detect(runtime, &context)? {
         return native::run(runtime, &context, command, &standing);
     }
     let command = match command {
@@ -396,7 +401,7 @@ pub(super) fn status(
     selection: Option<&str>,
 ) -> Result<()> {
     let context = Context::open(settings, selection)?;
-    if native::detect(runtime, &context)?.is_some() {
+    if native::detect(runtime, &context)?.standing().is_some() {
         return native::status(runtime, &context, OutputFormat::Json);
     }
     let request = context.envelope(Operation::Read(ReadRequest {
@@ -408,14 +413,19 @@ pub(super) fn status(
     super::output_response(reply).map_err(CliError::Other)
 }
 
+/// `schema validate` under the selected context: the engine is probed the
+/// way every mutation probes it, then the document is checked the way that
+/// engine's mutation path checks it. Nothing is journaled or sent.
 pub(super) fn schema_validate(
+    runtime: &tokio::runtime::Runtime,
     settings: &Settings,
     selection: Option<&str>,
     operation: &str,
     input: DocumentInput,
+    native: bool,
 ) -> Result<()> {
     let context = Context::open(settings, selection)?;
-    discovery::validate(operation, input, Some(&context))
+    discovery::validate_online(runtime, &context, operation, input, native)
 }
 pub(super) fn request(
     runtime: &tokio::runtime::Runtime,

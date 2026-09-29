@@ -1,21 +1,25 @@
 //! The MCP adapter adds only correlation/recovery fields to the shared DTO schema.
 use crate::{ProtocolError, Tool};
-use focal_client::operations;
+use focal_client::operations::{self, WireProfile};
 use serde_json::{Map, Value};
 #[path = "catalog_schema.rs"]
 pub(crate) mod schema;
 
+/// The catalogue an adapter serves on a V1 ledger: the V1 application
+/// catalogue (`application(WireProfile::V1)`) plus the six managed recovery
+/// tools.
 pub(crate) fn catalog() -> Result<Vec<Tool>, ProtocolError> {
+    let descriptors = operations::application(WireProfile::V1);
     let mut tools = Vec::new();
     tools
         .try_reserve_exact(
-            operations::descriptors()
+            descriptors
                 .len()
                 .checked_add(6)
                 .ok_or(ProtocolError::Capacity)?,
         )
         .map_err(|_| ProtocolError::Capacity)?;
-    for descriptor in operations::descriptors() {
+    for descriptor in descriptors {
         let mut input = descriptor
             .input_schema()
             .map_err(|_| ProtocolError::Limits)?;

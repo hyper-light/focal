@@ -152,24 +152,14 @@ fn main() {
 }
 fn execute(args: Args) -> Result<()> {
     let args = match args.command {
+        // Context-backed validation probes the ledger's engine, so it runs
+        // where a runtime exists, with the other manual commands.
         Commands::Schema {
             command:
                 cli::discovery::SchemaCommand::Validate {
-                    operation,
-                    input,
-                    shape_only: false,
+                    shape_only: false, ..
                 },
-        } => {
-            let settings =
-                load_settings(args.config.as_deref(), args.data_dir, Resolution::Command)?;
-            return cli::schema_validate(
-                &settings,
-                args.client_context.as_deref(),
-                &operation,
-                input,
-            )
-            .map_err(Into::into);
-        }
+        } => args,
         Commands::Schema { command } => return cli::discovery::schema(command).map_err(Into::into),
         Commands::Completion { shell } => {
             return cli::discovery::completion(shell).map_err(Into::into);
@@ -334,6 +324,23 @@ fn run(runtime: &tokio::runtime::Runtime, args: Args) -> Result<()> {
             print_json(&report)
         }
         Commands::Identity => print_json(&decode_identity(&settings.data_dir()?.join("IDENTITY"))?),
+        Commands::Schema {
+            command:
+                cli::discovery::SchemaCommand::Validate {
+                    operation,
+                    input,
+                    shape_only: false,
+                    native,
+                },
+        } => cli::schema_validate(
+            runtime,
+            &settings,
+            args.client_context.as_deref(),
+            &operation,
+            input,
+            native,
+        )
+        .map_err(Into::into),
         Commands::Schema { command } => cli::discovery::schema(command).map_err(Into::into),
         Commands::Completion { shell } => cli::discovery::completion(shell).map_err(Into::into),
         Commands::Status => {

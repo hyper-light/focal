@@ -46,6 +46,12 @@ Receipt: e2c5670ea738bf9bfd18035388f80e8f (epoch 1)
 Claim: d4cc83c48c5ad2bafaa1802bb87c3e07
 ```
 
+The flow above is the V1 engine's, which a fresh ledger runs; a ledger that runs the
+native engine (`cluster replicas activate-native`) takes the same commands with the
+native engine's example — `focal schema example claim.submit --native` — as the
+[quickstart](#on-a-native-ledger) shows. Discovery serves each engine's own contract:
+what `schema example` prints is what `submit` accepts.
+
 > [!NOTE]
 > Console output in this README was captured from a debug build at `125effd` on macOS with
 > `--data-dir` pointed at a scratch directory; JSON is trimmed where marked with `...`.
@@ -149,6 +155,45 @@ without setting up an evaluator. IDs are 32 hex characters and hashes are 64. Ev
 prints the `SEQUENCE` it was served at, so you know how current it is.
 
 Stop the service with Ctrl-C and run `focal start` again: the same ledger comes back.
+
+### On a native ledger
+
+A ledger activated for the native engine (`focal cluster replicas activate-native`,
+before `start` on a laptop) accepts the native engine's documents. Ask discovery for
+that engine's example — it names another participant as the claim's subject, since a
+native claim is never on oneself — and the same verbs carry it:
+
+```console
+$ focal schema example claim.submit --native > claim.json
+$ focal submit claim --file claim.json
+CONDITION	Committed
+OPERATION_ID	n1:d391b67e030f273cf53bca42fbe16c8f
+SEQUENCE	1
+OPERATION	create
+CREATED	claim	95d3a0b16c827c6bbe926527efc3a290
+CREATED	validation	28b0a2f156a6d98355d56d8195a863c0
+
+$ focal claim post 95d3a0b16c827c6bbe926527efc3a290
+CONDITION	Committed
+OPERATION_ID	n1:8304fd65c72167246b7467a9a868c94e
+SEQUENCE	2
+OPERATION	post
+
+$ focal get claim 95d3a0b16c827c6bbe926527efc3a290
+PREFIX	2	LOGICAL_TIME	1790718813146
+OBJECT	Claim	{"acceptance":[],"binding":{…},…,"status":2,…}
+
+$ focal schema validate claim.submit --file claim.json
+valid claim.submit (native engine; authored input compiled against the ledger's committed bindings into its exact frame; nothing journaled or sent; server acceptance unchecked)
+```
+
+`schema list --native`, `schema get NAME --native`, `schema example NAME --native` and
+`schema validate NAME --native --shape-only` are the native engine's offline discovery;
+without `--native` a name both engines share is served by V1 and a native-only name by
+the native engine. A command that reaches a ledger probes its engine and serves that
+one; `--native` against a ledger that answers V1 is refused, never redirected.
+(Captured from a debug build of `slates-port` on macOS, 2026-09-29;
+`tests/cli_native_quickstart.rs` runs this block verbatim.)
 
 ### Run the whole workflow
 

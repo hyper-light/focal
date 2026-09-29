@@ -167,3 +167,104 @@ fn actual_help_describes_local_configuration_and_only_supported_family_filters()
     assert!(!help.contains("--confidence"));
     assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
 }
+
+/// The native engine's discovery offline (the audit's F09): its catalogue
+/// lists every native descriptor with an example, every example decodes
+/// through the native contract that `submit`/the native tools decode with,
+/// shape-only validation accepts each one, a shared name's V1 example is
+/// refused by the native engine by name, and nothing touches the disk.
+#[test]
+fn the_native_catalogue_examples_and_validation_need_no_state_either() {
+    use focal_client::operations::{WireProfile, native_descriptors};
+    let root = tempfile::tempdir().unwrap();
+    let catalog = json(
+        root.path(),
+        &["schema", "list", "--native", "--format", "json"],
+    );
+    assert_eq!(catalog["engine"], "native");
+    let entries = catalog["operations"].as_array().unwrap();
+    assert_eq!(entries.len(), native_descriptors().len());
+    assert_eq!(entries.len(), 43);
+    for entry in entries {
+        assert_eq!(entry["engine"], "native", "{entry}");
+        assert_eq!(entry["version"], 2, "{entry}");
+        assert_eq!(entry["example_available"], true, "{entry}");
+    }
+    for descriptor in native_descriptors() {
+        assert_eq!(descriptor.wire, WireProfile::Native);
+        let name = descriptor.name;
+        let example = json(root.path(), &["schema", "example", name, "--native"]);
+        assert_eq!(
+            example,
+            focal_client::operations::example(WireProfile::Native, name).unwrap(),
+            "{name}"
+        );
+        // The example decodes through the engine's own decoder and the
+        // command's shape-only validation, which is that decoder.
+        focal_client::operations::decode_application(
+            WireProfile::Native,
+            name,
+            example.to_string().as_bytes(),
+        )
+        .unwrap_or_else(|error| panic!("{name}: {error}"));
+        let file = root.path().join("example.json");
+        std::fs::write(&file, example.to_string()).unwrap();
+        let validated = run(
+            root.path(),
+            &[
+                "schema",
+                "validate",
+                name,
+                "--native",
+                "--shape-only",
+                "--file",
+                file.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            validated.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&validated.stderr)
+        );
+        std::fs::remove_file(&file).unwrap();
+    }
+    // A claim's native example names a subject other than the issuer: the
+    // owner never posts a claim on oneself.
+    let claim = json(
+        root.path(),
+        &["schema", "example", "claim.submit", "--native"],
+    );
+    assert_ne!(claim["target"], "self");
+    // The V1 example of the shared name is refused by the native engine, by
+    // the field the native contract lacks, and a V1-only name under --native
+    // is refused by name: exit 2, no redirect, no file.
+    let v1 = json(root.path(), &["schema", "example", "claim.submit"]);
+    assert_eq!(v1["target"], "self");
+    let file = root.path().join("v1.json");
+    std::fs::write(&file, v1.to_string()).unwrap();
+    let refused = run(
+        root.path(),
+        &[
+            "schema",
+            "validate",
+            "claim.submit",
+            "--native",
+            "--shape-only",
+            "--file",
+            file.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("evidence_schemas"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    std::fs::remove_file(&file).unwrap();
+    let batch = run(
+        root.path(),
+        &["schema", "example", "claim.submit_batch", "--native"],
+    );
+    assert_eq!(batch.status.code(), Some(2), "{batch:?}");
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+}

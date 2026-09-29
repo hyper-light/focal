@@ -93,7 +93,7 @@ pub fn serve<T: ClientTransport + 'static, R: Read + Send + 'static, W: Write + 
                 0
             })
         }
-        None => focal_client::operations::descriptors()
+        None => focal_client::operations::application(focal_client::operations::WireProfile::V1)
             .len()
             .checked_add(6)
             .and_then(|n| {

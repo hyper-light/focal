@@ -11924,3 +11924,31 @@ the client's driver), `focal-wire`
 `native::tests::native_pages_are_validated_against_the_shape_their_query_names`,
 `focal-native-client`
 `validation_get_follows_pages_at_one_prefix_and_refuses_a_span_beyond_its_bound`.
+### 2026-09-29 — F09: discovery selects the engine the mutation path uses
+
+`focal schema example claim.submit` printed the V1 engine's document whatever engine
+the ledger ran, normalised through the V1 decoder, and on a native ledger it failed at
+four layers in turn (an unknown `evidence_schemas`, a missing per-declaration
+`deadline`, a receipt declaration naming an evaluator, a claim on oneself the owner
+never posts); `schema list`, shape-only validation and name completion used the V1
+registry too, and discovery's tests validated examples against the registry that
+produced them. One engine selection serves every surface now
+(`focal_client::operations::engine`): offline, `--native` wins, else the only catalogue
+that has the name, else V1; online, the standing probe every host performs once
+(shared by the CLI and the MCP adapter), with `--native` against a V1 answer refused and
+an assumed engine reported as assumed. Every native descriptor has an authored example
+(`operations::native_examples`, the single source the tests draw on: deadlines at
+2100-01-01, claims that name another participant), normalised through the native
+decoder; `schema list` shows each operation's engine and version; `schema validate`
+with a context compiles the document against the ledger's committed bindings without
+claiming a journal identity. Tests: both engines' examples decode through their own
+decoder and shape (`discovery_tests`, `engine_tests`, `native_tests`), each authored
+coverage row's example loads through its command with the same canonical intent
+(`cli/tests.rs`), the generated example commits through the MCP adapter unchanged
+(`native_stdio_tests`), documented commands and their flags resolve in the command
+tree (`command_tree_tests`), the native catalogue and every example need no state
+(`tests/cli_discovery.rs`), and the documented native quickstart runs verbatim on a
+fresh native ledger through the real binary (`tests/cli_native_quickstart.rs`: submit,
+post, a read showing the claim posted, the engine named by the context-backed
+validation, the V1 example refused by the field the native contract lacks). The README
+and the manual carry the native quickstart and the rule.
