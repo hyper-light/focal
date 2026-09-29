@@ -362,6 +362,36 @@ Ordered by expected wall-clock gain, memory second. Each states the site, the me
 ### Not proposed (by design, documented)
 `Box<ReadyPhase>`/`Box<LightPhase>` per cycle (comment `persistence.rs:24-25`), `HandlerFuture` boxes (object-safe trait), one `tokio` task per QUIC stream, `Box` per `NativeObject` in wire pages (keeps the enum small), the child-budget `Arc` (one per session).
 
+## 6a. Corrections (2026-09-29, the audit's F54)
+
+The audit (`docs/audit/2026-09-29_audit.md` F54) found four places where this record
+said more than its instrumentation measured. They stand corrected here; the figures
+above are left as written, dated.
+
+- **"Bytes moved by realloc" was an upper bound, not an observation.** The counter
+  added `min(old, new)` on every reallocation whether or not the allocator moved the
+  block. The allocator now counts a reallocation as a copy only when it returned a
+  different pointer (`realloc_moved`, `realloc_moved_bytes`) and counts in-place growth
+  apart (`realloc_in_place`); what an allocator does inside an in-place growth is not
+  visible to the program. Every "moved" figure in §2 is the old upper bound.
+- **Requested bytes are not live memory.** `bytes/op` (now labelled `requested/op`) is
+  allocation requests plus the new size of every reallocation; it says nothing about
+  resident set size or retained memory. Peak and live growth are per phase, between
+  `Meter::start` and `finish`, and include what the phase allocated outside its gated
+  operations.
+- **The page size of this host is 16,384 bytes, not 4,096.** §3 converted minor faults
+  to "fresh pages" at 4 KiB: "0.67 faults (2.7 MB of fresh pages) per committed claim"
+  is 0.67 faults × 16 KiB ≈ 10.7 KB of first-touched pages per claim — which is what the
+  same paragraph measured as RSS growth per claim (10.9 KB); the 4 KiB arithmetic was
+  wrong by four and the agreement was hidden by it. A fault count is events, and a
+  fault does not say how many bytes of the page were new; "0 major faults" means no
+  fault needed I/O, not that there was no memory pressure, compression or reclaim.
+  `getconf PAGESIZE` is recorded with every process-level figure from now on.
+- **Counting perturbs.** The counters' atomics and the sampler's backtraces change
+  timing, residency and faults even with sampling off; counted runs attribute, and
+  uninstrumented release runs measure speed and residency (the 2026-09-29 performance
+  record was measured uninstrumented).
+
 ## 7. Observations and instrumentation limits
 - `benches/replicate.rs` delivers newest-first (`at: net.len() − 1`) and therefore measures a reject/re-probe path on every round; in-order delivery is 24 allocations per entry cheaper for both cores and changes the batch=16 comparison (§2.5). Worth a note in the qualification doc when its numbers are next refreshed.
 - `focal schema example claim.submit` produces a document `submit claim` rejects (`evidence_schemas` unknown; then `deadline` missing) — the manual's "self-targeted handoff example, suitable for trying the local protocol" does not currently work as written.

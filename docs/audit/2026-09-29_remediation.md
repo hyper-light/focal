@@ -48,6 +48,25 @@ ruling before work starts).
 | F33 | P2 | open | 4 | — |
 | F34 | P2 | open | 4 | — |
 | F35 | P1 | open | 3 | — |
+| F36 | P1 | open | 9 | — |
+| F37 | P1 | open | 8 | — |
+| F38 | P2 | open | 8 | — |
+| F39 | P2 | open | 12 | — |
+| F40 | P2 | open | 10 | — |
+| F41 | P2 | open | 10 | — |
+| F42 | P1 | open | 9 | — |
+| F43 | P2 | open | 10 | — |
+| F44 | P2 | open | 10 | — |
+| F45 | P2 | open | 10 | — |
+| F46 | P1 | open | 8 | — |
+| F47 | P2 | open | 11 | — |
+| F48 | P1 | open | 9 | — |
+| F49 | P1 | open | 9 | — |
+| F50 | P2 | open | 11 | — |
+| F51 | P2 | open | 11 | — |
+| F52 | P2 | open | 11 | — |
+| F53 | P2 | open | 10 | — |
+| F54 | P2 | in tree | 12 | [F54](#f54) |
 
 Batches follow the audit's §13 order: 1 failure handling and recovery (F01, F02); 2
 sustainable participant operation (F04–F06, F09); 3 admission and authorization (F03,
@@ -56,6 +75,15 @@ F34); 5 continuous use and fault-domain guarantees (F12, F13, F22, F24, F25); 6 
 amplification and critical paths (F14, F17–F19, F23, F31); 7 the global architecture and
 its qualification (F21, F26, F28, F32, F30), then the entry documentation and gates
 (F27 — done first, since it governs every other batch's proof — and F29).
+
+The audit's extension (§14, F36–F54, added 2026-09-29 after the first batch) follows
+its §18 order: 8 the reproduced cross-request failure and the same-budget restart
+refusal (F37, F38, F46); 9 legitimate poor-path progress and healthy-majority isolation
+(F36, F42, F48, F49); 10 byte-fair replication, proof batching, completion wakes,
+freshness and scalar views (F40, F41, F43, F44, F45, F53); 11 checkpoint and transfer
+amplification (F47, F50, F51, F52); 12 the congestion signal, the controller verdict
+and the instrumentation's honesty (F39, F54, §17.1), with §17.2's production-limit
+matrix folded into F28's qualification campaign.
 
 ## F01
 
@@ -111,3 +139,23 @@ runs it before Clippy. A `forbid` level was tried and is not usable: derive macr
 
 **Tests.** The fixture self-test (the negative fixture must be refused, the positive
 passed) runs on every gate; 1,061 production sources scanned.
+
+## F54
+
+**Cause.** The counting allocator (`crates/focal-memory/benches/support/alloc_count.rs`,
+bench-only) added `min(old, new)` to "bytes moved" on every reallocation, in place or
+not; its `bytes/op` was requested bytes read as if live; phase peaks were read as
+per-operation; and the allocation record converted page faults at 4 KiB on a 16 KiB
+host.
+
+**Fix.** Reallocations are counted as copies only when the allocator returned another
+block (`realloc_moved`, `realloc_moved_bytes`), in-place growth apart
+(`realloc_in_place`); the report's columns are `moved/op` and `requested/op` with the
+header saying what they are; the module comment states the meaning and the limits of
+every figure (perturbation, phase-wide peaks, page size, faults as events). The
+allocation record gains a dated corrections section (§6a) and the performance record
+states the page size.
+
+**Tests.** The benches that include the allocator (`focal-memory`, `-wire`, `-log`,
+`-core`, `-raft`, `focal-load`) build under `--benches` clippy; the counters are
+exercised by every `allocs` bench run.

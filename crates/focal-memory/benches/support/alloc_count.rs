@@ -11,6 +11,22 @@
 //! bytes are tracked whether or not the gate is open so a peak stays
 //! consistent across gated phases.
 //!
+//! What the figures are, and are not (the 2026-09-29 audit's F54):
+//! `bytes` is what was *requested* of the allocator — allocations plus the
+//! new size of every reallocation — never live memory or resident set size.
+//! A reallocation copies only when the allocator moved the block: those are
+//! counted apart (`realloc_moved`, and `realloc_moved_bytes` = the
+//! preserved `min(old, new)` of each moved block — the copy the program
+//! observed; what the allocator did inside an in-place growth is not
+//! visible here) from the reallocations that stayed in place. A phase's
+//! peak and live growth are measured between `Meter::start` and `finish`,
+//! so they include what the phase allocated outside its gated operations.
+//! The counters' atomics and the sampler's backtraces perturb timing,
+//! resident memory and page faults, so a count run attributes and a
+//! separate uninstrumented run measures speed and residency; a report of
+//! faults states the host's page size (`getconf PAGESIZE` — 16 KiB on
+//! Apple silicon, not 4 KiB), and a fault count is events, never bytes.
+//!
 //! Attribution: every `SAMPLE_EVERY`th counted allocation and every
 //! `REALLOC_EVERY`th counted reallocation captures
 //! `std::backtrace::Backtrace::force_capture()`, renders it (symbol names, and
@@ -62,7 +78,9 @@ static DEALLOCS: AtomicU64 = AtomicU64::new(0);
 static REALLOCS: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
 static REALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
-static REALLOC_COPIED: AtomicU64 = AtomicU64::new(0);
+static REALLOC_MOVED: AtomicU64 = AtomicU64::new(0);
+static REALLOC_MOVED_BYTES: AtomicU64 = AtomicU64::new(0);
+static REALLOC_IN_PLACE: AtomicU64 = AtomicU64::new(0);
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 static HIST: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
@@ -131,13 +149,20 @@ fn note_alloc(size: usize) {
     }
 }
 
-fn note_realloc(old: usize, new: usize) {
+fn note_realloc(old: usize, new: usize, moved: bool) {
     if !GATE.load(Ordering::Relaxed) {
         return;
     }
     let n = REALLOCS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     REALLOC_BYTES.fetch_add(new as u64, Ordering::Relaxed);
-    REALLOC_COPIED.fetch_add(old.min(new) as u64, Ordering::Relaxed);
+    if moved {
+        // The allocator returned another block: the program's bytes were
+        // copied into it, `min(old, new)` of them.
+        REALLOC_MOVED.fetch_add(1, Ordering::Relaxed);
+        REALLOC_MOVED_BYTES.fetch_add(old.min(new) as u64, Ordering::Relaxed);
+    } else {
+        REALLOC_IN_PLACE.fetch_add(1, Ordering::Relaxed);
+    }
     let every = REALLOC_EVERY.load(Ordering::Relaxed);
     if every != 0 && n.is_multiple_of(every) {
         sample(new, Some(old));
@@ -368,7 +393,7 @@ unsafe impl GlobalAlloc for Counting {
             } else {
                 track_live_sub(layout.size());
                 track_live_add(new_size);
-                note_realloc(layout.size(), new_size);
+                note_realloc(layout.size(), new_size, next != ptr);
             }
         }
         next
@@ -436,7 +461,11 @@ pub struct Snapshot {
     pub reallocs: u64,
     pub bytes: u64,
     pub realloc_bytes: u64,
-    pub realloc_copied: u64,
+    /// Reallocations the allocator moved (the program's bytes were copied),
+    /// the bytes those copies preserved, and reallocations grown in place.
+    pub realloc_moved: u64,
+    pub realloc_moved_bytes: u64,
+    pub realloc_in_place: u64,
     pub overhead: u64,
     pub hist: [u64; BUCKETS],
 }
@@ -453,7 +482,9 @@ impl Snapshot {
             reallocs: REALLOCS.load(Ordering::Relaxed),
             bytes: BYTES.load(Ordering::Relaxed),
             realloc_bytes: REALLOC_BYTES.load(Ordering::Relaxed),
-            realloc_copied: REALLOC_COPIED.load(Ordering::Relaxed),
+            realloc_moved: REALLOC_MOVED.load(Ordering::Relaxed),
+            realloc_moved_bytes: REALLOC_MOVED_BYTES.load(Ordering::Relaxed),
+            realloc_in_place: REALLOC_IN_PLACE.load(Ordering::Relaxed),
             overhead: OVERHEAD.load(Ordering::Relaxed),
             hist,
         }
@@ -470,7 +501,13 @@ impl Snapshot {
             reallocs: self.reallocs.saturating_sub(earlier.reallocs),
             bytes: self.bytes.saturating_sub(earlier.bytes),
             realloc_bytes: self.realloc_bytes.saturating_sub(earlier.realloc_bytes),
-            realloc_copied: self.realloc_copied.saturating_sub(earlier.realloc_copied),
+            realloc_moved: self.realloc_moved.saturating_sub(earlier.realloc_moved),
+            realloc_moved_bytes: self
+                .realloc_moved_bytes
+                .saturating_sub(earlier.realloc_moved_bytes),
+            realloc_in_place: self
+                .realloc_in_place
+                .saturating_sub(earlier.realloc_in_place),
             overhead: self.overhead.saturating_sub(earlier.overhead),
             hist,
         }
@@ -486,7 +523,11 @@ impl Snapshot {
             reallocs: self.reallocs.saturating_add(other.reallocs),
             bytes: self.bytes.saturating_add(other.bytes),
             realloc_bytes: self.realloc_bytes.saturating_add(other.realloc_bytes),
-            realloc_copied: self.realloc_copied.saturating_add(other.realloc_copied),
+            realloc_moved: self.realloc_moved.saturating_add(other.realloc_moved),
+            realloc_moved_bytes: self
+                .realloc_moved_bytes
+                .saturating_add(other.realloc_moved_bytes),
+            realloc_in_place: self.realloc_in_place.saturating_add(other.realloc_in_place),
             overhead: self.overhead.saturating_add(other.overhead),
             hist,
         }
@@ -559,26 +600,32 @@ pub fn per_op(total: u64, ops: u64) -> f64 {
 
 pub fn header() -> String {
     format!(
-        "{:<44} {:>8} {:>10} {:>11} {:>11} {:>12} {:>12}  {}",
+        "{:<44} {:>8} {:>10} {:>11} {:>11} {:>12} {:>12} {:>12}  {}",
         "path",
         "ops",
         "allocs/op",
         "reallocs/op",
-        "bytes/op",
+        "moved/op",
+        "requested/op",
         "peak-growth",
         "live-growth",
-        "hist ≤16 ≤64 ≤256 ≤1K ≤4K ≤64K >64K (allocs)"
+        "hist ≤16 ≤64 ≤256 ≤1K ≤4K ≤64K >64K (allocs); moved = reallocations the allocator moved and the bytes they copied; requested = bytes asked for, never live"
     )
 }
 
 pub fn row(phase: &Phase) -> String {
     let c = &phase.counts;
     format!(
-        "{:<44} {:>8} {:>10.2} {:>11.3} {:>11.1} {:>12} {:>12}  {} {} {} {} {} {} {}",
+        "{:<44} {:>8} {:>10.2} {:>11.3} {:>11} {:>12.1} {:>12} {:>12}  {} {} {} {} {} {} {}",
         phase.name,
         phase.ops,
         per_op(c.allocs, phase.ops),
         per_op(c.reallocs, phase.ops),
+        format!(
+            "{:.3}/{:.0}B",
+            per_op(c.realloc_moved, phase.ops),
+            per_op(c.realloc_moved_bytes, phase.ops)
+        ),
         per_op(c.bytes.saturating_add(c.realloc_bytes), phase.ops),
         phase.peak_growth,
         phase.live_growth,

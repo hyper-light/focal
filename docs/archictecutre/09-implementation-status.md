@@ -11819,3 +11819,19 @@ encode 262 → 120 and 3040 → 1072 ns, the empty frame's fixed cost unchanged;
 WAL's path A moves 3.6× fewer bytes per 4 KiB append (16 810 → 4 607) with half
 the reallocations. Nothing on disk or on the wire changed; the frozen-format and
 replay suites pass unchanged.
+
+### 2026-09-29 — F54: what the allocation counter measures, said exactly
+
+The audit's F54: the counting allocator's "bytes moved by realloc" added
+`min(old, new)` on every reallocation whether or not the block moved, requested
+bytes were read as live memory, a phase's peak was read as an operation's, and the
+allocation record converted this host's page faults at 4 KiB where the page is
+16 KiB. The allocator counts a reallocation as a copy only when it returned another
+pointer (`realloc_moved`, `realloc_moved_bytes`) and in-place growth apart
+(`realloc_in_place`), its report labels `moved/op` and `requested/op` for what they
+are, and its module comment states what each figure is and is not. The allocation
+record carries a dated corrections section (§6a): the 4 KiB fault arithmetic,
+corrected to the host's 16 KiB page, agrees with the RSS growth per claim it sat
+next to (10.7 KB against 10.9 KB); the "moved" figures of §2 are marked upper bounds;
+process figures state the page size from now on, and counted runs attribute while
+uninstrumented runs measure.
