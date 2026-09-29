@@ -26,3 +26,7 @@ workspace = true
 [[bench]]
 name = "append"
 harness = false
+
+[[bench]]
+name = "allocs"
+harness = false

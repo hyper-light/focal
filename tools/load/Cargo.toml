@@ -27,3 +27,7 @@ serde_json = { workspace = true }
 serde_saphyr = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
+
+[[bench]]
+name = "allocs"
+harness = false

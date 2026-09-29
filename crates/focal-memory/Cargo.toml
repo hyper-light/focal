@@ -17,3 +17,7 @@ workspace = true
 [[bench]]
 name = "budget"
 harness = false
+
+[[bench]]
+name = "allocs"
+harness = false

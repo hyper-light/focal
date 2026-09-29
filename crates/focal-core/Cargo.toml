@@ -30,3 +30,7 @@ test-support = []
 [[bench]]
 name = "reduce"
 harness = false
+
+[[bench]]
+name = "allocs"
+harness = false
