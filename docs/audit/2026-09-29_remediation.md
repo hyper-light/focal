@@ -67,6 +67,17 @@ ruling before work starts).
 | F52 | P2 | in tree (encode) | 11 | [F52](#f52) |
 | F53 | P2 | open | 10 | — |
 | F54 | P2 | in tree | 12 | [F54](#f54) |
+| F55 | P1 | open | 13 | — |
+| F56 | P1 | open | 13 | — |
+| F57 | P1 | open | 14 | — |
+| F58 | P2 | open | 14 | — |
+| F59 | P2 | open | 15 | — |
+| F60 | P2 | open | 15 | — |
+| F61 | P2 | open | 15 | — |
+| F62 | P1 | open | 15 | — |
+| F63 | P2 | open | 13 | — |
+| F64 | P2 | open | 15 | — |
+| F65 | P2 | open | 15 | — |
 
 Batches follow the audit's §13 order: 1 failure handling and recovery (F01, F02); 2
 sustainable participant operation (F04–F06, F09); 3 admission and authorization (F03,
@@ -84,6 +95,30 @@ freshness and scalar views (F40, F41, F43, F44, F45, F53); 11 checkpoint and tra
 amplification (F47, F50, F51, F52); 12 the congestion signal, the controller verdict
 and the instrumentation's honesty (F39, F54, §17.1), with §17.2's production-limit
 matrix folded into F28's qualification campaign.
+
+### The continuation (§19, F55–F65) and what it says of the closed findings
+
+The audit's continuation (2026-09-29, after `fc405c6`) adds eleven findings and reviews
+the concurrent fixes. Batches: **13** the replicated read path and Raft ingress (F55 a
+follower's read barrier ahead of its log is lag, not corruption; F56 participant
+waiters starve the Raft acknowledgments that would complete them; F63 identical read
+contexts from distinct origins lose one reader), first with F01/F04–F06; **14** one
+admitted-history/recovery/funding contract (F57 the recovery work envelope smaller
+than admitted history; F58 completion-funded restore meeting ordinary-only
+constructors) with F02 and F46; **15** continuous operation (F62 expired consumers
+keep their admission slots — with the journal, enrollment and founder lifecycle
+ceilings; F59 duplicate verified chunks charged to the disk estimate; F60 uncoalesced
+participant dials; F61 cursor renewals that copy the registry and idle polls that
+commit; F64 unjittered retry waves; F65 sequential diagnostics stalling metrics).
+
+Of the fixes it reviewed (§19.1) it leaves open, recorded under their findings below:
+F19's cached plans are not charged to a `MemoryBudget` and one mutex is held through
+the chunk reads; F52's WAL record encoder still zeroes (R6) and the generic
+`encode_payload` grows `postcard::to_extend`'s vector before the mismatch check when a
+serializer's size changes between passes (a fallible, capacity-limited append sink);
+F54's report header still says "bytes copied" for preserved length and the allocation
+record's §6 (lines 382–386) still converts faults to bytes and claims agreement with
+RSS — to be removed. F25 and F31 it credits as addressed, within their stated scope.
 
 ## F01
 
