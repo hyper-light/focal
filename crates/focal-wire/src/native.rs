@@ -20,8 +20,9 @@ pub const NATIVE_FRAME_VERSION: u16 = 1;
 pub const NATIVE_ACTOR_HEADER_BYTES: usize = 84;
 /// The actor header and its command byte: the least a request frame carries.
 pub const NATIVE_REQUEST_MIN_BYTES: usize = 85;
-/// Command tags 0..=27 are registered by the input format; timers use namespaces.
-pub const NATIVE_COMMAND_TAGS: u8 = 28;
+/// Command tags 0..=28 are registered by the input format (28 is the
+/// client protocol's generation floor, F12); timers use namespaces.
+pub const NATIVE_COMMAND_TAGS: u8 = 29;
 pub const NATIVE_ACTOR_NAMESPACE: u8 = 0;
 pub const MAX_NATIVE_LIST_CURSOR_BYTES: usize = 256;
 /// Residual filtering may visit this many rows for one page.
@@ -176,9 +177,13 @@ pub enum NativeOperationKind {
     ClaimDeadline,
     Import,
     Retire,
+    /// A principal advanced its request generation floor (F12).
+    AdvanceEpochFloor,
+    /// Closed outcomes sealed into a bundle (F12): a session decision.
+    Seal,
 }
 impl NativeOperationKind {
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 34] = [
         Self::RegisterMonitor,
         Self::RebindMonitor,
         Self::CancelMonitor,
@@ -211,6 +216,8 @@ impl NativeOperationKind {
         Self::ClaimDeadline,
         Self::Import,
         Self::Retire,
+        Self::AdvanceEpochFloor,
+        Self::Seal,
     ];
     pub const fn registered_tag(self) -> u8 {
         match self {
@@ -246,6 +253,8 @@ impl NativeOperationKind {
             Self::ClaimDeadline => 29,
             Self::Import => 30,
             Self::Retire => 31,
+            Self::AdvanceEpochFloor => 32,
+            Self::Seal => 33,
         }
     }
     /// Trusted operations never arrive as participant frames.
@@ -257,6 +266,7 @@ impl NativeOperationKind {
                 | Self::ClaimDeadline
                 | Self::Import
                 | Self::Retire
+                | Self::Seal
         )
     }
     pub const fn name(self) -> &'static str {
@@ -293,6 +303,8 @@ impl NativeOperationKind {
             Self::ClaimDeadline => "claim_deadline",
             Self::Import => "import",
             Self::Retire => "retire",
+            Self::AdvanceEpochFloor => "advance_epoch_floor",
+            Self::Seal => "seal",
         }
     }
 }
@@ -356,6 +368,12 @@ pub enum NativeErrorCode {
     /// completion operation.
     Legacy,
     Unsupported,
+    /// The request's generation is below its principal's floor: its history
+    /// is sealed, readable from the archive, and never executed again.
+    RequestHistoryExpired,
+    /// The request's generation is not open: generations open in order, two
+    /// at a time, until the floor advances.
+    EpochNotAdmitted,
 }
 /// Closed refusal categories mapped to stable client exit codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -533,6 +551,31 @@ pub enum NativeReadQuery {
     /// answer is an `Archived` object, or `Missing` when the bundle holds
     /// no such row.
     Archived(NativeArchiveQuery),
+    /// A principal's request generation window (F12): its own, or any for
+    /// a node. A principal never seen answers with the first window.
+    Epochs(ParticipantId),
+    /// The outcome of a request whose generation was sealed (F12), read
+    /// from the seal's bundle by the content owner: the bundle a `Sealed`
+    /// reference named, and the request. The answer is the outcome, or
+    /// `Missing` when the seal never held it.
+    Sealed(NativeSealQuery),
+}
+/// The sealed outcome a read names (F12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeSealQuery {
+    pub bundle: ContentHash,
+    pub bytes: u64,
+    pub request: RequestKey,
+}
+impl NativeSealQuery {
+    pub fn valid(&self) -> bool {
+        self.bundle.0 != [0; 32]
+            && self.bytes != 0
+            && !self.request.principal.is_zero()
+            && !self.request.id.is_zero()
+            && self.request.epoch.0 != 0
+    }
 }
 /// The bundle a retired claim's continuation names — its content root and
 /// length, an object of the ledger's tenant domain — and the object wanted
@@ -620,6 +663,8 @@ impl NativeReadRequest {
             }
             NativeReadQuery::Events { limit, .. } => within(*limit),
             NativeReadQuery::Archived(query) => query.valid(),
+            NativeReadQuery::Epochs(principal) => !principal.is_zero(),
+            NativeReadQuery::Sealed(query) => query.valid(),
             NativeReadQuery::Outcome(_) | NativeReadQuery::Standing => true,
         };
         if valid {
@@ -1278,6 +1323,48 @@ pub enum NativeObject {
     /// F11): the object as the family's core held it at the prefix the
     /// bundle claims, and the bundle it came from.
     Archived(Box<NativeArchivedObject>),
+    /// A principal's request generation window (F12).
+    Epochs(Box<NativeEpochWindow>),
+    /// The outcome asked for left the live core into a seal (F12): where to
+    /// read it. A `Sealed` read of the bundle answers with the outcome.
+    Sealed(NativeSealedRef),
+}
+/// A principal's request generation window (F12): generations below the
+/// floor are closed, `sealed..floor` await a seal, `floor..floor + open`
+/// are open with their resident outcomes, and the sealed generations name
+/// the seal holding their outcomes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeEpochWindow {
+    pub principal: ParticipantId,
+    pub floor: RequestEpoch,
+    pub sealed: RequestEpoch,
+    pub open: Vec<NativeOpenEpoch>,
+    pub ranges: Vec<NativeSealedRange>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeOpenEpoch {
+    pub epoch: RequestEpoch,
+    pub outcomes: u32,
+    pub last_logical_time: u64,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeSealedRange {
+    pub first: RequestEpoch,
+    pub last: RequestEpoch,
+    pub seal: u64,
+}
+/// Where a sealed outcome is (F12): the seal row covering the generation
+/// (a fold's, when the seal was folded) and its bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeSealedRef {
+    pub request: RequestKey,
+    pub ordinal: u64,
+    pub bundle: ContentHash,
+    pub bytes: u64,
 }
 /// One object of a retired family, read from its bundle: the bundle's
 /// content root and length, the family's root claim, the prefix the bundle

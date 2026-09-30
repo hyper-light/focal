@@ -56,6 +56,7 @@ use placement_owner::{PendingPlacementCall, PlacementCall};
 pub use range_owner::{
     ArchivedFamily, RANGE_CONTROL_SCHEMA, RangeControlReply, RangeControlRequest, RangeFact,
     RangeFactRequest, RangeHistoryView, RangeMemberView, RangePendingView, RangeView,
+    SealedOutcomes,
 };
 pub(crate) use range_owner::{verify_fact, verify_progress};
 

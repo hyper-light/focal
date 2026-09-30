@@ -59,7 +59,7 @@ pub(super) fn value(s: &mut impl Sink, row: &Row, ledger: LedgerId) -> Result<()
         Row::Meta(v) => {
             // Cumulative ledger counters are u64, never host-size integers or
             // u32 collection lengths. The decoder must checked-convert them.
-            s.visit(15)?;
+            s.visit(19)?;
             for value in [
                 v.claims,
                 v.outcomes,
@@ -75,6 +75,10 @@ pub(super) fn value(s: &mut impl Sink, row: &Row, ledger: LedgerId) -> Result<()
                 v.monitor_links,
                 v.creation_results,
                 v.legacy,
+                v.sealed,
+                v.sealed_events,
+                v.seals,
+                v.principals,
             ] {
                 write_u64(s, u64::try_from(value).map_err(|_| Error::Capacity)?)?;
             }
@@ -142,6 +146,24 @@ pub(super) fn value(s: &mut impl Sink, row: &Row, ledger: LedgerId) -> Result<()
         | Row::LegacyRun(v)
         | Row::LegacyDefinition(v) => legacy(s, v),
         Row::Index => write_u8(s, 1),
+        Row::Epochs(v) => {
+            write_u64(s, v.floor.0)?;
+            write_u64(s, v.sealed.0)?;
+            write_u8(s, v.open)?;
+            for count in &v.counts {
+                write_u32(s, count.outcomes)?;
+                write_u64(s, count.last)?;
+            }
+            s.visit(v.ranges().len().checked_add(1).ok_or(Error::Capacity)?)?;
+            bytes::write_count(s, v.ranges().len())?;
+            for range in v.ranges() {
+                write_u64(s, range.first.0)?;
+                write_u64(s, range.last.0)?;
+                write_u64(s, range.seal)?;
+            }
+            Ok(())
+        }
+        Row::Seal(v) => fixed::seal_row(s, v),
     }
 }
 /// Frozen legacy bytes, count-prefixed; the decoder bounds the count by the

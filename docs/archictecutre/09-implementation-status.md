@@ -12379,3 +12379,21 @@ results. Denied access, custody the node lacks and an object the bundle never he
 `Unauthorized`, `Unavailable` and `Missing`. Tests:
 `a_bundle_hydrates_into_a_core_of_the_family_read_as_the_live_one_was`,
 `cli_archive::a_retired_family_is_read_from_its_bundle_by_every_identity_a_participant_kept`.
+
+### 2026-09-30 — F12: the outcome history leaves the live core
+
+A principal's requests are issued in generations ([21 §3](21-native-input-format.md)):
+the owner keeps a window per principal (`Key::Epochs`), admits at most two open
+generations in order, refuses a request below the floor `RequestHistoryExpired` and one
+beyond the next `EpochNotAdmitted`; the client's journal rotates at half its capacity and
+advances the floor with `epoch.advance` (tag 28) once the generations below are delivered.
+A seal (`FOCALSO1`, `FCNSEAL1`, `Key::Seal`; [26 §4a](26-custody-archive-retention-and-restore.md))
+moves the closed outcomes into a bundle under custody, applied alike on every replica,
+forcing least-recently-used floors under pressure and folding its index at its bound;
+resident outcomes are `outcomes − sealed`. A sealed outcome is read through
+`NativeObject::Sealed` → `NativeReadQuery::Sealed` on the content owner. Tests:
+`seal_tests` (five), `native_store::tests` (two), 
+`committed_seals_apply_on_every_replica_fence_proposals_and_close_the_generation`,
+`cli_native_epochs::a_closed_generation_is_learned_by_name_and_its_sealed_outcomes_are_still_read`.
+`FOCAL_NATIVE_OUTCOMES` sizes a node's resident window for qualification.
+

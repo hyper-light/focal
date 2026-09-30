@@ -58,8 +58,11 @@ pub(crate) fn locations(query: &NativeReadQuery) -> Vec<focal_core::native::Nati
             }
             NativeInvocationRef::ClaimDeadline { claim, .. }
             | NativeInvocationRef::MonitorDeadline { claim, .. } => L::Claim(*claim),
-            NativeInvocationRef::Import => L::Control,
-            NativeInvocationRef::Retirement { root } => L::Claim(*root),
+            // Retirements' and seals' own outcomes sit under the control
+            // affinity (F12).
+            NativeInvocationRef::Import
+            | NativeInvocationRef::Retirement { .. }
+            | NativeInvocationRef::Seal { .. } => L::Control,
         }
     }
     match query {
@@ -86,9 +89,11 @@ pub(crate) fn locations(query: &NativeReadQuery) -> Vec<focal_core::native::Nati
                 L::Control,
             ]
         }
-        NativeReadQuery::Events { .. } | NativeReadQuery::Standing => vec![L::Control],
+        NativeReadQuery::Events { .. } | NativeReadQuery::Standing | NativeReadQuery::Epochs(_) => {
+            vec![L::Control]
+        }
         // Served from custody, never from a session's core (`archive_reads`).
-        NativeReadQuery::Archived(_) => Vec::new(),
+        NativeReadQuery::Archived(_) | NativeReadQuery::Sealed(_) => Vec::new(),
     }
 }
 
@@ -508,7 +513,36 @@ pub(crate) fn page(
             Ok(finish(reader, objects, next, visited))
         }
         NativeReadQuery::Outcome(invocation) => {
-            let objects = vec![object(reader, NativeObjectRef::Outcome(*invocation))?];
+            let mut found = object(reader, NativeObjectRef::Outcome(*invocation))?;
+            // A request's outcome that left the live core into a seal (F12)
+            // is answered with where it is; a generation the window still
+            // holds, or never held, is `Missing`.
+            if let (NativeObject::Missing(_), NativeInvocationRef::Request(request)) =
+                (&found, invocation)
+                && let Some(window) = core.native_epochs(request.principal)
+                && request.epoch.0 < window.sealed.0
+                && let Some(seal) = window.seal_of(request.epoch)
+                && let Some((ordinal, row)) = core.native_seal(seal)
+            {
+                found = NativeObject::Sealed(NativeSealedRef {
+                    request: *request,
+                    ordinal,
+                    bundle: row.bundle,
+                    bytes: row.bytes,
+                });
+            }
+            Ok(finish(reader, vec![found], None, 1))
+        }
+        NativeReadQuery::Epochs(principal) => {
+            // A principal reads its own window; a runtime any.
+            if reader.role != NativePeerRole::Runtime && *principal != reader.principal {
+                return Err(AccessError::Unauthorized);
+            }
+            let first = focal_core::native::EpochWindow::first();
+            let window = core.native_epochs(*principal).unwrap_or(&first);
+            let objects = vec![NativeObject::Epochs(Box::new(docs::epoch_window(
+                *principal, window,
+            )))];
             Ok(finish(reader, objects, None, 1))
         }
         NativeReadQuery::Receipt(id) => {
@@ -683,9 +717,11 @@ pub(crate) fn page(
             Ok(finish(reader, objects, None, visited))
         }
         NativeReadQuery::ValidationContext(query) => validation_context(reader, query, max_items),
-        // An archived object is read from custody by the content owner
-        // (`archive_reads`), never from a session's core.
-        NativeReadQuery::Archived(_) => Err(AccessError::UnsupportedOperation),
+        // An archived object and a sealed outcome are read from custody by
+        // the content owner (`archive_reads`), never from a session's core.
+        NativeReadQuery::Archived(_) | NativeReadQuery::Sealed(_) => {
+            Err(AccessError::UnsupportedOperation)
+        }
         NativeReadQuery::Events { after, limit } => {
             let prefix = core.native_sequence();
             let (mut sequence, mut ordinal) = match after {

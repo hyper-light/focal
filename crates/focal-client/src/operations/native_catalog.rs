@@ -21,6 +21,8 @@ pub enum NativeInputKind {
     ObjectId,
     /// No fields: `{}`.
     Empty,
+    /// The journal's generation floor: `{ "minimum": N }` (F12).
+    Epoch,
     ClaimList,
     ArtifactList,
     ValidationList,
@@ -346,6 +348,17 @@ native_descriptor!(
     Some(ObjectKind::Validation),
     false,
     "Report the begun attempt's verdict (pass, fail, incomplete or error) with its typed result artifact bound to the exact target, generation and attempt. Error and incomplete verdicts carry an error report; the owner derives acceptance."
+);
+// The journal's own protocol operation (F12): not among the descriptors a
+// host lists, so it is neither a tool nor an example; a request file may
+// carry it, and the journal issues it itself.
+native_descriptor!(
+    NATIVE_EPOCH_ADVANCE,
+    "epoch.advance",
+    Epoch,
+    None,
+    false,
+    "Advance the principal's request generation floor: every generation below the minimum is closed, its outcomes leave for a seal, and a request in one is refused as expired. The journal issues this itself once every operation of the earlier generations was reported."
 );
 native_descriptor!(
     NATIVE_CLAIM_RELEASE_SCOPE,

@@ -172,7 +172,11 @@ impl Harness {
         let compiled = compile(
             operation,
             &context(actor),
-            RequestId::from_u128(request),
+            RequestKey {
+                principal: actor,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(request),
+            },
             &mut generator,
             resolved,
             &limits,
@@ -193,7 +197,11 @@ impl Harness {
         let again = compile(
             operation,
             &context(actor),
-            RequestId::from_u128(request),
+            RequestKey {
+                principal: actor,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(request),
+            },
             &mut ids(request * 1000),
             resolved,
             &limits,
@@ -229,7 +237,11 @@ impl Harness {
         let compiled = compile(
             operation,
             &context(actor),
-            RequestId::from_u128(request),
+            RequestKey {
+                principal: actor,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(request),
+            },
             &mut ids(request * 1000),
             resolved,
             &limits,
@@ -364,7 +376,11 @@ fn the_two_party_workflow_compiles_from_documents_and_commits_through_the_owner(
         compile(
             &work,
             &context(ISSUER),
-            RequestId::from_u128(4),
+            RequestKey {
+                principal: ISSUER,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(4),
+            },
             &mut ids(4000),
             &resolved,
             &CompileLimits::default()
@@ -472,7 +488,11 @@ fn the_two_party_workflow_compiles_from_documents_and_commits_through_the_owner(
         compile(
             &begin,
             &context(EVALUATOR),
-            RequestId::from_u128(10),
+            RequestKey {
+                principal: EVALUATOR,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(10),
+            },
             &mut ids(10_000),
             &h.resolved(claim, None, Some(key)),
             &CompileLimits::default()
@@ -489,7 +509,11 @@ fn the_two_party_workflow_compiles_from_documents_and_commits_through_the_owner(
         compile(
             &report,
             &context(SUBJECT),
-            RequestId::from_u128(10),
+            RequestKey {
+                principal: SUBJECT,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(10),
+            },
             &mut ids(10_000),
             &resolved,
             &CompileLimits::default()
@@ -516,7 +540,11 @@ fn the_two_party_workflow_compiles_from_documents_and_commits_through_the_owner(
     let compiled = compile(
         &cancel,
         &context(ISSUER),
-        RequestId::from_u128(11),
+        RequestKey {
+            principal: ISSUER,
+            epoch: RequestEpoch(1),
+            id: RequestId::from_u128(11),
+        },
         &mut ids(11_000),
         &resolved,
         &CompileLimits::default(),
@@ -575,7 +603,11 @@ fn the_two_party_workflow_compiles_from_documents_and_commits_through_the_owner(
         compile(
             &post,
             &context(ISSUER),
-            RequestId::from_u128(15),
+            RequestKey {
+                principal: ISSUER,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(15),
+            },
             &mut ids(15_000),
             &resolved,
             &CompileLimits::default()
@@ -679,7 +711,11 @@ fn the_remaining_verbs_name_their_reads_and_bind_committed_objects() {
                 compile(
                     &operation,
                     &context(ISSUER),
-                    RequestId::from_u128(1),
+                    RequestKey {
+                        principal: ISSUER,
+                        epoch: RequestEpoch(1),
+                        id: RequestId::from_u128(1),
+                    },
                     &mut ids(1_000),
                     &Resolved::default(),
                     &CompileLimits::default()
@@ -718,7 +754,11 @@ fn the_remaining_verbs_name_their_reads_and_bind_committed_objects() {
     let compiled = compile(
         &adopt,
         &context(ISSUER),
-        RequestId::from_u128(2),
+        RequestKey {
+            principal: ISSUER,
+            epoch: RequestEpoch(1),
+            id: RequestId::from_u128(2),
+        },
         &mut ids(2_000),
         &resolved,
         &CompileLimits::default(),
@@ -748,7 +788,11 @@ fn the_remaining_verbs_name_their_reads_and_bind_committed_objects() {
     let compiled = compile(
         &register,
         &context(ISSUER),
-        RequestId::from_u128(3),
+        RequestKey {
+            principal: ISSUER,
+            epoch: RequestEpoch(1),
+            id: RequestId::from_u128(3),
+        },
         &mut ids(3_000),
         &resolved,
         &CompileLimits::default(),
@@ -790,7 +834,11 @@ fn the_remaining_verbs_name_their_reads_and_bind_committed_objects() {
             compile(
                 &parse("monitor.register", document),
                 &context(ISSUER),
-                RequestId::from_u128(4),
+                RequestKey {
+                    principal: ISSUER,
+                    epoch: RequestEpoch(1),
+                    id: RequestId::from_u128(4),
+                },
                 &mut ids(4_000),
                 &resolved,
                 &CompileLimits::default()
@@ -813,7 +861,11 @@ fn the_remaining_verbs_name_their_reads_and_bind_committed_objects() {
         compile(
             &rebind,
             &context(ISSUER),
-            RequestId::from_u128(5),
+            RequestKey {
+                principal: ISSUER,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(5),
+            },
             &mut ids(5_000),
             &resolved,
             &CompileLimits::default()
@@ -836,7 +888,11 @@ fn creation_rules_are_checked_before_any_identity_leaves_the_compiler() {
         let error = compile(
             &operation,
             &context(ISSUER),
-            RequestId::from_u128(1),
+            RequestKey {
+                principal: ISSUER,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(1),
+            },
             &mut ids(1),
             &Resolved::default(),
             &limits,
@@ -882,7 +938,11 @@ fn creation_rules_are_checked_before_any_identity_leaves_the_compiler() {
         compile(
             &operation,
             &context(ISSUER),
-            RequestId::from_u128(0),
+            RequestKey {
+                principal: ISSUER,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(0),
+            },
             &mut ids(1),
             &Resolved::default(),
             &limits
@@ -902,7 +962,11 @@ fn creation_rules_are_checked_before_any_identity_leaves_the_compiler() {
         compile(
             &operation,
             &context(ISSUER),
-            RequestId::from_u128(1),
+            RequestKey {
+                principal: ISSUER,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(1),
+            },
             &mut ids(1),
             &Resolved::default(),
             &limits
@@ -942,7 +1006,11 @@ fn responses_need_diagnostics_for_failure_and_bind_content_to_the_authored_repor
         compile(
             &failed,
             &context(SUBJECT),
-            RequestId::from_u128(4),
+            RequestKey {
+                principal: SUBJECT,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(4),
+            },
             &mut ids(4000),
             &resolved,
             &CompileLimits::default()
@@ -964,7 +1032,11 @@ fn responses_need_diagnostics_for_failure_and_bind_content_to_the_authored_repor
     let first = compile(
         &cited,
         &context(SUBJECT),
-        RequestId::from_u128(5),
+        RequestKey {
+            principal: SUBJECT,
+            epoch: RequestEpoch(1),
+            id: RequestId::from_u128(5),
+        },
         &mut ids(5000),
         &resolved,
         &CompileLimits::default(),
@@ -987,7 +1059,11 @@ fn responses_need_diagnostics_for_failure_and_bind_content_to_the_authored_repor
     let second = compile(
         &other,
         &context(SUBJECT),
-        RequestId::from_u128(5),
+        RequestKey {
+            principal: SUBJECT,
+            epoch: RequestEpoch(1),
+            id: RequestId::from_u128(5),
+        },
         &mut ids(5000),
         &resolved,
         &CompileLimits::default(),
@@ -1167,7 +1243,11 @@ fn resolution_reads_wire_objects_and_selects_the_current_evaluation() {
     let compiled = compile(
         &begin,
         &context(EVALUATOR),
-        RequestId::from_u128(1),
+        RequestKey {
+            principal: EVALUATOR,
+            epoch: RequestEpoch(1),
+            id: RequestId::from_u128(1),
+        },
         &mut ids(1),
         &resolved,
         &CompileLimits::default(),
@@ -1191,7 +1271,11 @@ fn resolution_reads_wire_objects_and_selects_the_current_evaluation() {
     let compiled = compile(
         &report,
         &context(EVALUATOR),
-        RequestId::from_u128(2),
+        RequestKey {
+            principal: EVALUATOR,
+            epoch: RequestEpoch(1),
+            id: RequestId::from_u128(2),
+        },
         &mut ids(2),
         &resolved,
         &CompileLimits::default(),
@@ -1312,7 +1396,11 @@ fn a_challenge_cites_exact_committed_evidence_and_carries_its_policy_through_the
         let compiled = compile(
             &parse("claim.submit", stale),
             &context(ISSUER),
-            RequestId::from_u128(6),
+            RequestKey {
+                principal: ISSUER,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(6),
+            },
             &mut ids(6000),
             &Resolved::default(),
             &CompileLimits::default(),
@@ -1359,7 +1447,11 @@ fn a_challenge_cites_exact_committed_evidence_and_carries_its_policy_through_the
         compile(
             &parse("claim.submit", dependent),
             &context(ISSUER),
-            RequestId::from_u128(7),
+            RequestKey {
+                principal: ISSUER,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(7),
+            },
             &mut ids(7000),
             &Resolved::default(),
             &CompileLimits::default()

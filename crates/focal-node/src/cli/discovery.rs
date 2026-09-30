@@ -227,6 +227,8 @@ fn coverage(format: OutputFormat, output: &mut dyn Write) -> Result<()> {
                 NativeExposure::WireOnly => "wire_only",
                 NativeExposure::Activation => "activation",
                 NativeExposure::Retirement => "retirement",
+                NativeExposure::Seal => "seal",
+                NativeExposure::ClientProtocol => "client_protocol",
             },
             result: row.result,
             reads: row.reads,
@@ -597,7 +599,11 @@ pub(super) fn validate_online(
             let compiled = focal_native_client::compile(
                 &authored,
                 &context.build,
-                RequestId(super::random_id()?),
+                focal_model::RequestKey {
+                    principal: context.build.actor,
+                    epoch: focal_model::RequestEpoch(1),
+                    id: RequestId(super::random_id()?),
+                },
                 &mut ids,
                 &resolved,
                 &limits,

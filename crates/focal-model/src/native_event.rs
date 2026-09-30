@@ -67,6 +67,10 @@ pub enum NativeInvocationRef {
     Retirement {
         root: ClaimId,
     },
+    /// A committed seal of closed outcomes (F12), by its ordinal.
+    Seal {
+        ordinal: u64,
+    },
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

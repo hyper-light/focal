@@ -1120,7 +1120,9 @@ fn native_family(object: &NativeObject) -> Option<ObjectKind> {
         | NativeObject::Legacy(_)
         | NativeObject::Missing(_)
         | NativeObject::Retired(_)
-        | NativeObject::Archived(_) => return None,
+        | NativeObject::Archived(_)
+        | NativeObject::Epochs(_)
+        | NativeObject::Sealed(_) => return None,
     })
 }
 

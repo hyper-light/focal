@@ -68,6 +68,8 @@ pub(super) fn phase(key: Key) -> Result<usize, NativeError> {
         | Key::RetiredCycleHead(_)
         | Key::Retired(_)
         | Key::RetiredCycle(_)
+        | Key::Epochs(_)
+        | Key::Seal(_)
         | Key::WorkSlot(..)
         | Key::ClaimResultTestament(_)
         | Key::Outcome(_)

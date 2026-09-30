@@ -464,6 +464,76 @@ retired around. A checkpoint already encoded past its bound by the
 unchecked retirement is still refused at restore; its repair is a decision
 the remediation record leaves open.
 
+## 4a. Seals: the outcome history leaves the live core (F12, 2026-09-30)
+
+Retirement takes families and leaves their outcomes, so a session's lifetime
+history stayed its live capacity: every request's outcome row, kept for the
+exact retry that may still ask it, counted against `limits.outcomes` for good
+(the audit's F12). Resident outcomes are now exactly what the live path can
+still be asked: the open obligations and the unsealed tail. An outcome is
+closed when nothing asks it again through the live path — a request's once its
+generation is below its principal's floor ([21 §3](21-native-input-format.md):
+the fence answers `RequestHistoryExpired`, never executes the request again),
+a timer's once its claim retired (its rows left with the family), a
+retirement's and a seal's own as they are published. A **seal** is a session
+decision beside retirement: the authority derives from its committed state, at
+the committed prefix, the closed outcome and creation-result rows — whole
+generations of whole principals, then the retirements' and seals' own
+outcomes, at most a bundle's worth — writes them into an `FCNSEAL1` bundle
+under custody ([22 §3](22-native-record-format.md)), and proposes the
+`FOCALSO1` record naming the prefix, the bundle, the count it must derive, the
+bound of the derivation and the floors it forces. Every replica derives the
+same plan from the same prefix and applies it alike: the rows leave, each
+sealed principal's window records which seal holds which generations, the
+seal's row is written, the Meta counts the sealed rows and the seal, and the
+seal's own outcome is published at the next prefix. A record derived at an
+older prefix is inert and counted; a plan whose count differs from the
+record's is a divergence and fails closed; a replica whose resident outcome
+bound differs from the authority's derives other floors and fails closed by
+name (`OutcomeBound`), as for a retirement. While the record is in flight
+every other proposal is fenced (`Sealing`), and the owner is reconstructed at
+the next readiness barrier.
+
+**Pressure.** The live window is bounded for everyone (`limits.outcomes`) and
+shared among the principals with a window (each may hold at most its share:
+the window divided by the principals, at least one). When the resident
+outcomes and the candidates that may still be admitted (`limits.pending`)
+would pass the bound, the seal forces floors: the open generations least
+recently used — by the logical time of their last request, then by principal
+— close first, until what they hold covers the excess. The floors are derived
+deterministically from the committed state and named by the record, so every
+replica re-derives and checks them. A client whose generation was closed under
+it learns so by name on its next request, resolves the outcome it may already
+have from the seal, and continues in the generation the owner admits.
+
+**Reading a sealed outcome.** An exact retry of a sealed request is refused
+`RequestHistoryExpired`; its outcome is read by `request inspect --remote` (and
+the adapter's `request.inspect`): the owner answers an outcome read whose
+request's generation is sealed with where it went (`NativeObject::Sealed`: the
+seal's ordinal, bundle and length), and the client follows it
+(`NativeReadQuery::Sealed`) to the content owner, which reads the bundle under
+the tenant scope and answers the outcome row, descending folds to the member
+that holds it. A journal that lost the operation asks the owner's window
+(`NativeReadQuery::Epochs`) which generations to probe.
+
+**The index is bounded.** Seal rows are at most `limits.seals` (derived from
+the bundle's byte bound over a fold member's bytes); at the bound a seal
+carries a **fold**: the oldest half of the seal rows become one directory row
+keyed by the last of them, whose bundle names the members and every window
+range pointing into them, and every window's ranges follow it (adjacent
+ranges under one seal merge). A window's own ranges are bounded by the same
+count; the fold is applied to a window before the seal that carries it is
+recorded, so a window at the bound admits the seal that makes room. Seal
+bundles are content roots: the collector keeps them and a backup carries them.
+
+**Bounds and settings.** `limits.principals` bounds the windows (the
+enrollment bound); `limits.outcomes` sizes the window and is a node's own
+setting (`FOCAL_NATIVE_OUTCOMES` for qualification; every replica of a session
+runs under one value, or the seal record's bound names the difference). The
+archive agent proposes a seal on each tick when the pressure floors are
+non-empty or the closed rows reach half a bundle; a bundle whose copies have
+not all answered is re-offered next tick (`seals_waiting`), as a retirement's.
+
 ## 5. Reclaiming bytes: the collector (R8.5, 2026-09-10)
 
 **What is reclaimable.** Nothing the committed rows name, and nothing

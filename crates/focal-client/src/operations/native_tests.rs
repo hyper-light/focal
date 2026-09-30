@@ -212,9 +212,18 @@ fn coverage_table_maps_every_frame_tag_once_and_only_exposed_rows_have_descripto
             }
             NativeExposure::InternalTimer
             | NativeExposure::Activation
-            | NativeExposure::Retirement => {
+            | NativeExposure::Retirement
+            | NativeExposure::Seal => {
                 assert!(row.name.is_none() && row.tags.is_empty() && row.cli.is_empty());
                 assert_eq!(row.actor, NativeActor::Internal);
+                assert!(row.descriptor().is_none());
+            }
+            // The generation floor is a participant frame the journal issues
+            // by itself (F12): one tag, the issuer's authority, no tool.
+            NativeExposure::ClientProtocol => {
+                assert!(row.name.is_none() && row.cli.is_empty());
+                assert_eq!(row.tags, &[28]);
+                assert_eq!(row.actor, NativeActor::Issuer);
                 assert!(row.descriptor().is_none());
             }
             NativeExposure::WireOnly => {
@@ -223,7 +232,7 @@ fn coverage_table_maps_every_frame_tag_once_and_only_exposed_rows_have_descripto
             }
         }
     }
-    // Every participant frame tag 0..=27 belongs to exactly one operation.
+    // Every participant frame tag 0..=28 belongs to exactly one operation.
     assert_eq!(tags, (0..focal_wire::NATIVE_COMMAND_TAGS).collect());
     // Every native descriptor is claimed by exactly one exposed row; the
     // peer verbs are authored shapes of claim.submit and are claimed through

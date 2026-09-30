@@ -22,6 +22,7 @@ fn copy_row(row: &Row) -> Result<Row, MemoryError> {
         Row::Outcome(value) => Ok(Row::Outcome(*value)),
         Row::Event(value) => value.copy().map(Row::Event),
         Row::Index => Ok(Row::Index),
+        Row::Epochs(value) => value.copy().map(Row::Epochs),
         _ => panic!("unexpected row in Admission-only book fixture"),
     }
 }

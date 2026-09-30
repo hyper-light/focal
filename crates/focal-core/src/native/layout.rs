@@ -129,6 +129,8 @@ pub(super) fn family(key: &Key) -> u16 {
         Key::DueTimer(..) => 47,
         Key::ByObject(..) => 48,
         Key::Retired(_) => 49,
+        Key::Epochs(_) => 50,
+        Key::Seal(_) => 51,
         Key::End => u16::MAX,
     }
 }
@@ -164,9 +166,13 @@ pub(super) fn affinity(key: &Key) -> [u8; 16] {
             NativeInvocation::EvaluationDeadline(key) => key.evaluation.claim.0,
             NativeInvocation::ClaimDeadline(key) => key.claim.0,
             NativeInvocation::MonitorDeadline(key) => key.claim.0,
-            NativeInvocation::Import => CONTROL,
-            NativeInvocation::Retirement(root) => root.0,
+            // Retirements' and seals' own outcomes sit together under the
+            // control affinity: a seal walks them as one range (F12).
+            NativeInvocation::Import
+            | NativeInvocation::Retirement(_)
+            | NativeInvocation::Seal(_) => CONTROL,
         },
+        Key::Epochs(_) | Key::Seal(_) => CONTROL,
         Key::ArtifactIdentity(hash) => low(hash),
         Key::ClaimIdentity(_, hash) | Key::DefinitionIdentity(_, hash) => low(hash),
         Key::ByIssuer(participant, _)
@@ -290,6 +296,7 @@ impl Fields {
                 .n(key.generation),
             NativeInvocation::Import => self.n(4),
             NativeInvocation::Retirement(root) => self.n(5).id(root.0),
+            NativeInvocation::Seal(ordinal) => self.n(6).n(*ordinal),
         }
     }
     fn timer(self, target: &TimerTarget) -> Self {
@@ -333,6 +340,8 @@ fn order_key(key: &Key) -> OrderKey {
         Key::WorkSlot(cycle, slot) => fields.cycle(cycle).n(u64::from(*slot)),
         Key::Response(t) | Key::ResultTestament(t) | Key::LegacyTestament(t) => fields.id(t.0),
         Key::Outcome(invocation) | Key::CreationResult(invocation) => fields.invocation(invocation),
+        Key::Epochs(principal) => fields.id(principal.0),
+        Key::Seal(ordinal) => fields.n(*ordinal),
         Key::Event(sequence, ordinal) => fields.n(sequence.0).n(u64::from(*ordinal)),
         Key::ClaimIdentity(kind, hash) | Key::DefinitionIdentity(kind, hash) => {
             fields.n(u64::from(*kind)).hash(hash)

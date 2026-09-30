@@ -73,6 +73,8 @@ struct Cluster {
     inbox: Vec<Message>,
     clock: u64,
     serial: u128,
+    /// The request generation fresh requests are minted in (F12).
+    epoch: u64,
     boundaries: Vec<NativeReadBoundary>,
     /// Nodes whose retryable refusals (memory, custody) are expected.
     retry_ok: Vec<u64>,
@@ -123,6 +125,7 @@ impl Cluster {
             inbox,
             clock: 0,
             serial: 0,
+            epoch: 1,
             boundaries: Vec::new(),
             retry_ok: Vec::new(),
             fail_ok: Vec::new(),
@@ -296,7 +299,7 @@ impl Cluster {
     }
     fn next(&mut self, actor: ParticipantId) -> RequestKey {
         self.serial = self.serial.saturating_add(1);
-        fx::request(actor, 1, self.serial)
+        fx::request(actor, self.epoch, self.serial)
     }
     fn propose(&mut self, id: u64, actor: ParticipantId, input: NativeInput) -> NativeSubmission {
         self.clock = self.clock.saturating_add(1);
@@ -2019,6 +2022,297 @@ fn committed_retirements_apply_on_every_replica_and_fence_proposals() {
     assert_eq!(cluster.node(2).retired_families(), 1);
     assert_eq!(cluster.status(2, 1), None);
     assert_same_digest(&mut cluster, &[2, 3, 5, 6]);
+}
+
+/// The audit's F12: a seal is a session decision every replica applies
+/// alike. The issuer closes its first generation from its second; the
+/// authority derives the seal at the committed prefix and writes its
+/// bundle, as every replica derives it; only the authority proposes, a
+/// bundle that is none, a length that is none or a fold above the seal is
+/// refused, a pending candidate makes it wait and a plan from an older
+/// prefix is refused; while the record is in flight every other proposal
+/// is fenced. Every replica — one that receives the record in one delivery
+/// with what followed, one restarted from its own log, one caught up by a
+/// checkpoint — seals the same rows at the same prefix; the sealed
+/// request's exact retry and a fresh request of the closed generation are
+/// refused by name and never executed; the bundle answers what the request
+/// committed; the open generation's work goes on.
+#[test]
+fn committed_seals_apply_on_every_replica_fence_proposals_and_close_the_generation() {
+    use focal_core::native::record_codec::StructuralSeal;
+    use focal_core::native::seal::{
+        DEFAULT_SEAL_ROWS_PER_BUNDLE, Fold, SealBound, SealPlan, SealRefusal,
+    };
+    use focal_core::native::{NativeCommand, NativeInvocation, NativeOperation};
+    use focal_model::RequestEpoch;
+    let bound = |limits: focal_core::native::NativeLimits| SealBound {
+        principals: limits.principals,
+        rows: DEFAULT_SEAL_ROWS_PER_BUNDLE,
+    };
+    let mut cluster = Cluster::new();
+    cluster.elect(1, &[]);
+    let create = cluster.creation(1);
+    let first = create.request;
+    let created = cluster.commit(1, PARTIES.issuer, create, &[]);
+    for claim in 2..=3u128 {
+        let creation = cluster.creation(claim);
+        cluster.commit(1, PARTIES.issuer, creation, &[]);
+    }
+    // Nothing is closed: nothing to seal.
+    {
+        let core = cluster.node(1).committed_core().unwrap();
+        assert_eq!(
+            core.seal_plan(&[], bound(core.native_limits()))
+                .unwrap_err(),
+            SealRefusal::Nothing
+        );
+    }
+    // The issuer closes generation one from generation two.
+    cluster.epoch = 2;
+    let advance = NativeInput {
+        request: cluster.next(PARTIES.issuer),
+        command: NativeCommand::AdvanceEpochFloor {
+            minimum: RequestEpoch(2),
+        },
+    };
+    let advanced = cluster.commit(1, PARTIES.issuer, advance, &[]);
+    assert_eq!(advanced.operation, NativeOperation::AdvanceEpochFloor);
+    // A fresh request of the closed generation is refused by name before
+    // anything is proposed.
+    cluster.serial = cluster.serial.saturating_add(1);
+    let stale = creation_for(fx::request(PARTIES.issuer, 1, cluster.serial), 9);
+    cluster.clock = cluster.clock.saturating_add(1);
+    let clock = cluster.clock;
+    assert!(matches!(
+        cluster
+            .node(1)
+            .propose(fx::context(PARTIES.issuer, clock), stale),
+        Err(NativeSessionError::Owner(NativeOwnerError::Native(
+            NativeError::Contract(ContractError::RequestHistoryExpired)
+        )))
+    ));
+    // The plan and its bundle from the committed state, as any replica
+    // derives them.
+    fn derive(cluster: &mut Cluster, id: u64) -> (SealPlan, ContentHash, u64, Vec<u8>) {
+        let core = cluster.node(id).committed_core().unwrap();
+        let floors = core
+            .pressure_floors(crate::native_session::seal::MAX_FLOORS)
+            .unwrap();
+        assert!(floors.is_empty());
+        let plan = core
+            .seal_plan(
+                &floors,
+                focal_core::native::seal::SealBound {
+                    principals: core.native_limits().principals,
+                    rows: focal_core::native::seal::DEFAULT_SEAL_ROWS_PER_BUNDLE,
+                },
+            )
+            .unwrap();
+        let quote = core.seal_quote(&plan, limits().encoding).unwrap();
+        let mut bytes = vec![0; quote.bytes];
+        let hash = core.seal_into(&plan, &mut bytes, quote.visits).unwrap();
+        assert!(bytes.starts_with(b"FCNSEAL1"));
+        assert_eq!(hash, quote.hash);
+        (plan, hash, bytes.len() as u64, bytes)
+    }
+    let (plan, bundle, length, _) = derive(&mut cluster, 1);
+    assert_eq!(
+        (plan.outcomes(), plan.principals.len(), plan.ordinal),
+        (3, 1, 1)
+    );
+    let (on_two, bundle_on_two, length_on_two, _) = derive(&mut cluster, 2);
+    assert_eq!(
+        (on_two, bundle_on_two, length_on_two),
+        (plan.clone(), bundle, length)
+    );
+    // Only the authority proposes; a bundle that is none, a length that is
+    // none, or a fold at or above the seal's own ordinal is refused, and
+    // nothing is in flight after a refusal.
+    assert!(matches!(
+        cluster.node(2).propose_seal(&plan, bundle, length, None),
+        Err(NativeSessionError::NotReady { .. })
+    ));
+    for (root, bytes, fold) in [
+        (ContentHash([0; 32]), length, None),
+        (bundle, 0, None),
+        (
+            bundle,
+            length,
+            Some(Fold {
+                first: 1,
+                last: 1,
+                bundle,
+                bytes: 1,
+            }),
+        ),
+    ] {
+        assert!(matches!(
+            cluster.node(1).propose_seal(&plan, root, bytes, fold),
+            Err(NativeSessionError::Native(NativeError::Contract(
+                ContractError::InvalidManifest
+            )))
+        ));
+        assert!(cluster.node(1).seal_in_flight().is_none());
+    }
+    // A pending candidate holds the prefix: the seal waits; once the prefix
+    // moved, the plan is from an older prefix and is refused: derive again.
+    let fourth = cluster.creation(4);
+    let request = fourth.request;
+    let NativeSubmission::Pending { outcome, .. } = cluster.propose(1, PARTIES.issuer, fourth)
+    else {
+        panic!("a fresh proposal is pending until the log commits it");
+    };
+    assert!(matches!(
+        cluster.node(1).propose_seal(&plan, bundle, length, None),
+        Err(NativeSessionError::Capacity)
+    ));
+    for _ in 0..8 {
+        cluster.pump(&[]);
+        if cluster.node(1).outcome(request).unwrap() == Some(outcome) {
+            break;
+        }
+    }
+    assert_eq!(cluster.node(1).outcome(request).unwrap(), Some(outcome));
+    assert!(matches!(
+        cluster.node(1).propose_seal(&plan, bundle, length, None),
+        Err(NativeSessionError::Native(NativeError::Contract(
+            ContractError::InvalidManifest
+        )))
+    ));
+    let (plan, bundle, length, bytes) = derive(&mut cluster, 1);
+    let before = cluster.sequence(1);
+    assert_eq!(plan.through, before);
+    // Node 3 misses the seal and what follows; in flight, the record fences
+    // another seal, a native proposal, a retirement and a layout change.
+    cluster
+        .node(1)
+        .propose_seal(&plan, bundle, length, None)
+        .unwrap();
+    assert_eq!(
+        cluster.node(1).seal_in_flight().map(|record| record.count),
+        Some(plan.rows() as u64)
+    );
+    assert!(matches!(
+        cluster.node(1).propose_seal(&plan, bundle, length, None),
+        Err(NativeSessionError::Sealing)
+    ));
+    let fifth = cluster.creation(5);
+    cluster.clock = cluster.clock.saturating_add(1);
+    let clock = cluster.clock;
+    assert!(matches!(
+        cluster
+            .node(1)
+            .propose(fx::context(PARTIES.issuer, clock), fifth),
+        Err(NativeSessionError::Sealing)
+    ));
+    assert!(matches!(
+        cluster
+            .node(1)
+            .propose_retirement(ClaimId::from_u128(1), bundle, length, before),
+        Err(NativeSessionError::Sealing)
+    ));
+    assert!(matches!(
+        cluster.node(1).propose_layout(LayoutOperation::Split {
+            at: ClaimId::from_u128(2).0,
+            id: RangeId(33),
+        }),
+        Err(NativeSessionError::Sealing)
+    ));
+    cluster.pump(&[3]);
+    assert!(cluster.node(1).seal_in_flight().is_none());
+    cluster.settle(&[3]);
+    assert_eq!(cluster.sequence(1), SessionSeq(before.0 + 1));
+    // Work goes on in the open generation while node 3 is still cut off;
+    // it receives the seal and the work in one delivery.
+    let fifth = cluster.creation(5);
+    cluster.commit(1, PARTIES.issuer, fifth, &[3]);
+    cluster.settle(&[]);
+    cluster.pump(&[]);
+    assert_eq!(cluster.sequence(3), cluster.sequence(1));
+    assert_same_digest(&mut cluster, &[1, 2, 3, 4, 5]);
+    for id in 1..=3u64 {
+        assert_eq!(cluster.node(id).seals_applied(), 1, "node {id}");
+        assert_eq!(cluster.node(id).seals_inert(), 0, "node {id}");
+        let core = cluster.node(id).committed_core().unwrap();
+        let (ordinal, row) = core.native_seal(1).unwrap();
+        assert_eq!(ordinal, 1);
+        assert_eq!(
+            (row.bundle, row.bytes, row.count),
+            (bundle, length, plan.rows() as u64)
+        );
+        assert_eq!(
+            (row.through, row.sealed_at, row.first),
+            (before, SessionSeq(before.0 + 1), 1)
+        );
+        assert_eq!(core.native_outcome(NativeInvocation::Request(first)), None);
+        assert!(core.native_outcome(NativeInvocation::Seal(1)).is_some());
+        let window = core.native_epochs(PARTIES.issuer).unwrap();
+        assert_eq!(
+            (window.floor, window.sealed),
+            (RequestEpoch(2), RequestEpoch(2))
+        );
+        assert_eq!(window.seal_of(RequestEpoch(1)), Some(1));
+        assert!(core.native_claim(ClaimId::from_u128(1)).is_some());
+    }
+    // The sealed request's exact retry is refused by name on the authority
+    // and executes nothing; the bundle answers what it committed.
+    let sequence = cluster.sequence(1);
+    cluster.clock = cluster.clock.saturating_add(1);
+    let clock = cluster.clock;
+    assert!(matches!(
+        cluster
+            .node(1)
+            .propose(fx::context(PARTIES.issuer, clock), creation_for(first, 1)),
+        Err(NativeSessionError::Owner(NativeOwnerError::Native(
+            NativeError::Contract(ContractError::RequestHistoryExpired)
+        )))
+    ));
+    assert_eq!(cluster.sequence(1), sequence);
+    let inspected = StructuralSeal::inspect(&bytes, limits().inspection).unwrap();
+    assert_eq!(
+        inspected.outcome(NativeInvocation::Request(first)).unwrap(),
+        Some(created)
+    );
+    assert_eq!(
+        inspected
+            .header()
+            .member_of(PARTIES.issuer, RequestEpoch(1)),
+        Some(1)
+    );
+    // Nothing awaits a seal but the seal's own outcome; a second seal of
+    // generation one is not derivable.
+    {
+        let core = cluster.node(1).committed_core().unwrap();
+        let next = core.seal_plan(&[], bound(core.native_limits())).unwrap();
+        assert!(next.principals.is_empty());
+        assert_eq!((next.rows(), next.ordinal), (1, 2));
+    }
+    // A restart replays the record from its own log.
+    cluster.stop(2);
+    cluster.reopen(2).unwrap();
+    cluster.settle(&[]);
+    assert_eq!(cluster.node(2).seals_applied(), 1);
+    assert_same_digest(&mut cluster, &[1, 2, 3, 4, 5]);
+    // A follower caught up by the authority's checkpoint restores the seal
+    // row and the window, then replays the records after it.
+    let sixth = cluster.creation(6);
+    cluster.commit(1, PARTIES.issuer, sixth, &[3]);
+    cluster.node(1).begin_checkpoint().unwrap();
+    cluster.pump(&[3]);
+    assert!(!cluster.node(1).checkpoint_pending());
+    let seventh = cluster.creation(7);
+    cluster.commit(1, PARTIES.issuer, seventh, &[3]);
+    cluster.settle(&[]);
+    assert_eq!(cluster.sequence(3), cluster.sequence(1));
+    assert_same_digest(&mut cluster, &[1, 2, 3, 4, 5, 6, 7]);
+    let core = cluster.node(3).committed_core().unwrap();
+    assert_eq!(core.native_seal(1).map(|(_, row)| row.bundle), Some(bundle));
+    assert_eq!(
+        core.native_epochs(PARTIES.issuer)
+            .unwrap()
+            .seal_of(RequestEpoch(1)),
+        Some(1)
+    );
 }
 
 /// Three voters one under the outcome bound: the authority retires the

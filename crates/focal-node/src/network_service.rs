@@ -1884,6 +1884,26 @@ pub(crate) const DISK_HEADROOM_ENV: &str = "FOCAL_DISK_HEADROOM_BYTES";
 /// travels as seeds (25 §5). Unset keeps the standard 4 MiB; a campaign
 /// lowers it so every checkpoint is seeded.
 pub(crate) const SEED_INLINE_ENV: &str = "FOCAL_SEED_INLINE_BYTES";
+/// The resident outcome window of a native session (F12): the outcomes the
+/// live core keeps for exact retries and open obligations before the
+/// closed generations' outcomes seal into bundles under custody. Unset
+/// keeps the standard window; a campaign lowers it so the seals, the
+/// generation floors they force and the sealed reads run within a test's
+/// lifetime. It sizes memory: every replica of a session must run under
+/// the same window, or a seal record derived under one is refused by name
+/// under the other (`OutcomeBound`).
+pub(crate) const NATIVE_OUTCOMES_ENV: &str = "FOCAL_NATIVE_OUTCOMES";
+pub(crate) fn native_outcomes() -> Result<Option<usize>, focal_evidence::ContentError> {
+    match std::env::var_os(NATIVE_OUTCOMES_ENV) {
+        Some(value) => value
+            .to_str()
+            .and_then(|text| text.trim().parse::<usize>().ok())
+            .filter(|outcomes| *outcomes != 0)
+            .map(Some)
+            .ok_or(focal_evidence::ContentError::Invalid),
+        None => Ok(None),
+    }
+}
 pub(crate) fn seed_inline_bytes() -> Result<usize, focal_evidence::ContentError> {
     match std::env::var_os(SEED_INLINE_ENV) {
         Some(value) => value
@@ -1920,6 +1940,9 @@ pub(crate) fn native_limits(
     let mut limits = focal_ledger::NativeSessionLimits::standard(domain);
     limits.disk_headroom_bytes = disk_headroom_bytes()?;
     limits.checkpoint.inline_bytes = seed_inline_bytes()?;
+    if let Some(outcomes) = native_outcomes()? {
+        limits.recovery.native.outcomes = outcomes;
+    }
     // Committed records this node did not author are materialized in
     // dependency waves on up to four workers (doc 25 §2); the result is
     // byte-identical to the serial replay at any count.

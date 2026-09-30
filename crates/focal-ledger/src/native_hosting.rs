@@ -1132,6 +1132,43 @@ impl Session {
     pub fn native_retirements_inert(&self) -> Result<u64, LedgerError> {
         Ok(self.native_engine()?.retirements_inert())
     }
+    /// Whether this authority could propose a seal now (F12): the archive
+    /// agent asks before it derives a plan and writes a bundle.
+    pub fn native_check_seal(&self) -> Result<(), LedgerError> {
+        self.check()?;
+        let engine = self
+            .native
+            .as_deref()
+            .ok_or(LedgerError::NativeUnsupported)?;
+        engine.check_seal(&self.consensus.status())?;
+        Ok(())
+    }
+    /// Propose one seal of closed outcomes as a session decision (F12).
+    pub fn native_propose_seal(
+        &mut self,
+        plan: &focal_core::native::seal::SealPlan,
+        bundle: ContentHash,
+        bytes: u64,
+        fold: Option<focal_core::native::seal::Fold>,
+    ) -> Result<(), LedgerError> {
+        self.check()?;
+        let engine = self
+            .native
+            .as_deref_mut()
+            .ok_or(LedgerError::NativeUnsupported)?;
+        engine.propose_seal(&mut self.consensus, plan, bundle, bytes, fold)?;
+        Ok(())
+    }
+    /// Seals applied through this replica's applied prefix, and the seal
+    /// records it applied nothing for (F12).
+    pub fn native_seals(&self) -> Result<(u64, u64), LedgerError> {
+        let engine = self.native_engine()?;
+        Ok((engine.seals_applied(), engine.seals_inert()))
+    }
+    /// The seal this authority proposed and has not seen applied (F12).
+    pub fn native_seal_in_flight(&self) -> Result<Option<crate::native_session::SealRecord>, LedgerError> {
+        Ok(self.native_engine()?.seal_in_flight())
+    }
     /// Propose one family's retirement as a session decision (26 §4).
     pub fn native_propose_retirement(
         &mut self,

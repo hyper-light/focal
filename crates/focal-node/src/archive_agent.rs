@@ -46,6 +46,8 @@ pub struct ArchiveAgent {
     ticks: u64,
     proposed: u64,
     waiting: u64,
+    seals_proposed: u64,
+    seals_waiting: u64,
     status: watch::Sender<AdminArchiveAgent>,
 }
 
@@ -66,6 +68,8 @@ impl ArchiveAgent {
             ticks: 0,
             proposed: 0,
             waiting: 0,
+            seals_proposed: 0,
+            seals_waiting: 0,
             last_tick_ms: 0,
         });
         (
@@ -76,6 +80,8 @@ impl ArchiveAgent {
                 ticks: 0,
                 proposed: 0,
                 waiting: 0,
+                seals_proposed: 0,
+                seals_waiting: 0,
                 status,
             },
             ArchiveHandle(receiver),
@@ -88,6 +94,8 @@ impl ArchiveAgent {
             ticks: self.ticks,
             proposed: self.proposed,
             waiting: self.waiting,
+            seals_proposed: self.seals_proposed,
+            seals_waiting: self.seals_waiting,
             last_tick_ms: now_ms(),
         };
         let _ = self.status.send(status);
@@ -123,9 +131,69 @@ impl ArchiveAgent {
             // A replica that is not native, not authoritative, or refuses
             // the walk simply waits for a later tick.
             let _ = self.step(ledger, &host, handles).await;
+            let _ = self.seal_step(ledger, &host, handles).await;
         }
         self.ticks = self.ticks.saturating_add(1);
         self.publish();
+    }
+    /// One seal for the replica when the committed state yields one worth
+    /// proposing (F12): the bundle (and a fold's) sealed as content under
+    /// custody first, the record proposed once every required copy holds
+    /// them.
+    async fn seal_step(
+        &mut self,
+        ledger: LedgerId,
+        host: &ReplicaHost,
+        handles: &NetworkHandles,
+    ) -> Result<(), AccessError> {
+        let Some(sealed) = host
+            .seal_bundle()
+            .await
+            .map_err(|_| AccessError::Unavailable)?
+        else {
+            return Ok(());
+        };
+        let crate::fleet::SealedOutcomes {
+            plan,
+            bundle,
+            fold,
+            _allocation,
+            ..
+        } = sealed;
+        let policy = handles
+            .content
+            .policy(ledger)
+            .await?
+            .ok_or(AccessError::Unavailable)?;
+        let route = policy.scope().route_epoch;
+        let outcome = handles.evidence.archive(ledger, route, bundle).await?;
+        let folded = match fold {
+            Some((plan, bytes, _)) => {
+                let outcome = handles.evidence.archive(ledger, route, bytes).await?;
+                Some((plan, outcome))
+            }
+            None => None,
+        };
+        drop(_allocation);
+        if !outcome.obligation.satisfied()
+            || folded
+                .as_ref()
+                .is_some_and(|(_, outcome)| !outcome.obligation.satisfied())
+        {
+            self.seals_waiting = self.seals_waiting.saturating_add(1);
+            return Ok(());
+        }
+        let fold = folded.map(|(plan, outcome)| focal_core::native::seal::Fold {
+            first: plan.first,
+            last: plan.last,
+            bundle: outcome.reference.root,
+            bytes: outcome.reference.length,
+        });
+        host.propose_seal(plan, outcome.reference.root, outcome.reference.length, fold)
+            .await
+            .map_err(|_| AccessError::Unavailable)?;
+        self.seals_proposed = self.seals_proposed.saturating_add(1);
+        Ok(())
     }
     async fn step(
         &mut self,

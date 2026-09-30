@@ -517,6 +517,15 @@ fn dispatch(
                     query,
                     limits,
                 ),
+                NativeReadQuery::Sealed(query) => crate::archive_reads::sealed_page(
+                    &node.content,
+                    request.ledger,
+                    peer,
+                    request.route_epoch,
+                    read,
+                    query,
+                    limits,
+                ),
                 _ => crate::native_reads::local(
                     &mut node.session,
                     peer,

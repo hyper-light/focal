@@ -456,6 +456,14 @@ fn render_list_page(page: NativeListPage, format: OutputFormat) -> Result<()> {
 }
 
 /// One blocking linearizable read per driver requirement on this context.
+/// One blocking submission of an exact journaled frame over this context's
+/// connection.
+pub(super) fn submits<'a>(
+    runtime: &'a tokio::runtime::Runtime,
+    context: &'a Context,
+) -> impl FnMut(RequestEnvelope) -> std::result::Result<NativeMutationReply, DriveError> + 'a {
+    move |request| Ok(runtime.block_on(context.client.submit_native(request))?)
+}
 pub(super) fn reads<'a>(
     runtime: &'a tokio::runtime::Runtime,
     context: &'a Context,
@@ -498,14 +506,23 @@ pub(super) fn submit(
         .transpose()?;
     let store = store(context, true)?.ok_or(CliError::InvalidResponse)?;
     let limits = CompileLimits::default();
+    let preparation = Preparation {
+        store: &store,
+        context: context.operation,
+        build: &context.build,
+        profile: profile(standing),
+        limits: &limits,
+    };
+    // The journal's own upkeep first (F12): the generation floor advances
+    // once every earlier operation was reported.
+    focal_native_client::maintain(
+        &preparation,
+        &mut random_id,
+        &mut reads(runtime, context),
+        &mut submits(runtime, context),
+    )?;
     let prepared = focal_native_client::prepare(
-        &Preparation {
-            store: &store,
-            context: context.operation,
-            build: &context.build,
-            profile: profile(standing),
-            limits: &limits,
-        },
+        &preparation,
         &operation,
         requested,
         &mut random_id,
@@ -558,6 +575,19 @@ fn drive(
             Err(CliError::Unconfirmed)
         }
         Ok(NativeMutationReply::Refused(refusal)) => {
+            // A generation the owner closed before this frame reached it
+            // (F12): the outcome, when the request had committed, is read
+            // from the seal and delivered as the receipt it is.
+            if refusal.kind == NativeRefusalKind::Refused(NativeErrorCode::RequestHistoryExpired)
+                && let Some(receipt) = focal_native_client::expired(
+                    store,
+                    &context.operation,
+                    &operation,
+                    &mut reads(runtime, context),
+                )?
+            {
+                return deliver(&receipt);
+            }
             let classified = failure::native(&refusal);
             render_failure(
                 &operation,
@@ -691,9 +721,19 @@ pub(super) fn inspect(
     if remote {
         // The owner's committed outcome for this request key; it does not
         // need this adapter's journal, so an operation another adapter
-        // journaled under the same context is observable here.
-        let page =
-            focal_native_client::outcome(id.key(&context.operation), &mut reads(runtime, context))?;
+        // journaled under the same context is observable here. The journal
+        // names the generation when it has the operation; without it the
+        // owner's window says which generations to ask (F12).
+        let key =
+            store(context, false)?.and_then(|store| store.key_of(id, &context.operation).ok());
+        let page = match key {
+            Some(key) => focal_native_client::outcome(key, &mut reads(runtime, context))?,
+            None => focal_native_client::outcome_by_id(
+                context.operation.principal,
+                id.request(),
+                &mut reads(runtime, context),
+            )?,
+        };
         return render_page_as("Observed", page, format);
     }
     let store = store(context, false)?.ok_or(NativeStoreError::MissingOperation)?;

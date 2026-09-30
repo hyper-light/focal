@@ -1,5 +1,6 @@
 //! Check actual control prefixes and real model graph/scope replacements.
 use super::*;
+use crate::native::claim_changes::Admitted;
 use crate::native::{
     control_graph, monitor_index,
     prepare::{Extras, Scratch},
@@ -370,15 +371,19 @@ fn creation_with_new_parent_child_and_supersession_keeps_true_original_prefix() 
     let Staged {
         plan,
         extras,
-        meta,
+        mut meta,
         outcome,
         mut scratch,
     } = staged;
+    let window = crate::native::epochs::staged(&view(&core), &mut meta, outcome, core.limits);
     OriginalPlan::check(
         plan,
         extras,
-        meta,
-        outcome,
+        Admitted {
+            meta,
+            outcome,
+            window,
+        },
         &view(&core),
         core.limits,
         &mut scratch,

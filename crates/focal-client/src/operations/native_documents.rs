@@ -35,6 +35,12 @@ pub enum NativeAuthoredOperation {
     ValidationReport(NativeReportDocument),
     #[serde(rename = "claim.release_scope")]
     ClaimReleaseScope(NativeClaimTargetDocument),
+    /// The journal's own protocol operation (F12): advance the principal's
+    /// request generation floor to `minimum`, closing every generation
+    /// below it. Issued by the journal once every operation of the earlier
+    /// generations was reported; never an authored tool.
+    #[serde(rename = "epoch.advance")]
+    EpochAdvance(NativeEpochAdvanceDocument),
     #[serde(rename = "receipt.adopt")]
     ReceiptAdopt(NativeAdoptReceiptDocument),
     #[serde(rename = "artifact.fail")]
@@ -74,6 +80,7 @@ impl NativeAuthoredOperation {
             Self::ClaimCorrect(_) => &native_catalog::NATIVE_CLAIM_CORRECT,
             Self::ClaimFollowUp(_) => &native_catalog::NATIVE_CLAIM_FOLLOW_UP,
             Self::ClaimReleaseScope(_) => &native_catalog::NATIVE_CLAIM_RELEASE_SCOPE,
+            Self::EpochAdvance(_) => &native_catalog::NATIVE_EPOCH_ADVANCE,
             Self::ReceiptAdopt(_) => &native_catalog::NATIVE_RECEIPT_ADOPT,
             Self::ArtifactFail(_) => &native_catalog::NATIVE_ARTIFACT_FAIL,
             Self::ArtifactReceive(_) => &native_catalog::NATIVE_ARTIFACT_RECEIVE,
@@ -589,6 +596,7 @@ pub fn parse_native_json(name: &str, bytes: &[u8]) -> Result<NativeAuthoredOpera
         "validation.begin" => document!(ValidationBegin),
         "validation.report" => document!(ValidationReport),
         "claim.release_scope" => document!(ClaimReleaseScope),
+        "epoch.advance" => document!(EpochAdvance),
         "receipt.adopt" => document!(ReceiptAdopt),
         "artifact.fail" => document!(ArtifactFail),
         "artifact.receive" => document!(ArtifactReceive),
@@ -969,6 +977,12 @@ pub struct NativeCheckDocument {
 #[serde(deny_unknown_fields)]
 pub struct NativeClaimTargetDocument {
     pub claim: String,
+}
+/// The generation floor a journal advances its principal to (F12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeEpochAdvanceDocument {
+    pub minimum: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

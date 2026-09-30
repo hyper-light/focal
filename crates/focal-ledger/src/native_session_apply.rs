@@ -438,6 +438,79 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         self.retired_families = self.retired_families.saturating_add(1);
         Ok(())
     }
+    /// Apply a committed seal record (F12): inert when the prefix it named
+    /// has passed or a movement is pending — the same on every replica, and
+    /// counted (`seals_inert`); otherwise the same plan is derived from the
+    /// committed state under the floors and the bound the record names, and
+    /// the same rows leave this replica alike behind the seal's row. The
+    /// floors are the pressure floors of the prefix: a replica that derives
+    /// others under another resident outcome bound than the authority's is
+    /// configured apart from it and fails closed by name (`OutcomeBound`),
+    /// as for a retirement; under the same bound they are a divergence
+    /// (`Corrupt`), as is a plan whose count is not the record's. On an
+    /// authority the record ends every pending candidate first; the owner
+    /// is reconstructed at the next readiness barrier.
+    fn apply_seal(&mut self, data: &[u8]) -> Result<(), NativeSessionError> {
+        let record = seal::SealRecord::decode(data)?;
+        if record.ledger != self.ledger {
+            return Err(NativeSessionError::Corrupt);
+        }
+        if self.seal.as_ref() == Some(&record) {
+            self.seal = None;
+        }
+        if self.sequence()? != record.expected_prefix {
+            self.seals_inert = self.seals_inert.saturating_add(1);
+            return Ok(());
+        }
+        if self
+            .movement
+            .as_ref()
+            .is_some_and(|movement| movement.pending().is_some())
+        {
+            self.seals_inert = self.seals_inert.saturating_add(1);
+            return Ok(());
+        }
+        if !self.pending.is_empty() {
+            self.resolve_suffix(SuffixEvidence::Retired)?;
+        } else if matches!(self.domain, Some(Domain::Active(..))) {
+            self.passive_for_replay()?;
+        }
+        self.readiness_requested = None;
+        self.reconstruction_needed = true;
+        let local = u64::try_from(self.limits.recovery.native.outcomes).unwrap_or(u64::MAX);
+        let Some(Domain::Passive(core)) = self.domain.as_mut() else {
+            return Err(NativeSessionError::Failed);
+        };
+        let floors = core
+            .pressure_floors(record.floors.len())
+            .map_err(NativeSessionError::Native)?;
+        if floors != record.floors {
+            if record.outcome_limit != local {
+                return Err(NativeSessionError::OutcomeBound {
+                    committed: record.outcome_limit,
+                    local,
+                });
+            }
+            return Err(NativeSessionError::Corrupt);
+        }
+        let applied = core.apply_seal(focal_core::native::seal::SealRecord {
+            floors: &record.floors,
+            bound: record.bound,
+            bundle: record.bundle,
+            bytes: record.bytes,
+            count: record.count,
+            fold: record.fold,
+        });
+        match applied {
+            Ok(_) => {}
+            Err(error @ (NativeError::Memory(_) | NativeError::Capacity(_))) => {
+                return Err(error.into());
+            }
+            Err(_) => return Err(NativeSessionError::Corrupt),
+        }
+        self.seals_applied = self.seals_applied.saturating_add(1);
+        Ok(())
+    }
     /// Apply a committed movement record (25 §6): the coordinator's step at
     /// the current native prefix under a proof minted from the entry; inert
     /// when the committed state refuses it, the same on every replica.
@@ -523,6 +596,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             self.genesis_proposed = false;
             self.layout_change = None;
             self.retirement = None;
+            self.seal = None;
             if let Some(movement) = self.movement.as_mut() {
                 movement.in_flight = None;
             }
@@ -537,6 +611,7 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             || data.starts_with(&range::MAGIC)
             || data.starts_with(&movement::MAGIC)
             || data.starts_with(&retirement::MAGIC)
+            || data.starts_with(&seal::MAGIC)
     }
     /// Caller-issued read barriers carry this correlation namespace.
     pub(crate) fn is_correlated_read(context: &[u8]) -> bool {
@@ -606,6 +681,14 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
                 return Err(NativeSessionError::Corrupt);
             }
             self.apply_retirement(&entry.data)?;
+            self.applied_raft = entry.index;
+            return Ok(());
+        }
+        if entry.data.starts_with(&seal::MAGIC) {
+            if self.genesis.is_none() {
+                return Err(NativeSessionError::Corrupt);
+            }
+            self.apply_seal(&entry.data)?;
             self.applied_raft = entry.index;
             return Ok(());
         }

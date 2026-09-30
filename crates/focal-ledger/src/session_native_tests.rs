@@ -2868,7 +2868,7 @@ fn a_sustained_workload_stays_within_its_budgets_and_keeps_every_outcome() {
                         | ContentRoot::Inline { pointer, .. } => {
                             protection.protect_object(domain, pointer.root).unwrap();
                         }
-                        ContentRoot::Bundle { root, .. } => {
+                        ContentRoot::Bundle { root, .. } | ContentRoot::Seal { root, .. } => {
                             protection.protect_object(domain, root).unwrap();
                         }
                     }

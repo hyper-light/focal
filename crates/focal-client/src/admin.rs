@@ -312,6 +312,10 @@ pub struct AdminArchiveAgent {
     pub proposed: u64,
     /// Bundles sealed whose required copies have not all answered yet.
     pub waiting: u64,
+    /// Seal records proposed (F12), and seal bundles whose required copies
+    /// have not all answered yet.
+    pub seals_proposed: u64,
+    pub seals_waiting: u64,
     pub last_tick_ms: u64,
 }
 /// One hosted native session's retention as the storage view lists it.

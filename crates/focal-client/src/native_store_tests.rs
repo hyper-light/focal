@@ -36,19 +36,15 @@ pub(crate) fn frame(ledger: LedgerId, key: RequestKey, command: u8) -> Vec<u8> {
     bytes.extend_from_slice(b"body");
     bytes
 }
-fn prepared(context: &OperationContext, id: RequestId, command: u8) -> PreparedNativeRequest {
-    let key = RequestKey {
-        principal: context.principal,
-        epoch: RequestEpoch(1),
-        id,
-    };
+fn prepared(context: &OperationContext, key: RequestKey, command: u8) -> PreparedNativeRequest {
+    assert_eq!(key.principal, context.principal);
     PreparedNativeRequest {
         request: RequestEnvelope {
             protocol: NATIVE_PROTOCOL_VERSION,
             ledger: context.ledger,
             route_epoch: RouteEpoch(1),
-            request_epoch: RequestEpoch(1),
-            request_id: id,
+            request_epoch: key.epoch,
+            request_id: key.id,
             operation: Operation::Native {
                 frame: frame(context.ledger, key, command),
             },
@@ -60,13 +56,9 @@ fn prepared(context: &OperationContext, id: RequestId, command: u8) -> PreparedN
         }],
     }
 }
-fn receipt(context: &OperationContext, id: RequestId, fingerprint: ContentHash) -> NativeReceipt {
+fn receipt(operation: &NativeOperation, fingerprint: ContentHash) -> NativeReceipt {
     NativeReceipt {
-        invocation: NativeInvocationRef::Request(RequestKey {
-            principal: context.principal,
-            epoch: RequestEpoch(1),
-            id,
-        }),
+        invocation: NativeInvocationRef::Request(operation.key()),
         sequence: SessionSeq(4),
         logical_time: 10,
         operation: NativeOperationKind::Post,
@@ -176,7 +168,7 @@ fn prepare_claims_an_identity_once_then_retry_returns_the_exact_frame_and_binds_
     ));
 
     // Only a receipt proving this exact frame is recorded.
-    let wrong_intent = receipt(&context, operation.id.request(), ContentHash([5; 32]));
+    let wrong_intent = receipt(&operation, ContentHash([5; 32]));
     assert!(matches!(
         store.record_reply(
             operation.id,
@@ -197,7 +189,7 @@ fn prepare_claims_an_identity_once_then_retry_returns_the_exact_frame_and_binds_
         store.record_delivered(operation.id, &context),
         Err(NativeStoreError::NotCommitted)
     ));
-    let committed = receipt(&context, operation.id.request(), operation.fingerprint);
+    let committed = receipt(&operation, operation.fingerprint);
     assert_eq!(
         store
             .record_reply(
@@ -282,7 +274,7 @@ fn prepare_claims_an_identity_once_then_retry_returns_the_exact_frame_and_binds_
     assert_eq!(reopened.refusal, Some(capacity.clone()));
     assert!(reopened.receipt.is_none() && reopened.delivered);
     assert_eq!(reopened.request, refused.request);
-    let committed_late = receipt(&context, refused.id.request(), refused.fingerprint);
+    let committed_late = receipt(&refused, refused.fingerprint);
     assert_eq!(
         store
             .record_reply(
@@ -356,7 +348,7 @@ fn a_reported_operation_retires_when_a_claim_needs_its_slot_and_its_identity_sta
                 Ok(prepared(&context, id, 10 + round))
             })
             .unwrap();
-        let committed = receipt(&context, operation.id.request(), operation.fingerprint);
+        let committed = receipt(&operation, operation.fingerprint);
         store
             .record_reply(
                 operation.id,
@@ -478,11 +470,7 @@ fn a_failed_or_interrupted_claim_holds_no_slot() {
         .record_reply(
             operation.id,
             &context,
-            &NativeMutationReply::Committed(receipt(
-                &context,
-                operation.id.request(),
-                operation.fingerprint,
-            )),
+            &NativeMutationReply::Committed(receipt(&operation, operation.fingerprint)),
         )
         .unwrap();
     store.record_delivered(operation.id, &context).unwrap();
@@ -536,7 +524,7 @@ fn concurrent_transitions_never_lose_a_committed_receipt() {
                 Ok(prepared(&context, id, 1 + round % 20))
             })
             .unwrap();
-        let committed = receipt(&context, operation.id.request(), operation.fingerprint);
+        let committed = receipt(&operation, operation.fingerprint);
         let id = operation.id;
         let (a, b) = (
             NativeOperationStore::open(&path, limits).unwrap(),
@@ -694,4 +682,216 @@ fn capacity_and_limits_are_enforced_and_stored_with_the_catalogue() {
         )
         .is_err()
     );
+}
+
+fn issue(
+    store: &NativeOperationStore,
+    context: &OperationContext,
+    generator: &mut impl IdGenerator,
+    command: u8,
+) -> NativeOperation {
+    store
+        .prepare(*context, intent(b"{}"), None, generator, |key| {
+            Ok(prepared(context, key, command))
+        })
+        .unwrap()
+}
+fn deliver(store: &NativeOperationStore, context: &OperationContext, operation: &NativeOperation) {
+    store
+        .record_reply(
+            operation.id,
+            context,
+            &NativeMutationReply::Committed(receipt(operation, operation.fingerprint)),
+        )
+        .unwrap();
+    store.record_delivered(operation.id, context).unwrap();
+}
+
+/// The audit's F12: a journal issues its operations in generations. Half
+/// its capacity issued in the current one, with the floor standing there,
+/// opens the next; once every operation of the generations below the
+/// current is delivered the floor is due, and its advance — issued in the
+/// current generation, committed — moves the floor there. A retired
+/// identity keeps the generation it was issued in. The owner's word of a
+/// floor forced past this journal moves it to where the owner admits, and
+/// the generation the owner already holds open after the floor is
+/// continued in rather than a third opened. Reopening keeps it all.
+#[test]
+fn a_journal_rotates_its_generation_and_advances_its_floor_when_the_old_one_is_delivered() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("native");
+    let limits = NativeStoreLimits {
+        max_operations: 4,
+        max_reserved_bytes: 16 * 1024 * 1024,
+    };
+    let store = NativeOperationStore::create(&path, limits).unwrap();
+    let context = context();
+    let mut generator = ids(900);
+    let a = issue(&store, &context, &mut generator, 10);
+    let b = issue(&store, &context, &mut generator, 11);
+    assert_eq!(a.key().epoch, RequestEpoch(1));
+    assert_eq!(b.key().epoch, RequestEpoch(1));
+    assert_eq!(
+        store.generations().unwrap(),
+        (RequestEpoch(1), RequestEpoch(1))
+    );
+    assert_eq!(store.key_of(a.id, &context).unwrap(), a.key());
+    assert_eq!(store.floor_due().unwrap(), None);
+    // Two of four issued in generation one and the floor at it: the next
+    // opens with the third operation.
+    let c = issue(&store, &context, &mut generator, 12);
+    assert_eq!(c.key().epoch, RequestEpoch(2));
+    assert_eq!(
+        store.generations().unwrap(),
+        (RequestEpoch(2), RequestEpoch(1))
+    );
+    // The floor is due once every operation below the current generation
+    // is delivered, not before.
+    assert_eq!(store.floor_due().unwrap(), None);
+    deliver(&store, &context, &a);
+    assert_eq!(store.floor_due().unwrap(), None);
+    deliver(&store, &context, &b);
+    assert_eq!(store.floor_due().unwrap(), Some(RequestEpoch(2)));
+    // The advance is issued in the current generation; its committed
+    // receipt moves the floor there, and nothing is due until the next
+    // generation opens.
+    let advance = store
+        .prepare(
+            context,
+            OperationIntent {
+                name: EPOCH_ADVANCE,
+                version: 1,
+                canonical: br#"{"minimum":2}"#,
+            },
+            None,
+            &mut generator,
+            |key| Ok(prepared(&context, key, 28)),
+        )
+        .unwrap();
+    assert_eq!(advance.key().epoch, RequestEpoch(2));
+    assert_eq!(
+        store.generations().unwrap(),
+        (RequestEpoch(2), RequestEpoch(1))
+    );
+    store
+        .record_reply(
+            advance.id,
+            &context,
+            &NativeMutationReply::Committed(receipt(&advance, advance.fingerprint)),
+        )
+        .unwrap();
+    assert_eq!(
+        store.generations().unwrap(),
+        (RequestEpoch(2), RequestEpoch(2))
+    );
+    assert_eq!(store.floor_due().unwrap(), None);
+    store.record_delivered(advance.id, &context).unwrap();
+    assert_eq!(store.floor_due().unwrap(), None);
+    // Two issued in generation two and the floor there: the next operation
+    // opens generation three — taking the room of the operation reported
+    // longest ago, whose identity keeps its generation.
+    let d = issue(&store, &context, &mut generator, 13);
+    assert_eq!(d.key().epoch, RequestEpoch(3));
+    assert_eq!(
+        store.generations().unwrap(),
+        (RequestEpoch(3), RequestEpoch(2))
+    );
+    assert!(matches!(
+        store.retry(a.id, &context),
+        Err(NativeStoreError::Retired)
+    ));
+    assert_eq!(store.key_of(a.id, &context).unwrap(), a.key());
+    assert_eq!(store.key_of(d.id, &context).unwrap(), d.key());
+    // Generation two is not delivered (c): the floor is not due.
+    assert_eq!(store.floor_due().unwrap(), None);
+    deliver(&store, &context, &c);
+    assert_eq!(store.floor_due().unwrap(), Some(RequestEpoch(3)));
+    // The owner's floor, forced past this journal: the journal moves up to
+    // it and issues there; the generation the owner holds open after the
+    // floor is continued in; a floor below the journal's changes nothing.
+    store
+        .observe_window(RequestEpoch(5), RequestEpoch(5))
+        .unwrap();
+    assert_eq!(
+        store.generations().unwrap(),
+        (RequestEpoch(5), RequestEpoch(5))
+    );
+    assert_eq!(store.floor_due().unwrap(), None);
+    let e = issue(&store, &context, &mut generator, 14);
+    assert_eq!(e.key().epoch, RequestEpoch(5));
+    store
+        .observe_window(RequestEpoch(5), RequestEpoch(6))
+        .unwrap();
+    assert_eq!(
+        store.generations().unwrap(),
+        (RequestEpoch(6), RequestEpoch(5))
+    );
+    store
+        .observe_window(RequestEpoch(3), RequestEpoch(4))
+        .unwrap();
+    assert_eq!(
+        store.generations().unwrap(),
+        (RequestEpoch(6), RequestEpoch(5))
+    );
+    // An operation of a closed generation, undelivered, never blocks the
+    // floor of a later one: the owner closed it, and the journal's floor
+    // stands past it already.
+    assert_eq!(store.floor_due().unwrap(), None);
+    let reopened = NativeOperationStore::open(&path, limits).unwrap();
+    assert_eq!(
+        reopened.generations().unwrap(),
+        (RequestEpoch(6), RequestEpoch(5))
+    );
+    assert_eq!(reopened.key_of(e.id, &context).unwrap(), e.key());
+    assert_eq!(reopened.key_of(a.id, &context).unwrap(), a.key());
+}
+
+/// A catalogue written before request generations (schema two) is read
+/// once more and carried forward: every operation and retired identity in
+/// the first generation, the journal at generation one with its floor
+/// there, and as many issued as it held.
+#[test]
+fn a_catalogue_from_before_generations_is_carried_into_the_first_generation() {
+    let context = context();
+    let old = CatalogueV2 {
+        schema: 2,
+        limits: NativeStoreLimits::default(),
+        entries: [(
+            [7; 16],
+            EntryV2 {
+                context,
+                intent: [1; 32],
+                ready: true,
+                retirable: Some(3),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        retired: [(
+            [8; 16],
+            RetiredV2 {
+                intent: [2; 32],
+                outcome: NativeRetired::Refused,
+                order: 2,
+            },
+        )]
+        .into_iter()
+        .collect(),
+        retired_next: 4,
+    };
+    let carried = Catalogue::from(old);
+    assert_eq!(carried.schema, CATALOGUE_SCHEMA);
+    assert_eq!(
+        (carried.generation, carried.floor, carried.issued),
+        (1, 1, 2)
+    );
+    assert_eq!(carried.retired_next, 4);
+    let entry = carried.entries.get(&[7; 16]).unwrap();
+    assert_eq!(
+        (entry.epoch, entry.ready, entry.retirable),
+        (1, true, Some(3))
+    );
+    let retired = carried.retired.get(&[8; 16]).unwrap();
+    assert_eq!((retired.epoch, retired.order), (1, 2));
+    assert_eq!(retired.outcome, NativeRetired::Refused);
 }

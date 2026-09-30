@@ -270,6 +270,10 @@ impl GcAgent {
                                 .map_err(|_| AccessError::Capacity)?;
                             bundles.push((root, bytes));
                         }
+                        // A seal's bundle (F12) names no content of its own.
+                        ContentRoot::Seal { root, .. } => {
+                            protection.protect_object(domain, root).map_err(content)?;
+                        }
                     }
                 }
                 cursor = page.next;

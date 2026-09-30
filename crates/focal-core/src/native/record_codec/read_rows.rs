@@ -101,8 +101,13 @@ fn decode_fixed(key: Key, c: &mut Cursor<'_>) -> Result<Option<Row>, CodecError>
             monitor_links: count(c)?,
             creation_results: count(c)?,
             legacy: count(c)?,
+            sealed: count(c)?,
+            sealed_events: count(c)?,
+            seals: count(c)?,
+            principals: count(c)?,
             logical_time: c.u64()?,
         }),
+        Key::Seal(_) => Row::Seal(fixed::read_seal_row(c)?),
         Key::ArtifactIdentity(_) => Row::ArtifactIdentity(ArtifactId(c.fixed()?)),
         Key::Receipt(_) => Row::Receipt(NativeReceipt {
             claim: ClaimId(c.fixed()?),
@@ -231,6 +236,7 @@ fn invocation(value: NativeInvocation) -> bool {
         }
         NativeInvocation::Import => true,
         NativeInvocation::Retirement(root) => !root.is_zero(),
+        NativeInvocation::Seal(ordinal) => ordinal != 0,
     }
 }
 
@@ -284,6 +290,8 @@ pub(super) fn check_fixed(key: Key, row: &Row, ledger: LedgerId) -> Result<(), N
                 && chain(row.diagnostic_head.map(|id| id.0), row.diagnostic_count)
                 && optional_nonzero(row.response.map(|id| id.0))
         }
+        (Key::Seal(ordinal), Row::Seal(row)) => row.valid(ordinal),
+        (Key::Epochs(principal), Row::Epochs(row)) => !principal.is_zero() && row.valid(),
         (Key::Retired(claim), Row::Retired(row)) => {
             !claim.is_zero()
                 && row.binding.object.0 == claim.0
@@ -329,6 +337,7 @@ pub(super) fn check_fixed(key: Key, row: &Row, ledger: LedgerId) -> Result<(), N
                         | NativeOperation::MonitorDeadline
                         | NativeOperation::Import
                         | NativeOperation::Retire
+                        | NativeOperation::Seal
                 ),
                 NativeInvocation::EvaluationDeadline(_) => {
                     row.operation == NativeOperation::EvaluationDeadline
@@ -344,6 +353,9 @@ pub(super) fn check_fixed(key: Key, row: &Row, ledger: LedgerId) -> Result<(), N
                 }
                 NativeInvocation::Retirement(_) => {
                     row.operation == NativeOperation::Retire && row.events == 0
+                }
+                NativeInvocation::Seal(_) => {
+                    row.operation == NativeOperation::Seal && row.events == 0
                 }
             };
             key == row.invocation
@@ -477,6 +489,92 @@ impl EventPlan {
     }
 }
 
+/// A principal's generation window as recorded (F12): the scalars read, the
+/// ranges borrowed until built, so a refused row costs no heap.
+pub(super) struct EpochsPlan<'a> {
+    floor: RequestEpoch,
+    sealed: RequestEpoch,
+    open: u8,
+    counts: [OpenEpoch; OPEN_EPOCHS],
+    ranges: &'a [u8],
+    count: usize,
+}
+const RANGE_BYTES: usize = 24;
+/// Building one range reads its three fields: each one operation and its
+/// eight bytes.
+const RANGE_VISITS: usize = RANGE_BYTES + 3;
+impl<'a> EpochsPlan<'a> {
+    pub(super) fn read(
+        key: Key,
+        cursor: &mut Cursor<'a>,
+        max_ranges: usize,
+    ) -> Result<Self, NativeError> {
+        let Key::Epochs(principal) = key else {
+            return Err(invalid());
+        };
+        if principal.is_zero() {
+            return Err(invalid());
+        }
+        let floor = RequestEpoch(cursor.u64().map_err(codec)?);
+        let sealed = RequestEpoch(cursor.u64().map_err(codec)?);
+        let open = cursor.u8().map_err(codec)?;
+        let mut counts = [OpenEpoch::default(); OPEN_EPOCHS];
+        for count in &mut counts {
+            count.outcomes = cursor.u32().map_err(codec)?;
+            count.last = cursor.u64().map_err(codec)?;
+        }
+        let count = cursor.count(max_ranges).map_err(codec)?;
+        let ranges = cursor
+            .take(
+                count
+                    .checked_mul(RANGE_BYTES)
+                    .ok_or(ContractError::Capacity)?,
+            )
+            .map_err(codec)?;
+        Ok(Self {
+            floor,
+            sealed,
+            open,
+            counts,
+            ranges,
+            count,
+        })
+    }
+    pub(super) fn heap_bytes(&self) -> Result<usize, NativeError> {
+        EpochWindow::heap_of(self.count)
+    }
+    pub(super) const fn build_visits(&self) -> usize {
+        self.count.saturating_mul(RANGE_VISITS).saturating_add(1)
+    }
+    pub(super) fn build(
+        self,
+        allowance: usize,
+        max_visits: usize,
+    ) -> Result<(Row, usize), NativeError> {
+        if self.heap_bytes()? > allowance || self.build_visits() > max_visits {
+            return Err(ContractError::Capacity.into());
+        }
+        let mut ranges = Vec::new();
+        ranges
+            .try_reserve_exact(self.count)
+            .map_err(|_| MemoryError::AllocationFailed)?;
+        let mut cursor = Cursor::new(self.ranges, self.ranges.len(), max_visits).map_err(codec)?;
+        for _ in 0..self.count {
+            ranges.push(SealedRange {
+                first: RequestEpoch(cursor.u64().map_err(codec)?),
+                last: RequestEpoch(cursor.u64().map_err(codec)?),
+                seal: cursor.u64().map_err(codec)?,
+            });
+        }
+        cursor.finish().map_err(codec)?;
+        let window = EpochWindow::new(self.floor, self.sealed, self.open, self.counts, ranges)?;
+        let actual = window.heap_charge()?;
+        if actual > allowance {
+            return Err(ContractError::Capacity.into());
+        }
+        Ok((Row::Epochs(window), actual))
+    }
+}
 fn check_event(event: NativeEvent, ledger: LedgerId) -> Result<(), NativeError> {
     let valid = match event.fact {
         NativeFact::ResultTestament {

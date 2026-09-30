@@ -105,6 +105,8 @@ pub(super) fn copy(row: &Row) -> Result<Row, MemoryError> {
         Row::Cycle(cycle) => Ok(Row::Cycle(*cycle)),
         Row::RetiredCycleHead(row) => Ok(Row::RetiredCycleHead(*row)),
         Row::Retired(row) => Ok(Row::Retired(*row)),
+        Row::Seal(row) => Ok(Row::Seal(*row)),
+        Row::Epochs(row) => row.copy().map(Row::Epochs),
         Row::RetiredCycle(row) => Ok(Row::RetiredCycle(*row)),
         Row::WorkSlot(id) => Ok(Row::WorkSlot(*id)),
         Row::ClaimResultTestament(id) => Ok(Row::ClaimResultTestament(*id)),
@@ -472,6 +474,7 @@ impl Core<NativeState> {
             NativeCommand::RebindMonitor { .. } => NativeOperation::RebindMonitor,
             NativeCommand::CancelMonitor { .. } => NativeOperation::CancelMonitor,
             NativeCommand::ReleaseScope { .. } => NativeOperation::ReleaseScope,
+            NativeCommand::AdvanceEpochFloor { .. } => NativeOperation::AdvanceEpochFloor,
             NativeCommand::GenerateResultTestament { .. } => {
                 NativeOperation::GenerateResultTestament
             }
@@ -563,7 +566,9 @@ impl Core<NativeState> {
         }
         meta.logical_time = logical_time;
         meta.outcomes = add(meta.outcomes, 1)?;
-        within(meta.outcomes, self.limits.outcomes)?;
+        if meta.outcomes.saturating_sub(meta.sealed) > self.limits.outcomes {
+            return Err(NativeError::Capacity("outcomes"));
+        }
         let sequence = SessionSeq(
             view.prefix()
                 .0
@@ -655,9 +660,14 @@ impl Core<NativeState> {
         }
         meta.logical_time = context.logical_time;
         meta.outcomes = add(meta.outcomes, 1)?;
-        if meta.outcomes > self.limits.outcomes {
+        if meta.outcomes.saturating_sub(meta.sealed) > self.limits.outcomes {
             return Err(NativeError::Capacity("outcomes"));
         }
+        // The generation fence (F12), after the exact-retry lookup and the
+        // window's own bound: a request below its principal's floor is
+        // refused here, never executed; the window itself is written by
+        // the build.
+        super::epochs::check(&view, meta, request, self.limits)?;
         let sequence = SessionSeq(
             view.prefix()
                 .0
@@ -717,7 +727,9 @@ impl Core<NativeState> {
         }
         meta.logical_time = logical_time;
         meta.outcomes = add(meta.outcomes, 1)?;
-        within(meta.outcomes, self.limits.outcomes)?;
+        if meta.outcomes.saturating_sub(meta.sealed) > self.limits.outcomes {
+            return Err(NativeError::Capacity("outcomes"));
+        }
         let sequence = SessionSeq(
             view.prefix()
                 .0
@@ -1352,19 +1364,43 @@ impl<'a> Fresh<'a> {
             )),
             _ => None,
         };
+        let mut window = None;
         let plan = match dispatch {
-            Dispatch::Request { input, context } => transactions::prepare(
-                input.command,
-                input.request,
-                evidence,
-                context,
-                cut,
-                &view,
-                limits,
-                &mut meta,
-                &mut extras,
-                &mut scratch,
-            )?,
+            Dispatch::Request { input, context } => {
+                // The principal's window as this request leaves it (F12):
+                // admitted here again on the same facts the fence saw, and
+                // written beside the meta and the outcome.
+                let mut window_scratch = Scratch {
+                    used: 0,
+                    max: construction.window_bytes,
+                };
+                let mut admitted = super::epochs::admit(
+                    &view,
+                    &mut meta,
+                    input.request,
+                    logical_time,
+                    limits,
+                    &mut window_scratch,
+                )?;
+                let plan = if let NativeCommand::AdvanceEpochFloor { minimum } = input.command {
+                    super::epochs::prepare_advance(context, input.request, minimum, &mut admitted)?
+                } else {
+                    transactions::prepare(
+                        input.command,
+                        input.request,
+                        evidence,
+                        context,
+                        cut,
+                        &view,
+                        limits,
+                        &mut meta,
+                        &mut extras,
+                        &mut scratch,
+                    )?
+                };
+                window = Some((input.request.principal, admitted));
+                plan
+            }
             Dispatch::Deadline { resolved, .. } => {
                 if resolved.begun && deadline_envelope.is_none() {
                     return Err(ContractError::InvalidPolicy.into());
@@ -1499,11 +1535,19 @@ impl<'a> Fresh<'a> {
             limits.events,
             "events",
         )?;
+        let control = if window.is_some() {
+            super::prepare_budget::REQUEST_CONTROL_ROWS
+        } else {
+            super::prepare_budget::TIMER_CONTROL_ROWS
+        };
         let original = claim_changes::OriginalPlan::check(
             plan,
             extras,
-            meta,
-            outcome,
+            claim_changes::Admitted {
+                meta,
+                outcome,
+                window,
+            },
             &view,
             limits,
             &mut scratch,
@@ -1523,7 +1567,7 @@ impl<'a> Fresh<'a> {
             usize::try_from(outcome.events).map_err(|_| NativeError::Capacity("event count"))?;
         let final_extras = changes
             .len()
-            .checked_sub(add(add(changed, events)?, add(2, index)?)?)
+            .checked_sub(add(add(changed, events)?, add(control, index)?)?)
             .ok_or(ContractError::InvalidManifest)?;
         construction.check_counts(changed, final_extras, events, index)?;
         if final_meta.events != add(view.meta().events, events)? {

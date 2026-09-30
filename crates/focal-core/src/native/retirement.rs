@@ -142,6 +142,10 @@ fn names_member(key: Key, member: ClaimId) -> bool {
             result.evaluation.claim == member
         }
         Key::ArtifactInput(object, _) => object.0 == member.0,
+        // A timer's outcome is its claim's (F12); a request's never.
+        Key::Outcome(NativeInvocation::ClaimDeadline(key)) => key.claim == member,
+        Key::Outcome(NativeInvocation::MonitorDeadline(key)) => key.claim == member,
+        Key::Outcome(NativeInvocation::EvaluationDeadline(key)) => key.evaluation.claim == member,
         Key::Outcome(_) | Key::CreationResult(_) => false,
         other => match index_rows::primary(other) {
             Some(index_rows::Primary::Claim(claim)) => claim == member,
@@ -310,7 +314,13 @@ impl Closure<'_> {
             if layout::affinity(&entry.key) != affinity {
                 break;
             }
-            if matches!(entry.key, Key::Outcome(_) | Key::CreationResult(_)) {
+            // An outcome under an object's affinity is one of its timers'
+            // (F12): it leaves with the family, into the bundle, since
+            // nothing re-delivers a retired object's timer. Requests'
+            // outcomes sit under their principal, never here.
+            if matches!(entry.key, Key::CreationResult(_))
+                || matches!(entry.key, Key::Outcome(NativeInvocation::Request(_)))
+            {
                 continue;
             }
             if found.len() >= MAX_FAMILY_ROWS {
@@ -353,7 +363,7 @@ impl Core<NativeState> {
     /// before it derives one. One row read.
     pub fn check_retirement_outcome(&self) -> Result<(), RetirementRefusal> {
         let outcomes = match self.state.rows.get(&Key::Meta) {
-            Some(Row::Meta(meta)) => meta.outcomes,
+            Some(Row::Meta(meta)) => meta.outcomes.saturating_sub(meta.sealed),
             _ => return Err(RetirementRefusal::Corrupt),
         };
         if outcomes
@@ -728,6 +738,7 @@ impl Core<NativeState> {
         }
         if meta
             .outcomes
+            .saturating_sub(meta.sealed)
             .checked_add(1)
             .is_none_or(|outcomes| outcomes > self.limits.outcomes)
         {
@@ -788,6 +799,22 @@ impl Core<NativeState> {
                 Row::Monitor(_) => Some(&mut meta.monitors),
                 Row::MonitorLink(_) => Some(&mut meta.monitor_links),
                 Row::Event(_) => Some(&mut meta.events),
+                Row::Outcome(outcome) => {
+                    // A timer's outcome leaving with the family is sealed
+                    // in its bundle (F12), its events with it.
+                    meta.sealed = meta
+                        .sealed
+                        .checked_add(1)
+                        .ok_or(NativeError::Capacity("sealed outcomes"))?;
+                    meta.sealed_events = meta
+                        .sealed_events
+                        .checked_add(
+                            usize::try_from(outcome.events)
+                                .map_err(|_| NativeError::Capacity("sealed events"))?,
+                        )
+                        .ok_or(NativeError::Capacity("sealed events"))?;
+                    None
+                }
                 _ => None,
             };
             if let Some(counter) = counter {

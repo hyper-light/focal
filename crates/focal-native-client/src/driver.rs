@@ -146,7 +146,7 @@ pub fn prepare(
         },
         requested,
         &mut operation_ids,
-        |request| {
+        |request: RequestKey| {
             let mut expand = || -> Result<PreparedNativeRequest, DriveError> {
                 let resolved = resolve(preparation.build.ledger, operation, reads)?;
                 let mut object_ids = || ids.borrow_mut().next_id();
@@ -170,8 +170,8 @@ pub fn prepare(
                         protocol: NATIVE_PROTOCOL_VERSION,
                         ledger: preparation.build.ledger,
                         route_epoch: RouteEpoch(1),
-                        request_epoch: RequestEpoch(1),
-                        request_id: request,
+                        request_epoch: request.epoch,
+                        request_id: request.id,
                         operation: Operation::Native { frame },
                     },
                     fingerprint,
@@ -438,15 +438,179 @@ fn read_page(
     })
 }
 
+/// One blocking submission of an exact journaled frame. The host supplies
+/// the transport and cancellation; the driver supplies only the request.
+pub type Submits<'a> = dyn FnMut(RequestEnvelope) -> Result<NativeMutationReply, DriveError> + 'a;
+
+/// The journal's own upkeep before an operation (F12): when every operation
+/// of the earlier generations was reported and the current generation is
+/// above the floor, the floor advance is issued as a journaled protocol
+/// operation and its receipt recorded. A pending ticket or a refusal leaves
+/// the journal as it was: the next upkeep asks again. The receipt, when
+/// the floor moved now.
+pub fn maintain(
+    preparation: &Preparation<'_>,
+    ids: &mut dyn IdGenerator,
+    reads: &mut Reads<'_>,
+    submit: &mut Submits<'_>,
+) -> Result<Option<NativeReceipt>, DriveError> {
+    let Some(minimum) = preparation.store.floor_due()? else {
+        return Ok(None);
+    };
+    let operation = NativeAuthoredOperation::EpochAdvance(
+        focal_client::operations::NativeEpochAdvanceDocument { minimum: minimum.0 },
+    );
+    let prepared = prepare(preparation, &operation, None, ids, reads)?;
+    if let Some(receipt) = prepared.receipt {
+        preparation
+            .store
+            .record_delivered(prepared.id, &preparation.context)?;
+        return Ok(Some(receipt));
+    }
+    match submit(prepared.request.clone())? {
+        reply @ NativeMutationReply::Committed(receipt) => {
+            preparation
+                .store
+                .record_reply(prepared.id, &preparation.context, &reply)?;
+            preparation
+                .store
+                .record_delivered(prepared.id, &preparation.context)?;
+            Ok(Some(receipt))
+        }
+        NativeMutationReply::Refused(refusal) => {
+            preparation
+                .store
+                .record_refusal(prepared.id, &preparation.context, &refusal)?;
+            Ok(None)
+        }
+        NativeMutationReply::Pending(_) => Ok(None),
+    }
+}
+
+/// An operation refused because its generation expired (F12): the owner
+/// forced the principal's floor past it. Its outcome, when the request had
+/// committed before — read from the seal and recorded as the operation's
+/// receipt — else `None`, and the journal learns the owner's window so its
+/// next operation is issued in a generation the owner admits.
+pub fn expired(
+    store: &NativeOperationStore,
+    context: &OperationContext,
+    operation: &NativeOperation,
+    reads: &mut Reads<'_>,
+) -> Result<Option<NativeReceipt>, DriveError> {
+    let key = operation.key();
+    let page = outcome(key, reads)?;
+    if let Some(NativeObject::Outcome(receipt)) = page.objects.first()
+        && receipt.invocation == NativeInvocationRef::Request(key)
+    {
+        let receipt = **receipt;
+        store.record_reply(
+            operation.id,
+            context,
+            &NativeMutationReply::Committed(receipt),
+        )?;
+        return Ok(Some(receipt));
+    }
+    let window = reads(NativeReadRequest {
+        consistency: ReadConsistency::Linearizable,
+        query: NativeReadQuery::Epochs(context.principal),
+        max_items: 1,
+    })?;
+    if let Some(NativeObject::Epochs(window)) = window.objects.first() {
+        let next = RequestEpoch(
+            window
+                .floor
+                .0
+                .saturating_add(u64::try_from(window.open.len()).unwrap_or(u64::MAX)),
+        );
+        store.observe_window(window.floor, next)?;
+    }
+    Ok(None)
+}
+
+/// The most generations a recovery without the journal probes (F12): the
+/// open ones, then the sealed ones newest first.
+pub const RECOVERY_PROBES: usize = 64;
+
+/// The committed outcome of one request identity without its journal
+/// (F12): the owner's window says which generations the principal has
+/// open; each is asked, then the sealed generations newest first, within
+/// [`RECOVERY_PROBES`]. The page of the first outcome found, else the last
+/// page asked (`Missing`).
+pub fn outcome_by_id(
+    principal: ParticipantId,
+    id: RequestId,
+    reads: &mut Reads<'_>,
+) -> Result<NativeReadPage, DriveError> {
+    let window = reads(NativeReadRequest {
+        consistency: ReadConsistency::Linearizable,
+        query: NativeReadQuery::Epochs(principal),
+        max_items: 1,
+    })?;
+    let Some(NativeObject::Epochs(window)) = window.objects.first() else {
+        return Err(ClientError::InvalidResponse.into());
+    };
+    let mut epochs: Vec<RequestEpoch> = Vec::new();
+    epochs
+        .try_reserve_exact(RECOVERY_PROBES)
+        .map_err(|_| InputError::Capacity)?;
+    for open in window.open.iter().rev() {
+        if epochs.len() < RECOVERY_PROBES {
+            epochs.push(open.epoch);
+        }
+    }
+    'ranges: for range in window.ranges.iter().rev() {
+        let mut epoch = range.last.0;
+        while epoch >= range.first.0 {
+            if epochs.len() >= RECOVERY_PROBES {
+                break 'ranges;
+            }
+            epochs.push(RequestEpoch(epoch));
+            let Some(previous) = epoch.checked_sub(1) else {
+                break;
+            };
+            epoch = previous;
+        }
+    }
+    let mut last = None;
+    for epoch in epochs {
+        let key = RequestKey {
+            principal,
+            epoch,
+            id,
+        };
+        let page = outcome(key, reads)?;
+        if matches!(page.objects.first(), Some(NativeObject::Outcome(_))) {
+            return Ok(page);
+        }
+        last = Some(page);
+    }
+    last.ok_or_else(|| ClientError::InvalidResponse.into())
+}
+
 /// The committed outcome of one journaled operation, read from the owner by
 /// its request key: the cross-tool recovery read when the local journal of
 /// another adapter is not at hand.
 pub fn outcome(key: RequestKey, reads: &mut Reads<'_>) -> Result<NativeReadPage, DriveError> {
-    reads(NativeReadRequest {
+    let page = reads(NativeReadRequest {
         consistency: ReadConsistency::Linearizable,
         query: NativeReadQuery::Outcome(NativeInvocationRef::Request(key)),
         max_items: 1,
-    })
+    })?;
+    // An outcome that left the live core into a seal (F12) is read from
+    // the seal's bundle: the owner said where.
+    match page.objects.first() {
+        Some(NativeObject::Sealed(sealed)) => reads(NativeReadRequest {
+            consistency: ReadConsistency::Linearizable,
+            query: NativeReadQuery::Sealed(NativeSealQuery {
+                bundle: sealed.bundle,
+                bytes: sealed.bytes,
+                request: key,
+            }),
+            max_items: 1,
+        }),
+        _ => Ok(page),
+    }
 }
 
 /// One blocking bounded list. The host supplies the envelope, transport and

@@ -38,8 +38,11 @@ pub mod range;
 pub mod retention;
 #[path = "native_session_retirement.rs"]
 pub mod retirement;
+#[path = "native_session_seal.rs"]
+pub mod seal;
 pub use range::LayoutOperation;
 pub use retirement::RetirementRecord;
+pub use seal::SealRecord;
 #[path = "native_session_movement.rs"]
 pub mod movement;
 pub use movement::{LedgerRangeVerifier, MovementRecord};
@@ -261,6 +264,10 @@ pub enum NativeSessionError {
     Range(focal_ranges::RangeError),
     #[error("a committed retirement is in flight; propose again once it applies")]
     Retiring,
+    #[error("a committed seal is in flight; propose again once it applies")]
+    Sealing,
+    #[error("seal refused: {0:?}")]
+    Seal(focal_core::native::seal::SealRefusal),
     #[error("retirement refused: {0:?}")]
     Retirement(focal_core::native::retirement::RetirementRefusal),
     /// A committed retirement the authority checked against an outcome
@@ -317,8 +324,9 @@ impl NativeSessionError {
             | Self::CustodyPending
             | Self::LayoutChanging
             | Self::Retiring
+            | Self::Sealing
             | Self::RangeMoving => Retryable,
-            Self::Retirement(_) => Request,
+            Self::Retirement(_) | Self::Seal(_) => Request,
             Self::Range(
                 focal_ranges::RangeError::Capacity | focal_ranges::RangeError::Memory(_),
             ) => Retryable,
@@ -738,6 +746,33 @@ impl<S: NativeSchemaVerifier> NativeSession<S> {
     /// The retirement this authority proposed and has not seen applied.
     pub fn retirement_in_flight(&self) -> Option<RetirementRecord> {
         self.engine.retirement_in_flight()
+    }
+    /// Propose one seal of closed outcomes as a session decision (F12): the
+    /// plan is derived from the committed state first, so an applicable
+    /// record is what the log carries. Refused under the retirement's
+    /// gates, while a seal or a retirement is in flight, or when the plan
+    /// does not name the committed prefix.
+    pub fn propose_seal(
+        &mut self,
+        plan: &focal_core::native::seal::SealPlan,
+        bundle: ContentHash,
+        bytes: u64,
+        fold: Option<focal_core::native::seal::Fold>,
+    ) -> Result<(), NativeSessionError> {
+        self.engine
+            .propose_seal(&mut self.consensus, plan, bundle, bytes, fold)
+    }
+    /// The seal this authority proposed and has not seen applied.
+    pub fn seal_in_flight(&self) -> Option<SealRecord> {
+        self.engine.seal_in_flight()
+    }
+    /// Seals applied through this replica's applied prefix.
+    pub fn seals_applied(&self) -> u64 {
+        self.engine.seals_applied()
+    }
+    /// Committed seal records this replica applied nothing for.
+    pub fn seals_inert(&self) -> u64 {
+        self.engine.seals_inert()
     }
     /// Families retired through this replica's applied prefix (26 §4),
     /// counted from genesis or the checkpoint that seeded it.

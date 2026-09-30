@@ -134,18 +134,21 @@ pub struct NativeIdentity {
     pub id: [u8; 16],
 }
 
-/// `n1:` plus the request identity. The request epoch is fixed at one for
-/// native operations; exactness comes from the request key and the frame.
+/// `n1:` plus the request identity. An operation is keyed by the request
+/// generation it was issued in (F12): the journal's current generation at
+/// the claim, kept with the operation; exactness comes from the request key
+/// and the frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NativeOperationId(RequestId);
 impl NativeOperationId {
     pub fn request(self) -> RequestId {
         self.0
     }
-    pub fn key(self, context: &OperationContext) -> RequestKey {
+    /// The request key under `context` in generation `epoch`.
+    pub fn key_in(self, context: &OperationContext, epoch: RequestEpoch) -> RequestKey {
         RequestKey {
             principal: context.principal,
-            epoch: RequestEpoch(1),
+            epoch,
             id: self.0,
         }
     }
@@ -203,8 +206,9 @@ impl NativeOperation {
             NativeStage::Pending
         }
     }
+    /// The request key the frame was issued under: its own generation.
     pub fn key(&self) -> RequestKey {
-        self.id.key(&self.context)
+        self.id.key_in(&self.context, self.request.request_epoch)
     }
 }
 
@@ -221,6 +225,30 @@ struct EntryV1 {
     intent: [u8; 32],
     ready: bool,
 }
+/// The catalogue as schema 2 wrote it (before the request generations of
+/// F12): read once more and carried forward, every operation in the first
+/// generation.
+#[derive(Serialize, Deserialize)]
+struct CatalogueV2 {
+    schema: u16,
+    limits: NativeStoreLimits,
+    entries: BTreeMap<[u8; 16], EntryV2>,
+    retired: BTreeMap<[u8; 16], RetiredV2>,
+    retired_next: u64,
+}
+#[derive(Serialize, Deserialize)]
+struct EntryV2 {
+    context: OperationContext,
+    intent: [u8; 32],
+    ready: bool,
+    retirable: Option<u64>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct RetiredV2 {
+    intent: [u8; 32],
+    outcome: NativeRetired,
+    order: u64,
+}
 #[derive(Serialize, Deserialize)]
 struct Catalogue {
     schema: u16,
@@ -233,10 +261,23 @@ struct Catalogue {
     retired: BTreeMap<[u8; 16], Retired>,
     /// The order the next report or retirement takes.
     retired_next: u64,
+    /// The request generation a fresh operation is issued in (F12): opened
+    /// by its first request; the next one opens once half the journal's
+    /// occupancy was issued here and the floor stands at this generation.
+    generation: u64,
+    /// The generation the owner's floor stands at as this journal advanced
+    /// it, or learned it: every earlier generation is closed.
+    floor: u64,
+    /// Operations issued in the current generation.
+    issued: u32,
 }
-const CATALOGUE_SCHEMA: u16 = 2;
+const CATALOGUE_SCHEMA: u16 = 3;
+/// The name of the journal's own floor advance (F12): the descriptor the
+/// protocol operation carries.
+pub const EPOCH_ADVANCE: &str = "epoch.advance";
 impl From<CatalogueV1> for Catalogue {
     fn from(old: CatalogueV1) -> Self {
+        let issued = u32::try_from(old.entries.len()).unwrap_or(u32::MAX);
         Self {
             schema: CATALOGUE_SCHEMA,
             limits: old.limits,
@@ -251,12 +292,61 @@ impl From<CatalogueV1> for Catalogue {
                             intent: entry.intent,
                             ready: entry.ready,
                             retirable: None,
+                            epoch: 1,
                         },
                     )
                 })
                 .collect(),
             retired: BTreeMap::new(),
             retired_next: 0,
+            generation: 1,
+            floor: 1,
+            issued,
+        }
+    }
+}
+impl From<CatalogueV2> for Catalogue {
+    fn from(old: CatalogueV2) -> Self {
+        let issued =
+            u32::try_from(old.entries.len().saturating_add(old.retired.len())).unwrap_or(u32::MAX);
+        Self {
+            schema: CATALOGUE_SCHEMA,
+            limits: old.limits,
+            entries: old
+                .entries
+                .into_iter()
+                .map(|(id, entry)| {
+                    (
+                        id,
+                        Entry {
+                            context: entry.context,
+                            intent: entry.intent,
+                            ready: entry.ready,
+                            retirable: entry.retirable,
+                            epoch: 1,
+                        },
+                    )
+                })
+                .collect(),
+            retired: old
+                .retired
+                .into_iter()
+                .map(|(id, retired)| {
+                    (
+                        id,
+                        Retired {
+                            intent: retired.intent,
+                            outcome: retired.outcome,
+                            order: retired.order,
+                            epoch: 1,
+                        },
+                    )
+                })
+                .collect(),
+            retired_next: old.retired_next,
+            generation: 1,
+            floor: 1,
+            issued,
         }
     }
 }
@@ -270,6 +360,8 @@ struct Entry {
     /// A capacity refusal keeps the frame for its retry and is never
     /// retirable.
     retirable: Option<u64>,
+    /// The request generation the operation was issued in (F12).
+    epoch: u64,
 }
 /// What a delivered operation leaves behind: the intent it was bound to and
 /// how it ended, so an exact retry is answered and the identity is never
@@ -279,6 +371,7 @@ struct Retired {
     intent: [u8; 32],
     outcome: NativeRetired,
     order: u64,
+    epoch: u64,
 }
 /// How a retired operation ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,6 +400,13 @@ impl Catalogue {
             || self.retired.keys().any(|id| *id == [0; 16])
             || self.retired.keys().any(|id| self.entries.contains_key(id))
             || self.retired.len() > limits.max_operations as usize
+            || self.generation == 0
+            || self.floor == 0
+            || self.floor > self.generation
+            || self
+                .entries
+                .values()
+                .any(|entry| entry.epoch == 0 || entry.epoch > self.generation)
         {
             return Err(NativeStoreError::Corrupt);
         }
@@ -349,7 +449,7 @@ impl Catalogue {
         outcome: NativeRetired,
         limits: NativeStoreLimits,
     ) -> Result<(), NativeStoreError> {
-        self.entries.remove(&id);
+        let epoch = self.entries.remove(&id).map_or(1, |entry| entry.epoch);
         let order = self.next_order()?;
         self.retired.insert(
             id,
@@ -357,6 +457,7 @@ impl Catalogue {
                 intent,
                 outcome,
                 order,
+                epoch,
             },
         );
         while self.retired.len() > limits.max_operations as usize {
@@ -398,7 +499,13 @@ impl Prepared {
         }
         crate::operation_store::validate_context(self.context)?;
         self.intent().digest()?;
-        validate_request(&self.context, id, &self.request, self.fingerprint)
+        validate_request(
+            &self.context,
+            id,
+            self.request.request_epoch,
+            &self.request,
+            self.fingerprint,
+        )
     }
 }
 #[derive(Serialize, Deserialize)]
@@ -418,6 +525,7 @@ struct Journal {
 fn validate_request(
     context: &OperationContext,
     id: [u8; 16],
+    epoch: RequestEpoch,
     request: &RequestEnvelope,
     fingerprint: ContentHash,
 ) -> Result<(), NativeStoreError> {
@@ -426,7 +534,8 @@ fn validate_request(
     };
     if request.protocol != NATIVE_PROTOCOL_VERSION
         || request.ledger != context.ledger
-        || request.request_epoch != RequestEpoch(1)
+        || request.request_epoch != epoch
+        || epoch.0 == 0
         || request.request_id != RequestId(id)
         || request.route_epoch.0 == 0
         || frame.len() > MAX_NATIVE_FRAME_BYTES
@@ -440,7 +549,7 @@ fn validate_request(
         || header.key
             != (RequestKey {
                 principal: context.principal,
-                epoch: RequestEpoch(1),
+                epoch,
                 id: RequestId(id),
             })
     {
@@ -451,12 +560,13 @@ fn validate_request(
 fn validate_receipt(
     context: &OperationContext,
     id: [u8; 16],
+    epoch: RequestEpoch,
     fingerprint: ContentHash,
     receipt: &NativeReceipt,
 ) -> Result<(), NativeStoreError> {
     let key = RequestKey {
         principal: context.principal,
-        epoch: RequestEpoch(1),
+        epoch,
         id: RequestId(id),
     };
     if receipt.invocation != NativeInvocationRef::Request(key)
@@ -513,6 +623,9 @@ impl NativeOperationStore {
             entries: BTreeMap::new(),
             retired: BTreeMap::new(),
             retired_next: 0,
+            generation: 1,
+            floor: 1,
+            issued: 0,
         };
         let bytes = encode(&catalogue, CATALOGUE_BYTES)?;
         let directory = files::Directory::create_native(root.as_ref())?;
@@ -608,7 +721,7 @@ impl NativeOperationStore {
         intent: OperationIntent<'_>,
         operation: Option<NativeOperationId>,
         ids: &mut dyn IdGenerator,
-        expand: impl FnOnce(RequestId) -> Result<PreparedNativeRequest, NativeStoreError>,
+        expand: impl FnOnce(RequestKey) -> Result<PreparedNativeRequest, NativeStoreError>,
     ) -> Result<NativeOperation, NativeStoreError> {
         crate::operation_store::validate_context(context)?;
         let digest = intent.digest()?;
@@ -681,6 +794,20 @@ impl NativeOperationStore {
             if directory.exists(&component)? {
                 return Err(NativeStoreError::Corrupt);
             }
+            // The generation this operation is issued in (F12): the next one
+            // opens once half the journal's occupancy was issued in the
+            // current one and the floor stands at it — the owner holds two
+            // generations open, the one drained and the one filled.
+            if catalogue.issued >= self.limits.max_operations / 2
+                && catalogue.floor == catalogue.generation
+            {
+                catalogue.generation = catalogue
+                    .generation
+                    .checked_add(1)
+                    .ok_or(NativeStoreError::Capacity)?;
+                catalogue.issued = 0;
+            }
+            catalogue.issued = catalogue.issued.saturating_add(1);
             catalogue.entries.insert(
                 id,
                 Entry {
@@ -688,6 +815,7 @@ impl NativeOperationStore {
                     intent: digest,
                     ready: false,
                     retirable: None,
+                    epoch: catalogue.generation,
                 },
             );
             self.save(&directory, &catalogue)?;
@@ -699,10 +827,21 @@ impl NativeOperationStore {
             .get(&id)
             .ok_or(NativeStoreError::Corrupt)?
             .ready;
+        let epoch = RequestEpoch(
+            catalogue
+                .entries
+                .get(&id)
+                .ok_or(NativeStoreError::Corrupt)?
+                .epoch,
+        );
         if !ready && !directory.exists(&prepared_path)? {
             // Nothing durable names this identity beyond the claim, so the
             // compiler may run (again); no bytes have ever left this store.
-            let expanded = match expand(RequestId(id)) {
+            let expanded = match expand(RequestKey {
+                principal: context.principal,
+                epoch,
+                id: RequestId(id),
+            }) {
                 Ok(expanded) => expanded,
                 Err(error) => {
                     // The claim is released with the failure (the audit's
@@ -713,7 +852,7 @@ impl NativeOperationStore {
                     return Err(error);
                 }
             };
-            validate_request(&context, id, &expanded.request, expanded.fingerprint)?;
+            validate_request(&context, id, epoch, &expanded.request, expanded.fingerprint)?;
             let value = Prepared {
                 schema: 1,
                 context,
@@ -737,7 +876,7 @@ impl NativeOperationStore {
             Some(value) => value,
             None => self.prepared(&directory, id, ready)?,
         };
-        if prepared.context != context {
+        if prepared.context != context || prepared.request.request_epoch != epoch {
             return Err(NativeStoreError::ContextMismatch);
         }
         if prepared.name != intent.name
@@ -799,7 +938,13 @@ impl NativeOperationStore {
         }
         let journal = self.journal(directory, id.0.0)?;
         if let Some(receipt) = &journal.receipt {
-            validate_receipt(&prepared.context, id.0.0, prepared.fingerprint, receipt)?;
+            validate_receipt(
+                &prepared.context,
+                id.0.0,
+                prepared.request.request_epoch,
+                prepared.fingerprint,
+                receipt,
+            )?;
         }
         Ok((catalogue, prepared, journal))
     }
@@ -873,8 +1018,14 @@ impl NativeOperationStore {
             return Err(NativeStoreError::NotCommitted);
         };
         let directory = files::Directory::open_native(&self.root)?;
-        let (_, prepared, journal) = self.journaled(&directory, id, context)?;
-        validate_receipt(context, id.0.0, prepared.fingerprint, receipt)?;
+        let (mut catalogue, prepared, journal) = self.journaled(&directory, id, context)?;
+        validate_receipt(
+            context,
+            id.0.0,
+            prepared.request.request_epoch,
+            prepared.fingerprint,
+            receipt,
+        )?;
         if let Some(existing) = &journal.receipt {
             return if existing == receipt {
                 Ok(NativeStage::Completed)
@@ -896,6 +1047,12 @@ impl NativeOperationStore {
                 delivered: false,
             },
         )?;
+        // A committed floor advance (F12) moves the journal's floor to the
+        // generation it asked for: its own.
+        if prepared.name == EPOCH_ADVANCE && catalogue.floor < prepared.request.request_epoch.0 {
+            catalogue.floor = prepared.request.request_epoch.0;
+            self.save(&directory, &catalogue)?;
+        }
         Ok(NativeStage::Completed)
     }
     /// The committed result was reported to the caller: the operation is no
@@ -978,6 +1135,87 @@ impl NativeOperationStore {
         }
         self.mark_reported(&directory, &mut catalogue, id.0.0)
     }
+    /// The generation the journal should advance the owner's floor to (F12):
+    /// the current one, once it is above the floor and every operation of an
+    /// earlier generation has been reported (a lost reply is recovered
+    /// first, never fenced away by the journal's own advance).
+    pub fn floor_due(&self) -> Result<Option<RequestEpoch>, NativeStoreError> {
+        let directory = files::Directory::open_native(&self.root)?;
+        let catalogue = self.catalogue(&directory)?;
+        if catalogue.floor >= catalogue.generation {
+            return Ok(None);
+        }
+        for (id, entry) in &catalogue.entries {
+            if entry.epoch >= catalogue.generation {
+                continue;
+            }
+            if !entry.ready || !self.journal(&directory, *id)?.delivered {
+                return Ok(None);
+            }
+        }
+        Ok(Some(RequestEpoch(catalogue.generation)))
+    }
+    /// The owner's window as this journal learned it (F12): a floor the
+    /// owner forced past this journal's generation moves the generation up
+    /// to it, so the next operation is issued where the owner admits one.
+    pub fn observe_window(
+        &self,
+        floor: RequestEpoch,
+        next: RequestEpoch,
+    ) -> Result<(), NativeStoreError> {
+        let directory = files::Directory::open_native(&self.root)?;
+        let mut catalogue = self.catalogue(&directory)?;
+        let mut changed = false;
+        if floor.0 > catalogue.floor {
+            catalogue.floor = floor.0;
+            changed = true;
+        }
+        if catalogue.generation < catalogue.floor {
+            catalogue.generation = catalogue.floor;
+            catalogue.issued = 0;
+            changed = true;
+        }
+        if next.0 > catalogue.generation && catalogue.floor.checked_add(1) == Some(next.0) {
+            // The owner has the generation after the floor open already:
+            // continue in it rather than open a third.
+            catalogue.generation = next.0;
+            catalogue.issued = 0;
+            changed = true;
+        }
+        if changed {
+            self.save(&directory, &catalogue)?;
+        }
+        Ok(())
+    }
+    /// The journal's current generation and floor (F12).
+    pub fn generations(&self) -> Result<(RequestEpoch, RequestEpoch), NativeStoreError> {
+        let directory = files::Directory::open_native(&self.root)?;
+        let catalogue = self.catalogue(&directory)?;
+        Ok((
+            RequestEpoch(catalogue.generation),
+            RequestEpoch(catalogue.floor),
+        ))
+    }
+    /// The request key of a journaled operation: its own generation.
+    pub fn key_of(
+        &self,
+        id: NativeOperationId,
+        context: &OperationContext,
+    ) -> Result<RequestKey, NativeStoreError> {
+        let directory = files::Directory::open_native(&self.root)?;
+        let catalogue = self.catalogue(&directory)?;
+        if let Some(retired) = catalogue.retired.get(&id.0.0) {
+            return Ok(id.key_in(context, RequestEpoch(retired.epoch)));
+        }
+        let entry = catalogue
+            .entries
+            .get(&id.0.0)
+            .ok_or(NativeStoreError::MissingOperation)?;
+        if entry.context != *context {
+            return Err(NativeStoreError::ContextMismatch);
+        }
+        Ok(id.key_in(context, RequestEpoch(entry.epoch)))
+    }
     /// Ready operations whose result has not been reported to the caller, in
     /// identity order: pending ones and committed ones whose reply was lost.
     pub fn outstanding(&self) -> Result<Vec<NativeOperationId>, NativeStoreError> {
@@ -1005,7 +1243,13 @@ impl NativeOperationStore {
     ) -> Result<NativeOperation, NativeStoreError> {
         let journal = self.journal(directory, id)?;
         if let Some(receipt) = &journal.receipt {
-            validate_receipt(&prepared.context, id, prepared.fingerprint, receipt)?;
+            validate_receipt(
+                &prepared.context,
+                id,
+                prepared.request.request_epoch,
+                prepared.fingerprint,
+                receipt,
+            )?;
         }
         Ok(assemble(id, prepared, journal))
     }
@@ -1070,6 +1314,12 @@ impl NativeOperationStore {
             postcard::take_from_bytes(&bytes).map_err(|_| NativeStoreError::Corrupt)?;
         let catalogue = if schema == 1 {
             let old: CatalogueV1 = decode(&bytes)?;
+            if encode(&old, CATALOGUE_BYTES)? != bytes {
+                return Err(NativeStoreError::Corrupt);
+            }
+            Catalogue::from(old)
+        } else if schema == 2 {
+            let old: CatalogueV2 = decode(&bytes)?;
             if encode(&old, CATALOGUE_BYTES)? != bytes {
                 return Err(NativeStoreError::Corrupt);
             }

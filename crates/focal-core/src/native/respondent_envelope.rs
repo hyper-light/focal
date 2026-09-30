@@ -206,11 +206,12 @@ impl RespondentEnvelope {
             ConstructionBudget::for_operation(NativeOperation::PostResponse, limits)?;
         // Index rows (doc 22 §7): a diagnostic artifact's identity, producer,
         // kind, schema and inputs; a close's and a post's claim status move. A
-        // diagnostic's eight primary rows and four fixed index rows leave the
-        // batch's remainder to the inputs its descriptor may cite.
+        // diagnostic's nine primary rows (the principal's window among them,
+        // F12) and four fixed index rows leave the batch's remainder to the
+        // inputs its descriptor may cite.
         let inputs = crate::native::index_rows::cap_inputs(
             super::completion_envelope::input_bound(descriptor),
-            add(8, crate::native::index_rows::ARTIFACT_FIXED_ROWS)?,
+            add(9, crate::native::index_rows::ARTIFACT_FIXED_ROWS)?,
             limits.range.max_batch_entries,
         );
         descriptor.inputs = inputs;
@@ -308,7 +309,7 @@ impl RespondentEnvelope {
         let diagnostic = action(
             view,
             limits.max_ranges,
-            add(8, diagnostic_index)?,
+            add(9, diagnostic_index)?,
             0,
             add(
                 add(
@@ -334,7 +335,7 @@ impl RespondentEnvelope {
         let close = action(
             view,
             limits.max_ranges,
-            add(add(multiply(2, work_limit)?, 7)?, close_index)?,
+            add(add(multiply(2, work_limit)?, 8)?, close_index)?,
             1,
             add(
                 add(claim_row, response_row)?,
@@ -352,7 +353,7 @@ impl RespondentEnvelope {
         let post = action(
             view,
             limits.max_ranges,
-            add(6, post_index)?,
+            add(7, post_index)?,
             1,
             add(add(claim_row, response_row)?, event_containers(2)?)?,
             CompletionSlots {

@@ -24,7 +24,7 @@ ruling before work starts).
 | F09 | P2 | in tree | 2 | [F09](#f09) |
 | F10 | P2 | in tree | 4 | [F10](#f10) |
 | F11 | P2 | in tree | 4 | [F11](#f11) |
-| F12 | P1 | open | 5 | — |
+| F12 | P1 | in tree | 5 | [F12](#f12) |
 | F13 | P1 | open | 5 | — |
 | F14 | P1 | open | 6 | — |
 | F15 | P2 | in tree | 3 | [F15](#f15) |
@@ -1178,3 +1178,96 @@ answers unwrapped; an object the bundle never held is `Missing`; a tampered bund
 `unavailable`; a kill and restart change none of it), the catalogue, schema, example and
 skill contract tests, the client suites (`NativeReadOutcome` and the read page cover the
 new object).
+
+## F12
+
+**Cause.** Every native request's outcome row stayed resident for good — the exact retry
+that might still ask it had no other place to look — and the checkpoint's contract pinned
+the outcome count to the native prefix, so a session's lifetime history was its live
+capacity: retirement freed a family's rows and left its outcomes (and published one more),
+and `limits.outcomes` counted down from the first request to the last, whatever the live
+obligations were. Nothing distinguished an outcome something could still ask through the
+live path from one nothing could, and nothing fenced a retry of a request whose outcome
+had gone, so the only safe answer was to keep them all.
+
+**Fix.** Resident outcomes are exactly the open obligations and the unsealed tail, and the
+history leaves the live core into bundles under custody without ever executing old work
+again. A request is closed when its generation is below its principal's floor: the owner
+keeps one window per principal (`Key::Epochs`, family 50: the floor, the sealed-through
+generation, at most two open generations with their resident counts and last logical times,
+and which seal holds each sealed generation), admits a request only in an open generation
+or the next one (`EpochNotAdmitted` otherwise), refuses a request below the floor by name
+(`RequestHistoryExpired`) before it is prepared, and writes the window beside every request
+record so replay derives and checks it. The client's journal issues in generations
+(catalogue schema 3, carried from schema 2 with everything in generation one), opens the
+next once half its capacity was issued in the current one, and advances the floor itself
+with the protocol operation `epoch.advance` (`AdvanceEpochFloor`, input tag 28, wire
+operation 32; a participant frame the journal issues, never an authored tool) once every
+operation of the generations below is delivered; a request never closes its own
+generation. A **seal** is a session decision beside retirement (`FOCALSO1`; core
+`seal.rs`): the authority derives from its committed state at the committed prefix the
+closed outcome and creation-result rows (whole generations of whole principals, then the
+retirements' and seals' own outcomes), writes them into an `FCNSEAL1` bundle under custody,
+and proposes the record naming the prefix, the bundle, the count, the bound of the
+derivation, the resident outcome bound it was derived under and the floors it forces; every
+replica derives the same plan and applies it alike (rows leave, windows record the seal,
+`Key::Seal(ordinal)` family 51 is written, the Meta counts `sealed`, `sealed_events` and
+`seals`, the seal's own outcome is published), inert at another prefix, fail-closed on a
+different count or on floors that differ under another outcome bound (`OutcomeBound`), and
+fencing every other proposal while in flight (`Sealing`). Resident outcomes
+(`outcomes − sealed`) are what admission, retirement, the completion book and the checkpoint
+bound; `outcomes` still equals the prefix. Under pressure — resident plus the candidates that
+may still be admitted past the bound — the seal forces floors on the least recently used
+open generations (by last logical time, then principal; derived deterministically and
+re-derived at apply), and the window is shared among principals (each holds at most its
+share, at least one). The seal index is bounded (`limits.seals`, derived from the bundle
+bound over a fold member's bytes): at the bound a seal carries a fold of the oldest half into
+one directory row (`FCNSEAL1` kind 1) and every window's ranges follow it, the fold applied
+to a window before the seal it carries is recorded. A sealed outcome is read where it went:
+an outcome read of a sealed generation answers `NativeObject::Sealed`, the client follows it
+(`NativeReadQuery::Sealed`) to the content owner, which reads the bundle under the tenant
+scope, descending folds; a journal without the operation asks the owner's window
+(`NativeReadQuery::Epochs`) which generations to probe. A client refused by name resolves the
+outcome it may have from the seal, records it as the receipt it is, learns the owner's window
+and continues in the generation the owner admits. Seal bundles are content roots (kept by the
+collector, carried by a backup). The archive agent proposes a seal when the pressure floors
+are non-empty or the closed rows reach half a bundle, and counts `seals_proposed` and
+`seals_waiting`. The node's resident window is `FOCAL_NATIVE_OUTCOMES` for qualification.
+Found on the way and fixed at cause: the wire header check refused the new command tag
+(`NATIVE_COMMAND_TAGS`); the window row's rebuild budget counted one visit per range where the
+reader takes three fields; the fold directory wrote its range count as eight bytes where its
+reader takes four; the principals bound and the timers' outcome bound reused a helper whose
+refusal was labelled "preparation bytes"; and the ledger's apply path for the seal record
+had been lost between edits and was restored.
+
+**Tests.** Core (`seal_tests`): `a_principals_generations_open_in_order_and_close_at_the_floor`
+(order, two open, the advance's bounds, a request never closes its own generation, the exact
+retry of a resident outcome still answers, a fresh request below the floor is refused by name),
+`the_window_is_bounded_for_everyone_and_shared_among_principals` (the bound first, then the
+share, then the principals bound), `a_closed_generation_seals_into_a_bundle_the_live_core_points_to`
+(the plan, the bundle read by its inspector, the rows gone, the window and seal row, the seal's
+outcome, the fence, the checkpoint restore and an owner rebuilt over it),
+`pressure_closes_the_least_recent_generations_and_the_index_folds_at_its_bound` (LRU floors,
+the record must name them, a seal refused at the range bound without a fold and applied with
+it, the fold's directory names its members, the folded index restores),
+`a_seal_record_that_differs_from_the_derived_plan_is_refused_unchanged`; the codec's
+frame, checkpoint and replay pins for tag 28, families 50/51 and the Meta counters. Client
+(`native_store::tests`): `a_journal_rotates_its_generation_and_advances_its_floor_when_the_old_one_is_delivered`,
+`a_catalogue_from_before_generations_is_carried_into_the_first_generation`; the coverage
+table pins the client-protocol row; the wire pins tag 28 admitted and tag 29 refused. Ledger
+(`native_session_cluster_tests`):
+`committed_seals_apply_on_every_replica_fence_proposals_and_close_the_generation` (only the
+authority proposes, refusals leave nothing in flight, a pending candidate makes it wait and a
+stale plan is refused, the fences, a follower that receives the seal in one delivery, one
+restarted from its log and one caught up by a checkpoint hold the same rows and digest, the
+exact retry of the sealed request is refused by name and the bundle answers what it committed).
+Node (`cli_native_epochs.rs`):
+`a_closed_generation_is_learned_by_name_and_its_sealed_outcomes_are_still_read` (the real
+binary under a small resident window: the founder's generation is closed under pressure and
+the refusal is by name with exit 5, the next command commits in the admitted generation, every
+committed operation of the closed generation is still answered by its journal and read from
+the seal by `request inspect --remote`, the claims stay live, and a restart changes none of
+it). Measurements: the seal plan and bundle are derived once per tick on the authority
+within the archive agent's interval; the resident window is a configured count, not a
+lifetime one.
+

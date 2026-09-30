@@ -38,59 +38,38 @@ pub(super) struct ValidationRead<'v, 'r> {
     pub(super) budget: &'v MemoryBudget,
 }
 
-/// One bit and one logical-time scalar per outcome prove unique, contiguous
-/// sequences and a nondecreasing owner clock, including zero-event outcomes.
-/// Both vectors drop before their shared permit on success and refusal paths.
+/// One (sequence, logical time) pair per resident outcome proves the
+/// sequences unique and at most the prefix and the owner clock
+/// nondecreasing along them. Every sequence once had its outcome; the ones
+/// missing here left into a seal or a retirement bundle (F12), which the
+/// meta counts (`outcomes - sealed` resident rows). The vector drops before
+/// its permit on success and refusal paths.
 struct Sequences {
-    bits: Vec<u8>,
-    logical_times: Vec<u64>,
+    values: Vec<(u64, u64)>,
     _allocation: Allocation,
 }
 impl Sequences {
     fn new(count: usize, read: &ValidationRead<'_, '_>) -> Result<Self, NativeError> {
-        let bytes = count
-            .checked_div(8)
-            .and_then(|n| n.checked_add(usize::from(!count.is_multiple_of(8))))
-            .ok_or(ContractError::Capacity)?;
-        let quote = sum(prepare::array::<u8>(bytes)?, prepare::array::<u64>(count)?)?;
+        let quote = prepare::array::<(u64, u64)>(count)?;
         read.charge(sum(
-            sum(
-                bytes,
-                count
-                    .checked_mul(size_of::<u64>())
-                    .ok_or(ContractError::Capacity)?,
-            )?,
+            count
+                .checked_mul(size_of::<(u64, u64)>())
+                .ok_or(ContractError::Capacity)?,
             2,
         )?)?;
         let allocation = read
             .budget
             .reserve(BudgetKind::Recovery, BudgetLane::Completion, quote)?
             .commit();
-        let mut bits = Vec::new();
-        bits.try_reserve_exact(bytes)
-            .map_err(|_| MemoryError::AllocationFailed)?;
-        if prepare::array::<u8>(bits.capacity())? > prepare::array::<u8>(bytes)?
-            || bits.capacity() < bytes
-        {
-            return Err(MemoryError::AllocationFailed.into());
-        }
-        let mut logical_times = Vec::new();
-        logical_times
+        let mut values = Vec::new();
+        values
             .try_reserve_exact(count)
             .map_err(|_| MemoryError::AllocationFailed)?;
-        if sum(
-            prepare::array::<u8>(bits.capacity())?,
-            prepare::array::<u64>(logical_times.capacity())?,
-        )? > quote
-            || logical_times.capacity() < count
-        {
+        if prepare::array::<(u64, u64)>(values.capacity())? > quote || values.capacity() < count {
             return Err(MemoryError::AllocationFailed.into());
         }
-        bits.resize(bytes, 0);
-        logical_times.resize(count, 0);
         Ok(Self {
-            bits,
-            logical_times,
+            values,
             _allocation: allocation,
         })
     }
@@ -98,38 +77,32 @@ impl Sequences {
         &mut self,
         sequence: SessionSeq,
         logical_time: u64,
-        count: usize,
+        prefix: SessionSeq,
         read: &ValidationRead<'_, '_>,
     ) -> Result<(), NativeError> {
         read.charge(16)?;
-        let index = usize::try_from(sequence.0.checked_sub(1).ok_or_else(invalid)?)
-            .map_err(|_| ContractError::Capacity)?;
-        if index >= count {
+        if sequence.0 == 0 || sequence > prefix || self.values.len() == self.values.capacity() {
             return Err(invalid());
         }
-        let bit = 1u8
-            .checked_shl(u32::try_from(index % 8).map_err(|_| ContractError::Capacity)?)
-            .ok_or(ContractError::Capacity)?;
-        let slot = self.bits.get_mut(index / 8).ok_or_else(invalid)?;
-        if *slot & bit != 0 {
-            return Err(invalid());
-        }
-        let clock = self.logical_times.get_mut(index).ok_or_else(invalid)?;
-        *clock = logical_time;
-        *slot |= bit;
+        self.values.push((sequence.0, logical_time));
         Ok(())
     }
-    fn monotonic(&self, read: &ValidationRead<'_, '_>) -> Result<(), NativeError> {
+    /// Unique sequences, all present, and a clock that never goes back.
+    fn finish(mut self, count: usize, read: &ValidationRead<'_, '_>) -> Result<(), NativeError> {
         read.charge(
-            sum(self.logical_times.len(), 1)?
-                .checked_mul(8)
+            sum(self.values.len(), 1)?
+                .checked_mul(usize::try_from(usize::BITS).map_err(|_| ContractError::Capacity)?)
                 .ok_or(ContractError::Capacity)?,
         )?;
-        for pair in self.logical_times.windows(2) {
-            let [previous, next] = pair else {
+        if self.values.len() != count {
+            return Err(invalid());
+        }
+        self.values.sort_unstable();
+        for pair in self.values.windows(2) {
+            let [(previous, before), (next, after)] = pair else {
                 return Err(invalid());
             };
-            if previous > next {
+            if previous >= next || before > after {
                 return Err(invalid());
             }
         }
@@ -140,6 +113,7 @@ impl Sequences {
 #[derive(Default)]
 struct Counts {
     meta: Meta,
+    seals: usize,
     contents: usize,
     claim_identities: usize,
     definition_identities: usize,
@@ -178,6 +152,8 @@ impl Counts {
             }
             Row::CreationResult(_) => increment(&mut self.meta.creation_results),
             Row::Outcome(_) => increment(&mut self.meta.outcomes),
+            Row::Epochs(_) => increment(&mut self.meta.principals),
+            Row::Seal(_) => increment(&mut self.seals),
             Row::Event(_) => increment(&mut self.meta.events),
             Row::ClaimContent(_) => increment(&mut self.contents),
             Row::ClaimIdentity(_) => increment(&mut self.claim_identities),
@@ -196,7 +172,18 @@ impl Counts {
     fn check(&self, expected: Meta, read: &ValidationRead<'_, '_>) -> Result<(), NativeError> {
         let pairs = [
             (self.meta.claims, expected.claims, read.limits.claims),
-            (self.meta.outcomes, expected.outcomes, read.limits.outcomes),
+            // Resident outcomes (F12): the lifetime count less what left.
+            (
+                self.meta.outcomes,
+                expected.outcomes.saturating_sub(expected.sealed),
+                read.limits.outcomes,
+            ),
+            (
+                self.meta.principals,
+                expected.principals,
+                read.limits.principals,
+            ),
+            (self.seals, self.seals, read.limits.seals),
             (self.meta.events, expected.events, read.limits.events),
             (
                 self.meta.definitions,
@@ -247,7 +234,8 @@ impl Counts {
                 return Err(ContractError::Capacity.into());
             }
         }
-        if u64::try_from(self.meta.outcomes).map_err(|_| ContractError::Capacity)? != read.prefix.0
+        if u64::try_from(expected.outcomes).map_err(|_| ContractError::Capacity)? != read.prefix.0
+            || expected.sealed > expected.outcomes
         {
             return Err(invalid());
         }
@@ -324,6 +312,8 @@ pub(super) fn validate(
         (0usize, 0usize, 0usize, 0usize, 0u64);
     let (mut works, mut diagnostics) = (0usize, 0usize);
     let (mut archived_events, mut retired_events) = (0usize, 0usize);
+    let expected_seals = u64::try_from(expected.seals).map_err(|_| ContractError::Capacity)?;
+    let mut next_seal = 1u64;
     read.charge(sum(root.len(), 1)?)?;
     for entry in root.entries() {
         let key = entry.key;
@@ -332,14 +322,39 @@ pub(super) fn validate(
         match (key, row) {
             (Key::Outcome(_), Row::Outcome(value)) => {
                 read_rows::check_fixed(key, row, ledger)?;
-                sequences.mark(
-                    value.sequence,
-                    value.logical_time,
-                    counts.meta.outcomes,
-                    &read,
-                )?;
+                sequences.mark(value.sequence, value.logical_time, prefix, &read)?;
                 if value.sequence > prefix || value.logical_time > expected.logical_time {
                     return Err(invalid());
+                }
+                // Resident is what is open (F12): a request's generation at
+                // or above its principal's sealed floor; a timer's claim
+                // not retired (its outcome left with the family).
+                match value.invocation {
+                    NativeInvocation::Request(request) => {
+                        let Some(Row::Epochs(window)) = read.get(Key::Epochs(request.principal))?
+                        else {
+                            return Err(invalid());
+                        };
+                        if request.epoch.0 < window.sealed.0 {
+                            return Err(invalid());
+                        }
+                    }
+                    NativeInvocation::ClaimDeadline(NativeClaimDeadlineKey { claim, .. })
+                    | NativeInvocation::MonitorDeadline(NativeMonitorDeadlineKey {
+                        claim, ..
+                    }) => {
+                        if read.get(Key::Retired(claim))?.is_some() {
+                            return Err(invalid());
+                        }
+                    }
+                    NativeInvocation::EvaluationDeadline(deadline) => {
+                        if read.get(Key::Retired(deadline.evaluation.claim))?.is_some() {
+                            return Err(invalid());
+                        }
+                    }
+                    NativeInvocation::Import
+                    | NativeInvocation::Retirement(_)
+                    | NativeInvocation::Seal(_) => {}
                 }
                 if value.sequence == prefix {
                     last_time = value.logical_time;
@@ -376,16 +391,31 @@ pub(super) fn validate(
             }
             (Key::Event(sequence, ordinal), Row::Event(value)) => {
                 let event = value.get().ok_or_else(invalid)?.expand(ledger);
-                let outcome = match read.require(Key::Outcome(event.invocation))? {
-                    Row::Outcome(value) => value,
-                    _ => return Err(invalid()),
-                };
-                if event.sequence != sequence
-                    || event.ordinal != ordinal
-                    || outcome.sequence != sequence
-                    || ordinal >= outcome.events
-                {
+                if event.sequence != sequence || event.ordinal != ordinal {
                     return Err(invalid());
+                }
+                match read.get(Key::Outcome(event.invocation))? {
+                    Some(Row::Outcome(outcome)) => {
+                        if outcome.sequence != sequence || ordinal >= outcome.events {
+                            return Err(invalid());
+                        }
+                    }
+                    Some(_) => return Err(invalid()),
+                    // An event of a live object whose request's outcome was
+                    // sealed (F12): its generation is below the sealed floor.
+                    None => match event.invocation {
+                        NativeInvocation::Request(request) => {
+                            let Some(Row::Epochs(window)) =
+                                read.get(Key::Epochs(request.principal))?
+                            else {
+                                return Err(invalid());
+                            };
+                            if request.epoch.0 >= window.sealed.0 || sequence > prefix {
+                                return Err(invalid());
+                            }
+                        }
+                        _ => return Err(invalid()),
+                    },
                 }
             }
             (Key::IncomingHead(target), Row::IncomingHead(head)) => {
@@ -399,6 +429,55 @@ pub(super) fn validate(
             (Key::RetiredCycleHead(target), Row::RetiredCycleHead(head)) => {
                 read_rows::check_fixed(key, row, ledger)?;
                 retired = sum(retired, links::retired(target, *head, &read)?)?;
+            }
+            // A principal's window (F12): valid in itself, its ranges naming
+            // seals that exist, and holding the resident request outcomes
+            // of its open generations, counted under its affinity.
+            (Key::Epochs(principal), Row::Epochs(window)) => {
+                read_rows::check_fixed(key, row, ledger)?;
+                if entry.heap_bytes != window.heap_charge()?
+                    || window
+                        .ranges()
+                        .iter()
+                        .any(|range| range.seal == 0 || range.seal > expected_seals)
+                {
+                    return Err(invalid());
+                }
+                read.charge(sum(window.ranges().len(), 8)?)?;
+                let mut held = [0u32; OPEN_EPOCHS];
+                let first = Key::Outcome(NativeInvocation::Request(RequestKey {
+                    principal,
+                    epoch: window.floor,
+                    id: RequestId([0; 16]),
+                }));
+                for entry in read.root.entries_from(&first, false) {
+                    read.charge(1)?;
+                    let Key::Outcome(NativeInvocation::Request(request)) = entry.key else {
+                        break;
+                    };
+                    if request.principal != principal || request.epoch >= window.next() {
+                        break;
+                    }
+                    let at = usize::try_from(request.epoch.0.saturating_sub(window.floor.0))
+                        .map_err(|_| ContractError::Capacity)?;
+                    let slot = held.get_mut(at).ok_or_else(invalid)?;
+                    *slot = slot.checked_add(1).ok_or_else(invalid)?;
+                }
+                for (slot, count) in held.iter().zip(window.counts.iter()) {
+                    if *slot != count.outcomes {
+                        return Err(invalid());
+                    }
+                }
+            }
+            // A seal's row (F12): the rows cover the ordinals 1..=seals
+            // exactly once, in order.
+            (Key::Seal(ordinal), Row::Seal(value)) => {
+                read_rows::check_fixed(key, row, ledger)?;
+                read.charge(2)?;
+                if value.first != next_seal || value.sealed_at > prefix {
+                    return Err(invalid());
+                }
+                next_seal = ordinal.checked_add(1).ok_or_else(invalid)?;
             }
             // A retired claim's continuation (26 §4): its rows are gone and
             // the archive holds them; nothing here is a live claim.
@@ -502,7 +581,17 @@ pub(super) fn validate(
             _ => return Err(invalid()),
         }
     }
-    sequences.monotonic(&read)?;
+    sequences.finish(counts.meta.outcomes, &read)?;
+    // Every event ever published is resident, left with a retired member
+    // (its continuation counts it) or belongs to an outcome that left (the
+    // meta counts those, F12); what is missing among the resident outcomes'
+    // events is at most what retired.
+    if next_seal.checked_sub(1) != Some(expected_seals)
+        || sum(total_events, expected.sealed_events)? != sum(counts.meta.events, retired_events)?
+        || archived_events > retired_events
+    {
+        return Err(invalid());
+    }
     if incoming != counts.incoming_links
         || incoming != counts.declared_links
         || monitors != counts.active_monitor_links
@@ -514,8 +603,6 @@ pub(super) fn validate(
         || counts.registrations != counts.meta.evaluations
         || counts.declared_definitions != counts.meta.definitions
         || counts.receipt_epochs != counts.meta.receipts
-        || total_events != sum(counts.meta.events, retired_events)?
-        || archived_events != retired_events
         || last_time != expected.logical_time
     {
         return Err(invalid());

@@ -179,19 +179,30 @@ impl<T: ClientTransport> Backend<T> {
                     return Err(InputError::Invalid("unsupported recovery argument").into());
                 }
                 if remote {
-                    let key = id.key(&self.context);
-                    let page =
-                        focal_native_client::outcome(key, &mut self.native_reads(runtime, cancel))?;
+                    let page = match native.store.key_of(id, &self.context) {
+                        Ok(key) => focal_native_client::outcome(
+                            key,
+                            &mut self.native_reads(runtime, cancel),
+                        )?,
+                        Err(_) => focal_native_client::outcome_by_id(
+                            self.context.principal,
+                            id.request(),
+                            &mut self.native_reads(runtime, cancel),
+                        )?,
+                    };
                     // The wire layer validates the read reply's own envelope
                     // identity, but not that the outcome it carries is for the
                     // invocation we asked about. Bind it here, mirroring the
                     // receipt-identity check the V1 and managed inspect paths
                     // apply: a returned outcome for a different request is a
                     // ReceiptMismatch, never shown as this operation's outcome.
-                    let expected = NativeInvocationRef::Request(key);
+                    let expected = |invocation: NativeInvocationRef| {
+                        matches!(invocation, NativeInvocationRef::Request(key)
+                            if key.principal == self.context.principal && key.id == id.request())
+                    };
                     for object in &page.objects {
                         if let NativeObject::Outcome(receipt) = object
-                            && receipt.invocation != expected
+                            && !expected(receipt.invocation)
                         {
                             return Err(
                                 focal_client::native_store::NativeStoreError::ReceiptMismatch
@@ -255,14 +266,47 @@ impl<T: ClientTransport> Backend<T> {
                 if cancelled(cancel) {
                     return Err(BackendError::Cancelled);
                 }
+                let preparation = Preparation {
+                    store: &native.store,
+                    context: self.context,
+                    build: &self.build,
+                    profile: profile(&native.standing),
+                    limits: &native.limits,
+                };
+                // The journal's own upkeep first (F12).
+                {
+                    let cell = std::cell::RefCell::new(&mut *cancel);
+                    let mut reads = |read: NativeReadRequest| {
+                        let request = envelope(self.build.ledger, Operation::NativeRead(read))?;
+                        let mut cancel = cell.borrow_mut();
+                        runtime.block_on(async {
+                            tokio::select! {
+                                result = self.client.native_read(request) => Ok(result?),
+                                _ = &mut **cancel => Err(DriveError::Cancelled),
+                            }
+                        })
+                    };
+                    let mut submits = |request: RequestEnvelope| {
+                        let mut cancel = cell.borrow_mut();
+                        runtime.block_on(async {
+                            tokio::select! {
+                                result = self.client.submit_native(request) => Ok(result?),
+                                _ = &mut **cancel => Err(DriveError::Cancelled),
+                            }
+                        })
+                    };
+                    focal_native_client::maintain(
+                        &preparation,
+                        &mut random_id,
+                        &mut reads,
+                        &mut submits,
+                    )?;
+                }
+                if cancelled(cancel) {
+                    return Err(BackendError::Cancelled);
+                }
                 let prepared = focal_native_client::prepare(
-                    &Preparation {
-                        store: &native.store,
-                        context: self.context,
-                        build: &self.build,
-                        profile: profile(&native.standing),
-                        limits: &native.limits,
-                    },
+                    &preparation,
                     &authored,
                     requested,
                     &mut random_id,
@@ -359,6 +403,19 @@ impl<T: ClientTransport> Backend<T> {
             }
             NativeMutationReply::Pending(ticket) => Err(BackendError::NativePending(ticket)),
             NativeMutationReply::Refused(refusal) => {
+                // A generation the owner closed before this frame reached it
+                // (F12): a committed outcome is read from the seal.
+                if refusal.kind
+                    == NativeRefusalKind::Refused(NativeErrorCode::RequestHistoryExpired)
+                    && let Some(receipt) = focal_native_client::expired(
+                        &native.store,
+                        &self.context,
+                        &operation,
+                        &mut self.native_reads(runtime, cancel),
+                    )?
+                {
+                    return Ok(committed(receipt, operation.created));
+                }
                 native
                     .store
                     .record_refusal(operation.id, &self.context, &refusal)?;

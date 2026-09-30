@@ -858,8 +858,13 @@ impl CompletionBook {
         )?;
         within(add(meta.events, slots.events)?, self.limits.events)?;
         let control = usize::from(self.totals.live != 0);
+        // Resident outcomes (F12): the lifetime count less what left into
+        // seals and retirement bundles.
         within(
-            add(add(meta.outcomes, slots.outcomes)?, control)?,
+            add(
+                add(meta.outcomes.saturating_sub(meta.sealed), slots.outcomes)?,
+                control,
+            )?,
             self.limits.outcomes,
         )?;
         sequence

@@ -809,6 +809,38 @@ fn handle_request(
     // request's tenant scope (the audit's F11): the bundle's fetch and
     // hydration are this owner's, bounded by the bundle's inspection limits.
     if let Operation::NativeRead(read) = &request.operation
+        && let NativeReadQuery::Sealed(query) = &read.query
+    {
+        owner.check_scope(
+            scope,
+            &crate::archive_reads::seal_reference(request.ledger, query),
+        )?;
+        let page = crate::archive_reads::sealed_page(
+            owner.content(),
+            request.ledger,
+            verified.peer(),
+            request.route_epoch,
+            read,
+            query,
+            limits,
+        )?;
+        let reply = request.reply(Response::NativeRead(page));
+        let bytes = postcard::experimental::serialized_size(&reply)
+            .map_err(|_| AccessError::InvalidRequest)?;
+        if bytes > limits.max_frame_bytes as usize {
+            return Err(AccessError::Capacity);
+        }
+        let allocation = budget
+            .reserve(
+                BudgetKind::Query,
+                BudgetLane::Ordinary,
+                bytes.saturating_add(4096),
+            )
+            .map_err(|_| AccessError::Capacity)?
+            .commit();
+        return Ok(owner.accounted(reply, allocation));
+    }
+    if let Operation::NativeRead(read) = &request.operation
         && let NativeReadQuery::Archived(query) = &read.query
     {
         owner.check_scope(

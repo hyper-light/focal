@@ -309,6 +309,7 @@ pub(super) fn heap(row: &Row) -> Result<usize, NativeError> {
         Row::Event(value) => value.heap_charge()?,
         Row::ClaimContent(value) => value.heap_charge()?,
         Row::CreationResult(value) => value.heap_charge()?,
+        Row::Epochs(value) => value.heap_charge()?,
         Row::LegacyTestament(value)
         | Row::LegacyEvidenceSet(value)
         | Row::LegacyRun(value)
@@ -330,6 +331,7 @@ pub(super) fn heap(row: &Row) -> Result<usize, NativeError> {
         | Row::Outcome(_)
         | Row::ClaimIdentity(_)
         | Row::DefinitionIdentity(_)
+        | Row::Seal(_)
         | Row::Index => 0,
     })
 }

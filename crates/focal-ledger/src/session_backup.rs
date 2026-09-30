@@ -604,6 +604,10 @@ pub mod backup {
                         bundles.try_reserve_exact(1).map_err(|_| BackupError::Capacity)?;
                         bundles.push((root, bytes));
                     }
+                    // A seal's bundle (F12) holds no content of its own.
+                    ContentRoot::Seal { root, .. } => {
+                        objects.insert(root);
+                    }
                 }
             }
             cursor = page.next;

@@ -115,6 +115,8 @@ fn code(error: ContractError) -> NativeErrorCode {
         ContractError::Capacity => NativeErrorCode::Capacity,
         ContractError::ConflictingCause => NativeErrorCode::ConflictingCause,
         ContractError::InvalidCut => NativeErrorCode::InvalidCut,
+        ContractError::RequestHistoryExpired => NativeErrorCode::RequestHistoryExpired,
+        ContractError::EpochNotAdmitted => NativeErrorCode::EpochNotAdmitted,
     }
 }
 fn native_kind(error: &NativeError) -> NativeRefusalKind {

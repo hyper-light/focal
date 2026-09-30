@@ -157,6 +157,7 @@ pub fn requirements(operation: &NativeAuthoredOperation) -> Result<Vec<Requireme
         Op::ClaimReleaseScope(document) | Op::ValidationSealIncrements(document) => {
             vec![Requirement::Objects(vec![claim(&document.claim)?])]
         }
+        Op::EpochAdvance(_) => Vec::new(),
         Op::ReceiptAdopt(document) => vec![Requirement::Objects(vec![claim(&document.claim)?])],
         Op::ArtifactFail(document) => vec![Requirement::Objects(vec![
             claim(&document.claim)?,

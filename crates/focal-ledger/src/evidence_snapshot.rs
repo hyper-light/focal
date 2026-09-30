@@ -285,6 +285,24 @@ impl Session {
                             }),
                         }
                     }
+                    // A seal's bundle (F12) is inventoried under an identity
+                    // derived from its ordinal: no claim names it.
+                    focal_core::native::ContentRoot::Seal {
+                        ordinal,
+                        root,
+                        bytes,
+                    } => ArtifactEvidence {
+                        artifact: ArtifactRef {
+                            id: seal_inventory_id(ordinal),
+                            hash: root,
+                        },
+                        content: Some(ContentRef {
+                            domain,
+                            root,
+                            length: bytes,
+                            class: ContentClass::Evidence,
+                        }),
+                    },
                 };
                 objects.push(entry);
             }
@@ -353,4 +371,17 @@ impl Session {
             Err(error) => Err(error.into()),
         }
     }
+}
+
+/// The inventory identity of a seal's bundle (F12): the low half of a keyed
+/// digest of its ordinal, distinct from every claim's and every other seal's.
+fn seal_inventory_id(ordinal: u64) -> ArtifactId {
+    let mut hasher = blake3::Hasher::new_derive_key("focal.native.seal.inventory.v1");
+    hasher.update(&ordinal.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut id = [0u8; 16];
+    for (target, source) in id.iter_mut().zip(digest.as_bytes().iter()) {
+        *target = *source;
+    }
+    ArtifactId(id)
 }

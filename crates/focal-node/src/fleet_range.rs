@@ -4,6 +4,7 @@
 //! from its committed rows, and the operator's view names every member.
 use super::*;
 use focal_core::native::retirement::{RetirementCandidates, RetirementCursor};
+use focal_core::native::seal::{Fold, FoldPlan, SealBound, SealPlan, SealRefusal};
 use focal_core::native::{ContentRootsPage, NativeRowCursor, RetiredClaim};
 use focal_ledger::LedgerRangeVerifier;
 use focal_memory::RangeId;
@@ -155,6 +156,18 @@ pub(super) enum RangeCall {
         claim: ClaimId,
         reply: oneshot::Sender<Result<Option<RetiredClaim>, LedgerError>>,
     },
+    /// The seal the committed state yields now, with its bundle (F12).
+    SealBundle {
+        reply: oneshot::Sender<Result<Option<SealedOutcomes>, LedgerError>>,
+    },
+    /// Propose one seal (F12).
+    Seal {
+        plan: Box<SealPlan>,
+        bundle: ContentHash,
+        bytes: u64,
+        fold: Option<Fold>,
+        reply: oneshot::Sender<Result<(), LedgerError>>,
+    },
     /// One page of the content roots the committed rows name (26 §5).
     ContentRoots {
         cursor: Option<NativeRowCursor>,
@@ -168,6 +181,17 @@ pub(super) enum RangeCall {
         max_items: usize,
         reply: oneshot::Sender<Result<focal_evidence::SeedReport, LedgerError>>,
     },
+}
+/// One seal of closed outcomes as the committed core wrote it (F12): the
+/// plan it was derived from, its bundle, and a fold of older seal rows with
+/// its directory bundle when the index reached its bound. The bytes stay
+/// charged to the replica's budget until the agent is done with them.
+pub struct SealedOutcomes {
+    pub plan: SealPlan,
+    pub bundle: Vec<u8>,
+    pub digest: ContentHash,
+    pub fold: Option<(FoldPlan, Vec<u8>, ContentHash)>,
+    pub(crate) _allocation: Allocation,
 }
 /// One family's archive bundle as the committed core wrote it (26 §4):
 /// what the archive agent seals as content before it proposes the
@@ -348,6 +372,29 @@ impl ReplicaHost {
         })
         .await
     }
+    /// The seal the committed state yields now and its bundle, when this
+    /// replica is the authority and a seal is worth proposing (F12).
+    pub async fn seal_bundle(&self) -> Result<Option<SealedOutcomes>, LedgerError> {
+        self.range_call(|reply| RangeCall::SealBundle { reply })
+            .await
+    }
+    /// Propose one seal as a session decision (F12).
+    pub async fn propose_seal(
+        &self,
+        plan: SealPlan,
+        bundle: ContentHash,
+        bytes: u64,
+        fold: Option<Fold>,
+    ) -> Result<(), LedgerError> {
+        self.range_call(|reply| RangeCall::Seal {
+            plan: Box::new(plan),
+            bundle,
+            bytes,
+            fold,
+            reply,
+        })
+        .await
+    }
     /// The continuation of a retired claim, if the claim retired.
     pub async fn retired(&self, claim: ClaimId) -> Result<Option<RetiredClaim>, LedgerError> {
         self.range_call(|reply| RangeCall::Retired { claim, reply })
@@ -477,6 +524,22 @@ impl Owner {
                 drop(charge);
                 let _ = reply.send(result);
             }
+            RangeCall::SealBundle { reply } => {
+                let result = self.seal_bundle();
+                drop(charge);
+                let _ = reply.send(result);
+            }
+            RangeCall::Seal {
+                plan,
+                bundle,
+                bytes,
+                fold,
+                reply,
+            } => {
+                let result = self.session.native_propose_seal(&plan, bundle, bytes, fold);
+                drop(charge);
+                let _ = reply.send(result);
+            }
             RangeCall::ContentRoots {
                 cursor,
                 max_visits,
@@ -565,6 +628,108 @@ impl Owner {
             digest,
             rows,
             bundle,
+            _allocation: allocation,
+        }))
+    }
+    /// The seal the committed state yields now, when it is worth proposing
+    /// (F12): under pressure (the floors it forces are not empty), or when
+    /// the closed outcomes fill half a bundle at the read bound; a fold of
+    /// the oldest half of the seal rows when the next seal would reach the
+    /// bound. The bundle is written at the bound the read serves, the rows
+    /// halved until it fits.
+    fn seal_bundle(&self) -> Result<Option<SealedOutcomes>, LedgerError> {
+        if !self.session.native_authoritative() {
+            return Ok(None);
+        }
+        if self.session.native_check_seal().is_err() {
+            return Ok(None);
+        }
+        let mut limits = self.session.native_encoding_limits()?;
+        limits.bytes = limits
+            .bytes
+            .min(focal_core::native::seal::SEAL_BUNDLE_BYTES);
+        let core = self.session.native_core()?;
+        let floors = core
+            .pressure_floors(focal_ledger::native_session::seal::MAX_FLOORS)
+            .map_err(|error| LedgerError::Native(error.into()))?;
+        let mut bound = SealBound {
+            principals: core.native_limits().principals,
+            rows: focal_core::native::seal::DEFAULT_SEAL_ROWS_PER_BUNDLE,
+        };
+        let (plan, quote) = loop {
+            let plan = match core.seal_plan(&floors, bound) {
+                Ok(plan) => plan,
+                Err(SealRefusal::Nothing) => return Ok(None),
+                Err(SealRefusal::Capacity) => return Err(LedgerError::Capacity),
+                Err(_) => return Err(LedgerError::Corrupt),
+            };
+            match core.seal_quote(&plan, limits) {
+                Ok(quote) => break (plan, quote),
+                Err(_) if bound.rows > 1 => bound.rows /= 2,
+                Err(error) => return Err(LedgerError::Native(error.into())),
+            }
+        };
+        let full = bound.rows / 2;
+        if floors.is_empty() && plan.rows() < full.max(1) {
+            return Ok(None);
+        }
+        // A fold when the seal rows would reach the bound: the oldest half
+        // into the row keyed by the last of them.
+        let seal_rows = core
+            .native_seal_rows()
+            .map_err(|error| LedgerError::Native(error.into()))?;
+        let fold = if seal_rows.len().saturating_add(1) >= core.native_limits().seals {
+            let half = seal_rows.len() / 2;
+            match (seal_rows.first(), seal_rows.get(half)) {
+                (Some((_, first_row)), Some((last, _))) if half >= 1 => {
+                    let plan = core
+                        .fold_plan(first_row.first, *last)
+                        .map_err(|_| LedgerError::Corrupt)?;
+                    let quote = core
+                        .fold_quote(&plan, limits)
+                        .map_err(|error| LedgerError::Native(error.into()))?;
+                    Some((plan, quote))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let total = quote
+            .bytes
+            .checked_add(fold.as_ref().map_or(0, |(_, quote)| quote.bytes))
+            .ok_or(LedgerError::Capacity)?;
+        let allocation = self
+            .budget
+            .reserve(BudgetKind::Payload, BudgetLane::Ordinary, total)?
+            .commit();
+        let mut bundle = Vec::new();
+        bundle
+            .try_reserve_exact(quote.bytes)
+            .map_err(|_| LedgerError::Capacity)?;
+        bundle.resize(quote.bytes, 0);
+        let digest = core
+            .seal_into(&plan, &mut bundle, quote.visits)
+            .map_err(|error| LedgerError::Native(error.into()))?;
+        let fold = match fold {
+            Some((plan, quote)) => {
+                let mut bytes = Vec::new();
+                bytes
+                    .try_reserve_exact(quote.bytes)
+                    .map_err(|_| LedgerError::Capacity)?;
+                bytes.resize(quote.bytes, 0);
+                let digest = core
+                    .fold_into(&plan, &mut bytes, quote.visits)
+                    .map_err(|error| LedgerError::Native(error.into()))?;
+                Some((plan, bytes, digest))
+            }
+            None => None,
+        };
+        Ok(Some(SealedOutcomes {
+            plan,
+            bundle,
+            digest,
+            fold,
             _allocation: allocation,
         }))
     }

@@ -89,6 +89,14 @@ fn fixed_header_inspection_reads_exactly_the_registered_layout() {
             command: 27,
         }
     );
+    // The client protocol's generation floor (tag 28, F12) is a registered
+    // participant command; the tag after the registry is refused below.
+    assert_eq!(
+        inspect_native_frame(&frame(0, 0, ledger(), key(), 28))
+            .unwrap()
+            .command,
+        28
+    );
     // Timer namespaces parse; admissibility refuses them.
     assert_eq!(
         inspect_native_frame(&frame(0, 2, ledger(), key(), 0))
@@ -229,13 +237,16 @@ fn native_operations_carry_registered_tags_actor_capability_and_mutation_class()
         .collect();
     assert_eq!(tags.len(), NativeOperationKind::ALL.len());
     assert_eq!(names.len(), NativeOperationKind::ALL.len());
-    assert_eq!(tags.iter().max(), Some(&31));
+    // 32 advances a principal's generation floor and 33 seals closed
+    // outcomes (F12); the seal joins the timers, import and retirement as
+    // the operations no participant authors.
+    assert_eq!(tags.iter().max(), Some(&33));
     assert_eq!(
         NativeOperationKind::ALL
             .iter()
             .filter(|kind| !kind.participant_authored())
             .count(),
-        5
+        6
     );
     assert_eq!(
         NativeProfile::from_registered(1),

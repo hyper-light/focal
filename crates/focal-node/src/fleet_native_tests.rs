@@ -71,7 +71,11 @@ fn frame(
     let compiled = focal_native_client::compile(
         &operation,
         &context,
-        RequestId::from_u128(request),
+        RequestKey {
+            principal: context.actor,
+            epoch: RequestEpoch(1),
+            id: RequestId::from_u128(request),
+        },
         &mut ids(request * 1000),
         resolved,
         &limits,

@@ -2074,7 +2074,11 @@ impl RequestHandler for FleetService {
                 Operation::Custody(_) | Operation::Upload(_) | Operation::Download { .. }
             ) || matches!(
                 &request.request().operation,
-                Operation::NativeRead(read) if matches!(read.query, NativeReadQuery::Archived(_))
+                Operation::NativeRead(read)
+                    if matches!(
+                        read.query,
+                        NativeReadQuery::Archived(_) | NativeReadQuery::Sealed(_)
+                    )
             ) {
                 // Content, and an archived object read from a bundle this
                 // node holds (the audit's F11), are the content owner's.

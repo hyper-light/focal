@@ -92,6 +92,8 @@ pub fn native(refusal: &NativeRefusal) -> Failure {
             NativeErrorCode::InvalidCut => Failure::error("invalid_cut", 5),
             NativeErrorCode::Legacy => Failure::error("legacy_engine", 2),
             NativeErrorCode::Unsupported => Failure::error("unsupported_operation", 2),
+            NativeErrorCode::RequestHistoryExpired => Failure::error("request_history_expired", 5),
+            NativeErrorCode::EpochNotAdmitted => Failure::error("epoch_not_admitted", 5),
         },
     }
 }

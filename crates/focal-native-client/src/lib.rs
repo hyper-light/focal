@@ -31,8 +31,9 @@ mod tests;
 
 pub use compile::{Compiled, compile};
 pub use driver::{
-    CLAIM_EXPAND, DriveError, Lists, NativeReadOutcome, Preparation, READ_ITEMS, Reads, admissible,
-    list, list_request, outcome, prepare, read, resolve,
+    CLAIM_EXPAND, DriveError, Lists, NativeReadOutcome, Preparation, READ_ITEMS, RECOVERY_PROBES,
+    Reads, Submits, admissible, expired, list, list_request, maintain, outcome, outcome_by_id,
+    prepare, read, resolve,
 };
 pub use focal_core::native::NativeContentProfile;
 pub use frame::{FrameLimits, encode_frame, fingerprint};

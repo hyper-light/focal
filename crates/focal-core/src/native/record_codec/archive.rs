@@ -140,9 +140,20 @@ impl<'a> StructuralArchive<'a> {
             if row.deleted() || previous.is_some_and(|last| last >= row.key) {
                 return Err(CodecError::InvalidTag("archive row"));
             }
+            // The accounting stays in the core; a member's timer outcomes
+            // are the family's rows (F12) and leave with it.
             if matches!(
                 row.key,
-                Key::Meta | Key::Outcome(_) | Key::CreationResult(_)
+                Key::Meta
+                    | Key::CreationResult(_)
+                    | Key::Epochs(_)
+                    | Key::Seal(_)
+                    | Key::Outcome(
+                        NativeInvocation::Request(_)
+                            | NativeInvocation::Import
+                            | NativeInvocation::Retirement(_)
+                            | NativeInvocation::Seal(_)
+                    )
             ) {
                 return Err(CodecError::InvalidTag("archive accounting row"));
             }

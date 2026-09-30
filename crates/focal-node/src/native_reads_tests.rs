@@ -191,7 +191,11 @@ impl Harness {
         let compiled = compile(
             operation,
             &build(actor),
-            RequestId::from_u128(request),
+            RequestKey {
+                principal: actor,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(request),
+            },
             &mut ids(request * 1000),
             &resolved,
             &limits,
@@ -680,7 +684,11 @@ fn the_owner_selects_the_current_evaluation_over_the_whole_span_and_the_client_b
     let compiled = compile(
         &begin,
         &build(ISSUER),
-        RequestId::from_u128(9_000),
+        RequestKey {
+            principal: ISSUER,
+            epoch: RequestEpoch(1),
+            id: RequestId::from_u128(9_000),
+        },
         &mut ids(9_000_000),
         &resolved,
         &CompileLimits::default(),
@@ -707,7 +715,11 @@ fn the_owner_selects_the_current_evaluation_over_the_whole_span_and_the_client_b
         compile(
             &ambiguous,
             &build(ISSUER),
-            RequestId::from_u128(9_001),
+            RequestKey {
+                principal: ISSUER,
+                epoch: RequestEpoch(1),
+                id: RequestId::from_u128(9_001),
+            },
             &mut ids(9_001_000),
             &resolved,
             &CompileLimits::default(),

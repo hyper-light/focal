@@ -66,6 +66,14 @@ pub(crate) struct NativeEngine<S: NativeSchemaVerifier> {
     /// Committed retirement records this replica applied nothing for since
     /// it opened; a diagnostic, never an input to state.
     pub(super) retirements_inert: u64,
+    /// The seal record this authority proposed and has not seen applied
+    /// (F12); native admission waits for it, and a term change lets it go.
+    pub(super) seal: Option<super::seal::SealRecord>,
+    /// Seals applied through the applied prefix, from genesis or the
+    /// checkpoint that seeded this replica; and the records applied nothing
+    /// for since it opened (a diagnostic).
+    pub(super) seals_applied: u64,
+    pub(super) seals_inert: u64,
     /// The chunks of this replica's latest checkpoint seed (25 §5): what
     /// its seed store must keep for peers that seed from it (26 §5).
     pub(super) seed_chunks: Vec<ContentHash>,
@@ -181,6 +189,9 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
             retirement: None,
             retired_families: 0,
             retirements_inert: 0,
+            seal: None,
+            seals_applied: 0,
+            seals_inert: 0,
             seed_chunks: Vec::new(),
             movement: None,
             disk_sample: None,
@@ -273,6 +284,9 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         if self.retirement.is_some() {
             return Err(NativeSessionError::Retiring);
         }
+        if self.seal.is_some() {
+            return Err(NativeSessionError::Sealing);
+        }
         if self
             .movement
             .as_ref()
@@ -318,6 +332,15 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
     }
     pub(crate) fn retirement_in_flight(&self) -> Option<super::retirement::RetirementRecord> {
         self.retirement
+    }
+    pub(crate) fn seal_in_flight(&self) -> Option<super::seal::SealRecord> {
+        self.seal.clone()
+    }
+    pub(crate) fn seals_applied(&self) -> u64 {
+        self.seals_applied
+    }
+    pub(crate) fn seals_inert(&self) -> u64 {
+        self.seals_inert
     }
     /// The owner must be reconstructed before this engine is authoritative
     /// again: a record it did not author through its owner applied through
@@ -368,6 +391,9 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         self.require_authority(status)?;
         if self.retirement.is_some() {
             return Err(NativeSessionError::Retiring);
+        }
+        if self.seal.is_some() {
+            return Err(NativeSessionError::Sealing);
         }
         if self.layout_change.is_some() {
             return Err(NativeSessionError::LayoutChanging);
@@ -471,6 +497,74 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         self.retirement = Some(record);
         Ok(())
     }
+    /// Whether this authority could propose a seal now (F12): the gates a
+    /// retirement passes, and the owner's reservation of outcomes for the
+    /// reports it promised (the seal publishes one outcome of its own).
+    pub(crate) fn check_seal(&self, status: &NodeStatus) -> Result<(), NativeSessionError> {
+        self.retirement_gates(status)?;
+        self.retirement_reservation()
+    }
+    /// Propose one seal as a session decision (F12). Only an authority with
+    /// no pending candidate and nothing else in flight may; the plan must
+    /// have been derived at the committed prefix (a plan derived earlier is
+    /// refused, never proposed), and the core must hold the seal's outcome.
+    pub(crate) fn propose_seal(
+        &mut self,
+        consensus: &mut DurableNode,
+        plan: &focal_core::native::seal::SealPlan,
+        bundle: ContentHash,
+        bytes: u64,
+        fold: Option<focal_core::native::seal::Fold>,
+    ) -> Result<(), NativeSessionError> {
+        let status = consensus.status();
+        self.retirement_gates(&status)?;
+        let core = self.committed_core()?;
+        let prefix = core.native_sequence();
+        if plan.through != prefix
+            || bundle.0 == [0; 32]
+            || bytes == 0
+            || plan.rows() == 0
+            || fold.is_some_and(|fold| fold.last >= plan.ordinal)
+        {
+            return Err(NativeError::Contract(
+                focal_model::lifecycle::ContractError::InvalidManifest,
+            )
+            .into());
+        }
+        core.check_seal_outcome()
+            .map_err(NativeSessionError::Seal)?;
+        self.retirement_reservation()?;
+        // The floors the plan was derived under are the pressure floors of
+        // this prefix: the record names them, and apply derives them again.
+        let floors = core
+            .pressure_floors(super::seal::MAX_FLOORS)
+            .map_err(NativeSessionError::Native)?;
+        let record = super::seal::SealRecord {
+            ledger: self.ledger,
+            expected_prefix: prefix,
+            through: plan.through,
+            bundle,
+            bytes,
+            count: u64::try_from(plan.rows()).map_err(|_| NativeSessionError::Capacity)?,
+            bound: focal_core::native::seal::SealBound {
+                principals: plan.principals.len().max(1),
+                rows: plan.rows(),
+            },
+            outcome_limit: u64::try_from(self.limits.recovery.native.outcomes)
+                .map_err(|_| NativeSessionError::Capacity)?,
+            floors,
+            fold,
+        };
+        let encoded = record.encode()?;
+        let _permit = self.budget.reserve(
+            BudgetKind::Pending,
+            BudgetLane::Completion,
+            array::<u8>(encoded.len())?,
+        )?;
+        consensus.propose_borrowed_in(&encoded, BudgetLane::Completion)?;
+        self.seal = Some(record);
+        Ok(())
+    }
     /// Propose one movement step (25 §6). The step is prepared against the
     /// committed coordinator state under the session verifier before the
     /// record is proposed, so an applicable record is what the log carries;
@@ -487,6 +581,9 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         }
         if self.retirement.is_some() {
             return Err(NativeSessionError::Retiring);
+        }
+        if self.seal.is_some() {
+            return Err(NativeSessionError::Sealing);
         }
         if !self.pending.is_empty() || self.delivery.is_some() {
             return Err(NativeSessionError::Capacity);
@@ -753,6 +850,9 @@ impl<S: NativeSchemaVerifier> NativeEngine<S> {
         }
         if self.retirement.is_some() {
             return Err(NativeSessionError::Retiring);
+        }
+        if self.seal.is_some() {
+            return Err(NativeSessionError::Sealing);
         }
         let limit = self.limits.recovery.native.pending;
         let full = self.pending.len() >= limit || self.pending.len() == self.pending.capacity();

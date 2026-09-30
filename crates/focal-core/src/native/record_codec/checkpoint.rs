@@ -751,6 +751,179 @@ pub(in crate::native) fn archive_frame<'a>(
     write_raw(hashed.sink, &digest.0)?;
     Ok(digest)
 }
+/// A seal bundle's frame (the audit's F12): the outcome and creation-result
+/// rows that left the core in one seal, in key order, under a header naming
+/// the ledger, the prefix the seal was derived at, its ordinal and the
+/// generations of each principal it holds; or a fold: the seals it covers
+/// and the generations that point into each. Digested like a checkpoint
+/// root; read, never restored.
+pub const SEAL_MAGIC: [u8; 8] = *b"FCNSEAL1";
+pub const SEAL_VERSION: u16 = 1;
+pub(super) const SEAL_HASH_DOMAIN: &str = "focal.native.seal.v1";
+pub(in crate::native) enum SealFrame<'m> {
+    Seal {
+        ledger: LedgerId,
+        profile: NativeContentProfile,
+        through: SessionSeq,
+        ordinal: u64,
+        /// Sorted by principal: the sealed generations of each.
+        principals: &'m [super::super::seal::SealedPrincipal],
+        count: usize,
+    },
+    Fold {
+        ledger: LedgerId,
+        profile: NativeContentProfile,
+        first: u64,
+        last: u64,
+        /// The rows folded, by ordinal, ascending.
+        members: &'m [(u64, super::super::seal::SealRow)],
+        /// Every sealed range pointing into a member, by principal then
+        /// range.
+        ranges: &'m [(ParticipantId, super::super::epochs::SealedRange)],
+    },
+}
+pub(in crate::native) fn seal_frame<'a>(
+    sink: &mut impl Sink,
+    frame: SealFrame<'_>,
+    mut entries: impl Iterator<Item = (Key, &'a Row)>,
+) -> Result<ContentHash, CodecError> {
+    let mut hashed = HashSink {
+        sink,
+        hash: blake3::Hasher::new_derive_key(SEAL_HASH_DOMAIN),
+    };
+    write_raw(&mut hashed, &SEAL_MAGIC)?;
+    write_u16(&mut hashed, SEAL_VERSION)?;
+    let (ledger, profile) = match &frame {
+        SealFrame::Seal {
+            ledger, profile, ..
+        }
+        | SealFrame::Fold {
+            ledger, profile, ..
+        } => (*ledger, *profile),
+    };
+    if ledger.tenant.is_zero() || ledger.session.is_zero() {
+        return Err(CodecError::InvalidTag("seal frame"));
+    }
+    write_u8(
+        &mut hashed,
+        match profile {
+            NativeContentProfile::ProjectionOnly => 0,
+            NativeContentProfile::AuthoredV1 => 1,
+        },
+    )?;
+    types::ledger(&mut hashed, ledger)?;
+    let count = match frame {
+        SealFrame::Seal {
+            through,
+            ordinal,
+            principals,
+            count,
+            ..
+        } => {
+            if through.0 == 0 || ordinal == 0 || count == 0 {
+                return Err(CodecError::InvalidTag("seal frame"));
+            }
+            if !principals
+                .windows(2)
+                .all(|pair| matches!(pair, [a, b] if a.principal < b.principal))
+                || principals.iter().any(|entry| {
+                    entry.principal.is_zero() || entry.first.0 == 0 || entry.first > entry.last
+                })
+            {
+                return Err(CodecError::InvalidTag("seal principals"));
+            }
+            hashed.visit(add(256, principals.len())?)?;
+            write_u8(&mut hashed, 0)?;
+            write_u64(&mut hashed, through.0)?;
+            write_u64(&mut hashed, ordinal)?;
+            write_u32(
+                &mut hashed,
+                u32::try_from(principals.len()).map_err(|_| CodecError::Capacity)?,
+            )?;
+            for entry in principals {
+                write_raw(&mut hashed, &entry.principal.0)?;
+                write_u64(&mut hashed, entry.first.0)?;
+                write_u64(&mut hashed, entry.last.0)?;
+            }
+            write_u64(
+                &mut hashed,
+                u64::try_from(count).map_err(|_| CodecError::Capacity)?,
+            )?;
+            count
+        }
+        SealFrame::Fold {
+            first,
+            last,
+            members,
+            ranges,
+            ..
+        } => {
+            if first == 0
+                || first >= last
+                || members.len() < 2
+                || !members
+                    .windows(2)
+                    .all(|pair| matches!(pair, [a, b] if a.0 < b.0))
+                || members.first().is_none_or(|(_, row)| row.first != first)
+                || members.last().is_none_or(|(ordinal, _)| *ordinal != last)
+                || !ranges
+                    .windows(2)
+                    .all(|pair| matches!(pair, [a, b] if (a.0, a.1.last.0) < (b.0, b.1.first.0)))
+                || ranges.iter().any(|(principal, range)| {
+                    principal.is_zero() || !(first..=last).contains(&range.seal)
+                })
+            {
+                return Err(CodecError::InvalidTag("fold frame"));
+            }
+            hashed.visit(add(add(256, members.len())?, ranges.len())?)?;
+            write_u8(&mut hashed, 1)?;
+            write_u64(&mut hashed, first)?;
+            write_u64(&mut hashed, last)?;
+            write_u32(
+                &mut hashed,
+                u32::try_from(members.len()).map_err(|_| CodecError::Capacity)?,
+            )?;
+            for (ordinal, row) in members {
+                write_u64(&mut hashed, *ordinal)?;
+                fixed::seal_row(&mut hashed, row)?;
+            }
+            write_u32(
+                &mut hashed,
+                u32::try_from(ranges.len()).map_err(|_| CodecError::Capacity)?,
+            )?;
+            for (principal, range) in ranges {
+                write_raw(&mut hashed, &principal.0)?;
+                write_u64(&mut hashed, range.first.0)?;
+                write_u64(&mut hashed, range.last.0)?;
+                write_u64(&mut hashed, range.seal)?;
+            }
+            write_u64(&mut hashed, 0)?;
+            0
+        }
+    };
+    let iteration = iteration_work()?;
+    let mut previous = None;
+    for _ in 0..count {
+        hashed.visit(iteration)?;
+        let (key, value) = entries
+            .next()
+            .ok_or(CodecError::InvalidTag("seal row count"))?;
+        if previous.is_some_and(|last| last >= key)
+            || !matches!(key, Key::Outcome(_) | Key::CreationResult(_))
+        {
+            return Err(CodecError::InvalidTag("seal key order"));
+        }
+        rows::family(key, value)?;
+        previous = Some(key);
+        put_row(&mut hashed, key, value, ledger)?;
+    }
+    if entries.next().is_some() {
+        return Err(CodecError::InvalidTag("seal row count"));
+    }
+    let digest = ContentHash(*hashed.hash.finalize().as_bytes());
+    write_raw(hashed.sink, &digest.0)?;
+    Ok(digest)
+}
 fn frame_entries<'a>(
     sink: &mut impl Sink,
     frame: RootFrame<'_>,
