@@ -2,7 +2,11 @@
 //! each mutation first reserves clone/fanout headroom before entering Raft.
 use crate::{ConsensusError, Entry, Message, NodeConfig, NodeEvents, Snapshot, storage::RamLog};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
-use focal_raft::RawNode;
+use focal_raft::{
+    MAX_MEMBERS, RawNode, Storage,
+    progress::Tracker,
+    proto::{self, EntryType},
+};
 
 fn add(a: usize, b: usize) -> Result<usize, ConsensusError> {
     a.checked_add(b).ok_or(ConsensusError::Capacity)
@@ -125,6 +129,78 @@ pub(super) fn initial_bytes(config: &NodeConfig) -> Result<usize, ConsensusError
         mul(add(config.voters.len(), config.learners.len())?, 4096)?,
     )
 }
+/// What a transition's sends copy out of the log (`Raft::send_append`,
+/// `bcast_append`, `send_append_all`): a page to each member behind this
+/// one — the core's bytes and entries a message at most, and the entries'
+/// own slots — or the snapshot to one behind the log; and to the one member
+/// whose answer the transition may be, as many pages as its window admits.
+/// Pages are read from the running totals the storage keeps beside its
+/// entries; the entries not yet durable are counted whole when a page
+/// reaches them. Nothing is walked but the members.
+fn sends_bytes(raw: &RawNode<RamLog>) -> Result<usize, ConsensusError> {
+    let raft = &raw.raft;
+    let log = raft.log();
+    let store = raw.store();
+    let core = raft.config();
+    let per_message = core.limits.entries_per_message.max(1);
+    let page = usize::try_from(core.max_size_per_msg)
+        .unwrap_or(usize::MAX)
+        .saturating_add(per_message.saturating_mul(std::mem::size_of::<Entry>()));
+    let window = core.max_inflight_msgs.max(1);
+    let first = log.first_index().map_err(ConsensusError::Raft)?;
+    let last = log.last_index().map_err(ConsensusError::Raft)?;
+    let durable = Storage::last_index(store)?;
+    let pending = add(log.unstable().payload(), log.unstable().encoded_bytes())?;
+    let snapshot = store
+        .snapshot
+        .data
+        .capacity()
+        .max(log.unstable().snapshot_bytes());
+    let pages_from = |next: u64, pages: usize| -> Result<usize, ConsensusError> {
+        let entries = per_message.saturating_mul(pages);
+        let high = next
+            .saturating_add(u64::try_from(entries).unwrap_or(u64::MAX))
+            .min(last.saturating_add(1));
+        if next >= high {
+            return Ok(0);
+        }
+        let cap = page.saturating_mul(pages);
+        let stored =
+            store.bytes_between(next, high.min(durable.saturating_add(1)), entries, cap)?;
+        let not_yet_durable = if high > durable.saturating_add(1) {
+            pending
+        } else {
+            0
+        };
+        Ok(add(stored, not_yet_durable)?.min(cap))
+    };
+    let mut pages = 0usize;
+    let mut window_more = 0usize;
+    for (member, progress) in raft.tracker().iter() {
+        if member == raft.id() {
+            continue;
+        }
+        if progress.pending_request_snapshot != 0 || progress.next_index < first {
+            pages = add(pages, snapshot)?;
+            continue;
+        }
+        let one = pages_from(progress.next_index, 1)?;
+        let all = pages_from(progress.next_index, window)?;
+        pages = add(pages, one)?;
+        window_more = window_more.max(all.saturating_sub(one));
+    }
+    add(pages, window_more)
+}
+/// The bytes of the log's last entry: what a member that joins is sent
+/// first, its progress beginning at the last index (`Tracker::apply`).
+fn last_entry_bytes(raw: &RawNode<RamLog>) -> Result<usize, ConsensusError> {
+    if let Some(entry) = raw.raft.log().unstable().entries().last() {
+        return entry_bytes(entry);
+    }
+    let last = Storage::last_index(raw.store())?;
+    raw.store()
+        .bytes_between(last, last.saturating_add(1), 1, usize::MAX)
+}
 pub(super) fn staging_bytes(
     raw: &RawNode<RamLog>,
     config: &NodeConfig,
@@ -132,21 +208,110 @@ pub(super) fn staging_bytes(
     new_members: usize,
 ) -> Result<usize, ConsensusError> {
     let members = add(raw.raft.tracker().len(), new_members)?.max(1);
-    // A transition can copy retained entries to one outbound batch per peer,
-    // Ready, encoded WAL records, prepared storage, and committed application output.
-    // No history-sized temporary allocation escapes this guard.
-    let history = raw.store().resident_bytes()?;
-    let batch = history.min(config.max_entry_bytes.saturating_add(1024));
-    let snapshot = raw.store().snapshot.data.capacity();
-    let mut bytes = mul(history, 2)?;
-    bytes = add(bytes, mul(add(batch, snapshot)?, add(members, 2)?)?)?;
+    let log = raw.raft.log();
+    // What a transition copies, each copy named, and nothing the size of
+    // the history (the audit's F16): the entries not yet durable go into
+    // the Ready, the WAL's records and the prepared storage; the proposals
+    // this member holds by itself likewise; the committed page the Ready
+    // gives is read from storage a page at most; a snapshot on its way goes
+    // into the Ready, the prepared storage and the events; what the leader sends is
+    // priced from each member's progress (`sends_bytes`); a member whose
+    // progress this transition makes is sent the last entry, and its pages
+    // come in later transitions, priced then; a proposal's bytes join the
+    // entries not yet durable and one message a peer; the queue of
+    // messages grows by its own rule. The counters that say what the core
+    // holds are kept as it changes, so asking walks nothing but the
+    // members.
+    let unstable = add(log.unstable().payload(), log.unstable().encoded_bytes())?;
+    // A snapshot on its way goes into the Ready, the prepared storage and
+    // the events delivered.
+    let arriving = log.unstable().snapshot_bytes();
+    let held = raw.raft.held_bytes();
+    let page = usize::try_from(crate::COMMITTED_PAGE_BYTES).unwrap_or(usize::MAX);
+    let committed_page = raw.store().bytes_between(
+        log.applied().saturating_add(1),
+        log.committed().saturating_add(1),
+        usize::MAX,
+        page,
+    )?;
+    let sends = sends_bytes(raw)?;
+    let message = usize::try_from(raw.raft.config().max_size_per_msg).unwrap_or(usize::MAX);
+    let joining = mul(new_members, last_entry_bytes(raw)?.min(message))?;
+    let queue = raw.raft.outgoing().growth_of(mul(members, 2)?);
+    let mut bytes = raw_bytes(raw)?;
+    bytes = add(bytes, queue)?;
+    bytes = add(bytes, mul(unstable, 2)?)?;
+    bytes = add(bytes, mul(arriving, 3)?)?;
+    bytes = add(bytes, mul(held, 3)?)?;
+    bytes = add(bytes, mul(committed_page, 2)?)?;
+    bytes = add(bytes, sends)?;
+    bytes = add(bytes, joining)?;
     bytes = add(bytes, mul(incoming, add(members, 8)?)?)?;
-    bytes = add(bytes, mul(raw_bytes(raw)?, 6)?)?;
     bytes = add(
         bytes,
         mul(members, add(mul(config.max_inflight_messages, 8)?, 4096)?)?,
     )?;
     add(bytes, 65536)
+}
+/// Whether a change of `kind` (`ConfChangeType`) names `member` as a new
+/// voter or learner the core does not track.
+fn adds_member(kind: u64, member: u64, tracker: &Tracker) -> bool {
+    const ADD_NODE: u64 = 0;
+    const ADD_LEARNER_NODE: u64 = 2;
+    (kind == ADD_NODE || kind == ADD_LEARNER_NODE) && member != 0 && tracker.get(member).is_none()
+}
+/// The type (`kind_field`) and the member (`member_field`) one encoded
+/// change names.
+fn change_named(
+    bytes: &[u8],
+    kind_field: u64,
+    member_field: u64,
+) -> Result<(u64, u64), ConsensusError> {
+    let (mut kind, mut member) = (0u64, 0u64);
+    fields(bytes, |field, wire, value, _| {
+        if wire == 0 {
+            if field == kind_field {
+                kind = value;
+            }
+            if field == member_field {
+                member = value;
+            }
+        }
+        Ok(())
+    })?;
+    Ok((kind, member))
+}
+/// The members a committed change adds that the core does not track yet,
+/// counted from the change's bytes without decoding it into anything: a
+/// `ConfChangeV2`'s `changes` (field 2), each a `ConfChangeSingle` of type
+/// (field 1) `AddNode` or `AddLearnerNode` and member (field 2); or a
+/// `ConfChange`'s one (type field 2, member field 3). A change that does
+/// not decode adds no one here: the core refuses it when it is applied.
+pub(super) fn members_added(entry: &Entry, tracker: &Tracker) -> usize {
+    let mut added = 0usize;
+    let walked = match proto::entry_type(entry) {
+        Some(EntryType::EntryConfChange) => {
+            change_named(&entry.data, 2, 3).map(|(kind, member)| {
+                if adds_member(kind, member, tracker) {
+                    added = 1;
+                }
+            })
+        }
+        Some(EntryType::EntryConfChangeV2) => fields(&entry.data, |field, wire, _, single| {
+            if field == 2 && wire == 2 {
+                let (kind, member) = change_named(single, 1, 2)?;
+                if adds_member(kind, member, tracker) {
+                    added = added.saturating_add(1);
+                }
+            }
+            Ok(())
+        }),
+        _ => Ok(()),
+    };
+    if walked.is_err() {
+        return 0;
+    }
+    added.min(MAX_MEMBERS)
 }
 
 fn varint(input: &mut &[u8]) -> Result<u64, ConsensusError> {
@@ -172,9 +337,12 @@ fn varint(input: &mut &[u8]) -> Result<u64, ConsensusError> {
         "protobuf integer overflow",
     ))
 }
+/// Walks the fields of an encoded protobuf message: `visit` is given each
+/// field's number, wire type, integer (a varint's value; zero otherwise)
+/// and bytes (a length-delimited field's; empty otherwise).
 fn fields(
     mut bytes: &[u8],
-    mut visit: impl FnMut(u64, u8, &[u8]) -> Result<(), ConsensusError>,
+    mut visit: impl FnMut(u64, u8, u64, &[u8]) -> Result<(), ConsensusError>,
 ) -> Result<(), ConsensusError> {
     while !bytes.is_empty() {
         let tag = varint(&mut bytes)?;
@@ -183,18 +351,14 @@ fn fields(
             return Err(ConsensusError::MalformedMessage("zero protobuf field"));
         }
         let wire = (tag & 7) as u8;
-        let length = match wire {
-            0 => {
-                let original = bytes;
-                varint(&mut bytes)?;
-                original
-                    .len()
-                    .checked_sub(bytes.len())
-                    .ok_or(ConsensusError::Capacity)?
-            }
-            1 => 8,
-            2 => usize::try_from(varint(&mut bytes)?).map_err(|_| ConsensusError::Capacity)?,
-            5 => 4,
+        let (value, length) = match wire {
+            0 => (varint(&mut bytes)?, 0),
+            1 => (0, 8),
+            2 => (
+                0,
+                usize::try_from(varint(&mut bytes)?).map_err(|_| ConsensusError::Capacity)?,
+            ),
+            5 => (0, 4),
             _ => {
                 return Err(ConsensusError::MalformedMessage(
                     "unsupported protobuf group/wire type",
@@ -202,24 +366,24 @@ fn fields(
             }
         };
         if wire == 0 {
-            visit(field, wire, &[])?;
+            visit(field, wire, value, &[])?;
         } else {
-            let (value, tail) = bytes
+            let (nested, tail) = bytes
                 .split_at_checked(length)
                 .ok_or(ConsensusError::MalformedMessage("truncated protobuf field"))?;
             bytes = tail;
-            visit(field, wire, value)?;
+            visit(field, wire, value, nested)?;
         }
     }
     Ok(())
 }
 fn snapshot_scratch(bytes: &[u8]) -> Result<usize, ConsensusError> {
     let mut members = 0usize;
-    fields(bytes, |field, wire, metadata| {
+    fields(bytes, |field, wire, _, metadata| {
         if field == 2 && wire == 2 {
-            fields(metadata, |field, wire, conf| {
+            fields(metadata, |field, wire, _, conf| {
                 if field == 1 && wire == 2 {
-                    fields(conf, |field, wire, mut packed| {
+                    fields(conf, |field, wire, _, mut packed| {
                         if (1..=4).contains(&field) {
                             if wire == 0 {
                                 members = add(members, 1)?;
@@ -245,7 +409,7 @@ fn snapshot_scratch(bytes: &[u8]) -> Result<usize, ConsensusError> {
 }
 pub(super) fn message_scratch(bytes: &[u8]) -> Result<usize, ConsensusError> {
     let mut extra = 4096usize;
-    fields(bytes, |field, wire, nested| {
+    fields(bytes, |field, wire, _, nested| {
         if field == 7 && wire == 2 {
             extra = add(extra, mul(std::mem::size_of::<Entry>(), 2)?)?;
         }
@@ -283,4 +447,107 @@ pub(super) fn replay_scratch(record: &focal_log::Record) -> Result<usize, Consen
         return add(mul(members, 16)?, 16384);
     }
     add(mul(record.payload.len(), 2)?, 4096)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        DurableNode,
+        tests::{Cluster, config},
+    };
+    use focal_raft::StateRole;
+
+    /// A change naming the most members the core admits — which it then
+    /// refuses, the group holding three — is priced by what the transition
+    /// copies for each: its progress, its places in the queue, its share
+    /// of the incoming bytes and the last entry it is sent; not a page and
+    /// the snapshot apiece, which priced the audit's malformed message at
+    /// 8.6 GB and refused it for capacity before the core could refuse it.
+    #[test]
+    fn a_member_that_joins_is_priced_its_progress_and_the_last_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut node = DurableNode::open(config(1), dir.path()).unwrap();
+        node.campaign().unwrap();
+        node.drain().unwrap();
+        node.propose(vec![7; 300]).unwrap();
+        node.drain().unwrap();
+        let none = staging_bytes(&node.raw, &node.config, 657, 0).unwrap();
+        let most = staging_bytes(&node.raw, &node.config, 657, MAX_MEMBERS).unwrap();
+        let last = last_entry_bytes(&node.raw).unwrap();
+        assert!((300..1024).contains(&last), "{last}");
+        // Two places in the queue a member (`Outgoing::growth_of` reserves
+        // twice the count), its share of the incoming bytes, its inflight
+        // bookkeeping and the last entry.
+        let each = 4 * std::mem::size_of::<Message>()
+            + 657
+            + 8 * node.config.max_inflight_messages
+            + 4096
+            + last;
+        assert_eq!(most - none, MAX_MEMBERS * each);
+        assert!(most < 8 * 1024 * 1024, "{most}");
+    }
+
+    /// A member behind the leader is priced the page it is sent and, for
+    /// the one whose answer the transition may be, the window of pages;
+    /// the pages read from the running totals are what a walk of the
+    /// entries says.
+    #[test]
+    fn a_member_behind_is_priced_its_pages_from_the_running_totals() {
+        let mut cluster = Cluster::new();
+        cluster.nodes[0].campaign().unwrap();
+        cluster.pump(None);
+        assert_eq!(cluster.nodes[0].status().role, StateRole::Leader);
+        // Member 3 hears nothing while forty entries commit on the other
+        // two; the leader then learns it could not be reached and probes it
+        // from where it was.
+        for round in 0..40u8 {
+            cluster.nodes[0]
+                .propose(vec![round; 1024 + usize::from(round) * 16])
+                .unwrap();
+            cluster.pump(Some(3));
+        }
+        cluster.nodes[0].report_unreachable(3).unwrap();
+        let leader = &cluster.nodes[0];
+        let raft = &leader.raw.raft;
+        let core = raft.config();
+        let store = leader.raw.store();
+        assert!(raft.log().unstable().entries().is_empty());
+        let last = raft.log().last_index().unwrap();
+        let page = |pages: usize| {
+            usize::try_from(core.max_size_per_msg).unwrap() * pages
+                + core.limits.entries_per_message * pages * std::mem::size_of::<Entry>()
+        };
+        let walk = |next: u64, pages: usize| {
+            store
+                .entries
+                .iter()
+                .filter(|entry| entry.index >= next && entry.index <= last)
+                .take(core.limits.entries_per_message * pages)
+                .map(|entry| entry_bytes(entry).unwrap())
+                .sum::<usize>()
+                .min(page(pages))
+        };
+        let (mut expected, mut more, mut behind) = (0usize, 0usize, 0usize);
+        for (member, progress) in raft.tracker().iter() {
+            if member == raft.id() {
+                continue;
+            }
+            assert!(progress.next_index >= raft.log().first_index().unwrap());
+            let one = walk(progress.next_index, 1);
+            let all = walk(progress.next_index, core.max_inflight_msgs);
+            if progress.next_index <= last {
+                behind += 1;
+                assert!(one > 0);
+                assert_eq!(all, one, "forty entries are one page");
+            }
+            expected += one;
+            more = more.max(all - one);
+        }
+        assert_eq!(behind, 1, "member 3 alone is behind");
+        assert_eq!(sends_bytes(&leader.raw).unwrap(), expected + more);
+        // The estimate names that page once, whatever lies behind it.
+        let with = staging_bytes(&leader.raw, &leader.config, 0, 0).unwrap();
+        assert!(with >= expected, "{with} < {expected}");
+    }
 }

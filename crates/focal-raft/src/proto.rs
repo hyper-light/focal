@@ -43,6 +43,35 @@ pub fn approximate_bytes(entry: &Entry) -> usize {
         .saturating_add(entry.context.len())
         .saturating_add(12)
 }
+/// What a message is allowed beyond its buffers' capacities: what an
+/// allocator keeps for the buffers themselves. A message owns at most
+/// three of its own (its context, its entries, a snapshot's data), each
+/// with a header of a few words and a rounding to its size class, taken
+/// as 128 apiece and rounded up to a power of two.
+pub const MESSAGE_ALLOWANCE: usize = 512;
+/// The bytes a message holds, by capacity: its context, its entries' slots
+/// and buffers, its snapshot, and [`MESSAGE_ALLOWANCE`]. The core counts a
+/// queued message at this, and its owner charges one for the same, so that
+/// a message moved from the one to the other costs the same at both.
+pub fn message_bytes(message: &Message) -> usize {
+    let slots = message
+        .entries
+        .capacity()
+        .saturating_mul(std::mem::size_of::<Entry>());
+    let payload = message.entries.iter().fold(0usize, |bytes, entry| {
+        bytes
+            .saturating_add(entry.data.capacity())
+            .saturating_add(entry.context.capacity())
+    });
+    let snapshot = message.snapshot.as_ref().map_or(0, |snapshot| {
+        snapshot.data.capacity().saturating_add(MESSAGE_ALLOWANCE)
+    });
+    MESSAGE_ALLOWANCE
+        .saturating_add(message.context.capacity())
+        .saturating_add(slots)
+        .saturating_add(payload)
+        .saturating_add(snapshot)
+}
 pub fn snapshot_index(snapshot: &Snapshot) -> u64 {
     snapshot
         .metadata

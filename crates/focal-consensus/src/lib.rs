@@ -62,6 +62,9 @@ pub struct RestoredLog {
     pub transition: Option<([u8; 32], [u8; 32])>,
 }
 
+/// The bytes of committed entries one Ready gives to apply: the page a
+/// transition reads from storage at most.
+pub(crate) const COMMITTED_PAGE_BYTES: u64 = 16 * 1024 * 1024;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NodeConfig {
     pub node_id: u64,
@@ -565,12 +568,15 @@ impl DurableNode {
         }
         storage.validate()?;
         let applied = proto::snapshot_index(&storage.snapshot);
+        // The recovered snapshot is an event awaiting the caller's first
+        // drain: charged as every delivered event is, so that the drain
+        // hands it over under the one charge it carries.
         let recovered_allocation = if storage.snapshot.is_empty() {
             None
         } else {
             Some(memory::reserve(
                 &budget,
-                BudgetKind::Recovery,
+                BudgetKind::Pending,
                 BudgetLane::Completion,
                 memory::snapshot_bytes(&storage.snapshot)?,
             )?)
@@ -584,7 +590,7 @@ impl DurableNode {
             max_size_per_msg: (config.max_entry_bytes as u64).saturating_add(1024),
             max_inflight_msgs: config.max_inflight_messages,
             max_uncommitted_size: config.max_uncommitted_bytes,
-            max_committed_size_per_ready: 16 * 1024 * 1024,
+            max_committed_size_per_ready: COMMITTED_PAGE_BYTES,
             check_quorum: true,
             pre_vote: true,
             fast: config.fast,
@@ -652,6 +658,13 @@ impl DurableNode {
 
     pub fn campaign(&mut self) -> Result<(), ConsensusError> {
         self.guarded(|replica| replica.campaign_inner())
+    }
+    /// What one transition of this node may stage at most, as its guard
+    /// reserves it (`memory::staging_bytes` for an operation that brings
+    /// nothing): the bound a heartbeat, a read barrier or a report is held
+    /// to, whatever the history.
+    pub fn staging_estimate(&self) -> Result<usize, ConsensusError> {
+        memory::staging_bytes(&self.raw, &self.config, 0, 0)
     }
     pub fn is_budgeted_within(&self, parent: &MemoryBudget) -> bool {
         self.budget.is_within(parent)
@@ -730,23 +743,21 @@ impl DurableNode {
     /// validated before Raft; unexpected dependency failures stop this replica.
     pub fn step(&mut self, message: Message) -> Result<(), ConsensusError> {
         let bytes = memory::message_bytes(&message)?;
-        let added = if message.entries.iter().any(proto::changes_configuration) {
-            1024
-        } else {
-            message
-                .get_snapshot()
-                .get_metadata()
-                .get_conf_state()
-                .voters
-                .len()
-                .saturating_add(
-                    message
-                        .get_snapshot()
-                        .get_metadata()
-                        .get_conf_state()
-                        .learners
-                        .len(),
-                )
+        // A change carried in an entry makes no member's progress here: the
+        // core appends it, and the members it adds are priced by the drain
+        // that applies it. A snapshot restores its configuration as it is
+        // stepped: the members it names that the core does not track yet.
+        let added = {
+            let conf = message.get_snapshot().get_metadata().get_conf_state();
+            let tracker = self.raw.raft.tracker();
+            conf.voters
+                .iter()
+                .chain(&conf.voters_outgoing)
+                .chain(&conf.learners)
+                .chain(&conf.learners_next)
+                .filter(|member| tracker.get(**member).is_none())
+                .count()
+                .min(focal_raft::MAX_MEMBERS)
         };
         self.guarded_in(bytes, added, BudgetLane::Completion, |replica| {
             replica.step_inner(message)
@@ -763,9 +774,11 @@ impl DurableNode {
         })
     }
     pub fn propose_conf_change(&mut self, change: ConfChangeV2) -> Result<(), ConsensusError> {
+        // Proposed, the change is an entry; the members it adds are priced
+        // by the drain that applies it.
         self.guarded_in(
             change.compute_size() as usize,
-            change.changes.len(),
+            0,
             BudgetLane::Completion,
             |replica| replica.propose_conf_change_inner(change),
         )

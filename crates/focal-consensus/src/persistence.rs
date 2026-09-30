@@ -72,7 +72,11 @@ impl DurableNode {
             return Err(ConsensusError::PersistencePending);
         }
         if self.persistence.is_none() {
-            let membership_pending = self
+            // The members the committed changes about to be applied add,
+            // whose progress this drain makes (`Tracker::apply`).
+            let delivered = self.delivered_index;
+            let tracker = self.raw.raft.tracker();
+            let joining = self
                 .raw
                 .raft
                 .log()
@@ -80,22 +84,21 @@ impl DurableNode {
                 .entries()
                 .iter()
                 .rev()
-                .take_while(|entry| entry.index > self.delivered_index)
-                .any(proto::changes_configuration)
-                || self
-                    .raw
-                    .store()
-                    .entries
-                    .iter()
-                    .rev()
-                    .take_while(|entry| entry.index > self.delivered_index)
-                    .any(proto::changes_configuration);
-            let bytes = memory::staging_bytes(
-                &self.raw,
-                &self.config,
-                0,
-                if membership_pending { 1024 } else { 0 },
-            )?;
+                .take_while(|entry| entry.index > delivered)
+                .chain(
+                    self.raw
+                        .store()
+                        .entries
+                        .iter()
+                        .rev()
+                        .take_while(|entry| entry.index > delivered),
+                )
+                .filter(|entry| proto::changes_configuration(entry))
+                .fold(0usize, |added, entry| {
+                    added.saturating_add(memory::members_added(entry, tracker))
+                })
+                .min(focal_raft::MAX_MEMBERS);
+            let bytes = memory::staging_bytes(&self.raw, &self.config, 0, joining)?;
             // Nothing has been taken from Raft yet: a refused staging reservation
             // leaves the replica exactly as it was, so the caller retries once
             // memory returns instead of losing the node to a transient shortage.
@@ -138,13 +141,35 @@ impl DurableNode {
                     if !self.raw.has_ready() {
                         pending.events.applied_index = pending.delivered;
                         let bytes = memory::events_bytes(&pending.events)?;
-                        pending.events.allocation = Some(
-                            self.active_allocation
-                                .as_mut()
-                                .ok_or(ConsensusError::Failed)?
-                                .split_off(bytes)
-                                .map_err(|_| ConsensusError::Capacity)?,
-                        );
+                        // What the events carry already — recovered at
+                        // opening and charged then, or delivered by the
+                        // drain that built them — is not charged again:
+                        // the staging pays for what this drain added, and
+                        // the one charge the events leave with is exact.
+                        let charge = match pending.events.allocation.take() {
+                            Some(mut carried) if carried.bytes() >= bytes => {
+                                carried
+                                    .shrink_to(bytes)
+                                    .map_err(|_| ConsensusError::Capacity)?;
+                                carried
+                            }
+                            carried => {
+                                let have = carried.as_ref().map_or(0, Allocation::bytes);
+                                let mut grown = self
+                                    .active_allocation
+                                    .as_mut()
+                                    .ok_or(ConsensusError::Failed)?
+                                    .split_off(bytes.saturating_sub(have))
+                                    .map_err(|_| ConsensusError::Capacity)?;
+                                if let Some(mut carried) = carried {
+                                    grown
+                                        .absorb(&mut carried)
+                                        .map_err(|_| ConsensusError::Failed)?;
+                                }
+                                grown
+                            }
+                        };
+                        pending.events.allocation = Some(charge);
                         let retained = memory::raw_bytes(&self.raw)?;
                         let mut allocation = self
                             .active_allocation

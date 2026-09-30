@@ -18,7 +18,10 @@ pub struct InitialState {
 pub trait Storage {
     fn initial_state(&self) -> Result<InitialState, StorageError>;
     /// The entries of `[low, high)` in order, appended to `into`: as many
-    /// as `max_bytes` of their encoding admit, and one at least.
+    /// as `max_bytes` of their encoding admit, and one at least. The page
+    /// is chosen before it is copied: what is appended is reserved for
+    /// exactly, so that a page's spare capacity never holds a place for
+    /// the entries behind it.
     fn entries(
         &self,
         low: u64,
@@ -26,6 +29,14 @@ pub trait Storage {
         max_bytes: u64,
         into: &mut Vec<Entry>,
     ) -> Result<(), StorageError>;
+    /// Whether an entry of `[low, high)` satisfies `predicate`, in order
+    /// and without copying any: the first that does ends the walk.
+    fn any_entry(
+        &self,
+        low: u64,
+        high: u64,
+        predicate: &mut dyn FnMut(&Entry) -> bool,
+    ) -> Result<bool, StorageError>;
     /// The term of the entry at `index`, which is in `[first_index - 1,
     /// last_index]`: the index before the first is the snapshot's.
     fn term(&self, index: u64) -> Result<u64, StorageError>;

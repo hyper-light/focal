@@ -12300,3 +12300,34 @@ writes under one hold of the store's file lock. The catalogue is schema 2 (schem
 `a_failed_or_interrupted_claim_holds_no_slot`,
 `concurrent_transitions_never_lose_a_committed_receipt`, and the adapted
 `prepare_claims_an_identity_once_then_retry_returns_the_exact_frame_and_binds_receipts`.
+
+### 2026-09-29 — F15, F16: a page is chosen before it is copied, and a transition stages its own copies
+
+Raft catch-up copied the whole selected suffix before cutting it to the page (the
+audit's probe: one entry returned, 4,268,032 bytes requested, room for 1,024
+retained), and every guarded transition — a tick, a read barrier, a report —
+reserved twice the resident history and six times the core's state before it ran,
+walking the message queue and the unstable entries to know it. Now the page is
+chosen before any of it is copied (`log::page_of`, exact reservation, the entry
+bound applied before the bytes, `Storage::any_entry` for a question that copies
+nothing), and the guard's allowance names the transition's own copies — the
+unstable entries into the Ready, the records and the prepared storage; the held
+proposals; a committed page read from storage a page at most; a page to each peer
+behind, the window of pages to the one that answers, or the snapshot to one behind
+the log, read from running totals the storage keeps beside its entries
+(`RamLog::bytes_between`); a joining member the last entry; the queue's growth —
+from counters kept as the core changes and checked against a walk in the
+differential harness. The members a change adds are counted where their progress
+is made (the drain that applies it, from the change's bytes), not as the most a
+change may name: a first cut priced a malformed change naming 1,024 members at
+8.6 GB and refused it for capacity before the core could refuse it. The events a
+drain delivers keep the charge they carry. Measured under the counting allocator:
+the estimate is 79,272 bytes at 64 and at 1,024 committed entries (before 546,728
+and 23,385,104), and the transitions' peaks — 0, 1,184, 0, 21,916 bytes — are
+unchanged by the history. Tests:
+`a_page_is_chosen_before_it_is_copied_and_holds_no_spare_room`,
+`the_cores_agree_on_pages_of_a_hundred_bytes_and_a_window_of_four`,
+`staging_peaks::a_transition_stages_its_own_copies_whatever_the_history`,
+`a_member_that_joins_is_priced_its_progress_and_the_last_entry`,
+`a_member_behind_is_priced_its_pages_from_the_running_totals`,
+`the_running_totals_say_what_a_walk_of_the_entries_says`.

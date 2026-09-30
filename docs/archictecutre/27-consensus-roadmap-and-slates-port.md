@@ -14,7 +14,13 @@ transfer.
 
 focal's consensus is `focal-consensus::DurableNode`, a durable, memory-accounted shell
 around a core that owns elections and the log. The shell owns persistence, checkpoints,
-decoder fences and the unwind boundary. Until 2026-09-28 the core was tikv raft-rs 0.7
+decoder fences and the unwind boundary. Its guard reserves, before a transition runs,
+what the transition copies and nothing the size of the history (2026-09-29, the audit's
+F15/F16): a page of the log is chosen before it is copied and copied exactly, the
+entries not yet durable, the held proposals, the committed page, each lagging peer's
+page or snapshot and the window of pages for the one that answers are named from
+counters the core keeps as it changes and running totals the storage keeps beside its
+entries, and a heartbeat over a long history asks for what a heartbeat copies. Until 2026-09-28 the core was tikv raft-rs 0.7
 `RawNode`; since then it is `focal-raft` (section 4.5), which keeps raft-rs's log and
 speaks its messages. The table states what raft-rs gave and what focal ran when this
 plan was made.

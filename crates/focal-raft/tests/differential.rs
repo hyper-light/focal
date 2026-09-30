@@ -376,6 +376,22 @@ fn the_cores_agree_with_a_window_of_two_and_a_message_of_one_entry() {
     assert!(reached.committed > 0);
 }
 
+/// Pages of a hundred bytes and a window of four: a lagging member is
+/// caught up a page at a time, each sized before it is copied, and the
+/// cores still say the same. Every page the new core sends is checked
+/// to hold no spare room (`support::New::drain`).
+#[test]
+fn the_cores_agree_on_pages_of_a_hundred_bytes_and_a_window_of_four() {
+    let settings = Settings {
+        max_size_per_msg: 100,
+        max_committed_size_per_ready: 100,
+        max_inflight_msgs: 4,
+        ..Settings::shell()
+    };
+    let reached = campaign("paged", settings, Mix::everything());
+    assert!(reached.committed > 0 && reached.rejections > 0);
+}
+
 #[test]
 fn the_cores_agree_on_what_a_leader_may_hold_uncommitted() {
     // A change that is refused for its size leaves `raft-rs` believing one

@@ -145,21 +145,24 @@ impl Disk {
             _ => self.boot.clone(),
         };
     }
+    /// The page is chosen before it is copied, as the core's own storage
+    /// chooses it: what is returned holds no spare room.
     fn slice(&self, low: u64, high: u64, max_bytes: u64) -> Vec<Entry> {
         let first = self.first_index();
-        let mut entries: Vec<Entry> =
-            self.entries[(low - first) as usize..(high - first) as usize].to_vec();
+        let range = &self.entries[(low - first) as usize..(high - first) as usize];
         let mut bytes = 0u64;
         let mut kept = 0usize;
-        for entry in &entries {
+        for entry in range {
             bytes += entry.encoded_len() as u64;
             if kept > 0 && bytes > max_bytes {
                 break;
             }
             kept += 1;
         }
-        entries.truncate(kept);
-        entries
+        let mut page = Vec::new();
+        page.try_reserve_exact(kept).expect("a page");
+        page.extend(range[..kept].iter().cloned());
+        page
     }
 }
 
@@ -248,8 +251,31 @@ impl focal_raft::Storage for Store {
         if low > high || high > disk.last_index() + 1 {
             return Err(focal_raft::StorageError::Unavailable);
         }
-        into.extend(disk.slice(low, high, max_bytes));
+        let page = disk.slice(low, high, max_bytes);
+        into.try_reserve_exact(page.len())
+            .map_err(|_| focal_raft::StorageError::Unavailable)?;
+        into.extend(page);
         Ok(())
+    }
+    fn any_entry(
+        &self,
+        low: u64,
+        high: u64,
+        predicate: &mut dyn FnMut(&Entry) -> bool,
+    ) -> Result<bool, focal_raft::StorageError> {
+        let disk = self.0.borrow();
+        if low < disk.first_index() {
+            return Err(focal_raft::StorageError::Compacted);
+        }
+        if low > high || high > disk.last_index() + 1 {
+            return Err(focal_raft::StorageError::Unavailable);
+        }
+        let first = disk.first_index();
+        Ok(
+            disk.entries[(low - first) as usize..(high - first) as usize]
+                .iter()
+                .any(predicate),
+        )
     }
     fn term(&self, index: u64) -> Result<u64, focal_raft::StorageError> {
         let disk = self.0.borrow();
@@ -895,6 +921,16 @@ impl Replica for New {
                 output.hard_states.push((hard.term, hard.vote, hard.commit));
                 self.store.0.borrow_mut().hard_state = hard.clone();
             }
+            for message in ready.messages().iter().chain(ready.persisted_messages()) {
+                // A page is sized before it is copied: it holds no spare
+                // room for the entries behind it.
+                assert_eq!(
+                    message.entries.capacity(),
+                    message.entries.len(),
+                    "member {}: a page with spare room",
+                    self.raw.raft.id()
+                );
+            }
             messages.extend(ready.take_messages());
             messages.extend(ready.take_persisted_messages());
             output.reads.extend(
@@ -922,6 +958,10 @@ impl Replica for New {
         output
     }
     fn view(&self) -> View {
+        // What the member counts is what it holds, after every operation.
+        self.raw
+            .check_accounting()
+            .expect("the member's accounting adds up");
         let raft = &self.raw.raft;
         let members = raft
             .tracker()

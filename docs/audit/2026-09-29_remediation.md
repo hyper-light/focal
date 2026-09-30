@@ -27,8 +27,8 @@ ruling before work starts).
 | F12 | P1 | open | 5 | — |
 | F13 | P1 | open | 5 | — |
 | F14 | P1 | open | 6 | — |
-| F15 | P2 | open | 3 | — |
-| F16 | P2 | open | 3 | — |
+| F15 | P2 | in tree | 3 | [F15](#f15) |
+| F16 | P2 | in tree | 3 | [F16](#f16) |
 | F17 | P2 | open | 6 | — |
 | F18 | P2 | open | 6 | — |
 | F19 | P2 | in tree | 6 | [F19](#f19) |
@@ -899,3 +899,105 @@ refusal on separate threads: the receipt is recorded and delivered whichever cam
 the receipt and refused — and the journal ends with the receipt, delivered, every time),
 the adapted `prepare_claims_...` (a refusal after a receipt is `ReceiptMismatch`; a
 different receipt is refused; the identical one is harmless).
+
+## F15
+
+**Cause.** A page of the log was copied before it was sized: the stable fetch reserved
+`high − low` entry slots and the unstable slice copied the whole selected suffix, then
+`limit_bytes` cut what the page admitted — the audit's probe: 1,024 unstable entries of
+4 KiB under a 4 KiB page returned one entry, requested 4,268,032 bytes and retained room
+for 1,024. A lagging replica's catch-up repeated it a page at a time.
+
+**Fix.** The page is chosen before any of it is copied (`focal_raft::log::page_of`: the
+longest prefix whose running total of encoded bytes fits, and the first entry whatever
+its bytes — the rule `limit_bytes` cut by, carried across the stable/unstable boundary
+with the bytes already taken), reserved for exactly (`try_reserve_exact(taken)`) and
+copied only that far; `Log::entries` takes the entry bound too, before the bytes are
+counted (both bound a prefix, so the page is the same whichever applies first). The
+stable storage (`RamLog::entries`, the differential harness's `Store`, the memory
+`Storage` of the tests) chooses its own part by the same rule. A question about the
+entries — whether a range holds a configuration change — copies none of them
+(`Storage::any_entry`, `Log::any_entry`), where `has_unapplied_conf_changes` copied the
+range. The cut after the copy is kept, so a storage that gives more than its part admits
+is cut here. Every copy of entries reserves for exactly what it copies (`copy_entries`,
+`copy_entries_of`): the vote's answer that carries the held proposals reserved by growth
+— room for four, one entry — until the fast suite's page check found it.
+
+**Tests.** `focal_raft::log::tests::a_page_is_chosen_before_it_is_copied_and_holds_no_spare_room`
+(across the boundary, at every budget from zero to unbounded: the page's capacity is its
+length, each entry's buffer is exact, and the entries are what copying everything and
+cutting gives; an oversized first entry is taken alone, stable or not; what follows one
+is left for the next page), `the_cores_agree_on_pages_of_a_hundred_bytes_and_a_window_of_four`
+(the differential campaign at pages of a hundred bytes and a window of four: every page
+the new core sends is checked to hold no spare room, and the cores say the same), the
+existing slice and scan tests (`scan` is gone; `any_entry` replaces its one use),
+`tests/fast.rs` (every page a member sends holds no spare room, the answer carrying the
+held proposals included).
+
+## F16
+
+**Cause.** Every guarded transition — a tick, a campaign, a read barrier, a report, a
+step — reserved `2 × resident history + (batch + snapshot) × (members + 2) + incoming ×
+(members + 8) + 6 × raw + …` before it ran, and `raw` walked the message queue and the
+unstable entries to say what the core held. A heartbeat over a long history asked for
+history-sized headroom, and at capacity was refused although it copied a few kilobytes:
+the measurement below found the estimate at 546,728 bytes for 64 committed entries and
+23,385,104 for 4,096, while the transitions' measured peaks were 0 (tick), 1,184 (read
+barrier), 0 (beat) and 22,132 (a proposal with its WAL append) at both.
+
+**Fix.** The allowance names what a transition copies and nothing the size of the
+history (`memory::staging_bytes`): the entries not yet durable go into the Ready, the
+WAL's records and the prepared storage (2 × their payload and encoded bytes); the
+proposals this member holds by itself likewise (3 ×); a snapshot on its way into the
+Ready, the prepared storage and the events (3 ×); the committed page the Ready gives is
+read from storage a page at most (2 ×); what the leader's sends copy out of the log is
+priced from each member's progress (`sends_bytes`): a page to each member behind it —
+the core's bytes and entries a message, and the entries' slots — or the snapshot to one
+behind the log, and to the one member whose answer the transition may be as many pages
+as its window admits (`send_append_all`; F41 is where that window becomes a byte
+budget); a member whose progress the transition makes is sent the last entry, its pages
+coming in later transitions and priced then; a proposal's bytes join the unstable
+entries and one message a peer (`incoming × (members + 8)`, as before); the queue grows
+by its own rule (`Outgoing::growth_of`); what the core holds now (`raw`, once), the
+inflight bookkeeping per member and 64 KiB. The pages are read from running totals the
+storage keeps beside its entries (`RamLog::bytes_between`: the bytes of any range are a
+subtraction, maintained on append, replacement, compaction and snapshot, checked by
+`validate`), so the estimate walks nothing but the members; the counters that say what
+the core holds are kept as it changes (`Unstable.payload`, `Outgoing.payload`, the held
+proposals' bytes), each checked against a walk in the differential harness
+(`check_accounting`). The members a transition adds are counted where their progress is
+made: a step counts the members of a snapshot it restores that the core does not track;
+a change carried in an entry, proposed or stepped, adds no one until the drain applies
+it, which counts the additions from the change's bytes without decoding it
+(`members_added`; before, any change was priced as the most members, 1,024). A first cut
+priced a joining member at a page and the snapshot: the audit's malformed message naming
+1,024 members was priced at 8,599,227,675 bytes and refused for capacity before the core
+could refuse it as malformed — nine focal-consensus tests said so, and are the
+regression. The events a drain delivers keep the charge they carry (recovered at
+opening, or delivered by the drain that built them): the staging pays for what the drain
+added, and the one charge the events leave with is exact — before, the second drain
+split the whole of the recovered events from a staging that, exact now, had no
+history-sized room for them. `DurableNode::staging_estimate` states the bound a control
+transition is held to; `campaigns_on_next_tick`/`beats_on_next_tick` let an owner know
+what a tick may send. Control transitions stay on the completion lane.
+
+**Measurements** (`tests/staging_peaks.rs`, a single voter under the counting allocator,
+1 KiB entries): estimate 79,272 bytes at 64 and at 1,024 committed entries (before:
+546,728 and 23,385,104 — and 2 × history further at every entry); peaks tick 0, read
+barrier 1,184, beat 0, proposal 21,916 / 21,918, unchanged by the history and within the
+estimate. A change naming 1,024 members on a three-member group: 7,476,224 bytes above
+the change-free estimate (each member's progress, places in the queue, share of the
+incoming bytes and the last entry), where the first cut asked 8,599,227,675.
+
+**Tests.** `staging_peaks::a_transition_stages_its_own_copies_whatever_the_history`,
+`memory::tests::a_member_that_joins_is_priced_its_progress_and_the_last_entry` (the
+change naming the most members costs each what the transition copies for it, and less
+than eight mebibytes in all),
+`memory::tests::a_member_behind_is_priced_its_pages_from_the_running_totals` (a
+three-member group, one member forty entries behind and probed from where it was: the
+sends are what a walk of the entries says, the window's pages for that member),
+`storage::tests::the_running_totals_say_what_a_walk_of_the_entries_says`, the nine
+focal-consensus tests the first cut failed (`what_may_not_go_by_the_fast_track_is_refused_before_the_core`,
+the joint-change, removal and unknown-peer safety tests, restart, recovery and learner
+tests), the focal-raft and focal-consensus suites (the differential campaigns hold the
+counters to a walk after every operation).

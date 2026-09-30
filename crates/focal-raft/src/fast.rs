@@ -118,7 +118,7 @@ impl Proposals {
         Ok(true)
     }
     /// What storage does not hold yet.
-    pub fn unstable(&self) -> impl Iterator<Item = &Entry> {
+    pub fn unstable(&self) -> impl Iterator<Item = &Entry> + Clone {
         self.held
             .iter()
             .filter(|held| !held.durable)
@@ -148,7 +148,7 @@ impl Proposals {
             .filter(|held| held.durable)
             .map(|held| &held.entry)
     }
-    pub fn iter(&self) -> impl Iterator<Item = &Entry> {
+    pub fn iter(&self) -> impl Iterator<Item = &Entry> + Clone {
         self.held.iter().map(|held| &held.entry)
     }
     /// The log reaches `index`: what was held at or below it is held no
@@ -184,6 +184,22 @@ impl Proposals {
                 .capacity()
                 .saturating_mul(std::mem::size_of::<Held>()),
         )
+    }
+    /// The bytes of what is held, as counted.
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+    /// Whether the counter says what a walk of what is held says.
+    pub(crate) fn check(&self) -> Result<()> {
+        let held = self.held.iter().fold(0usize, |total, held| {
+            total.saturating_add(bytes(&held.entry))
+        });
+        if held != self.bytes {
+            return Err(Error::Invariant(
+                "what is approved by this member is not what its counter says",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -370,6 +386,20 @@ impl Votes {
                     )
                 })
             })
+    }
+    /// Whether the counter says what a walk of the votes says.
+    pub(crate) fn check(&self) -> Result<()> {
+        let voted = self.slots.iter().fold(0usize, |total, slot| {
+            slot.choices.iter().fold(total, |total, choice| {
+                total.saturating_add(bytes(&choice.entry))
+            })
+        });
+        if voted != self.bytes {
+            return Err(Error::Invariant(
+                "what the voters hold is not what its counter says",
+            ));
+        }
+        Ok(())
     }
 }
 

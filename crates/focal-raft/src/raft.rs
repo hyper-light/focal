@@ -278,7 +278,7 @@ pub struct Raft<S> {
     pub(crate) tracker: Tracker,
     pub(crate) read_only: ReadOnly,
     pub(crate) read_states: Vec<ReadState>,
-    pub(crate) msgs: Vec<Message>,
+    pub(crate) msgs: Outgoing,
     uncommitted_bytes: usize,
     /// The last index when this member last became leader: entries at or
     /// below are no proposals of its own.
@@ -287,10 +287,93 @@ pub struct Raft<S> {
     pub(crate) config: Config,
 }
 
+/// The messages that wait to be taken, and what they hold, by capacity,
+/// kept as they are queued so that asking costs nothing.
+///
+/// The queue grows by a policy of its own — doubled when full, and never
+/// given fewer than [`Outgoing::SMALLEST`] slots — so that what a burst of
+/// messages may grow it by is known before they are sent
+/// ([`Outgoing::growth_of`]), and does not depend on what a library keeps
+/// as its own.
+#[derive(Debug, Default)]
+pub struct Outgoing {
+    msgs: Vec<Message>,
+    payload: usize,
+}
+impl Outgoing {
+    /// The fewest slots a queue is given: what a tick of a three-member
+    /// group queues at most, a heartbeat a peer or a vote request a peer,
+    /// and one more.
+    pub const SMALLEST: usize = 4;
+    pub fn len(&self) -> usize {
+        self.msgs.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.msgs.is_empty()
+    }
+    pub fn as_slice(&self) -> &[Message] {
+        &self.msgs
+    }
+    pub fn capacity(&self) -> usize {
+        self.msgs.capacity()
+    }
+    /// The bytes the messages hold, by capacity ([`proto::message_bytes`]).
+    pub fn payload(&self) -> usize {
+        self.payload
+    }
+    /// The bytes held, by capacity: the slots and what the messages hold.
+    pub fn resident_bytes(&self) -> usize {
+        self.msgs
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Message>())
+            .saturating_add(self.payload)
+    }
+    /// The most bytes the slots may grow by when `count` messages are
+    /// queued. Doubling from a capacity `c` that holds `len <= c` until
+    /// `len + count` fit ends below `2 (len + count)` slots, or at
+    /// [`Outgoing::SMALLEST`] from nothing: the growth is at most
+    /// `SMALLEST + c + 2 count` slots.
+    pub fn growth_of(&self, count: usize) -> usize {
+        Self::SMALLEST
+            .saturating_add(self.msgs.capacity())
+            .saturating_add(count.saturating_mul(2))
+            .saturating_mul(std::mem::size_of::<Message>())
+    }
+    fn push(&mut self, message: Message) -> Result<()> {
+        if self.msgs.len() == self.msgs.capacity() {
+            let more = self.msgs.capacity().max(Self::SMALLEST);
+            self.msgs
+                .try_reserve_exact(more)
+                .map_err(|_| Error::Memory)?;
+        }
+        self.payload = self.payload.saturating_add(proto::message_bytes(&message));
+        self.msgs.push(message);
+        Ok(())
+    }
+    /// Everything queued, given up: the queue that remains holds nothing
+    /// and keeps no room.
+    pub fn take(&mut self) -> Vec<Message> {
+        self.payload = 0;
+        std::mem::take(&mut self.msgs)
+    }
+    /// Whether the counter says what a walk of the messages says.
+    pub(crate) fn check(&self) -> Result<()> {
+        let payload = self.msgs.iter().fold(0usize, |bytes, message| {
+            bytes.saturating_add(proto::message_bytes(message))
+        });
+        if payload != self.payload {
+            return Err(Error::Invariant(
+                "what waits to be taken is not what its counter says",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// What sends for a leader while it walks its members.
 struct Outbox<'a, S> {
     log: &'a Log<S>,
-    msgs: &'a mut Vec<Message>,
+    msgs: &'a mut Outgoing,
     id: NodeId,
     term: u64,
     priority: i64,
@@ -299,7 +382,7 @@ struct Outbox<'a, S> {
 }
 
 fn push(
-    msgs: &mut Vec<Message>,
+    msgs: &mut Outgoing,
     id: NodeId,
     term: u64,
     priority: i64,
@@ -319,9 +402,7 @@ fn push(
         if message.msg_type == fast::FAST_VOTE {
             message.term = term;
         }
-        msgs.try_reserve(1).map_err(|_| Error::Memory)?;
-        msgs.push(message);
-        return Ok(());
+        return msgs.push(message);
     }
     let kind = proto::message_type(&message).ok_or(Error::Invariant("a message of no kind"))?;
     match kind {
@@ -359,9 +440,7 @@ fn push(
         }
         message.priority = priority;
     }
-    msgs.try_reserve(1).map_err(|_| Error::Memory)?;
-    msgs.push(message);
-    Ok(())
+    msgs.push(message)
 }
 
 fn priority_of(message: &Message) -> i64 {
@@ -415,13 +494,11 @@ impl<S: Storage> Outbox<'_, S> {
                 return Ok(false);
             }
         } else {
-            let entries =
-                self.log
-                    .entries(progress.next_index, self.max_bytes)
-                    .map(|mut entries| {
-                        entries.truncate(self.max_entries);
-                        entries
-                    });
+            // The page is bounded by its bytes and by its entries before
+            // any of it is copied.
+            let entries = self
+                .log
+                .entries(progress.next_index, self.max_bytes, self.max_entries);
             if !allow_empty && entries.as_ref().map_or(true, Vec::is_empty) {
                 return Ok(false);
             }
@@ -524,7 +601,7 @@ impl<S: Storage> Raft<S> {
             tracker,
             read_only: ReadOnly::new(config.limits.pending_reads),
             read_states: Vec::new(),
-            msgs: Vec::new(),
+            msgs: Outgoing::default(),
             uncommitted_bytes: 0,
             leader_tail: 0,
             random: config.seed,
@@ -550,6 +627,10 @@ impl<S: Storage> Raft<S> {
         Ok(raft)
     }
 
+    /// The configuration the core runs under.
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
     pub fn id(&self) -> NodeId {
         self.id
     }
@@ -588,7 +669,16 @@ impl<S: Storage> Raft<S> {
         self.tracker.configuration()
     }
     pub fn messages(&self) -> &[Message] {
+        self.msgs.as_slice()
+    }
+    /// The messages that wait to be taken, with what they hold.
+    pub fn outgoing(&self) -> &Outgoing {
         &self.msgs
+    }
+    /// The bytes of the entries this member holds approved by itself
+    /// ([`crate::fast`]), as counted.
+    pub fn held_bytes(&self) -> usize {
+        self.held.bytes()
     }
     pub fn read_states(&self) -> &[ReadState] {
         &self.read_states
@@ -680,32 +770,12 @@ impl<S: Storage> Raft<S> {
         Ok(())
     }
     /// The bytes held, by capacity: what is queued, what is not durable,
-    /// and what is known of the members.
+    /// and what is known of the members. The queue and what is not yet
+    /// durable, which grow without a bound of their own but the limits,
+    /// are counted as they change; the rest is bounded by the
+    /// configuration and the limits and is walked.
     pub fn resident_bytes(&self) -> usize {
-        let messages = self
-            .msgs
-            .capacity()
-            .saturating_mul(std::mem::size_of::<Message>());
-        let messages = self.msgs.iter().fold(messages, |bytes, message| {
-            let entries = message
-                .entries
-                .capacity()
-                .saturating_mul(std::mem::size_of::<Entry>());
-            let payload = message.entries.iter().fold(0usize, |bytes, entry| {
-                bytes
-                    .saturating_add(entry.data.capacity())
-                    .saturating_add(entry.context.capacity())
-            });
-            let snapshot = message
-                .snapshot
-                .as_ref()
-                .map_or(0, |snapshot| snapshot.data.capacity().saturating_add(512));
-            bytes
-                .saturating_add(message.context.capacity())
-                .saturating_add(entries)
-                .saturating_add(payload)
-                .saturating_add(snapshot)
-        });
+        let messages = self.msgs.resident_bytes();
         let reads = self
             .read_states
             .capacity()
@@ -734,6 +804,35 @@ impl<S: Storage> Raft<S> {
             )
             .saturating_add(self.tracker.resident_bytes())
             .saturating_add(self.log.unstable().resident_bytes())
+    }
+    /// Whether every counter that [`Raft::resident_bytes`] trusts says what
+    /// a walk of what it counts says: the queue, what is not yet durable,
+    /// and what the fast track holds. An invariant error names the first
+    /// that does not.
+    pub fn check_accounting(&self) -> Result<()> {
+        self.msgs.check()?;
+        self.log.unstable().check()?;
+        self.held.check()?;
+        self.votes.check()
+    }
+    /// Whether the next tick makes this member campaign: it is no leader,
+    /// it may campaign, and its election timeout and its patience end
+    /// with that tick. Asked before the tick, so that its owner knows what
+    /// the tick may send.
+    pub fn campaigns_on_next_tick(&self) -> bool {
+        self.state != StateRole::Leader
+            && self.promotable
+            && self.election_elapsed.saturating_add(1)
+                >= self
+                    .randomized_election_timeout
+                    .saturating_add(self.patience)
+    }
+    /// Whether the next tick makes this leader send its heartbeats, or ask
+    /// itself whether it still has a quorum.
+    pub fn beats_on_next_tick(&self) -> bool {
+        self.state == StateRole::Leader
+            && (self.heartbeat_elapsed.saturating_add(1) >= self.config.heartbeat_tick
+                || self.election_elapsed.saturating_add(1) >= self.config.election_tick)
     }
 
     pub(crate) fn send(&mut self, message: Message) -> Result<()> {
@@ -1189,21 +1288,13 @@ impl<S: Storage> Raft<S> {
         }
         Ok(tally)
     }
+    /// Whether `[low, high)` holds a change of the configuration: a yes or
+    /// a no, read where the entries are and copying none of them.
     fn has_unapplied_conf_changes(&self, low: u64, high: u64) -> Result<bool> {
         if self.log.applied() >= self.log.committed() {
             return Ok(false);
         }
-        let mut found = false;
-        self.log.scan(
-            low,
-            high,
-            self.config.max_committed_size_per_ready,
-            |page| {
-                found = page.iter().any(proto::changes_configuration);
-                !found
-            },
-        )?;
-        Ok(found)
+        self.log.any_entry(low, high, proto::changes_configuration)
     }
     fn hup(&mut self, transfer: bool) -> Result<()> {
         if self.state == StateRole::Leader {
@@ -2047,7 +2138,7 @@ impl<S: Storage> Raft<S> {
 pub(crate) fn held<S: Storage>(raft: &Raft<S>) -> Vec<(u64, u64)> {
     let first = raft.log.first_index().unwrap();
     raft.log
-        .entries(first, u64::MAX)
+        .entries(first, u64::MAX, usize::MAX)
         .unwrap()
         .iter()
         .map(|entry| (entry.index, entry.term))

@@ -388,8 +388,13 @@ impl<S: Storage> RawNode<S> {
         Ok(LightReady {
             commit_index: None,
             committed_entries,
-            messages: std::mem::take(&mut self.raft.msgs),
+            messages: self.raft.msgs.take(),
         })
+    }
+    /// Whether every counter the member trusts for what it holds says what
+    /// a walk says ([`Raft::check_accounting`]).
+    pub fn check_accounting(&self) -> Result<()> {
+        self.raft.check_accounting()
     }
     pub fn has_ready(&self) -> bool {
         let raft = &self.raft;
