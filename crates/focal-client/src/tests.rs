@@ -442,6 +442,108 @@ async fn route_changes_preserve_retry_identity_and_command() {
     ));
 }
 
+/// A session whose leader moves while the request looks for it: the node
+/// asked first names the leader it knew, which has handed leadership on
+/// within the same route epoch and names its successor.
+struct Handoff {
+    seen: std::sync::Arc<Mutex<Vec<Option<String>>>>,
+    stale_epoch: bool,
+}
+impl ClientTransport for Handoff {
+    fn request<'a>(
+        &'a self,
+        route: Option<&'a RouteHint>,
+        request: &'a RequestEnvelope,
+    ) -> TransportFuture<'a> {
+        Box::pin(async move {
+            let mut seen = self.seen.lock().unwrap();
+            seen.push(route.map(|hint| hint.endpoint.clone()));
+            let hint = |epoch: u64, endpoint: &str| {
+                Ok(
+                    request.reply(Response::Error(AccessError::RouteChanged(RouteHint {
+                        epoch: RouteEpoch(epoch),
+                        endpoint: endpoint.into(),
+                        server_name: "localhost".into(),
+                    }))),
+                )
+            };
+            match route.map(|hint| hint.endpoint.as_str()) {
+                None => hint(2, "127.0.0.1:7777"),
+                Some("127.0.0.1:7777") if self.stale_epoch => hint(1, "127.0.0.1:8888"),
+                Some("127.0.0.1:7777") => hint(2, "127.0.0.1:8888"),
+                Some(_) => {
+                    assert_eq!(request.route_epoch, RouteEpoch(2));
+                    Ok(
+                        request.reply(Response::Submitted(MutationReply::Committed(receipt(
+                            request,
+                        )))),
+                    )
+                }
+            }
+        })
+    }
+}
+#[tokio::test]
+async fn a_leader_that_moves_within_a_route_epoch_is_followed_and_an_older_epoch_is_refused() {
+    let seen = std::sync::Arc::new(Mutex::new(vec![]));
+    let client = Client::new(
+        Handoff {
+            seen: seen.clone(),
+            stale_epoch: false,
+        },
+        policy(),
+        WireLimits::default(),
+        1,
+    )
+    .unwrap();
+    // The second hint is at the epoch of the first and names another
+    // endpoint: the leader moved, and the request follows it there.
+    assert!(matches!(
+        client.submit(request()).await.unwrap(),
+        MutationReply::Committed(_)
+    ));
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            None,
+            Some("127.0.0.1:7777".to_owned()),
+            Some("127.0.0.1:8888".to_owned())
+        ]
+    );
+    // The next request starts where the leader was found.
+    assert!(matches!(
+        client.submit(request()).await.unwrap(),
+        MutationReply::Committed(_)
+    ));
+    assert_eq!(
+        seen.lock().unwrap().last().unwrap().as_deref(),
+        Some("127.0.0.1:8888")
+    );
+    // A hint from an older epoch than the one held is not a route: it is
+    // not followed, and the write it answered is reported as the unknown
+    // outcome an invalid reply to a mutation is.
+    let seen = std::sync::Arc::new(Mutex::new(vec![]));
+    let client = Client::new(
+        Handoff {
+            seen: seen.clone(),
+            stale_epoch: true,
+        },
+        policy(),
+        WireLimits::default(),
+        1,
+    )
+    .unwrap();
+    let error = client.submit(request()).await.unwrap_err();
+    assert!(
+        matches!(error, ClientError::OutcomeUnknown { .. }),
+        "{error:?}"
+    );
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![None, Some("127.0.0.1:7777".to_owned())]
+    );
+}
+
 struct LostAppendReply {
     first: Mutex<Option<RequestEnvelope>>,
     always_fail: bool,

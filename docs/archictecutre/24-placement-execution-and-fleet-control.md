@@ -987,7 +987,13 @@ the leader the replica's consensus state names, and a current read is served
 here whoever leads. The replica's own route-epoch check stays as the last
 fence behind the cache. The client already follows `RouteChanged` hints over
 QUIC (a new connection to the hinted endpoint under the cluster's trust,
-the epoch updated per ledger) and refuses to loop on an unchanged hint; it
+the epoch updated per ledger) and refuses to loop on an unchanged hint; a
+hint at the epoch it holds that names another endpoint is followed — a
+route epoch names a placement, and within one the leader moves (a drained
+leader hands leadership on, §19; leaders are spread, 27 §5) — each hint
+counted against the request's attempts, and a hint from an older epoch is
+refused (until 2026-09-30 a second hint within one epoch was refused as an
+invalid response, which a request arriving during a hand-off met); it
 keeps one connection per route (`focal_wire::RouteConnections`: concurrent
 cold calls to a route join its one dial in flight and share the connection,
 and a failed request forgets a route only while the connection that failed

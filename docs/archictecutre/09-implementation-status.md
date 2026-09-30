@@ -12447,3 +12447,16 @@ is authorized while its members are), and a renewed leader was refused by a foll
 had not applied the renewal it could learn only from that leader (the transport admits a
 CA-verified renewal of an enrolled key before the registry names it). CA succession and issuer recovery remain designed (the remediation
 record, F13).
+
+### 2026-09-30 — a request follows a leader that moves within a route epoch
+
+`drain_leader` failed now and then with `invalid_response` on a `receipt acquire` issued
+while the drained leader handed leadership on. Cause: the client's route cache refused a
+hint at the epoch it held that named another endpoint (`Routes::insert`), taking a route
+epoch's hint for immutable; but a route epoch names a placement, and within one the leader
+moves — the node asked first named the leader it knew, which had handed on and named its
+successor at the same epoch, and the second hint was an invalid response. The hint is now
+followed (each one counted against the request's attempts, an unchanged one still ends the
+request, an older epoch is still refused); `focal-client`
+`a_leader_that_moves_within_a_route_epoch_is_followed_and_an_older_epoch_is_refused`
+reproduces the two hints ([24](24-placement-execution-and-fleet-control.md) §10).

@@ -129,9 +129,16 @@ impl Routes {
         entry.used = self.clock;
         Some(entry.hint.clone())
     }
+    /// Hold `hint` for `ledger`. A hint at the epoch held that names
+    /// another endpoint replaces it: a route epoch names a placement, and
+    /// within one the session's leader moves (a drained leader hands
+    /// leadership on, 24 §19; leaders are spread over the voters, 27 §5),
+    /// so the node asked last knows where it went. A hint from an older
+    /// epoch is never adopted. What follows a hint is counted against the
+    /// request's attempts, so hints that lead in a circle end with them.
     fn insert(&mut self, ledger: LedgerId, hint: RouteHint) -> Result<(), ClientError> {
         if let Some(old) = self.entries.get(&ledger)
-            && (hint.epoch < old.hint.epoch || (hint.epoch == old.hint.epoch && hint != old.hint))
+            && hint.epoch < old.hint.epoch
         {
             return Err(ClientError::InvalidResponse);
         }
