@@ -12257,3 +12257,23 @@ refused together by a service serving fifty a millisecond: the whole step
 takes 10,500 calls in twenty waves (tallest 950) and drains in 7,602 ms; the
 spread takes 2,029–2,046 calls, its tallest wave 82–109, and drains in 69–83
 ms. Tests: `backoff_tests` (two), `a_peer_pause_is_spread_over_its_second_half`.
+
+### 2026-09-29 — F65: a slow owner costs its entry, never the sample
+
+The metrics sampler asked each hosted replica's owner in turn and awaited each
+without a deadline, so one stuck owner delayed every later session and the
+whole snapshot while the previous stayed published; a refused or departed
+owner was skipped in silence; the cadence stretched by the collection; and the
+loopback rendered the whole snapshot before reading a request, serially, so a
+slow scraper held the rest. Now every replica is asked at once and the round
+closes at the cadence (`metrics::collect`): an owner refused, gone or late
+leaves its entry `focal_session_observed 0` with the owner-side series absent
+and is counted in `focal_metrics_sessions_unobserved`;
+`focal_metrics_collection_milliseconds` says how long the round took; rounds
+start on the cadence whatever the last one took; the text is rendered once at
+publication (`MetricsPage`) and served as it is by the socket and the
+loopback, which reads the request before it writes and serves as many scrapes
+at once as the admin socket admits operators. Tests: `metrics::tests`
+(`an_unobserved_session_says_so_and_carries_no_owner_side_numbers`,
+`a_round_closes_at_its_deadline_with_the_late_unobserved`,
+`a_silent_scrape_delays_no_other_and_the_text_is_the_page_s`).

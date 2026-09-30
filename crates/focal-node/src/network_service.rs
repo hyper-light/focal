@@ -456,7 +456,7 @@ pub struct NetworkService {
     /// The fixed labels of this node's metrics and the latest snapshot the
     /// sampler published (24 §23).
     metrics_labels: crate::metrics::MetricLabels,
-    metrics: tokio::sync::watch::Sender<Option<crate::metrics::MetricsSnapshot>>,
+    metrics: tokio::sync::watch::Sender<Option<crate::metrics::MetricsPage>>,
     /// The loopback endpoint bound at open when `node.metrics_listen` names one.
     metrics_listener: Option<tokio::net::TcpListener>,
     // All service handles and futures drop before registration closes. The
@@ -1050,7 +1050,7 @@ impl NetworkService {
         let (gc_agent, gc_handle) = crate::gc::GcAgent::from_env(identity.node);
         let (archive_agent, archive_handle) = crate::archive_agent::ArchiveAgent::from_env();
         let (metrics, metrics_view) =
-            tokio::sync::watch::channel::<Option<crate::metrics::MetricsSnapshot>>(None);
+            tokio::sync::watch::channel::<Option<crate::metrics::MetricsPage>>(None);
         let metrics_labels = crate::metrics::MetricLabels {
             node: identity.node,
             cluster: crate::cluster_admin::hex(&identity.cluster),
@@ -1146,7 +1146,10 @@ impl NetworkService {
         })
     }
     /// One metrics sample of everything this node knows about itself (24 §23).
-    async fn sample_metrics(&self) -> crate::metrics::MetricsSnapshot {
+    async fn sample_metrics(
+        &self,
+        started: tokio::time::Instant,
+    ) -> crate::metrics::MetricsSnapshot {
         fn count(value: usize) -> u64 {
             u64::try_from(value).unwrap_or(u64::MAX)
         }
@@ -1227,20 +1230,48 @@ impl NetworkService {
             (Ok(directory), Err(_)) => (Some(directory), None),
             (Err(_), _) => (None, None),
         };
-        let mut sessions = Vec::new();
+        // Every hosted replica asked at once, the round closed at the
+        // cadence (the audit's F65): an owner that is refused, gone or late
+        // costs its entry the owner-side numbers, never another entry and
+        // never the round.
+        let deadline = started
+            .checked_add(crate::metrics::SAMPLE_INTERVAL)
+            .unwrap_or(started);
+        let mut hosts = Vec::new();
         let mut truncated = false;
         let mut after = None;
         while let Some((ledger, host)) = self.handles.fleet.next_host(after) {
             after = Some(ledger);
-            if sessions.len() >= crate::metrics::MAX_SESSIONS || sessions.try_reserve(1).is_err() {
+            if hosts.len() >= crate::metrics::MAX_SESSIONS || hosts.try_reserve(1).is_err() {
                 truncated = true;
                 break;
             }
+            hosts.push((ledger, host));
+        }
+        let mut asks = Vec::new();
+        if asks.try_reserve_exact(hosts.len()).is_err() {
+            truncated = true;
+            hosts.clear();
+        }
+        for (_, host) in &hosts {
+            let host = host.clone();
+            asks.push(async move { host.diagnostics().await.ok() });
+        }
+        let answers = crate::metrics::collect(asks, deadline).await;
+        let mut sessions = Vec::new();
+        let mut unobserved = 0u64;
+        for (index, (ledger, host)) in hosts.iter().enumerate() {
+            if sessions.try_reserve(1).is_err() {
+                truncated = true;
+                break;
+            }
+            let ledger = *ledger;
             let progress = host.progress();
-            let Ok(reply) = host.diagnostics().await else {
-                continue;
-            };
-            let diagnostics = reply.value();
+            let diagnostics = answers.get(index).and_then(Option::as_ref);
+            if diagnostics.is_none() {
+                unobserved = unobserved.saturating_add(1);
+            }
+            let diagnostics = diagnostics.map(|reply| reply.value());
             let listed = directory.as_ref().and_then(|report| {
                 report.partitions.iter().find_map(|(_, checkpoint)| {
                     checkpoint.sessions.get(&ledger).map(|descriptor| {
@@ -1265,22 +1296,25 @@ impl NetworkService {
             sessions.push(SessionMetrics {
                 tenant: ledger.tenant.to_string(),
                 session: ledger.session.to_string(),
+                observed: diagnostics.is_some(),
                 leader: progress.leader,
                 term: progress.term,
-                committed_index: diagnostics.committed_index,
-                applied_index: diagnostics.applied_index,
-                sequence: diagnostics.sequence,
-                pending: count(diagnostics.pending),
-                authoritative: diagnostics.authoritative,
-                preferred_leader: diagnostics.preferred_leader,
-                leader_returns: diagnostics.leader_returns,
-                leader_returns_failed: diagnostics.leader_returns_failed,
-                native_authoritative: diagnostics.native_authoritative,
-                log_entries_since_checkpoint: diagnostics.log_entries_since_checkpoint,
-                retention: diagnostics.retention.clone(),
-                seed_chunks_missing: diagnostics.seed_chunks_missing.map(count),
-                custody_objects_missing: diagnostics.custody_objects_missing.map(count),
-                delivery_retained: diagnostics.delivery_retained,
+                committed_index: diagnostics.map_or(0, |d| d.committed_index),
+                applied_index: diagnostics.map_or(0, |d| d.applied_index),
+                sequence: diagnostics.map_or(0, |d| d.sequence),
+                pending: diagnostics.map_or(0, |d| count(d.pending)),
+                authoritative: diagnostics.is_some_and(|d| d.authoritative),
+                preferred_leader: diagnostics.and_then(|d| d.preferred_leader),
+                leader_returns: diagnostics.map_or(0, |d| d.leader_returns),
+                leader_returns_failed: diagnostics.map_or(0, |d| d.leader_returns_failed),
+                native_authoritative: diagnostics.is_some_and(|d| d.native_authoritative),
+                log_entries_since_checkpoint: diagnostics
+                    .map_or(0, |d| d.log_entries_since_checkpoint),
+                retention: diagnostics.and_then(|d| d.retention.clone()),
+                seed_chunks_missing: diagnostics.and_then(|d| d.seed_chunks_missing.map(count)),
+                custody_objects_missing: diagnostics
+                    .and_then(|d| d.custody_objects_missing.map(count)),
+                delivery_retained: diagnostics.is_some_and(|d| d.delivery_retained),
                 route_epoch: listed.map(|listed| listed.0),
                 placement_epoch: listed.map(|listed| listed.1),
                 desired_max_failures: listed.map(|listed| listed.2),
@@ -1351,6 +1385,8 @@ impl NetworkService {
             credential,
             sessions,
             sessions_truncated: truncated,
+            sessions_unobserved: unobserved,
+            collection_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             agent,
             fence_level,
             announced_level: crate::upgrade::announced_level(),
@@ -1581,9 +1617,20 @@ impl NetworkService {
         // latest one, never sampling on a caller's behalf.
         let metrics_sampler = async {
             loop {
-                let snapshot = self.sample_metrics().await;
-                self.metrics.send_replace(Some(snapshot));
-                tokio::time::sleep(crate::metrics::SAMPLE_INTERVAL).await;
+                // A round has the cadence to observe its sessions: a slow
+                // or stuck owner costs its entry, never the round, and the
+                // next round starts on the cadence whatever this one took
+                // (the audit's F65). The text is rendered here, once.
+                let started = tokio::time::Instant::now();
+                let snapshot = self.sample_metrics(started).await;
+                self.metrics
+                    .send_replace(Some(crate::metrics::MetricsPage::new(snapshot)));
+                tokio::time::sleep_until(
+                    started
+                        .checked_add(crate::metrics::SAMPLE_INTERVAL)
+                        .unwrap_or(started),
+                )
+                .await;
             }
         };
         // The root group's tick period follows the round trips this node

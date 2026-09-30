@@ -1382,14 +1382,26 @@ reads (`OperatorRead::Metrics` → `AdminResult::Metrics { text }`, CLI
 0.0.4) with `# HELP`/`# TYPE` per series and fixed labels on every sample
 (`node`, `cluster`; `focal_node_info` carries `role`, `region`, `zone` and
 `capability`); label values are escaped. Nothing is sampled on a caller's
-behalf: a read renders the latest snapshot, so a scraper's cadence never
-drives owner work.
+behalf: a read serves the latest page, so a scraper's cadence never drives
+owner work. Every hosted replica is asked at once and the round closes at
+the cadence (2026-09-29, the audit's F65): an owner that is refused at its
+door, gone or late costs its entry the owner-side series — the entry says
+`focal_session_observed 0` and carries what the node knows without the
+owner — and is counted in `focal_metrics_sessions_unobserved`, never read
+as healthy and never in the way of another entry; `focal_metrics_collection_milliseconds`
+is how long the round took, and the next round starts on the cadence
+whatever this one took. The text is rendered once, when the snapshot is
+published (`metrics::MetricsPage`); the socket and the loopback serve it
+as it is.
 
 `node.metrics_listen` (local configuration, loopback only, [08](08-stepped-complexity-and-deployment.md)
 §2) binds a `TcpListener` at open and serves `GET /metrics` over HTTP/1.0
-(`metrics::serve_loopback`): one connection at a time, a request bounded to
-4 KiB and two seconds, `Connection: close`, `404` for another path and
-`405` for another method, no HTTP crate. It is read-only and
+(`metrics::serve_loopback`): as many connections at once as the admin
+socket admits operators (eight; one beyond them is closed unanswered),
+each request bounded to 4 KiB and two seconds and read before anything is
+written, `Connection: close`, `404` for another path and `405` for another
+method, no HTTP crate; a scrape that never speaks costs no other its
+answer. It is read-only and
 unauthenticated by construction, which is why it never leaves the loopback
 interface; the admin socket stays the authenticated path. Sessions beyond
 `metrics::MAX_SESSIONS` are counted as truncated, never silently dropped.

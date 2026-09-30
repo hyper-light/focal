@@ -129,10 +129,11 @@ impl LocalNetworkAdmin {
                 .map(|readiness| OperatorReply::Readiness(Box::new(readiness))),
             OperatorRead::Metrics => {
                 let view = self.metrics.as_ref().ok_or(AccessError::Unavailable)?;
+                // The page's text, rendered once when it was sampled.
                 let text = view
                     .borrow()
                     .as_ref()
-                    .map(crate::metrics::MetricsSnapshot::render)
+                    .map(|page| page.text.clone())
                     .unwrap_or_else(|| "# metrics not sampled yet\n".to_owned());
                 Ok(OperatorReply::Metrics(text))
             }

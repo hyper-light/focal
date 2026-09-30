@@ -77,7 +77,7 @@ ruling before work starts).
 | F62 | P1 | in tree | 15 | [F62](#f62) |
 | F63 | P2 | in tree | 13 | [F63](#f63) |
 | F64 | P2 | in tree | 15 | [F64](#f64) |
-| F65 | P2 | open | 15 | — |
+| F65 | P2 | in tree | 15 | [F65](#f65) |
 
 Batches follow the audit's §13 order: 1 failure handling and recovery (F01, F02); 2
 sustainable participant operation (F04–F06, F09); 3 admission and authorization (F03,
@@ -777,3 +777,39 @@ nothing, the largest draw → the step, the middle → half; what remains of the
 it), the simulation above, `focal_wire::tests::a_peer_pause_is_spread_over_its_second_half`;
 the client and pool suites unchanged (the cooldown tests hold: a send within half the
 cooldown fails fast, and the peer is dialed again after the whole of it).
+
+## F65
+
+**Cause.** `sample_metrics` asked each hosted replica's owner for its diagnostics in turn
+and awaited each without a deadline, so one busy or stuck owner delayed every later
+session and the whole snapshot, the previous one staying published; an owner that
+refused or had gone was skipped in silence; the sampler slept the cadence after a
+collection of any length, so the nominal five seconds stretched by the collection. The
+loopback rendered the complete snapshot before reading the request — outside the
+two-second bound, for a `404` or `405` too — and served one connection at a time, so a
+slow scraper held every other for up to two seconds.
+
+**Fix.** `metrics::collect(asks, deadline)`: every session asked at once (bounded by
+`MAX_SESSIONS`, each ask by the 64 KiB it reserves at its owner), each answer taken as
+it comes, the round closed at the cadence (`SAMPLE_INTERVAL`); an ask not answered by
+then is dropped with the set. A session without an answer is `observed: false`, counted
+in `sessions_unobserved`, listed with what the node knows without the owner (leader,
+term, the owner's pace and periods, the directory's epochs) and rendered
+`focal_session_observed 0` with the owner-side series absent — never zero read as
+health; `collection_ms` says how long the round took. The sampler starts each round on
+the cadence (`sleep_until`), whatever the last one took. `MetricsPage` renders the text
+once, when the snapshot is published; the admin socket and the loopback serve it as it
+is. `serve_loopback` reads and judges the request first, under the bound, then writes;
+connections are served on tasks of their own, as many at once as the admin socket admits
+operators (`admin_wire_limits().max_connections`, eight) and one beyond closed
+unanswered, as the socket does. Readiness (`probe`) never touched the sampler and
+still does not.
+
+**Tests.** `metrics::tests::an_unobserved_session_says_so_and_carries_no_owner_side_numbers`,
+`metrics::tests::a_round_closes_at_its_deadline_with_the_late_unobserved` (an instant
+answer, one ten seconds late, one refused, one ten milliseconds late, a hundred
+millisecond round: `[Some, None, None, Some]`, closed at the deadline),
+`metrics::tests::a_silent_scrape_delays_no_other_and_the_text_is_the_page_s` (a scrape
+that never speaks holds its connection while three others are answered — `200` with
+the page's text, `404`, `405` — within a second, not behind its two-second bound), the
+CLI metrics test unchanged.
