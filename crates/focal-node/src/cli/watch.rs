@@ -168,6 +168,10 @@ fn follow_pages(
             WatchAction::Delivery => {
                 let delivery = journal.delivery().ok_or(CliError::InvalidResponse)?;
                 let id = delivery.id;
+                // An empty page: the source had nothing, and answered so
+                // only after waiting for something where it can wait.
+                let idle =
+                    matches!(&delivery.page, WatchPage::Events { page } if page.events.is_empty());
                 let bytes = encode_delivery(delivery, follow.output.format)?;
                 let flushed=runtime.block_on(async{tokio::select!{result=async{stdout.write_all(&bytes).await?;stdout.flush().await}=>{result?;Ok::<_,io::Error>(true)},signal=&mut interrupted=>{signal?;Ok(false)}}})?;
                 if !flushed {
@@ -179,6 +183,12 @@ fn follow_pages(
                     .ok_or_else(|| CliError::Input("watch page counter exhausted".into()))?;
                 if follow.pages.is_some_and(|limit| count >= limit) {
                     return Ok(false);
+                }
+                // A page with events is followed by the next poll at once;
+                // only an empty one is paced, for a source that answers
+                // empty pages without waiting.
+                if !idle {
+                    continue;
                 }
                 let stopped=runtime.block_on(async{tokio::select!{_=tokio::time::sleep(Duration::from_millis(250))=>Ok::<_,io::Error>(false),signal=&mut interrupted=>{signal?;Ok(true)}}})?;
                 if stopped {

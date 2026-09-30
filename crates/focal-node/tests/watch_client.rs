@@ -718,3 +718,142 @@ fn native_watches_seed_through_native_reads_and_stream_schema_two_deltas_in_proc
     drop(everything);
     fixture.stop();
 }
+
+/// The audit's F61: a tail poll with nothing new to acknowledge is a plain
+/// read — no managed ordinal, no receipt — and the source commits nothing
+/// for it; the acknowledgment of a consumed page stays a durable request.
+#[test]
+fn idle_tail_polls_are_plain_reads_that_commit_nothing_and_take_no_ordinal() {
+    let root = tempfile::tempdir().unwrap();
+    let local = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(local.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut settings = Settings::default();
+    settings.node.data_dir = Some(root.path().into());
+    focal_node::native_activation::activate_local(&settings, NativeContentProfile::ProjectionOnly)
+        .unwrap();
+    let fixture = Fixture::start(root.path());
+    commit_native(&runtime, &fixture, 1, 100);
+    let store = WatchStore::open(local.path(), fixture.context).unwrap();
+    let mut watch = store
+        .create(
+            "idle",
+            WatchOptions {
+                engine: WatchEngine::Native,
+                seed: false,
+                max_items: 64,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // Every request the watch issues, by kind, and the page it ends in.
+    let deliver = |journal: &mut WatchJournal, issued: &mut Vec<&'static str>| -> WatchDelivery {
+        for _ in 0..64 {
+            match journal.next_action(&mut random).unwrap() {
+                WatchAction::Delivery => return journal.delivery().unwrap().clone(),
+                WatchAction::Request(action) => {
+                    issued.push(match &action.request.operation {
+                        Operation::Managed {
+                            operation:
+                                ManagedOperation::Cursor(StreamRequest::Poll {
+                                    acknowledged: Some(_),
+                                    ..
+                                }),
+                            ..
+                        } => "ack",
+                        Operation::Managed {
+                            operation: ManagedOperation::Cursor(_),
+                            ..
+                        } => "managed",
+                        Operation::Stream(StreamRequest::Poll {
+                            acknowledged: None, ..
+                        }) => "read",
+                        Operation::RequestStreamControl { .. }
+                        | Operation::RequestStreamRead { .. } => "maintenance",
+                        other => panic!("{other:?}"),
+                    });
+                    let reply = runtime
+                        .block_on(fixture.client.request(action.request.clone()))
+                        .unwrap();
+                    journal.accept(action, reply).unwrap();
+                }
+            }
+        }
+        panic!("watch did not reach delivery")
+    };
+    let events_of = |delivery: &WatchDelivery| -> usize {
+        let WatchPage::Events { page } = &delivery.page else {
+            panic!("{delivery:?}");
+        };
+        page.events.len()
+    };
+    let mut issued = Vec::new();
+    // The registration delivers the record's facts; consuming them makes
+    // the next poll a durable acknowledgment, which finds nothing more.
+    let first = deliver(&mut watch, &mut issued);
+    assert!(events_of(&first) > 0, "{first:?}");
+    watch.acknowledge(first.id).unwrap();
+    let second = deliver(&mut watch, &mut issued);
+    assert_eq!(events_of(&second), 0);
+    assert_eq!(
+        issued.iter().filter(|kind| **kind == "ack").count(),
+        1,
+        "{issued:?}"
+    );
+    watch.acknowledge(second.id).unwrap();
+    // From here every poll is a read: no ordinal, so nothing to retire
+    // beyond the acknowledgment's own, which one control retires first.
+    let before = issued.len();
+    for _ in 0..8 {
+        let page = deliver(&mut watch, &mut issued);
+        assert_eq!(events_of(&page), 0);
+        watch.acknowledge(page.id).unwrap();
+    }
+    let idle = &issued[before..];
+    assert_eq!(
+        idle.iter().filter(|kind| **kind == "read").count(),
+        8,
+        "{issued:?}"
+    );
+    assert!(
+        idle.iter()
+            .filter(|kind| **kind != "read")
+            .all(|kind| *kind == "maintenance")
+            && idle.iter().filter(|kind| **kind == "maintenance").count() <= 1,
+        "{issued:?}"
+    );
+    // A new record arrives through a read; consuming it is acknowledged
+    // durably by the poll after, and the polls after that read again.
+    commit_native(&runtime, &fixture, 2, 101);
+    let page = deliver(&mut watch, &mut issued);
+    assert!(events_of(&page) > 0);
+    assert_eq!(issued.last(), Some(&"read"), "{issued:?}");
+    watch.acknowledge(page.id).unwrap();
+    let page = deliver(&mut watch, &mut issued);
+    assert_eq!(events_of(&page), 0);
+    assert!(issued.contains(&"ack"), "{issued:?}");
+    assert_eq!(
+        issued.iter().filter(|kind| **kind == "ack").count(),
+        2,
+        "{issued:?}"
+    );
+    watch.acknowledge(page.id).unwrap();
+    // The acknowledgment the source holds is saved with the watch: a resumed
+    // watch reads on.
+    drop(watch);
+    let mut watch = store.resume("idle").unwrap();
+    let page = deliver(&mut watch, &mut issued);
+    assert_eq!(events_of(&page), 0);
+    assert_eq!(issued.last(), Some(&"read"), "{issued:?}");
+    watch.acknowledge(page.id).unwrap();
+    drop(watch);
+    drop(store);
+    fixture.stop();
+    // The node committed nothing for the reads: the registry's revision is
+    // the registration's and the two acknowledgments'.
+    let node = EmbeddedNode::open(&settings).unwrap();
+    assert_eq!(node.session.cursor_revision(), 3);
+}

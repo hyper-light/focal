@@ -12210,3 +12210,34 @@ and the current one lets the route be dialed again; a caller cancelled
 microseconds into the dial leaves it to the next, which starts no third dial —
 with each caller dialing alone, callers failed with `Connection` as their
 connections were replaced under them).
+
+### 2026-09-29 — F61: a poll with nothing to acknowledge costs nothing durable
+
+Every tail poll of a projection consumer copied the cursor registry three times
+over and committed once: `CursorRegistry::prepare` cloned the whole checkpoint
+(every consumer's row and filter) for a scalar renewal, charged and validated it
+whole; the session's candidate cloned the receipt and owner maps beside it; and
+the poll itself was a managed request that committed `AcknowledgeAndRenew` or
+`Renew` whether or not it acknowledged anything, took a receipt and a window
+ordinal the client retired with a later control — every 250 ms per idle watcher.
+Now a prepared update is one named row's patch, insert or replacement plus the
+names it retires, validated as that row will stand, its bytes joined to the
+registry's per-lane charge at publication; the session's candidate carries its
+receipt and owner as charged entries; a plain poll with nothing to acknowledge
+proposes nothing and is answered after its barrier as a read; a polled lease
+past its half-life is renewed by the node's own maintenance entry (a `Renew`
+under `FOCALCM1`, no receipt, judged due on every replica from the committed
+row); on a replicated host an empty read parks for a page — holding only its
+request's bytes — until the stream line moves or the owner gives it up with the
+empty page; and the watch journal (schema 3) polls as a plain read whenever its
+cursor is no further than the acknowledgment its last page reported, sending a
+durable acknowledgment only for a consumed page. Preparing one renewal over the
+audit's row (64 consumers × 256-claim filters) charged 7,039,128 bytes before
+and 0 after; a registry restored under exactly its bytes renews; a session
+candidate holds the same at 3 receipts as at 515. Tests:
+`focal-stream/tests/renewal_cost.rs`,
+`a_cursor_command_holds_its_entry_never_the_receipts`,
+`a_polled_lease_past_its_half_life_is_renewed_by_the_node_s_own_entry`,
+`a_poll_with_nothing_to_acknowledge_is_a_read_and_the_node_renews_a_lease_past_its_half`,
+`a_poll_with_nothing_new_parks_for_a_page_and_holds_only_its_request`,
+`watch_client::idle_tail_polls_are_plain_reads_that_commit_nothing_and_take_no_ordinal`.

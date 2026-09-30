@@ -73,7 +73,7 @@ ruling before work starts).
 | F58 | P2 | in tree | 14 | [F58](#f58) |
 | F59 | P2 | in tree | 15 | [F59](#f59) |
 | F60 | P2 | in tree | 15 | [F60](#f60) |
-| F61 | P2 | open | 15 | — |
+| F61 | P2 | in tree | 15 | [F61](#f61) |
 | F62 | P1 | in tree | 15 | [F62](#f62) |
 | F63 | P2 | in tree | 13 | [F63](#f63) |
 | F64 | P2 | open | 15 | — |
@@ -675,3 +675,70 @@ the route be dialed again; a caller cancelled microseconds into a dial leaves it
 next caller, which starts no third dial); with each caller dialing alone (the mutation
 before the fix) callers failed with `Connection` as their connections were replaced
 under them. The wire and client suites unchanged.
+
+## F61
+
+**Cause.** Three copies per idle poll. `CursorRegistry::prepare` cloned the whole
+checkpoint — every consumer's row and filter — for any command, a scalar renewal
+included, charged it whole and validated it whole; the session's candidate cloned the
+receipt map and the owner map beside it (and serialised the whole metadata for its
+scratch charge); and every tail poll was a managed request that committed
+`AcknowledgeAndRenew` or `Renew` whether or not anything was acknowledged, took a
+receipt and a window ordinal the client later retired with a control, and the CLI
+polled again 250 ms later. An idle fleet of observers therefore drove consensus, the
+WAL, registry copying and client disk work with no event progress; the aggregate copy
+work grew as O(C²R).
+
+**Fix.** (1) The prepared update is a delta: at most one row, named — a patch of its
+scalars for a renewal, an acknowledgment, a seed's completion or a resync (nothing
+copied, not even the filter), the one row for a registration or a seed, the names it
+retires — validated as that row will stand (the clock only advances and the floor
+moves only under the retention limit, so no untouched row's invariant can change); the
+row's bytes are admitted before it is built and joined to the registry's per-lane
+charge at publication, and leaving rows return theirs. `publish` writes the row,
+removes the retired names and hands them back. (2) The session's cursor candidate
+carries its receipt and, for a consumer named first, its owner, charged as entries;
+`apply` inserts them and retires owners with the registry's names; the metadata's
+charge is the sum of its entries. The managed candidate likewise. (3) A plain poll
+(`Operation::Stream`) with nothing to acknowledge — no token, or one at the row's
+position — proposes nothing: it is a read answered after its barrier from the row's own
+token, with no receipt and no request key; one that acknowledges what is new commits
+as before, and a managed poll (a durable request whose receipt the client retires)
+commits as before. The lease of a polled consumer is renewed by the node's own
+maintenance entry once half of it has passed (`Session::propose_cursor_renewal`, a
+`Renew` under `FOCALCM1` with no receipt, validated on every replica as due from the
+committed row: what remains is at most half the term granted); renewing at the half
+keeps the time between renewals and the time to recover a lost renewal equal, so an
+idle consumer costs at most two entries a term and one polling more often than half a
+term needs every poll in the remaining half to fail before it expires. (4) On a
+replicated host a read whose page is empty parks after its barrier until the stream
+line moves or the owner gives the request up (then it answers the empty page it held,
+its barrier having been current), holding only its request's bytes — the page's
+staging is released while it waits and taken back to pump; the one-voter driver
+answers in place. (5) The watch journal (schema 3; a schema-2 record is read once more
+and carried forward) sends a tail poll whose cursor is no further than the
+acknowledgment its last page reported as a plain read — no managed ordinal, no
+receipt, no retirement control — and a durable acknowledgment when it has consumed a
+page; the CLI's follow pauses 250 ms only after an empty page. **Not changed:**
+acknowledgments stay durable before retention is released; exact retry of a request
+answered once is answered from its receipt; the registry's checkpoint format and the
+wire are untouched.
+
+**Measurements.** Registry, the audit's row (64 consumers × 256-claim filters):
+preparing one renewal charged 7,039,128 bytes before (a copy of the registry) and 0
+after; a registry restored under exactly its bytes renews. Session: what a candidate
+holds while it waits for its quorum is the same at 3 receipts and at 515 (one varint of
+the receipt's revision apart), where before it held a copy of the map. Host: a poll
+with nothing to acknowledge leaves the cursor revision and the committed index where
+they were; the renewal arrives once per half term.
+
+**Tests.** `focal-stream/tests/renewal_cost.rs` (three), `session::tests::a_cursor_command_holds_its_entry_never_the_receipts`,
+`session::tests::a_polled_lease_past_its_half_life_is_renewed_by_the_node_s_own_entry`
+(due at the half, not before; no receipt; a stale generation refused; a protected
+consumer never; replayed from the log),
+`streams_tests::a_poll_with_nothing_to_acknowledge_is_a_read_and_the_node_renews_a_lease_past_its_half`,
+`streams_tests::a_poll_with_nothing_new_parks_for_a_page_and_holds_only_its_request`,
+`watch_client::idle_tail_polls_are_plain_reads_that_commit_nothing_and_take_no_ordinal`
+(eight idle reads, no ordinal; the node's registry at the registration's and the
+acknowledgments' revision after the client resumed once); the consumer retirement,
+durable delivery, cursor, managed, stream host and CLI watch suites unchanged.

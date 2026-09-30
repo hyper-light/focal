@@ -187,7 +187,15 @@ names ever seen. A retired name registers again under a generation no
 earlier token carries (a generation is the revision that issued it), so a
 stale acknowledgment or renewal is refused as the wrong generation and
 never moves the next incarnation's cursor; a protected consumer leaves by
-acknowledgment alone.
+acknowledgment alone. A command against the registry prepares one row, never
+a copy of it (2026-09-29, the audit's F61): a renewal, an acknowledgment, a
+seed's completion or a resync patches the row's scalars at publication, a
+registration or a seed carries its one row, and the retired names leave with
+it; the row's bytes join the registry's charge and leaving rows return theirs.
+A poll with nothing to acknowledge is a read that commits nothing, and the
+node renews a polled lease itself once half of it has passed, by a
+maintenance entry with no receipt (`Session::propose_cursor_renewal`), so an
+idle consumer costs at most two entries a lease term.
 
 ## 4. Retirement to the archive (R8.4b, 2026-09-10)
 

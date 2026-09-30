@@ -40,6 +40,10 @@ enum Pending {
     },
     Read(RequestEnvelope),
     NativeRead(RequestEnvelope),
+    /// A tail poll with nothing new to acknowledge: a plain read, which the
+    /// source answers without a commit, a receipt or an ordinal of the
+    /// managed stream (the audit's F61).
+    Poll(RequestEnvelope),
 }
 #[derive(Serialize, Deserialize)]
 struct State {
@@ -56,7 +60,49 @@ struct State {
     delivered: u64,
     acknowledged: u64,
     last_ack: Option<ContentHash>,
+    /// The acknowledgment the source holds durably, as its last page
+    /// reported it: a tail whose cursor is no further along has nothing to
+    /// acknowledge and polls as a plain read.
+    durable: Option<CursorToken>,
 }
+/// The record as schema 2 wrote it, read once more and carried forward.
+#[derive(Serialize, Deserialize)]
+struct StateV2 {
+    schema: u16,
+    context: OperationContext,
+    name: String,
+    options: WatchOptions,
+    consumer: ConsumerId,
+    ownership_ready: bool,
+    phase: Phase,
+    pending: Option<Pending>,
+    delivery: Option<WatchDelivery>,
+    cleanup: Option<ManagedRequestKey>,
+    delivered: u64,
+    acknowledged: u64,
+    last_ack: Option<ContentHash>,
+}
+impl From<StateV2> for State {
+    fn from(old: StateV2) -> Self {
+        Self {
+            schema: SCHEMA,
+            context: old.context,
+            name: old.name,
+            options: old.options,
+            consumer: old.consumer,
+            ownership_ready: old.ownership_ready,
+            phase: old.phase,
+            pending: old.pending,
+            delivery: old.delivery,
+            cleanup: old.cleanup,
+            delivered: old.delivered,
+            acknowledged: old.acknowledged,
+            last_ack: old.last_ack,
+            durable: None,
+        }
+    }
+}
+const SCHEMA: u16 = 3;
 impl State {
     fn validate(&self) -> Result<(), WatchError> {
         if self.delivered.checked_sub(self.acknowledged) != Some(u64::from(self.delivery.is_some()))
@@ -156,6 +202,37 @@ impl State {
                                     max_bytes: self.options.max_bytes.saturating_sub(512),
                                 },
                                 max_items: self.options.max_items,
+                            })
+                    {
+                        return Err(WatchError::Corrupt);
+                    }
+                }
+                Pending::Poll(request) => {
+                    let Phase::Tail { cursor } = self.phase else {
+                        return Err(WatchError::Corrupt);
+                    };
+                    if self
+                        .durable
+                        .is_none_or(|durable| durable.position < cursor.position)
+                    {
+                        return Err(WatchError::Corrupt);
+                    }
+                    let protocol = if self.options.engine == WatchEngine::Native {
+                        NATIVE_PROTOCOL_VERSION
+                    } else {
+                        focal_wire::PROTOCOL_VERSION
+                    };
+                    if request.protocol != protocol
+                        || request.ledger != self.context.ledger
+                        || request.request_epoch != RequestEpoch(1)
+                        || request.request_id.is_zero()
+                        || request.route_epoch.0 == 0
+                        || request.operation
+                            != Operation::Stream(StreamRequest::Poll {
+                                cursor,
+                                filter: self.options.filter(),
+                                acknowledged: None,
+                                credits: self.options.credits(),
                             })
                     {
                         return Err(WatchError::Corrupt);
@@ -433,7 +510,7 @@ impl WatchJournal {
                 *target = *source;
             }
             let state = State {
-                schema: 2,
+                schema: SCHEMA,
                 context,
                 name: name.into(),
                 options: options.clone(),
@@ -446,16 +523,29 @@ impl WatchJournal {
                 delivered: 0,
                 acknowledged: 0,
                 last_ack: None,
+                durable: None,
             };
             directory.write(&record, MAGIC, &encode(&state)?, false)?;
         }
         let bytes = directory.read(&record, MAGIC, RECORD_BYTES)?;
-        let (state, rest): (State, &[u8]) =
+        let (schema, _): (u16, &[u8]) =
             postcard::take_from_bytes(&bytes).map_err(|_| WatchError::Corrupt)?;
-        if !rest.is_empty() || encode(&state)? != bytes {
-            return Err(WatchError::Corrupt);
-        }
-        if state.schema != 2
+        let state = if schema == 2 {
+            let (old, rest): (StateV2, &[u8]) =
+                postcard::take_from_bytes(&bytes).map_err(|_| WatchError::Corrupt)?;
+            if !rest.is_empty() || encode(&old)? != bytes {
+                return Err(WatchError::Corrupt);
+            }
+            State::from(old)
+        } else {
+            let (state, rest): (State, &[u8]) =
+                postcard::take_from_bytes(&bytes).map_err(|_| WatchError::Corrupt)?;
+            if !rest.is_empty() || encode(&state)? != bytes {
+                return Err(WatchError::Corrupt);
+            }
+            state
+        };
+        if state.schema != SCHEMA
             || state.context != context
             || state.name != name
             || state.options != options
@@ -585,12 +675,34 @@ impl WatchJournal {
                     self.state.pending = Some(Pending::Read(request));
                     None
                 }
-                Phase::Tail { cursor } => Some(StreamRequest::Poll {
-                    cursor,
-                    filter,
-                    acknowledged: Some(cursor),
-                    credits,
-                }),
+                Phase::Tail { cursor } => {
+                    if self
+                        .state
+                        .durable
+                        .is_some_and(|durable| durable.position >= cursor.position)
+                    {
+                        // Nothing new to acknowledge: a plain read (the
+                        // audit's F61), answered without a commit.
+                        let request = self.envelope(
+                            fresh(ids)?,
+                            Operation::Stream(StreamRequest::Poll {
+                                cursor,
+                                filter,
+                                acknowledged: None,
+                                credits,
+                            }),
+                        );
+                        self.state.pending = Some(Pending::Poll(request));
+                        None
+                    } else {
+                        Some(StreamRequest::Poll {
+                            cursor,
+                            filter,
+                            acknowledged: Some(cursor),
+                            credits,
+                        })
+                    }
+                }
                 Phase::NativeSeed {
                     cursor,
                     next: NativeSeedNext::Complete,
@@ -628,7 +740,9 @@ impl WatchJournal {
         }
         let pending = self.state.pending.as_ref().ok_or(WatchError::Corrupt)?;
         let request = match pending {
-            Pending::Read(request) | Pending::NativeRead(request) => request.clone(),
+            Pending::Read(request) | Pending::NativeRead(request) | Pending::Poll(request) => {
+                request.clone()
+            }
             Pending::Managed { key, operation } => {
                 let store = self.requests.store()?;
                 let id = ManagedOperationId::from_key(*key)?;
@@ -747,6 +861,14 @@ impl WatchJournal {
                     },
                 }
             }
+            (Pending::Poll(saved), Response::Stream(reply)) if saved == &action.request => {
+                if !matches!(self.state.phase, Phase::Tail { .. }) {
+                    return Err(WatchError::InvalidResponse);
+                }
+                WatchPage::Events {
+                    page: Box::new(reply),
+                }
+            }
             (Pending::Managed { key, operation }, Response::Managed(reply)) => {
                 if !matches!(&action.request.operation,Operation::Managed{key:actual,operation:ManagedOperation::Cursor(actual_op)} if actual==key&&actual_op==operation)
                 {
@@ -798,6 +920,10 @@ impl WatchJournal {
             postcard::experimental::serialized_size(&page).map_err(|_| WatchError::Capacity)?;
         if size > MAX_WATCH_PAGE_BYTES {
             return Err(WatchError::Capacity);
+        }
+        // What the source holds durably, as this page reports it.
+        if let WatchPage::Events { page } = &page {
+            self.state.durable = Some(page.acknowledged);
         }
         let number = self
             .state

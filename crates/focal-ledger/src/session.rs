@@ -430,7 +430,7 @@ impl Session {
             .reserve(
                 BudgetKind::ReadPins,
                 BudgetLane::Completion,
-                reference_charge(&cursor_meta)?,
+                metadata_charge(&cursor_meta)?,
             )?
             .commit();
         let consensus_cluster = consensus.cluster_id();

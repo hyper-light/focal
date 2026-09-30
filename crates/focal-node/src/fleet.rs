@@ -3600,21 +3600,34 @@ impl Owner {
             if let Some(result) = result {
                 pending.finish(result);
             } else if self.pace.periods() >= pending.deadline || status.term != pending.term {
-                let error = match &pending.waiting {
-                    WaitingFor::Mutation(_)
-                    | WaitingFor::ManagedMutation { .. }
-                    | WaitingFor::RequestStreamControl { .. } => AccessError::OutcomeUnknown,
-                    WaitingFor::Stream(stream) | WaitingFor::ManagedStream { stream, .. } => {
-                        stream.interrupted()
-                    }
-                    _ => AccessError::Unavailable,
-                };
-                pending.finish(Response::Error(error));
+                let result = self.given_up(&mut pending);
+                pending.finish(result);
             } else {
                 self.pending.push_back(pending);
             }
         }
         Ok(())
+    }
+    /// What a request the owner gives up is answered with: a read parked
+    /// with an empty page gets that page — its barrier was current when it
+    /// crossed it (the audit's F61) — and every other request the outcome
+    /// the owner can vouch for.
+    fn given_up(&self, pending: &mut Pending) -> Response {
+        match &mut pending.waiting {
+            WaitingFor::Stream(stream) => {
+                if let Some(reply) = stream.parked_reply() {
+                    return Response::Stream(reply);
+                }
+                Response::Error(stream.interrupted())
+            }
+            WaitingFor::ManagedStream { stream, .. } => Response::Error(stream.interrupted()),
+            WaitingFor::Mutation(_)
+            | WaitingFor::ManagedMutation { .. }
+            | WaitingFor::RequestStreamControl { .. } => {
+                Response::Error(AccessError::OutcomeUnknown)
+            }
+            _ => Response::Error(AccessError::Unavailable),
+        }
     }
     /// The owner's period at which a request taken now is given up: the
     /// request time in the periods it holds at the configured tick, counted
@@ -3658,22 +3671,14 @@ impl Owner {
         // stalled disk retains both its Ready and client input reservations.
         let count = self.pending.len();
         for _ in 0..count {
-            let Some(pending) = self.pending.pop_front() else {
+            let Some(mut pending) = self.pending.pop_front() else {
                 break;
             };
             if pending.response.is_closed() {
                 drop(pending);
             } else if now >= pending.deadline {
-                let error = match &pending.waiting {
-                    WaitingFor::Mutation(_)
-                    | WaitingFor::ManagedMutation { .. }
-                    | WaitingFor::RequestStreamControl { .. } => AccessError::OutcomeUnknown,
-                    WaitingFor::Stream(stream) | WaitingFor::ManagedStream { stream, .. } => {
-                        stream.interrupted()
-                    }
-                    _ => AccessError::Unavailable,
-                };
-                pending.finish(Response::Error(error));
+                let result = self.given_up(&mut pending);
+                pending.finish(result);
             } else {
                 self.pending.push_back(pending);
             }

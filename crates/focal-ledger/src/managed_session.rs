@@ -59,8 +59,10 @@ struct ManagedDomainCandidate {
 struct ManagedCursorCandidate {
     key: ManagedRequestKey,
     prepared: PreparedCursorUpdate,
-    metadata: CursorMetadata,
-    metadata_charge: Allocation,
+    /// The consumer this request names first, and its principal: the
+    /// owner once the request applies.
+    owner: Option<(ConsumerId, ParticipantId)>,
+    owner_charge: Allocation,
     registry: PreparedStream,
     result_charge: Allocation,
 }
@@ -482,9 +484,12 @@ impl Session {
                     .clone();
                 self.request_streams
                     .validate_publication(&candidate.registry)?;
-                self.cursors.publish(candidate.prepared)?;
-                self.cursor_meta = candidate.metadata;
-                self.cursor_charge = candidate.metadata_charge;
+                let retired = self.cursors.publish(candidate.prepared)?;
+                self.retire_owners(&retired)?;
+                if let Some((consumer, principal)) = candidate.owner {
+                    self.cursor_meta.owners.entry(consumer).or_insert(principal);
+                }
+                self.cursor_charge.absorb(&mut candidate.owner_charge)?;
                 let floor = match receipt.outcome {
                     ManagedReceiptOutcome::Cursor { floor, .. } => floor,
                     _ => return Err(LedgerError::Corrupt),
@@ -677,9 +682,8 @@ impl Session {
         }
         // Owner metadata is shared with legacy consumers, but managed outcomes
         // never enter its legacy RequestKey receipt map.
-        let meta_bytes = reference_charge(&self.cursor_meta)?
-            .checked_add(reference_charge(input)?)
-            .and_then(|n| n.checked_mul(3))
+        let meta_bytes = reference_charge(input)?
+            .checked_mul(3)
             .ok_or(LedgerError::Capacity)?;
         let _scratch = self.managed_charge(meta_bytes)?;
         let published = self.stream_published();
@@ -690,7 +694,8 @@ impl Session {
             self.cursors.prepare(&input.command, published)?
         };
         let record = consumer
-            .and_then(|id| prepared.checkpoint().consumers.get(&id))
+            .and_then(|id| self.cursors.projected(&prepared, id))
+            .as_ref()
             .map(crate::reconciliation::copy_record)
             .transpose()?;
         let receipt = ManagedReceipt {
@@ -699,28 +704,20 @@ impl Session {
             raft_index: 0,
             intent_hash: input.intent_hash,
             outcome: ManagedReceiptOutcome::Cursor {
-                revision: prepared.checkpoint().revision,
-                floor: envelope.replay_floor.max(prepared.checkpoint().floor),
+                revision: prepared.revision(),
+                floor: envelope.replay_floor.max(prepared.floor()),
                 record,
             },
         };
-        let mut metadata = CursorMetadata {
-            receipts: self.cursor_meta.receipts.clone(),
-            owners: self.cursor_meta.owners.clone(),
-        };
-        if let Some(consumer) = consumer {
-            metadata
-                .owners
-                .entry(consumer)
-                .or_insert(input.key.stream.principal);
-        }
-        let metadata_charge = self
+        let owner = consumer
+            .filter(|id| self.cursor_owner(*id).is_none())
+            .map(|id| (id, input.key.stream.principal));
+        let owner_bytes = owner.map_or(Ok(0), |(id, principal)| {
+            owner_entry_charge(&id, &principal)
+        })?;
+        let owner_charge = self
             .budget
-            .reserve(
-                BudgetKind::ReadPins,
-                BudgetLane::Completion,
-                reference_charge(&metadata)?,
-            )?
+            .reserve(BudgetKind::ReadPins, BudgetLane::Completion, owner_bytes)?
             .commit();
         let result_charge = self.managed_charge(reference_charge(&receipt)?)?;
         let registry =
@@ -729,8 +726,8 @@ impl Session {
         Ok(ManagedCursorCandidate {
             key: input.key,
             prepared,
-            metadata,
-            metadata_charge,
+            owner,
+            owner_charge,
             registry,
             result_charge,
         })
