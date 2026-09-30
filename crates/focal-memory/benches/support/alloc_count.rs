@@ -717,6 +717,41 @@ pub fn share_by_innermost(groups: &[&[&str]], fallback_from: usize) -> (Vec<Shar
 /// Print each group's estimated allocations and reallocations per operation:
 /// the phase's per-op figures scaled by the group's share of the samples of
 /// that kind.
+/// The bytes requested by the sites of each group, attributed as
+/// [`share_by_innermost`] attributes samples, since the last `reset_sites`:
+/// per group, the unclassified sites' and the total.
+pub fn bytes_by_innermost(groups: &[&[&str]], fallback_from: usize) -> (Vec<u64>, u64, u64) {
+    inside_scope(|| {
+        let mut counts = vec![0u64; groups.len()];
+        let Ok(sites) = SITES.lock() else {
+            return (counts, 0, 0);
+        };
+        let mut total = 0u64;
+        let mut other = 0u64;
+        for site in sites.iter() {
+            total += site.bytes;
+            let judge = |range: std::ops::Range<usize>| {
+                frames_of(&site.excerpt).find_map(|(name, at)| {
+                    let judged = at.unwrap_or(name);
+                    groups
+                        .get(range.clone())
+                        .unwrap_or(&[])
+                        .iter()
+                        .position(|needles| needles.iter().any(|needle| judged.contains(needle)))
+                        .map(|index| index.saturating_add(range.start))
+                })
+            };
+            let group = judge(0..fallback_from.min(groups.len()))
+                .or_else(|| judge(fallback_from.min(groups.len())..groups.len()));
+            match group {
+                Some(index) => counts[index] += site.bytes,
+                None => other += site.bytes,
+            }
+        }
+        (counts, other, total)
+    })
+}
+
 pub fn shares_report(
     phase: &Phase,
     names: &[&str],

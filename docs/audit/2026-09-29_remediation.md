@@ -959,7 +959,43 @@ budget); a member whose progress the transition makes is sent the last entry, it
 coming in later transitions and priced then; a proposal's bytes join the unstable
 entries and one message a peer (`incoming × (members + 8)`, as before); the queue grows
 by its own rule (`Outgoing::growth_of`); what the core holds now (`raw`, once), the
-inflight bookkeeping per member and 64 KiB. The pages are read from running totals the
+member's row in the tracker with its in-flight window, and the transition's own
+structures. **Every fixed allowance is derived, none chosen** (2026-09-30, the batch's
+residual): the core's message allowance is the message and the bookkeeping of its three
+buffers (`proto::MESSAGE_ALLOWANCE`, `BUFFER_OVERHEAD` the four words
+`focal_memory::ALLOCATOR_OVERHEAD` keeps), and the consensus crate prices one message the
+same; a snapshot is the snapshot and its retained configuration with each member's id in
+both and the bookkeeping of its nine buffers; the events are the structure and its five
+lists; what the node keeps beside the core's resident bytes is its own state around the
+core and its ten containers' bookkeeping, two allocations a member; opening a group is the
+node, the smallest message queue, the identity record's encoding (twice, for the buffer's
+doubling) and its append, and for each member its validation (two ordered sets at half-full
+leaves and the two sorts' buffers: eight slots of an id), its identity bytes (ten a varint,
+twice), its id in the log's configuration and its tracker row — the in-flight window is
+priced by the transition that makes the member's progress; a transition's own structures
+are the Ready, the events, the drain's phase, the hard and soft states and thirteen lists'
+bookkeeping, and a record with its buffer for each entry not yet durable, the snapshot and
+the hard state; decoding a message is twice its bytes (its buffers double), the message,
+each entry's slot twice with its two buffers, and a snapshot's structures with each member
+reserved at its length hint (its bytes are among the message's, counted once now, not
+twice); replaying a record is twice its bytes and the entry, or the configuration with its
+members at their hints; the log's own metadata is the log and its configuration's ids with
+four lists. `tests/allowances.rs` holds each to the counting allocator, attributing the
+bytes the consensus crate and the core asked for by their innermost frame (the WAL's are
+the log budget's): decoding 4,096 empty entries peaks at 294,912 bytes under a charge of
+868,736, a 1 MiB entry at 2,097,152 under 2,097,760, a 4 MiB snapshot naming 2,048 members
+at 8,388,608 under 8,430,150; a group opened alone on a shared WAL asks 4,444 bytes under
+an allowance of 5,396 with one member and 187,110 under 304,112 with 1,024 (before:
+20,480 and 4,210,688); a 1 KiB proposal's transition asks 10,675 under a staging of 17,352
+(before: 79,272 with the 64 KiB). `staging_peaks` stays: the estimate is 8,136 at 64 and
+at 1,024 entries; peaks tick 0, read 1,184, beat 0, proposal 21,916 / 21,918 (the whole
+process, the WAL's records included). Three things the 64 KiB had hidden, found by the
+suites once it was gone and priced at their cause: a transition may commit and deliver
+every durable entry above the applied — a campaign the whole of them — so the page the
+Ready gives is priced from the durable index, not the committed; a member's answer may
+reject what was sent and move its next index back to what it holds, so its page is priced
+from its matched index; and each message a transition may queue (two a member) carries
+the message allowance beyond its slot. The pages are read from running totals the
 storage keeps beside its entries (`RamLog::bytes_between`: the bytes of any range are a
 subtraction, maintained on append, replacement, compaction and snapshot, checked by
 `validate`), so the estimate walks nothing but the members; the counters that say what

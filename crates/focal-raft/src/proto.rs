@@ -43,12 +43,15 @@ pub fn approximate_bytes(entry: &Entry) -> usize {
         .saturating_add(entry.context.len())
         .saturating_add(12)
 }
-/// What a message is allowed beyond its buffers' capacities: what an
-/// allocator keeps for the buffers themselves. A message owns at most
-/// three of its own (its context, its entries, a snapshot's data), each
-/// with a header of a few words and a rounding to its size class, taken
-/// as 128 apiece and rounded up to a power of two.
-pub const MESSAGE_ALLOWANCE: usize = 512;
+/// What an allocator keeps for one buffer beyond its bytes — a header of a
+/// few words and a rounding to its size class — taken as four words: the
+/// figure `focal_memory::ALLOCATOR_OVERHEAD` keeps for every allocation
+/// the engine makes, stated here because the core depends on nothing.
+pub const BUFFER_OVERHEAD: usize = 4 * std::mem::size_of::<usize>();
+/// What a message is allowed beyond its buffers' capacities: the message
+/// itself, and the bookkeeping of the at most three buffers it owns (its
+/// context, its entries, a snapshot's data).
+pub const MESSAGE_ALLOWANCE: usize = std::mem::size_of::<Message>() + 3 * BUFFER_OVERHEAD;
 /// The bytes a message holds, by capacity: its context, its entries' slots
 /// and buffers, its snapshot, and [`MESSAGE_ALLOWANCE`]. The core counts a
 /// queued message at this, and its owner charges one for the same, so that

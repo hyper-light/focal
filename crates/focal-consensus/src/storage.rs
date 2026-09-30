@@ -43,12 +43,16 @@ pub(super) struct PreparedUpdate {
 }
 impl RamLog {
     pub fn new(config: &NodeConfig, budget: MemoryBudget) -> Result<Self, ConsensusError> {
+        // The log's own state and its copy of the configuration: each
+        // member's id once, in the voters or the learners, with the
+        // bookkeeping of the four member lists.
         let amount = config
             .voters
             .len()
             .checked_add(config.learners.len())
-            .and_then(|n| n.checked_mul(64))
-            .and_then(|n| n.checked_add(4096))
+            .and_then(|n| n.checked_mul(std::mem::size_of::<u64>()))
+            .and_then(|n| n.checked_add(std::mem::size_of::<Self>()))
+            .and_then(|n| n.checked_add(4 * focal_memory::ALLOCATOR_OVERHEAD))
             .ok_or(ConsensusError::Capacity)?;
         let metadata = reserve(&budget, BudgetKind::Control, BudgetLane::Completion, amount)?;
         Ok(Self {

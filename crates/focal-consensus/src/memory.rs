@@ -1,12 +1,94 @@
 //! Accounting for owned Prost/Raft buffers. Retained bytes use actual capacities;
 //! each mutation first reserves clone/fanout headroom before entering Raft.
 use crate::{ConsensusError, Entry, Message, NodeConfig, NodeEvents, Snapshot, storage::RamLog};
-use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
-use focal_raft::{
-    MAX_MEMBERS, RawNode, Storage,
-    progress::Tracker,
-    proto::{self, EntryType},
+use focal_memory::{
+    ALLOCATOR_OVERHEAD as OVERHEAD, Allocation, BudgetKind, BudgetLane, MemoryBudget,
 };
+use focal_raft::{
+    MAX_MEMBERS, Outgoing, Raft, RawNode, Storage,
+    progress::{Progress, Tracker},
+    proto::{self, ConfState, EntryType, HardState},
+};
+use std::mem::size_of;
+
+// Every fixed allowance below names the structures it stands for and the
+// allocations whose bookkeeping (`ALLOCATOR_OVERHEAD` apiece) it carries;
+// none is a chosen number (the audit's F16). `tests/allowances.rs` holds
+// each to what the counting allocator measures.
+
+/// A snapshot beyond its data: the snapshot and the independently retained
+/// copy of its configuration, with the bookkeeping of the data buffer and
+/// the eight member lists.
+const SNAPSHOT_BYTES: usize = size_of::<Snapshot>() + size_of::<ConfState>() + 9 * OVERHEAD;
+/// The events a drain delivers, beyond what they carry: the structure and
+/// the bookkeeping of its five lists.
+const EVENTS_BYTES: usize = size_of::<NodeEvents>() + 5 * OVERHEAD;
+/// The core's own containers, whose bookkeeping its resident bytes do not
+/// count: the message queue, the read states, the read-only queue and its
+/// pending reads, the held proposals and their bytes, the votes, the
+/// decided indexes, the displaced entries and the holders.
+const RAW_CONTAINERS: usize = 10;
+/// What the node keeps beside the core's resident bytes: the node's own
+/// state around the core (the core's own size is in its resident bytes)
+/// and its containers' bookkeeping.
+const RAW_BYTES: usize =
+    size_of::<RawNode<RamLog>>() - size_of::<Raft<RamLog>>() + RAW_CONTAINERS * OVERHEAD;
+/// What one member costs the core beyond its resident bytes: the
+/// bookkeeping of its slot in the tracker and of its in-flight window.
+const MEMBER_BOOKKEEPING: usize = 2 * OVERHEAD;
+/// What a transition copies for a member whose progress it makes: the
+/// tracker's row for it (its progress, its vote, its match, its place among
+/// the members), an in-flight window of `window` indexes, and their
+/// bookkeeping.
+pub(super) fn member_bytes(window: usize) -> Result<usize, ConsensusError> {
+    const ROW: usize =
+        size_of::<(u64, Progress)>() + size_of::<(u64, bool)>() + 2 * size_of::<u64>();
+    add(
+        add(ROW, mul(window, size_of::<u64>())?)?,
+        MEMBER_BOOKKEEPING,
+    )
+}
+/// The structures one transition builds and drops, and the bookkeeping of
+/// their lists: the Ready (four lists and the light Ready's two), the
+/// events (five), the drain's phase, the records list and the append's
+/// receipt, the hard and soft states.
+const TRANSITION_BYTES: usize = size_of::<focal_raft::Ready>()
+    + size_of::<NodeEvents>()
+    + size_of::<crate::persistence::PendingDrain>()
+    + size_of::<HardState>()
+    + size_of::<focal_raft::SoftState>()
+    + 13 * OVERHEAD;
+/// One record a transition appends, beyond its payload: the record and the
+/// bookkeeping of its payload buffer.
+const RECORD_BYTES: usize = size_of::<focal_log::Record>() + OVERHEAD;
+/// A configuration's members validated: two ordered sets over the ids, whose
+/// leaves are at least half full so a key takes at most two slots of its
+/// size and a share of its node's header, and the two sorts' buffers of one
+/// id each.
+const VALIDATION_SLOTS_PER_MEMBER: usize = 8;
+const VALIDATION_BYTES_PER_MEMBER: usize = VALIDATION_SLOTS_PER_MEMBER * size_of::<u64>();
+/// A member's id, once in each of two places.
+const ID_TWICE: usize = 2 * size_of::<u64>();
+/// An entry decoded, beyond its bytes: the entry and the bookkeeping of its
+/// two buffers; among a message's entries, its slot twice (the entries list
+/// grows by doubling).
+const ENTRY_BYTES: usize = size_of::<Entry>() + 2 * OVERHEAD;
+const ENTRY_SCRATCH: usize = 2 * size_of::<Entry>() + 2 * OVERHEAD;
+/// The identity record's encoding of a configuration: its scalar fields and
+/// ids take at most their in-memory size in varints, and each member's id at
+/// most ten bytes in whichever list it is; the buffer grows by doubling, so
+/// twice the encoding.
+const IDENTITY_BYTES: usize = 2 * size_of::<NodeConfig>();
+const IDENTITY_BYTES_PER_MEMBER: usize = 2 * 10;
+/// What opening a group allocates before its first drain prices it again
+/// (`raw_bytes`): the node, the smallest message queue, the identity
+/// record with its append (two records' worth of slots), the record buffer
+/// and the containers' bookkeeping.
+const INITIAL_BYTES: usize = size_of::<crate::DurableNode>()
+    + Outgoing::SMALLEST * size_of::<Message>()
+    + IDENTITY_BYTES
+    + 2 * RECORD_BYTES
+    + RAW_CONTAINERS * OVERHEAD;
 
 fn add(a: usize, b: usize) -> Result<usize, ConsensusError> {
     a.checked_add(b).ok_or(ConsensusError::Capacity)
@@ -41,11 +123,16 @@ pub(super) fn snapshot_bytes(snapshot: &Snapshot) -> Result<usize, ConsensusErro
     ]
     .into_iter()
     .try_fold(0, add)?;
-    // Snapshot metadata plus the independently retained ConfState clone.
-    add(add(snapshot.data.capacity(), mul(members, 16)?)?, 1024)
+    // Each member's id in the state and in its retained clone.
+    add(
+        add(snapshot.data.capacity(), mul(members, ID_TWICE)?)?,
+        SNAPSHOT_BYTES,
+    )
 }
+/// A message as the core prices it too (`proto::message_bytes`), so one
+/// moved between the two costs the same at both.
 pub(super) fn message_bytes(message: &Message) -> Result<usize, ConsensusError> {
-    let mut bytes = add(512, message.context.capacity())?;
+    let mut bytes = add(proto::MESSAGE_ALLOWANCE, message.context.capacity())?;
     bytes = add(
         bytes,
         mul(message.entries.capacity(), std::mem::size_of::<Entry>())?,
@@ -62,12 +149,15 @@ pub(super) fn raw_bytes(raw: &RawNode<RamLog>) -> Result<usize, ConsensusError> 
     let members = raw.raft.tracker().len();
     // What the core says it holds, by capacity: its queue of messages, what
     // is not yet durable, the reads that wait and what it knows of each
-    // member. The allowance above it covers the node's own scalar state and
-    // what an allocator keeps for each of those buffers.
-    add(add(4096, mul(members, 512)?)?, raw.raft.resident_bytes())
+    // member. Above it: the node's own state and what an allocator keeps
+    // for each of those buffers, the members' apiece.
+    add(
+        add(RAW_BYTES, mul(members, MEMBER_BOOKKEEPING)?)?,
+        raw.raft.resident_bytes(),
+    )
 }
 pub(super) fn events_bytes(events: &NodeEvents) -> Result<usize, ConsensusError> {
-    let mut bytes = 1024usize;
+    let mut bytes = EVENTS_BYTES;
     bytes = add(
         bytes,
         mul(events.messages.capacity(), std::mem::size_of::<Message>())?,
@@ -123,17 +213,25 @@ pub(super) fn events_bytes(events: &NodeEvents) -> Result<usize, ConsensusError>
     }
     Ok(bytes)
 }
+/// What opening a group allocates: the node and its queue, the identity
+/// record and its append, and for each member its validation, its identity
+/// bytes, its id in the log's configuration and its row in the tracker
+/// (its in-flight window is allocated when its progress is made, and
+/// priced by that transition's staging).
 pub(super) fn initial_bytes(config: &NodeConfig) -> Result<usize, ConsensusError> {
-    add(
-        16384,
-        mul(add(config.voters.len(), config.learners.len())?, 4096)?,
-    )
+    let members = add(config.voters.len(), config.learners.len())?;
+    let each = add(
+        add(VALIDATION_BYTES_PER_MEMBER, IDENTITY_BYTES_PER_MEMBER)?,
+        add(size_of::<u64>(), member_bytes(0)?)?,
+    )?;
+    add(INITIAL_BYTES, mul(members, each)?)
 }
 /// What a transition's sends copy out of the log (`Raft::send_append`,
 /// `bcast_append`, `send_append_all`): a page to each member behind this
 /// one — the core's bytes and entries a message at most, and the entries'
-/// own slots — or the snapshot to one behind the log; and to the one member
-/// whose answer the transition may be, as many pages as its window admits.
+/// own slots — from what the member is known to hold, or the snapshot to
+/// one behind the log; and to the one member whose answer the transition
+/// may be, as many pages as its window admits.
 /// Pages are read from the running totals the storage keeps beside its
 /// entries; the entries not yet durable are counted whole when a page
 /// reaches them. Nothing is walked but the members.
@@ -180,12 +278,17 @@ fn sends_bytes(raw: &RawNode<RamLog>) -> Result<usize, ConsensusError> {
         if member == raft.id() {
             continue;
         }
-        if progress.pending_request_snapshot != 0 || progress.next_index < first {
+        // A member's answer may reject what was sent and move its next
+        // index back to what it is known to hold: the page is priced from
+        // its matched index, the lowest an answer can reset it to; below
+        // the log, the snapshot.
+        let from = progress.matched.saturating_add(1).min(progress.next_index);
+        if progress.pending_request_snapshot != 0 || from < first {
             pages = add(pages, snapshot)?;
             continue;
         }
-        let one = pages_from(progress.next_index, 1)?;
-        let all = pages_from(progress.next_index, window)?;
+        let one = pages_from(from, 1)?;
+        let all = pages_from(from, window)?;
         pages = add(pages, one)?;
         window_more = window_more.max(all.saturating_sub(one));
     }
@@ -212,8 +315,9 @@ pub(super) fn staging_bytes(
     // What a transition copies, each copy named, and nothing the size of
     // the history (the audit's F16): the entries not yet durable go into
     // the Ready, the WAL's records and the prepared storage; the proposals
-    // this member holds by itself likewise; the committed page the Ready
-    // gives is read from storage a page at most; a snapshot on its way goes
+    // this member holds by itself likewise; the page the Ready gives of the
+    // durable entries above the applied is read from storage and delivered
+    // in the events, a page at most; a snapshot on its way goes
     // into the Ready, the prepared storage and the events; what the leader sends is
     // priced from each member's progress (`sends_bytes`); a member whose
     // progress this transition makes is sent the last entry, and its pages
@@ -228,16 +332,28 @@ pub(super) fn staging_bytes(
     let arriving = log.unstable().snapshot_bytes();
     let held = raw.raft.held_bytes();
     let page = usize::try_from(crate::COMMITTED_PAGE_BYTES).unwrap_or(usize::MAX);
+    // What the Ready may give this transition: every durable entry above
+    // the applied — the transition itself may commit them, a campaign the
+    // whole of them — a page at most.
+    let durable = Storage::last_index(raw.store())?;
     let committed_page = raw.store().bytes_between(
         log.applied().saturating_add(1),
-        log.committed().saturating_add(1),
+        durable.max(log.committed()).saturating_add(1),
         usize::MAX,
         page,
     )?;
     let sends = sends_bytes(raw)?;
     let message = usize::try_from(raw.raft.config().max_size_per_msg).unwrap_or(usize::MAX);
     let joining = mul(new_members, last_entry_bytes(raw)?.min(message))?;
-    let queue = raw.raft.outgoing().growth_of(mul(members, 2)?);
+    // The queue's slots for the messages a transition may queue — two a
+    // member: an append and a heartbeat, a vote and its answer — and the
+    // allowance each carries beyond its slot (its entries are priced by the
+    // sends); the queue grows by its own rule.
+    let queued = mul(members, 2)?;
+    let queue = add(
+        raw.raft.outgoing().growth_of(queued),
+        mul(queued, proto::MESSAGE_ALLOWANCE)?,
+    )?;
     let mut bytes = raw_bytes(raw)?;
     bytes = add(bytes, queue)?;
     bytes = add(bytes, mul(unstable, 2)?)?;
@@ -249,9 +365,12 @@ pub(super) fn staging_bytes(
     bytes = add(bytes, mul(incoming, add(members, 8)?)?)?;
     bytes = add(
         bytes,
-        mul(members, add(mul(config.max_inflight_messages, 8)?, 4096)?)?,
+        mul(members, member_bytes(config.max_inflight_messages)?)?,
     )?;
-    add(bytes, 65536)
+    // The transition's own structures, and a record for each entry not yet
+    // durable, the snapshot and the hard state.
+    let records = mul(add(log.unstable().entries().len(), 2)?, RECORD_BYTES)?;
+    add(add(bytes, records)?, TRANSITION_BYTES)
 }
 /// Whether a change of `kind` (`ConfChangeType`) names `member` as a new
 /// voter or learner the core does not track.
@@ -377,48 +496,81 @@ fn fields(
     }
     Ok(())
 }
+/// The workspace decoding a snapshot record takes: twice its bytes and
+/// the snapshot's structures.
 fn snapshot_scratch(bytes: &[u8]) -> Result<usize, ConsensusError> {
     let mut members = 0usize;
     fields(bytes, |field, wire, _, metadata| {
         if field == 2 && wire == 2 {
             fields(metadata, |field, wire, _, conf| {
                 if field == 1 && wire == 2 {
-                    fields(conf, |field, wire, _, mut packed| {
-                        if (1..=4).contains(&field) {
-                            if wire == 0 {
-                                members = add(members, 1)?;
-                            } else if wire == 2 {
-                                while !packed.is_empty() {
-                                    varint(&mut packed)?;
-                                    members = add(members, 1)?;
-                                }
-                            }
-                            if members > 2048 {
-                                return Err(ConsensusError::Capacity);
-                            }
-                        }
-                        Ok(())
-                    })?;
+                    members = add(members, conf_members(conf)?)?;
                 }
                 Ok(())
             })?;
         }
         Ok(())
     })?;
-    add(add(mul(bytes.len(), 2)?, mul(members, 32)?)?, 4096)
+    add(mul(bytes.len(), 2)?, snapshot_structs(members)?)
 }
+/// What decoding a snapshot builds beyond its bytes: the snapshot and its
+/// configuration, each member's id in a list reserved at its length hint,
+/// and the bookkeeping of the data buffer and the four lists.
+fn snapshot_structs(members: usize) -> Result<usize, ConsensusError> {
+    const STRUCTS: usize = size_of::<Snapshot>() + size_of::<ConfState>() + 5 * OVERHEAD;
+    add(mul(members, ID_TWICE)?, STRUCTS)
+}
+/// The workspace decoding a message takes: twice its bytes (its buffers
+/// grow by doubling), the message with its buffers' bookkeeping, each
+/// entry's slot twice (the entries list doubles too) with the bookkeeping
+/// of its two buffers, and a snapshot's structures (its bytes are among
+/// the message's).
 pub(super) fn message_scratch(bytes: &[u8]) -> Result<usize, ConsensusError> {
-    let mut extra = 4096usize;
+    let mut extra = proto::MESSAGE_ALLOWANCE;
     fields(bytes, |field, wire, _, nested| {
         if field == 7 && wire == 2 {
-            extra = add(extra, mul(std::mem::size_of::<Entry>(), 2)?)?;
+            extra = add(extra, ENTRY_SCRATCH)?;
         }
         if field == 9 && wire == 2 {
-            extra = add(extra, snapshot_scratch(nested)?)?;
+            let mut members = 0usize;
+            fields(nested, |field, wire, _, metadata| {
+                if field == 2 && wire == 2 {
+                    fields(metadata, |field, wire, _, conf| {
+                        if field == 1 && wire == 2 {
+                            members = add(members, conf_members(conf)?)?;
+                        }
+                        Ok(())
+                    })?;
+                }
+                Ok(())
+            })?;
+            extra = add(extra, snapshot_structs(members)?)?;
         }
         Ok(())
     })?;
     add(mul(bytes.len(), 2)?, extra)
+}
+/// The members an encoded configuration names across its four lists,
+/// refused past twice the most a configuration may hold.
+fn conf_members(conf: &[u8]) -> Result<usize, ConsensusError> {
+    let mut members = 0usize;
+    fields(conf, |field, wire, _, mut packed| {
+        if (1..=4).contains(&field) {
+            if wire == 0 {
+                members = add(members, 1)?;
+            } else if wire == 2 {
+                while !packed.is_empty() {
+                    varint(&mut packed)?;
+                    members = add(members, 1)?;
+                }
+            }
+            if members > 2 * MAX_MEMBERS {
+                return Err(ConsensusError::Capacity);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(members)
 }
 pub(super) fn replay_scratch(record: &focal_log::Record) -> Result<usize, ConsensusError> {
     use focal_log::RecordKind;
@@ -444,9 +596,14 @@ pub(super) fn replay_scratch(record: &focal_log::Record) -> Result<usize, Consen
                 tail = next;
             }
         }
-        return add(mul(members, 16)?, 16384);
+        // The configuration decoded: each member's id in a list reserved at
+        // its length hint, the structure and the two lists' bookkeeping.
+        const IDENTITY_SCRATCH: usize = size_of::<NodeConfig>() + 2 * OVERHEAD;
+        return add(mul(members, ID_TWICE)?, IDENTITY_SCRATCH);
     }
-    add(mul(record.payload.len(), 2)?, 4096)
+    // An entry, a proposal or a hard state decoded: twice its bytes (its
+    // buffers grow by doubling), the entry and its two buffers' bookkeeping.
+    add(mul(record.payload.len(), 2)?, ENTRY_BYTES)
 }
 
 #[cfg(test)]
@@ -477,12 +634,13 @@ mod tests {
         let last = last_entry_bytes(&node.raw).unwrap();
         assert!((300..1024).contains(&last), "{last}");
         // Two places in the queue a member (`Outgoing::growth_of` reserves
-        // twice the count), its share of the incoming bytes, its inflight
-        // bookkeeping and the last entry.
+        // twice the count) and the two messages' allowances, its share of
+        // the incoming bytes, its row and window in the tracker and the
+        // last entry.
         let each = 4 * std::mem::size_of::<Message>()
+            + 2 * proto::MESSAGE_ALLOWANCE
             + 657
-            + 8 * node.config.max_inflight_messages
-            + 4096
+            + member_bytes(node.config.max_inflight_messages).unwrap()
             + last;
         assert_eq!(most - none, MAX_MEMBERS * each);
         assert!(most < 8 * 1024 * 1024, "{most}");

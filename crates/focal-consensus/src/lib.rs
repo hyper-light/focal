@@ -470,6 +470,11 @@ impl DurableNode {
         Self::open_on_wal_in(config, shared, &budget)
     }
 
+    /// What opening a group under `config` charges before its first drain
+    /// prices what it holds (`memory::initial_bytes`).
+    pub fn initial_estimate(config: &NodeConfig) -> Result<usize, ConsensusError> {
+        memory::initial_bytes(config)
+    }
     /// Charge this group's retained Raft data and operation staging to a tenant
     /// or node hierarchy. The physical shared WAL has its own node-wide budget.
     pub fn open_on_wal_in(
@@ -665,6 +670,11 @@ impl DurableNode {
     /// to, whatever the history.
     pub fn staging_estimate(&self) -> Result<usize, ConsensusError> {
         memory::staging_bytes(&self.raw, &self.config, 0, 0)
+    }
+    /// The bound a proposal of `incoming` bytes is held to
+    /// (`memory::staging_bytes` as its guard reserves it).
+    pub fn staging_estimate_for(&self, incoming: usize) -> Result<usize, ConsensusError> {
+        memory::staging_bytes(&self.raw, &self.config, incoming, 0)
     }
     pub fn is_budgeted_within(&self, parent: &MemoryBudget) -> bool {
         self.budget.is_within(parent)

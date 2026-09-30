@@ -12402,3 +12402,15 @@ shared in `archive_derive`), so it retires and seals as a network node does
 `focal-load` issues in generations as the journal does and reports `expired` and
 `floors_advanced`.
 
+### 2026-09-30 — F16's residual: every fixed allowance of the consensus pricing is derived
+
+`focal-consensus/src/memory.rs` (and `RamLog::new`, `proto::MESSAGE_ALLOWANCE`) name each
+allowance by the structures it stands for and the allocations whose bookkeeping
+(`ALLOCATOR_OVERHEAD` apiece) it carries — the message, the snapshot and its retained
+configuration, the events, the node around the core, a member's tracker row and window, a
+transition's own structures and records, a decoded message's and record's structures —
+where 512, 1024, 4096, 16384, 65536 and per-member 512/4096 stood. `tests/allowances.rs`
+holds each to the counting allocator by innermost frame (decode of three shapes, a group's
+open alone on a shared WAL with one and 1,024 members, a proposal's transition); the
+measurements are in the remediation record under F16.
+
