@@ -277,7 +277,10 @@ async fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() 
     .unwrap();
     let signing = tokio::spawn(async move { driver.run(&router).await });
     let registry = PeerRegistry::new(16).unwrap();
-    let network_budget = MemoryBudget::new(16 * 1024 * 1024, 0).unwrap();
+    // The listener's budget carries a completion reserve, as the node's does:
+    // nodes' bodies are admitted on the completion lane, participants' on the
+    // ordinary one, so that control traffic is never starved by participants.
+    let network_budget = MemoryBudget::new(16 * 1024 * 1024, 4 * 1024 * 1024).unwrap();
     let listener = Arc::new(
         NetworkListener::bind(
             "127.0.0.1:0".parse().unwrap(),
@@ -560,20 +563,36 @@ async fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() 
     })
     .await
     .unwrap();
+    // A participant holds a connection through the pressure that follows.
+    let actor = actor_connector
+        .connect(address, &founder_name)
+        .await
+        .unwrap();
+    let stats = network_budget.stats();
     let pressure = network_budget
         .reserve(
             focal_memory::BudgetKind::Control,
             focal_memory::BudgetLane::Ordinary,
-            network_budget.stats().limit - network_budget.stats().used,
+            stats.limit - stats.completion_reserve - stats.ordinary_used,
         )
         .unwrap()
         .commit();
+    // The ordinary lane is full: no connection is admitted, and a
+    // participant's body is refused before any of it is allocated — the
+    // stream is reset as capacity, the connection kept. A node's body is
+    // funded from the completion reserve and served.
     assert!(connector.connect(address, &founder_name).await.is_err());
+    assert!(actor.request(&discovery()).await.is_err());
     assert!(matches!(
         remote.request(&discovery()).await.unwrap().result,
         Response::Control { .. }
     ));
     drop(pressure);
+    assert_eq!(
+        actor.request(&discovery()).await.unwrap().result,
+        Response::Error(AccessError::Unauthorized)
+    );
+    actor.close();
     registry.revoke(fingerprint).unwrap();
     // Revocation is checked before decoding a stream, so no error envelope with
     // a caller-controlled request identity is manufactured after rejection.
