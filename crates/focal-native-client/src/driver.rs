@@ -207,6 +207,7 @@ pub const CLAIM_EXPAND: NativeClaimExpand = NativeClaimExpand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeReadOutcome {
     Page(NativeReadPage),
+    Lineage(Box<focal_client::operations::NativeLineage>),
     Wait(focal_client::operations::NativeWaitResult),
 }
 
@@ -221,9 +222,9 @@ pub fn read(
     pause: &mut crate::observe::Pause<'_>,
 ) -> Result<NativeReadOutcome, DriveError> {
     Ok(match operation {
-        NativeReadOperation::ClaimLineage(document) => {
-            NativeReadOutcome::Page(crate::observe::lineage(document, build, reads, lists)?)
-        }
+        NativeReadOperation::ClaimLineage(document) => NativeReadOutcome::Lineage(Box::new(
+            crate::observe::lineage(document, build, reads, lists)?,
+        )),
         NativeReadOperation::ClaimWait(document) => {
             NativeReadOutcome::Wait(crate::observe::wait(document, reads, pause)?)
         }

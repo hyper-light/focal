@@ -59,6 +59,8 @@ pub(crate) fn catalog(standing: &NativeStanding) -> Result<Vec<Tool>, ProtocolEr
             &["native_list", "error"]
         } else if descriptor.name == "claim.wait" {
             &["native_wait", "error"]
+        } else if descriptor.name == "claim.lineage" {
+            &["native_lineage", "error"]
         } else {
             &["native_read", "error"]
         };
@@ -297,6 +299,9 @@ mod tests {
                         assert!(operation_id.is_none());
                     } else if descriptor.name == "claim.wait" {
                         assert_eq!(kinds, ["native_wait", "error"].into());
+                        assert!(operation_id.is_none());
+                    } else if descriptor.name == "claim.lineage" {
+                        assert_eq!(kinds, ["native_lineage", "error"].into());
                         assert!(operation_id.is_none());
                     } else {
                         assert_eq!(kinds, ["native_read", "error"].into());

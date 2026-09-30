@@ -166,6 +166,7 @@ impl Harness {
             &mut pause,
         )? {
             NativeReadOutcome::Page(page) => Ok(page),
+            NativeReadOutcome::Lineage(lineage) => panic!("a plain read: {lineage:?}"),
             NativeReadOutcome::Wait(wait) => panic!("a plain read: {wait:?}"),
         }
     }
@@ -789,6 +790,7 @@ fn validation_get_follows_the_evaluation_pages_to_the_end() {
     .unwrap()
     {
         NativeReadOutcome::Page(page) => page,
+        NativeReadOutcome::Lineage(lineage) => panic!("{lineage:?}"),
         NativeReadOutcome::Wait(wait) => panic!("{wait:?}"),
     };
     // The definition, then every evaluation of its span in key order, from

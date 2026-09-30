@@ -502,11 +502,17 @@ is one claim. `claim follow-up` refines a committed consultation and
 defaults its target to that consultation's subject; its identity derives
 from the refined claim, the query and you. Every verb also takes the
 document form (`--json`, `--yaml`, `--file`) with the same fields as the MCP
-tools. `claim lineage` prints one page of committed claims: the claim with
-its content, its `caused_by` ancestors nearest first, then the corrections
-that invalidate it, the consultations that refine it and the children it
-caused, each with its content and all read at or after the first read's
-token. `claim wait` observes a native claim like the V1 observer (31 probes,
+tools. `claim lineage` prints one observation at one prefix: the claim with
+its content, its `caused_by` ancestors nearest first (up to 16), then the
+corrections that invalidate it, the consultations that refine it and the
+children it caused (up to 64, each with its content), every object read
+exact at the first read's token — and what those bounds left out, named:
+`ancestors_beyond` (the next ancestor past the depth), `ancestors_missing`
+(an ancestor unreadable at the prefix) and `followers_beyond` (per relation,
+the followers listed but not read and the list's continuation, which
+`list claims --relation` resumes). Empty `followers_beyond` and null
+ancestor fields mean the lineage is complete at that prefix (`COMPLETE` in
+the table). `claim wait` observes a native claim like the V1 observer (31 probes,
 one second apart, at most 30 seconds) and adds `--until testament`, met once
 the issuer has received a closing testament.
 

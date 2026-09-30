@@ -649,8 +649,11 @@ relation index. The client packages these as authored shapes of
 `claim.follow_up`: typed documents lowered to one claim document by
 `focal-native-client/src/peer.rs`, so the coverage table claims them through
 `claim.submit`'s frame tags), composes `claim.lineage` from one full claim
-read, bounded ancestor reads and three relation lists at or after the first
-read's token (`observe.rs`), and observes `claim.wait` with the V1 bounds
+read, bounded ancestor reads and three relation lists, every later read exact
+at the first read's token, into one `NativeLineage` observation that names
+what its bounds left beyond it — the next ancestor past the depth, an
+ancestor unreadable at the prefix, followers listed but not read and each
+relation list's continuation (`observe.rs`; the audit's F10), and observes `claim.wait` with the V1 bounds
 plus the `testament` predicate; the CLI verbs `claim challenge|consult|
 correct|follow-up|lineage|wait` and the MCP tools of the same names share
 those documents.

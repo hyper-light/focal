@@ -2091,7 +2091,7 @@ fn the_wait_observer_and_the_lineage_read_compose_bounded_exact_reads() {
         })
     };
     let mut pause = |_: std::time::Duration| panic!("a lineage read never pauses");
-    let NativeReadOutcome::Page(page) = crate::read(
+    let NativeReadOutcome::Lineage(lineage) = crate::read(
         &NativeReadOperation::ClaimLineage(NativeObjectDocument {
             id: hex_of(claim.0),
         }),
@@ -2103,17 +2103,24 @@ fn the_wait_observer_and_the_lineage_read_compose_bounded_exact_reads() {
     .unwrap() else {
         panic!()
     };
-    let ids: Vec<_> = page
-        .objects
-        .iter()
-        .map(|object| match object {
-            NativeObject::Claim(claim) => ClaimId(claim.binding.object.0),
-            _ => panic!(),
-        })
-        .collect();
-    assert_eq!(ids, vec![claim, parent, correction, child]);
-    assert_eq!(page.token.sequence, SessionSeq(20));
-    assert_eq!(page.visited, 7);
+    let id_of = |object: &NativeObject| match object {
+        NativeObject::Claim(claim) => ClaimId(claim.binding.object.0),
+        _ => panic!(),
+    };
+    assert_eq!(id_of(&lineage.claim), claim);
+    assert_eq!(
+        lineage.ancestors.iter().map(id_of).collect::<Vec<_>>(),
+        vec![parent]
+    );
+    assert_eq!(
+        lineage.followers.iter().map(id_of).collect::<Vec<_>>(),
+        vec![correction, child]
+    );
+    // Nothing lies beyond this observation: the chain reached its root and
+    // every relation list reached its end within the bounds.
+    assert!(lineage.is_complete(), "{lineage:?}");
+    assert_eq!(lineage.token.sequence, SessionSeq(20));
+    assert_eq!(lineage.visited, 7);
     assert_eq!(
         kinds,
         vec![
@@ -2122,8 +2129,154 @@ fn the_wait_observer_and_the_lineage_read_compose_bounded_exact_reads() {
             RelationKind::CausedBy
         ]
     );
+    // One prefix: the first read is linearizable and every later read is
+    // exact at its token (the audit's F10).
     assert_eq!(tokens[0], ReadConsistency::Linearizable);
-    assert!(tokens[1..].iter().all(|consistency| matches!(consistency, ReadConsistency::AtLeast(token) if token.sequence == SessionSeq(20))));
+    assert!(tokens[1..].iter().all(|consistency| matches!(consistency, ReadConsistency::Exact(token) if token.sequence == SessionSeq(20))));
+}
+
+/// The audit's F10: what the lineage's bounds leave out is named. A chain
+/// deeper than the depth names the next ancestor; a relation list past the
+/// related bound counts the followers it named but the observation did not
+/// read, and carries the list's own continuation; an ancestor unreadable at
+/// the prefix is named where the chain stops short.
+#[test]
+fn a_lineage_names_what_its_bounds_left_beyond_it() {
+    use crate::NativeReadOutcome;
+    use crate::observe::LINEAGE_DEPTH;
+    use focal_client::operations::{NativeObjectDocument, NativeReadOperation};
+    use focal_wire::*;
+    let root = Cause::Root(RootCommandId::from_u128(1));
+    // Claim 100 is caused by 101, which is caused by 102, ... a chain of
+    // forty; claim 900 is missing at the prefix.
+    let chain = |n: u128| ClaimId::from_u128(100 + n);
+    let missing = ClaimId::from_u128(900);
+    let mut reads = |request: NativeReadRequest| {
+        let NativeReadQuery::Claim { id, .. } = request.query else {
+            panic!("{request:?}");
+        };
+        if id == missing {
+            let mut page = synthetic_claim(id, ClaimStatus::Posted, 1, false, root.clone(), 20);
+            page.objects.clear();
+            return Ok(page);
+        }
+        let n = u128::from_be_bytes(id.0) - 100;
+        let cause = if n < 40 {
+            Cause::Claim(chain(n + 1))
+        } else {
+            root.clone()
+        };
+        Ok(synthetic_claim(
+            id,
+            ClaimStatus::Posted,
+            1,
+            false,
+            cause,
+            20,
+        ))
+    };
+    // Every relation list names a hundred followers and continues.
+    let mut lists = |request: NativeListRequest| {
+        let NativeListFilter::Claims {
+            relation: Some(relation),
+            ..
+        } = &request.filter
+        else {
+            panic!("{request:?}");
+        };
+        let base = match relation.kind {
+            RelationKind::Invalidates => 1000,
+            RelationKind::Refines => 2000,
+            _ => 3000,
+        };
+        let mut objects = Vec::new();
+        for i in 0..100u128 {
+            objects.extend(
+                synthetic_claim(
+                    ClaimId::from_u128(base + i),
+                    ClaimStatus::Posted,
+                    1,
+                    false,
+                    root.clone(),
+                    20,
+                )
+                .objects,
+            );
+        }
+        Ok(NativeListPage {
+            token: ReadToken {
+                ledger: ledger(),
+                sequence: SessionSeq(20),
+                route_epoch: RouteEpoch(1),
+            },
+            native_sequence: SessionSeq(20),
+            objects,
+            next: Some(NativeListCursor(vec![7; 8])),
+            visited: 100,
+        })
+    };
+    let mut pause = |_: std::time::Duration| panic!("a lineage read never pauses");
+    let mut observe = |id: ClaimId, reads: &mut Reads<'_>, lists: &mut Lists<'_>| {
+        let NativeReadOutcome::Lineage(lineage) = crate::read(
+            &NativeReadOperation::ClaimLineage(NativeObjectDocument { id: hex_of(id.0) }),
+            &context(ISSUER),
+            reads,
+            lists,
+            &mut pause,
+        )
+        .unwrap() else {
+            panic!()
+        };
+        lineage
+    };
+    let lineage = observe(chain(0), &mut reads, &mut lists);
+    assert!(!lineage.is_complete());
+    assert_eq!(lineage.ancestors.len(), LINEAGE_DEPTH);
+    assert_eq!(
+        lineage.ancestors_beyond,
+        Some(chain(LINEAGE_DEPTH as u128 + 1))
+    );
+    assert_eq!(lineage.ancestors_missing, None);
+    // Sixty-four followers read: all of the corrections' hundred that fit,
+    // none of the refinements' or the children's; each list says what it
+    // named beyond them and that it continues.
+    assert_eq!(lineage.followers.len(), 64);
+    let beyond: Vec<_> = lineage
+        .followers_beyond
+        .iter()
+        .map(|beyond| (beyond.kind, beyond.listed_not_read, beyond.cursor.is_some()))
+        .collect();
+    assert_eq!(
+        beyond,
+        vec![
+            (RelationKind::Invalidates, 36, true),
+            (RelationKind::Refines, 100, true),
+            (RelationKind::CausedBy, 100, true),
+        ]
+    );
+    // A chain that stops at an ancestor unreadable at the prefix names it.
+    let mut reads_missing = |request: NativeReadRequest| {
+        let NativeReadQuery::Claim { id, .. } = request.query else {
+            panic!("{request:?}");
+        };
+        if id == missing {
+            let mut page = synthetic_claim(id, ClaimStatus::Posted, 1, false, root.clone(), 20);
+            page.objects.clear();
+            return Ok(page);
+        }
+        Ok(synthetic_claim(
+            id,
+            ClaimStatus::Posted,
+            1,
+            false,
+            Cause::Claim(missing),
+            20,
+        ))
+    };
+    let lineage = observe(chain(0), &mut reads_missing, &mut lists);
+    assert!(lineage.ancestors.is_empty());
+    assert_eq!(lineage.ancestors_missing, Some(missing));
+    assert_eq!(lineage.ancestors_beyond, None);
 }
 
 #[test]
@@ -2244,6 +2397,7 @@ fn validation_get_follows_pages_at_one_prefix_and_refuses_a_span_beyond_its_boun
     .unwrap()
     {
         NativeReadOutcome::Page(page) => page,
+        NativeReadOutcome::Lineage(lineage) => panic!("{lineage:?}"),
         NativeReadOutcome::Wait(wait) => panic!("{wait:?}"),
     };
     assert_eq!(page.objects.len(), 4);

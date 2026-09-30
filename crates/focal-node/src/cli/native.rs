@@ -104,10 +104,10 @@ pub(super) fn run(
                     context,
                     &NativeReadOperation::ClaimLineage(NativeObjectDocument { id: args.id }),
                 )?;
-                let focal_native_client::NativeReadOutcome::Page(page) = outcome else {
+                let focal_native_client::NativeReadOutcome::Lineage(lineage) = outcome else {
                     return Err(CliError::InvalidResponse);
                 };
-                return render_page_as("Lineage", page, args.output.format);
+                return render_lineage(*lineage, args.output.format);
             }
             ClaimCommand::Challenge(args) => {
                 let (document, options) = native_documents::challenge(*args)?;
@@ -773,7 +773,8 @@ fn read(
 ) -> Result<NativeReadPage> {
     match observe(runtime, context, operation)? {
         focal_native_client::NativeReadOutcome::Page(page) => Ok(page),
-        focal_native_client::NativeReadOutcome::Wait(_) => Err(CliError::InvalidResponse),
+        focal_native_client::NativeReadOutcome::Lineage(_)
+        | focal_native_client::NativeReadOutcome::Wait(_) => Err(CliError::InvalidResponse),
     }
 }
 /// `claim wait` on the native engine: the same predicates as the V1
@@ -834,6 +835,74 @@ pub(super) fn render_page(page: NativeReadPage, format: OutputFormat) -> Result<
 }
 /// An observation of the owner (a remote outcome read) is labelled apart from
 /// an object read so callers never mistake one for the other.
+/// `claim lineage`: one observation at one prefix, what it holds by role
+/// and what its bounds left beyond it, so a bounded sample is never read as
+/// the whole lineage.
+fn render_lineage(
+    lineage: focal_client::operations::NativeLineage,
+    format: OutputFormat,
+) -> Result<()> {
+    match format {
+        OutputFormat::Json | OutputFormat::Yaml => output::structured(
+            &ApplicationResult {
+                schema_version: 2,
+                operation_id: None,
+                condition: "Lineage".into(),
+                result: OperationOutput::NativeLineage {
+                    lineage: Box::new(lineage),
+                },
+            },
+            format,
+        ),
+        OutputFormat::Table => {
+            let mut out = std::io::stdout().lock();
+            writeln!(
+                out,
+                "PREFIX\t{}\tLOGICAL_TIME\t{}\tCOMPLETE\t{}",
+                lineage.native_sequence.0,
+                lineage.logical_time,
+                lineage.is_complete()
+            )?;
+            let row = |out: &mut std::io::StdoutLock<'_>, role: &str, object: &NativeObject| {
+                let value =
+                    serde_json::to_value(object).map_err(|e| CliError::Other(Box::new(e)))?;
+                let body = value
+                    .as_object()
+                    .and_then(|map| map.values().next().cloned())
+                    .unwrap_or(serde_json::Value::Null);
+                writeln!(out, "{role}\t{body}")?;
+                Ok::<(), CliError>(())
+            };
+            row(&mut out, "CLAIM", &lineage.claim)?;
+            for ancestor in &lineage.ancestors {
+                row(&mut out, "ANCESTOR", ancestor)?;
+            }
+            if let Some(beyond) = lineage.ancestors_beyond {
+                writeln!(out, "ANCESTORS_BEYOND\t{}", hex_id(&beyond.0))?;
+            }
+            if let Some(missing) = lineage.ancestors_missing {
+                writeln!(out, "ANCESTORS_MISSING\t{}", hex_id(&missing.0))?;
+            }
+            for follower in &lineage.followers {
+                row(&mut out, "FOLLOWER", follower)?;
+            }
+            for beyond in &lineage.followers_beyond {
+                writeln!(
+                    out,
+                    "FOLLOWERS_BEYOND\t{:?}\tLISTED_NOT_READ\t{}\tCONTINUES\t{}",
+                    beyond.kind,
+                    beyond.listed_not_read,
+                    beyond.cursor.is_some()
+                )?;
+            }
+            out.flush()?;
+            Ok(())
+        }
+    }
+}
+fn hex_id(id: &[u8; 16]) -> String {
+    id.iter().map(|byte| format!("{byte:02x}")).collect()
+}
 fn render_page_as(condition: &str, page: NativeReadPage, format: OutputFormat) -> Result<()> {
     match format {
         OutputFormat::Json | OutputFormat::Yaml => output::structured(

@@ -20,7 +20,7 @@
     },
     {
       "path": "references/peer-workflows.md",
-      "blake3": "dd44a8d90b6f7c7e1ee1600feb7e97a11cb63bb922ee8e10985b41cef545e737"
+      "blake3": "cc114556dc3cfea5e54141b202eb11f4da37ff0a71e440b57f6d7b2acf95c662"
     }
   ],
   "skills": [
@@ -856,9 +856,9 @@
     },
     {
       "name": "focal-peers",
-      "version": 1,
+      "version": 2,
       "path": "focal-peers/SKILL.md",
-      "blake3": "f4f315128cda921e828aa456672c38903eeddee936ed60f4a56709512ccb3e66",
+      "blake3": "71dc328c9aa266b88255087ef9e90994df3a854c09af94feec517d8eeb91e3e9",
       "references": [
         "references/workflow-contract.md",
         "references/peer-workflows.md"

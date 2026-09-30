@@ -672,6 +672,9 @@ pub enum OperationOutput {
     NativeWait {
         result: super::NativeWaitResult,
     },
+    NativeLineage {
+        lineage: Box<super::NativeLineage>,
+    },
 }
 impl ApplicationResult {
     pub fn is_error(&self) -> bool {

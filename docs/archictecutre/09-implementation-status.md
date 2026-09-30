@@ -12352,3 +12352,15 @@ releasing the bodies in flight and their permits. Tests:
 `a_complete_request_is_authorized_by_the_grant_current_at_dispatch`. Metrics:
 `focal_listener_refused_total{bound="connections"|"bytes"|"memory"}`,
 `focal_listener_ingress_bytes`.
+
+### 2026-09-29 — F10: a lineage is one observation at one prefix, and names what it left out
+
+`claim.lineage` returns `NativeLineage` (result kind `native_lineage`): the claim, its
+ancestors and its followers every one read exact at the first read's token, with
+`ancestors_beyond`, `ancestors_missing` and `followers_beyond` naming what the depth of
+16, the related bound of 64 and the relation lists' visits left beyond the observation
+(`focal-native-client/src/observe.rs`, `focal-client/src/operations/native_lineage.rs`).
+The CLI prints it by role with a `COMPLETE` flag; the peers skill is at version 2. Tests:
+`a_lineage_names_what_its_bounds_left_beyond_it`,
+`the_wait_observer_and_the_lineage_read_compose_bounded_exact_reads`, the peer-workflow
+suites.

@@ -22,7 +22,7 @@ ruling before work starts).
 | F07 | P2 | in tree | 4 | [F07](#f07) |
 | F08 | P2 | in tree | 4 | [F08](#f08) |
 | F09 | P2 | in tree | 2 | [F09](#f09) |
-| F10 | P2 | open | 4 | — |
+| F10 | P2 | in tree | 4 | [F10](#f10) |
 | F11 | P2 | open | 4 | — |
 | F12 | P1 | open | 5 | — |
 | F13 | P1 | open | 5 | — |
@@ -1099,3 +1099,35 @@ rest of the body has nowhere to go, the handler never runs, the permit and the
 connection are given back), `a_complete_request_is_authorized_by_the_grant_current_at_dispatch`
 (a grant withdrawn while a request runs: nothing after it is served on the connection),
 the existing `mutual_tls_tenant_isolation_live_revocation_and_independent_streams`.
+
+## F10
+
+**Cause.** The client composed a claim's lineage into an ordinary `NativeReadPage`:
+sixteen ancestors and sixty-four related claims at most, the relation lists' continuations
+ignored and the extra related claims dropped, `next: None` — a page-shaped value that
+could be taken for a complete observation. And the objects were read `AtLeast` the first
+token while the page carried that first token, so the page's prefix claim did not hold
+for what it showed.
+
+**Fix.** The lineage is one observation at one prefix (`NativeLineage`, a distinct
+result kind `native_lineage`): the first read is linearizable and every later read is
+`Exact` at its token, so the token, native sequence and logical time the observation
+carries are those of every object in it. Its bounds stay and their effects are visible:
+`ancestors_beyond` names the next ancestor past the depth (the chain continues above
+it), `ancestors_missing` names an ancestor unreadable at the prefix (the chain stops
+short of its root), and `followers_beyond` says, per relation, how many followers the
+list named that the observation did not read and carries the list's own continuation
+(`claim.list` with the same relation filter resumes there); `is_complete` is all of
+them absent. The CLI prints `claim lineage` by role (`CLAIM`, `ANCESTOR`, `FOLLOWER`)
+with a `COMPLETE` flag and the `*_BEYOND`/`*_MISSING` rows; MCP returns
+`native_lineage` under condition `Lineage`; the schema names every field; the peers
+skill (version 2) tells an agent to check the bounds before reading a sample as the
+whole.
+
+**Tests.** `the_wait_observer_and_the_lineage_read_compose_bounded_exact_reads` (every
+later read exact at the first token; the observation complete),
+`a_lineage_names_what_its_bounds_left_beyond_it` (a chain of forty names the seventeenth
+ancestor; lists of a hundred each count what they named past the bound of sixty-four and
+carry their continuations; an ancestor unreadable at the prefix is named where the chain
+stops), the CLI and MCP peer-workflow suites (`lineage_ids`/`lineage` assert a complete
+observation), the catalogue's kind and schema tests, the skill contract.

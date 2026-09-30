@@ -322,6 +322,9 @@ impl<T: ClientTransport> Backend<T> {
                     page: Box::new(page),
                 },
             ),
+            focal_native_client::NativeReadOutcome::Lineage(lineage) => {
+                ("Lineage", OperationOutput::NativeLineage { lineage })
+            }
             focal_native_client::NativeReadOutcome::Wait(result) => (
                 result.condition.as_str(),
                 OperationOutput::NativeWait { result },

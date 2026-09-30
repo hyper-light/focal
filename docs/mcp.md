@@ -221,7 +221,7 @@ ledger lists `ledger.standing` and never lists `request.reserve` or
 | Purpose | Native tools |
 | --- | --- |
 | Claim lifecycle | `claim.submit`, `claim.post`, `claim.cancel` (version 2 documents) |
-| Peer workflows | `claim.challenge`, `claim.consult`, `claim.correct`, `claim.follow_up` (authored shapes of `claim.submit`: same frame, identity and receipt), `claim.lineage` (one composed page: the claim, its cause ancestors, its corrections, refinements and children), `claim.wait` (`testament`, `satisfied`, `terminal` or `released`; result kind `native_wait`) |
+| Peer workflows | `claim.challenge`, `claim.consult`, `claim.correct`, `claim.follow_up` (authored shapes of `claim.submit`: same frame, identity and receipt), `claim.lineage` (one observation at one prefix — the claim, its cause ancestors, its corrections, refinements and children — naming what its bounds left beyond it; result kind `native_lineage`), `claim.wait` (`testament`, `satisfied`, `terminal` or `released`; result kind `native_wait`) |
 | Respondent cycle | `receipt.acquire`, `artifact.submit`, `artifact.diagnostic`, `artifact.fail`, `testament.submit`, `testament.post` |
 | Issuer and evaluator | `testament.receive`, `artifact.receive`, `artifact.reject`, `validation.begin`, `validation.report` (admission, increment or whole-work evaluations by `phase`), `validation.seal_increments`, `validation.enter_whole_work`, `receipt.adopt`, `claim.release_scope`, `audit.generate`, `audit.post` |
 | Durable waits | `monitor.register`, `monitor.rebind`, `monitor.cancel` |
@@ -263,8 +263,12 @@ the challenge, the verdict and the author so a repeated delivery resolves to
 one correction) and `claim.follow_up` (`refines`, `target` defaulting to the
 refined consultation's subject, an identity derived from the refined claim
 and the query). A projection-only ledger withholds them with `claim.submit`.
-`claim.lineage` reads one claim's lineage as a `native_read` page and
-`claim.wait` observes a claim as `native_wait`; the `focal-peers` skill
+`claim.lineage` reads one claim's lineage as `native_lineage`: `claim`,
+`ancestors` (nearest first, up to 16), `followers` (corrections,
+refinements, children, up to 64), all exact at one `token`, with
+`ancestors_beyond`, `ancestors_missing` and `followers_beyond` naming what
+the bounds left out (a complete lineage has them null and empty); `claim.wait`
+observes a claim as `native_wait`; the `focal-peers` skill
 sequences them.
 
 Native tools take no reservation. Every mutation compiles its document with

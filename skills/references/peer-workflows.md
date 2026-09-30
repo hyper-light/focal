@@ -53,9 +53,14 @@ different claim. Supply `occurrence` only to override this deliberately.
 
 ## Reading and waiting
 
-`claim.lineage` returns one `native_read` page: `[claim, ancestors…,
-followers…]`, followers being the committed corrections, refinements and
-children of the claim (at most 64, each with content). `claim.wait` returns
+`claim.lineage` returns one `native_lineage` observation at one prefix:
+`claim`, `ancestors` (nearest first, at most 16), `followers` (the committed
+corrections, refinements and children, at most 64, each with content), all
+read exact at its `token`; `ancestors_beyond`, `ancestors_missing` and
+`followers_beyond` name what those bounds left out (a relation's followers
+listed but not read, and its list `cursor`, which `claim.list` with the same
+`relation` filter resumes). A complete lineage has them null and empty; never
+read a bounded sample as the whole. `claim.wait` returns
 `native_wait`: `condition` (`Met`, `Pending`, `Unmet`), `until`, the latest
 `observation` (token, claim, status code, revision, local completion,
 release) and `probes`. Neither mints an identity.
