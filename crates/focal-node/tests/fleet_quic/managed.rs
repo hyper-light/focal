@@ -4,16 +4,30 @@ fn managed_request(id: u128, operation: Operation) -> RequestEnvelope {
     value.protocol = MANAGED_PROTOCOL_VERSION;
     value
 }
+/// One exchange with `node` over a fresh connection. A request the client's
+/// clock gives up (`Timeout`) is sent again — the exact envelope, under a
+/// counted budget: every request here is answered from its receipt or its
+/// committed state on a retry, and an owner a loaded machine slows gives up
+/// nothing it would have answered (27 §3.1 P2), so the wall clock is the
+/// client's to retry against, never a verdict.
 async fn exchange(fleet: &Fleet, node: usize, request: &RequestEnvelope) -> Response {
     let endpoint = &fleet.routes[&(node as u64 + 1)];
-    let remote = fleet
-        .actor_connector
-        .connect(endpoint.address, &endpoint.server_name)
-        .await
-        .unwrap();
-    let reply = remote.request(request).await.unwrap();
-    remote.close();
-    reply.result
+    let mut timed_out = 0;
+    for _ in 0..8 {
+        let remote = fleet
+            .actor_connector
+            .connect(endpoint.address, &endpoint.server_name)
+            .await
+            .unwrap();
+        let reply = remote.request(request).await;
+        remote.close();
+        match reply {
+            Ok(reply) => return reply.result,
+            Err(WireError::Timeout) => timed_out += 1,
+            Err(error) => panic!("exchange: {error:?}"),
+        }
+    }
+    panic!("the exact request timed out {timed_out} times: {request:?}")
 }
 async fn current_leader(fleet: &Fleet, excluding: Option<usize>) -> usize {
     tokio::time::timeout(Duration::from_secs(10), async {

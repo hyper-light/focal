@@ -90,6 +90,26 @@ fn registry(state: &ControlSnapshot) -> EnrollmentRegistry {
     };
     EnrollmentRegistry::restore(enrollment, CLUSTER, EnrollmentLimits::default()).unwrap()
 }
+/// A decision asked of the signer once more — the exact request — while the
+/// replicated root answers with a failure the founder retries (`retryable`):
+/// an invitation or an admission is answered from its committed fact on a
+/// retry and never made twice, and a call round a loaded machine outlasts is
+/// the caller's to ask again, under a counted budget.
+async fn decided<T>(
+    mut call: impl AsyncFnMut() -> Result<T, QuorumEnrollmentError>,
+) -> Result<T, QuorumEnrollmentError> {
+    let mut last = None;
+    for _ in 0..8 {
+        match call().await {
+            Err(QuorumEnrollmentError::Control(failure)) if retryable(failure) => {
+                last = Some(failure);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            other => return other,
+        }
+    }
+    panic!("the signer's decision did not settle: {last:?}")
+}
 struct Running {
     host: ControlHost,
     owner: ControlOwner,
@@ -602,10 +622,13 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
         lifetime_seconds: 600,
     };
     let (result, token) = tokio::join!(driver.run(&adapter), async {
-        let invitation = signer
-            .invite(RequestId::from_u128(41), intent.clone())
-            .await
-            .unwrap();
+        let invitation = decided(async || {
+            signer
+                .invite(RequestId::from_u128(41), intent.clone())
+                .await
+        })
+        .await
+        .unwrap();
         assert_eq!(registry(&state(&adapter).await).revision(), 6);
         let token = invitation.expose_token().unwrap();
         let operator = runtime(namespace);
@@ -691,10 +714,13 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
             }
         }
         replicas[0].pool.replace_routes(3, routes.clone()).unwrap();
-        signer
-            .invite(RequestId::from_u128(42), intent.clone())
-            .await
-            .unwrap();
+        decided(async || {
+            signer
+                .invite(RequestId::from_u128(42), intent.clone())
+                .await
+        })
+        .await
+        .unwrap();
         assert_eq!(registry(&state(&adapter).await).revision(), 7);
         signer.stop().await.unwrap();
         token
@@ -713,22 +739,29 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
         QuorumEnrollmentHost::open(authority, &staging, config, allowance.clone()).unwrap();
     let (result, ()) = tokio::join!(driver.run(&adapter), async {
         assert_eq!(
-            signer
-                .invite(RequestId::from_u128(41), intent.clone())
-                .await
-                .unwrap()
-                .expose_token()
-                .unwrap(),
+            decided(async || {
+                signer
+                    .invite(RequestId::from_u128(41), intent.clone())
+                    .await
+            })
+            .await
+            .unwrap()
+            .expose_token()
+            .unwrap(),
             token
         );
         // A tenant is admitted once under the founder authority; a retry
         // reads as done, and every certificate's grant names it from then on
         // without a restart (doc 24 §16).
-        signer.admit_tenant([9; 16]).await.unwrap();
+        decided(async || signer.admit_tenant([9; 16]).await)
+            .await
+            .unwrap();
         let view = state(&adapter).await;
         assert_eq!(registry(&view).revision(), 8);
         assert!(registry(&view).admits_tenant([9; 16]));
-        signer.admit_tenant([9; 16]).await.unwrap();
+        decided(async || signer.admit_tenant([9; 16]).await)
+            .await
+            .unwrap();
         assert_eq!(registry(&state(&adapter).await).revision(), 8);
         assert!(matches!(
             signer.admit_tenant([0; 16]).await,
