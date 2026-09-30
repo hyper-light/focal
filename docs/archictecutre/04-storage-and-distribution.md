@@ -211,7 +211,12 @@ custody records. A promise is refused with a typed capacity error before any
 acknowledgement when the volume's sampled free bytes, less what is already
 promised, would fall below the headroom watermark (or, for ordinary work, the
 completion reserve); it is charged against the estimate once the write is
-behind its fence and returned if it never happens. The envelope samples the
+behind its fence and returned if it never happens. A write whose identical
+bytes are already on the volume asks for no promise at all (2026-09-29, the
+audit's F59): a chunk an exact retry or a resumed transfer sends again, a
+manifest a repeated completion installs, a custody record installed twice
+refresh their freshness and add no byte, so they lower no estimate and are
+not refused near the watermark. The envelope samples the
 volume at a bounded cadence and refuses fresh work while it cannot.
 
 The sequencer's lifecycle/affordance projection is itself budgeted and measured.

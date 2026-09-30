@@ -71,7 +71,7 @@ ruling before work starts).
 | F56 | P1 | in tree | 13 | [F56](#f56) |
 | F57 | P1 | in tree | 14 | [F57](#f57) |
 | F58 | P2 | in tree | 14 | [F58](#f58) |
-| F59 | P2 | open | 15 | — |
+| F59 | P2 | in tree | 15 | [F59](#f59) |
 | F60 | P2 | open | 15 | — |
 | F61 | P2 | open | 15 | — |
 | F62 | P1 | in tree | 15 | [F62](#f62) |
@@ -622,3 +622,23 @@ read twice at open (sequential, checksummed both times); the format is unchanged
 shape; the old cost, 256 × 288 bytes, exceeds the retained bytes plus the scan's transient
 and would refuse), `the_packed_index_never_costs_more_than_the_appends_across_groups_batches_and_checkpoints`,
 the existing startup, compaction and corruption tests unchanged.
+
+## F59
+
+**Cause.** `import_chunk` reserved the chunk's bytes on the volume and committed the
+reservation unconditionally; `install_transferred_chunk` recognised an identical
+verified chunk and only refreshed its mtime, so the committed promise lowered the
+free-space estimate for bytes that were never added. The transfer's manifest on a
+repeated completion and a custody record installed twice had the same shape.
+
+**Fix.** `already_installed(path, bytes, hash)` is asked before the promise: the chunk
+import, the completion's manifest install and `install_custody_record` refresh an
+identical file's freshness and return without a promise (a promise asked first would
+itself be refused at the watermark — the duplicate must not need one); a new or
+repaired payload is promised, installed and charged as before. Nothing about freshness
+(GC's marks, repair) changed; the resampling cadence is as it was.
+
+**Tests.** `store::transfer::tests::duplicate_chunk_imports_and_a_repeated_completion_charge_the_volume_once`
+(the audit's shape at an exact estimate; before the fix the duplicates consumed the
+estimate and the completion was refused), the transfer, upload and record suites
+unchanged.

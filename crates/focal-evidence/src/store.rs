@@ -471,23 +471,27 @@ impl ContentStore {
         }
         let directory = self.root.join(kind.directory());
         let path = directory.join(format!("{name}.record"));
-        let record = disk_reserve(
-            &self.disk,
-            &self.root,
-            DiskKind::Content,
-            BudgetLane::Completion,
-            u64::try_from(bytes.len()).map_err(|_| ContentError::Capacity)?,
-        )?;
-        let installed = durable_directory(&directory)
-            .map_err(ContentError::Io)
-            .and_then(|()| atomic_install(&path, bytes));
-        if let Err(error) = installed {
-            if matches!(error, ContentError::Io(_)) {
-                self.failed = true;
+        // The identical record on the volume already needs no promise and
+        // adds no byte.
+        if !already_installed(&path, bytes, None)? {
+            let record = disk_reserve(
+                &self.disk,
+                &self.root,
+                DiskKind::Content,
+                BudgetLane::Completion,
+                u64::try_from(bytes.len()).map_err(|_| ContentError::Capacity)?,
+            )?;
+            let installed = durable_directory(&directory)
+                .map_err(ContentError::Io)
+                .and_then(|()| atomic_install(&path, bytes));
+            if let Err(error) = installed {
+                if matches!(error, ContentError::Io(_)) {
+                    self.failed = true;
+                }
+                return Err(error);
             }
-            return Err(error);
+            record.commit();
         }
-        record.commit();
         Ok(())
     }
     /// A named record's bytes, `None` when none was installed.
@@ -1297,20 +1301,28 @@ fn refresh_mtime(path: &Path) -> Result<(), ContentError> {
 /// them is left alone; one holding anything else is corrupt under this
 /// content-addressed name and is replaced by the verified bytes, never
 /// kept: a recopy is how a corrupt chunk is repaired.
-pub(crate) fn install_transferred_chunk(
+/// Whether an identical file — equal bytes, and the hash when one is named
+/// — is already at `path`; when it is, its freshness is refreshed and nothing
+/// else is written. Asked before a durable write is promised its bytes (the
+/// audit's F59): a chunk an exact retry or a resumed transfer sends again, a
+/// manifest a repeated completion installs, a custody record installed
+/// twice add no byte to the volume, so they neither need the promise nor
+/// lower the estimate — and near the watermark they are not refused.
+pub(crate) fn already_installed(
     path: &Path,
     bytes: &[u8],
-    hash: ContentHash,
-) -> Result<(), ContentError> {
+    hash: Option<ContentHash>,
+) -> Result<bool, ContentError> {
     if path.exists()
         && read_bounded(path, bytes.len()).is_ok_and(|previous| {
-            previous == bytes && ContentHash(*blake3::hash(&previous).as_bytes()) == hash
+            previous == bytes
+                && hash.is_none_or(|hash| ContentHash(*blake3::hash(&previous).as_bytes()) == hash)
         })
     {
         refresh_mtime(path)?;
-        return Ok(());
+        return Ok(true);
     }
-    atomic_install(path, bytes)
+    Ok(false)
 }
 
 fn atomic_install(path: &Path, bytes: &[u8]) -> Result<(), ContentError> {

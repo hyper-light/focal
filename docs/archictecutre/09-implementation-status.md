@@ -12164,3 +12164,20 @@ transient three records, admit the reopen, and the reopen retains no more) and
 `the_packed_index_never_costs_more_than_the_appends_across_groups_batches_and_checkpoints`
 (three logs, batches of 1–100 interleaved, a rewrite, a reopen; every log replays
 what was written).
+
+### 2026-09-29 — F59: a duplicate chunk adds no byte, so it charges none
+
+A chunk import promised the volume its payload and committed the promise
+whatever the installation did; a verified duplicate — an exact retry, or a
+resumed transfer's chunk already held — rewrote nothing, refreshed the file's
+freshness, and still lowered the free-space estimate by its length, so retries
+near the watermark invented volume use until the next sample (the audit's
+reproduction: 16 free bytes, four duplicate imports of a four-byte chunk, the
+estimate at 0, the fifth refused). `already_installed` is asked before the
+promise: a chunk, a transfer's manifest on a repeated completion or a custody
+record whose identical bytes are on the volume refreshes its freshness and
+needs neither promise nor charge — and is not refused near the watermark, where
+the promise itself would have been; a new or repaired payload is promised and
+charged as before. `store::transfer::tests::duplicate_chunk_imports_and_a_repeated_completion_charge_the_volume_once`
+(an estimate of exactly the payload, the manifest and four bytes: four exact
+retries and a second completion move it by nothing; every payload once).

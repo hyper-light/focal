@@ -176,6 +176,13 @@ impl ContentStore {
                 .root
                 .join("objects")
                 .join(hex(&transfer.reference.domain.0));
+            let path = directory.join(format!("{}.chunk", chunk.hash));
+            // A verified duplicate — an exact retry, or a resumed transfer's
+            // chunk already held — adds no byte to the volume: it needs no
+            // promise and lowers no estimate (the audit's F59).
+            if already_installed(&path, bytes, Some(chunk.hash))? {
+                return Ok(());
+            }
             // Custody transfers are fleet work: they draw on the completion
             // lane so a tenant's uploads cannot starve replication.
             let copy = disk_reserve(
@@ -186,11 +193,7 @@ impl ContentStore {
                 u64::try_from(bytes.len()).map_err(|_| ContentError::Capacity)?,
             )?;
             durable_directory(&directory)?;
-            install_transferred_chunk(
-                &directory.join(format!("{}.chunk", chunk.hash)),
-                bytes,
-                chunk.hash,
-            )?;
+            atomic_install(&path, bytes)?;
             copy.commit();
             Ok(())
         })();
@@ -237,6 +240,12 @@ impl ContentStore {
                 .root
                 .join("objects")
                 .join(hex(&transfer.reference.domain.0));
+            let path = directory.join(format!("{}.manifest", transfer.reference.root));
+            // A repeated completion finds its manifest installed: no promise,
+            // no byte.
+            if already_installed(&path, &transfer.encoded, Some(transfer.reference.root))? {
+                return Ok(transfer.reference.clone());
+            }
             let manifest = disk_reserve(
                 &self.disk,
                 &self.root,
@@ -245,10 +254,7 @@ impl ContentStore {
                 u64::try_from(transfer.encoded.len()).map_err(|_| ContentError::Capacity)?,
             )?;
             durable_directory(&directory)?;
-            atomic_install(
-                &directory.join(format!("{}.manifest", transfer.reference.root)),
-                &transfer.encoded,
-            )?;
+            atomic_install(&path, &transfer.encoded)?;
             manifest.commit();
             Ok(transfer.reference.clone())
         })();
@@ -531,5 +537,61 @@ mod tests {
         assert!(receiver.complete_import(&imported).is_err());
         assert!(receiver.verify(&reference).is_err());
         assert!(receiver.read_transfer_chunk(&imported, usize::MAX).is_err());
+    }
+    /// The audit's F59: an exact retry of a chunk, a resumed transfer's chunk
+    /// already held, and a repeated completion add no byte to the volume, so
+    /// none lowers the free-space estimate; only the first installation of
+    /// each payload does.
+    #[test]
+    fn duplicate_chunk_imports_and_a_repeated_completion_charge_the_volume_once() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let mut sender = ContentStore::open(source_dir.path(), limits(4)).unwrap();
+        let reference = source(&mut sender);
+        let descriptor = sender.export_manifest(&reference).unwrap();
+        let disk = DiskBudget::new(DiskBudgetConfig {
+            headroom: 0,
+            completion_reserve: 0,
+            sample_interval: 64,
+        })
+        .unwrap();
+        // Exactly the payload, the manifest and four more bytes: a duplicate
+        // that charged the estimate would leave the completion without room.
+        let manifest_bytes = descriptor.encoded().len() as u64;
+        disk.observe(reference.length + manifest_bytes + 4);
+        let mut receiver =
+            ContentStore::open_with_disk(target_dir.path(), limits(8), disk.clone()).unwrap();
+        let imported = receiver
+            .prepare_import(reference.clone(), descriptor.encoded().to_vec())
+            .unwrap();
+        let chunk = sender.read_transfer_chunk(&descriptor, 0).unwrap();
+        let before = disk.uncommitted_free();
+        receiver.import_chunk(&imported, 0, &chunk).unwrap();
+        let once = disk.uncommitted_free();
+        assert_eq!(once, before - chunk.len() as u64);
+        for _ in 0..4 {
+            receiver.import_chunk(&imported, 0, &chunk).unwrap();
+        }
+        assert_eq!(
+            disk.uncommitted_free(),
+            once,
+            "four exact retries added no byte"
+        );
+        for index in 1..descriptor.chunks() {
+            let bytes = sender.read_transfer_chunk(&descriptor, index).unwrap();
+            receiver.import_chunk(&imported, index, &bytes).unwrap();
+        }
+        assert_eq!(disk.uncommitted_free(), before - reference.length);
+        assert_eq!(receiver.complete_import(&imported).unwrap(), reference);
+        let completed = disk.uncommitted_free();
+        assert_eq!(completed, before - reference.length - manifest_bytes);
+        assert_eq!(receiver.complete_import(&imported).unwrap(), reference);
+        assert_eq!(
+            disk.uncommitted_free(),
+            completed,
+            "a repeated completion added no byte"
+        );
+        assert_eq!(receiver.read_bytes(&reference, 10).unwrap(), b"abcdefghij");
+        assert_eq!(disk.stats().outstanding, 0);
     }
 }
