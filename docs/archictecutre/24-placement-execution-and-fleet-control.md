@@ -868,8 +868,12 @@ the leader the replica's consensus state names, and a current read is served
 here whoever leads. The replica's own route-epoch check stays as the last
 fence behind the cache. The client already follows `RouteChanged` hints over
 QUIC (a new connection to the hinted endpoint under the cluster's trust,
-the epoch updated per ledger) and refuses to loop on an unchanged hint; the
-local socket transport cannot follow one and surfaces it.
+the epoch updated per ledger) and refuses to loop on an unchanged hint; it
+keeps one connection per route (`focal_wire::RouteConnections`: concurrent
+cold calls to a route join its one dial in flight and share the connection,
+and a failed request forgets a route only while the connection that failed
+is the one cached); the local socket transport cannot follow a hint and
+surfaces it.
 
 **Limits.** The directory's `leader` is the placement's preferred leader,
 not the log's: without leader transfer the two differ after an expansion,

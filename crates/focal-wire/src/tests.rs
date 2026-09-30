@@ -2951,3 +2951,88 @@ fn every_operation_has_its_class_and_control_goes_first() {
     assert_eq!(Operation::Summary.class(), TrafficClass::Exchange);
     assert_eq!(download_request(1).operation.class(), TrafficClass::Bulk);
 }
+
+/// The audit's F60: twenty-four cold calls to one route dial once and share
+/// the connection — none is replaced under a dispatched call; a failure
+/// reported for a generation no longer cached forgets nothing; a caller that
+/// gives up under its own deadline does not abandon the dial.
+#[tokio::test]
+async fn cold_calls_to_one_route_share_one_dial_and_a_stale_failure_forgets_nothing() {
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(16).unwrap();
+    registry
+        .register_certificate(&certificate, grant())
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler: Arc<dyn RequestHandler> = {
+        let calls = calls.clone();
+        Arc::new(move |verified: VerifiedRequest| {
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                // Long enough for the cold calls to overlap on the wire.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                response(verified.request())
+            }
+        })
+    };
+    let (server, task) = server(&pki, registry, handler).await;
+    let connector = connector(&pki, certificate, key);
+    let address = server.local_addr().unwrap().to_string();
+    let routes = Arc::new(RouteConnections::new(connector, 1).unwrap());
+    let mut waves = tokio::task::JoinSet::new();
+    for id in 1..=24u128 {
+        let routes = routes.clone();
+        let address = address.clone();
+        waves.spawn(async move {
+            let connected = routes.connect(&address, "localhost").await?;
+            connected
+                .remote
+                .request(&request(id))
+                .await
+                .map(|reply| (id, reply))
+        });
+    }
+    let mut answered = 0;
+    while let Some(joined) = waves.join_next().await {
+        let (id, reply) = joined.unwrap().unwrap();
+        assert_eq!(reply, response(&request(id)));
+        answered += 1;
+    }
+    assert_eq!(answered, 24);
+    assert_eq!(calls.load(Ordering::SeqCst), 24);
+    assert_eq!(routes.dials(), 1, "one dial for every cold call");
+    let stats = server.admission();
+    assert_eq!((stats.admitted, stats.replaced), (1, 0), "{stats:?}");
+    // A failure reported for a generation no longer cached forgets nothing;
+    // one for the cached generation lets the route be dialed again.
+    let current = routes.connect(&address, "localhost").await.unwrap();
+    routes.forget(&address, "localhost", current.generation.wrapping_add(1));
+    assert_eq!(
+        routes
+            .connect(&address, "localhost")
+            .await
+            .unwrap()
+            .generation,
+        current.generation
+    );
+    assert_eq!(routes.dials(), 1);
+    routes.forget(&address, "localhost", current.generation);
+    let fresh = routes.connect(&address, "localhost").await.unwrap();
+    assert_ne!(fresh.generation, current.generation);
+    assert_eq!(routes.dials(), 2);
+    // A caller that gives up under its own deadline does not abandon the
+    // dial: the next caller finds it, and no third dial is started.
+    routes.forget(&address, "localhost", fresh.generation);
+    let gave_up = tokio::time::timeout(
+        Duration::from_micros(10),
+        routes.connect(&address, "localhost"),
+    )
+    .await;
+    let next = routes.connect(&address, "localhost").await.unwrap();
+    assert_eq!(routes.dials(), 3, "gave up: {}", gave_up.is_ok());
+    assert!(next.generation > fresh.generation);
+    server.close();
+    task.await.unwrap().unwrap();
+}

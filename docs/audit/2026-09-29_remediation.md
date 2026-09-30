@@ -72,7 +72,7 @@ ruling before work starts).
 | F57 | P1 | in tree | 14 | [F57](#f57) |
 | F58 | P2 | in tree | 14 | [F58](#f58) |
 | F59 | P2 | in tree | 15 | [F59](#f59) |
-| F60 | P2 | open | 15 | — |
+| F60 | P2 | in tree | 15 | [F60](#f60) |
 | F61 | P2 | open | 15 | — |
 | F62 | P1 | in tree | 15 | [F62](#f62) |
 | F63 | P2 | in tree | 13 | [F63](#f63) |
@@ -642,3 +642,36 @@ repaired payload is promised, installed and charged as before. Nothing about fre
 (the audit's shape at an exact estimate; before the fix the duplicates consumed the
 estimate and the completion was refused), the transfer, upload and record suites
 unchanged.
+
+## F60
+
+**Cause.** `QuicTransport::connection` released the cache mutex before resolving and
+connecting, so concurrent cold misses for one route each opened a connection and
+overwrote one entry while keeping their own; `max_connections` bounded keys, not
+connections or dials in flight; the server's per-identity limit then replaced the
+earlier connections under calls already dispatched, and a request's failure removed
+the key whichever connection it held by then.
+
+**Fix.** `focal_wire::RouteConnections`, which `QuicTransport` now holds: a route's dial
+runs on its own task with a `watch` of its outcome; callers arriving while it dials
+join it and share its connection, waiting no longer than the dial itself (resolver,
+connection and greeting under one `request_timeout` each, so the task always ends and
+always speaks — or, dropped with its runtime, closes the channel, which a waiter reads
+as failure); a caller that gives up under its own deadline drops only its receiver;
+the first caller to see the outcome settles it into the cache, later ones take what is
+cached or, when it was forgotten already, dial afresh rather than re-cache it; a caller
+waits on at most two dials. Dials in flight hold their room in `max_routes` (the least
+recently used cached route leaves for a new one; `Limit` when every room is a dial).
+Connections carry a generation and `forget(route, generation)` removes only a matching
+one. Waiters are the caller's own concurrency — the cache holds nothing per waiter — and
+the connection's lanes queue them as they queue any request. **Cost:** one task and one
+`watch` channel per dial in flight; the redirect path (`RouteHint`) and the node's peer
+pool are untouched.
+
+**Tests.** `focal_wire::tests::cold_calls_to_one_route_share_one_dial_and_a_stale_failure_forgets_nothing`
+(24 concurrent cold calls over loopback QUIC to a cache of one: one dial, one admission,
+no replacement, 24 answers; a stale generation forgets nothing and the current one lets
+the route be dialed again; a caller cancelled microseconds into a dial leaves it to the
+next caller, which starts no third dial); with each caller dialing alone (the mutation
+before the fix) callers failed with `Connection` as their connections were replaced
+under them. The wire and client suites unchanged.

@@ -6,8 +6,11 @@ use quinn::{
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use std::{net::SocketAddr, sync::Arc};
-use tokio::{sync::Semaphore, task::JoinSet};
+use std::{collections::BTreeMap, net::SocketAddr, sync::Arc};
+use tokio::{
+    sync::{Semaphore, watch},
+    task::JoinSet,
+};
 
 /// DER credentials supplied by the deployment's existing PKI. Private keys are
 /// never Debug/Serialize and are never accepted in a request envelope.
@@ -657,6 +660,253 @@ impl QuicDialer {
             server_name,
         ))
         .await
+    }
+}
+/// The connections a participant keeps to the routes it reaches — its
+/// initial endpoint and the hints its requests are redirected to — one per
+/// route, dialed once (the audit's F60). Concurrent cold calls to one route
+/// wait on the one dial in flight instead of each dialing, which opened as
+/// many connections as callers and let the server's per-identity limit
+/// replace the earlier ones under calls already dispatched. A dial runs on
+/// its own task, so a caller giving up under its own deadline neither
+/// abandons it nor keeps the others waiting, and a connection leaves the
+/// cache only when the generation that failed is still the one cached.
+pub struct RouteConnections {
+    connector: QuicConnector,
+    max_routes: usize,
+    routes: std::sync::Mutex<Routes>,
+    dials: std::sync::atomic::AtomicU64,
+}
+/// A connection the cache handed out, with the generation it holds it
+/// under: a request that fails on it names the generation when it asks for
+/// the route to be forgotten.
+pub struct Connected {
+    pub remote: QuicRemote,
+    pub generation: u64,
+}
+#[derive(Clone)]
+enum DialOutcome {
+    Pending,
+    Connected(QuicRemote),
+    Failed,
+}
+/// A dial in flight for a route. Whoever calls the route while it dials
+/// waits on it, holding nothing of the cache but a receiver, and then takes
+/// its turn on the connection's lanes as any request does. The wait is
+/// bounded by the dial's own deadline: the dial resolves, connects and
+/// greets under one `request_timeout` each, and its task always speaks —
+/// or, dropped with its runtime, closes the channel, which a waiter reads
+/// as the dial failing.
+struct RouteDial {
+    state: watch::Receiver<DialOutcome>,
+}
+struct CachedRoute {
+    remote: QuicRemote,
+    used: u64,
+    generation: u64,
+}
+type RouteKey = (String, String);
+#[derive(Default)]
+struct Routes {
+    entries: BTreeMap<RouteKey, CachedRoute>,
+    dialing: BTreeMap<RouteKey, RouteDial>,
+    clock: u64,
+    generations: u64,
+}
+impl Routes {
+    fn store(&mut self, key: &RouteKey, remote: QuicRemote) -> Connected {
+        self.clock = self.clock.saturating_add(1);
+        if let Some(entry) = self.entries.get_mut(key) {
+            entry.used = self.clock;
+            return Connected {
+                remote: entry.remote.clone(),
+                generation: entry.generation,
+            };
+        }
+        self.generations = self.generations.saturating_add(1);
+        let generation = self.generations;
+        self.entries.insert(
+            key.clone(),
+            CachedRoute {
+                remote: remote.clone(),
+                used: self.clock,
+                generation,
+            },
+        );
+        Connected { remote, generation }
+    }
+}
+impl RouteConnections {
+    pub fn new(connector: QuicConnector, max_routes: usize) -> Result<Self, WireError> {
+        if max_routes == 0 || max_routes > 1024 {
+            return Err(WireError::Limit);
+        }
+        Ok(Self {
+            connector,
+            max_routes,
+            routes: std::sync::Mutex::new(Routes::default()),
+            dials: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+    pub fn limits(&self) -> &WireLimits {
+        self.connector.limits()
+    }
+    /// Physical dials this cache has started since it opened.
+    pub fn dials(&self) -> u64 {
+        self.dials.load(std::sync::atomic::Ordering::Acquire)
+    }
+    /// The connection to `endpoint` under `server_name`: the cached one, the
+    /// one being dialed once it is there, or a fresh dial. A caller waits on
+    /// at most two dials — the one in flight when it arrived and, should
+    /// that one fail, its own — and the number of callers waiting on a dial
+    /// is the caller's own concurrency: the cache holds nothing per waiter.
+    pub async fn connect(&self, endpoint: &str, server_name: &str) -> Result<Connected, WireError> {
+        tokio::runtime::Handle::try_current().map_err(|_| WireError::Connection)?;
+        if endpoint.len() > 512 || server_name.len() > 253 {
+            return Err(WireError::Limit);
+        }
+        let key: RouteKey = (endpoint.to_owned(), server_name.to_owned());
+        for _ in 0..2 {
+            let mut receiver = {
+                let mut routes = self.routes.lock().map_err(|_| WireError::Connection)?;
+                routes.clock = routes.clock.saturating_add(1);
+                let clock = routes.clock;
+                if let Some(entry) = routes.entries.get_mut(&key) {
+                    entry.used = clock;
+                    return Ok(Connected {
+                        remote: entry.remote.clone(),
+                        generation: entry.generation,
+                    });
+                }
+                // A dial that ended while nobody watched settles now.
+                let settled = routes
+                    .dialing
+                    .get(&key)
+                    .map(|dial| dial.state.borrow().clone());
+                match settled {
+                    Some(DialOutcome::Connected(remote)) => {
+                        routes.dialing.remove(&key);
+                        return Ok(routes.store(&key, remote));
+                    }
+                    Some(DialOutcome::Failed) => {
+                        routes.dialing.remove(&key);
+                    }
+                    Some(DialOutcome::Pending) | None => {}
+                }
+                if let Some(dial) = routes.dialing.get(&key) {
+                    dial.state.clone()
+                } else {
+                    // A new route: room for it, or the least recently used
+                    // cached one leaves; dials in flight hold their room.
+                    if routes.entries.len().saturating_add(routes.dialing.len()) >= self.max_routes
+                    {
+                        let evict = routes
+                            .entries
+                            .iter()
+                            .min_by_key(|(_, cached)| cached.used)
+                            .map(|(evict_key, _)| evict_key.clone());
+                        match evict {
+                            Some(evict) => {
+                                routes.entries.remove(&evict);
+                            }
+                            None => return Err(WireError::Limit),
+                        }
+                    }
+                    let dialer = self.connector.dialer()?;
+                    let period = self.connector.limits().request_timeout;
+                    let (sender, receiver) = watch::channel(DialOutcome::Pending);
+                    self.dials.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    let (endpoint, server_name) = key.clone();
+                    tokio::spawn(async move {
+                        // The resolver answers under the same deadline the
+                        // connection and the greeting each have, so the dial
+                        // ends — and its waiters with it — within three.
+                        let outcome = async {
+                            let mut addresses = tokio::time::timeout(
+                                period,
+                                tokio::net::lookup_host(endpoint.as_str()),
+                            )
+                            .await
+                            .map_err(|_| WireError::Timeout)?
+                            .map_err(|_| WireError::Connection)?;
+                            let address = addresses.next().ok_or(WireError::Connection)?;
+                            dialer.connect(address, &server_name).await
+                        }
+                        .await;
+                        sender.send_replace(match outcome {
+                            Ok(remote) => DialOutcome::Connected(remote),
+                            Err(_) => DialOutcome::Failed,
+                        });
+                    });
+                    routes.dialing.insert(
+                        key.clone(),
+                        RouteDial {
+                            state: receiver.clone(),
+                        },
+                    );
+                    receiver
+                }
+            };
+            // Wait for the dial to end, under its deadline; the lock is
+            // never held across the wait.
+            loop {
+                let outcome = receiver.borrow_and_update().clone();
+                match outcome {
+                    DialOutcome::Pending => {
+                        if receiver.changed().await.is_err() {
+                            // The dial's task ended without a word: treat
+                            // it as failed and dial again.
+                            let mut routes =
+                                self.routes.lock().map_err(|_| WireError::Connection)?;
+                            routes.dialing.remove(&key);
+                            break;
+                        }
+                    }
+                    DialOutcome::Connected(remote) => {
+                        let mut routes = self.routes.lock().map_err(|_| WireError::Connection)?;
+                        if routes.dialing.remove(&key).is_some() {
+                            // This caller settles the dial: its connection
+                            // is the route's.
+                            return Ok(routes.store(&key, remote));
+                        }
+                        // Another caller settled it first: what it cached
+                        // serves — unless the connection already failed and
+                        // was forgotten, in which case it is not cached
+                        // again here; this caller dials afresh.
+                        routes.clock = routes.clock.saturating_add(1);
+                        let clock = routes.clock;
+                        if let Some(entry) = routes.entries.get_mut(&key) {
+                            entry.used = clock;
+                            return Ok(Connected {
+                                remote: entry.remote.clone(),
+                                generation: entry.generation,
+                            });
+                        }
+                        break;
+                    }
+                    DialOutcome::Failed => {
+                        let mut routes = self.routes.lock().map_err(|_| WireError::Connection)?;
+                        routes.dialing.remove(&key);
+                        break;
+                    }
+                }
+            }
+        }
+        Err(WireError::Connection)
+    }
+    /// Forget the route's connection a request found failed — only while it
+    /// is still the one cached; a newer connection another caller opened
+    /// since stays.
+    pub fn forget(&self, endpoint: &str, server_name: &str, generation: u64) {
+        let key: RouteKey = (endpoint.to_owned(), server_name.to_owned());
+        if let Ok(mut routes) = self.routes.lock()
+            && routes
+                .entries
+                .get(&key)
+                .is_some_and(|entry| entry.generation == generation)
+        {
+            routes.entries.remove(&key);
+        }
     }
 }
 async fn open_remote(

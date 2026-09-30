@@ -12181,3 +12181,32 @@ the promise itself would have been; a new or repaired payload is promised and
 charged as before. `store::transfer::tests::duplicate_chunk_imports_and_a_repeated_completion_charge_the_volume_once`
 (an estimate of exactly the payload, the manifest and four bytes: four exact
 retries and a second completion move it by nothing; every payload once).
+
+### 2026-09-29 — F60: cold calls to one route dial once
+
+The participant's QUIC transport kept one connection per route but dialed under
+no lock: concurrent cold calls to one endpoint each resolved, connected and
+greeted, then overwrote the same cache entry while keeping the connection each
+had opened; `max_connections` bounded the cached routes, not the physical
+connections or the dials in flight, and the server's per-identity limit replaced
+the earlier connections — under calls already dispatched (the audit's probe: 24
+cold calls to a cache of one; 24 admitted, 8 replaced, 16 of 24 completed). A
+request's failure also removed the route whichever connection was cached by
+then. `focal_wire::RouteConnections` now owns the participant's routes: one dial
+per route at a time, on its own task, so a caller that gives up under its own
+deadline neither abandons the dial nor holds the others; callers arriving while
+it dials wait on it (a `watch` of the outcome, nothing of the cache per waiter,
+bounded by the dial's own deadline — resolver, connection and greeting under one
+`request_timeout` each) and share the connection, whose lanes then queue them as
+they queue any request; dials in flight hold their room in `max_routes`, the
+least recently used cached route leaves for a new one, and a caller waits on at
+most two dials. Every cached connection carries a generation: a failed request
+forgets the route only while its generation is the one cached, and a slow
+waiter never re-caches a connection already forgotten.
+`cold_calls_to_one_route_share_one_dial_and_a_stale_failure_forgets_nothing`
+(24 concurrent cold calls over real loopback QUIC to a cache of one: one dial,
+one admission, no replacement, 24 answers; a stale generation forgets nothing
+and the current one lets the route be dialed again; a caller cancelled
+microseconds into the dial leaves it to the next, which starts no third dial —
+with each caller dialing alone, callers failed with `Connection` as their
+connections were replaced under them).
