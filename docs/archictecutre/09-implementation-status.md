@@ -12414,3 +12414,19 @@ holds each to the counting allocator by innermost frame (decode of three shapes,
 open alone on a shared WAL with one and 1,024 members, a proposal's transition); the
 measurements are in the remediation record under F16.
 
+
+### 2026-09-30 — F13 (stage 1): the founder renews its own credential
+
+The founder's node credential is an ordinary credential of its genesis key ([24](24-placement-execution-and-fleet-control.md)
+§11): the founding subject binds the assigned principal at every revision, the controller
+asks the enrollment host it runs itself and publishes the certificate it presents once
+granted, the founder's authority over the root pins its identity and no certificate (each
+enrollment-control request is authorized by the certificate it presented, at dispatch and
+at completion), the start presents what the key holds and adopts a committed renewal the
+crash lost, a rotated founder key restarts, the renewal window is a third of the receipt's
+lifetime and the retry a sixtieth of the window, and the lifetime is committed policy
+(`node.credential_lifetime_seconds`, [08](08-stepped-complexity-and-deployment.md) §2;
+three seconds to a year; restore adopts the committed lifetimes). The root's group record
+seats the founder at the generation of its grant and a founder re-granted since holds it.
+The bootstrap server certificate's succession and the issuer's are designed in the
+remediation record under F13.

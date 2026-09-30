@@ -31,16 +31,38 @@ impl Default for EnrollmentLimits {
         }
     }
 }
+/// The shortest credential lifetime a registry admits, in seconds. The
+/// registry decides in whole seconds and a renewal must be decided in a later
+/// second than the issue it extends and before the expiry of the certificate
+/// that proves it; the holder renews in the last third of the lifetime
+/// (`focal_node::credential_renewal::renewal_window`), so the lifetime has
+/// three seconds at least: one to be issued in, one to renew in, one to
+/// expire in.
+pub const MIN_CREDENTIAL_LIFETIME: u64 = 3;
+/// The longest credential lifetime a registry admits: a year, the bound the
+/// bootstrap server certificate is issued for.
+pub const MAX_CREDENTIAL_LIFETIME: u64 = 365 * 86400;
 impl EnrollmentLimits {
-    fn validate(&self) -> Result<(), EnrollmentError> {
+    /// The capacity limits: what the process restoring a registry bounds
+    /// (its memory), as opposed to the lifetimes, which are the committed
+    /// policy of the cluster the registry belongs to.
+    fn capacities(&self) -> (usize, usize, usize, usize) {
+        (
+            self.max_invitations,
+            self.max_enrollments,
+            self.max_checkpoint_bytes,
+            self.max_tenants,
+        )
+    }
+    pub fn validate(&self) -> Result<(), EnrollmentError> {
         if self.max_invitations == 0
             || self.max_invitations > 65536
             || self.max_enrollments == 0
             || self.max_enrollments > self.max_invitations
             || self.max_invitation_lifetime == 0
             || self.max_invitation_lifetime > 7 * 86400
-            || self.credential_lifetime == 0
-            || self.credential_lifetime > 365 * 86400
+            || self.credential_lifetime < MIN_CREDENTIAL_LIFETIME
+            || self.credential_lifetime > MAX_CREDENTIAL_LIFETIME
             || !(16 * 1024..=64 * 1024 * 1024).contains(&self.max_checkpoint_bytes)
             || self.max_tenants == 0
             || self.max_tenants > 65536
@@ -953,7 +975,17 @@ impl EnrollmentRegistry {
                 },
             );
         let founding = crate::pki::founding_principal(current)?;
-        let certificate = if derived || (founding && !rotation) {
+        // The founder's principal was assigned at genesis: a renewal of the
+        // founding key is issued under the founding subject, as the genesis
+        // certificate was, so the binding stays verifiable.
+        let certificate = if founding && !rotation {
+            authority.issue_founder(
+                &request.csr,
+                &current.identity,
+                now,
+                self.limits.credential_lifetime,
+            )?
+        } else if derived {
             authority.issue(
                 &request.csr,
                 &current.identity,
@@ -1640,9 +1672,15 @@ impl EnrollmentRegistry {
         {
             return Err(EnrollmentError::Corrupt);
         }
+        // The lifetimes are the committed policy of the cluster (the founder
+        // chose them at genesis); the restoring process bounds the capacities.
+        registry
+            .limits
+            .validate()
+            .map_err(|_| EnrollmentError::Corrupt)?;
         if !rest.is_empty()
             || registry.schema != REGISTRY_SCHEMA
-            || registry.limits != limits
+            || registry.limits.capacities() != limits.capacities()
             || registry.records.len() > limits.max_invitations
             || registry.certificates.len() > limits.max_enrollments
         {

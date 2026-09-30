@@ -12,8 +12,8 @@ use crate::{
 use focal_control::{ControlBootstrap, ControlEvents, ControlOptions, ControlReplica};
 use focal_directory::{RootConfig, RootDirectory};
 use focal_enrollment::{
-    BootstrapAuthority, CredentialMaterial, EnrollmentLimits, FoundingEnrollmentDraft, JoinKey,
-    PrivateJournal, ServerTrust, server_fingerprint,
+    BootstrapAuthority, CredentialMaterial, FoundingEnrollmentDraft, JoinKey, PrivateJournal,
+    ServerTrust, server_fingerprint,
 };
 use focal_log::{SharedWal, WalIdentity, WalOptions, WalWriterLimits};
 use focal_memory::{Allocation, BudgetKind, BudgetLane, MemoryBudget};
@@ -208,15 +208,27 @@ impl FoundingNetwork {
             now,
         )?;
         let key = JoinKey::open_or_create(private.join("node-key"), identity.cluster)?;
+        let limits = settings.enrollment_limits();
         let founder = FoundingEnrollmentDraft::open_or_create(
             private.join("founder"),
             &authority,
             &key,
             identity.node,
             identity.issuer.0,
-            EnrollmentLimits::default(),
+            limits.clone(),
             now,
         )?;
+        // The credential lifetime is the cluster's policy, committed in the
+        // registry at genesis; a start that asks for another is a
+        // committed-policy change (08 §2), never a silent one.
+        if founder.registry().limits().credential_lifetime != limits.credential_lifetime {
+            return Err(
+                NodeError::Config(crate::config::ConfigError::CommittedPolicyChange {
+                    field: "node.credential_lifetime_seconds",
+                })
+                .into(),
+            );
+        }
         let root_directory = RootDirectory::new(
             focal_directory::ClusterId(identity.cluster),
             RootConfig::default(),
@@ -310,12 +322,35 @@ impl FoundingNetwork {
         // Recovery may include revocation after genesis. The immutable founding
         // draft cannot override the live committed registry's authorization.
         let enrollment = control.enrollment().ok_or(NodeError::Identity)?;
-        if enrollment.authorize_certificate(&founder.receipt().certificate, now)?
-            != founder.receipt().identity
+        // The credential the founder presents is the receipt its key holds:
+        // the genesis one at the first start, the latest renewal installed
+        // since (24 §11). When the committed registry renewed the same key
+        // and the install was lost to a crash, the committed renewal is
+        // adopted here, as the controller would adopt it; a rotation the
+        // registry committed for a staged key is left to the controller,
+        // which adopts it from that key.
+        if key.enrollment()?.is_none() {
+            key.complete(founder.receipt(), authority.ca_certificate(), now)?;
+        }
+        let held = key.enrollment()?.ok_or(NodeError::Identity)?;
+        let committed = enrollment
+            .enrollments()
+            .find(|listed| listed.identity.node_id == Some(identity.node))
+            .ok_or(NodeError::Identity)?;
+        let receipt = if committed.identity == held.identity
+            && committed.public_key == held.public_key
+            && committed.expires_at > held.expires_at
+        {
+            committed.clone()
+        } else {
+            held
+        };
+        if receipt.identity != founder.receipt().identity
+            || enrollment.authorize_certificate(&receipt.certificate, now)? != receipt.identity
         {
             return Err(NodeError::Identity.into());
         }
-        let credentials = key.complete(founder.receipt(), authority.ca_certificate(), now)?;
+        let credentials = key.renew(&receipt, authority.ca_certificate(), now)?;
         let enrollment_identity = authority.server_identity();
         let principal = signer_principal(identity.cluster);
         let config = QuorumEnrollmentConfig::new(
@@ -338,7 +373,6 @@ impl FoundingNetwork {
             QuorumEnrollmentHost::create(authority, signer_path, config, allowance)?
         };
         state.install(&directory)?;
-        let receipt = founder.receipt().clone();
         drop(founder);
         drop(key);
         drop(saved);

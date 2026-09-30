@@ -1,17 +1,40 @@
 //! A node's own credential over time: the controller renews it before it
 //! expires (or when the operator asks), installs the renewed receipt under
 //! the same key, and presents the new certificate on every path at once.
-//! The founder's identity is the bootstrap authority's own server
-//! certificate and is not renewed here.
+//! The founder's node credential is one of these too: its controller asks
+//! the enrollment host it runs itself (24 §11).
 use crate::{network_listener::ListenerIdentity, placement_control::PlacementHandle};
-use focal_enrollment::JoinFailure;
+use focal_enrollment::{EnrollmentReceipt, JoinFailure};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
-/// Renew this far ahead of expiry: a third of the standard credential life.
-pub const RENEWAL_WINDOW_SECONDS: i64 = 10 * 86400;
-/// Retry a failed automatic renewal no sooner than this.
-pub const RENEWAL_RETRY_SECONDS: i64 = 60;
+/// A credential is renewed once this fraction of its lifetime remains: a
+/// third, the practice ACME clients follow (Let's Encrypt's integration
+/// guide asks clients to renew when a third of the lifetime is left, so a
+/// renewal that fails leaves two more windows' worth of lifetime before the
+/// expiry). The lifetime is the cluster's committed policy
+/// (`node.credential_lifetime_seconds` at genesis), read from the receipt
+/// itself, so a short one is renewed at its own pace.
+pub const RENEWAL_WINDOW_DIVISOR: i64 = 3;
+/// A failed renewal is retried at most this many times across the window:
+/// certbot's cadence, twice a day across its thirty-day window. The retry
+/// interval scales with the window as the window does with the lifetime,
+/// and is never under the second the registry decides in.
+pub const RENEWAL_ATTEMPTS: i64 = 60;
+/// How long before its expiry a credential is renewed: the last third of
+/// the lifetime it was issued for.
+pub fn renewal_window(receipt: &EnrollmentReceipt) -> i64 {
+    receipt
+        .expires_at
+        .saturating_sub(receipt.issued_at)
+        .max(0)
+        .checked_div(RENEWAL_WINDOW_DIVISOR)
+        .unwrap_or(0)
+}
+/// How soon a failed renewal is retried, for a window this long.
+pub fn renewal_retry(window: i64) -> i64 {
+    window.checked_div(RENEWAL_ATTEMPTS).unwrap_or(0).max(1)
+}
 /// How long the certificate a renewal replaces keeps authorizing, so
 /// connections and statements in flight complete; the sponsor decides it.
 pub const DEFAULT_GRACE_SECONDS: u64 = 60;
@@ -50,8 +73,6 @@ pub struct CredentialSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 pub enum RenewalError {
-    #[error("the founder's identity is the bootstrap authority's own certificate")]
-    Unsupported,
     #[error("the sponsor rejected the renewal: {0:?}")]
     Rejected(JoinFailure),
     #[error("the sponsor could not be reached or did not answer")]

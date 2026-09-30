@@ -3,8 +3,8 @@
 use crate::{
     control_host::{ControlHost, RootObservation},
     credential_renewal::{
-        CredentialRequest, CredentialSummary, CredentialSwap, RENEWAL_RETRY_SECONDS,
-        RENEWAL_WINDOW_SECONDS, RenewalError,
+        CredentialRequest, CredentialSummary, CredentialSwap, RenewalError, renewal_retry,
+        renewal_window,
     },
     embedded::atomic_file,
     network_bootstrap::unix_time,
@@ -900,6 +900,13 @@ pub struct NetworkController {
     state: NetworkState,
     /// Where the sponsor's name resolved at this start (24 §24).
     sponsor_address: Option<std::net::SocketAddr>,
+    /// The enrollment host this node runs itself — the founder's — which a
+    /// renewal of its own credential is asked of in-process (24 §11).
+    local_sponsor: Option<QuorumEnrollmentHost>,
+    /// Where the founder's enrollment control learns the certificate the
+    /// founder presents on its own behalf: published by a refresh once the
+    /// registry grants it, so the control never presents an ungranted one.
+    presented: Option<tokio::sync::watch::Sender<[u8; 32]>>,
     receipt: EnrollmentReceipt,
     credentials: CredentialMaterial,
     root: PathBuf,
@@ -934,6 +941,20 @@ impl NetworkController {
     /// (24 §24).
     pub fn with_sponsor_address(mut self, address: std::net::SocketAddr) -> Self {
         self.sponsor_address = Some(address);
+        self
+    }
+    /// The enrollment host this node runs itself: the founder's credential
+    /// is renewed and rotated through it, as a joined node's is through the
+    /// founder over the network (24 §11).
+    pub fn with_local_sponsor(mut self, host: QuorumEnrollmentHost) -> Self {
+        self.local_sponsor = Some(host);
+        self
+    }
+    /// Where to publish the fingerprint of the certificate this node
+    /// presents, once its own registry grants it (the founder's enrollment
+    /// control reads it).
+    pub fn with_presented(mut self, presented: tokio::sync::watch::Sender<[u8; 32]>) -> Self {
+        self.presented = Some(presented);
         self
     }
     pub fn with_topology(
@@ -992,6 +1013,8 @@ impl NetworkController {
         Ok(Self {
             state,
             sponsor_address: None,
+            local_sponsor: None,
+            presented: None,
             receipt,
             credentials,
             root,
@@ -1175,9 +1198,8 @@ impl NetworkController {
         swap: &CredentialSwap,
         now: i64,
     ) {
-        if self.state.node == self.state.genesis.founder.node
-            || now.saturating_sub(self.last_renewal_attempt) < RENEWAL_RETRY_SECONDS
-        {
+        let window = renewal_window(&self.receipt);
+        if now.saturating_sub(self.last_renewal_attempt) < renewal_retry(window) {
             return;
         }
         // A rotation the sponsor committed but this holder never adopted (a
@@ -1187,13 +1209,7 @@ impl NetworkController {
             self.last_renewal_error = self.adopt_rotation(pool, swap, now).await.err();
             return;
         }
-        if !self.registry_ahead
-            && now
-                < self
-                    .receipt
-                    .expires_at
-                    .saturating_sub(RENEWAL_WINDOW_SECONDS)
-        {
+        if !self.registry_ahead && now < self.receipt.expires_at.saturating_sub(window) {
             return;
         }
         self.last_renewal_attempt = now;
@@ -1233,10 +1249,28 @@ impl NetworkController {
         self.rotation_ahead = false;
         Ok(())
     }
+    /// The directory of the key this node's credential is held under: the
+    /// founder's beside its genesis authority, a joined node's beside its
+    /// join.
+    fn key_directory(&self) -> PathBuf {
+        if self.state.node == self.state.genesis.founder.node {
+            self.root.join("cluster").join("network").join("node-key")
+        } else {
+            self.root.join("JOIN").join("node-key")
+        }
+    }
+    /// The key this node's credential is held under.
+    fn held_key(&self) -> Result<focal_enrollment::JoinKey, RenewalError> {
+        focal_enrollment::JoinKey::open_or_create(
+            self.key_directory(),
+            self.state.genesis.founder.cluster,
+        )
+        .map_err(|_| RenewalError::Identity)
+    }
     /// The staged key a rotation is or was requested for.
     fn staged_key(&self) -> Result<focal_enrollment::JoinKey, RenewalError> {
         focal_enrollment::JoinKey::open_or_create(
-            self.root.join("JOIN").join("node-key.next"),
+            self.key_directory().with_extension("next"),
             self.state.genesis.founder.cluster,
         )
         .map_err(|_| RenewalError::Identity)
@@ -1252,15 +1286,7 @@ impl NetworkController {
         swap: &CredentialSwap,
         now: i64,
     ) -> Result<(), RenewalError> {
-        if self.state.node == self.state.genesis.founder.node {
-            return Err(RenewalError::Unsupported);
-        }
-        let cluster = self.state.genesis.founder.cluster;
-        let key = focal_enrollment::JoinKey::open_or_create(
-            self.root.join("JOIN").join("node-key"),
-            cluster,
-        )
-        .map_err(|_| RenewalError::Identity)?;
+        let key = self.held_key()?;
         let next = self.staged_key()?;
         let request = self
             .credentials
@@ -1284,12 +1310,7 @@ impl NetworkController {
         swap: &CredentialSwap,
         now: i64,
     ) -> Result<(), RenewalError> {
-        let cluster = self.state.genesis.founder.cluster;
-        let key = focal_enrollment::JoinKey::open_or_create(
-            self.root.join("JOIN").join("node-key"),
-            cluster,
-        )
-        .map_err(|_| RenewalError::Identity)?;
+        let key = self.held_key()?;
         let next = self.staged_key()?;
         // The committed receipt is answered to the same rotation request.
         let request = self
@@ -1307,12 +1328,23 @@ impl NetworkController {
         self.rotations = self.rotations.saturating_add(1);
         Ok(())
     }
-    /// One renewal or rotation exchange with the sponsor.
+    /// One renewal or rotation exchange with the sponsor: the enrollment
+    /// host this node runs itself (the founder's), else the founder over
+    /// the enrollment transport.
     async fn ask_sponsor(
         &self,
         request: focal_enrollment::RenewRequest,
         now: i64,
     ) -> Result<EnrollmentReceipt, RenewalError> {
+        if let Some(sponsor) = &self.local_sponsor {
+            // The grant for the renewed certificate is this controller's own
+            // next refresh to publish, so the host is asked directly rather
+            // than through the registered handler that waits for it.
+            return match JoinHandler::renew(sponsor, request).await {
+                JoinResponse::Enrolled(receipt) => Ok(receipt),
+                JoinResponse::Rejected(failure) => Err(RenewalError::Rejected(failure)),
+            };
+        }
         let address: std::net::SocketAddr = self
             .state
             .sponsor
@@ -1349,15 +1381,7 @@ impl NetworkController {
         swap: &CredentialSwap,
         now: i64,
     ) -> Result<(), RenewalError> {
-        if self.state.node == self.state.genesis.founder.node {
-            return Err(RenewalError::Unsupported);
-        }
-        let cluster = self.state.genesis.founder.cluster;
-        let key = focal_enrollment::JoinKey::open_or_create(
-            self.root.join("JOIN").join("node-key"),
-            cluster,
-        )
-        .map_err(|_| RenewalError::Identity)?;
+        let key = self.held_key()?;
         let request = self
             .credentials
             .renewal_request(&key, &self.receipt)
@@ -1430,11 +1454,19 @@ impl NetworkController {
         let mut routes = BTreeMap::new();
         // The immutable sponsor is an authenticated bootstrap route, not a hint
         // supplied by an arbitrary peer. A committed contact can supersede it.
-        let initial = genesis_enrollment(&self.state)?;
-        let founder = initial
+        // The founder's certificate as committed now: the genesis one until
+        // the founder renews its credential, the renewal after (24 §11).
+        let founder = match enrollment
             .enrollments()
-            .next()
-            .ok_or(ControllerError::Identity)?;
+            .find(|listed| listed.identity.node_id == Some(self.state.genesis.founder.node))
+        {
+            Some(founder) => founder.clone(),
+            None => genesis_enrollment(&self.state)?
+                .enrollments()
+                .next()
+                .cloned()
+                .ok_or(ControllerError::Identity)?,
+        };
         if self.state.node != self.state.genesis.founder.node
             && grants.contains_key(&certificate_fingerprint(&founder.certificate))
         {
@@ -1504,7 +1536,21 @@ impl NetworkController {
                 );
             }
         }
+        // The certificate this node presents on its own behalf, once this
+        // refresh has granted it; until then the previous one, granted
+        // through the grace (24 §11).
+        let held = certificate_fingerprint(&self.receipt.certificate);
+        let held_granted = grants.contains_key(&held);
         registry.replace_grants(grants)?;
+        if held_granted && let Some(presented) = &self.presented {
+            presented.send_if_modified(|current| {
+                if *current == held {
+                    return false;
+                }
+                *current = held;
+                true
+            });
+        }
         if routes != self.routes {
             let revision = self
                 .route_revision

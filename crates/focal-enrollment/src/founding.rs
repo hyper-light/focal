@@ -63,6 +63,23 @@ impl FoundingEnrollmentDraft {
         if registry.ca_certificate() != authority.ca_certificate() {
             return Err(EnrollmentError::WrongCluster);
         }
+        let key_hash = crate::pki::csr_key_hash(key.csr())?;
+        let csr_hash = hash("focal.enrollment.csr.v1", key.csr());
+        let bound_to_key = receipt.request == key.request_id()
+            && receipt.public_key == key_hash
+            && receipt.csr_hash == csr_hash;
+        // The founder's key may have rotated since genesis (24 §11): the
+        // directory then holds a later receipt of the genesis identity,
+        // issued for the key it holds now. The committed registry, never
+        // this draft, authorizes what the founder presents.
+        let carried_to_key = !bound_to_key
+            && key.enrollment()?.is_some_and(|held| {
+                held.identity == receipt.identity
+                    && held.revision > receipt.revision
+                    && held.request == key.request_id()
+                    && held.public_key == key_hash
+                    && held.csr_hash == csr_hash
+            });
         if registry.revision() != 1
             || registry.applied_index() != 0
             || registry.enrollments().count() != 1
@@ -71,9 +88,7 @@ impl FoundingEnrollmentDraft {
             || receipt.identity.role != EnrollmentRole::Node
             || receipt.identity.node_id != Some(node)
             || receipt.identity.principal != principal
-            || receipt.request != key.request_id()
-            || receipt.public_key != crate::pki::csr_key_hash(key.csr())?
-            || receipt.csr_hash != hash("focal.enrollment.csr.v1", key.csr())
+            || !(bound_to_key || carried_to_key)
         {
             return Err(EnrollmentError::Conflict);
         }

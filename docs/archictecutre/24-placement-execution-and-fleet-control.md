@@ -531,8 +531,12 @@ certificate. A renewal decided within the second the current certificate was
 issued cannot extend it and is refused. Revoking the invitation revokes both
 certificates.
 
-**The holder.** The network controller of a joined node renews ten days ahead
-of expiry, or now on `cluster credentials renew` (`AdminCommand::RenewCredential`
+**The holder.** The network controller of every node — the founder's
+included, below — renews in the last third of the credential's lifetime
+(`credential_renewal::renewal_window`: a third, as ACME clients renew; the
+lifetime is read from the receipt itself and is the cluster's committed
+`node.credential_lifetime_seconds`, thirty days by default), or now on
+`cluster credentials renew` (`AdminCommand::RenewCredential`
 over the admin socket, `cluster.credentials.renew` in the MCP catalogue,
 served by a `CredentialHandle` in the node's handles). It signs the request
 with the credential it holds, installs the renewed receipt over the one on
@@ -554,8 +558,52 @@ sponsor's commit and the install leaves the node holding the retired receipt:
 it starts (its registry knows the same identity and key), sees the committed
 registry ahead of what it holds, renews at once and converges on the
 committed renewal without another issuance, and never announces the retired
-certificate over the renewed one. A failed attempt is retried after a minute;
-the controller keeps running on the credential it holds.
+certificate over the renewed one. A failed attempt is retried at a sixtieth
+of the window (`renewal_retry`: certbot's cadence across its own window —
+four hours under the default lifetime, never under the second the registry
+decides in); the controller keeps running on the credential it holds.
+
+**The founder (2026-09-30; the audit's F13).** The founder's node credential
+is an ordinary credential of its genesis key: issued at genesis under the
+founding subject (`focal-genesis-principal:<principal>`, since its principal
+is assigned rather than derived from the key) and renewed under the same
+subject at every revision (`issue_founder` in `prepare_renew`;
+`founding_principal` no longer requires revision 1), so every checkpoint
+and holder check keeps verifying the binding; a rotation of the founder's
+key carries the principal as any rotation does. Its controller asks the
+enrollment host it runs itself (`NetworkController::with_local_sponsor`,
+`QuorumEnrollmentHost::renew` in-process) rather than the registered
+handler, whose wait for the renewed certificate's grant is this very
+controller's next refresh; the key is `cluster/network/node-key` beside the
+genesis authority. At start the founder presents the receipt its key holds
+(the genesis one at the first start, the latest renewal installed since);
+when the committed registry renewed the same key and a crash lost the
+install, the committed renewal is adopted at once, and the founding draft
+accepts a key a committed rotation moved the identity to (the draft binds
+the genesis receipt to the key it began with or to a later receipt of the
+same identity the key holds). The sponsor route a joined node keeps is
+checked against the founder's certificate as committed now, not the genesis
+one. The lifetime is the cluster's policy: `node.credential_lifetime_seconds`
+is committed in the registry's limits at genesis, a start that asks for
+another is refused as a committed-policy change, and
+`EnrollmentRegistry::restore` adopts the committed lifetimes and compares
+only the capacities (the restoring process's own bound). A registry admits a
+lifetime of three seconds at least (`MIN_CREDENTIAL_LIFETIME`: a second to be
+issued in, one to renew in, one to expire in) and a year at most. The
+founder's authority over the root (`FounderControlAuthority`) pins its
+identity — its node and its assigned principal — and no certificate: an
+enrollment-control request is authorized by the certificate it presented,
+against the committed registry, at dispatch and again at completion (its
+`RootPeer`, as a Raft or peer-control request's), and the founder's own
+enrollment control presents the certificate its controller published last
+(a watch the controller sets once a refresh has granted the certificate it
+holds, so the control never presents one its registry does not grant yet).
+The seat the root's own group record gives the founder in its first
+directory partition names the generation of the grant that seated it; the
+founder re-granted since — its key rotated, its topology changed — holds it
+at or below its current generation (the verifier's rule for the root's group
+records, §19), where a re-granted founder could not restart its directory
+before.
 
 **Rotation (2026-09-10, R9.3).** `cluster credentials rotate`
 (`AdminCommand::RotateCredential`, `cluster.credentials.rotate`) moves a
@@ -592,9 +640,13 @@ generation before any other root work (`next_root_command`); the partition
 learns the re-grant like a drain's (§19) and the node's seats stay its own.
 `cluster credentials get` and the renewal reply report `key_identity`.
 
-**Limits.** The founder's identity is the bootstrap authority's own server
-certificate and is neither renewed nor rotated here; CA rotation is not
-implemented; client (participant) credentials are not renewed or rotated
+**Limits.** The bootstrap enrollment server's certificate (a year, pinned by
+every invitation and by the founder's own `NetworkState.sponsor`) is not
+renewed yet: its succession — a committed successor pin joiners and joined
+nodes accept, the enrollment listener switched once every invitation issued
+before it has expired — is the next step of the audit's F13, and CA
+succession and issuer recovery are designed after it (the remediation
+record, F13); client (participant) credentials are not renewed or rotated
 yet; the contact re-announcement's request sequence is the committed
 contact generation plus one, which assumes every committed contact command
 of a node advanced its generation.

@@ -1225,7 +1225,9 @@ impl<V: AuthorityVerifier> Owner<V> {
         let root_peer = if self.replica.identity().scope == ControlScope::Root
             && matches!(
                 verified.request().operation,
-                Operation::Raft { .. } | Operation::PeerControl { .. }
+                Operation::Raft { .. }
+                    | Operation::PeerControl { .. }
+                    | Operation::EnrollmentControl { .. }
             ) {
             match (
                 verified.peer().role(),
@@ -1554,11 +1556,17 @@ impl<V: AuthorityVerifier> Owner<V> {
                         }) =>
                 {
                     let result = (|| {
+                        let peer = pending.root_peer.ok_or(ControlFailure::Unauthorized)?;
                         self.config
                             .enrollment_authority
                             .as_ref()
                             .ok_or(ControlFailure::Unauthorized)?
-                            .authorize_current(&self.replica)?;
+                            .authorize_current(
+                                &self.replica,
+                                peer.node,
+                                peer.principal,
+                                peer.fingerprint,
+                            )?;
                         if let Some(request) = request.take() {
                             match self
                                 .replica
@@ -1635,11 +1643,21 @@ impl<V: AuthorityVerifier> Owner<V> {
             }
             if let Some(result) = ready {
                 let result = if pending.enrollment {
-                    self.config
-                        .enrollment_authority
-                        .as_ref()
+                    pending
+                        .root_peer
                         .ok_or(ControlFailure::Unauthorized)
-                        .and_then(|authority| authority.authorize_current(&self.replica))
+                        .and_then(|peer| {
+                            self.config
+                                .enrollment_authority
+                                .as_ref()
+                                .ok_or(ControlFailure::Unauthorized)?
+                                .authorize_current(
+                                    &self.replica,
+                                    peer.node,
+                                    peer.principal,
+                                    peer.fingerprint,
+                                )
+                        })
                         .and(result)
                 } else {
                     result

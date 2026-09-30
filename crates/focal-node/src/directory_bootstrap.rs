@@ -506,7 +506,14 @@ pub(crate) fn authorize_first_directory(
             })
         || group.membership_epoch != 1
         || group.voters.len() != 1
-        || group.voters.get(&plan.founder_node) != Some(&node.enrollment.generation)
+        // A seat belongs to the node at the generation it was granted, and
+        // the same node re-granted since (a rotated key, a changed
+        // topology, an undrain; 24 §19) holds every seat at or below its
+        // current generation.
+        || group
+            .voters
+            .get(&plan.founder_node)
+            .is_none_or(|seat| *seat > node.enrollment.generation)
         || !group.outgoing_voters.is_empty()
         || !group.learners.is_empty()
         || !node.enrollment.eligible

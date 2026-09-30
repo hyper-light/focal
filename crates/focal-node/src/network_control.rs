@@ -7,7 +7,6 @@ use crate::{
     quorum_enrollment::{ControlFuture, EnrollmentControl},
 };
 use focal_control::*;
-use focal_enrollment::{EnrollmentLimits, EnrollmentRegistry};
 use focal_memory::{BudgetKind, BudgetLane, MemoryBudget};
 use focal_model::{LedgerId, ParticipantId, RequestEpoch, RequestId, RouteEpoch};
 use focal_wire::*;
@@ -22,15 +21,18 @@ const MAX_ROUTE_PROBES: usize = 8;
 const ROUTE_ROUND_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Constructed only by the trusted owner from its immutable genesis manifest.
-/// No serialized request or live contact table can replace this pin. A changed
-/// certificate requires an explicit future genesis-authority migration.
+/// No serialized request or live contact table can replace this pin: the
+/// founder's identity (its node and its assigned principal, bound at genesis
+/// by the CA-signed founding subject). The certificate that identity presents
+/// is whichever the committed enrollment registry authorizes for it at the
+/// moment — the genesis one, or a renewal of the same key (24 §11) — so the
+/// authority pins no certificate fingerprint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FounderControlAuthority {
     root: ControlIdentity,
     namespace: LedgerId,
     node: u64,
     principal: ParticipantId,
-    certificate: [u8; 32],
     signer: ParticipantId,
 }
 impl FounderControlAuthority {
@@ -38,25 +40,14 @@ impl FounderControlAuthority {
         genesis
             .validate(&genesis.founder)
             .map_err(|_| ControlFailure::Unauthorized)?;
-        let ControlBootstrap::Root { enrollment, .. } = &genesis.bootstrap else {
+        if !matches!(genesis.bootstrap, ControlBootstrap::Root { .. }) {
             return Err(ControlFailure::WrongOwner);
-        };
-        let registry = EnrollmentRegistry::restore(
-            enrollment,
-            genesis.root.cluster.0,
-            EnrollmentLimits::default(),
-        )
-        .map_err(|_| ControlFailure::Unauthorized)?;
-        let receipt = registry
-            .enrollments()
-            .next()
-            .ok_or(ControlFailure::Unauthorized)?;
+        }
         Ok(Self {
             root: genesis.root,
             namespace: genesis.root_namespace,
             node: genesis.founder.node,
             principal: genesis.founder.issuer,
-            certificate: certificate_fingerprint(&receipt.certificate),
             signer: signer_principal(genesis.root.cluster.0),
         })
     }
@@ -69,25 +60,39 @@ impl FounderControlAuthority {
     pub fn signer_principal(&self) -> ParticipantId {
         self.signer
     }
-    fn verify_peer(&self, peer: &AuthenticatedPeer) -> Result<(), ControlFailure> {
+    /// The founder's identity, authenticated by a certificate: the
+    /// fingerprint of the certificate it presented.
+    fn verify_peer(&self, peer: &AuthenticatedPeer) -> Result<[u8; 32], ControlFailure> {
         if peer.role() != (PeerRole::Node { node_id: self.node })
             || peer.principal() != self.principal
-            || peer.certificate_fingerprint() != Some(self.certificate)
         {
             return Err(ControlFailure::Unauthorized);
         }
-        Ok(())
+        peer.certificate_fingerprint()
+            .ok_or(ControlFailure::Unauthorized)
     }
-    pub(crate) fn authorize_current(&self, replica: &ControlReplica) -> Result<(), ControlFailure> {
+    /// Whether the committed registry authorizes the certificate the founder
+    /// presented for its identity now: the genesis certificate, or a
+    /// renewal of the same key, and neither past its retirement (24 §11).
+    pub(crate) fn authorize_current(
+        &self,
+        replica: &ControlReplica,
+        node: u64,
+        principal: [u8; 16],
+        fingerprint: [u8; 32],
+    ) -> Result<(), ControlFailure> {
         if replica.identity() != self.root {
             return Err(ControlFailure::WrongOwner);
+        }
+        if node != self.node || principal != self.principal.0 {
+            return Err(ControlFailure::Unauthorized);
         }
         let registry = replica.enrollment().ok_or(ControlFailure::WrongOwner)?;
         authorize_node_contact(
             registry,
             self.node,
             self.principal.0,
-            self.certificate,
+            fingerprint,
             unix_time().map_err(|_| ControlFailure::Unavailable)?,
         )
         .map_err(|_| ControlFailure::Unauthorized)?;
@@ -98,8 +103,8 @@ impl FounderControlAuthority {
         replica: &ControlReplica,
         verified: &VerifiedRequest,
     ) -> Result<ControlRpc, ControlFailure> {
-        self.verify_peer(verified.peer())?;
-        self.authorize_current(replica)?;
+        let fingerprint = self.verify_peer(verified.peer())?;
+        self.authorize_current(replica, self.node, self.principal.0, fingerprint)?;
         let Operation::EnrollmentControl {
             group,
             genesis,
@@ -163,7 +168,14 @@ pub struct NetworkEnrollmentControl<'a> {
     pool: &'a PeerConnectionPool,
     local: &'a ControlHost,
     authority: FounderControlAuthority,
-    peer: AuthenticatedPeer,
+    /// The founder's peer registry, which authenticates the certificate it
+    /// presents on its own behalf.
+    registry: &'a PeerRegistry,
+    /// The fingerprint of the certificate the founder presents now, as its
+    /// controller publishes it once the registry grants it: the genesis
+    /// certificate until the founder renews its credential, the renewal
+    /// after (24 §11).
+    presented: tokio::sync::watch::Receiver<[u8; 32]>,
     route_epoch: RouteEpoch,
     budget: &'a MemoryBudget,
     route_cursor: AtomicU64,
@@ -173,23 +185,36 @@ impl<'a> NetworkEnrollmentControl<'a> {
         pool: &'a PeerConnectionPool,
         local: &'a ControlHost,
         authority: FounderControlAuthority,
-        peer: AuthenticatedPeer,
+        registry: &'a PeerRegistry,
+        presented: tokio::sync::watch::Receiver<[u8; 32]>,
         route_epoch: RouteEpoch,
         budget: &'a MemoryBudget,
     ) -> Result<Self, ControlFailure> {
-        authority.verify_peer(&peer)?;
         if local.progress().identity != authority.root || route_epoch.0 == 0 {
             return Err(ControlFailure::WrongOwner);
         }
-        Ok(Self {
+        let control = Self {
             pool,
             local,
             authority,
-            peer,
+            registry,
+            presented,
             route_epoch,
             budget,
             route_cursor: AtomicU64::new(0),
-        })
+        };
+        control.founder_peer()?;
+        Ok(control)
+    }
+    /// The founder as its own registry authenticates the certificate it
+    /// presents now.
+    fn founder_peer(&self) -> Result<AuthenticatedPeer, ControlFailure> {
+        let peer = self
+            .registry
+            .authenticate(*self.presented.borrow())
+            .map_err(peer_access)?;
+        self.authority.verify_peer(&peer)?;
+        Ok(peer)
     }
     async fn call(&self, id: RequestId, rpc: ControlRpc) -> Result<ControlReply, ControlFailure> {
         if tokio::runtime::Handle::try_current().is_err() {
@@ -262,7 +287,7 @@ impl<'a> NetworkEnrollmentControl<'a> {
         let mut preferred = (progress.leader != 0).then_some(progress.leader);
         if progress.leader == progress.node && !progress.stopped {
             let verified = verify_request(
-                self.peer.clone(),
+                self.founder_peer()?,
                 packet.clone(),
                 &ControlHost::wire_limits(),
             )

@@ -641,8 +641,11 @@ pub(crate) fn carried_principal(receipt: &EnrollmentReceipt) -> Result<bool, Enr
             .is_some_and(|unit| unit.as_str().is_ok_and(|value| value == expected))
         && units.next().is_none())
 }
-/// This exception is accepted only for the first Node receipt in a new genesis;
-/// its identity and principal are bound by the already verified CA signature.
+/// The founder's principal was assigned at genesis, not derived from its key;
+/// the CA-signed subject binds it, so every certificate the founder's key is
+/// issued — the genesis one and each renewal of it — carries the binding, and
+/// only the authority can write it (`issue_founder`). Only meaningful after
+/// `verify_issued`.
 pub(crate) fn founding_principal(receipt: &EnrollmentReceipt) -> Result<bool, EnrollmentError> {
     let (_, certificate) =
         X509Certificate::from_der(&receipt.certificate).map_err(|_| EnrollmentError::Corrupt)?;
@@ -651,8 +654,7 @@ pub(crate) fn founding_principal(receipt: &EnrollmentReceipt) -> Result<bool, En
         hex(&receipt.identity.principal)
     );
     let mut units = certificate.subject().iter_organizational_unit();
-    Ok(receipt.revision == 1
-        && receipt.identity.role == EnrollmentRole::Node
+    Ok(receipt.identity.role == EnrollmentRole::Node
         && units
             .next()
             .is_some_and(|unit| unit.as_str().is_ok_and(|value| value == expected))

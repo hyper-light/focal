@@ -77,6 +77,7 @@ must show the missing independent capacity and keep the existing guarantee uncha
 | `node.seeds` | Optional bootstrap override for managed recovery/infrastructure; normal join persists a bounded peer set automatically |
 | `node.max_tenants` | Tenants this node hosts sessions for at most, its own included (default 8, at most 1024); a placement that needs one more is refused by this node as a capacity refusal ([24](24-placement-execution-and-fleet-control.md) §10) |
 | `node.metrics_listen` | An optional loopback endpoint for the read-only metrics text (§9); node-local, never a cluster fact |
+| `node.credential_lifetime_seconds` | How long every credential the cluster issues lasts — the founder's own, each joined node's, each participant's (default thirty days; from three seconds to a year); the founder commits it in the enrollment registry at genesis, and a start that asks for another is refused as a committed-policy change (§2); every node renews its own in the last third of it ([24](24-placement-execution-and-fleet-control.md) §11) |
 | `topology.zone`, `topology.region` | Infrastructure facts, validated against the configured source of topology authority |
 | `durability.survive` | Failure-domain class `node`, `zone`, or `region` |
 | `durability.max_failures` | Number of simultaneous independent failures in that class to tolerate |

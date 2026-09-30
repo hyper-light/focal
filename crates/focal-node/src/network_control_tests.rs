@@ -355,9 +355,6 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
             )
             .unwrap();
     }
-    let founder_peer = peers
-        .authenticate(certificate_fingerprint(&receipts[0].certificate))
-        .unwrap();
     let mut pending = Vec::new();
     let mut routes = BTreeMap::new();
     let limits = WireLimits {
@@ -437,11 +434,14 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
     // The trusted setup transferred the established seed leader to node 2;
     // bypassing its active lease with another campaign would race node 1.
     let allowance = budget();
+    let (_presented, presented) =
+        tokio::sync::watch::channel(certificate_fingerprint(&receipts[0].certificate));
     let adapter = NetworkEnrollmentControl::new(
         &replicas[0].pool,
         &replicas[0].host,
         pin.clone(),
-        founder_peer.clone(),
+        &peers,
+        presented,
         RouteEpoch(1),
         &allowance,
     )

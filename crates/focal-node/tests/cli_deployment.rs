@@ -616,7 +616,20 @@ fn a_deployment_plan_is_dry_run_written_applied_resumed_and_refused_when_stale_o
     // provides the committed `max_failures` 1 and the session has applied
     // it, so the plan is valid and the guarantee is active. The observed
     // section names every node and the session's achieved level.
-    let explained = explain(founder, None);
+    // The restart without a topology moved the founder to the unknown
+    // region, which re-grants it at its next generation (24 §22); its seats
+    // stay its own and the controller re-seats every group it votes in at
+    // the generation it signs at now (24 §19), so the guarantee is active
+    // again once that has committed.
+    let explained = {
+        let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
+        let mut last = explain(founder, None);
+        while last["activated"] != true && deadline.open() {
+            std::thread::sleep(Duration::from_millis(250));
+            last = explain(founder, None);
+        }
+        last
+    };
     assert_eq!(explained["condition"], "PlanValid", "{explained}");
     assert_eq!(explained["activated"], true, "{explained}");
     assert_eq!(explained["committed_revision"], 2);

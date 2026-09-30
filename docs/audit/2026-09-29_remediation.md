@@ -25,7 +25,7 @@ ruling before work starts).
 | F10 | P2 | in tree | 4 | [F10](#f10) |
 | F11 | P2 | in tree | 4 | [F11](#f11) |
 | F12 | P1 | in tree | 5 | [F12](#f12) |
-| F13 | P1 | open | 5 | — |
+| F13 | P1 | in tree (stage 1; 2–3 designed) | 5 | [F13](#f13) |
 | F14 | P1 | open | 6 | — |
 | F15 | P2 | in tree | 3 | [F15](#f15) |
 | F16 | P2 | in tree | 3 | [F16](#f16) |
@@ -1323,3 +1323,104 @@ capacity). Measurements: the seal plan and bundle are derived once per tick on t
 within the archive agent's interval; the resident window is a configured count, not a
 lifetime one.
 
+
+## F13
+
+**Cause.** The founder's node credential was issued at genesis for the registry's
+credential lifetime (thirty days) and excluded from the renewal every joined node has:
+`founding_principal` accepted the founding subject at revision 1 only, so a renewal of the
+founding key could not be issued under it; the controller refused the founder's renewal
+and rotation (`Unsupported`); startup authorized the genesis draft's receipt, never one
+the key had renewed to; the founder's authority over the root pinned the fingerprint of
+its genesis certificate (`FounderControlAuthority::certificate`, checked at construction
+and at every enrollment-control request), so a renewed founder could not have committed
+an enrollment; the sponsor route joined nodes keep was checked against the genesis
+certificate; the renewal window was a constant ten days and the retry a constant minute,
+neither derived from the lifetime; and the lifetime itself was a constant compared by
+equality on every restore (`registry.limits != limits`), so no cluster could commit
+another. A rotation of the founder's key would also have failed the founding draft's
+binding to the key it began with, and the root's own group record for the first
+directory partition seated the founder at the generation of its genesis grant and was
+verified by equality against the current grant, so a founder re-granted for any reason
+(a rotated key, a changed topology) could not restart its directory.
+
+**Fix.** The founder's credential is an ordinary credential of its genesis key. The
+founding subject binds the assigned principal at every revision (`founding_principal`
+without the revision pin; `prepare_renew` issues a founding receipt's renewal with
+`issue_founder`, a rotation carries the principal as any rotation does). The controller
+has no founder exclusion: it asks the enrollment host it runs itself
+(`with_local_sponsor`, `QuorumEnrollmentHost::renew` in-process — not the registered
+handler, whose wait for the grant is this controller's own next refresh), under the key
+beside the genesis authority (`cluster/network/node-key`), and publishes the fingerprint
+it presents once a refresh has granted it (`with_presented`; the founder's enrollment
+control reads the watch and authenticates that fingerprint at each local request). The
+founder's authority pins its identity and no certificate: `verify_peer` yields the
+request's fingerprint and `authorize_current` authorizes it for the founder's node and
+principal against the committed registry; an enrollment-control request carries its
+`RootPeer` like a Raft one, re-authorized at dispatch and at completion. At start the
+founder presents the receipt its key holds, adopts the committed renewal of the same key
+when a crash lost the install, and the founding draft accepts a key a committed rotation
+moved the identity to (`bound_to_key || carried_to_key`). The sponsor route is checked
+against the founder's certificate as committed now. The renewal window is a third of the
+receipt's own lifetime (`renewal_window`, `RENEWAL_WINDOW_DIVISOR = 3`: the ACME practice
+of renewing when a third of the lifetime remains) and a failed attempt is retried at a
+sixtieth of the window (`renewal_retry`, `RENEWAL_ATTEMPTS = 60`: certbot's twice-daily
+cadence across its thirty-day window; never under the second the registry decides in).
+The lifetime is committed policy: `node.credential_lifetime_seconds` (schema, doc 08)
+founds the registry's limits, a start that asks for another is refused as
+`CommittedPolicyChange`, `EnrollmentRegistry::restore` adopts the committed lifetimes and
+compares only the capacities, and a registry admits three seconds at least
+(`MIN_CREDENTIAL_LIFETIME`: a second to be issued in, one to renew in, one to expire in)
+and a year at most. The root's group record seats the founder at the generation of its
+grant and the founder re-granted since holds the seat at or below its current generation
+(`directory_bootstrap`, the verifier's rule for root group records, 24 §19).
+
+**Tests.** Enrollment: `the_founder_renews_under_its_founding_subject_and_rotates_carrying_its_principal`
+(revision 2 under the founding subject, authorized after restore, the genesis certificate
+retired at the grace; the rotation carries the principal and a renewal under the rotated
+key carries it again),
+`a_restored_registry_keeps_the_lifetimes_it_committed_and_the_capacities_it_is_given`
+(an hour's lifetime restored under the standard limits, a capacity mismatch still refused,
+lifetimes of 0, 2 and a year and a second refused, the shortest founds and renews in its
+second second). Node (`credential_renewal::tests`):
+`the_founder_renews_and_rotates_its_own_credential_and_restarts_on_what_it_holds` (the
+founder renews through its own host, the registry lists the renewal under the founding
+identity with the genesis certificate retiring, the renewed certificate is announced, a
+joined host renews through the founder and a new host enrolls after; the crash window —
+the genesis receipt written back — restarts on the committed renewal without another
+issuance; a rotation is re-granted under the new key, the restart finds the rotated key
+beside the genesis draft, and a renewal under it and the joined host's renewal follow),
+`a_committed_short_lifetime_renews_every_node_ahead_of_expiry_and_admits_a_late_joiner`
+(a twelve-second lifetime issued to the founder and to a joined host; each renews itself
+twice unasked; past the genesis expiry the registry authorizes neither genesis
+certificate and a new host enrolls),
+`the_credential_lifetime_is_committed_at_genesis_and_a_later_change_is_refused`; the
+settings test pins the field's bounds; `network_control::tests` build the enrollment
+control from the registry and the presented fingerprint. `cli_deployment` now waits on
+the guarantee after the founder's restart without a topology: that restart moves the
+founder to the unknown region and re-grants it at its next generation, and with the
+seat rule the founder's directory starts on the stale seat and the controller re-seats
+every group it votes in (about nine seconds in the run) — before, the verification
+refused the re-granted founder's directory at that restart. Docs 08 and 24 §11, the
+runbook, `cluster-admin.md`, `network-startup.md` and the schema carry the change.
+
+**Measurements.** Derived quantities under the default lifetime: window 10 days, retry
+every 4 hours; under the twelve-second test lifetime: window 4 s, retry every second;
+the founder test runs in 11.6 s, the short-lifetime test watches two renewals of two
+nodes within its 60 s allowance.
+
+**Residual (designed, next batches).** Stage 2 — the bootstrap enrollment server's
+certificate (a year, pinned by every invitation and by the founder's own
+`NetworkState.sponsor`): the registry commits the server certificate and a staged
+successor (`Change::BootstrapServer`), `ServerTrust` gains a successor pin joiners and
+joined nodes accept, the founder stages at a third of the lifetime and switches the
+enrollment listener once every invitation issued before the staging has expired
+(`max_invitation_lifetime`), `state.install` accepts a pin that chains to the same CA.
+Stage 3 — issuer succession (a successor CA cross-signed both ways, committed as
+`Change::SucceedIssuer`; nodes accept a committed successor chained from the pinned CA;
+renewals issue under it; the old CA retires at its expiry) and recovery of a lost
+`authority.bin` (the CA key is custody, never replicated: a verified backup of the private
+directory, or a documented re-founding with re-enrollment; the operator decides whether
+the private directory is part of `cluster backup`). A founder whose credential expired
+outright (down for the last third of its lifetime and longer) cannot sign a renewal
+request: the runbook's escalation stands.

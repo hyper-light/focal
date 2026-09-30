@@ -170,11 +170,11 @@ impl Drop for Running {
     }
 }
 pub(crate) struct TestSettings {
-    value: Settings,
+    pub(crate) value: Settings,
     // Keep the physical reservation throughout startup, client creation, and
     // restart. Quinn receives a duplicate handle to this same bound socket,
     // never an address obtained by closing a temporary socket.
-    socket: std::net::UdpSocket,
+    pub(crate) socket: std::net::UdpSocket,
 }
 impl std::ops::Deref for TestSettings {
     type Target = Settings;
@@ -183,7 +183,7 @@ impl std::ops::Deref for TestSettings {
     }
 }
 impl TestSettings {
-    async fn open(&self) -> Result<NetworkService, ServiceError> {
+    pub(crate) async fn open(&self) -> Result<NetworkService, ServiceError> {
         NetworkService::open_with_socket(&self.value, Some(self.socket.try_clone().unwrap())).await
     }
 }

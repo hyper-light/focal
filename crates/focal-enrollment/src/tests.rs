@@ -1502,3 +1502,207 @@ fn the_upgrade_fence_rises_once_under_the_founder_authority_and_survives_schema_
     assert_eq!(registry.fence().level, 3);
     assert_eq!(registry.fence().activated_at, at + 2);
 }
+
+/// The founder's genesis identity: the founding registry and receipt, the
+/// key they were issued for and the material the key completes with.
+fn founder(
+    dir: &tempfile::TempDir,
+    authority: &BootstrapAuthority,
+    name: &str,
+    limits: EnrollmentLimits,
+) -> (
+    EnrollmentRegistry,
+    JoinKey,
+    EnrollmentReceipt,
+    CredentialMaterial,
+) {
+    let key = JoinKey::open_or_create(dir.path().join(name), [1; 16]).unwrap();
+    let (registry, receipt) =
+        EnrollmentRegistry::founding(authority, &key, 1, [7; 16], limits, now()).unwrap();
+    let material = key
+        .complete(&receipt, authority.ca_certificate(), now())
+        .unwrap();
+    (registry, key, receipt, material)
+}
+
+#[test]
+fn the_founder_renews_under_its_founding_subject_and_rotates_carrying_its_principal() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = authority(&dir, [1; 16]);
+    let (mut registry, key, genesis, material) =
+        founder(&dir, &authority, "founder-key", EnrollmentLimits::default());
+    assert_eq!(genesis.revision, 1);
+    assert!(crate::pki::founding_principal(&genesis).unwrap());
+    // The founder's principal is assigned, not derived from its key.
+    assert_ne!(
+        genesis.identity,
+        assigned(
+            authority.cluster(),
+            EnrollmentRole::Node,
+            1,
+            genesis.public_key
+        )
+    );
+    let request = material.renewal_request(&key, &genesis).unwrap();
+    let at = now() + 10;
+    let RenewPreparation::Commit(command) = registry
+        .prepare_renew(&authority, &request, at, 30)
+        .unwrap()
+    else {
+        panic!("the founder's first renewal commits")
+    };
+    registry
+        .apply_committed(&command, registry.applied_index() + 1)
+        .unwrap();
+    let renewed = registry.release_renewal(&request, at).unwrap();
+    // The same identity, principal and key under a fresh certificate that
+    // carries the founding subject at its new revision.
+    assert_eq!(renewed.identity, genesis.identity);
+    assert_eq!(renewed.public_key, genesis.public_key);
+    assert_eq!(renewed.revision, 2);
+    assert_eq!(renewed.issued_at, at);
+    assert_eq!(
+        renewed.expires_at,
+        at + EnrollmentLimits::default().credential_lifetime as i64
+    );
+    assert!(crate::pki::founding_principal(&renewed).unwrap());
+    assert!(crate::pki::identity_bound(&renewed).unwrap());
+    assert_eq!(
+        registry
+            .authorize_certificate(&renewed.certificate, at + 31)
+            .unwrap(),
+        genesis.identity
+    );
+    assert!(matches!(
+        registry.authorize_certificate(&genesis.certificate, at + 30),
+        Err(EnrollmentError::Expired)
+    ));
+    // A checkpoint of the renewed registry restores and still authorizes it:
+    // the founding subject is accepted at every revision.
+    let restored = EnrollmentRegistry::restore(
+        &registry.checkpoint().unwrap(),
+        authority.cluster(),
+        EnrollmentLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        restored
+            .authorize_certificate(&renewed.certificate, at + 31)
+            .unwrap(),
+        genesis.identity
+    );
+    // The holder installs the renewal over the genesis receipt under its key.
+    let material = key.renew(&renewed, authority.ca_certificate(), at).unwrap();
+    assert_eq!(material.certificate_chain()[0], renewed.certificate);
+    assert_eq!(key.enrollment().unwrap().unwrap(), renewed);
+    // A rotation of the founder's key carries the assigned principal to the
+    // new key in a CA-signed subject, as any rotation does.
+    let next = JoinKey::open_or_create(dir.path().join("founder-key.next"), [1; 16]).unwrap();
+    let rotation = material.rotation_request(&key, &next, &renewed).unwrap();
+    let RenewPreparation::Commit(command) = registry
+        .prepare_renew(&authority, &rotation, at + 5, 30)
+        .unwrap()
+    else {
+        panic!("the founder's rotation commits")
+    };
+    registry
+        .apply_committed(&command, registry.applied_index() + 1)
+        .unwrap();
+    let rotated = registry.release_renewal(&rotation, at + 5).unwrap();
+    assert_eq!(rotated.identity, genesis.identity);
+    assert_eq!(rotated.public_key, csr_key_hash(next.csr()).unwrap());
+    assert!(crate::pki::carried_principal(&rotated).unwrap());
+    assert!(!crate::pki::founding_principal(&rotated).unwrap());
+    let rotated_material = key
+        .rotate_into(&next, &rotated, authority.ca_certificate(), at + 5)
+        .unwrap();
+    assert_eq!(rotated_material.certificate_chain()[0], rotated.certificate);
+    drop(key);
+    drop(next);
+    // The key directory now holds the rotated key and its receipt.
+    let key = JoinKey::open_or_create(dir.path().join("founder-key"), [1; 16]).unwrap();
+    assert_eq!(key.key_identity().unwrap(), rotated.public_key);
+    assert_eq!(key.enrollment().unwrap().unwrap(), rotated);
+    // Under the rotated key a renewal carries the principal again.
+    let again = rotated_material.renewal_request(&key, &rotated).unwrap();
+    let RenewPreparation::Commit(command) = registry
+        .prepare_renew(&authority, &again, at + 10, 30)
+        .unwrap()
+    else {
+        panic!("a renewal after the rotation commits")
+    };
+    registry
+        .apply_committed(&command, registry.applied_index() + 1)
+        .unwrap();
+    let renewed_again = registry.release_renewal(&again, at + 10).unwrap();
+    assert!(crate::pki::carried_principal(&renewed_again).unwrap());
+    assert_eq!(renewed_again.public_key, rotated.public_key);
+}
+
+#[test]
+fn a_restored_registry_keeps_the_lifetimes_it_committed_and_the_capacities_it_is_given() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = authority(&dir, [1; 16]);
+    let committed = EnrollmentLimits {
+        credential_lifetime: 3600,
+        max_invitation_lifetime: 600,
+        ..EnrollmentLimits::default()
+    };
+    let (registry, _key, genesis, _material) =
+        founder(&dir, &authority, "hour-key", committed.clone());
+    assert_eq!(genesis.expires_at - genesis.issued_at, 3600);
+    let checkpoint = registry.checkpoint().unwrap();
+    // A process restoring under the standard limits adopts the committed
+    // lifetimes: they are the cluster's policy, not the process's bound.
+    let restored =
+        EnrollmentRegistry::restore(&checkpoint, [1; 16], EnrollmentLimits::default()).unwrap();
+    assert_eq!(restored.limits(), &committed);
+    // A capacity that differs from the restoring process's is refused, as before.
+    let smaller = EnrollmentLimits {
+        max_enrollments: 16,
+        ..EnrollmentLimits::default()
+    };
+    assert!(matches!(
+        EnrollmentRegistry::restore(&checkpoint, [1; 16], smaller),
+        Err(EnrollmentError::Corrupt)
+    ));
+    // A lifetime the registry would not admit cannot be founded.
+    let key = JoinKey::open_or_create(dir.path().join("short-key"), [1; 16]).unwrap();
+    for lifetime in [0, MIN_CREDENTIAL_LIFETIME - 1, MAX_CREDENTIAL_LIFETIME + 1] {
+        assert!(matches!(
+            EnrollmentRegistry::founding(
+                &authority,
+                &key,
+                1,
+                [7; 16],
+                EnrollmentLimits {
+                    credential_lifetime: lifetime,
+                    ..EnrollmentLimits::default()
+                },
+                now(),
+            ),
+            Err(EnrollmentError::Capacity)
+        ));
+    }
+    // The shortest lifetime founds, and a renewal in its second second extends it.
+    let shortest = EnrollmentLimits {
+        credential_lifetime: MIN_CREDENTIAL_LIFETIME,
+        ..EnrollmentLimits::default()
+    };
+    let (mut registry, key, genesis, material) =
+        founder(&dir, &authority, "shortest-key", shortest);
+    let request = material.renewal_request(&key, &genesis).unwrap();
+    let RenewPreparation::Commit(command) = registry
+        .prepare_renew(&authority, &request, genesis.issued_at + 1, 30)
+        .unwrap()
+    else {
+        panic!("a renewal a second after the issue commits")
+    };
+    registry
+        .apply_committed(&command, registry.applied_index() + 1)
+        .unwrap();
+    let renewed = registry
+        .release_renewal(&request, genesis.issued_at + 1)
+        .unwrap();
+    assert_eq!(renewed.expires_at, genesis.expires_at + 1);
+}

@@ -64,6 +64,13 @@ pub struct NodeSettings {
     /// An optional loopback endpoint for the read-only metrics text (doc
     /// 08 §9); node-local, never a cluster fact.
     pub metrics_listen: Option<SocketAddr>,
+    /// How long a credential the cluster issues lasts, in seconds — the
+    /// founder's own, every joined node's and every participant's; a node
+    /// renews its own in the last third of it (24 §11). The founder commits
+    /// it in the enrollment registry at genesis (default thirty days; from
+    /// three seconds to a year), and a start that asks for another is
+    /// refused as a committed-policy change (08 §2).
+    pub credential_lifetime_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,6 +145,19 @@ impl Settings {
         settings.validate()?;
         Ok(settings)
     }
+    /// The enrollment registry's limits as this configuration asks for
+    /// them: the standard capacities, and the credential lifetime the
+    /// founder commits at genesis (24 §11).
+    pub fn enrollment_limits(&self) -> focal_enrollment::EnrollmentLimits {
+        let standard = focal_enrollment::EnrollmentLimits::default();
+        focal_enrollment::EnrollmentLimits {
+            credential_lifetime: self
+                .node
+                .credential_lifetime_seconds
+                .unwrap_or(standard.credential_lifetime),
+            ..standard
+        }
+    }
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.version != CONFIG_VERSION {
             return Err(ConfigError::Version(self.version));
@@ -184,6 +204,20 @@ impl Settings {
             return Err(ConfigError::Invalid {
                 field: "node.max_tenants",
                 reason: "must be between 1 and 1024",
+            });
+        }
+        if self
+            .node
+            .credential_lifetime_seconds
+            .is_some_and(|seconds| {
+                !(focal_enrollment::MIN_CREDENTIAL_LIFETIME
+                    ..=focal_enrollment::MAX_CREDENTIAL_LIFETIME)
+                    .contains(&seconds)
+            })
+        {
+            return Err(ConfigError::Invalid {
+                field: "node.credential_lifetime_seconds",
+                reason: "must be between 3 seconds and a year (31536000)",
             });
         }
         if self
@@ -339,6 +373,36 @@ mod tests {
         );
         assert!(Settings::from_yaml("version: 1\nshards: 3").is_err());
         assert!(Settings::from_yaml("version: 1\nnode:\n  shards: 3").is_err());
+    }
+    #[test]
+    fn the_credential_lifetime_is_optional_and_bounded_by_what_the_registry_admits() {
+        assert_eq!(Settings::default().node.credential_lifetime_seconds, None);
+        assert_eq!(
+            Settings::default().enrollment_limits(),
+            focal_enrollment::EnrollmentLimits::default()
+        );
+        let settings =
+            Settings::from_yaml("version: 1\nnode:\n  credential_lifetime_seconds: 3600").unwrap();
+        assert_eq!(settings.node.credential_lifetime_seconds, Some(3600));
+        assert_eq!(settings.enrollment_limits().credential_lifetime, 3600);
+        for good in ["3", "31536000"] {
+            assert!(
+                Settings::from_yaml(&format!(
+                    "version: 1\nnode:\n  credential_lifetime_seconds: {good}"
+                ))
+                .is_ok(),
+                "{good}"
+            );
+        }
+        for bad in ["0", "2", "31536001", "-1", "soon"] {
+            assert!(
+                Settings::from_yaml(&format!(
+                    "version: 1\nnode:\n  credential_lifetime_seconds: {bad}"
+                ))
+                .is_err(),
+                "{bad}"
+            );
+        }
     }
     #[test]
     fn the_tenant_bound_is_optional_and_bounded() {

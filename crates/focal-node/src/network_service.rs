@@ -445,7 +445,9 @@ pub struct NetworkService {
     signer: Option<QuorumEnrollmentDriver>,
     enrollment: Option<RegisteredEnrollment>,
     authority: FounderControlAuthority,
-    founder_fingerprint: [u8; 32],
+    /// The fingerprint of the certificate the founder presents now, as its
+    /// controller publishes it (24 §11).
+    presented: tokio::sync::watch::Receiver<[u8; 32]>,
     budget: MemoryBudget,
     _configuration: Allocation,
     /// The cluster this node belongs to, for restoring the enrollment
@@ -665,7 +667,9 @@ impl NetworkService {
             &registry,
             unix_time()?,
         )?;
-        let founder_fingerprint = founder_fingerprint(&state)?;
+        // The founder's own credential as it presents it now (24 §11).
+        let (presented_sender, presented) =
+            tokio::sync::watch::channel(certificate_fingerprint(&receipt.certificate));
         // A sponsor named rather than addressed resolves at each start
         // (24 §24); an unresolvable name is not fatal here.
         let sponsor_address = crate::network_state::resolve_endpoint(&state.sponsor.endpoint)
@@ -692,6 +696,13 @@ impl NetworkService {
                 .cloned()
                 .collect(),
         );
+        // The founder renews its own credential through the enrollment host
+        // it runs (24 §11).
+        if let Some(sponsor) = &enrollment {
+            controller = controller
+                .with_local_sponsor(sponsor.clone())
+                .with_presented(presented_sender);
+        }
         let (credential_handle, credential_requests) =
             crate::credential_renewal::CredentialHandle::channel(4);
         let limits = ControlHost::wire_limits();
@@ -1134,7 +1145,7 @@ impl NetworkService {
             signer,
             enrollment: enrollment_service,
             authority,
-            founder_fingerprint,
+            presented,
             budget,
             _configuration: allocation,
             cluster: identity.cluster,
@@ -1539,7 +1550,8 @@ impl NetworkService {
                 &self.pool,
                 &self.handles.control,
                 self.authority.clone(),
-                self.registry.authenticate(self.founder_fingerprint)?,
+                &self.registry,
+                self.presented.clone(),
                 RouteEpoch(1),
                 &self.budget,
             )?)
@@ -1832,20 +1844,6 @@ fn clean_socket(path: &Path, root: &Path) -> Result<(), ServiceError> {
         Ok(())
     }
 }
-fn founder_fingerprint(state: &NetworkState) -> Result<[u8; 32], ServiceError> {
-    let focal_control::ControlBootstrap::Root { enrollment, .. } = &state.genesis.bootstrap else {
-        return Err(NodeError::Identity.into());
-    };
-    let registry = focal_enrollment::EnrollmentRegistry::restore(
-        enrollment,
-        state.genesis.founder.cluster,
-        focal_enrollment::EnrollmentLimits::default(),
-    )
-    .map_err(NetworkError::from)?;
-    let founder = registry.enrollments().next().ok_or(NodeError::Identity)?;
-    Ok(certificate_fingerprint(&founder.certificate))
-}
-
 #[cfg(test)]
 #[path = "network_service_tests.rs"]
 pub(crate) mod tests;
