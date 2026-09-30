@@ -1174,8 +1174,16 @@ fn a_poll_with_nothing_to_acknowledge_is_a_read_and_the_node_renews_a_lease_past
     let mut node = open(root.path());
     crate::demo::run(&mut node).unwrap();
     let mut views = ReadViews::new();
-    // A lease of 400 ms: past 200 ms a poll has the node renew it.
+    // A lease of 400 ms: past 200 ms a poll has the node renew it. The
+    // test names every time the host reads, so what it asserts of the
+    // lease's half never depends on how long the machine took between two
+    // polls.
+    let start = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     let mut streams = Streams::new().unwrap().with_lease(400);
+    streams.at(start);
     let consumer = ConsumerId::from_u128(100);
     let principal = node.identity.issuer;
     let key = move |id: u128| RequestKey {
@@ -1207,6 +1215,9 @@ fn a_poll_with_nothing_to_acknowledge_is_a_read_and_the_node_renews_a_lease_past
     let revision = node.session.cursor_revision();
     let index = node.session.status().committed_index;
     let expires = node.session.cursor(consumer).unwrap().expires_at;
+    assert_eq!(expires, start + 400);
+    // A millisecond short of the lease's half, a poll is still a read.
+    streams.at(start + 199);
     for _ in 0..4 {
         let reply = invoke(
             &mut node,
@@ -1245,7 +1256,7 @@ fn a_poll_with_nothing_to_acknowledge_is_a_read_and_the_node_renews_a_lease_past
     id += 1;
     // Half the lease after its last renewal, a poll has the node renew it:
     // one entry, no receipt, no request key.
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    streams.at(start + 200);
     let reply = invoke(
         &mut node,
         &mut views,
@@ -1258,9 +1269,10 @@ fn a_poll_with_nothing_to_acknowledge_is_a_read_and_the_node_renews_a_lease_past
     assert_eq!(node.session.cursor_revision(), revision + 1);
     assert!(node.session.cursor_receipt(&key(id)).is_none());
     let renewed = node.session.cursor(consumer).unwrap().expires_at;
-    assert!(renewed >= expires + 200, "{renewed} {expires}");
+    assert_eq!(renewed, expires + 200);
     id += 1;
     // Within the first half of the new lease: nothing again.
+    streams.at(start + 399);
     invoke(
         &mut node,
         &mut views,

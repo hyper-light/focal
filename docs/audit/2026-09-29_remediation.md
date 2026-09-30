@@ -743,6 +743,23 @@ consumer never; replayed from the log),
 acknowledgments' revision after the client resumed once); the consumer retirement,
 durable delivery, cursor, managed, stream host and CLI watch suites unchanged.
 
+**Residual closed (2026-09-30): the node's own entries on a native ledger.** The
+maintenance entry judged its command on the legacy domain sequence
+(`prepare_maintenance`: `cursors.prepare(.., self.sequence())`, and the floor bound beside
+it), where the client commands had been moved to the stream line (23 §6). On a native
+ledger the legacy sequence stays at the sealed prefix — zero on a genesis ledger — so a
+renewal of any cursor that had acknowledged a native record was refused `CursorAhead`
+before it was proposed, and the poll that found the lease past its half failed
+(`invalid_input` at the CLI) on every later poll until the lease ran out. Found by
+restarting a node under a resumed watch forty times over (each restart a poll; the third
+fell past the half); every copy failed at that poll, and none of 492 restarts after the
+fix. The entry is now judged on the stream line: positions and the floor against
+`stream_published()`, the entry still naming the domain sequence it was made at.
+`session::native_tests::a_native_cursor_is_renewed_and_expired_by_the_nodes_own_entries_across_a_restart`
+(a cursor past the legacy prefix: not renewed in its first half, renewed past it with
+its position kept, its expiry advancing the clock through the log, and both entries
+replayed by a restart; it fails `Stream(CursorAhead)` on the code before).
+
 ## F64
 
 **Cause.** The participant's retry loop slept the capped exponential step whole (20, 40,
@@ -1457,9 +1474,19 @@ node `a_committed_short_lifetime_renews_every_node_ahead_of_expiry_and_admits_a_
 through the succeeded one, a late host enrolls with the invitation's pins, and the founder
 restarts past its genesis lifetime on it and enrolls another).
 
-**Residual (designed, next batch).** Stage 3 — issuer succession (a successor CA cross-signed both ways, committed as
-`Change::SucceedIssuer`; nodes accept a committed successor chained from the pinned CA;
-renewals issue under it; the old CA retires at its expiry) and recovery of a lost
+**Residual (designed, next batch).** Stage 3 — issuer succession. Facts the design rests
+on (read 2026-09-30): the root is issued with path length zero (`pki.rs`,
+`BasicConstraints::Constrained(0)`), so it cannot sign an intermediate and a successor
+cannot be cross-certified under it; and the CA is pinned as bytes or by hash in the
+registry (`ca_certificate`, `check_authority`), every `ServerTrust`, the listener's and the
+pool's trust roots, `verify_issued`, the saved network state, and the root authority's
+anchor (`AuthorityAnchor.enrollment_ca`, which every proof statement carries). The
+succession is therefore a second root every verifier holds beside the first: the registry
+commits the successor (`Change::Issuer`, staged then activated as the bootstrap server is),
+trust becomes a set of at most two roots (the listener, the pool, `ServerTrust`,
+`verify_issued`), the anchor names the successor's hash beside the first, issuance moves
+to the successor at activation, and the first root retires one credential lifetime after
+it, when every credential issued under it has been renewed. Recovery of a lost
 `authority.bin` (the CA key is custody, never replicated: a verified backup of the private
 directory, or a documented re-founding with re-enrollment; the operator decides whether
 the private directory is part of `cluster backup`). A founder whose credential expired

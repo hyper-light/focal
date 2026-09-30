@@ -170,10 +170,14 @@ impl Session {
         envelope: &MaintenanceEnvelope,
         digest: ContentHash,
     ) -> Result<MaintenanceCandidate, LedgerError> {
+        // Floors and positions are values of the stream line (23 §6), whose
+        // published end is past the legacy domain sequence on a native
+        // ledger; the entry keeps naming the domain sequence it was made at.
+        let published = self.stream_published();
         if envelope.schema != 1
             || envelope.ledger != self.ledger
             || envelope.domain_sequence != self.sequence()
-            || envelope.replay_floor > self.sequence()
+            || envelope.replay_floor > published
             || envelope.replay_floor < self.cursors.checkpoint().floor
         {
             return Err(LedgerError::Corrupt);
@@ -201,7 +205,7 @@ impl Session {
         if !due {
             return Err(LedgerError::Corrupt);
         }
-        let prepared = self.cursors.prepare(&envelope.command, self.sequence())?;
+        let prepared = self.cursors.prepare(&envelope.command, published)?;
         Ok(MaintenanceCandidate {
             digest,
             prepared,

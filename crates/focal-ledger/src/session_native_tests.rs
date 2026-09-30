@@ -1947,6 +1947,130 @@ fn native_records_stream_as_schema_two_deltas_on_the_continuous_sequence_line() 
     );
 }
 
+/// The node's own cursor entries on a native ledger: a lease whose cursor
+/// stands past the legacy prefix is renewed past its half-life, and its
+/// expiry advances the clock — both judged on the stream line, where the
+/// cursor's position is, and both replayed from the log by a restart.
+#[test]
+fn a_native_cursor_is_renewed_and_expired_by_the_nodes_own_entries_across_a_restart() {
+    let mut cluster = Cluster::new(1, &[true]);
+    cluster.elect(1, &[]);
+    cluster.activate(1, &[]);
+    let stream = ancillary::stream_register(&mut cluster, 1);
+    let consumer = focal_stream::ConsumerId::from_u128(1);
+    let managed = |session: &Session, ordinal: u64, operation| {
+        let input = ancillary::cursor_input(session, 7_000 + u128::from(ordinal), operation);
+        ManagedCursorInput {
+            key: ManagedRequestKey {
+                stream,
+                ordinal,
+                id: RequestId::from_u128(7_000 + u128::from(ordinal)),
+            },
+            intent_hash: input.intent_hash,
+            command: input.command,
+        }
+    };
+    let submit = |cluster: &mut Cluster, input: ManagedCursorInput| match cluster
+        .node(1)
+        .propose_managed_cursor(&input, false)
+        .unwrap()
+    {
+        ManagedSubmission::Committed(_) => {}
+        ManagedSubmission::Pending(_) => cluster.pump(&[]),
+        ManagedSubmission::Domain(outcome) => panic!("{outcome:?}"),
+    };
+    let registration = managed(
+        cluster.node(1),
+        1,
+        focal_stream::CursorOperation::Register {
+            consumer,
+            scope: ContentHash([8; 32]),
+            filter: focal_stream::DeltaFilter::All,
+            start: focal_stream::Position::origin(ledger()),
+            expires_at: 1_000,
+        },
+    );
+    submit(&mut cluster, registration);
+    // Two native records, and the cursor acknowledges the second: its
+    // position is past the legacy prefix, which a genesis ledger ends at zero.
+    let create = creation(cluster.next(PARTIES.issuer), 1);
+    cluster.commit(1, PARTIES.issuer, create, &[]);
+    let expected = cluster.claim(1, 1);
+    let post = fx::post(cluster.next(PARTIES.issuer), expected);
+    cluster.commit(1, PARTIES.issuer, post, &[]);
+    assert_eq!(cluster.node(1).sequence(), SessionSeq(0));
+    assert_eq!(cluster.node(1).stream_published(), SessionSeq(2));
+    let token = cluster.node(1).cursor(consumer).unwrap().token;
+    let position = focal_stream::Position::resolved(ledger(), SessionSeq(2));
+    let acknowledge = managed(
+        cluster.node(1),
+        2,
+        focal_stream::CursorOperation::Acknowledge {
+            token: focal_stream::CursorToken { position, ..token },
+        },
+    );
+    submit(&mut cluster, acknowledge);
+    let row = cluster.node(1).cursor(consumer).unwrap().clone();
+    assert_eq!(row.token.position, position);
+    assert_eq!(row.expires_at, 1_000);
+
+    // In its first half the lease is not renewed; past the half it is, by
+    // one entry of the node's own, and the cursor stays where it stands.
+    let generation = row.token.generation;
+    assert_eq!(
+        cluster
+            .node(1)
+            .propose_cursor_renewal(consumer, generation, 499, 1_499)
+            .unwrap(),
+        None
+    );
+    let target = cluster
+        .node(1)
+        .propose_cursor_renewal(consumer, generation, 600, 1_600)
+        .unwrap()
+        .expect("a lease past its half-life is renewed");
+    cluster.pump(&[]);
+    assert_eq!(cluster.node(1).cursor_revision(), target.revision);
+    assert_eq!(cluster.node(1).cursor_clock(), 600);
+    let renewed = cluster.node(1).cursor(consumer).unwrap().clone();
+    assert_eq!(renewed.expires_at, 1_600);
+    assert_eq!(renewed.token, row.token);
+
+    // The lease runs out: the clock advances through the log, the floor
+    // stays, and the cursor is released where it stood.
+    assert_eq!(cluster.node(1).next_cursor_expiry(), Some(1_600));
+    assert_eq!(cluster.node(1).propose_cursor_clock(1_599).unwrap(), None);
+    let target = cluster
+        .node(1)
+        .propose_cursor_clock(1_600)
+        .unwrap()
+        .expect("a due lease advances the clock");
+    cluster.pump(&[]);
+    assert_eq!(cluster.node(1).cursor_revision(), target.revision);
+    assert_eq!(cluster.node(1).cursor_clock(), 1_600);
+    assert_eq!(cluster.node(1).next_cursor_expiry(), None);
+    assert_eq!(cluster.node(1).stream_bounds().floor, SessionSeq(0));
+
+    // A restart replays both entries from the log to the same registry.
+    let before = (
+        cluster.node(1).cursor_revision(),
+        cluster.node(1).cursor_clock(),
+        cluster.node(1).cursor(consumer).cloned(),
+    );
+    cluster.stop(1);
+    cluster.reopen(1, true);
+    cluster.elect(1, &[]);
+    assert_eq!(
+        (
+            cluster.node(1).cursor_revision(),
+            cluster.node(1).cursor_clock(),
+            cluster.node(1).cursor(consumer).cloned(),
+        ),
+        before
+    );
+    assert_eq!(cluster.node(1).stream_published(), SessionSeq(2));
+}
+
 /// Retirement through the hosted session (26 §4): the authority applies
 /// the record it proposed through its committed core and is reconstructed
 /// at once, so linearizable reads answer with the continuation right after,

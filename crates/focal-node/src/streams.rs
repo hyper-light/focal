@@ -137,6 +137,11 @@ pub(crate) struct Streams {
     incarnation: [u8; 16],
     next: u64,
     lease: u64,
+    /// The time a test set in place of the wall clock, so what it asserts
+    /// of a lease's half is a fact of the times it names and never of how
+    /// long the machine took between two calls.
+    #[cfg(test)]
+    clock: Option<u64>,
 }
 impl Streams {
     #[cfg(test)]
@@ -164,6 +169,8 @@ impl Streams {
             incarnation,
             next: 0,
             lease: LEASE_MS,
+            #[cfg(test)]
+            clock: None,
         })
     }
     /// The same host with another lease term, in milliseconds.
@@ -171,6 +178,19 @@ impl Streams {
     pub fn with_lease(mut self, lease: u64) -> Self {
         self.lease = lease;
         self
+    }
+    /// From now on this host reads `now` (Unix milliseconds) as its clock.
+    #[cfg(test)]
+    pub fn at(&mut self, now: u64) {
+        self.clock = Some(now);
+    }
+    /// The wall clock in Unix milliseconds; in a test, the time it set.
+    fn now_ms(&self) -> Result<u64, AccessError> {
+        #[cfg(test)]
+        if let Some(now) = self.clock {
+            return Ok(now);
+        }
+        wall_ms()
     }
     pub fn begin(
         &mut self,
@@ -330,7 +350,7 @@ impl Streams {
                 }
             };
             let original = original_cursor_token(session, pending.key, pending.intent_hash)?;
-            let now = wall_ms()?.max(session.cursor_clock());
+            let now = self.now_ms()?.max(session.cursor_clock());
             let lease = self.lease;
             match Self::operation(
                 session, views, pending, original, prefix, now, lease, limits,
@@ -401,7 +421,7 @@ impl Streams {
         } else {
             row_token(session, pending)?
         };
-        let now = wall_ms()?.max(session.cursor_clock());
+        let now = self.now_ms()?.max(session.cursor_clock());
         let reply = self.reply(session, pending, original, now, limits)?;
         // A read with nothing to read waits for something, where the host
         // answers from its loop; a poll that acknowledged carries its

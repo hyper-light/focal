@@ -12460,3 +12460,27 @@ followed (each one counted against the request's attempts, an unchanged one stil
 request, an older epoch is still refused); `focal-client`
 `a_leader_that_moves_within_a_route_epoch_is_followed_and_an_older_epoch_is_refused`
 reproduces the two hints ([24](24-placement-execution-and-fleet-control.md) §10).
+
+### 2026-09-30 — the node's own cursor entries on a native ledger, and two tests that read the wall clock
+
+The gate run on the batch above failed two tests, and the host's power log
+(`pmset -g log`) shows why: the machine was cycling through maintenance sleep on battery
+for the whole of the run, so tests crossed suspends that the wall clock counts and a
+test's own (monotonic) duration does not. `cli_native_watch` resumed a watch after a
+restart and was told `resync_required` sixteen seconds into a run: its sixty-second lease
+had run out on the wall clock, which is what a lease is measured on and what a consumer
+of a node that was away that long is owed. The stream host's lease test asserted a
+400 ms lease against real time between four polls. That test now sets the host's clock
+(`Streams::at`, test builds only) and states each time it polls at; the watch test is
+unchanged, and a gate is run on a host that stays awake.
+
+Reproducing the first by restarting a node under a resumed watch forty times found a
+defect the suspend had nothing to do with: the node's own cursor entries (the renewal of
+a polled lease past its half-life, F61, and the clock advance of an expired one) judged
+positions on the legacy domain sequence, so on a native ledger every renewal of a cursor
+that had acknowledged a native record was refused `CursorAhead` and the poll that needed
+it failed. They are judged on the stream line now, as the client's commands are
+([23](23-native-activation-and-import.md) §6); `focal-ledger`
+`a_native_cursor_is_renewed_and_expired_by_the_nodes_own_entries_across_a_restart` fails on
+the code before and passes after, and 492 restarts under a resumed watch through the real
+binary (twelve runs of forty-one) renewed and resumed every time.
