@@ -76,7 +76,7 @@ ruling before work starts).
 | F61 | P2 | in tree | 15 | [F61](#f61) |
 | F62 | P1 | in tree | 15 | [F62](#f62) |
 | F63 | P2 | in tree | 13 | [F63](#f63) |
-| F64 | P2 | open | 15 | — |
+| F64 | P2 | in tree | 15 | [F64](#f64) |
 | F65 | P2 | open | 15 | — |
 
 Batches follow the audit's §13 order: 1 failure handling and recovery (F01, F02); 2
@@ -742,3 +742,38 @@ consumer never; replayed from the log),
 (eight idle reads, no ordinal; the node's registry at the registration's and the
 acknowledgments' revision after the client resumed once); the consumer retirement,
 durable delivery, cursor, managed, stream host and CLI watch suites unchanged.
+
+## F64
+
+**Cause.** The participant's retry loop slept the capped exponential step whole (20, 40,
+80 … 500 ms), so every caller a leader loss, a service still opening or one capacity
+refusal had turned away came back at the same instant, each wave as tall as the last;
+the node's peer pool rested (`retry_backoff`) and cooled down (`unreachable_cooldown`) by
+fixed pauses, so peers that lost one node dialed it again in step.
+
+**Fix.** `focal_client::client::jittered(policy, backoffs, remaining, random)`: the step
+from the base, capped, spread by full jitter — a wait drawn uniformly between nothing
+and the whole step — under the attempt, elapsed and refusal budgets as before (a draw
+never adds an attempt; a pause never outlasts what remains of the clock). Full jitter is
+the spread AWS's analysis (Brooker, 2015) found finishes the same work in the fewest
+calls. `focal_wire::peers::spread(delay, random)`: the pool's retry pause and its
+cooldown drawn uniformly from half the configured pause to the whole of it (equal
+jitter), because half of each pause is its meaning — an unreachable peer is not dialed
+again before its cooldown, a lost exchange rests before it is retried. Draws are the
+operating system's (`getrandom`); when it has none to give, the pause is the whole
+step, never a shorter one. Both are pure functions of the draw, so tests fix it. Exact
+request identity is untouched; no retry layer, token or hint was added — the existing
+budgets are the allowance and the node's `Capacity`/`Unavailable` refusals the
+pressure signal.
+
+**Measurements** (`backoff_tests::a_wave_of_refused_callers_thins_over_its_spread_and_takes_fewer_calls`,
+a seeded simulation: a thousand callers refused together by a service that serves fifty
+a millisecond, the default policy). The whole step: 10,500 calls in twenty waves whose
+tallest is 950, drained in 7,602 ms. The spread (SplitMix64, seeds 1–3): 2,046 / 2,039 /
+2,029 calls, tallest wave 109 / 89 / 82, drained in 69 / 71 / 83 ms.
+
+**Tests.** `backoff_tests::a_step_is_spread_over_itself_and_never_past_the_budget` (0 →
+nothing, the largest draw → the step, the middle → half; what remains of the clock caps
+it), the simulation above, `focal_wire::tests::a_peer_pause_is_spread_over_its_second_half`;
+the client and pool suites unchanged (the cooldown tests hold: a send within half the
+cooldown fails fast, and the peer is dialed again after the whole of it).

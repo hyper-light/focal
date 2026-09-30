@@ -836,7 +836,7 @@ impl PeerConnectionPool {
                         if attempt.saturating_add(1) == self.limits.attempts {
                             return Err(error);
                         }
-                        tokio::time::sleep(self.limits.retry_backoff).await;
+                        tokio::time::sleep(spread(self.limits.retry_backoff, entropy())).await;
                         continue;
                     }
                 };
@@ -891,7 +891,7 @@ impl PeerConnectionPool {
                     *cached = None;
                 }
                 if attempt.saturating_add(1) < self.limits.attempts {
-                    tokio::time::sleep(self.limits.retry_backoff).await;
+                    tokio::time::sleep(spread(self.limits.retry_backoff, entropy())).await;
                 }
             }
             Err(PeerSendError::Lost)
@@ -1066,7 +1066,7 @@ impl PeerConnectionPool {
                 Err(_) => {
                     // Every candidate failed: the announced address and each
                     // fresh one the name resolved to.
-                    task_slot.mark_unreachable(cooldown);
+                    task_slot.mark_unreachable(spread(cooldown, entropy()));
                     DialState::Failed
                 }
             };
@@ -1190,4 +1190,34 @@ fn increment(counter: &AtomicU64) {
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         Some(value.saturating_add(1))
     });
+}
+
+/// One past the largest draw: what a draw is measured against.
+const DRAWS: u128 = 1 << 64;
+/// A pause spread by equal jitter (the audit's F64): drawn uniformly
+/// between half of `delay` and the whole of it. Peers that lost one node
+/// at once would otherwise retry it, and dial it again after its cooldown,
+/// in step. Half the pause is kept whole because the pause has a meaning
+/// of its own — an unreachable peer is not dialed again before its
+/// cooldown, a lost exchange rests before it is retried — and the other
+/// half is the spread.
+pub(crate) fn spread(delay: Duration, random: u64) -> Duration {
+    let half = delay.checked_div(2).unwrap_or(Duration::ZERO);
+    let drawn = half
+        .as_nanos()
+        .saturating_mul(u128::from(random))
+        .checked_div(DRAWS)
+        .unwrap_or(0);
+    half.saturating_add(Duration::from_nanos(
+        u64::try_from(drawn).unwrap_or(u64::MAX),
+    ))
+}
+/// Sixty-four random bits from the operating system — and when it has none
+/// to give, the largest draw: the whole pause, never a shorter one.
+fn entropy() -> u64 {
+    let mut bytes = [0; 8];
+    match getrandom::fill(&mut bytes) {
+        Ok(()) => u64::from_le_bytes(bytes),
+        Err(_) => u64::MAX,
+    }
 }

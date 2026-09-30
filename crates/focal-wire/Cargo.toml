@@ -12,6 +12,7 @@ focal-memory = { version = "0.1.0", path = "../focal-memory", features = ["serde
 focal-timing = { version = "0.1.0", path = "../focal-timing" }
 focal-stream = { version = "0.1.0", path = "../focal-stream" }
 blake3.workspace = true
+getrandom.workspace = true
 postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true

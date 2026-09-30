@@ -17,6 +17,7 @@ serde_json.workspace = true
 serde_saphyr.workspace = true
 focal-platform = { version = "0.1.0", path = "../focal-platform" }
 blake3.workspace = true
+getrandom.workspace = true
 
 [dev-dependencies]
 focal-core = { version = "0.1.0", path = "../focal-core" }

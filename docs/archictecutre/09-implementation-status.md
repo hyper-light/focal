@@ -12241,3 +12241,19 @@ candidate holds the same at 3 receipts as at 515. Tests:
 `a_poll_with_nothing_to_acknowledge_is_a_read_and_the_node_renews_a_lease_past_its_half`,
 `a_poll_with_nothing_new_parks_for_a_page_and_holds_only_its_request`,
 `watch_client::idle_tail_polls_are_plain_reads_that_commit_nothing_and_take_no_ordinal`.
+
+### 2026-09-29 — F64: callers that failed together do not return together
+
+The participant's retry loop slept the capped exponential step whole (20, 40,
+80 … 500 ms), so every caller one leader loss, opening service or capacity
+refusal turned away came back at the same instant, each wave as tall as the
+last; the peer pool's retry pause and unreachable cooldown were fixed the same
+way. The step is now spread by full jitter — a wait drawn uniformly between
+nothing and the whole step, under the attempt, elapsed and refusal budgets as
+before — and the pool's pauses by equal jitter, from half the configured pause
+to the whole of it; the draw is the operating system's, and when it has none
+to give the pause is the whole step. A seeded simulation of a thousand callers
+refused together by a service serving fifty a millisecond: the whole step
+takes 10,500 calls in twenty waves (tallest 950) and drains in 7,602 ms; the
+spread takes 2,029–2,046 calls, its tallest wave 82–109, and drains in 69–83
+ms. Tests: `backoff_tests` (two), `a_peer_pause_is_spread_over_its_second_half`.

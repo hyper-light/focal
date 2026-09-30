@@ -183,7 +183,11 @@ unknown with the request retained, and a refusal is final even after an
 uncertain attempt because the owner resolves the request key before admission.
 A capacity refusal from the node admitted nothing, so the client resends the
 identical request up to three times with backoff and then reports the refusal
-itself; the journaled reference stays pending for a later exact retry.
+itself; the journaled reference stays pending for a later exact retry. Each
+pause is the capped exponential step spread by full jitter — drawn uniformly
+from nothing to the step (2026-09-29, the audit's F64) — so callers refused
+together do not return together; the attempt, elapsed and refusal budgets
+bound the retries as before.
 Only a committed receipt whose invocation and intent equal the journaled frame
 is recorded. Refusal categories map to the exit classes of
 [failure.rs](../../crates/focal-client/src/failure.rs): invalid input 2,

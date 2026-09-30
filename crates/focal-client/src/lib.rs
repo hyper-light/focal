@@ -52,6 +52,9 @@ pub use focal_wire::{
 pub use trace::{TraceEntry, TraceOutcome, TraceSink};
 pub use transport::*;
 #[cfg(test)]
+#[path = "backoff_tests.rs"]
+mod backoff_tests;
+#[cfg(test)]
 #[path = "native_client_tests.rs"]
 mod native_client_tests;
 #[cfg(test)]

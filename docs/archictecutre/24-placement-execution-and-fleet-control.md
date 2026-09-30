@@ -1451,6 +1451,10 @@ probe or a bounded control read that gives up neither abandons the dial
 nor makes the next caller start over from the dead address, and the
 dial's outcome — the cached connection, or the unreachable cooldown when
 every candidate failed — is recorded whether or not anyone still waits.
+The pool's retry pause and its cooldown are spread by equal jitter, a
+draw from half the configured pause to the whole of it (2026-09-29, the
+audit's F64), so peers that lost one node at once do not return to it in
+step; half of each pause is kept because it is the pause's meaning.
 (Revised 2026-09-13: the first shape awaited the announced address inline
 to the connector's deadline before trying the name; every caller's shorter
 deadline cancelled it, so a fleet whose pods all moved at once never

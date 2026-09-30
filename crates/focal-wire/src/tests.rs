@@ -3036,3 +3036,26 @@ async fn cold_calls_to_one_route_share_one_dial_and_a_stale_failure_forgets_noth
     server.close();
     task.await.unwrap().unwrap();
 }
+
+/// The audit's F64: a peer pause is spread over its second half — never
+/// shorter than half the configured pause, never longer than the whole.
+#[test]
+fn a_peer_pause_is_spread_over_its_second_half() {
+    let pause = Duration::from_millis(600);
+    assert_eq!(crate::peers::spread(pause, 0), Duration::from_millis(300));
+    let whole = crate::peers::spread(pause, u64::MAX);
+    assert!(
+        whole <= pause && whole >= pause - Duration::from_nanos(1),
+        "{whole:?}"
+    );
+    let middle = crate::peers::spread(pause, u64::MAX / 2);
+    assert!(
+        middle >= Duration::from_millis(450) - Duration::from_nanos(1)
+            && middle <= Duration::from_millis(450),
+        "{middle:?}"
+    );
+    assert_eq!(
+        crate::peers::spread(Duration::ZERO, u64::MAX),
+        Duration::ZERO
+    );
+}
