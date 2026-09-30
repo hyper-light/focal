@@ -16,9 +16,9 @@ ruling before work starts).
 | F01 | P1 | closed (a6cb86e) | 1 | [F01](#f01) |
 | F02 | P1 | in tree | 1 | [F02](#f02) |
 | F03 | P1 | open | 3 | — |
-| F04 | P1 | open | 2 | — |
-| F05 | P2 | open | 2 | — |
-| F06 | P1 | open | 2 | — |
+| F04 | P1 | in tree | 2 | [F04](#f04) |
+| F05 | P2 | in tree | 2 | [F05](#f05) |
+| F06 | P1 | in tree | 2 | [F06](#f06) |
 | F07 | P2 | in tree | 4 | [F07](#f07) |
 | F08 | P2 | in tree | 4 | [F08](#f08) |
 | F09 | P2 | in tree | 2 | [F09](#f09) |
@@ -813,3 +813,89 @@ millisecond round: `[Some, None, None, Some]`, closed at the deadline),
 that never speaks holds its connection while three others are answered — `200` with
 the page's text, `404`, `405` — within a second, not behind its two-second bound), the
 CLI metrics test unchanged.
+
+## F04
+
+**Cause.** The native journal's capacity counted catalogue entries and nothing ever left
+the catalogue: `record_delivered` marked a journal delivered and kept the entry, its
+frame and its reservation, so the default 256 was a cumulative-use cutoff — the audit's
+one-slot probe: `outstanding()` 0, usage 1, the next unrelated prepare `Capacity`.
+
+**Fix.** A reported operation is retirable: `record_delivered` (a committed receipt
+reported, or a closed refusal acknowledged) and `record_refusal` for a closed refusal
+(every kind but `Capacity`, which admitted nothing, keeps the frame for the exact retry
+and is never retirable) mark the entry with the order it was reported in; the operation
+stays answered from its journal. A claim that finds the journal full retires the
+operation reported longest ago: the identity moves from the live entries to the
+catalogue's `retired` table — with the intent it was bound to and how it ended
+(`NativeRetired::Committed { receipt digest, sequence }` or `Refused`) — durably first,
+then its directory (frame and journal) leaves. Retired identities are bounded to
+`max_operations`, the oldest leaving first, and are never another operation: `prepare`
+with a retired identity under any intent, `retry` and `record_*` answer `Retired`; a
+generated identity that is retired or live is passed over. The catalogue is schema 2
+(schema 1 is read once more and carried forward). Live storage is therefore bounded by
+the capacity and never by the work ever done; the exact-result contract is kept by the
+journal while it lasts, by the retired outcome after, and by the owner, which answers
+an exact retry from its receipt.
+
+**Tests.** `native_store::tests::a_reported_operation_retires_when_a_claim_needs_its_slot_and_its_identity_stays_taken`
+(five operations through a journal of two, each reported: the first three retire in
+order as the claims need their slots, the retired table holds two with the oldest
+gone, the last two are still answered; a retired identity under the same and another
+intent is `Retired`; a generated identity that is retired or live is passed over;
+reopening keeps it all), the adapted
+`prepare_claims_an_identity_once_then_retry_returns_the_exact_frame_and_binds_receipts`
+(a reported receipt and a closed refusal stay answered and are not outstanding; a
+capacity refusal stays for the exact retry, a later commit is recorded, and it is no
+result to acknowledge), the CLI and MCP native suites unchanged (`cli_native_a4`
+retries committed work after it was printed).
+
+## F05
+
+**Cause.** `prepare` durably claimed the identity (`ready = false`) before expansion; a
+failed resolution, read or compilation left the claim, invisible to `outstanding()`
+(which lists ready operations) and permanent — the audit's probe: an error, zero
+outstanding, usage one, nothing sent.
+
+**Fix.** A failed expansion releases its claim with the failure, under the same hold of
+the lock the claim was made under: nothing durable named the identity beyond the claim
+and no bytes ever left. A claim that never became ready (a crash after the claim, or
+after the frame but before ready) is swept when the store is next opened, together
+with any directory of an identity the catalogue no longer lists (a retirement
+interrupted before its directory left): under the lock a claim seen not ready is not
+being prepared, since preparation holds the lock throughout; a reported operation is
+never swept, only retired when a claim needs its slot. The crash boundaries
+(claimed, prepared, ready, retired) are the injected faults of the tests; a frame
+escapes only after durable ready, as before.
+
+**Tests.** `native_store::tests::a_failed_or_interrupted_claim_holds_no_slot` (a failed
+expansion releases the slot; crashes after the claim and after the frame are swept at
+open; a retirement interrupted before the removal is completed at open and the identity
+stays retired), `interrupted_initialization_resumes_without_minting_a_second_identity`
+unchanged (the same handle resumes a claim under the same intent).
+
+## F06
+
+**Cause.** `record_reply`, `record_delivered` and `record_refusal` each read the
+operation through `retry()` — its own open and release of the store lock — then opened
+the directory again to write a journal derived from what they had read; the transition
+was not serialised, so a stale `record_refusal` could overwrite a receipt another
+process had just recorded, and a delayed `record_reply` could regress a delivered
+journal to generation one.
+
+**Fix.** One hold of the lock per transition: `journaled(&directory, id, context)`
+reads the catalogue, the frame and the journal under the directory the caller opened,
+and the transition is judged against that state and written through the same handle —
+the journal's generation advances from the one read, a committed receipt is never
+replaced (`ReceiptMismatch`; `Retired` once the operation retired), a repeated
+identical receipt or acknowledgment is harmless, and a refusal recorded before the
+owner's receipt is replaced by it. The lock is the store's file lock (`open_native`, waited for briefly), not a
+process-local mutex.
+
+**Tests.** `native_store::tests::concurrent_transitions_never_lose_a_committed_receipt`
+(twenty-four rounds of two store handles racing a receipt-and-delivery against a closed
+refusal on separate threads: the receipt is recorded and delivered whichever came first
+— a refusal before it is replaced by the owner's receipt, one after it is judged against
+the receipt and refused — and the journal ends with the receipt, delivered, every time),
+the adapted `prepare_claims_...` (a refusal after a receipt is `ReceiptMismatch`; a
+different receipt is refused; the identical one is harmless).

@@ -12277,3 +12277,26 @@ at once as the admin socket admits operators. Tests: `metrics::tests`
 (`an_unobserved_session_says_so_and_carries_no_owner_side_numbers`,
 `a_round_closes_at_its_deadline_with_the_late_unobserved`,
 `a_silent_scrape_delays_no_other_and_the_text_is_the_page_s`).
+
+### 2026-09-29 — F04, F05, F06: the native journal's life ends by retirement
+
+The native journal counted catalogue entries and nothing ever left it, so the
+default 256 operations was a cumulative-use cutoff (the audit's probe: one slot,
+delivered, `outstanding()` 0, usage 1, the next prepare `Capacity`); a claim whose
+expansion failed held its slot unseen; and every transition read the operation
+under one hold of the lock and wrote under another, so a stale refusal could
+overwrite a committed receipt. Now an operation whose committed receipt or closed
+refusal has been reported stays answered from its journal until a claim needs its
+slot; then the one reported longest ago retires: its identity moves to the
+catalogue's bounded retired table (with its intent and how it ended, durably
+first) and its frame and journal leave; a retired identity is never another
+operation under any intent (`Retired`); a capacity refusal keeps the frame for the
+exact retry and never retires; a failed expansion releases its claim with the
+failure and a claim that never became ready is swept at the next open, as is a
+retirement's directory left by a crash; and every transition reads, judges and
+writes under one hold of the store's file lock. The catalogue is schema 2 (schema
+1 read once more). Tests:
+`a_reported_operation_retires_when_a_claim_needs_its_slot_and_its_identity_stays_taken`,
+`a_failed_or_interrupted_claim_holds_no_slot`,
+`concurrent_transitions_never_lose_a_committed_receipt`, and the adapted
+`prepare_claims_an_identity_once_then_retry_returns_the_exact_frame_and_binds_receipts`.

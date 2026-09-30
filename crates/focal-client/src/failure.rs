@@ -117,6 +117,7 @@ pub fn native_store(error: &NativeStoreError) -> Failure {
         | NativeStoreError::ReceiptMismatch => Failure::error("operation_conflict", 5),
         NativeStoreError::MissingOperation => Failure::error("not_found", 4),
         NativeStoreError::Incomplete => Failure::error("operation_conflict", 5),
+        NativeStoreError::Retired => Failure::error("operation_retired", 5),
         NativeStoreError::NotCommitted => Failure::outcome_unknown(),
     }
 }

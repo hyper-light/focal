@@ -176,7 +176,22 @@ Identity is durable before transmission
 ([native_store.rs](../../crates/focal-client/src/native_store.rs)): the store
 claims an `n1:` reference (the request identity, epoch one) under the
 canonical document, persists the compiled frame, fingerprint and minted object
-identities, and only then marks the operation ready. `Client::submit_native`
+identities, and only then marks the operation ready. An operation's life ends
+by retirement (2026-09-29, the audit's F04–F06): once its committed receipt or
+a closed refusal has been reported it stays answered from its journal until a
+claim needs its slot; then the one reported longest ago retires — its frame
+and journal leave the store, its identity stays taken in the catalogue's
+retired table, bounded to the journal's capacity with the oldest leaving
+first — so the journal is bounded by its capacity rather than by the work
+ever done, and an old reference is never another operation under any intent
+(`Retired` answers it; the owner answers an exact retry from its receipt). A
+capacity refusal admitted nothing and keeps the frame for the exact retry,
+never retirable. A claim whose expansion fails is released with the failure, and
+a claim that never became ready is swept when the store is next opened: no
+bytes ever left under it. Every transition — receipt, delivery, refusal —
+reads, judges and writes under one hold of the store's lock, so a committed
+receipt is never overwritten by a stale refusal and a delivery never
+regresses, whichever process speaks second. `Client::submit_native`
 resends the identical frame while the owner answers with a pending ticket; if
 the ticket never commits within the retry policy the outcome is reported
 unknown with the request retained, and a refusal is final even after an
