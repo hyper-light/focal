@@ -12142,3 +12142,25 @@ restores the 4096-claim history in 16 s under the derived ceiling and within its
 envelope; `native_session::tests::the_standard_recovery_work_is_derived_from_the_checkpoint_bounds`
 holds the configuration to the derivation. Record replay's per-record meters
 draw on the same ceiling as before.
+
+### 2026-09-29 — F46: a history admitted under a budget reopens under it
+
+The WAL's recovery index charged one chunk per append batch (the batch's frame
+locations plus 256 bytes) but, at reopen and at a checkpoint's rewrite, one
+chunk per record: a 256-record batch retained 8,448 index bytes when written
+and 81,920 when reopened, so a budget that admitted the history refused its
+recovery (the audit's reproduction: append `Ok`, reopen `Err(Capacity)` at an
+unchanged budget). A reopen now reads the durable prefix twice — first each
+frame's logical log from the record's leading field (`postcard::take_from_bytes`
+of the frozen layout's first field, nothing owned), then the records — and packs
+one exactly sized chunk a log (`RecoveryIndex::{count, pack, place, seal}`); the
+checkpoint's rewrite packs its replacement index from the counts it already
+knows; the scan lends every frame's bytes from one buffer that grows to the
+largest record and no further, instead of a vector per frame (the audit's 795
+allocations). The index therefore costs `32 × records + 256 × logs`, at most
+what the appends charged. `an_admitted_history_reopens_within_the_budget_that_admitted_it`
+(256 records of 64 bytes: the bytes retained after the appends, plus the scan's
+transient three records, admit the reopen, and the reopen retains no more) and
+`the_packed_index_never_costs_more_than_the_appends_across_groups_batches_and_checkpoints`
+(three logs, batches of 1–100 interleaved, a rewrite, a reopen; every log replays
+what was written).

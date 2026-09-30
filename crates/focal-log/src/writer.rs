@@ -253,7 +253,19 @@ impl IndexChunk {
 }
 struct GroupIndex {
     chunks: Vec<IndexChunk>,
+    /// Frames counted toward the chunk that will hold them, before it is
+    /// allocated.
+    expected: usize,
+    /// The chunk being packed, exactly `expected` frames.
+    open: Option<IndexChunk>,
     _allocation: Allocation,
+}
+impl GroupIndex {
+    fn records(&self) -> usize {
+        self.chunks.iter().fold(0usize, |total, chunk| {
+            total.saturating_add(chunk.frames.len())
+        })
+    }
 }
 struct RecoveryIndex {
     groups: BTreeMap<LogicalLogId, GroupIndex>,
@@ -287,9 +299,70 @@ impl RecoveryIndex {
             log,
             GroupIndex {
                 chunks: Vec::new(),
+                expected: 0,
+                open: None,
                 _allocation: allocation,
             },
         );
+        Ok(())
+    }
+    /// Count `frames` of `log` toward the one chunk that will hold the
+    /// group when it is packed.
+    fn count(&mut self, log: LogicalLogId, frames: usize) -> Result<(), LogError> {
+        self.ensure_group(log)?;
+        let group = self.groups.get_mut(&log).ok_or(LogError::Failed)?;
+        group.expected = group
+            .expected
+            .checked_add(frames)
+            .ok_or(LogError::Capacity)?;
+        Ok(())
+    }
+    /// Allocate every counted group's chunk at exactly its count: the index
+    /// of a history costs what its records cost — one chunk a group — never
+    /// what the batches that wrote it cost, so a history admitted under a
+    /// budget reopens under it (the audit's F46).
+    fn pack(&mut self) -> Result<(), LogError> {
+        for group in self.groups.values_mut() {
+            if group.expected == 0 {
+                continue;
+            }
+            let chunk = IndexChunk::allocate(&self.budget, group.expected, BudgetLane::Completion)?;
+            group
+                .chunks
+                .try_reserve(1)
+                .map_err(|_| LogError::Capacity)?;
+            group.open = Some(chunk);
+        }
+        Ok(())
+    }
+    /// Place one frame into its group's packed chunk. A frame beyond the
+    /// count is the durable prefix changing between the two readings — a
+    /// failure of the writer's own premise, never capacity.
+    fn place(&mut self, log: LogicalLogId, frame: FrameLocation) -> Result<(), LogError> {
+        let group = self.groups.get_mut(&log).ok_or(LogError::Failed)?;
+        let chunk = group.open.as_mut().ok_or(LogError::Failed)?;
+        if chunk.frames.len() >= group.expected {
+            return Err(LogError::Failed);
+        }
+        chunk.frames.push(frame);
+        Ok(())
+    }
+    /// Every packed chunk becomes its group's; one short of its count is the
+    /// same failure as one beyond it.
+    fn seal(&mut self) -> Result<(), LogError> {
+        for group in self.groups.values_mut() {
+            if let Some(chunk) = group.open.take() {
+                if chunk.frames.len() != group.expected {
+                    return Err(LogError::Failed);
+                }
+                self.records = self
+                    .records
+                    .checked_add(chunk.frames.len())
+                    .ok_or(LogError::Capacity)?;
+                group.chunks.push(chunk);
+            }
+            group.expected = 0;
+        }
         Ok(())
     }
     fn reserve_slot(&mut self, log: LogicalLogId, count: usize) -> Result<(), LogError> {
@@ -316,19 +389,6 @@ impl RecoveryIndex {
         }
         Ok(total)
     }
-    fn prepare(
-        &mut self,
-        log: LogicalLogId,
-        count: usize,
-        pending_chunks: usize,
-        lane: BudgetLane,
-    ) -> Result<IndexChunk, LogError> {
-        self.records.checked_add(count).ok_or(LogError::Capacity)?;
-        let chunk = IndexChunk::allocate(&self.budget, count, lane)?;
-        self.ensure_group(log)?;
-        self.reserve_slot(log, pending_chunks)?;
-        Ok(chunk)
-    }
     fn publish(&mut self, log: LogicalLogId, chunk: IndexChunk) -> Result<(), LogError> {
         if chunk.frames.is_empty() {
             return Ok(());
@@ -343,11 +403,6 @@ impl RecoveryIndex {
             .chunks
             .push(chunk);
         Ok(())
-    }
-    fn push(&mut self, log: LogicalLogId, frame: FrameLocation) -> Result<(), LogError> {
-        let mut chunk = self.prepare(log, 1, 1, BudgetLane::Completion)?;
-        chunk.frames.push(frame);
-        self.publish(log, chunk)
     }
 }
 struct Writer {
@@ -465,9 +520,16 @@ impl SharedWal {
                 .ok_or(LogError::Capacity)?,
         )?;
         let mut index = RecoveryIndex::new(budget.clone(), limits.max_groups);
-        let wal = Wal::open_indexed(directory, options.clone(), |record, location| {
-            index.push(record.log, location)
+        // Two readings of the durable prefix: the first counts each group's
+        // frames, the second places them into one chunk a group, sized
+        // exactly — the index costs what the history's records cost, never
+        // what the batches that wrote them cost (the audit's F46).
+        let wal = Wal::open_indexed(directory, options.clone(), |event| match event {
+            crate::ScanEvent::Log(log) => index.count(log, 1),
+            crate::ScanEvent::Counted => index.pack(),
+            crate::ScanEvent::Frame(record, location) => index.place(record.log, location),
         })?;
+        index.seal()?;
         drop(scratch);
         let stats = WalWriterStats {
             startup_scan_records: u64::try_from(index.records).map_err(|_| LogError::Capacity)?,
@@ -1162,13 +1224,24 @@ impl Writer {
             for log in self.leases.keys() {
                 index.ensure_group(*log)?;
             }
+            // The replacement index is packed to the counts the rewrite will
+            // produce: every other group its records, the rewritten log the
+            // checkpoint's — one chunk a group, sized exactly.
+            for (log, group) in &self.index.groups {
+                if *log != batch.log {
+                    index.count(*log, group.records())?;
+                }
+            }
+            index.count(batch.log, batch.encoded.len())?;
+            index.pack()?;
             // The replacement index is built while streaming the new generation,
             // before its durable fence can be installed. The old index stays live.
             let position =
                 self.wal
                     .rewrite_log_encoded(batch.log, &batch.encoded, |log, location| {
-                        index.push(log, location)
+                        index.place(log, location)
                     })?;
+            index.seal()?;
             self.index = index;
             Ok(position)
         })();

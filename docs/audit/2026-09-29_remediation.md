@@ -58,7 +58,7 @@ ruling before work starts).
 | F43 | P2 | open | 10 | — |
 | F44 | P2 | open | 10 | — |
 | F45 | P2 | open | 10 | — |
-| F46 | P1 | open | 8 | — |
+| F46 | P1 | in tree | 8 | [F46](#f46) |
 | F47 | P2 | open | 11 | — |
 | F48 | P1 | open | 9 | — |
 | F49 | P1 | open | 9 | — |
@@ -600,3 +600,25 @@ source 976 M / 27 M; 16 s in debug.
 (the old constant is below the used model and lookup work),
 `native_session::tests::the_standard_recovery_work_is_derived_from_the_checkpoint_bounds`,
 the recovery and replay suites unchanged.
+
+## F46
+
+**Cause.** `RecoveryIndex::push` built one `IndexChunk` per record at startup and at a
+checkpoint's rewrite (frame locations plus 256 bytes each), while appends built one per
+batch; the startup scan also allocated a vector per frame and an owned record per frame.
+A history that fitted its budget when written did not fit when reopened.
+
+**Fix.** Two readings of the durable prefix at open (`Wal::open_indexed` with
+`ScanEvent::{Log, Counted, Frame}`): `scan_logs` reads each record's leading field
+(`LogicalLogId`, the frozen layout's first field) and counts; `pack` allocates one chunk a
+log at exactly its count; `scan_indexed` places each frame; `seal` checks every count was
+met (a prefix that changed between the readings is the writer's failure, never capacity).
+The checkpoint rewrite packs its replacement index from the old index's counts and the
+checkpoint's records. `scan_frames` lends each frame from one buffer bounded by the
+largest record. The per-record `push`/`prepare` paths are gone. **Cost:** the prefix is
+read twice at open (sequential, checksummed both times); the format is unchanged.
+
+**Tests.** `an_admitted_history_reopens_within_the_budget_that_admitted_it` (the audit's
+shape; the old cost, 256 × 288 bytes, exceeds the retained bytes plus the scan's transient
+and would refuse), `the_packed_index_never_costs_more_than_the_appends_across_groups_batches_and_checkpoints`,
+the existing startup, compaction and corruption tests unchanged.

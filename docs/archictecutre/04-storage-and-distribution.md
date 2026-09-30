@@ -434,6 +434,14 @@ durable historical event archive; a current-state snapshot is not an event-histo
 Raft term/index snapshot metadata must remain consistent with compacted entries.
 Physical segments are reclaimed only when all resident logical logs permit it; rewrite
 live stragglers with an atomic segment-index update before unlinking old segments.
+The writer's recovery index — each logical log's frame locations — costs what the
+history's records cost, never what the batches that wrote them cost (2026-09-29, the
+audit's F46): a reopen reads the durable prefix twice, counting each log's frames from
+the record's leading field and then placing them into one exactly sized chunk a log,
+through one scan buffer that grows to the largest record and no further; a
+checkpoint's rewrite packs its replacement index the same way from the counts it
+knows. A history admitted under a budget therefore reopens under it, the reopen's
+only transient being that buffer (three records' bytes, reserved for the scan).
 
 ## 11. Range split, move, merge, and fencing
 

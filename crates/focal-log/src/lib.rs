@@ -169,13 +169,18 @@ impl Wal {
     /// Open an exclusively owned stream, validate the entire durable prefix, and
     /// discard only bytes that no successful append could have acknowledged.
     pub fn open(directory: impl AsRef<Path>, options: WalOptions) -> Result<Self, LogError> {
-        Self::open_indexed(directory, options, |_, _| Ok(()))
+        Self::open_indexed(directory, options, |_| Ok(()))
     }
 
+    /// Open, reading the durable prefix twice: first the logical log of
+    /// every frame (`ScanEvent::Log`, from the record's leading field, nothing
+    /// owned), then, after `ScanEvent::Counted`, every record with its
+    /// location — so an index can size each group exactly before it holds a
+    /// frame.
     fn open_indexed(
         directory: impl AsRef<Path>,
         options: WalOptions,
-        visitor: impl FnMut(Record, FrameLocation) -> Result<(), LogError>,
+        mut visitor: impl FnMut(ScanEvent) -> Result<(), LogError>,
     ) -> Result<Self, LogError> {
         if options.max_record_bytes == 0
             || options.max_record_bytes > u32::MAX as usize
@@ -236,7 +241,13 @@ impl Wal {
             sync_dir(&directory)?;
             position
         };
-        scan_indexed(&directory, &options, position, visitor)?;
+        scan_logs(&directory, &options, position, |log| {
+            visitor(ScanEvent::Log(log))
+        })?;
+        visitor(ScanEvent::Counted)?;
+        scan_indexed(&directory, &options, position, |record, location| {
+            visitor(ScanEvent::Frame(record, location))
+        })?;
         // An interrupted first initialization may have installed CURRENT before
         // the sentinel. Never admit appends until metadata-loss detection is durable.
         if !directory.join("INITIALIZED").exists() {
@@ -677,14 +688,53 @@ fn scan(
     scan_indexed(directory, options, fence, |record, _| visitor(record))
 }
 
+/// What an indexed open tells its visitor, in order: each frame's logical
+/// log, then that the count is complete, then each frame's record.
+pub(crate) enum ScanEvent {
+    Log(LogicalLogId),
+    Counted,
+    Frame(Record, FrameLocation),
+}
+/// Every durable record of the fenced prefix, decoded, with its location.
 fn scan_indexed(
     directory: &Path,
     options: &WalOptions,
     fence: DurablePosition,
     mut visitor: impl FnMut(Record, FrameLocation) -> Result<(), LogError>,
 ) -> Result<(), LogError> {
+    scan_frames(directory, options, fence, |bytes, location, path| {
+        let record = decode_record(bytes)
+            .map_err(|_| corrupt(path, location.byte, "invalid durable record"))?;
+        visitor(record, location)
+    })
+}
+/// The logical log of every durable record of the fenced prefix, read from
+/// the record's leading field alone: what a recovery index counts before it
+/// packs its groups, owning nothing of the records.
+fn scan_logs(
+    directory: &Path,
+    options: &WalOptions,
+    fence: DurablePosition,
+    mut visitor: impl FnMut(LogicalLogId) -> Result<(), LogError>,
+) -> Result<(), LogError> {
+    scan_frames(directory, options, fence, |bytes, location, path| {
+        let (log, _) = postcard::take_from_bytes::<LogicalLogId>(bytes)
+            .map_err(|_| corrupt(path, location.byte, "invalid durable record"))?;
+        visitor(log)
+    })
+}
+/// Every durable frame of the fenced prefix, in order, its bytes verified
+/// (length, sequence, predecessor, checksum) and lent from one buffer that
+/// grows to the largest record and no further.
+fn scan_frames(
+    directory: &Path,
+    options: &WalOptions,
+    fence: DurablePosition,
+    mut on_frame: impl FnMut(&[u8], FrameLocation, &Path) -> Result<(), LogError>,
+) -> Result<(), LogError> {
     let mut sequence = 0u64;
     let mut previous = 0u32;
+    let mut data = Vec::new();
     for segment in 0..=fence.segment {
         let path = segment_path(directory, fence.generation, segment);
         let mut file = File::open(&path).map_err(|e| {
@@ -743,7 +793,10 @@ fn scan_indexed(
                     "frame sequence or predecessor mismatch",
                 ));
             }
-            let mut data = vec![0u8; len];
+            data.clear();
+            data.try_reserve_exact(len)
+                .map_err(|_| LogError::Capacity)?;
+            data.resize(len, 0);
             file.read_exact(&mut data)?;
             let mut hash = crc32fast::Hasher::new();
             hash.update(header.get(..16).ok_or(LogError::Capacity)?);
@@ -752,10 +805,8 @@ fn scan_indexed(
             if checksum != read_u32(&header, 16..20)? {
                 return Err(corrupt(&path, offset, "durable frame checksum mismatch"));
             }
-            let record = decode_record(&data)
-                .map_err(|_| corrupt(&path, offset, "invalid durable record"))?;
-            visitor(
-                record,
+            on_frame(
+                &data,
                 FrameLocation {
                     generation: fence.generation,
                     segment,
@@ -765,6 +816,7 @@ fn scan_indexed(
                     previous,
                     checksum,
                 },
+                &path,
             )?;
             sequence = next;
             previous = checksum;

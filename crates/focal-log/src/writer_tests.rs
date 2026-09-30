@@ -646,3 +646,142 @@ fn a_batch_is_promised_its_volume_bytes_before_queueing_and_charged_after_its_fe
     assert_eq!(open.stats().outstanding, 0);
     assert!(open.stats().free.unwrap() < stats.free.unwrap());
 }
+
+/// The audit's F46: a history admitted under a budget reopens under it. The
+/// index of a reopened history costs what its records cost — one chunk a
+/// group — never what the batches that wrote it cost, so the bytes retained
+/// after a reopen are at most those retained after the appends; the reopen's
+/// own transient is the scan's buffer, three records at most.
+#[test]
+fn an_admitted_history_reopens_within_the_budget_that_admitted_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = options();
+    options.max_record_bytes = 4096;
+    options.max_batch_bytes = 64 * 1024;
+    options.segment_bytes = 1 << 20;
+    let ample = MemoryBudget::new(64 << 20, 16 << 20).unwrap();
+    let retained = {
+        let shared = SharedWal::open_with_budget(
+            dir.path(),
+            options.clone(),
+            WalWriterLimits::default(),
+            ample.clone(),
+        )
+        .unwrap();
+        let idle = ample.stats().used;
+        let mut lease = shared.lease(LogicalLogId([1; 16])).unwrap();
+        let records: Vec<Record> = (1..=256)
+            .map(|index| Record {
+                payload: vec![7; 64],
+                ..record(1, index)
+            })
+            .collect();
+        lease.append(&records).unwrap();
+        drop(lease);
+        let after = ample.stats().used;
+        assert!(after > idle, "the history is retained: {after} > {idle}");
+        after
+    };
+    assert_eq!(ample.stats().used, 0);
+    // The bytes that admitted the history, plus the scan's transient buffer,
+    // admit its reopen; what the reopen retains is at most what the appends
+    // retained.
+    let same = MemoryBudget::new(retained + 3 * options.max_record_bytes, 4096).unwrap();
+    let reopened = SharedWal::open_with_budget(
+        dir.path(),
+        options.clone(),
+        WalWriterLimits::default(),
+        same.clone(),
+    )
+    .unwrap_or_else(|error| panic!("{error:?} under {retained} + the scan buffer"));
+    assert_eq!(reopened.stats().unwrap().startup_scan_records, 256);
+    let after_reopen = same.stats().used;
+    assert!(
+        after_reopen <= retained,
+        "reopen retains {after_reopen} > appends {retained}"
+    );
+    let lease = reopened.lease(LogicalLogId([1; 16])).unwrap();
+    assert_eq!(records(&lease).len(), 256);
+}
+
+/// Across interleaved groups, batches of every size, a checkpoint's rewrite
+/// and a reopen, the index never costs more than the appends that wrote it,
+/// and every log replays exactly what was written.
+#[test]
+fn the_packed_index_never_costs_more_than_the_appends_across_groups_batches_and_checkpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = options();
+    options.max_record_bytes = 4096;
+    options.max_batch_bytes = 64 * 1024;
+    options.segment_bytes = 1 << 20;
+    let budget = MemoryBudget::new(64 << 20, 16 << 20).unwrap();
+    let (retained, expected) = {
+        let shared = SharedWal::open_with_budget(
+            dir.path(),
+            options.clone(),
+            WalWriterLimits::default(),
+            budget.clone(),
+        )
+        .unwrap();
+        let mut leases: Vec<_> = (1..=3u8)
+            .map(|log| shared.lease(LogicalLogId([log; 16])).unwrap())
+            .collect();
+        let batches: [(usize, &[u64]); 3] = [(0, &[1, 7, 64]), (1, &[3, 3, 3, 3]), (2, &[100])];
+        let mut written = vec![Vec::new(), Vec::new(), Vec::new()];
+        let mut next = [1u64; 3];
+        // Interleaved: one batch of each log in turn.
+        for round in 0..4 {
+            for (slot, sizes) in batches {
+                let Some(size) = sizes.get(round) else {
+                    continue;
+                };
+                let log = slot as u8 + 1;
+                let records: Vec<Record> = (0..*size)
+                    .map(|_| {
+                        let index = next[slot];
+                        next[slot] += 1;
+                        record(log, index)
+                    })
+                    .collect();
+                leases[slot].append(&records).unwrap();
+                written[slot].extend(records);
+            }
+        }
+        let after_appends = budget.stats().used;
+        // The rewrite of one log packs the replacement index: it costs no
+        // more than the appends did.
+        let mut checkpoint = record(1, 72);
+        checkpoint.kind = RecordKind::Snapshot;
+        leases[0].rewrite_checkpoint(&[checkpoint.clone()]).unwrap();
+        written[0] = vec![checkpoint];
+        let after_checkpoint = budget.stats().used;
+        assert!(
+            after_checkpoint <= after_appends,
+            "the rewrite retains {after_checkpoint} > the appends {after_appends}"
+        );
+        for (slot, lease) in leases.iter().enumerate() {
+            assert_eq!(records(lease), written[slot], "log {}", slot + 1);
+        }
+        drop(leases);
+        (budget.stats().used, written)
+    };
+    assert_eq!(budget.stats().used, 0);
+    let same = MemoryBudget::new(retained + 3 * options.max_record_bytes, 4096).unwrap();
+    let reopened = SharedWal::open_with_budget(
+        dir.path(),
+        options.clone(),
+        WalWriterLimits::default(),
+        same.clone(),
+    )
+    .unwrap_or_else(|error| panic!("{error:?} under {retained} + the scan buffer"));
+    assert!(
+        same.stats().used <= retained,
+        "{} > {retained}",
+        same.stats().used
+    );
+    assert_eq!(reopened.stats().unwrap().startup_scan_records, 1 + 12 + 100);
+    for (slot, expected) in expected.iter().enumerate() {
+        let lease = reopened.lease(LogicalLogId([slot as u8 + 1; 16])).unwrap();
+        assert_eq!(&records(&lease), expected, "log {} after reopen", slot + 1);
+    }
+}
