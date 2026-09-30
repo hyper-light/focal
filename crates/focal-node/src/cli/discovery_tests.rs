@@ -93,7 +93,7 @@ fn discovery_schema_is_exact_registry_projection_and_builtins_stay_compatible() 
         assert_eq!(catalog["engine"], engine_name(wire));
         let entries = catalog["operations"].as_array().unwrap();
         assert_eq!(entries.len(), operations::application(wire).len());
-        assert_eq!(entries.len(), if native { 43 } else { 34 });
+        assert_eq!(entries.len(), if native { 44 } else { 34 });
         for entry in entries {
             assert_eq!(entry["engine"], engine_name(wire), "{entry}");
             assert_eq!(entry["version"], if native { 2 } else { 1 }, "{entry}");

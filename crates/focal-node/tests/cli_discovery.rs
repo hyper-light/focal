@@ -184,7 +184,7 @@ fn the_native_catalogue_examples_and_validation_need_no_state_either() {
     assert_eq!(catalog["engine"], "native");
     let entries = catalog["operations"].as_array().unwrap();
     assert_eq!(entries.len(), native_descriptors().len());
-    assert_eq!(entries.len(), 43);
+    assert_eq!(entries.len(), 44);
     for entry in entries {
         assert_eq!(entry["engine"], "native", "{entry}");
         assert_eq!(entry["version"], 2, "{entry}");
