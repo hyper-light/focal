@@ -47,6 +47,7 @@ impl LocalHost {
         let budget =
             MemoryBudget::new(64 * 1024 * 1024, 8 * 1024 * 1024).map_err(LedgerError::from)?;
         let host_limits = limits.clone();
+        let host_budget = budget.clone();
         let native = node.session.activation().is_native();
         let (sender, receiver) = mpsc::sync_channel(32);
         let (liveness, ended) = watch::channel(());
@@ -84,8 +85,14 @@ impl LocalHost {
                     match work {
                         Work::Request(request, response, charge) => {
                             // A vanished caller cannot cancel an already admitted mutation.
-                            let reply =
-                                dispatch(&mut node, &mut views, &mut streams, *request, &limits);
+                            let reply = dispatch(
+                                &mut node,
+                                &mut views,
+                                &mut streams,
+                                *request,
+                                &limits,
+                                &host_budget,
+                            );
                             let _ = response.send(finish_response(reply, charge));
                         }
                         Work::Stop(response) => {
@@ -414,6 +421,7 @@ fn dispatch(
     streams: &mut crate::streams::Streams,
     verified: VerifiedRequest,
     limits: &WireLimits,
+    budget: &MemoryBudget,
 ) -> ResponseEnvelope {
     let principal = verified.peer().principal();
     let peer = verified.peer();
@@ -496,14 +504,28 @@ fn dispatch(
             Operation::Native { frame } => {
                 crate::native_ingress::admit_local(node, peer, request, frame)
             }
-            Operation::NativeRead(read) => crate::native_reads::local(
-                &mut node.session,
-                peer,
-                read,
-                request.request_id,
-                request.route_epoch,
-                limits,
-            )
+            // An archived object is read from the node's own custody (the
+            // audit's F11); every other read from the session's core.
+            Operation::NativeRead(read) => match &read.query {
+                NativeReadQuery::Archived(query) => crate::archive_reads::page(
+                    &node.content,
+                    budget,
+                    request.ledger,
+                    peer,
+                    request.route_epoch,
+                    read,
+                    query,
+                    limits,
+                ),
+                _ => crate::native_reads::local(
+                    &mut node.session,
+                    peer,
+                    read,
+                    request.request_id,
+                    request.route_epoch,
+                    limits,
+                ),
+            }
             .map(Response::NativeRead),
             Operation::NativeList(list) => crate::native_lists::local(
                 &mut node.session,

@@ -225,6 +225,7 @@ fn native_seed_row(object: &NativeObject) -> (&'static str, String) {
         NativeObject::Legacy(row) => ("Legacy", format!("{:?}", row.key)),
         NativeObject::Missing(reference) => ("Missing", format!("{reference:?}")),
         NativeObject::Retired(value) => ("Retired", id(ObjectId(value.claim.0))),
+        NativeObject::Archived(value) => ("Archived", id(ObjectId(value.root.0))),
     }
 }
 /// The compact table label of one native fact: its kind and the object it

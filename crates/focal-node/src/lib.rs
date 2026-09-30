@@ -82,6 +82,7 @@ mod managed_requests;
 mod participant_ingress;
 mod snapshot_feedback;
 
+mod archive_reads;
 mod ledger_summary;
 mod monitor_reads;
 pub mod native_activation;

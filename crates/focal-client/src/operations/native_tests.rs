@@ -13,7 +13,7 @@ fn fixture(name: &str) -> Value {
 
 #[test]
 fn native_catalog_is_sorted_versioned_and_every_field_has_a_schema_property() {
-    assert_eq!(native_descriptors().len(), 43);
+    assert_eq!(native_descriptors().len(), 44);
     let mut previous = "";
     for descriptor in native_descriptors() {
         assert!(previous < descriptor.name, "{}", descriptor.name);

@@ -2072,7 +2072,12 @@ impl RequestHandler for FleetService {
             } else if matches!(
                 request.request().operation,
                 Operation::Custody(_) | Operation::Upload(_) | Operation::Download { .. }
+            ) || matches!(
+                &request.request().operation,
+                Operation::NativeRead(read) if matches!(read.query, NativeReadQuery::Archived(_))
             ) {
+                // Content, and an archived object read from a bundle this
+                // node holds (the audit's F11), are the content owner's.
                 self.content.handle_accounted(&request).await
             } else if let Operation::Native { frame } = &request.request().operation
                 && inspect_native_frame(frame)

@@ -148,6 +148,16 @@ impl<'a> StructuralRecord<'a> {
     }
 }
 
+/// A frame a hydration reads rows from: a checkpoint (the whole core) or an
+/// archive bundle (one retired family, the audit's F11). What the index and
+/// the phased hydration need of either: the ledger it is of, the scan it was
+/// quoted, and its rows; the rest of a frame's declaration reaches the
+/// hydration as its header.
+pub(super) trait RowFrame<'a> {
+    fn ledger(&self) -> LedgerId;
+    fn quote(&self) -> InspectionQuote;
+    fn rows(&self, max_visits: usize) -> Result<RecordRows<'a>, Error>;
+}
 /// An exact key and borrowed body. The family label does not attest that the
 /// body decodes as that family or satisfies its references and history.
 pub struct EncodedRow<'a> {

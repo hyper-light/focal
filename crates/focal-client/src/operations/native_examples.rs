@@ -146,6 +146,9 @@ pub(super) fn native_raw_example(name: &str) -> Option<&'static str> {
         "artifact.get" => r#"{"id":"00000000000000000000000000000015"}"#,
         "validation.get" => r#"{"id":"00000000000000000000000000000011"}"#,
         "validation.context" => r#"{"validation":"00000000000000000000000000000011"}"#,
+        "archive.get" => {
+            r#"{"claim":"00000000000000000000000000000010","object":{"artifact":{"id":"00000000000000000000000000000015"}}}"#
+        }
         "ledger.standing" => "{}",
         "claim.wait" => {
             r#"{"claim":"00000000000000000000000000000010","until":"testament","timeout_ms":30000}"#

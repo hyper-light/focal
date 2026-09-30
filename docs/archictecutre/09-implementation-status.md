@@ -12364,3 +12364,18 @@ The CLI prints it by role with a `COMPLETE` flag; the peers skill is at version 
 `a_lineage_names_what_its_bounds_left_beyond_it`,
 `the_wait_observer_and_the_lineage_read_compose_bounded_exact_reads`, the peer-workflow
 suites.
+
+### 2026-09-29 — F11: a retired family is read from its bundle by every identity a participant kept
+
+`archive.get` / `get archived CLAIM [--artifact|--work|--diagnostic|--validation|--testament|--receipt ID]`
+follows an identity through its claim: a live family answers from the ledger, a retired
+one from the archive bundle its `Retired` continuation names
+(`NativeReadQuery::Archived`, `NativeObject::Archived`). The bundle is hydrated into a
+core of the family alone by the phased hydration a checkpoint restore runs
+(`recovery::hydrate_frame` over a `RowFrame`; `StructuralArchive::hydrate` →
+`ArchiveCore`) and read by the documents a live read builds, on the content owner
+(`archive_reads`), under the tenant scope; a validation comes with its evaluations and
+results. Denied access, custody the node lacks and an object the bundle never held are
+`Unauthorized`, `Unavailable` and `Missing`. Tests:
+`a_bundle_hydrates_into_a_core_of_the_family_read_as_the_live_one_was`,
+`cli_archive::a_retired_family_is_read_from_its_bundle_by_every_identity_a_participant_kept`.

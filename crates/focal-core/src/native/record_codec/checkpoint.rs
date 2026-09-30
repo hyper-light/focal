@@ -362,6 +362,18 @@ impl<'a> StructuralCheckpoint<'a> {
     }
 }
 
+impl<'a> inspect::RowFrame<'a> for StructuralCheckpoint<'a> {
+    fn ledger(&self) -> LedgerId {
+        self.header.ledger
+    }
+    fn quote(&self) -> InspectionQuote {
+        self.quote
+    }
+    fn rows(&self, max_visits: usize) -> Result<RecordRows<'a>, CodecError> {
+        StructuralCheckpoint::rows(self, max_visits)
+    }
+}
+
 fn iteration_work() -> Result<usize, CodecError> {
     // A next/initial seek may walk the bounded persistent directory height.
     // Include key comparisons and the terminating probe without a root pin or

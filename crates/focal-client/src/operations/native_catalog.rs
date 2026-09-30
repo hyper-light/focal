@@ -44,6 +44,9 @@ pub enum NativeInputKind {
     Correction,
     FollowUp,
     Wait,
+    /// A family's member by the claim and the identity kept: `{ "claim": ID,
+    /// "object": { "artifact": { "id": ID } } }`.
+    Archive,
 }
 macro_rules! native_descriptor {
     ($symbol:ident,$name:literal,$input:ident,$family:expr,$destructive:expr,$description:literal) => {
@@ -111,6 +114,13 @@ native_read!(
     ObjectId,
     Some(ObjectKind::Claim),
     "Read one claim's lineage as a bounded page of committed claims: the claim itself with its content, its cause ancestors up the caused_by chain, the corrections that invalidate it, the consultations that refine it and the children it caused. Every object is an exact fixed-prefix claim read at or after the first read's token; roles follow from each claim's cause and relations."
+);
+native_read!(
+    NATIVE_ARCHIVE_GET,
+    "archive.get",
+    Archive,
+    Some(ObjectKind::Claim),
+    "Read one object of a claim's family wherever the family is: the claim itself, or an artifact, work artifact, diagnostic, validation, testament or receipt of it by the identity you kept. A live family answers from the ledger; a retired one is read from the archive bundle its continuation names — verified, hydrated and read as the live core was — and returned as an archived object with the bundle and the prefix it claims. Denied tenant access, custody this node lacks and an object the bundle never held are told apart."
 );
 native_read!(
     NATIVE_CLAIM_WAIT,
@@ -436,6 +446,7 @@ native_descriptor!(
 /// Name order is part of catalog pagination and digest stability.
 pub fn native_descriptors() -> &'static [OperationDescriptor] {
     &[
+        NATIVE_ARCHIVE_GET,
         NATIVE_ARTIFACT_DIAGNOSTIC,
         NATIVE_ARTIFACT_FAIL,
         NATIVE_ARTIFACT_GET,

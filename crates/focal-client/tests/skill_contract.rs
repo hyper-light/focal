@@ -107,7 +107,7 @@ fn packaged_skills_pin_real_application_versions_and_complete_relative_resources
             match skill.name.as_str() {
                 "focal-claims" => 10,
                 "focal-peers" => 2,
-                "focal-evidence" => 8,
+                "focal-evidence" => 9,
                 "focal-validation" => 4,
                 "focal-cluster" => 18,
                 _ => 2,

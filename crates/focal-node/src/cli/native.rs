@@ -975,6 +975,31 @@ fn get(runtime: &tokio::runtime::Runtime, context: &Context, command: GetCommand
                 args.display.format,
             )
         }
+        GetCommand::Archived(args) => {
+            use focal_client::operations::{NativeArchiveDocument, NativeArchiveTarget};
+            let object = if let Some(id) = args.artifact {
+                NativeArchiveTarget::Artifact { id }
+            } else if let Some(id) = args.work {
+                NativeArchiveTarget::Work { id }
+            } else if let Some(id) = args.diagnostic {
+                NativeArchiveTarget::Diagnostic { id }
+            } else if let Some(id) = args.validation {
+                NativeArchiveTarget::Validation { id }
+            } else if let Some(id) = args.testament {
+                NativeArchiveTarget::Testament { id }
+            } else if let Some(id) = args.receipt {
+                NativeArchiveTarget::Receipt { id }
+            } else {
+                NativeArchiveTarget::Claim
+            };
+            (
+                NativeReadOperation::ArchiveGet(NativeArchiveDocument {
+                    claim: args.claim,
+                    object,
+                }),
+                args.output.format,
+            )
+        }
         GetCommand::Validation(args) => {
             if args.context {
                 let results_after = args

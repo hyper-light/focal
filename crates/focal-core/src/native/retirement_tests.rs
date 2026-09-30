@@ -735,3 +735,97 @@ fn a_retirement_never_takes_an_outcome_promised_to_a_live_report() {
         Ok(NativeStaging::Prepared { .. })
     ));
 }
+
+/// The audit's F11: a family's bundle hydrates into a core of the family
+/// alone, read as the live core was read before the family left — the same
+/// decoders, verification and custody recovery a checkpoint restore runs —
+/// at the prefix the bundle claims, holding nothing of any other family.
+#[test]
+fn a_bundle_hydrates_into_a_core_of_the_family_read_as_the_live_one_was() {
+    use super::authored::tests as a;
+    use record_codec::archive::StructuralArchive;
+    let directory = tempfile::tempdir().unwrap();
+    let store = ckpt::store(directory.path());
+    let mut core = a::core();
+    core.limits.plan_edges = 65_536;
+    a::publish(
+        &mut core,
+        a::create(1, vec![a::proposal(1, 11), a::proposal(2, 12)]),
+    );
+    let expected = binding_of(&core, 1);
+    a::publish(&mut core, a::input(2, NativeCommand::Cancel { expected }));
+    let expected = binding_of(&core, 1);
+    a::publish(
+        &mut core,
+        a::input(3, NativeCommand::ReleaseScope { expected }),
+    );
+    let (family, hash, bytes_len, through) = bundle_of(&core, id(1));
+    let quote = core
+        .archive_family_quote(&family, through, limits())
+        .unwrap();
+    let mut bytes = vec![0; quote.bytes];
+    let written = core
+        .archive_family_into(&family, through, &mut bytes, quote.visits)
+        .unwrap();
+    assert_eq!((written, bytes.len() as u64), (hash, bytes_len));
+    // What the live core says of the family before it leaves.
+    let live = core.native_claim(id(1)).unwrap();
+    let (live_binding, live_status, live_issuer) = (live.binding(), live.status(), live.issuer());
+    let live_definition = core
+        .native_definition(ValidationId::from_u128(11))
+        .unwrap()
+        .binding();
+    assert!(core.native_claim_content(id(1)).is_some());
+    let archive = StructuralArchive::inspect(
+        &bytes,
+        record_codec::InspectionLimits {
+            bytes: bytes.len(),
+            visits: 1_000_000_000,
+            rows: 100_000,
+            row_bytes: 32 << 20,
+        },
+    )
+    .unwrap();
+    assert_eq!(archive.header().members, vec![id(1)]);
+    let hydrated = archive
+        .hydrate(
+            RangeId(7),
+            ckpt::limits(core.limits),
+            ckpt::budget(),
+            &store,
+            &BuiltinNativeSchemas,
+        )
+        .unwrap();
+    assert_eq!(hydrated.digest(), hash);
+    let view = hydrated.core();
+    assert_eq!(view.native_sequence(), through);
+    let archived = view.native_claim(id(1)).unwrap();
+    assert_eq!(archived.binding(), live_binding);
+    assert_eq!(archived.status(), live_status);
+    assert_eq!(archived.issuer(), live_issuer);
+    assert_eq!(
+        view.native_definition(ValidationId::from_u128(11))
+            .unwrap()
+            .binding(),
+        live_definition
+    );
+    assert!(view.native_claim_content(id(1)).is_some());
+    // Nothing of the sibling family, and no accounting.
+    assert!(view.native_claim(id(2)).is_none());
+    assert!(
+        view.native_definition(ValidationId::from_u128(12))
+            .is_none()
+    );
+    assert!(view.native_outcome(f::request(f::ISSUER, 1)).is_none());
+    // The family leaves the live core behind its continuation; the bundle
+    // still answers for it.
+    core.retire_native_family(&family, hash, bytes_len, through)
+        .unwrap();
+    assert!(core.native_claim(id(1)).is_none());
+    let continuation = core.native_retired(id(1)).unwrap();
+    assert_eq!((continuation.bundle, continuation.bytes), (hash, bytes_len));
+    assert_eq!(
+        hydrated.core().native_claim(id(1)).unwrap().binding(),
+        live_binding
+    );
+}

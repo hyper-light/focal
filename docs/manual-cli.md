@@ -337,6 +337,9 @@ focal get artifact ARTIFACT_ID
 focal get artifact ARTIFACT_ID --output ./report.json
 focal get validation VALIDATION_ID
 focal get validation VALIDATION_ID --context
+focal get archived CLAIM_ID
+focal get archived CLAIM_ID --artifact ARTIFACT_ID
+focal get archived CLAIM_ID --validation VALIDATION_ID
 
 focal list claims
 focal list testaments

@@ -247,6 +247,31 @@ and length; the retirement record carries both, and the continuation keeps
 both, so any replica can locate the bundle without a catalog record: the
 continuations are the catalog.
 
+**Reading a retired family (the audit's F11, 2026-09-29).** A participant that
+kept an exact identity — an artifact, a validation, a testament, a receipt of a
+claim — follows it through the claim: `archive.get` (`get archived CLAIM …`)
+reads the claim, and where the claim answers with its `Retired` continuation,
+asks for the object from the bundle the continuation names
+(`NativeReadQuery::Archived { bundle, bytes, object }`). The read is the content
+owner's, never a session's: the bundle is fetched from this node's custody under
+the request's tenant scope (`CustodyStore::check_scope`), verified structurally
+(`StructuralArchive::inspect`), hydrated into a core of the family alone
+(`StructuralArchive::hydrate`: the same decoders, schema verification and custody
+recovery of its artifacts a checkpoint restore runs, through the shared phased
+hydration `recovery::hydrate_frame`, validated as a family — every member claim
+present — and laid out as one member at the prefix the bundle claims), and the
+object built by the documents a live read builds (`native_reads::object`), each
+returned as `NativeObject::Archived` with the bundle, the family's root and the
+prefix it claims; a validation comes with its evaluations in key order and their
+accepted results, the pages a live `validation.get` follows. What is told apart:
+denied tenant access is `Unauthorized`, custody this node does not hold (or holds
+corrupt) is `Unavailable`, a row the bundle never held is `Missing`; a live family
+answers unwrapped from the ledger, so the read says which it was, and its latency
+— a bundle's read and hydration, bounded by the bundle's inspection limits and
+the restore's work envelope — is never mistaken for a live read's. A plain read
+of an evaluation or a result whose claim retired answers with the claim's
+continuation instead of an absence, since its key names the claim.
+
 **The record and its application.** `FOCALRT1` version 2 (154 fixed
 bytes: magic, version, ledger, the native prefix the family was derived at,
 the root, the bundle's content root, its length, the prefix it claims, the

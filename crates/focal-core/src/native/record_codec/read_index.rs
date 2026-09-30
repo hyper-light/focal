@@ -112,8 +112,8 @@ pub(super) fn lookup_work() -> Result<usize, NativeError> {
         .ok_or(NativeError::Capacity("recovery index work"))
 }
 impl<'a> Index<'a> {
-    pub(super) fn build(
-        checkpoint: &checkpoint::StructuralCheckpoint<'a>,
+    pub(super) fn build<F: inspect::RowFrame<'a>>(
+        checkpoint: &F,
         limits: NativeLimits,
         budget: &MemoryBudget,
         parsing: &Meter,
@@ -195,8 +195,7 @@ impl<'a> Index<'a> {
                             NativeInvocation::Import => ArtifactRequest::Import,
                             _ => return Err(invalid()),
                         };
-                        if binding.ledger != checkpoint.header().ledger || binding.object.is_zero()
-                        {
+                        if binding.ledger != checkpoint.ledger() || binding.object.is_zero() {
                             return Err(invalid());
                         }
                         Some(Entry::new(

@@ -23,7 +23,7 @@ ruling before work starts).
 | F08 | P2 | in tree | 4 | [F08](#f08) |
 | F09 | P2 | in tree | 2 | [F09](#f09) |
 | F10 | P2 | in tree | 4 | [F10](#f10) |
-| F11 | P2 | open | 4 | — |
+| F11 | P2 | in tree | 4 | [F11](#f11) |
 | F12 | P1 | open | 5 | — |
 | F13 | P1 | open | 5 | — |
 | F14 | P1 | open | 6 | — |
@@ -1131,3 +1131,50 @@ ancestor; lists of a hundred each count what they named past the bound of sixty-
 carry their continuations; an ancestor unreadable at the prefix is named where the chain
 stops), the CLI and MCP peer-workflow suites (`lineage_ids`/`lineage` assert a complete
 observation), the catalogue's kind and schema tests, the skill contract.
+
+## F11
+
+**Cause.** A claim read answered a retired family with its `Retired` continuation, but
+every other exact identity a participant kept — an artifact, a validation, an evaluation,
+a result, a testament — read only the live core's rows and reported the object missing
+once the family had left; nothing on the participant surface followed an identity into
+the bundle, though the bytes were under custody and the operator could inspect them. A
+missing live object implied that accepted proof had never existed.
+
+**Fix.** The bundle is read as the live core was. In the core, the phased hydration a
+checkpoint restore runs is shared (`recovery::hydrate_frame` over a `RowFrame`: the
+checkpoint, or the archive), and `StructuralArchive::hydrate` builds a core of the family
+alone — the same decoders, schema verification and custody recovery of its artifacts,
+validated as a family (every member claim present, no accounting rows, which the
+inspection already refuses) and laid out as one member at the prefix the bundle claims
+(`ArchiveCore`, read-only by construction). On the wire, `NativeReadQuery::Archived
+{ bundle, bytes, object }` asks for one object of the bundle a continuation names, and
+`NativeObject::Archived` carries the object with the bundle, the family's root and the
+prefix it claims (`native_contract_version` 2, append-only). In the node the read is the
+content owner's, never a session's (`archive_reads`; `FleetService` routes it to the
+content host, the embedded host serves it from its store): the bundle is fetched under the
+request's tenant scope (`check_scope`), inspected, hydrated, and the object built by the
+documents a live read builds (`native_reads::object`); a validation comes with its
+evaluations in key order and their accepted results, the pages a live `validation.get`
+follows. What is told apart: denied tenant access is `Unauthorized`, custody this node
+does not hold or holds corrupt is `Unavailable` (never the caller's fault), a row the
+bundle never held is `Missing`. A plain read of an evaluation or a result whose claim
+retired answers with the claim's continuation, since its key names the claim. The client
+follows an identity through its claim (`archive.get`, `get archived CLAIM [--artifact |
+--work | --diagnostic | --validation | --testament | --receipt ID]`): the claim read says
+where the family is — live, and the object is read from the ledger unwrapped; retired,
+and it is read from the bundle as `Archived` — so online and archival reads are distinct
+operations with distinct latencies. The evidence skill (version 9) requires the tool.
+
+**Tests.** `retirement_tests::a_bundle_hydrates_into_a_core_of_the_family_read_as_the_live_one_was`
+(the family's claim, definition and content read from the hydrated core equal the live
+core's before retirement; nothing of the sibling family, no accounting; the live core keeps
+the continuation while the bundle still answers),
+`cli_archive::a_retired_family_is_read_from_its_bundle_by_every_identity_a_participant_kept`
+(the A1 two-party cycle, satisfied and released, retires; `get archived` follows the
+claim, the artifact by its content hash, the validation with its `Validated` evaluation and
+accepted result, and the testament, by the issuer and by the respondent; a live family
+answers unwrapped; an object the bundle never held is `Missing`; a tampered bundle chunk is
+`unavailable`; a kill and restart change none of it), the catalogue, schema, example and
+skill contract tests, the client suites (`NativeReadOutcome` and the read page cover the
+new object).

@@ -50,6 +50,7 @@ separately. Unknown outcomes retain the original expanded command.
 | `validation enter-whole-work ID --claim ID` | `validation.enter_whole_work` | Native: the issuer closes the increment cohort of the received testament and enters whole-work evaluation. |
 | `audit generate --claim ID`, `audit post ID` | `audit.generate`, `audit.post` | Native: the issuer generates and posts the closed claim's result testament. |
 | `monitor register\|rebind\|cancel` | `monitor.register`, `monitor.rebind`, `monitor.cancel` | Native: durable waits over committed claims with a logical-time deadline; rebinding follows a committed supersession; cancellation needs a terminal owner. |
+| `get archived CLAIM [--artifact\|--work\|--diagnostic\|--validation\|--testament\|--receipt ID]` | `archive.get` | Native: one object of a claim's family wherever the family is — from the ledger while it is live, from the archive bundle its `Retired` continuation names once it retired (the audit's F11); a validation comes with its evaluations and accepted results. |
 
 Each of the four families has singular `get` and plural `list` commands. List
 filters are optional. `get claim --source` enforces singular selection; use a list

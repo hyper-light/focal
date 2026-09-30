@@ -134,6 +134,8 @@ pub enum NativeReadOperation {
     ClaimLineage(NativeObjectDocument),
     #[serde(rename = "claim.wait")]
     ClaimWait(NativeWaitDocument),
+    #[serde(rename = "archive.get")]
+    ArchiveGet(NativeArchiveDocument),
 }
 /// The evaluator's view of one declaration at one prefix: the evaluation
 /// selected like `validation.begin` does (by `phase`, `slot` or `target`,
@@ -170,6 +172,7 @@ impl NativeReadOperation {
             Self::Standing(_) => &native_catalog::NATIVE_LEDGER_STANDING,
             Self::ClaimLineage(_) => &native_catalog::NATIVE_CLAIM_LINEAGE,
             Self::ClaimWait(_) => &native_catalog::NATIVE_CLAIM_WAIT,
+            Self::ArchiveGet(_) => &native_catalog::NATIVE_ARCHIVE_GET,
         }
     }
     pub fn name(&self) -> &'static str {
@@ -181,6 +184,43 @@ impl NativeReadOperation {
 #[serde(deny_unknown_fields)]
 pub struct NativeObjectDocument {
     pub id: String,
+}
+/// One object of a claim's family, wherever the family is (the audit's
+/// F11): the claim names the family, and `object` the member wanted — the
+/// claim itself by default. A live family answers from the ledger; a retired
+/// one from the archive bundle its continuation names, as `Archived`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeArchiveDocument {
+    pub claim: String,
+    #[serde(default)]
+    pub object: NativeArchiveTarget,
+}
+/// The member of a family an archive read asks for, by the identity a
+/// participant kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum NativeArchiveTarget {
+    #[default]
+    Claim,
+    Artifact {
+        id: String,
+    },
+    Work {
+        id: String,
+    },
+    Diagnostic {
+        id: String,
+    },
+    Validation {
+        id: String,
+    },
+    Testament {
+        id: String,
+    },
+    Receipt {
+        id: String,
+    },
 }
 
 /// The issuer replaces the claim's current holder: the committed receipt is
@@ -523,6 +563,7 @@ pub fn parse_native_read_json(name: &str, bytes: &[u8]) -> Result<NativeReadOper
         "ledger.standing" => document!(Standing),
         "claim.lineage" => document!(ClaimLineage),
         "claim.wait" => document!(ClaimWait),
+        "archive.get" => document!(ArchiveGet),
         _ => Err(InputError::Invalid("unknown native read operation")),
     }
 }

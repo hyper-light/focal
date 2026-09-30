@@ -87,6 +87,8 @@ pub(crate) fn locations(query: &NativeReadQuery) -> Vec<focal_core::native::Nati
             ]
         }
         NativeReadQuery::Events { .. } | NativeReadQuery::Standing => vec![L::Control],
+        // Served from custody, never from a session's core (`archive_reads`).
+        NativeReadQuery::Archived(_) => Vec::new(),
     }
 }
 
@@ -216,7 +218,10 @@ pub(crate) fn check_consistency(
     }
     Ok(())
 }
-fn object(reader: &Reader<'_>, reference: NativeObjectRef) -> Result<NativeObject, AccessError> {
+pub(crate) fn object(
+    reader: &Reader<'_>,
+    reference: NativeObjectRef,
+) -> Result<NativeObject, AccessError> {
     let core = reader.core;
     let found = match reference {
         NativeObjectRef::Claim(id) => core
@@ -244,12 +249,21 @@ fn object(reader: &Reader<'_>, reference: NativeObjectRef) -> Result<NativeObjec
                 (Some(declaration), Some(state)) => Some(NativeObject::Evaluation(Box::new(
                     docs::evaluation(declaration, core_key, state)?,
                 ))),
-                _ => None,
+                // The key names its claim: a claim that retired answers with
+                // its continuation, where the evaluation went (the audit's
+                // F11), never with an absence.
+                _ => core
+                    .native_retired(key.claim)
+                    .map(|value| NativeObject::Retired(docs::retired(key.claim, value))),
             }
         }
         NativeObjectRef::Result(key) => core
             .native_result(docs::result_key_of(key))
-            .map(|accepted| NativeObject::Result(Box::new(docs::result(accepted)))),
+            .map(|accepted| NativeObject::Result(Box::new(docs::result(accepted))))
+            .or_else(|| {
+                core.native_retired(key.evaluation.claim)
+                    .map(|value| NativeObject::Retired(docs::retired(key.evaluation.claim, value)))
+            }),
         NativeObjectRef::Artifact(id) => core
             .native_artifact(id)
             .map(|artifact| NativeObject::Artifact(Box::new(docs::artifact(artifact)))),
@@ -669,6 +683,9 @@ pub(crate) fn page(
             Ok(finish(reader, objects, None, visited))
         }
         NativeReadQuery::ValidationContext(query) => validation_context(reader, query, max_items),
+        // An archived object is read from custody by the content owner
+        // (`archive_reads`), never from a session's core.
+        NativeReadQuery::Archived(_) => Err(AccessError::UnsupportedOperation),
         NativeReadQuery::Events { after, limit } => {
             let prefix = core.native_sequence();
             let (mut sequence, mut ordinal) = match after {

@@ -805,6 +805,42 @@ fn handle_request(
     ) {
         return Err(AccessError::UnsupportedOperation);
     }
+    // An archived object is read from the bundle this node holds under the
+    // request's tenant scope (the audit's F11): the bundle's fetch and
+    // hydration are this owner's, bounded by the bundle's inspection limits.
+    if let Operation::NativeRead(read) = &request.operation
+        && let NativeReadQuery::Archived(query) = &read.query
+    {
+        owner.check_scope(
+            scope,
+            &crate::archive_reads::reference(request.ledger, query),
+        )?;
+        let page = crate::archive_reads::page(
+            owner.content(),
+            budget,
+            request.ledger,
+            verified.peer(),
+            request.route_epoch,
+            read,
+            query,
+            limits,
+        )?;
+        let reply = request.reply(Response::NativeRead(page));
+        let bytes = postcard::experimental::serialized_size(&reply)
+            .map_err(|_| AccessError::InvalidRequest)?;
+        if bytes > limits.max_frame_bytes as usize {
+            return Err(AccessError::Capacity);
+        }
+        let allocation = budget
+            .reserve(
+                BudgetKind::Query,
+                BudgetLane::Ordinary,
+                bytes.saturating_add(4096),
+            )
+            .map_err(|_| AccessError::Capacity)?
+            .commit();
+        return Ok(owner.accounted(reply, allocation));
+    }
     let output = match &request.operation {
         Operation::Download { max_bytes, .. } => {
             ((*max_bytes).min(limits.max_frame_bytes.saturating_sub(256)) as usize)

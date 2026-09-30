@@ -97,7 +97,7 @@ impl Work {
     pub fn for_limits(visits: usize, bytes: usize, rows: usize) -> Self {
         Self::for_shape(visits, bytes, rows)
     }
-    fn min(self, other: Self) -> Self {
+    pub(super) fn min(self, other: Self) -> Self {
         Self {
             parsing: self.parsing.min(other.parsing),
             source: self.source.min(other.source),
@@ -331,17 +331,126 @@ pub(crate) fn restore_with_work<S: NativeSchemaVerifier, R: NativeCustodyReader>
 ) -> Result<(Core<NativeState>, Envelope), NativeError> {
     let header = checkpoint.header();
     limits.native = checked_native_limits(header.ledger, limits.native)?;
+    // The rows are restored into one store, validated as a whole, then laid
+    // out per the recorded layout (25 §4): members keep their durable
+    // identities while the producer identity is the caller's fresh one.
+    let layout = checkpoint.layout(limits.native.max_ranges, &budget, lane)?;
+    let first_member = layout
+        .members()
+        .first()
+        .map(|member| member.id)
+        .ok_or(ContractError::InvalidManifest)?;
+    let hydrated = hydrate_frame(
+        checkpoint,
+        header,
+        first_member,
+        limits,
+        &budget,
+        store,
+        schemas,
+        lane,
+        work,
+        |view, meter, budget| {
+            read_validate::validate(
+                view,
+                header.ledger,
+                header.profile,
+                header.prefix,
+                limits.native,
+                meter,
+                budget,
+            )
+        },
+    )?;
+    let (rows, envelope) = hydrated.assemble(range, layout, &budget, lane)?;
+    Ok((
+        Core {
+            state: NativeState {
+                ledger: header.ledger,
+                profile: header.profile,
+                rows,
+                budget,
+            },
+            limits: limits.native,
+        },
+        envelope,
+    ))
+}
+/// Rows hydrated from a frame and validated as a whole, not yet laid out:
+/// what a checkpoint restore lays out per its recorded layout and an
+/// archive bundle's hydration (`archive::ArchiveCore`) lays out as one
+/// member.
+pub(super) struct Hydrated {
+    rows: RangeStore<Key, Row>,
+    meters: Meters,
+    allowed: Work,
+}
+impl Hydrated {
+    pub(super) fn assemble(
+        self,
+        range: RangeId,
+        layout: ranges::RangeLayout,
+        budget: &MemoryBudget,
+        lane: BudgetLane,
+    ) -> Result<(ranges::NativeRanges, Envelope), NativeError> {
+        let meters = self.meters;
+        let rows =
+            ranges::NativeRanges::from_store(range, layout, self.rows, budget, lane, |row| {
+                let work = read_dispatch::objects::copy_work(row)
+                    .map_err(|_| MemoryError::InvalidConfiguration("native row copy"))?;
+                meters
+                    .model
+                    .charge(work)
+                    .map_err(|_| MemoryError::InvalidConfiguration("native row copy work"))?;
+                prepare::copy(row)
+            })?;
+        let used = self.allowed.used(&meters);
+        Ok((
+            rows,
+            Envelope {
+                allowed: self.allowed,
+                used,
+            },
+        ))
+    }
+}
+/// The phased hydration of a frame's rows into one store: the dependency
+/// index, every phase in order under the meters, and `validate` over the
+/// whole before the store is given up. A checkpoint and an archive bundle
+/// hydrate the same way; what they are validated as differs.
+#[allow(clippy::too_many_arguments)] // The hydration's inputs, each its own owner's.
+pub(super) fn hydrate_frame<'a, F, S, R>(
+    frame: &F,
+    header: checkpoint::CheckpointHeader,
+    store_id: RangeId,
+    limits: Limits,
+    budget: &MemoryBudget,
+    store: &R,
+    schemas: &S,
+    lane: BudgetLane,
+    work: Work,
+    validate: impl FnOnce(
+        focal_memory::RangeHydrationView<'_, Key, Row>,
+        &Meter,
+        &MemoryBudget,
+    ) -> Result<(), NativeError>,
+) -> Result<Hydrated, NativeError>
+where
+    F: inspect::RowFrame<'a>,
+    S: NativeSchemaVerifier,
+    R: NativeCustodyReader,
+{
     let meters = Meters::new(work);
     let custody = Custody {
         store,
         schemas,
-        budget: &budget,
+        budget,
         work: &meters.model,
     };
     let index = read_index::Index::build(
-        checkpoint,
+        frame,
         limits.native,
-        &budget,
+        budget,
         &meters.parsing,
         &meters.lookup,
         lane,
@@ -365,23 +474,14 @@ pub(crate) fn restore_with_work<S: NativeSchemaVerifier, R: NativeCustodyReader>
         header,
         limits: limits.dispatch(),
         meters: &meters,
-        budget: &budget,
+        budget,
         custody: &custody,
         failure: Cell::new(None),
     };
     let expected_entries =
         usize::try_from(header.rows).map_err(|_| NativeError::Capacity("checkpoint row count"))?;
-    // The rows are restored into one store, validated as a whole, then laid
-    // out per the recorded layout (25 §4): members keep their durable
-    // identities while the producer identity is the caller's fresh one.
-    let layout = checkpoint.layout(limits.native.max_ranges, &budget, lane)?;
-    let first_member = layout
-        .members()
-        .first()
-        .map(|member| member.id)
-        .ok_or(ContractError::InvalidManifest)?;
     let mut owner = RangeStore::begin_hydration_partitioned_in(
-        first_member,
+        store_id,
         limits.native.range,
         budget.clone(),
         page_partition,
@@ -399,12 +499,12 @@ pub(crate) fn restore_with_work<S: NativeSchemaVerifier, R: NativeCustodyReader>
         if count == 0 {
             continue;
         }
-        let scan_work = checkpoint.quote().visits;
+        let scan_work = frame.quote().visits;
         meters
             .parsing
             .charge(scan_work)
             .map_err(read_evidence::codec)?;
-        let rows = checkpoint.rows(scan_work).map_err(read_evidence::codec)?;
+        let rows = frame.rows(scan_work).map_err(read_evidence::codec)?;
         let sources = source::Sources::new(rows, phase, &shared);
         owner = owner
             .insert_sources(count, sources, |row| {
@@ -423,41 +523,15 @@ pub(crate) fn restore_with_work<S: NativeSchemaVerifier, R: NativeCustodyReader>
     }
     let rows = owner
         .finish(header.prefix.0, |view| {
-            read_validate::validate(
-                view,
-                header.ledger,
-                header.profile,
-                header.prefix,
-                limits.native,
-                &meters.model,
-                &budget,
-            )
-            .map_err(|error| shared.refuse(error))
+            validate(view, &meters.model, budget).map_err(|error| shared.refuse(error))
         })
         .map_err(|error| shared.error(error))?;
-    let rows = ranges::NativeRanges::from_store(range, layout, rows, &budget, lane, |row| {
-        let work = read_dispatch::objects::copy_work(row).map_err(|error| shared.refuse(error))?;
-        meters
-            .model
-            .charge(work)
-            .map_err(|error| shared.refuse(read_evidence::codec(error)))?;
-        prepare::copy(row)
-    })
-    .map_err(|error| shared.error(error))?;
     // All decoder/index/workspace borrows end before exposing the sole owner.
     drop(shared);
     drop(index);
-    let used = allowed.used(&meters);
-    Ok((
-        Core {
-            state: NativeState {
-                ledger: header.ledger,
-                profile: header.profile,
-                rows,
-                budget,
-            },
-            limits: limits.native,
-        },
-        Envelope { allowed, used },
-    ))
+    Ok(Hydrated {
+        rows,
+        meters,
+        allowed,
+    })
 }

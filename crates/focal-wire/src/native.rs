@@ -527,6 +527,46 @@ pub enum NativeReadQuery {
     },
     Standing,
     SelectEvaluation(NativeSelectionQuery),
+    /// One object of a retired family, read from its archive bundle (the
+    /// audit's F11): the bundle a `Retired` continuation names, hydrated
+    /// as a checkpoint is restored and read at the prefix it claims. The
+    /// answer is an `Archived` object, or `Missing` when the bundle holds
+    /// no such row.
+    Archived(NativeArchiveQuery),
+}
+/// The bundle a retired claim's continuation names — its content root and
+/// length, an object of the ledger's tenant domain — and the object wanted
+/// from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeArchiveQuery {
+    pub bundle: ContentHash,
+    pub bytes: u64,
+    pub object: NativeObjectRef,
+}
+impl NativeArchiveQuery {
+    /// Whether the query names a bundle and an object a bundle can hold: a
+    /// family's rows, never the accounting, the events' index or legacy
+    /// frames.
+    pub fn valid(&self) -> bool {
+        self.bundle.0 != [0; 32]
+            && self.bytes != 0
+            && matches!(
+                self.object,
+                NativeObjectRef::Claim(_)
+                    | NativeObjectRef::Definition(_)
+                    | NativeObjectRef::Evaluation(_)
+                    | NativeObjectRef::Result(_)
+                    | NativeObjectRef::Artifact(_)
+                    | NativeObjectRef::Work(_)
+                    | NativeObjectRef::Diagnostic(_)
+                    | NativeObjectRef::Response(_)
+                    | NativeObjectRef::ResultTestament(_)
+                    | NativeObjectRef::Receipt(_)
+                    | NativeObjectRef::Monitor { .. }
+                    | NativeObjectRef::Event { .. }
+            )
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -579,6 +619,7 @@ impl NativeReadRequest {
                 !query.claim.is_zero() && !query.validation.is_zero()
             }
             NativeReadQuery::Events { limit, .. } => within(*limit),
+            NativeReadQuery::Archived(query) => query.valid(),
             NativeReadQuery::Outcome(_) | NativeReadQuery::Standing => true,
         };
         if valid {
@@ -1233,6 +1274,22 @@ pub enum NativeObject {
     /// The claim retired to the archive (26 §4): its rows left the core
     /// behind this continuation; the bundle holds them.
     Retired(NativeRetiredClaim),
+    /// An object read from a retired family's archive bundle (the audit's
+    /// F11): the object as the family's core held it at the prefix the
+    /// bundle claims, and the bundle it came from.
+    Archived(Box<NativeArchivedObject>),
+}
+/// One object of a retired family, read from its bundle: the bundle's
+/// content root and length, the family's root claim, the prefix the bundle
+/// claims (every object in it is at or below it), and the object as it was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeArchivedObject {
+    pub bundle: ContentHash,
+    pub bytes: u64,
+    pub root: ClaimId,
+    pub through: SessionSeq,
+    pub object: NativeObject,
 }
 /// The continuation of a retired claim: its final binding and status, the
 /// archive bundle holding its family's rows (an object of the ledger's

@@ -265,6 +265,47 @@ fn read_page(
                 NativeObjectRef::Diagnostic(artifact),
             ]))?
         }
+        NativeReadOperation::ArchiveGet(document) => {
+            use focal_client::operations::NativeArchiveTarget as Target;
+            let claim = ClaimId(id(&document.claim)?);
+            let object = match &document.object {
+                Target::Claim => NativeObjectRef::Claim(claim),
+                Target::Artifact { id: value } => NativeObjectRef::Artifact(ArtifactId(id(value)?)),
+                Target::Work { id: value } => NativeObjectRef::Work(ArtifactId(id(value)?)),
+                Target::Diagnostic { id: value } => {
+                    NativeObjectRef::Diagnostic(ArtifactId(id(value)?))
+                }
+                Target::Validation { id: value } => {
+                    NativeObjectRef::Definition(ValidationId(id(value)?))
+                }
+                Target::Testament { id: value } => {
+                    NativeObjectRef::Response(TestamentId(id(value)?))
+                }
+                Target::Receipt { id: value } => NativeObjectRef::Receipt(ReceiptId(id(value)?)),
+            };
+            // The claim says where its family is: live, and the object is
+            // read from the ledger; retired, and it is read from the bundle
+            // the continuation names (the audit's F11).
+            let located = linearizable(NativeReadQuery::Claim {
+                id: claim,
+                expand: NativeClaimExpand::default(),
+                after: None,
+            })?;
+            match located.objects.first() {
+                Some(NativeObject::Retired(retired)) => {
+                    let (bundle, bytes) = (retired.bundle, retired.bytes);
+                    linearizable(NativeReadQuery::Archived(NativeArchiveQuery {
+                        bundle,
+                        bytes,
+                        object,
+                    }))?
+                }
+                Some(NativeObject::Claim(_)) => {
+                    linearizable(NativeReadQuery::Objects(vec![object]))?
+                }
+                _ => located,
+            }
+        }
         NativeReadOperation::ValidationGet(document) => {
             let validation = ValidationId(id(&document.id)?);
             let definition =

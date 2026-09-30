@@ -229,9 +229,9 @@
     },
     {
       "name": "focal-evidence",
-      "version": 8,
+      "version": 9,
       "path": "focal-evidence/SKILL.md",
-      "blake3": "c563f964cf1e602341cfa1bbd7c02626fb73920c18e6c44021111209422c35cc",
+      "blake3": "e1bcb388496179874974eb05d69987c27686463fc06260c9890e860d2a963f3b",
       "references": [
         "references/workflow-contract.md"
       ],
@@ -385,6 +385,10 @@
       ],
       "required_admin_tools": [],
       "required_native_operations": [
+        {
+          "name": "archive.get",
+          "version": 2
+        },
         {
           "name": "artifact.diagnostic",
           "version": 2

@@ -21,7 +21,7 @@ fn every_engine_example_decodes_through_its_engine_matches_its_schema_and_round_
     for wire in [WireProfile::V1, WireProfile::Native] {
         assert_eq!(
             application(wire).len(),
-            if wire == WireProfile::V1 { 34 } else { 43 }
+            if wire == WireProfile::V1 { 34 } else { 44 }
         );
         for descriptor in application(wire) {
             let name = descriptor.name;
@@ -239,7 +239,7 @@ fn offline_selection_takes_the_request_then_the_only_catalogue_then_v1() {
         assert!(select_offline(false, descriptor.name).is_ok());
     }
     // Nineteen names are shared by both catalogues.
-    assert_eq!(union.len(), 34 + 43 - 19);
+    assert_eq!(union.len(), 34 + 44 - 19);
 }
 
 fn standing(principal: ParticipantId) -> NativeStanding {

@@ -77,7 +77,7 @@ discovery; this MCP adapter does not advertise a schema resource or lookup tool.
 | Receipt and evidence | `receipt.acquire`, `evidence.begin`, `artifact.register`, `artifact.submit`, `testament.submit`, `testament.receive` |
 | Peer validation | `validation.begin`, `validation.begin_increment`, `validation.submit`, `validation.complete` |
 | Payload transfer | `upload.begin`, `upload.append`, `upload.seal`, `upload.cancel`, `artifact.download` |
-| Exact object/result reads | `claim.get`, `testament.get`, `artifact.get`, `validation.get` |
+| Exact object/result reads | `claim.get`, `testament.get`, `artifact.get`, `validation.get`, `archive.get` (a claim's family wherever it is: live from the ledger, retired from its archive bundle) |
 | Coherent validation inspection | `validation.context` |
 | Recorded validator contracts | `validator.list`, `validator.get` |
 | Bounded claim observation | `claim.wait` |
@@ -226,6 +226,7 @@ ledger lists `ledger.standing` and never lists `request.reserve` or
 | Issuer and evaluator | `testament.receive`, `artifact.receive`, `artifact.reject`, `validation.begin`, `validation.report` (admission, increment or whole-work evaluations by `phase`), `validation.seal_increments`, `validation.enter_whole_work`, `receipt.adopt`, `claim.release_scope`, `audit.generate`, `audit.post` |
 | Durable waits | `monitor.register`, `monitor.rebind`, `monitor.cancel` |
 | Exact fixed-prefix reads | `claim.get`, `testament.get`, `artifact.get`, `validation.get`, `validation.context` (the evaluator's composed view: claim, definition, selected registration and evaluation, manifest with custody, results after a revision cursor, delivery result), `ledger.standing` |
+| Archived families | `archive.get` (`claim`, and `object`: the claim itself, or `artifact`, `work`, `diagnostic`, `validation` — with its evaluations and accepted results — `testament` or `receipt` by the identity kept; a retired family is read from the bundle its `Retired` continuation names, each object returned as `Archived` with the bundle and the prefix it claims; a live family answers from the ledger unwrapped; denied tenant access is `unauthorized`, custody the node lacks `unavailable`, an object the bundle never held `Missing`) |
 | Bounded lists | `claim.list`, `artifact.list`, `validation.list`, `evaluation.list`, `testament.list`, `receipt.list`, `monitor.list`, `event.list` |
 | Journal recovery | `request.inspect`, `request.retry`, `request.pending`, `request.acknowledge` |
 
