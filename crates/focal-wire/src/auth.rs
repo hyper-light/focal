@@ -82,16 +82,32 @@ impl AuthenticatedPeer {
     }
 }
 
+/// What the registry holds: the grants by certificate, and the connections
+/// each certificate has open on this node's listeners, so that a revocation
+/// closes them (the audit's F35: a grant withdrawn releases what waits on
+/// it) instead of leaving them to their idle timeout.
+#[derive(Default)]
+struct Grants {
+    grants: BTreeMap<[u8; 32], PeerGrant>,
+    live: BTreeMap<[u8; 32], Vec<(usize, quinn::Connection)>>,
+}
 /// Certificate grants and revocations are shared by active connection tasks.
 /// Clones must observe the same revocation table, so this Arc is intentional.
 #[derive(Clone)]
 pub struct PeerRegistry {
-    grants: Arc<RwLock<BTreeMap<[u8; 32], PeerGrant>>>,
+    grants: Arc<RwLock<Grants>>,
     max_peers: usize,
+}
+fn close_revoked(connections: Vec<(usize, quinn::Connection)>) {
+    for (_, connection) in connections {
+        connection.close(1u8.into(), b"revoked");
+    }
 }
 impl PeerRegistry {
     /// Replace a complete server-owned grant projection atomically. Validate
     /// before locking; existing requests must never see a partial rebuild.
+    /// The connections of a certificate the projection no longer grants are
+    /// closed.
     pub fn replace_grants(&self, next: BTreeMap<[u8; 32], PeerGrant>) -> Result<(), AccessError> {
         if next.len() > self.max_peers {
             return Err(AccessError::Capacity);
@@ -102,11 +118,25 @@ impl PeerRegistry {
             }
             validate_grant(grant)?;
         }
-        let previous = {
+        let (previous, revoked) = {
             let mut grants = self.grants.write().map_err(|_| AccessError::Unavailable)?;
-            std::mem::replace(&mut *grants, next)
+            let previous = std::mem::replace(&mut grants.grants, next);
+            let gone: Vec<[u8; 32]> = grants
+                .live
+                .keys()
+                .filter(|fingerprint| !grants.grants.contains_key(*fingerprint))
+                .copied()
+                .collect();
+            let revoked: Vec<_> = gone
+                .iter()
+                .filter_map(|fingerprint| grants.live.remove(fingerprint))
+                .collect();
+            (previous, revoked)
         };
         drop(previous);
+        for connections in revoked {
+            close_revoked(connections);
+        }
         Ok(())
     }
     pub fn new(max_peers: usize) -> Result<Self, AccessError> {
@@ -114,7 +144,7 @@ impl PeerRegistry {
             return Err(AccessError::Capacity);
         }
         Ok(Self {
-            grants: Arc::new(RwLock::new(BTreeMap::new())),
+            grants: Arc::new(RwLock::new(Grants::default())),
             max_peers,
         })
     }
@@ -126,24 +156,48 @@ impl PeerRegistry {
         validate_grant(&grant)?;
         let hash = certificate_fingerprint(der);
         let mut grants = self.grants.write().map_err(|_| AccessError::Unavailable)?;
-        if !grants.contains_key(&hash) && grants.len() >= self.max_peers {
+        if !grants.grants.contains_key(&hash) && grants.grants.len() >= self.max_peers {
             return Err(AccessError::Capacity);
         }
-        grants.insert(hash, grant);
+        grants.grants.insert(hash, grant);
         Ok(hash)
     }
+    /// Withdraw a certificate's grant and close the connections it holds:
+    /// nothing more is received on them, and what was waiting for a body on
+    /// one ends with it.
     pub fn revoke(&self, fingerprint: [u8; 32]) -> Result<(), AccessError> {
-        self.grants
-            .write()
-            .map_err(|_| AccessError::Unavailable)?
-            .remove(&fingerprint);
+        let revoked = {
+            let mut grants = self.grants.write().map_err(|_| AccessError::Unavailable)?;
+            grants.grants.remove(&fingerprint);
+            grants.live.remove(&fingerprint)
+        };
+        if let Some(connections) = revoked {
+            close_revoked(connections);
+        }
         Ok(())
     }
+    /// Whether the certificate is granted now, without copying its grant:
+    /// asked before anything is read for a stream.
+    pub fn granted(&self, fingerprint: [u8; 32]) -> Result<(), AccessError> {
+        if self
+            .grants
+            .read()
+            .map_err(|_| AccessError::Unavailable)?
+            .grants
+            .contains_key(&fingerprint)
+        {
+            Ok(())
+        } else {
+            Err(AccessError::Unauthorized)
+        }
+    }
+    /// The grant current now, for a request about to be dispatched.
     pub fn authenticate(&self, fingerprint: [u8; 32]) -> Result<AuthenticatedPeer, AccessError> {
         let grant = self
             .grants
             .read()
             .map_err(|_| AccessError::Unavailable)?
+            .grants
             .get(&fingerprint)
             .cloned()
             .ok_or(AccessError::Unauthorized)?;
@@ -151,6 +205,59 @@ impl PeerRegistry {
             grant,
             fingerprint: Some(fingerprint),
         })
+    }
+    /// A connection authenticated by `fingerprint` is held under it until
+    /// the returned guard is dropped, so that a revocation closes it; at
+    /// most `bound` connections a certificate, the listener's own bound.
+    pub fn attach(
+        &self,
+        fingerprint: [u8; 32],
+        connection: &quinn::Connection,
+        bound: usize,
+    ) -> Result<LiveConnection, AccessError> {
+        let mut grants = self.grants.write().map_err(|_| AccessError::Unavailable)?;
+        if !grants.grants.contains_key(&fingerprint) {
+            return Err(AccessError::Unauthorized);
+        }
+        let live = grants.live.entry(fingerprint).or_default();
+        if live.len() >= bound {
+            return Err(AccessError::Capacity);
+        }
+        live.try_reserve(1).map_err(|_| AccessError::Capacity)?;
+        let id = connection.stable_id();
+        live.push((id, connection.clone()));
+        Ok(LiveConnection {
+            registry: self.clone(),
+            fingerprint,
+            id,
+        })
+    }
+    /// The connections held under `fingerprint` now.
+    pub fn live_connections(&self, fingerprint: [u8; 32]) -> usize {
+        self.grants
+            .read()
+            .ok()
+            .and_then(|grants| grants.live.get(&fingerprint).map(Vec::len))
+            .unwrap_or(0)
+    }
+}
+/// A connection held under its certificate in the registry until dropped.
+pub struct LiveConnection {
+    registry: PeerRegistry,
+    fingerprint: [u8; 32],
+    id: usize,
+}
+impl Drop for LiveConnection {
+    fn drop(&mut self) {
+        let Ok(mut grants) = self.registry.grants.write() else {
+            return;
+        };
+        if let Some(live) = grants.live.get_mut(&self.fingerprint) {
+            live.retain(|(id, _)| *id != self.id);
+            if live.is_empty() {
+                grants.live.remove(&self.fingerprint);
+            }
+        }
     }
 }
 pub fn certificate_fingerprint(der: &[u8]) -> [u8; 32] {

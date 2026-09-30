@@ -216,9 +216,12 @@ impl NetworkListener {
             )
         }))
         .map_err(|_| WireError::Connection)??;
-        let admission = focal_wire::Admission::new(focal_wire::AdmissionLimits::for_connections(
-            limits.max_connections,
-        ))
+        // The listener's budget funds the request bodies it admits (the
+        // audit's F03), beside the charge of each connection.
+        let admission = focal_wire::Admission::new(
+            focal_wire::AdmissionLimits::for_connections(limits.max_connections),
+            budget.clone(),
+        )
         .map_err(|_| WireError::Limit)?;
         Ok(Self {
             endpoint: Some(endpoint),
@@ -291,9 +294,15 @@ impl NetworkListener {
             tokio::select! {
                 incoming = endpoint.accept() => {
                     let Some(incoming) = incoming else { break; };
-                    if connections.len() >= self.limits.max_connections { incoming.refuse(); continue; }
                     // A handshake takes a pending place, which no
-                    // authenticated connection uses.
+                    // authenticated connection uses; connections are bounded
+                    // by the admission's total, met after the replacement
+                    // rule, and enrollment by its slots — never by an outer
+                    // count that a full listener would refuse a replacement
+                    // with (the audit's F20). A source that has not proven
+                    // its address takes no place while half of them are
+                    // taken (RFC 9000 §8.1.2, Retry under load).
+                    if focal_wire::validate_address(&incoming, &self.admission) { let _ = incoming.retry(); continue; }
                     let Ok(pending) = self.admission.begin() else { incoming.refuse(); continue; };
                     let Ok(charge) = self.budget.reserve(BudgetKind::Control, BudgetLane::Ordinary, 64 * 1024) else { incoming.refuse(); continue; };
                     let data = data.clone();

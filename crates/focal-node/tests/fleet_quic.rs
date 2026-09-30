@@ -335,8 +335,14 @@ impl Fleet {
                 .unwrap();
             let tls = server_tls(identity.tls(), pki.roots(), &wire_limits()).unwrap();
             let server = Arc::new(
-                QuicServer::bind("127.0.0.1:0".parse().unwrap(), tls, peers, wire_limits())
-                    .unwrap(),
+                QuicServer::bind(
+                    "127.0.0.1:0".parse().unwrap(),
+                    tls,
+                    peers,
+                    wire_limits(),
+                    focal_memory::MemoryBudget::new(64 * 1024 * 1024, 16 * 1024 * 1024).unwrap(),
+                )
+                .unwrap(),
             );
             let serving = server.clone();
             let handler = host.clone();

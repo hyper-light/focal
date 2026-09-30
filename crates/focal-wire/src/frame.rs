@@ -197,22 +197,44 @@ pub async fn read_frame_payload_into<'a, R: AsyncRead + Unpin>(
 /// end: what one datagram of the least size a path of QUIC carries holds.
 pub const LEAST_PROGRESS: usize = 1_200;
 
+/// How long a payload of `bytes` may take to arrive over a path whose
+/// round trip is `rtt`, at the least a live sender delivers: two datagrams
+/// of the least size a round trip, the smallest congestion window QUIC
+/// keeps (RFC 9002 §7.2). A sender slower than that is not sending; a
+/// faster one is done sooner. The payload's buffer is held no longer than
+/// this (the audit's F03: occupancy is priced by the path, not by a fixed
+/// wait a byte at a time).
+pub fn residency(bytes: usize, rtt: std::time::Duration) -> std::time::Duration {
+    let round_trips = bytes.div_ceil(LEAST_PROGRESS.saturating_mul(2));
+    rtt.saturating_mul(u32::try_from(round_trips).unwrap_or(u32::MAX))
+}
+
 /// Read the payload of `header` and decode it, however long the path
 /// takes to carry it: a payload is given up when a `wait` has brought
-/// neither its end nor [`LEAST_PROGRESS`] more of it. So it is read in as
-/// many waits as it has datagrams at most, and a megabyte arrives over a
-/// path that carries a megabit in a second as over one that carries a
-/// thousand.
+/// neither its end nor [`LEAST_PROGRESS`] more of it, or when its
+/// [`residency`] is spent (`wait` at least). So it is read in as many
+/// waits as it has datagrams at most, a megabyte arrives over a path that
+/// carries a megabit in a second as over one that carries a thousand, and
+/// no buffer is held for longer than its bytes take at the least a live
+/// path delivers.
 pub async fn read_payload_arriving<R: AsyncRead + Unpin, T: DeserializeOwned>(
     reader: &mut R,
     header: FrameHeader,
     wait: std::time::Duration,
+    residency: std::time::Duration,
 ) -> Result<T, WireError> {
     let mut bytes = payload_buffer(header.payload_bytes())?;
     let mut filled = 0_usize;
+    let spent = tokio::time::Instant::now()
+        .checked_add(residency.max(wait))
+        .ok_or(WireError::Timeout)?;
     while filled < bytes.len() {
         let owed = filled.saturating_add(LEAST_PROGRESS).min(bytes.len());
-        let arrived = tokio::time::timeout(wait, async {
+        let remaining = spent.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(WireError::Timeout);
+        }
+        let arrived = tokio::time::timeout(wait.min(remaining), async {
             while filled < owed {
                 let rest = bytes.get_mut(filled..).ok_or(WireError::Limit)?;
                 let read = reader.read(rest).await?;

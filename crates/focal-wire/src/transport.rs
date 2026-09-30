@@ -1,6 +1,7 @@
 //! Mutually authenticated TLS 1.3 over Quinn. One bounded request occupies one
 //! bidirectional stream; slow work on one stream does not serialize other streams.
 use crate::*;
+use focal_memory::MemoryBudget;
 use quinn::{
     Connection, Endpoint,
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
@@ -297,14 +298,17 @@ pub struct QuicServer {
     admission: crate::Admission,
 }
 impl QuicServer {
+    /// `budget` funds the request bodies the server admits (the audit's
+    /// F03): a body is permitted from it before it is allocated.
     pub fn bind(
         address: SocketAddr,
         tls: quinn::ServerConfig,
         registry: PeerRegistry,
         limits: WireLimits,
+        budget: MemoryBudget,
     ) -> Result<Self, WireError> {
         let admission = crate::AdmissionLimits::for_connections(limits.max_connections);
-        Self::bind_admitting(address, tls, registry, limits, admission)
+        Self::bind_admitting(address, tls, registry, limits, admission, budget)
     }
     /// [`Self::bind`] with the admission bounds stated.
     pub fn bind_admitting(
@@ -313,9 +317,10 @@ impl QuicServer {
         registry: PeerRegistry,
         limits: WireLimits,
         admission: crate::AdmissionLimits,
+        budget: MemoryBudget,
     ) -> Result<Self, WireError> {
         limits.validate()?;
-        let admission = crate::Admission::new(admission).map_err(|_| WireError::Limit)?;
+        let admission = crate::Admission::new(admission, budget).map_err(|_| WireError::Limit)?;
         let endpoint = transport_setup(|| Ok(Endpoint::server(tls, address)?))?;
         Ok(Self {
             endpoint,
@@ -344,7 +349,12 @@ impl QuicServer {
                 Some(())=futures_util::StreamExt::next(&mut connections),if !connections.is_empty()=>{},
                 incoming=self.endpoint.accept()=>{
                     let Some(incoming)=incoming else{break};
-                    if connections.len() >= self.limits.max_connections {incoming.refuse();continue;}
+                    // Handshakes are bounded by their pending places and
+                    // connections by the admission's total, met after the
+                    // replacement rule (the audit's F20); a source that has
+                    // not proven its address takes no place while half of
+                    // them are taken (RFC 9000 §8.1.2, Retry under load).
+                    if validate_address(&incoming, &self.admission) { let _ = incoming.retry(); continue; }
                     let Ok(pending)=self.admission.begin() else {incoming.refuse();continue;};
                     let registry=self.registry.clone();let limits=self.limits.clone();let handler=handler.clone();
                     connections.push(async move {
@@ -384,7 +394,7 @@ pub async fn serve_admitted_connection<H: RequestHandler + Clone>(
     registry: PeerRegistry,
     limits: WireLimits,
     handler: H,
-    pending: crate::Pending<'_>,
+    pending: crate::Pending,
 ) -> Result<(), WireError> {
     transport_exchange(serve_authenticated_connection_inner(
         connection,
@@ -395,12 +405,20 @@ pub async fn serve_admitted_connection<H: RequestHandler + Clone>(
     ))
     .await
 }
+/// Whether `incoming` should prove its address before it takes a pending
+/// place: it has not yet, and half the places are taken.
+pub fn validate_address(incoming: &quinn::Incoming, admission: &crate::Admission) -> bool {
+    if incoming.remote_address_validated() || !incoming.may_retry() {
+        return false;
+    }
+    admission.stats().pending.saturating_mul(2) >= admission.limits().pending
+}
 async fn serve_authenticated_connection_inner<H: RequestHandler + Clone>(
     connection: Connection,
     registry: PeerRegistry,
     limits: WireLimits,
     handler: H,
-    pending: Option<crate::Pending<'_>>,
+    pending: Option<crate::Pending>,
 ) -> Result<(), WireError> {
     limits.validate()?;
     let authenticated = (|| {
@@ -442,6 +460,15 @@ async fn serve_authenticated_connection_inner<H: RequestHandler + Clone>(
             return Err(WireError::Access(AccessError::Capacity));
         }
     };
+    // Held under its certificate until served: a revocation closes it.
+    let _live = match registry.attach(fingerprint, &connection, limits.max_connections) {
+        Ok(live) => live,
+        Err(error) => {
+            connection.close(4u8.into(), b"capacity");
+            return Err(WireError::Access(error));
+        }
+    };
+    let lane = admitted.as_ref().map(crate::Admitted::lane);
     let handshake = async {
         let (mut send, mut recv) = connection
             .accept_bi()
@@ -499,27 +526,45 @@ async fn serve_authenticated_connection_inner<H: RequestHandler + Clone>(
                 let Ok((mut send,mut recv))=streams else{break};
                 if let Some(admitted) = &admitted { admitted.used(); }
                 if tasks.len() >= task_limit {let _=send.reset(2u8.into());let _=recv.stop(2u8.into());continue;}
-                let registry=registry.clone();let limits=limits.clone();let handler=handler.clone();let carrying=connection.clone();let held=held.clone();
+                let registry=registry.clone();let limits=limits.clone();let handler=handler.clone();let carrying=connection.clone();let held=held.clone();let lane=lane.clone();
                 tasks.spawn(async move {
                     // Each part of an exchange has its own wait: what is
                     // asked as it arrives, its handler the time of a
                     // request (`dispatch`), and its answer as long as the
                     // path takes to carry it.
                     let work=async {
-                        // Recheck registry on every stream, so revocation applies
-                        // to already established authenticated connections.
-                        let peer=registry.authenticate(fingerprint)?;
+                        // The grant is looked up twice: here, so that a
+                        // revoked certificate is refused before anything
+                        // is read for it, and once the whole request has
+                        // arrived, so that what is dispatched is
+                        // authorized by the grant current then, never by
+                        // one captured before its body (the audit's F35).
+                        registry.granted(fingerprint)?;
                         let header=tokio::time::timeout(limits.request_timeout,read_frame_header(&mut recv,FrameKind::Request,limits.max_frame_bytes))
                             .await.map_err(|_|WireError::Timeout)??;
-                        let request:RequestEnvelope=read_payload_arriving(&mut recv,header,limits.request_timeout).await?;
+                        // The body is permitted before any of it is
+                        // allocated (F03): the identity's share of the
+                        // listener's ingress, from its budget. A refusal
+                        // is a reset the peer sees as capacity.
+                        let ingress = match lane.as_ref().map(|lane| lane.take(header.payload_bytes(), usize::try_from(limits.max_frame_bytes).unwrap_or(usize::MAX))).transpose() {
+                            Ok(ingress) => ingress,
+                            Err(_) => {
+                                let _=send.reset(5u8.into());let _=recv.stop(5u8.into());
+                                return Err(WireError::Access(AccessError::Capacity));
+                            }
+                        };
+                        let request:RequestEnvelope=read_payload_arriving(&mut recv,header,limits.request_timeout,residency(header.payload_bytes(),carrying.rtt())).await?;
                         tokio::time::timeout(limits.request_timeout,require_end(&mut recv))
                             .await.map_err(|_|WireError::Timeout)??;
+                        let peer=registry.authenticate(fingerprint)?;
                         send.set_priority(request.operation.class().priority()).map_err(|_|WireError::Connection)?;
                         let response = if negotiated.accepts_protocol(request.protocol) {
                             dispatch_accounted(&handler,peer,request,&limits).await
                         } else {
                             OwnedResponse::new(request.reply(Response::Error(AccessError::UnsupportedProtocol)))
                         };
+                        // The body was consumed by its dispatch.
+                        drop(ingress);
                         let bytes=postcard::experimental::serialized_size(response.envelope()).map_err(|_|WireError::InvalidFrame)?;
                         carried(&carrying,&held,bytes,limits.request_timeout,send_owned_response(send,response,limits.max_frame_bytes)).await
                     };
@@ -1063,7 +1108,13 @@ impl QuicRemote {
         };
         let (mut recv, header) =
             carried(&self.connection, &self.capacity.held, bytes, period, asked).await?;
-        let response: ResponseEnvelope = read_payload_arriving(&mut recv, header, period).await?;
+        let response: ResponseEnvelope = read_payload_arriving(
+            &mut recv,
+            header,
+            period,
+            residency(header.payload_bytes(), self.connection.rtt()),
+        )
+        .await?;
         tokio::time::timeout(period, require_end(&mut recv))
             .await
             .map_err(|_| WireError::Timeout)??;

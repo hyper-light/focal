@@ -94,6 +94,11 @@ fn limits() -> WireLimits {
         ..Default::default()
     }
 }
+/// What a test server's listener funds its bodies from: sixty-four frames
+/// of the default limit, a quarter of them kept for the completion lane.
+fn budget() -> MemoryBudget {
+    MemoryBudget::new(64 * 1024 * 1024, 16 * 1024 * 1024).unwrap()
+}
 
 #[derive(Clone)]
 struct AccountedDownload {
@@ -363,7 +368,14 @@ async fn server(
     )
     .unwrap();
     let server = Arc::new(
-        QuicServer::bind("127.0.0.1:0".parse().unwrap(), tls, registry, limits()).unwrap(),
+        QuicServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            tls,
+            registry,
+            limits(),
+            budget(),
+        )
+        .unwrap(),
     );
     let running = server.clone();
     let task = tokio::spawn(async move { running.serve(handler).await });
@@ -434,6 +446,176 @@ async fn mutual_tls_tenant_isolation_live_revocation_and_independent_streams() {
     registry.revoke(fingerprint).unwrap();
     assert!(remote.request(&request(4)).await.is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+    server.close();
+    task.await.unwrap().unwrap();
+}
+
+/// A raw connection through the Hello, for streams a client would not
+/// send: a request header alone, or a body in pieces.
+async fn raw_connection(
+    pki: &Pki,
+    certificate: Vec<u8>,
+    key: Vec<u8>,
+    to: std::net::SocketAddr,
+) -> quinn::Connection {
+    let tls = client_tls(
+        TlsIdentity::from_pkcs8(vec![certificate], key),
+        vec![pki.ca.der().to_vec()],
+        &limits(),
+    )
+    .unwrap();
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint.set_default_client_config(tls);
+    let connection = endpoint.connect(to, "localhost").unwrap().await.unwrap();
+    let (mut send, mut receive) = connection.open_bi().await.unwrap();
+    write_frame(
+        &mut send,
+        FrameKind::Hello,
+        &Hello {
+            versions: vec![PROTOCOL_VERSION],
+            max_frame_bytes: limits().max_frame_bytes,
+            max_items: limits().max_items,
+        },
+        4096,
+    )
+    .await
+    .unwrap();
+    send.finish().unwrap();
+    let _: HelloReply = read_frame(&mut receive, FrameKind::HelloReply, 4096)
+        .await
+        .unwrap();
+    require_end(&mut receive).await.unwrap();
+    connection
+}
+/// A request frame's header announcing `payload` bytes.
+fn request_header(payload: u32) -> [u8; HEADER_BYTES] {
+    let mut header = [0; HEADER_BYTES];
+    header[..8].copy_from_slice(b"FOCALQ01");
+    header[8..10].copy_from_slice(&1u16.to_be_bytes());
+    header[10..12].copy_from_slice(&(FrameKind::Request as u16).to_be_bytes());
+    header[12..].copy_from_slice(&payload.to_be_bytes());
+    header
+}
+/// A wait on the listener's admission, charged to its changes.
+async fn admission_settles(
+    server: &QuicServer,
+    settled: impl Fn(&AdmissionStats) -> bool,
+) -> AdmissionStats {
+    let mut wait = focal_timing::ProgressDeadline::begin(
+        &[server.admission().changes],
+        u64::MAX,
+        Duration::from_secs(30),
+    );
+    loop {
+        let stats = server.admission();
+        if settled(&stats) {
+            return stats;
+        }
+        if let Err(spent) = wait.check(&[stats.changes]) {
+            panic!("the admission never settled: {spent}: {stats:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// The audit's F35: a grant revoked while a request's body is still
+/// arriving. The request is refused when it is complete — what is
+/// dispatched is authorized by the grant current then — and the
+/// revocation closes the certificate's connection, so nothing more is
+/// received on it and what waited for the body ends with it.
+#[tokio::test]
+async fn a_grant_revoked_while_a_body_arrives_dispatches_nothing_and_closes_the_connection() {
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(16).unwrap();
+    let fingerprint = registry
+        .register_certificate(&certificate, grant())
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        async move { response(verified.request()) }
+    });
+    let (server, task) = server(&pki, registry.clone(), handler).await;
+    let connection = raw_connection(&pki, certificate, key, server.local_addr().unwrap()).await;
+    assert_eq!(registry.live_connections(fingerprint), 1);
+    let body = encode_payload(&request(1), limits().max_frame_bytes).unwrap();
+    let (mut send, mut receive) = connection.open_bi().await.unwrap();
+    send.write_all(&request_header(body.len() as u32))
+        .await
+        .unwrap();
+    send.write_all(&body[..body.len() / 2]).await.unwrap();
+    // The half body is held under its permit before the revocation.
+    admission_settles(&server, |stats| stats.bytes == body.len()).await;
+    registry.revoke(fingerprint).unwrap();
+    // The connection is closed by the revocation: the rest of the body
+    // has nowhere to go, and the permit it held is given back.
+    let closed = tokio::time::timeout(Duration::from_secs(5), connection.closed())
+        .await
+        .expect("the revoked connection closes");
+    assert!(
+        matches!(
+            &closed,
+            quinn::ConnectionError::ApplicationClosed(close) if close.reason.as_ref() == b"revoked"
+        ),
+        "{closed:?}"
+    );
+    assert!(send.write_all(&body[body.len() / 2..]).await.is_err());
+    assert!(receive.read_to_end(64).await.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(registry.live_connections(fingerprint), 0);
+    let stats =
+        admission_settles(&server, |stats| stats.bytes == 0 && stats.connections == 0).await;
+    assert_eq!(stats.bytes, 0);
+    server.close();
+    task.await.unwrap().unwrap();
+}
+
+/// The audit's F35, the other order: a body that completes after the
+/// grant was withdrawn but before the close reaches its stream is refused
+/// at dispatch by the grant current then. The registry is asked again
+/// once the whole request has arrived; the early check alone would have
+/// dispatched it.
+#[tokio::test]
+async fn a_complete_request_is_authorized_by_the_grant_current_at_dispatch() {
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(16).unwrap();
+    let fingerprint = registry
+        .register_certificate(&certificate, grant())
+        .unwrap();
+    let revoking = registry.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    // The handler is where a dispatched request lands; the registry's
+    // grant is withdrawn by the first request while it runs, and the
+    // second request, sent on the same connection before the close, must
+    // never land.
+    let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        let revoking = revoking.clone();
+        async move {
+            if verified.request().request_id == RequestId::from_u128(1) {
+                revoking.revoke(fingerprint).unwrap();
+            }
+            response(verified.request())
+        }
+    });
+    let (server, task) = server(&pki, registry.clone(), handler).await;
+    let connector = connector(&pki, certificate, key);
+    let remote = connector
+        .connect(server.local_addr().unwrap(), "localhost")
+        .await
+        .unwrap();
+    // The first request revokes the grant from inside the handler: its
+    // own answer is lost with the connection, and nothing after it is
+    // served.
+    let first = remote.request(&request(1)).await;
+    assert!(first.is_err(), "{first:?}");
+    assert!(remote.request(&request(2)).await.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(registry.live_connections(fingerprint), 0);
     server.close();
     task.await.unwrap().unwrap();
 }
@@ -1658,7 +1840,14 @@ async fn narrow_path_carries_a_megabyte_that_takes_longer_than_a_request_is_give
     )
     .unwrap();
     let server = Arc::new(
-        QuicServer::bind("127.0.0.1:0".parse().unwrap(), tls, registry, wire.clone()).unwrap(),
+        QuicServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            tls,
+            registry,
+            wire.clone(),
+            budget(),
+        )
+        .unwrap(),
     );
     let running = server.clone();
     let task = tokio::spawn(async move { running.serve(handler).await });
@@ -2144,6 +2333,7 @@ async fn multiplexed_connection_cannot_bypass_data_alpn_or_client_identity() {
                 server_tls,
                 registry,
                 limits(),
+                budget(),
             )
             .unwrap(),
         );
@@ -2196,6 +2386,7 @@ fn quic_server_bind_contains_missing_driver_failure() {
                     tls,
                     PeerRegistry::new(1).unwrap(),
                     limits(),
+                    budget(),
                 )
             })
         }));
@@ -2703,6 +2894,7 @@ mod admission {
                 registry,
                 limits(),
                 admission,
+                budget(),
             )
             .unwrap(),
         );
@@ -2716,6 +2908,7 @@ mod admission {
         AdmissionLimits {
             pending: 8,
             identities: 8,
+            connections: 16,
             per_node: 4,
             per_participant: 2,
         }
@@ -2748,17 +2941,23 @@ mod admission {
     #[test]
     fn pending_places_are_bounded_and_given_back() {
         assert_eq!(
-            Admission::new(AdmissionLimits {
-                pending: 0,
-                ..bounds()
-            })
+            Admission::new(
+                AdmissionLimits {
+                    pending: 0,
+                    ..bounds()
+                },
+                budget()
+            )
             .err(),
             Some(AdmissionRefusal::InvalidLimits)
         );
-        let admission = Admission::new(AdmissionLimits {
-            pending: 2,
-            ..bounds()
-        })
+        let admission = Admission::new(
+            AdmissionLimits {
+                pending: 2,
+                ..bounds()
+            },
+            budget(),
+        )
         .unwrap();
         let first = admission.begin().unwrap();
         let second = admission.begin().unwrap();
@@ -2776,11 +2975,139 @@ mod admission {
             AdmissionLimits {
                 pending: 32,
                 identities: 128,
+                connections: 128,
                 per_node: 4,
                 per_participant: 16,
             }
         );
         assert_eq!(AdmissionLimits::for_connections(1).pending, 1);
+    }
+
+    /// The audit's F20: the connections held in all are bounded after the
+    /// replacement rule. With the listener full, an identity at its own
+    /// bound still reaches its replacement; only a connection that would
+    /// be one more is refused, typed and counted.
+    #[tokio::test]
+    async fn a_full_listener_still_replaces_an_identity_s_own_connection() {
+        let pki = Pki::new();
+        let (first_certificate, first_key) = pki.issue(false);
+        let (second_certificate, second_key) = pki.issue(false);
+        let registry = PeerRegistry::new(16).unwrap();
+        registry
+            .register_certificate(&first_certificate, grant())
+            .unwrap();
+        let mut second = grant();
+        second.principal = ParticipantId::from_u128(2);
+        registry
+            .register_certificate(&second_certificate, second)
+            .unwrap();
+        // Three connections in all; a participant holds two.
+        let (server, task) = admitting(
+            &pki,
+            registry,
+            AdmissionLimits {
+                connections: 3,
+                ..bounds()
+            },
+        )
+        .await;
+        let address = server.local_addr().unwrap();
+        let first = connector(&pki, first_certificate, first_key);
+        let second = connector(&pki, second_certificate, second_key);
+        let first_a = first.connect(address, "localhost").await.unwrap();
+        let first_b = first.connect(address, "localhost").await.unwrap();
+        let second_a = second.connect(address, "localhost").await.unwrap();
+        assert!(
+            serves(&first_a, 1).await && serves(&first_b, 2).await && serves(&second_a, 3).await
+        );
+        assert_eq!(held(&server, 3).await.connections, 3);
+        // The second identity, under its own bound, would be one more:
+        // refused at its handshake, and the three it did not displace
+        // serve on.
+        assert!(second.connect(address, "localhost").await.is_err());
+        let stats = held(&server, 3).await;
+        assert_eq!(stats.refused_connections, 1);
+        assert!(serves(&first_a, 5).await && serves(&second_a, 6).await);
+        // The first identity, at its bound, replaces the connection it
+        // used least recently although the listener is full.
+        let first_c = first.connect(address, "localhost").await.unwrap();
+        assert!(serves(&first_c, 7).await);
+        let stats = held(&server, 3).await;
+        assert_eq!(stats.replaced, 1);
+        assert!(!serves(&first_b, 8).await, "the least used was replaced");
+        assert!(serves(&first_a, 9).await);
+        drop((first_a, first_b, first_c, second_a));
+        held(&server, 0).await;
+        server.close();
+        task.await.unwrap().unwrap();
+    }
+
+    /// The audit's F03: a body is permitted before it is allocated, within
+    /// its identity's share of the listener's budget. A header announcing
+    /// the largest frame holds a permit for it while nothing arrives; a
+    /// second such header from the same identity is refused for its share,
+    /// typed and counted, and the permit is given back with the stream.
+    #[tokio::test]
+    async fn a_body_is_permitted_before_it_is_allocated_within_the_identity_s_share() {
+        let pki = Pki::new();
+        let (certificate, key) = pki.issue(false);
+        let registry = PeerRegistry::new(16).unwrap();
+        registry
+            .register_certificate(&certificate, grant())
+            .unwrap();
+        let frame = limits().max_frame_bytes;
+        // A budget of one frame and a little: one body's permit fits it,
+        // and one identity's share of it is the frame.
+        let (tls_certificate, tls_key) = pki.issue(true);
+        let tls = server_tls(
+            TlsIdentity::from_pkcs8(vec![tls_certificate], tls_key),
+            vec![pki.ca.der().to_vec()],
+            &limits(),
+        )
+        .unwrap();
+        let budget = MemoryBudget::new(frame as usize + 64 * 1024, 0).unwrap();
+        let server = Arc::new(
+            QuicServer::bind_admitting(
+                "127.0.0.1:0".parse().unwrap(),
+                tls,
+                registry,
+                limits(),
+                bounds(),
+                budget.clone(),
+            )
+            .unwrap(),
+        );
+        let running = server.clone();
+        let handler: Arc<dyn RequestHandler> =
+            Arc::new(|verified: VerifiedRequest| async move { response(verified.request()) });
+        let task = tokio::spawn(async move { running.serve(handler).await });
+        let connection = raw_connection(&pki, certificate, key, server.local_addr().unwrap()).await;
+        let (mut first, _first_receive) = connection.open_bi().await.unwrap();
+        first.write_all(&request_header(frame)).await.unwrap();
+        let stats = admission_settles(&server, |stats| stats.bytes == frame as usize).await;
+        assert_eq!(stats.refused_bytes, 0);
+        // The permit is what the budget holds for the body, before a byte
+        // of it arrived.
+        assert!(
+            budget.stats().used >= frame as usize,
+            "{:?}",
+            budget.stats()
+        );
+        // A second body of a frame would take more than the identity's
+        // share: refused before any allocation, the stream reset.
+        let (mut second, mut second_receive) = connection.open_bi().await.unwrap();
+        second.write_all(&request_header(frame)).await.unwrap();
+        let stats = admission_settles(&server, |stats| stats.refused_bytes == 1).await;
+        assert_eq!(stats.bytes, frame as usize);
+        assert!(second_receive.read_to_end(64).await.is_err());
+        // The first stream ends without its body: its permit is given back.
+        drop(first);
+        let stats = admission_settles(&server, |stats| stats.bytes == 0).await;
+        assert_eq!(stats.refused_bytes, 1);
+        assert!(budget.stats().used < frame as usize);
+        drop(connection);
+        server.close();
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]

@@ -623,9 +623,17 @@ impl MetricsSnapshot {
         for (bound, refused) in [
             ("handshakes", self.listener.refused_pending),
             ("identities", self.listener.refused_identities),
+            ("connections", self.listener.refused_connections),
+            ("bytes", self.listener.refused_bytes),
+            ("memory", self.listener.refused_memory),
         ] {
             text.labeled("focal_listener_refused_total", &[("bound", bound)], refused);
         }
+        text.gauge(
+            "focal_listener_ingress_bytes",
+            "Bytes of request bodies permitted to the listener's identities and not yet given back.",
+            self.listener.bytes,
+        );
         if !self.peer_rtts.is_empty() {
             text.header(
                 "focal_peer_rtt_ms",

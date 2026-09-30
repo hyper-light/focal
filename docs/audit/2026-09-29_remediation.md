@@ -15,7 +15,7 @@ ruling before work starts).
 |---|---|---|---|---|
 | F01 | P1 | closed (a6cb86e) | 1 | [F01](#f01) |
 | F02 | P1 | in tree | 1 | [F02](#f02) |
-| F03 | P1 | open | 3 | — |
+| F03 | P1 | in tree | 3 | [F03](#f03) |
 | F04 | P1 | in tree | 2 | [F04](#f04) |
 | F05 | P2 | in tree | 2 | [F05](#f05) |
 | F06 | P1 | in tree | 2 | [F06](#f06) |
@@ -32,7 +32,7 @@ ruling before work starts).
 | F17 | P2 | open | 6 | — |
 | F18 | P2 | open | 6 | — |
 | F19 | P2 | in tree | 6 | [F19](#f19) |
-| F20 | P1 | open | 3 | — |
+| F20 | P1 | in tree | 3 | [F20](#f20) |
 | F21 | P1 | open | 7 | — |
 | F22 | P1 | open | 5 | — |
 | F23 | P2 | open | 6 | — |
@@ -47,7 +47,7 @@ ruling before work starts).
 | F32 | P1 | open | 7 | — |
 | F33 | P2 | open | 4 | — |
 | F34 | P2 | open | 4 | — |
-| F35 | P1 | open | 3 | — |
+| F35 | P1 | in tree | 3 | [F35](#f35) |
 | F36 | P1 | open | 9 | — |
 | F37 | P1 | open | 8 | — |
 | F38 | P2 | open | 8 | — |
@@ -1001,3 +1001,101 @@ focal-consensus tests the first cut failed (`what_may_not_go_by_the_fast_track_i
 the joint-change, removal and unknown-peer safety tests, restart, recovery and learner
 tests), the focal-raft and focal-consensus suites (the differential campaigns hold the
 counters to a walk after every operation).
+
+## F03
+
+**Cause.** An authenticated stream validated its 16-byte header and then allocated and
+zero-filled the whole announced payload — up to the negotiated frame, 10 MiB on the
+production control path — before a byte of it arrived and before `dispatch_accounted`
+admitted anything; the listener's 64 KiB charge per connection was no permit for it. The
+audit's probe: a header announcing 10 MiB allocated 10,485,760 bytes while its reader
+waited, and with `for_consensus(128)` streams a connection could hold about 1.4 GiB of
+such buffers; and a body dripping `LEAST_PROGRESS` bytes every wait held its buffer for
+`bytes / 1,200` waits — 73 hours for 10 MiB at the 30 s wait.
+
+**Fix.** The body is permitted before any of it is allocated. After the header, the
+stream's task asks its identity's `IngressLane` for the announced bytes
+(`Admission::take`): the permit is funded from the listener's own budget (the node's
+listener child, `network_service.rs`; the generic server's caller states one) — nodes on
+the completion lane, so control traffic is never starved by participants' bodies, any
+other identity on the ordinary lane — and bounded to the identity's share of that lane,
+its capacity among the identities holding connections and one frame at least, so an
+identity alone may always ask one frame and no identity takes the pool from the others.
+A refusal is typed and counted (`refused_bytes`, `refused_memory`; the metric
+`focal_listener_refused_total{bound="bytes"|"memory"}`, the gauge
+`focal_listener_ingress_bytes`) and resets the stream (code 5) before allocating; the
+permit is held through the body and its dispatch and given back with the stream,
+cancelled or not. Occupancy is priced by the path: a payload's buffer is held no longer
+than its bytes take at the least a live QUIC sender delivers — two datagrams of the least
+size a round trip, the smallest congestion window RFC 9002 §7.2 keeps — over the
+connection's measured round trip (`frame::residency`; `read_payload_arriving` gives up
+at that or at the wait, whichever is longer), on the server's requests and the client's
+responses alike: 10 MiB over a 200 ms path is fifteen minutes, not seventy-three hours,
+and a sender slower than the smallest window is not sending. The generic server takes
+its budget explicitly (`QuicServer::bind(.., budget)`).
+
+**Tests.** `admission::a_body_is_permitted_before_it_is_allocated_within_the_identity_s_share`
+(a header alone holds a permit of a frame in the budget with nothing arrived; a second
+header from the same identity is refused for its share, reset, counted; the permit goes
+back with the stream), the admission's existing cases, and the node's listener tests.
+`residency` is exercised by every request and response read in the suites.
+
+## F20
+
+**Cause.** The listener counted every connection future — handshakes, enrollment and
+established — against `max_connections` and refused newcomers at that count before
+authentication, so full occupancy took with it the opportunity to authenticate a
+replacement: eight participants holding sixteen connections each filled the 128 places,
+and a restarting node or a participant replacing its own stale connection never reached
+the identity admission that would have made room. Enrollment shared the bottleneck.
+
+**Fix.** The outer count is gone from both listeners (`NetworkListener::serve_inner`,
+`QuicServer::serve`). What is held is bounded where it is admitted: handshakes by their
+pending places, enrollment by its slots, and established connections by the admission's
+total (`AdmissionLimits::connections`, the listener's `max_connections`), met **after**
+the replacement rule — an identity at its own bound reaches its replacement however full
+the listener is, and only a connection that would be one more is refused (`Connections`,
+counted, `focal_listener_refused_total{bound="connections"}`). Half-open handshakes from
+addresses that have not proven themselves take no pending place while half the places
+are taken: the listener answers them with QUIC's Retry (`validate_address`;
+RFC 9000 §8.1.2, address validation under load), so a spoofed flood cannot hold the
+handshake stage, and a real one holds at most its places for one request timeout. The
+admission is one shared handle now (`Admission(Arc<Inner>)`): the tasks that serve a
+connection's streams hold their identity's permits beyond any borrow of the listener's
+loop (doc 10).
+
+**Tests.** `admission::a_full_listener_still_replaces_an_identity_s_own_connection`
+(three connections in all: an identity under its own bound is refused at its handshake
+when it would be one more; an identity at its bound replaces the connection it used
+least although the listener is full; the others serve on), the existing pending-place
+and replacement cases.
+
+## F35
+
+**Cause.** Each stream cloned its `AuthenticatedPeer` from the registry before waiting
+for the header and body, and `dispatch_accounted` verified the request against that
+snapshot. Revocation removed the registry entry and nothing else: the audit's probe sent
+a header, revoked the certificate, then sent the body, and the handler ran
+(`registry_denies=true, handler_calls=1`); with F03's progress-based waits a peer could
+pre-open incomplete requests and keep the captured grant for hours.
+
+**Fix.** The grant is looked up twice: before anything is read for a stream
+(`PeerRegistry::granted`, no copy), so a revoked certificate is refused before a body is
+permitted for it, and once the whole request has arrived (`authenticate`), so what is
+dispatched is authorized by the grant current then, never by one captured before its
+body. Invalidation releases what waits: the registry holds the connections each
+certificate has open (`attach` under the listener's bound; `LiveConnection` until
+served), and `revoke` and `replace_grants` close the connections of a certificate no
+longer granted (`revoked`), so nothing more is received on them, the bodies in flight end
+with them and give their permits back. The authorization lease is therefore: a request is
+authorized by the grant current when its complete frame was received, honoured through
+its handler for at most the request timeout; a revocation takes effect for every request
+not yet complete at once, and for connections at once. Work the handler already accepted
+durably keeps its exact-result recovery; that is the owner's contract, not the wire's.
+
+**Tests.** `a_grant_revoked_while_a_body_arrives_dispatches_nothing_and_closes_the_connection`
+(the half body's permit is held, the revocation closes the connection with `revoked`, the
+rest of the body has nowhere to go, the handler never runs, the permit and the
+connection are given back), `a_complete_request_is_authorized_by_the_grant_current_at_dispatch`
+(a grant withdrawn while a request runs: nothing after it is served on the connection),
+the existing `mutual_tls_tenant_isolation_live_revocation_and_independent_streams`.

@@ -378,6 +378,7 @@ async fn founder_enrollment_follows_remote_quorum_leaders_and_rechecks_genesis_p
                 server_tls(tls(material), roots.clone(), &limits).unwrap(),
                 peers.clone(),
                 limits.clone(),
+                focal_memory::MemoryBudget::new(64 * 1024 * 1024, 16 * 1024 * 1024).unwrap(),
             )
             .unwrap(),
         );

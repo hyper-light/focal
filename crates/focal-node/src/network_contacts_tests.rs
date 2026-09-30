@@ -154,6 +154,7 @@ async fn contact_uses_active_committed_certificate_and_exact_receipt_survives_lo
             .unwrap(),
             peers.clone(),
             limits.clone(),
+            MemoryBudget::new(64 * 1024 * 1024, 16 * 1024 * 1024).unwrap(),
         )
         .unwrap(),
     );

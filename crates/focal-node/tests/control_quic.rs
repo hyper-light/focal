@@ -422,7 +422,14 @@ async fn three_metadata_owners_use_mutual_tls_with_majority_retry_and_scoped_ope
         }
         let tls = server_tls(identity.tls(), roots.clone(), &limits()).unwrap();
         let server = Arc::new(
-            QuicServer::bind("127.0.0.1:0".parse().unwrap(), tls, peers, limits()).unwrap(),
+            QuicServer::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                tls,
+                peers,
+                limits(),
+                focal_memory::MemoryBudget::new(64 * 1024 * 1024, 16 * 1024 * 1024).unwrap(),
+            )
+            .unwrap(),
         );
         let serving_server = server.clone();
         let handler = host.clone();

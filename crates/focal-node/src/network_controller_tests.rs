@@ -381,6 +381,7 @@ async fn cancelling_controller_run_withdraws_live_and_unpolled_peer_projections(
         server_tls(identity(), roots.clone(), &limits).unwrap(),
         registry.clone(),
         limits.clone(),
+        MemoryBudget::new(64 * 1024 * 1024, 16 * 1024 * 1024).unwrap(),
     )
     .unwrap();
     let pool = PeerConnectionPool::new(
@@ -520,6 +521,7 @@ async fn contact_announcement_reaches_alternate_after_blackholed_preferred_leade
         server_tls(identity(), roots.clone(), &limits).unwrap(),
         peers,
         limits.clone(),
+        MemoryBudget::new(64 * 1024 * 1024, 16 * 1024 * 1024).unwrap(),
     )
     .unwrap();
     // Keeping the UDP socket open suppresses an immediate unreachable-port

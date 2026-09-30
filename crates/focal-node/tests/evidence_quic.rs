@@ -415,6 +415,7 @@ impl Fleet {
                     server_tls(identity.tls(), pki.roots(), &wire_limits()).unwrap(),
                     peers,
                     wire_limits(),
+                    focal_memory::MemoryBudget::new(64 * 1024 * 1024, 16 * 1024 * 1024).unwrap(),
                 )
                 .unwrap(),
             );

@@ -12331,3 +12331,24 @@ unchanged by the history. Tests:
 `a_member_that_joins_is_priced_its_progress_and_the_last_entry`,
 `a_member_behind_is_priced_its_pages_from_the_running_totals`,
 `the_running_totals_say_what_a_walk_of_the_entries_says`.
+
+### 2026-09-29 — F03, F20, F35: a body is permitted before it is allocated, a full listener still replaces, and a grant is current at dispatch
+
+A request's body is permitted before any of it is allocated (`focal_wire::IngressLane`,
+funded from the listener's budget, nodes on the completion lane, within the identity's
+share of the lane and one frame at least; refusals typed and counted, the stream reset),
+and a payload's buffer is held no longer than its bytes take at the least a live QUIC
+sender delivers over the measured round trip (`frame::residency`, RFC 9002 §7.2). The
+listeners' outer connection count is gone: handshakes are bounded by their pending
+places, enrollment by its slots and connections by the admission's total met after the
+replacement rule, and a source that has not proven its address is answered with Retry
+while half the pending places are taken (RFC 9000 §8.1.2). A stream's grant is looked
+up before anything is read and again once the whole request has arrived; a revocation
+closes the certificate's connections (`PeerRegistry::attach`/`revoke`/`replace_grants`),
+releasing the bodies in flight and their permits. Tests:
+`a_body_is_permitted_before_it_is_allocated_within_the_identity_s_share`,
+`a_full_listener_still_replaces_an_identity_s_own_connection`,
+`a_grant_revoked_while_a_body_arrives_dispatches_nothing_and_closes_the_connection`,
+`a_complete_request_is_authorized_by_the_grant_current_at_dispatch`. Metrics:
+`focal_listener_refused_total{bound="connections"|"bytes"|"memory"}`,
+`focal_listener_ingress_bytes`.
