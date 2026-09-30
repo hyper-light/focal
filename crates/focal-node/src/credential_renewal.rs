@@ -24,9 +24,13 @@ pub const RENEWAL_ATTEMPTS: i64 = 60;
 /// How long before its expiry a credential is renewed: the last third of
 /// the lifetime it was issued for.
 pub fn renewal_window(receipt: &EnrollmentReceipt) -> i64 {
-    receipt
-        .expires_at
-        .saturating_sub(receipt.issued_at)
+    window_of(receipt.issued_at, receipt.expires_at)
+}
+/// The renewal window of a certificate valid from `issued_at` to
+/// `expires_at`: the last third of its lifetime.
+pub fn window_of(issued_at: i64, expires_at: i64) -> i64 {
+    expires_at
+        .saturating_sub(issued_at)
         .max(0)
         .checked_div(RENEWAL_WINDOW_DIVISOR)
         .unwrap_or(0)

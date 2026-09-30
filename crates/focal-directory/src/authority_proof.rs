@@ -153,7 +153,8 @@ impl InstalledAuthorityVerifier<'_> {
         {
             return Err(DirectoryError::StaleEpoch);
         }
-        if group.expires_at <= self.now || statement.expires_at > group.expires_at {
+        let expires_at = self.registry.group_expires_at(group);
+        if expires_at <= self.now || statement.expires_at > expires_at {
             return Err(DirectoryError::Expired);
         }
         Ok(group)

@@ -338,8 +338,8 @@ pub fn prepare_replica_ready_proof(
                 .get(&ready.node)
                 .is_none_or(|granted| *granted > generation)
             && grant.learners.get(&ready.node) != Some(&generation))
-        || grant.expires_at <= now
-        || window.expires_at > grant.expires_at
+        || authority.group_expires_at(grant) <= now
+        || window.expires_at > authority.group_expires_at(grant)
         || node.expires_at < window.expires_at
     {
         return Err(PlacementProofError::Unauthorized);
@@ -445,8 +445,8 @@ pub fn prepare_membership_proof(
                 .outgoing_voters
                 .get(&node)
                 .is_some_and(|granted| *granted <= generation))
-        || current.expires_at <= now
-        || window.expires_at > current.expires_at
+        || authority.group_expires_at(current) <= now
+        || window.expires_at > authority.group_expires_at(current)
         || next.expires_at < window.expires_at
     {
         return Err(PlacementProofError::Unauthorized);
@@ -588,8 +588,8 @@ pub fn prepare_delegation_proof(
                 .outgoing_voters
                 .get(&node)
                 .is_some_and(|granted| *granted <= generation))
-        || current.expires_at <= now
-        || window.expires_at > current.expires_at
+        || authority.group_expires_at(current) <= now
+        || window.expires_at > authority.group_expires_at(current)
     {
         return Err(PlacementProofError::Unauthorized);
     }

@@ -148,6 +148,7 @@ enum Action {
     Authorize(Vec<u8>, oneshot::Sender<Answer<PeerGrant>>),
     AdmitTenant([u8; 16], oneshot::Sender<Answer<()>>),
     ActivateFence(u32, oneshot::Sender<Answer<focal_enrollment::UpgradeFence>>),
+    MaintainBootstrapServer(i64, oneshot::Sender<Answer<Option<CredentialMaterial>>>),
     Stop(oneshot::Sender<()>),
 }
 struct Work {
@@ -364,6 +365,22 @@ impl QuorumEnrollmentHost {
             .map_err(|_| QuorumEnrollmentError::Stopped)?
             .result
     }
+    /// One step of the bootstrap server certificate's succession (24 §11):
+    /// record the certificate held, stage a successor in the last third of
+    /// its lifetime, present the successor once every invitation open at
+    /// its staging has closed. Answers the identity to present when it
+    /// changed.
+    pub async fn maintain_bootstrap_server(
+        &self,
+        now: i64,
+    ) -> Result<Option<CredentialMaterial>, QuorumEnrollmentError> {
+        let (send, receive) = oneshot::channel();
+        self.enqueue(Action::MaintainBootstrapServer(now, send), 4096)?;
+        receive
+            .await
+            .map_err(|_| QuorumEnrollmentError::Stopped)?
+            .result
+    }
     pub async fn authorize_certificate(
         &self,
         certificate: Vec<u8>,
@@ -464,6 +481,13 @@ impl QuorumEnrollmentDriver {
                 }
                 Action::ActivateFence(level, send) => {
                     let result = self.activate_fence(control, level).await;
+                    let _ = send.send(Answer {
+                        result,
+                        _charge: work._charge,
+                    });
+                }
+                Action::MaintainBootstrapServer(now, send) => {
+                    let result = self.maintain_bootstrap_server(control, now).await;
                     let _ = send.send(Answer {
                         result,
                         _charge: work._charge,
@@ -727,13 +751,15 @@ impl QuorumEnrollmentDriver {
         self.reconcile(control).await?;
         let (registry, charge) = self.registry(control).await?;
         let grace = crate::credential_renewal::grace_seconds(registry.limits().credential_lifetime);
-        let command = match registry.prepare_renew(&self.authority, request, now()?, grace)? {
+        let prepared = registry.prepare_renew(&self.authority, request, now()?, grace);
+        let command = match prepared? {
             RenewPreparation::Existing(receipt) => return Ok(receipt),
             RenewPreparation::Commit(command) => command,
         };
         drop(registry);
         drop(charge);
-        self.commit(control, command).await?;
+        let committed = self.commit(control, command).await;
+        committed?;
         let (registry, _charge) = self.registry(control).await?;
         Ok(registry.release_renewal(request, now()?)?)
     }
@@ -796,6 +822,50 @@ impl QuorumEnrollmentDriver {
             return Err(EnrollmentError::NotCommitted.into());
         }
         Ok(registry.fence())
+    }
+    /// The bootstrap server certificate's succession (24 §11), one step: an
+    /// activation the registry committed before this authority presented it
+    /// (a crash between the two) is presented now; a successor is staged in
+    /// the last third of the current certificate's lifetime; the registry
+    /// is told what the authority holds (the record, the staging, or the
+    /// activation once every invitation open at the staging has closed);
+    /// an activation just committed is presented.
+    async fn maintain_bootstrap_server(
+        &mut self,
+        control: &impl EnrollmentControl,
+        now: i64,
+    ) -> Result<Option<CredentialMaterial>, QuorumEnrollmentError> {
+        self.reconcile(control).await?;
+        let (registry, charge) = self.registry(control).await?;
+        let activated = |authority: &BootstrapAuthority, registry: &EnrollmentRegistry| {
+            authority.successor().is_some_and(|(certificate, _)| {
+                registry.bootstrap().current.fingerprint == server_fingerprint(certificate)
+            })
+        };
+        if activated(&self.authority, &registry) {
+            drop(registry);
+            drop(charge);
+            return Ok(Some(self.authority.activate_successor()?));
+        }
+        if self.authority.successor().is_none() && !registry.bootstrap().current.is_unknown() {
+            let (issued_at, expires_at) = self.authority.server_validity()?;
+            let window = crate::credential_renewal::window_of(issued_at, expires_at);
+            if now >= expires_at.saturating_sub(window) {
+                self.authority
+                    .stage_successor(now, registry.limits().credential_lifetime)?;
+            }
+        }
+        let Some(command) = registry.prepare_bootstrap_server(&self.authority, now)? else {
+            return Ok(None);
+        };
+        drop(registry);
+        drop(charge);
+        self.commit(control, command).await?;
+        let (registry, _charge) = self.registry(control).await?;
+        if activated(&self.authority, &registry) {
+            return Ok(Some(self.authority.activate_successor()?));
+        }
+        Ok(None)
     }
     /// The grant a certificate earns: the configured tenants and every tenant
     /// the committed registry admits, so admission never needs a restart and

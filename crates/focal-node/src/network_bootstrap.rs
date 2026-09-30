@@ -201,14 +201,18 @@ impl FoundingNetwork {
             return Err(NetworkError::MissingCredentials);
         }
         crate::embedded::durable_dir(&private)?;
-        let authority = BootstrapAuthority::open_or_create(
+        let limits = settings.enrollment_limits();
+        // The bootstrap server certificate lasts the cluster's credential
+        // lifetime, as everything the cluster issues does, and succeeds
+        // itself before it expires (24 §11).
+        let authority = BootstrapAuthority::open_or_create_for(
             private.join("authority"),
             identity.cluster,
             names.clone(),
+            limits.credential_lifetime,
             now,
         )?;
         let key = JoinKey::open_or_create(private.join("node-key"), identity.cluster)?;
-        let limits = settings.enrollment_limits();
         let founder = FoundingEnrollmentDraft::open_or_create(
             private.join("founder"),
             &authority,
@@ -254,6 +258,9 @@ impl FoundingNetwork {
                 server_name: names.first().ok_or(NodeError::Identity)?.clone(),
                 ca_certificate: authority.ca_certificate().to_vec(),
                 server_fingerprint: server_fingerprint(authority.server_certificate()),
+                successor_fingerprint: authority
+                    .successor()
+                    .map(|(certificate, _)| server_fingerprint(certificate)),
             },
             genesis: NetworkGenesis {
                 founder: identity.clone(),

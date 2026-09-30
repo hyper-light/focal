@@ -52,6 +52,10 @@ pub struct PeerGrant {
 pub struct AuthenticatedPeer {
     grant: PeerGrant,
     fingerprint: Option<[u8; 32]>,
+    /// The enrolled key whose grant this certificate holds, when the grant
+    /// projection did not name the certificate itself: a renewal committed
+    /// elsewhere that this node has not applied yet.
+    renewal_of: Option<[u8; 32]>,
 }
 impl AuthenticatedPeer {
     /// Trusted local ingress may use this only after its OS credential checks.
@@ -60,7 +64,13 @@ impl AuthenticatedPeer {
         Ok(Self {
             grant,
             fingerprint: None,
+            renewal_of: None,
         })
+    }
+    /// The enrolled key this peer was admitted under when the projection
+    /// did not name its certificate (`PeerRegistry::authenticate_certificate`).
+    pub fn renewal_of(&self) -> Option<[u8; 32]> {
+        self.renewal_of
     }
     /// Borrowed scope check for trusted service routers before ledger lookup.
     /// A node peer is infrastructure: it replicates, hosts and drives the
@@ -89,7 +99,43 @@ impl AuthenticatedPeer {
 #[derive(Default)]
 struct Grants {
     grants: BTreeMap<[u8; 32], PeerGrant>,
+    /// The enrolled keys, by their identity: what a renewal is admitted by.
+    keys: BTreeMap<[u8; 32], EnrolledKey>,
+    /// Certificates admitted as renewals of an enrolled key, by
+    /// fingerprint: each holds its key's grant until the projection names
+    /// it or drops the key. Bounded by `max_peers`.
+    provisional: BTreeMap<[u8; 32], [u8; 32]>,
     live: BTreeMap<[u8; 32], Vec<(usize, quinn::Connection)>>,
+}
+/// A key an enrollment holds. A certificate of it that the grant projection
+/// does not name — issued by the cluster's CA (the listener verified the
+/// chain) after the certificate the projection names — is a renewal
+/// committed elsewhere and not applied here yet, and is granted as the key
+/// is: a node that renews must still reach a peer that learns of the
+/// renewal only from it.
+#[derive(Debug, Clone)]
+pub struct EnrolledKey {
+    pub grant: PeerGrant,
+    /// The start of validity of the newest certificate of this key the
+    /// projection names; only a certificate valid from later is a renewal.
+    pub not_before: i64,
+}
+/// The identity of the key a certificate certifies, in the domain the
+/// enrollment registry names enrolled keys in, and the start of the
+/// certificate's validity in Unix seconds.
+pub fn certificate_key(der: &[u8]) -> Result<([u8; 32], i64), AccessError> {
+    let (rest, certificate) =
+        x509_parser::parse_x509_certificate(der).map_err(|_| AccessError::Unauthorized)?;
+    if !rest.is_empty() {
+        return Err(AccessError::Unauthorized);
+    }
+    Ok((
+        blake3::derive_key(
+            "focal.enrollment.public-key.v1",
+            certificate.public_key().raw,
+        ),
+        certificate.validity().not_before.timestamp(),
+    ))
 }
 /// Certificate grants and revocations are shared by active connection tasks.
 /// Clones must observe the same revocation table, so this Arc is intentional.
@@ -109,7 +155,17 @@ impl PeerRegistry {
     /// The connections of a certificate the projection no longer grants are
     /// closed.
     pub fn replace_grants(&self, next: BTreeMap<[u8; 32], PeerGrant>) -> Result<(), AccessError> {
-        if next.len() > self.max_peers {
+        self.replace_projection(next, BTreeMap::new())
+    }
+    /// [`replace_grants`](Self::replace_grants), with the enrolled keys a
+    /// renewal is admitted by. A certificate admitted as a renewal keeps its
+    /// key's grant while the projection neither names it nor drops the key.
+    pub fn replace_projection(
+        &self,
+        next: BTreeMap<[u8; 32], PeerGrant>,
+        keys: BTreeMap<[u8; 32], EnrolledKey>,
+    ) -> Result<(), AccessError> {
+        if next.len() > self.max_peers || keys.len() > self.max_peers {
             return Err(AccessError::Capacity);
         }
         for (fingerprint, grant) in &next {
@@ -118,9 +174,28 @@ impl PeerRegistry {
             }
             validate_grant(grant)?;
         }
+        for (key, enrolled) in &keys {
+            if *key == [0; 32] {
+                return Err(AccessError::InvalidRequest);
+            }
+            validate_grant(&enrolled.grant)?;
+        }
         let (previous, revoked) = {
-            let mut grants = self.grants.write().map_err(|_| AccessError::Unavailable)?;
-            let previous = std::mem::replace(&mut grants.grants, next);
+            let mut guard = self.grants.write().map_err(|_| AccessError::Unavailable)?;
+            let grants = &mut *guard;
+            let previous = (
+                std::mem::replace(&mut grants.grants, next),
+                std::mem::replace(&mut grants.keys, keys),
+            );
+            for (fingerprint, key) in std::mem::take(&mut grants.provisional) {
+                if grants.grants.contains_key(&fingerprint) {
+                    continue;
+                }
+                if let Some(enrolled) = grants.keys.get(&key) {
+                    grants.grants.insert(fingerprint, enrolled.grant.clone());
+                    grants.provisional.insert(fingerprint, key);
+                }
+            }
             let gone: Vec<[u8; 32]> = grants
                 .live
                 .keys()
@@ -169,6 +244,7 @@ impl PeerRegistry {
         let revoked = {
             let mut grants = self.grants.write().map_err(|_| AccessError::Unavailable)?;
             grants.grants.remove(&fingerprint);
+            grants.provisional.remove(&fingerprint);
             grants.live.remove(&fingerprint)
         };
         if let Some(connections) = revoked {
@@ -193,10 +269,8 @@ impl PeerRegistry {
     }
     /// The grant current now, for a request about to be dispatched.
     pub fn authenticate(&self, fingerprint: [u8; 32]) -> Result<AuthenticatedPeer, AccessError> {
-        let grant = self
-            .grants
-            .read()
-            .map_err(|_| AccessError::Unavailable)?
+        let grants = self.grants.read().map_err(|_| AccessError::Unavailable)?;
+        let grant = grants
             .grants
             .get(&fingerprint)
             .cloned()
@@ -204,6 +278,39 @@ impl PeerRegistry {
         Ok(AuthenticatedPeer {
             grant,
             fingerprint: Some(fingerprint),
+            renewal_of: grants.provisional.get(&fingerprint).copied(),
+        })
+    }
+    /// The grant of the certificate a connection presented, after the
+    /// listener verified its chain to the cluster's CA: the grant the
+    /// projection names it with, or — when it names no such certificate —
+    /// the grant of the enrolled key it certifies, if it was issued after
+    /// the certificate of that key the projection knows ([`EnrolledKey`]).
+    pub fn authenticate_certificate(&self, der: &[u8]) -> Result<AuthenticatedPeer, AccessError> {
+        let fingerprint = certificate_fingerprint(der);
+        match self.authenticate(fingerprint) {
+            Err(AccessError::Unauthorized) => {}
+            answered => return answered,
+        }
+        let (key, not_before) = certificate_key(der)?;
+        let mut guard = self.grants.write().map_err(|_| AccessError::Unavailable)?;
+        let grants = &mut *guard;
+        let enrolled = grants.keys.get(&key).ok_or(AccessError::Unauthorized)?;
+        if not_before <= enrolled.not_before {
+            return Err(AccessError::Unauthorized);
+        }
+        if !grants.provisional.contains_key(&fingerprint)
+            && grants.provisional.len() >= self.max_peers
+        {
+            return Err(AccessError::Capacity);
+        }
+        let grant = enrolled.grant.clone();
+        grants.grants.insert(fingerprint, grant.clone());
+        grants.provisional.insert(fingerprint, key);
+        Ok(AuthenticatedPeer {
+            grant,
+            fingerprint: Some(fingerprint),
+            renewal_of: Some(key),
         })
     }
     /// A connection authenticated by `fingerprint` is held under it until

@@ -27,6 +27,45 @@ struct AuthorityBundle {
     ca_key: SecretBytes,
     server: Vec<u8>,
     server_key: SecretBytes,
+    /// The bootstrap server certificate staged to succeed `server` (24
+    /// §11): issued, committed in the registry, presented once every
+    /// invitation issued before it was staged has closed.
+    successor: Option<StagedServer>,
+}
+/// The bundle as schema 1 wrote it, before a successor could be staged.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct AuthorityBundleV1 {
+    schema: u16,
+    cluster: ClusterId,
+    names: Vec<String>,
+    ca: Vec<u8>,
+    ca_key: SecretBytes,
+    server: Vec<u8>,
+    server_key: SecretBytes,
+}
+#[derive(Serialize, Deserialize)]
+struct StagedServer {
+    certificate: Vec<u8>,
+    key: SecretBytes,
+    staged_at: i64,
+}
+const AUTHORITY_SCHEMA: u16 = 2;
+/// When a certificate was issued and when it expires, in Unix seconds.
+pub fn certificate_validity(certificate: &[u8]) -> Result<(i64, i64), EnrollmentError> {
+    if certificate.len() > 4096 {
+        return Err(EnrollmentError::Capacity);
+    }
+    let (_, parsed) =
+        X509Certificate::from_der(certificate).map_err(|_| EnrollmentError::Corrupt)?;
+    let validity = parsed.validity();
+    // `params` sets `not_before` a minute before the issue.
+    let issued_at = validity
+        .not_before
+        .timestamp()
+        .checked_add(60)
+        .ok_or(EnrollmentError::Corrupt)?;
+    Ok((issued_at, validity.not_after.timestamp()))
 }
 
 /// CA custody is deliberately separate from replicated public enrollment
@@ -37,22 +76,62 @@ pub struct BootstrapAuthority {
     _directory: PrivateDirectory,
 }
 impl BootstrapAuthority {
+    /// Open the authority, or create it with a bootstrap server certificate
+    /// for the longest lifetime a registry admits (a year).
     pub fn open_or_create(
         path: impl AsRef<Path>,
         cluster: ClusterId,
         server_names: Vec<String>,
         now: i64,
     ) -> Result<Self, EnrollmentError> {
+        Self::open_or_create_for(
+            path,
+            cluster,
+            server_names,
+            crate::registry::MAX_CREDENTIAL_LIFETIME,
+            now,
+        )
+    }
+    /// Open the authority, or create it: a self-signed CA and the bootstrap
+    /// server certificate the enrollment endpoint presents, issued for
+    /// `lifetime` seconds — the cluster's credential lifetime, the one
+    /// lifetime for everything it issues (24 §11).
+    pub fn open_or_create_for(
+        path: impl AsRef<Path>,
+        cluster: ClusterId,
+        server_names: Vec<String>,
+        lifetime: u64,
+        now: i64,
+    ) -> Result<Self, EnrollmentError> {
         if cluster == [0; 16]
             || server_names.is_empty()
             || server_names.len() > 16
             || server_names.iter().any(|n| n.is_empty() || n.len() > 253)
+            || lifetime == 0
         {
             return Err(EnrollmentError::Invalid);
         }
         let directory = PrivateDirectory::open(path.as_ref())?;
         let bundle: AuthorityBundle = if let Some(bytes) = directory.read("authority.bin")? {
-            decode(&bytes)?
+            let (schema, _) = postcard::take_from_bytes::<u16>(&bytes)?;
+            if schema == 1 {
+                let legacy: AuthorityBundleV1 = decode(&bytes)?;
+                if legacy.schema != 1 {
+                    return Err(EnrollmentError::Corrupt);
+                }
+                AuthorityBundle {
+                    schema: AUTHORITY_SCHEMA,
+                    cluster: legacy.cluster,
+                    names: legacy.names,
+                    ca: legacy.ca,
+                    ca_key: legacy.ca_key,
+                    server: legacy.server,
+                    server_key: legacy.server_key,
+                    successor: None,
+                }
+            } else {
+                decode(&bytes)?
+            }
         } else {
             let key = KeyPair::generate()?;
             let mut ca_params = params(vec![], now, 10 * 365 * 86400)?;
@@ -65,17 +144,18 @@ impl BootstrapAuthority {
             let ca = ca_params.self_signed(&key)?;
             let issuer = Issuer::from_ca_cert_der(ca.der(), &key)?;
             let server_key = KeyPair::generate()?;
-            let mut server_params = params(server_names.clone(), now, 365 * 86400)?;
+            let mut server_params = params(server_names.clone(), now, lifetime)?;
             server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
             let server = server_params.signed_by(&server_key, &issuer)?;
             let bundle = AuthorityBundle {
-                schema: 1,
+                schema: AUTHORITY_SCHEMA,
                 cluster,
                 names: server_names.clone(),
                 ca: ca.der().to_vec(),
                 ca_key: SecretBytes(key.serialize_der()),
                 server: server.der().to_vec(),
                 server_key: SecretBytes(server_key.serialize_der()),
+                successor: None,
             };
             let bytes = Zeroizing::new(encode(&bundle)?);
             directory.install_new("authority.bin", &bytes)?;
@@ -84,7 +164,7 @@ impl BootstrapAuthority {
         if bundle.cluster != cluster {
             return Err(EnrollmentError::WrongCluster);
         }
-        if bundle.schema != 1 || bundle.names != server_names {
+        if bundle.schema != AUTHORITY_SCHEMA || bundle.names != server_names {
             return Err(EnrollmentError::Invalid);
         }
         let key = KeyPair::try_from(bundle.ca_key.0.as_slice())?;
@@ -102,11 +182,97 @@ impl BootstrapAuthority {
         server
             .verify_signature(Some(ca.public_key()))
             .map_err(|_| EnrollmentError::Corrupt)?;
+        if let Some(staged) = &bundle.successor {
+            let staged_key = KeyPair::try_from(staged.key.0.as_slice())?;
+            let (_, certificate) = X509Certificate::from_der(&staged.certificate)
+                .map_err(|_| EnrollmentError::Corrupt)?;
+            if certificate.public_key().raw != staged_key.subject_public_key_info()
+                || staged.staged_at <= 0
+            {
+                return Err(EnrollmentError::Corrupt);
+            }
+            certificate
+                .verify_signature(Some(ca.public_key()))
+                .map_err(|_| EnrollmentError::Corrupt)?;
+        }
         Ok(Self {
             bundle,
             key,
             _directory: directory,
         })
+    }
+    fn save(&self) -> Result<(), EnrollmentError> {
+        let bytes = Zeroizing::new(encode(&self.bundle)?);
+        self._directory.replace("authority.bin", &bytes)
+    }
+    /// Write the bundle as schema 1 wrote it, for the upgrade test.
+    #[cfg(test)]
+    pub(crate) fn save_as_schema_one_for_tests(&self) -> Result<(), EnrollmentError> {
+        if self.bundle.successor.is_some() {
+            return Err(EnrollmentError::Invalid);
+        }
+        let legacy = AuthorityBundleV1 {
+            schema: 1,
+            cluster: self.bundle.cluster,
+            names: self.bundle.names.clone(),
+            ca: self.bundle.ca.clone(),
+            ca_key: SecretBytes(self.bundle.ca_key.0.clone()),
+            server: self.bundle.server.clone(),
+            server_key: SecretBytes(self.bundle.server_key.0.clone()),
+        };
+        let bytes = Zeroizing::new(encode(&legacy)?);
+        self._directory.replace("authority.bin", &bytes)
+    }
+    /// When the bootstrap server certificate was issued and when it expires.
+    pub fn server_validity(&self) -> Result<(i64, i64), EnrollmentError> {
+        certificate_validity(&self.bundle.server)
+    }
+    /// The bootstrap server certificate staged to succeed the current one,
+    /// and when it was staged.
+    pub fn successor(&self) -> Option<(&[u8], i64)> {
+        self.bundle
+            .successor
+            .as_ref()
+            .map(|staged| (staged.certificate.as_slice(), staged.staged_at))
+    }
+    /// Stage a successor to the bootstrap server certificate: a fresh key
+    /// and a certificate for the same names under the CA, issued for
+    /// `lifetime` seconds, kept beside the current one until activated (24
+    /// §11). A successor already staged is answered as it is.
+    pub fn stage_successor(&mut self, now: i64, lifetime: u64) -> Result<Vec<u8>, EnrollmentError> {
+        if let Some(staged) = &self.bundle.successor {
+            return Ok(staged.certificate.clone());
+        }
+        if lifetime == 0 || now <= 0 {
+            return Err(EnrollmentError::Invalid);
+        }
+        let issuer =
+            Issuer::from_ca_cert_der(&CertificateDer::from(self.bundle.ca.as_slice()), &self.key)?;
+        let key = KeyPair::generate()?;
+        let mut server_params = params(self.bundle.names.clone(), now, lifetime)?;
+        server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let certificate = server_params.signed_by(&key, &issuer)?.der().to_vec();
+        self.bundle.successor = Some(StagedServer {
+            certificate: certificate.clone(),
+            key: SecretBytes(key.serialize_der()),
+            staged_at: now,
+        });
+        self.save()?;
+        Ok(certificate)
+    }
+    /// Present the staged successor from now on: it becomes the bootstrap
+    /// server certificate and the one it succeeds is dropped. Refused when
+    /// nothing is staged.
+    pub fn activate_successor(&mut self) -> Result<CredentialMaterial, EnrollmentError> {
+        let staged = self
+            .bundle
+            .successor
+            .take()
+            .ok_or(EnrollmentError::NotCommitted)?;
+        self.bundle.server = staged.certificate;
+        self.bundle.server_key = staged.key;
+        self.save()?;
+        Ok(self.server_identity())
     }
     pub fn cluster(&self) -> ClusterId {
         self.bundle.cluster

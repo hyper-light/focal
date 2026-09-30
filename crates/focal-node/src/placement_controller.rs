@@ -347,6 +347,8 @@ impl PlacementAgent {
                 voters,
                 outgoing_voters,
                 learners,
+                // The grant lasts as long as its members' grants do, which
+                // extend as their credentials are renewed (24 §11).
                 expires_at: configuration
                     .voters
                     .iter()
@@ -354,8 +356,7 @@ impl PlacementAgent {
                     .chain(&configuration.learners)
                     .filter_map(|id| authority.nodes.get(id).map(|grant| grant.expires_at))
                     .min()
-                    .unwrap_or(grant.expires_at)
-                    .min(grant.expires_at),
+                    .unwrap_or(grant.expires_at),
             };
             let record = MembershipRecord {
                 index: RaftIndex(receipt.index),

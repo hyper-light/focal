@@ -703,6 +703,9 @@ impl NetworkService {
                 .with_local_sponsor(sponsor.clone())
                 .with_presented(presented_sender);
         }
+        if let Some(identity) = &signing_identity {
+            controller = controller.with_enrollment_identity(identity.clone());
+        }
         let (credential_handle, credential_requests) =
             crate::credential_renewal::CredentialHandle::channel(4);
         let limits = ControlHost::wire_limits();

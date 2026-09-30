@@ -53,10 +53,17 @@ impl Running {
                 )
                 .await
         });
-        let status = tokio::time::timeout(Duration::from_secs(15), status)
+        let mut task = task;
+        let status = match tokio::time::timeout(Duration::from_secs(15), status)
             .await
             .expect("service did not publish startup status")
-            .unwrap();
+        {
+            Ok(status) => status,
+            Err(_) => panic!(
+                "the service ended before publishing its status: {:?}",
+                (&mut task).await
+            ),
+        };
         Self {
             handles,
             status,

@@ -270,8 +270,37 @@ pub fn seed_peer_registry(
         }
         enrollment.authorize_certificate(&receipt.certificate, now)?;
     }
-    registry.replace_grants(grants)?;
+    registry.replace_projection(grants, enrolled_keys(enrollment, state)?)?;
     Ok(())
+}
+/// The keys the registry's unrevoked node enrollments hold, each with the
+/// grant its node has and the start of validity of the certificate the
+/// registry names: what a peer's renewal this node has not applied yet is
+/// admitted by (24 §11; `PeerRegistry::authenticate_certificate`).
+fn enrolled_keys(
+    enrollment: &EnrollmentRegistry,
+    state: &NetworkState,
+) -> Result<BTreeMap<[u8; 32], EnrolledKey>, ControllerError> {
+    let mut keys = BTreeMap::new();
+    for receipt in enrollment.enrollments() {
+        let (EnrollmentRole::Node, Some(node)) = (receipt.identity.role, receipt.identity.node_id)
+        else {
+            continue;
+        };
+        if node == 0 || !matches!(enrollment.invitation_revoked(receipt.invitation), Ok(false)) {
+            continue;
+        }
+        let (_, not_before) =
+            certificate_key(&receipt.certificate).map_err(|_| ControllerError::Identity)?;
+        keys.insert(
+            receipt.public_key,
+            EnrolledKey {
+                grant: node_grant(node, receipt.identity.principal, state),
+                not_before,
+            },
+        );
+    }
+    Ok(keys)
 }
 
 fn genesis_enrollment(state: &NetworkState) -> Result<EnrollmentRegistry, ControllerError> {
@@ -731,6 +760,26 @@ fn next_root_command(
         if matches!(enrollment.invitation_revoked(receipt.invitation), Ok(true)) {
             continue;
         }
+        // A node whose credential was renewed (24 §11) has its grant
+        // extended to the renewed expiry at the same generation: its seats
+        // and proofs stay, and every group it votes in lasts with it.
+        if grant.expires_at < receipt.expires_at
+            && receipt.expires_at > now
+            && grant.enrollment.identity == focal_model::ContentHash(receipt.public_key)
+        {
+            let mut extended = grant.clone();
+            extended.expires_at = receipt.expires_at;
+            extended.enrollment.attestation = focal_model::ContentHash([0; 32]);
+            return Ok(Some(ControlCommand::Authority(AuthorityCommand {
+                expected_revision: authority.revision,
+                enrollment_revision: enrollment.revision(),
+                decided_at: now,
+                operation: AuthorityOperation::GrantNode {
+                    expected_generation: Some(grant.enrollment.generation),
+                    grant: extended,
+                },
+            })));
+        }
         // Only what a node announces changes its grant. A node with no
         // committed contact has announced nothing, which is not a move to
         // the unknown region.
@@ -907,6 +956,15 @@ pub struct NetworkController {
     /// founder presents on its own behalf: published by a refresh once the
     /// registry grants it, so the control never presents an ungranted one.
     presented: Option<tokio::sync::watch::Sender<[u8; 32]>>,
+    /// The enrollment identity this node's listener presents (the
+    /// founder's bootstrap server certificate; none elsewhere), replaced
+    /// when the certificate succeeds itself (24 §11).
+    enrollment_identity: Option<CredentialMaterial>,
+    /// When the bootstrap server certificate's succession was last stepped.
+    last_bootstrap_attempt: i64,
+    /// The enrollment identity above has yet to reach the listener: the
+    /// replacement failed and is tried again on every round.
+    enrollment_unpresented: bool,
     receipt: EnrollmentReceipt,
     credentials: CredentialMaterial,
     root: PathBuf,
@@ -955,6 +1013,12 @@ impl NetworkController {
     /// control reads it).
     pub fn with_presented(mut self, presented: tokio::sync::watch::Sender<[u8; 32]>) -> Self {
         self.presented = Some(presented);
+        self
+    }
+    /// The enrollment identity this node's listener presents beside its
+    /// own: the founder's bootstrap server certificate.
+    pub fn with_enrollment_identity(mut self, identity: CredentialMaterial) -> Self {
+        self.enrollment_identity = Some(identity);
         self
     }
     pub fn with_topology(
@@ -1015,6 +1079,9 @@ impl NetworkController {
             sponsor_address: None,
             local_sponsor: None,
             presented: None,
+            enrollment_identity: None,
+            last_bootstrap_attempt: 0,
+            enrollment_unpresented: false,
             receipt,
             credentials,
             root,
@@ -1141,6 +1208,7 @@ impl NetworkController {
                 }
             }
             self.maintain_credential(pool, &swap, now).await;
+            self.maintain_bootstrap_server(&swap, now).await;
             tokio::select! {
                 () = tokio::time::sleep(Duration::from_millis(250)) => {}
                 request = swap.requests.recv() => {
@@ -1215,6 +1283,37 @@ impl NetworkController {
         self.last_renewal_attempt = now;
         self.last_renewal_error = self.renew(pool, swap, now).await.err();
     }
+    /// One step of the bootstrap server certificate's succession on the
+    /// founder (24 §11), at the cadence of a credential's retries; when the
+    /// successor is presented, the listener presents it from the next
+    /// handshake on. A failed step is retried; the certificate held keeps
+    /// serving until it expires.
+    async fn maintain_bootstrap_server(&mut self, swap: &CredentialSwap, now: i64) {
+        let Some(sponsor) = self.local_sponsor.clone() else {
+            return;
+        };
+        // A succeeded certificate the listener has not taken yet is
+        // presented before anything else: the registry already names it.
+        if self.enrollment_unpresented
+            && let (Some(listener), Some(identity)) = (&swap.listener, &self.enrollment_identity)
+            && listener.replace(&self.credentials, Some(identity)).is_ok()
+        {
+            self.enrollment_unpresented = false;
+        }
+        let retry = renewal_retry(renewal_window(&self.receipt));
+        if now.saturating_sub(self.last_bootstrap_attempt) < retry {
+            return;
+        }
+        self.last_bootstrap_attempt = now;
+        // Nothing to do, or a step that failed, is taken again at the
+        // cadence above: the certificate presented serves on.
+        if let Ok(Some(identity)) = sponsor.maintain_bootstrap_server(now).await {
+            self.enrollment_unpresented = !swap.listener.as_ref().is_some_and(|listener| {
+                listener.replace(&self.credentials, Some(&identity)).is_ok()
+            });
+            self.enrollment_identity = Some(identity);
+        }
+    }
     /// Present a credential everywhere at once: the listener, the peer
     /// pool and the placement agent.
     fn present(
@@ -1227,7 +1326,7 @@ impl NetworkController {
         swap.listener
             .as_ref()
             .ok_or(RenewalError::Install)?
-            .replace(&material)
+            .replace(&material, self.enrollment_identity.as_ref())
             .map_err(|_| RenewalError::Install)?;
         let tls = client_tls(
             TlsIdentity::from_pkcs8(
@@ -1539,9 +1638,35 @@ impl NetworkController {
         // The certificate this node presents on its own behalf, once this
         // refresh has granted it; until then the previous one, granted
         // through the grace (24 §11).
+        // The bootstrap server certificate's pins, as the registry names
+        // them (24 §11): the current one and a staged successor. A node
+        // dials its sponsor with these, so a succession it observed reaches
+        // its next renewal, and one it slept through is learned here first.
+        // An observation older than this node's own enrollment (a joiner's
+        // first look at the genesis state, before replication reaches it)
+        // says nothing newer than the invitation it joined with.
+        let bootstrap = enrollment.bootstrap();
+        if !bootstrap.current.is_unknown() && enrollment.revision() >= self.receipt.revision {
+            let successor = bootstrap
+                .successor
+                .as_ref()
+                .map(|staged| staged.record.fingerprint);
+            if self.state.sponsor.server_fingerprint != bootstrap.current.fingerprint
+                || self.state.sponsor.successor_fingerprint != successor
+            {
+                let mut sponsor = self.state.sponsor.clone();
+                sponsor.server_fingerprint = bootstrap.current.fingerprint;
+                sponsor.successor_fingerprint = successor;
+                sponsor.validate().map_err(|_| ControllerError::Identity)?;
+                self.state.sponsor = sponsor;
+                self.state
+                    .write(&self.root)
+                    .map_err(|_| ControllerError::Identity)?;
+            }
+        }
         let held = certificate_fingerprint(&self.receipt.certificate);
         let held_granted = grants.contains_key(&held);
-        registry.replace_grants(grants)?;
+        registry.replace_projection(grants, enrolled_keys(&enrollment, &self.state)?)?;
         if held_granted && let Some(presented) = &self.presented {
             presented.send_if_modified(|current| {
                 if *current == held {

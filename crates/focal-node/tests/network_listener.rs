@@ -357,10 +357,15 @@ async fn one_port_enrolls_pinned_keys_then_requires_committed_grants_for_data() 
     )
     .unwrap();
     // Changing only the leaf pin keeps normal CA/name validation valid, but no
-    // application request or invitation secret may reach the handler.
+    // application request or invitation secret may reach the handler. The
+    // token ends with the pin and the byte that says no successor is staged
+    // (24 §11): the pin's last digit is the third character from the end.
     let mut rogue_token = invitation.expose_token().unwrap().to_string();
+    let absent = rogue_token.split_off(rogue_token.len() - 2);
+    assert_eq!(absent, "00");
     let last = rogue_token.pop().unwrap();
     rogue_token.push(if last == '0' { '1' } else { '0' });
+    rogue_token.push_str(&absent);
     let rogue = Invitation::parse(&rogue_token).unwrap();
     assert!(
         client

@@ -3386,3 +3386,130 @@ fn a_peer_pause_is_spread_over_its_second_half() {
         Duration::ZERO
     );
 }
+
+/// A certificate of `key` valid from the given day: what the registry
+/// compares is the key and the start of validity (the listener verifies
+/// the chain).
+fn certificate_valid_from(key: &KeyPair, day: u8) -> Vec<u8> {
+    let mut params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+    params.not_before = rcgen::date_time_ymd(2026, 1, day);
+    params.self_signed(key).unwrap().der().to_vec()
+}
+
+#[test]
+fn a_renewal_of_an_enrolled_key_is_admitted_until_the_projection_names_or_drops_it() {
+    let key = KeyPair::generate().unwrap();
+    let known = certificate_valid_from(&key, 10);
+    let renewal = certificate_valid_from(&key, 20);
+    let older = certificate_valid_from(&key, 5);
+    let foreign = certificate_valid_from(&KeyPair::generate().unwrap(), 20);
+    let (enrolled, not_before) = certificate_key(&known).unwrap();
+    assert_eq!(certificate_key(&renewal).unwrap().0, enrolled);
+    assert!(certificate_key(&renewal).unwrap().1 > not_before);
+    assert_ne!(certificate_key(&foreign).unwrap().0, enrolled);
+    assert!(matches!(
+        certificate_key(b"not a certificate"),
+        Err(AccessError::Unauthorized)
+    ));
+    let grant = PeerGrant {
+        principal: ParticipantId::from_u128(7),
+        tenants: BTreeSet::from([TenantId::from_u128(1)]),
+        role: PeerRole::Node { node_id: 3 },
+    };
+    let keys = |not_before: i64| {
+        std::collections::BTreeMap::from([(
+            enrolled,
+            EnrolledKey {
+                grant: grant.clone(),
+                not_before,
+            },
+        )])
+    };
+    let named = |certificate: &[u8]| {
+        std::collections::BTreeMap::from([(certificate_fingerprint(certificate), grant.clone())])
+    };
+    let registry = PeerRegistry::new(8).unwrap();
+    registry
+        .replace_projection(named(&known), keys(not_before))
+        .unwrap();
+    // The certificate the projection names is granted as it always was.
+    let peer = registry.authenticate_certificate(&known).unwrap();
+    assert!(peer.renewal_of().is_none());
+    // A later certificate of the same key is a renewal this node has not
+    // applied yet: admitted under the key's grant, and known as such at
+    // dispatch.
+    let peer = registry.authenticate_certificate(&renewal).unwrap();
+    assert_eq!(peer.renewal_of(), Some(enrolled));
+    assert_eq!(
+        peer.certificate_fingerprint(),
+        Some(certificate_fingerprint(&renewal))
+    );
+    assert_eq!(peer.role(), PeerRole::Node { node_id: 3 });
+    assert_eq!(
+        registry
+            .authenticate(certificate_fingerprint(&renewal))
+            .unwrap()
+            .renewal_of(),
+        Some(enrolled)
+    );
+    registry.granted(certificate_fingerprint(&renewal)).unwrap();
+    // A certificate of the key from before the one named, and one of a key
+    // no enrollment holds, are refused.
+    for refused in [&older, &foreign] {
+        assert!(matches!(
+            registry.authenticate_certificate(refused),
+            Err(AccessError::Unauthorized)
+        ));
+    }
+    // The projection catches up and names the renewal: it is an ordinary
+    // grant, and the certificate it replaced — no longer named, and not
+    // later than the one that is — is refused.
+    let (_, renewed_from) = certificate_key(&renewal).unwrap();
+    registry
+        .replace_projection(named(&renewal), keys(renewed_from))
+        .unwrap();
+    assert!(
+        registry
+            .authenticate_certificate(&renewal)
+            .unwrap()
+            .renewal_of()
+            .is_none()
+    );
+    assert!(matches!(
+        registry.authenticate_certificate(&known),
+        Err(AccessError::Unauthorized)
+    ));
+    // A renewal admitted while the projection still enrolls its key keeps
+    // the grant across a replacement; one whose key the projection drops
+    // (the enrollment revoked) loses it.
+    let next = certificate_valid_from(&key, 25);
+    registry.authenticate_certificate(&next).unwrap();
+    registry
+        .replace_projection(named(&renewal), keys(renewed_from))
+        .unwrap();
+    assert_eq!(
+        registry
+            .authenticate(certificate_fingerprint(&next))
+            .unwrap()
+            .renewal_of(),
+        Some(enrolled)
+    );
+    registry
+        .replace_projection(named(&renewal), std::collections::BTreeMap::new())
+        .unwrap();
+    assert!(matches!(
+        registry.authenticate(certificate_fingerprint(&next)),
+        Err(AccessError::Unauthorized)
+    ));
+    assert!(matches!(
+        registry.authenticate_certificate(&next),
+        Err(AccessError::Unauthorized)
+    ));
+    // A projection without keys admits only what it names.
+    registry.replace_grants(named(&known)).unwrap();
+    assert!(registry.authenticate_certificate(&known).is_ok());
+    assert!(matches!(
+        registry.authenticate_certificate(&renewal),
+        Err(AccessError::Unauthorized)
+    ));
+}

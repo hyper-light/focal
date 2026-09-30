@@ -495,8 +495,8 @@ async fn a_committed_short_lifetime_renews_every_node_ahead_of_expiry_and_admits
         genesis_summary.expires_at - genesis_summary.issued_at,
         SHORT_LIFETIME as i64
     );
-    let genesis = root_registry(&founder, founder_dir.path())
-        .await
+    let genesis_registry = root_registry(&founder, founder_dir.path()).await;
+    let genesis = genesis_registry
         .enrollments()
         .find(|listed| listed.identity.node_id == Some(founder_id))
         .unwrap()
@@ -505,6 +505,15 @@ async fn a_committed_short_lifetime_renews_every_node_ahead_of_expiry_and_admits
         certificate_fingerprint(&genesis.certificate),
         genesis_summary.certificate_fingerprint
     );
+    // The bootstrap server certificate the enrollment endpoint presents
+    // lasts the same lifetime (24 §11).
+    let genesis_bootstrap = genesis_registry.bootstrap().current;
+    assert!(!genesis_bootstrap.is_unknown());
+    assert_eq!(
+        genesis_bootstrap.expires_at - genesis_bootstrap.issued_at,
+        SHORT_LIFETIME as i64
+    );
+    drop(genesis_registry);
     // The lifetime is the cluster's: a joined host's credential is issued
     // for it too.
     let (peer, node) = join_peer(&founder, founder_dir.path(), "host", &peer_settings).await;
@@ -512,17 +521,24 @@ async fn a_committed_short_lifetime_renews_every_node_ahead_of_expiry_and_admits
     assert_eq!(joined.expires_at - joined.issued_at, SHORT_LIFETIME as i64);
     // Each renews itself in the last third of its lifetime, twice over,
     // without being asked.
-    let (founder_renewed, peer_renewed) = until(
-        "the founder and the host renew themselves twice",
-        &[&founder, &peer],
-        Duration::from_secs(60),
-        async || {
-            let founder = founder.handles.credentials.current().await.ok()?;
-            let peer = peer.handles.credentials.current().await.ok()?;
-            (founder.renewals >= 2 && peer.renewals >= 2).then_some((founder, peer))
-        },
-    )
+    let renewed = try_until(&[&founder, &peer], Duration::from_secs(60), async || {
+        let founder = founder.handles.credentials.current().await.ok()?;
+        let peer = peer.handles.credentials.current().await.ok()?;
+        (founder.renewals >= 2 && peer.renewals >= 2).then_some((founder, peer))
+    })
     .await;
+    let (founder_renewed, peer_renewed) = match renewed {
+        Ok(renewed) => renewed,
+        Err(spent) => {
+            let founder_state = founder.handles.credentials.current().await;
+            let peer_state = peer.handles.credentials.current().await;
+            panic!(
+                "the founder and the host did not renew themselves twice ({spent}); founder {founder_state:?} / {:?}; host {peer_state:?} / {:?}",
+                founder.outcome().await,
+                peer.outcome().await
+            )
+        }
+    };
     assert_eq!(founder_renewed.node, founder_id);
     assert_eq!(founder_renewed.key_identity, genesis_summary.key_identity);
     assert_eq!(peer_renewed.node, node);
@@ -553,8 +569,47 @@ async fn a_committed_short_lifetime_renews_every_node_ahead_of_expiry_and_admits
         assert!(listed.expires_at >= summary.expires_at);
         assert_eq!(listed.public_key, summary.key_identity);
     }
+    // The bootstrap server certificate succeeded itself: the founder staged
+    // a successor in the last third of its lifetime and presented it once
+    // no invitation open at the staging remained (the host's was redeemed),
+    // and the registry names the successor now, for another lifetime.
+    let succeeded = until(
+        "the bootstrap server certificate succeeds itself",
+        &[&founder, &peer],
+        Duration::from_secs(60),
+        async || {
+            let registry = root_registry(&founder, founder_dir.path()).await;
+            (registry.bootstrap().current.fingerprint != genesis_bootstrap.fingerprint)
+                .then(|| registry.bootstrap().clone())
+        },
+    )
+    .await;
+    assert_eq!(
+        succeeded.current.expires_at - succeeded.current.issued_at,
+        SHORT_LIFETIME as i64
+    );
+    assert!(succeeded.current.issued_at > genesis_bootstrap.issued_at);
+    // The joined host renews through the founder under the pins it learned
+    // from the registry: the succeeded certificate is what it dials now.
+    let peer_after = until(
+        "the host renews through the succeeded bootstrap server certificate",
+        &[&founder, &peer],
+        Duration::from_secs(30),
+        async || match peer.handles.credentials.renew().await {
+            Ok(renewed) => Some(renewed),
+            Err(_) => {
+                // A renewal is decided in whole seconds: the next attempt
+                // is a second on, as the controller's own retries are.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                None
+            }
+        },
+    )
+    .await;
+    assert!(peer_after.renewals > peer_renewed.renewals);
     // A new host enrolls after the genesis credentials expired: the founder
-    // serves on what it renewed to.
+    // serves on what it renewed to, and the invitation pins what it
+    // presents now.
     let late_dir = tempfile::tempdir().unwrap();
     let late_settings = settings(late_dir.path());
     let (late, late_node) = join_peer(&founder, founder_dir.path(), "late", &late_settings).await;
@@ -566,6 +621,21 @@ async fn a_committed_short_lifetime_renews_every_node_ahead_of_expiry_and_admits
     );
     late.stop().await;
     peer.stop().await;
+    // The founder restarts on the succeeded bootstrap server certificate
+    // (its authority holds it as the current one) and enrolls another host.
+    founder.stop().await;
+    let founder = Running::start(&founder_settings).await;
+    let restarted = root_registry(&founder, founder_dir.path()).await;
+    assert_ne!(
+        restarted.bootstrap().current.fingerprint,
+        genesis_bootstrap.fingerprint
+    );
+    let after_dir = tempfile::tempdir().unwrap();
+    let after_settings = settings(after_dir.path());
+    let (after, after_node) =
+        join_peer(&founder, founder_dir.path(), "after", &after_settings).await;
+    assert_ne!(after_node, late_node);
+    after.stop().await;
     founder.stop().await;
 }
 

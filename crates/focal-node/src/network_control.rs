@@ -62,14 +62,20 @@ impl FounderControlAuthority {
     }
     /// The founder's identity, authenticated by a certificate: the
     /// fingerprint of the certificate it presented.
-    fn verify_peer(&self, peer: &AuthenticatedPeer) -> Result<[u8; 32], ControlFailure> {
+    fn verify_peer(
+        &self,
+        peer: &AuthenticatedPeer,
+    ) -> Result<([u8; 32], Option<[u8; 32]>), ControlFailure> {
         if peer.role() != (PeerRole::Node { node_id: self.node })
             || peer.principal() != self.principal
         {
             return Err(ControlFailure::Unauthorized);
         }
-        peer.certificate_fingerprint()
-            .ok_or(ControlFailure::Unauthorized)
+        Ok((
+            peer.certificate_fingerprint()
+                .ok_or(ControlFailure::Unauthorized)?,
+            peer.renewal_of(),
+        ))
     }
     /// Whether the committed registry authorizes the certificate the founder
     /// presented for its identity now: the genesis certificate, or a
@@ -80,6 +86,7 @@ impl FounderControlAuthority {
         node: u64,
         principal: [u8; 16],
         fingerprint: [u8; 32],
+        key: Option<[u8; 32]>,
     ) -> Result<(), ControlFailure> {
         if replica.identity() != self.root {
             return Err(ControlFailure::WrongOwner);
@@ -88,23 +95,22 @@ impl FounderControlAuthority {
             return Err(ControlFailure::Unauthorized);
         }
         let registry = replica.enrollment().ok_or(ControlFailure::WrongOwner)?;
-        authorize_node_contact(
+        crate::control_host::authorize_node_peer(
             registry,
             self.node,
             self.principal.0,
             fingerprint,
+            key,
             unix_time().map_err(|_| ControlFailure::Unavailable)?,
         )
-        .map_err(|_| ControlFailure::Unauthorized)?;
-        Ok(())
     }
     pub(crate) fn decode(
         &self,
         replica: &ControlReplica,
         verified: &VerifiedRequest,
     ) -> Result<ControlRpc, ControlFailure> {
-        let fingerprint = self.verify_peer(verified.peer())?;
-        self.authorize_current(replica, self.node, self.principal.0, fingerprint)?;
+        let (fingerprint, key) = self.verify_peer(verified.peer())?;
+        self.authorize_current(replica, self.node, self.principal.0, fingerprint, key)?;
         let Operation::EnrollmentControl {
             group,
             genesis,

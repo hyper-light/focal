@@ -101,6 +101,81 @@ pub struct UpgradeFence {
     /// The registry revision the activation committed at.
     pub revision: u64,
 }
+/// A bootstrap server certificate as the registry names it (24 §11): its
+/// fingerprint and its validity, never the certificate itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ServerRecord {
+    pub fingerprint: Fingerprint,
+    pub issued_at: i64,
+    pub expires_at: i64,
+}
+impl ServerRecord {
+    pub fn of(certificate: &[u8]) -> Result<Self, EnrollmentError> {
+        let (issued_at, expires_at) = crate::pki::certificate_validity(certificate)?;
+        Ok(Self {
+            fingerprint: server_fingerprint(certificate),
+            issued_at,
+            expires_at,
+        })
+    }
+    /// A registry that predates the record names no certificate.
+    pub fn is_unknown(&self) -> bool {
+        self.fingerprint == [0; 32]
+    }
+    fn validate(&self) -> Result<(), EnrollmentError> {
+        if self.is_unknown() || self.issued_at <= 0 || self.expires_at <= self.issued_at {
+            return Err(EnrollmentError::Invalid);
+        }
+        Ok(())
+    }
+}
+/// A bootstrap server certificate staged to succeed the current one: it is
+/// presented once every invitation open when it was staged — an invitation
+/// that pins the current certificate alone — has closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedRecord {
+    pub record: ServerRecord,
+    pub staged_at: i64,
+    pub awaiting: std::collections::BTreeSet<InvitationId>,
+}
+/// The bootstrap server certificate the founder's enrollment endpoint
+/// presents, as committed (24 §11): what joined nodes and invitations pin.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct BootstrapServer {
+    pub current: ServerRecord,
+    pub successor: Option<StagedRecord>,
+}
+/// What an awaited invitation's id costs the checkpoint.
+const AWAITING_CHARGE: usize = 32;
+impl BootstrapServer {
+    fn charge(&self) -> Result<usize, EnrollmentError> {
+        self.successor
+            .as_ref()
+            .map_or(Some(0), |staged| {
+                staged.awaiting.len().checked_mul(AWAITING_CHARGE)
+            })
+            .ok_or(EnrollmentError::Capacity)
+    }
+    fn validate(&self, max_invitations: usize) -> Result<(), EnrollmentError> {
+        if self.current.is_unknown() {
+            if self.successor.is_some() {
+                return Err(EnrollmentError::Invalid);
+            }
+            return Ok(());
+        }
+        self.current.validate()?;
+        if let Some(staged) = &self.successor {
+            staged.record.validate()?;
+            if staged.record.fingerprint == self.current.fingerprint
+                || staged.staged_at <= 0
+                || staged.awaiting.len() > max_invitations
+            {
+                return Err(EnrollmentError::Invalid);
+            }
+        }
+        Ok(())
+    }
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnrollmentReceipt {
     pub invitation: InvitationId,
@@ -115,7 +190,7 @@ pub struct EnrollmentReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct InviteMetadata {
+pub(crate) struct InviteMetadata {
     id: InvitationId,
     cluster: ClusterId,
     role: EnrollmentRole,
@@ -126,7 +201,7 @@ struct InviteMetadata {
     receipt: Option<EnrollmentReceipt>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-enum Change {
+pub(crate) enum Change {
     Invite(InviteMetadata),
     Consume {
         invitation: InvitationId,
@@ -160,6 +235,12 @@ enum Change {
     /// (24 §21); a fence only rises.
     ActivateFence {
         level: u32,
+    },
+    /// The bootstrap server certificate as the founder's authority holds it
+    /// (24 §11): recorded once, a successor staged, the successor presented.
+    BootstrapServer {
+        current: ServerRecord,
+        successor: Option<StagedRecord>,
     },
 }
 /// A certificate a renewal replaced: still authorized for the grace the
@@ -301,6 +382,15 @@ pub struct EnrollmentCommand {
     change: Change,
 }
 impl EnrollmentCommand {
+    /// A command as a peer might commit it, for tests of what apply refuses.
+    #[cfg(test)]
+    pub(crate) fn for_tests(revision: u64, decided_at: i64, change: Change) -> Self {
+        Self {
+            revision,
+            decided_at,
+            change,
+        }
+    }
     pub fn expected_revision(&self) -> u64 {
         self.revision
     }
@@ -366,6 +456,25 @@ struct SavedInvitation {
     command: EnrollmentCommand,
     invitation: InvitationData,
 }
+impl SavedInvitation {
+    /// Decode a saved draft; one saved with a schema 1 invitation (one pin)
+    /// decodes by that invitation's layout.
+    fn decode_any(bytes: &[u8]) -> Result<Self, EnrollmentError> {
+        if bytes.len() > MAX_MESSAGE_BYTES {
+            return Err(EnrollmentError::Capacity);
+        }
+        let (schema, rest) = postcard::take_from_bytes::<u16>(bytes)?;
+        let (intent_hash, rest) = postcard::take_from_bytes::<Fingerprint>(rest)?;
+        let (command, rest) = postcard::take_from_bytes::<EnrollmentCommand>(rest)?;
+        let invitation = InvitationData::decode_any(rest)?;
+        Ok(Self {
+            schema,
+            intent_hash,
+            command,
+            invitation,
+        })
+    }
+}
 /// Durable private retry state. Secret material has no Debug/Serialize surface;
 /// the only public release method checks the committed enrollment registry.
 pub struct PendingInvitation {
@@ -381,13 +490,14 @@ impl PendingInvitation {
         let bytes = directory
             .read("invitation.bin")?
             .ok_or(EnrollmentError::Corrupt)?;
-        let saved: SavedInvitation = decode(&bytes)?;
+        let saved = SavedInvitation::decode_any(&bytes)?;
         let Change::Invite(record) = &saved.command.change else {
             return Err(EnrollmentError::Corrupt);
         };
         let data = &saved.invitation;
         if saved.schema != 1
-            || data.schema != 1
+            || !(data.schema == crate::invitation::INVITATION_SCHEMA_V1
+                || data.schema == crate::invitation::INVITATION_SCHEMA)
             || data.cluster != cluster
             || record.cluster != cluster
             || record.id != data.id
@@ -396,7 +506,7 @@ impl PendingInvitation {
             || record.expires_at != data.expires_at
             || data.secret.0.len() != 32
             || record.token_hash != token_hash(&data.secret.0)
-            || record.trust != data.trust.fingerprint()?
+            || record.trust != data.trust_fingerprint()?
             || record.revoked
             || record.receipt.is_some()
         {
@@ -485,6 +595,28 @@ pub struct EnrollmentRegistry {
     tenants: std::collections::BTreeSet<[u8; 16]>,
     /// The committed upgrade fence (24 §21); zero until one is activated.
     fence: UpgradeFence,
+    /// The bootstrap server certificate the enrollment endpoint presents
+    /// (24 §11); unknown in a registry founded before it was recorded.
+    bootstrap: BootstrapServer,
+}
+/// The registry as schema 4 wrote it, before the bootstrap server record.
+#[derive(Deserialize)]
+struct RegistryV4 {
+    schema: u16,
+    cluster: ClusterId,
+    ca_certificate: Vec<u8>,
+    limits: EnrollmentLimits,
+    revision: u64,
+    applied_index: u64,
+    time_floor: i64,
+    next_node: u64,
+    charged_bytes: usize,
+    records: BTreeMap<InvitationId, InviteMetadata>,
+    certificates: BTreeMap<Fingerprint, InvitationId>,
+    enrolled_keys: BTreeMap<Fingerprint, InvitationId>,
+    retired: BTreeMap<Fingerprint, RetiredCredential>,
+    tenants: std::collections::BTreeSet<[u8; 16]>,
+    fence: UpgradeFence,
 }
 /// The registry as schema 3 wrote it, before the upgrade fence.
 #[derive(Deserialize)]
@@ -505,8 +637,9 @@ struct RegistryV3 {
     tenants: std::collections::BTreeSet<[u8; 16]>,
 }
 /// The registry's persisted layout; schema 2 (before admitted tenants)
-/// restores with none, any other schema is not this registry.
-const REGISTRY_SCHEMA: u16 = 4;
+/// restores with none, schema 3 without a fence, schema 4 without the
+/// bootstrap server record; any other schema is not this registry.
+const REGISTRY_SCHEMA: u16 = 5;
 /// The schema 2 layout, converted on restore.
 #[derive(Deserialize)]
 struct RegistryV2 {
@@ -564,6 +697,7 @@ impl EnrollmentRegistry {
             retired: BTreeMap::new(),
             tenants: std::collections::BTreeSet::new(),
             fence: UpgradeFence::default(),
+            bootstrap: BootstrapServer::default(),
         })
     }
     // Only the private new-genesis draft constructor can select the existing
@@ -583,6 +717,7 @@ impl EnrollmentRegistry {
             next_node,
             limits,
         )?;
+        registry.bootstrap.current = ServerRecord::of(authority.server_certificate())?;
         registry.check_time(now)?;
         let public_key = csr_key_hash(key.csr())?;
         let mut identity = assigned(registry.cluster, EnrollmentRole::Node, node, public_key);
@@ -726,6 +861,95 @@ impl EnrollmentRegistry {
     pub fn fence(&self) -> UpgradeFence {
         self.fence
     }
+    /// The bootstrap server certificate as committed (24 §11).
+    pub fn bootstrap(&self) -> &BootstrapServer {
+        &self.bootstrap
+    }
+    /// The invitations still open at `now`: unredeemed, unrevoked, unexpired.
+    fn open_invitations(&self, now: i64) -> std::collections::BTreeSet<InvitationId> {
+        self.records
+            .values()
+            .filter(|record| !record.revoked && record.receipt.is_none() && record.expires_at > now)
+            .map(|record| record.id)
+            .collect()
+    }
+    /// Whether every invitation open when the successor was staged has
+    /// closed, so no joiner pins the current certificate alone any more.
+    pub fn bootstrap_ready_to_activate(&self, now: i64) -> bool {
+        self.bootstrap.successor.as_ref().is_some_and(|staged| {
+            staged.awaiting.iter().all(|id| {
+                self.records.get(id).is_none_or(|record| {
+                    record.revoked || record.receipt.is_some() || record.expires_at <= now
+                })
+            })
+        })
+    }
+    /// The next committed step of the bootstrap server certificate's
+    /// succession under the founder authority (24 §11), from what the
+    /// authority holds: the record of a certificate the registry does not
+    /// name yet, the staging of a successor the authority issued, or the
+    /// activation of a staged successor once every invitation open at its
+    /// staging has closed. None when the registry says what the authority
+    /// holds, or the activation committed and the authority has yet to
+    /// present it (`activate_successor`).
+    pub fn prepare_bootstrap_server(
+        &self,
+        authority: &BootstrapAuthority,
+        now: i64,
+    ) -> Result<Option<EnrollmentCommand>, EnrollmentError> {
+        self.check_time(now)?;
+        self.check_authority(authority)?;
+        let current = ServerRecord::of(authority.server_certificate())?;
+        let staged = authority
+            .successor()
+            .map(|(certificate, staged_at)| {
+                Ok::<_, EnrollmentError>((ServerRecord::of(certificate)?, staged_at))
+            })
+            .transpose()?;
+        let committed = &self.bootstrap;
+        let stage = |record: ServerRecord, staged_at: i64| StagedRecord {
+            record,
+            staged_at,
+            awaiting: self.open_invitations(now),
+        };
+        let change = if committed.current.is_unknown() {
+            Change::BootstrapServer {
+                current,
+                successor: staged.map(|(record, staged_at)| stage(record, staged_at)),
+            }
+        } else if committed.current.fingerprint == current.fingerprint {
+            match (&committed.successor, staged) {
+                (None, None) => return Ok(None),
+                (None, Some((record, staged_at))) => Change::BootstrapServer {
+                    current,
+                    successor: Some(stage(record, staged_at)),
+                },
+                (Some(known), Some((record, _)))
+                    if known.record.fingerprint == record.fingerprint =>
+                {
+                    if !self.bootstrap_ready_to_activate(now) {
+                        return Ok(None);
+                    }
+                    Change::BootstrapServer {
+                        current: record,
+                        successor: None,
+                    }
+                }
+                _ => return Err(EnrollmentError::Conflict),
+            }
+        } else if committed.successor.is_none()
+            && staged.is_some_and(|(record, _)| record.fingerprint == committed.current.fingerprint)
+        {
+            return Ok(None);
+        } else {
+            return Err(EnrollmentError::Conflict);
+        };
+        Ok(Some(EnrollmentCommand {
+            revision: self.revision,
+            decided_at: now,
+            change,
+        }))
+    }
     /// Raise the upgrade fence to `level` under the founder authority: a
     /// conflict when the fence is there already (an operator's retry reads
     /// that as done), invalid when it would lower the fence.
@@ -786,16 +1010,29 @@ impl EnrollmentRegistry {
             return Err(EnrollmentError::Capacity);
         }
         self.check_invitation_expiry(options.expires_at, now)?;
+        // A successor the authority staged and the registry committed is
+        // pinned beside the current certificate, so this invitation still
+        // redeems once the successor is presented (24 §11).
+        let successor_fingerprint = authority
+            .successor()
+            .map(|(certificate, _)| server_fingerprint(certificate))
+            .filter(|staged| {
+                self.bootstrap
+                    .successor
+                    .as_ref()
+                    .is_some_and(|known| known.record.fingerprint == *staged)
+            });
         let trust = ServerTrust {
             endpoint: options.endpoint,
             server_name: options.server_name,
             ca_certificate: self.ca_certificate.clone(),
             server_fingerprint: server_fingerprint(authority.server_certificate()),
+            successor_fingerprint,
         };
         trust.validate()?;
         trust.verify_chain(&[authority.server_certificate().to_vec().into()], now)?;
         let data = InvitationData {
-            schema: 1,
+            schema: crate::invitation::INVITATION_SCHEMA,
             id: random()?,
             cluster: self.cluster,
             role: options.role,
@@ -809,7 +1046,7 @@ impl EnrollmentRegistry {
             role: data.role,
             expires_at: data.expires_at,
             token_hash: token_hash(&data.secret.0),
-            trust: data.trust.fingerprint()?,
+            trust: data.trust_fingerprint()?,
             revoked: false,
             receipt: None,
         };
@@ -1274,6 +1511,48 @@ impl EnrollmentRegistry {
                     revision: next_revision,
                 };
             }
+            Change::BootstrapServer { current, successor } => {
+                let next = BootstrapServer {
+                    current: *current,
+                    successor: successor.clone(),
+                };
+                next.validate(self.limits.max_invitations)?;
+                if next
+                    .successor
+                    .as_ref()
+                    .is_some_and(|staged| staged.staged_at > command.decided_at)
+                {
+                    return Err(EnrollmentError::Invalid);
+                }
+                let previous = &self.bootstrap;
+                // Recorded once, staged over the same current, or the staged
+                // successor made current: no other move.
+                let admitted = if previous.current.is_unknown() {
+                    true
+                } else if previous.current == next.current {
+                    previous.successor.is_none() && next.successor.is_some()
+                } else {
+                    previous
+                        .successor
+                        .as_ref()
+                        .is_some_and(|staged| staged.record == next.current)
+                        && next.successor.is_none()
+                };
+                if !admitted {
+                    return Err(EnrollmentError::Invalid);
+                }
+                let before = previous.charge()?;
+                let after = next.charge()?;
+                if let Some(more) = after.checked_sub(before).filter(|more| *more > 0) {
+                    self.reserve(more)?;
+                }
+                self.charged_bytes = self
+                    .charged_bytes
+                    .checked_sub(before)
+                    .and_then(|bytes| bytes.checked_add(after))
+                    .ok_or(EnrollmentError::Corrupt)?;
+                self.bootstrap = next;
+            }
             Change::AdmitTenant { tenant } => {
                 if *tenant == [0; 16] || self.tenants.contains(tenant) {
                     return Err(EnrollmentError::Invalid);
@@ -1501,6 +1780,48 @@ impl EnrollmentRegistry {
         bytes.truncate(length);
         Ok(bytes)
     }
+    /// The schema 4 encoding of this registry, for the upgrade test.
+    #[cfg(test)]
+    pub(crate) fn encode_as_schema_four_for_tests(&self) -> Result<Vec<u8>, EnrollmentError> {
+        #[derive(Serialize)]
+        struct Legacy<'a> {
+            schema: u16,
+            cluster: ClusterId,
+            ca_certificate: &'a [u8],
+            limits: &'a EnrollmentLimits,
+            revision: u64,
+            applied_index: u64,
+            time_floor: i64,
+            next_node: u64,
+            charged_bytes: usize,
+            records: &'a BTreeMap<InvitationId, InviteMetadata>,
+            certificates: &'a BTreeMap<Fingerprint, InvitationId>,
+            enrolled_keys: &'a BTreeMap<Fingerprint, InvitationId>,
+            retired: &'a BTreeMap<Fingerprint, RetiredCredential>,
+            tenants: &'a std::collections::BTreeSet<[u8; 16]>,
+            fence: UpgradeFence,
+        }
+        encode(&Legacy {
+            schema: 4,
+            cluster: self.cluster,
+            ca_certificate: &self.ca_certificate,
+            limits: &self.limits,
+            revision: self.revision,
+            applied_index: self.applied_index,
+            time_floor: self.time_floor,
+            next_node: self.next_node,
+            charged_bytes: self
+                .charged_bytes
+                .checked_sub(self.bootstrap.charge()?)
+                .ok_or(EnrollmentError::Corrupt)?,
+            records: &self.records,
+            certificates: &self.certificates,
+            enrolled_keys: &self.enrolled_keys,
+            retired: &self.retired,
+            tenants: &self.tenants,
+            fence: self.fence,
+        })
+    }
     /// The schema 3 encoding of this registry, for the upgrade test.
     #[cfg(test)]
     pub(crate) fn encode_as_schema_three_for_tests(&self) -> Result<Vec<u8>, EnrollmentError> {
@@ -1629,6 +1950,7 @@ impl EnrollmentRegistry {
                     retired: legacy.retired,
                     tenants: std::collections::BTreeSet::new(),
                     fence: UpgradeFence::default(),
+                    bootstrap: BootstrapServer::default(),
                 },
                 rest,
             )
@@ -1656,12 +1978,46 @@ impl EnrollmentRegistry {
                     retired: legacy.retired,
                     tenants: legacy.tenants,
                     fence: UpgradeFence::default(),
+                    bootstrap: BootstrapServer::default(),
+                },
+                rest,
+            )
+        } else if schema == 4 {
+            // A schema-4 checkpoint names no bootstrap server certificate;
+            // the founder records the one it holds (24 §11).
+            let (legacy, rest): (RegistryV4, &[u8]) = postcard::take_from_bytes(bytes)?;
+            if legacy.schema != 4 {
+                return Err(EnrollmentError::Corrupt);
+            }
+            (
+                Self {
+                    owner: None,
+                    schema: REGISTRY_SCHEMA,
+                    cluster: legacy.cluster,
+                    ca_certificate: legacy.ca_certificate,
+                    limits: legacy.limits,
+                    revision: legacy.revision,
+                    applied_index: legacy.applied_index,
+                    time_floor: legacy.time_floor,
+                    next_node: legacy.next_node,
+                    charged_bytes: legacy.charged_bytes,
+                    records: legacy.records,
+                    certificates: legacy.certificates,
+                    enrolled_keys: legacy.enrolled_keys,
+                    retired: legacy.retired,
+                    tenants: legacy.tenants,
+                    fence: legacy.fence,
+                    bootstrap: BootstrapServer::default(),
                 },
                 rest,
             )
         } else {
             postcard::take_from_bytes(bytes)?
         };
+        registry
+            .bootstrap
+            .validate(limits.max_invitations)
+            .map_err(|_| EnrollmentError::Corrupt)?;
         if registry.tenants.len() > limits.max_tenants || registry.tenants.contains(&[0; 16]) {
             return Err(EnrollmentError::Corrupt);
         }
@@ -1789,6 +2145,7 @@ impl EnrollmentRegistry {
                     .checked_mul(64)
                     .ok_or(EnrollmentError::Capacity)?,
             )
+            .and_then(|bytes| bytes.checked_add(registry.bootstrap.charge().ok()?))
             .ok_or(EnrollmentError::Capacity)?;
         if charged_bytes != registry.charged_bytes || charged_bytes > limits.max_checkpoint_bytes {
             return Err(EnrollmentError::Corrupt);

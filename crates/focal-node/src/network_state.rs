@@ -114,15 +114,27 @@ pub struct NetworkState {
     pub sponsor: focal_enrollment::ServerTrust,
     pub genesis: NetworkGenesis,
 }
-pub const NETWORK_STATE_SCHEMA: u16 = 2;
-/// The shape schema 1 wrote: no advertised name.
+pub const NETWORK_STATE_SCHEMA: u16 = 3;
+/// The shape schema 1 wrote: no advertised name, a sponsor with one pin.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct NetworkStateV1 {
     schema: u16,
     node: u64,
     listen: SocketAddr,
     advertise: SocketAddr,
-    sponsor: focal_enrollment::ServerTrust,
+    sponsor: focal_enrollment::ServerTrustV1,
+    genesis: NetworkGenesis,
+}
+/// The shape schema 2 wrote: a sponsor with one pin (before the bootstrap
+/// server certificate could stage a successor, 24 §11).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct NetworkStateV2 {
+    schema: u16,
+    node: u64,
+    listen: SocketAddr,
+    advertise: SocketAddr,
+    endpoint: Option<String>,
+    sponsor: focal_enrollment::ServerTrustV1,
     genesis: NetworkGenesis,
 }
 /// The addresses a start resolved against the saved state (24 §24).
@@ -211,7 +223,22 @@ impl NetworkState {
                     listen: legacy.listen,
                     advertise: legacy.advertise,
                     endpoint: None,
-                    sponsor: legacy.sponsor,
+                    sponsor: legacy.sponsor.into(),
+                    genesis: legacy.genesis,
+                }
+            }
+            2 => {
+                let (legacy, trailing): (NetworkStateV2, _) = postcard::take_from_bytes(payload)?;
+                if !trailing.is_empty() {
+                    return Err(NodeError::Identity);
+                }
+                Self {
+                    schema: NETWORK_STATE_SCHEMA,
+                    node: legacy.node,
+                    listen: legacy.listen,
+                    advertise: legacy.advertise,
+                    endpoint: legacy.endpoint,
+                    sponsor: legacy.sponsor.into(),
                     genesis: legacy.genesis,
                 }
             }
@@ -245,10 +272,17 @@ impl NetworkState {
         )?;
         Ok(())
     }
+    /// The same node under the same sponsor and genesis. The sponsor's pins
+    /// are facts the registry moves as the bootstrap server certificate
+    /// succeeds itself (24 §11), not identity.
     fn same_identity(&self, other: &Self) -> bool {
-        self.node == other.node && self.sponsor == other.sponsor && self.genesis == other.genesis
+        self.node == other.node
+            && self.sponsor.same_sponsor(&other.sponsor)
+            && self.genesis == other.genesis
     }
-    fn write(&self, root: &Path) -> Result<(), NodeError> {
+    /// Write this state over the saved one: the controller adopts the
+    /// sponsor's pins the registry names (24 §11).
+    pub(crate) fn write(&self, root: &Path) -> Result<(), NodeError> {
         let length = postcard::experimental::serialized_size(self)?;
         if length > MAX_BYTES.checked_sub(40).ok_or(NodeError::Identity)? {
             return Err(NodeError::Identity);

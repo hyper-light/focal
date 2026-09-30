@@ -605,6 +605,75 @@ at or below its current generation (the verifier's rule for the root's group
 records, §19), where a re-granted founder could not restart its directory
 before.
 
+**The bootstrap server certificate (2026-09-30; the audit's F13, stage 2).**
+The certificate the founder's enrollment endpoint presents — what every
+invitation and every joined node's `NetworkState.sponsor` pin — is issued
+for the cluster's credential lifetime, as everything the cluster issues is
+(`BootstrapAuthority::open_or_create_for`), and succeeds itself before it
+expires. The registry (schema 5) names it: `BootstrapServer { current,
+successor }`, each a `ServerRecord` (fingerprint, issued, expires), with the
+successor's `staged_at` and the invitations open when it was staged
+(`awaiting`); one change under the founder authority,
+`Change::BootstrapServer`, moves it three ways and no other — the record of
+a certificate a registry founded before schema 5 does not name, the staging
+of a successor over the same current, the staged successor made current
+(`prepare_bootstrap_server` derives the next move from what the authority
+holds). The authority's bundle (schema 2) keeps a staged successor beside
+the current certificate (`stage_successor`, issued for the committed
+lifetime, once; `activate_successor` presents it). The founder's controller
+steps the succession at the cadence of a credential's retries
+(`QuorumEnrollmentHost::maintain_bootstrap_server`): the successor is staged
+in the last third of the current certificate's lifetime
+(`credential_renewal::window_of`), committed with the invitations open at
+that moment — which pin the current certificate alone — and activated once
+every one of them has closed (redeemed, revoked or expired:
+`bootstrap_ready_to_activate`); the bundle is swapped after the commit, and
+an activation the registry committed before the authority presented it (a
+crash between) is presented at the next step. On an activation the listener
+presents the new enrollment identity from the next handshake
+(`ListenerIdentity::replace(node, enrollment)`). `ServerTrust` carries the
+successor's pin beside the current one (`successor_fingerprint`; invitations
+are schema 2, network states schema 3, older ones decode with one pin), and
+accepts either on the connection (`accepts`); an invitation issued while a
+successor is staged carries both, so it redeems whichever the founder
+presents when it arrives; a joined node adopts the pins the committed
+registry names on every refresh (`NetworkState::write`), so a succession it
+observed reaches its next renewal and one it slept through is learned from
+the registry — over the node transport — before it dials the sponsor. The
+pins are facts, not identity: `same_identity` compares the sponsor's
+endpoint, name and CA (`ServerTrust::same_sponsor`). An invitation's record
+binds the trust as the invitation's schema encoded it
+(`ServerTrust::fingerprint_as`), so an invitation issued by a schema-1
+binary still matches its record. Two horizons the renewals had left in
+place go with them. A node's grant in the root authority expired with the
+credential it was granted under; now a renewed credential extends the grant
+at the same generation (`AuthorityOperation::GrantNode` with the grant as it
+stands and a later expiry, issued by `next_root_command` when the committed
+receipt outlives the grant), so the node's seats and proofs, keyed by the
+generation, stay. A group's grant expired with the members' grants at the
+time it was issued; now a group is authorized while its members are — its
+end is the earliest of its members' current grants
+(`AuthorityCheckpoint::group_expires_at`), read wherever the grant's own
+expiry was (the proof verifier, the placement proofs, the founder's directory
+at restart), and a group grant re-issued for a membership change lasts as its
+members do. And a peer that has not applied a renewal's commit must
+still admit the renewed node — it may learn of the commit only from that
+node (a leader replicating to a learner), and one that slept through the
+grace would otherwise never be reached again — so the transport admits a
+renewal it does not know by the key it renews: the grant projection carries
+the enrolled keys beside the certificates (`PeerRegistry::replace_projection`
+with each unrevoked node enrollment's key and the start of validity of the
+certificate the registry names), and a certificate the projection does not
+name, whose chain the listener verified to the cluster's CA, is granted as
+its key is when it was issued after the one named
+(`authenticate_certificate`; an earlier certificate of the key, and a key no
+enrollment holds, are refused; the admission lasts until the projection
+names the certificate or drops the key). At dispatch the replica authorizes
+such a peer by the certificate when its registry names it and otherwise by
+the key its unrevoked enrollment holds (`authorize_node_peer`,
+`focal_control::authorize_enrolled_key`), so the renewal's own commit is
+accepted from the node that renewed.
+
 **Rotation (2026-09-10, R9.3).** `cluster credentials rotate`
 (`AdminCommand::RotateCredential`, `cluster.credentials.rotate`) moves a
 node's credential to a fresh key under the same identity. The holder stages
@@ -640,13 +709,11 @@ generation before any other root work (`next_root_command`); the partition
 learns the re-grant like a drain's (§19) and the node's seats stay its own.
 `cluster credentials get` and the renewal reply report `key_identity`.
 
-**Limits.** The bootstrap enrollment server's certificate (a year, pinned by
-every invitation and by the founder's own `NetworkState.sponsor`) is not
-renewed yet: its succession — a committed successor pin joiners and joined
-nodes accept, the enrollment listener switched once every invitation issued
-before it has expired — is the next step of the audit's F13, and CA
-succession and issuer recovery are designed after it (the remediation
-record, F13); client (participant) credentials are not renewed or rotated
+**Limits.** CA succession and issuer recovery are designed and not built
+(the remediation record, F13: a successor CA cross-signed both ways,
+committed and accepted from the pinned one; a lost `authority.bin` recovered
+from a verified backup of the private directory or by a documented
+re-founding); client (participant) credentials are not renewed or rotated
 yet; the contact re-announcement's request sequence is the committed
 contact generation plus one, which assumes every committed contact command
 of a node advanced its generation.

@@ -6,6 +6,7 @@ use rcgen::{
 };
 use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
 use std::{
+    collections::BTreeSet,
     io::Cursor,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -491,6 +492,7 @@ fn tls_ca_and_name_verification_does_not_replace_the_exact_invited_leaf_pin() {
                 server_name: "localhost".into(),
                 ca_certificate: ca.der().to_vec(),
                 server_fingerprint: server_fingerprint(invited_leaf.der()),
+                successor_fingerprint: None,
             },
         },
     };
@@ -1182,6 +1184,7 @@ async fn a_node_renews_over_the_enrollment_transport_and_a_join_only_handler_ref
         server_name: "localhost".into(),
         ca_certificate: authority.ca_certificate().to_vec(),
         server_fingerprint: server_fingerprint(authority.server_certificate()),
+        successor_fingerprint: None,
     };
     let request = material.renewal_request(&key, &receipt).unwrap();
     let renewed = client
@@ -1705,4 +1708,227 @@ fn a_restored_registry_keeps_the_lifetimes_it_committed_and_the_capacities_it_is
         .release_renewal(&request, genesis.issued_at + 1)
         .unwrap();
     assert_eq!(renewed.expires_at, genesis.expires_at + 1);
+}
+
+#[test]
+fn the_bootstrap_server_certificate_is_recorded_staged_and_presented_once_older_invitations_close()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let mut authority = BootstrapAuthority::open_or_create_for(
+        dir.path().join("authority"),
+        [1; 16],
+        vec!["localhost".into()],
+        3600,
+        now(),
+    )
+    .unwrap();
+    // The certificate lasts the lifetime it was issued for, and a founding
+    // registry names it from the start.
+    let (issued_at, expires_at) = authority.server_validity().unwrap();
+    assert_eq!(expires_at - issued_at, 3600);
+    let (mut registry, _key, _genesis, _material) =
+        founder(&dir, &authority, "founder-key", EnrollmentLimits::default());
+    let genesis_record = ServerRecord::of(authority.server_certificate()).unwrap();
+    assert_eq!(registry.bootstrap().current, genesis_record);
+    assert!(registry.bootstrap().successor.is_none());
+    assert!(
+        registry
+            .prepare_bootstrap_server(&authority, now())
+            .unwrap()
+            .is_none()
+    );
+    // An invitation issued before the staging pins the current certificate
+    // alone.
+    let older = invite(&mut registry, &authority, EnrollmentRole::Node);
+    assert_eq!(older.trust().successor_fingerprint, None);
+    // The authority stages a successor (once; asked again it is the same),
+    // and the registry commits it with the invitations open at the time.
+    let at = now();
+    let successor = authority.stage_successor(at, 3600).unwrap();
+    assert_eq!(authority.stage_successor(at + 5, 3600).unwrap(), successor);
+    assert_ne!(server_fingerprint(&successor), genesis_record.fingerprint);
+    let command = registry
+        .prepare_bootstrap_server(&authority, at)
+        .unwrap()
+        .unwrap();
+    registry
+        .apply_committed(&command, registry.applied_index() + 1)
+        .unwrap();
+    let staged = registry.bootstrap().successor.clone().unwrap();
+    assert_eq!(staged.record.fingerprint, server_fingerprint(&successor));
+    assert_eq!(staged.staged_at, at);
+    assert_eq!(staged.awaiting, BTreeSet::from([older.id()]));
+    assert_eq!(registry.bootstrap().current, genesis_record);
+    // Not presented while that invitation is open: nothing to commit.
+    assert!(!registry.bootstrap_ready_to_activate(at + 1));
+    assert!(
+        registry
+            .prepare_bootstrap_server(&authority, at + 1)
+            .unwrap()
+            .is_none()
+    );
+    // An invitation issued now carries both pins, so it redeems whichever
+    // certificate the founder presents; the older one accepts only the
+    // current.
+    let newer = invite(&mut registry, &authority, EnrollmentRole::Client);
+    assert_eq!(
+        newer.trust().successor_fingerprint,
+        Some(server_fingerprint(&successor))
+    );
+    newer
+        .trust()
+        .verify_chain(&[authority.server_certificate().to_vec().into()], now())
+        .unwrap();
+    newer
+        .trust()
+        .verify_chain(&[successor.clone().into()], now())
+        .unwrap();
+    assert!(matches!(
+        older
+            .trust()
+            .verify_chain(&[successor.clone().into()], now()),
+        Err(EnrollmentError::Unauthorized)
+    ));
+    // The newer invitation was issued after the staging: it is not awaited.
+    assert_eq!(
+        registry.bootstrap().successor.as_ref().unwrap().awaiting,
+        BTreeSet::from([older.id()])
+    );
+    // Once the older invitation has expired the successor is activated:
+    // the registry names it current, and the authority presents it.
+    let later = older.expires_at() + 1;
+    assert!(registry.bootstrap_ready_to_activate(later));
+    let command = registry
+        .prepare_bootstrap_server(&authority, later)
+        .unwrap()
+        .unwrap();
+    registry
+        .apply_committed(&command, registry.applied_index() + 1)
+        .unwrap();
+    assert_eq!(
+        registry.bootstrap().current,
+        ServerRecord::of(&successor).unwrap()
+    );
+    assert!(registry.bootstrap().successor.is_none());
+    // The activation committed and the authority has yet to present it: the
+    // registry has nothing more to say (a crash here is reconciled by
+    // presenting).
+    assert!(
+        registry
+            .prepare_bootstrap_server(&authority, later)
+            .unwrap()
+            .is_none()
+    );
+    let identity = authority.activate_successor().unwrap();
+    assert_eq!(identity.certificate_chain()[0], successor);
+    assert_eq!(authority.server_certificate(), successor.as_slice());
+    assert!(authority.successor().is_none());
+    assert!(matches!(
+        authority.activate_successor(),
+        Err(EnrollmentError::NotCommitted)
+    ));
+    assert!(
+        registry
+            .prepare_bootstrap_server(&authority, later)
+            .unwrap()
+            .is_none()
+    );
+    // Reopened, the authority holds the successor as its certificate.
+    drop(authority);
+    let authority = BootstrapAuthority::open_or_create_for(
+        dir.path().join("authority"),
+        [1; 16],
+        vec!["localhost".into()],
+        3600,
+        now(),
+    )
+    .unwrap();
+    assert_eq!(authority.server_certificate(), successor.as_slice());
+    // A move the registry does not admit is refused: a stage over a current
+    // it does not name, a successor equal to the current, an activation of
+    // nothing.
+    for change in [
+        Change::BootstrapServer {
+            current: genesis_record,
+            successor: None,
+        },
+        Change::BootstrapServer {
+            current: registry.bootstrap().current,
+            successor: Some(StagedRecord {
+                record: registry.bootstrap().current,
+                staged_at: later,
+                awaiting: BTreeSet::new(),
+            }),
+        },
+    ] {
+        let mut copy = registry.clone();
+        let command = EnrollmentCommand::for_tests(copy.revision(), later, change);
+        assert!(matches!(
+            copy.apply_committed(&command, copy.applied_index() + 1),
+            Err(EnrollmentError::Invalid)
+        ));
+    }
+    // The checkpoint restores the record; a schema-4 checkpoint names no
+    // certificate, and the founder records the one it holds.
+    let restored = EnrollmentRegistry::restore(
+        &registry.checkpoint().unwrap(),
+        [1; 16],
+        EnrollmentLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(restored.bootstrap(), registry.bootstrap());
+    let mut legacy = EnrollmentRegistry::restore(
+        &registry.encode_as_schema_four_for_tests().unwrap(),
+        [1; 16],
+        EnrollmentLimits::default(),
+    )
+    .unwrap();
+    assert!(legacy.bootstrap().current.is_unknown());
+    let command = legacy
+        .prepare_bootstrap_server(&authority, later)
+        .unwrap()
+        .unwrap();
+    legacy
+        .apply_committed(&command, legacy.applied_index() + 1)
+        .unwrap();
+    assert_eq!(legacy.bootstrap(), registry.bootstrap());
+    // A schema-1 authority bundle opens with no successor and is written
+    // forward; a schema-1 token decodes to the same invitation with the
+    // fingerprint that schema bound.
+    authority.save_as_schema_one_for_tests().unwrap();
+    drop(authority);
+    let authority = BootstrapAuthority::open_or_create_for(
+        dir.path().join("authority"),
+        [1; 16],
+        vec!["localhost".into()],
+        3600,
+        now(),
+    )
+    .unwrap();
+    assert_eq!(authority.server_certificate(), successor.as_slice());
+    assert!(authority.successor().is_none());
+    let mut fresh = self::registry(&authority);
+    let plain = invite(&mut fresh, &authority, EnrollmentRole::Node);
+    let legacy_token = plain.expose_token_as_schema_one_for_tests().unwrap();
+    let decoded = Invitation::parse(&legacy_token).unwrap();
+    assert_eq!(decoded.id(), plain.id());
+    assert_eq!(decoded.trust(), plain.trust());
+    assert_eq!(decoded.data.schema, 1);
+    let one_pin = ServerTrustV1 {
+        endpoint: plain.trust().endpoint.clone(),
+        server_name: plain.trust().server_name.clone(),
+        ca_certificate: plain.trust().ca_certificate.clone(),
+        server_fingerprint: plain.trust().server_fingerprint,
+    };
+    assert_eq!(
+        decoded.data.trust_fingerprint().unwrap(),
+        hash(
+            "focal.enrollment.server-trust.v1",
+            &encode(&one_pin).unwrap()
+        )
+    );
+    assert_ne!(
+        decoded.data.trust_fingerprint().unwrap(),
+        plain.data.trust_fingerprint().unwrap()
+    );
 }

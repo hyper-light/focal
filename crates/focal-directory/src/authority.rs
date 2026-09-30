@@ -55,6 +55,27 @@ pub struct AuthorityCheckpoint {
     pub nodes: BTreeMap<u64, NodeTopologyGrant>,
     pub groups: BTreeMap<LogGroupId, GroupAuthorityGrant>,
 }
+impl AuthorityCheckpoint {
+    /// When a group's authorization ends: with the earliest of its members'
+    /// grants. A member's grant is extended as its credential is renewed
+    /// (24 §11), and the group follows it without a change of its own; the
+    /// expiry the grant was issued with bounds a member the checkpoint no
+    /// longer names.
+    pub fn group_expires_at(&self, group: &GroupAuthorityGrant) -> i64 {
+        group
+            .voters
+            .keys()
+            .chain(group.outgoing_voters.keys())
+            .chain(group.learners.keys())
+            .map(|node| {
+                self.nodes
+                    .get(node)
+                    .map_or(group.expires_at, |grant| grant.expires_at)
+            })
+            .min()
+            .unwrap_or(group.expires_at)
+    }
+}
 #[derive(Debug, Clone, Copy)]
 pub struct AuthorityConfig {
     pub max_nodes: usize,
@@ -204,6 +225,10 @@ impl AuthorityRegistry {
     pub fn group(&self, group: LogGroupId) -> Option<&GroupAuthorityGrant> {
         self.root.state.groups.get(&group)
     }
+    /// When `group`'s authorization ends (`AuthorityCheckpoint::group_expires_at`).
+    pub fn group_expires_at(&self, group: &GroupAuthorityGrant) -> i64 {
+        self.root.state.group_expires_at(group)
+    }
     pub(crate) fn config(&self) -> AuthorityConfig {
         self.config
     }
@@ -290,11 +315,29 @@ impl AuthorityRegistry {
                 if old.map(|entry| entry.enrollment.generation) != *expected_generation {
                     return Err(DirectoryError::CompareFailed);
                 }
-                if expected_generation.map_or(Some(1), |old| old.checked_add(1))
-                    != Some(grant.enrollment.generation)
-                    || old.is_some_and(|old| {
-                        grant.enrollment.authority_epoch < old.enrollment.authority_epoch
-                    })
+                // An extension keeps the grant as it stands — the same
+                // generation, enrollment and principal — and moves only its
+                // expiry later: the node's credential was renewed (24 §11),
+                // and its seats and proofs, keyed by the generation, stay.
+                // Every other change is a re-grant at the next generation.
+                let extension = old.is_some_and(|old| {
+                    grant.enrollment.generation == old.enrollment.generation
+                        && grant.enrollment.node == old.enrollment.node
+                        && grant.enrollment.region == old.enrollment.region
+                        && grant.enrollment.zone == old.enrollment.zone
+                        && grant.enrollment.endpoint == old.enrollment.endpoint
+                        && grant.enrollment.identity == old.enrollment.identity
+                        && grant.enrollment.authority_epoch == old.enrollment.authority_epoch
+                        && grant.enrollment.eligible == old.enrollment.eligible
+                        && grant.principal == old.principal
+                        && grant.expires_at > old.expires_at
+                });
+                if !extension
+                    && (expected_generation.map_or(Some(1), |old| old.checked_add(1))
+                        != Some(grant.enrollment.generation)
+                        || old.is_some_and(|old| {
+                            grant.enrollment.authority_epoch < old.enrollment.authority_epoch
+                        }))
                 {
                     return Err(DirectoryError::StaleNode);
                 }

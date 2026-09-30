@@ -120,17 +120,24 @@ fn server_config(
     focal_wire::server_transport(tls, limits)
 }
 /// The endpoint's identity, swappable while it serves: a renewed node
-/// credential is presented to the next handshake without rebinding.
+/// credential, or a succeeded bootstrap server certificate (24 §11), is
+/// presented to the next handshake without rebinding.
 #[derive(Clone)]
 pub struct ListenerIdentity {
     endpoint: quinn::Endpoint,
     ca: Vec<u8>,
-    enrollment: Option<CredentialMaterial>,
     limits: WireLimits,
 }
 impl ListenerIdentity {
-    pub fn replace(&self, node: &CredentialMaterial) -> Result<(), WireError> {
-        let config = server_config(node, self.enrollment.as_ref(), &self.ca, &self.limits)?;
+    /// Present `node` as the data identity and `enrollment` as the
+    /// enrollment identity (the founder's; none elsewhere) from the next
+    /// handshake on.
+    pub fn replace(
+        &self,
+        node: &CredentialMaterial,
+        enrollment: Option<&CredentialMaterial>,
+    ) -> Result<(), WireError> {
+        let config = server_config(node, enrollment, &self.ca, &self.limits)?;
         self.endpoint.set_server_config(Some(config));
         Ok(())
     }
@@ -148,7 +155,6 @@ pub struct NetworkListener {
     admission: focal_wire::Admission,
     budget: MemoryBudget,
     ca: Vec<u8>,
-    enrollment: Option<CredentialMaterial>,
 }
 impl NetworkListener {
     /// A handle that swaps the identity this endpoint presents.
@@ -156,7 +162,6 @@ impl NetworkListener {
         Ok(ListenerIdentity {
             endpoint: self.endpoint.clone().ok_or(WireError::Connection)?,
             ca: self.ca.clone(),
-            enrollment: self.enrollment.clone(),
             limits: self.limits.clone(),
         })
     }
@@ -233,7 +238,6 @@ impl NetworkListener {
             join_limits,
             budget,
             ca: ca.to_vec(),
-            enrollment: enrollment.cloned(),
         })
     }
     pub fn local_addr(&self) -> Result<SocketAddr, WireError> {

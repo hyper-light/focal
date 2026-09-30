@@ -25,7 +25,7 @@ ruling before work starts).
 | F10 | P2 | in tree | 4 | [F10](#f10) |
 | F11 | P2 | in tree | 4 | [F11](#f11) |
 | F12 | P1 | in tree | 5 | [F12](#f12) |
-| F13 | P1 | in tree (stage 1; 2–3 designed) | 5 | [F13](#f13) |
+| F13 | P1 | in tree (stages 1–2; 3 designed) | 5 | [F13](#f13) |
 | F14 | P1 | open | 6 | — |
 | F15 | P2 | in tree | 3 | [F15](#f15) |
 | F16 | P2 | in tree | 3 | [F16](#f16) |
@@ -1409,14 +1409,55 @@ every 4 hours; under the twelve-second test lifetime: window 4 s, retry every se
 the founder test runs in 11.6 s, the short-lifetime test watches two renewals of two
 nodes within its 60 s allowance.
 
-**Residual (designed, next batches).** Stage 2 — the bootstrap enrollment server's
-certificate (a year, pinned by every invitation and by the founder's own
-`NetworkState.sponsor`): the registry commits the server certificate and a staged
-successor (`Change::BootstrapServer`), `ServerTrust` gains a successor pin joiners and
-joined nodes accept, the founder stages at a third of the lifetime and switches the
-enrollment listener once every invitation issued before the staging has expired
-(`max_invitation_lifetime`), `state.install` accepts a pin that chains to the same CA.
-Stage 3 — issuer succession (a successor CA cross-signed both ways, committed as
+**Stage 2 (2026-09-30): the bootstrap server certificate succeeds itself.** Cause: the
+certificate the enrollment endpoint presents was issued once for a year (`authority.bin`,
+schema 1), pinned by every invitation and by every joined node's `NetworkState.sponsor`,
+and nothing could replace it: a changed pin was an identity change (`same_identity`), and
+the registry knew nothing of it. Fix: it lasts the cluster's credential lifetime
+(`open_or_create_for`) and the registry names it (schema 5, `BootstrapServer { current,
+successor }`, `Change::BootstrapServer` moving it record → stage → activate under the
+founder authority, `prepare_bootstrap_server` deriving the move from the authority's
+bundle, schema 2 with a staged successor); the founder's controller steps it at the
+credential retry cadence (`maintain_bootstrap_server`: stage in the last third, activate
+once every invitation open at the staging has closed, swap the bundle after the commit,
+present a committed activation after a crash between), the listener presents the new
+identity from the next handshake (`ListenerIdentity::replace(node, enrollment)`),
+`ServerTrust` carries and accepts a successor pin (invitations schema 2, network states
+schema 3, legacy decode with one pin, `fingerprint_as` binding a record to its
+invitation's schema), joined nodes adopt the committed pins on every refresh
+(`NetworkState::write`), and the pins are no longer identity (`same_sponsor`). Found on the
+way, at the twelve-second lifetime: a node's grant in the root authority expired with the
+credential it was granted under, so a renewed founder could not restart its directory once
+the genesis lifetime had passed — a renewed credential now extends the grant at its
+generation (`GrantNode` extension; `next_root_command` issues it when the committed receipt
+outlives the grant); group grants expired with their members' grants as issued, so no proof
+could be prepared or verified for a group past its first lifetime — a group is now
+authorized while its members are (`group_expires_at`, read wherever the grant's expiry was);
+and a renewed leader's new certificate was refused by a follower that had not applied the
+renewal's commit — which it learns only from that leader — so replication to it stopped for
+good (stage 1 made the founder renew and so made this reachable; a joined leader had the
+same hole): the transport now admits a renewal it does not know by the key it renews (the grant projection
+carries the enrolled keys; a CA-verified certificate of an enrolled key issued after the one
+the registry names is granted as the key is, `PeerRegistry::authenticate_certificate`, and
+authorized at dispatch by that key, `authorize_node_peer`). A joiner also adopted pins from
+its first, empty view of the root; pins are adopted only from a registry at least as new as
+the node's own receipt. Tests: wire
+`a_renewal_of_an_enrolled_key_is_admitted_until_the_projection_names_or_drops_it`; control
+`an_enrolled_key_authorizes_the_node_that_holds_it_and_no_other`;
+enrollment
+`the_bootstrap_server_certificate_is_recorded_staged_and_presented_once_older_invitations_close`
+(the founding registry names the certificate; an older invitation pins one certificate
+and is awaited; staging is idempotent; a newer invitation carries both pins and its trust
+accepts either; activation waits for the older invitation, then names the successor; the
+authority presents it and reopens on it; inadmissible moves refused; checkpoints,
+schema-4 checkpoints, schema-1 bundles and schema-1 tokens restore);
+directory `a_renewed_credential_extends_the_grant_at_its_generation_and_a_group_lasts_with_its_members`;
+node `a_committed_short_lifetime_renews_every_node_ahead_of_expiry_and_admits_a_late_joiner`
+(under the twelve-second lifetime the certificate succeeds itself, the joined host renews
+through the succeeded one, a late host enrolls with the invitation's pins, and the founder
+restarts past its genesis lifetime on it and enrolls another).
+
+**Residual (designed, next batch).** Stage 3 — issuer succession (a successor CA cross-signed both ways, committed as
 `Change::SucceedIssuer`; nodes accept a committed successor chained from the pinned CA;
 renewals issue under it; the old CA retires at its expiry) and recovery of a lost
 `authority.bin` (the CA key is custody, never replicated: a verified backup of the private

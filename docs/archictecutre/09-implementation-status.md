@@ -12430,3 +12430,20 @@ three seconds to a year; restore adopts the committed lifetimes). The root's gro
 seats the founder at the generation of its grant and a founder re-granted since holds it.
 The bootstrap server certificate's succession and the issuer's are designed in the
 remediation record under F13.
+
+### 2026-09-30 — F13 (stage 2): the bootstrap server certificate succeeds itself
+
+The certificate the founder's enrollment endpoint presents lasts the cluster's credential
+lifetime and succeeds itself ([24](24-placement-execution-and-fleet-control.md) §11): the
+registry names it and its staged successor (schema 5, one change under the founder
+authority moving record → stage → activate), the founder stages in the last third of the
+lifetime and presents the successor once every invitation open at the staging has closed,
+invitations and joined nodes carry and accept both pins (invitations schema 2, network
+states schema 3, older ones decode), and the pins are facts the registry moves rather than
+the sponsor's identity. Running a whole cluster at a twelve-second lifetime found what the
+renewals had left: a node's grant and every group grant expired with the credentials of
+their first lifetime (a renewal now extends the node's grant at its generation, and a group
+is authorized while its members are), and a renewed leader was refused by a follower that
+had not applied the renewal it could learn only from that leader (the transport admits a
+CA-verified renewal of an enrolled key before the registry names it). CA succession and issuer recovery remain designed (the remediation
+record, F13).

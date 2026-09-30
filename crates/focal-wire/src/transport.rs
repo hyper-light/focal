@@ -435,10 +435,12 @@ async fn serve_authenticated_connection_inner<H: RequestHandler + Clone>(
             .ok_or(WireError::Authentication)?
             .downcast::<Vec<CertificateDer<'static>>>()
             .map_err(|_| WireError::Authentication)?;
-        let fingerprint =
-            certificate_fingerprint(identity.first().ok_or(WireError::Authentication)?.as_ref());
+        let certificate = identity.first().ok_or(WireError::Authentication)?.as_ref();
+        let fingerprint = certificate_fingerprint(certificate);
+        // The certificate the projection names, or a renewal of an enrolled
+        // key it has not applied yet (24 §11).
         let peer = registry
-            .authenticate(fingerprint)
+            .authenticate_certificate(certificate)
             .map_err(|_| WireError::Authentication)?;
         Ok((fingerprint, peer))
     })();

@@ -297,6 +297,10 @@ struct RootPeer {
     node: u64,
     principal: [u8; 16],
     fingerprint: [u8; 32],
+    /// The enrolled key the peer was admitted under when the listener's
+    /// projection did not name its certificate: a renewal this replica may
+    /// not have applied yet (24 §11).
+    key: Option<[u8; 32]>,
 }
 struct Owner<V> {
     replica: ControlReplica,
@@ -1237,6 +1241,7 @@ impl<V: AuthorityVerifier> Owner<V> {
                     node: node_id,
                     principal: verified.peer().principal().0,
                     fingerprint,
+                    key: verified.peer().renewal_of(),
                 }),
                 _ => None,
             }
@@ -1281,7 +1286,12 @@ impl<V: AuthorityVerifier> Owner<V> {
                     verified.peer().certificate_fingerprint(),
                 ) {
                     (PeerRole::Node { node_id }, Some(fingerprint)) => {
-                        self.authorize_placement_peer(node_id, principal.0, fingerprint)?;
+                        self.authorize_placement_peer(
+                            node_id,
+                            principal.0,
+                            fingerprint,
+                            verified.peer().renewal_of(),
+                        )?;
                     }
                     _ => return Err(ControlFailure::Unauthorized),
                 }
@@ -1566,6 +1576,7 @@ impl<V: AuthorityVerifier> Owner<V> {
                                 peer.node,
                                 peer.principal,
                                 peer.fingerprint,
+                                peer.key,
                             )?;
                         if let Some(request) = request.take() {
                             match self
@@ -1656,6 +1667,7 @@ impl<V: AuthorityVerifier> Owner<V> {
                                     peer.node,
                                     peer.principal,
                                     peer.fingerprint,
+                                    peer.key,
                                 )
                         })
                         .and(result)
@@ -1767,15 +1779,14 @@ impl<V: AuthorityVerifier> Owner<V> {
         node: u64,
         principal: [u8; 16],
         fingerprint: [u8; 32],
+        key: Option<[u8; 32]>,
     ) -> Result<(), ControlFailure> {
         let enrollment = self
             .replica
             .installed_enrollment()
             .ok_or(ControlFailure::Unauthorized)?;
         let now = crate::network_bootstrap::unix_time().map_err(|_| ControlFailure::Unavailable)?;
-        authorize_node_contact(enrollment, node, principal, fingerprint, now)
-            .map(|_| ())
-            .map_err(|_| ControlFailure::Unauthorized)
+        authorize_node_peer(enrollment, node, principal, fingerprint, key, now)
     }
     fn authorize_root_peer(&self, peer: RootPeer) -> Result<(), ControlFailure> {
         let enrollment = self
@@ -1783,9 +1794,14 @@ impl<V: AuthorityVerifier> Owner<V> {
             .enrollment()
             .ok_or(ControlFailure::Unauthorized)?;
         let now = crate::network_bootstrap::unix_time().map_err(|_| ControlFailure::Unavailable)?;
-        authorize_node_contact(enrollment, peer.node, peer.principal, peer.fingerprint, now)
-            .map(|_| ())
-            .map_err(|_| ControlFailure::Unauthorized)
+        authorize_node_peer(
+            enrollment,
+            peer.node,
+            peer.principal,
+            peer.fingerprint,
+            peer.key,
+            now,
+        )
     }
     fn finish(&self, pending: Pending, result: Result<ControlReply, ControlFailure>) {
         self.finish_charged(pending, result, None);
@@ -1956,3 +1972,26 @@ mod auth_tests;
 #[cfg(test)]
 #[path = "control_snapshot_tests.rs"]
 mod snapshot_tests;
+
+/// A node peer's authority at this replica: the certificate it presented is
+/// one the committed registry authorizes for it (the current one, or one a
+/// renewal retired that is still within its grace), or — when the registry
+/// here does not name that certificate — the peer was admitted under the
+/// key its unrevoked enrollment holds, a renewal this replica has not
+/// applied yet (24 §11): the very commit it may be receiving from that peer.
+pub(crate) fn authorize_node_peer(
+    enrollment: &focal_enrollment::EnrollmentRegistry,
+    node: u64,
+    principal: [u8; 16],
+    fingerprint: [u8; 32],
+    key: Option<[u8; 32]>,
+    now: i64,
+) -> Result<(), ControlFailure> {
+    if authorize_node_contact(enrollment, node, principal, fingerprint, now).is_ok() {
+        return Ok(());
+    }
+    let key = key.ok_or(ControlFailure::Unauthorized)?;
+    focal_control::authorize_enrolled_key(enrollment, node, principal, key)
+        .map(|_| ())
+        .map_err(|_| ControlFailure::Unauthorized)
+}

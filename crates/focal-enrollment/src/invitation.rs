@@ -20,7 +20,34 @@ pub struct ServerTrust {
     pub server_name: String,
     pub ca_certificate: Vec<u8>,
     pub server_fingerprint: Fingerprint,
+    /// The bootstrap server certificate staged to succeed the pinned one
+    /// (24 §11), accepted as it is: an invitation issued while one is staged
+    /// carries both, and a joined node learns both from the registry.
+    pub successor_fingerprint: Option<Fingerprint>,
 }
+/// The trust as schema 1 invitations and network states wrote it: one pin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerTrustV1 {
+    pub endpoint: String,
+    pub server_name: String,
+    pub ca_certificate: Vec<u8>,
+    pub server_fingerprint: Fingerprint,
+}
+impl From<ServerTrustV1> for ServerTrust {
+    fn from(legacy: ServerTrustV1) -> Self {
+        Self {
+            endpoint: legacy.endpoint,
+            server_name: legacy.server_name,
+            ca_certificate: legacy.ca_certificate,
+            server_fingerprint: legacy.server_fingerprint,
+            successor_fingerprint: None,
+        }
+    }
+}
+/// The invitation schema whose trust carries one pin.
+pub(crate) const INVITATION_SCHEMA_V1: u16 = 1;
+/// The invitation schema whose trust may carry a staged successor's pin.
+pub(crate) const INVITATION_SCHEMA: u16 = 2;
 impl ServerTrust {
     /// Validate persisted trust before using its endpoint or building TLS state.
     pub fn validate(&self) -> Result<(), EnrollmentError> {
@@ -34,11 +61,45 @@ impl ServerTrust {
         if self.server_fingerprint == [0; 32] || self.ca_certificate.is_empty() {
             return Err(EnrollmentError::Invalid);
         }
+        if self
+            .successor_fingerprint
+            .is_some_and(|successor| successor == [0; 32] || successor == self.server_fingerprint)
+        {
+            return Err(EnrollmentError::Invalid);
+        }
         ServerName::try_from(self.server_name.clone()).map_err(|_| EnrollmentError::Invalid)?;
         self.roots()?;
         Ok(())
     }
-    pub(crate) fn fingerprint(&self) -> Result<Fingerprint, EnrollmentError> {
+    /// Whether `fingerprint` is a pin this trust accepts: the pinned
+    /// certificate's, or its staged successor's.
+    pub fn accepts(&self, fingerprint: Fingerprint) -> bool {
+        fingerprint == self.server_fingerprint || Some(fingerprint) == self.successor_fingerprint
+    }
+    /// Whether this trust names the same sponsor as `other`: the same
+    /// endpoint, name and CA. The pins are facts the registry moves as the
+    /// bootstrap server certificate succeeds itself (24 §11).
+    pub fn same_sponsor(&self, other: &Self) -> bool {
+        self.endpoint == other.endpoint
+            && self.server_name == other.server_name
+            && self.ca_certificate == other.ca_certificate
+    }
+    /// The trust's fingerprint as an invitation of `schema` bound it: over
+    /// the encoding that schema wrote, so an invitation issued before the
+    /// successor pin existed still matches the record it made.
+    pub(crate) fn fingerprint_as(&self, schema: u16) -> Result<Fingerprint, EnrollmentError> {
+        if schema == INVITATION_SCHEMA_V1 {
+            if self.successor_fingerprint.is_some() {
+                return Err(EnrollmentError::Invalid);
+            }
+            let legacy = ServerTrustV1 {
+                endpoint: self.endpoint.clone(),
+                server_name: self.server_name.clone(),
+                ca_certificate: self.ca_certificate.clone(),
+                server_fingerprint: self.server_fingerprint,
+            };
+            return Ok(hash("focal.enrollment.server-trust.v1", &encode(&legacy)?));
+        }
         Ok(hash("focal.enrollment.server-trust.v1", &encode(self)?))
     }
     /// Ordinary TLS 1.3 chain/name verification against the pinned CA, for
@@ -115,7 +176,7 @@ impl ServerTrust {
                 now,
             )
             .map_err(|_| EnrollmentError::Unauthorized)?;
-        if server_fingerprint(first.as_ref()) != self.server_fingerprint {
+        if !self.accepts(server_fingerprint(first.as_ref())) {
             return Err(EnrollmentError::Unauthorized);
         }
         Ok(())
@@ -134,6 +195,41 @@ pub(crate) struct InvitationData {
     pub expires_at: i64,
     pub secret: SecretBytes,
     pub trust: ServerTrust,
+}
+/// The invitation as schema 1 wrote it: a trust with one pin.
+#[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
+struct InvitationDataV1 {
+    schema: u16,
+    id: InvitationId,
+    cluster: ClusterId,
+    role: EnrollmentRole,
+    expires_at: i64,
+    secret: SecretBytes,
+    trust: ServerTrustV1,
+}
+impl InvitationData {
+    /// Decode an invitation of either schema; schema 1 carries one pin.
+    pub(crate) fn decode_any(bytes: &[u8]) -> Result<Self, EnrollmentError> {
+        let (schema, _) = postcard::take_from_bytes::<u16>(bytes)?;
+        if schema == INVITATION_SCHEMA_V1 {
+            let legacy: InvitationDataV1 = decode(bytes)?;
+            return Ok(Self {
+                schema: legacy.schema,
+                id: legacy.id,
+                cluster: legacy.cluster,
+                role: legacy.role,
+                expires_at: legacy.expires_at,
+                secret: legacy.secret,
+                trust: legacy.trust.into(),
+            });
+        }
+        decode(bytes)
+    }
+    /// The trust's fingerprint as this invitation bound it.
+    pub(crate) fn trust_fingerprint(&self) -> Result<Fingerprint, EnrollmentError> {
+        self.trust.fingerprint_as(self.schema)
+    }
 }
 /// Operator-delivered bearer material. The explicit encoding operation exposes
 /// the invitation; Debug and errors always redact its secret.
@@ -166,6 +262,31 @@ impl Invitation {
     pub fn trust(&self) -> &ServerTrust {
         &self.data.trust
     }
+    /// The token as a schema 1 binary wrote it, for the upgrade test.
+    #[cfg(test)]
+    pub(crate) fn expose_token_as_schema_one_for_tests(
+        &self,
+    ) -> Result<Zeroizing<String>, EnrollmentError> {
+        if self.data.trust.successor_fingerprint.is_some() {
+            return Err(EnrollmentError::Invalid);
+        }
+        let legacy = InvitationDataV1 {
+            schema: INVITATION_SCHEMA_V1,
+            id: self.data.id,
+            cluster: self.data.cluster,
+            role: self.data.role,
+            expires_at: self.data.expires_at,
+            secret: self.data.secret.clone(),
+            trust: ServerTrustV1 {
+                endpoint: self.data.trust.endpoint.clone(),
+                server_name: self.data.trust.server_name.clone(),
+                ca_certificate: self.data.trust.ca_certificate.clone(),
+                server_fingerprint: self.data.trust.server_fingerprint,
+            },
+        };
+        let bytes = Zeroizing::new(encode(&legacy)?);
+        Ok(Zeroizing::new(format!("focal-invite-v1:{}", hex(&bytes))))
+    }
     pub fn expose_token(&self) -> Result<Zeroizing<String>, EnrollmentError> {
         let bytes = Zeroizing::new(encode(&self.data)?);
         Ok(Zeroizing::new(format!("focal-invite-v1:{}", hex(&bytes))))
@@ -189,8 +310,8 @@ impl Invitation {
             };
             bytes.push((digit(*high)? << 4) | digit(*low)?);
         }
-        let data: InvitationData = decode(&bytes)?;
-        if data.schema != 1
+        let data = InvitationData::decode_any(&bytes)?;
+        if !(data.schema == INVITATION_SCHEMA_V1 || data.schema == INVITATION_SCHEMA)
             || data.id == [0; 16]
             || data.cluster == [0; 16]
             || data.secret.0.len() != 32
@@ -272,7 +393,7 @@ impl Invitation {
             invitation: self.data.id,
             cluster: self.data.cluster,
             role: self.data.role,
-            trust: self.data.trust.fingerprint()?,
+            trust: self.data.trust_fingerprint()?,
             secret: self.data.secret.clone(),
             request: key.request_id(),
             csr: key.csr().to_vec(),

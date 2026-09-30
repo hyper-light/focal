@@ -517,8 +517,9 @@ pub(crate) fn authorize_first_directory(
         || !group.outgoing_voters.is_empty()
         || !group.learners.is_empty()
         || !node.enrollment.eligible
-        || group.expires_at <= now
-        || node.expires_at < group.expires_at
+        // The group is authorized while its voter is: the founder's grant,
+        // extended as its credential is renewed (24 §11).
+        || authority.checkpoint().group_expires_at(group) <= now
     {
         return Err(DirectoryBootstrapError::Unauthorized);
     }
@@ -535,11 +536,11 @@ pub(crate) fn authorize_first_directory(
         .map_err(|_| DirectoryBootstrapError::Unauthorized)?;
     if identity.role != focal_enrollment::EnrollmentRole::Node
         || identity.node_id != Some(plan.founder_node)
-        || certificate.expires_at < group.expires_at
+        || certificate.expires_at < authority.checkpoint().group_expires_at(group)
     {
         return Err(DirectoryBootstrapError::Unauthorized);
     }
-    let expires_at = group.expires_at;
+    let expires_at = authority.checkpoint().group_expires_at(group);
     let ControlReadResult::Authority(Some(snapshot)) = owner.read_local(&ControlRead::Authority)?
     else {
         return Err(DirectoryBootstrapError::Unauthorized);
@@ -698,8 +699,7 @@ pub(crate) fn next_first_directory_command(
             || existing.voters != grant.voters
             || !existing.outgoing_voters.is_empty()
             || !existing.learners.is_empty()
-            || existing.expires_at <= now
-            || existing.expires_at > node.expires_at
+            || authority.group_expires_at(existing) <= now
         {
             return Err(DirectoryBootstrapError::Unauthorized);
         }
