@@ -58,10 +58,13 @@ impl LocalHost {
             .name("focal-session-owner".into())
             .spawn(move || {
                 let _liveness = liveness;
+                let mut archive = crate::archive_agent::EmbeddedArchive::from_env();
                 let mut next_tick = Instant::now();
                 loop {
                     if Instant::now() >= next_tick {
-                        if let Err(error) = maintain(&mut node, &mut views) {
+                        if let Err(error) =
+                            maintain(&mut node, &mut views, &mut archive, &host_budget)
+                        {
                             use std::io::Write as _;
                             let _ = writeln!(
                                 std::io::stderr().lock(),
@@ -397,7 +400,12 @@ pub(crate) fn access(error: LedgerError) -> AccessError {
         _ => AccessError::OutcomeUnknown,
     }
 }
-fn maintain(node: &mut EmbeddedNode, views: &mut crate::reads::ReadViews) -> Result<(), NodeError> {
+fn maintain(
+    node: &mut EmbeddedNode,
+    views: &mut crate::reads::ReadViews,
+    archive: &mut crate::archive_agent::EmbeddedArchive,
+    budget: &MemoryBudget,
+) -> Result<(), NodeError> {
     views
         .advance(&mut node.session)
         .map_err(|error| NodeError::Domain(error.to_string()))?;
@@ -413,6 +421,10 @@ fn maintain(node: &mut EmbeddedNode, views: &mut crate::reads::ReadViews) -> Res
     // Trusted timers of the native engine fire from this clock; a refusal
     // of one timer is that timer's outcome, not a maintenance failure.
     crate::native_timers::sweep(&mut node.session)?;
+    // The archive agent of this node (26 §4, F12): released families retire
+    // and closed outcomes seal here as on a network node, into this node's
+    // own store.
+    archive.maintain(node, budget)?;
     Ok(())
 }
 fn dispatch(

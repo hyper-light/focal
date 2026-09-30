@@ -10,13 +10,15 @@
 //! exactly this run's retained size.
 use crate::authored;
 use crate::error::LoadError;
+use crate::generations::{Finished, Generations};
 use crate::native;
 use crate::report::{self, Latency, Report};
 use crate::shape::{Profile, Transport, WorkloadShape};
 use focal_client::{Client, ClientError, EmbeddedTransport, RetryPolicy, UnixTransport};
 use focal_ledger::NativeContentProfile;
 use focal_model::{
-    ClaimId, LedgerId, ParticipantId, RequestEpoch, RequestId, RootCommandId, RouteEpoch,
+    ClaimId, LedgerId, ParticipantId, RequestEpoch, RequestId, RequestKey, RootCommandId,
+    RouteEpoch,
 };
 use focal_node::{
     config::Settings,
@@ -24,9 +26,9 @@ use focal_node::{
     host::LocalHost,
 };
 use focal_wire::{
-    AuthenticatedPeer, NativeClaimExpand, NativeMutationReply, NativeReadQuery, NativeReadRequest,
-    Operation, PeerGrant, PeerRole, ReadConsistency, RequestEnvelope, Response, ResponseEnvelope,
-    WireLimits,
+    AuthenticatedPeer, NativeClaimExpand, NativeErrorCode, NativeMutationReply, NativeObject,
+    NativeReadQuery, NativeReadRequest, NativeRefusalKind, Operation, PeerGrant, PeerRole,
+    ReadConsistency, RequestEnvelope, Response, ResponseEnvelope, WireLimits,
 };
 use std::{
     collections::BTreeSet,
@@ -42,6 +44,12 @@ const WORKER_SHIFT: u32 = 32;
 const CLAIM_OFFSET: u128 = 0x4000_0000;
 /// Read request ids start here within a worker's space.
 const READ_OFFSET: u128 = 0x8000_0000;
+/// The request ids of a worker's floor advances and window reads (the
+/// audit's F12) start here within its space.
+const PROTOCOL_OFFSET: u128 = 0xC000_0000;
+/// Request ids a write may take: the request, and its re-issue when the
+/// owner refused it by name.
+const ATTEMPTS: u128 = 2;
 /// The worker index the reopen probe uses; above every real worker.
 const PROBE_WORKER: u128 = 0xFF;
 /// Distinct refusal reasons kept per run.
@@ -176,7 +184,197 @@ fn read_hit(result: &Result<ResponseEnvelope, ClientError>) -> bool {
     matches!(result, Ok(envelope) if matches!(&envelope.result, Response::NativeRead(page) if !page.objects.is_empty()))
 }
 
-fn worker(job: Job, phase: Phase, run_start: Instant) -> Result<Outcome, LoadError> {
+/// How the owner answered a write.
+enum Reply {
+    Committed,
+    /// Refused by name: the request's generation is closed, or not admitted
+    /// yet (the audit's F12); never executed.
+    Expired,
+    Refused(String),
+    Unknown(String),
+}
+
+fn classify(result: Result<ResponseEnvelope, ClientError>) -> Reply {
+    match result {
+        Ok(envelope) => match envelope.result {
+            Response::Native(NativeMutationReply::Committed(_)) => Reply::Committed,
+            Response::Native(NativeMutationReply::Refused(refusal))
+                if matches!(
+                    refusal.kind,
+                    NativeRefusalKind::Refused(
+                        NativeErrorCode::RequestHistoryExpired | NativeErrorCode::EpochNotAdmitted
+                    )
+                ) =>
+            {
+                Reply::Expired
+            }
+            Response::Native(NativeMutationReply::Refused(refusal)) => {
+                Reply::Refused(format!("refused: {refusal:?}"))
+            }
+            Response::Native(NativeMutationReply::Pending(_)) => {
+                Reply::Unknown("pending: ticket, not a receipt".into())
+            }
+            Response::Error(error) => Reply::Refused(format!("access: {error:?}")),
+            _ => Reply::Refused("unexpected reply kind".into()),
+        },
+        // The client gave up on a refusal the node made (capacity, after
+        // its bounded retries): admitted nothing, so refused, not unknown.
+        Err(ClientError::Access(error)) => Reply::Refused(format!("access: {error:?}")),
+        Err(error) => Reply::Unknown(format!("client: {error}")),
+    }
+}
+
+fn window_envelope(names: &Names, request: u128) -> RequestEnvelope {
+    RequestEnvelope {
+        protocol: focal_wire::NATIVE_PROTOCOL_VERSION,
+        ledger: names.ledger,
+        route_epoch: RouteEpoch(1),
+        request_epoch: RequestEpoch(1),
+        request_id: RequestId::from_u128(request),
+        operation: Operation::NativeRead(NativeReadRequest {
+            consistency: ReadConsistency::Linearizable,
+            query: NativeReadQuery::Epochs(names.issuer),
+            max_items: 1,
+        }),
+    }
+}
+
+/// The write `offset` of this worker: a structural creation names its claim
+/// id; a compiled one mints its identities from a span of the same space.
+fn build(
+    job: &Job,
+    offset: u128,
+    request: RequestKey,
+) -> Result<(RequestEnvelope, u128), LoadError> {
+    match job.names.profile {
+        NativeContentProfile::ProjectionOnly => {
+            let claim = job
+                .base
+                .checked_add(CLAIM_OFFSET)
+                .and_then(|id| id.checked_add(offset))
+                .ok_or(LoadError::Bound("claim id space"))?;
+            let envelope = native::create_envelope(
+                job.names.ledger,
+                job.names.issuer,
+                job.names.worker,
+                job.names.profile,
+                request,
+                claim,
+            )?;
+            Ok((envelope, claim))
+        }
+        NativeContentProfile::AuthoredV1 => {
+            let first_id = offset
+                .checked_mul(authored::IDS_PER_CREATION)
+                .and_then(|span| job.base.checked_add(CLAIM_OFFSET)?.checked_add(span))
+                .ok_or(LoadError::Bound("claim id space"))?;
+            let created = authored::create_envelope(
+                job.names.ledger,
+                job.names.issuer,
+                job.names.worker,
+                job.names.root,
+                request,
+                first_id,
+            )?;
+            Ok((created.envelope, created.claim))
+        }
+    }
+}
+
+/// The protocol requests of one worker — floor advances and window reads —
+/// numbered in their own part of its id space.
+struct Protocol {
+    next: u128,
+}
+impl Protocol {
+    fn request(&mut self, job: &Job) -> Result<u128, LoadError> {
+        let id = job
+            .base
+            .checked_add(PROTOCOL_OFFSET)
+            .and_then(|first| first.checked_add(self.next))
+            .filter(|_| self.next < READ_OFFSET)
+            .ok_or(LoadError::Bound("protocol request id space"))?;
+        self.next = self
+            .next
+            .checked_add(1)
+            .ok_or(LoadError::Bound("protocol request id space"))?;
+        Ok(id)
+    }
+}
+
+/// One worker's means of speaking to the owner: its runtime and client,
+/// its job, the run's generations and its own protocol request ids.
+struct Caller<'a> {
+    runtime: &'a tokio::runtime::Runtime,
+    conn: &'a Conn,
+    job: &'a Job,
+    generations: &'a Generations,
+    protocol: Protocol,
+}
+impl Caller<'_> {
+    fn send(&self, envelope: RequestEnvelope) -> Result<ResponseEnvelope, ClientError> {
+        self.runtime.block_on(self.conn.request(envelope))
+    }
+    /// The owner's window, read after a refusal by name: the run issues
+    /// where the owner admits. `false` when the window could not be read.
+    fn learn(&mut self, outcome: &mut Outcome) -> Result<bool, LoadError> {
+        let request = self.protocol.request(self.job)?;
+        match self.send(window_envelope(&self.job.names, request)) {
+            Ok(envelope) => {
+                if let Response::NativeRead(page) = &envelope.result
+                    && let Some(NativeObject::Epochs(window)) = page.objects.first()
+                {
+                    let open: Vec<RequestEpoch> =
+                        window.open.iter().map(|open| open.epoch).collect();
+                    self.generations.learn(window.floor, &open)?;
+                    return Ok(true);
+                }
+                note(
+                    &mut outcome.refusals,
+                    format!("window: unexpected reply {:?}", envelope.result),
+                );
+            }
+            Err(error) => note(&mut outcome.refusals, format!("window: client: {error}")),
+        }
+        Ok(false)
+    }
+    /// The floor advance the journal sends once the generation below
+    /// drained: committed, the floor stands at `minimum`; refused by name,
+    /// the window is learned; otherwise the next reply sends it again.
+    fn advance(
+        &mut self,
+        outcome: &mut Outcome,
+        epoch: RequestEpoch,
+        minimum: RequestEpoch,
+    ) -> Result<(), LoadError> {
+        let request = RequestKey {
+            principal: self.job.names.issuer,
+            epoch,
+            id: RequestId::from_u128(self.protocol.request(self.job)?),
+        };
+        let names = &self.job.names;
+        let envelope = native::advance_envelope(names.ledger, names.profile, request, minimum)?;
+        match classify(self.send(envelope)) {
+            Reply::Committed => self.generations.advanced(minimum),
+            Reply::Expired => {
+                self.generations.advance_failed()?;
+                self.learn(outcome).map(|_| ())
+            }
+            Reply::Refused(reason) | Reply::Unknown(reason) => {
+                self.generations.advance_failed()?;
+                note(&mut outcome.refusals, format!("floor advance: {reason}"));
+                Ok(())
+            }
+        }
+    }
+}
+
+fn worker(
+    job: Job,
+    phase: Phase,
+    run_start: Instant,
+    generations: &Generations,
+) -> Result<Outcome, LoadError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -186,87 +384,75 @@ fn worker(job: Job, phase: Phase, run_start: Instant) -> Result<Outcome, LoadErr
         samples: Vec::with_capacity(count),
         ..Outcome::default()
     };
+    let mut caller = Caller {
+        runtime: &runtime,
+        conn: &conn,
+        job: &job,
+        generations,
+        protocol: Protocol { next: 0 },
+    };
     match phase {
         Phase::Write => {
             outcome.created = Vec::with_capacity(count);
             for i in 0..job.count {
                 let offset = u128::from(i);
-                let request = job
-                    .base
-                    .checked_add(1)
-                    .and_then(|id| id.checked_add(offset))
-                    .ok_or(LoadError::Bound("request id space"))?;
-                // A structural creation names its claim id; a compiled one
-                // mints its identities from a span of the same space.
-                let (envelope, claim) = match job.names.profile {
-                    NativeContentProfile::ProjectionOnly => {
-                        let claim = job
-                            .base
-                            .checked_add(CLAIM_OFFSET)
-                            .and_then(|id| id.checked_add(offset))
-                            .ok_or(LoadError::Bound("claim id space"))?;
-                        let envelope = native::create_envelope(
-                            job.names.ledger,
-                            job.names.issuer,
-                            job.names.worker,
-                            job.names.profile,
-                            request,
-                            claim,
-                        )?;
-                        (envelope, claim)
+                // Every write is issued in the generation the run's
+                // journal stands at; one the owner refused by name is
+                // issued once more, with the next request id, in the
+                // generation the owner admits — never executed twice.
+                let mut attempt = 0u128;
+                loop {
+                    let request = offset
+                        .checked_mul(ATTEMPTS)
+                        .and_then(|slot| slot.checked_add(attempt))
+                        .and_then(|slot| slot.checked_add(1))
+                        .filter(|slot| *slot < CLAIM_OFFSET)
+                        .and_then(|slot| job.base.checked_add(slot))
+                        .ok_or(LoadError::Bound("request id space"))?;
+                    let minted = generations.mint()?;
+                    let key = RequestKey {
+                        principal: job.names.issuer,
+                        epoch: minted.epoch,
+                        id: RequestId::from_u128(request),
+                    };
+                    let (envelope, claim) = build(&job, offset, key)?;
+                    let started = Instant::now();
+                    let reply = classify(caller.send(envelope));
+                    outcome.samples.push((
+                        started.saturating_duration_since(run_start).as_nanos(),
+                        started.elapsed().as_nanos(),
+                    ));
+                    if let Finished::Advance { epoch, minimum } =
+                        generations.finish(minted.epoch)?
+                    {
+                        caller.advance(&mut outcome, epoch, minimum)?;
                     }
-                    NativeContentProfile::AuthoredV1 => {
-                        let first_id = offset
-                            .checked_mul(authored::IDS_PER_CREATION)
-                            .and_then(|span| job.base.checked_add(CLAIM_OFFSET)?.checked_add(span))
-                            .ok_or(LoadError::Bound("claim id space"))?;
-                        let created = authored::create_envelope(
-                            job.names.ledger,
-                            job.names.issuer,
-                            job.names.worker,
-                            job.names.root,
-                            request,
-                            first_id,
-                        )?;
-                        (created.envelope, created.claim)
-                    }
-                };
-                let started = Instant::now();
-                let result = runtime.block_on(conn.request(envelope));
-                outcome.samples.push((
-                    started.saturating_duration_since(run_start).as_nanos(),
-                    started.elapsed().as_nanos(),
-                ));
-                match result {
-                    Ok(envelope) => match envelope.result {
-                        Response::Native(NativeMutationReply::Committed(_)) => {
+                    match reply {
+                        Reply::Committed => {
                             outcome.committed = outcome.committed.saturating_add(1);
                             outcome.created.push(claim);
                         }
-                        Response::Native(NativeMutationReply::Refused(refusal)) => {
+                        Reply::Expired => {
+                            attempt = attempt.saturating_add(1);
+                            if attempt < ATTEMPTS && caller.learn(&mut outcome)? {
+                                continue;
+                            }
                             outcome.refused = outcome.refused.saturating_add(1);
-                            note(&mut outcome.refusals, format!("refused: {refusal:?}"));
-                        }
-                        Response::Native(NativeMutationReply::Pending(_)) => {
-                            outcome.unknown = outcome.unknown.saturating_add(1);
                             note(
                                 &mut outcome.refusals,
-                                "pending: ticket, not a receipt".into(),
+                                "refused by name in the generation the owner named".into(),
                             );
                         }
-                        Response::Error(error) => {
+                        Reply::Refused(reason) => {
                             outcome.refused = outcome.refused.saturating_add(1);
-                            note(&mut outcome.refusals, format!("access: {error:?}"));
+                            note(&mut outcome.refusals, reason);
                         }
-                        _ => {
-                            outcome.refused = outcome.refused.saturating_add(1);
-                            note(&mut outcome.refusals, "unexpected reply kind".into());
+                        Reply::Unknown(reason) => {
+                            outcome.unknown = outcome.unknown.saturating_add(1);
+                            note(&mut outcome.refusals, reason);
                         }
-                    },
-                    Err(error) => {
-                        outcome.unknown = outcome.unknown.saturating_add(1);
-                        note(&mut outcome.refusals, format!("client: {error}"));
                     }
+                    break;
                 }
             }
         }
@@ -299,14 +485,18 @@ fn worker(job: Job, phase: Phase, run_start: Instant) -> Result<Outcome, LoadErr
 
 /// Runs one phase on every job at once and waits for all of them; the wall
 /// time is the phase's, from the first spawn to the last join.
-fn run_phase(jobs: Vec<Job>, phase: Phase) -> Result<(Vec<Outcome>, u128), LoadError> {
+fn run_phase(
+    jobs: Vec<Job>,
+    phase: Phase,
+    generations: &Generations,
+) -> Result<(Vec<Outcome>, u128), LoadError> {
     let run_start = Instant::now();
     let outcomes = std::thread::scope(|scope| -> Result<Vec<Outcome>, LoadError> {
         let mut handles = Vec::with_capacity(jobs.len());
         for job in jobs {
             let handle = std::thread::Builder::new()
                 .name(format!("focal-load-{}", job.index))
-                .spawn_scoped(scope, move || worker(job, phase, run_start))?;
+                .spawn_scoped(scope, move || worker(job, phase, run_start, generations))?;
             handles.push(handle);
         }
         let mut outcomes = Vec::with_capacity(handles.len());
@@ -516,7 +706,11 @@ pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
             created: Vec::new(),
         });
     }
-    let (write_outcomes, write_nanos) = run_phase(jobs, Phase::Write)?;
+    // One journal's generations for every caller, as N processes of one
+    // participant share one (the audit's F12).
+    let generations = Generations::new();
+    let (write_outcomes, write_nanos) = run_phase(jobs, Phase::Write, &generations)?;
+    let (floors_advanced, expired) = generations.counts()?;
     let mut writes = merged(&write_outcomes);
     let (committed, refused, unknown) = (writes.committed, writes.refused, writes.unknown);
     let (latency_ns, first_half, second_half) = halves(&mut writes.samples)?;
@@ -547,7 +741,7 @@ pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
                 created: outcome.created.clone(),
             });
         }
-        let (read_outcomes, read_nanos) = run_phase(jobs, Phase::Read)?;
+        let (read_outcomes, read_nanos) = run_phase(jobs, Phase::Read, &generations)?;
         let reads = merged(&read_outcomes);
         let issued = u64::try_from(reads.samples.len()).map_err(|_| LoadError::Bound("reads"))?;
         let mut latencies: Vec<u128> = reads.samples.iter().map(|(_, latency)| *latency).collect();
@@ -602,6 +796,8 @@ pub fn run(shape: WorkloadShape) -> Result<Report, LoadError> {
         committed,
         refused,
         unknown,
+        expired,
+        floors_advanced,
         wall_ms: write_nanos.checked_div(1_000_000).unwrap_or(0),
         throughput_ops_per_s: report::per_second(committed, write_nanos),
         latency_ns,

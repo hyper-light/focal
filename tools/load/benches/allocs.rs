@@ -28,6 +28,7 @@
 #[path = "../../../crates/focal-memory/benches/support/alloc_count.rs"]
 mod alloc_count;
 #[path = "../src/native.rs"]
+#[allow(dead_code)]
 mod native;
 
 use alloc_count::Meter;
@@ -150,7 +151,11 @@ fn main() {
             issuer,
             worker,
             NativeContentProfile::ProjectionOnly,
-            request,
+            focal_model::RequestKey {
+                principal: issuer,
+                epoch: focal_model::RequestEpoch(1),
+                id: focal_model::RequestId::from_u128(request),
+            },
             claim,
         )
         .unwrap();

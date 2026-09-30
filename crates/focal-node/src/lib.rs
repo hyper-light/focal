@@ -13,6 +13,7 @@
 //! Node composition and user-facing deployment intent.
 pub mod admission;
 pub mod archive_agent;
+mod archive_derive;
 pub mod backup;
 pub mod cluster;
 pub mod cluster_admin;

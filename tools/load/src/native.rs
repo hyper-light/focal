@@ -128,7 +128,7 @@ fn create(
     ledger: LedgerId,
     issuer: ParticipantId,
     worker: ParticipantId,
-    request: u128,
+    request: RequestKey,
     id: u128,
 ) -> Result<NativeInput, FixtureError> {
     let proposals = vec![proposal(ledger, issuer, worker, id)?];
@@ -137,11 +137,7 @@ fn create(
         declarations.push(definition(issuer, proposal.definition.binding)?);
     }
     Ok(NativeInput {
-        request: RequestKey {
-            principal: issuer,
-            epoch: RequestEpoch(1),
-            id: RequestId::from_u128(request),
-        },
+        request,
         command: NativeCommand::Create {
             claims: proposals,
             declarations,
@@ -172,24 +168,49 @@ fn frame(
     Ok(bytes)
 }
 
-/// One structural native Create request envelope.
+fn envelope(
+    ledger: LedgerId,
+    profile: NativeContentProfile,
+    input: &NativeInput,
+) -> Result<RequestEnvelope, FixtureError> {
+    Ok(RequestEnvelope {
+        protocol: NATIVE_PROTOCOL_VERSION,
+        ledger,
+        route_epoch: RouteEpoch(1),
+        request_epoch: input.request.epoch,
+        request_id: input.request.id,
+        operation: Operation::Native {
+            frame: frame(ledger, profile, input)?,
+        },
+    })
+}
+
+/// One structural native Create request envelope, sent as `request` (the
+/// principal, its generation and the request id).
 pub fn create_envelope(
     ledger: LedgerId,
     issuer: ParticipantId,
     worker: ParticipantId,
     profile: NativeContentProfile,
-    request: u128,
+    request: RequestKey,
     id: u128,
 ) -> Result<RequestEnvelope, FixtureError> {
     let input = create(ledger, issuer, worker, request, id)?;
-    Ok(RequestEnvelope {
-        protocol: NATIVE_PROTOCOL_VERSION,
-        ledger,
-        route_epoch: RouteEpoch(1),
-        request_epoch: RequestEpoch(1),
-        request_id: RequestId::from_u128(request),
-        operation: Operation::Native {
-            frame: frame(ledger, profile, &input)?,
-        },
-    })
+    envelope(ledger, profile, &input)
+}
+
+/// The client protocol's floor advance (the audit's F12): `request`, sent in
+/// its own generation, asks the owner to close this principal's generations
+/// below `minimum`. Shared by both profiles.
+pub fn advance_envelope(
+    ledger: LedgerId,
+    profile: NativeContentProfile,
+    request: RequestKey,
+    minimum: RequestEpoch,
+) -> Result<RequestEnvelope, FixtureError> {
+    let input = NativeInput {
+        request,
+        command: NativeCommand::AdvanceEpochFloor { minimum },
+    };
+    envelope(ledger, profile, &input)
 }

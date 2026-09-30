@@ -46,19 +46,21 @@ fn address() -> String {
 /// the generation floors once the resident outcomes and the candidates
 /// that may still be admitted (the standard thirty-two) would pass it.
 const OUTCOMES: &str = "48";
-fn start(root: &Path, advertise: &str) -> Server {
+/// A node on the network when `advertise` names its endpoint, else the
+/// embedded node of the data directory alone.
+fn start(root: &Path, advertise: Option<&str>) -> Server {
     deadline::observe(root);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_focal"))
-        .args([
-            "--data-dir",
-            root.to_str().unwrap(),
-            "start",
-            "--advertise",
-            advertise,
-        ])
+    let mut command = Command::new(env!("CARGO_BIN_EXE_focal"));
+    command.args(["--data-dir", root.to_str().unwrap(), "start"]);
+    if let Some(advertise) = advertise {
+        command.args(["--advertise", advertise]);
+    }
+    let mut child = command
         .env("FOCAL_NATIVE_OUTCOMES", OUTCOMES)
-        // The archive agent looks every fifth of a second.
+        // The archive agent looks every fifth of a second, and retires a
+        // released family at once.
         .env("FOCAL_RETIRE_INTERVAL_MS", "200")
+        .env("FOCAL_RETIRE_AFTER_MS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -217,7 +219,7 @@ fn a_closed_generation_is_learned_by_name_and_its_sealed_outcomes_are_still_read
     let activation = admin(root, None, &["cluster", "replicas", "activate-native"]);
     assert_eq!(activation["activated"], true, "{activation}");
     let advertise = address();
-    let server = start(root, &advertise);
+    let server = start(root, Some(&advertise));
     let invitation = client.path().join("alice.invite");
     admin(
         root,
@@ -343,7 +345,7 @@ fn a_closed_generation_is_learned_by_name_and_its_sealed_outcomes_are_still_read
     // outcomes are read as before, the closed generation stays closed, and
     // work goes on in the open one.
     drop(server);
-    let server = start(root, &advertise);
+    let server = start(root, Some(&advertise));
     let after_restart = observed(root, first_id);
     assert_eq!(after_restart, sealed);
     let (code, again) = attempt(
@@ -362,6 +364,146 @@ fn a_closed_generation_is_learned_by_name_and_its_sealed_outcomes_are_still_read
             "claim",
             "--json",
             &claim_document(&alice, "The claim after the restart.").to_string(),
+        ],
+    ));
+    drop(server);
+}
+
+/// Poll `get claim` until the continuation replaces the claim (26 §4).
+fn retired(root: &Path, claim: &str) -> Value {
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(60));
+    loop {
+        let page = cli(root, None, &["get", "claim", claim]);
+        let object = objects(&page)[0].clone();
+        if object.get("Retired").is_some() {
+            return object["Retired"].clone();
+        }
+        assert!(deadline.open(), "claim {claim} never retired: {object}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// The embedded node — `focal start` without a network — runs the archive
+/// agent's walk on its owner thread against its own store (26 §4a): under
+/// the same pressure its founder's generation closes and is learned by
+/// name, its sealed outcomes are read from the seal, a released family
+/// retires behind its continuation, and a restart keeps it all.
+#[test]
+fn an_embedded_node_seals_its_closed_generations_and_retires_released_families() {
+    let founder = tempfile::Builder::new()
+        .prefix("focal-epochs-embedded-")
+        .tempdir()
+        .unwrap();
+    private(founder.path());
+    let root = founder.path();
+    let activation = admin(root, None, &["cluster", "replicas", "activate-native"]);
+    assert_eq!(activation["activated"], true, "{activation}");
+    let server = start(root, None);
+    // The founder issues to the worker identity its data directory names.
+    let identity = focal_node::embedded::decode_identity(&root.join("IDENTITY")).unwrap();
+    let worker: String = identity
+        .worker
+        .0
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+
+    // A family released before the pressure: it retires by itself.
+    let (_, result) = committed(&cli(
+        root,
+        None,
+        &[
+            "submit",
+            "claim",
+            "--json",
+            &claim_document(&worker, "A claim to release.").to_string(),
+        ],
+    ));
+    let released = hex_hash(&result["created"][0]["id"]);
+    committed(&cli(root, None, &["claim", "cancel", &released]));
+    committed(&cli(root, None, &["claim", "release-scope", &released]));
+    let continuation = retired(root, &released);
+    assert!(continuation["bundle"].is_array(), "{continuation}");
+
+    // The founder issues claims until the owner closes its generation.
+    let mut committed_ops: Vec<(String, Value)> = Vec::new();
+    let mut expired = None;
+    let mut deadline = deadline::Deadline::after(Duration::from_secs(120));
+    for round in 0..96u32 {
+        assert!(
+            deadline.open(),
+            "the generation never closed: {committed_ops:?}"
+        );
+        let document = claim_document(&worker, &format!("Claim {round} of the window."));
+        let (code, value) = attempt(
+            root,
+            None,
+            &["submit", "claim", "--json", &document.to_string()],
+        );
+        if code == 0 {
+            committed_ops.push(committed(&value));
+            continue;
+        }
+        assert_eq!(code, 5, "{value}");
+        assert_eq!(
+            value["result"]["code"], "request_history_expired",
+            "{value}"
+        );
+        expired = value["operation_id"].as_str().map(str::to_string);
+        break;
+    }
+    let expired = expired.expect("the founder's generation was closed under pressure");
+    assert!(committed_ops.len() >= 8, "{}", committed_ops.len());
+    // The next command commits in the admitted generation; the sealed
+    // operations are still answered from the seal, the claims are live.
+    let (_, resumed) = committed(&cli(
+        root,
+        None,
+        &[
+            "submit",
+            "claim",
+            "--json",
+            &claim_document(&worker, "The first claim after the floor.").to_string(),
+        ],
+    ));
+    let (first_id, first_result) = &committed_ops[0];
+    let sealed = observed(root, first_id);
+    assert_eq!(sealed["intent"], first_result["receipt"]["intent"]);
+    let missing = cli(
+        root,
+        None,
+        &["request", "inspect", "--operation-id", &expired, "--remote"],
+    );
+    assert!(objects(&missing)[0].get("Missing").is_some(), "{missing}");
+    let claim = hex_hash(&resumed["created"][0]["id"]);
+    assert!(
+        objects(&cli(root, None, &["get", "claim", &claim]))[0]
+            .get("Claim")
+            .is_some()
+    );
+    // The retired family stays retired; a restart keeps the seals and the
+    // continuation and admits work in the open generation.
+    assert!(
+        objects(&cli(root, None, &["get", "claim", &released]))[0]
+            .get("Retired")
+            .is_some()
+    );
+    drop(server);
+    let server = start(root, None);
+    assert_eq!(observed(root, first_id), sealed);
+    assert!(
+        objects(&cli(root, None, &["get", "claim", &released]))[0]
+            .get("Retired")
+            .is_some()
+    );
+    committed(&cli(
+        root,
+        None,
+        &[
+            "submit",
+            "claim",
+            "--json",
+            &claim_document(&worker, "The claim after the restart.").to_string(),
         ],
     ));
     drop(server);

@@ -9,7 +9,7 @@ use focal_client::input::{BuildContext, InputError};
 use focal_client::native_store::NativeIdentityKind;
 use focal_client::operations::{NativeAuthoredOperation, NativeClaimDocument};
 use focal_core::native::input_codec::EncodingLimits;
-use focal_model::{LedgerId, ParticipantId, RequestEpoch, RequestId, RootCommandId, RouteEpoch};
+use focal_model::{LedgerId, ParticipantId, RequestKey, RootCommandId, RouteEpoch};
 use focal_native_client::{CompileLimits, NativeContentProfile, Resolved, compile, encode_frame};
 use focal_wire::{NATIVE_PROTOCOL_VERSION, Operation, RequestEnvelope};
 
@@ -37,19 +37,19 @@ fn fixture<E: std::fmt::Display>(what: &'static str) -> impl FnOnce(E) -> LoadEr
     move |error| LoadError::Fixture(format!("{what}: {error}"))
 }
 
-/// One compiled `claim.submit`: `actor` issues to `subject`, request
-/// `request`, minting identities from `first_id` upward (fewer than
-/// [`IDS_PER_CREATION`]).
+/// One compiled `claim.submit`: `actor` issues to `subject`, sent as
+/// `request` (the principal, its generation and the request id), minting
+/// identities from `first_id` upward (fewer than [`IDS_PER_CREATION`]).
 pub fn create_envelope(
     ledger: LedgerId,
     actor: ParticipantId,
     subject: ParticipantId,
     root: RootCommandId,
-    request: u128,
+    request: RequestKey,
     first_id: u128,
 ) -> Result<Authored, LoadError> {
     let document: NativeClaimDocument = serde_json::from_value(serde_json::json!({
-        "description": format!("focal-load claim {request:x}"),
+        "description": format!("focal-load claim {}", hex(request.id.0)),
         "target": hex(subject.0),
         "validations": [{
             "kind": "receipt",
@@ -81,7 +81,7 @@ pub fn create_envelope(
     let compiled = compile(
         &operation,
         &context,
-        RequestId::from_u128(request),
+        request,
         &mut ids,
         &resolved,
         &CompileLimits::default(),
@@ -108,8 +108,8 @@ pub fn create_envelope(
             protocol: NATIVE_PROTOCOL_VERSION,
             ledger,
             route_epoch: RouteEpoch(1),
-            request_epoch: RequestEpoch(1),
-            request_id: RequestId::from_u128(request),
+            request_epoch: request.epoch,
+            request_id: request.id,
             operation: Operation::Native { frame },
         },
         claim,

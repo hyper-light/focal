@@ -66,6 +66,7 @@ so two runs never collide and a run is reproducible.
   "shape": { "claims": 1000, "seed": 7, "reads": 2000, "transport": "embedded",
              "data_dir": null, "profile": null, "concurrency": 1, "reopen": true },
   "committed": 1000, "refused": 0, "unknown": 0,
+  "expired": 0, "floors_advanced": 7,
   "wall_ms": 30000,
   "throughput_ops_per_s": 33.3,
   "latency_ns": { "p50": 30000000, "p95": 34000000, "p99": 35000000, "max": 36000000 },
@@ -83,6 +84,18 @@ so two runs never collide and a run is reproducible.
   "data_dir_bytes": 4194304
 }
 ```
+
+The callers issue their writes in request generations as the CLI's journal
+does (the audit's F12): one generation for the run, shared by every worker as
+N processes of one participant share one journal, rotated once half the
+journal's capacity was issued in it, its floor advanced by the protocol
+operation `epoch.advance` once the generation below drained
+(`floors_advanced`). A write the owner refused by name — its generation
+closed under pressure on the owner's resident window, or not admitted yet —
+was never executed: the run reads the owner's window and issues the write
+once more in the generation the owner admits (`expired`, counted apart from
+`refused`; both attempts are in the samples). `FOCAL_NATIVE_OUTCOMES` on the
+node sets the resident window such a run presses on.
 
 Writes are `F_FULLFSYNC`-bound per commit (tens of ms; batching is the throughput
 lever — see `crates/focal-log/benches/append.rs`); linearizable reads take no

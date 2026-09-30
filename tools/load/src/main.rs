@@ -1,3 +1,15 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::panic,
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::unreachable,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::disallowed_macros
+    )
+)]
 //! `focal-load` drives a [`shape::WorkloadShape`] against a node — an
 //! `EmbeddedNode` in this process, or a running `focal start` node over its
 //! Unix socket — from one or more concurrent callers, and writes a
@@ -8,6 +20,7 @@
 mod authored;
 mod driver;
 mod error;
+mod generations;
 mod native;
 mod report;
 mod shape;

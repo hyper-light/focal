@@ -12395,5 +12395,10 @@ resident outcomes are `outcomes − sealed`. A sealed outcome is read through
 `seal_tests` (five), `native_store::tests` (two), 
 `committed_seals_apply_on_every_replica_fence_proposals_and_close_the_generation`,
 `cli_native_epochs::a_closed_generation_is_learned_by_name_and_its_sealed_outcomes_are_still_read`.
-`FOCAL_NATIVE_OUTCOMES` sizes a node's resident window for qualification.
+`FOCAL_NATIVE_OUTCOMES` sizes a node's resident window for qualification. The embedded
+node runs the archive agent's walk on its owner thread (`EmbeddedArchive`; the derivations
+shared in `archive_derive`), so it retires and seals as a network node does
+(`an_embedded_node_seals_its_closed_generations_and_retires_released_families`);
+`focal-load` issues in generations as the journal does and reports `expired` and
+`floors_advanced`.
 

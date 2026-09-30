@@ -13,6 +13,14 @@ pub struct Report {
     pub committed: u64,
     pub refused: u64,
     pub unknown: u64,
+    /// Writes the owner refused by name — their generation closed under
+    /// pressure, or not admitted yet (the audit's F12) — and re-issued in
+    /// the generation the owner admits; counted apart from `refused`, as
+    /// the protocol working, and in the samples twice.
+    pub expired: u64,
+    /// Generation floors this run advanced, as the journal does once the
+    /// generation below drained.
+    pub floors_advanced: u64,
     /// Wall time of the write phase, every worker included.
     pub wall_ms: u128,
     pub throughput_ops_per_s: f64,

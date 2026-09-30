@@ -1232,7 +1232,15 @@ outcome it may have from the seal, records it as the receipt it is, learns the o
 and continues in the generation the owner admits. Seal bundles are content roots (kept by the
 collector, carried by a backup). The archive agent proposes a seal when the pressure floors
 are non-empty or the closed rows reach half a bundle, and counts `seals_proposed` and
-`seals_waiting`. The node's resident window is `FOCAL_NATIVE_OUTCOMES` for qualification.
+`seals_waiting`. The node's resident window is `FOCAL_NATIVE_OUTCOMES` for qualification. The embedded node
+(`focal start` without a network) runs the agent's walk on its owner thread
+(`EmbeddedArchive`, the derivations shared with the fleet's owner in `archive_derive`), each
+bundle sealed into its own store: before, it neither retired nor — now — sealed, so its window
+would have filled for good; found by driving `focal-load` under a small window. The load tool
+itself issues in generations as the CLI's journal does (one journal for the run's callers,
+rotation at half the journal's capacity, `epoch.advance` once the generation below drained, a
+refusal by name learned from the owner's window and the write re-issued once; `expired` and
+`floors_advanced` in its report).
 Found on the way and fixed at cause: the wire header check refused the new command tag
 (`NATIVE_COMMAND_TAGS`); the window row's rebuild budget counted one visit per range where the
 reader takes three fields; the fold directory wrote its range count as eight bytes where its
@@ -1267,7 +1275,15 @@ binary under a small resident window: the founder's generation is closed under p
 the refusal is by name with exit 5, the next command commits in the admitted generation, every
 committed operation of the closed generation is still answered by its journal and read from
 the seal by `request inspect --remote`, the claims stay live, and a restart changes none of
-it). Measurements: the seal plan and bundle are derived once per tick on the authority
+it), `an_embedded_node_seals_its_closed_generations_and_retires_released_families` (the same
+on the embedded node, and a released family retires behind its continuation across a
+restart). `focal-load` (`generations::tests`): the rotation at the journal's pace, the
+advance once the old generation drains, the window learned from a refusal; a run of 300
+claims from four callers under the standard window advances two floors with nothing refused,
+and from two callers under `FOCAL_NATIVE_OUTCOMES=48` commits them all through the forced
+floors (16 writes refused by name and re-issued, 6 floors advanced, nothing refused or
+unknown; before the embedded node ran the agent, 48 committed and the rest were refused for
+capacity). Measurements: the seal plan and bundle are derived once per tick on the authority
 within the archive agent's interval; the resident window is a configured count, not a
 lifetime one.
 

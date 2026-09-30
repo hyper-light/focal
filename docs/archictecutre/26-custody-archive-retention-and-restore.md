@@ -526,6 +526,19 @@ count; the fold is applied to a window before the seal that carries it is
 recorded, so a window at the bound admits the seal that makes room. Seal
 bundles are content roots: the collector keeps them and a backup carries them.
 
+**The embedded node.** A node started without a network (`focal start` on
+its data directory alone) hosts its session on one owner thread and has no
+network service to run the agent; until this batch it never retired a family
+nor, now, sealed a generation, so its window would have filled for good. The
+owner thread runs the agent's walk itself (`EmbeddedArchive`, in the
+maintenance step, at the agent's interval and grace from the same settings):
+the same derivations the fleet's replica owner uses (`archive_derive`:
+a released family's bundle, the seal the closed outcomes yield), each bundle
+sealed into the node's own content store — the one copy such a node has —
+before its record is proposed and polled to commitment; a step that cannot
+run now waits for a later tick and is counted. The reads of a retired or
+sealed object come from that store, as on a network node.
+
 **Bounds and settings.** `limits.principals` bounds the windows (the
 enrollment bound); `limits.outcomes` sizes the window and is a node's own
 setting (`FOCAL_NATIVE_OUTCOMES` for qualification; every replica of a session
