@@ -1044,6 +1044,108 @@ fn a_renewal_keeps_the_key_and_identity_retires_the_old_certificate_after_grace_
     assert_eq!(restored.charged_bytes(), registry.charged_bytes());
 }
 
+/// A member's replica follows the registry its credential was committed
+/// in, and after a restart knows only what its log says committed: the
+/// member may open holding a renewal the registry it recovered has not
+/// reached. It presents it; nothing else it is not listed with passes.
+#[test]
+fn a_member_opens_on_a_registry_that_has_not_reached_the_renewal_it_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = authority(&dir, [1; 16]);
+    let mut registry = registry(&authority);
+    let (key, first, material) = enroll_node(&dir, &mut registry, &authority, "node");
+    let (_, other, _) = enroll_node(&dir, &mut registry, &authority, "other");
+    // What the member's replica holds when it restarts: the registry before
+    // the renewal.
+    let behind = EnrollmentRegistry::restore(
+        &registry.checkpoint().unwrap(),
+        [1; 16],
+        EnrollmentLimits::default(),
+    )
+    .unwrap();
+    let request = material.renewal_request(&key, &first).unwrap();
+    let at = now() + 10;
+    let RenewPreparation::Commit(command) = registry
+        .prepare_renew(&authority, &request, at, 30)
+        .unwrap()
+    else {
+        panic!("a first renewal commits")
+    };
+    registry
+        .apply_committed(&command, registry.applied_index() + 1)
+        .unwrap();
+    let renewed = registry.release_renewal(&request, at).unwrap();
+    assert!(renewed.revision > behind.revision());
+    // The registry that committed it authorizes it; the one behind does not
+    // know the certificate, and stands by it as a later credential of the
+    // identity it lists.
+    registry.authorize_held(&renewed, at).unwrap();
+    assert!(matches!(
+        behind.authorize_certificate(&renewed.certificate, at),
+        Err(EnrollmentError::Unauthorized)
+    ));
+    behind.authorize_held(&renewed, at).unwrap();
+    behind.authorize_held(&first, at).unwrap();
+    // Out of its validity it is refused as any credential is.
+    assert!(matches!(
+        behind.authorize_held(&renewed, at - 1),
+        Err(EnrollmentError::Expired)
+    ));
+    assert!(matches!(
+        behind.authorize_held(&renewed, renewed.expires_at),
+        Err(EnrollmentError::Expired)
+    ));
+    // A receipt that says another identity, or another enrollment, than
+    // the one its certificate was issued for is not the CA's.
+    let mut forged = renewed.clone();
+    forged.identity = other.identity.clone();
+    assert!(behind.authorize_held(&forged, at).is_err());
+    let mut forged = renewed.clone();
+    forged.invitation = other.invitation;
+    assert!(behind.authorize_held(&forged, at).is_err());
+    // A revision the registry has reached without listing the certificate
+    // is no renewal it has yet to apply.
+    let mut stale = renewed.clone();
+    stale.revision = behind.revision();
+    assert!(matches!(
+        behind.authorize_held(&stale, at),
+        Err(EnrollmentError::Unauthorized)
+    ));
+    // A certificate another authority issued for the same key and names.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let foreign = self::authority(&elsewhere, [1; 16]);
+    let mut forged = renewed.clone();
+    forged.certificate = foreign
+        .issue(
+            key.csr(),
+            &renewed.identity,
+            at,
+            EnrollmentLimits::default().credential_lifetime,
+        )
+        .unwrap();
+    assert!(matches!(
+        behind.authorize_held(&forged, at),
+        Err(EnrollmentError::Unauthorized)
+    ));
+    // A revoked enrollment is refused whatever it holds.
+    let mut revoked = EnrollmentRegistry::restore(
+        &behind.checkpoint().unwrap(),
+        [1; 16],
+        EnrollmentLimits::default(),
+    )
+    .unwrap();
+    let revoke = revoked.prepare_revoke(first.invitation, now()).unwrap();
+    revoked
+        .apply_committed(&revoke, revoked.applied_index() + 1)
+        .unwrap();
+    let mut later = renewed.clone();
+    later.revision = revoked.revision() + 1;
+    assert!(matches!(
+        revoked.authorize_held(&later, at),
+        Err(EnrollmentError::Revoked)
+    ));
+}
+
 #[test]
 fn renewals_need_the_holder_s_own_key_and_a_live_unrevoked_enrollment() {
     let dir = tempfile::tempdir().unwrap();

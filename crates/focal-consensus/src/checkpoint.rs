@@ -262,6 +262,10 @@ impl DurableNode {
         drop(records);
         drop(receipt);
         self.raw.store_mut().compact_prepared(prepared)?;
+        // The checkpoint wrote the stored hard state, and no commit moved
+        // while it was written.
+        self.commit_unwritten = false;
+        self.commit_durable = self.commit_durable.max(self.raw.store().hard_state.commit);
         _allocation
             .shrink_to(memory::raw_bytes(&self.raw)?)
             .map_err(|_| ConsensusError::Capacity)?;

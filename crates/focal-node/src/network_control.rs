@@ -199,7 +199,12 @@ impl<'a> NetworkEnrollmentControl<'a> {
         if local.progress().identity != authority.root || route_epoch.0 == 0 {
             return Err(ControlFailure::WrongOwner);
         }
-        let control = Self {
+        // The certificate the founder presents is authenticated at each
+        // request, never here: a founder that restarts holding a renewal
+        // its own replica has yet to apply is granted it by its controller
+        // once the replica has (`EnrollmentRegistry::authorize_held`), and
+        // is refused its own requests until then.
+        Ok(Self {
             pool,
             local,
             authority,
@@ -208,9 +213,7 @@ impl<'a> NetworkEnrollmentControl<'a> {
             route_epoch,
             budget,
             route_cursor: AtomicU64::new(0),
-        };
-        control.founder_peer()?;
-        Ok(control)
+        })
     }
     /// The founder as its own registry authenticates the certificate it
     /// presents now.

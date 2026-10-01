@@ -195,9 +195,18 @@ impl WalAppend {
     }
 }
 
+/// What the writer calls once an asynchronous append is answered, durable
+/// or not: its owner's wake, so that an owner of many groups learns of the
+/// answer when it is given instead of asking for it at intervals. Called on
+/// the writer's thread: it does no more than send a signal.
+pub type Persisted = Box<dyn FnOnce() + Send>;
 enum Reply<T> {
     Blocking(mpsc::SyncSender<Result<T, LogError>>),
-    Async(oneshot::Sender<Result<T, LogError>>, mpsc::SyncSender<()>),
+    Async(
+        oneshot::Sender<Result<T, LogError>>,
+        mpsc::SyncSender<()>,
+        Option<Persisted>,
+    ),
 }
 impl<T> Reply<T> {
     fn finish(self, value: Result<T, LogError>) {
@@ -205,9 +214,12 @@ impl<T> Reply<T> {
             Self::Blocking(sender) => {
                 let _ = sender.try_send(value);
             }
-            Self::Async(sender, completed) => {
+            Self::Async(sender, completed, persisted) => {
                 let _ = sender.send(value);
                 let _ = completed.try_send(());
+                if let Some(persisted) = persisted {
+                    persisted();
+                }
             }
         }
     }
@@ -1130,7 +1142,18 @@ impl WalLease {
         records: &[Record],
         lane: BudgetLane,
     ) -> Result<WalAppend, LogError> {
-        self.batch_async_in(records, lane, false)
+        self.batch_async_in(records, lane, false, None)
+    }
+    /// The same append, with what the writer calls once it is answered
+    /// ([`Persisted`]). An append the writer never took calls nothing: its
+    /// refusal is this call's.
+    pub fn append_async_notified(
+        &mut self,
+        records: &[Record],
+        lane: BudgetLane,
+        persisted: Option<Persisted>,
+    ) -> Result<WalAppend, LogError> {
+        self.batch_async_in(records, lane, false, persisted)
     }
     /// Queues the same checkpoint as the synchronous API. The receipt
     /// resolves only after its CURRENT fence; dropping it does not cancel an
@@ -1140,13 +1163,14 @@ impl WalLease {
         records: &[Record],
         lane: BudgetLane,
     ) -> Result<WalAppend, LogError> {
-        self.batch_async_in(records, lane, true)
+        self.batch_async_in(records, lane, true, None)
     }
     fn batch_async_in(
         &mut self,
         records: &[Record],
         lane: BudgetLane,
         checkpoint: bool,
+        persisted: Option<Persisted>,
     ) -> Result<WalAppend, LogError> {
         let allocation = reserve(&self.shared.0.budget, BudgetKind::Pending, lane, 1024)?;
         let (sender, receiver) = oneshot::channel();
@@ -1155,7 +1179,7 @@ impl WalLease {
             self.log,
             self.generation,
             records,
-            Reply::Async(sender, completed),
+            Reply::Async(sender, completed, persisted),
             checkpoint,
             lane,
         )?;

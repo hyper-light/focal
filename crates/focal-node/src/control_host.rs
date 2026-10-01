@@ -1536,15 +1536,37 @@ impl<V: AuthorityVerifier> Owner<V> {
         let _source_allocation;
         let mut events = match self.initial.take() {
             Some(events) => events,
-            None => match self.replica.drain(&self.verifier) {
-                Ok(events) => events,
-                // Refused before anything was taken: what waits to be
-                // drained waits for the next drain.
-                Err(error) if self.replica.checkpoint_retryable(&error) => {
-                    self.pace.refuse();
-                    return Ok(());
+            // What a leader sends leaves while its own write is in flight
+            // (27 §3.4, the audit's F17): its members persist it for
+            // themselves, so the two writes overlap. This owner's thread
+            // then waits for the write, and takes the events whole.
+            None => loop {
+                match self.replica.try_drain(&self.verifier) {
+                    Ok(Some(events)) => break events,
+                    Ok(None) => {
+                        self.send_early()?;
+                        if self.replica.wait_persisted()? {
+                            continue;
+                        }
+                        // No write to wait for (a checkpoint, a log with
+                        // no room yet): the drain that waits takes over.
+                        match self.replica.drain(&self.verifier) {
+                            Ok(events) => break events,
+                            Err(error) if self.replica.checkpoint_retryable(&error) => {
+                                self.pace.refuse();
+                                return Ok(());
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    // Refused before anything was taken: what waits to be
+                    // drained waits for the next drain.
+                    Err(error) if self.replica.checkpoint_retryable(&error) => {
+                        self.pace.refuse();
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
             },
         };
         _source_allocation = events.take_allocation();
@@ -1696,7 +1718,35 @@ impl<V: AuthorityVerifier> Owner<V> {
             }
             drop(read_charge);
         }
-        for message in events.messages {
+        self.carry(std::mem::take(&mut events.messages), status.node_id)?;
+        // Drain has completed its persistence before reporting transport status.
+        // Register every newly emitted flight first: an old completion must not
+        // act on a newer snapshot for the same peer in this event prefix.
+        self.snapshot_feedback
+            .poll(status.term, |peer, term, index, result| {
+                self.replica.report_snapshot_at(peer, term, index, result)
+            })?;
+        self.publish_progress(false);
+        Ok(())
+    }
+    /// Send what may be sent while the replica's write is in flight
+    /// (`ControlReplica::sendable`). No snapshot is among it: a snapshot is
+    /// sent with the events of the drain, where what became of it is told.
+    fn send_early(&mut self) -> Result<(), ControlError> {
+        let Some(mut early) = self.replica.sendable()? else {
+            return Ok(());
+        };
+        let _charge = early.take_allocation();
+        let node = self.replica.status().node_id;
+        self.carry(std::mem::take(&mut early.messages), node)
+    }
+    /// Hand the replica's messages to the driver that carries them.
+    fn carry(
+        &mut self,
+        messages: Vec<focal_consensus::Message>,
+        node: u64,
+    ) -> Result<(), ControlError> {
+        for message in messages {
             // Register the exact current flight before any local operation can
             // drop it. Replacing a prior receiver fences late transport results.
             let snapshot = match self.snapshot_feedback.begin(&message, &self.budget) {
@@ -1742,9 +1792,7 @@ impl<V: AuthorityVerifier> Owner<V> {
                 ledger: self.config.namespace,
                 route_epoch: self.config.route_epoch,
                 request_epoch: RequestEpoch(1),
-                request_id: RequestId::from_u128(
-                    (u128::from(status.node_id) << 64) | u128::from(self.nonce),
-                ),
+                request_id: RequestId::from_u128((u128::from(node) << 64) | u128::from(self.nonce)),
                 operation: Operation::Raft {
                     group: self.replica.identity().group,
                     message: encoded,
@@ -1764,14 +1812,6 @@ impl<V: AuthorityVerifier> Owner<V> {
                 self.dropped = self.dropped.saturating_add(1);
             }
         }
-        // Drain has completed its persistence before reporting transport status.
-        // Register every newly emitted flight first: an old completion must not
-        // act on a newer snapshot for the same peer in this event prefix.
-        self.snapshot_feedback
-            .poll(status.term, |peer, term, index, result| {
-                self.replica.report_snapshot_at(peer, term, index, result)
-            })?;
-        self.publish_progress(false);
         Ok(())
     }
     fn authorize_placement_peer(

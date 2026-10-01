@@ -229,6 +229,26 @@ pub struct NodeEvents {
     pub applied_index: u64,
     allocation: Option<Allocation>,
 }
+/// Makes, for each write of a group, what the log's writer calls once the
+/// write is answered ([`focal_log::Persisted`]).
+pub type PersistedSignal = Box<dyn Fn() -> focal_log::Persisted + Send>;
+/// A member that is let go writes the commit its log does not hold: its
+/// log then says what it applied, and a restart needs no one to tell it.
+/// The write is queued, not waited for; the log finishes what it was given
+/// before it closes. Nothing is written for a member that failed or still
+/// persists something: its log answers for itself.
+impl Drop for DurableNode {
+    fn drop(&mut self) {
+        if !self.failed
+            && self.persistence.is_none()
+            && self.checkpoint.is_none()
+            && self.decoder_write.is_none()
+            && self.commit_unwritten
+        {
+            let _ = self.write_commit_behind();
+        }
+    }
+}
 impl NodeEvents {
     /// Transfer this permit alongside buffers moved into another owner/queue.
     pub fn take_allocation(&mut self) -> Option<Allocation> {
@@ -290,6 +310,26 @@ pub struct DurableNode {
     // membership is deferred until the decoder is confirmed. While it is pending,
     // no election or network step may observe the stale snapshot-only voter set.
     membership_rebuild_pending: bool,
+    /// The stored hard state names a commit the log does not hold yet: the
+    /// commit moved and no write was made for it (`persistence`). The
+    /// group's next record carries it.
+    commit_unwritten: bool,
+    /// The write of such a commit, behind what was released for it: one in
+    /// flight at a time, waited for by no one.
+    commit_write: Option<(focal_log::WalAppend, u64)>,
+    /// The commit the log holds: what a restart replays to. A change of
+    /// membership past it is not applied before a write has stated its
+    /// commit (`persistence`).
+    commit_durable: u64,
+    /// The group applies nothing on a commit its log does not hold
+    /// (`apply_on_written_commit`).
+    written_commit: bool,
+    /// The unwritten commit as the owner's last period found it: one that
+    /// is the same a period later is written (`settle_commit`).
+    commit_waiting: Option<u64>,
+    /// What tells this group's owner that a write of the group was answered
+    /// (`notify_persisted`): made anew for every write.
+    persisted: Option<PersistedSignal>,
     /// The election priority the owner configured; see `set_priority`.
     priority: i64,
     // Drop after any pending Ready/output payloads, including owner cancellation.
@@ -625,6 +665,7 @@ impl DurableNode {
                 .checked_mul(4096)
                 .ok_or(ConsensusError::Capacity)?,
         )?;
+        let commit_durable = storage.hard_state.commit;
         let raw = catch_unwind(AssertUnwindSafe(|| RawNode::new(&raft_config, storage)))
             .map_err(|_| ConsensusError::DependencyFailure)??;
         let mut node = Self {
@@ -650,6 +691,12 @@ impl DurableNode {
             // (required_decoder set) cannot drain yet, so its rebuild is deferred
             // to decoder confirmation and fenced until then.
             membership_rebuild_pending: required_decoder.is_some(),
+            commit_unwritten: false,
+            commit_write: None,
+            commit_durable,
+            written_commit: false,
+            commit_waiting: None,
+            persisted: None,
             priority: 0,
         };
         // Rebuild committed membership before elections or network messages can
@@ -774,7 +821,10 @@ impl DurableNode {
         })
     }
     pub fn tick(&mut self) -> Result<(), ConsensusError> {
-        self.guarded(|replica| replica.tick_inner())
+        self.guarded(|replica| replica.tick_inner())?;
+        // The period that passed is the measure of a quiet group: a commit
+        // no record has carried through it is written now.
+        self.settle_commit().inspect_err(|_| self.failed = true)
     }
     /// Completion arrives in drain after a quorum read barrier. Publication must
     /// reach that index before serving the read; there is no clock lease.

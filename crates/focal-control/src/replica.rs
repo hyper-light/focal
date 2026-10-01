@@ -150,7 +150,11 @@ impl ControlReplica {
         let identity = bootstrap.identity(&options)?;
         let machine = Machine::restore(bootstrap, &options, &budget)?;
         let retries = RetryState::restore(BTreeMap::new(), &options.limits, &budget, 0)?;
-        let node = DurableNode::open_in(options.consensus.clone(), directory, &budget)?;
+        let mut node = DurableNode::open_in(options.consensus.clone(), directory, &budget)?;
+        // What a control group applies — who is enrolled, the fence a binary
+        // serves under, where a ledger is placed — its members act on when
+        // they next start, before the group tells them anything.
+        node.apply_on_written_commit();
         Ok(Self {
             node,
             options,
@@ -175,7 +179,9 @@ impl ControlReplica {
         let identity = bootstrap.identity(&options)?;
         let machine = Machine::restore(bootstrap, &options, &budget)?;
         let retries = RetryState::restore(BTreeMap::new(), &options.limits, &budget, 0)?;
-        let node = DurableNode::open_on_wal_in(options.consensus.clone(), wal, &budget)?;
+        let mut node = DurableNode::open_on_wal_in(options.consensus.clone(), wal, &budget)?;
+        // As `open`: a control group applies on a commit its log holds.
+        node.apply_on_written_commit();
         Ok(Self {
             node,
             options,
@@ -759,6 +765,45 @@ impl ControlReplica {
             self.pending = None;
         }
         result
+    }
+    /// The drain without the wait for the disk: none while the node still
+    /// persists what it took, when an owner sends what may be sent
+    /// meanwhile (`sendable`) and waits for the write (`wait_persisted`).
+    /// What it gives is what `drain` gives, whole.
+    pub fn try_drain(
+        &mut self,
+        verifier: &impl AuthorityVerifier,
+    ) -> Result<Option<ControlEvents>, ControlError> {
+        self.check()?;
+        let events = match self.node.try_drain() {
+            Ok(Some(events)) => events,
+            Ok(None) => return Ok(None),
+            Err(error) if !self.node.failed() => return Err(error.into()),
+            Err(error) => {
+                self.failed = true;
+                self.pending = None;
+                return Err(error.into());
+            }
+        };
+        let result = self.drain_inner(events, verifier);
+        if result.is_err() {
+            self.failed = true;
+            self.pending = None;
+        }
+        result.map(Some)
+    }
+    /// The Raft messages that may be sent while the node's write is in
+    /// flight (`DurableNode::sendable`): a leader's, which its members
+    /// persist for themselves.
+    pub fn sendable(&mut self) -> Result<Option<focal_consensus::NodeEvents>, ControlError> {
+        self.check()?;
+        Ok(self.node.sendable()?)
+    }
+    /// Waits for the write the node has in flight, when it has one
+    /// (`DurableNode::wait_persisted`).
+    pub fn wait_persisted(&mut self) -> Result<bool, ControlError> {
+        self.check()?;
+        Ok(self.node.wait_persisted()?)
     }
     fn drain_inner(
         &mut self,

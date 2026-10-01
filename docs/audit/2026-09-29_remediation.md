@@ -29,7 +29,7 @@ ruling before work starts).
 | F14 | P1 | in tree | 6 | [F14](#f14) |
 | F15 | P2 | in tree | 3 | [F15](#f15) |
 | F16 | P2 | in tree | 3 | [F16](#f16) |
-| F17 | P2 | open | 6 | — |
+| F17 | P2 | in tree (the commit and the overlap; the log's fence open) | 6 | [F17](#f17) |
 | F18 | P2 | open | 6 | — |
 | F19 | P2 | in tree | 6 | [F19](#f19) |
 | F20 | P1 | in tree | 3 | [F20](#f20) |
@@ -1629,3 +1629,125 @@ every group as the model held it). The existing writer, consensus and
 session suites are unchanged but for one assertion: a checkpoint no longer starts a
 generation.
 
+## F17
+
+**Cause.** The core says what a `Ready` needs — which messages may be sent before its
+write, whether it asks for a write at all (`must_sync`), that a commit "need not be durable
+to be acted on" — and the shell used none of it (`focal-consensus/src/persistence.rs`).
+Every output of a `Ready` waited for its write, a leader's appends among them, and for
+every later `Ready` of the same drain. A commit that moved once a write was durable was
+given a write and a flush of its own (`Phase::Light`) before anything it committed was
+released. A `Ready` that moved nothing but the commit was written and waited for. So a
+member that alone decides paid two group commits for every entry; a follower paid one for
+every commit it was told of; a leader's followers began to persist only once the leader
+had; and the owner that shares a thread among sessions learned of an answered write by
+asking the log every millisecond (`group_deadline`). The user pointed at mantle's replica,
+which drives the same core and fixed what it found of this for itself
+(`../mantle/docs/design/replica.md` §3, its audit §11 and its resolution rows 5.1, R19);
+each of its findings was checked against this shell and its owners before any was taken
+(27 §9 has the table: the owners here always queued what came behind a pending write, so
+its R19 did not apply; a tick that comes meanwhile is dropped by design).
+
+**Fix.** 27 §9 states the rules and why each is safe. A commit waits for no write of its
+own: a `Ready` that asks for none is not waited for, and a commit that moves once a write
+is durable is released at once, kept with the stored hard state, and carried by the
+group's next record or by a checkpoint. A member that alone decides writes the commit of
+its entries in the append that holds them — true exactly when that append is durable —
+and the core's commit is checked against it. A commit no record has carried for a whole
+period of its owner is written then, and when the member is dropped, by a write no one
+waits for; a group that keeps writing never writes one for itself. A change of membership
+is the exception: it is applied, and said to have committed, only once a write has stated
+the commit that covers it and that write is durable — whoever hears that a member was
+removed may stop it, and a member that restarted without that commit would count the
+removed one again and wait for it for good. What a leader sends
+leaves while its write is in flight (`DurableNode::sendable`, never a snapshot;
+`wait_persisted` for an owner on its own thread), and nothing else is said early: the
+events of a drain are still given whole, so no owner meets events while its replica
+refuses mutation. The session owner (both forms) and the control owner send before they
+wait. The shared owner waits on a signal — work was queued, or the log's writer answered a
+session's write (`focal_log::Persisted`, `DurableNode::notify_persisted`,
+`fleet_group::Signal`) — and its millisecond poll remains only for a signal that found
+the queue full.
+
+**What the node suite found.** With every commit volatile,
+`cluster::actual_cli_promotes_caught_up_learner_transfers_and_removes_with_exact_restart_receipt`
+failed: the founder removed its one peer, the command answered `committed`, both processes
+were killed inside the founder's period, and the founder opened with a log that held the
+removal and not its commit — two voters, one gone for good, and no election to be won.
+The exception for changes of membership above is that test's finding;
+`a_change_of_membership_is_applied_only_once_the_log_holds_its_commit` holds the leader's
+disk and sees the removal neither applied nor given until its commit is durable, and
+fails without the rule.
+
+A second run found the same cause in another place.
+`cli_upgrade::the_fence_rises_only_once_every_node_reports_the_level_and_a_lower_binary_refuses_to_serve`
+failed: a host that had applied the upgrade fence was killed inside its owner's period and
+started below the fence; its root replica opened without the activation, the host published
+that it was ready, and it stopped only when its group told it of the fence again (24 §21
+says it "does not start again while its applied registry carries it"). The registry's
+revocations are read at a start the same way. This is not one entry's exception: what a
+control group applies — enrollment, the fence, placement — its members act on when they
+next start, before the group has told them anything, where what a ledger applied is served
+only through its group. So a control group applies on a commit its log holds
+(`DurableNode::apply_on_written_commit`, set by `ControlReplica::open` and `open_on_wal`,
+the two places a control group is opened): the commit rides the group's next append under
+load, a quiet group pays one flush for it, and a group of one voter pays nothing.
+`a_group_its_members_act_on_at_their_start_applies_only_on_a_commit_its_log_holds` cuts two
+voters the moment after each applied an entry and opens what their disks held: with the
+rule each holds the entry, and without it neither does.
+
+**What was tried and left.** Releasing everything a `Ready` says that waits for nothing —
+the reads it confirms and the entries already committed, with the messages — while its
+write is in flight: owners act on events by mutating the replica (the session's readiness
+barrier, the control owner's enrollment write behind a read barrier), and a replica with a
+`Ready` out refuses them; the events were kept whole. Writing the commit behind every
+release, as soon as it moved: on a group that writes again at once the next entry's write
+queued behind that flush (64 ms a commit against 37 ms, three members on one disk); it is
+written once the group has been quiet for a period.
+
+**Found on the way.** A member authorized the credential it holds against the registry
+its own replica recovered (`seed_peer_registry`, `FoundingNetwork::prepare`). A replica
+can be behind the registry its credential was committed in: a follower always could — a
+founder that followed another root leader and restarted between its renewal and its own
+replica's apply could not start — and with a volatile commit a leader can, for the last
+period before a cut. `EnrollmentRegistry::authorize_held` admits a credential issued at a
+revision the registry has not reached, for the identity the registry lists under the same
+enrollment, the CA's, unrevoked and in its validity; the founder's enrollment control
+authenticates what the founder presents at each request, not when it is built.
+
+**Tests.** `focal-consensus`: `single_owner_queues_many_groups_into_one_covering_flush`
+(twelve groups commit an entry each on one flush and each log gives it back committed);
+`a_failed_write_never_releases_success_and_recovery_uses_its_exact_fence` (the three cuts
+of the one write an entry and its commit share);
+`a_leaders_appends_leave_while_it_flushes_and_a_followers_answer_after` (the leader's disk
+held: its appends are given, nothing else, and the member refuses a tick; a follower with
+its disk held gives nothing; the entry commits once the leader's write is durable);
+`what_is_sent_early_is_charged_and_leaves_a_snapshot_for_the_drain`;
+`a_commit_is_waited_for_by_no_write_and_is_written_behind_what_it_released` (every disk
+held while a commit is applied by all three; each log holds it after a stop);
+`dropping_pending_owner_releases_ram_but_cannot_cancel_an_admitted_write` (a sole voter's
+admitted write is committed when the log is opened again). `focal-control`
+`io_failure_has_no_completion_and_fail_stops_until_disk_recovery` (a cut after the fence
+leaves the request committed and found by its exact retry). `focal-enrollment`
+`a_member_opens_on_a_registry_that_has_not_reached_the_renewal_it_holds`. The existing
+restart tests of the consensus, control, ledger and node suites pass unchanged.
+
+**Measurements** (`cargo bench -p focal-consensus --bench commits`, release, this host: an
+APFS volume where a group commit is three `F_FULLFSYNC`; the three members' logs share the
+one disk, so their flushes queue behind each other and the overlap shows as far less than
+it is on a disk each):
+
+| | before | after, an owner that waits before it sends | after |
+|---|---|---|---|
+| One voter, an entry at a time, median | 25.5 ms | 12.8 ms | 12.8 ms |
+| One voter, group commits a commit | 2.00 | 1.00 | 1.00 |
+| Three voters, an entry at a time, median | 70.1 ms | 38.5 ms | 36.2 ms |
+| Three voters, 4,000 entries as fast as the leader takes them | 18,092 /s | 24,213 /s | 28,880 /s |
+| Three voters, group commits by member for 4,201 entries | 405, 404, 404 | 203, 204, 203 | 202, 203, 203 |
+
+**Residual.** A group commit is three device flushes (`focal_log::install_fence`: the
+data, the fence file, the directory entry of its rename), where the fence could be made
+durable in place; it is the next stage, with the research it needs (what tells a torn
+fence from a damaged one once it is overwritten in place). Reads are confirmed a heartbeat
+round each (the audit's F43). A replacement of a member is not held until every voter
+knows the configuration it made (mantle's `configuration_known`; the audit's F24/F25).

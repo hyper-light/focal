@@ -171,7 +171,7 @@ struct ManagementState {
 }
 #[derive(Clone)]
 pub struct FleetManager {
-    sender: mpsc::SyncSender<FleetInput>,
+    sender: OwnerQueue,
     state: watch::Receiver<ManagementState>,
     budget: MemoryBudget,
     slots: MemoryBudget,
@@ -341,7 +341,7 @@ impl FleetManager {
             permit,
         });
         if let Err(error) = self.sender.try_send(input) {
-            let (error, input) = match error {
+            let (error, input) = match *error {
                 mpsc::TrySendError::Full(input) => (FleetError::Capacity, input),
                 mpsc::TrySendError::Disconnected(input) => (FleetError::Unavailable, input),
             };
@@ -394,7 +394,7 @@ impl FleetManager {
     fn send(&self, work: ManagementWork) -> Result<(), FleetError> {
         self.sender
             .try_send(FleetInput::Management(work))
-            .map_err(|error| match error {
+            .map_err(|error| match *error {
                 mpsc::TrySendError::Full(_) => FleetError::Capacity,
                 mpsc::TrySendError::Disconnected(_) => FleetError::Unavailable,
             })
@@ -525,7 +525,7 @@ pub(super) struct ManagementOwner {
     sequence: u64,
     owner: OwnerId,
     max_sessions: usize,
-    sender: mpsc::SyncSender<FleetInput>,
+    sender: OwnerQueue,
     outbound: async_mpsc::Sender<ReplicationFrame>,
     /// The queue-slot allowance every tenant's per-session slots descend from.
     items: MemoryBudget,
@@ -702,6 +702,9 @@ impl ManagementOwner {
             .send_modify(|progress| progress._allocation = Some(allocation));
         session.incarnation = sequence;
         session.nonblocking = true;
+        session
+            .session
+            .notify_persisted(Some(self.sender.persisted(ledger)));
         let now = Instant::now();
         session.next_tick = now;
         session.wake_at = now;
@@ -906,6 +909,7 @@ impl ReplicaFleet {
         }
         let shared_bytes = size_of::<FleetInput>()
             .checked_add(size_of::<ReplicationFrame>())
+            .and_then(|size| size.checked_add(size_of::<Signal>()))
             .and_then(|size| size.checked_add(128))
             .and_then(|size| QUEUED.checked_mul(size))
             .and_then(|bytes| bytes.checked_add(policy_bytes))
@@ -942,7 +946,7 @@ impl ReplicaFleet {
                 .map_err(|_| LedgerError::Capacity)?;
             tenant_budgets.insert(tenant.tenant, (tenant.budget, item_budget.child(256, 32)?));
         }
-        let (sender, receiver) = mpsc::sync_channel(QUEUED);
+        let (sender, receiver, signals) = OwnerQueue::new();
         let (outbound, outgoing) = async_mpsc::channel(QUEUED);
         let (state, changes) = watch::channel(ManagementState {
             quiesced: false,
@@ -980,6 +984,7 @@ impl ReplicaFleet {
             sessions: BTreeMap::new(),
             deadlines: BTreeMap::new(),
             scheduler,
+            signals,
             nonce: 0,
             management: Some(management),
             _wal_owners: writers,

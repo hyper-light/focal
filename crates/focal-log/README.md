@@ -19,7 +19,7 @@ After a receipt is consumed, another poll or a subsequent await returns
 `ReceiptConsumed`; it never polls Tokio's already-consumed receiver.
 An owner must await a Ready's durable receipt before releasing its Raft messages
 or advancing persistence state. `DurableNode::try_drain` retains that ownership
-across polls, including the additional LightReady hard-state fence. Its blocking
+across polls. Its blocking
 `drain` compatibility path waits the same exact ticket. A bounded one-slot signal
 supports synchronous waiting even inside a Tokio runtime; the future's receipt
 and that signal share the existing ticket reservation and hold no writer handle.

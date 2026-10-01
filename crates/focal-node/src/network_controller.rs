@@ -265,10 +265,14 @@ pub fn seed_peer_registry(
         // to before the holder adopted it; the held certificate still
         // authorizes through the grace, and the controller adopts the
         // committed rotation from the staged key (24 §11).
+        // The node may hold a renewal this prefix has not reached: its
+        // replica follows the registry the sponsor committed it in, and a
+        // restart knows only what its log says committed
+        // (`EnrollmentRegistry::authorize_held`).
         if known.identity != receipt.identity {
             return Err(ControllerError::Identity);
         }
-        enrollment.authorize_certificate(&receipt.certificate, now)?;
+        enrollment.authorize_held(receipt, now)?;
     }
     registry.replace_projection(grants, enrolled_keys(enrollment, state)?)?;
     Ok(())

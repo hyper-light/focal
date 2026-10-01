@@ -352,11 +352,13 @@ impl FoundingNetwork {
         } else {
             held
         };
-        if receipt.identity != founder.receipt().identity
-            || enrollment.authorize_certificate(&receipt.certificate, now)? != receipt.identity
-        {
+        if receipt.identity != founder.receipt().identity {
             return Err(NodeError::Identity.into());
         }
+        // A renewal the founder holds may be one its own replica has yet to
+        // apply: the replica follows the root's leader as any member's
+        // does, and a restart knows only what its log says committed.
+        enrollment.authorize_held(&receipt, now)?;
         let credentials = key.renew(&receipt, authority.ca_certificate(), now)?;
         let enrollment_identity = authority.server_identity();
         let principal = signer_principal(identity.cluster);

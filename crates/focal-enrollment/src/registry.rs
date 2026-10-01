@@ -1726,6 +1726,50 @@ impl EnrollmentRegistry {
             .clone()
             .ok_or(EnrollmentError::NotCommitted)
     }
+    /// Whether a member that opens on this registry may present the
+    /// credential it holds. The registry authorizes it; or the registry has
+    /// yet to reach the revision it was issued at — a renewal or rotation the
+    /// holder was handed once it committed, which the holder's own replica
+    /// has not applied: a replica follows the registry its credential came
+    /// from, and after a restart knows only what its log says committed.
+    /// The credential is then the CA's, for the identity the registry lists
+    /// under the same enrollment, unrevoked and in its validity; the member
+    /// converges on the committed renewal as it applies it.
+    pub fn authorize_held(
+        &self,
+        held: &EnrollmentReceipt,
+        now: i64,
+    ) -> Result<(), EnrollmentError> {
+        match self.authorize_certificate(&held.certificate, now) {
+            Ok(identity) if identity == held.identity => Ok(()),
+            Ok(_) => Err(EnrollmentError::Unauthorized),
+            Err(EnrollmentError::Unauthorized) if held.revision > self.revision => {
+                let record = self
+                    .records
+                    .get(&held.invitation)
+                    .ok_or(EnrollmentError::Unauthorized)?;
+                if record.revoked {
+                    return Err(EnrollmentError::Revoked);
+                }
+                let listed = record
+                    .receipt
+                    .as_ref()
+                    .ok_or(EnrollmentError::Unauthorized)?;
+                if listed.identity != held.identity {
+                    return Err(EnrollmentError::Unauthorized);
+                }
+                if now < held.issued_at || now >= held.expires_at {
+                    return Err(EnrollmentError::Expired);
+                }
+                verify_issued(held, &self.ca_certificate)?;
+                if !crate::pki::identity_bound(held)? {
+                    return Err(EnrollmentError::Unauthorized);
+                }
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
     /// Recheck this on each privileged connection/request; a certificate's valid
     /// signature alone does not override a committed enrollment revocation.
     pub fn authorize_certificate(

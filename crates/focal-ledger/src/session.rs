@@ -1036,6 +1036,30 @@ impl Session {
             }
         }
     }
+    /// The Raft messages that may be sent while the replica's write is in
+    /// flight (`DurableNode::sendable`): a leader's, which its members
+    /// persist for themselves, so its write and theirs overlap. Asked after
+    /// a `try_poll` that gave nothing; the events of a poll are given
+    /// whole, as before.
+    pub fn sendable(&mut self) -> Result<Option<focal_consensus::NodeEvents>, LedgerError> {
+        self.check()?;
+        Ok(self.consensus.sendable()?)
+    }
+    /// Tell this session's owner when a write of its replica is answered
+    /// (`DurableNode::notify_persisted`).
+    pub fn notify_persisted(&mut self, signal: Option<focal_consensus::PersistedSignal>) {
+        self.consensus.notify_persisted(signal);
+    }
+    /// Waits for the write the replica has in flight, when it has one
+    /// (`DurableNode::wait_persisted`): an owner on its own thread waits
+    /// here once it has sent what `sendable` gave, and polls after.
+    pub fn wait_persisted(&mut self) -> Result<bool, LedgerError> {
+        self.check()?;
+        if self.retained.is_some() || self.consensus.checkpoint_pending() {
+            return Ok(false);
+        }
+        Ok(self.consensus.wait_persisted()?)
+    }
     /// What a drain failed with. One the node refused before it took
     /// anything, for the room or for what it still persists, left the node
     /// as it was: it is asked again, and the session goes on.

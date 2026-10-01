@@ -712,3 +712,65 @@ of it was changed.
 | A restore cut where it records its copy | Cut at three places and issued again on real processes (`runbook_interrupted_restore`); the cut between the copy's record and its attachment is covered by the record alone |
 | A voter that dies and returns within the hold, end to end | Done: `cluster plan` says for how many seconds a death still stands (`focal_directory::deaths_stand_for`), and a voter that returns within the hold keeps its seat on real processes while a spare waits; one that stays dead loses it to the spare without an operator (`runbook_node_loss_within_the_hold_moves_no_seat`) |
 | The fast track for an owner | A receipt states its entry's term: a durable format, and a decision |
+
+## 9. What a commit waits for (2026-09-30)
+
+The audit's F17, and what mantle's replica does with the same core (its
+`docs/design/replica.md` §3, read against this shell on 2026-09-30). The core says what a
+`Ready` needs: `Ready::messages` are a leader's and may be sent at once,
+`Ready::persisted_messages` answer for what the `Ready` persists, `Ready::must_sync` is
+false when nothing but the commit moved, and `LightReady::commit_index` "need not be
+durable to be acted on". Until this section the shell used none of it: every output of a
+`Ready` waited for its write, a leader's appends among them; a commit that moved once a
+write was durable was given a write and a flush of its own before anything it committed
+was released; and a `Ready` that moved nothing but the commit was written and waited for.
+A member that alone decides paid two flushes for every entry, a follower one for every
+commit it was told of, and a leader's followers began to persist only after it had.
+
+| Rule | Why it is safe | Where |
+|---|---|---|
+| A commit waits for no write of its own. A `Ready` that asks for no write is not waited for; a commit that moves once a write is durable is released at once | The commit index is volatile state (Ongaro's thesis, figure 3.1): what is durable is the term, the vote and the entries, and an entry is committed by where it is durable, not by a member's record of it. A member that restarts replays what its log says committed and is told the rest by its group; what it applied before it stopped it applies again from the same entries | `persistence.rs`, `finish_light` |
+| The commit is kept with the stored hard state and rides the group's next record; a checkpoint writes it too | The log's records of a group are in order, so a commit a record carries names entries the log holds by then (`replay_record` reads it back under the same check) | `commit_unwritten` |
+| A member that alone decides — it leads, it is the one voter, the configuration is not joint, the entries are of its term — writes `commit = last entry` in the append that holds the entries | No other member's answer is waited for: the commit is true exactly when that append is durable, which is when the record that states it is. Asked once the entries the `Ready` gave to apply are applied, so a change of membership among them is in force when the core counts; the core's commit is checked against it after the append and a difference stops the member | `sole_commit` |
+| A commit no record has carried for a whole period of the owner is written then, and when the member is let go; one such write in flight, no one waiting | A group that keeps writing never writes a commit for itself — a write made the moment the commit moved would hold the disk the next entry needs (measured: 64 ms a commit against 37 ms, three members on one disk). A quiet group's log says what it applied within a period, so a member that stops reads back what it applied but for what a cut inside the period took | `settle_commit`, `Drop` |
+| What a leader sends may leave while its write is in flight (`DurableNode::sendable`), and nothing else: the events of a drain are given whole, with nothing still to persist | Its members persist what it sends for themselves (Ongaro's thesis §10.2.1), and the core counts the leader's own copy only once `advance_append` says it is durable. A follower's acknowledgement and a vote stay behind the write they answer for. A snapshot stays with the drain, whose owner answers for what became of it | `sendable`, `wait_persisted`; the session owner and the control owner send before they wait |
+| A change of membership is applied only once a write has stated the commit that covers it, and that write is waited for | Whoever is told that a change committed may act on it where no log records it: stop the member it removed. A member that then restarted without the commit would count that member again and wait for it for good — two voters, one removed and stopped, leave one that cannot elect itself (`cli_network` met it: the founder removed its peer, both were stopped, and the founder did not come back). Changes are rare; the wait is one flush for each | `fenced`, `after_advance`, `commit_durable` |
+| A control group — the root, a directory partition — applies nothing, and says of nothing that it committed, before a write has stated the commit that covers it | What a control group applies its members act on when they next start, before the group has told them anything: who is enrolled and who was revoked, the fence below which a binary does not serve (24 §21), where a ledger is placed. A member that stopped within its owner's period would start again without what it had applied and act against it (`cli_upgrade` met it: a host that had honoured the fence, killed and started below it, published that it was ready before its group told it of the fence again). What a ledger applied is served only through its group — a read by a barrier, a write by a leader that committed in its term — so its members need no such rule. Under load the commit rides the group's next append, as before; a quiet group pays one flush for the commit; a control group of one voter pays nothing, its commit being in the append | `apply_on_written_commit`, `fenced`; `ControlReplica::open`, `open_on_wal` |
+| The entries a `Ready` gives to apply are applied before its write | They are committed and durable here already (`Ready::committed_entries`); a `Ready` with a snapshot gives none | `drain_progress` |
+
+What a member opens with follows from the first rule, and one place did not allow for it:
+a member authorized the credential it holds against the registry its own replica
+recovered, and a replica can be behind the registry its credential was committed in — a
+follower always could be, and a leader now can for the last period before a cut. A member
+may present a credential issued at a revision its registry has not reached, for the
+identity the registry lists under the same enrollment
+(`EnrollmentRegistry::authorize_held`); the founder's enrollment control authenticates
+what the founder presents at each request and not when it is built.
+
+Measured on this host (`cargo bench -p focal-consensus --bench commits`; an APFS volume
+where a group commit is three `F_FULLFSYNC`; three members share the one disk, so their
+flushes queue behind each other and the overlap of a leader's write with its followers'
+shows as far less than it is on a disk each):
+
+| | before | after, an owner that waits before it sends | after |
+|---|---|---|---|
+| One voter, an entry at a time, median | 25.5 ms | 12.8 ms | 12.8 ms |
+| One voter, flushes a commit | 2.00 | 1.00 | 1.00 |
+| Three voters, an entry at a time, median | 70.1 ms | 38.5 ms | 36.2 ms |
+| Three voters, 4,000 entries as fast as the leader takes them | 18,092 /s | 24,213 /s | 28,880 /s |
+| Three voters, flushes by member for 4,201 entries | 405, 404, 404 | 203, 204, 203 | 202, 203, 203 |
+
+What mantle's replica does that this shell does not, and why:
+
+| mantle | focal |
+|---|---|
+| Holds the messages and ticks that come while a `Ready` is out and takes them after (its R19: refused, none of a loaded leader's proposals committed) | The owners queue what comes behind a pending write (`fleet_group`'s scheduler, a blocking owner's channel) and always did: nothing is refused. A tick that comes meanwhile is not held: the period has passed without it and the owner's stalls are the replica's patience (section 3.1 P3) — a member that replays held ticks after a stall campaigns for a leader that was only as slow as itself |
+| Confirms reads a round at a time | Open, the audit's F43: an owner asks the core a heartbeat round for each read |
+| Applies committed entries without the commit durable and repairs the log's commit from its engine at open | The same rule, without an engine: the state is the log's, replayed to the commit the log holds |
+| Marks a member whose last frame was lost and repairs it in place | A log damaged before its fence does not open; the member is replaced (24 §19). Open with the log's fence (below) |
+
+Open, and the audit's F17 still: a group commit is three device flushes here (the data,
+the fence file, the directory entry of its rename; `focal_log::install_fence`), where the
+fence could be made durable by one write in place; and the session owner that shares a
+thread among groups polls a pending write every millisecond, which is the floor of a
+commit on a device that flushes faster than that.

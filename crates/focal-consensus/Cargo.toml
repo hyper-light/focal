@@ -23,5 +23,9 @@ focal-sim = { version = "0.1.0", path = "../focal-sim" }
 focal-log = { version = "0.1.0", path = "../focal-log", features = ["test-support"] }
 tempfile.workspace = true
 
+[[bench]]
+name = "commits"
+harness = false
+
 [lints]
 workspace = true

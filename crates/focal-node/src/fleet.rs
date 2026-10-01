@@ -437,7 +437,7 @@ enum HostSender {
     Group {
         ledger: LedgerId,
         incarnation: u64,
-        sender: mpsc::SyncSender<grouped::FleetInput>,
+        sender: grouped::OwnerQueue,
         slots: MemoryBudget,
         _backing: std::sync::Arc<Allocation>,
     },
@@ -464,7 +464,7 @@ impl HostSender {
                         work,
                         _slot: slot.commit(),
                     }))
-                    .map_err(host_queue_error)
+                    .map_err(|error| host_queue_error(*error))
             }
         }
     }
@@ -3110,10 +3110,15 @@ impl Owner {
         // A retained delivery (a retryable native refusal, an import waiting
         // for sealed custody) resumes at the next poll; it never stops the
         // replica.
+        // What a leader sends leaves while its own write is in flight (27
+        // §3.4, the audit's F17): its members persist it for themselves, so
+        // the two writes overlap. The events of a poll are taken whole, once
+        // nothing of them is still to persist.
         let events = if self.nonblocking {
             match self.session.try_poll() {
                 Ok(Some(events)) => events,
                 Ok(None) => {
+                    self.send_early()?;
                     self.expire_pending();
                     self.publish_progress(false);
                     return Ok(());
@@ -3125,13 +3130,34 @@ impl Owner {
                 Err(error) => return Err(error),
             }
         } else {
-            match self.session.poll() {
-                Ok(events) => events,
-                Err(LedgerError::Retry) => {
-                    self.publish_progress(false);
-                    return Ok(());
+            loop {
+                match self.session.try_poll() {
+                    Ok(Some(events)) => break events,
+                    Ok(None) => {
+                        self.send_early()?;
+                        // This owner's thread has nothing else to do for
+                        // its replica: it waits for the write. Where there
+                        // is none to wait for — a checkpoint, a decoder
+                        // floor, a log with no room yet — the poll that
+                        // waits for those takes over.
+                        if self.session.wait_persisted()? {
+                            continue;
+                        }
+                        match self.session.poll() {
+                            Ok(events) => break events,
+                            Err(LedgerError::Retry) => {
+                                self.publish_progress(false);
+                                return Ok(());
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Err(LedgerError::Retry) => {
+                        self.publish_progress(false);
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
             }
         };
         if drive_runtime && let Some(runtime) = &mut self.runtime {
@@ -3142,7 +3168,24 @@ impl Owner {
             }
         }
         self.resolve(&events)?;
-        for message in &events.messages {
+        self.send(&events.messages)?;
+        self.poll_snapshot_feedback()?;
+        self.publish_progress(false);
+        Ok(())
+    }
+    /// Send what may be sent while the replica's write is in flight
+    /// (`Session::sendable`). No snapshot is among it: a snapshot is sent
+    /// with the events of the poll, where what became of it can be told.
+    fn send_early(&mut self) -> Result<(), LedgerError> {
+        let Some(mut early) = self.session.sendable()? else {
+            return Ok(());
+        };
+        let _charge = early.take_allocation();
+        self.send(&early.messages)
+    }
+    /// Hand the replica's messages to the driver that carries them.
+    fn send(&mut self, messages: &[focal_consensus::Message]) -> Result<(), LedgerError> {
+        for message in messages {
             let snapshot = match self.snapshot_feedback.begin(message, &self.budget) {
                 Ok(snapshot) => snapshot,
                 Err(_) => {
@@ -3210,8 +3253,6 @@ impl Owner {
                 self.dropped = self.dropped.saturating_add(1);
             }
         }
-        self.poll_snapshot_feedback()?;
-        self.publish_progress(false);
         Ok(())
     }
     fn poll_snapshot_feedback(&mut self) -> Result<(), LedgerError> {

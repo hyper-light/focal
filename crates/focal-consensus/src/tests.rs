@@ -232,6 +232,13 @@ impl Cluster {
             snapshots: vec![Vec::new(); 3],
         }
     }
+    /// The flushes each member's log has made.
+    fn flushes(&self) -> Vec<u64> {
+        self.nodes
+            .iter()
+            .map(|node| node.shared_wal().stats().unwrap().group_commits)
+            .collect()
+    }
     pub(crate) fn pump(&mut self, isolated: Option<u64>) {
         for _ in 0..100 {
             let mut messages = Vec::new();
@@ -307,6 +314,8 @@ fn three_voters_partition_leader_change_and_restart() {
     for actual in &cluster.applied {
         assert_eq!(actual, &expected);
     }
+    // Every member stops and opens again alone: its log holds what it
+    // applied, the commit written behind each release (the audit's F17).
     let Cluster { dirs, nodes, .. } = cluster;
     drop(nodes);
     for (i, dir) in dirs.iter().enumerate() {
@@ -321,6 +330,120 @@ fn three_voters_partition_leader_change_and_restart() {
                 .map(|entry| entry.data)
                 .collect::<Vec<_>>(),
             expected
+        );
+    }
+}
+
+/// The audit's F17: what a write waits for at each member. A commit is
+/// waited for by no write of its own: the leader waits for one flush, its
+/// entry's, and each follower for one; the entry is applied everywhere
+/// while every disk is held; and the commit is written behind, so a member
+/// that stops finds in its log what it applied, and one cut before that
+/// write is told of the entry again.
+#[test]
+fn a_commit_is_waited_for_by_no_write_and_is_written_behind_what_it_released() {
+    let mut cluster = Cluster::new();
+    cluster.nodes[0].campaign().unwrap();
+    cluster.pump(None);
+    cluster.nodes[0].propose(b"settle".to_vec()).unwrap();
+    cluster.pump(None);
+    for _ in 0..4 {
+        for node in &mut cluster.nodes {
+            node.tick().unwrap();
+        }
+        cluster.pump(None);
+    }
+    let wals: Vec<SharedWal> = cluster.nodes.iter().map(DurableNode::shared_wal).collect();
+    // Each member's entry is durable, by one flush each, before any disk is
+    // held.
+    cluster.nodes[0].propose(b"released".to_vec()).unwrap();
+    let before = cluster.flushes();
+    let appends = cluster.nodes[0].drain().unwrap().messages;
+    let mut answers = Vec::new();
+    for message in appends {
+        let to = message.to as usize - 1;
+        cluster.nodes[to].step(message).unwrap();
+        answers.extend(cluster.nodes[to].drain().unwrap().messages);
+    }
+    for (before, after) in before.iter().zip(cluster.flushes()) {
+        assert_eq!(after - before, 1);
+    }
+    // Every disk is held from here on: nothing more can become durable.
+    let held: Vec<_> = wals
+        .iter()
+        .map(|wal| {
+            let mut lease = wal.lease(LogicalLogId([250; 16])).unwrap();
+            lease
+                .append(&[Record {
+                    log: LogicalLogId([250; 16]),
+                    kind: RecordKind::Entry,
+                    index: 1,
+                    term: 1,
+                    payload: vec![1],
+                }])
+                .unwrap();
+            let (entered, entry) = std::sync::mpsc::sync_channel(1);
+            let (resume, resumed) = std::sync::mpsc::sync_channel::<()>(1);
+            let worker = std::thread::spawn(move || {
+                let mut first = true;
+                lease
+                    .replay(|_| {
+                        if first {
+                            first = false;
+                            entered.send(()).unwrap();
+                            resumed.recv().unwrap();
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                lease
+            });
+            entry.recv().unwrap();
+            (resume, worker)
+        })
+        .collect();
+    // The answers commit the entry at the leader, which applies it and
+    // tells its followers, which apply it: no member waits for its disk.
+    let mut commits = Vec::new();
+    for message in answers {
+        cluster.nodes[0].step(message).unwrap();
+        let events = cluster.nodes[0].drain().unwrap();
+        cluster.applied[0].extend(events.committed.into_iter().map(|entry| entry.data));
+        commits.extend(events.messages);
+    }
+    assert_eq!(cluster.applied[0].last().unwrap(), b"released");
+    assert!(!cluster.nodes[0].persistence_pending());
+    for message in commits {
+        let to = message.to as usize - 1;
+        cluster.nodes[to].step(message).unwrap();
+        let events = cluster.nodes[to].drain().unwrap();
+        cluster.applied[to].extend(events.committed.into_iter().map(|entry| entry.data));
+    }
+    for applied in &cluster.applied {
+        assert_eq!(applied.last().unwrap(), b"released");
+    }
+    // A member cut here — its commit not yet written — is told of the
+    // entry again; one that stops once its disk has caught up finds it in
+    // its log. The disks are released and the members stop.
+    for (resume, worker) in held {
+        resume.send(()).unwrap();
+        drop(worker.join().unwrap());
+    }
+    let Cluster { dirs, nodes, .. } = cluster;
+    drop(nodes);
+    drop(wals);
+    for (i, dir) in dirs.iter().enumerate() {
+        let mut cfg = config(i as u64 + 1);
+        cfg.voters = vec![1, 2, 3];
+        let mut node = DurableNode::open(cfg, dir.path()).unwrap();
+        assert_eq!(
+            node.drain()
+                .unwrap()
+                .committed
+                .into_iter()
+                .map(|entry| entry.data)
+                .collect::<Vec<_>>(),
+            vec![b"settle".to_vec(), b"released".to_vec()]
         );
     }
 }

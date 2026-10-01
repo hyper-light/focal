@@ -12526,3 +12526,27 @@ about a dozen runs of the wire suite. The reader now asks the connection's round
 the payload arrives and prices the residency by the longest it has answered
 (`focal_wire::read_payload_arriving`). `focal-wire`: 111 tests, the new one in virtual
 time and failing on the rule before; thirty runs of the suite without a failure.
+
+### 2026-09-30 — F17: what a commit waits for
+
+A commit waits for no write of its own, a member that alone decides writes its commit
+with the entries it commits, and what a leader sends leaves while its own write is in
+flight ([27](27-consensus-roadmap-and-slates-port.md) §9). The shell used none of what
+the core says of a `Ready` before: every output waited for the write, and a commit got a
+group commit of its own before anything it committed was released. On this host a member
+alone commits an entry in 12.8 ms where it took 25.5 ms (one group commit, where two),
+three members in 36.2 ms where they took 70.1 ms, and 28,880 entries a second where
+18,092 (`cargo bench -p focal-consensus --bench commits`; the remediation record, F17, has
+the table). A member that restarts replays what its log says committed — a quiet group's
+commit is written within its owner's period, and at a stop — and is told the rest by its
+group; a member may open holding a renewal its own replica has not applied
+(`EnrollmentRegistry::authorize_held`). The owner that shares a thread among sessions is
+woken when the log answers a write instead of asking every millisecond. Two things are
+applied only on a commit the log holds, both found by the node suite: a change of
+membership in any group, and everything in a control group — the root and the directory
+partitions hold what a member acts on at its next start before its group tells it
+anything (enrollment and revocation, the upgrade fence, placement), where a ledger's state
+is served only through its group. A control group's commit rides its next append under
+load, and a control group of one voter pays nothing. Open under F17: a group commit is
+still three device flushes. `focal-consensus`: 80 tests; the control, ledger and node
+suites pass with their restart tests unchanged.
