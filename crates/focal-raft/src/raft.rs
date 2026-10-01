@@ -324,6 +324,17 @@ pub struct Raft<S> {
     /// What the fast track did here since the member opened.
     pub(crate) fast_stats: FastStats,
     pub(crate) holders: Vec<NodeId>,
+    /// In a fast group that this member leads: the voters of the
+    /// configuration it had applied when it was elected, by which a member
+    /// that holds entries of this term may still count ([`crate::track`]).
+    pub(crate) term_voters: Vec<NodeId>,
+    /// The one other set of voters a configuration it applied since named;
+    /// empty for none.
+    pub(crate) term_next: Vec<NodeId>,
+    /// Whether every configuration in force since it was elected names no
+    /// voters but those two sets: then what a member that holds an entry of
+    /// this term counts by is known here.
+    pub(crate) term_known: bool,
     /// The priority the owner gave.
     priority: i64,
     /// The priority votes are judged by: the one given, once the member
@@ -665,6 +676,9 @@ impl<S: Storage> Raft<S> {
             voted_to: (0, 0),
             fast_stats: FastStats::default(),
             holders: Vec::new(),
+            term_voters: Vec::new(),
+            term_next: Vec::new(),
+            term_known: false,
             priority: config.priority,
             priority_in_force: 0,
             promotable: false,
@@ -1347,6 +1361,7 @@ impl<S: Storage> Raft<S> {
         // There may be a change in the log that is not applied: none is
         // proposed until all of the log is.
         self.pending_conf_index = last;
+        self.note_term_configuration()?;
         let mut first = self.recover(reports, last)?;
         first.try_reserve(1).map_err(|_| Error::Memory)?;
         first.push(Entry::default());
@@ -2319,6 +2334,9 @@ impl<S: Storage> Raft<S> {
         let from = self.log.last_index()?;
         self.tracker
             .apply(changed.configuration, &changed.renewed, from)?;
+        if self.state == StateRole::Leader {
+            self.note_term_change()?;
+        }
         self.post_conf_change()
     }
     fn load_state(&mut self, state: &HardState) -> Result<()> {

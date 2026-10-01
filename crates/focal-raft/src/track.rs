@@ -20,16 +20,58 @@
 //! themselves than are outside R, so it is the most held among them, and
 //! one that holds it from the leader votes for no one whose log lacks it.
 //!
+//! **A vote counts once the voter's log is of the leader's term.** That
+//! argument needs the later leader's log to end below the index, for the
+//! entry most held is taken only above the log. An election compares logs
+//! alone, and a member that holds the entry beside a log of older terms
+//! votes for a candidate whose log fills the index with an entry of an
+//! older term: elected, it keeps that entry, and commits it in place of
+//! the one committed (found by the schedules: `fast.rs`,
+//! `an_election_never_commits_a_second_entry_at_a_committed_index`). So a
+//! member that holds the entry beside its log counts for the fast quorum
+//! only once the leader knows its log holds an entry of the leader's term
+//! (`matched` is of that term). Every member of R then votes for no
+//! candidate whose last term is older than the leader's, by the classic
+//! rule, and a candidate whose last term is the leader's or later holds
+//! that leader's log, or a later leader's, which holds the entry, through
+//! its last entry: it holds the entry, or its log ends below the index and
+//! it takes the entry most held. This is Fast Paxos's condition that a
+//! value is chosen in a round only by votes cast in that round (Lamport,
+//! "Fast Paxos", 2006, §3.3, condition O4), with the round a vote was cast in
+//! kept where elections read it: a vote is of the leader's round once the
+//! voter's log is. It costs no message and no state: the leader's first
+//! entry of its term reaches its members with its first append.
+//!
 //! **A fast quorum counts once the group's configuration is applied.** The
 //! leader commits by the fast quorum only while no change is committed and
-//! not applied and the configuration is not joint, so that the quorum it
-//! counts is of the configuration a later leader counts by.
+//! not applied and the configuration is not joint.
+//!
+//! **And it is a fast quorum of every configuration a member may count
+//! by.** A member campaigns by the configuration it has applied, which can
+//! be older than the leader's: one that has not heard the change
+//! committed. Raft's classic argument holds across one change because any
+//! two majorities of configurations one change apart meet; a fast quorum
+//! of the new configuration need not be a fast quorum of the old, and a
+//! member counting by the old was elected by voters most of whom held
+//! another entry (`fast.rs`,
+//! `a_member_that_counts_by_the_configuration_before_commits_no_second_entry`).
+//! A member that took an entry of this leader's term took with it this
+//! leader's commit, which covers the configuration the leader was elected
+//! under, and it campaigns only once it has applied what it committed: it
+//! counts by that configuration or by one the leader applied since. One
+//! that took no entry of the term has an older last term than every member
+//! of the fast quorum, which refuse it, and no majority of a configuration
+//! near this one is without them. So the leader notes the voters it was
+//! elected under and the one other set a change since named, and counts a
+//! fast quorum only where it is one of each; after a second change it
+//! commits by the classic quorum until the next term.
 use crate::{
     NodeId,
     error::{Error, Result},
     fast::{self, Votes, same},
     log::{copy_entries_of, copy_entry},
     proto::{self, Entry, EntryType, Message},
+    quorum,
     raft::{FastStats, Raft, StateRole},
     storage::Storage,
 };
@@ -433,11 +475,23 @@ impl<S: Storage> Raft<S> {
                     .map_err(|_| Error::Memory)?;
                 let decided = self.decided.holders(index);
                 for (member, progress) in self.tracker.iter() {
-                    if progress.matched >= index || decided.binary_search(&member).is_ok() {
+                    // One that holds the entry beside its log counts only
+                    // once its log holds an entry of this term: then its
+                    // log says, to every later election, that it took
+                    // this leader's word, and it votes for no one whose
+                    // log is older (module header).
+                    let beside = || {
+                        decided.binary_search(&member).is_ok()
+                            && self
+                                .log
+                                .term(progress.matched)
+                                .is_ok_and(|term| term == self.term)
+                    };
+                    if progress.matched >= index || beside() {
                         holding.push(member);
                     }
                 }
-                if !self.tracker.has_fast_quorum(&holding) {
+                if !self.fast_quorum_of_the_term(&holding) {
                     break;
                 }
                 self.log.commit_to(index)?;
@@ -451,6 +505,65 @@ impl<S: Storage> Raft<S> {
         Ok(moved)
     }
 
+    /// A member that is elected notes the configuration it counts by: a
+    /// member that takes an entry of its term from it takes with it a
+    /// commit that reaches that configuration, and counts by it or by one
+    /// this member applies after.
+    pub(crate) fn note_term_configuration(&mut self) -> Result<()> {
+        self.term_voters.clear();
+        self.term_next.clear();
+        let configuration = self.tracker.configuration();
+        self.term_known = self.config.fast && !configuration.is_joint();
+        if !self.term_known {
+            return Ok(());
+        }
+        let voters = configuration.voters();
+        self.term_voters
+            .try_reserve(voters.len())
+            .map_err(|_| Error::Memory)?;
+        self.term_voters.extend_from_slice(voters);
+        Ok(())
+    }
+    /// A leader applied a change: its sets of voters join those of its
+    /// term. A third set leaves what a member counts by not known here
+    /// until the next term.
+    pub(crate) fn note_term_change(&mut self) -> Result<()> {
+        if !self.term_known {
+            return Ok(());
+        }
+        let configuration = self.tracker.configuration();
+        for voters in [configuration.voters(), configuration.outgoing()] {
+            if voters.is_empty() || voters == self.term_voters.as_slice() {
+                continue;
+            }
+            if self.term_next.is_empty() {
+                self.term_next
+                    .try_reserve(voters.len())
+                    .map_err(|_| Error::Memory)?;
+                self.term_next.extend_from_slice(voters);
+            } else if voters != self.term_next.as_slice() {
+                self.term_known = false;
+            }
+        }
+        Ok(())
+    }
+    /// Whether `holding`, in order, is a fast quorum of every configuration
+    /// a member that holds an entry of this term may count by: the one in
+    /// force, the one this member was elected under, and the one other set
+    /// of voters a change since named. Of more, it says no: what a member
+    /// counts by is then not known here, and the index is committed by the
+    /// classic quorum.
+    fn fast_quorum_of_the_term(&self, holding: &[NodeId]) -> bool {
+        let fast = |voters: &[NodeId]| {
+            quorum::tally(voters, quorum::Quorum::Fast, |member| {
+                holding.binary_search(&member).ok().map(|_| true)
+            }) == quorum::Tally::Won
+        };
+        self.term_known
+            && self.tracker.has_fast_quorum(holding)
+            && fast(&self.term_voters)
+            && (self.term_next.is_empty() || fast(&self.term_next))
+    }
     /// One that granted its vote said what it holds.
     pub(crate) fn hear_report(&mut self, message: &Message) -> Result<()> {
         if !self.config.fast || !self.tracker.configuration().votes(message.from) {

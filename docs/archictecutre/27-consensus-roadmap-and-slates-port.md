@@ -166,8 +166,9 @@ configuration so every member agrees on the quorum rule in force.
 - Configuration entries never take the fast track.
 
 These are checked three ways: a TLA+ model (`docs/models/FastTrack.tla`, checked by
-`scripts/check-model.sh` in CI, with the rule the core does not follow beside it, which
-the checker must refuse), tests over the sans-io core under seeded schedules
+`scripts/check-model.sh` in CI, every configuration within the states it states, with
+the rules the core does not follow beside it, which the checker must refuse;
+section 4.6), tests over the sans-io core under seeded schedules
 (`crates/focal-raft/tests/fast.rs`) and over durable nodes and P7's network model
 (`fast_track_tests`, `sim_fast_tests`), and the existing black-box history checker on
 real processes, for an owner that takes the fast track (section 4.6).
@@ -215,19 +216,6 @@ needs no exception for them.
 
 ### 4.6 The fast track as built
 
-**Not safe as built, and to be used by no group until it is (found 2026-10-01).** A
-leader elected with a log that already fills an index keeps its own uncommitted entry
-there, though a fast quorum committed another under a leader between: the voters that
-made that quorum hold the committed entry beside their logs, the classic rule by which
-they vote compares logs, and the elected leader takes again only what lies above its
-own log. Forty thousand schedules of `a_group_with_the_fast_track_is_safe_and_settles`
-meet it (seed 9843 on the commit before any change of 2026-10-01; the ninety-six of an
-ordinary run, and three thousand, do not); the model (`docs/models/FastTrack.tla`)
-passes, so the model lacks the run. What a member holds beside its log must say the
-term of the leader it last voted it to, and an election must weigh it at every index
-above the candidate's commit — or a voter must refuse a candidate whose log is older
-than its own latest fast vote. Neither is built. No owner sets `NodeConfig::fast`.
-
 `focal_raft::fast` and `track` in the core, `DurableNode::propose_fast` in the shell. A
 group has the fast track or has none from the day it is made (`NodeConfig::fast`), and
 says so in a record of its own in its log (`RecordKind::FastTrack`), which a binary
@@ -264,7 +252,145 @@ members that elected it, more hold that entry by themselves than are outside R, 
 is the entry most held among them; and a member that holds it from the leader votes
 for no one whose log lacks it. An entry of an index no voter holds anything at was
 committed by no one, and one that is elected writes an entry there that states
-nothing.
+nothing. That argument takes the later leader's log to end below the index, and the
+members that elect it to count by the configuration the fast quorum was counted in.
+Neither held as first built; the two rules that follow make them hold.
+
+**A vote counts once the voter's log is of the leader's term (2026-10-01).** As first
+built an election could commit a second entry at an index that held a committed one.
+Forty thousand schedules of `a_group_with_the_fast_track_is_safe_and_settles` met it
+(seed 9843 from seed 3,000, on the commit before any change of that date; ninety-six
+and three thousand did not): the leader of term 3 committed index 32 by the fast
+quorum {1, 2, 4} of four voters, of whom 2 and 4 held the entry beside their logs and
+had told the leader nothing of their logs; member 3's log held an entry of an older
+term at 32; 2 and 4, whose logs were no more current than its own, elected it; one
+that is elected takes the entry most held only above its own log, so it kept its
+entry and committed it. The cause is that a fast quorum's members vote for the entry
+in the leader's round and for a candidate by their logs, and nothing an election
+reads recorded the first. Fast Paxos chooses a value in a round only by votes cast in
+that round, and its recovery reads each acceptor's round of its last vote, which the
+acceptor keeps durable (Lamport, "Fast Paxos", Distributed Computing 19(2), 2006,
+§3.3, condition O4); Raft counts replicas only for an entry of the leader's own term
+for the same reason (Ongaro's thesis, §3.6.2). Fast Raft's proof (Castiglia, Goldberg
+and Patterson, Lemma 2) shows that a follower never overwrites a chosen entry and
+that a new leader inserts the most-voted one, and says nothing of a leader elected
+with a leader-approved entry of an older term at the index: the paper's rule has the
+defect too.
+
+The rule: a member that holds the entry beside its log counts toward a fast quorum
+only once the leader knows its log holds an entry of the leader's term
+(`log.term(progress.matched) == term`, `Raft::fast_commit`). Every member of R then
+has a last term at or above the leader's and keeps it, because what it holds through
+the leader's first entry of the term a majority holds (R is one), so no later leader
+truncates below it. By the classic rule each refuses a candidate whose last term is
+older. A candidate whose last term is the leader's or later holds, through its last
+entry, the log of a leader that holds the committed entry: it holds the entry, or its
+log ends below the index and the argument above applies. The round is recorded where
+elections read it. It adds no message, no field and no durable state: the leader's
+first entry of its term reaches a member with its first append. Considered and not
+taken: a voter that refuses a candidate whose log is older than its own latest fast
+vote (the vote's term must be durable, and one term for the whole log does not
+protect an index: a candidate stale at the committed index can have voted later
+entries to the same leader); and holding the term with every entry beside the log
+and weighing it at every index above the candidate's commit (a durable write each
+time a held entry is voted to a new leader, a candidate that truncates its own log,
+and a term that is only a lower bound of the round the entry was accepted in).
+
+**A fast quorum is one of every configuration a member may count by (2026-10-01).**
+With the first rule in, forty thousand schedules from seed 43,000 and from 200,000
+each failed once (seeds 54104 and 203544). A leader had applied a change that made a
+voter a learner and committed an index by three of its four voters; one of the three
+had not heard the change committed and counted by the five voters before it (a
+member campaigns by the configuration it has applied); it was elected by itself and
+two of the five that held another entry, the most held among them. Majorities of two
+configurations one change apart meet, which is all the classic track needs; a fast
+quorum of the new one need not be a fast quorum of the old, and the guard below
+(applied, not joint, at the leader) says nothing of the members. A member that took
+an entry of the leader's term took the leader's commit with it, which covers the
+configuration the leader was elected under, and campaigns only once it has applied
+every change it committed (`Raft::hup`): it counts by that configuration or by one
+the leader applied since. One that took no entry of the term has an older last term
+than every member of R, which refuse it, and no majority of a configuration one
+change away is without them. So a leader notes the voters it was elected under and
+the one other set of voters a change in its term named (the two halves of a joint
+configuration are the two sets), and counts a fast quorum only where it is one of
+each (`Raft::note_term_configuration`, `note_term_change`,
+`fast_quorum_of_the_term`). A change that names a third set leaves it to the classic
+quorum until its term ends.
+
+This takes a member to write an entry and the commit it took with it in one write,
+and to apply a change only on a commit its log holds. focal's shell does both: the
+hard state follows the entries in the same batch (`persistence.rs`), and a change of
+the configuration waits for the write that states its commit (section 9).
+
+**What the rules cost.** A fast commit that counted a member whose log was not yet of
+the leader's term becomes a classic one, a round later: those at a new leader's first
+indexes, chiefly what it recovered at its election, which Fast Paxos also commits by
+a classic round. After a change, a fast quorum must also be one of the voters before
+it; after a second change in one term there is none until the next term.
+
+| Fast schedules | Fast commits before | With both rules |
+|---|---|---|
+| 96 from seed 0 (an ordinary run) | 418 | 188 |
+| 40,000 from seed 3,000 | fails at seed 9843 | 93,864 |
+
+The schedules change leaders and configurations far more often than a group in
+service does (five terms and many changes in 4,000 steps); a group with one leader
+and no change commits every proposal by the fast quorum as before.
+
+**Open before any owner takes it.** A leader that outlives two changes of its
+configuration has no fast track for the rest of its term, and terms in service are
+long. A set of voters can be dropped once no member can still count by it, which is
+when every member of it has applied the change after it; a leader knows what a member
+holds and not what it has applied, so that takes an answer that says so, and the
+model a configuration per member. It is not built. No owner sets `NodeConfig::fast`.
+
+**Evidence.** `an_election_never_commits_a_second_entry_at_a_committed_index` runs
+seed 9843's schedule under the rules it was found under and
+`a_member_that_counts_by_the_configuration_before_commits_no_second_entry` runs seed
+54104's; each fails without its rule. 160,000 schedules of 4,000 steps pass, 40,000
+from each of the seeds 3,000, 43,000, 100,000 and 200,000 (`FOCAL_RAFT_SEEDS=40000
+FOCAL_RAFT_SEED=<seed> cargo test -p focal-raft --release --test fast
+a_group_with_the_fast_track`), with 373,536 fast commits among 11,967,015 entries.
+The classic track is untouched: 3,000 schedules of the group and of the comparison
+with raft-rs pass as before.
+
+
+**The model.** `docs/models/FastTrack.tla` missed the run twice over. It had no step
+by which a leader that was deposed campaigns again with the log it led with, so no
+member whose log held what no other took was ever elected, at any bound; and its five
+voters ran two terms where the run takes three. It has the step and the rule now
+(`OfTheRound`). Without the rule the checker refuses it: four voters over three terms
+reach a leader that lacks what was committed (`FastTrackAnyRound.cfg`, in 190,662
+states); with it the same four voters hold every property in all 3,207,204 states
+(`FastTrackFour.cfg`). With the rule one index shows nothing of the fast quorum — a
+member whose log is of the leader's term holds the index from the leader — so three
+voters are checked over two indexes (`FastTrackRound.cfg`, 2,462,010 states), where
+the checker must also find an index committed by what members hold by themselves
+(`FastTrackReached.cfg`), or the configuration would check nothing of it. Four voters
+over two indexes, three voters over three terms and two indexes, and five voters are
+each more than twenty million states and are not visited (five voters at one index
+ran nightly, for hours, and with the rule that index shows nothing of the fast
+quorum); the schedules of the core are what cover them. The model has no change of configuration,
+so the second rule rests on its argument, its directed test and the schedules.
+
+**The checker is bounded like everything else.** As first changed, the model at two
+indexes did not end: 208 million states, and 26 GB of them on disk, in 87 minutes,
+under a JVM free to take half the machine's memory. Three things changed. An election
+is one step of the model, where it was four and more, each interleaved with every
+other step; a member says what it holds when it comes to hold it and with its vote,
+and the separate record of what it held when it voted is gone. Both keep every run, up
+to the order of steps that do not touch each other (the model's header says why).
+Three voters at three terms and one index were 1,219,562 states before the model had
+the step a deposed leader takes and are 560,563 with it, and the rule one that is
+elected does not follow is refused in 89,337 states where it took 26,212,234. A
+configuration states how many distinct states it has, and the checker stops at one
+more (`StateBudget`, `WithinBudget`); one that passes must have exactly that many, so
+a change that makes a model larger or smaller is refused until its states are counted
+and stated again. And `scripts/check-model.sh` gives the checker 256 MB of heap and as
+much again beside it, which is what the largest configuration was measured to need
+(404 MB resident, and no faster with four times that), one thread unless it is told
+of more, and removes a run's states however the run ends.
 
 **A member does not compare terms at or below its commit.** An entry committed by the
 fast quorum bears the term of the leader that took it; the leader after it, which
@@ -725,7 +851,7 @@ of it was changed.
 | The control suite's single asks inside a request deadline of 350 ms | Done, at the cause: the owner gave a request 350 ms of the clock while a loaded machine slowed its rounds, so every ask timed out. A request now waits its time in the owner's own periods (`ControlHost`, `Pending::deadline`), and every ask of the suite that expects an answer waits for a definite one, charged to the hosts' periods (`Rig::definite`, `read_on_leader`); eight copies of the suite at once pass |
 | A restore cut where it records its copy | Cut at three places and issued again on real processes (`runbook_interrupted_restore`); the cut between the copy's record and its attachment is covered by the record alone |
 | A voter that dies and returns within the hold, end to end | Done: `cluster plan` says for how many seconds a death still stands (`focal_directory::deaths_stand_for`), and a voter that returns within the hold keeps its seat on real processes while a spare waits; one that stays dead loses it to the spare without an operator (`runbook_node_loss_within_the_hold_moves_no_seat`) |
-| The fast track for an owner | A receipt states its entry's term: a durable format, and a decision. And first, its election is not safe (section 4.6): two entries can be committed at one index |
+| The fast track for an owner | A receipt states its entry's term: a durable format, and a decision. Its election is mended (section 4.6, 2026-10-01). Before an owner takes it: a leader that outlives two changes of its configuration has no fast track until its term ends, and the model has no change of configuration |
 
 ## 9. What a commit waits for (2026-09-30)
 

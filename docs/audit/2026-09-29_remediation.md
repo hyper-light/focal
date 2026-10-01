@@ -1974,20 +1974,71 @@ member that may not campaign; `a_member_that_left_refuses_no_one_for_priority` b
 run and fails without it. The classic core had this, and so does any group whose owner
 sets priorities (27 §5).
 
-*The fast track's election is not safe.* Forty thousand schedules of the fast group
+*The fast track's election was not safe.* Forty thousand schedules of the fast group
 commit two entries at one index (seed 9843 on the commit before any change of this date;
 `a_group_with_the_fast_track_is_safe_and_settles`). 27 §4.6 has the cause: a fast quorum's
 members hold the committed entry beside their logs, vote by the classic comparison of
-logs, and the leader they elect keeps its own older entry at that index. It is recorded
-there, in `fast.rs` and at `NodeConfig::fast`; it is not mended in this batch. No owner
-uses the fast track.
+logs, and the leader they elect keeps its own older entry at that index. It was recorded
+in this batch and mended in the next (below). No owner uses the fast track.
 
 *The settle check proposed once.* `Cluster::settles` proposed to the leader of the moment
 and waited for that index for good; a proposal taken by a leader that was then deposed is
 gone with its term. It proposes again to the leader that followed.
 
 **Residual.** A peer's frames go each on its own stream and arrive in no order (27 §12).
-The fast track's election (above).
+
+### The fast track's election, mended (2026-10-01)
+
+**Cause.** A member votes for an entry in a leader's round and for a candidate by its
+log, and nothing an election reads recorded the first. And a member campaigns by the
+configuration it has applied, of which a fast quorum of the leader's need not be one.
+
+**Fix, at the cause** (27 §4.6; first made in mantle's copy of the core, `hyper-raft`
+565e19e, and taken here against focal's own schedules). A member that holds the entry
+beside its log counts toward a fast quorum only once the leader knows its log holds an
+entry of the leader's term: Fast Paxos's rule that a value is chosen by votes of one
+round, with the round kept where an election reads it. And a fast quorum is counted
+only where it is one of the voters the leader was elected under and of the one other set
+a change in its term named; after a third set, the classic quorum until the term ends.
+No message, field or durable state is added.
+
+**The model lacked the run twice over.** `docs/models/FastTrack.tla` had no step by which
+a leader that was deposed campaigns again with the log it led with, so no member whose
+log held what no other took was ever elected, at any bound; and its five voters ran two
+terms where the run takes three. The model now has the step and the rule
+(`OfTheRound`). Without the rule the checker refuses it (`FastTrackAnyRound.cfg`: four
+voters, three terms, a leader that lacks what was committed, in 190,662 states); with it
+the same four voters hold every property in all 3,207,204 states (`FastTrackFour.cfg`).
+With the rule one index shows nothing of the fast quorum, so three voters are checked
+over two indexes (`FastTrackRound.cfg`, 2,462,010 states), and the checker must find an
+index committed there by what members hold by themselves (`FastTrackReached.cfg`).
+
+**The checker had no bound, and has three.** The model as first changed did not end at
+two indexes: 208 million states and 26 GB on disk in 87 minutes, under a JVM free to
+take half the machine's memory (rule 2 of this repository, broken by its own tool). An
+election is one step of the model and a member's vote is what it says, which keeps
+every run: three voters at three terms were 1,219,562 states without the deposed
+leader's step and are 560,563 with it, and the rule one that is elected does not follow
+is refused in 89,337 states where it took 26,212,234; every
+configuration states its distinct states and the checker stops at one more
+(`StateBudget`, `WithinBudget`), a passing one having exactly that many; and
+`scripts/check-model.sh` gives the checker 256 MB of heap and as much beside it (what
+the largest configuration was measured to need), one thread unless told of more, and
+removes a run's states however it ends. Six configurations run on every change.
+
+**Tests.** `an_election_never_commits_a_second_entry_at_a_committed_index` (seed 9843,
+under the rules it was found under) and
+`a_member_that_counts_by_the_configuration_before_commits_no_second_entry` (seed 54104);
+each fails without its rule, with the entry and the index the schedules reported.
+
+**Measured.** 160,000 fast schedules pass, 40,000 from each of the seeds 3,000, 43,000,
+100,000 and 200,000; 3,000 of the group and of the comparison with raft-rs pass as
+before. Fast commits in the ordinary ninety-six schedules: 418 before, 188 after; the
+others are committed by the classic quorum a round later (27 §4.6 says which).
+
+**Residual.** A leader that outlives two changes of its configuration has no fast track
+until its term ends; the model has no change of configuration. Both stand in 27 §8.4
+against any owner taking the fast track.
 
 ## F37
 

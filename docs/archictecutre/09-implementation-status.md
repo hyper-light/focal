@@ -12622,3 +12622,28 @@ remediation record, F37). On real QUIC a held request is answered across two ref
 ones and across one the peer never answers, with one connection opened. Open: an
 exchange's own wait is still charged to the whole connection's progress (F38).
 
+
+### 2026-10-01 — The fast track's election, mended; and a model checker with bounds
+
+An election in a group with the fast track could commit a second entry at an index
+that held a committed one: a fast quorum's members voted for the entry in the leader's
+round and for a candidate by their logs, and nothing an election reads recorded the
+first. A member that holds the entry beside its log now counts toward a fast quorum
+only once the leader knows its log holds an entry of the leader's term, and a fast
+quorum is counted only where it is one of every set of voters a member may still count
+by ([27](27-consensus-roadmap-and-slates-port.md) §4.6; the remediation record, after
+F42). The fix was first made in mantle's copy of the core and is taken here against
+focal's own evidence: each of two directed schedules fails without its rule, 160,000
+fast schedules pass, and the classic track's schedules and its comparison with raft-rs
+are unchanged. Fast commits in an ordinary run fall from 418 to 188; the rest are
+committed by the classic quorum a round later.
+
+The model could not have found the defect and now does: it had no step by which a
+deposed leader campaigns again with the log it led with. And its checker had no bound:
+the model as first changed took 26 GB of disk in 87 minutes without ending. Every
+configuration now states its distinct states and the checker stops at one more; the
+script gives it 256 MB of heap, one thread by default, and removes its states however
+it ends. Six configurations run on every change, the largest of 3,207,204 states. Open,
+against any owner taking the fast track: a leader that outlives two changes of its
+configuration has no fast track until its term ends, and the model has no change of
+configuration. No owner takes it.

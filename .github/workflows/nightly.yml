@@ -78,11 +78,3 @@ jobs:
         env:
           FOCAL_CONGESTION_FULL: "1"
         run: bash scripts/cargo.sh test -p focal-wire --release --locked --test congestion -- --nocapture
-  model:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 350
-    steps:
-      - uses: actions/checkout@v7.0.1
-      # Five voters: every state.
-      - name: The fast track's model, five voters
-        run: bash scripts/check-model.sh five

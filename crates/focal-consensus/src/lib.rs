@@ -86,9 +86,9 @@ pub struct NodeConfig {
     /// group that has it says so in a record of its own, which a binary
     /// that knows no fast track refuses.
     ///
-    /// No group that holds anything of worth may have it yet: an election
-    /// in a fast group can commit a second entry at an index that holds
-    /// one (27 §4.6, found 2026-10-01). No owner sets it.
+    /// No owner sets it: an owner must derive nothing from an entry's
+    /// term, and a leader that outlives two changes of its configuration
+    /// commits by the classic quorum until its term ends (27 §4.6).
     #[serde(skip)]
     pub fast: bool,
 }

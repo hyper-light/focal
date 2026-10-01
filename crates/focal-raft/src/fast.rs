@@ -1,13 +1,6 @@
 //! The fast track (Fast Raft: Castiglia, Goldberg and Patterson, ICDCS
 //! 2020; 27 §4).
 //!
-//! **Not safe as built (27 §4.6, found 2026-10-01).** An elected leader
-//! whose log already fills an index keeps its own uncommitted entry there,
-//! though a fast quorum committed another since: the claim below that
-//! elections compare the log "as they always did" does not hold once a
-//! commit can rest on what members hold beside their logs. No group that
-//! holds anything of worth may have the fast track until that is mended.
-//!
 //! A proposer sends its entry for an index to every voter and not to the
 //! leader. A voter that holds nothing at the index holds the entry there,
 //! **approved by itself**, and once that is durable tells the leader what it
@@ -20,7 +13,10 @@
 //! in it: the log holds what a leader approved and nothing else, so the
 //! log is the classic one, elections compare it as they always did, and a
 //! leader's entry takes the place of what a member held by taking its
-//! index.
+//! index. Because elections see only the log, what a member holds beside
+//! it counts for a fast commit only once its log holds an entry of the
+//! committing leader's term ([`crate::track`]): an election weighs the log,
+//! and the log must then say the member took that leader's word.
 //!
 //! A leader stamps what it takes with its own term. The term a proposer
 //! gave says nothing of the entry, for two proposers of one term propose
