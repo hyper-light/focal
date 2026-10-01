@@ -193,30 +193,55 @@ pub async fn read_frame_payload_into<'a, R: AsyncRead + Unpin>(
     Ok(payload)
 }
 
-/// The least of a payload that a wait brings, where it does not bring its
-/// end: what one datagram of the least size a path of QUIC carries holds.
+/// What one datagram of the least size a path of QUIC carries holds.
 pub const LEAST_PROGRESS: usize = 1_200;
 
-/// How long a payload of `bytes` may take to arrive over a path whose
-/// round trip is `rtt`, at the least a live sender delivers: two datagrams
-/// of the least size a round trip, the smallest congestion window QUIC
-/// keeps (RFC 9002 §7.2). A sender slower than that is not sending; a
-/// faster one is done sooner. The payload's buffer is held no longer than
-/// this (the audit's F03: occupancy is priced by the path, not by a fixed
-/// wait a byte at a time).
+/// The probe timeout of a path whose round trip is `rtt`: the round trip
+/// and four times its variance (RFC 9002 §6.2.1), three round trips with
+/// the variance a first sample is given (§5.3), which is all that one who
+/// knows the round trip alone has of it.
+pub fn probe_timeout(rtt: std::time::Duration) -> std::time::Duration {
+    rtt.saturating_mul(3)
+}
+
+/// How long `bytes` may take to arrive over a path whose round trip is
+/// `rtt`, at the least a live sender delivers: two datagrams of the least
+/// size in a probe timeout. A sender whose window is as small as QUIC
+/// keeps it, two datagrams (RFC 9002 §7.2), and whose every flight has to
+/// be asked for again, sends two datagrams when its probe timer ends and
+/// no fewer (§6.2.4, which the window does not hold back, §7.5). A sender
+/// slower than that is not sending; a faster one is done sooner. A
+/// payload's buffer is held no longer than this (the audit's F03:
+/// occupancy is priced by the path, not by a fixed wait a byte at a time).
+///
+/// It was two datagrams a round trip, which is what a path delivers at
+/// its best with that window and not at its least. A path whose window is
+/// the smallest carries a datagram in about the round trip the reader
+/// measures, whose samples are of small packets waiting behind one: 256
+/// kilobytes over eight kilobits a second took 262 seconds and were given
+/// 225 (the audit's F36, `adverse_paths_measured`).
 pub fn residency(bytes: usize, rtt: std::time::Duration) -> std::time::Duration {
-    let round_trips = bytes.div_ceil(LEAST_PROGRESS.saturating_mul(2));
-    rtt.saturating_mul(u32::try_from(round_trips).unwrap_or(u32::MAX))
+    let probes = bytes.div_ceil(LEAST_PROGRESS.saturating_mul(2));
+    probe_timeout(rtt).saturating_mul(u32::try_from(probes).unwrap_or(u32::MAX))
 }
 
 /// Read the payload of `header` and decode it, however long the path
-/// takes to carry it: a payload is given up when a `wait` has brought
-/// neither its end nor [`LEAST_PROGRESS`] more of it, or when its
-/// [`residency`] is spent (`wait` at least). So it is read in as many
-/// waits as it has datagrams at most, a megabyte arrives over a path that
-/// carries a megabit in a second as over one that carries a thousand, and
-/// no buffer is held for longer than its bytes take at the least a live
-/// path delivers.
+/// takes to carry it: a payload is given up when its [`residency`] is
+/// spent (`wait` at least), and by nothing else. So a megabyte arrives
+/// over a path that carries a megabit in a second as over one that
+/// carries a thousand, and no buffer is held for longer than its bytes
+/// take at the least a live path delivers.
+///
+/// A payload was also given up when a `wait` brought less than a datagram
+/// of it. That asked of every path a datagram a wait, and of a sender that
+/// it lose nothing: one whose flight is lost sends again when its probe
+/// timer ends, three round trips on, which on a path that carries four
+/// kilobits a second is half a minute in which nothing arrives and nothing
+/// is wrong (the audit's F36, `narrow_lossy_paths_measured`: sixteen
+/// kilobytes arriving a datagram every 2.6 s were given up five seconds
+/// into such a silence, with 175 s of their residency left). A sender that
+/// stops for good is given up when the residency is spent, and one whose
+/// connection carries nothing at all when the connection ends.
 ///
 /// `round_trip` is the path's round trip as the connection measures it,
 /// asked as the payload arrives, and the residency is priced by the longest
@@ -240,24 +265,19 @@ pub async fn read_payload_arriving<R: AsyncRead + Unpin, T: DeserializeOwned>(
         let spent = began
             .checked_add(residency(bytes.len(), longest).max(wait))
             .ok_or(WireError::Timeout)?;
-        let owed = filled.saturating_add(LEAST_PROGRESS).min(bytes.len());
         let remaining = spent.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return Err(WireError::Timeout);
         }
-        let arrived = tokio::time::timeout(wait.min(remaining), async {
-            while filled < owed {
-                let rest = bytes.get_mut(filled..).ok_or(WireError::Limit)?;
-                let read = reader.read(rest).await?;
-                if read == 0 {
-                    return Err(WireError::InvalidFrame);
-                }
-                filled = filled.saturating_add(read);
+        // The round trip is asked again every wait, whatever arrived in it.
+        let rest = bytes.get_mut(filled..).ok_or(WireError::Limit)?;
+        if let Ok(read) = tokio::time::timeout(wait.min(remaining), reader.read(rest)).await {
+            let read = read?;
+            if read == 0 {
+                return Err(WireError::InvalidFrame);
             }
-            Ok(())
-        })
-        .await;
-        arrived.map_err(|_| WireError::Timeout)??;
+            filled = filled.saturating_add(read);
+        }
     }
     decode_payload(&bytes)
 }

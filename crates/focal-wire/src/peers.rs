@@ -861,9 +861,15 @@ impl PeerConnectionPool {
                 } else {
                     Some(slot.bulk.try_acquire().map_err(|_| PeerSendError::Busy)?)
                 };
-                let connected = tokio::time::timeout(self.limits.timeout, self.connection(&slot))
-                    .await
-                    .unwrap_or(Err(PeerSendError::Lost));
+                let connected =
+                    match tokio::time::timeout(self.limits.timeout, self.connection(&slot)).await {
+                        Ok(connected) => connected,
+                        // A group's exchange has waited its time for a
+                        // connection, and is not made to wait it again: the
+                        // dial goes on, for whoever asks next.
+                        Err(_) if !bulk => return Err(PeerSendError::Lost),
+                        Err(_) => Err(PeerSendError::Lost),
+                    };
                 let (generation, remote) = match connected {
                     Ok(connection) => connection,
                     Err(error) => {
@@ -876,11 +882,7 @@ impl PeerConnectionPool {
                 };
                 let sent = std::time::Instant::now();
                 let before = slot.answered.load(Ordering::Acquire);
-                let answered = if bulk {
-                    remote.request_within(request, self.limits.timeout).await
-                } else {
-                    remote.request(request).await
-                };
+                let answered = remote.request_within(request, self.limits.timeout).await;
                 // What kept this exchange from an answer, when the
                 // connection itself is to be judged for it.
                 let failure = match answered {
@@ -961,23 +963,29 @@ impl PeerConnectionPool {
                         *cached = None;
                     }
                 }
+                // A group's exchange whose peer was given its time and did
+                // not answer in it is not asked again here: its second time
+                // would hold the peer's lane for as long again, and its
+                // owner asks again by its own clock. (One time for all the
+                // attempts used to end them together.) Content is asked
+                // again, as it was: its sender finds the copy's room by it.
+                if !bulk && matches!(failure, WireError::Timeout) {
+                    return Err(PeerSendError::Lost);
+                }
                 if attempt.saturating_add(1) < self.limits.attempts {
                     tokio::time::sleep(spread(self.limits.retry_backoff, entropy())).await;
                 }
             }
             Err(PeerSendError::Lost)
         };
-        // Content is given as long as the path takes to carry it, each
-        // part of its exchange by a wait of its own
-        // (`QuicRemote::request_within`); everything else the time of one
-        // exchange, whatever it is made of.
-        if bulk {
-            exchange.await
-        } else {
-            tokio::time::timeout(self.limits.timeout, exchange)
-                .await
-                .map_err(|_| PeerSendError::Lost)?
-        }
+        // Each part of an exchange has a wait of its own: its turn on the
+        // lane, its connection, what it sends for as long as the path
+        // carries it, its peer's answer, and what the answer brings
+        // (`QuicRemote::request_within`). One time for the whole of it, the
+        // same for a vote and for four megabytes of entries, gave a path
+        // that carries less than a message in that time none of the
+        // message (the audit's F36).
+        exchange.await
     }
     fn slot(&self, target: u64) -> Result<Arc<Slot>, PeerSendError> {
         let mut state = self.state.lock().map_err(|_| PeerSendError::Closed)?;
@@ -1099,7 +1107,12 @@ impl PeerConnectionPool {
         increment(&self.counters.dials);
         let task_slot = slot.clone();
         let counters = self.counters.clone();
-        let timeout = self.limits.timeout;
+        // A dial is given what the connector gives its two parts, the
+        // handshake of the connection and the one of the protocol on it
+        // (`open_remote`), and no less for being asked for by an exchange:
+        // a caller waits for it its own time and no longer, and the dial
+        // that outlives it is the next caller's connection.
+        let timeout = self.connector.limits().request_timeout.saturating_mul(2);
         let cooldown = self.limits.unreachable_cooldown;
         let task = tokio::spawn(async move {
             let endpoint = task_slot.endpoint.clone();

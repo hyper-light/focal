@@ -12647,3 +12647,20 @@ it ends. Six configurations run on every change, the largest of 3,207,204 states
 against any owner taking the fast track: a leader that outlives two changes of its
 configuration has no fast track until its term ends, and the model has no change of
 configuration. No owner takes it.
+
+### 2026-10-01 — F38 and F36: an exchange waits on its own stream, for as long as its path takes
+
+Nothing a group sent a peer was delivered if its path took more than five seconds to
+carry it, and nothing at all at or below eight kilobits a second: the pool gave the whole
+of an exchange one time, and a dial the same. With that gone, the waits beneath it were
+charged to what the connection had sent, which is not what one stream delivered: an
+exchange was given its peer's period to answer while its last window was still on the
+path. Each part of an exchange has its own wait now, what is sent waits for its own
+stream to be acknowledged, and the bound between is the least a live sender delivers by
+RFC 9002, two datagrams a probe timeout, which is also the one thing a receiver gives a
+payload up by ([27](27-consensus-roadmap-and-slates-port.md) §7; the remediation record,
+F38 and F36). A path that returns a datagram within a connection's idle timeout, 1,920
+bits a second, carries a message of any size in the time it takes: a megabyte over 64
+kbit/s in 136.7 s, 64 KiB over 8 kbit/s in 67 s and a megabyte in 1,078 s, with loss,
+jitter, asymmetry and outages shorter than the idle timeout. A stream its peer never reads ends in half a
+second where the other traffic of its connection kept it for twenty-five.

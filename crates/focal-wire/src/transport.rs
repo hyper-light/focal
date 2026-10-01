@@ -147,49 +147,118 @@ impl Drop for Sending<'_> {
         }
     }
 }
-/// Wait for `work`, which sends `bytes` over `connection`, as long as the
-/// path takes to carry them. Every `period` that ends without it is
-/// charged what the connection sent in it and has not found lost. The
-/// work is given up at the end of a period in which less than a datagram
-/// was sent ([`LEAST_PROGRESS`]), and at the end of one that began when
-/// all the exchanges on the connection had to send beside it (`held`) and
-/// `bytes` more had been sent: the peer had the request and a period to
-/// answer it. So a megabyte is given eight seconds and more on a path
-/// that carries a megabit in a second, and an exchange whose peer
-/// stopped taking it one period or two on any path.
+/// The time an exchange is given to send what it has to send, told by its
+/// own stream and never by the connection's counters (the audit's F38): what
+/// a connection has sent is in flight, sent again or another stream's, and
+/// says nothing of what one stream delivered. An exchange credited with it
+/// was given its peer's time to answer while its last window was still on
+/// the path, and given up on a path that carried it all the while; and one
+/// its peer had stopped reading was kept for as long as the others of its
+/// connection sent a datagram a period.
 ///
-/// What is held is no more than the frames of the streams of a
-/// connection, and every period but the last sends a datagram of it: the
-/// wait ends.
-async fn carried<T>(
-    connection: &Connection,
-    held: &Held,
-    bytes: usize,
+/// A sender knows one thing of its own stream: that the peer has
+/// acknowledged all of it, or has stopped taking it
+/// ([`Carriage::acknowledged`]). Until then there is nothing to see. What
+/// the stream takes of what is written says little: it takes a window at
+/// once, and more only as the peer's reading lets it, an eighth of a window
+/// at a time, which on a narrow path is longer than any period. So the
+/// wait ends by a bound and not by a guess at delivery: the [`residency`]
+/// of what the exchanges under way on the connection had to send beside
+/// this one (`held`), at the longest round trip the path has shown — the
+/// least a live path delivers, and what the receiver holds the same bytes
+/// to. A connection whose path carries nothing ends by its own idle
+/// timeout, and its streams with it; a stream its peer does not read, or
+/// one starved by the others of its connection, ends here.
+struct Carriage<'a> {
+    connection: &'a Connection,
+    held: &'a Held,
+    owed: u64,
     period: std::time::Duration,
-    work: impl Future<Output = Result<T, WireError>>,
-) -> Result<T, WireError> {
-    let sent = || {
-        let stats = connection.stats();
-        stats.udp_tx.bytes.saturating_sub(stats.path.lost_bytes)
-    };
-    let (_sending, mut owed) = held.send(bytes);
-    let mut charged = 0_u64;
-    let mut before = sent();
-    let mut work = std::pin::pin!(work);
-    loop {
-        let had = charged >= owed;
-        if let Ok(done) = tokio::time::timeout(period, work.as_mut()).await {
-            return done;
+    began: tokio::time::Instant,
+    longest: std::time::Duration,
+    _sending: Sending<'a>,
+}
+/// How a stream that was written whole ended its wait.
+enum Carried<T> {
+    /// The peer has all of it (`None`), or stopped taking it and said why.
+    Stream(Option<quinn::VarInt>),
+    /// What was waited for beside it came first.
+    Answered(T),
+}
+impl<'a> Carriage<'a> {
+    fn begin(
+        connection: &'a Connection,
+        held: &'a Held,
+        bytes: usize,
+        period: std::time::Duration,
+    ) -> Self {
+        let (sending, owed) = held.send(bytes);
+        Self {
+            connection,
+            held,
+            owed,
+            period,
+            began: tokio::time::Instant::now(),
+            longest: std::time::Duration::ZERO,
+            _sending: sending,
         }
-        let now = sent();
-        let moved = now.saturating_sub(before);
-        before = now;
-        if had || moved < u64::try_from(LEAST_PROGRESS).unwrap_or(u64::MAX) {
+    }
+    /// How long the next wait may be: a period, or what is left of the
+    /// time the path is given; `Timeout` once none is.
+    fn wait(&mut self) -> Result<std::time::Duration, WireError> {
+        self.longest = self.longest.max(self.connection.rtt());
+        // What came to the connection since is sent in turn with this.
+        self.owed = self.owed.max(self.held.now());
+        let given = residency(
+            usize::try_from(self.owed).unwrap_or(usize::MAX),
+            self.longest,
+        )
+        .max(self.period);
+        let left = given.saturating_sub(self.began.elapsed());
+        if left.is_zero() {
             return Err(WireError::Timeout);
         }
-        charged = charged.saturating_add(moved);
-        // What came to the connection since is sent in turn with this.
-        owed = owed.max(held.now());
+        Ok(left.min(self.period))
+    }
+    /// The longest round trip the path has shown while this was carried.
+    fn longest(&self) -> std::time::Duration {
+        self.longest.max(self.connection.rtt())
+    }
+    /// Wait for `write`, which writes to the stream: given up when the
+    /// path's time is spent.
+    async fn written<T>(
+        &mut self,
+        write: impl Future<Output = Result<T, WireError>>,
+    ) -> Result<T, WireError> {
+        let mut write = std::pin::pin!(write);
+        loop {
+            let wait = self.wait()?;
+            if let Ok(done) = tokio::time::timeout(wait, write.as_mut()).await {
+                return done;
+            }
+        }
+    }
+    /// Wait until the peer has acknowledged all of a stream that was
+    /// written and ended, or stopped it, or `beside` is done, whichever is
+    /// first; given up when the path's time is spent.
+    async fn acknowledged<T>(
+        &mut self,
+        stream: &quinn::SendStream,
+        beside: std::pin::Pin<&mut impl Future<Output = Result<T, WireError>>>,
+    ) -> Result<Carried<T>, WireError> {
+        let mut stopped = std::pin::pin!(stream.stopped());
+        let mut beside = beside;
+        loop {
+            let wait = self.wait()?;
+            tokio::select! {
+                biased;
+                done = beside.as_mut() => return done.map(Carried::Answered),
+                ended = &mut stopped => {
+                    return ended.map(Carried::Stream).map_err(|_| WireError::Connection);
+                }
+                () = tokio::time::sleep(wait) => {}
+            }
+        }
     }
 }
 fn transport(limits: &WireLimits) -> Result<Arc<quinn::TransportConfig>, WireError> {
@@ -556,7 +625,8 @@ async fn serve_authenticated_connection_inner<H: RequestHandler + Clone>(
                             }
                         };
                         let request:RequestEnvelope=read_payload_arriving(&mut recv,header,limits.request_timeout,||carrying.rtt()).await?;
-                        tokio::time::timeout(limits.request_timeout,require_end(&mut recv))
+                        // The end of the stream is the last thing the path carries of it.
+                        tokio::time::timeout(limits.request_timeout.max(residency(1,carrying.rtt())),require_end(&mut recv))
                             .await.map_err(|_|WireError::Timeout)??;
                         let peer=registry.authenticate(fingerprint)?;
                         send.set_priority(request.operation.class().priority()).map_err(|_|WireError::Connection)?;
@@ -568,7 +638,7 @@ async fn serve_authenticated_connection_inner<H: RequestHandler + Clone>(
                         // The body was consumed by its dispatch.
                         drop(ingress);
                         let bytes=postcard::experimental::serialized_size(response.envelope()).map_err(|_|WireError::InvalidFrame)?;
-                        carried(&carrying,&held,bytes,limits.request_timeout,send_owned_response(send,response,limits.max_frame_bytes)).await
+                        send_owned_response(Carriage::begin(&carrying,&held,bytes,limits.request_timeout),send,response,limits.max_frame_bytes).await
                     };
                     let _=transport_exchange(work).await;
                 });
@@ -594,7 +664,10 @@ impl Drop for ResponseDelivery {
         }
     }
 }
+/// An answer is given as long as the path takes to carry it, told by its
+/// own stream ([`Carriage`]).
 async fn send_owned_response(
+    mut carriage: Carriage<'_>,
     stream: quinn::SendStream,
     response: OwnedResponse,
     limit: u32,
@@ -604,25 +677,22 @@ async fn send_owned_response(
         response,
         acknowledged: false,
     };
-    write_frame(
-        &mut delivery.stream,
-        FrameKind::Response,
-        delivery.response.envelope(),
-        limit,
-    )
-    .await?;
+    carriage
+        .written(write_frame(
+            &mut delivery.stream,
+            FrameKind::Response,
+            delivery.response.envelope(),
+            limit,
+        ))
+        .await?;
     delivery
         .stream
         .finish()
         .map_err(|_| WireError::Connection)?;
-    if delivery
-        .stream
-        .stopped()
-        .await
-        .map_err(|_| WireError::Connection)?
-        .is_some()
-    {
-        return Err(WireError::Connection);
+    let nothing = std::pin::pin!(std::future::pending::<Result<(), WireError>>());
+    match carriage.acknowledged(&delivery.stream, nothing).await? {
+        Carried::Stream(None) => {}
+        Carried::Stream(Some(_)) | Carried::Answered(()) => return Err(WireError::Connection),
     }
     delivery.acknowledged = true;
     Ok(())
@@ -1050,13 +1120,17 @@ impl QuicRemote {
     pub fn window(&self) -> u64 {
         self.connection.stats().path.cwnd
     }
+    /// The round trip the connection measures of its path.
+    pub fn round_trip(&self) -> std::time::Duration {
+        self.connection.rtt()
+    }
     pub async fn request(&self, request: &RequestEnvelope) -> Result<ResponseEnvelope, WireError> {
         self.request_within(request, self.limits.request_timeout)
             .await
     }
     /// An exchange whose peer is given `period` to answer what it has
     /// been asked, and whose request and answer are given as long as the
-    /// path takes to carry them ([`carried`], [`read_payload_arriving`]).
+    /// path takes to carry them ([`Carriage`], [`read_payload_arriving`]).
     pub async fn request_within(
         &self,
         request: &RequestEnvelope,
@@ -1086,39 +1160,56 @@ impl QuicRemote {
             .map_err(|_| WireError::Connection)?;
         let bytes = postcard::experimental::serialized_size(request)
             .map_err(|_| WireError::InvalidFrame)?;
-        // The answer begins once the request has been carried and the
-        // peer has answered it.
-        let asked = async {
-            let (mut send, mut recv) = self
-                .connection
-                .open_bi()
-                .await
-                .map_err(|_| WireError::Connection)?;
-            send.set_priority(request.operation.class().priority())
-                .map_err(|_| WireError::Connection)?;
-            write_frame(
+        let mut carriage = Carriage::begin(&self.connection, &self.capacity.held, bytes, period);
+        // The lanes keep the streams under way within what the peer lets a
+        // connection open, so a stream is there to be had at once.
+        let (mut send, mut recv) = tokio::time::timeout(period, self.connection.open_bi())
+            .await
+            .map_err(|_| WireError::Timeout)?
+            .map_err(|_| WireError::Connection)?;
+        send.set_priority(request.operation.class().priority())
+            .map_err(|_| WireError::Connection)?;
+        carriage
+            .written(write_frame(
                 &mut send,
                 FrameKind::Request,
                 request,
                 self.negotiated.max_frame_bytes,
-            )
+            ))
             .await?;
-            send.finish().map_err(|_| WireError::Connection)?;
-            let header = read_frame_header(
+        send.finish().map_err(|_| WireError::Connection)?;
+        // The peer's time to answer begins when it has the request: when
+        // the stream is acknowledged whole. An answer that comes before
+        // that says so itself; a peer that stopped the stream says why in
+        // what it answers, or by the end of the stream it answers on.
+        let header = {
+            let mut answer = std::pin::pin!(read_frame_header(
                 &mut recv,
                 FrameKind::Response,
                 self.negotiated.max_frame_bytes,
-            )
-            .await?;
-            Ok((recv, header))
+            ));
+            match carriage.acknowledged(&send, answer.as_mut()).await? {
+                Carried::Answered(header) => header,
+                // The peer's period to answer, and what the path is given
+                // to carry the first of the answer.
+                Carried::Stream(_) => tokio::time::timeout(
+                    period.saturating_add(residency(HEADER_BYTES, carriage.longest())),
+                    answer,
+                )
+                .await
+                .map_err(|_| WireError::Timeout)??,
+            }
         };
-        let (mut recv, header) =
-            carried(&self.connection, &self.capacity.held, bytes, period, asked).await?;
+        drop(carriage);
         let response: ResponseEnvelope =
             read_payload_arriving(&mut recv, header, period, || self.connection.rtt()).await?;
-        tokio::time::timeout(period, require_end(&mut recv))
-            .await
-            .map_err(|_| WireError::Timeout)??;
+        // The end of the stream is the last thing the path carries of it.
+        tokio::time::timeout(
+            period.max(residency(1, self.connection.rtt())),
+            require_end(&mut recv),
+        )
+        .await
+        .map_err(|_| WireError::Timeout)??;
         validate_response(request, &response, None, &self.limits)?;
         Ok(response)
     }

@@ -1936,18 +1936,52 @@ async fn peer_pool_saturation_is_bounded_and_route_change_retires_active_connect
     task.await.unwrap().unwrap();
 }
 
-/// A path between a client and `server` that carries `bits` in a second
-/// each way: a datagram waits its turn behind those before it, and one
-/// that finds `QUEUE` waiting is dropped.
-async fn narrow(
+/// A path between a client and a server, as a relay shapes it.
+#[derive(Clone, Copy, Debug)]
+struct Shape {
+    /// What the path carries in a second toward the server, and back.
+    up_bits: u64,
+    down_bits: u64,
+    /// How long a datagram travels once it has left the bottleneck, each
+    /// way, and how much longer at most (drawn for each datagram).
+    delay: Duration,
+    jitter: Duration,
+    /// Datagrams lost in a million, each way.
+    loss_ppm: u32,
+    /// The datagrams the bottleneck holds; one more is dropped.
+    queue: usize,
+    /// A time, from the relay's start, in which nothing is carried.
+    outage: Option<(Duration, Duration)>,
+    seed: u64,
+}
+impl Shape {
+    fn even(bits: u64) -> Self {
+        Self {
+            up_bits: bits,
+            down_bits: bits,
+            delay: Duration::ZERO,
+            jitter: Duration::ZERO,
+            loss_ppm: 0,
+            queue: 32,
+            outage: None,
+            seed: 1,
+        }
+    }
+}
+
+/// A path between a client and `server` shaped as `shape` says: a datagram
+/// waits its turn at the bottleneck behind those before it, one that finds
+/// the queue full is dropped, and what leaves the bottleneck travels its
+/// delay.
+async fn shaped(
     server: std::net::SocketAddr,
-    bits: u64,
+    shape: Shape,
 ) -> (std::net::SocketAddr, Vec<tokio::task::JoinHandle<()>>) {
-    const QUEUE: usize = 32;
     let front = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let back = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let address = front.local_addr().unwrap();
     let client = Arc::new(std::sync::Mutex::new(None::<std::net::SocketAddr>));
+    let began = tokio::time::Instant::now();
     let mut tasks = Vec::new();
     for up in [true, false] {
         let (from, to) = if up {
@@ -1955,7 +1989,8 @@ async fn narrow(
         } else {
             (back.clone(), front.clone())
         };
-        let (queue, mut waiting) = tokio::sync::mpsc::channel::<Vec<u8>>(QUEUE);
+        let bits = if up { shape.up_bits } else { shape.down_bits };
+        let (queue, mut waiting) = tokio::sync::mpsc::channel::<Vec<u8>>(shape.queue);
         let known = client.clone();
         tasks.push(tokio::spawn(async move {
             let mut datagram = vec![0u8; 65_536];
@@ -1968,23 +2003,60 @@ async fn narrow(
         }));
         let known = client.clone();
         tasks.push(tokio::spawn(async move {
+            let mut random = shape.seed ^ if up { 0x9E37_79B9_7F4A_7C15 } else { 0 };
+            let mut draw = move || {
+                random ^= random << 13;
+                random ^= random >> 7;
+                random ^= random << 17;
+                random
+            };
             let mut free = tokio::time::Instant::now();
             while let Some(datagram) = waiting.recv().await {
                 free = free.max(tokio::time::Instant::now())
                     + Duration::from_nanos(datagram.len() as u64 * 8 * 1_000_000_000 / bits);
                 tokio::time::sleep_until(free).await;
+                let lost = draw() % 1_000_000 < u64::from(shape.loss_ppm);
+                let out = shape.outage.is_some_and(|(from, length)| {
+                    let at = began.elapsed();
+                    at >= from && at < from + length
+                });
                 let target = if up {
                     Some(server)
                 } else {
                     *known.lock().unwrap()
                 };
-                if let Some(target) = target {
+                let Some(target) = target else { continue };
+                if lost || out {
+                    continue;
+                }
+                let travel = shape.delay
+                    + Duration::from_nanos(
+                        draw() % (shape.jitter.as_nanos() as u64).saturating_add(1),
+                    );
+                if travel.is_zero() {
                     let _ = to.send_to(&datagram, target).await;
+                } else {
+                    // No more travel at once than the bottleneck lets out
+                    // in the longest travel.
+                    let to = to.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(travel).await;
+                        let _ = to.send_to(&datagram, target).await;
+                    });
                 }
             }
         }));
     }
     (address, tasks)
+}
+
+/// A path that carries `bits` in a second each way, and nothing else of it
+/// shaped.
+async fn narrow(
+    server: std::net::SocketAddr,
+    bits: u64,
+) -> (std::net::SocketAddr, Vec<tokio::task::JoinHandle<()>>) {
+    shaped(server, Shape::even(bits)).await
 }
 
 /// A payload's residency is priced by the round trip the path shows while
@@ -2035,8 +2107,8 @@ async fn a_payload_is_given_the_round_trip_the_path_shows_while_it_arrives() {
         sender.abort();
         (arrived.map(|_| ()), began.elapsed())
     };
-    // The path showed one millisecond when the payload began: 110 round
-    // trips of it are 110 ms, and the payload takes ten times that.
+    // The path showed one millisecond when the payload began: 110 probe
+    // timeouts of it are 330 ms, and the payload takes three times that.
     let idle = Arc::new(AtomicU64::new(1_000));
     let (given_up, after) = read(idle.clone()).await;
     assert!(matches!(given_up, Err(WireError::Timeout)), "{given_up:?}");
@@ -2063,7 +2135,7 @@ async fn a_payload_is_given_the_round_trip_the_path_shows_while_it_arrives() {
 
 /// A megabyte over a path that takes longer to carry it than a request is
 /// given is carried, each way: an exchange waits as long as the path takes
-/// (`carried`, `read_payload_arriving`), and no longer for a peer that
+/// (`Carriage`, `read_payload_arriving`), and no longer for a peer that
 /// does not answer than the path would have taken.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn narrow_path_carries_a_megabyte_that_takes_longer_than_a_request_is_given() {
@@ -3787,4 +3859,816 @@ fn a_renewal_of_an_enrolled_key_is_admitted_until_the_projection_names_or_drops_
         registry.authenticate_certificate(&renewal),
         Err(AccessError::Unauthorized)
     ));
+}
+
+/// What became of an exchange whose stream its peer never read, while
+/// other exchanges went on over the same connection.
+struct Unread {
+    stalled: Result<ResponseEnvelope, WireError>,
+    after: Duration,
+    /// The longest round trip the connection measured meanwhile.
+    longest: Duration,
+    /// The other exchanges answered while it waited.
+    answered: u64,
+}
+const UNREAD_PERIOD: Duration = Duration::from_millis(500);
+const UNREAD_OTHER: usize = 4 * 1024;
+const UNREAD_EVERY: Duration = Duration::from_millis(100);
+/// Ask a peer that answers what is small and never reads what is not, over
+/// `shape` or directly, for `stalled`, while four kilobytes are sent to it
+/// ten times a second; then once more for something small.
+async fn unread(shape: Option<Shape>, stalled: RequestEnvelope) -> Unread {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let wire = WireLimits {
+        request_timeout: UNREAD_PERIOD,
+        max_frame_bytes: 4 * 1024 * 1024,
+        max_cost: 16 * 1024 * 1024,
+        ..Default::default()
+    };
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let (server_certificate, server_key) = pki.issue(true);
+    let config = server_tls(
+        TlsIdentity::from_pkcs8(vec![server_certificate], server_key),
+        vec![pki.ca.der().to_vec()],
+        &wire,
+    )
+    .unwrap();
+    let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let mut address = endpoint.local_addr().unwrap();
+    let limits = wire.clone();
+    let peer = tokio::spawn(async move {
+        let connection = endpoint.accept().await.unwrap().await.unwrap();
+        let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+        let hello: Hello = read_frame(&mut recv, FrameKind::Hello, 4096).await.unwrap();
+        write_frame(
+            &mut send,
+            FrameKind::HelloReply,
+            &HelloReply::Accepted(limits.negotiate(&hello).unwrap()),
+            4096,
+        )
+        .await
+        .unwrap();
+        send.finish().unwrap();
+        let mut unread = Vec::new();
+        while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+            let header = read_frame_header(&mut recv, FrameKind::Request, limits.max_frame_bytes)
+                .await
+                .unwrap();
+            if header.payload_bytes() > 1024 * 1024 {
+                unread.push((send, recv));
+                continue;
+            }
+            tokio::spawn(async move {
+                let asked: RequestEnvelope =
+                    read_payload_arriving(&mut recv, header, UNREAD_PERIOD, || {
+                        Duration::from_millis(1)
+                    })
+                    .await
+                    .unwrap();
+                write_frame(
+                    &mut send,
+                    FrameKind::Response,
+                    &asked.reply(Response::PeerAccepted),
+                    4096,
+                )
+                .await
+                .unwrap();
+                send.finish().unwrap();
+                let _ = send.stopped().await;
+            });
+        }
+    });
+    let mut relays = Vec::new();
+    if let Some(shape) = shape {
+        (address, relays) = shaped(address, shape).await;
+    }
+    let tls = client_tls(
+        TlsIdentity::from_pkcs8(vec![certificate], key),
+        vec![pki.ca.der().to_vec()],
+        &wire,
+    )
+    .unwrap();
+    let connector = QuicConnector::bind("127.0.0.1:0".parse().unwrap(), tls, wire).unwrap();
+    let remote = connector.connect(address, "localhost").await.unwrap();
+    fn other(id: u128) -> RequestEnvelope {
+        let mut packet = request(id);
+        packet.operation = Operation::Raft {
+            group: [2; 16],
+            message: vec![7; UNREAD_OTHER],
+        };
+        packet
+    }
+    let answered = Arc::new(AtomicU64::new(0));
+    let longest = Arc::new(AtomicU64::new(0));
+    let others = {
+        let (remote, answered) = (remote.clone(), answered.clone());
+        tokio::spawn(async move {
+            for id in 1_000.. {
+                remote
+                    .request_within(&other(id), UNREAD_PERIOD)
+                    .await
+                    .unwrap();
+                answered.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(UNREAD_EVERY).await;
+            }
+        })
+    };
+    // The round trip, asked far more often than the exchange asks it.
+    let measuring = {
+        let (remote, longest) = (remote.clone(), longest.clone());
+        tokio::spawn(async move {
+            loop {
+                longest.fetch_max(remote.round_trip().as_nanos() as u64, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    };
+    let began = std::time::Instant::now();
+    let stalled = remote.request_within(&stalled, UNREAD_PERIOD).await;
+    let after = began.elapsed();
+    let during = answered.load(Ordering::Relaxed);
+    // The others are answered after it as before, on the same connection.
+    remote
+        .request_within(&other(2), UNREAD_PERIOD)
+        .await
+        .unwrap();
+    assert!(!remote.closed());
+    assert!(!others.is_finished());
+    others.abort();
+    assert!(others.await.unwrap_err().is_cancelled());
+    measuring.abort();
+    let _ = measuring.await;
+    remote.close();
+    let _ = peer.await;
+    for relay in relays {
+        relay.abort();
+    }
+    Unread {
+        stalled,
+        after,
+        longest: Duration::from_nanos(longest.load(Ordering::Relaxed)),
+        answered: during,
+    }
+}
+
+/// A stream its peer does not read ends by what its own bytes are given,
+/// whatever else the connection carries meanwhile (the audit's F38).
+/// Charged with what the connection sent, it was kept for as long as the
+/// other exchanges moved a datagram a period, until they had sent as much
+/// as it had to: two megabytes at twenty kilobytes a period here, fifty
+/// periods on the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_its_peer_does_not_read_ends_whatever_else_its_connection_carries() {
+    const STALLED: usize = 2 * 1024 * 1024;
+    let mut packet = request(1);
+    packet.operation = Operation::Raft {
+        group: [2; 16],
+        message: vec![7; STALLED],
+    };
+    let unread = unread(None, packet).await;
+    assert!(
+        matches!(unread.stalled, Err(WireError::Timeout)),
+        "{:?}",
+        unread.stalled
+    );
+    assert!(unread.after >= UNREAD_PERIOD, "{:?}", unread.after);
+    // What the others send in a period, and the periods it would have
+    // taken them to send what the stalled exchange had to.
+    let moved = UNREAD_OTHER as u32 * (UNREAD_PERIOD.as_millis() / UNREAD_EVERY.as_millis()) as u32;
+    let kept = UNREAD_PERIOD * (STALLED as u32 / moved);
+    assert!(kept >= UNREAD_PERIOD * 100);
+    assert!(unread.after < kept / 8, "{:?} of {kept:?}", unread.after);
+    assert!(unread.answered >= 1, "{}", unread.answered);
+}
+
+/// The same over a path that loses a datagram in a hundred and delivers
+/// out of order, the stalled exchange content and the others a group's
+/// messages, which go before it: it ends when what the path is given to
+/// carry its bytes is spent — the least a live path delivers, at the longest
+/// round trip this one showed — and the others are answered throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_its_peer_does_not_read_ends_on_a_path_that_loses_and_reorders() {
+    // More than the megabyte a stream is let send ahead of its reader.
+    const STALLED: usize = 1024 * 1024 + 256 * 1024;
+    let mut packet = request(1);
+    packet.operation = Operation::Custody(CustodyRequest::Chunk {
+        transfer: [1; 16],
+        index: 3,
+        bytes: vec![7; STALLED],
+    });
+    let shape = Shape {
+        delay: Duration::from_millis(1),
+        jitter: Duration::from_millis(1),
+        loss_ppm: 10_000,
+        ..Shape::even(100_000_000)
+    };
+    let unread = unread(Some(shape), packet).await;
+    assert!(
+        matches!(unread.stalled, Err(WireError::Timeout)),
+        "{:?}",
+        unread.stalled
+    );
+    assert!(unread.after >= UNREAD_PERIOD, "{:?}", unread.after);
+    // What was held to send beside it is no more than the others' one
+    // message at a time; a period more for the wait that finds the time
+    // spent.
+    let given = crate::frame::residency(STALLED + 2 * UNREAD_OTHER, unread.longest)
+        .max(UNREAD_PERIOD)
+        + UNREAD_PERIOD;
+    assert!(
+        unread.after <= given,
+        "{:?} of {given:?} at {:?}",
+        unread.after,
+        unread.longest
+    );
+    assert!(unread.answered >= 1, "{}", unread.answered);
+}
+
+/// The time a peer is given to answer begins when it has what was asked:
+/// when the request's stream is acknowledged whole (the audit's F38).
+/// Thirty-two kilobytes over a path that carries eight in a second take
+/// four seconds, and the peer answers four tenths of a second after it has
+/// them, inside its half-second. Counted from when the connection had
+/// *sent* as much as the request, the half-second began while the last
+/// window of it, more than a second of this path, was still on its way,
+/// and ended before the peer had the request at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peers_time_to_answer_begins_when_it_has_what_was_asked() {
+    const BITS: u64 = 64_000;
+    const SIZE: usize = 32 * 1024;
+    const PERIOD: Duration = Duration::from_millis(500);
+    let wire = WireLimits {
+        max_frame_bytes: 2 * 1024 * 1024,
+        max_cost: 8 * 1024 * 1024,
+        ..Default::default()
+    };
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(16).unwrap();
+    let mut node_grant = grant();
+    node_grant.role = PeerRole::Node { node_id: 7 };
+    registry
+        .register_certificate(&certificate, node_grant)
+        .unwrap();
+    let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| async move {
+        tokio::time::sleep(PERIOD * 4 / 5).await;
+        verified.request().reply(Response::PeerAccepted)
+    });
+    let (server_certificate, server_key) = pki.issue(true);
+    let tls = server_tls(
+        TlsIdentity::from_pkcs8(vec![server_certificate], server_key),
+        vec![pki.ca.der().to_vec()],
+        &wire,
+    )
+    .unwrap();
+    let server = Arc::new(
+        QuicServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            tls,
+            registry,
+            wire.clone(),
+            budget(),
+        )
+        .unwrap(),
+    );
+    let running = server.clone();
+    let serving = tokio::spawn(async move { running.serve(handler).await });
+    let (path, relays) = shaped(
+        server.local_addr().unwrap(),
+        Shape {
+            delay: Duration::from_millis(10),
+            ..Shape::even(BITS)
+        },
+    )
+    .await;
+    let tls = client_tls(
+        TlsIdentity::from_pkcs8(vec![certificate], key),
+        vec![pki.ca.der().to_vec()],
+        &wire,
+    )
+    .unwrap();
+    let connector = QuicConnector::bind("127.0.0.1:0".parse().unwrap(), tls, wire).unwrap();
+    let remote = connector.connect(path, "localhost").await.unwrap();
+    let mut packet = request(1);
+    packet.operation = Operation::Raft {
+        group: [2; 16],
+        message: vec![7; SIZE],
+    };
+    let began = std::time::Instant::now();
+    let answered = remote.request_within(&packet, PERIOD).await;
+    let took = began.elapsed();
+    assert!(
+        matches!(&answered, Ok(answer) if answer.result == Response::PeerAccepted),
+        "{answered:?} in {took:?}"
+    );
+    // No sooner than the path carries it, which is many of its periods.
+    let least = Duration::from_millis(SIZE as u64 * 8 * 1_000 / BITS);
+    assert!(least >= PERIOD * 8);
+    assert!(took >= least, "{took:?}");
+    server.close();
+    for relay in relays {
+        relay.abort();
+    }
+    let _ = serving.await;
+}
+
+/// A pool, as a node's limits are but for `pool`, and a peer that accepts
+/// what it is sent, with a path shaped as `shape` between them.
+struct SlowRig {
+    pool: PeerConnectionPool,
+    server: Arc<QuicServer>,
+    serving: tokio::task::JoinHandle<Result<(), WireError>>,
+    relays: Vec<tokio::task::JoinHandle<()>>,
+}
+impl SlowRig {
+    async fn new(shape: Shape, pool: PeerPoolLimits) -> Self {
+        use std::collections::BTreeMap;
+        let wire = WireLimits {
+            max_frame_bytes: 10 * 1024 * 1024,
+            max_cost: 40 * 1024 * 1024,
+            ..WireLimits::for_consensus(128)
+        };
+        let pki = Pki::new();
+        let (certificate, key) = pki.issue(false);
+        let registry = PeerRegistry::new(16).unwrap();
+        let mut node_grant = grant();
+        node_grant.role = PeerRole::Node { node_id: 7 };
+        registry
+            .register_certificate(&certificate, node_grant)
+            .unwrap();
+        let handler: Arc<dyn RequestHandler> =
+            Arc::new(move |verified: VerifiedRequest| async move {
+                verified.request().reply(Response::PeerAccepted)
+            });
+        let (server_certificate, server_key) = pki.issue(true);
+        let tls = server_tls(
+            TlsIdentity::from_pkcs8(vec![server_certificate], server_key),
+            vec![pki.ca.der().to_vec()],
+            &wire,
+        )
+        .unwrap();
+        let server = Arc::new(
+            QuicServer::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                tls,
+                registry,
+                wire.clone(),
+                budget(),
+            )
+            .unwrap(),
+        );
+        let running = server.clone();
+        let serving = tokio::spawn(async move { running.serve(handler).await });
+        let (path, relays) = shaped(server.local_addr().unwrap(), shape).await;
+        let tls = client_tls(
+            TlsIdentity::from_pkcs8(vec![certificate], key),
+            vec![pki.ca.der().to_vec()],
+            &wire,
+        )
+        .unwrap();
+        let pool = PeerConnectionPool::new(
+            QuicConnector::bind("127.0.0.1:0".parse().unwrap(), tls, wire).unwrap(),
+            pool,
+        )
+        .unwrap();
+        pool.replace_routes(
+            1,
+            BTreeMap::from([(
+                2,
+                PeerEndpoint {
+                    address: path,
+                    server_name: "localhost".into(),
+                    name: None,
+                },
+            )]),
+        )
+        .unwrap();
+        Self {
+            pool,
+            server,
+            serving,
+            relays,
+        }
+    }
+    fn message(id: u128, size: usize) -> RequestEnvelope {
+        let mut packet = request(id);
+        packet.operation = Operation::Raft {
+            group: [2; 16],
+            message: vec![7; size],
+        };
+        packet
+    }
+    async fn close(self) {
+        self.pool.close();
+        self.server.close();
+        for relay in self.relays {
+            relay.abort();
+        }
+        let _ = self.serving.await;
+    }
+}
+
+/// A group's message is carried for as long as its path takes (the audit's
+/// F36): sixty-four kilobytes over a path that carries thirty-two in a
+/// second, by a pool whose every wait is one second. An exchange was given
+/// that one time whatever it carried, so a path that carried less than the
+/// message in it carried none of the message, at the first attempt or at
+/// any later one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_groups_message_is_carried_for_as_long_as_its_path_takes() {
+    const BITS: u64 = 256_000;
+    const SIZE: usize = 64 * 1024;
+    let limits = PeerPoolLimits {
+        timeout: Duration::from_secs(1),
+        ..PeerPoolLimits::for_consensus(128)
+    };
+    let least = Duration::from_millis(SIZE as u64 * 8 * 1_000 / BITS);
+    assert!(least >= limits.timeout * 2);
+    let rig = SlowRig::new(
+        Shape {
+            delay: Duration::from_millis(10),
+            ..Shape::even(BITS)
+        },
+        limits.clone(),
+    )
+    .await;
+    let began = std::time::Instant::now();
+    assert_eq!(rig.pool.send(2, &SlowRig::message(1, SIZE)).await, Ok(()));
+    let took = began.elapsed();
+    assert!(took >= least, "{took:?}");
+    let stats = rig.pool.stats();
+    assert_eq!((stats.dials, stats.connections_opened), (1, 1));
+    rig.close().await;
+}
+
+/// A dial is given what a handshake is given and not what one exchange is
+/// (the audit's F36): over a path that takes longer to connect than the
+/// pool's callers wait, the callers are told the peer was not reached, the
+/// dial goes on, and the next caller has its connection. The dial was
+/// given the callers' time, failed with them, and was begun again from
+/// nothing by the next: such a path was never connected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dial_is_given_a_handshakes_time_and_outlives_the_callers_that_asked_for_it() {
+    let limits = PeerPoolLimits {
+        timeout: Duration::from_millis(500),
+        retry_backoff: Duration::from_millis(10),
+        ..PeerPoolLimits::for_consensus(128)
+    };
+    // Sixteen kilobits a second: the two handshakes are some seven
+    // kilobytes, three seconds and more.
+    let rig = SlowRig::new(
+        Shape {
+            delay: Duration::from_millis(10),
+            ..Shape::even(16_000)
+        },
+        limits.clone(),
+    )
+    .await;
+    let began = std::time::Instant::now();
+    let mut lost = 0_u32;
+    // Charged to the dial: one more try for every caller's time it takes,
+    // and as many as a handshake is given at most.
+    let tries =
+        (WireLimits::default().request_timeout.as_millis() * 2 / limits.timeout.as_millis()) as u32;
+    loop {
+        match rig.pool.send(2, &SlowRig::message(1, 64)).await {
+            Ok(()) => break,
+            Err(PeerSendError::Lost) => lost += 1,
+            Err(other) => panic!("{other:?}"),
+        }
+        assert!(lost < tries, "{lost} tries in {:?}", began.elapsed());
+    }
+    assert!(lost >= 1, "connected within a caller's time");
+    assert!(began.elapsed() >= limits.timeout * 2);
+    let stats = rig.pool.stats();
+    assert_eq!((stats.dials, stats.connections_opened), (1, 1));
+    rig.close().await;
+}
+
+/// What the pool does with a group's message of `size` over a path shaped
+/// as `shape`, as a node's limits are: the outcome of sending it, and of
+/// sending it again, each given `cap` at most, and what the pool counted.
+type SlowCase = (
+    Result<Result<(), PeerSendError>, tokio::time::error::Elapsed>,
+    Duration,
+    Result<Result<(), PeerSendError>, tokio::time::error::Elapsed>,
+    Duration,
+    PeerPoolStats,
+);
+async fn slow_case(shape: Shape, size: usize, cap: Duration) -> SlowCase {
+    let rig = SlowRig::new(shape, PeerPoolLimits::for_consensus(128)).await;
+    let packet = SlowRig::message(u128::from(shape.up_bits) * 1_000_000 + size as u128, size);
+    let began = std::time::Instant::now();
+    let first = tokio::time::timeout(cap, rig.pool.send(2, &packet)).await;
+    let took = began.elapsed();
+    // A second message, on the connection the first opened, if it did.
+    let again = std::time::Instant::now();
+    let second = tokio::time::timeout(cap, rig.pool.send(2, &packet)).await;
+    let then = again.elapsed();
+    let stats = rig.pool.stats();
+    rig.close().await;
+    (first, took, second, then, stats)
+}
+fn slow_row(label: &str, case: &SlowCase) {
+    let say =
+        |outcome: &Result<Result<(), PeerSendError>, tokio::time::error::Elapsed>| match outcome {
+            Ok(Ok(())) => "delivered".to_string(),
+            Ok(Err(error)) => format!("{error:?}"),
+            Err(_) => "capped".to_string(),
+        };
+    let (first, took, second, then, stats) = case;
+    println!(
+        "{label:<44} {:<12} {:>6.1}s  {:<12} {:>6.1}s  {:>5} {:>6}",
+        say(first),
+        took.as_secs_f64(),
+        say(second),
+        then.as_secs_f64(),
+        stats.dials,
+        stats.connections_opened
+    );
+}
+fn slow_cap() -> Duration {
+    Duration::from_secs(
+        std::env::var("FOCAL_SLOW_PATH_CAP")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(120),
+    )
+}
+const SLOW_HEAD: &str = "path, bytes                                  first            in  second           in  dials opened";
+
+/// What the pool does with a group's message of each size over paths of
+/// each rate: a measurement, printed, which asserts nothing.
+/// `FOCAL_SLOW_PATH_CAP` is the seconds a send is given (default 120).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement of minutes; run by name"]
+async fn slow_paths_measured() {
+    let cap = slow_cap();
+    let mut cases = Vec::new();
+    for bits in [100_u64, 1_000, 8_000, 64_000, 256_000] {
+        for size in [64_usize, 4 * 1024, 64 * 1024, 1024 * 1024] {
+            let shape = Shape {
+                delay: Duration::from_millis(25),
+                ..Shape::even(bits)
+            };
+            cases.push((
+                format!("{bits} bit/s, {size}"),
+                tokio::spawn(slow_case(shape, size, cap)),
+            ));
+        }
+    }
+    println!("{SLOW_HEAD}");
+    for (label, case) in cases {
+        slow_row(&label, &case.await.unwrap());
+    }
+}
+
+/// The same over paths that lose, delay unevenly, carry less one way, and
+/// stop for a while: a measurement, printed, which asserts nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement of minutes; run by name"]
+async fn adverse_paths_measured() {
+    let cap = slow_cap();
+    let base = |bits: u64| Shape {
+        delay: Duration::from_millis(25),
+        ..Shape::even(bits)
+    };
+    let seconds = Duration::from_secs;
+    let mut shapes: Vec<(String, Shape)> = Vec::new();
+    for bits in [64_000_u64, 256_000] {
+        shapes.push((
+            format!("{bits} bit/s, loss 2%"),
+            Shape {
+                loss_ppm: 20_000,
+                ..base(bits)
+            },
+        ));
+        shapes.push((
+            format!("{bits} bit/s, loss 10%"),
+            Shape {
+                loss_ppm: 100_000,
+                ..base(bits)
+            },
+        ));
+        shapes.push((
+            format!("{bits} bit/s, jitter 50 ms"),
+            Shape {
+                jitter: Duration::from_millis(50),
+                ..base(bits)
+            },
+        ));
+        shapes.push((
+            format!("{bits} bit/s up, 8000 down"),
+            Shape {
+                down_bits: 8_000,
+                ..base(bits)
+            },
+        ));
+        shapes.push((
+            format!("8000 bit/s up, {bits} down"),
+            Shape {
+                up_bits: 8_000,
+                ..base(bits)
+            },
+        ));
+        shapes.push((
+            format!("{bits} bit/s, out 3 s at 4 s"),
+            Shape {
+                outage: Some((seconds(4), seconds(3))),
+                ..base(bits)
+            },
+        ));
+        shapes.push((
+            format!("{bits} bit/s, out 8 s at 4 s"),
+            Shape {
+                outage: Some((seconds(4), seconds(8))),
+                ..base(bits)
+            },
+        ));
+        shapes.push((
+            format!("{bits} bit/s, out 15 s at 4 s"),
+            Shape {
+                outage: Some((seconds(4), seconds(15))),
+                ..base(bits)
+            },
+        ));
+    }
+    let mut cases = Vec::new();
+    for (label, shape) in shapes {
+        for size in [4 * 1024_usize, 64 * 1024, 256 * 1024] {
+            cases.push((
+                format!("{label}, {size}"),
+                tokio::spawn(slow_case(shape, size, cap)),
+            ));
+        }
+    }
+    println!("{SLOW_HEAD}");
+    for (label, case) in cases {
+        slow_row(&label, &case.await.unwrap());
+    }
+}
+
+/// One exchange with a peer over a path shaped as `shape`, each part of it
+/// given `period`: `size` bytes sent to the peer, or asked of it (`down`).
+async fn direct_case(
+    shape: Shape,
+    size: usize,
+    down: bool,
+    period: Duration,
+) -> (Result<(), WireError>, Duration) {
+    let wire = WireLimits {
+        max_frame_bytes: 10 * 1024 * 1024,
+        max_cost: 40 * 1024 * 1024,
+        ..WireLimits::for_consensus(128)
+    };
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(16).unwrap();
+    let mut node_grant = grant();
+    node_grant.role = PeerRole::Node { node_id: 7 };
+    registry
+        .register_certificate(&certificate, node_grant)
+        .unwrap();
+    let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| async move {
+        let reply = match &verified.request().operation {
+            Operation::Custody(CustodyRequest::ReadChunk {
+                index, max_bytes, ..
+            }) => Response::Custody(CustodyReply::Chunk {
+                index: *index,
+                bytes: vec![7; *max_bytes as usize],
+            }),
+            _ => Response::PeerAccepted,
+        };
+        verified.request().reply(reply)
+    });
+    let (server_certificate, server_key) = pki.issue(true);
+    let tls = server_tls(
+        TlsIdentity::from_pkcs8(vec![server_certificate], server_key),
+        vec![pki.ca.der().to_vec()],
+        &wire,
+    )
+    .unwrap();
+    let server = Arc::new(
+        QuicServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            tls,
+            registry,
+            wire.clone(),
+            budget(),
+        )
+        .unwrap(),
+    );
+    let running = server.clone();
+    let serving = tokio::spawn(async move { running.serve(handler).await });
+    let (path, relays) = shaped(server.local_addr().unwrap(), shape).await;
+    let tls = client_tls(
+        TlsIdentity::from_pkcs8(vec![certificate], key),
+        vec![pki.ca.der().to_vec()],
+        &wire,
+    )
+    .unwrap();
+    let connector = QuicConnector::bind("127.0.0.1:0".parse().unwrap(), tls, wire).unwrap();
+    let outcome = match connector.connect(path, "localhost").await {
+        Err(error) => (Err(error), Duration::ZERO),
+        Ok(remote) => {
+            let mut packet = request(9);
+            packet.operation = if down {
+                Operation::Custody(CustodyRequest::ReadChunk {
+                    transfer: [1; 16],
+                    index: 4,
+                    max_bytes: size as u32,
+                })
+            } else {
+                Operation::Raft {
+                    group: [2; 16],
+                    message: vec![7; size],
+                }
+            };
+            let sent = std::time::Instant::now();
+            let outcome = remote.request_within(&packet, period).await;
+            (outcome.map(|_| ()), sent.elapsed())
+        }
+    };
+    server.close();
+    for relay in relays {
+        relay.abort();
+    }
+    let _ = serving.await;
+    outcome
+}
+
+/// Exchanges each way over the narrowest paths that connect, with and
+/// without loss, each part given five seconds: a measurement, printed,
+/// which asserts nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement of minutes; run by name"]
+async fn narrow_lossy_paths_measured() {
+    let mut cases = Vec::new();
+    for bits in [4_000_u64, 8_000, 16_000] {
+        for loss_ppm in [0_u32, 20_000, 100_000] {
+            for size in [16 * 1024_usize, 64 * 1024] {
+                for down in [false, true] {
+                    let shape = Shape {
+                        delay: Duration::from_millis(25),
+                        loss_ppm,
+                        ..Shape::even(bits)
+                    };
+                    cases.push((
+                        format!(
+                            "{bits} bit/s, loss {}%, {size} {}",
+                            loss_ppm / 10_000,
+                            if down { "asked" } else { "sent" }
+                        ),
+                        (size as u64 * 8).div_ceil(bits),
+                        tokio::spawn(direct_case(shape, size, down, Duration::from_secs(5))),
+                    ));
+                }
+            }
+        }
+    }
+    println!(
+        "path, bytes                              outcome              in   at the path's rate"
+    );
+    for (label, least, case) in cases {
+        let (outcome, took) = case.await.unwrap();
+        println!(
+            "{label:<40} {:<14} {:>7.1}s   {least:>5}s",
+            match outcome {
+                Ok(()) => "answered".to_string(),
+                Err(error) => format!("{error:?}"),
+            },
+            took.as_secs_f64()
+        );
+    }
+}
+
+/// One exchange over one shaped path, told as it goes: a diagnostic.
+/// `FOCAL_SLOW_PATH_BITS`, `_BYTES`, `_PERIOD_MS`, `_LOSS_PPM`, and `_DOWN`
+/// for bytes asked of the peer instead of sent to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "a diagnostic; run by name"]
+async fn slow_path_one() {
+    let read = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let bits = read("FOCAL_SLOW_PATH_BITS", 8_000);
+    let size = read("FOCAL_SLOW_PATH_BYTES", 65_536) as usize;
+    let period = Duration::from_millis(read("FOCAL_SLOW_PATH_PERIOD_MS", 5_000));
+    let shape = Shape {
+        delay: Duration::from_millis(25),
+        loss_ppm: read("FOCAL_SLOW_PATH_LOSS_PPM", 0) as u32,
+        ..Shape::even(bits)
+    };
+    let down = read("FOCAL_SLOW_PATH_DOWN", 0) == 1;
+    let began = std::time::Instant::now();
+    let (outcome, took) = direct_case(shape, size, down, period).await;
+    println!(
+        "{bits} bit/s, {size} bytes {}, period {period:?}: {outcome:?} in {took:?} ({:?} in all)",
+        if down { "asked" } else { "sent" },
+        began.elapsed()
+    );
 }

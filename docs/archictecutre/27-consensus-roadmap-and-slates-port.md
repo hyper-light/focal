@@ -753,23 +753,82 @@ streaming to it, counted per session (`focal_session_peers_unreachable_total`).
 
 **How long an exchange waits.** An exchange was given a time: five seconds by the
 pool, thirty by a connection. A megabyte needs 1.7 Mbit/s for the first and 0.28 for
-the second, and a path that carries less carried no content at all. The parts of an
-exchange have waits of their own now, each charged to what it waits on
-(`transport::carried`, `frame::read_payload_arriving`):
+the second, and a path that carries less carried no content at all. Content was given
+waits of its own for its parts on 2026-09-28; what a group sends a peer kept the pool's
+five seconds for the whole of an exchange until the audit's F36, and the waits were
+charged to what the connection sent until its F38. Every exchange has these parts now,
+and each its own wait (`PeerConnectionPool::send_bounded`, `transport::Carriage`,
+`frame::read_payload_arriving`):
 
 | Part | Waits until | Given up when |
 |---|---|---|
-| What is sent, and the peer's answer to it | The answer begins | A period ends in which the connection sent less than a datagram; or a period ends that began when the connection had sent all that its exchanges had to send: the peer had the request, and a period to answer |
-| What arrives | Its last byte | A period brings neither its end nor a datagram more of it |
+| Its turn on the peer's lane, and its connection | It has them | The pool's time for each (`PeerPoolLimits::timeout`). The dial goes on without the caller, for the next: it is given what the connector gives a handshake (`request_timeout`, for the connection's and for the protocol's) |
+| What is sent | The peer has acknowledged the whole of its stream, or has answered | The residency of what the connection held to send beside it is spent; never before a period |
+| The peer's answer | It begins | A period after the peer had the request, and what the path is given to carry the first of it |
+| What arrives | Its last byte | Its residency is spent; never before a period |
 | The handler | It answers | The time of a request, as before |
 
-The period is the time the exchange was given before. What a connection sent is what
-it sent and has not found lost. So a megabyte crosses a path of 4 Mbit/s in both
-directions between endpoints that give a request one second
-(`narrow_path_carries_a_megabyte_that_takes_longer_than_a_request_is_given`, through a
-relay that carries that and drops what finds 32 datagrams waiting), and a peer that
-takes a request and does not answer is given up in one period or two on any path.
-Every period but the last moves a datagram of a bounded frame: the wait ends.
+The period is the pool's time. A group's exchange that ends by time is not asked again
+by the pool: its owner asks again by its own clock, and a second time would hold the
+peer's lane as long again.
+
+**What a sender knows of its own stream** is one thing: that the peer has acknowledged
+all of it, or stopped taking it (`SendStream::stopped`). What the connection sent is in
+flight, sent again, or another stream's. Charged with it, an exchange was given its
+peer's period to answer while its last window was still on the path: sixty-four
+kilobytes over eight kilobits a second were given up at sixty seconds, twelve periods
+to the second, five seconds before they had arrived. And a stream its peer had stopped
+reading was kept for as long as the other exchanges of its connection moved a datagram
+a period: two megabytes, twenty-five seconds, where it ends in half a second now. What
+a stream takes of what is written to it says little either: a window at once, and more
+only as the peer's reading lets it, an eighth of a window at a time, which on a narrow
+path is longer than any period (a megabyte over sixty-four kilobits was given up ten
+seconds in by that rule, tried and taken out). So between the last byte written and
+the acknowledgment the wait ends by a bound and not by a guess at delivery.
+
+**The bound is the residency** (`frame::residency`): what the bytes take at the least
+a live sender delivers, two datagrams of the least size in a probe timeout, at the
+longest round trip the path has shown. A sender whose window is as small as QUIC keeps
+it, and whose every flight must be asked for again, sends two datagrams when its probe
+timer ends (RFC 9002 §6.2.4, §7.2, §7.5), and the timer is three round trips with the
+variance a single sample is given (§5.3, §6.2.1). It was two datagrams a round trip,
+which is a path's best with that window and not its least: 256 kilobytes over eight
+kilobits a second took 262 seconds and were given 225. A receiver holds a payload to
+the same bound and to nothing else. It also gave a payload up when a period brought
+less than a datagram of it, which asked of every path a datagram a period and of every
+sender that it lose nothing: sixteen kilobytes arriving a datagram every 2.6 s were
+given up five seconds into the silence after a lost flight, with 175 s of their
+residency left. A sender that stops for good is given up when the residency is spent,
+one whose connection carries nothing when the connection ends, and a connection ends
+when its path is silent for ten seconds (`IDLE_TIMEOUT`).
+
+**What a path must carry**, then, is what a connection needs to live: a datagram of the
+least size returned within the idle timeout, 1,920 bits a second. Below that no
+connection is made, and every caller is told so in the pool's time; above it a message
+of any size the frame allows is carried in the time the path takes. Measured through a
+relay that carries so many bits a second each way with 50 ms of round trip, the pool
+as a node configures it sending a message of a group and then sending it again
+(`slow_paths_measured`, `adverse_paths_measured`, `narrow_lossy_paths_measured`):
+
+| Path | 64 B | 4 KiB | 64 KiB | 1 MiB |
+|---|---|---|---|---|
+| 100 bit/s, 1 kbit/s | `Lost`, `Lost` | `Lost`, `Lost` | `Lost`, `Lost` | `Lost`, `Lost` |
+| 8 kbit/s | `Lost`, then 5.0 s | `Lost`, 9.1 s | `Lost`, 75.0 s | 1,078 s on a connection that is open |
+| 64 kbit/s | 1.0 s, then 0.2 s | 1.6 s, 0.7 s | 9.8 s, 8.5 s | 136.7 s, 135.5 s |
+| 256 kbit/s | 0.4 s, then 0.1 s | 0.5 s, 0.2 s | 2.7 s, 2.2 s | 35.6 s, 35.4 s |
+
+The first send has no connection. Where the dial takes longer than the pool's five
+seconds (8.4 s at 8 kbit/s) it is told `Lost` at five, and the second has the
+connection when the dial is done. Before, nothing was delivered at 8 kbit/s (a dial was
+given the callers' five seconds and begun again from nothing by the next), and nothing
+that takes its path more than five seconds at any rate: 64 KiB at 64 kbit/s, a megabyte
+at 256. At 64 and 256 kbit/s, 4, 64 and 256 KiB are delivered with two and ten percent
+of datagrams lost, with 50 ms of jitter, with eight kilobits a second in either direction
+against the other, and across a path that carries nothing for three seconds or for
+eight; one that carries nothing for fifteen ends the connection, the message is `Lost`
+and the next is delivered over a new one. At 4, 8 and 16 kbit/s, sixteen and sixty-four
+kilobytes sent or asked for are answered at none, two and ten percent loss, thirty-six
+cases of which fourteen failed before the receiver's rule changed.
 
 **Classes** (`focal_wire::TrafficClass`, `Operation::class`). A stream of a higher
 priority sends all it has before one of a lower sends anything. Consensus, probes and
@@ -839,14 +898,15 @@ of it was changed.
 | An object is owned where it was created, until that host dies; then by a survivor chosen by hash | The only host | Every write from elsewhere crosses the long path; nothing moves an owner to its writers or spreads owners |
 | No migration, no path validation, no keep-alive, no key update | Nothing to see | A laptop that changes networks, or a NAT that forgets, ends the session |
 | Copa carries 0.795 of 100 Mbit/s at 100 ms and 0.496 at 300 ms | | focal measured the same law at 69% of 10 Mbit/s at 300 ms. With slow start judged by what was sent after a doubling and the stride bounded it carries 96.9% there (section 7); slates' law is as it was |
-| An exchange is given a time, whatever it carries | Nothing to see | A path that carries less than the object in that time carries none of it. focal had the same defect and waits on what the connection sent now (section 7) |
+| An exchange is given a time, whatever it carries | Nothing to see | A path that carries less than the object in that time carries none of it. focal had the same defect, for content until 2026-09-28 and for what groups send until 2026-10-01, and gives each part of an exchange what its own stream and its path take (section 7) |
 
 ### 8.4 What is open in focal
 
 | Open | Why it matters |
 |---|---|
 | The streams of a connection, sixteen by default (`WireLimits::streams_per_connection`) | Done (2026-09-29): derived from the consensus window and the reference path (`WireLimits::for_consensus`, section 7), and a group's message waits its turn on its lane, bounded by its exchange's time, instead of being refused; a peer the pool could not reach at all is told to the core, which probes it |
-| The pool's deadline of five seconds for what is not content, the announcement's round of five and enrollment control's of four | Set, not derived. An exchange of a group with a peer further than that is not made; no path on this planet is, but a peer under load may be |
+| The pool's five seconds, the announcement's round of five and enrollment control's of four | Set, not derived. The pool's is no longer the time of an exchange (section 7, 2026-10-01): it is what a caller waits for its lane and for its connection, and what a peer is given to answer once it has the request. A peer under load that takes longer to answer is still given up |
+| The idle timeout of a connection, ten seconds | Set, not derived. It is what a path must return a datagram in (1,920 bit/s), and a path that carries nothing for longer loses its connections and what they carried |
 | The request time an owner gives what it holds (`request_timeout`, five seconds) | Set, not derived; counted in the owner's periods now, so a loaded machine stretches it, but a follower whose owner stalls for longer than the leader's request time is not seen by the leader, whose own periods run on time. Under eight and sixteen copies of the control suite at once this is what remains (five of eight runs, none of sixteen): a leader whose term entry the stalled followers do not acknowledge in time answers `NotReady` until leadership has moved again. The request time should follow the exchange tails of the voters (`PeerConnectionPool::exchange_tail`), which a stalled follower stretches and the leader's own stall does not |
 | The control suite's single asks inside a request deadline of 350 ms | Done, at the cause: the owner gave a request 350 ms of the clock while a loaded machine slowed its rounds, so every ask timed out. A request now waits its time in the owner's own periods (`ControlHost`, `Pending::deadline`), and every ask of the suite that expects an answer waits for a definite one, charged to the hosts' periods (`Rig::definite`, `read_on_leader`); eight copies of the suite at once pass |
 | A restore cut where it records its copy | Cut at three places and issued again on real processes (`runbook_interrupted_restore`); the cut between the copy's record and its attachment is covered by the record alone |

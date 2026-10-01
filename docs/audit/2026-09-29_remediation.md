@@ -48,9 +48,9 @@ ruling before work starts).
 | F33 | P2 | open | 4 | — |
 | F34 | P2 | open | 4 | — |
 | F35 | P1 | in tree | 3 | [F35](#f35) |
-| F36 | P1 | open | 9 | — |
+| F36 | P1 | in tree | 9 | [F36](#f38-and-f36) |
 | F37 | P1 | in tree | 8 | [F37](#f37) |
-| F38 | P2 | open | 8 | — |
+| F38 | P2 | in tree | 8 | [F38](#f38-and-f36) |
 | F39 | P2 | open | 12 | — |
 | F40 | P2 | open | 10 | — |
 | F41 | P2 | in tree | 10 | [F41](#f41) |
@@ -1093,6 +1093,9 @@ header from the same identity is refused for its share, reset, counted; the perm
 back with the stream), the admission's existing cases, and the node's listener tests.
 `residency` is exercised by every request and response read in the suites.
 
+**Changed since (2026-10-01):** the residency is two datagrams a probe timeout, and is
+the only thing a payload is given up by ([F36](#f38-and-f36)).
+
 **Residual (2026-09-30): the residency was priced by the round trip of an idle path.**
 *Cause.* `residency(bytes, rtt)` was computed once, from the connection's round trip when
 the header arrived. That round trip is the handshake's: nothing queued behind it. The law
@@ -2075,10 +2078,89 @@ by kind of failure, with and without another answer meanwhile).
 `peer_pool_caches_connections_reconnects_identical_packets_and_fences_routes` expected
 two connections for a message answered `Unavailable` and then accepted: it expects one.
 
-**Residual.** With other exchanges under way on a connection, one exchange's wait does
-not end at its own time: what it waits on is charged to what the connection carries, not
-to its own stream (the audit's F38). So a request a peer never answers ends when the peer
-gives its handler up and says so, not before; and the rule for a stream that times out
-alone is the decision above, tested as a decision, until F38 gives a stream its own
-progress.
+**Residual.** Closed with F38 (below): an exchange's wait is told by its own stream, so
+one a peer never answers ends at its own time whatever else the connection carries.
+
+## F38 and F36
+
+Measured first, on the tree as it was (`slow_paths_measured`: the pool as a node
+configures it, one message of a group, through a relay that carries so many bits a second
+each way): nothing was delivered at or below 8 kbit/s, and nothing that takes its path
+more than five seconds at any rate — 64 KiB at 64 kbit/s, a megabyte at 256.
+
+**Causes.** Four, each found by a measurement and mended at its cause.
+
+1. *One time for the whole of an exchange* (F36). `send_bounded` gave what is not content
+   the pool's five seconds for the lane, the dial, the request, the answer and every
+   attempt together; a dial was given the same five seconds, failed with its callers, and
+   was begun again from nothing by the next.
+2. *A wait charged to what the connection sent* (F38). `transport::carried` took
+   `udp_tx.bytes - lost_bytes` of the whole connection for the progress of one exchange.
+   With the outer time gone, sixty-four kilobytes over eight kilobits a second were given
+   up at 60.0 s, twelve periods to the second, 5 s before they had arrived: the connection
+   had *sent* as much as the request when its last window, seventeen kilobytes, was still
+   on the path, and the peer's period to answer began then. The same counters kept a stream
+   its peer had stopped reading for as long as the other exchanges moved a datagram a
+   period (25 s for two megabytes on the loopback).
+3. *The least a live path delivers, taken for its best* (F36). `residency` priced a
+   payload at two datagrams a round trip, which a path delivers at its best with the
+   smallest window QUIC keeps. 256 KiB over 8 kbit/s took 262 s and were given 225.
+4. *A datagram a period asked of every path* (F36). `read_payload_arriving` gave a
+   payload up when a period brought less than 1,200 bytes of it. A sender whose flight is
+   lost sends again when its probe timer ends, three round trips on; on a path of 4 kbit/s
+   that is half a minute in which nothing arrives and nothing is wrong. Fourteen of
+   thirty-six exchanges over 4, 8 and 16 kbit/s with none, two and ten percent loss ended
+   that way (`narrow_lossy_paths_measured`).
+
+**Fix** (27 §7). Each part of an exchange has its own wait: its lane and its connection
+the pool's time each, and the dial goes on without its caller, given what the connector
+gives a handshake. What is sent waits for the one thing a sender knows of its own stream,
+that the peer acknowledged all of it or stopped taking it (`Carriage::acknowledged`,
+`SendStream::stopped`), and the peer's period to answer begins there. Between the last
+byte written and that acknowledgment there is nothing to see, so the wait ends by a
+bound: the residency of what the connection held to send beside it. The residency is two
+datagrams a probe timeout, three round trips (RFC 9002 §5.3, §6.2.1, §6.2.4, §7.2), at
+the longest round trip the path has shown; a receiver holds a payload to that and to
+nothing else. A group's exchange that ends by time, waiting for its connection or for its
+answer, is not asked a second time by the pool: one time used to end all its attempts
+together, and its owner asks again by its own clock. No counter of the connection is
+read for any of it.
+
+Tried and taken out: giving a write up when its stream took nothing in a period. A stream
+takes a window at once and more only as the peer's reading lets it, an eighth of a window
+at a time, which a narrow path takes longer than a period to read (a megabyte over 64
+kbit/s, given up at 10 s).
+
+**The contract** (the audit's "declared operating contract"). A path is one that returns
+a datagram of the least size within a connection's idle timeout: 1,920 bit/s. Below it no
+connection is made and every caller is told `Lost` in the pool's time; above it a message
+of any size the frame allows is carried in the time the path takes, and held no longer
+than its residency, from a budget (F03).
+
+**Tests.** `focal-wire`, real QUIC:
+`a_stream_its_peer_does_not_read_ends_whatever_else_its_connection_carries` (two megabytes
+a peer never reads, beside four kilobytes ten times a second: 0.5 s; 25.2 s on the tree
+before); `..._ends_on_a_path_that_loses_and_reorders` (the same as content behind a
+group's messages, one datagram in a hundred lost and a millisecond of jitter: ended
+within its residency at the longest round trip the path showed);
+`a_peers_time_to_answer_begins_when_it_has_what_was_asked` (32 KiB over 64 kbit/s to a
+peer that answers 0.4 s after it has them, a period of 0.5 s; with the period begun when
+the request was written it fails at 1.5 s);
+`a_groups_message_is_carried_for_as_long_as_its_path_takes` (64 KiB over 256 kbit/s by a
+pool whose time is one second; `Lost` before);
+`a_dial_is_given_a_handshakes_time_and_outlives_the_callers_that_asked_for_it` (16 kbit/s,
+callers that wait half a second: one dial, one connection; 120 failed tries in two
+seconds before). The relay of these tests carries a rate each way, a delay, jitter, loss
+and an outage (`Shape`).
+
+**Measured** (27 §7 has the table). 8 kbit/s: the dial takes 8.4 s, so the first send is
+`Lost` at five and the next is delivered; 64 KiB in 67 s on an open connection, a megabyte
+in 1,078 s. 64 kbit/s: a megabyte in 136.7 s. 256 kbit/s: a megabyte in 35.6 s. With 2% and 10% loss, 50 ms of jitter, 8 kbit/s against the other direction,
+and outages of 3 s and 8 s, every message of 4, 64 and 256 KiB at 64 and 256 kbit/s is
+delivered; an outage of 15 s ends the connection, the message is `Lost` and the next is
+delivered. All thirty-six narrow lossy exchanges are answered.
+
+**Residual.** The pool's five seconds and the connection's ten of idle are set, not
+derived (27 §8.4). A stream starved by others of its connection ends at its residency,
+which is long on a slow path; bandwidth is not reserved for a class (the audit's F40).
 
