@@ -402,6 +402,41 @@ impl MetricsSnapshot {
                 "Records the WAL index holds.",
                 wal.indexed_records,
             );
+            text.gauge(
+                "focal_wal_physical_bytes",
+                "Bytes of every frame the WAL holds from its base to its tail.",
+                wal.physical_bytes,
+            );
+            text.gauge(
+                "focal_wal_live_bytes",
+                "Bytes of the WAL's live frames.",
+                wal.live_bytes,
+            );
+            text.counter(
+                "focal_wal_checkpoint_bytes_total",
+                "Bytes group checkpoints wrote: their records and floors.",
+                wal.checkpoint_bytes,
+            );
+            text.counter(
+                "focal_wal_reclaimed_bytes_total",
+                "Bytes of the frames the WAL's base passed.",
+                wal.reclaimed_bytes,
+            );
+            text.counter(
+                "focal_wal_reclaimed_segments_total",
+                "Segments removed behind the WAL's base.",
+                wal.reclaimed_segments,
+            );
+            text.counter(
+                "focal_wal_relocated_records_total",
+                "Live frames the WAL's base met and wrote again at the tail.",
+                wal.relocated_records,
+            );
+            text.counter(
+                "focal_wal_relocated_bytes_total",
+                "Bytes of the frames written again at the tail.",
+                wal.relocated_bytes,
+            );
         }
         text.gauge(
             "focal_fleet_installed",

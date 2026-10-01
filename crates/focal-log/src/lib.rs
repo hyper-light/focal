@@ -18,6 +18,14 @@
 //! every byte before the fence must validate; only the suffix after it is discarded.
 //! A failed write permanently poisons the writer until it is reopened and recovered.
 //!
+//! The fence also names the base: where the durable prefix starts. A group's
+//! checkpoint writes what the group keeps and a floor that retires what it
+//! held before; nothing else is rewritten. The shared writer moves the base
+//! toward the tail over the frames floors retired, writes each live frame it
+//! meets again at the tail under the sequence it was first written at (its
+//! origin, which keeps its place in its group's order), and removes the
+//! segments behind the base — the copies and the base durable by one fence.
+//!
 //! `File::sync_all` and directory synchronization provide the OS/filesystem flush
 //! contract. This does not claim protection against a drive that lies about flushes.
 
@@ -67,6 +75,20 @@ pub enum RecordKind {
     /// An entry a member approved by itself, held beside its log until the
     /// log reaches its index. Variant 9.
     Proposal,
+    /// The physical layer's own record: every frame of `log` whose origin
+    /// is before the sequence in `index` is dead — a checkpoint of the
+    /// group wrote what it keeps from that sequence on, in the `term`
+    /// frames just before this one. Never delivered to a group's replay.
+    /// Variant 10, so a binary that knows no floors refuses the stream
+    /// rather than replaying the frames a floor retired.
+    Floor,
+    /// The physical layer's own wrapper: a live frame the base of the log
+    /// passed, written again at its tail. `index` is the frame's origin —
+    /// the sequence it was first written at, which places it among its
+    /// group's frames and is what its group's floor is compared with — and
+    /// the payload is the record as it was first encoded, which is what a
+    /// group's replay is given. Variant 11.
+    Moved,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -107,8 +129,46 @@ pub struct DurablePosition {
     pub checksum: u32,
 }
 
+/// Where the durable prefix starts: the first retained frame's place, and
+/// the chain state before it (the sequence and checksum of the frame the
+/// base last passed). Nothing before it is live: segments before its
+/// segment are gone, and the frames before it in its segment are read by
+/// nothing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DurableBase {
+    pub segment: u64,
+    pub byte: u64,
+    pub sequence: u64,
+    pub checksum: u32,
+}
+impl Default for DurableBase {
+    /// The start of a stream: the first frame of segment zero.
+    fn default() -> Self {
+        Self {
+            segment: 0,
+            byte: HEADER_LEN,
+            sequence: 0,
+            checksum: 0,
+        }
+    }
+}
+
+/// What the wrapper of a moved frame adds to the record it carries: the
+/// log, the kind, the origin, the term and the payload's length, each at
+/// its longest encoding.
+const MOVED_OVERHEAD: usize = 16 + 5 + 10 + 10 + 10;
+
+const FENCE_VERSION: u32 = 2;
 #[derive(Serialize, Deserialize)]
 struct Fence {
+    version: u32,
+    identity: WalIdentity,
+    position: DurablePosition,
+    base: DurableBase,
+}
+/// The fence as version 1 wrote it: a prefix that starts at segment zero.
+#[derive(Deserialize)]
+struct FenceV1 {
     version: u32,
     identity: WalIdentity,
     position: DurablePosition,
@@ -140,6 +200,8 @@ pub enum LogError {
     ReplayReentry,
     #[error("WAL append receipt was already consumed")]
     ReceiptConsumed,
+    #[error("WAL holds moved frames; its groups replay through the shared writer's index")]
+    Relocated,
 }
 
 pub struct Wal {
@@ -148,6 +210,7 @@ pub struct Wal {
     _lock: File,
     active: File,
     position: DurablePosition,
+    base: DurableBase,
     failed: bool,
     fault: Option<FaultPoint>,
 }
@@ -163,6 +226,9 @@ pub enum FaultPoint {
     AfterAppend,
     AfterDataSync,
     AfterFenceInstall,
+    /// The fence names a later base and the segments before it are still
+    /// on disk.
+    AfterBaseFence,
 }
 
 impl Wal {
@@ -172,11 +238,12 @@ impl Wal {
         Self::open_indexed(directory, options, |_| Ok(()))
     }
 
-    /// Open, reading the durable prefix twice: first the logical log of
-    /// every frame (`ScanEvent::Log`, from the record's leading field, nothing
-    /// owned), then, after `ScanEvent::Counted`, every record with its
-    /// location — so an index can size each group exactly before it holds a
-    /// frame.
+    /// Open, reading the durable prefix twice: first the header of every
+    /// frame (`ScanEvent::Header`: its log, kind, index and term, from the
+    /// record's leading fields, nothing owned), then, after
+    /// `ScanEvent::Counted`, every record with its location — so an index
+    /// can size each group exactly, and know each group's floor, before it
+    /// holds a frame.
     fn open_indexed(
         directory: impl AsRef<Path>,
         options: WalOptions,
@@ -208,12 +275,12 @@ impl Wal {
             }
         })?;
         let current = directory.join("CURRENT");
-        let position = if current.exists() {
+        let (position, base) = if current.exists() {
             let fence = read_fence(&current)?;
-            if fence.version != 1 || fence.identity != options.identity {
+            if fence.version != FENCE_VERSION || fence.identity != options.identity {
                 return Err(LogError::Identity);
             }
-            fence.position
+            (fence.position, fence.base)
         } else {
             // A missing fence is safe only for a never-acknowledged initial stream.
             // A durable sentinel distinguishes that case from accidental metadata loss.
@@ -232,20 +299,21 @@ impl Wal {
                 fs::remove_file(&path)?;
             }
             create_segment(&directory, &options, position, 0)?;
-            install_fence(&directory, &options, position)?;
+            install_fence(&directory, &options, position, DurableBase::default())?;
             let sentinel = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(directory.join("INITIALIZED"))?;
             sentinel.sync_all()?;
             sync_dir(&directory)?;
-            position
+            (position, DurableBase::default())
         };
-        scan_logs(&directory, &options, position, |log| {
-            visitor(ScanEvent::Log(log))
+        visitor(ScanEvent::Base(base))?;
+        scan_headers(&directory, &options, base, position, |header, sequence| {
+            visitor(ScanEvent::Header(header, sequence))
         })?;
         visitor(ScanEvent::Counted)?;
-        scan_indexed(&directory, &options, position, |record, location| {
+        scan_indexed(&directory, &options, base, position, |record, location| {
             visitor(ScanEvent::Frame(record, location))
         })?;
         // An interrupted first initialization may have installed CURRENT before
@@ -265,13 +333,14 @@ impl Wal {
             active.sync_all()?;
         }
         active.seek(SeekFrom::Start(position.byte))?;
-        cleanup_segments(&directory, position)?;
+        cleanup_segments(&directory, base, position)?;
         Ok(Self {
             directory,
             options,
             _lock: lock,
             active,
             position,
+            base,
             failed: false,
             fault: None,
         })
@@ -280,16 +349,60 @@ impl Wal {
     pub fn position(&self) -> DurablePosition {
         self.position
     }
+    /// Where the durable prefix starts.
+    pub fn base(&self) -> DurableBase {
+        self.base
+    }
 
-    /// Recovery is streaming: at most one bounded frame is decoded at a time.
+    /// Recovery is streaming: at most one bounded frame is decoded at a
+    /// time. Only live records are delivered: a frame below its group's
+    /// floor, and the floors themselves, are the physical layer's.
     pub fn replay(
         &self,
-        visitor: impl FnMut(Record) -> Result<(), LogError>,
+        mut visitor: impl FnMut(Record) -> Result<(), LogError>,
     ) -> Result<(), LogError> {
         if self.failed {
             return Err(LogError::Failed);
         }
-        scan(&self.directory, &self.options, self.position, visitor)
+        let mut floors: std::collections::BTreeMap<LogicalLogId, u64> =
+            std::collections::BTreeMap::new();
+        scan_headers(
+            &self.directory,
+            &self.options,
+            self.base,
+            self.position,
+            |header, _| {
+                // A moved frame stands after frames its group wrote later:
+                // only an index that places frames by origin replays such
+                // a stream in its groups' order.
+                if header.kind == RecordKind::Moved {
+                    return Err(LogError::Relocated);
+                }
+                if header.kind == RecordKind::Floor {
+                    if !floors.contains_key(&header.log) && floors.len() >= MAX_REPLAY_FLOORS {
+                        return Err(LogError::Capacity);
+                    }
+                    floors.insert(header.log, header.index);
+                }
+                Ok(())
+            },
+        )?;
+        scan_indexed(
+            &self.directory,
+            &self.options,
+            self.base,
+            self.position,
+            |record, location| {
+                if record.kind == RecordKind::Floor
+                    || floors
+                        .get(&record.log)
+                        .is_some_and(|floor| location.origin < *floor)
+                {
+                    return Ok(());
+                }
+                visitor(record)
+            },
+        )
     }
 
     /// Append one natural group-commit batch. No returned position precedes both
@@ -333,12 +446,16 @@ impl Wal {
         let result = (|| {
             self.active = create_segment(&self.directory, &self.options, position, 0)?;
             self.position = position;
+            // The replacement generation starts its own prefix.
+            self.base = DurableBase::default();
             let position = self.append_encoded(&encoded)?;
             if encoded.is_empty() {
-                install_fence(&self.directory, &self.options, position)?;
+                install_fence(&self.directory, &self.options, position, self.base)?;
             }
-            scan(&self.directory, &self.options, position, |_| Ok(()))?;
-            cleanup_segments(&self.directory, position)?;
+            scan(&self.directory, &self.options, self.base, position, |_| {
+                Ok(())
+            })?;
+            cleanup_segments(&self.directory, self.base, position)?;
             Ok(position)
         })();
         if result.is_err() {
@@ -347,57 +464,33 @@ impl Wal {
         result
     }
 
-    /// Compact one logical group while streaming all other groups through the
-    /// replacement generation. Other sessions' records are never discarded or
-    /// accumulated into an unbounded temporary vector.
-    pub fn rewrite_log_checkpoint(
-        &mut self,
-        log: LogicalLogId,
-        retained: &[Record],
-    ) -> Result<DurablePosition, LogError> {
+    /// Name a later base for the next fence to install. The caller has
+    /// read every frame between the two from the durable prefix and written
+    /// each live one again, in the same group commit the fence closes; the
+    /// fence makes both durable at once, or neither.
+    fn set_base(&mut self, base: DurableBase) -> Result<(), LogError> {
         if self.failed {
             return Err(LogError::Failed);
         }
-        if retained.iter().any(|r| r.log != log) {
-            return Err(LogError::Identity);
+        if (base.segment, base.byte) < (self.base.segment, self.base.byte)
+            || base.sequence < self.base.sequence
+            || base.segment > self.position.segment
+            || base.sequence > self.position.sequence
+        {
+            return Err(LogError::Failed);
         }
-        let encoded = self.encode_batch(retained)?;
-        self.rewrite_log_encoded(log, &encoded, |_, _| Ok(()))
+        self.base = base;
+        Ok(())
     }
-
-    fn rewrite_log_encoded(
-        &mut self,
-        log: LogicalLogId,
-        encoded: &[Vec<u8>],
-        mut visitor: impl FnMut(LogicalLogId, FrameLocation) -> Result<(), LogError>,
-    ) -> Result<DurablePosition, LogError> {
-        let old = self.position;
-        let generation = old.generation.checked_add(1).ok_or(LogError::Capacity)?;
-        let directory = self.directory.clone();
-        let options = self.options.clone();
-        let position = DurablePosition {
-            generation,
-            segment: 0,
-            byte: HEADER_LEN,
-            sequence: 0,
-            checksum: 0,
-        };
+    /// Remove the segments before the base the fence names (a crash before
+    /// this leaves them for the next open to remove).
+    fn retire_segments(&mut self) -> Result<(), LogError> {
+        if self.failed {
+            return Err(LogError::Failed);
+        }
         let result = (|| {
-            self.active = create_segment(&directory, &options, position, 0)?;
-            self.position = position;
-            scan(&directory, &options, old, |record| {
-                if record.log != log {
-                    let group = record.log;
-                    let record = self.encode_batch(&[record])?;
-                    self.write_encoded_indexed(&record, |location| visitor(group, location))?;
-                }
-                Ok(())
-            })?;
-            self.write_encoded_indexed(encoded, |location| visitor(log, location))?;
-            let position = self.finish_append()?;
-            scan(&directory, &options, position, |_| Ok(()))?;
-            cleanup_segments(&directory, position)?;
-            Ok(position)
+            self.fail_at(FaultPoint::AfterBaseFence)?;
+            cleanup_segments(&self.directory, self.base, self.position)
         })();
         if result.is_err() {
             self.failed = true;
@@ -423,6 +516,10 @@ impl Wal {
         let mut total = 0usize;
         let mut encoded = Vec::with_capacity(records.len().min(1024));
         for record in records {
+            // The floor and the moved frame are the physical layer's own.
+            if matches!(record.kind, RecordKind::Floor | RecordKind::Moved) {
+                return Err(LogError::Identity);
+            }
             if record.payload.len() > self.options.max_record_bytes {
                 return Err(LogError::Capacity);
             }
@@ -460,6 +557,14 @@ impl Wal {
         mut visit: impl FnMut(FrameLocation) -> Result<(), LogError>,
     ) -> Result<(), LogError> {
         for data in encoded {
+            visit(self.write_frame(data)?)?;
+        }
+        Ok(())
+    }
+
+    /// Write one frame at the tail. Its origin is its own sequence.
+    fn write_frame(&mut self, data: &[u8]) -> Result<FrameLocation, LogError> {
+        {
             let frame_bytes = FRAME_HEADER
                 .checked_add(data.len())
                 .ok_or(LogError::Capacity)? as u64;
@@ -509,12 +614,12 @@ impl Wal {
                 byte: self.position.byte,
                 length: data.len(),
                 sequence,
+                origin: sequence,
                 previous: self.position.checksum,
                 checksum,
             };
             self.active.write_all(&header)?;
             self.active.write_all(data)?;
-            visit(location)?;
             self.position.byte = self
                 .position
                 .byte
@@ -522,15 +627,15 @@ impl Wal {
                 .ok_or(LogError::Capacity)?;
             self.position.sequence = sequence;
             self.position.checksum = checksum;
+            Ok(location)
         }
-        Ok(())
     }
 
     fn finish_append(&mut self) -> Result<DurablePosition, LogError> {
         self.fail_at(FaultPoint::AfterAppend)?;
         self.active.sync_all()?;
         self.fail_at(FaultPoint::AfterDataSync)?;
-        install_fence(&self.directory, &self.options, self.position)?;
+        install_fence(&self.directory, &self.options, self.position, self.base)?;
         self.fail_at(FaultPoint::AfterFenceInstall)?;
         Ok(self.position)
     }
@@ -612,15 +717,49 @@ fn create_segment(
     Ok(file)
 }
 
+/// The base a prefix starting at `segment` has: what the segment's own
+/// header says came before its first frame.
+fn segment_base(
+    directory: &Path,
+    options: &WalOptions,
+    generation: u64,
+    segment: u64,
+) -> Result<DurableBase, LogError> {
+    let path = segment_path(directory, generation, segment);
+    let mut file = File::open(&path)?;
+    let mut header = [0u8; HEADER_LEN as usize];
+    file.read_exact(&mut header)?;
+    if header.get(..8) != Some(MAGIC.as_slice())
+        || read_u32(&header, 8..12)? != 1
+        || header.get(12..28) != Some(options.identity.cluster.as_slice())
+        || read_u64(&header, 28..36)? != options.identity.node
+        || read_u32(&header, 36..40)? != options.identity.stream
+        || read_u64(&header, 40..48)? != generation
+        || read_u64(&header, 48..56)? != segment
+        || read_u32(&header, 68..72)?
+            != crc32fast::hash(header.get(..68).ok_or(LogError::Capacity)?)
+    {
+        return Err(corrupt(&path, 0, "segment header mismatch"));
+    }
+    Ok(DurableBase {
+        segment,
+        byte: HEADER_LEN,
+        sequence: read_u64(&header, 56..64)?,
+        checksum: read_u32(&header, 64..68)?,
+    })
+}
+
 fn install_fence(
     directory: &Path,
     options: &WalOptions,
     position: DurablePosition,
+    base: DurableBase,
 ) -> Result<(), LogError> {
     let data = postcard::to_stdvec(&Fence {
-        version: 1,
+        version: FENCE_VERSION,
         identity: options.identity,
         position,
+        base,
     })?;
     let temp = directory.join("CURRENT.tmp");
     let mut file = OpenOptions::new()
@@ -665,6 +804,22 @@ fn read_fence(path: &Path) -> Result<Fence, LogError> {
     if crc32fast::hash(payload) != checksum {
         return Err(corrupt(path, 0, "fence checksum mismatch"));
     }
+    let (version, _) = postcard::take_from_bytes::<u32>(payload)
+        .map_err(|_| corrupt(path, 0, "invalid fence payload"))?;
+    if version == 1 {
+        // A version 1 fence names a prefix that starts at segment zero.
+        let legacy: FenceV1 =
+            postcard::from_bytes(payload).map_err(|_| corrupt(path, 0, "invalid fence payload"))?;
+        if legacy.version != 1 {
+            return Err(corrupt(path, 0, "invalid fence payload"));
+        }
+        return Ok(Fence {
+            version: FENCE_VERSION,
+            identity: legacy.identity,
+            position: legacy.position,
+            base: DurableBase::default(),
+        });
+    }
     postcard::from_bytes(payload).map_err(|_| corrupt(path, 0, "invalid fence payload"))
 }
 
@@ -675,23 +830,47 @@ struct FrameLocation {
     byte: u64,
     length: usize,
     sequence: u64,
+    /// The sequence the frame's record was first written at: its own,
+    /// unless the frame is a moved one.
+    origin: u64,
     previous: u32,
     checksum: u32,
+}
+
+/// The longest frame a stream of these options holds: a record at its
+/// bound, inside the wrapper of a moved frame.
+fn frame_limit(options: &WalOptions) -> usize {
+    options.max_record_bytes.saturating_add(MOVED_OVERHEAD)
 }
 
 fn scan(
     directory: &Path,
     options: &WalOptions,
+    base: DurableBase,
     fence: DurablePosition,
     mut visitor: impl FnMut(Record) -> Result<(), LogError>,
 ) -> Result<(), LogError> {
-    scan_indexed(directory, options, fence, |record, _| visitor(record))
+    scan_indexed(directory, options, base, fence, |record, _| visitor(record))
 }
 
-/// What an indexed open tells its visitor, in order: each frame's logical
-/// log, then that the count is complete, then each frame's record.
+/// The floors a single-owner replay holds at once, one a logical log.
+const MAX_REPLAY_FLOORS: usize = 65536;
+
+/// What a frame says of itself before its payload: read from the record's
+/// leading fields, owning nothing.
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub(crate) struct FrameHeader {
+    pub(crate) log: LogicalLogId,
+    pub(crate) kind: RecordKind,
+    pub(crate) index: u64,
+    pub(crate) term: u64,
+}
+/// What an indexed open tells its visitor, in order: where the durable
+/// prefix starts, each frame's header with its sequence, then that the
+/// count is complete, then each frame's record.
 pub(crate) enum ScanEvent {
-    Log(LogicalLogId),
+    Base(DurableBase),
+    Header(FrameHeader, u64),
     Counted,
     Frame(Record, FrameLocation),
 }
@@ -699,28 +878,36 @@ pub(crate) enum ScanEvent {
 fn scan_indexed(
     directory: &Path,
     options: &WalOptions,
+    base: DurableBase,
     fence: DurablePosition,
     mut visitor: impl FnMut(Record, FrameLocation) -> Result<(), LogError>,
 ) -> Result<(), LogError> {
-    scan_frames(directory, options, fence, |bytes, location, path| {
-        let record = decode_record(bytes)
+    scan_frames(directory, options, base, fence, |bytes, location, path| {
+        let (record, origin) = decode_frame(bytes)
             .map_err(|_| corrupt(path, location.byte, "invalid durable record"))?;
-        visitor(record, location)
+        visitor(
+            record,
+            FrameLocation {
+                origin: origin.unwrap_or(location.sequence),
+                ..location
+            },
+        )
     })
 }
-/// The logical log of every durable record of the fenced prefix, read from
-/// the record's leading field alone: what a recovery index counts before it
-/// packs its groups, owning nothing of the records.
-fn scan_logs(
+/// The header of every durable record of the fenced prefix, read from the
+/// record's leading fields alone: what a recovery index counts, and learns
+/// each group's floor from, before it packs its groups.
+fn scan_headers(
     directory: &Path,
     options: &WalOptions,
+    base: DurableBase,
     fence: DurablePosition,
-    mut visitor: impl FnMut(LogicalLogId) -> Result<(), LogError>,
+    mut visitor: impl FnMut(FrameHeader, u64) -> Result<(), LogError>,
 ) -> Result<(), LogError> {
-    scan_frames(directory, options, fence, |bytes, location, path| {
-        let (log, _) = postcard::take_from_bytes::<LogicalLogId>(bytes)
+    scan_frames(directory, options, base, fence, |bytes, location, path| {
+        let (header, _) = postcard::take_from_bytes::<FrameHeader>(bytes)
             .map_err(|_| corrupt(path, location.byte, "invalid durable record"))?;
-        visitor(log)
+        visitor(header, location.sequence)
     })
 }
 /// Every durable frame of the fenced prefix, in order, its bytes verified
@@ -729,13 +916,25 @@ fn scan_logs(
 fn scan_frames(
     directory: &Path,
     options: &WalOptions,
+    base: DurableBase,
     fence: DurablePosition,
     mut on_frame: impl FnMut(&[u8], FrameLocation, &Path) -> Result<(), LogError>,
 ) -> Result<(), LogError> {
-    let mut sequence = 0u64;
-    let mut previous = 0u32;
+    if base.segment > fence.segment
+        || base.sequence > fence.sequence
+        || base.byte < HEADER_LEN
+        || (base.segment == fence.segment && base.byte > fence.byte)
+    {
+        return Err(corrupt(
+            &directory.join("CURRENT"),
+            0,
+            "fence base is beyond its position",
+        ));
+    }
+    let mut sequence = base.sequence;
+    let mut previous = base.checksum;
     let mut data = Vec::new();
-    for segment in 0..=fence.segment {
+    for segment in base.segment..=fence.segment {
         let path = segment_path(directory, fence.generation, segment);
         let mut file = File::open(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -761,14 +960,26 @@ fn scan_frames(
             || read_u32(&header, 36..40)? != options.identity.stream
             || read_u64(&header, 40..48)? != fence.generation
             || read_u64(&header, 48..56)? != segment
-            || read_u64(&header, 56..64)? != sequence
-            || read_u32(&header, 64..68)? != previous
             || read_u32(&header, 68..72)?
                 != crc32fast::hash(header.get(..68).ok_or(LogError::Capacity)?)
         {
             return Err(corrupt(&path, 0, "segment header or predecessor mismatch"));
         }
-        let mut offset = HEADER_LEN;
+        // A base inside its segment starts past that segment's first
+        // frames: the chain state there is the fence's, not the header's.
+        let inside = segment == base.segment && base.byte > HEADER_LEN;
+        if !inside
+            && (read_u64(&header, 56..64)? != sequence || read_u32(&header, 64..68)? != previous)
+        {
+            return Err(corrupt(&path, 0, "segment header or predecessor mismatch"));
+        }
+        let mut offset = if inside { base.byte } else { HEADER_LEN };
+        if offset > end {
+            return Err(corrupt(&path, offset, "fence base is beyond its segment"));
+        }
+        if inside {
+            file.seek(SeekFrom::Start(offset))?;
+        }
         while offset < end {
             let remaining = end.checked_sub(offset).ok_or(LogError::Capacity)?;
             if remaining < FRAME_HEADER as u64 {
@@ -777,7 +988,7 @@ fn scan_frames(
             let mut header = [0u8; FRAME_HEADER];
             file.read_exact(&mut header)?;
             let len = read_u32(&header, 0..4)? as usize;
-            if len > options.max_record_bytes
+            if len > frame_limit(options)
                 || len as u64
                     > remaining
                         .checked_sub(FRAME_HEADER as u64)
@@ -813,6 +1024,7 @@ fn scan_frames(
                     byte: offset,
                     length: len,
                     sequence: next,
+                    origin: next,
                     previous,
                     checksum,
                 },
@@ -865,6 +1077,54 @@ fn decode_record(bytes: &[u8]) -> Result<Record, LogError> {
     })
 }
 
+/// A durable frame's record and, for a moved frame, the origin it carries:
+/// the record a moved frame wraps is decoded from the frame's own bytes.
+fn decode_frame(bytes: &[u8]) -> Result<(Record, Option<u64>), LogError> {
+    let (header, payload) = postcard::take_from_bytes::<FrameHeader>(bytes)?;
+    if header.kind != RecordKind::Moved {
+        return Ok((decode_record(bytes)?, None));
+    }
+    let (length, inner) = postcard::take_from_bytes::<usize>(payload)?;
+    if inner.len() != length {
+        return Err(LogError::Encoding(
+            postcard::Error::DeserializeUnexpectedEnd,
+        ));
+    }
+    let record = decode_record(inner)?;
+    if record.log != header.log || matches!(record.kind, RecordKind::Moved | RecordKind::Floor) {
+        return Err(LogError::Encoding(postcard::Error::DeserializeBadEnum));
+    }
+    Ok((record, Some(header.index)))
+}
+/// The frame a live record is written again as: the wrapper that carries
+/// its origin, around the record's bytes as they were first encoded.
+fn moved_frame(log: LogicalLogId, origin: u64, record: &[u8]) -> Result<Vec<u8>, LogError> {
+    #[derive(Serialize)]
+    struct Wrapper {
+        log: LogicalLogId,
+        kind: RecordKind,
+        index: u64,
+        term: u64,
+        length: usize,
+    }
+    let wrapper = Wrapper {
+        log,
+        kind: RecordKind::Moved,
+        index: origin,
+        term: 0,
+        length: record.len(),
+    };
+    let head = postcard::experimental::serialized_size(&wrapper)?;
+    let mut frame = Vec::new();
+    frame
+        .try_reserve_exact(head.checked_add(record.len()).ok_or(LogError::Capacity)?)
+        .map_err(|_| LogError::Capacity)?;
+    frame.resize(head, 0);
+    postcard::to_slice(&wrapper, &mut frame)?;
+    frame.extend_from_slice(record);
+    Ok(frame)
+}
+
 fn read_u64(bytes: &[u8], range: std::ops::Range<usize>) -> Result<u64, LogError> {
     let value = bytes
         .get(range)
@@ -880,7 +1140,13 @@ fn read_u32(bytes: &[u8], range: std::ops::Range<usize>) -> Result<u32, LogError
     Ok(u32::from_le_bytes(value))
 }
 
-fn cleanup_segments(directory: &Path, p: DurablePosition) -> Result<(), LogError> {
+/// Remove every segment file that is not of the fenced prefix: another
+/// generation's, one beyond the position, one before the base.
+fn cleanup_segments(
+    directory: &Path,
+    base: DurableBase,
+    p: DurablePosition,
+) -> Result<(), LogError> {
     let mut changed = false;
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
@@ -901,7 +1167,7 @@ fn cleanup_segments(directory: &Path, p: DurablePosition) -> Result<(), LogError
         else {
             continue;
         };
-        if generation != p.generation || segment > p.segment {
+        if generation != p.generation || segment > p.segment || segment < base.segment {
             fs::remove_file(entry.path())?;
             changed = true;
         }

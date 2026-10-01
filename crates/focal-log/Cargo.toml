@@ -30,3 +30,7 @@ harness = false
 [[bench]]
 name = "allocs"
 harness = false
+
+[[bench]]
+name = "checkpoints"
+harness = false

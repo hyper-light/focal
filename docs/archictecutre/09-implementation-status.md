@@ -12484,3 +12484,26 @@ it failed. They are judged on the stream line now, as the client's commands are
 `a_native_cursor_is_renewed_and_expired_by_the_nodes_own_entries_across_a_restart` fails on
 the code before and passes after, and 492 restarts under a resumed watch through the real
 binary (twelve runs of forty-one) renewed and resumed every time.
+
+### 2026-09-30 — F14: a checkpoint is its group's own, and the shared log is cleaned by a base that moves
+
+A logical group's checkpoint no longer rewrites the physical log
+([04](04-storage-and-distribution.md) §10). It is one group commit — what the group keeps
+and a floor frame that retires what it held — and the fence names a base beside the tail:
+where the durable prefix starts. The writer moves the base toward the tail, past segments
+with nothing live without reading them and, while the log holds more dead bytes than live
+ones and a segment, over frames it reads and verifies, writing each live one again at the
+tail under its origin (the sequence it was first written at), which is what a group's
+order and its floor are judged by; the copies and the base are durable by one fence, and
+the segments behind the base are removed after it. A commit's cleaning writes no more
+than its callers did and shares their flush; an idle writer takes one bounded step at a
+time. On the bench's log of 56 cold groups and 8 hot ones, 128 checkpoints wrote 5.1 MiB
+where they wrote 599.2 MiB, a checkpoint took 26 ms at the median where it took 170 ms,
+another group's appends waited 59 ms at the 99th percentile where they waited 185 ms, and
+the most disk a checkpoint added fell from the log's size to two thirds of a segment; the
+log holds up to as many dead bytes as live ones and a segment, where a rewrite left none
+(the remediation record, F14, has the table).
+`focal-log`: 38 tests, among them seeded histories against a model with a cut at every
+durability boundary (a campaign of seeds 100 to 399 replayed every group as the model held
+it); `focal-consensus` unchanged and green. The node exports the log's physical and live bytes and the cleaning counters.
+

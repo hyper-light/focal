@@ -26,7 +26,7 @@ ruling before work starts).
 | F11 | P2 | in tree | 4 | [F11](#f11) |
 | F12 | P1 | in tree | 5 | [F12](#f12) |
 | F13 | P1 | in tree (stages 1–2; 3 designed) | 5 | [F13](#f13) |
-| F14 | P1 | open | 6 | — |
+| F14 | P1 | in tree | 6 | [F14](#f14) |
 | F15 | P2 | in tree | 3 | [F15](#f15) |
 | F16 | P2 | in tree | 3 | [F16](#f16) |
 | F17 | P2 | open | 6 | — |
@@ -1492,3 +1492,101 @@ directory, or a documented re-founding with re-enrollment; the operator decides 
 the private directory is part of `cluster backup`). A founder whose credential expired
 outright (down for the last third of its lifetime and longer) cannot sign a renewal
 request: the runbook's escalation stands.
+
+## F14
+
+**Cause.** A logical group's checkpoint was a rewrite of the physical log.
+`Writer::checkpoint` reserved disk for every indexed byte (`index.total_bytes()`), and
+`Wal::rewrite_log_encoded` streamed every other group's record into a new generation,
+wrote the group's retained records, installed the fence, scanned the new generation and
+removed the old one — on the one writer thread, so every group's append and replay waited
+for it. The log had no other way to give space back: the fence named only a tail, and a
+scan started at segment zero of the generation. A checkpoint's cost was therefore the
+whole log's size, its headroom the whole log again, and each of many groups at its
+cadence paid it over.
+
+**Fix.** Three parts, in `focal-log`.
+(1) *A checkpoint is its group's own.* It is one group commit: the records the group
+keeps, written at the tail, and a floor frame (`RecordKind::Floor`, variant 10: every
+frame of the group whose origin is before the sequence it names is dead; the frames it
+kept are the `term` just before it). Nothing of any other group is read or written, and
+the volume is asked for those records and the floor. `rewrite_log_checkpoint` and
+`rewrite_log_encoded` are gone.
+(2) *The fence names a base.* `CURRENT` (version 2; a version 1 fence reads as a prefix
+from the stream's first frame) carries `DurableBase {segment, byte, sequence, checksum}`:
+where the durable prefix starts, and the chain state before it. Scans start there; the
+segments before it are removed after the fence that names it, and again at the next open.
+(3) *The base moves, and what it meets alive is written again under its origin.* A frame's
+origin is the sequence it was first written at. A group's order is its origins' order and
+a floor is compared with origins, so one frame can be moved alone, from anywhere, any
+number of times, without its group's order depending on where frames stand — which is what
+moving part of a group needs, and what a first design (the whole head group moved in one
+commit behind a floor) could not give: it made a step as large as a group's history, and
+a group larger than a batch immovable. One step of cleaning (`Writer::clean`) takes the
+base toward the tail over frames the last fence made durable: a segment with no live frame
+is left unread; while the log holds more dead bytes than live ones and a segment — past
+that point a whole pass, which writes the live bytes once, frees more than it writes —
+each frame is read and verified against the chain, and a live one is written at the tail
+as `RecordKind::Moved` (variant 11: the origin, and the record as first encoded). The
+copies and the new base are made durable by one fence, so a crash leaves a frame in one
+place or the other, never both and never neither. A step reads at most a batch and writes
+at most what it is given: inside a commit, the bytes the callers' own commands wrote and
+cleaning has not spent (banked up to one step), behind their fence and their flush;
+while no command waits, one step at a time with a look at the queue between. A checkpoint
+puts its floor in the index before its commit's step, so what it retired is passed in the
+same commit and never written again. A step that finds no memory or no room on the volume
+leaves the base where it is. Recovery reads headers first — a floor sets its group's floor
+and the count of the frames it kept that the scan still reads (those the base passed were
+written again after the floor and count there) — then places frames at or above their
+group's floor and orders each group by origin; a duplicate origin fails the open. The
+single-owner `Wal::replay` delivers live records of a stream with floors and refuses one
+with moved frames (`LogError::Relocated`); a caller's batch that holds a floor or a moved
+frame is refused (`Identity`). Memory: the index holds one more word a frame (the origin)
+and one row a segment, charged; rows for the segments a write may open are reserved
+before the write and returned after. The node exports the log's physical and live bytes
+and the cleaning counters (`focal_wal_*`).
+
+**Measurements** (`cargo bench -p focal-log --bench checkpoints`: 64 groups on one writer,
+56 cold with 256 records each — a 4.1 MiB old log — and 8 hot appending 256 records and
+checkpointing to a 4 KiB snapshot sixteen times; one more group appending from its own
+thread throughout; 1 MiB segments; the same workload against the code before, where what
+a checkpoint wrote is the generation it left; one host, one after the other, each commit
+three flushes of its disk):
+
+| | before | after |
+|---|---|---|
+| written by 128 checkpoints | 599.2 MiB | 5.1 MiB (0.5 their own, 4.6 frames written again) |
+| written a byte freed | 64.8 | 0.64 |
+| most disk a checkpoint added | 5.2 MiB (the log again) | 0.67 MiB |
+| checkpoint p50 / p99 / max | 170 / 476 / 628 ms | 26 / 172 / 192 ms |
+| the other group's append p50 / p99 / max | 26 / 185 / 631 ms | 26 / 59 / 451 ms |
+| on disk at the end | 4.7 MiB | 11.1 MiB for 5.0 MiB live |
+
+The last row is the bound's price: the log keeps up to as many dead bytes as live ones and
+a segment, where a rewrite left none; the tail of the neighbour's waits (the maximum, in
+both columns) is the host's own flush.
+
+**Tests** (`focal-log`, `writer::tests`): `a_checkpoint_writes_what_its_group_keeps_and_its_floor_and_asks_the_volume_for_those_bytes`
+(a volume with room for the checkpoint's own frames admits it and one byte less refuses
+it cleanly; the log grows by exactly those bytes; a reopen learns the floor);
+`a_cold_group_the_base_meets_is_written_again_in_its_order_and_the_log_keeps_its_bound`
+(a hundred and twenty rounds of a hot group behind a cold one: the cold frames moved lap after
+lap, moved frames moved again, the order kept, dead ≤ live + a segment once settled, less
+written than freed, the files on disk from the base's segment, memory returned, the same
+after a reopen, and the single-owner reader refusing the stream);
+`a_crash_at_every_cut_of_a_cleaning_commit_recovers_every_group` (after the append, after
+the data flush, after the fence, and after the fence that moved the base with the segments
+behind it still on disk); `a_base_inside_the_frames_a_checkpoint_kept_recovers_the_group_whole`;
+`garbage_is_worked_off_while_no_command_waits`;
+`a_fence_of_the_first_version_opens_as_a_prefix_from_the_start_and_is_written_forward`;
+`a_single_owner_replays_the_live_records_of_a_stream_with_floors`;
+`a_caller_cannot_write_the_physical_layers_records_and_the_largest_record_is_moved`;
+`seeded_histories_of_appends_checkpoints_cuts_and_reopens_replay_every_group_as_written`
+(five groups against a model: appends, checkpoints that keep nothing to three records,
+leases given up and retaken, cleaning inside commits and between them, a cut armed at any
+of the four boundaries, reopens; four seeds in an ordinary run, `FOCAL_SEED_START` /
+`FOCAL_SEED_COUNT` for a campaign — seeds 100 to 399, five hundred steps each, replayed
+every group as the model held it). The existing writer, consensus and
+session suites are unchanged but for one assertion: a checkpoint no longer starts a
+generation.
+

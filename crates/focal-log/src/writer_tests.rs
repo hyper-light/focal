@@ -361,7 +361,10 @@ async fn checkpoint_is_a_fifo_barrier_between_pending_appends() {
     let before = before.await.unwrap();
     let checkpoint = receiver.recv().unwrap().unwrap();
     let after = after.await.unwrap();
-    assert!(checkpoint.generation > before.generation);
+    // A checkpoint is a commit of the one generation: its frames and its
+    // floor follow what was queued before it and precede what came after.
+    assert_eq!(checkpoint.generation, before.generation);
+    assert!(checkpoint.sequence > before.sequence);
     assert_eq!(after.generation, checkpoint.generation);
     assert!(after.sequence > checkpoint.sequence);
     assert_eq!(records(&a), vec![snapshot, record(1, 2)]);
@@ -784,4 +787,679 @@ fn the_packed_index_never_costs_more_than_the_appends_across_groups_batches_and_
         let lease = reopened.lease(LogicalLogId([slot as u8 + 1; 16])).unwrap();
         assert_eq!(&records(&lease), expected, "log {} after reopen", slot + 1);
     }
+}
+
+// ---- The audit's F14: a checkpoint is its group's own, and the log is
+// ---- cleaned by a base that moves.
+
+fn snapshot(log: u8, index: u64) -> Record {
+    Record {
+        kind: RecordKind::Snapshot,
+        ..record(log, index)
+    }
+}
+/// What a record takes on disk as one frame.
+fn frame(record: &Record) -> u64 {
+    (FRAME_HEADER + postcard::experimental::serialized_size(record).unwrap()) as u64
+}
+/// Clean until the base can move no further; the writer's counts then.
+fn settle(shared: &SharedWal) -> WalWriterStats {
+    let (done, settled) = mpsc::sync_channel(1);
+    shared.send(Command::Settle(done)).unwrap();
+    settled.recv().unwrap();
+    shared.stats().unwrap()
+}
+/// Hold the base still between commands, or let it move.
+fn idle(shared: &SharedWal, idle: bool) {
+    let (done, set) = mpsc::sync_channel(1);
+    shared.send(Command::Idle(idle, done)).unwrap();
+    set.recv().unwrap();
+}
+fn fence(dir: &Path) -> Fence {
+    read_fence(&dir.join("CURRENT")).unwrap()
+}
+/// The segments on disk, in order.
+fn segments(dir: &Path) -> Vec<u64> {
+    let mut found: Vec<u64> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|entry| {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            let rest = name.strip_prefix("wal-")?.strip_suffix(".seg")?.to_string();
+            rest.split_once('-')?.1.parse().ok()
+        })
+        .collect();
+    found.sort_unstable();
+    found
+}
+fn due(stats: &WalWriterStats, options: &WalOptions) -> bool {
+    stats.physical_bytes - stats.live_bytes > stats.live_bytes + options.segment_bytes
+}
+
+#[test]
+fn a_checkpoint_writes_what_its_group_keeps_and_its_floor_and_asks_the_volume_for_those_bytes() {
+    use focal_memory::{DiskBudget, DiskBudgetConfig};
+    let dir = tempfile::tempdir().unwrap();
+    let disk = DiskBudget::new(DiskBudgetConfig {
+        headroom: 0,
+        completion_reserve: 0,
+        sample_interval: u32::MAX,
+    })
+    .unwrap();
+    let shared = SharedWal::open_with_budgets(
+        dir.path(),
+        options(),
+        WalWriterLimits::default(),
+        memory(),
+        disk.clone(),
+    )
+    .unwrap();
+    let mut a = shared.lease(LogicalLogId([1; 16])).unwrap();
+    let mut b = shared.lease(LogicalLogId([2; 16])).unwrap();
+    let mut kept = Vec::new();
+    for index in 1..=60 {
+        a.append(&[record(1, index)]).unwrap();
+        b.append(&[record(2, index)]).unwrap();
+        kept.push(record(2, index));
+    }
+    let before = shared.stats().unwrap();
+    assert_eq!(before.physical_bytes, before.live_bytes);
+    assert_eq!(before.checkpoint_bytes, 0);
+    // The volume has room for the checkpoint's own frames and no more: a
+    // fraction of the log, which holds two groups' histories.
+    let checkpoint = snapshot(1, 60);
+    let floor = frame(&Record {
+        log: LogicalLogId([1; 16]),
+        kind: RecordKind::Floor,
+        index: before.appended_records + 1,
+        term: 1,
+        payload: Vec::new(),
+    });
+    let own = frame(&checkpoint) + floor;
+    assert!(own * 20 < before.physical_bytes);
+    disk.observe(own - 1);
+    assert!(matches!(
+        a.rewrite_checkpoint_in(std::slice::from_ref(&checkpoint), BudgetLane::Completion),
+        Err(LogError::Capacity)
+    ));
+    assert_eq!(disk.stats().outstanding, 0);
+    assert_eq!(records(&a).len(), 60);
+    disk.observe(own);
+    a.rewrite_checkpoint_in(std::slice::from_ref(&checkpoint), BudgetLane::Completion)
+        .unwrap();
+    let after = shared.stats().unwrap();
+    assert_eq!(after.checkpoint_bytes, own);
+    assert_eq!(after.relocated_bytes, 0);
+    // The other group's frames were not read, moved or written: the log
+    // grew by the checkpoint alone, and what the group held before is dead.
+    assert_eq!(after.physical_bytes, before.physical_bytes + own);
+    assert_eq!(after.live_bytes, before.live_bytes / 2 + frame(&checkpoint));
+    assert_eq!(after.indexed_records, 61);
+    assert_eq!(records(&a), vec![checkpoint.clone()]);
+    assert_eq!(records(&b), kept);
+    drop((a, b, shared));
+    // A reopen learns the floor from the log.
+    let shared = SharedWal::open(dir.path(), options()).unwrap();
+    assert_eq!(shared.stats().unwrap().startup_scan_records, 61);
+    let a = shared.lease(LogicalLogId([1; 16])).unwrap();
+    let b = shared.lease(LogicalLogId([2; 16])).unwrap();
+    assert_eq!(records(&a), vec![checkpoint]);
+    assert_eq!(records(&b), kept);
+}
+
+/// A cold group whose frames stand at the head of the log, behind a hot
+/// one that appends and checkpoints: the base meets the cold frames and
+/// writes them again at the tail, lap after lap, in the group's order; the
+/// log holds no more dead bytes than live ones and a segment; and a reopen
+/// finds every group as it was.
+#[test]
+fn a_cold_group_the_base_meets_is_written_again_in_its_order_and_the_log_keeps_its_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let budget = memory();
+    let cold_records: Vec<Record> = (1..=40).map(|index| record(1, index)).collect();
+    let kept = {
+        let shared = SharedWal::open_with_budget(
+            dir.path(),
+            options(),
+            WalWriterLimits::default(),
+            budget.clone(),
+        )
+        .unwrap();
+        let mut cold = shared.lease(LogicalLogId([1; 16])).unwrap();
+        let mut hot = shared.lease(LogicalLogId([2; 16])).unwrap();
+        for batch in cold_records.chunks(8) {
+            cold.append(batch).unwrap();
+        }
+        let mut kept = Vec::new();
+        for round in 1..=120u64 {
+            let batch: Vec<Record> = (0..16).map(|at| record(2, round * 100 + at)).collect();
+            hot.append(&batch).unwrap();
+            kept = vec![snapshot(2, round)];
+            hot.rewrite_checkpoint(&kept).unwrap();
+            if round % 25 == 0 {
+                assert_eq!(records(&cold), cold_records, "round {round}");
+                assert_eq!(records(&hot), kept, "round {round}");
+            }
+        }
+        let stats = settle(&shared);
+        assert!(!due(&stats, &options()), "{stats:?}");
+        assert_eq!(stats.indexed_records, 41);
+        // The cold frames were met more than once: a frame written again
+        // is written again as it stands, under the origin it carries.
+        assert!(stats.relocated_records > 80, "{stats:?}");
+        assert!(stats.reclaimed_segments > 0, "{stats:?}");
+        // What cleaning wrote is less than what it freed.
+        assert!(stats.relocated_bytes < stats.reclaimed_bytes, "{stats:?}");
+        // The files on disk are the base's segment to the tail's.
+        let base = fence(dir.path()).base;
+        let held = segments(dir.path());
+        assert_eq!(held.first(), Some(&base.segment));
+        assert!(base.segment > 0);
+        assert!(
+            (held.len() as u64) * options().segment_bytes
+                <= stats.physical_bytes + 2 * options().segment_bytes,
+            "{held:?} {stats:?}"
+        );
+        assert_eq!(records(&cold), cold_records);
+        assert_eq!(records(&hot), kept);
+        kept
+    };
+    assert_eq!(budget.stats().used, 0);
+    {
+        let shared = SharedWal::open(dir.path(), options()).unwrap();
+        assert_eq!(shared.stats().unwrap().startup_scan_records, 41);
+        let mut cold = shared.lease(LogicalLogId([1; 16])).unwrap();
+        let hot = shared.lease(LogicalLogId([2; 16])).unwrap();
+        assert_eq!(records(&cold), cold_records);
+        assert_eq!(records(&hot), kept);
+        // What the group writes next follows what it held.
+        cold.append(&[record(1, 41)]).unwrap();
+        let mut all = cold_records.clone();
+        all.push(record(1, 41));
+        assert_eq!(records(&cold), all);
+    }
+    // A reader of the stream in its physical order cannot give a group its
+    // order once frames were written again, and says so.
+    let wal = Wal::open(dir.path(), options()).unwrap();
+    assert!(matches!(wal.replay(|_| Ok(())), Err(LogError::Relocated)));
+}
+
+/// A crash at every durability boundary of a commit that cleans, and
+/// after the fence that moved the base before the segments behind it are
+/// removed: a reopen finds the cold group whole and in order, and the hot
+/// one as the fence left it.
+#[test]
+fn a_crash_at_every_cut_of_a_cleaning_commit_recovers_every_group() {
+    for point in [
+        FaultPoint::AfterAppend,
+        FaultPoint::AfterDataSync,
+        FaultPoint::AfterFenceInstall,
+        FaultPoint::AfterBaseFence,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let cold_records: Vec<Record> = (1..=40).map(|index| record(1, index)).collect();
+        let shared = SharedWal::open(dir.path(), options()).unwrap();
+        // The base moves inside commits alone, so the cut is a commit's.
+        idle(&shared, false);
+        let mut cold = shared.lease(LogicalLogId([1; 16])).unwrap();
+        let mut hot = shared.lease(LogicalLogId([2; 16])).unwrap();
+        cold.append(&cold_records).unwrap();
+        let mut kept = Vec::new();
+        let mut round = 0u64;
+        // Until cleaning has begun.
+        while shared.stats().unwrap().relocated_records == 0 {
+            round += 1;
+            assert!(round < 100);
+            let batch: Vec<Record> = (0..16).map(|at| record(2, round * 100 + at)).collect();
+            hot.append(&batch).unwrap();
+            kept = vec![snapshot(2, round)];
+            hot.rewrite_checkpoint(&kept).unwrap();
+        }
+        hot.try_inject_fault_once(point).unwrap();
+        // Commits until the cut is reached: every one acknowledged is kept,
+        // and the one that was cut is there or not as its fence is.
+        let mut cut_at: Option<Vec<Record>> = None;
+        let mut cut = false;
+        for _ in 0..100 {
+            round += 1;
+            let batch: Vec<Record> = (0..16).map(|at| record(2, round * 100 + at)).collect();
+            let mut next = kept.clone();
+            next.extend(batch.iter().cloned());
+            match hot.append(&batch) {
+                Ok(_) => kept = next,
+                Err(_) => {
+                    cut_at = Some(next);
+                    cut = true;
+                    break;
+                }
+            }
+            if shared.identity().is_err() {
+                // The cut fell after the commit's fence and its replies.
+                cut = true;
+                break;
+            }
+            let next = vec![snapshot(2, round)];
+            match hot.rewrite_checkpoint(&next) {
+                Ok(_) => kept = next,
+                Err(_) => {
+                    cut_at = Some(next);
+                    cut = true;
+                    break;
+                }
+            }
+            if shared.identity().is_err() {
+                cut = true;
+                break;
+            }
+        }
+        assert!(cut, "{point:?}");
+        assert!(matches!(shared.identity(), Err(LogError::Failed)));
+        drop((cold, hot, shared));
+        let shared = SharedWal::open(dir.path(), options()).unwrap();
+        let cold = shared.lease(LogicalLogId([1; 16])).unwrap();
+        let hot = shared.lease(LogicalLogId([2; 16])).unwrap();
+        assert_eq!(records(&cold), cold_records, "{point:?}");
+        match point {
+            // The fence was not installed: the commit is not there.
+            FaultPoint::AfterAppend | FaultPoint::AfterDataSync => {
+                assert!(cut_at.is_some());
+                assert_eq!(records(&hot), kept, "{point:?}")
+            }
+            // The fence was installed and the caller was not told.
+            FaultPoint::AfterFenceInstall => {
+                assert_eq!(Some(records(&hot)), cut_at, "{point:?}")
+            }
+            // The commit was whole and acknowledged; the segments behind
+            // its base were still there, and the reopen removed them.
+            FaultPoint::AfterBaseFence => {
+                assert!(cut_at.is_none());
+                assert_eq!(records(&hot), kept, "{point:?}")
+            }
+        }
+        // Nothing before the base is left on disk.
+        assert_eq!(
+            segments(dir.path()).first(),
+            Some(&fence(dir.path()).base.segment),
+            "{point:?}"
+        );
+    }
+}
+
+/// A reopen whose base stands inside the frames a checkpoint kept: the
+/// floor's count is of the frames the scan reads, and those the base
+/// passed are counted where they were written again.
+#[test]
+fn a_base_inside_the_frames_a_checkpoint_kept_recovers_the_group_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let cold_records: Vec<Record> = (1..=40).map(|index| snapshot(1, index)).collect();
+    let mut inside = 0;
+    let mut round = 0u64;
+    let mut kept = Vec::new();
+    {
+        let shared = SharedWal::open(dir.path(), options()).unwrap();
+        let mut cold = shared.lease(LogicalLogId([1; 16])).unwrap();
+        cold.rewrite_checkpoint(&cold_records).unwrap();
+    }
+    // The group's frames are the forty a checkpoint kept, from sequence one.
+    while inside < 3 {
+        assert!(round < 400, "the base never stood inside the checkpoint");
+        let shared = SharedWal::open(dir.path(), options()).unwrap();
+        idle(&shared, false);
+        let cold = shared.lease(LogicalLogId([1; 16])).unwrap();
+        let mut hot = shared.lease(LogicalLogId([2; 16])).unwrap();
+        assert_eq!(records(&cold), cold_records, "round {round}");
+        assert_eq!(records(&hot), kept, "round {round}");
+        round += 1;
+        let batch: Vec<Record> = (0..4).map(|at| record(2, round * 100 + at)).collect();
+        hot.append(&batch).unwrap();
+        kept = vec![snapshot(2, round)];
+        hot.rewrite_checkpoint(&kept).unwrap();
+        let base = fence(dir.path()).base;
+        if (1..40).contains(&base.sequence) {
+            inside += 1;
+        }
+    }
+    let shared = SharedWal::open(dir.path(), options()).unwrap();
+    let cold = shared.lease(LogicalLogId([1; 16])).unwrap();
+    assert_eq!(records(&cold), cold_records);
+}
+
+/// A group that checkpoints to nothing frees the log behind it with no
+/// further command: the writer cleans while nothing waits, and the frames
+/// of the group that stays are written again once.
+#[test]
+fn garbage_is_worked_off_while_no_command_waits() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared = SharedWal::open(dir.path(), options()).unwrap();
+    idle(&shared, false);
+    let mut stays = shared.lease(LogicalLogId([1; 16])).unwrap();
+    let mut leaves = shared.lease(LogicalLogId([2; 16])).unwrap();
+    let mut held = Vec::new();
+    for round in 0..25u64 {
+        let batch: Vec<Record> = (1..=4).map(|at| record(1, round * 4 + at)).collect();
+        stays.append(&batch).unwrap();
+        held.extend(batch);
+        let batch: Vec<Record> = (0..40).map(|at| record(2, round * 100 + at)).collect();
+        leaves.append(&batch).unwrap();
+    }
+    leaves.rewrite_checkpoint(&[]).unwrap();
+    let before = shared.stats().unwrap();
+    // The checkpoint's commit read a batch of the log and no more: most
+    // of what it freed is still there.
+    assert!(due(&before, &options()), "{before:?}");
+    let first = segments(dir.path());
+    idle(&shared, true);
+    let after = settle(&shared);
+    assert!(!due(&after, &options()), "{after:?}");
+    assert!(after.reclaimed_segments > before.reclaimed_segments);
+    assert!(segments(dir.path()).len() < first.len());
+    assert!(after.relocated_records <= 100, "{after:?}");
+    assert_eq!(records(&stays), held);
+    assert!(records(&leaves).is_empty());
+}
+
+#[test]
+fn a_fence_of_the_first_version_opens_as_a_prefix_from_the_start_and_is_written_forward() {
+    #[derive(Serialize)]
+    struct First {
+        version: u32,
+        identity: WalIdentity,
+        position: DurablePosition,
+    }
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let shared = SharedWal::open(dir.path(), options()).unwrap();
+        let mut lease = shared.lease(LogicalLogId([1; 16])).unwrap();
+        lease.append(&[record(1, 1), record(1, 2)]).unwrap();
+    }
+    let current = fence(dir.path());
+    assert_eq!(current.base, DurableBase::default());
+    let data = postcard::to_stdvec(&First {
+        version: 1,
+        identity: current.identity,
+        position: current.position,
+    })
+    .unwrap();
+    let mut bytes = FENCE_MAGIC.to_vec();
+    bytes.extend_from_slice(&data);
+    bytes.extend_from_slice(&crc32fast::hash(&data).to_le_bytes());
+    std::fs::write(dir.path().join("CURRENT"), &bytes).unwrap();
+    let shared = SharedWal::open(dir.path(), options()).unwrap();
+    let mut lease = shared.lease(LogicalLogId([1; 16])).unwrap();
+    assert_eq!(records(&lease), vec![record(1, 1), record(1, 2)]);
+    lease.append(&[record(1, 3)]).unwrap();
+    let written = std::fs::read(dir.path().join("CURRENT")).unwrap();
+    let (version, _) = postcard::take_from_bytes::<u32>(&written[8..]).unwrap();
+    assert_eq!(version, FENCE_VERSION);
+    assert_eq!(fence(dir.path()).base, DurableBase::default());
+}
+
+/// The stream read in its physical order, by its single owner: a floor's
+/// dead frames and the floors themselves are not delivered.
+#[test]
+fn a_single_owner_replays_the_live_records_of_a_stream_with_floors() {
+    let dir = tempfile::tempdir().unwrap();
+    let checkpoint = snapshot(1, 3);
+    {
+        let shared = SharedWal::open(dir.path(), options()).unwrap();
+        let mut a = shared.lease(LogicalLogId([1; 16])).unwrap();
+        let mut b = shared.lease(LogicalLogId([2; 16])).unwrap();
+        a.append(&[record(1, 1), record(1, 2)]).unwrap();
+        b.append(&[record(2, 1)]).unwrap();
+        a.append(&[record(1, 3)]).unwrap();
+        a.rewrite_checkpoint(std::slice::from_ref(&checkpoint))
+            .unwrap();
+        b.append(&[record(2, 2)]).unwrap();
+    }
+    let wal = Wal::open(dir.path(), options()).unwrap();
+    let mut seen = Vec::new();
+    wal.replay(|record| {
+        seen.push(record);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(seen, vec![record(2, 1), checkpoint, record(2, 2)]);
+}
+
+/// The floor and the moved frame are the physical layer's own records: a
+/// caller's batch that holds one is refused before anything is queued, and
+/// the largest record a batch admits is moved like any other.
+#[test]
+fn a_caller_cannot_write_the_physical_layers_records_and_the_largest_record_is_moved() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = options();
+    options.max_record_bytes = 1024;
+    options.max_batch_bytes = 1024 + FRAME_HEADER;
+    let shared = SharedWal::open(dir.path(), options.clone()).unwrap();
+    let mut cold = shared.lease(LogicalLogId([1; 16])).unwrap();
+    let mut hot = shared.lease(LogicalLogId([2; 16])).unwrap();
+    for kind in [RecordKind::Floor, RecordKind::Moved] {
+        let forged = Record {
+            kind,
+            ..record(1, 1)
+        };
+        assert!(matches!(
+            cold.append(std::slice::from_ref(&forged)),
+            Err(LogError::Identity)
+        ));
+        assert!(matches!(
+            cold.rewrite_checkpoint(std::slice::from_ref(&forged)),
+            Err(LogError::Identity)
+        ));
+    }
+    // A record whose encoding is exactly the bound: its frame alone is a
+    // batch, and written again it is a batch and its wrapper.
+    let mut largest = record(1, 1);
+    largest.payload = vec![7; 1024 - 21];
+    assert_eq!(
+        postcard::experimental::serialized_size(&largest).unwrap(),
+        1024
+    );
+    cold.append(std::slice::from_ref(&largest)).unwrap();
+    let mut round = 0u64;
+    while shared.stats().unwrap().relocated_records == 0 {
+        round += 1;
+        assert!(round < 200, "{:?}", shared.stats().unwrap());
+        hot.append(&[record(2, round)]).unwrap();
+        hot.rewrite_checkpoint(&[]).unwrap();
+        settle(&shared);
+    }
+    assert_eq!(records(&cold), vec![largest.clone()]);
+    drop((cold, hot, shared));
+    let shared = SharedWal::open(dir.path(), options).unwrap();
+    let cold = shared.lease(LogicalLogId([1; 16])).unwrap();
+    assert_eq!(records(&cold), vec![largest]);
+}
+
+/// A seeded generator for the histories below: the same seed, the same
+/// history.
+struct Seeded(u64);
+impl Seeded {
+    fn next(&mut self) -> u64 {
+        // SplitMix64.
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn below(&mut self, bound: u64) -> u64 {
+        self.next() % bound
+    }
+}
+
+/// Seeded histories over several groups: appends, checkpoints that keep
+/// anything from nothing to a few records, leases given up and taken again,
+/// cleaning inside commits and between them, a cut at every durability
+/// boundary, and reopens. After every command the group it touched replays
+/// exactly what the model holds; after every cut and reopen every group
+/// does, the cut command there or not; and a settled log keeps its bound.
+#[test]
+fn seeded_histories_of_appends_checkpoints_cuts_and_reopens_replay_every_group_as_written() {
+    const GROUPS: usize = 5;
+    const POINTS: [FaultPoint; 4] = [
+        FaultPoint::AfterAppend,
+        FaultPoint::AfterDataSync,
+        FaultPoint::AfterFenceInstall,
+        FaultPoint::AfterBaseFence,
+    ];
+    fn leases(shared: &SharedWal) -> Vec<Option<WalLease>> {
+        (0..GROUPS)
+            .map(|at| Some(shared.lease(LogicalLogId([at as u8 + 1; 16])).unwrap()))
+            .collect()
+    }
+    // The seeds of an ordinary run; a campaign names its own.
+    let number = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let first = number("FOCAL_SEED_START", 1);
+    // Frames written again, over every writer of every seed: a writer's
+    // count starts at its open.
+    let mut moved = 0u64;
+    for seed in first..first + number("FOCAL_SEED_COUNT", 4) {
+        let mut random = Seeded(seed);
+        let dir = tempfile::tempdir().unwrap();
+        let budget = memory();
+        let open = |budget: &MemoryBudget| {
+            SharedWal::open_with_budget(
+                dir.path(),
+                options(),
+                WalWriterLimits::default(),
+                budget.clone(),
+            )
+            .unwrap()
+        };
+        let mut shared = open(&budget);
+        let mut held = leases(&shared);
+        let mut model: Vec<Vec<Record>> = vec![Vec::new(); GROUPS];
+        let mut serial = 0u64;
+        let mut writer_moved = 0u64;
+        for step in 0..500 {
+            let at = random.below(GROUPS as u64) as usize;
+            let log = at as u8 + 1;
+            // A cut armed earlier and met by the writer's own cleaning
+            // stops it between commands: the step reopens, nothing cut.
+            let stopped = shared.identity().is_err();
+            let choice = if stopped { 16 } else { random.below(100) };
+            // A group's lease is given up and taken again now and then.
+            if choice < 4 {
+                held[at] = None;
+                held[at] = Some(shared.lease(LogicalLogId([log; 16])).unwrap());
+                assert_eq!(records(held[at].as_ref().unwrap()), model[at]);
+                continue;
+            }
+            if choice < 8 {
+                idle(&shared, random.below(2) == 0);
+                continue;
+            }
+            if choice < 12 {
+                let stats = settle(&shared);
+                assert!(
+                    !due(&stats, &options()),
+                    "seed {seed} step {step}: {stats:?}"
+                );
+                assert_eq!(
+                    stats.indexed_records,
+                    model.iter().map(Vec::len).sum::<usize>(),
+                    "seed {seed} step {step}"
+                );
+                writer_moved = writer_moved.max(stats.relocated_records);
+                continue;
+            }
+            if choice < 16 {
+                let point = POINTS[random.below(4) as usize];
+                held[at]
+                    .as_mut()
+                    .unwrap()
+                    .try_inject_fault_once(point)
+                    .unwrap();
+                continue;
+            }
+            let reopen = choice < 20;
+            let mut after = model[at].clone();
+            let result = if reopen {
+                Ok(())
+            } else if choice < 40 {
+                // A checkpoint keeps from nothing to three records.
+                let keep: Vec<Record> = (0..random.below(4))
+                    .map(|_| {
+                        serial += 1;
+                        Record {
+                            payload: vec![log; random.below(200) as usize],
+                            ..snapshot(log, serial)
+                        }
+                    })
+                    .collect();
+                after = keep.clone();
+                held[at]
+                    .as_mut()
+                    .unwrap()
+                    .rewrite_checkpoint(&keep)
+                    .map(|_| ())
+            } else {
+                let batch: Vec<Record> = (0..1 + random.below(6))
+                    .map(|_| {
+                        serial += 1;
+                        Record {
+                            payload: vec![log; random.below(200) as usize],
+                            ..record(log, serial)
+                        }
+                    })
+                    .collect();
+                after.extend(batch.iter().cloned());
+                held[at].as_mut().unwrap().append(&batch).map(|_| ())
+            };
+            // A cut armed earlier may fall after a commit's replies.
+            let failed = result.is_err() || shared.identity().is_err();
+            if result.is_ok() {
+                model[at] = after.clone();
+            }
+            if let Ok(stats) = shared.stats() {
+                writer_moved = writer_moved.max(stats.relocated_records);
+            }
+            if !failed && !reopen {
+                assert_eq!(
+                    records(held[at].as_ref().unwrap()),
+                    model[at],
+                    "seed {seed} step {step} log {log}"
+                );
+                continue;
+            }
+            moved += std::mem::take(&mut writer_moved);
+            held.clear();
+            drop(shared);
+            assert_eq!(budget.stats().used, 0, "seed {seed} step {step}");
+            shared = open(&budget);
+            held = leases(&shared);
+            for (other, lease) in held.iter().enumerate() {
+                let replayed = records(lease.as_ref().unwrap());
+                if other == at && replayed != model[at] {
+                    // The cut command is there whole, or not at all.
+                    assert_eq!(replayed, after, "seed {seed} step {step} log {log}");
+                    model[at] = after.clone();
+                } else {
+                    assert_eq!(
+                        replayed,
+                        model[other],
+                        "seed {seed} step {step} log {}",
+                        other + 1
+                    );
+                }
+            }
+            assert_eq!(
+                segments(dir.path()).first(),
+                Some(&fence(dir.path()).base.segment),
+                "seed {seed} step {step}"
+            );
+        }
+        if let Ok(stats) = shared.stats() {
+            writer_moved = writer_moved.max(stats.relocated_records);
+        }
+        moved += writer_moved;
+    }
+    // The histories are long enough for the base to have met live frames:
+    // what the model checked includes groups whose frames were moved.
+    assert!(moved > 0);
 }

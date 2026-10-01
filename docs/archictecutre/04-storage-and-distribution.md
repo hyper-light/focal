@@ -439,13 +439,22 @@ durable historical event archive; a current-state snapshot is not an event-histo
 Raft term/index snapshot metadata must remain consistent with compacted entries.
 Physical segments are reclaimed only when all resident logical logs permit it; rewrite
 live stragglers with an atomic segment-index update before unlinking old segments.
+The shared log does both without rewriting itself (2026-09-30, the audit's F14): a
+logical log's checkpoint is one group commit — what the log keeps and a floor frame
+that retires what it held — and the fence names a base, the start of the durable
+prefix, beside the tail. The writer moves the base toward the tail: past a segment
+with nothing live unread, and, while dead bytes exceed live ones and a segment, over
+frames it reads and verifies, writing each live one again at the tail under its
+origin (the sequence it was first written at, which keeps its place in its log's
+order and is what floors compare). The copies and the base are durable by one fence;
+segments behind the base are unlinked after it. A commit's cleaning writes no more
+than its callers did, and an idle writer takes one bounded step at a time.
 The writer's recovery index — each logical log's frame locations — costs what the
 history's records cost, never what the batches that wrote them cost (2026-09-29, the
 audit's F46): a reopen reads the durable prefix twice, counting each log's frames from
 the record's leading field and then placing them into one exactly sized chunk a log,
 through one scan buffer that grows to the largest record and no further; a
-checkpoint's rewrite packs its replacement index the same way from the counts it
-knows. A history admitted under a budget therefore reopens under it, the reopen's
+checkpoint replaces its log's chunks by the one it wrote. A history admitted under a budget therefore reopens under it, the reopen's
 only transient being that buffer (three records' bytes, reserved for the scan).
 
 ## 11. Range split, move, merge, and fencing
