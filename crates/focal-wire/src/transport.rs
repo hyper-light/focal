@@ -1042,6 +1042,10 @@ impl QuicRemote {
     pub fn close(&self) {
         self.connection.close(0u8.into(), b"client closed");
     }
+    /// Whether the connection has ended, by either side or by its path.
+    pub fn closed(&self) -> bool {
+        self.connection.close_reason().is_some()
+    }
     /// What the law of the connection holds in flight, in bytes.
     pub fn window(&self) -> u64 {
         self.connection.stats().path.cwnd

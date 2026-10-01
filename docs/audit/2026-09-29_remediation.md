@@ -49,7 +49,7 @@ ruling before work starts).
 | F34 | P2 | open | 4 | — |
 | F35 | P1 | in tree | 3 | [F35](#f35) |
 | F36 | P1 | open | 9 | — |
-| F37 | P1 | open | 8 | — |
+| F37 | P1 | in tree | 8 | [F37](#f37) |
 | F38 | P2 | open | 8 | — |
 | F39 | P2 | open | 12 | — |
 | F40 | P2 | open | 10 | — |
@@ -1988,4 +1988,46 @@ gone with its term. It proposes again to the leader that followed.
 
 **Residual.** A peer's frames go each on its own stream and arrive in no order (27 §12).
 The fast track's election (above).
+
+## F37
+
+**Cause.** In `PeerConnectionPool::exchange` a peer's answer `Unavailable` or
+`OutcomeUnknown` matched an arm that did nothing, and fell through to what follows a
+failed exchange: `remote.close()` and the cached connection forgotten. Every wire error
+of one stream took the same path. The connection carries every group's messages to that
+peer, its probes and its content; so one owner that was not ready, or one request that
+timed out, ended all of them, and the next exchange paid a handshake and began its
+congestion window again. The caller of the refused request was told `Lost` — to the
+liveness driver, that the peer answered nothing.
+
+**Fix.** A peer that answers `Unavailable` or `OutcomeUnknown` answered: the connection
+carried the question and the answer, and is kept. The same request is asked again on it,
+after the same spread wait as before, and what the peer last said is what the caller is
+told (`PeerSendError::Rejected(error)`): a refusal, which the liveness driver already
+reads as a peer that is there. An exchange that fails on the wire closes its connection
+only when the connection is what failed (`peers::connection_failed`): it has ended
+(`QuicRemote::closed`), it could not be used or trusted, the peer did not speak the
+protocol on it, or the peer answered nothing on it — this exchange or any other — since
+this one was sent (`Slot::answered`). A stream that timed out or ended early while the
+peer answered others failed alone. The pool's own deadline for an exchange drops the
+exchange and never touched the connection.
+
+**Tests.** `focal-wire`:
+`an_operation_refused_or_unanswered_takes_no_other_exchange_with_its_connection` (real
+QUIC on the loopback: a request the peer holds while it refuses two others is answered,
+and the two are told `Rejected(Unavailable)` and `Rejected(OutcomeUnknown)`; a request the
+peer's handler never answers ends, is asked again and ends, while the peer answers probes
+and a request sent meanwhile is held across that and answered; one connection is opened
+through all of it; with the refusal closing the connection again the test fails);
+`a_connection_is_closed_for_an_exchange_only_when_the_connection_failed` (the decision,
+by kind of failure, with and without another answer meanwhile).
+`peer_pool_caches_connections_reconnects_identical_packets_and_fences_routes` expected
+two connections for a message answered `Unavailable` and then accepted: it expects one.
+
+**Residual.** With other exchanges under way on a connection, one exchange's wait does
+not end at its own time: what it waits on is charged to what the connection carries, not
+to its own stream (the audit's F38). So a request a peer never answers ends when the peer
+gives its handler up and says so, not before; and the rule for a stream that times out
+alone is the decision above, tested as a decision, until F38 gives a stream its own
+progress.
 

@@ -12610,3 +12610,15 @@ member that had left a configuration vetoed the only candidate for priority (men
 the fast track's election can commit two entries at one index (forty thousand schedules;
 recorded at 27 §4.6, not mended, used by no owner).
 
+### 2026-10-01 — F37: one operation refused takes no other with it
+
+A peer's answer that something is not to be had now, or that its outcome is not known,
+closed the connection it came on, and with it every other exchange with that peer; so did
+one stream's failure. The connection is kept: the request is asked again on it and its
+caller is told that the peer refused, and a connection is closed for a failed exchange
+only when the connection is what failed — it has ended, it could not be trusted or
+spoken on, or nothing at all was answered on it since the exchange was sent (the
+remediation record, F37). On real QUIC a held request is answered across two refused
+ones and across one the peer never answers, with one connection opened. Open: an
+exchange's own wait is still charged to the whole connection's progress (F38).
+

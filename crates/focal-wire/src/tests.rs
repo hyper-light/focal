@@ -1141,7 +1141,9 @@ async fn peer_pool_caches_connections_reconnects_identical_packets_and_fences_ro
         assert_eq!(recorded.len(), 3);
         assert!(recorded.iter().all(|request| request == &packet));
     }
-    assert_eq!(pool.stats().connections_opened, 2);
+    // The first message was answered `Unavailable` and asked again: on the
+    // connection that carried the refusal, not on a new one.
+    assert_eq!(pool.stats().connections_opened, 1);
     assert_eq!(pool.stats().cached_connections, 1);
     // Two replication messages and two probes.
     assert_eq!(pool.stats().delivered, 4);
@@ -1161,6 +1163,205 @@ async fn peer_pool_caches_connections_reconnects_identical_packets_and_fences_ro
     assert_eq!(pool.send(2, &packet).await, Err(PeerSendError::Closed));
     server.close();
     task.await.unwrap().unwrap();
+}
+
+/// One operation that its peer refuses, or cannot say the outcome of, or
+/// never answers, takes no other exchange with it (the audit's F37: the
+/// pool closed the connection for it, and every exchange with the peer —
+/// other groups' messages, probes, content under way — was lost with it,
+/// and paid a handshake and a congestion window learned again). A request
+/// held by the peer while another is refused is answered; one in flight
+/// while another times out is answered; what the caller is told of a
+/// refusal is that the peer refused; and one connection is opened through
+/// all of it.
+#[tokio::test]
+async fn an_operation_refused_or_unanswered_takes_no_other_exchange_with_its_connection() {
+    use std::collections::BTreeMap;
+    use tokio::sync::{Notify, Semaphore};
+    const HELD: u128 = 101;
+    const REFUSED: u128 = 102;
+    const UNKNOWN: u128 = 103;
+    const SILENT: u128 = 104;
+    let pki = Pki::new();
+    let (certificate, key) = pki.issue(false);
+    let registry = PeerRegistry::new(16).unwrap();
+    let mut node_grant = grant();
+    node_grant.role = PeerRole::Node { node_id: 7 };
+    registry
+        .register_certificate(&certificate, node_grant)
+        .unwrap();
+    let gate = Arc::new(Semaphore::new(0));
+    let held = Arc::new(Notify::new());
+    let silent = Arc::new(Notify::new());
+    let (release, entered, asked) = (gate.clone(), held.clone(), silent.clone());
+    let handler: Arc<dyn RequestHandler> = Arc::new(move |verified: VerifiedRequest| {
+        let (release, entered, asked) = (release.clone(), entered.clone(), asked.clone());
+        async move {
+            let id = u128::from_be_bytes(verified.request().request_id.0);
+            let answer = match id {
+                _ if matches!(verified.request().operation, Operation::Probe { .. }) => {
+                    Response::Probe(vec![1])
+                }
+                HELD => {
+                    entered.notify_one();
+                    release.acquire().await.unwrap().forget();
+                    Response::PeerAccepted
+                }
+                REFUSED => Response::Error(AccessError::Unavailable),
+                UNKNOWN => Response::Error(AccessError::OutcomeUnknown),
+                SILENT => {
+                    asked.notify_one();
+                    std::future::pending().await
+                }
+                _ => Response::PeerAccepted,
+            };
+            verified.request().reply(answer)
+        }
+    });
+    let (server, task) = server(&pki, registry, handler).await;
+    // An exchange is given two seconds; a request is asked twice.
+    let wire = WireLimits {
+        request_timeout: Duration::from_secs(2),
+        ..limits()
+    };
+    let tls = client_tls(
+        TlsIdentity::from_pkcs8(vec![certificate], key),
+        vec![pki.ca.der().to_vec()],
+        &wire,
+    )
+    .unwrap();
+    let pool = Arc::new(
+        PeerConnectionPool::new(
+            QuicConnector::bind("127.0.0.1:0".parse().unwrap(), tls, wire).unwrap(),
+            PeerPoolLimits {
+                attempts: 2,
+                retry_backoff: Duration::ZERO,
+                timeout: Duration::from_secs(10),
+                ..PeerPoolLimits::default()
+            },
+        )
+        .unwrap(),
+    );
+    pool.replace_routes(
+        1,
+        BTreeMap::from([(
+            2,
+            PeerEndpoint {
+                address: server.local_addr().unwrap(),
+                server_name: "localhost".into(),
+                name: None,
+            },
+        )]),
+    )
+    .unwrap();
+    let message = |id: u128| {
+        let mut packet = request(id);
+        packet.operation = Operation::Raft {
+            group: [2; 16],
+            message: vec![7, 8, 9],
+        };
+        packet
+    };
+    let send = |id: u128| {
+        let pool = pool.clone();
+        let packet = message(id);
+        tokio::spawn(async move { pool.send(2, &packet).await })
+    };
+    pool.send(2, &message(100)).await.unwrap();
+    assert_eq!(pool.stats().connections_opened, 1);
+
+    // A request the peer holds, while it refuses two others.
+    let waiting = send(HELD);
+    held.notified().await;
+    assert_eq!(
+        pool.send(2, &message(REFUSED)).await,
+        Err(PeerSendError::Rejected(AccessError::Unavailable))
+    );
+    assert_eq!(
+        pool.send(2, &message(UNKNOWN)).await,
+        Err(PeerSendError::Rejected(AccessError::OutcomeUnknown))
+    );
+    gate.add_permits(1);
+    assert_eq!(waiting.await.unwrap(), Ok(()));
+    assert_eq!(pool.stats().connections_opened, 1);
+
+    // A request the peer's handler never answers. The peer answers probes
+    // meanwhile, as it does a node's liveness. The request ends when the
+    // peer gives its handler up and says so, is asked again on the same
+    // connection, and ends the same way. A second request is sent a second
+    // into the first, held by the peer, and let go once the first has been
+    // asked again: it was in flight across that, and is answered.
+    let probing = {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            let mut probe = request(200);
+            probe.operation = Operation::Probe {
+                request: vec![1, 2, 3],
+            };
+            loop {
+                assert_eq!(pool.send_probe(2, &probe).await, Ok(vec![1]));
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+    };
+    let unanswered = send(SILENT);
+    silent.notified().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let waiting = send(HELD);
+    held.notified().await;
+    // Asked again: its first exchange ended without what it asked for.
+    silent.notified().await;
+    gate.add_permits(1);
+    assert_eq!(waiting.await.unwrap(), Ok(()));
+    // Told at last that it is not to be had, or never told: lost to its
+    // caller either way, and to no one else.
+    let unanswered = unanswered.await.unwrap();
+    assert!(
+        matches!(
+            unanswered,
+            Err(PeerSendError::Lost | PeerSendError::Rejected(AccessError::Unavailable))
+        ),
+        "{unanswered:?}"
+    );
+    probing.abort();
+    let _ = probing.await;
+    pool.send(2, &message(105)).await.unwrap();
+    assert_eq!(pool.stats().connections_opened, 1);
+    assert_eq!(pool.stats().cached_connections, 1);
+    pool.close();
+    server.close();
+    task.await.unwrap().unwrap();
+}
+
+/// When an exchange fails on the wire, its connection is closed for it only
+/// if the connection is what failed. A stream that timed out, ended early
+/// or could not be read while the peer answered other exchanges on the same
+/// connection failed alone; with no answer at all since it was sent there
+/// is no evidence the connection carries anything; and a connection that
+/// has ended, could not be trusted, or on which the peer did not speak the
+/// protocol, is closed whatever else was answered.
+#[test]
+fn a_connection_is_closed_for_an_exchange_only_when_the_connection_failed() {
+    use crate::peers::connection_failed;
+    let stream = || {
+        [
+            WireError::Timeout,
+            WireError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+            WireError::Allocation,
+        ]
+    };
+    for failure in stream() {
+        assert!(!connection_failed(false, &failure, true), "{failure:?}");
+        assert!(connection_failed(false, &failure, false), "{failure:?}");
+        assert!(connection_failed(true, &failure, true), "{failure:?}");
+    }
+    for failure in [
+        WireError::Connection,
+        WireError::Authentication,
+        WireError::InvalidFrame,
+    ] {
+        assert!(connection_failed(false, &failure, true), "{failure:?}");
+    }
 }
 
 #[tokio::test]

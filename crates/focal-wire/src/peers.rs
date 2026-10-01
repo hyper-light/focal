@@ -175,6 +175,12 @@ struct Slot {
     connection: Mutex<Option<Connected>>,
     dial: Mutex<Option<Dial>>,
     generation: AtomicU64,
+    /// The answers the peer has given on this slot's connections, whatever
+    /// they said: a refusal is an answer. An exchange that failed while
+    /// another was answered failed alone; one that failed while nothing
+    /// was answered at all is no evidence the connection still carries
+    /// anything.
+    answered: AtomicU64,
     /// Until when a failed dial keeps this peer from being dialed again.
     unreachable_until: Mutex<Option<std::time::Instant>>,
     _reservation: OwnedSemaphorePermit,
@@ -237,6 +243,22 @@ struct Exchange {
 }
 /// The most doublings an estimate takes.
 const MAX_BACKOFF: u32 = 6;
+/// Whether an exchange that failed on the wire with `failure` says that its
+/// connection failed, and is to be closed and dialed again: the connection
+/// has `closed` already; the peer did not speak the protocol on it, or the
+/// connection could not be used or trusted; or the peer `answered` nothing
+/// on it — this exchange or any other — since this one was sent, which
+/// leaves no evidence that it carries anything. An exchange that timed out,
+/// lost its stream or could not be read while the peer answered others on
+/// the same connection failed alone.
+pub(crate) fn connection_failed(closed: bool, failure: &WireError, answered: bool) -> bool {
+    closed
+        || matches!(
+            failure,
+            WireError::Connection | WireError::Authentication | WireError::InvalidFrame
+        )
+        || !answered
+}
 /// One exchange in progress: given up on unless it says it was answered.
 struct Asked<'a> {
     pool: &'a PeerConnectionPool,
@@ -853,54 +875,91 @@ impl PeerConnectionPool {
                     }
                 };
                 let sent = std::time::Instant::now();
+                let before = slot.answered.load(Ordering::Acquire);
                 let answered = if bulk {
                     remote.request_within(request, self.limits.timeout).await
                 } else {
                     remote.request(request).await
                 };
-                match answered {
-                    Ok(response) => match response.result {
-                        value @ (Response::PeerAccepted
-                        | Response::Custody(_)
-                        | Response::Control { .. }
-                        | Response::ManagedSupport(_)
-                        | Response::Probe(_)) => {
-                            if slot.retired.load(Ordering::Acquire) {
+                // What kept this exchange from an answer, when the
+                // connection itself is to be judged for it.
+                let failure = match answered {
+                    Ok(response) => {
+                        // The peer answered on this connection, whatever it
+                        // said.
+                        slot.answered.fetch_add(1, Ordering::AcqRel);
+                        match response.result {
+                            value @ (Response::PeerAccepted
+                            | Response::Custody(_)
+                            | Response::Control { .. }
+                            | Response::ManagedSupport(_)
+                            | Response::Probe(_)) => {
+                                if slot.retired.load(Ordering::Acquire) {
+                                    asked.refused();
+                                    return Err(PeerSendError::RouteChanged);
+                                }
+                                asked.answered(sent.elapsed());
+                                // The path is measured by probes alone: the
+                                // peer's liveness driver answers one without
+                                // its replicas' owners. A replication message
+                                // is answered once the peer has persisted it,
+                                // and a peer that has just restarted answers
+                                // its first one seconds late; a control request
+                                // waits on a quorum commit. Neither is the path.
+                                if matches!(request.operation, Operation::Probe { .. }) {
+                                    self.observe(target, sent.elapsed());
+                                }
+                                return Ok(value);
+                            }
+                            // What was asked for is not to be had now, or
+                            // what became of it is not known. The peer said
+                            // so over a connection that carried the question
+                            // and the answer: the connection is kept, with
+                            // everything else it carries (the audit's F37:
+                            // it was closed, and every exchange with the
+                            // peer was lost with this one). The same request
+                            // is asked again on it, and what the peer last
+                            // said is what the caller is told.
+                            Response::Error(
+                                error @ (AccessError::Unavailable | AccessError::OutcomeUnknown),
+                            ) => {
                                 asked.refused();
-                                return Err(PeerSendError::RouteChanged);
+                                if attempt.saturating_add(1) == self.limits.attempts {
+                                    return Err(PeerSendError::Rejected(error));
+                                }
+                                tokio::time::sleep(spread(self.limits.retry_backoff, entropy()))
+                                    .await;
+                                continue;
                             }
-                            asked.answered(sent.elapsed());
-                            // The path is measured by probes alone: the
-                            // peer's liveness driver answers one without
-                            // its replicas' owners. A replication message
-                            // is answered once the peer has persisted it,
-                            // and a peer that has just restarted answers
-                            // its first one seconds late; a control request
-                            // waits on a quorum commit. Neither is the path.
-                            if matches!(request.operation, Operation::Probe { .. }) {
-                                self.observe(target, sent.elapsed());
+                            Response::Error(error) => {
+                                asked.refused();
+                                return Err(PeerSendError::Rejected(error));
                             }
-                            return Ok(value);
+                            _ => return Err(PeerSendError::Lost),
                         }
-                        Response::Error(AccessError::Unavailable | AccessError::OutcomeUnknown) => {
-                        }
-                        Response::Error(error) => {
-                            asked.refused();
-                            return Err(PeerSendError::Rejected(error));
-                        }
-                        _ => return Err(PeerSendError::Lost),
-                    },
+                    }
                     Err(WireError::Limit) => return Err(PeerSendError::Busy),
                     Err(WireError::Access(error)) => return Err(PeerSendError::Rejected(error)),
-                    Err(_) => (),
-                }
-                remote.close();
-                if let Ok(mut cached) = slot.connection.lock()
-                    && cached
-                        .as_ref()
-                        .is_some_and(|entry| entry.generation == generation)
-                {
-                    *cached = None;
+                    Err(error) => error,
+                };
+                // The exchange failed on the wire. The connection is closed
+                // for it when the connection is what failed: it is closed
+                // already, the peer did not speak the protocol on it, or it
+                // answered nothing at all — this exchange or any other —
+                // from the time this one was sent. An exchange that timed
+                // out or lost its stream while the peer answered others on
+                // the same connection failed alone, and takes nothing with
+                // it.
+                let answered = slot.answered.load(Ordering::Acquire) != before;
+                if connection_failed(remote.closed(), &failure, answered) {
+                    remote.close();
+                    if let Ok(mut cached) = slot.connection.lock()
+                        && cached
+                            .as_ref()
+                            .is_some_and(|entry| entry.generation == generation)
+                    {
+                        *cached = None;
+                    }
                 }
                 if attempt.saturating_add(1) < self.limits.attempts {
                     tokio::time::sleep(spread(self.limits.retry_backoff, entropy())).await;
@@ -969,6 +1028,7 @@ impl PeerConnectionPool {
             connection: Mutex::new(None),
             dial: Mutex::new(None),
             generation: AtomicU64::new(0),
+            answered: AtomicU64::new(0),
             unreachable_until: Mutex::new(None),
             _reservation: reservation,
         });
